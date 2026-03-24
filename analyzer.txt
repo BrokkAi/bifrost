@@ -1,0 +1,2339 @@
+package ai.brokk.analyzer;
+
+public interface CapabilityProvider {
+}
+
+public class JavascriptAnalyzer extends JsTsAnalyzer {
+  private static final LanguageSyntaxProfile JS_SYNTAX_PROFILE;
+  public JavascriptAnalyzer(IProject project)
+  public JavascriptAnalyzer(IProject project, ProgressListener listener)
+  private JavascriptAnalyzer(
+              IProject project, AnalyzerState state, ProgressListener listener, @Nullable AnalyzerCache cache)
+  public static JavascriptAnalyzer fromState(IProject project, AnalyzerState state, ProgressListener listener)
+  @Override protected JavascriptAnalyzer newSnapshot(
+              AnalyzerState state, ProgressListener listener, @Nullable AnalyzerCache previousCache)
+  @Override public Optional<String> extractCallReceiver(String reference)
+  @Override protected TSLanguage createTSLanguage()
+  @Override protected Optional<String> getQueryResource(QueryType type)
+  @Override protected @Nullable CodeUnit createCodeUnit(
+              ProjectFile file,
+              String captureName,
+              String simpleName,
+              String packageName,
+              String classChain,
+              List<ScopeSegment> scopeChain,
+              @Nullable TSNode definitionNode,
+              SkeletonType skeletonType)
+  @Override protected Set<String> getIgnoredCaptures()
+  @Override protected String bodyPlaceholder()
+  @Override protected ResolvedNodes resolveSignatureNodes(
+              TSNode definitionNode, String simpleName, SkeletonType refined, SourceContent sourceContent)
+  @Override protected boolean shouldMergeSignaturesForSameFqn()
+  @Override protected String renderFunctionDeclaration(
+              TSNode funcNode,
+              SourceContent sourceContent,
+              String exportPrefix,
+              String asyncPrefix,
+              String functionName,
+              String typeParamsText,
+              String paramsText,
+              String returnTypeText,
+              String indent)
+  private boolean isJsxNode(TSNode node)
+  private boolean returnsJsxElement(TSNode funcNode, SourceContent sourceContent)
+  @Override protected List<String> getExtraFunctionComments(
+              TSNode bodyNode, SourceContent sourceContent, @Nullable CodeUnit functionCu)
+  @Override protected String getVisibilityPrefix(TSNode node, SourceContent sourceContent)
+  @Override protected String renderClassHeader(
+              TSNode classNode,
+              SourceContent sourceContent,
+              String exportPrefix,
+              String signatureText,
+              String baseIndent)
+  @Override protected String getLanguageSpecificCloser(CodeUnit cu)
+  @Override protected String determinePackageName(
+              ProjectFile file, TSNode definitionNode, TSNode rootNode, SourceContent sourceContent)
+  private boolean isLiteralType(String type)
+  @Override protected String formatFieldSignature(
+              TSNode fieldNode,
+              SourceContent sourceContent,
+              String exportPrefix,
+              String signatureText,
+              String simpleName,
+              String baseIndent,
+              ProjectFile file)
+  @Override protected LanguageSyntaxProfile getLanguageSyntaxProfile()
+  @Override protected void extractImports(
+              Map<String, TSNode> capturedNodesForMatch, SourceContent sourceContent, List<ImportInfo> localImportInfos)
+  private void extractNamedImportIdentifiers(
+              TSNode importNode, SourceContent sourceContent, List<String> identifiers, List<String> aliases)
+  @Override public Set<String> extractIdentifiersFromImport(String importStatement)
+  @Override public Set<String> extractTypeIdentifiers(String source)
+}
+
+public class ScalaAnalyzer extends TreeSitterAnalyzer implements JvmBasedAnalyzer {
+  public ScalaAnalyzer(IProject project)
+  public ScalaAnalyzer(IProject project, ProgressListener listener)
+  private ScalaAnalyzer(
+              IProject project, AnalyzerState state, ProgressListener listener, @Nullable AnalyzerCache cache)
+  public static ScalaAnalyzer fromState(IProject project, AnalyzerState state, ProgressListener listener)
+  @Override protected IAnalyzer newSnapshot(
+              AnalyzerState state, ProgressListener listener, @Nullable AnalyzerCache previousCache)
+  @Override protected TSLanguage createTSLanguage()
+  @Override protected Optional<String> getQueryResource(QueryType type)
+  @Override protected LanguageSyntaxProfile getLanguageSyntaxProfile()
+  @Override protected @Nullable CodeUnit createCodeUnit(
+              ProjectFile file,
+              String captureName,
+              String simpleName,
+              String packageName,
+              String classChain,
+              List<ScopeSegment> scopeChain,
+              @Nullable TSNode definitionNode,
+              SkeletonType skeletonType)
+  @Override protected String determineClassName(String nodeType, String shortName)
+  @Override protected String determinePackageName(
+              ProjectFile file, TSNode definitionNode, TSNode rootNode, SourceContent sourceContent)
+  @Override protected String getLanguageSpecificCloser(CodeUnit cu)
+  @Override protected boolean requiresSemicolons()
+  @Override protected String renderClassHeader(
+              TSNode classNode,
+              SourceContent sourceContent,
+              String exportPrefix,
+              String signatureText,
+              String baseIndent)
+  @Override protected String bodyPlaceholder()
+  @Override protected String renderFunctionDeclaration(
+              TSNode funcNode,
+              SourceContent sourceContent,
+              String exportAndModifierPrefix,
+              String asyncPrefix,
+              String functionName,
+              String typeParamsText,
+              String paramsText,
+              String returnTypeText,
+              String indent)
+  private static final LanguageSyntaxProfile SCALA_SYNTAX_PROFILE;
+  @Override public Optional<String> extractCallReceiver(String reference)
+  @Override protected boolean isConstructor(CodeUnit candidate, @Nullable CodeUnit enclosingClass, String captureName)
+  @Override protected String formatFieldSignature(
+              TSNode fieldNode,
+              SourceContent sourceContent,
+              String exportPrefix,
+              String signatureText,
+              String simpleName,
+              String baseIndent,
+              ProjectFile file)
+  private boolean isLiteral(TSNode node)
+  private static final Set<String> TEST_ANNOTATIONS;
+  private static final Set<String> TEST_INFIX_KEYWORDS;
+  @Override protected boolean containsTestMarkers(TSTree tree, SourceContent sourceContent)
+}
+
+public final class CSharpAnalyzer extends TreeSitterAnalyzer {
+  static final Logger log;
+  private static final LanguageSyntaxProfile CS_SYNTAX_PROFILE;
+  public CSharpAnalyzer(IProject project)
+  public CSharpAnalyzer(IProject project, ProgressListener listener)
+  private CSharpAnalyzer(
+              IProject project, AnalyzerState prebuiltState, ProgressListener listener, @Nullable AnalyzerCache cache)
+  public static CSharpAnalyzer fromState(IProject project, AnalyzerState state, ProgressListener listener)
+  @Override protected IAnalyzer newSnapshot(
+              AnalyzerState state, ProgressListener listener, @Nullable AnalyzerCache previousCache)
+  @Override protected TSLanguage createTSLanguage()
+  @Override protected Optional<String> getQueryResource(QueryType type)
+  @Override protected @Nullable CodeUnit createCodeUnit(
+              ProjectFile file,
+              String captureName,
+              String simpleName,
+              String packageName,
+              String classChain,
+              List<ScopeSegment> scopeChain,
+              @Nullable TSNode definitionNode,
+              SkeletonType skeletonType)
+  @Override protected Set<String> getIgnoredCaptures()
+  @Override protected String bodyPlaceholder()
+  @Override protected String renderFunctionDeclaration(
+              TSNode funcNode,
+              SourceContent sourceContent,
+              String exportPrefix,
+              String asyncPrefix,
+              String functionName,
+              String typeParamsText,
+              String paramsText,
+              String returnTypeText,
+              String indent)
+  @Override protected String renderClassHeader(
+              TSNode classNode,
+              SourceContent sourceContent,
+              String exportPrefix,
+              String signatureText,
+              String baseIndent)
+  @Override protected String getLanguageSpecificCloser(CodeUnit cu)
+  @Override protected String determinePackageName(
+              ProjectFile file, TSNode definitionNode, TSNode rootNode, SourceContent sourceContent)
+  @Override protected LanguageSyntaxProfile getLanguageSyntaxProfile()
+  @Override protected String formatFieldSignature(
+              TSNode fieldNode,
+              SourceContent sourceContent,
+              String exportPrefix,
+              String signatureText,
+              String simpleName,
+              String baseIndent,
+              ProjectFile file)
+  private boolean isLiteralType(@Nullable String type)
+  private @Nullable TSNode findLiteralNode(TSNode node)
+  @Override public Optional<String> extractCallReceiver(String reference)
+  @Override protected boolean isConstructor(CodeUnit candidate, @Nullable CodeUnit enclosingClass, String captureName)
+  @Override protected @Nullable CodeUnit createImplicitConstructor(CodeUnit enclosingClass, String classCaptureName)
+  @Override public Set<CodeUnit> testFilesToCodeUnits(Collection<ProjectFile> files)
+  @Override protected boolean containsTestMarkers(TSTree tree, SourceContent sourceContent)
+}
+
+public final class DependencyCopyUtil {
+  private static final Logger logger;
+  private DependencyCopyUtil()
+  public record PyMeta(String name, String version) {
+    String name;
+    String version;
+  }
+  public static final List<String> PY_DOC_PREFIXES;
+  public static @Nullable PyMeta readPyMetadata(Path distInfoDir)
+  public static boolean pyIsAllowedFile(String fileNameLower)
+  public static List<Path> enumerateInstalledFiles(Path sitePackages, Path distInfoDir, String distName)
+  public static void copyPythonFiles(Path sitePackages, List<Path> rels, Path dest)
+  public static void copyRustCrate(Path source, Path destination)
+  public static void copyNodePackage(Path source, Path destination)
+  public static String toSafeFolderName(String name, String version)
+}
+
+public abstract class TreeSitterAnalyzer implements IAnalyzer, TypeAliasProvider, TestDetectionProvider {
+  protected static final Logger log;
+  private volatile boolean isStale = false;
+  private final AtomicBoolean staleWarningLogged;
+  private void checkStale(String methodName)
+  private static final int IO_VT_CAP;
+  private static final Semaphore IO_FD_SEMAPHORE;
+  private static final int MAX_IO_READ_RETRIES = 6;
+  private final ProgressListener progressListener;
+  private final AnalyzerCache cache;
+  private final Comparator<CodeUnit> DEFINITION_COMPARATOR;
+  private final ThreadLocal<TSLanguage> threadLocalLanguage;
+  private final ThreadLocal<TSParser> threadLocalParser;
+  public enum QueryType {
+    DEFINITIONS,
+    IMPORTS,
+    IDENTIFIERS
+  }
+  private final Map<QueryType, String> querySources;
+  private final ThreadLocal<Map<QueryType, TSQuery>> threadLocalQueries;
+  private final AtomicInteger queryCompilationCount;
+  protected int getQueryCompilationCount()
+  protected final void withCachedQuery(QueryType type, Consumer<TSQuery> fn)
+  protected final <T> T withCachedQuery(QueryType type, Function<TSQuery, T> fn, T defaultValue)
+  protected @Nullable TSQuery createQuery(QueryType type)
+  protected boolean hasQuery(QueryType type)
+  private final AnalyzerState state;
+  private final @Nullable StageTiming stageTiming;
+  public record FileProperties(
+              SequencedSet<CodeUnit> topLevelCodeUnits,
+              List<ImportInfo> importStatements,
+              boolean containsTests,
+              List<CodeUnit> topLevelList) {
+    SequencedSet<CodeUnit> topLevelCodeUnits;
+    List<ImportInfo> importStatements;
+    boolean containsTests;
+    List<CodeUnit> topLevelList;
+    public FileProperties(
+                    SequencedSet<CodeUnit> topLevelCodeUnits, List<ImportInfo> importStatements, boolean containsTests)
+    public static FileProperties empty()
+  }
+  public record CodeUnitProperties(
+              SequencedSet<CodeUnit> children,
+              SequencedSet<String> signatures,
+              SequencedSet<Range> ranges,
+              boolean hasBody,
+              boolean isTypeAlias,
+              List<CodeUnit> childrenList,
+              List<String> signaturesList,
+              List<Range> rangesList) {
+    SequencedSet<CodeUnit> children;
+    SequencedSet<String> signatures;
+    SequencedSet<Range> ranges;
+    boolean hasBody;
+    boolean isTypeAlias;
+    List<CodeUnit> childrenList;
+    List<String> signaturesList;
+    List<Range> rangesList;
+    public CodeUnitProperties(
+                    SequencedSet<CodeUnit> children,
+                    SequencedSet<String> signatures,
+                    SequencedSet<Range> ranges,
+                    boolean hasBody,
+                    boolean isTypeAlias)
+    public static CodeUnitProperties empty()
+  }
+  record SymbolKeyIndex(NavigableSet<String> keys) {
+    NavigableSet<String> keys;
+    Iterable<String> tailFrom(String fromInclusive)
+    Iterable<String> all()
+    int size()
+  }
+  public record AnalyzerState(
+              PMap<String, Set<CodeUnit>> symbolIndex,
+              PMap<CodeUnit, CodeUnitProperties> codeUnitState,
+              PMap<ProjectFile, FileProperties> fileState,
+              SymbolKeyIndex symbolKeyIndex,
+              long snapshotEpochNanos) {
+    PMap<String, Set<CodeUnit>> symbolIndex;
+    PMap<CodeUnit, CodeUnitProperties> codeUnitState;
+    PMap<ProjectFile, FileProperties> fileState;
+    SymbolKeyIndex symbolKeyIndex;
+    long snapshotEpochNanos;
+  }
+  private final AtomicLong lastUpdateEpochNanos;
+  private static final long MTIME_EPSILON_NANOS;
+  private final IProject project;
+  private final Language language;
+  protected record DefinitionInfoRecord(
+              String primaryCaptureName,
+              String simpleName,
+              List<String> modifierKeywords,
+              List<TSNode> decoratorNodes,
+              TSNode cachedParent) {
+    String primaryCaptureName;
+    String simpleName;
+    List<String> modifierKeywords;
+    List<TSNode> decoratorNodes;
+    TSNode cachedParent;
+  }
+  protected record LanguageSyntaxProfile(
+              Set<String> classLikeNodeTypes,
+              Set<String> functionLikeNodeTypes,
+              Set<String> fieldLikeNodeTypes,
+              Set<String> constructorNodeTypes,
+              Set<String> decoratorNodeTypes,
+              String importNodeType,
+              String identifierFieldName,
+              String bodyFieldName,
+              String parametersFieldName,
+              String returnTypeFieldName,
+              String typeParametersFieldName, // For generics on type aliases, classes, functions etc.
+              Map<String, SkeletonType> captureConfiguration,
+              String asyncKeywordNodeType,
+              Set<String> modifierNodeTypes) {
+    Set<String> classLikeNodeTypes;
+    Set<String> functionLikeNodeTypes;
+    Set<String> fieldLikeNodeTypes;
+    Set<String> constructorNodeTypes;
+    Set<String> decoratorNodeTypes;
+    String importNodeType;
+    String identifierFieldName;
+    String bodyFieldName;
+    String parametersFieldName;
+    String returnTypeFieldName;
+    String typeParametersFieldName;
+    Map<String, SkeletonType> captureConfiguration;
+    String asyncKeywordNodeType;
+    Set<String> modifierNodeTypes;
+  }
+  private record FileAnalysisResult(
+              List<CodeUnit> topLevelCUs,
+              Map<CodeUnit, CodeUnitProperties> codeUnitState,
+              Map<String, Set<CodeUnit>> codeUnitsBySymbol,
+              List<ImportInfo> importStatements,
+              boolean containsTests) {
+    List<CodeUnit> topLevelCUs;
+    Map<CodeUnit, CodeUnitProperties> codeUnitState;
+    Map<String, Set<CodeUnit>> codeUnitsBySymbol;
+    List<ImportInfo> importStatements;
+    boolean containsTests;
+  }
+  public record StageTiming(
+              long readNanos,
+              long parseNanos,
+              long processNanos,
+              long mergeNanos,
+              long readStartNanos,
+              long readEndNanos,
+              long parseStartNanos,
+              long parseEndNanos,
+              long processStartNanos,
+              long processEndNanos,
+              long mergeStartNanos,
+              long mergeEndNanos) {
+    long readNanos;
+    long parseNanos;
+    long processNanos;
+    long mergeNanos;
+    long readStartNanos;
+    long readEndNanos;
+    long parseStartNanos;
+    long parseEndNanos;
+    long processStartNanos;
+    long processEndNanos;
+    long mergeStartNanos;
+    long mergeEndNanos;
+  }
+  private record ConstructionTiming(
+              AtomicLong readStageNanos,
+              AtomicLong parseStageNanos,
+              AtomicLong processStageNanos,
+              AtomicLong mergeStageNanos,
+              AtomicLong readStageFirstStartNanos,
+              AtomicLong readStageLastEndNanos,
+              AtomicLong parseStageFirstStartNanos,
+              AtomicLong parseStageLastEndNanos,
+              AtomicLong processStageFirstStartNanos,
+              AtomicLong processStageLastEndNanos,
+              AtomicLong mergeStageFirstStartNanos,
+              AtomicLong mergeStageLastEndNanos) {
+    AtomicLong readStageNanos;
+    AtomicLong parseStageNanos;
+    AtomicLong processStageNanos;
+    AtomicLong mergeStageNanos;
+    AtomicLong readStageFirstStartNanos;
+    AtomicLong readStageLastEndNanos;
+    AtomicLong parseStageFirstStartNanos;
+    AtomicLong parseStageLastEndNanos;
+    AtomicLong processStageFirstStartNanos;
+    AtomicLong processStageLastEndNanos;
+    AtomicLong mergeStageFirstStartNanos;
+    AtomicLong mergeStageLastEndNanos;
+    static ConstructionTiming create()
+  }
+  private class DebouncedProgressReporter {
+    private final int total;
+    private final String phase;
+    private final long debounceMs;
+    private final AtomicInteger completed;
+    private volatile long lastReportTimeMs = 0;
+    DebouncedProgressReporter(int total, String phase, long debounceMs)
+    void increment()
+    void reportFinal()
+  }
+  private void notifyProgressListener(int completed, int total, String phase)
+  protected TreeSitterAnalyzer(IProject project, Language language)
+  protected TreeSitterAnalyzer(IProject project, Language language, ProgressListener listener)
+  protected TreeSitterAnalyzer(IProject project, Language language, ProgressListener listener, AnalyzerCache cache)
+  protected TreeSitterAnalyzer(IProject project, Language language, AnalyzerState prebuiltState)
+  protected final ProgressListener getProgressListener()
+  protected final AnalyzerCache getCache()
+  protected TreeSitterAnalyzer(
+              IProject project, Language language, AnalyzerState prebuiltState, ProgressListener listener)
+  protected TreeSitterAnalyzer(
+              IProject project,
+              Language language,
+              AnalyzerState prebuiltState,
+              ProgressListener listener,
+              @Nullable AnalyzerCache prebuiltCache)
+  protected <R> R withCodeUnitProperties(Function<Map<CodeUnit, CodeUnitProperties>, R> function)
+  public <R> R withFileProperties(Function<Map<ProjectFile, FileProperties>, R> function)
+  private CodeUnitProperties codeUnitProperties(CodeUnit codeUnit)
+  protected List<CodeUnit> childrenOf(CodeUnit codeUnit)
+  protected List<String> signaturesOf(CodeUnit codeUnit)
+  @Override public List<Range> rangesOf(CodeUnit codeUnit)
+  protected List<CodeUnit> supertypesOf(CodeUnit codeUnit)
+  private FileProperties fileProperties(ProjectFile file)
+  public @Nullable StageTiming getStageTiming()
+  public AnalyzerState snapshotState()
+  @Override public List<CodeUnit> getTopLevelDeclarations(ProjectFile file)
+  @Override public Set<ProjectFile> getAnalyzedFiles()
+  @Override public boolean containsTests(ProjectFile file)
+  @Override public List<String> importStatementsOf(ProjectFile file)
+  public List<ImportInfo> importInfoOf(ProjectFile file)
+  public Set<String> relevantImportsFor(CodeUnit cu)
+  protected String extractPackageFromWildcard(String rawSnippet)
+  public Set<String> extractTypeIdentifiers(String source)
+  protected Set<CodeUnit> performImportedCodeUnitsOf(ProjectFile file)
+  protected Set<ProjectFile> performReferencingFilesOf(ProjectFile file)
+  protected Set<String> typeIdentifiersOf(ProjectFile file)
+  protected <R> R withSource(
+              ProjectFile file, Function<SourceContent, R> fn, R defaultValue, byte @Nullable [] seedBytes)
+  protected <R> R withSource(ProjectFile file, Function<SourceContent, R> fn, R defaultValue)
+  protected <R> R withTreeOf(ProjectFile file, Function<TSTree, R> fn, R defaultValue)
+  @Override public Set<Language> languages()
+  @Override public Optional<String> getSkeletonHeader(CodeUnit cu)
+  @Override public SequencedSet<CodeUnit> getDefinitions(String fqName)
+  @Override public Comparator<CodeUnit> priorityComparator()
+  private Set<CodeUnit> lookupCandidatesByFqName(String baseName)
+  @Override public List<CodeUnit> getAllDeclarations()
+  @Override public Set<CodeUnit> searchDefinitions(String pattern, boolean autoQuote)
+  @Override public Set<CodeUnit> searchDefinitions(Pattern compiledPattern)
+  private Set<CodeUnit> searchDefinitionsInternal(Pattern compiledPattern, @Nullable String substringFilter)
+  @Override public Set<CodeUnit> autocompleteDefinitions(String query)
+  public Map<ProjectFile, List<CodeUnit>> getTopLevelDeclarations()
+  @Override public Map<CodeUnit, String> getSkeletons(ProjectFile file)
+  @Override public Set<CodeUnit> getDeclarations(ProjectFile file)
+  private String reconstructFullSkeleton(CodeUnit cu, boolean headerOnly)
+  private void reconstructSkeletonRecursive(CodeUnit cu, String indent, boolean headerOnly, StringBuilder sb)
+  @Override public Optional<String> getSkeleton(CodeUnit cu)
+  private static boolean containsAnyHierarchySeparator(String s)
+  protected String normalizeFullName(String fqName)
+  protected Comparator<CodeUnit> prioritizingComparator()
+  private int firstStartByteForSelection(CodeUnit cu)
+  @Override public Optional<String> getSource(CodeUnit codeUnit, boolean includeComments)
+  @Override public Set<String> getSources(CodeUnit codeUnit, boolean includeComments)
+  private Optional<String> getSourceForClass(CodeUnit cu, boolean includeComments)
+  private Set<String> getSourcesForFunction(CodeUnit cu, boolean includeComments)
+  @Override public boolean isTypeAlias(CodeUnit cu)
+  public int getStartLineForCodeUnit(CodeUnit codeUnit)
+  protected abstract TSLanguage createTSLanguage()
+  protected TSLanguage getTSLanguage()
+  protected TSParser getTSParser()
+  protected abstract LanguageSyntaxProfile getLanguageSyntaxProfile()
+  protected abstract Optional<String> getQueryResource(QueryType type)
+  public enum SkeletonType {
+    CLASS_LIKE,
+    FUNCTION_LIKE,
+    FIELD_LIKE,
+    ALIAS_LIKE,
+    DECORATOR,
+    MODULE_STATEMENT,
+    UNSUPPORTED
+  }
+  public enum ScopeType {
+    CLASS,
+    FUNCTION,
+    UNKNOWN
+  }
+  public record ScopeSegment(String name, ScopeType scopeType) {
+    String name;
+    ScopeType scopeType;
+    public boolean isFunctionScope()
+    public boolean isClassScope()
+  }
+  protected SkeletonType getSkeletonTypeForCapture(String captureName)
+  protected SkeletonType refineSkeletonType(
+              String captureName, TSNode definitionNode, LanguageSyntaxProfile profile)
+  protected TSNode adjustSourceRangeNode(TSNode definitionNode, String captureName)
+  @Nullable protected abstract CodeUnit createCodeUnit(
+              ProjectFile file,
+              String captureName,
+              String simpleName,
+              String packageName,
+              String classChain,
+              List<ScopeSegment> scopeChain,
+              @Nullable TSNode definitionNode,
+              SkeletonType skeletonType)
+  protected String enhanceFqName(
+              String fqName, String captureName, TSNode definitionNode, SourceContent sourceContent)
+  protected @Nullable String extractSignature(
+              String captureName, TSNode definitionNode, SourceContent sourceContent)
+  protected abstract String determinePackageName(
+              ProjectFile file, TSNode definitionNode, TSNode rootNode, SourceContent sourceContent)
+  protected boolean isClassLike(TSNode node)
+  protected boolean containsTestMarkers(TSTree tree)
+  protected boolean containsTestMarkers(TSTree tree, SourceContent sourceContent)
+  protected String buildParentFqName(CodeUnit cu, String classChain, List<ScopeSegment> scopeChain)
+  protected String buildParentFqName(CodeUnit cu, String classChain)
+  protected Set<String> getIgnoredCaptures()
+  protected String getLanguageSpecificIndent()
+  protected boolean shouldSkipNode(TSNode node, String captureName, SourceContent sourceContent)
+  protected boolean shouldReplaceOnDuplicate(CodeUnit existing, CodeUnit candidate)
+  protected boolean hasWrappingDecoratorNode()
+  protected TSNode extractContentFromDecoratedNode(
+              TSNode decoratedNode,
+              List<String> outDecoratorLines,
+              SourceContent sourceContent,
+              LanguageSyntaxProfile profile)
+  protected boolean shouldUnwrapExportStatements()
+  protected record ResolvedNodes(TSNode signatureNode, TSNode contentNode) {
+    TSNode signatureNode;
+    TSNode contentNode;
+  }
+  protected ResolvedNodes resolveSignatureNodes(
+              TSNode definitionNode, String simpleName, SkeletonType refined, SourceContent sourceContent)
+  protected boolean shouldMergeSignaturesForSameFqn()
+  protected Optional<String> extractReceiverType(
+              TSNode node, String primaryCaptureName, SourceContent sourceContent)
+  protected boolean shouldIgnoreDuplicate(CodeUnit existing, CodeUnit candidate, ProjectFile file)
+  protected boolean isBenignDuplicate(CodeUnit existing, CodeUnit candidate)
+  private void addTopLevelCodeUnit(CodeUnit cu, FileAnalysisAccumulator acc, ProjectFile file)
+  private void mergeCodeUnitProperties(CodeUnit target, CodeUnit source, FileAnalysisAccumulator acc)
+  private void addChildCodeUnit(CodeUnit cu, CodeUnit parentCu, FileAnalysisAccumulator acc)
+  protected Optional<TSNode> findDeclarator(
+              TSNode parent, String simpleName, SourceContent sourceContent, String declaratorType, String nameField)
+  protected String getPrefixText(
+              TSNode parent, TSNode target, SourceContent sourceContent, Set<String> acceptedNodeTypes)
+  protected abstract String getLanguageSpecificCloser(CodeUnit cu)
+  @Override public IProject getProject()
+  private FileAnalysisResult analyzeFileContent(
+              ProjectFile file, byte[] fileBytes, @Nullable TreeSitterAnalyzer.ConstructionTiming timing)
+  private List<Map.Entry<TSNode, DefinitionInfoRecord>> collectDefinitions(
+              TSNode rootNode, SourceContent sourceContent, List<ImportInfo> localImportInfos, ProjectFile file)
+  private Optional<String> resolveSimpleName(
+              String captureName,
+              TSNode definitionNode,
+              Map<String, TSNode> matchCaptures,
+              SourceContent sourceContent,
+              ProjectFile file)
+  protected List<ScopeSegment> buildScopeChain(TSNode node, TSNode rootNode, SourceContent sourceContent)
+  protected String buildClassChain(TSNode node, TSNode rootNode, SourceContent sourceContent)
+  protected boolean computeHasBody(TSNode nodeForBody, String captureName, SourceContent sourceContent)
+  protected boolean shouldAttachToParent(
+              CodeUnit cu, TSNode node, String captureName, String classChain, List<ScopeSegment> scopeChain)
+  protected @Nullable CodeUnit findParentForCodeUnit(
+              CodeUnit cu,
+              TSNode node,
+              String captureName,
+              String classChain,
+              List<ScopeSegment> scopeChain,
+              FileAnalysisAccumulator acc,
+              SourceContent sourceContent)
+  private void wrapModulesFromImports(
+              ProjectFile file,
+              List<String> localImportStatements,
+              TSNode rootNode,
+              SourceContent sourceContent,
+              FileAnalysisAccumulator acc)
+  protected String determineClassName(String captureName, String shortName)
+  protected String determineClassChainSegmentName(String nodeType, String shortName)
+  protected List<String> getRawSupertypesLazily(CodeUnit cu)
+  protected List<String> extractRawSupertypesForClassLike(
+              CodeUnit cu, TSNode classNode, String signature, SourceContent sourceContent)
+  protected FileAnalysisAccumulator createModulesFromImports(
+              ProjectFile file,
+              List<String> localImportStatements,
+              TSNode rootNode,
+              String modulePackageName,
+              FileAnalysisAccumulator acc)
+  protected abstract String renderClassHeader(
+              TSNode classNode,
+              SourceContent sourceContent,
+              String exportPrefix,
+              String signatureText,
+              String baseIndent)
+  protected String formatParameterList(TSNode parametersNode, SourceContent sourceContent)
+  protected String formatReturnType(@Nullable TSNode returnTypeNode, SourceContent sourceContent)
+  protected String formatHeritage(String signatureText)
+  protected String assembleFunctionSignature(
+              TSNode funcNode,
+              SourceContent sourceContent,
+              String exportPrefix,
+              String asyncPrefix,
+              String functionName,
+              String typeParamsText,
+              String paramsText,
+              String returnTypeText,
+              String indent)
+  protected String assembleClassSignature(
+              TSNode classNode,
+              SourceContent sourceContent,
+              String exportPrefix,
+              String classSignatureText,
+              String baseIndent)
+  protected String formatFieldSignature(
+              TSNode fieldNode,
+              SourceContent sourceContent,
+              String exportPrefix,
+              String signatureText,
+              String simpleName,
+              String baseIndent,
+              ProjectFile file)
+  protected boolean requiresSemicolons()
+  protected String getVisibilityPrefix(TSNode node, SourceContent sourceContent)
+  private String buildSignatureString(
+              TSNode definitionNode,
+              String simpleName,
+              SourceContent sourceContent,
+              String primaryCaptureName,
+              List<String> capturedModifierKeywords,
+              ProjectFile file)
+  protected void buildFunctionSkeleton(
+              TSNode funcNode,
+              Optional<String> providedNameOpt,
+              SourceContent sourceContent,
+              String indent,
+              List<String> lines,
+              String exportPrefix)
+  protected List<String> getExtraFunctionComments(
+              TSNode bodyNode, SourceContent sourceContent, @Nullable CodeUnit functionCu)
+  protected abstract String bodyPlaceholder()
+  protected String renderAliasSignature(
+              TSNode node,
+              SourceContent sourceContent,
+              String exportPrefix,
+              String simpleName,
+              LanguageSyntaxProfile profile,
+              ProjectFile file)
+  protected abstract String renderFunctionDeclaration(
+              TSNode funcNode,
+              SourceContent sourceContent,
+              String exportAndModifierPrefix,
+              String asyncPrefix, // Kept for signature compatibility, but ignored
+              String functionName,
+              String typeParamsText,
+              String paramsText,
+              String returnTypeText,
+              String indent)
+  private List<TSNode> getPrecedingDecorators(TSNode decoratedNode)
+  private static String formatSecondsMillis(long nanos)
+  private static long wallDuration(AtomicLong firstStart, AtomicLong lastEnd)
+  protected Optional<String> extractSimpleName(TSNode decl, SourceContent sourceContent)
+  protected Optional<String> findEnclosingFunctionName(TSNode node, SourceContent sourceContent)
+  private static String loadResource(String path)
+  @Override public List<CodeUnit> getDirectChildren(CodeUnit cu)
+  protected List<CodeUnit> performGetDirectAncestors(CodeUnit cu)
+  protected Set<CodeUnit> performGetDirectDescendants(CodeUnit cu)
+  private boolean isRelevantFile(ProjectFile file)
+  private Set<ProjectFile> filterRelevantFiles(Set<ProjectFile> files)
+  private byte[] readFileBytes(ProjectFile pf, @Nullable ConstructionTiming timing)
+  private static boolean isTooManyOpenFiles(IOException e)
+  private static long computeBackoffMillis(int attempt)
+  private static void sleepQuietly(long ms)
+  private void mergeAnalysisResultIntoMaps(
+              ProjectFile pf,
+              FileAnalysisResult analysisResult,
+              @Nullable ConstructionTiming timing,
+              Map<String, Set<CodeUnit>> targetSymbolIndex,
+              Map<CodeUnit, CodeUnitProperties> targetCodeUnitState,
+              Map<ProjectFile, FileProperties> targetFileState,
+              Cache<String, CodeUnit> moduleKeyCache)
+  protected final IAnalyzer newSnapshot(AnalyzerState state)
+  protected final IAnalyzer newSnapshot(AnalyzerState state, ProgressListener listener)
+  protected abstract IAnalyzer newSnapshot(
+              AnalyzerState state, ProgressListener listener, @Nullable AnalyzerCache previousCache)
+  protected AnalyzerCache createFilteredCache(AnalyzerCache previous, Set<ProjectFile> changedFiles)
+  @Override public IAnalyzer update(Set<ProjectFile> changedFiles)
+  @Override public IAnalyzer update()
+  protected List<CodeUnit> computeSupertypes(CodeUnit cu)
+  protected void extractImports(
+              Map<String, TSNode> capturedNodesForMatch, SourceContent sourceContent, List<ImportInfo> localImportInfos)
+  protected Set<CodeUnit> resolveImports(ProjectFile file, List<String> importStatements)
+  public boolean couldImportFile(ProjectFile sourceFile, List<ImportInfo> imports, ProjectFile target)
+  public boolean couldImportFile(List<ImportInfo> imports, ProjectFile target)
+  protected boolean isCommentNode(TSNode node)
+  protected boolean isLeadingMetadataNode(TSNode node)
+  protected Set<String> getLeadingMetadataNodeTypes()
+  protected List<TSNode> findPrecedingComments(TSNode declarationNode)
+  protected boolean isWhitespaceOnlyNode(TSNode node)
+  private boolean isOnlyWhitespace(byte[] bytes, int start, int end)
+  private int findLineStartByte(int byteOffset, SourceContent sourceContent)
+  protected Range expandRangeWithComments(TSNode declarationNode, SourceContent sourceContent)
+  protected boolean isAnonymousStructure(String fqName)
+  private static final class CUWithDepth {
+    final CodeUnit cu;
+    final int depth;
+    CUWithDepth(CodeUnit cu, int depth)
+  }
+  @Override public Optional<CodeUnit> enclosingCodeUnit(ProjectFile file, Range range)
+  private @Nullable CUWithDepth findDeepestEnclosing(CodeUnit current, Range range, int depth)
+  @Override public Optional<CodeUnit> enclosingCodeUnit(ProjectFile file, int startLine, int endLine)
+  private @Nullable CUWithDepth findDeepestEnclosingByLine(CodeUnit current, int startLine, int endLine, int depth)
+  protected boolean isBlankNameAllowed(String captureName, String simpleName, String nodeType, String file)
+  protected boolean isNullNameAllowed(String identifierFieldName, String nodeType, int lineNumber, String file)
+  protected boolean isMissingNameCaptureAllowed(String captureName, String nodeType, String fileName)
+  protected boolean isNullNameExpectedForExtraction(String nodeType)
+  protected boolean isConstructor(CodeUnit candidate, @Nullable CodeUnit enclosingClass, String captureName)
+  protected @Nullable CodeUnit createImplicitConstructor(CodeUnit enclosingClass, String classCaptureName)
+  public Set<String> performIdentifierExtraction(@Nullable TSNode root, String source)
+}
+
+public class MultiAnalyzer
+        implements IAnalyzer, TypeAliasProvider, ImportAnalysisProvider, TypeHierarchyProvider, TestDetectionProvider {
+  private static final Logger log;
+  private static final Set<Class<? extends CapabilityProvider>> SUPPORTED_CAPABILITIES;
+  private final Map<Language, IAnalyzer> delegates;
+  public MultiAnalyzer(Map<Language, IAnalyzer> delegates)
+  private <R> Optional<R> findFirst(Function<IAnalyzer, Optional<R>> extractor)
+  private Optional<IAnalyzer> delegateFor(CodeUnit cu)
+  private Optional<IAnalyzer> delegateFor(ProjectFile file)
+  @Override public boolean isEmpty()
+  @Override public Set<Language> languages()
+  @Override public <T extends CapabilityProvider> Optional<T> as(Class<T> capability)
+  @Override public List<String> importStatementsOf(ProjectFile file)
+  @Override public Set<CodeUnit> importedCodeUnitsOf(ProjectFile file)
+  @Override public Set<ProjectFile> referencingFilesOf(ProjectFile file)
+  @Override public List<ImportInfo> importInfoOf(ProjectFile file)
+  @Override public Set<String> relevantImportsFor(CodeUnit cu)
+  @Override public Optional<CodeUnit> enclosingCodeUnit(ProjectFile file, Range range)
+  @Override public Optional<CodeUnit> enclosingCodeUnit(ProjectFile file, int startLine, int endLine)
+  @Override public boolean isAccessExpression(ProjectFile file, int startByte, int endByte)
+  @Override public Optional<DeclarationInfo> findNearestDeclaration(
+              ProjectFile file, int startByte, int endByte, String identifierName)
+  @Override public IProject getProject()
+  @Override public Optional<String> getSkeleton(CodeUnit cu)
+  @Override public Optional<String> getSkeletonHeader(CodeUnit classUnit)
+  @Override public List<CodeUnit> getTopLevelDeclarations(ProjectFile file)
+  @Override public Set<ProjectFile> getAnalyzedFiles()
+  @Override public List<CodeUnit> getDirectChildren(CodeUnit cu)
+  @Override public List<Range> rangesOf(CodeUnit codeUnit)
+  @Override public Optional<String> getSource(CodeUnit codeUnit, boolean includeComments)
+  @Override public Set<String> getSources(CodeUnit codeUnit, boolean includeComments)
+  @Override public Map<CodeUnit, String> getSkeletons(ProjectFile file)
+  @Override public List<CodeUnit> getMembersInClass(CodeUnit classUnit)
+  @Override public List<CodeUnit> getAllDeclarations()
+  @Override public Set<CodeUnit> getDeclarations(ProjectFile file)
+  @Override public SequencedSet<CodeUnit> getDefinitions(String fqName)
+  @Override public Set<CodeUnit> searchDefinitions(String pattern)
+  @Override public Set<CodeUnit> autocompleteDefinitions(String query)
+  @Override public Set<String> getSymbols(Set<CodeUnit> sources)
+  @Override public IAnalyzer update()
+  @Override public IAnalyzer update(Set<ProjectFile> changedFiles)
+  @Override public Optional<String> extractCallReceiver(String reference)
+  @Override public boolean isTypeAlias(CodeUnit cu)
+  public Map<Language, IAnalyzer> getDelegates()
+  @Override public Optional<IAnalyzer> subAnalyzer(Language language)
+  @Override public List<CodeUnit> getDirectAncestors(CodeUnit cu)
+  @Override public boolean containsTests(ProjectFile file)
+  @Override public Set<CodeUnit> getDirectDescendants(CodeUnit cu)
+  @Override public List<String> getTestModules(Collection<ProjectFile> files)
+  @Override public Set<CodeUnit> testFilesToCodeUnits(Collection<ProjectFile> files)
+}
+
+public class ASTTraversalUtils {
+  public static @Nullable TSNode findNodeRecursive(@Nullable TSNode rootNode, Predicate<TSNode> predicate)
+  public static List<TSNode> findAllNodesRecursive(TSNode rootNode, Predicate<TSNode> predicate)
+  private static void findAllNodesRecursiveInternal(
+              @Nullable TSNode node, Predicate<TSNode> predicate, List<TSNode> results)
+  public static @Nullable TSNode findNodeByTypeAndName(
+              TSNode rootNode, String nodeType, String nodeName, SourceContent sourceContent)
+  public static String extractNodeText(@Nullable TSNode node, SourceContent sourceContent)
+  public static List<TSNode> findAllNodesByType(TSNode rootNode, String nodeType)
+}
+
+public class CppLanguage implements Language {
+  private final Set<String> extensions;
+  @Override public Set<String> getExtensions()
+  @Override public String name()
+  @Override public String internalName()
+  @Override public String toString()
+  @Override public IAnalyzer createAnalyzer(IProject project, IAnalyzer.ProgressListener listener)
+  @Override public IAnalyzer loadAnalyzer(IProject project, IAnalyzer.ProgressListener listener)
+  @Override public Set<String> getSearchPatterns(CodeUnitType type)
+}
+
+public record CallSite(CodeUnit target, String sourceLine) implements Comparable<CallSite> {
+  CodeUnit target;
+  String sourceLine;
+  @Override public int compareTo(CallSite other)
+}
+
+public class SymbolAmbiguousException extends RuntimeException {
+  public SymbolAmbiguousException(String message)
+}
+
+public record CodeBaseMetrics(int numberOfCodeUnits, int numberOfDeclarations) {
+  int numberOfCodeUnits;
+  int numberOfDeclarations;
+}
+
+public enum CodeUnitType {
+  CLASS,
+  FIELD,
+  FUNCTION,
+  MODULE
+  public static final Set<CodeUnitType> ALL;
+}
+
+public final class SourceContent {
+  private static final Logger log;
+  private final String text;
+  private final byte[] utf8Bytes;
+  private SourceContent(String text, byte[] utf8Bytes)
+  public static Optional<SourceContent> read(ProjectFile file)
+  public static SourceContent of(String src)
+  public String substringFromBytes(int startByte, int endByte)
+  public int byteOffsetToCharPosition(int byteOffset)
+  public int charPositionToByteOffset(int charPosition)
+  public String text()
+  public byte[] utf8Bytes()
+  public int byteLength()
+  @Override public boolean equals(@Nullable Object obj)
+  @Override public int hashCode()
+  @Override public String toString()
+  public String substringFrom(TSNode node)
+}
+
+public class CodeUnit implements Comparable<CodeUnit> {
+  @JsonProperty("source")
+      private final ProjectFile source;
+  @JsonProperty("kind")
+      private final CodeUnitType kind;
+  @JsonProperty("shortName")
+      private final String shortName;
+  @JsonProperty("packageName")
+      private final String packageName;
+  @JsonProperty("signature")
+      @Nullable
+      private final String signature;
+  @JsonProperty("synthetic")
+      private final boolean synthetic;
+  private final transient String fqName;
+  @JsonCreator public CodeUnit(
+              @JsonProperty("source") ProjectFile source,
+              @JsonProperty("kind") CodeUnitType kind,
+              @JsonProperty("packageName") String packageName,
+              @JsonProperty("shortName") String shortName,
+              @JsonProperty("signature") @Nullable String signature,
+              @JsonProperty("synthetic") boolean synthetic)
+  public CodeUnit(
+              @JsonProperty("source") ProjectFile source,
+              @JsonProperty("kind") CodeUnitType kind,
+              @JsonProperty("packageName") String packageName,
+              @JsonProperty("shortName") String shortName,
+              @JsonProperty("signature") @Nullable String signature)
+  public CodeUnit(
+              @JsonProperty("source") ProjectFile source,
+              @JsonProperty("kind") CodeUnitType kind,
+              @JsonProperty("packageName") String packageName,
+              @JsonProperty("shortName") String shortName)
+  public CodeUnit withoutSignature()
+  public CodeUnit withSynthetic(boolean synthetic)
+  public String fqName()
+  public String identifier()
+  public String shortName()
+  public boolean isClass()
+  public boolean isFunction()
+  public boolean isModule()
+  public boolean isField()
+  public CodeUnitType kind()
+  public String packageName()
+  public ProjectFile source()
+  @Nullable public String signature()
+  public boolean hasSignature()
+  public boolean isSynthetic()
+  public boolean isAnonymous()
+  @Override public int compareTo(CodeUnit other)
+  @Override public boolean equals(Object obj)
+  @Override public int hashCode()
+  @Override public String toString()
+  public static CodeUnit cls(ProjectFile source, String packageName, String shortName)
+  public static CodeUnit fn(ProjectFile source, String packageName, String shortName)
+  public static CodeUnit field(ProjectFile source, String packageName, String shortName)
+  public static CodeUnit module(ProjectFile source, String packageName, String shortName)
+}
+
+public interface JvmLanguage extends Language {
+}
+
+public interface TypeHierarchyProvider extends CapabilityProvider {
+  List<CodeUnit> getDirectAncestors(CodeUnit cu)
+  Set<CodeUnit> getDirectDescendants(CodeUnit cu)
+  default List<CodeUnit> getAncestors(CodeUnit cu)
+  default List<CodeUnit> getDescendants(CodeUnit cu)
+  default List<CodeUnit> getPolymorphicMatches(CodeUnit target, IAnalyzer analyzer)
+  private List<CodeUnit> traverseHierarchy(
+              CodeUnit cu, Function<CodeUnit, ? extends Collection<CodeUnit>> directionFn)
+}
+
+public interface TestDetectionProvider extends CapabilityProvider {
+}
+
+public interface TypeAliasProvider extends CapabilityProvider {
+  boolean isTypeAlias(CodeUnit cu)
+}
+
+public final class PhpAnalyzer extends TreeSitterAnalyzer {
+  private static final LanguageSyntaxProfile PHP_SYNTAX_PROFILE;
+  @Nullable
+      private final Map<ProjectFile, String> fileScopedPackageNames;
+  private static final String NAMESPACE_QUERY_STR = "(namespace_definition name: (namespace_name) @nsname)";
+  public PhpAnalyzer(IProject project)
+  public PhpAnalyzer(IProject project, ProgressListener listener)
+  private PhpAnalyzer(
+              IProject project, AnalyzerState state, ProgressListener listener, @Nullable AnalyzerCache cache)
+  public static PhpAnalyzer fromState(IProject project, AnalyzerState state, ProgressListener listener)
+  @Override protected IAnalyzer newSnapshot(
+              AnalyzerState state, ProgressListener listener, @Nullable AnalyzerCache previousCache)
+  @Override protected TSLanguage createTSLanguage()
+  @Override protected Optional<String> getQueryResource(QueryType type)
+  @Override protected LanguageSyntaxProfile getLanguageSyntaxProfile()
+  @Override protected @Nullable CodeUnit createCodeUnit(
+              ProjectFile file,
+              String captureName,
+              String simpleName,
+              String packageName,
+              String classChain,
+              List<ScopeSegment> scopeChain,
+              @Nullable TSNode definitionNode,
+              SkeletonType skeletonType)
+  private String computeFilePackageName(ProjectFile file, TSNode rootNode, SourceContent sourceContent)
+  private String runNamespaceQuery(TSQuery query, TSNode rootNode, SourceContent sourceContent)
+  @Override protected String determinePackageName(
+              ProjectFile file, TSNode definitionNode, TSNode rootNode, SourceContent sourceContent)
+  @Override protected String getLanguageSpecificCloser(CodeUnit cu)
+  @Override protected String getLanguageSpecificIndent()
+  private String extractModifiers(TSNode methodNode, SourceContent sourceContent)
+  @Override protected String formatFieldSignature(
+              TSNode fieldNode,
+              SourceContent sourceContent,
+              String exportPrefix,
+              String signatureText,
+              String simpleName,
+              String baseIndent,
+              ProjectFile file)
+  private @Nullable TSNode findNameNodeRecursive(TSNode node)
+  private boolean isLiteralType(String type)
+  @Override protected String renderClassHeader(
+              TSNode classNode,
+              SourceContent sourceContent,
+              String exportPrefix,
+              String signatureText,
+              String baseIndent)
+  @Override protected String renderFunctionDeclaration(
+              TSNode funcNode,
+              SourceContent sourceContent,
+              String exportPrefix,
+              String asyncPrefix,
+              String functionName,
+              String typeParamsText,
+              String paramsText,
+              String returnTypeText,
+              String indent)
+  @Override protected String bodyPlaceholder()
+  @Override protected String getVisibilityPrefix(TSNode node, SourceContent sourceContent)
+  @Override protected Set<String> getIgnoredCaptures()
+  @Override protected boolean containsTestMarkers(TSTree tree, SourceContent sourceContent)
+  @Override public Optional<String> extractCallReceiver(String reference)
+  @Override protected boolean isConstructor(CodeUnit candidate, @Nullable CodeUnit enclosingClass, String captureName)
+}
+
+public final class TreeSitterAnalyzerStateMigrator {
+  public static final SemVer JAVA_REBUILD_THRESHOLD;
+  public static final SemVer TYPESCRIPT_REBUILD_THRESHOLD;
+  public static final SemVer RUST_REBUILD_THRESHOLD;
+  private TreeSitterAnalyzerStateMigrator()
+  static boolean shouldForceRebuild(@Nullable Language language, @Nullable SemVer fromVer, SemVer currentVer)
+  static TreeSitterStateIO.AnalyzerStateDto migrate(TreeSitterStateIO.AnalyzerStateDto dto, SemVer from, SemVer to)
+}
+
+public final class CaptureNames {
+  public static final String CLASS_DEFINITION = "class.definition";
+  public static final String FUNCTION_DEFINITION = "function.definition";
+  public static final String FIELD_DEFINITION = "field.definition";
+  public static final String METHOD_DEFINITION = "method.definition";
+  public static final String CONSTRUCTOR_DEFINITION = "constructor.definition";
+  public static final String IMPORT_DECLARATION = "import.declaration";
+  public static final String INTERFACE_DEFINITION = "interface.definition";
+  public static final String ENUM_DEFINITION = "enum.definition";
+  public static final String STRUCT_DEFINITION = "struct.definition";
+  public static final String UNION_DEFINITION = "union.definition";
+  public static final String TYPE_DEFINITION = "type.definition";
+  public static final String TYPEALIAS_DEFINITION = "typealias.definition";
+  public static final String TYPEDEF_DEFINITION = "typedef.definition";
+  public static final String RECORD_DEFINITION = "record.definition";
+  public static final String TRAIT_DEFINITION = "trait.definition";
+  public static final String OBJECT_DEFINITION = "object.definition";
+  public static final String IMPL_DEFINITION = "impl.definition";
+  public static final String LAMBDA_DEFINITION = "lambda.definition";
+  public static final String ARROW_FUNCTION_DEFINITION = "arrow_function.definition";
+  public static final String DESTRUCTOR_DEFINITION = "destructor.definition";
+  public static final String ANNOTATION_DEFINITION = "annotation.definition";
+  public static final String ATTRIBUTE_DEFINITION = "attribute.definition";
+  public static final String DECORATOR_DEFINITION = "decorator.definition";
+  public static final String NAMESPACE_DEFINITION = "namespace.definition";
+  public static final String MODULE_DEFINITION = "module.definition";
+  public static final String PACKAGE_DEFINITION = "package.definition";
+  public static final String PACKAGE_NAME = "package.name";
+  public static final String VARIABLE_DEFINITION = "variable.definition";
+  public static final String CONSTANT_DEFINITION = "constant.definition";
+  public static final String VALUE_DEFINITION = "value.definition";
+  public static final String USING_DEFINITION = "using.definition";
+  private CaptureNames()
+}
+
+public record LintResult(List<LintDiagnostic> diagnostics) {
+  List<LintDiagnostic> diagnostics;
+  public boolean hasErrors()
+  public List<LintDiagnostic> getErrors()
+  public List<LintDiagnostic> getDiagnosticsForFiles(Set<ProjectFile> files)
+  public record LintDiagnostic(String file, int line, int column, Severity severity, String message, String code) {
+    String file;
+    int line;
+    int column;
+    Severity severity;
+    String message;
+    String code;
+    public enum Severity {
+      ERROR,
+      WARNING,
+      INFO,
+      HINT
+    }
+  }
+}
+
+public final class CommonTreeSitterNodeTypes {
+  public static final String CLASS_DECLARATION = "class_declaration";
+  public static final String INTERFACE_DECLARATION = "interface_declaration";
+  public static final String ENUM_DECLARATION = "enum_declaration";
+  public static final String FUNCTION_DECLARATION = "function_declaration";
+  public static final String METHOD_DECLARATION = "method_declaration";
+  public static final String CONSTRUCTOR_DECLARATION = "constructor_declaration";
+  public static final String ARROW_FUNCTION = "arrow_function";
+  public static final String METHOD_DEFINITION = "method_definition";
+  public static final String FIELD_DECLARATION = "field_declaration";
+  public static final String VARIABLE_DECLARATOR = "variable_declarator";
+  public static final String VARIABLE_DECLARATION = "variable_declaration";
+  public static final String LEXICAL_DECLARATION = "lexical_declaration";
+  public static final String DECORATOR = "decorator";
+  public static final String EXPORT_STATEMENT = "export_statement";
+  public static final String COMMENT = "comment";
+  public static final String LINE_COMMENT = "line_comment";
+  public static final String BLOCK_COMMENT = "block_comment";
+  public static final String DOC_COMMENT = "doc_comment";
+  public static final String DOCUMENTATION_COMMENT = "documentation_comment";
+  public static final String WHITESPACE = "whitespace";
+  public static final String NEWLINE = "newline";
+  private CommonTreeSitterNodeTypes()
+}
+
+public final class ClassNameExtractor {
+  private ClassNameExtractor()
+  public static Optional<String> extractForJava(@Nullable String reference)
+  public static Optional<String> extractForJsTs(@Nullable String reference)
+  private static String normalizeJsTsReference(String s)
+  private static String stripAngleGroups(String s)
+  private static String normalizeQuotedBracketProps(String s)
+  private static int findLastTopLevelDot(String s)
+  private static String stripBrackets(String s, char open, char close)
+  private static boolean isValidClassSegment(String beforeLast, String classRegex)
+  public static Optional<String> extractForPython(@Nullable String reference)
+  public static Optional<String> extractForCpp(@Nullable String reference)
+  public static Optional<String> extractForRust(String reference)
+  public static Optional<String> extractForScala(@Nullable String reference)
+  private static String stripSquareBrackets(String s)
+  public static Optional<String> extractForCSharp(@Nullable String reference)
+  public static Optional<String> extractForGo(@Nullable String reference)
+  public static Optional<String> extractForPhp(@Nullable String reference)
+  public static List<String> normalizeVariants(@Nullable String extracted)
+}
+
+public interface BrokkFile extends Comparable<BrokkFile> {
+  default boolean isBinary()
+  static boolean isBinary(String content)
+  Path absPath()
+  default Optional<String> read()
+  default boolean exists()
+  default boolean isDirectory()
+  @JsonIgnore default boolean isText()
+  @JsonIgnore default String getFileName()
+  @Override String toString()
+  @Override default int compareTo(BrokkFile o)
+  @JsonIgnore default long mtime()
+  @JsonIgnore default String extension()
+  default String getSyntaxStyle()
+}
+
+public class Languages {
+  public static final Language C_SHARP;
+  private final Set<String> extensions;
+  @Override public Set<String> getExtensions()
+  @Override public String name()
+  @Override public String internalName()
+  @Override public String toString()
+  @Override public IAnalyzer createAnalyzer(IProject project, IAnalyzer.ProgressListener listener)
+  @Override public IAnalyzer loadAnalyzer(IProject project, IAnalyzer.ProgressListener listener)
+  @Override public Set<String> getSearchPatterns(CodeUnitType type)
+  public static final Language JAVA;
+  public static final Language JAVASCRIPT;
+  @Override public List<Path> getDependencyCandidates(IProject project)
+  @Override public List<Language.DependencyCandidate> listDependencyPackages(IProject project)
+  @Override public boolean importDependency(
+                  Chrome chrome,
+                  Language.DependencyCandidate pkg,
+                  @Nullable DependenciesPanel.DependencyLifecycleListener lifecycle)
+  @Override public Language.ImportSupport getDependencyImportSupport()
+  @Override public boolean isAnalyzed(IProject project, Path pathToImport)
+  public static final Language PYTHON;
+  public static final Language C_CPP;
+  public static final Language GO;
+  public static final Language RUST;
+  public static final Language NONE;
+  public static final Language PHP;
+  public static final Language SQL;
+  public static final Language TYPESCRIPT;
+  public static final Language SCALA;
+  public static final List<Language> ALL_LANGUAGES;
+  public static Language aggregate(Set<Language> languages)
+  public static boolean isJvmLanguage(@Nullable Language language)
+  @Blocking public static List<Language> findLanguagesInProject(IProject project)
+  public static Language fromExtension(String extension)
+  public static Language[] values()
+  public static Language valueOf(String name)
+}
+
+public final class RustAnalyzer extends TreeSitterAnalyzer implements ImportAnalysisProvider {
+  private static final Logger log;
+  @Override public Optional<String> extractCallReceiver(String reference)
+  private static final LanguageSyntaxProfile RS_SYNTAX_PROFILE;
+  public RustAnalyzer(IProject project)
+  public RustAnalyzer(IProject project, ProgressListener listener)
+  private RustAnalyzer(
+              IProject project, AnalyzerState state, ProgressListener listener, @Nullable AnalyzerCache cache)
+  public static RustAnalyzer fromState(IProject project, AnalyzerState state, ProgressListener listener)
+  @Override protected IAnalyzer newSnapshot(
+              AnalyzerState state, ProgressListener listener, @Nullable AnalyzerCache previousCache)
+  @Override protected TSLanguage createTSLanguage()
+  @Override protected Optional<String> getQueryResource(QueryType type)
+  @Override protected LanguageSyntaxProfile getLanguageSyntaxProfile()
+  @Override protected String determinePackageName(
+              ProjectFile file, TSNode defNode, TSNode rootNode, SourceContent sourceContent)
+  @Override protected @Nullable CodeUnit createCodeUnit(
+              ProjectFile file,
+              String captureName,
+              String simpleName,
+              String packageName,
+              String classChain,
+              List<ScopeSegment> scopeChain,
+              @Nullable TSNode definitionNode,
+              SkeletonType skeletonType)
+  @Override protected String bodyPlaceholder()
+  @Override protected String getVisibilityPrefix(TSNode node, SourceContent sourceContent)
+  @Override protected String renderFunctionDeclaration(
+              TSNode fnNode,
+              SourceContent sourceContent,
+              String exportPrefix,
+              String asyncPrefix,
+              String functionName,
+              String typeParamsText,
+              String paramsText,
+              String returnTypeText,
+              String indent)
+  @Override protected String renderClassHeader(
+              TSNode classNode,
+              SourceContent sourceContent,
+              String exportPrefix,
+              String signatureText,
+              String baseIndent)
+  @Override protected String getLanguageSpecificCloser(CodeUnit cu)
+  @Override protected Set<String> getIgnoredCaptures()
+  private Optional<String> extractCoreTypeName(@Nullable TSNode typeNode, SourceContent sourceContent)
+  @Override protected Optional<String> extractSimpleName(TSNode decl, SourceContent sourceContent)
+  @Override protected String formatFieldSignature(
+              TSNode fieldNode,
+              SourceContent sourceContent,
+              String exportPrefix,
+              String signatureText,
+              String simpleName,
+              String baseIndent,
+              ProjectFile file)
+  @Override protected boolean requiresSemicolons()
+  @Override protected Set<String> getLeadingMetadataNodeTypes()
+  @Override public Set<CodeUnit> importedCodeUnitsOf(ProjectFile file)
+  @Override public Set<ProjectFile> referencingFilesOf(ProjectFile file)
+  @Override protected String extractPackageFromWildcard(String rawSnippet)
+  @Override protected Set<CodeUnit> resolveImports(ProjectFile file, List<String> importStatements)
+  private String resolveRustPathToFqn(String rustPath, String currentPackage)
+  @Override protected void extractImports(
+              Map<String, TSNode> capturedNodesForMatch, SourceContent sourceContent, List<ImportInfo> localImportInfos)
+  private void flattenRustImports(String pathPart, String prefix, List<ImportInfo> localImportInfos)
+  @Override protected boolean containsTestMarkers(TSTree tree, SourceContent sourceContent)
+}
+
+public interface ImportAnalysisProvider extends CapabilityProvider {
+  Set<CodeUnit> importedCodeUnitsOf(ProjectFile file)
+  Set<ProjectFile> referencingFilesOf(ProjectFile file)
+  default List<ImportInfo> importInfoOf(ProjectFile file)
+  default Set<String> relevantImportsFor(CodeUnit cu)
+}
+
+public class TreeSitterAnalysisException extends Exception {
+  private final ProjectFile file;
+  private final String operation;
+  public TreeSitterAnalysisException(String message, ProjectFile file, String operation)
+  public TreeSitterAnalysisException(String message, Throwable cause, ProjectFile file, String operation)
+  public ProjectFile getFile()
+  public String getOperation()
+  @Override public String getMessage()
+}
+
+public class SqlAnalyzer implements IAnalyzer {
+  private static final Logger logger;
+  private final IProject project;
+  private final Map<ProjectFile, List<CodeUnit>> declarationsByFile;
+  final Map<CodeUnit, List<Range>> rangesByCodeUnit;
+  private final List<CodeUnit> allDeclarationsList;
+  private final Map<String, List<CodeUnit>> definitionsByFqName;
+  private long lastAnalysisTimeNanos;
+  private static final Pattern CREATE_STMT_PATTERN;
+  public SqlAnalyzer(IProject projectInstance)
+  private void analyzeSqlFiles()
+  private int countLines(String text, int charEndOffset)
+  @Override public IProject getProject()
+  @Override public List<CodeUnit> getAllDeclarations()
+  @Override public Set<CodeUnit> getDeclarations(ProjectFile file)
+  @Override public SequencedSet<CodeUnit> getDefinitions(String fqName)
+  @Override public List<String> importStatementsOf(ProjectFile file)
+  @Override public Optional<CodeUnit> enclosingCodeUnit(ProjectFile file, int startLine, int endLine)
+  @Override public Optional<CodeUnit> enclosingCodeUnit(ProjectFile file, Range range)
+  @Override public Optional<String> getSkeleton(CodeUnit cu)
+  @Override public Optional<String> getSkeletonHeader(CodeUnit cu)
+  @Override public List<CodeUnit> getTopLevelDeclarations(ProjectFile file)
+  @Override public Set<ProjectFile> getAnalyzedFiles()
+  @Override public IAnalyzer update(Set<ProjectFile> changedFiles)
+  @Override public IAnalyzer update()
+  @Override public Set<Language> languages()
+  @Override public Optional<String> extractCallReceiver(String reference)
+  @Override public List<CodeUnit> getDirectChildren(CodeUnit cu)
+  @Override public boolean containsTests(ProjectFile file)
+  @Override public Optional<String> getSource(CodeUnit codeUnit, boolean includeComments)
+  @Override public Set<String> getSources(CodeUnit codeUnit, boolean includeComments)
+  @Override public <T extends CapabilityProvider> Optional<T> as(Class<T> capability)
+  @Override public List<Range> rangesOf(CodeUnit codeUnit)
+}
+
+public class RustLanguage implements Language {
+  private final Set<String> extensions;
+  RustLanguage()
+  @Override public Set<String> getExtensions()
+  @Override public String name()
+  @Override public String internalName()
+  @Override public String toString()
+  @Override public IAnalyzer createAnalyzer(IProject project, IAnalyzer.ProgressListener listener)
+  @Override public IAnalyzer loadAnalyzer(IProject project, IAnalyzer.ProgressListener listener)
+  @Override public Set<String> getSearchPatterns(CodeUnitType type)
+  @Override public List<Path> getDependencyCandidates(IProject project)
+  @Override public ImportSupport getDependencyImportSupport()
+  @Override public List<DependencyCandidate> listDependencyPackages(IProject project)
+  @Override public boolean importDependency(
+              Chrome chrome, DependencyCandidate pkg, @Nullable DependenciesPanel.DependencyLifecycleListener lifecycle)
+  private DependencyKind pickRustKind(Set<String> kinds)
+  private CargoMetadata runCargoMetadata(Path projectRoot)
+  private static long countRustFiles(@Nullable Path manifestPath)
+  @Override public boolean isAnalyzed(IProject project, Path pathToImport)
+  @JsonIgnoreProperties(ignoreUnknown = true)
+      public static class CargoMetadata {
+    public List<CargoPackage> packages;
+    public List<String> workspace_members;
+  }
+  @JsonIgnoreProperties(ignoreUnknown = true)
+      public static class CargoPackage {
+    public String id = "";
+    public String name = "";
+    public String version = "";
+    public @Nullable String manifest_path;
+    public @Nullable String source;
+    public List<CargoDependency> dependencies;
+  }
+  @JsonIgnoreProperties(ignoreUnknown = true)
+      public static class CargoDependency {
+    public String name = "";
+    public @Nullable String kind;
+  }
+}
+
+public class JavaAnalyzer extends TreeSitterAnalyzer
+        implements ImportAnalysisProvider, TypeHierarchyProvider, JvmBasedAnalyzer {
+  private static final Pattern LAMBDA_REGEX;
+  public JavaAnalyzer(IProject project)
+  public JavaAnalyzer(IProject project, ProgressListener listener)
+  private JavaAnalyzer(
+              IProject project, AnalyzerState state, ProgressListener listener, @Nullable AnalyzerCache cache)
+  public static JavaAnalyzer fromState(IProject project, AnalyzerState state, ProgressListener listener)
+  @Override protected IAnalyzer newSnapshot(
+              AnalyzerState state, ProgressListener listener, @Nullable AnalyzerCache previousCache)
+  @Override public Optional<String> extractCallReceiver(String reference)
+  @Override protected TSLanguage createTSLanguage()
+  @Override protected Optional<String> getQueryResource(QueryType type)
+  private static final LanguageSyntaxProfile JAVA_SYNTAX_PROFILE;
+  @Override protected LanguageSyntaxProfile getLanguageSyntaxProfile()
+  @Override protected @Nullable CodeUnit createCodeUnit(
+              ProjectFile file,
+              String captureName,
+              String simpleName,
+              String packageName,
+              String classChain,
+              List<ScopeSegment> scopeChain,
+              @Nullable TSNode definitionNode,
+              SkeletonType skeletonType)
+  @Override protected String determinePackageName(
+              ProjectFile file, TSNode definitionNode, TSNode rootNode, SourceContent sourceContent)
+  protected static String determineJvmPackageName(
+              TSNode rootNode,
+              SourceContent sourceContent,
+              String packageDef,
+              Set<String> classLikeNodeType,
+              BiFunction<TSNode, SourceContent, String> textSlice)
+  @Override protected String renderClassHeader(
+              TSNode classNode,
+              SourceContent sourceContent,
+              String exportPrefix,
+              String signatureText,
+              String baseIndent)
+  @Override protected String bodyPlaceholder()
+  @Override protected String renderFunctionDeclaration(
+              TSNode funcNode,
+              SourceContent sourceContent,
+              String exportAndModifierPrefix,
+              String asyncPrefix,
+              String functionName,
+              String typeParamsText,
+              String paramsText,
+              String returnTypeText,
+              String indent)
+  @Override protected String formatFieldSignature(
+              TSNode fieldNode,
+              SourceContent sourceContent,
+              String exportPrefix,
+              String signatureText,
+              String simpleName,
+              String baseIndent,
+              ProjectFile file)
+  private String formatEnumConstant(TSNode fieldNode, String signatureText, String baseIndent)
+  @Override protected String getLanguageSpecificCloser(CodeUnit cu)
+  private static final Set<String> TEST_ANNOTATIONS;
+  @Override protected boolean containsTestMarkers(TSTree tree, SourceContent sourceContent)
+  @Override public Set<CodeUnit> importedCodeUnitsOf(ProjectFile file)
+  @Override public Set<ProjectFile> referencingFilesOf(ProjectFile file)
+  @Override public List<CodeUnit> getDirectAncestors(CodeUnit cu)
+  @Override public Set<CodeUnit> getDirectDescendants(CodeUnit cu)
+  @Override public SequencedSet<CodeUnit> getDefinitions(String fqName)
+  public static String stripGenericTypeArguments(String name)
+  @Override protected String normalizeFullName(String fqName)
+  @Override protected Optional<String> extractSimpleName(TSNode decl, SourceContent sourceContent)
+  private Optional<String> findEnclosingJavaMethodOrClassName(TSNode node, SourceContent sourceContent)
+  @Override protected boolean isAnonymousStructure(String fqName)
+  @Override protected void extractImports(
+              Map<String, TSNode> capturedNodesForMatch, SourceContent sourceContent, List<ImportInfo> localImportInfos)
+  private ImportInfo parseJavaImport(String rawSnippet)
+  @Override protected Set<CodeUnit> resolveImports(ProjectFile file, List<String> importStatements)
+  @Override public List<CodeUnit> computeSupertypes(CodeUnit cu)
+  @Override public List<CodeUnit> getAncestors(CodeUnit cu)
+  @Override public boolean isAccessExpression(ProjectFile file, int startByte, int endByte)
+  @Override protected FileAnalysisAccumulator createModulesFromImports(
+              ProjectFile file,
+              List<String> localImportStatements,
+              TSNode rootNode,
+              String modulePackageName,
+              FileAnalysisAccumulator acc)
+  @Override public Set<String> extractTypeIdentifiers(String source)
+  @Override public Set<String> performIdentifierExtraction(@Nullable TSNode root, String source)
+  @Override public Set<String> relevantImportsFor(CodeUnit cu)
+  @Override public boolean couldImportFile(List<ImportInfo> imports, ProjectFile target)
+  @Override public boolean couldImportFile(ProjectFile sourceFile, List<ImportInfo> imports, ProjectFile target)
+  @Override public Optional<DeclarationInfo> findNearestDeclaration(
+              ProjectFile file, int startByte, int endByte, String identifierName)
+  private Optional<DeclarationInfo> findNearestDeclaration(
+              TSNode node, String identifierName, SourceContent sourceContent)
+  private Optional<DeclarationInfo> findNearestDeclarationFromNode(
+              TSNode startNode, String identifierName, SourceContent sourceContent)
+  private Optional<DeclarationInfo> checkFormalParameters(
+              TSNode methodOrConstructor, String identifierName, SourceContent sourceContent)
+  private Optional<DeclarationInfo> checkPrecedingLocalVariables(
+              TSNode current, String identifierName, SourceContent sourceContent)
+  private Optional<DeclarationInfo> checkEnhancedForStatement(
+              TSNode enhancedFor, String identifierName, SourceContent sourceContent)
+  private Optional<DeclarationInfo> checkCatchFormalParameter(
+              TSNode catchParam, String identifierName, SourceContent sourceContent)
+  private Optional<DeclarationInfo> checkResourceSpecification(
+              TSNode resourceSpec, String identifierName, SourceContent sourceContent)
+  private Optional<DeclarationInfo> checkLambdaParameters(
+              TSNode lambda, String identifierName, SourceContent sourceContent)
+  private Optional<DeclarationInfo> checkInstanceofPattern(
+              TSNode instanceofExpr, String identifierName, SourceContent sourceContent)
+  @Override protected String extractPackageFromWildcard(String rawSnippet)
+  @Override protected boolean isConstructor(CodeUnit candidate, @Nullable CodeUnit enclosingClass, String captureName)
+  @Override protected @Nullable String extractSignature(
+              String captureName, TSNode definitionNode, SourceContent sourceContent)
+  @Override protected boolean shouldAttachToParent(
+              CodeUnit cu, TSNode node, String captureName, String classChain, List<ScopeSegment> scopeChain)
+  @Override protected @Nullable CodeUnit findParentForCodeUnit(
+              CodeUnit cu,
+              TSNode node,
+              String captureName,
+              String classChain,
+              List<ScopeSegment> scopeChain,
+              FileAnalysisAccumulator acc,
+              SourceContent sourceContent)
+  @Override protected @Nullable CodeUnit createImplicitConstructor(CodeUnit enclosingClass, String classCaptureName)
+  @Override public Set<CodeUnit> testFilesToCodeUnits(Collection<ProjectFile> files)
+  @Override protected List<String> extractRawSupertypesForClassLike(
+              CodeUnit cu, TSNode classNode, String signature, SourceContent sourceContent)
+}
+
+public final class NodeJsDependencyHelper {
+  private static final Logger logger;
+  private static final ObjectMapper MAPPER;
+  private NodeJsDependencyHelper()
+  public static List<Path> getDependencyCandidates(IProject project)
+  public static List<Language.DependencyCandidate> listDependencyPackages(IProject project)
+  public static boolean importDependency(
+              Chrome chrome,
+              Language.DependencyCandidate pkg,
+              @Nullable DependenciesPanel.DependencyLifecycleListener lifecycle)
+  private static Language.DependencyKind pickKind(
+              String name, Set<String> deps, Set<String> devDeps, Set<String> peerDeps)
+  private static long countNodeFiles(Path root)
+  public static boolean isAnalyzed(IProject project, Path pathToImport)
+  public static boolean supportsDependencyKinds()
+  public static @Nullable NodePackage readPackageJsonFromDir(Path packageDir)
+  public static String displayNameFrom(NodePackage pkg)
+  private static @Nullable NodePackage readPackageJson(Path pkgJsonPath)
+  @JsonIgnoreProperties(ignoreUnknown = true)
+      public static class NodePackage {
+    public String name = "";
+    public String version = "";
+    public Map<String, String> dependencies;
+    public Map<String, String> devDependencies;
+    public Map<String, String> peerDependencies;
+    public Map<String, String> optionalDependencies;
+  }
+}
+
+public abstract class JsTsAnalyzer extends TreeSitterAnalyzer implements ImportAnalysisProvider {
+  protected record ModulePathKey(ProjectFile importingFile, String modulePath) {
+    ProjectFile importingFile;
+    String modulePath;
+  }
+  protected static final List<String> KNOWN_EXTENSIONS;
+  private static final Pattern ES6_IMPORT_PATTERN;
+  private static final Pattern ES6_SIDE_EFFECT_IMPORT_PATTERN;
+  private static final Pattern CJS_REQUIRE_PATTERN;
+  private final Cache<ModulePathKey, Optional<ProjectFile>> moduleResolutionCache;
+  protected JsTsAnalyzer(IProject project, Language language)
+  protected JsTsAnalyzer(IProject project, Language language, ProgressListener listener)
+  protected JsTsAnalyzer(IProject project, Language language, AnalyzerState state, ProgressListener listener)
+  protected JsTsAnalyzer(
+              IProject project,
+              Language language,
+              AnalyzerState state,
+              ProgressListener listener,
+              @Nullable AnalyzerCache cache)
+  @Override public Set<CodeUnit> importedCodeUnitsOf(ProjectFile file)
+  @Override public Set<ProjectFile> referencingFilesOf(ProjectFile file)
+  @Override public Set<String> relevantImportsFor(CodeUnit cu)
+  private boolean importMatchesAnyIdentifier(String importStatement, Set<String> codeIdentifiers)
+  public abstract Set<String> extractIdentifiersFromImport(String importStatement)
+  @Override protected void extractImports(
+              Map<String, TSNode> capturedNodesForMatch, SourceContent sourceContent, List<ImportInfo> localImportInfos)
+  @Override protected FileAnalysisAccumulator createModulesFromImports(
+              ProjectFile file,
+              List<String> localImportStatements,
+              TSNode rootNode,
+              String modulePackageName,
+              FileAnalysisAccumulator acc)
+  @Override protected Set<CodeUnit> resolveImports(ProjectFile file, List<String> importStatements)
+  @Override public boolean couldImportFile(List<ImportInfo> imports, ProjectFile target)
+  private boolean couldModulePathMatchTarget(String modulePath, ProjectFile target)
+  protected static Optional<String> extractModulePathFromImport(String importStatement)
+  protected static @Nullable ProjectFile resolveJavaScriptLikeModulePath(
+              Path projectRoot, Set<Path> absolutePaths, ProjectFile importingFile, String modulePath)
+  protected static void extractCommonJsRequireImport(
+              Map<String, TSNode> capturedNodesForMatch, SourceContent sourceContent, List<ImportInfo> localImportInfos)
+  @Override protected boolean isConstructor(CodeUnit candidate, @Nullable CodeUnit enclosingClass, String captureName)
+}
+
+public class JavaLanguage implements JvmLanguage {
+  private final Set<String> extensions;
+  JavaLanguage()
+  @Override public Set<String> getExtensions()
+  @Override public String name()
+  @Override public String internalName()
+  @Override public String toString()
+  @Override public IAnalyzer createAnalyzer(IProject project, IAnalyzer.ProgressListener listener)
+  @Override public IAnalyzer loadAnalyzer(IProject project, IAnalyzer.ProgressListener listener)
+  @Override public Set<String> getSearchPatterns(CodeUnitType type)
+  @Override public ImportSupport getDependencyImportSupport()
+  @Override public List<Path> getDependencyCandidates(IProject project)
+  @Override public List<DependencyCandidate> listDependencyPackages(IProject project)
+  @Override public boolean importDependency(
+              Chrome chrome, DependencyCandidate pkg, @Nullable DependenciesPanel.DependencyLifecycleListener lifecycle)
+  private String prettyJarName(Path jarPath)
+  private long countJarFiles(Path jarPath)
+}
+
+public final class PythonAnalyzer extends TreeSitterAnalyzer implements ImportAnalysisProvider, TypeHierarchyProvider {
+  private static final Pattern WILDCARD_IMPORT_PATTERN;
+  @Override public Optional<String> extractCallReceiver(String reference)
+  @Override public List<String> getTestModules(Collection<ProjectFile> files)
+  private static final LanguageSyntaxProfile PY_SYNTAX_PROFILE;
+  public PythonAnalyzer(IProject project)
+  public PythonAnalyzer(IProject project, ProgressListener listener)
+  private PythonAnalyzer(
+              IProject project, AnalyzerState state, ProgressListener listener, @Nullable AnalyzerCache cache)
+  public static PythonAnalyzer fromState(IProject project, AnalyzerState state, ProgressListener listener)
+  @Override protected IAnalyzer newSnapshot(
+              AnalyzerState state, ProgressListener listener, @Nullable AnalyzerCache previousCache)
+  @Override protected TSLanguage createTSLanguage()
+  @Override protected Optional<String> getQueryResource(QueryType type)
+  private record PythonModuleInfo(String packageName, String moduleName) {
+    String packageName;
+    String moduleName;
+    String moduleQualifiedPackage()
+  }
+  private PythonModuleInfo resolveModuleInfo(ProjectFile file)
+  @Override protected @Nullable CodeUnit createCodeUnit(
+              ProjectFile file,
+              String captureName,
+              String simpleName,
+              String packageName,
+              String classChain,
+              List<ScopeSegment> scopeChain,
+              @Nullable TSNode definitionNode,
+              SkeletonType skeletonType)
+  private static String normalized(List<ScopeSegment> scopeChain)
+  private static String normalizedRest(List<ScopeSegment> scopeChain)
+  @Override protected Set<String> getIgnoredCaptures()
+  @Override protected boolean shouldSkipNode(TSNode node, String captureName, SourceContent sourceContent)
+  @Override protected boolean shouldReplaceOnDuplicate(CodeUnit existing, CodeUnit candidate)
+  @Override protected boolean hasWrappingDecoratorNode()
+  @Override protected TSNode extractContentFromDecoratedNode(
+              TSNode decoratedNode,
+              List<String> outDecoratorLines,
+              SourceContent sourceContent,
+              LanguageSyntaxProfile profile)
+  @Override protected String bodyPlaceholder()
+  @Override protected String renderFunctionDeclaration(
+              TSNode funcNode,
+              SourceContent sourceContent,
+              String exportPrefix,
+              String asyncPrefix,
+              String functionName,
+              String typeParamsText,
+              String paramsText,
+              String returnTypeText,
+              String indent)
+  @Override protected String formatFieldSignature(
+              TSNode fieldNode,
+              SourceContent sourceContent,
+              String exportPrefix,
+              String signatureText,
+              String simpleName,
+              String baseIndent,
+              ProjectFile file)
+  private boolean isLiteralType(String type)
+  @Override protected ResolvedNodes resolveSignatureNodes(
+              TSNode definitionNode, String simpleName, SkeletonType refined, SourceContent sourceContent)
+  @Override protected @Nullable String extractSignature(
+              String captureName, TSNode definitionNode, SourceContent sourceContent)
+  @Override protected String renderClassHeader(
+              TSNode classNode,
+              SourceContent sourceContent,
+              String exportPrefix,
+              String signatureText,
+              String baseIndent)
+  @Override protected String getLanguageSpecificCloser(CodeUnit cu)
+  @Override protected boolean containsTestMarkers(TSTree tree, SourceContent sourceContent)
+  private boolean isPytestMark(TSNode decoratorNode, SourceContent sourceContent)
+  private String getPackageNameForFile(ProjectFile file)
+  @Override protected String determinePackageName(
+              ProjectFile file, TSNode definitionNode, TSNode rootNode, SourceContent sourceContent)
+  @Override protected String buildParentFqName(CodeUnit cu, String classChain, List<ScopeSegment> scopeChain)
+  @Override protected LanguageSyntaxProfile getLanguageSyntaxProfile()
+  @Override protected boolean requiresSemicolons()
+  @Override protected boolean isClassLike(TSNode node)
+  @Override protected List<String> extractRawSupertypesForClassLike(
+              CodeUnit cu, TSNode classNode, String signature, SourceContent sourceContent)
+  private Optional<String> resolveRelativeImport(ProjectFile file, String relativeImportText)
+  private @Nullable ProjectFile resolveModuleFile(String modulePath)
+  @Override protected Set<CodeUnit> resolveImports(ProjectFile file, List<String> importStatements)
+  @Override protected FileAnalysisAccumulator createModulesFromImports(
+              ProjectFile file,
+              List<String> localImportStatements,
+              TSNode rootNode,
+              String modulePackageName,
+              FileAnalysisAccumulator acc)
+  @Override public Set<CodeUnit> importedCodeUnitsOf(ProjectFile file)
+  @Override public Set<ProjectFile> referencingFilesOf(ProjectFile file)
+  @Override public List<CodeUnit> getDirectAncestors(CodeUnit cu)
+  @Override public Set<CodeUnit> getDirectDescendants(CodeUnit cu)
+  @Override protected void extractImports(
+              Map<String, TSNode> capturedNodesForMatch, SourceContent sourceContent, List<ImportInfo> localImportInfos)
+  @Override protected String extractPackageFromWildcard(String rawSnippet)
+  @Override public Set<String> relevantImportsFor(CodeUnit cu)
+  @Override public Set<String> extractTypeIdentifiers(String source)
+  @Override public boolean couldImportFile(ProjectFile sourceFile, List<ImportInfo> imports, ProjectFile target)
+  @Override protected boolean isConstructor(CodeUnit candidate, @Nullable CodeUnit enclosingClass, String captureName)
+  @Override public List<CodeUnit> computeSupertypes(CodeUnit cu)
+}
+
+public class FileExtensions {
+  public static boolean matches(Path path, String extension)
+  public static final Set<String> IMAGE_EXTENSIONS;
+  public static final Set<String> TEXT_EXTENSIONS;
+}
+
+@NullMarked
+public final class SourceRootScanner {
+  private static final Logger logger;
+  private SourceRootScanner()
+  @Blocking public static List<String> scan(IProject project, Language language)
+  @Override public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs)
+}
+
+public class PythonLanguage implements Language {
+  public static final Pattern PY_SITE_PKGS;
+  private final Set<String> extensions;
+  PythonLanguage()
+  @Override public Set<String> getExtensions()
+  @Override public String name()
+  @Override public String internalName()
+  @Override public String toString()
+  @Override public IAnalyzer createAnalyzer(IProject project, IAnalyzer.ProgressListener listener)
+  @Override public IAnalyzer loadAnalyzer(IProject project, IAnalyzer.ProgressListener listener)
+  @Override public Set<String> getSearchPatterns(CodeUnitType type)
+  @Override public ImportSupport getDependencyImportSupport()
+  private List<Path> findVirtualEnvs(@Nullable Path root)
+  private Path findSitePackagesInLibDir(Path libDir)
+  private Path sitePackagesDir(Path venv)
+  @Override public List<Path> getDependencyCandidates(IProject project)
+  @Override public List<DependencyCandidate> listDependencyPackages(IProject project)
+  @Override public boolean importDependency(
+              Chrome chrome, DependencyCandidate pkg, @Nullable DependenciesPanel.DependencyLifecycleListener lifecycle)
+  @Override public boolean isAnalyzed(IProject project, Path pathToImport)
+}
+
+public class CppAnalyzer extends TreeSitterAnalyzer implements ImportAnalysisProvider {
+  private static final Logger log;
+  private static final Pattern QUOTED_INCLUDE_PATTERN;
+  private static final Set<String> CPP_KEYWORDS;
+  @Override public Optional<String> extractCallReceiver(String reference)
+  private static Map<String, SkeletonType> createCaptureConfiguration()
+  private static final LanguageSyntaxProfile CPP_SYNTAX_PROFILE;
+  public CppAnalyzer(IProject project)
+  public CppAnalyzer(IProject project, ProgressListener listener)
+  private CppAnalyzer(
+              IProject project, AnalyzerState state, ProgressListener listener, @Nullable AnalyzerCache cache)
+  public static CppAnalyzer fromState(IProject project, AnalyzerState state, ProgressListener listener)
+  @Override protected IAnalyzer newSnapshot(
+              AnalyzerState state, ProgressListener listener, @Nullable AnalyzerCache previousCache)
+  @Override protected TSLanguage createTSLanguage()
+  @Override protected Optional<String> getQueryResource(QueryType type)
+  @Override protected LanguageSyntaxProfile getLanguageSyntaxProfile()
+  @Override protected @Nullable CodeUnit createCodeUnit(
+              ProjectFile file,
+              String captureName,
+              String simpleName,
+              String packageName,
+              String classChain,
+              List<ScopeSegment> scopeChain,
+              @Nullable TSNode definitionNode,
+              SkeletonType skeletonType)
+  public CodeUnit createCodeUnit(ProjectFile source, CodeUnitType kind, String packageName, String fqName)
+  @Override protected String buildParentFqName(CodeUnit cu, String classChain)
+  @Override protected String determinePackageName(
+              ProjectFile file, TSNode definitionNode, TSNode rootNode, SourceContent sourceContent)
+  @Override protected String renderClassHeader(
+              TSNode classNode,
+              SourceContent sourceContent,
+              String exportPrefix,
+              String signatureText,
+              String baseIndent)
+  @Override protected String bodyPlaceholder()
+  @Override protected String formatFieldSignature(
+              TSNode fieldNode,
+              SourceContent sourceContent,
+              String exportPrefix,
+              String signatureText,
+              String simpleName,
+              String baseIndent,
+              ProjectFile file)
+  private boolean isLiteralType(String type)
+  @Override protected String renderFunctionDeclaration(
+              TSNode funcNode,
+              SourceContent sourceContent,
+              String exportAndModifierPrefix,
+              String asyncPrefix,
+              String functionName,
+              String typeParamsText,
+              String paramsText,
+              String returnTypeText,
+              String indent)
+  @Override protected String getLanguageSpecificCloser(CodeUnit cu)
+  @Override public Set<CodeUnit> importedCodeUnitsOf(ProjectFile file)
+  @Override public Set<ProjectFile> referencingFilesOf(ProjectFile file)
+  @Override protected Set<CodeUnit> resolveImports(ProjectFile file, List<String> importStatements)
+  @Override public boolean couldImportFile(List<ImportInfo> imports, ProjectFile target)
+  @Override protected void extractImports(
+              Map<String, TSNode> capturedNodesForMatch, SourceContent sourceContent, List<ImportInfo> localImportInfos)
+  private String extractFilenameWithoutExtension(String path)
+  private Optional<ProjectFile> resolveRelativeInclude(ProjectFile includingFile, String relativePath)
+  @Override protected boolean requiresSemicolons()
+  @Override protected boolean isConstructor(CodeUnit candidate, @Nullable CodeUnit enclosingClass, String captureName)
+  @Override public Set<CodeUnit> getDeclarations(ProjectFile file)
+  @Override public Map<CodeUnit, String> getSkeletons(ProjectFile file)
+  private Map<CodeUnit, String> addCorrespondingSourceDeclarations(
+              Map<CodeUnit, String> resultSkeletons, ProjectFile file)
+  private boolean isHeaderFile(ProjectFile file)
+  private @Nullable ProjectFile findCorrespondingSourceFile(ProjectFile headerFile)
+  private boolean isGlobalFunctionOrVariable(CodeUnit cu)
+  @SuppressWarnings("RedundantNullCheck") // Defensive check for TreeSitter JNI interop private String buildCppOverloadSuffix(TSNode funcOrDeclNode, SourceContent sourceContent)
+  private @Nullable TSNode findFieldIdentifier(TSNode node)
+  private @Nullable TSNode findFunctionDeclaratorRecursive(TSNode node)
+  @Override protected Optional<String> extractSimpleName(TSNode decl, SourceContent sourceContent)
+  @Override protected boolean isBlankNameAllowed(String captureName, String simpleName, String nodeType, String file)
+  @Override protected boolean isNullNameAllowed(String identifierFieldName, String nodeType, int lineNumber, String file)
+  @Override protected boolean isNullNameExpectedForExtraction(String nodeType)
+  private boolean isComplexDeclarationStructure(String nodeType)
+  @Override protected String enhanceFqName(
+              String fqName, String captureName, TSNode definitionNode, SourceContent sourceContent)
+  @Override protected @Nullable String extractSignature(
+              String captureName, TSNode definitionNode, SourceContent sourceContent)
+  private @Nullable String buildEnclosingClassTemplateSignature(TSNode funcNode, SourceContent sourceContent)
+  private @Nullable String buildCppTemplateSignature(TSNode node, SourceContent sourceContent)
+  @SuppressWarnings("RedundantNullCheck") // Defensive check for TreeSitter JNI interop private String buildCppQualifierSuffix(TSNode funcOrDeclNode, SourceContent sourceContent)
+  private boolean hasKeywordWithBoundary(String text, String keyword)
+  private String extractNoexceptClause(String text)
+  @SuppressWarnings("RedundantNullCheck") // Defensive check for TreeSitter JNI interop private boolean scanForQualifier(
+              TSNode parent, int tailStart, int tailEnd, SourceContent sourceContent, String qualifier)
+  @Override protected String extractPackageFromWildcard(String rawSnippet)
+  @Override public Set<String> relevantImportsFor(CodeUnit cu)
+  private Optional<ProjectFile> resolveRelativeIncludeForRelevance(ProjectFile includingFile, String relativePath)
+  @Override protected boolean shouldIgnoreDuplicate(CodeUnit existing, CodeUnit candidate, ProjectFile file)
+  @Override protected Comparator<CodeUnit> prioritizingComparator()
+  @Override public Set<String> extractTypeIdentifiers(String source)
+  @Override protected boolean containsTestMarkers(TSTree tree, SourceContent sourceContent)
+}
+
+public interface IAnalyzer {
+  Set<String> COMMON_HIERARCHY_SEPARATORS;
+  record FileRelevance(ProjectFile file, double score) implements Comparable<FileRelevance> {
+    ProjectFile file;
+    double score;
+    @Override public int compareTo(FileRelevance other)
+  }
+  @FunctionalInterface
+      interface ProgressListener {
+    ProgressListener NOOP;
+    void onProgress(int completed, int total, String phase)
+  }
+  class NoopProgressListener implements ProgressListener {
+    @Override public void onProgress(int completed, int total, String phase)
+  }
+  List<CodeUnit> getTopLevelDeclarations(ProjectFile file)
+  default Set<ProjectFile> getAnalyzedFiles()
+  default boolean containsTests(ProjectFile file)
+  Set<Language> languages()
+  IAnalyzer update(Set<ProjectFile> changedFiles)
+  IAnalyzer update()
+  IProject getProject()
+  default List<CodeUnit> getMembersInClass(CodeUnit classUnit)
+  List<CodeUnit> getAllDeclarations()
+  default CodeBaseMetrics getMetrics()
+  Set<CodeUnit> getDeclarations(ProjectFile file)
+  SequencedSet<CodeUnit> getDefinitions(String fqName)
+  default Optional<CodeUnit> parentOf(CodeUnit cu)
+  List<CodeUnit> getDirectChildren(CodeUnit cu)
+  Optional<String> extractCallReceiver(String reference)
+  List<String> importStatementsOf(ProjectFile file)
+  Optional<CodeUnit> enclosingCodeUnit(ProjectFile file, Range range)
+  Optional<CodeUnit> enclosingCodeUnit(ProjectFile file, int startLine, int endLine)
+  default boolean isAccessExpression(ProjectFile file, int startByte, int endByte)
+  default Optional<DeclarationInfo> findNearestDeclaration(
+              ProjectFile file, int startByte, int endByte, String identifierName)
+  enum DeclarationKind {
+    PARAMETER,
+    LOCAL_VARIABLE,
+    FIELD,
+    CATCH_PARAMETER,
+    FOR_LOOP_VARIABLE,
+    PATTERN_VARIABLE,
+    RESOURCE_VARIABLE,
+    UNKNOWN
+  }
+  record DeclarationInfo(DeclarationKind kind, String name, @Nullable CodeUnit enclosingUnit) {
+    DeclarationKind kind;
+    String name;
+    @Nullable CodeUnit enclosingUnit;
+  }
+  record Range(int startByte, int endByte, int startLine, int endLine, int commentStartByte) {
+    int startByte;
+    int endByte;
+    int startLine;
+    int endLine;
+    int commentStartByte;
+    public boolean isEmpty()
+    public boolean isContainedWithin(Range other)
+  }
+  List<Range> rangesOf(CodeUnit codeUnit)
+  default boolean isEmpty()
+  default <T extends CapabilityProvider> Optional<T> as(Class<T> capability)
+  default Comparator<CodeUnit> priorityComparator()
+  default SequencedSet<CodeUnit> sortDefinitions(Set<CodeUnit> definitions)
+  default Set<CodeUnit> searchDefinitions(String pattern)
+  default Set<CodeUnit> searchDefinitions(String pattern, boolean autoQuote)
+  default Set<CodeUnit> searchDefinitions(Pattern compiledPattern)
+  static Comparator<CodeUnit> autocompleteDefinitionsSortComparator()
+  default Set<CodeUnit> autocompleteDefinitions(String query)
+  private static void addShort(String full, Set<String> out)
+  default Set<String> getSymbols(Set<CodeUnit> sources)
+  default Optional<IAnalyzer> subAnalyzer(Language language)
+  default String summarizeSymbols(ProjectFile file)
+  default String summarizeSymbols(ProjectFile file, Set<CodeUnitType> types)
+  default String summarizeSymbols(Collection<CodeUnit> units, Set<CodeUnitType> types, int indent)
+  private void renderSymbol(StringBuilder sb, CodeUnit cu, Set<CodeUnitType> types, int indent, String indentStr)
+  static String toUnixRelativePath(Path path)
+  default List<String> getTestModules(Collection<ProjectFile> files)
+  Optional<String> getSkeleton(CodeUnit cu)
+  Optional<String> getSkeletonHeader(CodeUnit classUnit)
+  default Map<CodeUnit, String> getSkeletons(ProjectFile file)
+  Optional<String> getSource(CodeUnit codeUnit, boolean includeComments)
+  Set<String> getSources(CodeUnit codeUnit, boolean includeComments)
+  default Set<CodeUnit> testFilesToCodeUnits(Collection<ProjectFile> files)
+}
+
+public interface JvmBasedAnalyzer extends IAnalyzer {
+}
+
+public final class GoAnalyzer extends TreeSitterAnalyzer implements ImportAnalysisProvider {
+  static final Logger log;
+  private static final Pattern IMPORT_PATH_PATTERN;
+  private static final Pattern GO_COMMENT_PATTERN;
+  private static final LanguageSyntaxProfile GO_SYNTAX_PROFILE;
+  public GoAnalyzer(IProject project)
+  public GoAnalyzer(IProject project, ProgressListener listener)
+  private GoAnalyzer(IProject project, ProgressListener listener, GoAnalyzerCache cache)
+  private void checkVendorDirectory(IProject project)
+  private GoAnalyzer(
+              IProject project, AnalyzerState state, ProgressListener listener, @Nullable GoAnalyzerCache cache)
+  public static GoAnalyzer fromState(IProject project, AnalyzerState state, ProgressListener listener)
+  @Override protected IAnalyzer newSnapshot(
+              AnalyzerState state, ProgressListener listener, @Nullable AnalyzerCache previousCache)
+  @Override protected AnalyzerCache createFilteredCache(AnalyzerCache previous, Set<ProjectFile> changedFiles)
+  @Override protected TSLanguage createTSLanguage()
+  @Override protected Optional<String> getQueryResource(QueryType type)
+  @Override protected LanguageSyntaxProfile getLanguageSyntaxProfile()
+  @Override protected String determinePackageName(
+              ProjectFile file, TSNode definitionNode, TSNode rootNode, SourceContent sourceContent)
+  @Override protected @Nullable CodeUnit createCodeUnit(
+              ProjectFile file,
+              String captureName,
+              String simpleName,
+              String packageName,
+              String classChain,
+              List<ScopeSegment> scopeChain,
+              @Nullable TSNode definitionNode,
+              SkeletonType skeletonType)
+  @Override protected String renderFunctionDeclaration(
+              TSNode funcNode,
+              SourceContent sourceContent,
+              String exportPrefix,
+              String asyncPrefix,
+              String functionName,
+              String typeParamsText,
+              String paramsText,
+              String returnTypeText,
+              String indent)
+  @Override protected TSNode adjustSourceRangeNode(TSNode definitionNode, String captureName)
+  @Override protected SkeletonType refineSkeletonType(
+              String captureName, TSNode definitionNode, LanguageSyntaxProfile profile)
+  @Override protected String renderClassHeader(
+              TSNode classNode,
+              SourceContent sourceContent,
+              String exportPrefix,
+              String signatureTextParam,
+              String baseIndent)
+  @Override protected String getLanguageSpecificCloser(CodeUnit cu)
+  @Override protected String formatFieldSignature(
+              TSNode fieldNode,
+              SourceContent sourceContent,
+              String exportPrefix,
+              String signatureText,
+              String simpleName,
+              String baseIndent,
+              ProjectFile file)
+  private static boolean isInsideStructType(TSNode node)
+  @Override protected String bodyPlaceholder()
+  @Override protected Optional<String> extractReceiverType(
+              TSNode node, String primaryCaptureName, SourceContent sourceContent)
+  @Override protected boolean requiresSemicolons()
+  @Override public Optional<String> extractCallReceiver(String reference)
+  @Override public List<String> getTestModules(Collection<ProjectFile> files)
+  public static List<String> getTestModulesStatic(Collection<ProjectFile> files)
+  public static String formatTestModule(@Nullable Path parent)
+  @Override public Set<CodeUnit> importedCodeUnitsOf(ProjectFile file)
+  @Override public Set<ProjectFile> referencingFilesOf(ProjectFile file)
+  @Override public boolean couldImportFile(List<ImportInfo> imports, ProjectFile target)
+  @Override public Set<String> relevantImportsFor(CodeUnit cu)
+  @Override protected void extractImports(
+              Map<String, TSNode> capturedNodesForMatch, SourceContent sourceContent, List<ImportInfo> localImportInfos)
+  private String getPackageNameFromPath(String importPath)
+  @Override public Set<String> extractTypeIdentifiers(String source)
+  @Override protected Set<CodeUnit> resolveImports(ProjectFile file, List<String> importStatements)
+  private String resolveImportPathToPackageName(String importPath)
+  private boolean isBlankImport(String text, int quoteStart)
+  @Override protected boolean containsTestMarkers(TSTree tree, SourceContent sourceContent)
+}
+
+public record ImportInfo(String rawSnippet, boolean isWildcard, @Nullable String identifier, @Nullable String alias) {
+  String rawSnippet;
+  boolean isWildcard;
+  @Nullable String identifier;
+  @Nullable String alias;
+}
+
+public final class TypescriptAnalyzer extends JsTsAnalyzer {
+  private static final Pattern TRAILING_SEMICOLON;
+  private static final Pattern ENUM_COMMA_CLEANUP;
+  private static final Pattern TYPE_ALIAS_LINE;
+  private static final Set<String> FUNCTION_NODE_TYPES;
+  private static final Map<String, String> CLASS_KEYWORDS;
+  private static final LanguageSyntaxProfile TS_SYNTAX_PROFILE;
+  public TypescriptAnalyzer(IProject project)
+  public TypescriptAnalyzer(IProject project, ProgressListener listener)
+  private TypescriptAnalyzer(
+              IProject project, AnalyzerState state, ProgressListener listener, @Nullable AnalyzerCache cache)
+  public static TypescriptAnalyzer fromState(IProject project, AnalyzerState state, ProgressListener listener)
+  @Override protected TypescriptAnalyzer newSnapshot(
+              AnalyzerState state, ProgressListener listener, @Nullable AnalyzerCache previousCache)
+  @Override protected Optional<String> getQueryResource(QueryType type)
+  @Override protected LanguageSyntaxProfile getLanguageSyntaxProfile()
+  @Override protected SkeletonType refineSkeletonType(
+              String captureName, TSNode definitionNode, LanguageSyntaxProfile profile)
+  @Override protected @Nullable CodeUnit createCodeUnit(
+              ProjectFile file,
+              String captureName,
+              String simpleName,
+              String packageName,
+              String classChain,
+              List<ScopeSegment> scopeChain,
+              @Nullable TSNode definitionNode,
+              SkeletonType skeletonType)
+  @Override protected String formatReturnType(@Nullable TSNode returnTypeNode, SourceContent sourceContent)
+  @Override protected String buildParentFqName(CodeUnit cu, String classChain)
+  private Optional<String> extractNamespacePath(TSNode definitionNode, SourceContent sourceContent)
+  @Override protected String determinePackageName(
+              ProjectFile file, TSNode definitionNode, TSNode rootNode, SourceContent sourceContent)
+  @Override protected String renderFunctionDeclaration(
+              TSNode funcNode,
+              SourceContent sourceContent,
+              String exportAndModifierPrefix,
+              String ignoredAsyncPrefix,
+              String functionName,
+              String typeParamsText,
+              String paramsText,
+              String returnTypeText,
+              String indent)
+  private String getKeywordForFunction(TSNode funcNode, String functionName)
+  private boolean isLiteralType(String type)
+  @Override protected String formatFieldSignature(
+              TSNode fieldNode,
+              SourceContent sourceContent,
+              String exportPrefix,
+              String signatureText,
+              String simpleName,
+              String baseIndent,
+              ProjectFile file)
+  @Override protected String renderClassHeader(
+              TSNode classNode,
+              SourceContent sourceContent,
+              String exportAndModifierPrefix,
+              String signatureText,
+              String baseIndent)
+  @Override protected String getVisibilityPrefix(TSNode node, SourceContent sourceContent)
+  @Override protected String bodyPlaceholder()
+  @Override protected ResolvedNodes resolveSignatureNodes(
+              TSNode definitionNode, String simpleName, SkeletonType refined, SourceContent sourceContent)
+  @Override protected boolean shouldMergeSignaturesForSameFqn()
+  @Override protected String enhanceFqName(
+              String fqName, String captureName, TSNode definitionNode, SourceContent sourceContent)
+  private boolean hasStaticModifier(TSNode node)
+  private String getAccessorType(TSNode node)
+  @Override protected boolean isMissingNameCaptureAllowed(String captureName, String nodeType, String fileName)
+  @Override protected boolean shouldSkipNode(TSNode node, String captureName, SourceContent sourceContent)
+  @Override protected String getLanguageSpecificCloser(CodeUnit cu)
+  @Override protected Set<String> getIgnoredCaptures()
+  @Override protected boolean isBenignDuplicate(CodeUnit existing, CodeUnit candidate)
+  @Override protected boolean shouldIgnoreDuplicate(CodeUnit existing, CodeUnit candidate, ProjectFile file)
+  public boolean isInAmbientContext(TSNode node)
+  public boolean isInNamespaceContext(TSNode node)
+  private boolean checkAmbientContextDirect(TSNode node)
+  @Override public Optional<String> getSkeleton(CodeUnit cu)
+  private CodeUnit findTopLevelParent(CodeUnit cu)
+  private @Nullable CodeUnit findDirectParent(CodeUnit cu)
+  @Override public Map<CodeUnit, String> getSkeletons(ProjectFile file)
+  @Override protected Optional<String> extractSimpleName(TSNode decl, SourceContent sourceContent)
+  @Override protected void buildFunctionSkeleton(
+              TSNode funcNode,
+              Optional<String> providedNameOpt,
+              SourceContent sourceContent,
+              String indent,
+              List<String> lines,
+              String exportPrefix)
+  @Override public Optional<String> extractCallReceiver(String reference)
+  @Override protected TSLanguage createTSLanguage()
+  @Override protected void extractImports(
+              Map<String, TSNode> capturedNodesForMatch, SourceContent sourceContent, List<ImportInfo> localImportInfos)
+  @Override protected @Nullable String extractSignature(
+              String captureName, TSNode definitionNode, SourceContent sourceContent)
+  @Override public Set<String> extractIdentifiersFromImport(String importStatement)
+  @Override public Set<String> extractTypeIdentifiers(String source)
+}
+
+public final class TreeSitterStateIO {
+  private static final Logger log;
+  static final SemVer CURRENT_SCHEMA;
+  private static final ObjectMapper SMILE_MAPPER;
+  private TreeSitterStateIO()
+  static final class ProjectFileJsonSerializer extends JsonSerializer<ProjectFile> {
+    @Override public void serialize(ProjectFile value, JsonGenerator gen, SerializerProvider serializers)
+  }
+  static final class ProjectFileJsonDeserializer extends JsonDeserializer<ProjectFile> {
+    @Override public @Nullable ProjectFile deserialize(JsonParser p, DeserializationContext ctxt)
+  }
+  static final class CodeUnitJsonSerializer extends JsonSerializer<CodeUnit> {
+    @Override public void serialize(CodeUnit value, JsonGenerator gen, SerializerProvider serializers)
+  }
+  static final class CodeUnitJsonDeserializer extends JsonDeserializer<CodeUnit> {
+    @Override public @Nullable CodeUnit deserialize(JsonParser p, DeserializationContext ctxt)
+  }
+  @JsonIgnoreProperties(ignoreUnknown = true)
+      public record ProjectFileDto(String root, String relPath) {
+    String root;
+    String relPath;
+  }
+  @JsonIgnoreProperties(ignoreUnknown = true)
+      public record CodeUnitDto(
+              ProjectFileDto source,
+              CodeUnitType kind,
+              String packageName,
+              String shortName,
+              @Nullable String signature,
+              @Nullable Boolean synthetic) {
+    ProjectFileDto source;
+    CodeUnitType kind;
+    String packageName;
+    String shortName;
+    @Nullable String signature;
+    @Nullable Boolean synthetic;
+  }
+  @JsonIgnoreProperties(ignoreUnknown = true)
+      public record ImportInfoDto(
+              String rawSnippet, boolean isWildcard, @Nullable String identifier, @Nullable String alias) {
+    String rawSnippet;
+    boolean isWildcard;
+    @Nullable String identifier;
+    @Nullable String alias;
+  }
+  @JsonIgnoreProperties(ignoreUnknown = true)
+      public record AnalyzerStateDto(
+              Map<String, List<CodeUnitDto>> symbolIndex,
+              List<CodeUnitEntryDto> codeUnitState,
+              List<FileStateEntryDto> fileState,
+              List<String> symbolKeys,
+              long snapshotEpochNanos,
+              @Nullable String schemaVersion,
+              @Nullable String languageInternalName) {
+    Map<String, List<CodeUnitDto>> symbolIndex;
+    List<CodeUnitEntryDto> codeUnitState;
+    List<FileStateEntryDto> fileState;
+    List<String> symbolKeys;
+    long snapshotEpochNanos;
+    @Nullable String schemaVersion;
+    @Nullable String languageInternalName;
+    @JsonCreator public AnalyzerStateDto(
+                    @JsonProperty("symbolIndex") Map<String, List<CodeUnitDto>> symbolIndex,
+                    @JsonProperty("codeUnitState") List<CodeUnitEntryDto> codeUnitState,
+                    @JsonProperty("fileState") List<FileStateEntryDto> fileState,
+                    @JsonProperty("symbolKeys") List<String> symbolKeys,
+                    @JsonProperty("snapshotEpochNanos") long snapshotEpochNanos,
+                    @JsonProperty("schemaVersion") @Nullable String schemaVersion,
+                    @JsonProperty("languageInternalName") @Nullable String languageInternalName)
+  }
+  @JsonIgnoreProperties(ignoreUnknown = true)
+      public record CodeUnitPropertiesDto(
+              @Nullable List<CodeUnitDto> children,
+              @Nullable List<String> signatures,
+              @Nullable List<IAnalyzer.Range> ranges,
+              boolean hasBody,
+              boolean isTypeAlias) {
+    @Nullable List<CodeUnitDto> children;
+    @Nullable List<String> signatures;
+    @Nullable List<IAnalyzer.Range> ranges;
+    boolean hasBody;
+    boolean isTypeAlias;
+  }
+  @JsonIgnoreProperties(ignoreUnknown = true)
+      public record CodeUnitEntryDto(CodeUnitDto key, CodeUnitPropertiesDto value) {
+    CodeUnitDto key;
+    CodeUnitPropertiesDto value;
+  }
+  @JsonIgnoreProperties(ignoreUnknown = true)
+      public record FileStateEntryDto(ProjectFileDto key, FilePropertiesDto value) {
+    ProjectFileDto key;
+    FilePropertiesDto value;
+  }
+  @JsonIgnoreProperties(ignoreUnknown = true)
+      public record FilePropertiesDto(
+              List<CodeUnitDto> topLevelCodeUnits, List<ImportInfoDto> importStatements, boolean containsTests) {
+    List<CodeUnitDto> topLevelCodeUnits;
+    List<ImportInfoDto> importStatements;
+    boolean containsTests;
+    @JsonCreator public FilePropertiesDto(
+                    @JsonProperty("topLevelCodeUnits") List<CodeUnitDto> topLevelCodeUnits,
+                    @JsonProperty("importStatements") List<ImportInfoDto> importStatements,
+                    @JsonProperty(value = "containsTests", required = true) boolean containsTests)
+  }
+  @Blocking public static void save(TreeSitterAnalyzer.AnalyzerState state, Path file)
+  @Blocking public static void save(TreeSitterAnalyzer.AnalyzerState state, Path file, @Nullable Language language)
+  @Blocking public static Optional<TreeSitterAnalyzer.AnalyzerState> load(Path file)
+  private static Optional<TreeSitterAnalyzer.AnalyzerState> loadFromStream(InputStream in, Path file, long startMs)
+  public static AnalyzerStateDto toDto(TreeSitterAnalyzer.AnalyzerState state)
+  public static AnalyzerStateDto toDto(TreeSitterAnalyzer.AnalyzerState state, @Nullable Language language)
+  public static TreeSitterAnalyzer.AnalyzerState fromDto(AnalyzerStateDto dto)
+  private static Path parseRootPath(String text)
+  private static CodeUnitDto toDto(CodeUnit cu)
+  private static CodeUnit fromDto(CodeUnitDto dto)
+  private static ProjectFileDto toDto(ProjectFile pf)
+  private static ImportInfoDto toDto(ImportInfo info)
+  private static ImportInfo fromDto(ImportInfoDto dto)
+  private static ProjectFile fromDto(ProjectFileDto dto)
+  private static void moveWithRetriesOrCopyFallback(Path temp, Path file)
+}
+
+public interface Language {
+  Logger logger;
+  String ANALYZER_STATE_SUFFIX = ".bin.lz4";
+  Set<String> getExtensions()
+  String name()
+  String internalName()
+  default IAnalyzer createAnalyzer(IProject project)
+  IAnalyzer createAnalyzer(IProject project, IAnalyzer.ProgressListener listener)
+  default IAnalyzer loadAnalyzer(IProject project)
+  IAnalyzer loadAnalyzer(IProject project, IAnalyzer.ProgressListener listener)
+  default Path getStoragePath(IProject project)
+  default void saveAnalyzer(IAnalyzer analyzer, IProject project)
+  default List<Path> getDependencyCandidates(IProject project)
+  default ImportSupport getDependencyImportSupport()
+  default Set<String> getSearchPatterns(CodeUnitType type)
+  enum ImportSupport {
+    NONE,
+    BASIC,
+    FINE_GRAINED
+  }
+  enum DependencyKind {
+    NORMAL,
+    BUILD,
+    DEV,
+    TEST,
+    TRANSITIVE,
+    UNKNOWN
+  }
+  record DependencyCandidate(String displayName, Path sourcePath, DependencyKind kind, long filesCount) {
+    String displayName;
+    Path sourcePath;
+    DependencyKind kind;
+    long filesCount;
+  }
+  default List<DependencyCandidate> listDependencyPackages(IProject project)
+  default boolean importDependency(
+              Chrome chrome, DependencyCandidate pkg, @Nullable DependenciesPanel.DependencyLifecycleListener lifecycle)
+  default boolean contains(Language other)
+  default boolean isAnalyzed(IProject project, Path path)
+  class MultiLanguage implements Language {
+    private final Set<Language> languages;
+    public MultiLanguage(Set<Language> languages)
+    @Override public Set<String> getExtensions()
+    @Override public String name()
+    @Override public String internalName()
+    @Override public Path getStoragePath(IProject project)
+    @Override public IAnalyzer createAnalyzer(IProject project, IAnalyzer.ProgressListener listener)
+    @Override public IAnalyzer loadAnalyzer(IProject project, IAnalyzer.ProgressListener listener)
+    @Override public List<Path> getDependencyCandidates(IProject project)
+    @Override public ImportSupport getDependencyImportSupport()
+    @Override public boolean contains(Language other)
+    @Override public boolean isAnalyzed(IProject project, Path path)
+    public Set<Language> getLanguages()
+    @Override public String toString()
+  }
+}
+
+public class ExternalFile implements BrokkFile {
+  private final transient Path path;
+  @JsonCreator public ExternalFile(@JsonProperty("path") Path path)
+  @Override public Path absPath()
+  @JsonGetter("path") public Path getPath()
+  @Override public String toString()
+}
+
+public class ProjectFile implements BrokkFile {
+  private final transient Path root;
+  private final transient Path relPath;
+  @JsonCreator public ProjectFile(@JsonProperty("root") Path root, @JsonProperty("relPath") Path relPath)
+  public ProjectFile(Path root, String relName)
+  @JsonGetter("root") public Path getRoot()
+  @JsonGetter("relPath") public Path getRelPath()
+  @Override public Path absPath()
+  public void create()
+  public void write(String st)
+  @JsonIgnore public Path getParent()
+  @Override public String toString()
+  @Override public boolean equals(@Nullable Object o)
+  @Override public int hashCode()
+  public Optional<Long> size()
+}
+
+public class DisabledAnalyzer implements IAnalyzer {
+  @Nullable
+      private final IProject project;
+  public DisabledAnalyzer()
+  public DisabledAnalyzer(@Nullable IProject project)
+  @Override public List<CodeUnit> getAllDeclarations()
+  @Override public List<CodeUnit> getMembersInClass(CodeUnit classUnit)
+  @Override public Set<CodeUnit> getDeclarations(ProjectFile file)
+  @Override public Set<CodeUnit> searchDefinitions(String pattern)
+  @Override public Set<String> getSymbols(Set<CodeUnit> sources)
+  @Override public List<CodeUnit> getTopLevelDeclarations(ProjectFile file)
+  @Override public Set<ProjectFile> getAnalyzedFiles()
+  @Override public List<String> importStatementsOf(ProjectFile file)
+  @Override public Optional<CodeUnit> enclosingCodeUnit(ProjectFile file, Range range)
+  @Override public Optional<CodeUnit> enclosingCodeUnit(ProjectFile file, int startLine, int endLine)
+  @Override public IAnalyzer update(Set<ProjectFile> changedFiles)
+  @Override public IAnalyzer update()
+  @Override public SequencedSet<CodeUnit> getDefinitions(String fqName)
+  @Override public IProject getProject()
+  @Override public Set<Language> languages()
+  @Override public List<CodeUnit> getDirectChildren(CodeUnit cu)
+  @Override public Optional<String> extractCallReceiver(String reference)
+  @Override public boolean containsTests(ProjectFile file)
+  @Override public Optional<String> getSkeleton(CodeUnit cu)
+  @Override public Optional<String> getSkeletonHeader(CodeUnit classUnit)
+  @Override public Optional<String> getSource(CodeUnit codeUnit, boolean includeComments)
+  @Override public Set<String> getSources(CodeUnit codeUnit, boolean includeComments)
+  @Override public List<Range> rangesOf(CodeUnit codeUnit)
+}
+
+public class FileAnalysisAccumulator {
+  private final Set<CodeUnit> topLevelCUs;
+  private final Map<CodeUnit, Set<CodeUnit>> children;
+  private final Map<CodeUnit, CodeUnit> childToParent;
+  private final Map<CodeUnit, Set<String>> signatures;
+  private final Map<CodeUnit, Set<Range>> sourceRanges;
+  private final Map<CodeUnit, Boolean> hasBody;
+  private final Map<CodeUnit, Boolean> isTypeAlias;
+  private final Map<String, Set<CodeUnit>> codeUnitsBySymbol;
+  private final Map<String, CodeUnit> cuByFqName;
+  private final Map<CodeUnit, Set<String>> lookupKeys;
+  public FileAnalysisAccumulator()
+  public FileAnalysisAccumulator addTopLevel(CodeUnit cu)
+  public FileAnalysisAccumulator addChild(CodeUnit parent, CodeUnit child)
+  public FileAnalysisAccumulator addSignature(CodeUnit cu, String signature)
+  public FileAnalysisAccumulator addRange(CodeUnit cu, Range range)
+  public FileAnalysisAccumulator setHasBody(CodeUnit cu, boolean body)
+  public FileAnalysisAccumulator setIsTypeAlias(CodeUnit cu, boolean typeAlias)
+  public FileAnalysisAccumulator addSymbolIndex(String symbol, CodeUnit cu)
+  public FileAnalysisAccumulator remove(CodeUnit cu)
+  public FileAnalysisAccumulator addLookupKey(String lookupKey, CodeUnit cu)
+  public FileAnalysisAccumulator replaceTopLevelCodeUnit(CodeUnit existing, CodeUnit replacement)
+  public FileAnalysisAccumulator replaceChildCodeUnit(CodeUnit parent, CodeUnit existing, CodeUnit replacement)
+  public FileAnalysisAccumulator registerCodeUnit(CodeUnit cu)
+  private void removeFromSymbolIndex(CodeUnit cu)
+  public @Nullable CodeUnit getByFqName(String key)
+  public boolean getHasBody(CodeUnit cu, boolean defaultValue)
+  public List<CodeUnit> getChildren(CodeUnit cu)
+  public List<String> getSignatures(CodeUnit cu)
+  public List<Range> getRanges(CodeUnit cu)
+  public List<String> getLookupKeys(CodeUnit cu)
+  public void detachChildren(CodeUnit cu)
+  public Map<CodeUnit, CodeUnitProperties> toCodeUnitProperties()
+  public Map<String, CodeUnit> cuByFqName()
+  public List<CodeUnit> topLevelCUs()
+  public Map<CodeUnit, Set<CodeUnit>> children()
+  public Map<CodeUnit, Set<String>> signatures()
+  public Map<CodeUnit, Set<Range>> sourceRanges()
+  public Map<CodeUnit, Boolean> hasBody()
+  public Map<String, Set<CodeUnit>> codeUnitsBySymbol()
+  public Map<CodeUnit, List<String>> lookupKeys()
+  public @Nullable CodeUnit findTopLevelDuplicate(CodeUnit cu)
+  public @Nullable CodeUnit findTopLevelCrossKindDuplicate(CodeUnit cu)
+  public @Nullable CodeUnit findChildDuplicate(CodeUnit parent, CodeUnit child)
+  public @Nullable CodeUnit findChildCrossKindDuplicate(CodeUnit parent, CodeUnit child)
+  private static boolean sameLogicalIdentity(CodeUnit left, CodeUnit right)
+}
+
+public class SymbolNotFoundException extends RuntimeException {
+  public SymbolNotFoundException(String message)
+}
