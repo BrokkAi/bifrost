@@ -20,9 +20,10 @@ After this change, this repository will contain a Rust library that reproduces t
 - [x] (2026-03-24T21:19Z) Added the first Rust smoke tests covering fixture parsing and explicit file updates; `cargo test --test java_analyzer_smoke` now passes.
 - [x] (2026-03-24T21:19Z) Implemented the first Java semantic layer: import resolution with explicit-over-wildcard precedence, same-package referencing detection, raw-supertype extraction, and direct/transitive hierarchy traversal. `cargo test --test java_imports_and_hierarchy` passes.
 - [x] (2026-03-24T21:19Z) Implemented a first rendering layer for class/function source extraction and recursive skeleton/header reconstruction. `cargo test --test java_source_and_skeleton` passes against the copied Java fixtures.
-- [ ] Complete the remaining Java-specific semantics: comment-aware source extraction, access-expression filtering, nearest declaration lookup, and broader update/regression parity.
+- [x] (2026-03-24T21:19Z) Implemented lexical scope lookup and access-expression filtering for constructor/method parameters, locals, enhanced-for variables, catch parameters, try-with-resources variables, and lambda parameters. `cargo test --test java_scope_analysis` passes.
+- [ ] Complete the remaining Java-specific semantics: comment-aware source extraction, module/implicit-constructor parity, and broader update/regression parity.
 - [ ] Translate the selected Java tests into Rust integration tests and make them pass.
-- [ ] Run the Rust test suite and commit each milestone as a logical unit.
+- [x] (2026-03-24T21:19Z) The current Rust suite passes with `cargo test`.
 
 ## Surprises & Discoveries
 
@@ -46,6 +47,9 @@ After this change, this repository will contain a Rust library that reproduces t
 
 - Observation: the existing declaration ranges plus lightweight stored signatures are enough to reconstruct the basic Java skeletons covered by the copied fixture tests.
   Evidence: `cargo test --test java_source_and_skeleton` passes for overloaded method source extraction, nested-class source slices, recursive class skeletons, and header-only skeletons.
+
+- Observation: the lexical-scope cases exercised by the Java tests are coverable with a direct upward Tree-sitter walk plus a few node-specific checks.
+  Evidence: `cargo test --test java_scope_analysis` passes for constructor parameters, local variables, enhanced-for variables, try-with-resources variables, lambda parameters, and field-vs-local access filtering.
 
 ## Decision Log
 
@@ -73,9 +77,13 @@ After this change, this repository will contain a Rust library that reproduces t
   Rationale: it avoids reparsing on every request and keeps the first source/skeleton milestone simple while still matching the fixture-backed Java tests.
   Date/Author: 2026-03-24 / Codex
 
+- Decision: implement the first scope-analysis pass in `JavaAnalyzer` by reparsing the current source text on demand instead of storing full per-file syntax trees in analyzer state.
+  Rationale: it keeps the snapshot state simpler for v1 while still providing correct local-scope answers for the exercised tests.
+  Date/Author: 2026-03-24 / Codex
+
 ## Outcomes & Retrospective
 
-The repository now has the crate scaffold, the copied Brokk resource corpus, the public Rust API layer, a single-threaded parse/index core, a Java semantic layer for imports and hierarchy, and a first rendering layer for source and skeletons. The major remaining gap is semantic parity for comment-aware extraction, local declaration and access-expression logic, and the broader translated acceptance suite.
+The repository now has the crate scaffold, the copied Brokk resource corpus, the public Rust API layer, a single-threaded parse/index core, Java semantics for imports and hierarchy, a rendering layer for source and skeletons, and a first lexical-scope/access-expression implementation. The major remaining gap is parity for comment-aware extraction, module and implicit-constructor behavior, duplicate/update regressions, and the broader translated acceptance suite.
 
 ## Context and Orientation
 

@@ -1,10 +1,10 @@
 use crate::analyzer::{
-    CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language, LanguageAdapter, Project,
-    ProjectFile, TreeSitterAnalyzer, TypeHierarchyProvider,
+    CodeUnit, DeclarationInfo, DeclarationKind, IAnalyzer, ImportAnalysisProvider, ImportInfo,
+    Language, LanguageAdapter, Project, ProjectFile, TreeSitterAnalyzer, TypeHierarchyProvider,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use tree_sitter::{Language as TsLanguage, Node, Tree};
+use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
 
 #[derive(Debug, Clone, Default)]
 pub struct JavaAdapter;
@@ -589,6 +589,205 @@ fn normalize_whitespace(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn parse_tree(source: &str) -> Option<Tree> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_java::LANGUAGE.into())
+        .expect("failed to load java parser");
+    parser.parse(source, None)
+}
+
+fn is_comment_node(node: Node<'_>) -> bool {
+    matches!(node.kind(), "line_comment" | "block_comment")
+}
+
+fn is_declaration_parent(kind: &str) -> bool {
+    matches!(
+        kind,
+        "method_declaration"
+            | "field_declaration"
+            | "class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "record_declaration"
+            | "variable_declarator"
+            | "formal_parameter"
+            | "catch_formal_parameter"
+            | "enhanced_for_statement"
+            | "resource"
+    )
+}
+
+fn find_nearest_declaration_from_node(
+    start_node: Node<'_>,
+    identifier: &str,
+    source: &str,
+) -> Option<DeclarationInfo> {
+    let mut current = Some(start_node);
+
+    while let Some(node) = current {
+        match node.kind() {
+            "method_declaration" | "constructor_declaration" => {
+                if let Some(found) = check_formal_parameters(node, identifier, source) {
+                    return Some(found);
+                }
+            }
+            "enhanced_for_statement" => {
+                if let Some(found) =
+                    match_named_field(node, "name", identifier, source, DeclarationKind::EnhancedForVariable)
+                {
+                    return Some(found);
+                }
+            }
+            "catch_clause" => {
+                let mut cursor = node.walk();
+                for child in node.named_children(&mut cursor) {
+                    if child.kind() == "catch_formal_parameter" {
+                        if let Some(found) =
+                            match_named_field(child, "name", identifier, source, DeclarationKind::CatchParameter)
+                        {
+                            return Some(found);
+                        }
+                    }
+                }
+            }
+            "try_with_resources_statement" => {
+                if let Some(resources) = node.child_by_field_name("resources") {
+                    let mut cursor = resources.walk();
+                    for child in resources.named_children(&mut cursor) {
+                        if child.kind() == "resource" {
+                            if let Some(found) = match_named_field(
+                                child,
+                                "name",
+                                identifier,
+                                source,
+                                DeclarationKind::ResourceVariable,
+                            ) {
+                                return Some(found);
+                            }
+                        }
+                    }
+                }
+            }
+            "lambda_expression" => {
+                if let Some(parameters) = node.child_by_field_name("parameters") {
+                    if parameters.kind() == "identifier" {
+                        if node_text(parameters, source).trim() == identifier {
+                            return Some(declaration_info(
+                                identifier,
+                                DeclarationKind::LambdaParameter,
+                                parameters,
+                            ));
+                        }
+                    } else {
+                        let mut cursor = parameters.walk();
+                        for child in parameters.named_children(&mut cursor) {
+                            if child.kind() == "identifier" && node_text(child, source).trim() == identifier {
+                                return Some(declaration_info(
+                                    identifier,
+                                    DeclarationKind::LambdaParameter,
+                                    child,
+                                ));
+                            }
+                            if child.kind() == "formal_parameter" {
+                                if let Some(found) = match_named_field(
+                                    child,
+                                    "name",
+                                    identifier,
+                                    source,
+                                    DeclarationKind::LambdaParameter,
+                                ) {
+                                    return Some(found);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        if let Some(found) = check_preceding_local_variables(node, identifier, source) {
+            return Some(found);
+        }
+
+        current = node.parent();
+    }
+
+    None
+}
+
+fn check_formal_parameters(node: Node<'_>, identifier: &str, source: &str) -> Option<DeclarationInfo> {
+    let params = node.child_by_field_name("parameters")?;
+    let mut cursor = params.walk();
+    for child in params.named_children(&mut cursor) {
+        if child.kind() == "formal_parameter" {
+            if let Some(found) =
+                match_named_field(child, "name", identifier, source, DeclarationKind::Parameter)
+            {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+fn check_preceding_local_variables(
+    current: Node<'_>,
+    identifier: &str,
+    source: &str,
+) -> Option<DeclarationInfo> {
+    let parent = current.parent()?;
+    let mut cursor = parent.walk();
+    for sibling in parent.named_children(&mut cursor) {
+        if sibling.end_byte() > current.start_byte() {
+            break;
+        }
+        if sibling.kind() != "local_variable_declaration" {
+            continue;
+        }
+        let mut local_cursor = sibling.walk();
+        for child in sibling.named_children(&mut local_cursor) {
+            if child.kind() == "variable_declarator" {
+                if let Some(found) =
+                    match_named_field(child, "name", identifier, source, DeclarationKind::LocalVariable)
+                {
+                    return Some(found);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn match_named_field(
+    node: Node<'_>,
+    field_name: &str,
+    identifier: &str,
+    source: &str,
+    kind: DeclarationKind,
+) -> Option<DeclarationInfo> {
+    let name_node = node.child_by_field_name(field_name)?;
+    if node_text(name_node, source).trim() == identifier {
+        Some(declaration_info(identifier, kind, name_node))
+    } else {
+        None
+    }
+}
+
+fn declaration_info(identifier: &str, kind: DeclarationKind, node: Node<'_>) -> DeclarationInfo {
+    DeclarationInfo {
+        identifier: identifier.to_string(),
+        kind,
+        range: crate::analyzer::Range {
+            start_byte: node.start_byte(),
+            end_byte: node.end_byte(),
+            start_line: node.start_position().row + 1,
+            end_line: node.end_position().row + 1,
+        },
+    }
+}
+
 fn class_signature(node: Node<'_>, source: &str) -> String {
     let body_start = node
         .child_by_field_name("body")
@@ -759,7 +958,74 @@ impl IAnalyzer for JavaAnalyzer {
     }
 
     fn is_access_expression(&self, file: &ProjectFile, start_byte: usize, end_byte: usize) -> bool {
-        self.inner.is_access_expression(file, start_byte, end_byte)
+        let Ok(source) = file.read_to_string() else {
+            return true;
+        };
+        let Some(tree) = parse_tree(&source) else {
+            return true;
+        };
+        let root = tree.root_node();
+        let Some(node) = root.named_descendant_for_byte_range(start_byte, end_byte) else {
+            return true;
+        };
+
+        let mut walk = Some(node);
+        while let Some(current) = walk {
+            if is_comment_node(current) {
+                return false;
+            }
+            walk = current.parent();
+        }
+
+        let mut current = Some(node);
+        while let Some(candidate) = current {
+            if let Some(parent) = candidate.parent() {
+                if is_declaration_parent(parent.kind()) {
+                    if let Some(name_node) = parent.child_by_field_name("name") {
+                        if name_node.start_byte() == start_byte {
+                            return false;
+                        }
+                    }
+                }
+            }
+            current = candidate.parent();
+        }
+
+        if let Some(parent) = node.parent() {
+            if parent.kind() == "field_access" {
+                if let Some(field_node) = parent.child_by_field_name("field") {
+                    if field_node.start_byte() == node.start_byte() {
+                        return true;
+                    }
+                }
+            }
+            if parent.kind() == "method_invocation" {
+                if let Some(name_node) = parent.child_by_field_name("name") {
+                    if name_node.start_byte() == node.start_byte() {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        let identifier = node_text(node, &source).trim().to_string();
+        if identifier.is_empty() {
+            return true;
+        }
+
+        match find_nearest_declaration_from_node(node, &identifier, &source) {
+            Some(info) => !matches!(
+                info.kind,
+                DeclarationKind::Parameter
+                    | DeclarationKind::LocalVariable
+                    | DeclarationKind::CatchParameter
+                    | DeclarationKind::EnhancedForVariable
+                    | DeclarationKind::ResourceVariable
+                    | DeclarationKind::PatternVariable
+                    | DeclarationKind::LambdaParameter
+            ),
+            None => true,
+        }
     }
 
     fn find_nearest_declaration(
@@ -769,8 +1035,15 @@ impl IAnalyzer for JavaAnalyzer {
         end_byte: usize,
         ident: &str,
     ) -> Option<crate::analyzer::DeclarationInfo> {
-        self.inner
-            .find_nearest_declaration(file, start_byte, end_byte, ident)
+        let Ok(source) = file.read_to_string() else {
+            return None;
+        };
+        let Some(tree) = parse_tree(&source) else {
+            return None;
+        };
+        let root = tree.root_node();
+        let node = root.named_descendant_for_byte_range(start_byte, end_byte)?;
+        find_nearest_declaration_from_node(node, ident, &source)
     }
 
     fn ranges_of(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
