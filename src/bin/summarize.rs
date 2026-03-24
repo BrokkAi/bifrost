@@ -63,7 +63,12 @@ fn run() -> Result<(), String> {
                 progress_for_build.set_length(total as u64);
                 progress_for_build.set_position(current as u64);
             }
-            progress_for_build.set_message(format!("Analyzing {}", file.rel_path().display()));
+            let name = file
+                .rel_path()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("unknown");
+            progress_for_build.set_message(format!("Analyzing {name}"));
         });
     progress.finish_with_message("Analysis complete");
     let summaries = summarize_inputs(&analyzer, &root, &inputs)?;
