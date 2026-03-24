@@ -106,6 +106,10 @@ impl ParsedFile {
     pub fn add_signature(&mut self, code_unit: CodeUnit, signature: String) {
         self.signatures.entry(code_unit).or_default().push(signature);
     }
+
+    pub fn add_child(&mut self, parent: CodeUnit, child: CodeUnit) {
+        self.children.entry(parent).or_default().push(child);
+    }
 }
 
 pub struct TreeSitterAnalyzer<A> {

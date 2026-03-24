@@ -21,7 +21,8 @@ After this change, this repository will contain a Rust library that reproduces t
 - [x] (2026-03-24T21:19Z) Implemented the first Java semantic layer: import resolution with explicit-over-wildcard precedence, same-package referencing detection, raw-supertype extraction, and direct/transitive hierarchy traversal. `cargo test --test java_imports_and_hierarchy` passes.
 - [x] (2026-03-24T21:19Z) Implemented a first rendering layer for class/function source extraction and recursive skeleton/header reconstruction. `cargo test --test java_source_and_skeleton` passes against the copied Java fixtures.
 - [x] (2026-03-24T21:19Z) Implemented lexical scope lookup and access-expression filtering for constructor/method parameters, locals, enhanced-for variables, catch parameters, try-with-resources variables, and lambda parameters. `cargo test --test java_scope_analysis` passes.
-- [ ] Complete the remaining Java-specific semantics: comment-aware source extraction, module/implicit-constructor parity, and broader update/regression parity.
+- [x] (2026-03-24T21:19Z) Added package-module code units and implicit-constructor synthesis for classes only, with explicit constructors suppressing synthesis. `cargo test --test java_modules_and_constructors` passes.
+- [ ] Complete the remaining Java-specific semantics: comment-aware source extraction and broader update/regression parity.
 - [ ] Translate the selected Java tests into Rust integration tests and make them pass.
 - [x] (2026-03-24T21:19Z) The current Rust suite passes with `cargo test`.
 
@@ -50,6 +51,9 @@ After this change, this repository will contain a Rust library that reproduces t
 
 - Observation: the lexical-scope cases exercised by the Java tests are coverable with a direct upward Tree-sitter walk plus a few node-specific checks.
   Evidence: `cargo test --test java_scope_analysis` passes for constructor parameters, local variables, enhanced-for variables, try-with-resources variables, lambda parameters, and field-vs-local access filtering.
+
+- Observation: package modules and implicit constructors fit cleanly into the existing parsed-file model without broad engine changes.
+  Evidence: a module code unit can be inserted as another top-level declaration with children pointing at the file's top-level classes, and synthetic constructors can be added as child function code units without source ranges; `cargo test --test java_modules_and_constructors` passes.
 
 ## Decision Log
 
@@ -81,9 +85,13 @@ After this change, this repository will contain a Rust library that reproduces t
   Rationale: it keeps the snapshot state simpler for v1 while still providing correct local-scope answers for the exercised tests.
   Date/Author: 2026-03-24 / Codex
 
+- Decision: represent package declarations as `CodeUnitType::Module` values whose fully qualified name is the package name, and attach top-level classes as their direct children.
+  Rationale: this matches the Brokk tests for top-level declarations and package-module child traversal while preserving the existing `CodeUnit` model.
+  Date/Author: 2026-03-24 / Codex
+
 ## Outcomes & Retrospective
 
-The repository now has the crate scaffold, the copied Brokk resource corpus, the public Rust API layer, a single-threaded parse/index core, Java semantics for imports and hierarchy, a rendering layer for source and skeletons, and a first lexical-scope/access-expression implementation. The major remaining gap is parity for comment-aware extraction, module and implicit-constructor behavior, duplicate/update regressions, and the broader translated acceptance suite.
+The repository now has the crate scaffold, the copied Brokk resource corpus, the public Rust API layer, a single-threaded parse/index core, Java semantics for imports, hierarchy, source/skeleton rendering, lexical scope analysis, package modules, and implicit constructors. The major remaining gap is parity for comment-aware extraction, duplicate/update regressions, and the broader translated acceptance suite.
 
 ## Context and Orientation
 

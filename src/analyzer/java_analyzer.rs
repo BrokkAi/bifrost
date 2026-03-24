@@ -44,6 +44,13 @@ impl LanguageAdapter for JavaAdapter {
         let package_name = determine_package_name(root, source);
         let mut parsed = crate::analyzer::tree_sitter_analyzer::ParsedFile::new(package_name.clone());
         collect_type_identifiers(root, source, &mut parsed.type_identifiers);
+        let module_code_unit = (!package_name.is_empty()).then(|| module_code_unit(file, &package_name));
+
+        if let Some(module) = &module_code_unit {
+            parsed.top_level_declarations.push(module.clone());
+            parsed.declarations.insert(module.clone());
+            parsed.add_signature(module.clone(), format!("package {};", package_name));
+        }
 
         for index in 0..root.named_child_count() {
             let Some(child) = root.named_child(index) else {
@@ -61,7 +68,7 @@ impl LanguageAdapter for JavaAdapter {
                 | "enum_declaration"
                 | "record_declaration"
                 | "annotation_type_declaration" => {
-                    visit_class_like(
+                    let class_code_unit = visit_class_like(
                         file,
                         source,
                         child,
@@ -70,6 +77,9 @@ impl LanguageAdapter for JavaAdapter {
                         None,
                         &mut parsed,
                     );
+                    if let (Some(module), Some(class_code_unit)) = (&module_code_unit, class_code_unit) {
+                        parsed.add_child(module.clone(), class_code_unit);
+                    }
                 }
                 _ => {}
             }
@@ -377,14 +387,14 @@ fn visit_class_like(
     parent: Option<&CodeUnit>,
     top_level_owner: Option<&CodeUnit>,
     parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
-) {
+) -> Option<CodeUnit> {
     let Some(name_node) = node.child_by_field_name("name") else {
-        return;
+        return None;
     };
 
     let simple_name = node_text(name_node, source).trim().to_string();
     if simple_name.is_empty() {
-        return;
+        return None;
     }
 
     let short_name = parent
@@ -411,6 +421,7 @@ fn visit_class_like(
     parsed.set_raw_supertypes(code_unit.clone(), raw_supertypes);
     parsed.add_signature(code_unit.clone(), signature);
 
+    let mut has_explicit_constructor = false;
     if let Some(body) = node.child_by_field_name("body") {
         for index in 0..body.named_child_count() {
             let Some(child) = body.named_child(index) else {
@@ -434,6 +445,9 @@ fn visit_class_like(
                     );
                 }
                 "method_declaration" | "constructor_declaration" => {
+                    if child.kind() == "constructor_declaration" {
+                        has_explicit_constructor = true;
+                    }
                     visit_callable(file, source, child, package_name, &code_unit, &top_level, parsed);
                 }
                 "field_declaration" | "constant_declaration" => {
@@ -462,6 +476,21 @@ fn visit_class_like(
             }
         }
     }
+
+    if should_create_implicit_constructor(node.kind(), has_explicit_constructor) {
+        let ctor = CodeUnit::with_signature(
+            file.clone(),
+            crate::analyzer::CodeUnitType::Function,
+            package_name.to_string(),
+            format!("{}.{}", code_unit.short_name(), simple_name),
+            Some("()".to_string()),
+            true,
+        );
+        parsed.declarations.insert(ctor.clone());
+        parsed.add_child(code_unit.clone(), ctor);
+    }
+
+    Some(code_unit)
 }
 
 fn visit_callable(
@@ -824,6 +853,27 @@ fn enum_constant_signature(node: Node<'_>, source: &str) -> String {
         text.push(',');
     }
     text
+}
+
+fn module_code_unit(file: &ProjectFile, package_name: &str) -> CodeUnit {
+    match package_name.rsplit_once('.') {
+        Some((parent, leaf)) => CodeUnit::new(
+            file.clone(),
+            crate::analyzer::CodeUnitType::Module,
+            parent.to_string(),
+            leaf.to_string(),
+        ),
+        None => CodeUnit::new(
+            file.clone(),
+            crate::analyzer::CodeUnitType::Module,
+            String::new(),
+            package_name.to_string(),
+        ),
+    }
+}
+
+fn should_create_implicit_constructor(node_kind: &str, has_explicit_constructor: bool) -> bool {
+    node_kind == "class_declaration" && !has_explicit_constructor
 }
 
 fn extract_raw_supertypes(node: Node<'_>, source: &str) -> Vec<String> {
