@@ -18,8 +18,8 @@ After this change, this repository will contain a Rust library that reproduces t
 - [x] (2026-03-24T21:19Z) Added the initial Cargo dependencies and verified that the scaffold compiles with `cargo check` on Rust `1.93.1`.
 - [x] (2026-03-24T21:19Z) Replaced the placeholder `TreeSitterAnalyzer` with a single-threaded parse/index core that loads Java files, builds declaration/range indexes, tracks imports, and supports snapshot-style updates.
 - [x] (2026-03-24T21:19Z) Added the first Rust smoke tests covering fixture parsing and explicit file updates; `cargo test --test java_analyzer_smoke` now passes.
-- [ ] Complete Java-specific semantics on top of the core engine: skeleton rendering, comment-aware source extraction, access-expression filtering, nearest declaration lookup, supertypes, and deterministic import resolution.
-- [ ] Implement Java-specific source extraction, imports, type hierarchy resolution, declaration lookup, and update semantics.
+- [x] (2026-03-24T21:19Z) Implemented the first Java semantic layer: import resolution with explicit-over-wildcard precedence, same-package referencing detection, raw-supertype extraction, and direct/transitive hierarchy traversal. `cargo test --test java_imports_and_hierarchy` passes.
+- [ ] Complete the remaining Java-specific semantics: skeleton rendering, comment-aware source extraction, access-expression filtering, nearest declaration lookup, and broader update/regression parity.
 - [ ] Translate the selected Java tests into Rust integration tests and make them pass.
 - [ ] Run the Rust test suite and commit each milestone as a logical unit.
 
@@ -40,6 +40,9 @@ After this change, this repository will contain a Rust library that reproduces t
 - Observation: a tiny Rust smoke suite is enough to catch snapshot-wrapper bugs immediately.
   Evidence: the first update smoke test failed until `JavaAnalyzer::update` and `JavaAnalyzer::update_all` stopped returning `self.clone()` and started wrapping the updated inner analyzer.
 
+- Observation: the current import-resolution rules can already cover the key Brokk precedence cases without a full query-driven name resolver.
+  Evidence: explicit imports beat wildcard imports, wildcard ambiguity is deterministic by import order, and same-package references are recoverable by matching extracted type identifiers; `cargo test --test java_imports_and_hierarchy` passes 7 tests.
+
 ## Decision Log
 
 - Decision: preserve Brokk's Java-like API names in Rust for v1 instead of inventing an idiomatic-Rust-first surface.
@@ -58,9 +61,13 @@ After this change, this repository will contain a Rust library that reproduces t
   Rationale: it gets the single-threaded engine and snapshot model in place quickly. The vendored `.scm` files remain in the repository and can be integrated later where query-driven extraction materially improves parity.
   Date/Author: 2026-03-24 / Codex
 
+- Decision: persist raw supertypes and extracted type identifiers in the generic analyzer state and resolve them in `JavaAnalyzer`.
+  Rationale: the generic state should own parsed facts, while Java-specific precedence rules decide how those facts become imports, ancestors, descendants, and same-package references.
+  Date/Author: 2026-03-24 / Codex
+
 ## Outcomes & Retrospective
 
-The repository now has the crate scaffold, the copied Brokk resource corpus, the public Rust API layer, and a first working single-threaded parse/index core that can parse Java declarations, imports, ranges, and file updates. The major remaining gap is semantic parity: skeleton rendering, comment-preserving source extraction, import precedence, hierarchy resolution, and the translated acceptance tests.
+The repository now has the crate scaffold, the copied Brokk resource corpus, the public Rust API layer, a single-threaded parse/index core, and a first Java semantic layer for imports and hierarchy. The major remaining gap is semantic parity for skeleton/source rendering, local declaration and access-expression logic, and the broader translated acceptance suite.
 
 ## Context and Orientation
 

@@ -2,7 +2,7 @@ use crate::analyzer::{
     CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language, LanguageAdapter, Project,
     ProjectFile, TreeSitterAnalyzer, TypeHierarchyProvider,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use tree_sitter::{Language as TsLanguage, Node, Tree};
 
@@ -43,6 +43,7 @@ impl LanguageAdapter for JavaAdapter {
         let root = tree.root_node();
         let package_name = determine_package_name(root, source);
         let mut parsed = crate::analyzer::tree_sitter_analyzer::ParsedFile::new(package_name.clone());
+        collect_type_identifiers(root, source, &mut parsed.type_identifiers);
 
         for index in 0..root.named_child_count() {
             let Some(child) = root.named_child(index) else {
@@ -104,7 +105,114 @@ impl JavaAnalyzer {
 
 impl ImportAnalysisProvider for JavaAnalyzer {
     fn imported_code_units_of(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
-        let mut resolved = BTreeSet::new();
+        self.resolve_imports(file).into_values().collect()
+    }
+
+    fn referencing_files_of(&self, file: &ProjectFile) -> BTreeSet<ProjectFile> {
+        let mut result: BTreeSet<ProjectFile> = self
+            .inner
+            .all_files()
+            .into_iter()
+            .filter(|candidate| candidate != file)
+            .filter(|candidate| {
+                self.imported_code_units_of(candidate)
+                    .into_iter()
+                    .any(|code_unit| code_unit.source() == file)
+            })
+            .collect();
+
+        let target_identifiers: BTreeSet<String> = self
+            .inner
+            .get_top_level_declarations(file)
+            .into_iter()
+            .filter(|code_unit| code_unit.is_class() || code_unit.is_module())
+            .map(|code_unit| code_unit.identifier().to_string())
+            .collect();
+
+        let target_package = self.inner.package_name_of(file).unwrap_or("");
+        for candidate in self.inner.all_files() {
+            if candidate == *file || result.contains(&candidate) {
+                continue;
+            }
+            if self.inner.package_name_of(&candidate).unwrap_or("") != target_package {
+                continue;
+            }
+
+            let candidate_identifiers = self.inner.type_identifiers_of(&candidate);
+            if candidate_identifiers
+                .iter()
+                .any(|identifier| target_identifiers.contains(identifier))
+            {
+                result.insert(candidate);
+            }
+        }
+
+        result
+    }
+
+    fn import_info_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
+        self.inner.import_info_of(file)
+    }
+
+    fn could_import_file(&self, source_file: &ProjectFile, imports: &[ImportInfo], target: &ProjectFile) -> bool {
+        if source_file == target {
+            return false;
+        }
+
+        let source_package = self.inner.package_name_of(source_file).unwrap_or("");
+        let target_package = self.inner.package_name_of(target).unwrap_or("");
+        if source_package == target_package {
+            return true;
+        }
+
+        self.could_import_file_without_source(imports, target)
+    }
+}
+
+impl JavaAnalyzer {
+    pub fn could_import_file_without_source(&self, imports: &[ImportInfo], target: &ProjectFile) -> bool {
+        let target_package = self.inner.package_name_of(target).unwrap_or("");
+        let mut target_name = target
+            .rel_path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_string();
+        if let Some(stripped) = target_name.strip_suffix(".java") {
+            target_name = stripped.to_string();
+        }
+
+        for import in imports {
+            let raw = import
+                .raw_snippet
+                .trim()
+                .strip_prefix("import ")
+                .unwrap_or(import.raw_snippet.trim())
+                .strip_suffix(';')
+                .unwrap_or(import.raw_snippet.trim())
+                .trim();
+
+            if !import.is_wildcard {
+                if import.identifier.as_deref() == Some(target_name.as_str()) {
+                    return true;
+                }
+                if raw.contains(&format!(".{}.", target_name)) {
+                    return true;
+                }
+                continue;
+            }
+
+            let import_package = raw.trim_end_matches(".*");
+            if import_package == target_package || import_package == format!("{}.{}", target_package, target_name) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn resolve_imports(&self, file: &ProjectFile) -> BTreeMap<String, CodeUnit> {
+        let mut resolved = BTreeMap::new();
 
         for import in self.inner.import_info_of(file) {
             if import.raw_snippet.trim_start().starts_with("import static ") {
@@ -120,74 +228,73 @@ impl ImportAnalysisProvider for JavaAnalyzer {
                 .unwrap_or(import.raw_snippet.trim())
                 .trim();
 
-            if import.is_wildcard {
-                let package_name = import_path.trim_end_matches(".*");
-                for code_unit in self.inner.get_all_declarations() {
-                    if code_unit.is_class() && code_unit.package_name() == package_name {
-                        resolved.insert(code_unit);
-                    }
+            if !import.is_wildcard {
+                if let Some(code_unit) = self
+                    .inner
+                    .get_definitions(import_path)
+                    .into_iter()
+                    .find(|code_unit| code_unit.is_class())
+                {
+                    resolved.insert(code_unit.identifier().to_string(), code_unit);
                 }
                 continue;
             }
 
-            for code_unit in self.inner.get_definitions(import_path) {
-                resolved.insert(code_unit);
+            let package_name = import_path.trim_end_matches(".*");
+            for code_unit in self.inner.get_all_declarations() {
+                if !code_unit.is_class() || code_unit.package_name() != package_name {
+                    continue;
+                }
+                resolved
+                    .entry(code_unit.identifier().to_string())
+                    .or_insert(code_unit);
             }
         }
 
         resolved
     }
 
-    fn referencing_files_of(&self, file: &ProjectFile) -> BTreeSet<ProjectFile> {
-        self.inner
-            .get_analyzed_files()
-            .into_iter()
-            .filter(|candidate| {
-                self.imported_code_units_of(candidate)
-                    .into_iter()
-                    .any(|code_unit| code_unit.source() == file)
-            })
-            .collect()
-    }
-
-    fn import_info_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
-        self.inner.import_info_of(file)
-    }
-
-    fn could_import_file(&self, source_file: &ProjectFile, imports: &[ImportInfo], target: &ProjectFile) -> bool {
-        if source_file == target {
-            return false;
+    fn resolve_type_name(&self, file: &ProjectFile, raw_name: &str) -> Option<CodeUnit> {
+        let normalized = raw_name.trim();
+        if normalized.is_empty() {
+            return None;
         }
 
-        let source_package = self.inner.package_name_of(source_file).unwrap_or("");
-        let target_package = self.inner.package_name_of(target).unwrap_or("");
-        if !source_package.is_empty() && source_package == target_package {
-            return true;
-        }
-
-        let temp_file = ProjectFile::new(source_file.root().to_path_buf(), source_file.rel_path().to_path_buf());
-        let _ = temp_file;
-
-        imports.iter().any(|import| {
-            let raw = import
-                .raw_snippet
-                .trim()
-                .strip_prefix("import ")
-                .unwrap_or(import.raw_snippet.trim())
-                .strip_suffix(';')
-                .unwrap_or(import.raw_snippet.trim())
-                .trim();
-
-            if raw.ends_with(".*") {
-                let import_package = raw.trim_end_matches(".*");
-                return self.inner.package_name_of(target) == Some(import_package);
-            }
-
-            self.inner
-                .get_definitions(raw)
+        if normalized.contains('.') {
+            if let Some(code_unit) = self
+                .inner
+                .get_definitions(normalized)
                 .into_iter()
-                .any(|code_unit| code_unit.source() == target)
-        })
+                .find(|code_unit| code_unit.is_class())
+            {
+                return Some(code_unit);
+            }
+        }
+
+        let imports = self.resolve_imports(file);
+        if let Some(code_unit) = imports.get(normalized) {
+            return Some(code_unit.clone());
+        }
+
+        let package_name = self.inner.package_name_of(file).unwrap_or("");
+        let same_package_fqn = if package_name.is_empty() {
+            normalized.to_string()
+        } else {
+            format!("{}.{}", package_name, normalized)
+        };
+        if let Some(code_unit) = self
+            .inner
+            .get_definitions(&same_package_fqn)
+            .into_iter()
+            .find(|code_unit| code_unit.is_class())
+        {
+            return Some(code_unit);
+        }
+
+        self.inner
+            .get_definitions(normalized)
+            .into_iter()
+            .find(|code_unit| code_unit.is_class())
     }
 }
 
@@ -245,6 +352,23 @@ fn parse_import_info(raw: String) -> ImportInfo {
     }
 }
 
+fn collect_type_identifiers(node: Node<'_>, source: &str, identifiers: &mut BTreeSet<String>) {
+    match node.kind() {
+        "type_identifier" | "scoped_type_identifier" => {
+            let text = node_text(node, source).trim();
+            if !text.is_empty() {
+                identifiers.insert(text.to_string());
+            }
+        }
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_type_identifiers(child, source, identifiers);
+    }
+}
+
 fn visit_class_like(
     file: &ProjectFile,
     source: &str,
@@ -273,6 +397,7 @@ fn visit_class_like(
         package_name.to_string(),
         short_name,
     );
+    let raw_supertypes = extract_raw_supertypes(node, source);
 
     let top_level = top_level_owner.cloned().unwrap_or_else(|| code_unit.clone());
     parsed.add_code_unit(
@@ -282,6 +407,7 @@ fn visit_class_like(
         parent.cloned(),
         Some(top_level.clone()),
     );
+    parsed.set_raw_supertypes(code_unit.clone(), raw_supertypes);
 
     if let Some(body) = node.child_by_field_name("body") {
         for index in 0..body.named_child_count() {
@@ -439,13 +565,63 @@ fn normalize_whitespace(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-impl TypeHierarchyProvider for JavaAnalyzer {
-    fn get_direct_ancestors(&self, _code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        Vec::new()
+fn extract_raw_supertypes(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut raw = Vec::new();
+
+    if let Some(superclass) = node.child_by_field_name("superclass") {
+        collect_supertype_nodes(superclass, source, &mut raw);
+    }
+    if let Some(interfaces) = node.child_by_field_name("interfaces") {
+        collect_supertype_nodes(interfaces, source, &mut raw);
     }
 
-    fn get_direct_descendants(&self, _code_unit: &CodeUnit) -> BTreeSet<CodeUnit> {
-        BTreeSet::new()
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "extends_interfaces" {
+            collect_supertype_nodes(child, source, &mut raw);
+        }
+    }
+
+    raw
+}
+
+fn collect_supertype_nodes(node: Node<'_>, source: &str, raw: &mut Vec<String>) {
+    match node.kind() {
+        "type_identifier" | "scoped_type_identifier" => {
+            let text = node_text(node, source).trim();
+            if !text.is_empty() {
+                raw.push(text.to_string());
+            }
+        }
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_supertype_nodes(child, source, raw);
+    }
+}
+
+impl TypeHierarchyProvider for JavaAnalyzer {
+    fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+        self.inner
+            .raw_supertypes_of(code_unit)
+            .into_iter()
+            .filter_map(|raw_name| self.resolve_type_name(code_unit.source(), &raw_name))
+            .collect()
+    }
+
+    fn get_direct_descendants(&self, code_unit: &CodeUnit) -> BTreeSet<CodeUnit> {
+        self.inner
+            .get_all_declarations()
+            .into_iter()
+            .filter(|candidate| candidate.is_class())
+            .filter(|candidate| {
+                self.get_direct_ancestors(candidate)
+                    .into_iter()
+                    .any(|ancestor| ancestor == *code_unit)
+            })
+            .collect()
     }
 }
 

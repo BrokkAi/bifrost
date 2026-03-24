@@ -27,6 +27,8 @@ struct FileState {
     declarations: BTreeSet<CodeUnit>,
     import_statements: Vec<String>,
     imports: Vec<ImportInfo>,
+    raw_supertypes: BTreeMap<CodeUnit, Vec<String>>,
+    type_identifiers: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -35,6 +37,7 @@ struct AnalyzerState {
     definitions: BTreeMap<String, Vec<CodeUnit>>,
     children: BTreeMap<CodeUnit, Vec<CodeUnit>>,
     ranges: BTreeMap<CodeUnit, Vec<Range>>,
+    raw_supertypes: BTreeMap<CodeUnit, Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +47,8 @@ pub struct ParsedFile {
     pub declarations: BTreeSet<CodeUnit>,
     pub import_statements: Vec<String>,
     pub imports: Vec<ImportInfo>,
+    pub raw_supertypes: BTreeMap<CodeUnit, Vec<String>>,
+    pub type_identifiers: BTreeSet<String>,
     ranges: BTreeMap<CodeUnit, Vec<Range>>,
     children: BTreeMap<CodeUnit, Vec<CodeUnit>>,
 }
@@ -56,6 +61,8 @@ impl ParsedFile {
             declarations: BTreeSet::new(),
             import_statements: Vec::new(),
             imports: Vec::new(),
+            raw_supertypes: BTreeMap::new(),
+            type_identifiers: BTreeSet::new(),
             ranges: BTreeMap::new(),
             children: BTreeMap::new(),
         }
@@ -86,6 +93,10 @@ impl ParsedFile {
         if let Some(top_level) = top_level {
             self.children.entry(top_level).or_default();
         }
+    }
+
+    pub fn set_raw_supertypes(&mut self, code_unit: CodeUnit, raw_supertypes: Vec<String>) {
+        self.raw_supertypes.insert(code_unit, raw_supertypes);
     }
 }
 
@@ -175,6 +186,8 @@ where
                     declarations: parsed.declarations,
                     import_statements: parsed.import_statements,
                     imports: parsed.imports,
+                    raw_supertypes: parsed.raw_supertypes,
+                    type_identifiers: parsed.type_identifiers,
                 },
             );
         }
@@ -195,6 +208,7 @@ where
         let mut definitions = BTreeMap::<String, Vec<CodeUnit>>::new();
         let mut children = BTreeMap::<CodeUnit, Vec<CodeUnit>>::new();
         let mut ranges = BTreeMap::<CodeUnit, Vec<Range>>::new();
+        let mut raw_supertypes = BTreeMap::<CodeUnit, Vec<String>>::new();
 
         for (file, state) in &files {
             let Some(tree) = parser.parse(state.source.as_str(), None) else {
@@ -216,6 +230,10 @@ where
             for (code_unit, mut code_unit_ranges) in parsed.ranges {
                 ranges.entry(code_unit).or_default().append(&mut code_unit_ranges);
             }
+
+            for (code_unit, raw) in parsed.raw_supertypes {
+                raw_supertypes.insert(code_unit, raw);
+            }
         }
 
         for descendants in children.values_mut() {
@@ -235,6 +253,7 @@ where
             definitions,
             children,
             ranges,
+            raw_supertypes,
         }
     }
 
@@ -250,6 +269,28 @@ where
         self.file_state(file)
             .map(|state| state.imports.clone())
             .unwrap_or_default()
+    }
+
+    pub(crate) fn raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String> {
+        self.state
+            .raw_supertypes
+            .get(code_unit)
+            .cloned()
+            .or_else(|| {
+                self.file_state(code_unit.source())
+                    .and_then(|state| state.raw_supertypes.get(code_unit).cloned())
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn type_identifiers_of(&self, file: &ProjectFile) -> BTreeSet<String> {
+        self.file_state(file)
+            .map(|state| state.type_identifiers.clone())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn all_files(&self) -> BTreeSet<ProjectFile> {
+        self.state.files.keys().cloned().collect()
     }
 
     fn source_slice(&self, code_unit: &CodeUnit, range: &Range) -> Option<String> {
@@ -313,6 +354,8 @@ where
                     declarations: parsed.declarations,
                     import_statements: parsed.import_statements,
                     imports: parsed.imports,
+                    raw_supertypes: parsed.raw_supertypes,
+                    type_identifiers: parsed.type_identifiers,
                 },
             );
         }
