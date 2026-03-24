@@ -10,8 +10,8 @@ pub use capabilities::{CapabilityProvider, ImportAnalysisProvider, TypeHierarchy
 pub use i_analyzer::IAnalyzer;
 pub use java_analyzer::JavaAnalyzer;
 pub use model::{
-    metrics_from_declarations, CodeBaseMetrics, CodeUnit, CodeUnitType, DeclarationInfo,
-    DeclarationKind, ImportInfo, Language, ProjectFile, Range,
+    CodeBaseMetrics, CodeUnit, CodeUnitType, DeclarationInfo, DeclarationKind, ImportInfo,
+    Language, ProjectFile, Range, metrics_from_declarations,
 };
 pub use project::{Project, TestProject};
 pub use source_content::SourceContent;

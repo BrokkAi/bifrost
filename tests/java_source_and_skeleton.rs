@@ -22,7 +22,12 @@ fn returns_overload_sources_in_file_order() {
 
     assert!(source.contains("public String method2(String input)"));
     assert!(source.contains("public String method2(String input, int otherInput)"));
-    assert!(source.find("method2(String input)").unwrap() < source.find("method2(String input, int otherInput)").unwrap());
+    assert!(
+        source.find("method2(String input)").unwrap()
+            < source
+                .find("method2(String input, int otherInput)")
+                .unwrap()
+    );
 }
 
 #[test]

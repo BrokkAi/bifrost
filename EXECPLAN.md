@@ -25,8 +25,9 @@ After this change, this repository will contain a Rust library that reproduces t
 - [x] (2026-03-24T21:19Z) Implemented comment-aware source extraction that includes immediately preceding Javadocs/comments without pulling in unrelated code from the same line. `cargo test --test java_comment_source` passes.
 - [x] (2026-03-24T21:19Z) Added regression coverage for duplicate overload preservation and multi-step updates. `cargo test --test java_update_regressions` passes.
 - [x] (2026-03-24T21:19Z) Added canonical callable-signature normalization coverage, including varargs. `cargo test --test java_signature_normalization` passes.
+- [x] (2026-03-24T21:49Z) Closed another Java parity slice: Java-style call-receiver extraction, generic/location/anonymous-name normalization for lookups, lambda code-unit attachment to overloads, module child merging across `package-info.java`, and relevant-import selection. `cargo test --test java_parity_edges` passes.
 - [ ] Translate the remaining selected Brokk Java tests that are still uncovered and close any parity gaps they expose.
-- [x] (2026-03-24T21:19Z) The current Rust suite passes with `cargo test`.
+- [x] (2026-03-24T21:49Z) The current Rust suite passes with `cargo test`.
 
 ## Surprises & Discoveries
 
@@ -62,6 +63,12 @@ After this change, this repository will contain a Rust library that reproduces t
 
 - Observation: synthetic constructors should be resolvable but should not contribute a normal callable signature in overload-sensitive regression tests.
   Evidence: the duplicate-overload regression passed only after synthetic constructors stopped carrying a concrete `"()"` signature.
+
+- Observation: package modules need cross-file merging semantics even though `CodeUnit` identity still includes the source file.
+  Evidence: `package-info.java` and ordinary package members each create a module-shaped declaration for the same package; Brokk-style child traversal only matches expectations after module definitions are deduplicated for lookup and their child lists are merged by package FQN.
+
+- Observation: Brokk's Java name normalization rules matter outside declaration indexing because tests query definitions with generics, location suffixes, and anonymous suffixes attached.
+  Evidence: the new parity tests only passed after Java lookup normalization stripped generic type arguments, trailing `:line[:col]` suffixes, and trailing numeric anonymous-class suffixes like `$1`.
 
 ## Decision Log
 
@@ -101,9 +108,17 @@ After this change, this repository will contain a Rust library that reproduces t
   Rationale: it was sufficient for the current Java acceptance cases and avoided widening the range/state model before more languages exist in the Rust port.
   Date/Author: 2026-03-24 / Codex
 
+- Decision: keep module merging as a lookup/child-aggregation behavior in the shared engine instead of changing `CodeUnit` equality semantics globally.
+  Rationale: Brokk parity required packages to behave like one logical module across files, but changing `CodeUnit` identity would have risked broader regressions in the Rust port's declaration model.
+  Date/Author: 2026-03-24 / Codex
+
+- Decision: synthesize Java lambda code units during callable parsing and attach them to the nearest enclosing callable using Brokk-style `$anon$line:col` names.
+  Rationale: this is the smallest change that satisfies the overload/lambda attachment regressions without reintroducing the full query-driven Brokk extraction pipeline.
+  Date/Author: 2026-03-24 / Codex
+
 ## Outcomes & Retrospective
 
-The repository now has the crate scaffold, the copied Brokk resource corpus, the public Rust API layer, a single-threaded parse/index core, Java semantics for imports, hierarchy, source/skeleton rendering, lexical scope analysis, package modules, implicit constructors, comment-aware extraction, and the first duplicate/update regressions. The major remaining gap is the rest of the translated Brokk Java acceptance suite and whatever parity gaps those additional tests expose.
+The repository now has the crate scaffold, the copied Brokk resource corpus, the public Rust API layer, a single-threaded parse/index core, Java semantics for imports, hierarchy, source/skeleton rendering, lexical scope analysis, package modules, implicit constructors, comment-aware extraction, Java call-receiver heuristics, normalized-name lookups, lambda attachment, relevant-import selection, and the first duplicate/update regressions. The major remaining gap is the rest of the translated Brokk Java acceptance suite and whatever parity gaps those additional tests expose.
 
 ## Context and Orientation
 

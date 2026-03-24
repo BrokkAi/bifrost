@@ -24,7 +24,12 @@ pub trait ImportAnalysisProvider: CapabilityProvider {
         BTreeSet::new()
     }
 
-    fn could_import_file(&self, _source_file: &ProjectFile, _imports: &[ImportInfo], _target: &ProjectFile) -> bool {
+    fn could_import_file(
+        &self,
+        _source_file: &ProjectFile,
+        _imports: &[ImportInfo],
+        _target: &ProjectFile,
+    ) -> bool {
         false
     }
 }
@@ -38,10 +43,16 @@ pub trait TypeHierarchyProvider: CapabilityProvider {
     }
 
     fn get_descendants(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        traverse_hierarchy(code_unit, |next| self.get_direct_descendants(next).into_iter().collect())
+        traverse_hierarchy(code_unit, |next| {
+            self.get_direct_descendants(next).into_iter().collect()
+        })
     }
 
-    fn get_polymorphic_matches<T: IAnalyzer>(&self, target: &CodeUnit, analyzer: &T) -> Vec<CodeUnit> {
+    fn get_polymorphic_matches<T: IAnalyzer>(
+        &self,
+        target: &CodeUnit,
+        analyzer: &T,
+    ) -> Vec<CodeUnit> {
         if !target.is_function() {
             return Vec::new();
         }

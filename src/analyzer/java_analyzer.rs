@@ -27,11 +27,11 @@ impl LanguageAdapter for JavaAdapter {
     }
 
     fn normalize_full_name(&self, fq_name: &str) -> String {
-        fq_name.replace('$', ".")
+        normalize_java_full_name(fq_name)
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {
-        reference.rsplit_once('.').map(|(left, _)| left.to_string())
+        extract_java_call_receiver(reference)
     }
 
     fn parse_file(
@@ -42,9 +42,11 @@ impl LanguageAdapter for JavaAdapter {
     ) -> crate::analyzer::tree_sitter_analyzer::ParsedFile {
         let root = tree.root_node();
         let package_name = determine_package_name(root, source);
-        let mut parsed = crate::analyzer::tree_sitter_analyzer::ParsedFile::new(package_name.clone());
+        let mut parsed =
+            crate::analyzer::tree_sitter_analyzer::ParsedFile::new(package_name.clone());
         collect_type_identifiers(root, source, &mut parsed.type_identifiers);
-        let module_code_unit = (!package_name.is_empty()).then(|| module_code_unit(file, &package_name));
+        let module_code_unit =
+            (!package_name.is_empty()).then(|| module_code_unit(file, &package_name));
 
         if let Some(module) = &module_code_unit {
             parsed.top_level_declarations.push(module.clone());
@@ -77,7 +79,9 @@ impl LanguageAdapter for JavaAdapter {
                         None,
                         &mut parsed,
                     );
-                    if let (Some(module), Some(class_code_unit)) = (&module_code_unit, class_code_unit) {
+                    if let (Some(module), Some(class_code_unit)) =
+                        (&module_code_unit, class_code_unit)
+                    {
                         parsed.add_child(module.clone(), class_code_unit);
                     }
                 }
@@ -110,6 +114,15 @@ impl JavaAnalyzer {
 
     pub fn inner(&self) -> &TreeSitterAnalyzer<JavaAdapter> {
         &self.inner
+    }
+
+    pub fn extract_type_identifiers(&self, source: &str) -> BTreeSet<String> {
+        let Some(tree) = parse_tree(source) else {
+            return BTreeSet::new();
+        };
+        let mut identifiers = BTreeSet::new();
+        collect_type_identifiers(tree.root_node(), source, &mut identifiers);
+        identifiers
     }
 }
 
@@ -164,7 +177,109 @@ impl ImportAnalysisProvider for JavaAnalyzer {
         self.inner.import_info_of(file)
     }
 
-    fn could_import_file(&self, source_file: &ProjectFile, imports: &[ImportInfo], target: &ProjectFile) -> bool {
+    fn relevant_imports_for(&self, code_unit: &CodeUnit) -> BTreeSet<String> {
+        let Some(source) = self.get_source(code_unit, false) else {
+            return BTreeSet::new();
+        };
+
+        let all_imports = self.import_info_of(code_unit.source());
+        if all_imports.is_empty() {
+            return BTreeSet::new();
+        }
+
+        let type_identifiers = self.extract_type_identifiers(&source);
+        if type_identifiers.is_empty() {
+            return BTreeSet::new();
+        }
+
+        let explicit_imports: Vec<_> = all_imports
+            .iter()
+            .filter(|import| !import.is_wildcard && import.identifier.is_some())
+            .collect();
+        let wildcard_imports: Vec<_> = all_imports
+            .iter()
+            .filter(|import| import.is_wildcard)
+            .collect();
+
+        let mut matched_imports = BTreeSet::new();
+        let mut resolved_identifiers = BTreeSet::new();
+
+        for import in explicit_imports {
+            let Some(identifier) = import.identifier.as_deref() else {
+                continue;
+            };
+
+            if type_identifiers.contains(identifier) {
+                matched_imports.insert(import.raw_snippet.clone());
+                resolved_identifiers.insert(identifier.to_string());
+            }
+        }
+
+        let mut unresolved_identifiers: BTreeSet<String> = type_identifiers
+            .into_iter()
+            .filter(|identifier| !resolved_identifiers.contains(identifier))
+            .collect();
+        if unresolved_identifiers.is_empty() {
+            return matched_imports;
+        }
+
+        let import_packages: BTreeSet<String> = all_imports
+            .iter()
+            .map(|import| extract_package_from_import(&import.raw_snippet))
+            .filter(|package| !package.is_empty())
+            .collect();
+
+        unresolved_identifiers.retain(|identifier| {
+            if !identifier.contains('.') {
+                return true;
+            }
+
+            import_packages
+                .iter()
+                .any(|package| identifier.starts_with(&format!("{package}.")))
+        });
+        if unresolved_identifiers.is_empty() {
+            return matched_imports;
+        }
+
+        let mut resolved_via_wildcard = BTreeSet::new();
+        for identifier in &unresolved_identifiers {
+            for import in &wildcard_imports {
+                let package = extract_package_from_import(&import.raw_snippet);
+                if package.is_empty() {
+                    continue;
+                }
+
+                let lookup_name = format!("{package}.{identifier}");
+                if self
+                    .get_definitions(&lookup_name)
+                    .into_iter()
+                    .any(|code_unit| code_unit.is_class())
+                {
+                    matched_imports.insert(import.raw_snippet.clone());
+                    resolved_via_wildcard.insert(identifier.clone());
+                }
+            }
+        }
+
+        let still_unresolved_simple = unresolved_identifiers.iter().any(|identifier| {
+            !resolved_via_wildcard.contains(identifier) && !identifier.contains('.')
+        });
+        if still_unresolved_simple {
+            for import in wildcard_imports {
+                matched_imports.insert(import.raw_snippet.clone());
+            }
+        }
+
+        matched_imports
+    }
+
+    fn could_import_file(
+        &self,
+        source_file: &ProjectFile,
+        imports: &[ImportInfo],
+        target: &ProjectFile,
+    ) -> bool {
         if source_file == target {
             return false;
         }
@@ -180,7 +295,11 @@ impl ImportAnalysisProvider for JavaAnalyzer {
 }
 
 impl JavaAnalyzer {
-    pub fn could_import_file_without_source(&self, imports: &[ImportInfo], target: &ProjectFile) -> bool {
+    pub fn could_import_file_without_source(
+        &self,
+        imports: &[ImportInfo],
+        target: &ProjectFile,
+    ) -> bool {
         let target_package = self.inner.package_name_of(target).unwrap_or("");
         let mut target_name = target
             .rel_path()
@@ -213,7 +332,9 @@ impl JavaAnalyzer {
             }
 
             let import_package = raw.trim_end_matches(".*");
-            if import_package == target_package || import_package == format!("{}.{}", target_package, target_name) {
+            if import_package == target_package
+                || import_package == format!("{}.{}", target_package, target_name)
+            {
                 return true;
             }
         }
@@ -225,7 +346,11 @@ impl JavaAnalyzer {
         let mut resolved = BTreeMap::new();
 
         for import in self.inner.import_info_of(file) {
-            if import.raw_snippet.trim_start().starts_with("import static ") {
+            if import
+                .raw_snippet
+                .trim_start()
+                .starts_with("import static ")
+            {
                 continue;
             }
 
@@ -362,6 +487,166 @@ fn parse_import_info(raw: String) -> ImportInfo {
     }
 }
 
+fn extract_package_from_import(raw: &str) -> String {
+    let trimmed = raw
+        .trim()
+        .strip_prefix("import ")
+        .unwrap_or(raw.trim())
+        .strip_suffix(';')
+        .unwrap_or(raw.trim())
+        .trim();
+    let trimmed = trimmed.strip_prefix("static ").unwrap_or(trimmed).trim();
+
+    if let Some(package) = trimmed.strip_suffix(".*") {
+        return package.trim().to_string();
+    }
+
+    trimmed
+        .rsplit_once('.')
+        .map(|(package, _)| package.trim().to_string())
+        .unwrap_or_default()
+}
+
+fn strip_generic_type_arguments(input: &str) -> String {
+    let mut depth = 0usize;
+    let mut out = String::with_capacity(input.len());
+
+    for ch in input.chars() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => out.push(ch),
+            _ => {}
+        }
+    }
+
+    out
+}
+
+fn normalize_java_full_name(fq_name: &str) -> String {
+    let mut normalized = strip_generic_type_arguments(fq_name);
+
+    if normalized.contains("$anon$") {
+        let mut out = String::with_capacity(normalized.len());
+        let mut index = 0usize;
+
+        while index < normalized.len() {
+            if normalized[index..].starts_with("$anon$") {
+                out.push_str("$anon$");
+                index += 6;
+                continue;
+            }
+
+            let ch = normalized.as_bytes()[index] as char;
+            out.push(if ch == '$' { '.' } else { ch });
+            index += 1;
+        }
+
+        return out;
+    }
+
+    normalized = strip_trailing_numeric_suffix(&normalized);
+    normalized = strip_location_suffix(&normalized);
+    normalized.replace('$', ".")
+}
+
+fn strip_trailing_numeric_suffix(input: &str) -> String {
+    let colon_split = input.rsplit_once(':');
+    let candidate = colon_split.map(|(head, _)| head).unwrap_or(input);
+    let Some((prefix, suffix)) = candidate.rsplit_once('$') else {
+        return input.to_string();
+    };
+
+    if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+        return input.to_string();
+    }
+
+    if let Some((_, location)) = colon_split {
+        format!("{prefix}:{location}")
+    } else {
+        prefix.to_string()
+    }
+}
+
+fn strip_location_suffix(input: &str) -> String {
+    let Some((head, tail)) = input.rsplit_once(':') else {
+        return input.to_string();
+    };
+    if !tail.bytes().all(|byte| byte.is_ascii_digit()) {
+        return input.to_string();
+    }
+
+    if let Some((grand_head, middle)) = head.rsplit_once(':') {
+        if middle.bytes().all(|byte| byte.is_ascii_digit()) {
+            return grand_head.to_string();
+        }
+    }
+
+    head.to_string()
+}
+
+fn extract_java_call_receiver(reference: &str) -> Option<String> {
+    let trimmed = reference.trim();
+    if trimmed.is_empty() || !trimmed.is_ascii() {
+        return None;
+    }
+
+    let before_args = trimmed
+        .split_once('(')
+        .map(|(head, _)| head)
+        .unwrap_or(trimmed)
+        .trim();
+    let (receiver, method_name) = before_args.rsplit_once('.')?;
+    if receiver.is_empty() || method_name.is_empty() || receiver.contains('$') {
+        return None;
+    }
+
+    if !looks_like_java_method_name(method_name) {
+        return None;
+    }
+
+    let segments: Vec<_> = receiver.split('.').collect();
+    let last = *segments.last()?;
+    if !looks_like_pascal_identifier(last) {
+        return None;
+    }
+
+    for segment in &segments {
+        if segment.is_empty()
+            || !segment
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        {
+            return None;
+        }
+
+        let first = segment.as_bytes()[0] as char;
+        if !first.is_ascii_lowercase() && !first.is_ascii_uppercase() {
+            return None;
+        }
+    }
+
+    Some(receiver.to_string())
+}
+
+fn looks_like_java_method_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+
+    first.is_ascii_lowercase() && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn looks_like_pascal_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+
+    first.is_ascii_uppercase() && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
 fn collect_type_identifiers(node: Node<'_>, source: &str, identifiers: &mut BTreeSet<String>) {
     match node.kind() {
         "type_identifier" | "scoped_type_identifier" => {
@@ -410,7 +695,9 @@ fn visit_class_like(
     let raw_supertypes = extract_raw_supertypes(node, source);
     let signature = class_signature(node, source);
 
-    let top_level = top_level_owner.cloned().unwrap_or_else(|| code_unit.clone());
+    let top_level = top_level_owner
+        .cloned()
+        .unwrap_or_else(|| code_unit.clone());
     parsed.add_code_unit(
         code_unit.clone(),
         node,
@@ -448,7 +735,15 @@ fn visit_class_like(
                     if child.kind() == "constructor_declaration" {
                         has_explicit_constructor = true;
                     }
-                    visit_callable(file, source, child, package_name, &code_unit, &top_level, parsed);
+                    visit_callable(
+                        file,
+                        source,
+                        child,
+                        package_name,
+                        &code_unit,
+                        &top_level,
+                        parsed,
+                    );
                 }
                 "field_declaration" | "constant_declaration" => {
                     visit_field_declaration(
@@ -532,7 +827,19 @@ fn visit_callable(
         Some(parent.clone()),
         Some(top_level.clone()),
     );
-    parsed.add_signature(code_unit, callable_sig);
+    parsed.add_signature(code_unit.clone(), callable_sig);
+
+    if let Some(body) = node.child_by_field_name("body") {
+        collect_lambda_expressions(
+            file,
+            source,
+            body,
+            package_name,
+            &code_unit,
+            top_level,
+            parsed,
+        );
+    }
 }
 
 fn visit_field_declaration(
@@ -610,6 +917,60 @@ fn visit_enum_constant(
     parsed.add_signature(code_unit, enum_constant_signature(node, source));
 }
 
+fn collect_lambda_expressions(
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    package_name: &str,
+    parent: &CodeUnit,
+    top_level: &CodeUnit,
+    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "lambda_expression" {
+            let lambda = lambda_code_unit(file, package_name, parent, child);
+            parsed.add_code_unit(
+                lambda.clone(),
+                child,
+                source,
+                Some(parent.clone()),
+                Some(top_level.clone()),
+            );
+            collect_lambda_expressions(
+                file,
+                source,
+                child,
+                package_name,
+                &lambda,
+                top_level,
+                parsed,
+            );
+            continue;
+        }
+
+        collect_lambda_expressions(file, source, child, package_name, parent, top_level, parsed);
+    }
+}
+
+fn lambda_code_unit(
+    file: &ProjectFile,
+    package_name: &str,
+    parent: &CodeUnit,
+    node: Node<'_>,
+) -> CodeUnit {
+    let line = node.start_position().row + 1;
+    let column = node.start_position().column + 1;
+    CodeUnit::with_signature(
+        file.clone(),
+        crate::analyzer::CodeUnitType::Function,
+        package_name.to_string(),
+        format!("{}$anon${line}:{column}", parent.short_name()),
+        None,
+        true,
+    )
+}
+
 fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     source.get(node.start_byte()..node.end_byte()).unwrap_or("")
 }
@@ -662,9 +1023,13 @@ fn find_nearest_declaration_from_node(
                 }
             }
             "enhanced_for_statement" => {
-                if let Some(found) =
-                    match_named_field(node, "name", identifier, source, DeclarationKind::EnhancedForVariable)
-                {
+                if let Some(found) = match_named_field(
+                    node,
+                    "name",
+                    identifier,
+                    source,
+                    DeclarationKind::EnhancedForVariable,
+                ) {
                     return Some(found);
                 }
             }
@@ -672,9 +1037,13 @@ fn find_nearest_declaration_from_node(
                 let mut cursor = node.walk();
                 for child in node.named_children(&mut cursor) {
                     if child.kind() == "catch_formal_parameter" {
-                        if let Some(found) =
-                            match_named_field(child, "name", identifier, source, DeclarationKind::CatchParameter)
-                        {
+                        if let Some(found) = match_named_field(
+                            child,
+                            "name",
+                            identifier,
+                            source,
+                            DeclarationKind::CatchParameter,
+                        ) {
                             return Some(found);
                         }
                     }
@@ -711,7 +1080,9 @@ fn find_nearest_declaration_from_node(
                     } else {
                         let mut cursor = parameters.walk();
                         for child in parameters.named_children(&mut cursor) {
-                            if child.kind() == "identifier" && node_text(child, source).trim() == identifier {
+                            if child.kind() == "identifier"
+                                && node_text(child, source).trim() == identifier
+                            {
                                 return Some(declaration_info(
                                     identifier,
                                     DeclarationKind::LambdaParameter,
@@ -746,14 +1117,22 @@ fn find_nearest_declaration_from_node(
     None
 }
 
-fn check_formal_parameters(node: Node<'_>, identifier: &str, source: &str) -> Option<DeclarationInfo> {
+fn check_formal_parameters(
+    node: Node<'_>,
+    identifier: &str,
+    source: &str,
+) -> Option<DeclarationInfo> {
     let params = node.child_by_field_name("parameters")?;
     let mut cursor = params.walk();
     for child in params.named_children(&mut cursor) {
         if child.kind() == "formal_parameter" {
-            if let Some(found) =
-                match_named_field(child, "name", identifier, source, DeclarationKind::Parameter)
-            {
+            if let Some(found) = match_named_field(
+                child,
+                "name",
+                identifier,
+                source,
+                DeclarationKind::Parameter,
+            ) {
                 return Some(found);
             }
         }
@@ -778,9 +1157,13 @@ fn check_preceding_local_variables(
         let mut local_cursor = sibling.walk();
         for child in sibling.named_children(&mut local_cursor) {
             if child.kind() == "variable_declarator" {
-                if let Some(found) =
-                    match_named_field(child, "name", identifier, source, DeclarationKind::LocalVariable)
-                {
+                if let Some(found) = match_named_field(
+                    child,
+                    "name",
+                    identifier,
+                    source,
+                    DeclarationKind::LocalVariable,
+                ) {
                     return Some(found);
                 }
             }
@@ -822,7 +1205,10 @@ fn class_signature(node: Node<'_>, source: &str) -> String {
         .child_by_field_name("body")
         .map(|body| body.start_byte())
         .unwrap_or(node.end_byte());
-    let header = source.get(node.start_byte()..body_start).unwrap_or("").trim_end();
+    let header = source
+        .get(node.start_byte()..body_start)
+        .unwrap_or("")
+        .trim_end();
     format!("{} {{", normalize_whitespace(header))
 }
 
@@ -860,7 +1246,10 @@ fn canonical_parameters_signature(parameters: Node<'_>, source: &str) -> String 
                     {
                         continue;
                     }
-                    parts.push(format!("{}[]", normalize_whitespace(node_text(grandchild, source))));
+                    parts.push(format!(
+                        "{}[]",
+                        normalize_whitespace(node_text(grandchild, source))
+                    ));
                     break;
                 }
             }

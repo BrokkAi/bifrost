@@ -5,7 +5,9 @@ fn analyzer_for(files: &[(&str, &str)]) -> JavaAnalyzer {
     let root = temp.path().canonicalize().unwrap();
 
     for (path, contents) in files {
-        ProjectFile::new(root.clone(), path).write(contents).unwrap();
+        ProjectFile::new(root.clone(), path)
+            .write(contents)
+            .unwrap();
     }
 
     let project = TestProject::new(root, Language::Java);
@@ -43,7 +45,11 @@ fn synthesizes_implicit_constructor_for_plain_class_only() {
     ]);
 
     let foo_ctors = analyzer.get_definitions("Foo.Foo");
-    assert!(foo_ctors.iter().any(|code_unit| code_unit.kind() == CodeUnitType::Function));
+    assert!(
+        foo_ctors
+            .iter()
+            .any(|code_unit| code_unit.kind() == CodeUnitType::Function)
+    );
     let foo_ctor = foo_ctors
         .into_iter()
         .find(|code_unit| code_unit.kind() == CodeUnitType::Function)

@@ -1,6 +1,6 @@
 use crate::analyzer::{
-    metrics_from_declarations, CodeBaseMetrics, CodeUnit, DeclarationInfo, Language, Project,
-    ProjectFile, Range,
+    CodeBaseMetrics, CodeUnit, DeclarationInfo, Language, Project, ProjectFile, Range,
+    metrics_from_declarations,
 };
 use std::any::Any;
 use std::collections::BTreeSet;
@@ -82,5 +82,4 @@ pub trait IAnalyzer: Send + Sync + Any {
             .into_iter()
             .find(|candidate| candidate.is_class() || candidate.is_module())
     }
-
 }

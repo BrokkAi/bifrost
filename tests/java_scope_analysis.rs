@@ -1,4 +1,6 @@
-use brokk_analyzer::{DeclarationKind, IAnalyzer, JavaAnalyzer, Language, ProjectFile, TestProject};
+use brokk_analyzer::{
+    DeclarationKind, IAnalyzer, JavaAnalyzer, Language, ProjectFile, TestProject,
+};
 
 fn analyzer_for(code: &str) -> (tempfile::TempDir, JavaAnalyzer, ProjectFile, String) {
     let temp = tempfile::tempdir().unwrap();
@@ -75,14 +77,24 @@ public class Test {
     let item_start = content.find("item);").unwrap();
     let item_start_byte = content[..item_start].len();
     let item = analyzer
-        .find_nearest_declaration(&file, item_start_byte, item_start_byte + "item".len(), "item")
+        .find_nearest_declaration(
+            &file,
+            item_start_byte,
+            item_start_byte + "item".len(),
+            "item",
+        )
         .unwrap();
     assert_eq!(DeclarationKind::EnhancedForVariable, item.kind);
 
     let stream_start = content.find("stream.read").unwrap();
     let stream_start_byte = content[..stream_start].len();
     let stream = analyzer
-        .find_nearest_declaration(&file, stream_start_byte, stream_start_byte + "stream".len(), "stream")
+        .find_nearest_declaration(
+            &file,
+            stream_start_byte,
+            stream_start_byte + "stream".len(),
+            "stream",
+        )
         .unwrap();
     assert_eq!(DeclarationKind::ResourceVariable, stream.kind);
 

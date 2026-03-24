@@ -39,7 +39,10 @@ impl ProjectFile {
         let rel_path = rel_path.into();
 
         assert!(root.is_absolute(), "project root must be absolute");
-        assert!(!rel_path.is_absolute(), "project file path must be relative");
+        assert!(
+            !rel_path.is_absolute(),
+            "project file path must be relative"
+        );
 
         Self {
             root: root.normalize(),
@@ -168,6 +171,10 @@ impl CodeUnit {
         self.synthetic
     }
 
+    pub fn is_anonymous(&self) -> bool {
+        self.short_name.contains("$anon$")
+    }
+
     pub fn fq_name(&self) -> String {
         if self.package_name.is_empty() {
             self.short_name.clone()
@@ -177,7 +184,11 @@ impl CodeUnit {
     }
 
     pub fn identifier(&self) -> &str {
-        let name = self.short_name.rsplit(['.', '$']).next().unwrap_or(&self.short_name);
+        let name = self
+            .short_name
+            .rsplit(['.', '$'])
+            .next()
+            .unwrap_or(&self.short_name);
         if matches!(self.kind, CodeUnitType::Function | CodeUnitType::Field) {
             self.short_name.rsplit('.').next().unwrap_or(name)
         } else {
@@ -324,7 +335,9 @@ impl NormalizePath for PathBuf {
     }
 }
 
-pub fn metrics_from_declarations(declarations: impl IntoIterator<Item = CodeUnit>) -> CodeBaseMetrics {
+pub fn metrics_from_declarations(
+    declarations: impl IntoIterator<Item = CodeUnit>,
+) -> CodeBaseMetrics {
     let declarations: Vec<CodeUnit> = declarations.into_iter().collect();
     let file_count = declarations
         .iter()

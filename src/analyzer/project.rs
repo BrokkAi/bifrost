@@ -87,7 +87,9 @@ impl Project for TestProject {
             .into_iter()
             .filter(|file| {
                 extension
-                    .map(|extension| file.rel_path().extension().and_then(|ext| ext.to_str()) == Some(extension))
+                    .map(|extension| {
+                        file.rel_path().extension().and_then(|ext| ext.to_str()) == Some(extension)
+                    })
                     .unwrap_or(false)
             })
             .collect())

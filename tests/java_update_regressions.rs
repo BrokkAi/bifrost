@@ -9,7 +9,9 @@ fn analyzer_for(files: &[(&str, &str)]) -> (tempfile::TempDir, JavaAnalyzer) {
     let root = temp.path().canonicalize().unwrap();
 
     for (path, contents) in files {
-        ProjectFile::new(root.clone(), path).write(contents).unwrap();
+        ProjectFile::new(root.clone(), path)
+            .write(contents)
+            .unwrap();
     }
 
     let project = TestProject::new(root, Language::Java);
@@ -39,7 +41,12 @@ fn multi_step_incremental_update_preserves_prior_state() {
         .into_iter()
         .next()
         .unwrap();
-    assert!(analyzer.get_skeleton(&derived_cu).unwrap().contains("derivedMethod"));
+    assert!(
+        analyzer
+            .get_skeleton(&derived_cu)
+            .unwrap()
+            .contains("derivedMethod")
+    );
 
     derived
         .write(
@@ -68,10 +75,12 @@ fn multi_step_incremental_update_preserves_prior_state() {
         .into_iter()
         .next()
         .unwrap();
-    assert!(analyzer
-        .get_direct_ancestors(&derived_cu)
-        .into_iter()
-        .any(|code_unit| code_unit == base_cu));
+    assert!(
+        analyzer
+            .get_direct_ancestors(&derived_cu)
+            .into_iter()
+            .any(|code_unit| code_unit == base_cu)
+    );
     assert!(analyzer.imported_code_units_of(&derived).contains(&base_cu));
 }
 
@@ -130,7 +139,11 @@ fn incremental_class_replacement_keeps_new_children() {
         .next()
         .unwrap();
     let children = analyzer.get_direct_children(&target_cu);
-    assert!(children.iter().any(|code_unit| code_unit.short_name() == "Target.method"));
+    assert!(
+        children
+            .iter()
+            .any(|code_unit| code_unit.short_name() == "Target.method")
+    );
     let skeleton = analyzer.get_skeleton(&target_cu).unwrap();
     assert!(skeleton.contains("method"));
     assert!(!skeleton.contains("baseline"));

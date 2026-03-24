@@ -13,11 +13,14 @@ fn parses_fixture_declarations() {
 
     assert!(!analyzer.get_definitions("A").is_empty());
     assert!(!analyzer.get_definitions("A.method1").is_empty());
-    assert!(!analyzer.get_top_level_declarations(&ProjectFile::new(
-        analyzer.project().root().to_path_buf(),
-        "A.java"
-    ))
-    .is_empty());
+    assert!(
+        !analyzer
+            .get_top_level_declarations(&ProjectFile::new(
+                analyzer.project().root().to_path_buf(),
+                "A.java"
+            ))
+            .is_empty()
+    );
 }
 
 #[test]

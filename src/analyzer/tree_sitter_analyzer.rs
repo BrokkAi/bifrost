@@ -91,7 +91,10 @@ impl ParsedFile {
             .push(node_range(node));
 
         if let Some(parent) = parent {
-            self.children.entry(parent).or_default().push(code_unit.clone());
+            self.children
+                .entry(parent)
+                .or_default()
+                .push(code_unit.clone());
         }
 
         if let Some(top_level) = top_level {
@@ -104,7 +107,10 @@ impl ParsedFile {
     }
 
     pub fn add_signature(&mut self, code_unit: CodeUnit, signature: String) {
-        self.signatures.entry(code_unit).or_default().push(signature);
+        self.signatures
+            .entry(code_unit)
+            .or_default()
+            .push(signature);
     }
 
     pub fn add_child(&mut self, parent: CodeUnit, child: CodeUnit) {
@@ -173,7 +179,9 @@ where
             .set_language(&adapter.parser_language())
             .expect("failed to load tree-sitter language");
 
-        let mut files = existing.map(|state| state.files.clone()).unwrap_or_default();
+        let mut files = existing
+            .map(|state| state.files.clone())
+            .unwrap_or_default();
 
         let analyzable_files = project
             .analyzable_files(adapter.language())
@@ -242,7 +250,10 @@ where
             }
 
             for (code_unit, mut code_unit_ranges) in parsed.ranges {
-                ranges.entry(code_unit).or_default().append(&mut code_unit_ranges);
+                ranges
+                    .entry(code_unit)
+                    .or_default()
+                    .append(&mut code_unit_ranges);
             }
 
             for (code_unit, raw) in parsed.raw_supertypes {
@@ -281,7 +292,8 @@ where
     }
 
     pub(crate) fn package_name_of(&self, file: &ProjectFile) -> Option<&str> {
-        self.file_state(file).map(|state| state.package_name.as_str())
+        self.file_state(file)
+            .map(|state| state.package_name.as_str())
     }
 
     pub(crate) fn import_info_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
@@ -324,7 +336,12 @@ where
             .unwrap_or_default()
     }
 
-    fn source_slice(&self, code_unit: &CodeUnit, range: &Range, include_comments: bool) -> Option<String> {
+    fn source_slice(
+        &self,
+        code_unit: &CodeUnit,
+        range: &Range,
+        include_comments: bool,
+    ) -> Option<String> {
         let file_state = self.file_state(code_unit.source())?;
         let start_byte = if include_comments {
             expanded_comment_start(&file_state.source, range.start_byte)
@@ -449,11 +466,7 @@ where
 
     fn update_all(&self) -> Self {
         let state = Self::build_state(self.project.as_ref(), self.adapter.as_ref(), None);
-        Self::from_state(
-            Arc::clone(&self.project),
-            Arc::clone(&self.adapter),
-            state,
-        )
+        Self::from_state(Arc::clone(&self.project), Arc::clone(&self.adapter), state)
     }
 
     fn project(&self) -> &dyn Project {
@@ -475,15 +488,49 @@ where
     }
 
     fn get_definitions(&self, fq_name: &str) -> Vec<CodeUnit> {
-        self.state
+        let matches = self
+            .state
             .definitions
             .get(&self.adapter.normalize_full_name(fq_name))
             .cloned()
-            .unwrap_or_default()
+            .unwrap_or_default();
+
+        let mut result = Vec::new();
+        let mut saw_module = false;
+        for code_unit in matches {
+            if code_unit.is_module() {
+                if saw_module {
+                    continue;
+                }
+                saw_module = true;
+            }
+            result.push(code_unit);
+        }
+        result
     }
 
     fn get_direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        let mut children = self.state.children.get(code_unit).cloned().unwrap_or_default();
+        let mut children = if code_unit.is_module() {
+            let target_name = self.adapter.normalize_full_name(&code_unit.fq_name());
+            self.state
+                .children
+                .iter()
+                .filter(|(parent, _)| {
+                    parent.is_module()
+                        && self.adapter.normalize_full_name(&parent.fq_name()) == target_name
+                })
+                .flat_map(|(_, descendants)| descendants.iter().cloned())
+                .collect::<Vec<_>>()
+        } else {
+            self.state
+                .children
+                .get(code_unit)
+                .cloned()
+                .unwrap_or_default()
+        };
+
+        children.sort();
+        children.dedup();
         children.sort_by_key(|child| {
             self.ranges_of(child)
                 .into_iter()
@@ -543,7 +590,12 @@ where
             .map(|(_, code_unit)| code_unit)
     }
 
-    fn is_access_expression(&self, _file: &ProjectFile, _start_byte: usize, _end_byte: usize) -> bool {
+    fn is_access_expression(
+        &self,
+        _file: &ProjectFile,
+        _start_byte: usize,
+        _end_byte: usize,
+    ) -> bool {
         true
     }
 
@@ -558,7 +610,11 @@ where
     }
 
     fn ranges_of(&self, code_unit: &CodeUnit) -> Vec<Range> {
-        self.state.ranges.get(code_unit).cloned().unwrap_or_default()
+        self.state
+            .ranges
+            .get(code_unit)
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
