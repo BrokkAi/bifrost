@@ -29,6 +29,7 @@ struct FileState {
     imports: Vec<ImportInfo>,
     raw_supertypes: BTreeMap<CodeUnit, Vec<String>>,
     type_identifiers: BTreeSet<String>,
+    signatures: BTreeMap<CodeUnit, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -38,6 +39,7 @@ struct AnalyzerState {
     children: BTreeMap<CodeUnit, Vec<CodeUnit>>,
     ranges: BTreeMap<CodeUnit, Vec<Range>>,
     raw_supertypes: BTreeMap<CodeUnit, Vec<String>>,
+    signatures: BTreeMap<CodeUnit, Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +51,7 @@ pub struct ParsedFile {
     pub imports: Vec<ImportInfo>,
     pub raw_supertypes: BTreeMap<CodeUnit, Vec<String>>,
     pub type_identifiers: BTreeSet<String>,
+    pub signatures: BTreeMap<CodeUnit, Vec<String>>,
     ranges: BTreeMap<CodeUnit, Vec<Range>>,
     children: BTreeMap<CodeUnit, Vec<CodeUnit>>,
 }
@@ -63,6 +66,7 @@ impl ParsedFile {
             imports: Vec::new(),
             raw_supertypes: BTreeMap::new(),
             type_identifiers: BTreeSet::new(),
+            signatures: BTreeMap::new(),
             ranges: BTreeMap::new(),
             children: BTreeMap::new(),
         }
@@ -97,6 +101,10 @@ impl ParsedFile {
 
     pub fn set_raw_supertypes(&mut self, code_unit: CodeUnit, raw_supertypes: Vec<String>) {
         self.raw_supertypes.insert(code_unit, raw_supertypes);
+    }
+
+    pub fn add_signature(&mut self, code_unit: CodeUnit, signature: String) {
+        self.signatures.entry(code_unit).or_default().push(signature);
     }
 }
 
@@ -188,6 +196,7 @@ where
                     imports: parsed.imports,
                     raw_supertypes: parsed.raw_supertypes,
                     type_identifiers: parsed.type_identifiers,
+                    signatures: parsed.signatures,
                 },
             );
         }
@@ -209,6 +218,7 @@ where
         let mut children = BTreeMap::<CodeUnit, Vec<CodeUnit>>::new();
         let mut ranges = BTreeMap::<CodeUnit, Vec<Range>>::new();
         let mut raw_supertypes = BTreeMap::<CodeUnit, Vec<String>>::new();
+        let mut signatures = BTreeMap::<CodeUnit, Vec<String>>::new();
 
         for (file, state) in &files {
             let Some(tree) = parser.parse(state.source.as_str(), None) else {
@@ -234,6 +244,10 @@ where
             for (code_unit, raw) in parsed.raw_supertypes {
                 raw_supertypes.insert(code_unit, raw);
             }
+
+            for (code_unit, mut sigs) in parsed.signatures {
+                signatures.entry(code_unit).or_default().append(&mut sigs);
+            }
         }
 
         for descendants in children.values_mut() {
@@ -254,6 +268,7 @@ where
             children,
             ranges,
             raw_supertypes,
+            signatures,
         }
     }
 
@@ -293,12 +308,70 @@ where
         self.state.files.keys().cloned().collect()
     }
 
+    fn signatures_of(&self, code_unit: &CodeUnit) -> Vec<String> {
+        self.state
+            .signatures
+            .get(code_unit)
+            .cloned()
+            .or_else(|| {
+                self.file_state(code_unit.source())
+                    .and_then(|state| state.signatures.get(code_unit).cloned())
+            })
+            .unwrap_or_default()
+    }
+
     fn source_slice(&self, code_unit: &CodeUnit, range: &Range) -> Option<String> {
         let file_state = self.file_state(code_unit.source())?;
         file_state
             .source
             .get(range.start_byte..range.end_byte)
             .map(str::to_string)
+    }
+
+    fn render_skeleton_recursive(
+        &self,
+        code_unit: &CodeUnit,
+        indent: &str,
+        header_only: bool,
+        out: &mut String,
+    ) {
+        for signature in self.signatures_of(code_unit) {
+            if signature.is_empty() {
+                continue;
+            }
+            for line in signature.lines() {
+                out.push_str(indent);
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+
+        let all_children = crate::analyzer::IAnalyzer::get_direct_children(self, code_unit);
+        let field_children: Vec<_> = all_children
+            .iter()
+            .filter(|child| child.is_field())
+            .cloned()
+            .collect();
+        let children = if header_only {
+            field_children.clone()
+        } else {
+            all_children.clone()
+        };
+
+        if !children.is_empty() || code_unit.is_class() {
+            let child_indent = format!("{indent}  ");
+            for child in children {
+                self.render_skeleton_recursive(&child, &child_indent, header_only, out);
+            }
+            if header_only && all_children.len() > field_children.len() {
+                out.push_str(&child_indent);
+                out.push_str("[...]\n");
+            }
+            if code_unit.is_class() {
+                out.push_str(indent);
+                out.push_str("}\n");
+            }
+        }
     }
 }
 
@@ -356,6 +429,7 @@ where
                     imports: parsed.imports,
                     raw_supertypes: parsed.raw_supertypes,
                     type_identifiers: parsed.type_identifiers,
+                    signatures: parsed.signatures,
                 },
             );
         }
@@ -400,7 +474,15 @@ where
     }
 
     fn get_direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        self.state.children.get(code_unit).cloned().unwrap_or_default()
+        let mut children = self.state.children.get(code_unit).cloned().unwrap_or_default();
+        children.sort_by_key(|child| {
+            self.ranges_of(child)
+                .into_iter()
+                .map(|range| range.start_byte)
+                .min()
+                .unwrap_or(usize::MAX)
+        });
+        children
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {
@@ -470,23 +552,42 @@ where
         self.state.ranges.get(code_unit).cloned().unwrap_or_default()
     }
 
-    fn get_skeleton(&self, _code_unit: &CodeUnit) -> Option<String> {
-        None
+    fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
+        let mut rendered = String::new();
+        self.render_skeleton_recursive(code_unit, "", false, &mut rendered);
+        (!rendered.is_empty()).then(|| rendered.trim_end().to_string())
     }
 
-    fn get_skeleton_header(&self, _code_unit: &CodeUnit) -> Option<String> {
-        None
+    fn get_skeleton_header(&self, code_unit: &CodeUnit) -> Option<String> {
+        let mut rendered = String::new();
+        self.render_skeleton_recursive(code_unit, "", true, &mut rendered);
+        (!rendered.is_empty()).then(|| rendered.trim_end().to_string())
     }
 
-    fn get_source(&self, code_unit: &CodeUnit, _include_comments: bool) -> Option<String> {
-        self.ranges_of(code_unit)
-            .into_iter()
-            .next()
-            .and_then(|range| self.source_slice(code_unit, &range))
+    fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String> {
+        let sources = self.get_sources(code_unit, include_comments);
+        if sources.is_empty() {
+            None
+        } else {
+            Some(sources.into_iter().collect::<Vec<_>>().join("\n\n"))
+        }
     }
 
     fn get_sources(&self, code_unit: &CodeUnit, _include_comments: bool) -> BTreeSet<String> {
-        self.ranges_of(code_unit)
+        let mut ranges = if code_unit.is_function() {
+            let mut grouped = Vec::new();
+            for candidate in self.get_definitions(&code_unit.fq_name()) {
+                if candidate.source() == code_unit.source() {
+                    grouped.extend(self.ranges_of(&candidate));
+                }
+            }
+            grouped
+        } else {
+            self.ranges_of(code_unit)
+        };
+
+        ranges.sort_by_key(|range| range.start_byte);
+        ranges
             .into_iter()
             .filter_map(|range| self.source_slice(code_unit, &range))
             .collect()

@@ -398,6 +398,7 @@ fn visit_class_like(
         short_name,
     );
     let raw_supertypes = extract_raw_supertypes(node, source);
+    let signature = class_signature(node, source);
 
     let top_level = top_level_owner.cloned().unwrap_or_else(|| code_unit.clone());
     parsed.add_code_unit(
@@ -408,6 +409,7 @@ fn visit_class_like(
         Some(top_level.clone()),
     );
     parsed.set_raw_supertypes(code_unit.clone(), raw_supertypes);
+    parsed.add_signature(code_unit.clone(), signature);
 
     if let Some(body) = node.child_by_field_name("body") {
         for index in 0..body.named_child_count() {
@@ -484,16 +486,24 @@ fn visit_callable(
         .child_by_field_name("parameters")
         .map(|parameters| normalize_whitespace(node_text(parameters, source)));
     let short_name = format!("{}.{}", parent.short_name(), name);
+    let callable_sig = callable_signature(node, source);
     let code_unit = CodeUnit::with_signature(
         file.clone(),
         crate::analyzer::CodeUnitType::Function,
         package_name.to_string(),
         short_name,
-        signature,
+        signature.clone(),
         false,
     );
 
-    parsed.add_code_unit(code_unit, node, source, Some(parent.clone()), Some(top_level.clone()));
+    parsed.add_code_unit(
+        code_unit.clone(),
+        node,
+        source,
+        Some(parent.clone()),
+        Some(top_level.clone()),
+    );
+    parsed.add_signature(code_unit, callable_sig);
 }
 
 fn visit_field_declaration(
@@ -526,7 +536,14 @@ fn visit_field_declaration(
             package_name.to_string(),
             format!("{}.{}", parent.short_name(), name),
         );
-        parsed.add_code_unit(code_unit, node, source, Some(parent.clone()), Some(top_level.clone()));
+        parsed.add_code_unit(
+            code_unit.clone(),
+            node,
+            source,
+            Some(parent.clone()),
+            Some(top_level.clone()),
+        );
+        parsed.add_signature(code_unit, field_signature(node, source, name));
     }
 }
 
@@ -554,7 +571,14 @@ fn visit_enum_constant(
         package_name.to_string(),
         format!("{}.{}", parent.short_name(), name),
     );
-    parsed.add_code_unit(code_unit, node, source, Some(parent.clone()), Some(top_level.clone()));
+    parsed.add_code_unit(
+        code_unit.clone(),
+        node,
+        source,
+        Some(parent.clone()),
+        Some(top_level.clone()),
+    );
+    parsed.add_signature(code_unit, enum_constant_signature(node, source));
 }
 
 fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
@@ -563,6 +587,44 @@ fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
 
 fn normalize_whitespace(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn class_signature(node: Node<'_>, source: &str) -> String {
+    let body_start = node
+        .child_by_field_name("body")
+        .map(|body| body.start_byte())
+        .unwrap_or(node.end_byte());
+    let header = source.get(node.start_byte()..body_start).unwrap_or("").trim_end();
+    format!("{} {{", normalize_whitespace(header))
+}
+
+fn callable_signature(node: Node<'_>, source: &str) -> String {
+    let end = node
+        .child_by_field_name("body")
+        .map(|body| body.start_byte())
+        .unwrap_or(node.end_byte());
+    normalize_whitespace(source.get(node.start_byte()..end).unwrap_or("").trim_end())
+}
+
+fn field_signature(node: Node<'_>, source: &str, name: &str) -> String {
+    let declaration = normalize_whitespace(node_text(node, source));
+    if declaration.contains(',') {
+        declaration
+            .split(',')
+            .find(|part| part.contains(name))
+            .map(|part| format!("{};", part.trim().trim_end_matches(';')))
+            .unwrap_or(declaration)
+    } else {
+        declaration
+    }
+}
+
+fn enum_constant_signature(node: Node<'_>, source: &str) -> String {
+    let mut text = node_text(node, source).trim().to_string();
+    if node.next_named_sibling().is_some() {
+        text.push(',');
+    }
+    text
 }
 
 fn extract_raw_supertypes(node: Node<'_>, source: &str) -> Vec<String> {

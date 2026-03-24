@@ -19,7 +19,8 @@ After this change, this repository will contain a Rust library that reproduces t
 - [x] (2026-03-24T21:19Z) Replaced the placeholder `TreeSitterAnalyzer` with a single-threaded parse/index core that loads Java files, builds declaration/range indexes, tracks imports, and supports snapshot-style updates.
 - [x] (2026-03-24T21:19Z) Added the first Rust smoke tests covering fixture parsing and explicit file updates; `cargo test --test java_analyzer_smoke` now passes.
 - [x] (2026-03-24T21:19Z) Implemented the first Java semantic layer: import resolution with explicit-over-wildcard precedence, same-package referencing detection, raw-supertype extraction, and direct/transitive hierarchy traversal. `cargo test --test java_imports_and_hierarchy` passes.
-- [ ] Complete the remaining Java-specific semantics: skeleton rendering, comment-aware source extraction, access-expression filtering, nearest declaration lookup, and broader update/regression parity.
+- [x] (2026-03-24T21:19Z) Implemented a first rendering layer for class/function source extraction and recursive skeleton/header reconstruction. `cargo test --test java_source_and_skeleton` passes against the copied Java fixtures.
+- [ ] Complete the remaining Java-specific semantics: comment-aware source extraction, access-expression filtering, nearest declaration lookup, and broader update/regression parity.
 - [ ] Translate the selected Java tests into Rust integration tests and make them pass.
 - [ ] Run the Rust test suite and commit each milestone as a logical unit.
 
@@ -43,6 +44,9 @@ After this change, this repository will contain a Rust library that reproduces t
 - Observation: the current import-resolution rules can already cover the key Brokk precedence cases without a full query-driven name resolver.
   Evidence: explicit imports beat wildcard imports, wildcard ambiguity is deterministic by import order, and same-package references are recoverable by matching extracted type identifiers; `cargo test --test java_imports_and_hierarchy` passes 7 tests.
 
+- Observation: the existing declaration ranges plus lightweight stored signatures are enough to reconstruct the basic Java skeletons covered by the copied fixture tests.
+  Evidence: `cargo test --test java_source_and_skeleton` passes for overloaded method source extraction, nested-class source slices, recursive class skeletons, and header-only skeletons.
+
 ## Decision Log
 
 - Decision: preserve Brokk's Java-like API names in Rust for v1 instead of inventing an idiomatic-Rust-first surface.
@@ -65,9 +69,13 @@ After this change, this repository will contain a Rust library that reproduces t
   Rationale: the generic state should own parsed facts, while Java-specific precedence rules decide how those facts become imports, ancestors, descendants, and same-package references.
   Date/Author: 2026-03-24 / Codex
 
+- Decision: persist rendered declaration signatures in the generic analyzer state and build skeletons recursively from those signatures plus ordered child relationships.
+  Rationale: it avoids reparsing on every request and keeps the first source/skeleton milestone simple while still matching the fixture-backed Java tests.
+  Date/Author: 2026-03-24 / Codex
+
 ## Outcomes & Retrospective
 
-The repository now has the crate scaffold, the copied Brokk resource corpus, the public Rust API layer, a single-threaded parse/index core, and a first Java semantic layer for imports and hierarchy. The major remaining gap is semantic parity for skeleton/source rendering, local declaration and access-expression logic, and the broader translated acceptance suite.
+The repository now has the crate scaffold, the copied Brokk resource corpus, the public Rust API layer, a single-threaded parse/index core, a Java semantic layer for imports and hierarchy, and a first rendering layer for source and skeletons. The major remaining gap is semantic parity for comment-aware extraction, local declaration and access-expression logic, and the broader translated acceptance suite.
 
 ## Context and Orientation
 
