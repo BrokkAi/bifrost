@@ -70,10 +70,10 @@ pub trait IAnalyzer: Send + Sync + Any {
         let mut last_index = None;
 
         for separator in [".", "$", "::", "->"] {
-            if let Some(index) = fq_name.rfind(separator) {
-                if last_index.map(|current| index > current).unwrap_or(true) {
-                    last_index = Some(index);
-                }
+            if let Some(index) = fq_name.rfind(separator)
+                && last_index.map(|current| index > current).unwrap_or(true)
+            {
+                last_index = Some(index);
             }
         }
 

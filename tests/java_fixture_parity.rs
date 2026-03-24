@@ -17,7 +17,9 @@ fn analyzer_for(files: &[(&str, &str)]) -> JavaAnalyzer {
     let root = temp.path().canonicalize().unwrap();
 
     for (path, contents) in files {
-        ProjectFile::new(root.clone(), path).write(contents).unwrap();
+        ProjectFile::new(root.clone(), path)
+            .write(contents)
+            .unwrap();
     }
 
     let project = TestProject::new(root, Language::Java);
@@ -41,12 +43,14 @@ fn top_level_declarations_match_java_fixture_shapes() {
     assert!(
         packaged_top_level
             .iter()
-            .any(|code_unit| code_unit.is_module() && code_unit.fq_name() == "io.github.jbellis.brokk")
+            .any(|code_unit| code_unit.is_module()
+                && code_unit.fq_name() == "io.github.jbellis.brokk")
     );
     assert!(
         packaged_top_level
             .iter()
-            .any(|code_unit| code_unit.is_class() && code_unit.fq_name() == "io.github.jbellis.brokk.Foo")
+            .any(|code_unit| code_unit.is_class()
+                && code_unit.fq_name() == "io.github.jbellis.brokk.Foo")
     );
 }
 
@@ -80,7 +84,11 @@ fn enclosing_code_unit_for_line_ranges_matches_fixture_expectations() {
     let analyzer = fixture_analyzer();
     let file = ProjectFile::new(analyzer.project().root().to_path_buf(), "A.java");
 
-    let method1 = analyzer.get_definitions("A.method1").into_iter().next().unwrap();
+    let method1 = analyzer
+        .get_definitions("A.method1")
+        .into_iter()
+        .next()
+        .unwrap();
     let method1_line = analyzer.ranges_of(&method1)[0].start_line;
     assert_eq!(
         "A.method1",
@@ -104,7 +112,11 @@ fn enclosing_code_unit_for_line_ranges_matches_fixture_expectations() {
             .fq_name()
     );
 
-    let method2 = analyzer.get_definitions("A.method2").into_iter().next().unwrap();
+    let method2 = analyzer
+        .get_definitions("A.method2")
+        .into_iter()
+        .next()
+        .unwrap();
     let method2_line = analyzer.ranges_of(&method2)[0].start_line;
     assert_eq!(
         "A",

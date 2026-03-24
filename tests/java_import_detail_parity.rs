@@ -7,7 +7,9 @@ fn analyzer_for(files: &[(&str, &str)]) -> JavaAnalyzer {
     let root = temp.path().canonicalize().unwrap();
 
     for (path, contents) in files {
-        ProjectFile::new(root.clone(), path).write(contents).unwrap();
+        ProjectFile::new(root.clone(), path)
+            .write(contents)
+            .unwrap();
     }
 
     let project = TestProject::new(root, Language::Java);
@@ -197,10 +199,13 @@ fn relevant_imports_ignore_fully_qualified_types() {
 
 #[test]
 fn extracted_type_identifiers_include_qualified_java_types() {
-    let analyzer = analyzer_for(&[("Foo.java", "public class Foo { List simple; java.util.List qualified; }")]);
+    let analyzer = analyzer_for(&[(
+        "Foo.java",
+        "public class Foo { List simple; java.util.List qualified; }",
+    )]);
 
-    let identifiers =
-        analyzer.extract_type_identifiers("public class Foo { List simple; java.util.List qualified; }");
+    let identifiers = analyzer
+        .extract_type_identifiers("public class Foo { List simple; java.util.List qualified; }");
     assert!(identifiers.contains("List"));
     assert!(identifiers.contains("java.util.List"));
 }

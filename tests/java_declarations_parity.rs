@@ -105,7 +105,11 @@ fn nested_class_identifiers_match_java_expectations() {
     assert_eq!("D", class_d.short_name());
     assert_eq!("D", class_d.identifier());
 
-    let class_d_sub = analyzer.get_definitions("D.DSub").into_iter().next().unwrap();
+    let class_d_sub = analyzer
+        .get_definitions("D.DSub")
+        .into_iter()
+        .next()
+        .unwrap();
     assert_eq!("D.DSub", class_d_sub.short_name());
     assert_eq!("DSub", class_d_sub.identifier());
 

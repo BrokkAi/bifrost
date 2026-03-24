@@ -30,6 +30,7 @@ After this change, this repository will contain a Rust library that reproduces t
 - [x] (2026-03-24T21:51Z) Added declaration-inventory parity coverage for fixture-wide class enumeration, packaged-file declarations, and nested-class `short_name`/`identifier` semantics. `cargo test --test java_declarations_parity` passes.
 - [x] (2026-03-24T21:52Z) Added import-detail parity coverage for import-info structure, mixed/static import resolution, circular import stability, relevant-import filtering for fully qualified types, and Java type-identifier extraction. `cargo test --test java_import_detail_parity` passes.
 - [x] (2026-03-24T21:53Z) Aligned Java search behavior with Brokk's case-insensitive matching and added focused search parity tests for basic patterns, regex patterns, nested classes, and missing results. `cargo test --test java_search_parity` passes.
+- [x] (2026-03-24T21:54Z) Cleaned up the current implementation to satisfy the plan's validation gate. `cargo test`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings` all pass.
 - [ ] Translate the remaining selected Brokk Java tests that are still uncovered and close any parity gaps they expose.
 - [x] (2026-03-24T21:49Z) The current Rust suite passes with `cargo test`.
 

@@ -395,15 +395,14 @@ impl JavaAnalyzer {
             return None;
         }
 
-        if normalized.contains('.') {
-            if let Some(code_unit) = self
+        if normalized.contains('.')
+            && let Some(code_unit) = self
                 .inner
                 .get_definitions(normalized)
                 .into_iter()
                 .find(|code_unit| code_unit.is_class())
-            {
-                return Some(code_unit);
-            }
+        {
+            return Some(code_unit);
         }
 
         let imports = self.resolve_imports(file);
@@ -576,10 +575,10 @@ fn strip_location_suffix(input: &str) -> String {
         return input.to_string();
     }
 
-    if let Some((grand_head, middle)) = head.rsplit_once(':') {
-        if middle.bytes().all(|byte| byte.is_ascii_digit()) {
-            return grand_head.to_string();
-        }
+    if let Some((grand_head, middle)) = head.rsplit_once(':')
+        && middle.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return grand_head.to_string();
     }
 
     head.to_string()
@@ -673,9 +672,7 @@ fn visit_class_like(
     top_level_owner: Option<&CodeUnit>,
     parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
 ) -> Option<CodeUnit> {
-    let Some(name_node) = node.child_by_field_name("name") else {
-        return None;
-    };
+    let name_node = node.child_by_field_name("name")?;
 
     let simple_name = node_text(name_node, source).trim().to_string();
     if simple_name.is_empty() {
@@ -1036,16 +1033,16 @@ fn find_nearest_declaration_from_node(
             "catch_clause" => {
                 let mut cursor = node.walk();
                 for child in node.named_children(&mut cursor) {
-                    if child.kind() == "catch_formal_parameter" {
-                        if let Some(found) = match_named_field(
+                    if child.kind() == "catch_formal_parameter"
+                        && let Some(found) = match_named_field(
                             child,
                             "name",
                             identifier,
                             source,
                             DeclarationKind::CatchParameter,
-                        ) {
-                            return Some(found);
-                        }
+                        )
+                    {
+                        return Some(found);
                     }
                 }
             }
@@ -1053,16 +1050,16 @@ fn find_nearest_declaration_from_node(
                 if let Some(resources) = node.child_by_field_name("resources") {
                     let mut cursor = resources.walk();
                     for child in resources.named_children(&mut cursor) {
-                        if child.kind() == "resource" {
-                            if let Some(found) = match_named_field(
+                        if child.kind() == "resource"
+                            && let Some(found) = match_named_field(
                                 child,
                                 "name",
                                 identifier,
                                 source,
                                 DeclarationKind::ResourceVariable,
-                            ) {
-                                return Some(found);
-                            }
+                            )
+                        {
+                            return Some(found);
                         }
                     }
                 }
@@ -1089,16 +1086,16 @@ fn find_nearest_declaration_from_node(
                                     child,
                                 ));
                             }
-                            if child.kind() == "formal_parameter" {
-                                if let Some(found) = match_named_field(
+                            if child.kind() == "formal_parameter"
+                                && let Some(found) = match_named_field(
                                     child,
                                     "name",
                                     identifier,
                                     source,
                                     DeclarationKind::LambdaParameter,
-                                ) {
-                                    return Some(found);
-                                }
+                                )
+                            {
+                                return Some(found);
                             }
                         }
                     }
@@ -1125,16 +1122,16 @@ fn check_formal_parameters(
     let params = node.child_by_field_name("parameters")?;
     let mut cursor = params.walk();
     for child in params.named_children(&mut cursor) {
-        if child.kind() == "formal_parameter" {
-            if let Some(found) = match_named_field(
+        if child.kind() == "formal_parameter"
+            && let Some(found) = match_named_field(
                 child,
                 "name",
                 identifier,
                 source,
                 DeclarationKind::Parameter,
-            ) {
-                return Some(found);
-            }
+            )
+        {
+            return Some(found);
         }
     }
     None
@@ -1156,16 +1153,16 @@ fn check_preceding_local_variables(
         }
         let mut local_cursor = sibling.walk();
         for child in sibling.named_children(&mut local_cursor) {
-            if child.kind() == "variable_declarator" {
-                if let Some(found) = match_named_field(
+            if child.kind() == "variable_declarator"
+                && let Some(found) = match_named_field(
                     child,
                     "name",
                     identifier,
                     source,
                     DeclarationKind::LocalVariable,
-                ) {
-                    return Some(found);
-                }
+                )
+            {
+                return Some(found);
             }
         }
     }
@@ -1460,32 +1457,28 @@ impl IAnalyzer for JavaAnalyzer {
 
         let mut current = Some(node);
         while let Some(candidate) = current {
-            if let Some(parent) = candidate.parent() {
-                if is_declaration_parent(parent.kind()) {
-                    if let Some(name_node) = parent.child_by_field_name("name") {
-                        if name_node.start_byte() == start_byte {
-                            return false;
-                        }
-                    }
-                }
+            if let Some(parent) = candidate.parent()
+                && is_declaration_parent(parent.kind())
+                && let Some(name_node) = parent.child_by_field_name("name")
+                && name_node.start_byte() == start_byte
+            {
+                return false;
             }
             current = candidate.parent();
         }
 
         if let Some(parent) = node.parent() {
-            if parent.kind() == "field_access" {
-                if let Some(field_node) = parent.child_by_field_name("field") {
-                    if field_node.start_byte() == node.start_byte() {
-                        return true;
-                    }
-                }
+            if parent.kind() == "field_access"
+                && let Some(field_node) = parent.child_by_field_name("field")
+                && field_node.start_byte() == node.start_byte()
+            {
+                return true;
             }
-            if parent.kind() == "method_invocation" {
-                if let Some(name_node) = parent.child_by_field_name("name") {
-                    if name_node.start_byte() == node.start_byte() {
-                        return true;
-                    }
-                }
+            if parent.kind() == "method_invocation"
+                && let Some(name_node) = parent.child_by_field_name("name")
+                && name_node.start_byte() == node.start_byte()
+            {
+                return true;
             }
         }
 
@@ -1519,9 +1512,7 @@ impl IAnalyzer for JavaAnalyzer {
         let Ok(source) = file.read_to_string() else {
             return None;
         };
-        let Some(tree) = parse_tree(&source) else {
-            return None;
-        };
+        let tree = parse_tree(&source)?;
         let root = tree.root_node();
         let node = root.named_descendant_for_byte_range(start_byte, end_byte)?;
         find_nearest_declaration_from_node(node, ident, &source)
