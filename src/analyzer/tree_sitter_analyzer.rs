@@ -1,7 +1,7 @@
 use crate::analyzer::{
     CodeUnit, DeclarationInfo, ImportInfo, Language, Project, ProjectFile, Range,
 };
-use regex::Regex;
+use regex::RegexBuilder;
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -663,12 +663,13 @@ where
             return BTreeSet::new();
         }
 
-        let compiled = if auto_quote {
-            Regex::new(&regex::escape(pattern))
+        let pattern = if auto_quote {
+            regex::escape(pattern)
         } else {
-            Regex::new(pattern)
+            pattern.to_string()
         };
-        let Ok(compiled) = compiled else {
+
+        let Ok(compiled) = RegexBuilder::new(&pattern).case_insensitive(true).build() else {
             return BTreeSet::new();
         };
 

@@ -29,6 +29,7 @@ After this change, this repository will contain a Rust library that reproduces t
 - [x] (2026-03-24T21:51Z) Added another fixture-driven translation pass covering top-level declarations, direct class children, line-range `enclosing_code_unit` behavior, and `could_import_file` Java edge cases. `cargo test --test java_fixture_parity` passes.
 - [x] (2026-03-24T21:51Z) Added declaration-inventory parity coverage for fixture-wide class enumeration, packaged-file declarations, and nested-class `short_name`/`identifier` semantics. `cargo test --test java_declarations_parity` passes.
 - [x] (2026-03-24T21:52Z) Added import-detail parity coverage for import-info structure, mixed/static import resolution, circular import stability, relevant-import filtering for fully qualified types, and Java type-identifier extraction. `cargo test --test java_import_detail_parity` passes.
+- [x] (2026-03-24T21:53Z) Aligned Java search behavior with Brokk's case-insensitive matching and added focused search parity tests for basic patterns, regex patterns, nested classes, and missing results. `cargo test --test java_search_parity` passes.
 - [ ] Translate the remaining selected Brokk Java tests that are still uncovered and close any parity gaps they expose.
 - [x] (2026-03-24T21:49Z) The current Rust suite passes with `cargo test`.
 
@@ -82,6 +83,9 @@ After this change, this repository will contain a Rust library that reproduces t
 - Observation: the Java import helper surface is mostly aligned now; the remaining import test work is translation-heavy rather than implementation-heavy.
   Evidence: the translated import-detail tests for import-info parsing, mixed import resolution, circular import stability, relevant-import filtering, and qualified type extraction all passed without code changes.
 
+- Observation: search behavior was one of the last real semantic mismatches rather than a missing test translation.
+  Evidence: the translated search tests required an implementation change so `search_definitions` compiles case-insensitive regexes, after which the new search parity suite passed.
+
 ## Decision Log
 
 - Decision: preserve Brokk's Java-like API names in Rust for v1 instead of inventing an idiomatic-Rust-first surface.
@@ -128,9 +132,13 @@ After this change, this repository will contain a Rust library that reproduces t
   Rationale: this is the smallest change that satisfies the overload/lambda attachment regressions without reintroducing the full query-driven Brokk extraction pipeline.
   Date/Author: 2026-03-24 / Codex
 
+- Decision: make `search_definitions` case-insensitive in the shared engine.
+  Rationale: Brokk's Java search semantics are case-insensitive, and the Rust port already routes search through the generic regex-based matcher.
+  Date/Author: 2026-03-24 / Codex
+
 ## Outcomes & Retrospective
 
-The repository now has the crate scaffold, the copied Brokk resource corpus, the public Rust API layer, a single-threaded parse/index core, Java semantics for imports, hierarchy, source/skeleton rendering, lexical scope analysis, package modules, implicit constructors, comment-aware extraction, Java call-receiver heuristics, normalized-name lookups, lambda attachment, relevant-import selection, fixture top-level/member parity coverage, declaration-inventory parity coverage, import-detail parity coverage, and the first duplicate/update regressions. The major remaining gap is the rest of the translated Brokk Java acceptance suite and whatever parity gaps those additional tests expose.
+The repository now has the crate scaffold, the copied Brokk resource corpus, the public Rust API layer, a single-threaded parse/index core, Java semantics for imports, hierarchy, source/skeleton rendering, lexical scope analysis, package modules, implicit constructors, comment-aware extraction, Java call-receiver heuristics, normalized-name lookups, lambda attachment, relevant-import selection, fixture top-level/member parity coverage, declaration-inventory parity coverage, import-detail parity coverage, case-insensitive search parity, and the first duplicate/update regressions. The major remaining gap is the rest of the translated Brokk Java acceptance suite and whatever parity gaps those additional tests expose.
 
 ## Context and Orientation
 
