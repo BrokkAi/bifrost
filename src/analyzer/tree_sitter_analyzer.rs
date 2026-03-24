@@ -1,18 +1,98 @@
 use crate::analyzer::{
-    CodeUnit, DeclarationInfo, IAnalyzer, Language, Project, ProjectFile, Range,
+    CodeUnit, DeclarationInfo, ImportInfo, Language, Project, ProjectFile, Range,
 };
-use std::collections::BTreeSet;
+use regex::Regex;
+use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 use std::sync::Arc;
+use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
 
 pub trait LanguageAdapter: Send + Sync + 'static {
     fn language(&self) -> Language;
     fn query_directory(&self) -> &'static str;
+    fn parser_language(&self) -> TsLanguage;
+    fn file_extension(&self) -> &'static str;
+    fn normalize_full_name(&self, fq_name: &str) -> String {
+        fq_name.to_string()
+    }
+    fn extract_call_receiver(&self, reference: &str) -> Option<String>;
+    fn parse_file(&self, file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFile;
+}
+
+#[derive(Debug, Clone)]
+struct FileState {
+    source: String,
+    package_name: String,
+    top_level_declarations: Vec<CodeUnit>,
+    declarations: BTreeSet<CodeUnit>,
+    import_statements: Vec<String>,
+    imports: Vec<ImportInfo>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AnalyzerState {
+    files: BTreeMap<ProjectFile, FileState>,
+    definitions: BTreeMap<String, Vec<CodeUnit>>,
+    children: BTreeMap<CodeUnit, Vec<CodeUnit>>,
+    ranges: BTreeMap<CodeUnit, Vec<Range>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ParsedFile {
+    pub package_name: String,
+    pub top_level_declarations: Vec<CodeUnit>,
+    pub declarations: BTreeSet<CodeUnit>,
+    pub import_statements: Vec<String>,
+    pub imports: Vec<ImportInfo>,
+    ranges: BTreeMap<CodeUnit, Vec<Range>>,
+    children: BTreeMap<CodeUnit, Vec<CodeUnit>>,
+}
+
+impl ParsedFile {
+    pub fn new(package_name: String) -> Self {
+        Self {
+            package_name,
+            top_level_declarations: Vec::new(),
+            declarations: BTreeSet::new(),
+            import_statements: Vec::new(),
+            imports: Vec::new(),
+            ranges: BTreeMap::new(),
+            children: BTreeMap::new(),
+        }
+    }
+
+    pub fn add_code_unit(
+        &mut self,
+        code_unit: CodeUnit,
+        node: Node<'_>,
+        _source: &str,
+        parent: Option<CodeUnit>,
+        top_level: Option<CodeUnit>,
+    ) {
+        if parent.is_none() {
+            self.top_level_declarations.push(code_unit.clone());
+        }
+
+        self.declarations.insert(code_unit.clone());
+        self.ranges
+            .entry(code_unit.clone())
+            .or_default()
+            .push(node_range(node));
+
+        if let Some(parent) = parent {
+            self.children.entry(parent).or_default().push(code_unit.clone());
+        }
+
+        if let Some(top_level) = top_level {
+            self.children.entry(top_level).or_default();
+        }
+    }
 }
 
 pub struct TreeSitterAnalyzer<A> {
     project: Arc<dyn Project>,
     adapter: Arc<A>,
+    state: Arc<AnalyzerState>,
     _state: PhantomData<A>,
 }
 
@@ -21,6 +101,7 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
         Self {
             project: Arc::clone(&self.project),
             adapter: Arc::clone(&self.adapter),
+            state: Arc::clone(&self.state),
             _state: PhantomData,
         }
     }
@@ -31,9 +112,13 @@ where
     A: LanguageAdapter,
 {
     pub fn new(project: Arc<dyn Project>, adapter: A) -> Self {
+        let adapter = Arc::new(adapter);
+        let state = Arc::new(Self::build_state(project.as_ref(), adapter.as_ref(), None));
+
         Self {
             project,
-            adapter: Arc::new(adapter),
+            adapter,
+            state,
             _state: PhantomData,
         }
     }
@@ -45,26 +130,204 @@ where
     pub fn adapter(&self) -> &A {
         self.adapter.as_ref()
     }
+
+    fn from_state(project: Arc<dyn Project>, adapter: Arc<A>, state: AnalyzerState) -> Self {
+        Self {
+            project,
+            adapter,
+            state: Arc::new(state),
+            _state: PhantomData,
+        }
+    }
+
+    fn build_state(
+        project: &dyn Project,
+        adapter: &A,
+        existing: Option<&AnalyzerState>,
+    ) -> AnalyzerState {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&adapter.parser_language())
+            .expect("failed to load tree-sitter language");
+
+        let mut files = existing.map(|state| state.files.clone()).unwrap_or_default();
+
+        let analyzable_files = project
+            .analyzable_files(adapter.language())
+            .unwrap_or_default();
+
+        files.retain(|file, _| analyzable_files.contains(file));
+
+        for file in analyzable_files {
+            let Ok(source) = file.read_to_string() else {
+                continue;
+            };
+            let Some(tree) = parser.parse(source.as_str(), None) else {
+                continue;
+            };
+            let parsed = adapter.parse_file(&file, &source, &tree);
+            files.insert(
+                file,
+                FileState {
+                    source,
+                    package_name: parsed.package_name,
+                    top_level_declarations: parsed.top_level_declarations,
+                    declarations: parsed.declarations,
+                    import_statements: parsed.import_statements,
+                    imports: parsed.imports,
+                },
+            );
+        }
+
+        Self::index_state(files, project, adapter)
+    }
+
+    fn index_state(
+        files: BTreeMap<ProjectFile, FileState>,
+        project: &dyn Project,
+        adapter: &A,
+    ) -> AnalyzerState {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&adapter.parser_language())
+            .expect("failed to load tree-sitter language");
+
+        let mut definitions = BTreeMap::<String, Vec<CodeUnit>>::new();
+        let mut children = BTreeMap::<CodeUnit, Vec<CodeUnit>>::new();
+        let mut ranges = BTreeMap::<CodeUnit, Vec<Range>>::new();
+
+        for (file, state) in &files {
+            let Some(tree) = parser.parse(state.source.as_str(), None) else {
+                continue;
+            };
+            let parsed = adapter.parse_file(file, &state.source, &tree);
+
+            for declaration in &state.declarations {
+                definitions
+                    .entry(adapter.normalize_full_name(&declaration.fq_name()))
+                    .or_default()
+                    .push(declaration.clone());
+            }
+
+            for (parent, descendants) in parsed.children {
+                children.entry(parent).or_default().extend(descendants);
+            }
+
+            for (code_unit, mut code_unit_ranges) in parsed.ranges {
+                ranges.entry(code_unit).or_default().append(&mut code_unit_ranges);
+            }
+        }
+
+        for descendants in children.values_mut() {
+            descendants.sort();
+            descendants.dedup();
+        }
+
+        for matches in definitions.values_mut() {
+            matches.sort();
+            matches.dedup();
+        }
+
+        let _ = project;
+
+        AnalyzerState {
+            files,
+            definitions,
+            children,
+            ranges,
+        }
+    }
+
+    fn file_state(&self, file: &ProjectFile) -> Option<&FileState> {
+        self.state.files.get(file)
+    }
+
+    pub(crate) fn package_name_of(&self, file: &ProjectFile) -> Option<&str> {
+        self.file_state(file).map(|state| state.package_name.as_str())
+    }
+
+    pub(crate) fn import_info_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
+        self.file_state(file)
+            .map(|state| state.imports.clone())
+            .unwrap_or_default()
+    }
+
+    fn source_slice(&self, code_unit: &CodeUnit, range: &Range) -> Option<String> {
+        let file_state = self.file_state(code_unit.source())?;
+        file_state
+            .source
+            .get(range.start_byte..range.end_byte)
+            .map(str::to_string)
+    }
 }
 
-impl<A> IAnalyzer for TreeSitterAnalyzer<A>
+impl<A> crate::analyzer::IAnalyzer for TreeSitterAnalyzer<A>
 where
     A: LanguageAdapter,
 {
-    fn get_top_level_declarations(&self, _file: &ProjectFile) -> Vec<CodeUnit> {
-        Vec::new()
+    fn get_top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
+        self.file_state(file)
+            .map(|state| state.top_level_declarations.clone())
+            .unwrap_or_default()
+    }
+
+    fn get_analyzed_files(&self) -> BTreeSet<ProjectFile> {
+        self.state.files.keys().cloned().collect()
     }
 
     fn languages(&self) -> BTreeSet<Language> {
         BTreeSet::from([self.adapter.language()])
     }
 
-    fn update(&self, _changed_files: &BTreeSet<ProjectFile>) -> Self {
-        self.clone()
+    fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
+        if changed_files.is_empty() {
+            return self.clone();
+        }
+
+        let mut parser = Parser::new();
+        parser
+            .set_language(&self.adapter.parser_language())
+            .expect("failed to load tree-sitter language");
+
+        let mut files = self.state.files.clone();
+
+        for file in changed_files {
+            if !file.exists() {
+                files.remove(file);
+                continue;
+            }
+
+            let Ok(source) = file.read_to_string() else {
+                continue;
+            };
+            let Some(tree) = parser.parse(source.as_str(), None) else {
+                continue;
+            };
+            let parsed = self.adapter.parse_file(file, &source, &tree);
+            files.insert(
+                file.clone(),
+                FileState {
+                    source,
+                    package_name: parsed.package_name,
+                    top_level_declarations: parsed.top_level_declarations,
+                    declarations: parsed.declarations,
+                    import_statements: parsed.import_statements,
+                    imports: parsed.imports,
+                },
+            );
+        }
+
+        let state = Self::index_state(files, self.project.as_ref(), self.adapter.as_ref());
+        Self::from_state(Arc::clone(&self.project), Arc::clone(&self.adapter), state)
     }
 
     fn update_all(&self) -> Self {
-        self.clone()
+        let state = Self::build_state(self.project.as_ref(), self.adapter.as_ref(), None);
+        Self::from_state(
+            Arc::clone(&self.project),
+            Arc::clone(&self.adapter),
+            state,
+        )
     }
 
     fn project(&self) -> &dyn Project {
@@ -72,40 +335,78 @@ where
     }
 
     fn get_all_declarations(&self) -> Vec<CodeUnit> {
-        Vec::new()
+        self.state
+            .files
+            .values()
+            .flat_map(|state| state.declarations.iter().cloned())
+            .collect()
     }
 
-    fn get_declarations(&self, _file: &ProjectFile) -> BTreeSet<CodeUnit> {
-        BTreeSet::new()
+    fn get_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
+        self.file_state(file)
+            .map(|state| state.declarations.clone())
+            .unwrap_or_default()
     }
 
-    fn get_definitions(&self, _fq_name: &str) -> Vec<CodeUnit> {
-        Vec::new()
+    fn get_definitions(&self, fq_name: &str) -> Vec<CodeUnit> {
+        self.state
+            .definitions
+            .get(&self.adapter.normalize_full_name(fq_name))
+            .cloned()
+            .unwrap_or_default()
     }
 
-    fn get_direct_children(&self, _code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        Vec::new()
+    fn get_direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+        self.state.children.get(code_unit).cloned().unwrap_or_default()
     }
 
-    fn extract_call_receiver(&self, _reference: &str) -> Option<String> {
-        None
+    fn extract_call_receiver(&self, reference: &str) -> Option<String> {
+        self.adapter.extract_call_receiver(reference)
     }
 
-    fn import_statements_of(&self, _file: &ProjectFile) -> Vec<String> {
-        Vec::new()
+    fn import_statements_of(&self, file: &ProjectFile) -> Vec<String> {
+        self.file_state(file)
+            .map(|state| state.import_statements.clone())
+            .unwrap_or_default()
     }
 
-    fn enclosing_code_unit(&self, _file: &ProjectFile, _range: &Range) -> Option<CodeUnit> {
-        None
+    fn enclosing_code_unit(&self, file: &ProjectFile, range: &Range) -> Option<CodeUnit> {
+        self.get_declarations(file)
+            .into_iter()
+            .filter_map(|code_unit| {
+                let best_range = self
+                    .ranges_of(&code_unit)
+                    .into_iter()
+                    .find(|candidate| candidate.contains(range))?;
+                Some((best_range.end_byte - best_range.start_byte, code_unit))
+            })
+            .min_by_key(|(span, _)| *span)
+            .map(|(_, code_unit)| code_unit)
     }
 
     fn enclosing_code_unit_for_lines(
         &self,
-        _file: &ProjectFile,
-        _start_line: usize,
-        _end_line: usize,
+        file: &ProjectFile,
+        start_line: usize,
+        end_line: usize,
     ) -> Option<CodeUnit> {
-        None
+        let line_range = Range {
+            start_byte: 0,
+            end_byte: usize::MAX,
+            start_line,
+            end_line,
+        };
+        self.get_declarations(file)
+            .into_iter()
+            .filter_map(|code_unit| {
+                let best_range = self.ranges_of(&code_unit).into_iter().find(|candidate| {
+                    candidate.start_line <= line_range.start_line
+                        && candidate.end_line >= line_range.end_line
+                })?;
+                Some((best_range.end_line - best_range.start_line, code_unit))
+            })
+            .min_by_key(|(span, _)| *span)
+            .map(|(_, code_unit)| code_unit)
     }
 
     fn is_access_expression(&self, _file: &ProjectFile, _start_byte: usize, _end_byte: usize) -> bool {
@@ -122,8 +423,8 @@ where
         None
     }
 
-    fn ranges_of(&self, _code_unit: &CodeUnit) -> Vec<Range> {
-        Vec::new()
+    fn ranges_of(&self, code_unit: &CodeUnit) -> Vec<Range> {
+        self.state.ranges.get(code_unit).cloned().unwrap_or_default()
     }
 
     fn get_skeleton(&self, _code_unit: &CodeUnit) -> Option<String> {
@@ -134,15 +435,46 @@ where
         None
     }
 
-    fn get_source(&self, _code_unit: &CodeUnit, _include_comments: bool) -> Option<String> {
-        None
+    fn get_source(&self, code_unit: &CodeUnit, _include_comments: bool) -> Option<String> {
+        self.ranges_of(code_unit)
+            .into_iter()
+            .next()
+            .and_then(|range| self.source_slice(code_unit, &range))
     }
 
-    fn get_sources(&self, _code_unit: &CodeUnit, _include_comments: bool) -> BTreeSet<String> {
-        BTreeSet::new()
+    fn get_sources(&self, code_unit: &CodeUnit, _include_comments: bool) -> BTreeSet<String> {
+        self.ranges_of(code_unit)
+            .into_iter()
+            .filter_map(|range| self.source_slice(code_unit, &range))
+            .collect()
     }
 
-    fn search_definitions(&self, _pattern: &str, _auto_quote: bool) -> BTreeSet<CodeUnit> {
-        BTreeSet::new()
+    fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit> {
+        if pattern.is_empty() {
+            return BTreeSet::new();
+        }
+
+        let compiled = if auto_quote {
+            Regex::new(&regex::escape(pattern))
+        } else {
+            Regex::new(pattern)
+        };
+        let Ok(compiled) = compiled else {
+            return BTreeSet::new();
+        };
+
+        self.get_all_declarations()
+            .into_iter()
+            .filter(|code_unit| compiled.is_match(&code_unit.fq_name()))
+            .collect()
+    }
+}
+
+fn node_range(node: Node<'_>) -> Range {
+    Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: node.start_position().row + 1,
+        end_line: node.end_position().row + 1,
     }
 }

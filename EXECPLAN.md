@@ -16,7 +16,8 @@ After this change, this repository will contain a Rust library that reproduces t
 - [x] (2026-03-24T21:19Z) Initialized the Rust crate and copied the Brokk resource trees into `resources/treesitter/` and `tests/fixtures/`.
 - [x] (2026-03-24T21:19Z) Created the first Rust API scaffold for the analyzer model, project abstraction, capability traits, and public module structure.
 - [x] (2026-03-24T21:19Z) Added the initial Cargo dependencies and verified that the scaffold compiles with `cargo check` on Rust `1.93.1`.
-- [ ] Implement the single-threaded `TreeSitterAnalyzer` state and parsing pipeline over Tree-sitter Java.
+- [x] (2026-03-24T21:19Z) Replaced the placeholder `TreeSitterAnalyzer` with a single-threaded parse/index core that loads Java files, builds declaration/range indexes, tracks imports, and supports snapshot-style updates.
+- [ ] Complete Java-specific semantics on top of the core engine: skeleton rendering, comment-aware source extraction, access-expression filtering, nearest declaration lookup, supertypes, and deterministic import resolution.
 - [ ] Implement Java-specific source extraction, imports, type hierarchy resolution, declaration lookup, and update semantics.
 - [ ] Translate the selected Java tests into Rust integration tests and make them pass.
 - [ ] Run the Rust test suite and commit each milestone as a logical unit.
@@ -32,6 +33,9 @@ After this change, this repository will contain a Rust library that reproduces t
 - Observation: the current environment had Rust toolchains installed through `1.93`, but `stable` was still on `1.84.0`.
   Evidence: `rustup show` reported `stable` active on `1.84.0`; `rustup run 1.93 rustc --version` reported `1.93.1`. The default toolchain has now been switched to `1.93`.
 
+- Observation: a useful early split is to keep the generic engine responsible for parsing, indexing, ranges, and snapshot updates while pushing language semantics into `JavaAnalyzer`.
+  Evidence: the generic state now compiles cleanly with declaration/import indexing, but features such as import resolution precedence and local shadowing still depend on Java-specific name resolution rules.
+
 ## Decision Log
 
 - Decision: preserve Brokk's Java-like API names in Rust for v1 instead of inventing an idiomatic-Rust-first surface.
@@ -46,9 +50,13 @@ After this change, this repository will contain a Rust library that reproduces t
   Rationale: the engine work spans declarations, imports, type hierarchy, and update semantics; locking the public types first reduces churn while the internals are built out.
   Date/Author: 2026-03-24 / Codex
 
+- Decision: build the first real parser/index layer by walking the Java syntax tree directly rather than reproducing Brokk's query-driven extraction immediately.
+  Rationale: it gets the single-threaded engine and snapshot model in place quickly. The vendored `.scm` files remain in the repository and can be integrated later where query-driven extraction materially improves parity.
+  Date/Author: 2026-03-24 / Codex
+
 ## Outcomes & Retrospective
 
-The repository now has the crate scaffold, the copied Brokk resource corpus, and the first Rust API layer that names the main concepts needed by the port. The actual analyzer behavior is still missing, so the next milestone is to replace the placeholder engine with a real single-threaded Tree-sitter Java implementation and then drive it with translated tests.
+The repository now has the crate scaffold, the copied Brokk resource corpus, the public Rust API layer, and a first working single-threaded parse/index core that can parse Java declarations, imports, ranges, and file updates. The major remaining gap is semantic parity: skeleton rendering, comment-preserving source extraction, import precedence, hierarchy resolution, and the translated acceptance tests.
 
 ## Context and Orientation
 
