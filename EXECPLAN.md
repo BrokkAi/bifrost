@@ -42,6 +42,7 @@ After this change, this repository will contain a Rust library that reproduces t
 - [x] (2026-03-25T00:31Z) Landed the first non-Java analyzers: `JavascriptAnalyzer` and `TypescriptAnalyzer`, plus extension-aware project file discovery, `get_symbols` on the shared analyzer API, JS/TS import resolution, TypeScript type-alias tagging, and `MultiAnalyzer` routing for Java + JavaScript + TypeScript. Added focused Rust smoke coverage for JavaScript arrow functions, JS relative-import resolution, TypeScript alias detection, TypeScript updates, and mixed-language `MultiAnalyzer` routing. `cargo test`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings` all pass again.
 - [x] (2026-03-25T01:07Z) Finished the JavaScript/TypeScript parity pass by adding broader fixture-driven skeleton/import/type-identifier coverage, side-effect and directory-index import resolution, exported JSX-return inference for component-like functions, and Brokk-style literal-only variable skeleton rendering. `cargo test --test javascript_and_typescript_smoke --test javascript_typescript_parity` and `cargo fmt --check` now pass for the widened JS/TS surface.
 - [x] (2026-03-25T01:19Z) Added the first Rust analyzer slice by integrating `RustAnalyzer` into the public API and `MultiAnalyzer`, then translating focused parity coverage for module/function/impl discovery, wrapped impl-target naming, `use` flattening and semantic import resolution, type-alias tagging, semantic test detection, and snapshot updates. `cargo test --test rust_analyzer_parity` now passes.
+- [x] (2026-03-25T01:31Z) Added the first Go analyzer slice by integrating `GoAnalyzer` into the public API and `MultiAnalyzer`, then translating focused parity coverage for fixture declarations, grouped/aliased/dot/blank imports, semantic Go test detection, Go test-module formatting helpers, and snapshot updates. `cargo test --test go_analyzer_parity` now passes.
 
 ## Surprises & Discoveries
 
@@ -129,6 +130,9 @@ After this change, this repository will contain a Rust library that reproduces t
 - Observation: the first Rust adapter could reuse the shared snapshot engine with only one semantic fix after integration.
   Evidence: once module children stopped extending `package_name` and instead relied on nested `short_name` chaining like the rest of the port, the translated Rust parity tests for module and impl-member discovery passed without broader engine changes.
 
+- Observation: Go also fits the direct-AST adapter pattern cleanly, but it needs language-specific naming conventions for top-level values and aliases.
+  Evidence: the translated Go parity tests only matched Brokk after top-level `var`/`const`/true-alias declarations were emitted as `_module_.Name` field code units while named `type` declarations stayed class-like and receiver methods attached to their extracted receiver type names.
+
 ## Decision Log
 
 - Decision: preserve Brokk's Java-like API names in Rust for v1 instead of inventing an idiomatic-Rust-first surface.
@@ -209,6 +213,10 @@ After this change, this repository will contain a Rust library that reproduces t
 
 - Decision: add Rust as the next language slice after JavaScript/TypeScript using the existing direct-AST adapter pattern.
   Rationale: the upstream Rust analyzer surface is compact enough to validate quickly, and it exercises the widened capability surface (`ImportAnalysisProvider`, `TypeAliasProvider`, `TestDetectionProvider`, and `MultiAnalyzer` routing) without requiring new hierarchy semantics first.
+  Date/Author: 2026-03-25 / Codex
+
+- Decision: follow Rust with Go before Python/C++.
+  Rationale: Go exercises imports, test detection, update behavior, and path-format helper logic while still fitting the current direct-AST snapshot model without introducing new hierarchy requirements.
   Date/Author: 2026-03-25 / Codex
 
 ## Outcomes & Retrospective

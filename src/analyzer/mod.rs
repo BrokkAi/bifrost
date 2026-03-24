@@ -1,5 +1,6 @@
 mod capabilities;
 mod config;
+mod go_analyzer;
 mod i_analyzer;
 mod java_analyzer;
 mod javascript_analyzer;
@@ -16,6 +17,7 @@ pub use capabilities::{
     TypeHierarchyProvider,
 };
 pub use config::AnalyzerConfig;
+pub use go_analyzer::GoAnalyzer;
 pub use i_analyzer::IAnalyzer;
 pub use java_analyzer::JavaAnalyzer;
 pub use javascript_analyzer::JavascriptAnalyzer;
