@@ -26,6 +26,7 @@ After this change, this repository will contain a Rust library that reproduces t
 - [x] (2026-03-24T21:19Z) Added regression coverage for duplicate overload preservation and multi-step updates. `cargo test --test java_update_regressions` passes.
 - [x] (2026-03-24T21:19Z) Added canonical callable-signature normalization coverage, including varargs. `cargo test --test java_signature_normalization` passes.
 - [x] (2026-03-24T21:49Z) Closed another Java parity slice: Java-style call-receiver extraction, generic/location/anonymous-name normalization for lookups, lambda code-unit attachment to overloads, module child merging across `package-info.java`, and relevant-import selection. `cargo test --test java_parity_edges` passes.
+- [x] (2026-03-24T21:51Z) Added another fixture-driven translation pass covering top-level declarations, direct class children, line-range `enclosing_code_unit` behavior, and `could_import_file` Java edge cases. `cargo test --test java_fixture_parity` passes.
 - [ ] Translate the remaining selected Brokk Java tests that are still uncovered and close any parity gaps they expose.
 - [x] (2026-03-24T21:49Z) The current Rust suite passes with `cargo test`.
 
@@ -69,6 +70,9 @@ After this change, this repository will contain a Rust library that reproduces t
 
 - Observation: Brokk's Java name normalization rules matter outside declaration indexing because tests query definitions with generics, location suffixes, and anonymous suffixes attached.
   Evidence: the new parity tests only passed after Java lookup normalization stripped generic type arguments, trailing `:line[:col]` suffixes, and trailing numeric anonymous-class suffixes like `$1`.
+
+- Observation: several remaining Brokk Java tests translate directly into Rust assertions over the existing public API without exposing new engine gaps.
+  Evidence: the new fixture-driven parity tests for top-level declarations, direct children, enclosing-by-lines, and `could_import_file` all passed immediately once translated.
 
 ## Decision Log
 
@@ -118,7 +122,7 @@ After this change, this repository will contain a Rust library that reproduces t
 
 ## Outcomes & Retrospective
 
-The repository now has the crate scaffold, the copied Brokk resource corpus, the public Rust API layer, a single-threaded parse/index core, Java semantics for imports, hierarchy, source/skeleton rendering, lexical scope analysis, package modules, implicit constructors, comment-aware extraction, Java call-receiver heuristics, normalized-name lookups, lambda attachment, relevant-import selection, and the first duplicate/update regressions. The major remaining gap is the rest of the translated Brokk Java acceptance suite and whatever parity gaps those additional tests expose.
+The repository now has the crate scaffold, the copied Brokk resource corpus, the public Rust API layer, a single-threaded parse/index core, Java semantics for imports, hierarchy, source/skeleton rendering, lexical scope analysis, package modules, implicit constructors, comment-aware extraction, Java call-receiver heuristics, normalized-name lookups, lambda attachment, relevant-import selection, fixture top-level/member parity coverage, and the first duplicate/update regressions. The major remaining gap is the rest of the translated Brokk Java acceptance suite and whatever parity gaps those additional tests expose.
 
 ## Context and Orientation
 
