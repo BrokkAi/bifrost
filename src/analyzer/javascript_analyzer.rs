@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use std::mem::size_of;
 use std::path::Path;
 use std::sync::Arc;
-use tree_sitter::{Language as TsLanguage, Node, Tree};
+use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
 
 #[derive(Debug, Clone, Default)]
 pub struct JavascriptAdapter;
@@ -146,6 +146,10 @@ impl JavascriptAnalyzer {
     pub fn inner(&self) -> &TreeSitterAnalyzer<JavascriptAdapter> {
         &self.inner
     }
+
+    pub fn extract_type_identifiers(&self, source: &str) -> BTreeSet<String> {
+        extract_js_type_identifiers(source)
+    }
 }
 
 impl ImportAnalysisProvider for JavascriptAnalyzer {
@@ -178,6 +182,12 @@ impl ImportAnalysisProvider for JavascriptAnalyzer {
                     if resolved.is_empty() && top_level.len() == 1 && !top_level[0].is_module() {
                         resolved.insert(top_level[0].clone());
                     }
+                } else {
+                    resolved.extend(
+                        top_level
+                            .into_iter()
+                            .filter(|code_unit| !code_unit.is_module()),
+                    );
                 }
             }
         }
@@ -641,7 +651,7 @@ fn visit_js_variable_statement(
         } else {
             parsed.add_signature(
                 code_unit,
-                declarator_statement_text(definition, child, source),
+                js_variable_signature(definition, child, source, exported),
             );
         }
     }
@@ -705,7 +715,12 @@ fn js_function_signature(node: Node<'_>, source: &str, name: &str, exported: boo
         .map(|parameters| node_text(parameters, source).trim().to_string())
         .unwrap_or_else(|| "()".to_string());
     prefix.push_str(async_prefix);
-    format!("{prefix}function {name}{params} ...")
+    let jsx_suffix = if exported && is_component_like_name(name) && node_returns_jsx(node, source) {
+        ": JSX.Element"
+    } else {
+        ""
+    };
+    format!("{prefix}function {name}{params}{jsx_suffix} ...")
 }
 
 fn js_method_signature(node: Node<'_>, source: &str) -> String {
@@ -717,21 +732,21 @@ fn js_method_signature(node: Node<'_>, source: &str) -> String {
         .child_by_field_name("parameters")
         .map(|parameters| node_text(parameters, source).trim().to_string())
         .unwrap_or_else(|| "()".to_string());
-    format!("{name}{params} ...")
+    let jsx_suffix = if name == "render" && node_returns_jsx(node, source) {
+        ": JSX.Element"
+    } else {
+        ""
+    };
+    format!("function {name}{params}{jsx_suffix} ...")
 }
 
 fn js_variable_function_signature(
-    statement: Node<'_>,
+    _statement: Node<'_>,
     declarator: Node<'_>,
     source: &str,
     name: &str,
     exported: bool,
 ) -> String {
-    let kind = statement
-        .named_child(0)
-        .and_then(|_| statement.child(0))
-        .map(|node| node_text(node, source).trim().to_string())
-        .unwrap_or_else(|| "const".to_string());
     let value = declarator
         .child_by_field_name("value")
         .unwrap_or(declarator);
@@ -744,27 +759,68 @@ fn js_variable_function_signature(
         .child_by_field_name("parameters")
         .map(|parameters| node_text(parameters, source).trim().to_string())
         .unwrap_or_else(|| "()".to_string());
+    let jsx_suffix = if exported && is_component_like_name(name) && node_returns_jsx(value, source)
+    {
+        ": JSX.Element"
+    } else {
+        ""
+    };
     let export_prefix = if exported { "export " } else { "" };
-    format!("{export_prefix}{kind} {name} = {async_prefix}{params} => ...")
+    format!("{export_prefix}{async_prefix}{name}{params}{jsx_suffix} => ...")
 }
 
-fn declarator_statement_text(statement: Node<'_>, declarator: Node<'_>, source: &str) -> String {
+fn js_variable_signature(
+    statement: Node<'_>,
+    declarator: Node<'_>,
+    source: &str,
+    exported: bool,
+) -> String {
+    let header = js_variable_header(statement, declarator, source, exported);
+    match declarator.child_by_field_name("value") {
+        Some(value) if is_simple_js_initializer(value) => {
+            let value_text = trim_statement(node_text(value, source));
+            format!("{header} = {value_text}")
+        }
+        _ => header,
+    }
+}
+
+fn js_variable_header(
+    statement: Node<'_>,
+    declarator: Node<'_>,
+    source: &str,
+    exported: bool,
+) -> String {
     let keyword = statement
         .child(0)
         .map(|node| node_text(node, source).trim().to_string())
         .unwrap_or_else(|| "const".to_string());
-    let name = declarator
-        .child_by_field_name("name")
-        .map(|node| node_text(node, source).trim().to_string())
-        .unwrap_or_default();
-    if let Some(value) = declarator.child_by_field_name("value") {
-        format!(
-            "{keyword} {name} = {}",
-            trim_statement(node_text(value, source))
-        )
-    } else {
-        format!("{keyword} {name}")
-    }
+    let declarator_text = trim_statement(node_text(declarator, source));
+    let left = declarator_text
+        .split('=')
+        .next()
+        .map(trim_statement)
+        .unwrap_or(declarator_text);
+    let export_prefix = if exported { "export " } else { "" };
+    format!("{export_prefix}{keyword} {left}")
+}
+
+fn is_simple_js_initializer(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "string"
+            | "number"
+            | "true"
+            | "false"
+            | "null"
+            | "undefined"
+            | "template_string"
+            | "unary_expression"
+            | "binary_expression"
+            | "identifier"
+            | "member_expression"
+            | "new_expression"
+    )
 }
 
 pub(crate) fn parse_js_import_infos(raw: &str) -> Vec<ImportInfo> {
@@ -925,15 +981,13 @@ pub(crate) fn resolve_js_ts_import_paths(
 }
 
 fn extract_import_module_path(raw_import: &str) -> Option<String> {
-    let trimmed = raw_import.trim();
+    let trimmed = raw_import.trim().trim_end_matches(';').trim();
     if trimmed.starts_with("import ") {
         if let Some((_, path)) = trimmed.trim_end_matches(';').rsplit_once(" from ") {
             return Some(path.trim().trim_matches('\'').trim_matches('"').to_string());
         }
-        return trimmed
-            .split_whitespace()
-            .nth(1)
-            .map(|path| path.trim_matches('\'').trim_matches('"').to_string());
+        let path = trimmed.split_whitespace().nth(1)?;
+        return Some(path.trim().trim_matches('\'').trim_matches('"').to_string());
     }
     let require = trimmed.split_once("require(")?.1;
     let path = require
@@ -990,6 +1044,71 @@ pub(crate) fn extract_js_ts_call_receiver(reference: &str) -> Option<String> {
         return None;
     }
     Some(receiver.to_string())
+}
+
+fn extract_js_type_identifiers(source: &str) -> BTreeSet<String> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_javascript::LANGUAGE.into())
+        .expect("failed to load javascript parser");
+    let Some(tree) = parser.parse(source, None) else {
+        return BTreeSet::new();
+    };
+    let mut identifiers = BTreeSet::new();
+    collect_js_ts_identifiers(tree.root_node(), source, &mut identifiers);
+    identifiers
+}
+
+pub(crate) fn collect_js_ts_identifiers(
+    node: Node<'_>,
+    source: &str,
+    identifiers: &mut BTreeSet<String>,
+) {
+    match node.kind() {
+        "identifier" | "type_identifier" | "property_identifier" => {
+            let text = node_text(node, source).trim();
+            if !text.is_empty() {
+                identifiers.insert(text.to_string());
+            }
+        }
+        "jsx_opening_element" | "jsx_self_closing_element" => {
+            if let Some(name) = node.child_by_field_name("name") {
+                let text = node_text(name, source)
+                    .trim()
+                    .split('.')
+                    .next_back()
+                    .unwrap_or("");
+                if !text.is_empty() {
+                    identifiers.insert(text.to_string());
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_js_ts_identifiers(child, source, identifiers);
+    }
+}
+
+fn node_returns_jsx(node: Node<'_>, source: &str) -> bool {
+    if matches!(
+        node.kind(),
+        "jsx_element" | "jsx_self_closing_element" | "jsx_fragment"
+    ) {
+        return true;
+    }
+
+    let text = node_text(node, source);
+    text.contains('<') && (text.contains("/>") || text.contains("</"))
+}
+
+fn is_component_like_name(name: &str) -> bool {
+    name.chars()
+        .next()
+        .map(|ch| ch.is_ascii_uppercase())
+        .unwrap_or(false)
 }
 
 fn js_ts_contains_tests(file: &ProjectFile, source: &str) -> bool {

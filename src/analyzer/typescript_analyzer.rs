@@ -6,7 +6,7 @@ use moka::sync::Cache;
 use std::collections::BTreeSet;
 use std::mem::size_of;
 use std::sync::Arc;
-use tree_sitter::{Language as TsLanguage, Node, Tree};
+use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
 
 use super::javascript_analyzer::{
     build_weighted_cache, extract_js_ts_call_receiver, imported_tokens, module_code_unit,
@@ -145,6 +145,23 @@ impl TypescriptAnalyzer {
     pub fn is_type_alias(&self, code_unit: &CodeUnit) -> bool {
         self.inner.is_type_alias(code_unit)
     }
+
+    pub fn extract_type_identifiers(&self, source: &str) -> BTreeSet<String> {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .expect("failed to load typescript parser");
+        let Some(tree) = parser.parse(source, None) else {
+            return BTreeSet::new();
+        };
+        let mut identifiers = BTreeSet::new();
+        super::javascript_analyzer::collect_js_ts_identifiers(
+            tree.root_node(),
+            source,
+            &mut identifiers,
+        );
+        identifiers
+    }
 }
 
 impl ImportAnalysisProvider for TypescriptAnalyzer {
@@ -177,6 +194,12 @@ impl ImportAnalysisProvider for TypescriptAnalyzer {
                     if resolved.is_empty() && top_level.len() == 1 && !top_level[0].is_module() {
                         resolved.insert(top_level[0].clone());
                     }
+                } else {
+                    resolved.extend(
+                        top_level
+                            .into_iter()
+                            .filter(|code_unit| !code_unit.is_module()),
+                    );
                 }
             }
         }
@@ -620,7 +643,10 @@ fn visit_ts_value(
                 ts_variable_function_signature(definition, child, source, exported),
             );
         } else {
-            parsed.add_signature(code_unit, trim_statement(node_text(node, source)));
+            parsed.add_signature(
+                code_unit,
+                ts_variable_signature(definition, child, source, exported),
+            );
         }
     }
 }
@@ -659,7 +685,13 @@ fn visit_ts_method(
     );
     parsed.add_signature(
         code_unit,
-        trim_statement(node_text(node, source).split('{').next().unwrap_or("")),
+        match node.kind() {
+            "method_definition" => format!(
+                "{} {{ ... }}",
+                trim_statement(node_text(node, source).split('{').next().unwrap_or(""))
+            ),
+            _ => trim_statement(node_text(node, source).split('{').next().unwrap_or("")),
+        },
     );
 }
 
@@ -688,7 +720,7 @@ fn visit_ts_field(
         Some(parent.clone()),
         Some(top_level.clone()),
     );
-    parsed.add_signature(code_unit, trim_statement(node_text(node, source)));
+    parsed.add_signature(code_unit, ts_field_signature(node, source));
 }
 
 fn visit_ts_enum_member(
@@ -810,6 +842,79 @@ fn ts_variable_function_signature(
         format!(": {}", return_type.trim_start_matches(':').trim())
     };
     format!("{export_prefix}{kind} {name} = {params}{return_suffix} => {{ ... }}")
+}
+
+fn ts_variable_signature(
+    statement: Node<'_>,
+    declarator: Node<'_>,
+    source: &str,
+    exported: bool,
+) -> String {
+    let header = ts_variable_header(statement, declarator, source, exported);
+    match declarator.child_by_field_name("value") {
+        Some(value) if is_simple_ts_initializer(value) => {
+            let value_text = trim_statement(node_text(value, source));
+            format!("{header} = {value_text}")
+        }
+        _ => header,
+    }
+}
+
+fn ts_field_signature(node: Node<'_>, source: &str) -> String {
+    if matches!(node.kind(), "property_signature" | "index_signature") {
+        return trim_statement(node_text(node, source));
+    }
+
+    let raw = trim_statement(node_text(node, source));
+    if let Some(value) = node.child_by_field_name("value")
+        && !is_simple_ts_initializer(value)
+    {
+        return raw
+            .split('=')
+            .next()
+            .map(trim_statement)
+            .filter(|header| !header.is_empty())
+            .unwrap_or(raw);
+    }
+    raw
+}
+
+fn ts_variable_header(
+    statement: Node<'_>,
+    declarator: Node<'_>,
+    source: &str,
+    exported: bool,
+) -> String {
+    let keyword = statement
+        .child(0)
+        .map(|node| node_text(node, source).trim().to_string())
+        .unwrap_or_else(|| "const".to_string());
+    let declarator_text = trim_statement(node_text(declarator, source));
+    let left = declarator_text
+        .split('=')
+        .next()
+        .map(trim_statement)
+        .unwrap_or(declarator_text);
+    let export_prefix = if exported { "export " } else { "" };
+    format!("{export_prefix}{keyword} {left}")
+}
+
+fn is_simple_ts_initializer(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "string"
+            | "number"
+            | "true"
+            | "false"
+            | "null"
+            | "undefined"
+            | "template_string"
+            | "unary_expression"
+            | "binary_expression"
+            | "identifier"
+            | "member_expression"
+            | "new_expression"
+    )
 }
 
 fn weight_string_set(_key: &CodeUnit, value: &Arc<BTreeSet<String>>) -> u32 {

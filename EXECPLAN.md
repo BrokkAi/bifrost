@@ -40,6 +40,7 @@ After this change, this repository will contain a Rust library that reproduces t
 - [x] (2026-03-24T23:41Z) Added bounded `moka` memo caches for Java import resolution, reverse referencing-file lookups, relevant imports, and direct hierarchy queries. Added focused regression coverage for sequential-vs-parallel parity and tiny-budget cache correctness. `cargo test`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings` all pass again.
 - [x] (2026-03-24T23:58Z) Started the multi-language expansion by widening the shared Rust analyzer surface with capability accessors, `get_skeletons`/`get_members_in_class`/`get_test_modules`/`test_files_to_code_units`, semantic test-detection metadata in the shared snapshot, extension-to-language routing, and an initial `MultiAnalyzer` that aggregates the existing Java delegate. Added focused routing/capability tests and kept the full current Rust suite green.
 - [x] (2026-03-25T00:31Z) Landed the first non-Java analyzers: `JavascriptAnalyzer` and `TypescriptAnalyzer`, plus extension-aware project file discovery, `get_symbols` on the shared analyzer API, JS/TS import resolution, TypeScript type-alias tagging, and `MultiAnalyzer` routing for Java + JavaScript + TypeScript. Added focused Rust smoke coverage for JavaScript arrow functions, JS relative-import resolution, TypeScript alias detection, TypeScript updates, and mixed-language `MultiAnalyzer` routing. `cargo test`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings` all pass again.
+- [x] (2026-03-25T01:07Z) Finished the JavaScript/TypeScript parity pass by adding broader fixture-driven skeleton/import/type-identifier coverage, side-effect and directory-index import resolution, exported JSX-return inference for component-like functions, and Brokk-style literal-only variable skeleton rendering. `cargo test --test javascript_and_typescript_smoke --test javascript_typescript_parity` and `cargo fmt --check` now pass for the widened JS/TS surface.
 
 ## Surprises & Discoveries
 
@@ -121,6 +122,9 @@ After this change, this repository will contain a Rust library that reproduces t
 - Observation: the first non-Java analyzers can land usefully without a full generic query-driven extraction substrate if they reuse the existing immutable snapshot engine and parse directly into the shared `ParsedFile` model.
   Evidence: the new JS/TS smoke suite passes with direct AST walks for declarations/imports/signatures while the shared `TreeSitterAnalyzer` still handles indexing, ranges, source extraction, search, and snapshot updates.
 
+- Observation: the next JS/TS parity gaps were mostly in import edge handling and skeleton rendering, not in declaration indexing.
+  Evidence: side-effect imports, explicit-file-over-index resolution, JSX-return annotation cases, and literal-only variable skeletons required targeted adapter changes, while the existing shared snapshot/index engine and top-level declaration model remained sufficient.
+
 ## Decision Log
 
 - Decision: preserve Brokk's Java-like API names in Rust for v1 instead of inventing an idiomatic-Rust-first surface.
@@ -194,6 +198,10 @@ After this change, this repository will contain a Rust library that reproduces t
 - Decision: land JavaScript and TypeScript as the first non-Java analyzers using concrete direct-AST adapters instead of blocking on a generalized query-execution layer.
   Rationale: it keeps momentum on real language/test coverage, reuses the existing shared snapshot/index engine, and still leaves room to introduce a common query layer later if broader language parity work benefits from it.
   Date/Author: 2026-03-25 / Codex
+
+- Decision: finish the JavaScript/TypeScript parity pass before moving on to Rust.
+  Rationale: the user explicitly asked to finish JS/TS first, and tightening those semantics before adding another delegate reduces the chance that follow-on interface changes obscure language-specific regressions.
+  Date/Author: 2026-03-25 / Codex + user
 
 ## Outcomes & Retrospective
 
