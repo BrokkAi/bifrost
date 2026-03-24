@@ -28,6 +28,7 @@ After this change, this repository will contain a Rust library that reproduces t
 - [x] (2026-03-24T21:49Z) Closed another Java parity slice: Java-style call-receiver extraction, generic/location/anonymous-name normalization for lookups, lambda code-unit attachment to overloads, module child merging across `package-info.java`, and relevant-import selection. `cargo test --test java_parity_edges` passes.
 - [x] (2026-03-24T21:51Z) Added another fixture-driven translation pass covering top-level declarations, direct class children, line-range `enclosing_code_unit` behavior, and `could_import_file` Java edge cases. `cargo test --test java_fixture_parity` passes.
 - [x] (2026-03-24T21:51Z) Added declaration-inventory parity coverage for fixture-wide class enumeration, packaged-file declarations, and nested-class `short_name`/`identifier` semantics. `cargo test --test java_declarations_parity` passes.
+- [x] (2026-03-24T21:52Z) Added import-detail parity coverage for import-info structure, mixed/static import resolution, circular import stability, relevant-import filtering for fully qualified types, and Java type-identifier extraction. `cargo test --test java_import_detail_parity` passes.
 - [ ] Translate the remaining selected Brokk Java tests that are still uncovered and close any parity gaps they expose.
 - [x] (2026-03-24T21:49Z) The current Rust suite passes with `cargo test`.
 
@@ -78,6 +79,9 @@ After this change, this repository will contain a Rust library that reproduces t
 - Observation: the current Rust `CodeUnit` naming and declaration indexing already line up with Brokk for the broader fixture inventory cases.
   Evidence: the translated declaration-parity tests for all Java fixture classes, packaged-file declarations, and nested-class identifiers passed without code changes.
 
+- Observation: the Java import helper surface is mostly aligned now; the remaining import test work is translation-heavy rather than implementation-heavy.
+  Evidence: the translated import-detail tests for import-info parsing, mixed import resolution, circular import stability, relevant-import filtering, and qualified type extraction all passed without code changes.
+
 ## Decision Log
 
 - Decision: preserve Brokk's Java-like API names in Rust for v1 instead of inventing an idiomatic-Rust-first surface.
@@ -126,7 +130,7 @@ After this change, this repository will contain a Rust library that reproduces t
 
 ## Outcomes & Retrospective
 
-The repository now has the crate scaffold, the copied Brokk resource corpus, the public Rust API layer, a single-threaded parse/index core, Java semantics for imports, hierarchy, source/skeleton rendering, lexical scope analysis, package modules, implicit constructors, comment-aware extraction, Java call-receiver heuristics, normalized-name lookups, lambda attachment, relevant-import selection, fixture top-level/member parity coverage, declaration-inventory parity coverage, and the first duplicate/update regressions. The major remaining gap is the rest of the translated Brokk Java acceptance suite and whatever parity gaps those additional tests expose.
+The repository now has the crate scaffold, the copied Brokk resource corpus, the public Rust API layer, a single-threaded parse/index core, Java semantics for imports, hierarchy, source/skeleton rendering, lexical scope analysis, package modules, implicit constructors, comment-aware extraction, Java call-receiver heuristics, normalized-name lookups, lambda attachment, relevant-import selection, fixture top-level/member parity coverage, declaration-inventory parity coverage, import-detail parity coverage, and the first duplicate/update regressions. The major remaining gap is the rest of the translated Brokk Java acceptance suite and whatever parity gaps those additional tests expose.
 
 ## Context and Orientation
 
