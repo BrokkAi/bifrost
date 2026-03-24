@@ -1,8 +1,11 @@
 use crate::analyzer::{
-    CodeUnit, DeclarationInfo, DeclarationKind, IAnalyzer, ImportAnalysisProvider, ImportInfo,
-    Language, LanguageAdapter, Project, ProjectFile, TreeSitterAnalyzer, TypeHierarchyProvider,
+    AnalyzerConfig, CodeUnit, DeclarationInfo, DeclarationKind, IAnalyzer, ImportAnalysisProvider,
+    ImportInfo, Language, LanguageAdapter, Project, ProjectFile, TreeSitterAnalyzer,
+    TypeHierarchyProvider,
 };
+use moka::sync::Cache;
 use std::collections::{BTreeMap, BTreeSet};
+use std::mem::size_of;
 use std::sync::Arc;
 use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
 
@@ -100,21 +103,90 @@ impl LanguageAdapter for JavaAdapter {
 #[derive(Clone)]
 pub struct JavaAnalyzer {
     inner: TreeSitterAnalyzer<JavaAdapter>,
+    memo_caches: Arc<JavaMemoCaches>,
+}
+
+#[derive(Clone)]
+struct JavaMemoCaches {
+    budget_bytes: u64,
+    resolved_imports: Cache<ProjectFile, Arc<BTreeMap<String, CodeUnit>>>,
+    referencing_files: Cache<ProjectFile, Arc<BTreeSet<ProjectFile>>>,
+    relevant_imports: Cache<CodeUnit, Arc<BTreeSet<String>>>,
+    direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
+    direct_descendants: Cache<CodeUnit, Arc<BTreeSet<CodeUnit>>>,
+}
+
+impl JavaMemoCaches {
+    fn new(budget_bytes: u64) -> Self {
+        Self {
+            budget_bytes,
+            resolved_imports: Self::build_cache(budget_bytes / 4, weight_import_map),
+            referencing_files: Self::build_cache(budget_bytes / 8, weight_project_file_set),
+            relevant_imports: Self::build_cache(budget_bytes / 8, weight_string_set),
+            direct_ancestors: Self::build_cache(budget_bytes / 8, weight_code_unit_vec),
+            direct_descendants: Self::build_cache(budget_bytes / 8, weight_code_unit_set),
+        }
+    }
+
+    fn budget_bytes(&self) -> u64 {
+        self.budget_bytes
+    }
+
+    fn build_cache<K, V>(
+        budget_bytes: u64,
+        weigher: impl Fn(&K, &V) -> u32 + Send + Sync + 'static,
+    ) -> Cache<K, V>
+    where
+        K: Clone + Eq + std::hash::Hash + Send + Sync + 'static,
+        V: Clone + Send + Sync + 'static,
+    {
+        let capacity = budget_bytes.max(1);
+        Cache::builder()
+            .max_capacity(capacity)
+            .weigher(weigher)
+            .build()
+    }
 }
 
 impl JavaAnalyzer {
     pub fn new(project: Arc<dyn Project>) -> Self {
+        Self::new_with_config(project, AnalyzerConfig::default())
+    }
+
+    pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
+        let memo_budget = config.memo_cache_budget_bytes();
+        let inner = TreeSitterAnalyzer::new_with_config(project, JavaAdapter, config);
         Self {
-            inner: TreeSitterAnalyzer::new(project, JavaAdapter),
+            inner,
+            memo_caches: Arc::new(JavaMemoCaches::new(memo_budget)),
         }
     }
 
     pub fn new_with_progress<F>(project: Arc<dyn Project>, progress: F) -> Self
     where
-        F: FnMut(usize, usize, &ProjectFile),
+        F: Fn(usize, usize, &ProjectFile) + Send + Sync + 'static,
     {
+        Self::new_with_config_and_progress(project, AnalyzerConfig::default(), progress)
+    }
+
+    pub fn new_with_config_and_progress<F>(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        progress: F,
+    ) -> Self
+    where
+        F: Fn(usize, usize, &ProjectFile) + Send + Sync + 'static,
+    {
+        let memo_budget = config.memo_cache_budget_bytes();
+        let inner = TreeSitterAnalyzer::new_with_config_and_progress(
+            project,
+            JavaAdapter,
+            config,
+            progress,
+        );
         Self {
-            inner: TreeSitterAnalyzer::new_with_progress(project, JavaAdapter, progress),
+            inner,
+            memo_caches: Arc::new(JavaMemoCaches::new(memo_budget)),
         }
     }
 
@@ -125,12 +197,31 @@ impl JavaAnalyzer {
         Self::new(Arc::new(project))
     }
 
+    pub fn from_project_with_config<P>(project: P, config: AnalyzerConfig) -> Self
+    where
+        P: Project + 'static,
+    {
+        Self::new_with_config(Arc::new(project), config)
+    }
+
     pub fn from_project_with_progress<P, F>(project: P, progress: F) -> Self
     where
         P: Project + 'static,
-        F: FnMut(usize, usize, &ProjectFile),
+        F: Fn(usize, usize, &ProjectFile) + Send + Sync + 'static,
     {
         Self::new_with_progress(Arc::new(project), progress)
+    }
+
+    pub fn from_project_with_config_and_progress<P, F>(
+        project: P,
+        config: AnalyzerConfig,
+        progress: F,
+    ) -> Self
+    where
+        P: Project + 'static,
+        F: Fn(usize, usize, &ProjectFile) + Send + Sync + 'static,
+    {
+        Self::new_with_config_and_progress(Arc::new(project), config, progress)
     }
 
     pub fn inner(&self) -> &TreeSitterAnalyzer<JavaAdapter> {
@@ -161,6 +252,10 @@ impl ImportAnalysisProvider for JavaAnalyzer {
     }
 
     fn referencing_files_of(&self, file: &ProjectFile) -> BTreeSet<ProjectFile> {
+        if let Some(cached) = self.memo_caches.referencing_files.get(file) {
+            return (*cached).clone();
+        }
+
         let mut result: BTreeSet<ProjectFile> = self
             .inner
             .all_files()
@@ -199,6 +294,9 @@ impl ImportAnalysisProvider for JavaAnalyzer {
             }
         }
 
+        self.memo_caches
+            .referencing_files
+            .insert(file.clone(), Arc::new(result.clone()));
         result
     }
 
@@ -207,18 +305,30 @@ impl ImportAnalysisProvider for JavaAnalyzer {
     }
 
     fn relevant_imports_for(&self, code_unit: &CodeUnit) -> BTreeSet<String> {
+        if let Some(cached) = self.memo_caches.relevant_imports.get(code_unit) {
+            return (*cached).clone();
+        }
+
         let Some(source) = self.get_source(code_unit, false) else {
             return BTreeSet::new();
         };
 
         let all_imports = self.import_info_of(code_unit.source());
         if all_imports.is_empty() {
-            return BTreeSet::new();
+            let empty = BTreeSet::new();
+            self.memo_caches
+                .relevant_imports
+                .insert(code_unit.clone(), Arc::new(empty.clone()));
+            return empty;
         }
 
         let type_identifiers = self.extract_type_identifiers(&source);
         if type_identifiers.is_empty() {
-            return BTreeSet::new();
+            let empty = BTreeSet::new();
+            self.memo_caches
+                .relevant_imports
+                .insert(code_unit.clone(), Arc::new(empty.clone()));
+            return empty;
         }
 
         let explicit_imports: Vec<_> = all_imports
@@ -249,6 +359,9 @@ impl ImportAnalysisProvider for JavaAnalyzer {
             .filter(|identifier| !resolved_identifiers.contains(identifier))
             .collect();
         if unresolved_identifiers.is_empty() {
+            self.memo_caches
+                .relevant_imports
+                .insert(code_unit.clone(), Arc::new(matched_imports.clone()));
             return matched_imports;
         }
 
@@ -300,6 +413,9 @@ impl ImportAnalysisProvider for JavaAnalyzer {
             }
         }
 
+        self.memo_caches
+            .relevant_imports
+            .insert(code_unit.clone(), Arc::new(matched_imports.clone()));
         matched_imports
     }
 
@@ -372,6 +488,18 @@ impl JavaAnalyzer {
     }
 
     fn resolve_imports(&self, file: &ProjectFile) -> BTreeMap<String, CodeUnit> {
+        if let Some(cached) = self.memo_caches.resolved_imports.get(file) {
+            return (*cached).clone();
+        }
+
+        let resolved = self.resolve_imports_uncached(file);
+        self.memo_caches
+            .resolved_imports
+            .insert(file.clone(), Arc::new(resolved.clone()));
+        resolved
+    }
+
+    fn resolve_imports_uncached(&self, file: &ProjectFile) -> BTreeMap<String, CodeUnit> {
         let mut resolved = BTreeMap::new();
 
         for import in self.inner.import_info_of(file) {
@@ -1493,15 +1621,29 @@ fn collect_supertype_nodes(node: Node<'_>, source: &str, raw: &mut Vec<String>) 
 
 impl TypeHierarchyProvider for JavaAnalyzer {
     fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        self.inner
+        if let Some(cached) = self.memo_caches.direct_ancestors.get(code_unit) {
+            return (*cached).clone();
+        }
+
+        let ancestors: Vec<_> = self
+            .inner
             .raw_supertypes_of(code_unit)
             .into_iter()
             .filter_map(|raw_name| self.resolve_type_name(code_unit.source(), &raw_name))
-            .collect()
+            .collect();
+        self.memo_caches
+            .direct_ancestors
+            .insert(code_unit.clone(), Arc::new(ancestors.clone()));
+        ancestors
     }
 
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> BTreeSet<CodeUnit> {
-        self.inner
+        if let Some(cached) = self.memo_caches.direct_descendants.get(code_unit) {
+            return (*cached).clone();
+        }
+
+        let descendants: BTreeSet<_> = self
+            .inner
             .get_all_declarations()
             .into_iter()
             .filter(|candidate| candidate.is_class())
@@ -1510,7 +1652,11 @@ impl TypeHierarchyProvider for JavaAnalyzer {
                     .into_iter()
                     .any(|ancestor| ancestor == *code_unit)
             })
-            .collect()
+            .collect();
+        self.memo_caches
+            .direct_descendants
+            .insert(code_unit.clone(), Arc::new(descendants.clone()));
+        descendants
     }
 }
 
@@ -1530,12 +1676,14 @@ impl IAnalyzer for JavaAnalyzer {
     fn update(&self, _changed_files: &BTreeSet<ProjectFile>) -> Self {
         Self {
             inner: self.inner.update(_changed_files),
+            memo_caches: Arc::new(JavaMemoCaches::new(self.memo_caches.budget_bytes())),
         }
     }
 
     fn update_all(&self) -> Self {
         Self {
             inner: self.inner.update_all(),
+            memo_caches: Arc::new(JavaMemoCaches::new(self.memo_caches.budget_bytes())),
         }
     }
 
@@ -1691,4 +1839,71 @@ impl IAnalyzer for JavaAnalyzer {
     fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit> {
         self.inner.search_definitions(pattern, auto_quote)
     }
+}
+
+fn weight_import_map(key: &ProjectFile, value: &Arc<BTreeMap<String, CodeUnit>>) -> u32 {
+    weight_bytes(estimate_project_file(key) + estimate_import_map(value.as_ref()))
+}
+
+fn weight_project_file_set(key: &ProjectFile, value: &Arc<BTreeSet<ProjectFile>>) -> u32 {
+    weight_bytes(estimate_project_file(key) + estimate_project_file_set(value.as_ref()))
+}
+
+fn weight_string_set(key: &CodeUnit, value: &Arc<BTreeSet<String>>) -> u32 {
+    weight_bytes(estimate_code_unit(key) + estimate_string_set(value.as_ref()))
+}
+
+fn weight_code_unit_vec(key: &CodeUnit, value: &Arc<Vec<CodeUnit>>) -> u32 {
+    weight_bytes(estimate_code_unit(key) + estimate_code_unit_vec(value.as_ref()))
+}
+
+fn weight_code_unit_set(key: &CodeUnit, value: &Arc<BTreeSet<CodeUnit>>) -> u32 {
+    weight_bytes(estimate_code_unit(key) + estimate_code_unit_set(value.as_ref()))
+}
+
+fn weight_bytes(bytes: u64) -> u32 {
+    bytes.clamp(1, u32::MAX as u64) as u32
+}
+
+fn estimate_path(path: &std::path::Path) -> u64 {
+    path.as_os_str().to_string_lossy().len() as u64
+}
+
+fn estimate_project_file(file: &ProjectFile) -> u64 {
+    size_of::<ProjectFile>() as u64 + estimate_path(file.root()) + estimate_path(file.rel_path())
+}
+
+fn estimate_code_unit(code_unit: &CodeUnit) -> u64 {
+    size_of::<CodeUnit>() as u64
+        + estimate_project_file(code_unit.source())
+        + code_unit.package_name().len() as u64
+        + code_unit.short_name().len() as u64
+        + code_unit
+            .signature()
+            .map_or(0, |signature| signature.len() as u64)
+}
+
+fn estimate_import_map(imports: &BTreeMap<String, CodeUnit>) -> u64 {
+    size_of::<BTreeMap<String, CodeUnit>>() as u64
+        + imports
+            .iter()
+            .map(|(name, code_unit)| name.len() as u64 + estimate_code_unit(code_unit))
+            .sum::<u64>()
+}
+
+fn estimate_project_file_set(files: &BTreeSet<ProjectFile>) -> u64 {
+    size_of::<BTreeSet<ProjectFile>>() as u64 + files.iter().map(estimate_project_file).sum::<u64>()
+}
+
+fn estimate_string_set(values: &BTreeSet<String>) -> u64 {
+    size_of::<BTreeSet<String>>() as u64
+        + values.iter().map(|value| value.len() as u64).sum::<u64>()
+}
+
+fn estimate_code_unit_vec(values: &[CodeUnit]) -> u64 {
+    size_of::<Vec<CodeUnit>>() as u64 + values.iter().map(estimate_code_unit).sum::<u64>()
+}
+
+fn estimate_code_unit_set(values: &BTreeSet<CodeUnit>) -> u64 {
+    size_of::<BTreeSet<CodeUnit>>() as u64 + values.iter().map(estimate_code_unit).sum::<u64>()
 }

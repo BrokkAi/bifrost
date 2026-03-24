@@ -6,7 +6,7 @@ This document must be maintained in accordance with `.agent/PLANS.md`.
 
 ## Purpose / Big Picture
 
-After this change, this repository will contain a Rust library that reproduces the single-threaded, in-memory behavior of Brokk's Java analyzer. A user will be able to load the copied Brokk Java fixtures, ask for declarations, source, skeletons, imports, and type hierarchy information, and then update the analyzer after file edits. The proof will be translated Rust tests that exercise the same behaviors as Brokk's Java test suite.
+After this change, this repository will contain a Rust library that reproduces the in-memory behavior of Brokk's Java analyzer while using a Rust-native concurrent snapshot pipeline. A user will be able to load the copied Brokk Java fixtures, ask for declarations, source, skeletons, imports, and type hierarchy information, and then update the analyzer after file edits. The proof will be translated Rust tests that exercise the same behaviors as Brokk's Java test suite and keep passing under both sequential and parallel analyzer construction.
 
 ## Progress
 
@@ -35,6 +35,9 @@ After this change, this repository will contain a Rust library that reproduces t
 - [x] (2026-03-24T22:24Z) Finished the remaining Java analyzer parity slice by translating the outstanding lambda, update, interface-constant, multi-declarator field, literal-initializer, final-varargs, comment-filtering, and method-parameter cases from Brokk's `Java*Analyzer*Test` files. This required fixing direct field-initializer lambda discovery, switching lambda `$anon$line:col` names to Brokk's zero-based coordinates, filtering anonymous structures from search, and rendering per-declarator field skeletons with literal-only initializer preservation. `cargo test`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings` now pass again.
 - [x] (2026-03-24T23:02Z) Added a `summarize` utility plus reusable summary rendering helpers so full-path filenames and FQCNs can be rendered through the Rust analyzer using Brokk-style file/codeunit skeleton summaries. Added CLI coverage for absolute-path and FQCN resolution, and verified the fixture invocation `cargo run --quiet --bin summarize -- --root tests/fixtures/testcode-java A`.
 - [x] (2026-03-24T21:49Z) The current Rust suite passes with `cargo test`.
+- [x] (2026-03-24T23:41Z) Replaced the remaining sequential build/update flow with one Rayon-backed file-shard pipeline shared by initial build, `update`, and `update_all`. Files are now parsed exactly once per snapshot and reduced deterministically into immutable analyzer state.
+- [x] (2026-03-24T23:41Z) Added `AnalyzerConfig` so callers can choose build parallelism and an approximate memo-cache RAM budget. The `summarize` progress hook now works with the thread-safe completion-based build callback used by the parallel pipeline.
+- [x] (2026-03-24T23:41Z) Added bounded `moka` memo caches for Java import resolution, reverse referencing-file lookups, relevant imports, and direct hierarchy queries. Added focused regression coverage for sequential-vs-parallel parity and tiny-budget cache correctness. `cargo test`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings` all pass again.
 
 ## Surprises & Discoveries
 
@@ -101,6 +104,12 @@ After this change, this repository will contain a Rust library that reproduces t
 - Observation: the existing analyzer API was already sufficient to reproduce Brokk-style summary rendering without adding a separate context-manager layer.
   Evidence: the new `summarize` utility only needed `getTopLevelDeclarations`, `getDefinitions`, `getSkeleton`, and direct-ancestor traversal to render file and codeunit summaries with Brokk-like package grouping and ancestor sections.
 
+- Observation: Rust can keep one shared concurrent architecture for both initial build and updates without adopting Java's shared mutable map model.
+  Evidence: the new `TreeSitterAnalyzer` pipeline parses files into fully owned per-file shards in parallel, then rebuilds global indexes deterministically from those shards for both `new` and `update`.
+
+- Observation: most of the Java-side cache wins translate cleanly as bounded memo caches over an immutable snapshot instead of mutable bidirectional caches intertwined with core analyzer state.
+  Evidence: import resolution, referencing-file lookup, relevant-import filtering, and direct hierarchy queries now use weighted `moka` caches while definitions, children, ranges, imports, and raw supertypes remain eagerly materialized in immutable analyzer state.
+
 ## Decision Log
 
 - Decision: preserve Brokk's Java-like API names in Rust for v1 instead of inventing an idiomatic-Rust-first surface.
@@ -159,9 +168,17 @@ After this change, this repository will contain a Rust library that reproduces t
   Rationale: tests like query-caching internals are implementation-specific in Brokk's query-driven engine, while the Rust port keeps the same user-visible analyzer semantics with a simpler single-threaded traversal-based core.
   Date/Author: 2026-03-24 / Codex + user
 
+- Decision: parallelize analyzer construction and updates with per-file shards plus a deterministic reduce instead of Java-style concurrent shared map mutation.
+  Rationale: it preserves one concurrent pipeline for both build and update, avoids GC-shaped shared mutable graphs, and keeps published analyzer snapshots lock-free for reads.
+  Date/Author: 2026-03-24 / Codex + user
+
+- Decision: keep hot structural facts eager in `AnalyzerState` and use narrow weighted memo caches only for expensive derived Java queries.
+  Rationale: Rust's immutable snapshot model makes definitions, children, ranges, imports, and raw supertypes cheap to read eagerly, while `moka` provides a practical approximate-RAM budget for second-order queries such as resolved imports and hierarchy lookups.
+  Date/Author: 2026-03-24 / Codex + user
+
 ## Outcomes & Retrospective
 
-The repository now has the crate scaffold, the copied Brokk resource corpus, the public Rust API layer, a single-threaded parse/index core, Java semantics for imports, hierarchy, source/skeleton rendering, lexical scope analysis, package modules, implicit constructors, comment-aware extraction, Java call-receiver heuristics, normalized-name lookups, Brokk-style lambda discovery/naming, relevant-import selection, fixture top-level/member parity coverage, declaration-inventory parity coverage, import-detail parity coverage, case-insensitive search parity, autocomplete parity, record-component field support, interface-constant and field-initializer parity, and duplicate/update regressions. For the scoped v1 port, the translated Rust suite now covers the full intended `Java*Analyzer*Test` surface except the explicitly excluded serialization round-trip case and `JavascriptAnalyzerTest`.
+The repository now has the crate scaffold, the copied Brokk resource corpus, the public Rust API layer, a concurrent parse/index core built around immutable snapshots, Java semantics for imports, hierarchy, source/skeleton rendering, lexical scope analysis, package modules, implicit constructors, comment-aware extraction, Java call-receiver heuristics, normalized-name lookups, Brokk-style lambda discovery/naming, relevant-import selection, fixture top-level/member parity coverage, declaration-inventory parity coverage, import-detail parity coverage, case-insensitive search parity, autocomplete parity, record-component field support, interface-constant and field-initializer parity, bounded memo caches for expensive Java queries, and duplicate/update regressions. For the scoped v1 port, the translated Rust suite now covers the full intended `Java*Analyzer*Test` surface except the explicitly excluded serialization round-trip case and `JavascriptAnalyzerTest`.
 
 The repository also now has a `summarize` CLI utility that resolves either absolute file paths under the project root or Java FQCN targets and prints Brokk-style skeleton summaries using the Rust analyzer implementation. This gives the port a direct command-line path for exercising file summaries and symbol summaries outside the translated test harness.
 
@@ -171,7 +188,7 @@ This repository started essentially empty. The reference implementation lives in
 
 In Brokk terminology, a `CodeUnit` is a named declaration such as a class, function, field, or module statement. A `ProjectFile` is a file identified relative to a project root so two paths can be compared safely. A "snapshot" analyzer means updates return a new analyzer value rather than mutating the previous one in place. A "skeleton" is the summarized code shape for a declaration rather than its full source text.
 
-The Rust crate root is `src/lib.rs`. The analyzer module tree is under `src/analyzer/`. The intent is to expose a Rust equivalent of Brokk's `IAnalyzer`, `TreeSitterAnalyzer`, `JavaAnalyzer`, `ImportAnalysisProvider`, and `TypeHierarchyProvider`, while keeping the implementation single-threaded in v1.
+The Rust crate root is `src/lib.rs`. The analyzer module tree is under `src/analyzer/`. The intent is to expose a Rust equivalent of Brokk's `IAnalyzer`, `TreeSitterAnalyzer`, `JavaAnalyzer`, `ImportAnalysisProvider`, and `TypeHierarchyProvider`, while keeping the published analyzer state immutable and allowing build/update work to run concurrently.
 
 ## Plan of Work
 

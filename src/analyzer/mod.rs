@@ -1,4 +1,5 @@
 mod capabilities;
+mod config;
 mod i_analyzer;
 mod java_analyzer;
 mod model;
@@ -7,6 +8,7 @@ mod source_content;
 mod tree_sitter_analyzer;
 
 pub use capabilities::{CapabilityProvider, ImportAnalysisProvider, TypeHierarchyProvider};
+pub use config::AnalyzerConfig;
 pub use i_analyzer::IAnalyzer;
 pub use java_analyzer::JavaAnalyzer;
 pub use model::{

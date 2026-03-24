@@ -1,10 +1,12 @@
 use crate::analyzer::{
-    CodeUnit, DeclarationInfo, ImportInfo, Language, Project, ProjectFile, Range,
+    AnalyzerConfig, CodeUnit, DeclarationInfo, ImportInfo, Language, Project, ProjectFile, Range,
 };
+use rayon::prelude::*;
 use regex::RegexBuilder;
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
 
 pub trait LanguageAdapter: Send + Sync + 'static {
@@ -22,7 +24,7 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     fn parse_file(&self, file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFile;
 }
 
-type BuildProgress<'a> = &'a mut dyn FnMut(usize, usize, &ProjectFile);
+type BuildProgress = Arc<dyn Fn(usize, usize, &ProjectFile) + Send + Sync>;
 
 #[derive(Debug, Clone)]
 struct FileState {
@@ -35,6 +37,8 @@ struct FileState {
     raw_supertypes: BTreeMap<CodeUnit, Vec<String>>,
     type_identifiers: BTreeSet<String>,
     signatures: BTreeMap<CodeUnit, Vec<String>>,
+    ranges: BTreeMap<CodeUnit, Vec<Range>>,
+    children: BTreeMap<CodeUnit, Vec<CodeUnit>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -126,6 +130,7 @@ impl ParsedFile {
 pub struct TreeSitterAnalyzer<A> {
     project: Arc<dyn Project>,
     adapter: Arc<A>,
+    config: AnalyzerConfig,
     state: Arc<AnalyzerState>,
     _state: PhantomData<A>,
 }
@@ -135,6 +140,7 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
         Self {
             project: Arc::clone(&self.project),
             adapter: Arc::clone(&self.adapter),
+            config: self.config.clone(),
             state: Arc::clone(&self.state),
             _state: PhantomData,
         }
@@ -146,10 +152,15 @@ where
     A: LanguageAdapter,
 {
     pub fn new(project: Arc<dyn Project>, adapter: A) -> Self {
+        Self::new_with_config(project, adapter, AnalyzerConfig::default())
+    }
+
+    pub fn new_with_config(project: Arc<dyn Project>, adapter: A, config: AnalyzerConfig) -> Self {
         let adapter = Arc::new(adapter);
         let state = Arc::new(Self::build_state(
             project.as_ref(),
             adapter.as_ref(),
+            &config,
             None,
             None,
         ));
@@ -157,26 +168,41 @@ where
         Self {
             project,
             adapter,
+            config,
             state,
             _state: PhantomData,
         }
     }
 
-    pub fn new_with_progress<F>(project: Arc<dyn Project>, adapter: A, mut progress: F) -> Self
+    pub fn new_with_progress<F>(project: Arc<dyn Project>, adapter: A, progress: F) -> Self
     where
-        F: FnMut(usize, usize, &ProjectFile),
+        F: Fn(usize, usize, &ProjectFile) + Send + Sync + 'static,
+    {
+        Self::new_with_config_and_progress(project, adapter, AnalyzerConfig::default(), progress)
+    }
+
+    pub fn new_with_config_and_progress<F>(
+        project: Arc<dyn Project>,
+        adapter: A,
+        config: AnalyzerConfig,
+        progress: F,
+    ) -> Self
+    where
+        F: Fn(usize, usize, &ProjectFile) + Send + Sync + 'static,
     {
         let adapter = Arc::new(adapter);
         let state = Arc::new(Self::build_state(
             project.as_ref(),
             adapter.as_ref(),
+            &config,
             None,
-            Some(&mut progress),
+            Some(Arc::new(progress)),
         ));
 
         Self {
             project,
             adapter,
+            config,
             state,
             _state: PhantomData,
         }
@@ -190,63 +216,113 @@ where
         self.adapter.as_ref()
     }
 
-    fn from_state(project: Arc<dyn Project>, adapter: Arc<A>, state: AnalyzerState) -> Self {
+    fn from_state(
+        project: Arc<dyn Project>,
+        adapter: Arc<A>,
+        config: AnalyzerConfig,
+        state: AnalyzerState,
+    ) -> Self {
         Self {
             project,
             adapter,
+            config,
             state: Arc::new(state),
             _state: PhantomData,
         }
     }
 
+    fn build_parser(language: TsLanguage) -> Parser {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&language)
+            .expect("failed to load tree-sitter language");
+        parser
+    }
+
+    fn analyze_file(parser: &mut Parser, adapter: &A, file: &ProjectFile) -> Option<FileState> {
+        let source = file.read_to_string().ok()?;
+        let tree = parser.parse(source.as_str(), None)?;
+        let parsed = adapter.parse_file(file, &source, &tree);
+
+        Some(FileState {
+            source,
+            package_name: parsed.package_name,
+            top_level_declarations: parsed.top_level_declarations,
+            declarations: parsed.declarations,
+            import_statements: parsed.import_statements,
+            imports: parsed.imports,
+            raw_supertypes: parsed.raw_supertypes,
+            type_identifiers: parsed.type_identifiers,
+            signatures: parsed.signatures,
+            ranges: parsed.ranges,
+            children: parsed.children,
+        })
+    }
+
+    fn analyze_files(
+        adapter: &A,
+        config: &AnalyzerConfig,
+        files: Vec<ProjectFile>,
+        progress: Option<BuildProgress>,
+    ) -> Vec<(ProjectFile, Option<FileState>)> {
+        if files.is_empty() {
+            return Vec::new();
+        }
+
+        let total = files.len();
+        let language = adapter.parser_language();
+        let completed = AtomicUsize::new(0);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(config.parallelism())
+            .build()
+            .expect("failed to build analyzer thread pool");
+
+        let mut analyzed = pool.install(|| {
+            files
+                .into_par_iter()
+                .map_init(
+                    || Self::build_parser(language.clone()),
+                    |parser, file| {
+                        let state = Self::analyze_file(parser, adapter, &file);
+                        if let Some(progress) = progress.as_ref() {
+                            let current = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                            progress(current, total, &file);
+                        }
+                        (file, state)
+                    },
+                )
+                .collect::<Vec<_>>()
+        });
+        analyzed.sort_by(|(left, _), (right, _)| left.cmp(right));
+        analyzed
+    }
+
     fn build_state(
         project: &dyn Project,
         adapter: &A,
+        config: &AnalyzerConfig,
         existing: Option<&AnalyzerState>,
-        mut progress: Option<BuildProgress<'_>>,
+        progress: Option<BuildProgress>,
     ) -> AnalyzerState {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&adapter.parser_language())
-            .expect("failed to load tree-sitter language");
-
         let mut files = existing
             .map(|state| state.files.clone())
             .unwrap_or_default();
 
-        let analyzable_files = project
+        let analyzable_files: Vec<_> = project
             .analyzable_files(adapter.language())
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let analyzable_set: BTreeSet<_> = analyzable_files.iter().cloned().collect();
 
-        files.retain(|file, _| analyzable_files.contains(file));
+        files.retain(|file, _| analyzable_set.contains(file));
 
-        let total = analyzable_files.len();
-        for (index, file) in analyzable_files.into_iter().enumerate() {
-            if let Some(progress) = progress.as_mut() {
-                progress(index + 1, total, &file);
+        for (file, state) in Self::analyze_files(adapter, config, analyzable_files, progress) {
+            if let Some(state) = state {
+                files.insert(file, state);
+            } else {
+                files.remove(&file);
             }
-
-            let Ok(source) = file.read_to_string() else {
-                continue;
-            };
-            let Some(tree) = parser.parse(source.as_str(), None) else {
-                continue;
-            };
-            let parsed = adapter.parse_file(&file, &source, &tree);
-            files.insert(
-                file,
-                FileState {
-                    source,
-                    package_name: parsed.package_name,
-                    top_level_declarations: parsed.top_level_declarations,
-                    declarations: parsed.declarations,
-                    import_statements: parsed.import_statements,
-                    imports: parsed.imports,
-                    raw_supertypes: parsed.raw_supertypes,
-                    type_identifiers: parsed.type_identifiers,
-                    signatures: parsed.signatures,
-                },
-            );
         }
 
         Self::index_state(files, project, adapter)
@@ -257,23 +333,13 @@ where
         project: &dyn Project,
         adapter: &A,
     ) -> AnalyzerState {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&adapter.parser_language())
-            .expect("failed to load tree-sitter language");
-
         let mut definitions = BTreeMap::<String, Vec<CodeUnit>>::new();
         let mut children = BTreeMap::<CodeUnit, Vec<CodeUnit>>::new();
         let mut ranges = BTreeMap::<CodeUnit, Vec<Range>>::new();
         let mut raw_supertypes = BTreeMap::<CodeUnit, Vec<String>>::new();
         let mut signatures = BTreeMap::<CodeUnit, Vec<String>>::new();
 
-        for (file, state) in &files {
-            let Some(tree) = parser.parse(state.source.as_str(), None) else {
-                continue;
-            };
-            let parsed = adapter.parse_file(file, &state.source, &tree);
-
+        for state in files.values() {
             for declaration in &state.declarations {
                 definitions
                     .entry(adapter.normalize_full_name(&declaration.fq_name()))
@@ -281,23 +347,29 @@ where
                     .push(declaration.clone());
             }
 
-            for (parent, descendants) in parsed.children {
-                children.entry(parent).or_default().extend(descendants);
-            }
-
-            for (code_unit, mut code_unit_ranges) in parsed.ranges {
-                ranges
-                    .entry(code_unit)
+            for (parent, descendants) in &state.children {
+                children
+                    .entry(parent.clone())
                     .or_default()
-                    .append(&mut code_unit_ranges);
+                    .extend(descendants.iter().cloned());
             }
 
-            for (code_unit, raw) in parsed.raw_supertypes {
-                raw_supertypes.insert(code_unit, raw);
+            for (code_unit, code_unit_ranges) in &state.ranges {
+                ranges
+                    .entry(code_unit.clone())
+                    .or_default()
+                    .extend(code_unit_ranges.iter().copied());
             }
 
-            for (code_unit, mut sigs) in parsed.signatures {
-                signatures.entry(code_unit).or_default().append(&mut sigs);
+            for (code_unit, raw) in &state.raw_supertypes {
+                raw_supertypes.insert(code_unit.clone(), raw.clone());
+            }
+
+            for (code_unit, sigs) in &state.signatures {
+                signatures
+                    .entry(code_unit.clone())
+                    .or_default()
+                    .extend(sigs.iter().cloned());
             }
         }
 
@@ -460,49 +532,50 @@ where
             return self.clone();
         }
 
-        let mut parser = Parser::new();
-        parser
-            .set_language(&self.adapter.parser_language())
-            .expect("failed to load tree-sitter language");
-
         let mut files = self.state.files.clone();
+        let mut to_reanalyze = Vec::new();
 
         for file in changed_files {
             if !file.exists() {
                 files.remove(file);
                 continue;
             }
+            to_reanalyze.push(file.clone());
+        }
 
-            let Ok(source) = file.read_to_string() else {
-                continue;
-            };
-            let Some(tree) = parser.parse(source.as_str(), None) else {
-                continue;
-            };
-            let parsed = self.adapter.parse_file(file, &source, &tree);
-            files.insert(
-                file.clone(),
-                FileState {
-                    source,
-                    package_name: parsed.package_name,
-                    top_level_declarations: parsed.top_level_declarations,
-                    declarations: parsed.declarations,
-                    import_statements: parsed.import_statements,
-                    imports: parsed.imports,
-                    raw_supertypes: parsed.raw_supertypes,
-                    type_identifiers: parsed.type_identifiers,
-                    signatures: parsed.signatures,
-                },
-            );
+        for (file, state) in
+            Self::analyze_files(self.adapter.as_ref(), &self.config, to_reanalyze, None)
+        {
+            if let Some(state) = state {
+                files.insert(file, state);
+            } else {
+                files.remove(&file);
+            }
         }
 
         let state = Self::index_state(files, self.project.as_ref(), self.adapter.as_ref());
-        Self::from_state(Arc::clone(&self.project), Arc::clone(&self.adapter), state)
+        Self::from_state(
+            Arc::clone(&self.project),
+            Arc::clone(&self.adapter),
+            self.config.clone(),
+            state,
+        )
     }
 
     fn update_all(&self) -> Self {
-        let state = Self::build_state(self.project.as_ref(), self.adapter.as_ref(), None, None);
-        Self::from_state(Arc::clone(&self.project), Arc::clone(&self.adapter), state)
+        let state = Self::build_state(
+            self.project.as_ref(),
+            self.adapter.as_ref(),
+            &self.config,
+            None,
+            None,
+        );
+        Self::from_state(
+            Arc::clone(&self.project),
+            Arc::clone(&self.adapter),
+            self.config.clone(),
+            state,
+        )
     }
 
     fn project(&self) -> &dyn Project {
