@@ -17,6 +17,7 @@ After this change, this repository will contain a Rust library that reproduces t
 - [x] (2026-03-24T21:19Z) Created the first Rust API scaffold for the analyzer model, project abstraction, capability traits, and public module structure.
 - [x] (2026-03-24T21:19Z) Added the initial Cargo dependencies and verified that the scaffold compiles with `cargo check` on Rust `1.93.1`.
 - [x] (2026-03-24T21:19Z) Replaced the placeholder `TreeSitterAnalyzer` with a single-threaded parse/index core that loads Java files, builds declaration/range indexes, tracks imports, and supports snapshot-style updates.
+- [x] (2026-03-24T21:19Z) Added the first Rust smoke tests covering fixture parsing and explicit file updates; `cargo test --test java_analyzer_smoke` now passes.
 - [ ] Complete Java-specific semantics on top of the core engine: skeleton rendering, comment-aware source extraction, access-expression filtering, nearest declaration lookup, supertypes, and deterministic import resolution.
 - [ ] Implement Java-specific source extraction, imports, type hierarchy resolution, declaration lookup, and update semantics.
 - [ ] Translate the selected Java tests into Rust integration tests and make them pass.
@@ -35,6 +36,9 @@ After this change, this repository will contain a Rust library that reproduces t
 
 - Observation: a useful early split is to keep the generic engine responsible for parsing, indexing, ranges, and snapshot updates while pushing language semantics into `JavaAnalyzer`.
   Evidence: the generic state now compiles cleanly with declaration/import indexing, but features such as import resolution precedence and local shadowing still depend on Java-specific name resolution rules.
+
+- Observation: a tiny Rust smoke suite is enough to catch snapshot-wrapper bugs immediately.
+  Evidence: the first update smoke test failed until `JavaAnalyzer::update` and `JavaAnalyzer::update_all` stopped returning `self.clone()` and started wrapping the updated inner analyzer.
 
 ## Decision Log
 

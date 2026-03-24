@@ -463,11 +463,15 @@ impl IAnalyzer for JavaAnalyzer {
     }
 
     fn update(&self, _changed_files: &BTreeSet<ProjectFile>) -> Self {
-        self.clone()
+        Self {
+            inner: self.inner.update(_changed_files),
+        }
     }
 
     fn update_all(&self) -> Self {
-        self.clone()
+        Self {
+            inner: self.inner.update_all(),
+        }
     }
 
     fn project(&self) -> &dyn Project {
