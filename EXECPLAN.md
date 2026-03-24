@@ -38,6 +38,7 @@ After this change, this repository will contain a Rust library that reproduces t
 - [x] (2026-03-24T23:41Z) Replaced the remaining sequential build/update flow with one Rayon-backed file-shard pipeline shared by initial build, `update`, and `update_all`. Files are now parsed exactly once per snapshot and reduced deterministically into immutable analyzer state.
 - [x] (2026-03-24T23:41Z) Added `AnalyzerConfig` so callers can choose build parallelism and an approximate memo-cache RAM budget. The `summarize` progress hook now works with the thread-safe completion-based build callback used by the parallel pipeline.
 - [x] (2026-03-24T23:41Z) Added bounded `moka` memo caches for Java import resolution, reverse referencing-file lookups, relevant imports, and direct hierarchy queries. Added focused regression coverage for sequential-vs-parallel parity and tiny-budget cache correctness. `cargo test`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings` all pass again.
+- [x] (2026-03-24T23:58Z) Started the multi-language expansion by widening the shared Rust analyzer surface with capability accessors, `get_skeletons`/`get_members_in_class`/`get_test_modules`/`test_files_to_code_units`, semantic test-detection metadata in the shared snapshot, extension-to-language routing, and an initial `MultiAnalyzer` that aggregates the existing Java delegate. Added focused routing/capability tests and kept the full current Rust suite green.
 
 ## Surprises & Discoveries
 
@@ -110,6 +111,9 @@ After this change, this repository will contain a Rust library that reproduces t
 - Observation: most of the Java-side cache wins translate cleanly as bounded memo caches over an immutable snapshot instead of mutable bidirectional caches intertwined with core analyzer state.
   Evidence: import resolution, referencing-file lookup, relevant-import filtering, and direct hierarchy queries now use weighted `moka` caches while definitions, children, ranges, imports, and raw supertypes remain eagerly materialized in immutable analyzer state.
 
+- Observation: the remaining non-Java and `MultiAnalyzer` work needs more shared interface surface than the original Java-only port exposed.
+  Evidence: upstream tests for non-Java analyzers and `MultiAnalyzer` rely on capability discovery, `getSkeletons`, `getMembersInClass`, `getTestModules`, `testFilesToCodeUnits`, test-detection behavior, and type-alias hooks, none of which were fully represented in the first Java-only Rust API.
+
 ## Decision Log
 
 - Decision: preserve Brokk's Java-like API names in Rust for v1 instead of inventing an idiomatic-Rust-first surface.
@@ -175,6 +179,10 @@ After this change, this repository will contain a Rust library that reproduces t
 - Decision: keep hot structural facts eager in `AnalyzerState` and use narrow weighted memo caches only for expensive derived Java queries.
   Rationale: Rust's immutable snapshot model makes definitions, children, ranges, imports, and raw supertypes cheap to read eagerly, while `moka` provides a practical approximate-RAM budget for second-order queries such as resolved imports and hierarchy lookups.
   Date/Author: 2026-03-24 / Codex + user
+
+- Decision: add `MultiAnalyzer` on top of explicit routed delegates and widen the shared analyzer interface before porting the remaining single-language analyzers.
+  Rationale: non-Java analyzer tests and `MultiAnalyzer` tests both depend on the same capability/test-module/type-alias surface, so stabilizing that layer first reduces repeated churn as each new language lands.
+  Date/Author: 2026-03-24 / Codex
 
 ## Outcomes & Retrospective
 

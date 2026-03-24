@@ -1,5 +1,6 @@
 use crate::analyzer::{
-    CodeBaseMetrics, CodeUnit, DeclarationInfo, Language, Project, ProjectFile, Range,
+    CodeBaseMetrics, CodeUnit, DeclarationInfo, ImportAnalysisProvider, Language, Project,
+    ProjectFile, Range, TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider,
     metrics_from_declarations,
 };
 use std::any::Any;
@@ -46,6 +47,22 @@ pub trait IAnalyzer: Send + Sync + Any {
     fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String>;
     fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String>;
     fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit>;
+
+    fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {
+        None
+    }
+
+    fn type_hierarchy_provider(&self) -> Option<&dyn TypeHierarchyProvider> {
+        None
+    }
+
+    fn type_alias_provider(&self) -> Option<&dyn TypeAliasProvider> {
+        None
+    }
+
+    fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {
+        None
+    }
 
     fn autocomplete_definitions(&self, query: &str) -> Vec<CodeUnit> {
         if query.is_empty() {
@@ -99,6 +116,55 @@ pub trait IAnalyzer: Send + Sync + Any {
 
     fn contains_tests(&self, _file: &ProjectFile) -> bool {
         false
+    }
+
+    fn get_skeletons(&self, file: &ProjectFile) -> BTreeMap<CodeUnit, String> {
+        let mut skeletons = BTreeMap::new();
+        for symbol in self.get_top_level_declarations(file) {
+            if let Some(skeleton) = self.get_skeleton(&symbol) {
+                skeletons.insert(symbol, skeleton);
+            }
+        }
+        skeletons
+    }
+
+    fn get_members_in_class(&self, class_unit: &CodeUnit) -> Vec<CodeUnit> {
+        if !class_unit.is_class() && !class_unit.is_module() {
+            return Vec::new();
+        }
+
+        self.get_direct_children(class_unit)
+            .into_iter()
+            .filter(|child| child.is_class() || child.is_function() || child.is_field())
+            .collect()
+    }
+
+    fn get_test_modules(&self, files: &[ProjectFile]) -> Vec<String> {
+        let mut modules: Vec<_> = files
+            .iter()
+            .flat_map(|file| self.get_top_level_declarations(file))
+            .map(|code_unit| {
+                if code_unit.is_module() {
+                    code_unit.fq_name()
+                } else {
+                    code_unit.package_name().to_string()
+                }
+            })
+            .filter(|module| !module.is_empty())
+            .collect();
+        modules.sort();
+        modules.dedup();
+        modules
+    }
+
+    fn test_files_to_code_units(&self, files: &[ProjectFile]) -> BTreeSet<CodeUnit> {
+        files
+            .iter()
+            .flat_map(|file| self.get_top_level_declarations(file))
+            .filter(|code_unit| {
+                code_unit.is_class() || code_unit.is_function() || code_unit.is_module()
+            })
+            .collect()
     }
 
     fn parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {

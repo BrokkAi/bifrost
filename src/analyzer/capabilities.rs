@@ -34,6 +34,14 @@ pub trait ImportAnalysisProvider: CapabilityProvider {
     }
 }
 
+pub trait TypeAliasProvider: CapabilityProvider {
+    fn is_type_alias(&self, _code_unit: &CodeUnit) -> bool {
+        false
+    }
+}
+
+pub trait TestDetectionProvider: CapabilityProvider {}
+
 pub trait TypeHierarchyProvider: CapabilityProvider {
     fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit>;
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> BTreeSet<CodeUnit>;
@@ -52,7 +60,10 @@ pub trait TypeHierarchyProvider: CapabilityProvider {
         &self,
         target: &CodeUnit,
         analyzer: &T,
-    ) -> Vec<CodeUnit> {
+    ) -> Vec<CodeUnit>
+    where
+        Self: Sized,
+    {
         if !target.is_function() {
             return Vec::new();
         }

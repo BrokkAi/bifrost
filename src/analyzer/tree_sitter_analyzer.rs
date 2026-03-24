@@ -20,6 +20,15 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     fn is_anonymous_structure(&self, _fq_name: &str) -> bool {
         false
     }
+    fn contains_tests(
+        &self,
+        _file: &ProjectFile,
+        _source: &str,
+        _tree: &Tree,
+        _parsed: &ParsedFile,
+    ) -> bool {
+        false
+    }
     fn extract_call_receiver(&self, reference: &str) -> Option<String>;
     fn parse_file(&self, file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFile;
 }
@@ -39,6 +48,8 @@ struct FileState {
     signatures: BTreeMap<CodeUnit, Vec<String>>,
     ranges: BTreeMap<CodeUnit, Vec<Range>>,
     children: BTreeMap<CodeUnit, Vec<CodeUnit>>,
+    type_aliases: BTreeSet<CodeUnit>,
+    contains_tests: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -49,6 +60,8 @@ struct AnalyzerState {
     ranges: BTreeMap<CodeUnit, Vec<Range>>,
     raw_supertypes: BTreeMap<CodeUnit, Vec<String>>,
     signatures: BTreeMap<CodeUnit, Vec<String>>,
+    #[allow(dead_code)]
+    type_aliases: BTreeSet<CodeUnit>,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +74,7 @@ pub struct ParsedFile {
     pub raw_supertypes: BTreeMap<CodeUnit, Vec<String>>,
     pub type_identifiers: BTreeSet<String>,
     pub signatures: BTreeMap<CodeUnit, Vec<String>>,
+    pub type_aliases: BTreeSet<CodeUnit>,
     ranges: BTreeMap<CodeUnit, Vec<Range>>,
     children: BTreeMap<CodeUnit, Vec<CodeUnit>>,
 }
@@ -76,6 +90,7 @@ impl ParsedFile {
             raw_supertypes: BTreeMap::new(),
             type_identifiers: BTreeSet::new(),
             signatures: BTreeMap::new(),
+            type_aliases: BTreeSet::new(),
             ranges: BTreeMap::new(),
             children: BTreeMap::new(),
         }
@@ -124,6 +139,10 @@ impl ParsedFile {
 
     pub fn add_child(&mut self, parent: CodeUnit, child: CodeUnit) {
         self.children.entry(parent).or_default().push(child);
+    }
+
+    pub fn mark_type_alias(&mut self, code_unit: CodeUnit) {
+        self.type_aliases.insert(code_unit);
     }
 }
 
@@ -243,6 +262,7 @@ where
         let source = file.read_to_string().ok()?;
         let tree = parser.parse(source.as_str(), None)?;
         let parsed = adapter.parse_file(file, &source, &tree);
+        let contains_tests = adapter.contains_tests(file, &source, &tree, &parsed);
 
         Some(FileState {
             source,
@@ -256,6 +276,8 @@ where
             signatures: parsed.signatures,
             ranges: parsed.ranges,
             children: parsed.children,
+            type_aliases: parsed.type_aliases,
+            contains_tests,
         })
     }
 
@@ -338,6 +360,7 @@ where
         let mut ranges = BTreeMap::<CodeUnit, Vec<Range>>::new();
         let mut raw_supertypes = BTreeMap::<CodeUnit, Vec<String>>::new();
         let mut signatures = BTreeMap::<CodeUnit, Vec<String>>::new();
+        let mut type_aliases = BTreeSet::<CodeUnit>::new();
 
         for state in files.values() {
             for declaration in &state.declarations {
@@ -371,6 +394,8 @@ where
                     .or_default()
                     .extend(sigs.iter().cloned());
             }
+
+            type_aliases.extend(state.type_aliases.iter().cloned());
         }
 
         for descendants in children.values_mut() {
@@ -392,6 +417,7 @@ where
             ranges,
             raw_supertypes,
             signatures,
+            type_aliases,
         }
     }
 
@@ -430,6 +456,11 @@ where
 
     pub(crate) fn all_files(&self) -> BTreeSet<ProjectFile> {
         self.state.files.keys().cloned().collect()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn is_type_alias(&self, code_unit: &CodeUnit) -> bool {
+        self.state.type_aliases.contains(code_unit)
     }
 
     fn signatures_of(&self, code_unit: &CodeUnit) -> Vec<String> {
@@ -795,6 +826,12 @@ where
             .filter(|code_unit| !self.adapter.is_anonymous_structure(&code_unit.fq_name()))
             .filter(|code_unit| compiled.is_match(&code_unit.fq_name()))
             .collect()
+    }
+
+    fn contains_tests(&self, file: &ProjectFile) -> bool {
+        self.file_state(file)
+            .map(|state| state.contains_tests)
+            .unwrap_or(false)
     }
 }
 

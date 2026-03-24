@@ -1,7 +1,7 @@
 use crate::analyzer::{
     AnalyzerConfig, CodeUnit, DeclarationInfo, DeclarationKind, IAnalyzer, ImportAnalysisProvider,
-    ImportInfo, Language, LanguageAdapter, Project, ProjectFile, TreeSitterAnalyzer,
-    TypeHierarchyProvider,
+    ImportInfo, Language, LanguageAdapter, Project, ProjectFile, TestDetectionProvider,
+    TreeSitterAnalyzer, TypeHierarchyProvider,
 };
 use moka::sync::Cache;
 use std::collections::{BTreeMap, BTreeSet};
@@ -39,6 +39,16 @@ impl LanguageAdapter for JavaAdapter {
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {
         extract_java_call_receiver(reference)
+    }
+
+    fn contains_tests(
+        &self,
+        _file: &ProjectFile,
+        source: &str,
+        _tree: &Tree,
+        _parsed: &crate::analyzer::tree_sitter_analyzer::ParsedFile,
+    ) -> bool {
+        java_source_contains_tests(source)
     }
 
     fn parse_file(
@@ -438,6 +448,8 @@ impl ImportAnalysisProvider for JavaAnalyzer {
         self.could_import_file_without_source(imports, target)
     }
 }
+
+impl TestDetectionProvider for JavaAnalyzer {}
 
 impl JavaAnalyzer {
     pub fn could_import_file_without_source(
@@ -1691,6 +1703,18 @@ impl IAnalyzer for JavaAnalyzer {
         self.inner.project()
     }
 
+    fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {
+        Some(self)
+    }
+
+    fn type_hierarchy_provider(&self) -> Option<&dyn TypeHierarchyProvider> {
+        Some(self)
+    }
+
+    fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {
+        Some(self)
+    }
+
     fn get_all_declarations(&self) -> Vec<CodeUnit> {
         self.inner.get_all_declarations()
     }
@@ -1839,6 +1863,10 @@ impl IAnalyzer for JavaAnalyzer {
     fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit> {
         self.inner.search_definitions(pattern, auto_quote)
     }
+
+    fn contains_tests(&self, file: &ProjectFile) -> bool {
+        self.inner.contains_tests(file)
+    }
 }
 
 fn weight_import_map(key: &ProjectFile, value: &Arc<BTreeMap<String, CodeUnit>>) -> u32 {
@@ -1906,4 +1934,17 @@ fn estimate_code_unit_vec(values: &[CodeUnit]) -> u64 {
 
 fn estimate_code_unit_set(values: &BTreeSet<CodeUnit>) -> u64 {
     size_of::<BTreeSet<CodeUnit>>() as u64 + values.iter().map(estimate_code_unit).sum::<u64>()
+}
+
+fn java_source_contains_tests(source: &str) -> bool {
+    let compact = source.replace(char::is_whitespace, "");
+    compact.contains("@Test")
+        || compact.contains(".Test")
+        || compact.contains("@ParameterizedTest")
+        || compact.contains("@RepeatedTest")
+        || compact.contains("@Rule")
+        || compact.contains("@ClassRule")
+        || compact.contains("@Ignore")
+        || compact.contains("extendsTestCase")
+        || compact.contains("extendsjunit.framework.TestCase")
 }

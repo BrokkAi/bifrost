@@ -19,6 +19,45 @@ pub enum Language {
     CSharp,
 }
 
+impl Language {
+    pub fn extensions(self) -> &'static [&'static str] {
+        match self {
+            Language::None => &[],
+            Language::Java => &["java"],
+            Language::Go => &["go"],
+            Language::Cpp => &["c", "cc", "cpp", "cxx", "h", "hpp", "hh", "hxx"],
+            Language::JavaScript => &["js", "mjs", "cjs", "jsx"],
+            Language::TypeScript => &["ts", "tsx"],
+            Language::Python => &["py"],
+            Language::Rust => &["rs"],
+            Language::Php => &["php"],
+            Language::Scala => &["scala"],
+            Language::CSharp => &["cs"],
+        }
+    }
+
+    pub fn from_extension(extension: &str) -> Self {
+        let normalized = extension.trim_start_matches('.').to_ascii_lowercase();
+        for language in [
+            Language::Java,
+            Language::Go,
+            Language::Cpp,
+            Language::JavaScript,
+            Language::TypeScript,
+            Language::Python,
+            Language::Rust,
+            Language::Php,
+            Language::Scala,
+            Language::CSharp,
+        ] {
+            if language.extensions().contains(&normalized.as_str()) {
+                return language;
+            }
+        }
+        Language::None
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CodeUnitType {
     Class,
