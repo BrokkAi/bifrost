@@ -32,7 +32,7 @@ After this change, this repository will contain a Rust library that reproduces t
 - [x] (2026-03-24T21:53Z) Aligned Java search behavior with Brokk's case-insensitive matching and added focused search parity tests for basic patterns, regex patterns, nested classes, and missing results. `cargo test --test java_search_parity` passes.
 - [x] (2026-03-24T21:54Z) Cleaned up the current implementation to satisfy the plan's validation gate. `cargo test`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings` all pass.
 - [x] (2026-03-24T21:57Z) Finished the remaining Java search/enclosure edge cases by adding `autocomplete_definitions`, treating record components as implicit field declarations, and rejecting empty byte ranges in `enclosing_code_unit`. `cargo test`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings` all pass.
-- [ ] Translate the remaining selected Brokk Java tests that are still uncovered and close any parity gaps they expose.
+- [x] (2026-03-24T22:24Z) Finished the remaining Java analyzer parity slice by translating the outstanding lambda, update, interface-constant, multi-declarator field, literal-initializer, final-varargs, comment-filtering, and method-parameter cases from Brokk's `Java*Analyzer*Test` files. This required fixing direct field-initializer lambda discovery, switching lambda `$anon$line:col` names to Brokk's zero-based coordinates, filtering anonymous structures from search, and rendering per-declarator field skeletons with literal-only initializer preservation. `cargo test`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings` now pass again.
 - [x] (2026-03-24T21:49Z) The current Rust suite passes with `cargo test`.
 
 ## Surprises & Discoveries
@@ -91,6 +91,12 @@ After this change, this repository will contain a Rust library that reproduces t
 - Observation: the remaining uncovered search regressions clustered around record declarations and autocomplete rather than general indexing.
   Evidence: once record components were emitted as field code units and `autocomplete_definitions` was added to the Rust `IAnalyzer` surface, the remaining translated Java search/enclosure tests passed without further engine redesign.
 
+- Observation: Brokk's lambda naming depends on Tree-sitter's raw zero-based row/column and on whether the nearest enclosing owner is a callable or a class-like declaration.
+  Evidence: the translated `JavaLambdaAnalyzerTest` only passed after direct field-initializer lambdas were traversed explicitly, `$anon$line:col` used zero-based coordinates, and class-owned lambdas were nested as `Class.Class$anon$...` while method-owned lambdas remained `Class.method$anon$...`.
+
+- Observation: Brokk's field skeleton behavior is per-declarator, not per-field-declaration string splitting.
+  Evidence: the translated interface-constant and initializer tests failed until Rust rebuilt each field signature from the declaration prefix, type node, declarator name, and only literal/boolean/null initializer nodes.
+
 ## Decision Log
 
 - Decision: preserve Brokk's Java-like API names in Rust for v1 instead of inventing an idiomatic-Rust-first surface.
@@ -145,9 +151,13 @@ After this change, this repository will contain a Rust library that reproduces t
   Rationale: Brokk exposes autocomplete at the interface level, and the remaining Java search tests only needed the shared substring/fuzzy ordering behavior rather than a Java-only override.
   Date/Author: 2026-03-24 / Codex
 
+- Decision: treat the remaining `Java*Analyzer*Test` translation work as behavior-equivalent acceptance rather than a line-for-line reproduction of internal helper tests.
+  Rationale: tests like query-caching internals are implementation-specific in Brokk's query-driven engine, while the Rust port keeps the same user-visible analyzer semantics with a simpler single-threaded traversal-based core.
+  Date/Author: 2026-03-24 / Codex + user
+
 ## Outcomes & Retrospective
 
-The repository now has the crate scaffold, the copied Brokk resource corpus, the public Rust API layer, a single-threaded parse/index core, Java semantics for imports, hierarchy, source/skeleton rendering, lexical scope analysis, package modules, implicit constructors, comment-aware extraction, Java call-receiver heuristics, normalized-name lookups, lambda attachment, relevant-import selection, fixture top-level/member parity coverage, declaration-inventory parity coverage, import-detail parity coverage, case-insensitive search parity, autocomplete parity, record-component field support, and the first duplicate/update regressions. The major remaining gap is no longer obvious from the translated Java analyzer surface; additional work would mostly be translating even more of the upstream suite or expanding beyond the originally requested v1 scope.
+The repository now has the crate scaffold, the copied Brokk resource corpus, the public Rust API layer, a single-threaded parse/index core, Java semantics for imports, hierarchy, source/skeleton rendering, lexical scope analysis, package modules, implicit constructors, comment-aware extraction, Java call-receiver heuristics, normalized-name lookups, Brokk-style lambda discovery/naming, relevant-import selection, fixture top-level/member parity coverage, declaration-inventory parity coverage, import-detail parity coverage, case-insensitive search parity, autocomplete parity, record-component field support, interface-constant and field-initializer parity, and duplicate/update regressions. For the scoped v1 port, the translated Rust suite now covers the full intended `Java*Analyzer*Test` surface except the explicitly excluded serialization round-trip case and `JavascriptAnalyzerTest`.
 
 ## Context and Orientation
 

@@ -30,6 +30,10 @@ impl LanguageAdapter for JavaAdapter {
         normalize_java_full_name(fq_name)
     }
 
+    fn is_anonymous_structure(&self, fq_name: &str) -> bool {
+        is_java_anonymous_structure(fq_name)
+    }
+
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {
         extract_java_call_receiver(reference)
     }
@@ -114,6 +118,14 @@ impl JavaAnalyzer {
 
     pub fn inner(&self) -> &TreeSitterAnalyzer<JavaAdapter> {
         &self.inner
+    }
+
+    pub fn normalize_full_name(&self, fq_name: &str) -> String {
+        normalize_java_full_name(fq_name)
+    }
+
+    pub fn is_anonymous_structure(&self, fq_name: &str) -> bool {
+        is_java_anonymous_structure(fq_name)
     }
 
     pub fn extract_type_identifiers(&self, source: &str) -> BTreeSet<String> {
@@ -646,6 +658,14 @@ fn looks_like_pascal_identifier(name: &str) -> bool {
     first.is_ascii_uppercase() && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
+fn is_java_anonymous_structure(fq_name: &str) -> bool {
+    fq_name.contains("$anon$")
+        || fq_name
+            .rsplit_once('$')
+            .map(|(_, suffix)| suffix.chars().all(|ch| ch.is_ascii_digit()))
+            .unwrap_or(false)
+}
+
 fn collect_type_identifiers(node: Node<'_>, source: &str, identifiers: &mut BTreeSet<String>) {
     match node.kind() {
         "type_identifier" | "scoped_type_identifier" => {
@@ -888,7 +908,19 @@ fn visit_field_declaration(
             Some(parent.clone()),
             Some(top_level.clone()),
         );
-        parsed.add_signature(code_unit, field_signature(node, source, name));
+        parsed.add_signature(code_unit, field_signature(node, child, source));
+
+        if let Some(value) = child.child_by_field_name("value") {
+            collect_lambda_expressions(
+                file,
+                source,
+                value,
+                package_name,
+                parent,
+                top_level,
+                parsed,
+            );
+        }
     }
 }
 
@@ -980,17 +1012,17 @@ fn collect_lambda_expressions(
     top_level: &CodeUnit,
     parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
 ) {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.kind() == "lambda_expression" {
-            let lambda = lambda_code_unit(file, package_name, parent, child);
-            parsed.add_code_unit(
-                lambda.clone(),
-                child,
-                source,
-                Some(parent.clone()),
-                Some(top_level.clone()),
-            );
+    if node.kind() == "lambda_expression" {
+        let lambda = lambda_code_unit(file, package_name, parent, node);
+        parsed.add_code_unit(
+            lambda.clone(),
+            node,
+            source,
+            Some(parent.clone()),
+            Some(top_level.clone()),
+        );
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
             collect_lambda_expressions(
                 file,
                 source,
@@ -1000,9 +1032,12 @@ fn collect_lambda_expressions(
                 top_level,
                 parsed,
             );
-            continue;
         }
+        return;
+    }
 
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
         collect_lambda_expressions(file, source, child, package_name, parent, top_level, parsed);
     }
 }
@@ -1013,13 +1048,22 @@ fn lambda_code_unit(
     parent: &CodeUnit,
     node: Node<'_>,
 ) -> CodeUnit {
-    let line = node.start_position().row + 1;
-    let column = node.start_position().column + 1;
+    let line = node.start_position().row;
+    let column = node.start_position().column;
+    let short_name = if parent.is_function() {
+        format!("{}$anon${line}:{column}", parent.short_name())
+    } else {
+        format!(
+            "{}.{}$anon${line}:{column}",
+            parent.short_name(),
+            parent.identifier()
+        )
+    };
     CodeUnit::with_signature(
         file.clone(),
         crate::analyzer::CodeUnitType::Function,
         package_name.to_string(),
-        format!("{}$anon${line}:{column}", parent.short_name()),
+        short_name,
         None,
         true,
     )
@@ -1319,16 +1363,48 @@ fn canonical_parameters_signature(parameters: Node<'_>, source: &str) -> String 
     format!("({})", parts.join(", "))
 }
 
-fn field_signature(node: Node<'_>, source: &str, name: &str) -> String {
-    let declaration = normalize_whitespace(node_text(node, source));
-    if declaration.contains(',') {
-        declaration
-            .split(',')
-            .find(|part| part.contains(name))
-            .map(|part| format!("{};", part.trim().trim_end_matches(';')))
-            .unwrap_or(declaration)
+fn field_signature(field_node: Node<'_>, declarator: Node<'_>, source: &str) -> String {
+    let Some(type_node) = field_node.child_by_field_name("type") else {
+        return normalize_whitespace(node_text(field_node, source));
+    };
+    let Some(name_node) = declarator.child_by_field_name("name") else {
+        return normalize_whitespace(node_text(field_node, source));
+    };
+
+    let prefix = normalize_whitespace(
+        source
+            .get(field_node.start_byte()..type_node.start_byte())
+            .unwrap_or(""),
+    );
+    let type_text = normalize_whitespace(node_text(type_node, source));
+    let name_text = node_text(name_node, source).trim();
+
+    let mut signature = String::new();
+    for part in [prefix.as_str(), type_text.as_str(), name_text] {
+        if part.is_empty() {
+            continue;
+        }
+        if !signature.is_empty() {
+            signature.push(' ');
+        }
+        signature.push_str(part);
+    }
+
+    let suffix = declarator
+        .child_by_field_name("value")
+        .and_then(|value| literal_field_initializer(value, source))
+        .map(|value| format!(" = {value};"))
+        .unwrap_or_else(|| ";".to_string());
+    signature.push_str(&suffix);
+    signature
+}
+
+fn literal_field_initializer<'a>(value: Node<'_>, source: &'a str) -> Option<&'a str> {
+    let kind = value.kind();
+    if kind.ends_with("_literal") || matches!(kind, "true" | "false" | "null_literal" | "null") {
+        Some(node_text(value, source).trim())
     } else {
-        declaration
+        None
     }
 }
 

@@ -15,6 +15,9 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     fn normalize_full_name(&self, fq_name: &str) -> String {
         fq_name.to_string()
     }
+    fn is_anonymous_structure(&self, _fq_name: &str) -> bool {
+        false
+    }
     fn extract_call_receiver(&self, reference: &str) -> Option<String>;
     fn parse_file(&self, file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFile;
 }
@@ -668,7 +671,11 @@ where
         }
 
         let pattern = if auto_quote {
-            regex::escape(pattern)
+            if pattern.contains(".*") {
+                pattern.to_string()
+            } else {
+                format!(".*?{}.*?", regex::escape(pattern))
+            }
         } else {
             pattern.to_string()
         };
@@ -679,6 +686,7 @@ where
 
         self.get_all_declarations()
             .into_iter()
+            .filter(|code_unit| !self.adapter.is_anonymous_structure(&code_unit.fq_name()))
             .filter(|code_unit| compiled.is_match(&code_unit.fq_name()))
             .collect()
     }
