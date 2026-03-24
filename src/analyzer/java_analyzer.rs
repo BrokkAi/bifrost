@@ -109,11 +109,28 @@ impl JavaAnalyzer {
         }
     }
 
+    pub fn new_with_progress<F>(project: Arc<dyn Project>, progress: F) -> Self
+    where
+        F: FnMut(usize, usize, &ProjectFile),
+    {
+        Self {
+            inner: TreeSitterAnalyzer::new_with_progress(project, JavaAdapter, progress),
+        }
+    }
+
     pub fn from_project<P>(project: P) -> Self
     where
         P: Project + 'static,
     {
         Self::new(Arc::new(project))
+    }
+
+    pub fn from_project_with_progress<P, F>(project: P, progress: F) -> Self
+    where
+        P: Project + 'static,
+        F: FnMut(usize, usize, &ProjectFile),
+    {
+        Self::new_with_progress(Arc::new(project), progress)
     }
 
     pub fn inner(&self) -> &TreeSitterAnalyzer<JavaAdapter> {

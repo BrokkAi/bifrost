@@ -22,6 +22,8 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     fn parse_file(&self, file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFile;
 }
 
+type BuildProgress<'a> = &'a mut dyn FnMut(usize, usize, &ProjectFile);
+
 #[derive(Debug, Clone)]
 struct FileState {
     source: String,
@@ -145,7 +147,32 @@ where
 {
     pub fn new(project: Arc<dyn Project>, adapter: A) -> Self {
         let adapter = Arc::new(adapter);
-        let state = Arc::new(Self::build_state(project.as_ref(), adapter.as_ref(), None));
+        let state = Arc::new(Self::build_state(
+            project.as_ref(),
+            adapter.as_ref(),
+            None,
+            None,
+        ));
+
+        Self {
+            project,
+            adapter,
+            state,
+            _state: PhantomData,
+        }
+    }
+
+    pub fn new_with_progress<F>(project: Arc<dyn Project>, adapter: A, mut progress: F) -> Self
+    where
+        F: FnMut(usize, usize, &ProjectFile),
+    {
+        let adapter = Arc::new(adapter);
+        let state = Arc::new(Self::build_state(
+            project.as_ref(),
+            adapter.as_ref(),
+            None,
+            Some(&mut progress),
+        ));
 
         Self {
             project,
@@ -176,6 +203,7 @@ where
         project: &dyn Project,
         adapter: &A,
         existing: Option<&AnalyzerState>,
+        mut progress: Option<BuildProgress<'_>>,
     ) -> AnalyzerState {
         let mut parser = Parser::new();
         parser
@@ -192,7 +220,12 @@ where
 
         files.retain(|file, _| analyzable_files.contains(file));
 
-        for file in analyzable_files {
+        let total = analyzable_files.len();
+        for (index, file) in analyzable_files.into_iter().enumerate() {
+            if let Some(progress) = progress.as_mut() {
+                progress(index + 1, total, &file);
+            }
+
             let Ok(source) = file.read_to_string() else {
                 continue;
             };
@@ -468,7 +501,7 @@ where
     }
 
     fn update_all(&self) -> Self {
-        let state = Self::build_state(self.project.as_ref(), self.adapter.as_ref(), None);
+        let state = Self::build_state(self.project.as_ref(), self.adapter.as_ref(), None, None);
         Self::from_state(Arc::clone(&self.project), Arc::clone(&self.adapter), state)
     }
 
