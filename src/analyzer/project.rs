@@ -68,28 +68,19 @@ impl Project for TestProject {
     }
 
     fn analyzable_files(&self, language: Language) -> io::Result<BTreeSet<ProjectFile>> {
-        let extension = match language {
-            Language::Java => Some("java"),
-            Language::Go => Some("go"),
-            Language::Cpp => Some("cpp"),
-            Language::JavaScript => Some("js"),
-            Language::TypeScript => Some("ts"),
-            Language::Python => Some("py"),
-            Language::Rust => Some("rs"),
-            Language::Php => Some("php"),
-            Language::Scala => Some("scala"),
-            Language::CSharp => Some("cs"),
-            Language::None => None,
-        };
+        let extensions = language.extensions();
+        if extensions.is_empty() {
+            return Ok(BTreeSet::new());
+        }
 
         let files = self.all_files()?;
         Ok(files
             .into_iter()
             .filter(|file| {
-                extension
-                    .map(|extension| {
-                        file.rel_path().extension().and_then(|ext| ext.to_str()) == Some(extension)
-                    })
+                file.rel_path()
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| extensions.contains(&ext))
                     .unwrap_or(false)
             })
             .collect())

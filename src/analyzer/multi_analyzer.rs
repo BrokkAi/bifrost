@@ -1,55 +1,71 @@
 use crate::analyzer::{
     CodeUnit, DeclarationInfo, IAnalyzer, ImportAnalysisProvider, ImportInfo, JavaAnalyzer,
-    Language, Project, ProjectFile, Range, TestDetectionProvider, TypeAliasProvider,
-    TypeHierarchyProvider,
+    JavascriptAnalyzer, Language, Project, ProjectFile, Range, TestDetectionProvider,
+    TypeAliasProvider, TypeHierarchyProvider, TypescriptAnalyzer,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone)]
 pub enum AnalyzerDelegate {
     Java(JavaAnalyzer),
+    JavaScript(JavascriptAnalyzer),
+    TypeScript(TypescriptAnalyzer),
 }
 
 impl AnalyzerDelegate {
     fn analyzer(&self) -> &dyn IAnalyzer {
         match self {
             Self::Java(analyzer) => analyzer,
+            Self::JavaScript(analyzer) => analyzer,
+            Self::TypeScript(analyzer) => analyzer,
         }
     }
 
     fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {
         match self {
             Self::Java(analyzer) => Some(analyzer),
+            Self::JavaScript(analyzer) => Some(analyzer),
+            Self::TypeScript(analyzer) => Some(analyzer),
         }
     }
 
     fn type_hierarchy_provider(&self) -> Option<&dyn TypeHierarchyProvider> {
         match self {
             Self::Java(analyzer) => Some(analyzer),
+            Self::JavaScript(analyzer) => analyzer.type_hierarchy_provider(),
+            Self::TypeScript(analyzer) => analyzer.type_hierarchy_provider(),
         }
     }
 
     fn type_alias_provider(&self) -> Option<&dyn TypeAliasProvider> {
         match self {
             Self::Java(analyzer) => analyzer.type_alias_provider(),
+            Self::JavaScript(analyzer) => analyzer.type_alias_provider(),
+            Self::TypeScript(analyzer) => analyzer.type_alias_provider(),
         }
     }
 
     fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {
         match self {
             Self::Java(analyzer) => Some(analyzer),
+            Self::JavaScript(analyzer) => Some(analyzer),
+            Self::TypeScript(analyzer) => Some(analyzer),
         }
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
         match self {
             Self::Java(analyzer) => Self::Java(analyzer.update(changed_files)),
+            Self::JavaScript(analyzer) => Self::JavaScript(analyzer.update(changed_files)),
+            Self::TypeScript(analyzer) => Self::TypeScript(analyzer.update(changed_files)),
         }
     }
 
     fn update_all(&self) -> Self {
         match self {
             Self::Java(analyzer) => Self::Java(analyzer.update_all()),
+            Self::JavaScript(analyzer) => Self::JavaScript(analyzer.update_all()),
+            Self::TypeScript(analyzer) => Self::TypeScript(analyzer.update_all()),
         }
     }
 }

@@ -39,6 +39,7 @@ After this change, this repository will contain a Rust library that reproduces t
 - [x] (2026-03-24T23:41Z) Added `AnalyzerConfig` so callers can choose build parallelism and an approximate memo-cache RAM budget. The `summarize` progress hook now works with the thread-safe completion-based build callback used by the parallel pipeline.
 - [x] (2026-03-24T23:41Z) Added bounded `moka` memo caches for Java import resolution, reverse referencing-file lookups, relevant imports, and direct hierarchy queries. Added focused regression coverage for sequential-vs-parallel parity and tiny-budget cache correctness. `cargo test`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings` all pass again.
 - [x] (2026-03-24T23:58Z) Started the multi-language expansion by widening the shared Rust analyzer surface with capability accessors, `get_skeletons`/`get_members_in_class`/`get_test_modules`/`test_files_to_code_units`, semantic test-detection metadata in the shared snapshot, extension-to-language routing, and an initial `MultiAnalyzer` that aggregates the existing Java delegate. Added focused routing/capability tests and kept the full current Rust suite green.
+- [x] (2026-03-25T00:31Z) Landed the first non-Java analyzers: `JavascriptAnalyzer` and `TypescriptAnalyzer`, plus extension-aware project file discovery, `get_symbols` on the shared analyzer API, JS/TS import resolution, TypeScript type-alias tagging, and `MultiAnalyzer` routing for Java + JavaScript + TypeScript. Added focused Rust smoke coverage for JavaScript arrow functions, JS relative-import resolution, TypeScript alias detection, TypeScript updates, and mixed-language `MultiAnalyzer` routing. `cargo test`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings` all pass again.
 
 ## Surprises & Discoveries
 
@@ -114,6 +115,12 @@ After this change, this repository will contain a Rust library that reproduces t
 - Observation: the remaining non-Java and `MultiAnalyzer` work needs more shared interface surface than the original Java-only port exposed.
   Evidence: upstream tests for non-Java analyzers and `MultiAnalyzer` rely on capability discovery, `getSkeletons`, `getMembersInClass`, `getTestModules`, `testFilesToCodeUnits`, test-detection behavior, and type-alias hooks, none of which were fully represented in the first Java-only Rust API.
 
+- Observation: `TestProject::analyzable_files` needed to be extension-set aware before JSX/TSX and mixed-language `MultiAnalyzer` routing could work reliably.
+  Evidence: the earlier single-extension implementation only discovered `.js` for JavaScript and `.ts` for TypeScript; the first JS/TS slice required routing through `Language::extensions()` so the project abstraction and `MultiAnalyzer` agreed on the same file-language mapping.
+
+- Observation: the first non-Java analyzers can land usefully without a full generic query-driven extraction substrate if they reuse the existing immutable snapshot engine and parse directly into the shared `ParsedFile` model.
+  Evidence: the new JS/TS smoke suite passes with direct AST walks for declarations/imports/signatures while the shared `TreeSitterAnalyzer` still handles indexing, ranges, source extraction, search, and snapshot updates.
+
 ## Decision Log
 
 - Decision: preserve Brokk's Java-like API names in Rust for v1 instead of inventing an idiomatic-Rust-first surface.
@@ -184,9 +191,13 @@ After this change, this repository will contain a Rust library that reproduces t
   Rationale: non-Java analyzer tests and `MultiAnalyzer` tests both depend on the same capability/test-module/type-alias surface, so stabilizing that layer first reduces repeated churn as each new language lands.
   Date/Author: 2026-03-24 / Codex
 
+- Decision: land JavaScript and TypeScript as the first non-Java analyzers using concrete direct-AST adapters instead of blocking on a generalized query-execution layer.
+  Rationale: it keeps momentum on real language/test coverage, reuses the existing shared snapshot/index engine, and still leaves room to introduce a common query layer later if broader language parity work benefits from it.
+  Date/Author: 2026-03-25 / Codex
+
 ## Outcomes & Retrospective
 
-The repository now has the crate scaffold, the copied Brokk resource corpus, the public Rust API layer, a concurrent parse/index core built around immutable snapshots, Java semantics for imports, hierarchy, source/skeleton rendering, lexical scope analysis, package modules, implicit constructors, comment-aware extraction, Java call-receiver heuristics, normalized-name lookups, Brokk-style lambda discovery/naming, relevant-import selection, fixture top-level/member parity coverage, declaration-inventory parity coverage, import-detail parity coverage, case-insensitive search parity, autocomplete parity, record-component field support, interface-constant and field-initializer parity, bounded memo caches for expensive Java queries, and duplicate/update regressions. For the scoped v1 port, the translated Rust suite now covers the full intended `Java*Analyzer*Test` surface except the explicitly excluded serialization round-trip case and `JavascriptAnalyzerTest`.
+The repository now has the crate scaffold, the copied Brokk resource corpus, the public Rust API layer, a concurrent parse/index core built around immutable snapshots, Java semantics for imports, hierarchy, source/skeleton rendering, lexical scope analysis, package modules, implicit constructors, comment-aware extraction, Java call-receiver heuristics, normalized-name lookups, Brokk-style lambda discovery/naming, relevant-import selection, fixture top-level/member parity coverage, declaration-inventory parity coverage, import-detail parity coverage, case-insensitive search parity, autocomplete parity, record-component field support, interface-constant and field-initializer parity, bounded memo caches for expensive Java queries, duplicate/update regressions, and the first non-Java analyzer slice for JavaScript and TypeScript. `MultiAnalyzer` now routes Java, JavaScript, and TypeScript delegates through the widened shared capability surface.
 
 The repository also now has a `summarize` CLI utility that resolves either absolute file paths under the project root or Java FQCN targets and prints Brokk-style skeleton summaries using the Rust analyzer implementation. This gives the port a direct command-line path for exercising file summaries and symbol summaries outside the translated test harness.
 

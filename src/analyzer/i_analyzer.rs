@@ -167,6 +167,19 @@ pub trait IAnalyzer: Send + Sync + Any {
             .collect()
     }
 
+    fn get_symbols(&self, sources: &BTreeSet<CodeUnit>) -> BTreeSet<String> {
+        let mut symbols = BTreeSet::new();
+        for source in sources {
+            symbols.insert(source.identifier().to_string());
+            if source.is_class() || source.is_module() {
+                for child in self.get_direct_children(source) {
+                    symbols.insert(child.identifier().to_string());
+                }
+            }
+        }
+        symbols
+    }
+
     fn parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
         let fq_name = code_unit.fq_name();
         let mut last_index = None;
