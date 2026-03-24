@@ -324,11 +324,16 @@ where
             .unwrap_or_default()
     }
 
-    fn source_slice(&self, code_unit: &CodeUnit, range: &Range) -> Option<String> {
+    fn source_slice(&self, code_unit: &CodeUnit, range: &Range, include_comments: bool) -> Option<String> {
         let file_state = self.file_state(code_unit.source())?;
+        let start_byte = if include_comments {
+            expanded_comment_start(&file_state.source, range.start_byte)
+        } else {
+            range.start_byte
+        };
         file_state
             .source
-            .get(range.start_byte..range.end_byte)
+            .get(start_byte..range.end_byte)
             .map(str::to_string)
     }
 
@@ -577,7 +582,7 @@ where
         }
     }
 
-    fn get_sources(&self, code_unit: &CodeUnit, _include_comments: bool) -> BTreeSet<String> {
+    fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String> {
         let mut ranges = if code_unit.is_function() {
             let mut grouped = Vec::new();
             for candidate in self.get_definitions(&code_unit.fq_name()) {
@@ -593,7 +598,7 @@ where
         ranges.sort_by_key(|range| range.start_byte);
         ranges
             .into_iter()
-            .filter_map(|range| self.source_slice(code_unit, &range))
+            .filter_map(|range| self.source_slice(code_unit, &range, include_comments))
             .collect()
     }
 
@@ -625,4 +630,60 @@ fn node_range(node: Node<'_>) -> Range {
         start_line: node.start_position().row + 1,
         end_line: node.end_position().row + 1,
     }
+}
+
+fn expanded_comment_start(source: &str, start_byte: usize) -> usize {
+    let mut line_starts = vec![0usize];
+    for (idx, ch) in source.char_indices() {
+        if ch == '\n' && idx + 1 < source.len() {
+            line_starts.push(idx + 1);
+        }
+    }
+
+    let line_index = match line_starts.binary_search(&start_byte) {
+        Ok(index) => index,
+        Err(index) => index.saturating_sub(1),
+    };
+
+    let mut comment_start = start_byte;
+    for line_idx in (0..line_index).rev() {
+        let line_start = line_starts[line_idx];
+        let line_end = line_starts
+            .get(line_idx + 1)
+            .copied()
+            .unwrap_or(source.len());
+        let line = &source[line_start..line_end];
+        let trimmed = line.trim_start();
+
+        if trimmed.trim().is_empty() {
+            continue;
+        }
+
+        if is_comment_like(trimmed) {
+            comment_start = line_start;
+            continue;
+        }
+
+        if let Some(offset) = first_comment_offset(line) {
+            comment_start = line_start + offset;
+        }
+        break;
+    }
+
+    comment_start
+}
+
+fn is_comment_like(trimmed_line: &str) -> bool {
+    trimmed_line.starts_with("/**")
+        || trimmed_line.starts_with("/*")
+        || trimmed_line.starts_with("*/")
+        || trimmed_line.starts_with('*')
+        || trimmed_line.starts_with("//")
+}
+
+fn first_comment_offset(line: &str) -> Option<usize> {
+    ["/**", "/*", "//"]
+        .into_iter()
+        .filter_map(|marker| line.find(marker))
+        .min()
 }

@@ -22,8 +22,10 @@ After this change, this repository will contain a Rust library that reproduces t
 - [x] (2026-03-24T21:19Z) Implemented a first rendering layer for class/function source extraction and recursive skeleton/header reconstruction. `cargo test --test java_source_and_skeleton` passes against the copied Java fixtures.
 - [x] (2026-03-24T21:19Z) Implemented lexical scope lookup and access-expression filtering for constructor/method parameters, locals, enhanced-for variables, catch parameters, try-with-resources variables, and lambda parameters. `cargo test --test java_scope_analysis` passes.
 - [x] (2026-03-24T21:19Z) Added package-module code units and implicit-constructor synthesis for classes only, with explicit constructors suppressing synthesis. `cargo test --test java_modules_and_constructors` passes.
-- [ ] Complete the remaining Java-specific semantics: comment-aware source extraction and broader update/regression parity.
-- [ ] Translate the selected Java tests into Rust integration tests and make them pass.
+- [x] (2026-03-24T21:19Z) Implemented comment-aware source extraction that includes immediately preceding Javadocs/comments without pulling in unrelated code from the same line. `cargo test --test java_comment_source` passes.
+- [x] (2026-03-24T21:19Z) Added regression coverage for duplicate overload preservation and multi-step updates. `cargo test --test java_update_regressions` passes.
+- [x] (2026-03-24T21:19Z) Added canonical callable-signature normalization coverage, including varargs. `cargo test --test java_signature_normalization` passes.
+- [ ] Translate the remaining selected Brokk Java tests that are still uncovered and close any parity gaps they expose.
 - [x] (2026-03-24T21:19Z) The current Rust suite passes with `cargo test`.
 
 ## Surprises & Discoveries
@@ -54,6 +56,12 @@ After this change, this repository will contain a Rust library that reproduces t
 
 - Observation: package modules and implicit constructors fit cleanly into the existing parsed-file model without broad engine changes.
   Evidence: a module code unit can be inserted as another top-level declaration with children pointing at the file's top-level classes, and synthetic constructors can be added as child function code units without source ranges; `cargo test --test java_modules_and_constructors` passes.
+
+- Observation: comment-aware source extraction did not require storing comment ranges in analyzer state; a backward source scan from the declaration start was enough for the exercised cases.
+  Evidence: `cargo test --test java_comment_source` passes for class Javadocs, method Javadocs, inner-class indentation preservation, and the inline-comment edge case.
+
+- Observation: synthetic constructors should be resolvable but should not contribute a normal callable signature in overload-sensitive regression tests.
+  Evidence: the duplicate-overload regression passed only after synthetic constructors stopped carrying a concrete `"()"` signature.
 
 ## Decision Log
 
@@ -89,9 +97,13 @@ After this change, this repository will contain a Rust library that reproduces t
   Rationale: this matches the Brokk tests for top-level declarations and package-module child traversal while preserving the existing `CodeUnit` model.
   Date/Author: 2026-03-24 / Codex
 
+- Decision: implement comment-aware extraction in the shared source path with a backward textual scan rather than extending `Range` with explicit comment offsets.
+  Rationale: it was sufficient for the current Java acceptance cases and avoided widening the range/state model before more languages exist in the Rust port.
+  Date/Author: 2026-03-24 / Codex
+
 ## Outcomes & Retrospective
 
-The repository now has the crate scaffold, the copied Brokk resource corpus, the public Rust API layer, a single-threaded parse/index core, Java semantics for imports, hierarchy, source/skeleton rendering, lexical scope analysis, package modules, and implicit constructors. The major remaining gap is parity for comment-aware extraction, duplicate/update regressions, and the broader translated acceptance suite.
+The repository now has the crate scaffold, the copied Brokk resource corpus, the public Rust API layer, a single-threaded parse/index core, Java semantics for imports, hierarchy, source/skeleton rendering, lexical scope analysis, package modules, implicit constructors, comment-aware extraction, and the first duplicate/update regressions. The major remaining gap is the rest of the translated Brokk Java acceptance suite and whatever parity gaps those additional tests expose.
 
 ## Context and Orientation
 

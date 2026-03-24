@@ -483,7 +483,7 @@ fn visit_class_like(
             crate::analyzer::CodeUnitType::Function,
             package_name.to_string(),
             format!("{}.{}", code_unit.short_name(), simple_name),
-            Some("()".to_string()),
+            None,
             true,
         );
         parsed.declarations.insert(ctor.clone());
@@ -513,7 +513,7 @@ fn visit_callable(
 
     let signature = node
         .child_by_field_name("parameters")
-        .map(|parameters| normalize_whitespace(node_text(parameters, source)));
+        .map(|parameters| canonical_parameters_signature(parameters, source));
     let short_name = format!("{}.{}", parent.short_name(), name);
     let callable_sig = callable_signature(node, source);
     let code_unit = CodeUnit::with_signature(
@@ -832,6 +832,48 @@ fn callable_signature(node: Node<'_>, source: &str) -> String {
         .map(|body| body.start_byte())
         .unwrap_or(node.end_byte());
     normalize_whitespace(source.get(node.start_byte()..end).unwrap_or("").trim_end())
+}
+
+fn canonical_parameters_signature(parameters: Node<'_>, source: &str) -> String {
+    let mut parts = Vec::new();
+    let mut cursor = parameters.walk();
+    for child in parameters.named_children(&mut cursor) {
+        match child.kind() {
+            "formal_parameter" => {
+                if let Some(type_node) = child.child_by_field_name("type") {
+                    let mut ty = normalize_whitespace(node_text(type_node, source));
+                    if let Some(dimensions) = child.child_by_field_name("dimensions") {
+                        ty.push_str(node_text(dimensions, source).trim());
+                    }
+                    parts.push(ty);
+                }
+            }
+            "spread_parameter" => {
+                let mut spread_cursor = child.walk();
+                for grandchild in child.named_children(&mut spread_cursor) {
+                    if grandchild.kind() == "variable_declarator" {
+                        continue;
+                    }
+                    if grandchild.kind() == "modifiers"
+                        || grandchild.kind() == "annotation"
+                        || grandchild.kind() == "marker_annotation"
+                    {
+                        continue;
+                    }
+                    parts.push(format!("{}[]", normalize_whitespace(node_text(grandchild, source))));
+                    break;
+                }
+            }
+            "receiver_parameter" => {
+                if let Some(type_node) = child.child_by_field_name("type") {
+                    parts.push(normalize_whitespace(node_text(type_node, source)));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    format!("({})", parts.join(", "))
 }
 
 fn field_signature(node: Node<'_>, source: &str, name: &str) -> String {
