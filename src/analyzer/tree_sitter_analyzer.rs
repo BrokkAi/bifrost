@@ -552,6 +552,10 @@ where
     }
 
     fn enclosing_code_unit(&self, file: &ProjectFile, range: &Range) -> Option<CodeUnit> {
+        if range.start_byte >= range.end_byte {
+            return None;
+        }
+
         self.get_declarations(file)
             .into_iter()
             .filter_map(|code_unit| {

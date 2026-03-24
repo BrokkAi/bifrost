@@ -31,6 +31,7 @@ After this change, this repository will contain a Rust library that reproduces t
 - [x] (2026-03-24T21:52Z) Added import-detail parity coverage for import-info structure, mixed/static import resolution, circular import stability, relevant-import filtering for fully qualified types, and Java type-identifier extraction. `cargo test --test java_import_detail_parity` passes.
 - [x] (2026-03-24T21:53Z) Aligned Java search behavior with Brokk's case-insensitive matching and added focused search parity tests for basic patterns, regex patterns, nested classes, and missing results. `cargo test --test java_search_parity` passes.
 - [x] (2026-03-24T21:54Z) Cleaned up the current implementation to satisfy the plan's validation gate. `cargo test`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings` all pass.
+- [x] (2026-03-24T21:57Z) Finished the remaining Java search/enclosure edge cases by adding `autocomplete_definitions`, treating record components as implicit field declarations, and rejecting empty byte ranges in `enclosing_code_unit`. `cargo test`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings` all pass.
 - [ ] Translate the remaining selected Brokk Java tests that are still uncovered and close any parity gaps they expose.
 - [x] (2026-03-24T21:49Z) The current Rust suite passes with `cargo test`.
 
@@ -87,6 +88,9 @@ After this change, this repository will contain a Rust library that reproduces t
 - Observation: search behavior was one of the last real semantic mismatches rather than a missing test translation.
   Evidence: the translated search tests required an implementation change so `search_definitions` compiles case-insensitive regexes, after which the new search parity suite passed.
 
+- Observation: the remaining uncovered search regressions clustered around record declarations and autocomplete rather than general indexing.
+  Evidence: once record components were emitted as field code units and `autocomplete_definitions` was added to the Rust `IAnalyzer` surface, the remaining translated Java search/enclosure tests passed without further engine redesign.
+
 ## Decision Log
 
 - Decision: preserve Brokk's Java-like API names in Rust for v1 instead of inventing an idiomatic-Rust-first surface.
@@ -137,9 +141,13 @@ After this change, this repository will contain a Rust library that reproduces t
   Rationale: Brokk's Java search semantics are case-insensitive, and the Rust port already routes search through the generic regex-based matcher.
   Date/Author: 2026-03-24 / Codex
 
+- Decision: add `autocomplete_definitions` as a default Rust `IAnalyzer` method and keep its behavior generic.
+  Rationale: Brokk exposes autocomplete at the interface level, and the remaining Java search tests only needed the shared substring/fuzzy ordering behavior rather than a Java-only override.
+  Date/Author: 2026-03-24 / Codex
+
 ## Outcomes & Retrospective
 
-The repository now has the crate scaffold, the copied Brokk resource corpus, the public Rust API layer, a single-threaded parse/index core, Java semantics for imports, hierarchy, source/skeleton rendering, lexical scope analysis, package modules, implicit constructors, comment-aware extraction, Java call-receiver heuristics, normalized-name lookups, lambda attachment, relevant-import selection, fixture top-level/member parity coverage, declaration-inventory parity coverage, import-detail parity coverage, case-insensitive search parity, and the first duplicate/update regressions. The major remaining gap is the rest of the translated Brokk Java acceptance suite and whatever parity gaps those additional tests expose.
+The repository now has the crate scaffold, the copied Brokk resource corpus, the public Rust API layer, a single-threaded parse/index core, Java semantics for imports, hierarchy, source/skeleton rendering, lexical scope analysis, package modules, implicit constructors, comment-aware extraction, Java call-receiver heuristics, normalized-name lookups, lambda attachment, relevant-import selection, fixture top-level/member parity coverage, declaration-inventory parity coverage, import-detail parity coverage, case-insensitive search parity, autocomplete parity, record-component field support, and the first duplicate/update regressions. The major remaining gap is no longer obvious from the translated Java analyzer surface; additional work would mostly be translating even more of the upstream suite or expanding beyond the originally requested v1 scope.
 
 ## Context and Orientation
 

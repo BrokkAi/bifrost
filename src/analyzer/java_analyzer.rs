@@ -705,6 +705,18 @@ fn visit_class_like(
     parsed.set_raw_supertypes(code_unit.clone(), raw_supertypes);
     parsed.add_signature(code_unit.clone(), signature);
 
+    if node.kind() == "record_declaration" {
+        visit_record_components(
+            file,
+            source,
+            node,
+            package_name,
+            &code_unit,
+            &top_level,
+            parsed,
+        );
+    }
+
     let mut has_explicit_constructor = false;
     if let Some(body) = node.child_by_field_name("body") {
         for index in 0..body.named_child_count() {
@@ -877,6 +889,51 @@ fn visit_field_declaration(
             Some(top_level.clone()),
         );
         parsed.add_signature(code_unit, field_signature(node, source, name));
+    }
+}
+
+fn visit_record_components(
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    package_name: &str,
+    parent: &CodeUnit,
+    top_level: &CodeUnit,
+    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+) {
+    let Some(parameters) = node.child_by_field_name("parameters") else {
+        return;
+    };
+
+    let mut cursor = parameters.walk();
+    for child in parameters.named_children(&mut cursor) {
+        if child.kind() != "formal_parameter" {
+            continue;
+        }
+
+        let Some(name_node) = child.child_by_field_name("name") else {
+            continue;
+        };
+
+        let name = node_text(name_node, source).trim();
+        if name.is_empty() {
+            continue;
+        }
+
+        let code_unit = CodeUnit::new(
+            file.clone(),
+            crate::analyzer::CodeUnitType::Field,
+            package_name.to_string(),
+            format!("{}.{}", parent.short_name(), name),
+        );
+        parsed.add_code_unit(
+            code_unit.clone(),
+            child,
+            source,
+            Some(parent.clone()),
+            Some(top_level.clone()),
+        );
+        parsed.add_signature(code_unit, normalize_whitespace(node_text(child, source)));
     }
 }
 

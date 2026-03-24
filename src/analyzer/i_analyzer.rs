@@ -3,7 +3,8 @@ use crate::analyzer::{
     metrics_from_declarations,
 };
 use std::any::Any;
-use std::collections::BTreeSet;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub trait IAnalyzer: Send + Sync + Any {
     fn get_top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit>;
@@ -46,6 +47,41 @@ pub trait IAnalyzer: Send + Sync + Any {
     fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String>;
     fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit>;
 
+    fn autocomplete_definitions(&self, query: &str) -> Vec<CodeUnit> {
+        if query.is_empty() {
+            return Vec::new();
+        }
+
+        let base_results = self.search_definitions(&format!(".*?{query}.*?"), false);
+
+        let fuzzy_results = if query.len() < 5 {
+            let mut pattern = String::from(".*?");
+            for ch in query.chars() {
+                pattern.push_str(&regex::escape(&ch.to_string()));
+                pattern.push_str(".*?");
+            }
+            self.search_definitions(&pattern, false)
+        } else {
+            BTreeSet::new()
+        };
+
+        let mut by_fq_name: BTreeMap<String, BTreeSet<CodeUnit>> = BTreeMap::new();
+        for code_unit in base_results.into_iter().chain(fuzzy_results.into_iter()) {
+            by_fq_name
+                .entry(code_unit.fq_name())
+                .or_default()
+                .insert(code_unit);
+        }
+
+        let mut merged: Vec<_> = by_fq_name
+            .into_values()
+            .flat_map(BTreeSet::into_iter)
+            .filter(|code_unit| !code_unit.is_synthetic())
+            .collect();
+        merged.sort_by(autocomplete_definitions_sort_comparator);
+        merged
+    }
+
     fn as_capability<T: Any>(&self) -> Option<&T>
     where
         Self: Sized,
@@ -81,5 +117,30 @@ pub trait IAnalyzer: Send + Sync + Any {
         self.get_definitions(parent_name)
             .into_iter()
             .find(|candidate| candidate.is_class() || candidate.is_module())
+    }
+}
+
+fn autocomplete_definitions_sort_comparator(left: &CodeUnit, right: &CodeUnit) -> Ordering {
+    autocomplete_rank(left)
+        .cmp(&autocomplete_rank(right))
+        .then_with(|| {
+            left.fq_name()
+                .to_lowercase()
+                .cmp(&right.fq_name().to_lowercase())
+        })
+        .then_with(|| {
+            left.signature()
+                .unwrap_or("")
+                .to_lowercase()
+                .cmp(&right.signature().unwrap_or("").to_lowercase())
+        })
+}
+
+fn autocomplete_rank(code_unit: &CodeUnit) -> usize {
+    match code_unit.kind() {
+        crate::analyzer::CodeUnitType::Class => 0,
+        crate::analyzer::CodeUnitType::Function => 1,
+        crate::analyzer::CodeUnitType::Field => 2,
+        crate::analyzer::CodeUnitType::Module => 3,
     }
 }
