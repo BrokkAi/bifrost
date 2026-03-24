@@ -33,6 +33,7 @@ After this change, this repository will contain a Rust library that reproduces t
 - [x] (2026-03-24T21:54Z) Cleaned up the current implementation to satisfy the plan's validation gate. `cargo test`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings` all pass.
 - [x] (2026-03-24T21:57Z) Finished the remaining Java search/enclosure edge cases by adding `autocomplete_definitions`, treating record components as implicit field declarations, and rejecting empty byte ranges in `enclosing_code_unit`. `cargo test`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings` all pass.
 - [x] (2026-03-24T22:24Z) Finished the remaining Java analyzer parity slice by translating the outstanding lambda, update, interface-constant, multi-declarator field, literal-initializer, final-varargs, comment-filtering, and method-parameter cases from Brokk's `Java*Analyzer*Test` files. This required fixing direct field-initializer lambda discovery, switching lambda `$anon$line:col` names to Brokk's zero-based coordinates, filtering anonymous structures from search, and rendering per-declarator field skeletons with literal-only initializer preservation. `cargo test`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings` now pass again.
+- [x] (2026-03-24T23:02Z) Added a `summarize` utility plus reusable summary rendering helpers so full-path filenames and FQCNs can be rendered through the Rust analyzer using Brokk-style file/codeunit skeleton summaries. Added CLI coverage for absolute-path and FQCN resolution, and verified the fixture invocation `cargo run --quiet --bin summarize -- --root tests/fixtures/testcode-java A`.
 - [x] (2026-03-24T21:49Z) The current Rust suite passes with `cargo test`.
 
 ## Surprises & Discoveries
@@ -97,6 +98,9 @@ After this change, this repository will contain a Rust library that reproduces t
 - Observation: Brokk's field skeleton behavior is per-declarator, not per-field-declaration string splitting.
   Evidence: the translated interface-constant and initializer tests failed until Rust rebuilt each field signature from the declaration prefix, type node, declarator name, and only literal/boolean/null initializer nodes.
 
+- Observation: the existing analyzer API was already sufficient to reproduce Brokk-style summary rendering without adding a separate context-manager layer.
+  Evidence: the new `summarize` utility only needed `getTopLevelDeclarations`, `getDefinitions`, `getSkeleton`, and direct-ancestor traversal to render file and codeunit summaries with Brokk-like package grouping and ancestor sections.
+
 ## Decision Log
 
 - Decision: preserve Brokk's Java-like API names in Rust for v1 instead of inventing an idiomatic-Rust-first surface.
@@ -158,6 +162,8 @@ After this change, this repository will contain a Rust library that reproduces t
 ## Outcomes & Retrospective
 
 The repository now has the crate scaffold, the copied Brokk resource corpus, the public Rust API layer, a single-threaded parse/index core, Java semantics for imports, hierarchy, source/skeleton rendering, lexical scope analysis, package modules, implicit constructors, comment-aware extraction, Java call-receiver heuristics, normalized-name lookups, Brokk-style lambda discovery/naming, relevant-import selection, fixture top-level/member parity coverage, declaration-inventory parity coverage, import-detail parity coverage, case-insensitive search parity, autocomplete parity, record-component field support, interface-constant and field-initializer parity, and duplicate/update regressions. For the scoped v1 port, the translated Rust suite now covers the full intended `Java*Analyzer*Test` surface except the explicitly excluded serialization round-trip case and `JavascriptAnalyzerTest`.
+
+The repository also now has a `summarize` CLI utility that resolves either absolute file paths under the project root or Java FQCN targets and prints Brokk-style skeleton summaries using the Rust analyzer implementation. This gives the port a direct command-line path for exercising file summaries and symbol summaries outside the translated test harness.
 
 ## Context and Orientation
 
