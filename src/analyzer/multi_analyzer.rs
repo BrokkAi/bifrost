@@ -4,6 +4,7 @@ use crate::analyzer::{
     Project, ProjectFile, PythonAnalyzer, Range, RustAnalyzer, ScalaAnalyzer,
     TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider, TypescriptAnalyzer,
 };
+use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone)]
@@ -21,7 +22,7 @@ pub enum AnalyzerDelegate {
 }
 
 impl AnalyzerDelegate {
-    fn analyzer(&self) -> &dyn IAnalyzer {
+    pub(crate) fn analyzer(&self) -> &dyn IAnalyzer {
         match self {
             Self::Java(analyzer) => analyzer,
             Self::CSharp(analyzer) => analyzer,
@@ -96,7 +97,7 @@ impl AnalyzerDelegate {
         }
     }
 
-    fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
+    pub(crate) fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
         match self {
             Self::Java(analyzer) => Self::Java(analyzer.update(changed_files)),
             Self::CSharp(analyzer) => Self::CSharp(analyzer.update(changed_files)),
@@ -111,7 +112,7 @@ impl AnalyzerDelegate {
         }
     }
 
-    fn update_all(&self) -> Self {
+    pub(crate) fn update_all(&self) -> Self {
         match self {
             Self::Java(analyzer) => Self::Java(analyzer.update_all()),
             Self::CSharp(analyzer) => Self::CSharp(analyzer.update_all()),
@@ -239,8 +240,13 @@ impl IAnalyzer for MultiAnalyzer {
     fn get_analyzed_files(&self) -> BTreeSet<ProjectFile> {
         self.delegates
             .values()
-            .flat_map(|delegate| delegate.analyzer().get_analyzed_files())
-            .collect()
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|delegate| delegate.analyzer().get_analyzed_files())
+            .reduce(BTreeSet::new, |mut acc, files| {
+                acc.extend(files);
+                acc
+            })
     }
 
     fn languages(&self) -> BTreeSet<Language> {
@@ -251,6 +257,8 @@ impl IAnalyzer for MultiAnalyzer {
         let delegates = self
             .delegates
             .iter()
+            .collect::<Vec<_>>()
+            .into_par_iter()
             .map(|(language, delegate)| (*language, delegate.update(changed_files)))
             .collect();
         Self::new(delegates)
@@ -260,6 +268,8 @@ impl IAnalyzer for MultiAnalyzer {
         let delegates = self
             .delegates
             .iter()
+            .collect::<Vec<_>>()
+            .into_par_iter()
             .map(|(language, delegate)| (*language, delegate.update_all()))
             .collect();
         Self::new(delegates)
@@ -278,7 +288,9 @@ impl IAnalyzer for MultiAnalyzer {
         let mut declarations: Vec<_> = self
             .delegates
             .values()
-            .flat_map(|delegate| delegate.analyzer().get_all_declarations())
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .flat_map_iter(|delegate| delegate.analyzer().get_all_declarations())
             .collect();
         declarations.sort();
         declarations.dedup();
@@ -295,7 +307,9 @@ impl IAnalyzer for MultiAnalyzer {
         let mut definitions: Vec<_> = self
             .delegates
             .values()
-            .flat_map(|delegate| delegate.analyzer().get_definitions(fq_name))
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .flat_map_iter(|delegate| delegate.analyzer().get_definitions(fq_name))
             .collect();
         definitions.sort();
         definitions.dedup();
@@ -392,8 +406,19 @@ impl IAnalyzer for MultiAnalyzer {
     fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit> {
         self.delegates
             .values()
-            .flat_map(|delegate| delegate.analyzer().search_definitions(pattern, auto_quote))
-            .collect()
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|delegate| delegate.analyzer().search_definitions(pattern, auto_quote))
+            .reduce(BTreeSet::new, |mut acc, definitions| {
+                acc.extend(definitions);
+                acc
+            })
+    }
+
+    fn signatures_of(&self, code_unit: &CodeUnit) -> Vec<String> {
+        self.delegate_for_code_unit(code_unit)
+            .map(|delegate| delegate.analyzer().signatures_of(code_unit))
+            .unwrap_or_default()
     }
 
     fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {

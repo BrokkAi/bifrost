@@ -1864,6 +1864,10 @@ impl IAnalyzer for JavaAnalyzer {
         self.inner.search_definitions(pattern, auto_quote)
     }
 
+    fn signatures_of(&self, code_unit: &CodeUnit) -> Vec<String> {
+        self.inner.signatures_of(code_unit)
+    }
+
     fn contains_tests(&self, file: &ProjectFile) -> bool {
         self.inner.contains_tests(file)
     }

@@ -16,6 +16,7 @@ mod scala_analyzer;
 mod source_content;
 mod tree_sitter_analyzer;
 mod typescript_analyzer;
+mod workspace;
 
 pub use capabilities::{
     CapabilityProvider, ImportAnalysisProvider, TestDetectionProvider, TypeAliasProvider,
@@ -34,10 +35,11 @@ pub use model::{
 };
 pub use multi_analyzer::{AnalyzerDelegate, MultiAnalyzer};
 pub use php_analyzer::PhpAnalyzer;
-pub use project::{Project, TestProject};
+pub use project::{FilesystemProject, Project, TestProject};
 pub use python_analyzer::PythonAnalyzer;
 pub use rust_analyzer::RustAnalyzer;
 pub use scala_analyzer::ScalaAnalyzer;
 pub use source_content::SourceContent;
 pub use tree_sitter_analyzer::{LanguageAdapter, TreeSitterAnalyzer};
 pub use typescript_analyzer::TypescriptAnalyzer;
+pub use workspace::{EmptyAnalyzer, WorkspaceAnalyzer};

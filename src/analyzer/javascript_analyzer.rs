@@ -382,6 +382,10 @@ impl IAnalyzer for JavascriptAnalyzer {
         self.inner.search_definitions(pattern, auto_quote)
     }
 
+    fn signatures_of(&self, code_unit: &CodeUnit) -> Vec<String> {
+        self.inner.signatures_of(code_unit)
+    }
+
     fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {
         Some(self)
     }

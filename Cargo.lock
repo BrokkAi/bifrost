@@ -27,12 +27,15 @@ checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
 name = "brokk_analyzer"
 version = "0.1.0"
 dependencies = [
+ "glob",
  "indicatif",
  "moka",
  "once_cell",
  "pretty_assertions",
  "rayon",
  "regex",
+ "serde",
+ "serde_json",
  "tempfile",
  "tree-sitter",
  "tree-sitter-c-sharp",
@@ -180,6 +183,12 @@ dependencies = [
  "wasip2",
  "wasip3",
 ]
+
+[[package]]
+name = "glob"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
 name = "hashbrown"
@@ -489,6 +498,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
 dependencies = [
  "serde_core",
+ "serde_derive",
 ]
 
 [[package]]

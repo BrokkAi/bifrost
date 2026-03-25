@@ -91,3 +91,101 @@ impl Project for TestProject {
         file.exists().then_some(file)
     }
 }
+
+#[derive(Debug, Clone)]
+pub struct FilesystemProject {
+    root: PathBuf,
+    languages: BTreeSet<Language>,
+}
+
+impl FilesystemProject {
+    pub fn new(root: impl Into<PathBuf>) -> io::Result<Self> {
+        let root = root.into().canonicalize()?;
+        if !root.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("project root is not a directory: {}", root.display()),
+            ));
+        }
+
+        let languages = detect_languages(&root)?;
+        Ok(Self { root, languages })
+    }
+
+    pub fn root_path(&self) -> &Path {
+        &self.root
+    }
+}
+
+impl Project for FilesystemProject {
+    fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn analyzer_languages(&self) -> BTreeSet<Language> {
+        self.languages.clone()
+    }
+
+    fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>> {
+        collect_project_files(&self.root)
+    }
+
+    fn analyzable_files(&self, language: Language) -> io::Result<BTreeSet<ProjectFile>> {
+        let extensions = language.extensions();
+        if extensions.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+
+        let files = self.all_files()?;
+        Ok(files
+            .into_iter()
+            .filter(|file| {
+                file.rel_path()
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| {
+                        let normalized = ext.to_ascii_lowercase();
+                        extensions.contains(&normalized.as_str())
+                    })
+                    .unwrap_or(false)
+            })
+            .collect())
+    }
+
+    fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile> {
+        let file = ProjectFile::new(self.root.clone(), rel_path.to_path_buf());
+        file.exists().then_some(file)
+    }
+}
+
+fn collect_project_files(root: &Path) -> io::Result<BTreeSet<ProjectFile>> {
+    let mut files = BTreeSet::new();
+
+    for entry in WalkDir::new(root) {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+
+        let rel = entry
+            .path()
+            .strip_prefix(root)
+            .expect("walkdir returned a path outside the project root");
+        files.insert(ProjectFile::new(root.to_path_buf(), rel.to_path_buf()));
+    }
+
+    Ok(files)
+}
+
+fn detect_languages(root: &Path) -> io::Result<BTreeSet<Language>> {
+    let mut languages = BTreeSet::new();
+    for file in collect_project_files(root)? {
+        if let Some(extension) = file.rel_path().extension().and_then(|ext| ext.to_str()) {
+            let language = Language::from_extension(extension);
+            if language != Language::None {
+                languages.insert(language);
+            }
+        }
+    }
+    Ok(languages)
+}

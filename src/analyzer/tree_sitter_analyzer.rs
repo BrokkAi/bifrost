@@ -858,7 +858,7 @@ where
         };
 
         self.get_all_declarations()
-            .into_iter()
+            .into_par_iter()
             .filter(|code_unit| !self.adapter.is_anonymous_structure(&code_unit.fq_name()))
             .filter(|code_unit| compiled.is_match(&code_unit.fq_name()))
             .collect()
