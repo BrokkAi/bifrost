@@ -94,6 +94,14 @@ impl crate::analyzer::LanguageAdapter for TypescriptAdapter {
                     visit_ts_function(file, source, child, None, &mut parsed, false);
                 }
                 "lexical_declaration" | "variable_declaration" | "type_alias_declaration" => {
+                    if matches!(child.kind(), "lexical_declaration" | "variable_declaration") {
+                        let raw = node_text(child, source).trim();
+                        if raw.contains("require(") {
+                            module_has_imports = true;
+                            parsed.import_statements.push(raw.to_string());
+                            parsed.imports.extend(parse_js_import_infos(raw));
+                        }
+                    }
                     visit_ts_value(file, source, child, None, &mut parsed, false);
                 }
                 _ => {}
@@ -441,9 +449,10 @@ fn visit_ts_class_like(
         short_name,
     );
     let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
+    let range_node = if exported { node } else { definition };
     parsed.add_code_unit(
         code_unit.clone(),
-        definition,
+        range_node,
         source,
         parent.cloned(),
         Some(top_level.clone()),
@@ -530,9 +539,10 @@ fn visit_ts_function(
         false,
     );
     let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
+    let range_node = if exported { node } else { definition };
     parsed.add_code_unit(
         code_unit.clone(),
-        definition,
+        range_node,
         source,
         parent.cloned(),
         Some(top_level),
@@ -754,7 +764,14 @@ fn visit_ts_enum_member(
         Some(parent.clone()),
         Some(top_level.clone()),
     );
-    parsed.add_signature(code_unit, trim_statement(node_text(node, source)));
+    let raw = trim_statement(node_text(node, source));
+    let suffix = source
+        .get(node.end_byte()..)
+        .map(str::trim_start)
+        .filter(|tail| tail.starts_with(','))
+        .map(|_| ",")
+        .unwrap_or("");
+    parsed.add_signature(code_unit, format!("{raw}{suffix}"));
 }
 
 fn ts_class_signature(node: Node<'_>, source: &str, exported: bool) -> String {
@@ -763,7 +780,11 @@ fn ts_class_signature(node: Node<'_>, source: &str, exported: bool) -> String {
     } else {
         node
     };
-    let text = node_text(definition, source);
+    let text = if node.kind() == "export_statement" {
+        node_text(node, source)
+    } else {
+        node_text(definition, source)
+    };
     let head = trim_statement(text.split('{').next().unwrap_or(text));
     if definition.kind() == "enum_declaration" {
         let open = format!(
@@ -793,7 +814,11 @@ fn ts_function_signature(node: Node<'_>, source: &str, exported: bool) -> String
         node
     };
     let head = trim_statement(
-        node_text(definition, source)
+        if node.kind() == "export_statement" {
+            node_text(node, source)
+        } else {
+            node_text(definition, source)
+        }
             .split('{')
             .next()
             .unwrap_or(node_text(definition, source)),
@@ -913,7 +938,6 @@ fn is_simple_ts_initializer(node: Node<'_>) -> bool {
             | "binary_expression"
             | "identifier"
             | "member_expression"
-            | "new_expression"
     )
 }
 

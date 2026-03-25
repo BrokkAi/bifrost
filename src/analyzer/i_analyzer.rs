@@ -180,6 +180,25 @@ pub trait IAnalyzer: Send + Sync + Any {
         symbols
     }
 
+    fn summarize_symbols(&self, file: &ProjectFile) -> String {
+        let mut lines = Vec::new();
+        for code_unit in self.get_top_level_declarations(file) {
+            if code_unit.is_anonymous() {
+                continue;
+            }
+            lines.push(format!("- {}", code_unit.identifier()));
+            if code_unit.is_class() || code_unit.is_module() {
+                for child in self.get_direct_children(&code_unit) {
+                    if child.is_anonymous() {
+                        continue;
+                    }
+                    lines.push(format!("  - {}", child.identifier()));
+                }
+            }
+        }
+        lines.join("\n")
+    }
+
     fn parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
         let fq_name = code_unit.fq_name();
         let mut last_index = None;

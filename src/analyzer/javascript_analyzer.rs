@@ -82,6 +82,11 @@ impl LanguageAdapter for JavascriptAdapter {
                     visit_js_function(file, source, child, None, &mut parsed, false);
                 }
                 "lexical_declaration" | "variable_declaration" => {
+                    if let Some(raw) = extract_require_statement(child, source) {
+                        module_has_imports = true;
+                        parsed.import_statements.push(raw.clone());
+                        parsed.imports.extend(parse_js_import_infos(&raw));
+                    }
                     visit_js_variable_statement(file, source, child, None, &mut parsed, false);
                 }
                 _ => {}
@@ -441,9 +446,10 @@ fn visit_js_class(
         short_name,
     );
     let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
+    let range_node = if exported { node } else { definition };
     parsed.add_code_unit(
         code_unit.clone(),
-        definition,
+        range_node,
         source,
         parent.cloned(),
         Some(top_level.clone()),
@@ -502,9 +508,10 @@ fn visit_js_function(
         short_name,
     );
     let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
+    let range_node = if exported { node } else { definition };
     parsed.add_code_unit(
         code_unit.clone(),
-        definition,
+        range_node,
         source,
         parent.cloned(),
         Some(top_level),
@@ -720,7 +727,11 @@ fn js_function_signature(node: Node<'_>, source: &str, name: &str, exported: boo
     } else {
         ""
     };
-    format!("{prefix}function {name}{params}{jsx_suffix} ...")
+    with_mutation_comment(
+        format!("{prefix}function {name}{params}{jsx_suffix} ..."),
+        node,
+        source,
+    )
 }
 
 fn js_method_signature(node: Node<'_>, source: &str) -> String {
@@ -766,7 +777,11 @@ fn js_variable_function_signature(
         ""
     };
     let export_prefix = if exported { "export " } else { "" };
-    format!("{export_prefix}{async_prefix}{name}{params}{jsx_suffix} => ...")
+    with_mutation_comment(
+        format!("{export_prefix}{async_prefix}{name}{params}{jsx_suffix} => ..."),
+        value,
+        source,
+    )
 }
 
 fn js_variable_signature(
@@ -819,8 +834,87 @@ fn is_simple_js_initializer(node: Node<'_>) -> bool {
             | "binary_expression"
             | "identifier"
             | "member_expression"
-            | "new_expression"
     )
+}
+
+fn with_mutation_comment(signature: String, node: Node<'_>, source: &str) -> String {
+    let mutations = mutation_names(node, source);
+    if mutations.is_empty() {
+        signature
+    } else {
+        format!("// mutates: {}\n{signature}", mutations.join(", "))
+    }
+}
+
+fn mutation_names(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut names = BTreeSet::new();
+    collect_mutation_names(node, source, node, &mut names);
+    names.into_iter().collect()
+}
+
+fn collect_mutation_names(
+    root: Node<'_>,
+    source: &str,
+    node: Node<'_>,
+    names: &mut BTreeSet<String>,
+) {
+    if node.id() != root.id()
+        && matches!(
+            node.kind(),
+            "function_declaration"
+                | "function_expression"
+                | "arrow_function"
+                | "method_definition"
+                | "class_declaration"
+        )
+    {
+        return;
+    }
+
+    match node.kind() {
+        "assignment_expression" => {
+            if let Some(left) = node.child_by_field_name("left")
+                && let Some(name) = mutation_target_name(left, source)
+            {
+                names.insert(name);
+            }
+        }
+        "update_expression" => {
+            let target = node
+                .child_by_field_name("argument")
+                .or_else(|| node.named_child(0))
+                .or_else(|| node.named_child(1));
+            if let Some(target) = target
+                && let Some(name) = mutation_target_name(target, source)
+            {
+                names.insert(name);
+            }
+        }
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_mutation_names(root, source, child, names);
+    }
+}
+
+fn mutation_target_name(node: Node<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "identifier" | "property_identifier" => Some(node_text(node, source).trim().to_string()),
+        "member_expression" => node
+            .child_by_field_name("property")
+            .and_then(|property| mutation_target_name(property, source))
+            .or_else(|| {
+                node_text(node, source)
+                    .split('.')
+                    .next_back()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string)
+            }),
+        _ => None,
+    }
 }
 
 pub(crate) fn parse_js_import_infos(raw: &str) -> Vec<ImportInfo> {
