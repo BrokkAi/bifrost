@@ -157,6 +157,10 @@ impl ParsedFile {
         self.type_aliases.insert(code_unit);
     }
 
+    pub fn set_primary_range(&mut self, code_unit: &CodeUnit, range: Range) {
+        self.ranges.insert(code_unit.clone(), vec![range]);
+    }
+
     fn remove_code_unit(&mut self, code_unit: &CodeUnit) {
         if let Some(children) = self.children.remove(code_unit) {
             for child in children {
@@ -923,10 +927,11 @@ fn is_comment_like(trimmed_line: &str) -> bool {
         || trimmed_line.starts_with("*/")
         || trimmed_line.starts_with('*')
         || trimmed_line.starts_with("//")
+        || trimmed_line.starts_with("#[")
 }
 
 fn first_comment_offset(line: &str) -> Option<usize> {
-    ["/**", "/*", "//"]
+    ["/**", "/*", "//", "#["]
         .into_iter()
         .filter_map(|marker| line.find(marker))
         .min()

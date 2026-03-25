@@ -5,7 +5,7 @@ pub use analyzer::{
     AnalyzerConfig, AnalyzerDelegate, CSharpAnalyzer, CapabilityProvider, CodeBaseMetrics,
     CodeUnit, CodeUnitType, CppAnalyzer, DeclarationInfo, DeclarationKind, GoAnalyzer, IAnalyzer,
     ImportAnalysisProvider, ImportInfo, JavaAnalyzer, JavascriptAnalyzer, Language, MultiAnalyzer,
-    Project, ProjectFile, PythonAnalyzer, Range, RustAnalyzer, SourceContent,
+    PhpAnalyzer, Project, ProjectFile, PythonAnalyzer, Range, RustAnalyzer, SourceContent,
     TestDetectionProvider, TestProject, TreeSitterAnalyzer, TypeAliasProvider,
     TypeHierarchyProvider, TypescriptAnalyzer,
 };

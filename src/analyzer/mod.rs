@@ -8,6 +8,7 @@ mod java_analyzer;
 mod javascript_analyzer;
 mod model;
 mod multi_analyzer;
+mod php_analyzer;
 mod project;
 mod python_analyzer;
 mod rust_analyzer;
@@ -31,6 +32,7 @@ pub use model::{
     Language, ProjectFile, Range, metrics_from_declarations,
 };
 pub use multi_analyzer::{AnalyzerDelegate, MultiAnalyzer};
+pub use php_analyzer::PhpAnalyzer;
 pub use project::{Project, TestProject};
 pub use python_analyzer::PythonAnalyzer;
 pub use rust_analyzer::RustAnalyzer;
