@@ -19,6 +19,14 @@ pub fn ts_fixture_project() -> TestProject {
 }
 
 #[allow(dead_code)]
+pub fn py_fixture_project() -> TestProject {
+    TestProject::new(
+        std::fs::canonicalize("tests/fixtures/testcode-py").unwrap(),
+        Language::Python,
+    )
+}
+
+#[allow(dead_code)]
 pub fn assert_code_eq(expected: &str, actual: &str) {
     assert_eq!(normalize_code(expected), normalize_code(actual));
 }
@@ -65,6 +73,7 @@ pub fn normalize_nonempty_lines(value: &str) -> String {
         .join("\n")
 }
 
+#[allow(dead_code)]
 pub fn write_file(root: &Path, rel_path: &str, contents: &str) -> ProjectFile {
     let file = ProjectFile::new(root.to_path_buf(), rel_path);
     file.write(contents).unwrap();

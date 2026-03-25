@@ -126,6 +126,18 @@ impl ParsedFile {
         }
     }
 
+    pub fn replace_code_unit(
+        &mut self,
+        code_unit: CodeUnit,
+        node: Node<'_>,
+        source: &str,
+        parent: Option<CodeUnit>,
+        top_level: Option<CodeUnit>,
+    ) {
+        self.remove_code_unit(&code_unit);
+        self.add_code_unit(code_unit, node, source, parent, top_level);
+    }
+
     pub fn set_raw_supertypes(&mut self, code_unit: CodeUnit, raw_supertypes: Vec<String>) {
         self.raw_supertypes.insert(code_unit, raw_supertypes);
     }
@@ -143,6 +155,25 @@ impl ParsedFile {
 
     pub fn mark_type_alias(&mut self, code_unit: CodeUnit) {
         self.type_aliases.insert(code_unit);
+    }
+
+    fn remove_code_unit(&mut self, code_unit: &CodeUnit) {
+        if let Some(children) = self.children.remove(code_unit) {
+            for child in children {
+                self.remove_code_unit(&child);
+            }
+        }
+
+        for siblings in self.children.values_mut() {
+            siblings.retain(|child| child != code_unit);
+        }
+
+        self.top_level_declarations.retain(|existing| existing != code_unit);
+        self.declarations.remove(code_unit);
+        self.raw_supertypes.remove(code_unit);
+        self.signatures.remove(code_unit);
+        self.type_aliases.remove(code_unit);
+        self.ranges.remove(code_unit);
     }
 }
 

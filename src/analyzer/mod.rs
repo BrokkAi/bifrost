@@ -7,6 +7,7 @@ mod javascript_analyzer;
 mod model;
 mod multi_analyzer;
 mod project;
+mod python_analyzer;
 mod rust_analyzer;
 mod source_content;
 mod tree_sitter_analyzer;
@@ -27,6 +28,7 @@ pub use model::{
 };
 pub use multi_analyzer::{AnalyzerDelegate, MultiAnalyzer};
 pub use project::{Project, TestProject};
+pub use python_analyzer::PythonAnalyzer;
 pub use rust_analyzer::RustAnalyzer;
 pub use source_content::SourceContent;
 pub use tree_sitter_analyzer::{LanguageAdapter, TreeSitterAnalyzer};
