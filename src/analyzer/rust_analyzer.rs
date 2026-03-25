@@ -625,7 +625,7 @@ fn visit_rust_field(
 
     let short_name = parent
         .map(|parent| format!("{}.{}", parent.short_name(), name))
-        .unwrap_or_else(|| name.clone());
+        .unwrap_or_else(|| format!("_module_.{name}"));
     let code_unit = CodeUnit::new(
         file.clone(),
         crate::analyzer::CodeUnitType::Field,
@@ -707,6 +707,10 @@ fn visit_rust_impl(
         package_name.to_string(),
         target_name,
     );
+    if !parsed.declarations.contains(&parent) {
+        let top_level = parent.clone();
+        parsed.add_code_unit(parent.clone(), node, source, None, Some(top_level));
+    }
 
     let Some(body) = node.child_by_field_name("body") else {
         return;
