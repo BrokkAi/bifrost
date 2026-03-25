@@ -1,0 +1,16 @@
+[project]
+name = "bifrost-searchtools"
+version = "0.1.0"
+description = "Python client for the bifrost MCP searchtools server"
+requires-python = ">=3.12"
+dependencies = ["mcp>=1.14.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+include = ["bifrost_searchtools/"]
+
+[tool.uv]
+package = false

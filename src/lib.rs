@@ -1,4 +1,5 @@
 pub mod analyzer;
+pub mod mcp_server;
 pub mod searchtools;
 pub mod summary;
 

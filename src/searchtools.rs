@@ -10,34 +10,6 @@ const FILE_SKIM_LIMIT: usize = 20;
 const CLASS_COUNT_LIMIT: usize = 10;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SearchtoolsRequest {
-    pub id: String,
-    pub method: String,
-    #[serde(default)]
-    pub params: serde_json::Value,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct SearchtoolsSuccess<T> {
-    pub id: String,
-    pub ok: bool,
-    pub result: T,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct SearchtoolsFailure {
-    pub id: String,
-    pub ok: bool,
-    pub error: SearchtoolsError,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct SearchtoolsError {
-    pub code: String,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefreshParams {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
