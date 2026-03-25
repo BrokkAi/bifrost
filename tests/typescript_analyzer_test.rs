@@ -465,3 +465,149 @@ fn test_complex_field_initializer_and_multi_assignment_signatures() {
             .trim()
     );
 }
+
+#[test]
+fn test_static_instance_member_overlap() {
+    let analyzer = fixture_analyzer();
+    let file = ProjectFile::new(
+        analyzer.project().root().to_path_buf(),
+        "StaticInstanceOverlap.ts",
+    );
+    let declarations = analyzer.get_declarations(&file);
+    assert!(!declarations.is_empty());
+
+    let color_units: Vec<_> = declarations
+        .iter()
+        .filter(|code_unit| code_unit.fq_name().starts_with("Color."))
+        .cloned()
+        .collect();
+
+    let instance_transparent = color_units
+        .iter()
+        .find(|code_unit| code_unit.fq_name() == "Color.transparent")
+        .unwrap();
+    let static_transparent = color_units
+        .iter()
+        .find(|code_unit| code_unit.fq_name() == "Color.transparent$static")
+        .unwrap();
+    assert!(instance_transparent.is_function());
+    assert!(static_transparent.is_field());
+
+    assert!(color_units
+        .iter()
+        .any(|code_unit| code_unit.fq_name() == "Color.normalize"));
+    assert!(color_units
+        .iter()
+        .any(|code_unit| code_unit.fq_name() == "Color.normalize$static"));
+    assert!(color_units
+        .iter()
+        .any(|code_unit| code_unit.fq_name() == "Color.count"));
+    assert!(color_units
+        .iter()
+        .any(|code_unit| code_unit.fq_name() == "Color.count$static"));
+}
+
+#[test]
+fn test_function_overload_signatures() {
+    let analyzer = fixture_analyzer();
+    let file = ProjectFile::new(analyzer.project().root().to_path_buf(), "Overloads.ts");
+    let skeletons = analyzer.get_skeletons(&file);
+    assert!(!skeletons.is_empty());
+
+    let add = skeletons
+        .keys()
+        .find(|code_unit| code_unit.short_name() == "add" && code_unit.is_function())
+        .unwrap();
+    let add_signatures = analyzer.signatures_of(add);
+    assert_eq!(3, add_signatures.len());
+    assert!(add_signatures.iter().any(|signature| {
+        signature.contains("number") && signature.contains("(a: number, b: number)")
+    }));
+    assert!(add_signatures.iter().any(|signature| {
+        signature.contains("string") && signature.contains("(a: string, b: string)")
+    }));
+    assert!(add_signatures.iter().any(|signature| signature.contains("any")));
+
+    let query = skeletons
+        .keys()
+        .find(|code_unit| code_unit.short_name() == "query" && code_unit.is_function())
+        .unwrap();
+    let query_signatures = analyzer.signatures_of(query);
+    assert_eq!(3, query_signatures.len());
+    assert!(query_signatures.iter().any(|signature| signature.contains('?')));
+
+    let combine = skeletons
+        .keys()
+        .find(|code_unit| code_unit.short_name() == "combine" && code_unit.is_function())
+        .unwrap();
+    let combine_signatures = analyzer.signatures_of(combine);
+    assert_eq!(3, combine_signatures.len());
+    assert!(combine_signatures.iter().any(|signature| signature.contains("...")));
+
+    let map = skeletons
+        .keys()
+        .find(|code_unit| code_unit.short_name() == "map" && code_unit.is_function())
+        .unwrap();
+    let map_signatures = analyzer.signatures_of(map);
+    assert_eq!(3, map_signatures.len());
+    assert!(map_signatures
+        .iter()
+        .any(|signature| signature.contains("[]") && signature.contains("=>")));
+
+    let multiply = analyzer
+        .get_declarations(&file)
+        .into_iter()
+        .find(|code_unit| code_unit.fq_name().contains("multiply"))
+        .unwrap();
+    let multiply_signatures = analyzer.signatures_of(&multiply);
+    assert_eq!(3, multiply_signatures.len());
+    assert!(multiply_signatures
+        .iter()
+        .any(|signature| signature.contains("(a: number, b: number)")));
+    assert!(multiply_signatures
+        .iter()
+        .any(|signature| signature.contains("(a: string, b: number)")));
+}
+
+#[test]
+fn test_identical_overloads_merged_by_lookup_key() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    let file = write_file(
+        root,
+        "IdenticalOverloads.ts",
+        r#"
+            interface Logger {
+                log(message: string): void;
+                log(message: string): void;
+            }
+        "#,
+    );
+    let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+    let declarations = analyzer.get_declarations(&file);
+    let log_methods: Vec<_> = declarations
+        .iter()
+        .filter(|code_unit| code_unit.short_name() == "Logger.log" && code_unit.is_function())
+        .cloned()
+        .collect();
+    assert_eq!(1, log_methods.len());
+    let signatures = analyzer.signatures_of(&log_methods[0]);
+    assert_eq!(1, signatures.len());
+    assert!(signatures[0].contains("log(message: string): void"));
+}
+
+#[test]
+fn test_alias_signature_formatting() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    let file = write_file(root, "AliasTest.ts", "export type Foo = string | number;");
+    let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+    let alias = analyzer
+        .get_declarations(&file)
+        .into_iter()
+        .find(|code_unit| code_unit.short_name().contains("Foo"))
+        .unwrap();
+    let signatures = analyzer.signatures_of(&alias);
+    assert!(!signatures.is_empty());
+    assert_eq!("export type Foo = string | number;", signatures[0]);
+}

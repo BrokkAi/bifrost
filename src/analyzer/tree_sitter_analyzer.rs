@@ -131,10 +131,10 @@ impl ParsedFile {
     }
 
     pub fn add_signature(&mut self, code_unit: CodeUnit, signature: String) {
-        self.signatures
-            .entry(code_unit)
-            .or_default()
-            .push(signature);
+        let entries = self.signatures.entry(code_unit).or_default();
+        if !entries.contains(&signature) {
+            entries.push(signature);
+        }
     }
 
     pub fn add_child(&mut self, parent: CodeUnit, child: CodeUnit) {
@@ -463,7 +463,7 @@ where
         self.state.type_aliases.contains(code_unit)
     }
 
-    fn signatures_of(&self, code_unit: &CodeUnit) -> Vec<String> {
+    pub(crate) fn signatures_of(&self, code_unit: &CodeUnit) -> Vec<String> {
         self.state
             .signatures
             .get(code_unit)

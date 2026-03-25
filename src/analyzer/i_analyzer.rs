@@ -47,6 +47,9 @@ pub trait IAnalyzer: Send + Sync + Any {
     fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String>;
     fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String>;
     fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit>;
+    fn signatures_of(&self, _code_unit: &CodeUnit) -> Vec<String> {
+        Vec::new()
+    }
 
     fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {
         None

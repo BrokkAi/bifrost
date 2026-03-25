@@ -380,6 +380,19 @@ impl IAnalyzer for TypescriptAnalyzer {
     fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit> {
         self.inner.search_definitions(pattern, auto_quote)
     }
+    fn signatures_of(&self, code_unit: &CodeUnit) -> Vec<String> {
+        self.inner
+            .signatures_of(code_unit)
+            .into_iter()
+            .map(|signature| {
+                if self.inner.is_type_alias(code_unit) && !signature.ends_with(';') {
+                    format!("{signature};")
+                } else {
+                    signature
+                }
+            })
+            .collect()
+    }
     fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {
         Some(self)
     }
@@ -524,19 +537,14 @@ fn visit_ts_function(
     if name.is_empty() {
         return;
     }
-    let signature = definition
-        .child_by_field_name("parameters")
-        .map(|node| trim_statement(node_text(node, source)));
     let short_name = parent
         .map(|parent| format!("{}.{}", parent.short_name(), name))
         .unwrap_or(name);
-    let code_unit = CodeUnit::with_signature(
+    let code_unit = CodeUnit::new(
         file.clone(),
         crate::analyzer::CodeUnitType::Function,
         "",
         short_name,
-        signature,
-        false,
     );
     let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
     let range_node = if exported { node } else { definition };
@@ -675,16 +683,16 @@ fn visit_ts_method(
     let name = trim_statement(node_text(name_node, source))
         .trim_matches('"')
         .to_string();
-    let signature = node
-        .child_by_field_name("parameters")
-        .map(|parameters| trim_statement(node_text(parameters, source)));
-    let code_unit = CodeUnit::with_signature(
+    let member_name = if is_static_ts_member(node, source) {
+        format!("{name}$static")
+    } else {
+        name
+    };
+    let code_unit = CodeUnit::new(
         file.clone(),
         crate::analyzer::CodeUnitType::Function,
         "",
-        format!("{}.{}", parent.short_name(), name),
-        signature,
-        false,
+        format!("{}.{}", parent.short_name(), member_name),
     );
     parsed.add_code_unit(
         code_unit.clone(),
@@ -717,11 +725,16 @@ fn visit_ts_field(
     let name = trim_statement(node_text(name_node, source))
         .trim_matches('"')
         .to_string();
+    let member_name = if is_static_ts_member(node, source) {
+        format!("{name}$static")
+    } else {
+        name
+    };
     let code_unit = CodeUnit::new(
         file.clone(),
         crate::analyzer::CodeUnitType::Field,
         "",
-        format!("{}.{}", parent.short_name(), name),
+        format!("{}.{}", parent.short_name(), member_name),
     );
     parsed.add_code_unit(
         code_unit.clone(),
@@ -939,6 +952,14 @@ fn is_simple_ts_initializer(node: Node<'_>) -> bool {
             | "identifier"
             | "member_expression"
     )
+}
+
+fn is_static_ts_member(node: Node<'_>, source: &str) -> bool {
+    let head = node_text(node, source)
+        .split(['{', ';'])
+        .next()
+        .unwrap_or("");
+    head.split_whitespace().any(|token| token == "static")
 }
 
 fn weight_string_set(_key: &CodeUnit, value: &Arc<BTreeSet<String>>) -> u32 {
