@@ -533,6 +533,78 @@ fn test_function_pointer_and_template_parameter_parsing() {
 }
 
 #[test]
+fn test_cpp_arrow_adaptive_builder_header_regression() {
+    let project = inline_cpp_project(&[(
+        ".venv/lib/python3.12/site-packages/pyarrow/include/arrow/array/builder_adaptive.h",
+        r#"
+namespace arrow {
+namespace internal {
+
+struct Status {};
+struct ResizableBuffer {};
+template <bool Cond, typename T>
+struct enable_if {
+  using type = T;
+};
+
+class AdaptiveIntBuilderBase {
+ public:
+  AdaptiveIntBuilderBase(unsigned char start_int_size, void* pool, long long alignment = 8);
+
+ protected:
+  template <typename new_type, typename old_type>
+  typename enable_if<sizeof(old_type) >= sizeof(new_type), Status>::type
+  ExpandIntSizeInternal();
+  template <typename new_type, typename old_type>
+  typename enable_if<(sizeof(old_type) < sizeof(new_type)), Status>::type
+  ExpandIntSizeInternal();
+
+  ResizableBuffer* data_;
+  unsigned char* raw_data_ = NULLPTR;
+
+  const unsigned char start_int_size_;
+  unsigned char int_size_;
+
+  static constexpr int pending_size_ = 1024;
+  unsigned char pending_valid_[pending_size_];
+  unsigned long long pending_data_[pending_size_];
+  int pending_pos_ = 0;
+  bool pending_has_nulls_ = false;
+};
+
+}  // namespace internal
+}  // namespace arrow
+"#,
+    )]);
+    let analyzer = CppAnalyzer::from_project(project.clone());
+    let file = ProjectFile::new(
+        project.root().to_path_buf(),
+        ".venv/lib/python3.12/site-packages/pyarrow/include/arrow/array/builder_adaptive.h",
+    );
+
+    let declarations = analyzer.get_declarations(&file);
+    assert!(
+        declarations.iter().any(|cu| cu.is_class() && cu.short_name().contains("AdaptiveIntBuilderBase"))
+    );
+
+    let fields: BTreeSet<_> = declarations
+        .iter()
+        .filter(|cu| cu.kind() == CodeUnitType::Field)
+        .map(|cu| cu.short_name().to_string())
+        .collect();
+    assert!(fields.contains("AdaptiveIntBuilderBase.data_"));
+    assert!(fields.contains("AdaptiveIntBuilderBase.raw_data_"));
+    assert!(fields.contains("AdaptiveIntBuilderBase.start_int_size_"));
+    assert!(fields.contains("AdaptiveIntBuilderBase.int_size_"));
+    assert!(fields.contains("AdaptiveIntBuilderBase.pending_size_"));
+    assert!(fields.contains("AdaptiveIntBuilderBase.pending_valid_"));
+    assert!(fields.contains("AdaptiveIntBuilderBase.pending_data_"));
+    assert!(fields.contains("AdaptiveIntBuilderBase.pending_pos_"));
+    assert!(fields.contains("AdaptiveIntBuilderBase.pending_has_nulls_"));
+    assert!(!fields.iter().any(|name| name.is_empty()));
+}
+
+#[test]
 fn test_constructor_destructor_scoped_definition_and_decl_vs_def_behavior() {
     let analyzer = fixture_analyzer();
     let ctor_dtor = ProjectFile::new(analyzer.project().root().to_path_buf(), "ctor_dtor.h");

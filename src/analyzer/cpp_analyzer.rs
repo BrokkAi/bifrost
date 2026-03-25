@@ -692,7 +692,15 @@ impl<'a> CppVisitor<'a> {
                 && let Some(inner) = child.child_by_field_name("declarator")
             {
                 self.visit_variable_declaration(node, inner, scope, true);
-            } else if child.kind() != "function_declarator" {
+            } else if matches!(
+                child.kind(),
+                "identifier"
+                    | "field_identifier"
+                    | "pointer_declarator"
+                    | "reference_declarator"
+                    | "array_declarator"
+                    | "parenthesized_declarator"
+            ) {
                 self.visit_variable_declaration(node, child, scope, true);
             }
         }
@@ -707,7 +715,12 @@ impl<'a> CppVisitor<'a> {
                 self.visit_variable_declaration(node, inner, scope, false);
             } else if matches!(
                 child.kind(),
-                "identifier" | "pointer_declarator" | "reference_declarator" | "array_declarator"
+                "identifier"
+                    | "field_identifier"
+                    | "pointer_declarator"
+                    | "reference_declarator"
+                    | "array_declarator"
+                    | "parenthesized_declarator"
             ) {
                 self.visit_variable_declaration(node, child, scope, false);
             }
@@ -852,7 +865,10 @@ fn extract_declarator_name(node: Node<'_>, source: &str) -> String {
 
 fn extract_variable_name(node: Node<'_>, source: &str) -> Option<String> {
     match node.kind() {
-        "identifier" | "field_identifier" => Some(node_text(node, source).trim().to_string()),
+        "identifier" | "field_identifier" => {
+            let name = node_text(node, source).trim().to_string();
+            (!name.is_empty()).then_some(name)
+        }
         _ => node
             .child_by_field_name("declarator")
             .or_else(|| node.child_by_field_name("name"))

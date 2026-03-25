@@ -173,13 +173,17 @@ impl CodeUnit {
         signature: Option<String>,
         synthetic: bool,
     ) -> Self {
+        let package_name = package_name.into();
         let short_name = short_name.into();
-        assert!(!short_name.is_empty(), "short_name must not be empty");
+        assert!(
+            !short_name.is_empty(),
+            "short_name must not be empty (kind={kind:?}, package_name={package_name:?}, source={source}, signature={signature:?}, synthetic={synthetic})"
+        );
 
         Self {
             source,
             kind,
-            package_name: package_name.into(),
+            package_name,
             short_name,
             signature,
             synthetic,
