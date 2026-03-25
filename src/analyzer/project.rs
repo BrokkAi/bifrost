@@ -1,4 +1,5 @@
 use crate::analyzer::{Language, ProjectFile};
+use ignore::WalkBuilder;
 use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -156,14 +157,32 @@ impl Project for FilesystemProject {
         let file = ProjectFile::new(self.root.clone(), rel_path.to_path_buf());
         file.exists().then_some(file)
     }
+
+    fn is_gitignored(&self, rel_path: &Path) -> bool {
+        let file = ProjectFile::new(self.root.clone(), rel_path.to_path_buf());
+        file.exists()
+            && self
+                .all_files()
+                .map(|files| !files.contains(&file))
+                .unwrap_or(false)
+    }
 }
 
 fn collect_project_files(root: &Path) -> io::Result<BTreeSet<ProjectFile>> {
     let mut files = BTreeSet::new();
+    let walker = WalkBuilder::new(root)
+        .hidden(false)
+        .ignore(false)
+        .git_ignore(true)
+        .git_global(false)
+        .git_exclude(true)
+        .parents(true)
+        .require_git(true)
+        .build();
 
-    for entry in WalkDir::new(root) {
-        let entry = entry?;
-        if !entry.file_type().is_file() {
+    for entry in walker {
+        let entry = entry.map_err(|err| io::Error::other(err.to_string()))?;
+        if !entry.file_type().is_some_and(|file_type| file_type.is_file()) {
             continue;
         }
 
