@@ -46,6 +46,7 @@ After this change, this repository will contain a Rust library that reproduces t
 - [x] (2026-03-25T02:21Z) Added `PythonAnalyzer`, integrated it into the public API and `MultiAnalyzer`, and translated the current Brokk Python analyzer test surface into Rust: core analyzer parity, decorators, module code units, relative-import behavior, type hierarchy, update behavior, and test detection. This required Python-specific comment expansion, property setter/deleter filtering, direct child attachment for function-local classes, Python "last definition wins" replacement semantics, and Brokk-style module-level control-flow capture limits. `cargo test` passes with the Python suite included.
 - [x] (2026-03-25T03:34Z) Enshrined the rule that once a language is in scope, acceptance means the full upstream Brokk analyzer test surface for that language translated into Rust, not a smaller "focused parity" subset.
 - [x] (2026-03-25T03:34Z) Added `CppAnalyzer`, integrated it into the public API and `MultiAnalyzer`, and translated the current Brokk `CppAnalyzerTest` surface into Rust fixture and inline tests. This required anonymous-namespace traversal, template-signature-aware class/function identities, Brokk-style in-class declaration vs out-of-line definition handling, per-declarator field skeleton rendering with literal-only initializer preservation, and C++ signature normalization for templates/qualifiers/operators. `cargo test`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings` all pass with the C++ suite included.
+- [x] (2026-03-25T04:05Z) Added `CSharpAnalyzer`, integrated it into the public API and `MultiAnalyzer`, and translated the Brokk C# analyzer, update, and test-detection suites into Rust. This required namespace/class/interface/struct traversal, Brokk-style method/property/constructor skeleton rendering, per-declarator C# field skeletons with literal-only initializer preservation, UTF-8 BOM-safe declaration extraction, and semantic test detection from NUnit/xUnit-style attributes including qualified names and `Attribute` suffixes. The translated C# suite passes.
 
 ## Surprises & Discoveries
 
@@ -141,6 +142,9 @@ After this change, this repository will contain a Rust library that reproduces t
 
 - Observation: the Brokk C++ surface relies on keeping declaration-only class members distinct from out-of-line definitions even when they share the same logical fq-name/signature.
   Evidence: `decl_vs_def.h` parity only matched after the Rust C++ analyzer kept the in-class declaration for class skeleton rendering while also publishing the out-of-line definition as the preferred top-level definition.
+
+- Observation: C# test detection is simpler and more reliable as file-level semantic attribute matching than as a full AST-side capability.
+  Evidence: the translated `CSharpTestDetectionTest` cases passed once Rust matched `[Test]`, `[Fact]`, `[Theory]`, qualified forms, and `Attribute` suffixes directly from source text while excluding non-test attributes like `[NotATest]`.
 
 ## Decision Log
 

@@ -1,6 +1,7 @@
 mod capabilities;
 mod config;
 mod cpp_analyzer;
+mod csharp_analyzer;
 mod go_analyzer;
 mod i_analyzer;
 mod java_analyzer;
@@ -20,6 +21,7 @@ pub use capabilities::{
 };
 pub use config::AnalyzerConfig;
 pub use cpp_analyzer::CppAnalyzer;
+pub use csharp_analyzer::CSharpAnalyzer;
 pub use go_analyzer::GoAnalyzer;
 pub use i_analyzer::IAnalyzer;
 pub use java_analyzer::JavaAnalyzer;

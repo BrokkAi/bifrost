@@ -23,6 +23,7 @@ tree-sitter-javascript = "0.25.0"
 tree-sitter-python = "0.25.0"
 
 # Grammars that still need older published releases for this port.
+tree-sitter-c-sharp = "0.23.1"
 tree-sitter-cpp = "0.23.4"
 tree-sitter-java = "0.23.5"
 tree-sitter-rust = "0.24.0"

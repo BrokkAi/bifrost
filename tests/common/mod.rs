@@ -35,6 +35,14 @@ pub fn cpp_fixture_project() -> TestProject {
 }
 
 #[allow(dead_code)]
+pub fn csharp_fixture_project() -> TestProject {
+    TestProject::new(
+        std::fs::canonicalize("tests/fixtures/testcode-cs").unwrap(),
+        Language::CSharp,
+    )
+}
+
+#[allow(dead_code)]
 pub fn assert_code_eq(expected: &str, actual: &str) {
     assert_eq!(normalize_code(expected), normalize_code(actual));
 }
