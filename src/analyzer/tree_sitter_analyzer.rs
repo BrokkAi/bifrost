@@ -168,7 +168,8 @@ impl ParsedFile {
             siblings.retain(|child| child != code_unit);
         }
 
-        self.top_level_declarations.retain(|existing| existing != code_unit);
+        self.top_level_declarations
+            .retain(|existing| existing != code_unit);
         self.declarations.remove(code_unit);
         self.raw_supertypes.remove(code_unit);
         self.signatures.remove(code_unit);

@@ -40,10 +40,26 @@ fn test_decorated_top_level_function_and_class() {
     let analyzer = PythonAnalyzer::from_project(project);
     let declarations = analyzer.get_declarations(&file);
 
-    assert!(declarations.iter().any(|cu| cu.fq_name() == "decorators.top_func"));
-    assert!(declarations.iter().any(|cu| cu.fq_name() == "decorators.TopClass"));
-    assert!(declarations.iter().any(|cu| cu.fq_name() == "decorators.TopClass.method"));
-    assert!(declarations.iter().any(|cu| cu.fq_name() == "decorators.TopClass.static_m"));
+    assert!(
+        declarations
+            .iter()
+            .any(|cu| cu.fq_name() == "decorators.top_func")
+    );
+    assert!(
+        declarations
+            .iter()
+            .any(|cu| cu.fq_name() == "decorators.TopClass")
+    );
+    assert!(
+        declarations
+            .iter()
+            .any(|cu| cu.fq_name() == "decorators.TopClass.method")
+    );
+    assert!(
+        declarations
+            .iter()
+            .any(|cu| cu.fq_name() == "decorators.TopClass.static_m")
+    );
 }
 
 #[test]
@@ -69,8 +85,16 @@ fn test_decorated_nested_in_function_and_class() {
     let analyzer = PythonAnalyzer::from_project(project);
     let declarations = analyzer.get_declarations(&file);
 
-    assert!(declarations.iter().any(|cu| cu.fq_name() == "decorators.outer$Inner"));
-    assert!(declarations.iter().any(|cu| cu.fq_name() == "decorators.outer$Inner.im"));
+    assert!(
+        declarations
+            .iter()
+            .any(|cu| cu.fq_name() == "decorators.outer$Inner")
+    );
+    assert!(
+        declarations
+            .iter()
+            .any(|cu| cu.fq_name() == "decorators.outer$Inner.im")
+    );
 }
 
 #[test]
@@ -97,6 +121,14 @@ fn test_decorated_declarations_in_top_level_conditional() {
     let analyzer = PythonAnalyzer::from_project(project);
     let declarations = analyzer.get_declarations(&file);
 
-    assert!(declarations.iter().any(|cu| cu.fq_name() == "decorators.cond_func"));
-    assert!(declarations.iter().any(|cu| cu.fq_name() == "decorators.CondClass"));
+    assert!(
+        declarations
+            .iter()
+            .any(|cu| cu.fq_name() == "decorators.cond_func")
+    );
+    assert!(
+        declarations
+            .iter()
+            .any(|cu| cu.fq_name() == "decorators.CondClass")
+    );
 }

@@ -1,7 +1,7 @@
 use crate::analyzer::{
-    CodeUnit, DeclarationInfo, GoAnalyzer, IAnalyzer, ImportAnalysisProvider, ImportInfo,
-    JavaAnalyzer, JavascriptAnalyzer, Language, Project, ProjectFile, PythonAnalyzer, Range,
-    RustAnalyzer, TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider,
+    CodeUnit, CppAnalyzer, DeclarationInfo, GoAnalyzer, IAnalyzer, ImportAnalysisProvider,
+    ImportInfo, JavaAnalyzer, JavascriptAnalyzer, Language, Project, ProjectFile, PythonAnalyzer,
+    Range, RustAnalyzer, TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider,
     TypescriptAnalyzer,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Clone)]
 pub enum AnalyzerDelegate {
     Java(JavaAnalyzer),
+    Cpp(CppAnalyzer),
     Go(GoAnalyzer),
     JavaScript(JavascriptAnalyzer),
     Python(PythonAnalyzer),
@@ -20,6 +21,7 @@ impl AnalyzerDelegate {
     fn analyzer(&self) -> &dyn IAnalyzer {
         match self {
             Self::Java(analyzer) => analyzer,
+            Self::Cpp(analyzer) => analyzer,
             Self::Go(analyzer) => analyzer,
             Self::JavaScript(analyzer) => analyzer,
             Self::Python(analyzer) => analyzer,
@@ -31,6 +33,7 @@ impl AnalyzerDelegate {
     fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {
         match self {
             Self::Java(analyzer) => Some(analyzer),
+            Self::Cpp(analyzer) => Some(analyzer),
             Self::Go(analyzer) => Some(analyzer),
             Self::JavaScript(analyzer) => Some(analyzer),
             Self::Python(analyzer) => Some(analyzer),
@@ -42,6 +45,7 @@ impl AnalyzerDelegate {
     fn type_hierarchy_provider(&self) -> Option<&dyn TypeHierarchyProvider> {
         match self {
             Self::Java(analyzer) => Some(analyzer),
+            Self::Cpp(analyzer) => analyzer.type_hierarchy_provider(),
             Self::Go(analyzer) => analyzer.type_hierarchy_provider(),
             Self::JavaScript(analyzer) => analyzer.type_hierarchy_provider(),
             Self::Python(analyzer) => Some(analyzer),
@@ -53,6 +57,7 @@ impl AnalyzerDelegate {
     fn type_alias_provider(&self) -> Option<&dyn TypeAliasProvider> {
         match self {
             Self::Java(analyzer) => analyzer.type_alias_provider(),
+            Self::Cpp(analyzer) => analyzer.type_alias_provider(),
             Self::Go(analyzer) => analyzer.type_alias_provider(),
             Self::JavaScript(analyzer) => analyzer.type_alias_provider(),
             Self::Python(analyzer) => analyzer.type_alias_provider(),
@@ -64,6 +69,7 @@ impl AnalyzerDelegate {
     fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {
         match self {
             Self::Java(analyzer) => Some(analyzer),
+            Self::Cpp(analyzer) => analyzer.test_detection_provider(),
             Self::Go(analyzer) => Some(analyzer),
             Self::JavaScript(analyzer) => Some(analyzer),
             Self::Python(analyzer) => Some(analyzer),
@@ -75,6 +81,7 @@ impl AnalyzerDelegate {
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
         match self {
             Self::Java(analyzer) => Self::Java(analyzer.update(changed_files)),
+            Self::Cpp(analyzer) => Self::Cpp(analyzer.update(changed_files)),
             Self::Go(analyzer) => Self::Go(analyzer.update(changed_files)),
             Self::JavaScript(analyzer) => Self::JavaScript(analyzer.update(changed_files)),
             Self::Python(analyzer) => Self::Python(analyzer.update(changed_files)),
@@ -86,6 +93,7 @@ impl AnalyzerDelegate {
     fn update_all(&self) -> Self {
         match self {
             Self::Java(analyzer) => Self::Java(analyzer.update_all()),
+            Self::Cpp(analyzer) => Self::Cpp(analyzer.update_all()),
             Self::Go(analyzer) => Self::Go(analyzer.update_all()),
             Self::JavaScript(analyzer) => Self::JavaScript(analyzer.update_all()),
             Self::Python(analyzer) => Self::Python(analyzer.update_all()),

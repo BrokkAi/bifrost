@@ -53,10 +53,26 @@ fn test_import_and_require_statements() {
     assert_eq!(expected, imports);
 
     let require_imports = analyzer.import_statements_of(&require_file);
-    assert!(require_imports.iter().any(|line| line.contains("require('path')")));
-    assert!(require_imports.iter().any(|line| line.contains("require('fs')")));
-    assert!(require_imports.iter().any(|line| line.contains("require('./local-module')")));
-    assert!(require_imports.iter().any(|line| line.contains("require('../other')")));
+    assert!(
+        require_imports
+            .iter()
+            .any(|line| line.contains("require('path')"))
+    );
+    assert!(
+        require_imports
+            .iter()
+            .any(|line| line.contains("require('fs')"))
+    );
+    assert!(
+        require_imports
+            .iter()
+            .any(|line| line.contains("require('./local-module')"))
+    );
+    assert!(
+        require_imports
+            .iter()
+            .any(|line| line.contains("require('../other')"))
+    );
     assert_eq!(4, require_imports.len());
 }
 
@@ -121,7 +137,11 @@ fn test_resolve_imports_relevant_imports_and_could_import_file() {
         "mixed.ts",
         "import { val } from './mod1';\nconst { otherVal } = require('./mod2');\n",
     );
-    write_file(root, "lib/index.ts", "export function libFunc(): string { return 'lib'; }\n");
+    write_file(
+        root,
+        "lib/index.ts",
+        "export function libFunc(): string { return 'lib'; }\n",
+    );
     write_file(
         root,
         "dir_main.ts",
@@ -132,7 +152,11 @@ fn test_resolve_imports_relevant_imports_and_could_import_file() {
         "require_dir.ts",
         "const { libFunc } = require('./lib/index');\nlibFunc();\n",
     );
-    write_file(root, "util-dir.ts", "export function fromFile(): number { return 1; }\n");
+    write_file(
+        root,
+        "util-dir.ts",
+        "export function fromFile(): number { return 1; }\n",
+    );
     write_file(
         root,
         "util-dir/index.ts",
@@ -158,7 +182,11 @@ fn test_resolve_imports_relevant_imports_and_could_import_file() {
         "require_app.ts",
         "const fs = require('fs');\nconst { readFile } = require('fs');\nconst path = require('path');\nexport function readConfig(): void { fs.readFileSync('config.json'); readFile('other.json', () => {}); }\nexport function unusedFunction(): number { return 1; }\n",
     );
-    write_file(root, "src/utils/helper.ts", "export function X(): void {}\n");
+    write_file(
+        root,
+        "src/utils/helper.ts",
+        "export function X(): void {}\n",
+    );
     write_file(
         root,
         "src/rel_main.ts",
@@ -175,7 +203,11 @@ fn test_resolve_imports_relevant_imports_and_could_import_file() {
         "src/external.ts",
         "import _ from 'lodash';\nfunction foo(): void {}\n",
     );
-    write_file(root, "src/utils/index.ts", "export function something(): void {}\n");
+    write_file(
+        root,
+        "src/utils/index.ts",
+        "export function something(): void {}\n",
+    );
     write_file(
         root,
         "src/index_main.ts",
@@ -195,12 +227,27 @@ fn test_resolve_imports_relevant_imports_and_could_import_file() {
     );
     let wildcard_imports =
         analyzer.imported_code_units_of(&ProjectFile::new(root.to_path_buf(), "calculator.ts"));
-    assert!(wildcard_imports.iter().any(|code_unit| code_unit.identifier() == "add"));
-    assert!(wildcard_imports.iter().any(|code_unit| code_unit.identifier() == "subtract"));
-    assert!(wildcard_imports.iter().any(|code_unit| code_unit.identifier() == "PI"));
+    assert!(
+        wildcard_imports
+            .iter()
+            .any(|code_unit| code_unit.identifier() == "add")
+    );
+    assert!(
+        wildcard_imports
+            .iter()
+            .any(|code_unit| code_unit.identifier() == "subtract")
+    );
+    assert!(
+        wildcard_imports
+            .iter()
+            .any(|code_unit| code_unit.identifier() == "PI")
+    );
     assert!(
         analyzer
-            .imported_code_units_of(&ProjectFile::new(root.to_path_buf(), "src/some/dir/ChildService.ts"))
+            .imported_code_units_of(&ProjectFile::new(
+                root.to_path_buf(),
+                "src/some/dir/ChildService.ts"
+            ))
             .iter()
             .any(|code_unit| {
                 code_unit.identifier() == "BaseService"
@@ -228,8 +275,16 @@ fn test_resolve_imports_relevant_imports_and_could_import_file() {
     );
     let mixed_imports =
         analyzer.imported_code_units_of(&ProjectFile::new(root.to_path_buf(), "mixed.ts"));
-    assert!(mixed_imports.iter().any(|code_unit| code_unit.identifier().ends_with("val")));
-    assert!(mixed_imports.iter().any(|code_unit| code_unit.identifier().ends_with("otherVal")));
+    assert!(
+        mixed_imports
+            .iter()
+            .any(|code_unit| code_unit.identifier().ends_with("val"))
+    );
+    assert!(
+        mixed_imports
+            .iter()
+            .any(|code_unit| code_unit.identifier().ends_with("otherVal"))
+    );
     assert!(
         analyzer
             .imported_code_units_of(&ProjectFile::new(root.to_path_buf(), "dir_main.ts"))
@@ -251,15 +306,25 @@ fn test_resolve_imports_relevant_imports_and_could_import_file() {
     let explicit_imports =
         analyzer.imported_code_units_of(&ProjectFile::new(root.to_path_buf(), "explicit_file.ts"));
     assert!(explicit_imports.iter().any(|code_unit| {
-        code_unit.identifier() == "fromFile" && code_unit.source().rel_path() == Path::new("util-dir.ts")
+        code_unit.identifier() == "fromFile"
+            && code_unit.source().rel_path() == Path::new("util-dir.ts")
     }));
-    assert!(!explicit_imports.iter().any(|code_unit| {
-        code_unit.source().rel_path() == Path::new("util-dir/index.ts")
-    }));
+    assert!(
+        !explicit_imports
+            .iter()
+            .any(|code_unit| { code_unit.source().rel_path() == Path::new("util-dir/index.ts") })
+    );
 
-    let do_work = analyzer.get_definitions("doWork").into_iter().next().unwrap();
+    let do_work = analyzer
+        .get_definitions("doWork")
+        .into_iter()
+        .next()
+        .unwrap();
     let relevant = analyzer.relevant_imports_for(&do_work);
-    assert_eq!(BTreeSet::from(["import { Used } from './used';".to_string()]), relevant);
+    assert_eq!(
+        BTreeSet::from(["import { Used } from './used';".to_string()]),
+        relevant
+    );
 
     let identifiers = analyzer.extract_type_identifiers(
         r#"
@@ -278,9 +343,21 @@ fn test_resolve_imports_relevant_imports_and_could_import_file() {
         .next()
         .unwrap();
     let read_relevant = analyzer.relevant_imports_for(&read_config);
-    assert!(read_relevant.iter().any(|line| line.contains("const fs = require('fs')")));
-    assert!(read_relevant.iter().any(|line| line.contains("const { readFile } = require('fs')")));
-    assert!(!read_relevant.iter().any(|line| line.contains("const path = require('path')")));
+    assert!(
+        read_relevant
+            .iter()
+            .any(|line| line.contains("const fs = require('fs')"))
+    );
+    assert!(
+        read_relevant
+            .iter()
+            .any(|line| line.contains("const { readFile } = require('fs')"))
+    );
+    assert!(
+        !read_relevant
+            .iter()
+            .any(|line| line.contains("const path = require('path')"))
+    );
 
     let rel_main = ProjectFile::new(root.to_path_buf(), "src/rel_main.ts");
     let rel_imports = analyzer.import_info_of(&rel_main);

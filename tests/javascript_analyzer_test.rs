@@ -34,7 +34,12 @@ fn test_javascript_jsx_skeletons() {
         "",
         "LocalJsxArrowFn",
     );
-    let plain_jsx = CodeUnit::new(hello_jsx.clone(), CodeUnitType::Function, "", "PlainJsxFunc");
+    let plain_jsx = CodeUnit::new(
+        hello_jsx.clone(),
+        CodeUnitType::Function,
+        "",
+        "PlainJsxFunc",
+    );
 
     assert!(skel_jsx.contains_key(&jsx_class));
     assert!(skel_jsx.contains_key(&jsx_arrow));
@@ -52,7 +57,10 @@ fn test_javascript_jsx_skeletons() {
         "export JsxArrowFnComponent({ name }): JSX.Element => ...",
         skel_jsx.get(&jsx_arrow).unwrap(),
     );
-    assert_code_eq("LocalJsxArrowFn() => ...", skel_jsx.get(&local_arrow).unwrap());
+    assert_code_eq(
+        "LocalJsxArrowFn() => ...",
+        skel_jsx.get(&local_arrow).unwrap(),
+    );
     assert_code_eq(
         "function PlainJsxFunc() ...",
         skel_jsx.get(&plain_jsx).unwrap(),
@@ -100,7 +108,12 @@ fn test_javascript_get_symbols() {
             "",
             "JsxArrowFnComponent",
         ),
-        CodeUnit::new(vars_js.clone(), CodeUnitType::Field, "", "Vars.js.TOP_CONST_JS"),
+        CodeUnit::new(
+            vars_js.clone(),
+            CodeUnitType::Field,
+            "",
+            "Vars.js.TOP_CONST_JS",
+        ),
     ]));
     assert_eq!(
         BTreeSet::from([
@@ -145,7 +158,8 @@ fn test_javascript_get_symbols() {
 #[test]
 fn test_jsx_features_skeletons() {
     let analyzer = fixture_analyzer();
-    let features_file = ProjectFile::new(analyzer.project().root().to_path_buf(), "FeaturesTest.jsx");
+    let features_file =
+        ProjectFile::new(analyzer.project().root().to_path_buf(), "FeaturesTest.jsx");
     let skeletons = analyzer.get_skeletons(&features_file);
 
     let module = CodeUnit::new(
@@ -254,11 +268,27 @@ fn test_javascript_top_level_variables_and_usage_page_imports() {
     let root = analyzer.project().root().to_path_buf();
     let vars_file = ProjectFile::new(root.clone(), "Vars.js");
     let skeletons = analyzer.get_skeletons(&vars_file);
-    let top_const = CodeUnit::new(vars_file.clone(), CodeUnitType::Field, "", "Vars.js.TOP_CONST_JS");
-    let local_var = CodeUnit::new(vars_file.clone(), CodeUnitType::Field, "", "Vars.js.localVarJs");
+    let top_const = CodeUnit::new(
+        vars_file.clone(),
+        CodeUnitType::Field,
+        "",
+        "Vars.js.TOP_CONST_JS",
+    );
+    let local_var = CodeUnit::new(
+        vars_file.clone(),
+        CodeUnitType::Field,
+        "",
+        "Vars.js.localVarJs",
+    );
 
-    assert_eq!("export const TOP_CONST_JS = 123", skeletons.get(&top_const).unwrap().trim());
-    assert_eq!("let localVarJs = \"abc\"", skeletons.get(&local_var).unwrap().trim());
+    assert_eq!(
+        "export const TOP_CONST_JS = 123",
+        skeletons.get(&top_const).unwrap().trim()
+    );
+    assert_eq!(
+        "let localVarJs = \"abc\"",
+        skeletons.get(&local_var).unwrap().trim()
+    );
     assert!(analyzer.get_declarations(&vars_file).contains(&top_const));
     assert!(analyzer.get_declarations(&vars_file).contains(&local_var));
 
@@ -304,11 +334,23 @@ fn test_get_skeleton_header_members_definitions_and_search() {
 
     let jsx_members = analyzer.get_members_in_class(&definition(&analyzer, "JsxClass"));
     assert_eq!(1, jsx_members.len());
-    assert!(jsx_members.iter().any(|code_unit| code_unit.fq_name() == "JsxClass.render"));
+    assert!(
+        jsx_members
+            .iter()
+            .any(|code_unit| code_unit.fq_name() == "JsxClass.render")
+    );
     let hello_members = analyzer.get_members_in_class(&definition(&analyzer, "Hello"));
     assert_eq!(1, hello_members.len());
-    assert!(hello_members.iter().any(|code_unit| code_unit.fq_name() == "Hello.greet"));
-    assert!(analyzer.get_members_in_class(&definition(&analyzer, "util")).is_empty());
+    assert!(
+        hello_members
+            .iter()
+            .any(|code_unit| code_unit.fq_name() == "Hello.greet")
+    );
+    assert!(
+        analyzer
+            .get_members_in_class(&definition(&analyzer, "util"))
+            .is_empty()
+    );
 
     assert_eq!(
         "Hello.jsx",
@@ -354,7 +396,10 @@ fn test_get_skeleton_header_members_definitions_and_search() {
         .into_iter()
         .map(|code_unit| code_unit.fq_name())
         .collect();
-    assert_eq!(BTreeSet::from(["JsxClass.render".to_string()]), render_results);
+    assert_eq!(
+        BTreeSet::from(["JsxClass.render".to_string()]),
+        render_results
+    );
 
     let lower: BTreeSet<_> = analyzer
         .search_definitions("hello", true)
@@ -387,7 +432,9 @@ fn test_get_class_and_method_sources_js() {
             greet() { console.log("hi"); }
         }
         "#,
-        &analyzer.get_source(&definition(&analyzer, "Hello"), true).unwrap(),
+        &analyzer
+            .get_source(&definition(&analyzer, "Hello"), true)
+            .unwrap(),
     );
     assert_code_eq(
         r#"
@@ -419,7 +466,9 @@ fn test_get_class_and_method_sources_js() {
     );
     assert_code_eq(
         r#"export function util() { return 42; }"#,
-        &analyzer.get_source(&definition(&analyzer, "util"), true).unwrap(),
+        &analyzer
+            .get_source(&definition(&analyzer, "util"), true)
+            .unwrap(),
     );
 }
 
@@ -450,7 +499,11 @@ fn test_build_related_identifiers_module_cu_and_field_signatures() {
         .into_iter()
         .find(|code_unit| code_unit.kind() == CodeUnitType::Module)
         .unwrap();
-    assert!(analyzer.get_definitions(module.short_name()).contains(&module));
+    assert!(
+        analyzer
+            .get_definitions(module.short_name())
+            .contains(&module)
+    );
 
     let temp = tempdir().unwrap();
     let root = temp.path();

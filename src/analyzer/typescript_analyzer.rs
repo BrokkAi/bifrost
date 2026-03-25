@@ -832,9 +832,9 @@ fn ts_function_signature(node: Node<'_>, source: &str, exported: bool) -> String
         } else {
             node_text(definition, source)
         }
-            .split('{')
-            .next()
-            .unwrap_or(node_text(definition, source)),
+        .split('{')
+        .next()
+        .unwrap_or(node_text(definition, source)),
     );
     let head = if exported && !head.starts_with("export ") {
         format!("export {head}")

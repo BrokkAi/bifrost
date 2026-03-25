@@ -1,8 +1,7 @@
 mod common;
 
 use brokk_analyzer::{
-    CodeUnit, IAnalyzer, ImportAnalysisProvider, ProjectFile, PythonAnalyzer,
-    TypeHierarchyProvider,
+    CodeUnit, IAnalyzer, ImportAnalysisProvider, ProjectFile, PythonAnalyzer, TypeHierarchyProvider,
 };
 use common::{assert_code_eq, normalize_nonempty_lines, py_fixture_project};
 use std::collections::BTreeSet;
@@ -59,7 +58,10 @@ fn test_python_initialization_and_skeletons() {
         "#,
         skeletons.get(&class_a).unwrap(),
     );
-    assert_code_eq("def funcA(): ...", analyzer.get_skeleton(&func_a).unwrap().as_str());
+    assert_code_eq(
+        "def funcA(): ...",
+        analyzer.get_skeleton(&func_a).unwrap().as_str(),
+    );
 }
 
 #[test]
@@ -81,7 +83,10 @@ fn test_python_top_level_variables() {
 
     let skeletons = analyzer.get_skeletons(&vars_py);
     assert_eq!("TOP_VALUE = 99", skeletons.get(&top_value).unwrap().trim());
-    assert_eq!("export_like = \"not really\"", skeletons.get(&export_like).unwrap().trim());
+    assert_eq!(
+        "export_like = \"not really\"",
+        skeletons.get(&export_like).unwrap().trim()
+    );
 
     let declarations = analyzer.get_declarations(&vars_py);
     assert!(declarations.contains(&top_value));
@@ -165,7 +170,9 @@ fn test_python_comment_expansion_edge_cases_and_dual_range_extraction() {
     let class_with_comments = analyzer.get_source(&documented_class, true).unwrap();
     let class_without_comments = analyzer.get_source(&documented_class, false).unwrap();
     assert!(normalize_nonempty_lines(&class_with_comments).starts_with("# Comment before class"));
-    assert!(normalize_nonempty_lines(&class_without_comments).starts_with("class DocumentedClass:"));
+    assert!(
+        normalize_nonempty_lines(&class_without_comments).starts_with("class DocumentedClass:")
+    );
 
     let get_value = definition(&analyzer, "documented.DocumentedClass.get_value");
     let method_with_comments = analyzer.get_source(&get_value, true).unwrap();
@@ -192,7 +199,10 @@ fn test_python_duplicate_fields_and_property_filtering() {
         .filter(|cu| cu.is_field() && cu.identifier() == "SRCFILES")
         .collect();
     assert_eq!(1, srcfiles_fields.len());
-    assert_eq!("duplictad_fields_test.SRCFILES", srcfiles_fields[0].fq_name());
+    assert_eq!(
+        "duplictad_fields_test.SRCFILES",
+        srcfiles_fields[0].fq_name()
+    );
 
     let local_var_fields: Vec<_> = declarations
         .iter()
@@ -262,15 +272,35 @@ fn test_python_property_setter_filtering() {
 
     let methods: Vec<_> = declarations.iter().filter(|cu| cu.is_function()).collect();
     assert_eq!(3, methods.len());
-    assert!(methods.iter().any(|cu| cu.fq_name() == "property_setter_test.MplTimeConverter.format"));
-    assert!(methods.iter().any(|cu| cu.fq_name() == "property_setter_test.MplTimeConverter.value"));
+    assert!(
+        methods
+            .iter()
+            .any(|cu| cu.fq_name() == "property_setter_test.MplTimeConverter.format")
+    );
+    assert!(
+        methods
+            .iter()
+            .any(|cu| cu.fq_name() == "property_setter_test.MplTimeConverter.value")
+    );
     assert!(
         methods
             .iter()
             .any(|cu| cu.fq_name() == "property_setter_test.MplTimeConverter.regular_method")
     );
-    assert_eq!(1, methods.iter().filter(|cu| cu.identifier() == "format").count());
-    assert_eq!(1, methods.iter().filter(|cu| cu.identifier() == "value").count());
+    assert_eq!(
+        1,
+        methods
+            .iter()
+            .filter(|cu| cu.identifier() == "format")
+            .count()
+    );
+    assert_eq!(
+        1,
+        methods
+            .iter()
+            .filter(|cu| cu.identifier() == "value")
+            .count()
+    );
 }
 
 #[test]
@@ -347,22 +377,23 @@ fn test_nested_and_underscore_prefixed_function_local_classes() {
         .unwrap();
     let deep_local = classes
         .iter()
-        .find(
-            |cu| {
-                cu.fq_name()
-                    == "nested_local_classes.outer_function$OuterLocal$InnerLocal$DeepLocal"
-            },
-        )
+        .find(|cu| {
+            cu.fq_name() == "nested_local_classes.outer_function$OuterLocal$InnerLocal$DeepLocal"
+        })
         .unwrap();
 
-    assert!(analyzer
-        .get_direct_children(inner_local)
-        .iter()
-        .any(|cu| cu == *deep_local));
-    assert!(analyzer
-        .get_direct_children(outer_local)
-        .iter()
-        .any(|cu| cu == *inner_local));
+    assert!(
+        analyzer
+            .get_direct_children(inner_local)
+            .iter()
+            .any(|cu| cu == *deep_local)
+    );
+    assert!(
+        analyzer
+            .get_direct_children(outer_local)
+            .iter()
+            .any(|cu| cu == *inner_local)
+    );
 
     let methods: Vec<_> = declarations
         .iter()
@@ -388,12 +419,16 @@ fn test_nested_and_underscore_prefixed_function_local_classes() {
         .filter(|cu| cu.is_class())
         .collect();
     assert_eq!(5, underscore_classes.len());
-    assert!(underscore_classes
-        .iter()
-        .any(|cu| cu.fq_name() == "underscore_functions._private_function$LocalClass"));
-    assert!(underscore_classes
-        .iter()
-        .any(|cu| cu.fq_name() == "underscore_functions.__dunder_function__$AnotherLocal"));
+    assert!(
+        underscore_classes
+            .iter()
+            .any(|cu| cu.fq_name() == "underscore_functions._private_function$LocalClass")
+    );
+    assert!(
+        underscore_classes
+            .iter()
+            .any(|cu| cu.fq_name() == "underscore_functions.__dunder_function__$AnotherLocal")
+    );
     let nested_class = underscore_classes
         .iter()
         .find(|cu| cu.fq_name() == "underscore_functions._PrivateClass$NestedClass")
@@ -402,10 +437,12 @@ fn test_nested_and_underscore_prefixed_function_local_classes() {
         .iter()
         .find(|cu| cu.fq_name() == "underscore_functions._PrivateClass")
         .unwrap();
-    assert!(analyzer
-        .get_direct_children(private_class)
-        .iter()
-        .any(|cu| cu == nested_class));
+    assert!(
+        analyzer
+            .get_direct_children(private_class)
+            .iter()
+            .any(|cu| cu == nested_class)
+    );
 }
 
 #[test]
@@ -426,9 +463,11 @@ fn test_function_redefinition_and_duplicate_children() {
 
     let classes: Vec<_> = declarations.iter().filter(|cu| cu.is_class()).collect();
     assert_eq!(2, classes.len());
-    assert!(classes
-        .iter()
-        .any(|cu| cu.fq_name() == "function_redefinition.MyClass"));
+    assert!(
+        classes
+            .iter()
+            .any(|cu| cu.fq_name() == "function_redefinition.MyClass")
+    );
     let second_local = classes
         .iter()
         .find(|cu| cu.fq_name() == "function_redefinition.my_function$SecondLocal")
@@ -452,23 +491,27 @@ fn test_function_redefinition_and_duplicate_children() {
     let classes: Vec<_> = declarations.iter().filter(|cu| cu.is_class()).collect();
     let second_local = classes
         .iter()
-        .find(
-            |cu| cu.fq_name() == "function_redefinition_with_imports.my_function$SecondLocal",
-        )
+        .find(|cu| cu.fq_name() == "function_redefinition_with_imports.my_function$SecondLocal")
         .unwrap();
     assert!(!classes.iter().any(|cu| cu.fq_name().contains("FirstLocal")));
-    assert!(analyzer
-        .get_direct_children(my_function)
-        .iter()
-        .any(|cu| cu == *second_local));
-    assert!(declarations
-        .iter()
-        .any(|cu| cu.is_function() && cu.fq_name() == "function_redefinition_with_imports.other_function"));
-    assert!(classes
-        .iter()
-        .any(|cu| cu.fq_name() == "function_redefinition_with_imports.MyClass"));
+    assert!(
+        analyzer
+            .get_direct_children(my_function)
+            .iter()
+            .any(|cu| cu == *second_local)
+    );
+    assert!(declarations.iter().any(|cu| cu.is_function()
+        && cu.fq_name() == "function_redefinition_with_imports.other_function"));
+    assert!(
+        classes
+            .iter()
+            .any(|cu| cu.fq_name() == "function_redefinition_with_imports.MyClass")
+    );
 
-    let file = ProjectFile::new(analyzer.project().root().to_path_buf(), "duplicate_children.py");
+    let file = ProjectFile::new(
+        analyzer.project().root().to_path_buf(),
+        "duplicate_children.py",
+    );
     let declarations = analyzer.get_declarations(&file);
     let test_duplicates = declarations
         .iter()
@@ -487,16 +530,22 @@ fn test_function_redefinition_and_duplicate_children() {
         children
             .iter()
             .filter(|cu| {
-                cu.is_class() && cu.short_name().contains("Inner") && !cu.short_name().contains("Unique")
+                cu.is_class()
+                    && cu.short_name().contains("Inner")
+                    && !cu.short_name().contains("Unique")
             })
             .count()
     );
-    assert!(children
-        .iter()
-        .any(|cu| cu.is_function() && cu.identifier() == "unique_method"));
-    assert!(children
-        .iter()
-        .any(|cu| cu.is_class() && cu.short_name().contains("UniqueInner")));
+    assert!(
+        children
+            .iter()
+            .any(|cu| cu.is_function() && cu.identifier() == "unique_method")
+    );
+    assert!(
+        children
+            .iter()
+            .any(|cu| cu.is_class() && cu.short_name().contains("UniqueInner"))
+    );
 }
 
 #[test]
@@ -524,32 +573,68 @@ fn test_code_units_are_deduplicated_and_conditionals_are_captured() {
     let functions: Vec<_> = declarations.iter().filter(|cu| cu.is_function()).collect();
     let fields: Vec<_> = declarations.iter().filter(|cu| cu.is_field()).collect();
 
-    assert!(classes
-        .iter()
-        .any(|cu| cu.fq_name() == "conditional_pkg.base.Base"));
-    assert!(classes
-        .iter()
-        .any(|cu| cu.fq_name() == "conditional_pkg.base.Base$Config"));
-    assert!(classes
-        .iter()
-        .any(|cu| cu.fq_name() == "conditional_pkg.base.FallbackBase"));
-    assert!(classes
-        .iter()
-        .any(|cu| cu.fq_name() == "conditional_pkg.base.TryClass"));
-    assert!(classes
-        .iter()
-        .any(|cu| cu.fq_name() == "conditional_pkg.base.ExceptClass"));
+    assert!(
+        classes
+            .iter()
+            .any(|cu| cu.fq_name() == "conditional_pkg.base.Base")
+    );
+    assert!(
+        classes
+            .iter()
+            .any(|cu| cu.fq_name() == "conditional_pkg.base.Base$Config")
+    );
+    assert!(
+        classes
+            .iter()
+            .any(|cu| cu.fq_name() == "conditional_pkg.base.FallbackBase")
+    );
+    assert!(
+        classes
+            .iter()
+            .any(|cu| cu.fq_name() == "conditional_pkg.base.TryClass")
+    );
+    assert!(
+        classes
+            .iter()
+            .any(|cu| cu.fq_name() == "conditional_pkg.base.ExceptClass")
+    );
 
-    assert!(functions.iter().any(|cu| cu.identifier() == "conditional_function"));
+    assert!(
+        functions
+            .iter()
+            .any(|cu| cu.identifier() == "conditional_function")
+    );
     assert!(functions.iter().any(|cu| cu.identifier() == "try_function"));
-    assert!(functions.iter().any(|cu| cu.identifier() == "except_function"));
-    assert!(functions.iter().any(|cu| cu.identifier() == "elif_function"));
-    assert!(functions.iter().any(|cu| cu.identifier() == "try_else_function"));
-    assert!(functions.iter().any(|cu| cu.identifier() == "finally_function"));
-    assert!(functions
-        .iter()
-        .any(|cu| cu.identifier() == "outer_conditional_function"));
-    assert!(functions.iter().any(|cu| cu.identifier() == "async_top_level"));
+    assert!(
+        functions
+            .iter()
+            .any(|cu| cu.identifier() == "except_function")
+    );
+    assert!(
+        functions
+            .iter()
+            .any(|cu| cu.identifier() == "elif_function")
+    );
+    assert!(
+        functions
+            .iter()
+            .any(|cu| cu.identifier() == "try_else_function")
+    );
+    assert!(
+        functions
+            .iter()
+            .any(|cu| cu.identifier() == "finally_function")
+    );
+    assert!(
+        functions
+            .iter()
+            .any(|cu| cu.identifier() == "outer_conditional_function")
+    );
+    assert!(
+        functions
+            .iter()
+            .any(|cu| cu.identifier() == "async_top_level")
+    );
     assert!(functions.iter().any(|cu| cu.identifier() == "async_in_if"));
     assert!(functions.iter().any(|cu| cu.identifier() == "async_in_try"));
 
@@ -561,25 +646,37 @@ fn test_code_units_are_deduplicated_and_conditionals_are_captured() {
     assert!(fields.iter().any(|cu| cu.identifier() == "TRY_ELSE_VAR"));
     assert!(fields.iter().any(|cu| cu.identifier() == "FINALLY_VAR"));
 
-    assert!(!functions
-        .iter()
-        .any(|cu| cu.identifier() == "inner_nested_function"));
+    assert!(
+        !functions
+            .iter()
+            .any(|cu| cu.identifier() == "inner_nested_function")
+    );
     assert!(!fields.iter().any(|cu| cu.identifier() == "INNER_VAR"));
-    assert!(!functions
-        .iter()
-        .any(|cu| cu.identifier() == "nested_if_try_function"));
-    assert!(!functions
-        .iter()
-        .any(|cu| cu.identifier() == "nested_if_except_function"));
-    assert!(!fields
-        .iter()
-        .any(|cu| cu.identifier() == "NESTED_IF_TRY_VAR"));
-    assert!(!functions
-        .iter()
-        .any(|cu| cu.identifier() == "deeply_nested_loop_function"));
-    assert!(!fields
-        .iter()
-        .any(|cu| cu.identifier() == "DEEPLY_NESTED_VAR"));
+    assert!(
+        !functions
+            .iter()
+            .any(|cu| cu.identifier() == "nested_if_try_function")
+    );
+    assert!(
+        !functions
+            .iter()
+            .any(|cu| cu.identifier() == "nested_if_except_function")
+    );
+    assert!(
+        !fields
+            .iter()
+            .any(|cu| cu.identifier() == "NESTED_IF_TRY_VAR")
+    );
+    assert!(
+        !functions
+            .iter()
+            .any(|cu| cu.identifier() == "deeply_nested_loop_function")
+    );
+    assert!(
+        !fields
+            .iter()
+            .any(|cu| cu.identifier() == "DEEPLY_NESTED_VAR")
+    );
 
     let subclass_py = ProjectFile::new(
         analyzer.project().root().to_path_buf(),
@@ -590,12 +687,18 @@ fn test_code_units_are_deduplicated_and_conditionals_are_captured() {
         .iter()
         .find(|cu| cu.identifier() == "MySubclass")
         .unwrap();
-    assert!(analyzer.get_skeleton(my_subclass).unwrap().contains("(Base)"));
+    assert!(
+        analyzer
+            .get_skeleton(my_subclass)
+            .unwrap()
+            .contains("(Base)")
+    );
 
     let import_info = analyzer.import_info_of(&subclass_py);
-    assert!(import_info
-        .iter()
-        .any(|imp| imp.raw_snippet.contains("from conditional_pkg.base import Base")));
+    assert!(import_info.iter().any(|imp| {
+        imp.raw_snippet
+            .contains("from conditional_pkg.base import Base")
+    }));
 
     let base_class = analyzer
         .get_all_declarations()

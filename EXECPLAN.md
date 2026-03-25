@@ -1,4 +1,4 @@
-# Port Brokk Java Analyzer To Rust
+# Port Brokk Analyzer Suite To Rust
 
 This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
 
@@ -6,7 +6,7 @@ This document must be maintained in accordance with `.agent/PLANS.md`.
 
 ## Purpose / Big Picture
 
-After this change, this repository will contain a Rust library that reproduces the in-memory behavior of Brokk's Java analyzer while using a Rust-native concurrent snapshot pipeline. A user will be able to load the copied Brokk Java fixtures, ask for declarations, source, skeletons, imports, and type hierarchy information, and then update the analyzer after file edits. The proof will be translated Rust tests that exercise the same behaviors as Brokk's Java test suite and keep passing under both sequential and parallel analyzer construction.
+After this change, this repository will contain a Rust library that reproduces the in-memory behavior of Brokk's Tree-sitter-backed analyzers while using a Rust-native concurrent snapshot pipeline. A user will be able to load the copied Brokk fixtures, ask for declarations, source, skeletons, imports, type hierarchy information, test-module information, and then update analyzers after file edits. The proof will be translated Rust tests that exercise the same behaviors as Brokk's upstream analyzer test suites and keep passing under both sequential and parallel analyzer construction.
 
 ## Progress
 
@@ -43,6 +43,9 @@ After this change, this repository will contain a Rust library that reproduces t
 - [x] (2026-03-25T01:07Z) Finished the JavaScript/TypeScript parity pass by adding broader fixture-driven skeleton/import/type-identifier coverage, side-effect and directory-index import resolution, exported JSX-return inference for component-like functions, and Brokk-style literal-only variable skeleton rendering. `cargo test --test javascript_and_typescript_smoke --test javascript_typescript_parity` and `cargo fmt --check` now pass for the widened JS/TS surface.
 - [x] (2026-03-25T01:19Z) Added the first Rust analyzer slice by integrating `RustAnalyzer` into the public API and `MultiAnalyzer`, then translating focused parity coverage for module/function/impl discovery, wrapped impl-target naming, `use` flattening and semantic import resolution, type-alias tagging, semantic test detection, and snapshot updates. `cargo test --test rust_analyzer_parity` now passes.
 - [x] (2026-03-25T01:31Z) Added the first Go analyzer slice by integrating `GoAnalyzer` into the public API and `MultiAnalyzer`, then translating focused parity coverage for fixture declarations, grouped/aliased/dot/blank imports, semantic Go test detection, Go test-module formatting helpers, and snapshot updates. `cargo test --test go_analyzer_parity` now passes.
+- [x] (2026-03-25T02:21Z) Added `PythonAnalyzer`, integrated it into the public API and `MultiAnalyzer`, and translated the current Brokk Python analyzer test surface into Rust: core analyzer parity, decorators, module code units, relative-import behavior, type hierarchy, update behavior, and test detection. This required Python-specific comment expansion, property setter/deleter filtering, direct child attachment for function-local classes, Python "last definition wins" replacement semantics, and Brokk-style module-level control-flow capture limits. `cargo test` passes with the Python suite included.
+- [x] (2026-03-25T03:34Z) Enshrined the rule that once a language is in scope, acceptance means the full upstream Brokk analyzer test surface for that language translated into Rust, not a smaller "focused parity" subset.
+- [x] (2026-03-25T03:34Z) Added `CppAnalyzer`, integrated it into the public API and `MultiAnalyzer`, and translated the current Brokk `CppAnalyzerTest` surface into Rust fixture and inline tests. This required anonymous-namespace traversal, template-signature-aware class/function identities, Brokk-style in-class declaration vs out-of-line definition handling, per-declarator field skeleton rendering with literal-only initializer preservation, and C++ signature normalization for templates/qualifiers/operators. `cargo test`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings` all pass with the C++ suite included.
 
 ## Surprises & Discoveries
 
@@ -133,6 +136,12 @@ After this change, this repository will contain a Rust library that reproduces t
 - Observation: Go also fits the direct-AST adapter pattern cleanly, but it needs language-specific naming conventions for top-level values and aliases.
   Evidence: the translated Go parity tests only matched Brokk after top-level `var`/`const`/true-alias declarations were emitted as `_module_.Name` field code units while named `type` declarations stayed class-like and receiver methods attached to their extracted receiver type names.
 
+- Observation: partial "focused parity" files are not an acceptable stopping point once a language is in scope; the real target is the full upstream analyzer test class surface for that language.
+  Evidence: Java and Python both exposed real semantic gaps only after translating the broader upstream test classes, including source-comment expansion, setter/deleter filtering, function-local class parenting, and last-definition-wins behavior.
+
+- Observation: the Brokk C++ surface relies on keeping declaration-only class members distinct from out-of-line definitions even when they share the same logical fq-name/signature.
+  Evidence: `decl_vs_def.h` parity only matched after the Rust C++ analyzer kept the in-class declaration for class skeleton rendering while also publishing the out-of-line definition as the preferred top-level definition.
+
 ## Decision Log
 
 - Decision: preserve Brokk's Java-like API names in Rust for v1 instead of inventing an idiomatic-Rust-first surface.
@@ -215,13 +224,21 @@ After this change, this repository will contain a Rust library that reproduces t
   Rationale: the upstream Rust analyzer surface is compact enough to validate quickly, and it exercises the widened capability surface (`ImportAnalysisProvider`, `TypeAliasProvider`, `TestDetectionProvider`, and `MultiAnalyzer` routing) without requiring new hierarchy semantics first.
   Date/Author: 2026-03-25 / Codex
 
+- Decision: once a language is accepted into scope, translated coverage must target the full upstream Brokk analyzer suite for that language rather than a curated subset.
+  Rationale: smaller parity slices repeatedly missed real semantic gaps that only appeared under the broader upstream tests; the user explicitly asked to make full-suite parity the standard going forward.
+  Date/Author: 2026-03-25 / Codex + user
+
 - Decision: follow Rust with Go before Python/C++.
   Rationale: Go exercises imports, test detection, update behavior, and path-format helper logic while still fitting the current direct-AST snapshot model without introducing new hierarchy requirements.
   Date/Author: 2026-03-25 / Codex
 
+- Decision: once a language is in scope, the acceptance standard is the full upstream Brokk analyzer test suite for that language, translated into Rust, rather than a curated "focused acceptance" subset.
+  Rationale: broader upstream suites have already exposed behavior gaps that focused smoke/parity files missed, and the user explicitly wants full-suite parity as the project standard.
+  Date/Author: 2026-03-25 / Codex + user
+
 ## Outcomes & Retrospective
 
-The repository now has the crate scaffold, the copied Brokk resource corpus, the public Rust API layer, a concurrent parse/index core built around immutable snapshots, Java semantics for imports, hierarchy, source/skeleton rendering, lexical scope analysis, package modules, implicit constructors, comment-aware extraction, Java call-receiver heuristics, normalized-name lookups, Brokk-style lambda discovery/naming, relevant-import selection, fixture top-level/member parity coverage, declaration-inventory parity coverage, import-detail parity coverage, case-insensitive search parity, autocomplete parity, record-component field support, interface-constant and field-initializer parity, bounded memo caches for expensive Java queries, duplicate/update regressions, and the first non-Java analyzer slice for JavaScript and TypeScript. `MultiAnalyzer` now routes Java, JavaScript, and TypeScript delegates through the widened shared capability surface.
+The repository now has the crate scaffold, the copied Brokk resource corpus, the public Rust API layer, a concurrent parse/index core built around immutable snapshots, Java semantics for imports, hierarchy, source/skeleton rendering, lexical scope analysis, package modules, implicit constructors, comment-aware extraction, Java call-receiver heuristics, normalized-name lookups, Brokk-style lambda discovery/naming, relevant-import selection, full translated Java analyzer-test parity, bounded memo caches for expensive Java queries, and the first non-Java analyzers for JavaScript, TypeScript, Rust, Go, and Python. `MultiAnalyzer` now routes Java, JavaScript, TypeScript, Rust, Go, and Python delegates through the widened shared capability surface. Python now also has translated analyzer-test parity across its current upstream analyzer classes.
 
 The repository also now has a `summarize` CLI utility that resolves either absolute file paths under the project root or Java FQCN targets and prints Brokk-style skeleton summaries using the Rust analyzer implementation. This gives the port a direct command-line path for exercising file summaries and symbol summaries outside the translated test harness.
 
@@ -239,7 +256,7 @@ The first code milestone creates the crate structure and public types in `src/an
 
 The second milestone will replace those placeholders with a real Tree-sitter-backed engine. That engine will parse Java files serially, load the vendored `.scm` queries from `resources/treesitter/java/`, build symbol indexes and file metadata, and expose snapshot updates. Once the generic engine exists, `src/analyzer/java_analyzer.rs` will add Java-specific package resolution, import resolution, source extraction, access-expression filtering, local declaration lookup, and type hierarchy logic.
 
-The third milestone will translate selected Brokk Java tests into Rust integration tests under `tests/`. Those tests will read the vendored fixtures directly from `tests/fixtures/` and create temporary projects for update scenarios. The translated tests are the acceptance gate for the port.
+The third milestone translates Brokk analyzer tests into Rust integration tests under `tests/`. Those tests read the vendored fixtures directly from `tests/fixtures/` and create temporary projects for update scenarios. For every language that enters scope, the acceptance gate is the full upstream Brokk analyzer test suite for that language, translated into Rust. Curated or "focused parity" files are acceptable only as temporary stepping stones during implementation, not as the stopping condition for a language milestone.
 
 ## Concrete Steps
 
@@ -281,7 +298,7 @@ The change is complete only when the Rust test suite demonstrates the same obser
     cargo fmt --check
     cargo clippy --all-targets --all-features -- -D warnings
 
-Acceptance is behavioral rather than structural. The analyzer must be able to load the copied Java fixtures, return matching declarations and skeletons, resolve imports and type hierarchy relationships, and produce a fresh snapshot after file updates.
+Acceptance is behavioral rather than structural. For every in-scope language, the Rust analyzer must be able to load the copied Brokk fixtures, return matching declarations and skeletons, resolve imports and type hierarchy relationships where supported, detect tests where supported, and produce a fresh snapshot after file updates. The stopping condition for a language is that the full upstream Brokk analyzer test suite for that language has a translated Rust counterpart that passes.
 
 ## Idempotence and Recovery
 
@@ -324,4 +341,4 @@ The crate must export these public items from `src/lib.rs` and `src/analyzer/mod
 
 The implementation will use Rust's `tree-sitter` and `tree-sitter-java` crates together with the vendored `.scm` query files under `resources/treesitter/`. Directory traversal will use `walkdir`. Temporary directories and fixture-heavy tests will use `tempfile`.
 
-Revision note: this initial checked-in ExecPlan records the final v1 scope, the vendored-resource decision, and the completion of the crate/resource scaffold so later work can restart from the working tree alone.
+Revision note: the plan now explicitly commits each in-scope language milestone to full upstream Brokk analyzer-test parity, not a curated subset, because that broader suite has already been necessary to close real semantic gaps in both the Java and Python ports.

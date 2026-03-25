@@ -177,7 +177,9 @@ impl PythonAnalyzer {
                             .map(|code_unit| (binding.clone(), code_unit))
                             .collect();
                     }
-                    let package_candidate = self.inner.get_definitions(&format!("{resolved_module}.{name}"));
+                    let package_candidate = self
+                        .inner
+                        .get_definitions(&format!("{resolved_module}.{name}"));
                     if !package_candidate.is_empty() {
                         return package_candidate
                             .into_iter()
@@ -200,8 +202,7 @@ impl PythonAnalyzer {
                     .all_files()
                     .into_iter()
                     .find(|file| python_module_name(file) == module_fq)
-                    .map(|file| module_code_unit(&file, module_fq))
-                    .flatten()
+                    .and_then(|file| module_code_unit(&file, module_fq))
             })
     }
 
@@ -224,11 +225,11 @@ impl PythonAnalyzer {
 
         let bindings = self.resolve_import_bindings(code_unit.source());
         if let Some((head, tail)) = trimmed.split_once('.') {
-            if let Some(bound) = bindings.get(head) {
-                if bound.is_module() {
-                    let fq_name = format!("{}.{}", bound.fq_name(), tail);
-                    return self.inner.get_definitions(&fq_name).into_iter().next();
-                }
+            if let Some(bound) = bindings.get(head)
+                && bound.is_module()
+            {
+                let fq_name = format!("{}.{}", bound.fq_name(), tail);
+                return self.inner.get_definitions(&fq_name).into_iter().next();
             }
             return self.inner.get_definitions(trimmed).into_iter().next();
         }
@@ -378,11 +379,15 @@ impl ImportAnalysisProvider for PythonAnalyzer {
             };
             match details {
                 PythonImportDetails::FromImport { module, name, .. } if module.starts_with('.') => {
-                    let Some(resolved_module) = resolve_python_relative_module(source_file, &module) else {
+                    let Some(resolved_module) =
+                        resolve_python_relative_module(source_file, &module)
+                    else {
                         return true;
                     };
                     let candidate_module = format!("{resolved_module}.{name}");
-                    if python_module_name(target) == candidate_module || python_module_name(target) == resolved_module {
+                    if python_module_name(target) == candidate_module
+                        || python_module_name(target) == resolved_module
+                    {
                         return true;
                     }
                 }
@@ -598,9 +603,7 @@ impl IAnalyzer for PythonAnalyzer {
             .into_iter()
             .filter_map(|range| {
                 let start_byte = python_expanded_comment_start(&source, range.start_byte);
-                source
-                    .get(start_byte..range.end_byte)
-                    .map(str::to_string)
+                source.get(start_byte..range.end_byte).map(str::to_string)
             })
             .collect()
     }
@@ -665,16 +668,15 @@ impl<'a> PythonVisitor<'a> {
             "class_definition" | "function_definition" => {
                 self.visit_definition(node, None, scope, module_control_depth)
             }
-            "expression_statement" => self.visit_expression_statement(node, scope, module_control_depth),
+            "expression_statement" => {
+                self.visit_expression_statement(node, scope, module_control_depth)
+            }
             "import_statement" | "import_from_statement" => {
                 if scope.is_empty() {
                     self.visit_import_statement(node);
                 }
             }
-            "if_statement"
-            | "try_statement"
-            | "with_statement"
-            | "for_statement"
+            "if_statement" | "try_statement" | "with_statement" | "for_statement"
             | "while_statement" => {
                 let next_depth = if scope.is_empty() {
                     module_control_depth + 1
@@ -705,14 +707,12 @@ impl<'a> PythonVisitor<'a> {
                 scope,
                 module_control_depth,
             ),
-            "function_definition" => {
-                self.visit_function_definition(
-                    definition,
-                    wrapper.unwrap_or(definition),
-                    scope,
-                    module_control_depth,
-                )
-            }
+            "function_definition" => self.visit_function_definition(
+                definition,
+                wrapper.unwrap_or(definition),
+                scope,
+                module_control_depth,
+            ),
             _ => {}
         }
     }
@@ -747,8 +747,10 @@ impl<'a> PythonVisitor<'a> {
         if capture {
             self.parsed
                 .replace_code_unit(code_unit.clone(), range_node, self.source, None, None);
-            self.parsed
-                .add_signature(code_unit.clone(), python_class_signature(range_node, self.source));
+            self.parsed.add_signature(
+                code_unit.clone(),
+                python_class_signature(range_node, self.source),
+            );
             if let Some(module) = &self.module
                 && scope.is_empty()
             {
@@ -795,7 +797,9 @@ impl<'a> PythonVisitor<'a> {
 
         let capture = !python_is_property_mutator(range_node, self.source)
             && ((scope.is_empty() && module_control_depth <= 1)
-                || scope.last().is_some_and(|parent| parent.kind == ScopeKind::Class));
+                || scope
+                    .last()
+                    .is_some_and(|parent| parent.kind == ScopeKind::Class));
         let short_name = if let Some(parent) = scope.last() {
             match parent.kind {
                 ScopeKind::Class => format!("{}.{}", parent.path, name),
@@ -819,8 +823,10 @@ impl<'a> PythonVisitor<'a> {
             );
             self.parsed
                 .replace_code_unit(code_unit.clone(), range_node, self.source, None, None);
-            self.parsed
-                .add_signature(code_unit.clone(), python_function_signature(range_node, self.source));
+            self.parsed.add_signature(
+                code_unit.clone(),
+                python_function_signature(range_node, self.source),
+            );
             if let Some(module) = &self.module
                 && scope.is_empty()
             {
@@ -828,10 +834,9 @@ impl<'a> PythonVisitor<'a> {
             }
             if let Some(parent) = scope.last()
                 && parent.kind == ScopeKind::Class
+                && let Some(parent_cu) = &parent.code_unit
             {
-                if let Some(parent_cu) = &parent.code_unit {
-                    self.parsed.add_child(parent_cu.clone(), code_unit.clone());
-                }
+                self.parsed.add_child(parent_cu.clone(), code_unit.clone());
             }
             let scope_code_unit = Some(code_unit);
             let mut next_scope = scope.to_vec();
@@ -892,8 +897,10 @@ impl<'a> PythonVisitor<'a> {
             );
             self.parsed
                 .replace_code_unit(code_unit.clone(), node, self.source, None, None);
-            self.parsed
-                .add_signature(code_unit.clone(), py_node_text(node, self.source).trim().to_string());
+            self.parsed.add_signature(
+                code_unit.clone(),
+                py_node_text(node, self.source).trim().to_string(),
+            );
             if let Some(module) = &self.module
                 && scope.is_empty()
             {
@@ -901,10 +908,9 @@ impl<'a> PythonVisitor<'a> {
             }
             if let Some(parent) = scope.last()
                 && parent.kind == ScopeKind::Class
+                && let Some(parent_cu) = &parent.code_unit
             {
-                if let Some(parent_cu) = &parent.code_unit {
-                    self.parsed.add_child(parent_cu.clone(), code_unit);
-                }
+                self.parsed.add_child(parent_cu.clone(), code_unit);
             }
         }
     }
@@ -1137,15 +1143,13 @@ fn parse_python_import_infos(raw: &str) -> Vec<ImportInfo> {
                     format!("import {module}")
                 },
                 is_wildcard: false,
-                identifier: Some(
-                    alias.clone().unwrap_or_else(|| {
-                        module
-                            .split('.')
-                            .next_back()
-                            .unwrap_or(module.as_str())
-                            .to_string()
-                    }),
-                ),
+                identifier: Some(alias.clone().unwrap_or_else(|| {
+                    module
+                        .split('.')
+                        .next_back()
+                        .unwrap_or(module.as_str())
+                        .to_string()
+                })),
                 alias,
             });
         }
@@ -1214,7 +1218,8 @@ fn split_top_level_commas(input: &str) -> Vec<String> {
 }
 
 fn split_alias(input: &str) -> (String, Option<String>) {
-    input.rsplit_once(" as ")
+    input
+        .rsplit_once(" as ")
         .map(|(name, alias)| (name.trim().to_string(), Some(alias.trim().to_string())))
         .unwrap_or_else(|| (input.trim().to_string(), None))
 }

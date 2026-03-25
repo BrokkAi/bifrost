@@ -13,10 +13,8 @@ fn explicit_update() {
         "#,
     )
     .unwrap();
-    let analyzer = PythonAnalyzer::from_project(TestProject::new(
-        root,
-        brokk_analyzer::Language::Python,
-    ));
+    let analyzer =
+        PythonAnalyzer::from_project(TestProject::new(root, brokk_analyzer::Language::Python));
 
     assert!(!analyzer.get_definitions("mod.foo").is_empty());
     assert!(analyzer.get_definitions("mod.bar").is_empty());
@@ -47,10 +45,8 @@ fn auto_detect_changes_and_deletes() {
         "#,
     )
     .unwrap();
-    let analyzer = PythonAnalyzer::from_project(TestProject::new(
-        root,
-        brokk_analyzer::Language::Python,
-    ));
+    let analyzer =
+        PythonAnalyzer::from_project(TestProject::new(root, brokk_analyzer::Language::Python));
 
     file.write(
         r#"

@@ -57,7 +57,11 @@ fn test_import() {
 fn test_resolve_imports_and_import_variants() {
     let temp = tempdir().unwrap();
     let root = temp.path();
-    write_file(root, "utils/helper.js", "export function helper() { return 42; }\n");
+    write_file(
+        root,
+        "utils/helper.js",
+        "export function helper() { return 42; }\n",
+    );
     write_file(
         root,
         "main.js",
@@ -83,7 +87,11 @@ fn test_resolve_imports_and_import_variants() {
         "src/some/dir/ChildService.js",
         "import { BaseService } from '../BaseService';\nexport class ChildService extends BaseService { process() { return this.getData().map(x => x * 2); } }\n",
     );
-    write_file(root, "lib/shared.js", "export function shared() { return 1; }\n");
+    write_file(
+        root,
+        "lib/shared.js",
+        "export function shared() { return 1; }\n",
+    );
     write_file(
         root,
         "index.js",
@@ -99,7 +107,11 @@ fn test_resolve_imports_and_import_variants() {
         "app.js",
         "import './polyfill';\nfunction main() { console.log('app started'); }\n",
     );
-    write_file(root, "utils/greet.js", "export function greet() { return 'hello'; }\n");
+    write_file(
+        root,
+        "utils/greet.js",
+        "export function greet() { return 'hello'; }\n",
+    );
     write_file(
         root,
         "explicit.js",
@@ -112,7 +124,11 @@ fn test_resolve_imports_and_import_variants() {
         "mixed.js",
         "import { val } from './mod1';\nconst { otherVal } = require('./mod2');\n",
     );
-    write_file(root, "lib/index.js", "export function libFunc() { return 'lib'; }\n");
+    write_file(
+        root,
+        "lib/index.js",
+        "export function libFunc() { return 'lib'; }\n",
+    );
     write_file(
         root,
         "dir_main.js",
@@ -123,7 +139,11 @@ fn test_resolve_imports_and_import_variants() {
         "require_dir.js",
         "const { libFunc } = require('./lib/index');\nlibFunc();\n",
     );
-    write_file(root, "util-dir.js", "export function fromFile() { return 1; }\n");
+    write_file(
+        root,
+        "util-dir.js",
+        "export function fromFile() { return 1; }\n",
+    );
     write_file(
         root,
         "util-dir/index.js",
@@ -160,7 +180,10 @@ fn test_resolve_imports_and_import_variants() {
     );
     assert!(
         analyzer
-            .imported_code_units_of(&ProjectFile::new(root.to_path_buf(), "src/some/dir/ChildService.js"))
+            .imported_code_units_of(&ProjectFile::new(
+                root.to_path_buf(),
+                "src/some/dir/ChildService.js"
+            ))
             .iter()
             .any(|code_unit| {
                 code_unit.identifier() == "BaseService"
@@ -190,9 +213,14 @@ fn test_resolve_imports_and_import_variants() {
                     && code_unit.source().rel_path() == Path::new("utils/greet.js")
             })
     );
-    let mixed_imports = imported_fq_names(&analyzer, &ProjectFile::new(root.to_path_buf(), "mixed.js"));
+    let mixed_imports =
+        imported_fq_names(&analyzer, &ProjectFile::new(root.to_path_buf(), "mixed.js"));
     assert!(mixed_imports.iter().any(|fq_name| fq_name.ends_with("val")));
-    assert!(mixed_imports.iter().any(|fq_name| fq_name.ends_with("otherVal")));
+    assert!(
+        mixed_imports
+            .iter()
+            .any(|fq_name| fq_name.ends_with("otherVal"))
+    );
     assert!(
         analyzer
             .imported_code_units_of(&ProjectFile::new(root.to_path_buf(), "dir_main.js"))
@@ -214,11 +242,14 @@ fn test_resolve_imports_and_import_variants() {
     let explicit_imports =
         analyzer.imported_code_units_of(&ProjectFile::new(root.to_path_buf(), "explicit_file.js"));
     assert!(explicit_imports.iter().any(|code_unit| {
-        code_unit.identifier() == "fromFile" && code_unit.source().rel_path() == Path::new("util-dir.js")
+        code_unit.identifier() == "fromFile"
+            && code_unit.source().rel_path() == Path::new("util-dir.js")
     }));
-    assert!(!explicit_imports.iter().any(|code_unit| {
-        code_unit.source().rel_path() == Path::new("util-dir/index.js")
-    }));
+    assert!(
+        !explicit_imports
+            .iter()
+            .any(|code_unit| { code_unit.source().rel_path() == Path::new("util-dir/index.js") })
+    );
 }
 
 #[test]
@@ -242,8 +273,16 @@ fn test_require_import() {
     let imports = analyzer.import_statements_of(&file);
     assert!(imports.iter().any(|line| line.contains("require('path')")));
     assert!(imports.iter().any(|line| line.contains("require('fs')")));
-    assert!(imports.iter().any(|line| line.contains("require('./local-module')")));
-    assert!(imports.iter().any(|line| line.contains("require('../other')")));
+    assert!(
+        imports
+            .iter()
+            .any(|line| line.contains("require('./local-module')"))
+    );
+    assert!(
+        imports
+            .iter()
+            .any(|line| line.contains("require('../other')"))
+    );
     assert_eq!(4, imports.len());
 }
 
@@ -351,20 +390,47 @@ fn test_extract_type_identifiers_and_relevant_imports() {
     assert!(identifiers.contains("Bar"));
     assert!(identifiers.contains("x"));
 
-    let use_foo = analyzer.get_definitions("useFoo").into_iter().next().unwrap();
+    let use_foo = analyzer
+        .get_definitions("useFoo")
+        .into_iter()
+        .next()
+        .unwrap();
     let relevant = analyzer.relevant_imports_for(&use_foo);
     assert!(relevant.contains("import { Foo } from './foo';"));
     assert!(!relevant.contains("import { Bar } from './bar';"));
 
-    let do_work = analyzer.get_definitions("doWork").into_iter().next().unwrap();
+    let do_work = analyzer
+        .get_definitions("doWork")
+        .into_iter()
+        .next()
+        .unwrap();
     let work_relevant = analyzer.relevant_imports_for(&do_work);
-    assert_eq!(BTreeSet::from(["import { Used } from './used';".to_string()]), work_relevant);
+    assert_eq!(
+        BTreeSet::from(["import { Used } from './used';".to_string()]),
+        work_relevant
+    );
 
-    let read_config = analyzer.get_definitions("readConfig").into_iter().next().unwrap();
+    let read_config = analyzer
+        .get_definitions("readConfig")
+        .into_iter()
+        .next()
+        .unwrap();
     let read_relevant = analyzer.relevant_imports_for(&read_config);
-    assert!(read_relevant.iter().any(|line| line.contains("const fs = require('fs')")));
-    assert!(read_relevant.iter().any(|line| line.contains("const { readFile } = require('fs')")));
-    assert!(!read_relevant.iter().any(|line| line.contains("const path = require('path')")));
+    assert!(
+        read_relevant
+            .iter()
+            .any(|line| line.contains("const fs = require('fs')"))
+    );
+    assert!(
+        read_relevant
+            .iter()
+            .any(|line| line.contains("const { readFile } = require('fs')"))
+    );
+    assert!(
+        !read_relevant
+            .iter()
+            .any(|line| line.contains("const path = require('path')"))
+    );
 
     let unused = analyzer
         .get_definitions("unusedFunction")
@@ -373,16 +439,34 @@ fn test_extract_type_identifiers_and_relevant_imports() {
         .unwrap();
     assert!(analyzer.relevant_imports_for(&unused).is_empty());
 
-    let call_helper = analyzer.get_definitions("callHelper").into_iter().next().unwrap();
-    assert!(analyzer
-        .relevant_imports_for(&call_helper)
-        .iter()
-        .any(|line| line.contains("const { helper, other } = require('./utils')")));
+    let call_helper = analyzer
+        .get_definitions("callHelper")
+        .into_iter()
+        .next()
+        .unwrap();
+    assert!(
+        analyzer
+            .relevant_imports_for(&call_helper)
+            .iter()
+            .any(|line| line.contains("const { helper, other } = require('./utils')"))
+    );
 
-    let component = analyzer.get_definitions("MyComponent").into_iter().next().unwrap();
+    let component = analyzer
+        .get_definitions("MyComponent")
+        .into_iter()
+        .next()
+        .unwrap();
     let component_relevant = analyzer.relevant_imports_for(&component);
     assert!(!component_relevant.contains("import React from 'react';"));
     assert!(component_relevant.contains("import { useState } from 'react';"));
-    assert!(component_relevant.iter().any(|line| line.contains("const fs = require('fs')")));
-    assert!(!component_relevant.iter().any(|line| line.contains("const path = require('path')")));
+    assert!(
+        component_relevant
+            .iter()
+            .any(|line| line.contains("const fs = require('fs')"))
+    );
+    assert!(
+        !component_relevant
+            .iter()
+            .any(|line| line.contains("const path = require('path')"))
+    );
 }

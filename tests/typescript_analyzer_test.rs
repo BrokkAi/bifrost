@@ -24,9 +24,18 @@ fn test_hello_ts_skeletons() {
     let pi = CodeUnit::new(hello.clone(), CodeUnitType::Field, "", "Hello.ts.PI");
     let point = CodeUnit::new(hello.clone(), CodeUnitType::Class, "", "Point");
     let color = CodeUnit::new(hello.clone(), CodeUnitType::Class, "", "Color");
-    let string_or_number =
-        CodeUnit::new(hello.clone(), CodeUnitType::Field, "", "Hello.ts.StringOrNumber");
-    let local_details = CodeUnit::new(hello.clone(), CodeUnitType::Field, "", "Hello.ts.LocalDetails");
+    let string_or_number = CodeUnit::new(
+        hello.clone(),
+        CodeUnitType::Field,
+        "",
+        "Hello.ts.StringOrNumber",
+    );
+    let local_details = CodeUnit::new(
+        hello.clone(),
+        CodeUnitType::Field,
+        "",
+        "Hello.ts.LocalDetails",
+    );
 
     assert_code_eq(
         r#"
@@ -40,9 +49,14 @@ fn test_hello_ts_skeletons() {
     );
     assert_eq!(
         "export function globalFunc(num: number): number { ... }",
-        analyzer.get_skeleton(&definition(&analyzer, "globalFunc")).unwrap()
+        analyzer
+            .get_skeleton(&definition(&analyzer, "globalFunc"))
+            .unwrap()
     );
-    assert_eq!("export const PI: number = 3.14159", skeletons.get(&pi).unwrap());
+    assert_eq!(
+        "export const PI: number = 3.14159",
+        skeletons.get(&pi).unwrap()
+    );
     assert_code_eq(
         r#"
         export interface Point {
@@ -76,9 +90,11 @@ fn test_hello_ts_skeletons() {
 
     let declarations = analyzer.get_declarations(&hello);
     assert!(declarations.contains(&greeter));
-    assert!(declarations
-        .iter()
-        .any(|code_unit| code_unit.fq_name() == "globalFunc"));
+    assert!(
+        declarations
+            .iter()
+            .any(|code_unit| code_unit.fq_name() == "globalFunc")
+    );
     assert!(declarations.contains(&pi));
     assert!(declarations.contains(&point));
     assert!(declarations.contains(&color));
@@ -90,27 +106,28 @@ fn test_hello_ts_skeletons() {
         "",
         "Greeter.greeting",
     )));
-    assert!(declarations
-        .iter()
-        .any(|code_unit| code_unit.fq_name() == "Greeter.constructor"));
-    assert!(declarations
-        .iter()
-        .any(|code_unit| code_unit.fq_name() == "Greeter.greet"));
+    assert!(
+        declarations
+            .iter()
+            .any(|code_unit| code_unit.fq_name() == "Greeter.constructor")
+    );
+    assert!(
+        declarations
+            .iter()
+            .any(|code_unit| code_unit.fq_name() == "Greeter.greet")
+    );
     assert!(declarations.contains(&CodeUnit::new(
         hello.clone(),
         CodeUnitType::Field,
         "",
         "Point.x",
     )));
-    assert!(declarations
-        .iter()
-        .any(|code_unit| code_unit.fq_name() == "Point.move"));
-    assert!(declarations.contains(&CodeUnit::new(
-        hello,
-        CodeUnitType::Field,
-        "",
-        "Color.Red",
-    )));
+    assert!(
+        declarations
+            .iter()
+            .any(|code_unit| code_unit.fq_name() == "Point.move")
+    );
+    assert!(declarations.contains(&CodeUnit::new(hello, CodeUnitType::Field, "", "Color.Red",)));
 }
 
 #[test]
@@ -126,7 +143,10 @@ fn test_vars_ts_skeletons_and_arrow_function_classification() {
     let legacy = CodeUnit::new(vars.clone(), CodeUnitType::Field, "", "Vars.ts.legacyVar");
     let _local_helper = CodeUnit::new(vars, CodeUnitType::Function, "", "localHelper");
 
-    assert_eq!("export const MAX_USERS = 100", skeletons.get(&max_users).unwrap());
+    assert_eq!(
+        "export const MAX_USERS = 100",
+        skeletons.get(&max_users).unwrap()
+    );
     assert_eq!(
         "let currentUser: string = \"Alice\"",
         skeletons.get(&current_user).unwrap()
@@ -136,10 +156,15 @@ fn test_vars_ts_skeletons_and_arrow_function_classification() {
         "const anArrowFunc = (msg: string): void => { ... }",
         skeletons.get(&arrow).unwrap()
     );
-    assert_eq!("export var legacyVar = \"legacy\"", skeletons.get(&legacy).unwrap());
+    assert_eq!(
+        "export var legacyVar = \"legacy\"",
+        skeletons.get(&legacy).unwrap()
+    );
     assert_eq!(
         "function localHelper(): string { ... }",
-        analyzer.get_skeleton(&definition(&analyzer, "localHelper")).unwrap()
+        analyzer
+            .get_skeleton(&definition(&analyzer, "localHelper"))
+            .unwrap()
     );
 }
 
@@ -273,7 +298,9 @@ fn test_get_method_source_get_symbols_and_get_class_source() {
         symbols
     );
 
-    let greeter_source = analyzer.get_source(&definition(&analyzer, "Greeter"), true).unwrap();
+    let greeter_source = analyzer
+        .get_source(&definition(&analyzer, "Greeter"), true)
+        .unwrap();
     assert!(greeter_source.starts_with("export class Greeter"));
     assert!(greeter_source.contains("greeting: string;"));
     assert!(greeter_source.contains("greet(): string {"));
@@ -313,7 +340,11 @@ fn test_search_definitions_case_sensitive_and_regex() {
         .into_iter()
         .map(|code_unit| code_unit.fq_name())
         .collect();
-    assert!(method_regex.iter().any(|name| name.contains("Greeter.greet")));
+    assert!(
+        method_regex
+            .iter()
+            .any(|name| name.contains("Greeter.greet"))
+    );
 }
 
 #[test]
@@ -355,18 +386,30 @@ fn test_file_filtering_and_top_level_behavior() {
     );
     let top_level = fixture_analyzer().get_top_level_declarations(&hello);
     let declarations = fixture_analyzer().get_declarations(&hello);
-    assert!(declarations.iter().all(|code_unit| declarations.contains(code_unit)));
+    assert!(
+        declarations
+            .iter()
+            .all(|code_unit| declarations.contains(code_unit))
+    );
     assert!(declarations.len() > top_level.len());
-    assert!(top_level.iter().any(|code_unit| code_unit.fq_name() == "Greeter"));
-    assert!(!top_level
-        .iter()
-        .any(|code_unit| code_unit.fq_name() == "Greeter.greet"));
-    assert!(fixture_analyzer()
-        .get_top_level_declarations(&ProjectFile::new(
-            fixture_analyzer().project().root().to_path_buf(),
-            "NonExistent.ts",
-        ))
-        .is_empty());
+    assert!(
+        top_level
+            .iter()
+            .any(|code_unit| code_unit.fq_name() == "Greeter")
+    );
+    assert!(
+        !top_level
+            .iter()
+            .any(|code_unit| code_unit.fq_name() == "Greeter.greet")
+    );
+    assert!(
+        fixture_analyzer()
+            .get_top_level_declarations(&ProjectFile::new(
+                fixture_analyzer().project().root().to_path_buf(),
+                "NonExistent.ts",
+            ))
+            .is_empty()
+    );
 }
 
 #[test]
@@ -493,18 +536,26 @@ fn test_static_instance_member_overlap() {
     assert!(instance_transparent.is_function());
     assert!(static_transparent.is_field());
 
-    assert!(color_units
-        .iter()
-        .any(|code_unit| code_unit.fq_name() == "Color.normalize"));
-    assert!(color_units
-        .iter()
-        .any(|code_unit| code_unit.fq_name() == "Color.normalize$static"));
-    assert!(color_units
-        .iter()
-        .any(|code_unit| code_unit.fq_name() == "Color.count"));
-    assert!(color_units
-        .iter()
-        .any(|code_unit| code_unit.fq_name() == "Color.count$static"));
+    assert!(
+        color_units
+            .iter()
+            .any(|code_unit| code_unit.fq_name() == "Color.normalize")
+    );
+    assert!(
+        color_units
+            .iter()
+            .any(|code_unit| code_unit.fq_name() == "Color.normalize$static")
+    );
+    assert!(
+        color_units
+            .iter()
+            .any(|code_unit| code_unit.fq_name() == "Color.count")
+    );
+    assert!(
+        color_units
+            .iter()
+            .any(|code_unit| code_unit.fq_name() == "Color.count$static")
+    );
 }
 
 #[test]
@@ -526,7 +577,11 @@ fn test_function_overload_signatures() {
     assert!(add_signatures.iter().any(|signature| {
         signature.contains("string") && signature.contains("(a: string, b: string)")
     }));
-    assert!(add_signatures.iter().any(|signature| signature.contains("any")));
+    assert!(
+        add_signatures
+            .iter()
+            .any(|signature| signature.contains("any"))
+    );
 
     let query = skeletons
         .keys()
@@ -534,7 +589,11 @@ fn test_function_overload_signatures() {
         .unwrap();
     let query_signatures = analyzer.signatures_of(query);
     assert_eq!(3, query_signatures.len());
-    assert!(query_signatures.iter().any(|signature| signature.contains('?')));
+    assert!(
+        query_signatures
+            .iter()
+            .any(|signature| signature.contains('?'))
+    );
 
     let combine = skeletons
         .keys()
@@ -542,7 +601,11 @@ fn test_function_overload_signatures() {
         .unwrap();
     let combine_signatures = analyzer.signatures_of(combine);
     assert_eq!(3, combine_signatures.len());
-    assert!(combine_signatures.iter().any(|signature| signature.contains("...")));
+    assert!(
+        combine_signatures
+            .iter()
+            .any(|signature| signature.contains("..."))
+    );
 
     let map = skeletons
         .keys()
@@ -550,9 +613,11 @@ fn test_function_overload_signatures() {
         .unwrap();
     let map_signatures = analyzer.signatures_of(map);
     assert_eq!(3, map_signatures.len());
-    assert!(map_signatures
-        .iter()
-        .any(|signature| signature.contains("[]") && signature.contains("=>")));
+    assert!(
+        map_signatures
+            .iter()
+            .any(|signature| signature.contains("[]") && signature.contains("=>"))
+    );
 
     let multiply = analyzer
         .get_declarations(&file)
@@ -561,12 +626,16 @@ fn test_function_overload_signatures() {
         .unwrap();
     let multiply_signatures = analyzer.signatures_of(&multiply);
     assert_eq!(3, multiply_signatures.len());
-    assert!(multiply_signatures
-        .iter()
-        .any(|signature| signature.contains("(a: number, b: number)")));
-    assert!(multiply_signatures
-        .iter()
-        .any(|signature| signature.contains("(a: string, b: number)")));
+    assert!(
+        multiply_signatures
+            .iter()
+            .any(|signature| signature.contains("(a: number, b: number)"))
+    );
+    assert!(
+        multiply_signatures
+            .iter()
+            .any(|signature| signature.contains("(a: string, b: number)"))
+    );
 }
 
 #[test]

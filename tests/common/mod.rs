@@ -27,13 +27,24 @@ pub fn py_fixture_project() -> TestProject {
 }
 
 #[allow(dead_code)]
+pub fn cpp_fixture_project() -> TestProject {
+    TestProject::new(
+        std::fs::canonicalize("tests/fixtures/testcode-cpp").unwrap(),
+        Language::Cpp,
+    )
+}
+
+#[allow(dead_code)]
 pub fn assert_code_eq(expected: &str, actual: &str) {
     assert_eq!(normalize_code(expected), normalize_code(actual));
 }
 
 #[allow(dead_code)]
 pub fn assert_linewise_eq(expected: &str, actual: &str) {
-    assert_eq!(normalize_nonempty_lines(expected), normalize_nonempty_lines(actual));
+    assert_eq!(
+        normalize_nonempty_lines(expected),
+        normalize_nonempty_lines(actual)
+    );
 }
 
 #[allow(dead_code)]
@@ -53,7 +64,11 @@ pub fn normalize_code(value: &str) -> String {
     let indent = slice
         .iter()
         .filter(|line| !line.trim().is_empty())
-        .map(|line| line.chars().take_while(|ch| *ch == ' ' || *ch == '\t').count())
+        .map(|line| {
+            line.chars()
+                .take_while(|ch| *ch == ' ' || *ch == '\t')
+                .count()
+        })
         .min()
         .unwrap_or(0);
     slice
@@ -65,7 +80,8 @@ pub fn normalize_code(value: &str) -> String {
 
 #[allow(dead_code)]
 pub fn normalize_nonempty_lines(value: &str) -> String {
-    value.replace("\r\n", "\n")
+    value
+        .replace("\r\n", "\n")
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())

@@ -27,9 +27,21 @@ fn test_top_level_arrow_functions() {
         .collect();
 
     assert_eq!(3, functions.len());
-    assert!(functions.iter().any(|code_unit| code_unit.fq_name().contains("myFunc")));
-    assert!(functions.iter().any(|code_unit| code_unit.fq_name().contains("asyncFunc")));
-    assert!(functions.iter().any(|code_unit| code_unit.fq_name().contains("anotherFunc")));
+    assert!(
+        functions
+            .iter()
+            .any(|code_unit| code_unit.fq_name().contains("myFunc"))
+    );
+    assert!(
+        functions
+            .iter()
+            .any(|code_unit| code_unit.fq_name().contains("asyncFunc"))
+    );
+    assert!(
+        functions
+            .iter()
+            .any(|code_unit| code_unit.fq_name().contains("anotherFunc"))
+    );
 }
 
 #[test]
@@ -58,8 +70,16 @@ fn test_exported_arrow_functions() {
         .collect();
 
     assert_eq!(2, functions.len());
-    assert!(functions.iter().any(|code_unit| code_unit.fq_name().contains("handler")));
-    assert!(functions.iter().any(|code_unit| code_unit.fq_name().contains("middleware")));
+    assert!(
+        functions
+            .iter()
+            .any(|code_unit| code_unit.fq_name().contains("handler"))
+    );
+    assert!(
+        functions
+            .iter()
+            .any(|code_unit| code_unit.fq_name().contains("middleware"))
+    );
 }
 
 #[test]
@@ -92,9 +112,21 @@ fn test_mixed_function_types() {
         .collect();
 
     assert_eq!(3, functions.len());
-    assert!(functions.iter().any(|code_unit| code_unit.fq_name().contains("regularFunc")));
-    assert!(functions.iter().any(|code_unit| code_unit.fq_name().contains("arrowFunc")));
-    assert!(functions.iter().any(|code_unit| code_unit.fq_name().contains("methodFunc")));
+    assert!(
+        functions
+            .iter()
+            .any(|code_unit| code_unit.fq_name().contains("regularFunc"))
+    );
+    assert!(
+        functions
+            .iter()
+            .any(|code_unit| code_unit.fq_name().contains("arrowFunc"))
+    );
+    assert!(
+        functions
+            .iter()
+            .any(|code_unit| code_unit.fq_name().contains("methodFunc"))
+    );
     assert_eq!(1, classes.len());
 }
 
@@ -129,7 +161,19 @@ fn test_react_patterns() {
         .collect();
 
     assert_eq!(3, functions.len());
-    assert!(functions.iter().any(|code_unit| code_unit.fq_name().contains("MyComponent")));
-    assert!(functions.iter().any(|code_unit| code_unit.fq_name().contains("useCustomHook")));
-    assert!(functions.iter().any(|code_unit| code_unit.fq_name().contains("ComponentWithProps")));
+    assert!(
+        functions
+            .iter()
+            .any(|code_unit| code_unit.fq_name().contains("MyComponent"))
+    );
+    assert!(
+        functions
+            .iter()
+            .any(|code_unit| code_unit.fq_name().contains("useCustomHook"))
+    );
+    assert!(
+        functions
+            .iter()
+            .any(|code_unit| code_unit.fq_name().contains("ComponentWithProps"))
+    );
 }
