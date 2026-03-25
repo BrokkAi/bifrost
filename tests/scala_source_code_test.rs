@@ -37,7 +37,11 @@ fn test_qualified_class_and_method_source() {
     )]);
     let analyzer = ScalaAnalyzer::from_project(project);
 
-    let foo = analyzer.get_definitions("ai.brokk.Foo").into_iter().next().unwrap();
+    let foo = analyzer
+        .get_definitions("ai.brokk.Foo")
+        .into_iter()
+        .next()
+        .unwrap();
     assert_eq!(
         r#"class Foo() {
 

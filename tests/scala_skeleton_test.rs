@@ -39,7 +39,11 @@ fn test_qualified_class_and_method_skeleton() {
         "#,
     )]);
     let analyzer = ScalaAnalyzer::from_project(project);
-    let foo = analyzer.get_definitions("ai.brokk.Foo").into_iter().next().unwrap();
+    let foo = analyzer
+        .get_definitions("ai.brokk.Foo")
+        .into_iter()
+        .next()
+        .unwrap();
 
     assert_code_eq(
         "class Foo() {\n  val field1: String = \"Test\"\n  val multiLineField: String = \"\"\"\n      das\n      \"\"\"\n  private def foo1(): Int = {...}\n}",

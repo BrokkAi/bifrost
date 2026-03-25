@@ -9,7 +9,9 @@ fn inline_project(files: &[(&str, &str)]) -> TestProject {
     let temp = tempdir().unwrap();
     let root = temp.keep();
     for (path, contents) in files {
-        ProjectFile::new(root.clone(), path).write(*contents).unwrap();
+        ProjectFile::new(root.clone(), path)
+            .write(*contents)
+            .unwrap();
     }
     TestProject::new(root, Language::Java)
 }
@@ -43,7 +45,11 @@ fn test_delegation_to_java_analyzer() {
         .find(|cu| cu.short_name() == "JavaClass")
         .unwrap();
     let relevant = provider.relevant_imports_for(&java_unit);
-    assert!(relevant.iter().any(|value| value.contains("java.util.List")));
+    assert!(
+        relevant
+            .iter()
+            .any(|value| value.contains("java.util.List"))
+    );
 }
 
 #[test]
@@ -65,7 +71,11 @@ fn test_delegation_to_python_analyzer() {
     let python_file = ProjectFile::new(project.root_path().to_path_buf(), "script.py");
     let provider = multi.import_analysis_provider().unwrap();
     let imports = provider.import_info_of(&python_file);
-    assert!(imports.iter().any(|import| import.identifier.as_deref() == Some("os")));
+    assert!(
+        imports
+            .iter()
+            .any(|import| import.identifier.as_deref() == Some("os"))
+    );
 
     let python_unit = multi
         .get_declarations(&python_file)
@@ -117,7 +127,11 @@ fn test_delegation_routes_to_correct_language() {
     assert_eq!("List", java_imports[0].identifier.as_deref().unwrap());
 
     let python_imports = provider.import_info_of(&python_file);
-    assert!(python_imports.iter().any(|import| import.identifier.as_deref() == Some("os")));
+    assert!(
+        python_imports
+            .iter()
+            .any(|import| import.identifier.as_deref() == Some("os"))
+    );
 
     let java_unit = multi
         .get_declarations(&java_file)
@@ -125,7 +139,11 @@ fn test_delegation_routes_to_correct_language() {
         .find(|cu| cu.short_name() == "JavaClass")
         .unwrap();
     let relevant_java = provider.relevant_imports_for(&java_unit);
-    assert!(relevant_java.iter().any(|value| value.contains("java.util.List")));
+    assert!(
+        relevant_java
+            .iter()
+            .any(|value| value.contains("java.util.List"))
+    );
 
     python_file
         .write("import os\ndef python_fn():\n    print(os.name)\n")
@@ -139,7 +157,11 @@ fn test_delegation_routes_to_correct_language() {
         .find(|cu| cu.short_name() == "python_fn")
         .unwrap();
     let relevant_python = updated_provider.relevant_imports_for(&updated_python_unit);
-    assert!(relevant_python.iter().any(|value| value.contains("import os")));
+    assert!(
+        relevant_python
+            .iter()
+            .any(|value| value.contains("import os"))
+    );
 }
 
 #[test]
@@ -191,10 +213,18 @@ fn test_three_way_routing_java_python_go() {
     let java_file = ProjectFile::new(project.root_path().to_path_buf(), "C.java");
 
     let go_imports = provider.import_info_of(&go_file);
-    assert!(go_imports.iter().any(|import| import.raw_snippet.contains("fmt")));
+    assert!(
+        go_imports
+            .iter()
+            .any(|import| import.raw_snippet.contains("fmt"))
+    );
 
     let py_imports = provider.import_info_of(&py_file);
-    assert!(py_imports.iter().any(|import| import.identifier.as_deref() == Some("math")));
+    assert!(
+        py_imports
+            .iter()
+            .any(|import| import.identifier.as_deref() == Some("math"))
+    );
 
     let java_unit = multi
         .get_declarations(&java_file)
@@ -202,5 +232,9 @@ fn test_three_way_routing_java_python_go() {
         .find(|cu| cu.short_name() == "C")
         .unwrap();
     let java_relevant = provider.relevant_imports_for(&java_unit);
-    assert!(java_relevant.iter().any(|value| value.contains("java.util.Set")));
+    assert!(
+        java_relevant
+            .iter()
+            .any(|value| value.contains("java.util.Set"))
+    );
 }

@@ -429,7 +429,8 @@ impl ImportAnalysisProvider for PythonAnalyzer {
         let mut used_wildcards = BTreeSet::new();
         for ident in &unresolved {
             for wildcard in &wildcard_imports {
-                let Some(package_name) = extract_package_from_python_wildcard(&wildcard.raw_snippet)
+                let Some(package_name) =
+                    extract_package_from_python_wildcard(&wildcard.raw_snippet)
                 else {
                     continue;
                 };

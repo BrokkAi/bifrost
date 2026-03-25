@@ -9,7 +9,9 @@ fn inline_project(files: &[(&str, &str)]) -> TestProject {
     let temp = tempdir().unwrap();
     let root = temp.keep();
     for (path, contents) in files {
-        ProjectFile::new(root.clone(), path).write(*contents).unwrap();
+        ProjectFile::new(root.clone(), path)
+            .write(*contents)
+            .unwrap();
     }
     TestProject::new(root, Language::Go)
 }
@@ -17,7 +19,10 @@ fn inline_project(files: &[(&str, &str)]) -> TestProject {
 #[test]
 fn test_get_test_modules_delegation() {
     let project = inline_project(&[
-        ("callbacks/x_test.go", "package callbacks\nfunc TestThing(t *testing.T) {}\n"),
+        (
+            "callbacks/x_test.go",
+            "package callbacks\nfunc TestThing(t *testing.T) {}\n",
+        ),
         ("pkg/test_x.py", "def test_ok():\n    assert True\n"),
     ]);
 

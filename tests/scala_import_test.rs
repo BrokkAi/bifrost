@@ -27,10 +27,7 @@ fn test_ordinary_import() {
     let file = ProjectFile::new(project.root().to_path_buf(), "Foo.scala");
     let imports: BTreeSet<_> = analyzer.import_statements_of(&file).into_iter().collect();
     assert_eq!(
-        BTreeSet::from([
-            "import foo.bar.Baz".to_string(),
-            "import Bar".to_string()
-        ]),
+        BTreeSet::from(["import foo.bar.Baz".to_string(), "import Bar".to_string()]),
         imports
     );
 }

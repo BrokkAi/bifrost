@@ -1,8 +1,8 @@
 use crate::analyzer::{
     CSharpAnalyzer, CodeUnit, CppAnalyzer, DeclarationInfo, GoAnalyzer, IAnalyzer,
     ImportAnalysisProvider, ImportInfo, JavaAnalyzer, JavascriptAnalyzer, Language, PhpAnalyzer,
-    Project, ProjectFile, PythonAnalyzer, Range, RustAnalyzer, ScalaAnalyzer, TestDetectionProvider,
-    TypeAliasProvider, TypeHierarchyProvider, TypescriptAnalyzer,
+    Project, ProjectFile, PythonAnalyzer, Range, RustAnalyzer, ScalaAnalyzer,
+    TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider, TypescriptAnalyzer,
 };
 use std::collections::{BTreeMap, BTreeSet};
 

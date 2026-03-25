@@ -301,9 +301,7 @@ impl<'a> ScalaVisitor<'a> {
                         self.parsed.import_statements.push(raw);
                     }
                 }
-                "class_definition"
-                | "object_definition"
-                | "trait_definition"
+                "class_definition" | "object_definition" | "trait_definition"
                 | "enum_definition" => self.visit_type_declaration(child, &current_package, None),
                 "function_definition" => self.visit_function(child, &current_package, None),
                 "val_definition" | "var_definition" => {
@@ -348,17 +346,14 @@ impl<'a> ScalaVisitor<'a> {
             return;
         }
 
-        self.parsed.add_code_unit(
-            code_unit.clone(),
-            node,
-            self.source,
-            parent.clone(),
-            None,
-        );
+        self.parsed
+            .add_code_unit(code_unit.clone(), node, self.source, parent.clone(), None);
         self.parsed
             .add_signature(code_unit.clone(), scala_type_signature(node, self.source));
 
-        if node.kind() == "class_definition" && node.child_by_field_name("class_parameters").is_some() {
+        if node.kind() == "class_definition"
+            && node.child_by_field_name("class_parameters").is_some()
+        {
             let constructor = CodeUnit::new(
                 self.file.clone(),
                 CodeUnitType::Function,
@@ -373,8 +368,10 @@ impl<'a> ScalaVisitor<'a> {
                 Some(code_unit.clone()),
                 None,
             );
-            self.parsed
-                .add_signature(constructor, scala_primary_constructor_signature(node, self.source));
+            self.parsed.add_signature(
+                constructor,
+                scala_primary_constructor_signature(node, self.source),
+            );
         }
 
         if let Some(body) = node.child_by_field_name("body") {
@@ -386,13 +383,13 @@ impl<'a> ScalaVisitor<'a> {
         let mut cursor = body.walk();
         for child in body.named_children(&mut cursor) {
             match child.kind() {
-                "function_definition" => self.visit_function(child, package_name, Some(parent.clone())),
+                "function_definition" => {
+                    self.visit_function(child, package_name, Some(parent.clone()))
+                }
                 "val_definition" | "var_definition" => {
                     self.visit_field_declaration(child, package_name, Some(parent.clone()))
                 }
-                "class_definition"
-                | "object_definition"
-                | "trait_definition"
+                "class_definition" | "object_definition" | "trait_definition"
                 | "enum_definition" => {
                     self.visit_type_declaration(child, package_name, Some(parent.clone()))
                 }
@@ -434,13 +431,8 @@ impl<'a> ScalaVisitor<'a> {
             package_name.to_string(),
             short_name,
         );
-        self.parsed.add_code_unit(
-            code_unit.clone(),
-            node,
-            self.source,
-            parent,
-            None,
-        );
+        self.parsed
+            .add_code_unit(code_unit.clone(), node, self.source, parent, None);
         self.parsed
             .add_signature(code_unit, scala_function_signature(node, self.source));
     }
@@ -467,13 +459,8 @@ impl<'a> ScalaVisitor<'a> {
                 package_name.to_string(),
                 short_name,
             );
-            self.parsed.add_code_unit(
-                code_unit.clone(),
-                node,
-                self.source,
-                parent.clone(),
-                None,
-            );
+            self.parsed
+                .add_code_unit(code_unit.clone(), node, self.source, parent.clone(), None);
             self.parsed
                 .add_signature(code_unit, scala_field_signature(node, self.source, &name));
         }
@@ -501,8 +488,7 @@ impl<'a> ScalaVisitor<'a> {
             Some(parent.clone()),
             None,
         );
-        self.parsed
-            .add_signature(code_unit, format!("case {name}"));
+        self.parsed.add_signature(code_unit, format!("case {name}"));
     }
 }
 
@@ -634,7 +620,9 @@ fn scala_modifier_prefix(node: Node<'_>, source: &str) -> String {
 
 fn scala_pattern_names(node: Node<'_>, source: &str) -> Vec<String> {
     match node.kind() {
-        "identifier" | "operator_identifier" => vec![scala_node_text(node, source).trim().to_string()],
+        "identifier" | "operator_identifier" => {
+            vec![scala_node_text(node, source).trim().to_string()]
+        }
         "identifiers" => {
             let mut names = Vec::new();
             let mut cursor = node.walk();
@@ -659,7 +647,11 @@ fn scala_pattern_names(node: Node<'_>, source: &str) -> Vec<String> {
     }
 }
 
-fn scala_literal_initializer(node: Node<'_>, source: &str, declaration_indent: usize) -> Option<String> {
+fn scala_literal_initializer(
+    node: Node<'_>,
+    source: &str,
+    declaration_indent: usize,
+) -> Option<String> {
     let kind = node.kind();
     if kind == "string"
         || kind.ends_with("_literal")
@@ -696,9 +688,7 @@ fn strip_declaration_indent(text: &str, declaration_indent: usize) -> String {
         let trimmed = if line.trim().is_empty() {
             String::new()
         } else {
-            line.chars()
-                .skip(continuation_indent)
-                .collect::<String>()
+            line.chars().skip(continuation_indent).collect::<String>()
         };
         normalized.push(trimmed);
     }

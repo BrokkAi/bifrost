@@ -206,10 +206,18 @@ fn test_file_summary_no_semicolons_after_imports() {
 
     let imports = analyzer.import_statements_of(&file);
     assert!(!imports.is_empty());
-    assert!(imports.iter().all(|import| !import.trim_end().ends_with(';')));
+    assert!(
+        imports
+            .iter()
+            .all(|import| !import.trim_end().ends_with(';'))
+    );
 
     let class_unit = definition(&analyzer, "ai.brokk.Foo");
-    let skeleton = analyzer.get_skeletons(&file).get(&class_unit).cloned().unwrap();
+    let skeleton = analyzer
+        .get_skeletons(&file)
+        .get(&class_unit)
+        .cloned()
+        .unwrap();
     let first_line = skeleton.lines().next().unwrap_or("");
     assert!(!first_line.ends_with(';'));
 }
@@ -329,7 +337,12 @@ fn test_private_field_context_is_preserved() {
     let analyzer = ScalaAnalyzer::from_project(project.clone());
     let file = ProjectFile::new(project.root().to_path_buf(), "ai/brokk/PrivateField.scala");
 
-    let secret = CodeUnit::new(file.clone(), CodeUnitType::Field, "ai.brokk", "PrivateField.secret");
+    let secret = CodeUnit::new(
+        file.clone(),
+        CodeUnitType::Field,
+        "ai.brokk",
+        "PrivateField.secret",
+    );
     assert_code_eq(
         "private val secret = \"password\"",
         &analyzer.get_skeleton(&secret).unwrap(),
