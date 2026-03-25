@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::mem::size_of;
 use std::path::Path;
 use std::sync::Arc;
-use tree_sitter::{Language as TsLanguage, Node, Tree};
+use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
 
 use super::javascript_analyzer::build_weighted_cache;
 
@@ -116,6 +116,19 @@ impl PythonAnalyzer {
         P: Project + 'static,
     {
         Self::new(Arc::new(project))
+    }
+
+    fn extract_type_identifiers(&self, source: &str) -> BTreeSet<String> {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .expect("failed to load python parser");
+        let Some(tree) = parser.parse(source, None) else {
+            return BTreeSet::new();
+        };
+        let mut identifiers = BTreeSet::new();
+        collect_python_identifiers(tree.root_node(), source, &mut identifiers);
+        identifiers
     }
 
     fn resolve_import_bindings(&self, file: &ProjectFile) -> BTreeMap<String, CodeUnit> {
@@ -365,6 +378,84 @@ impl ImportAnalysisProvider for PythonAnalyzer {
 
     fn import_info_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
         self.inner.import_info_of(file)
+    }
+
+    fn relevant_imports_for(&self, code_unit: &CodeUnit) -> BTreeSet<String> {
+        let Some(source) = self.inner.get_source(code_unit, false) else {
+            return BTreeSet::new();
+        };
+
+        let extracted = self.extract_type_identifiers(&source);
+        if extracted.is_empty() {
+            return BTreeSet::new();
+        }
+
+        let imports = self.inner.import_info_of(code_unit.source());
+        if imports.is_empty() {
+            return BTreeSet::new();
+        }
+
+        let mut matched = BTreeSet::new();
+        let mut resolved = BTreeSet::new();
+        let mut wildcard_imports = Vec::new();
+
+        for info in &imports {
+            if info.is_wildcard {
+                wildcard_imports.push(info.clone());
+                continue;
+            }
+
+            if let Some(identifier) = info.identifier.as_deref()
+                && extracted.contains(identifier)
+            {
+                matched.insert(info.raw_snippet.clone());
+                resolved.insert(identifier.to_string());
+            }
+
+            if let Some(alias) = info.alias.as_deref()
+                && extracted.contains(alias)
+            {
+                matched.insert(info.raw_snippet.clone());
+                resolved.insert(alias.to_string());
+            }
+        }
+
+        let unresolved: BTreeSet<_> = extracted.difference(&resolved).cloned().collect();
+        if unresolved.is_empty() || wildcard_imports.is_empty() {
+            return matched;
+        }
+
+        let mut resolved_via_wildcard = BTreeSet::new();
+        let mut used_wildcards = BTreeSet::new();
+        for ident in &unresolved {
+            for wildcard in &wildcard_imports {
+                let Some(package_name) = extract_package_from_python_wildcard(&wildcard.raw_snippet)
+                else {
+                    continue;
+                };
+
+                if !self
+                    .inner
+                    .get_definitions(&format!("{package_name}.{ident}"))
+                    .is_empty()
+                {
+                    used_wildcards.insert(wildcard.raw_snippet.clone());
+                    resolved_via_wildcard.insert(ident.clone());
+                }
+            }
+        }
+
+        matched.extend(used_wildcards);
+
+        let remaining: BTreeSet<_> = unresolved
+            .difference(&resolved_via_wildcard)
+            .cloned()
+            .collect();
+        if !remaining.is_empty() {
+            matched.extend(wildcard_imports.into_iter().map(|info| info.raw_snippet));
+        }
+
+        matched
     }
 
     fn could_import_file(
@@ -1115,6 +1206,16 @@ fn python_source_contains_tests(source: &str) -> bool {
     static TEST_DEF_RE: std::sync::LazyLock<Regex> =
         std::sync::LazyLock::new(|| Regex::new(r"(?m)^\s*def\s+test_[A-Za-z0-9_]*\s*\(").unwrap());
     source.contains("@pytest.mark.") || TEST_DEF_RE.is_match(source)
+}
+
+fn extract_package_from_python_wildcard(raw: &str) -> Option<String> {
+    let details = parse_python_import_details(raw)?;
+    match details {
+        PythonImportDetails::FromImport {
+            module, wildcard, ..
+        } if wildcard => Some(module),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone)]
