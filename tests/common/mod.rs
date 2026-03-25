@@ -51,6 +51,14 @@ pub fn php_fixture_project() -> TestProject {
 }
 
 #[allow(dead_code)]
+pub fn go_fixture_project() -> TestProject {
+    TestProject::new(
+        std::fs::canonicalize("tests/fixtures/testcode-go").unwrap(),
+        Language::Go,
+    )
+}
+
+#[allow(dead_code)]
 pub fn assert_code_eq(expected: &str, actual: &str) {
     assert_eq!(normalize_code(expected), normalize_code(actual));
 }

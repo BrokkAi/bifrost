@@ -193,13 +193,15 @@ impl ImportAnalysisProvider for GoAnalyzer {
             let Some(path) = extract_go_import_path(&import.raw_snippet) else {
                 continue;
             };
-            let package_segment = path.rsplit('/').next().unwrap_or(path.as_str());
+            let package_segment = go_import_package_segment(&path);
             let matching_files: Vec<_> = all_files
                 .iter()
                 .filter(|candidate| candidate != &file)
                 .filter(|candidate| {
                     let parent = candidate.parent().to_string_lossy().replace('\\', "/");
-                    parent == path || self.file_package_name(candidate) == package_segment
+                    parent == path
+                        || parent.ends_with(&format!("/{path}"))
+                        || self.file_package_name(candidate) == package_segment
                 })
                 .cloned()
                 .collect();
@@ -243,13 +245,46 @@ impl ImportAnalysisProvider for GoAnalyzer {
         self.inner.import_info_of(file)
     }
 
+    fn relevant_imports_for(&self, code_unit: &CodeUnit) -> BTreeSet<String> {
+        let source = self.inner.get_source(code_unit, false).unwrap_or_default();
+        let mut relevant = BTreeSet::new();
+        for import in self.inner.import_info_of(code_unit.source()) {
+            if import.alias.as_deref() == Some("_") {
+                continue;
+            }
+
+            let token = import
+                .alias
+                .as_ref()
+                .filter(|alias| alias.as_str() != ".")
+                .cloned()
+                .or_else(|| import.identifier.clone())
+                .unwrap_or_default();
+            if token.is_empty() || source.contains(&token) || import.alias.as_deref() == Some(".") {
+                relevant.insert(import.raw_snippet.clone());
+            }
+        }
+        relevant
+    }
+
     fn could_import_file(
         &self,
         source_file: &ProjectFile,
-        _imports: &[ImportInfo],
+        imports: &[ImportInfo],
         target: &ProjectFile,
     ) -> bool {
-        self.imported_code_units_of(source_file)
+        let target_parent = target.parent().to_string_lossy().replace('\\', "/");
+        let target_package = self.file_package_name(target);
+        imports.iter().any(|import| {
+            let Some(path) = extract_go_import_path(&import.raw_snippet) else {
+                return false;
+            };
+            let package_segment = go_import_package_segment(&path);
+            target_parent == path
+                || target_parent.ends_with(&format!("/{path}"))
+                || target_package == package_segment
+        }) || self
+            .imported_code_units_of(source_file)
             .into_iter()
             .any(|code_unit| code_unit.source() == target)
     }
@@ -360,15 +395,30 @@ impl IAnalyzer for GoAnalyzer {
     }
 
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
-        self.inner.get_skeleton(code_unit)
+        let skeleton = self.inner.get_skeleton(code_unit)?;
+        if code_unit.is_class() && !skeleton.trim_start().starts_with("type ") {
+            Some(format!("type {skeleton}"))
+        } else {
+            Some(skeleton)
+        }
     }
 
     fn get_skeleton_header(&self, code_unit: &CodeUnit) -> Option<String> {
-        self.inner.get_skeleton_header(code_unit)
+        let skeleton = self.inner.get_skeleton_header(code_unit)?;
+        if code_unit.is_class() && !skeleton.trim_start().starts_with("type ") {
+            Some(format!("type {skeleton}"))
+        } else {
+            Some(skeleton)
+        }
     }
 
     fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String> {
-        self.inner.get_source(code_unit, include_comments)
+        let source = self.inner.get_source(code_unit, include_comments)?;
+        if code_unit.is_class() && !source.trim_start().starts_with("type ") {
+            Some(format!("type {source}"))
+        } else {
+            Some(source)
+        }
     }
 
     fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String> {
@@ -482,7 +532,11 @@ fn parse_go_import_spec(node: Node<'_>, source: &str) -> Option<ImportInfo> {
         Some(alias) => format!("import {alias} \"{path}\""),
         None => format!("import \"{path}\""),
     };
-    let identifier = Some(path.rsplit('/').next().unwrap_or(path.as_str()).to_string());
+    let identifier = Some(
+        alias
+            .clone()
+            .unwrap_or_else(|| path.rsplit('/').next().unwrap_or(path.as_str()).to_string()),
+    );
 
     Some(ImportInfo {
         raw_snippet,
@@ -692,6 +746,7 @@ fn visit_go_struct_fields(
             if field.kind() != "field_declaration" {
                 continue;
             }
+            let suffix = go_struct_field_suffix(field, source);
             let mut name_cursor = field.walk();
             for name in field.named_children(&mut name_cursor) {
                 if name.kind() != "field_identifier" {
@@ -714,7 +769,7 @@ fn visit_go_struct_fields(
                     Some(parent.clone()),
                     Some(parent.clone()),
                 );
-                parsed.add_signature(code_unit, go_node_text(field, source).trim().to_string());
+                parsed.add_signature(code_unit, format!("{field_name}{suffix}"));
             }
         }
     }
@@ -798,6 +853,12 @@ fn visit_go_value_spec(
     keyword: &str,
     parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
 ) {
+    let identifier_count = {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .filter(|child| child.kind() == "identifier")
+            .count()
+    };
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         if child.kind() != "identifier" {
@@ -820,7 +881,10 @@ fn visit_go_value_spec(
             None,
             Some(code_unit.clone()),
         );
-        parsed.add_signature(code_unit, go_value_signature(node, source, keyword, name));
+        parsed.add_signature(
+            code_unit,
+            go_value_signature(node, source, keyword, name, identifier_count),
+        );
     }
 }
 
@@ -843,14 +907,42 @@ fn go_function_signature(node: Node<'_>, source: &str) -> String {
     }
 }
 
-fn go_value_signature(node: Node<'_>, source: &str, keyword: &str, name: &str) -> String {
+fn go_value_signature(
+    node: Node<'_>,
+    source: &str,
+    keyword: &str,
+    name: &str,
+    identifier_count: usize,
+) -> String {
     let raw = go_node_text(node, source).trim();
     let after_keyword = raw.strip_prefix(keyword).map(str::trim).unwrap_or(raw);
+    if identifier_count > 1 && after_keyword.contains('=') {
+        return name.to_string();
+    }
+
     let remainder = after_keyword
         .strip_prefix(name)
         .map(str::trim)
         .unwrap_or(after_keyword);
-    format!("{keyword} {name} {remainder}").trim().to_string()
+    let (type_part, value_part) = remainder
+        .split_once('=')
+        .map(|(left, right)| (left.trim(), Some(right.trim())))
+        .unwrap_or((remainder.trim(), None));
+
+    let mut signature = name.to_string();
+    if !type_part.is_empty() {
+        signature.push(' ');
+        signature.push_str(type_part);
+    }
+
+    if let Some(value) = value_part
+        && go_value_is_simple_literal(value)
+    {
+        signature.push_str(" = ");
+        signature.push_str(value);
+    }
+
+    signature
 }
 
 fn extract_go_receiver_name(node: Node<'_>, source: &str) -> Option<String> {
@@ -959,6 +1051,44 @@ fn extract_go_import_path(raw_import: &str) -> Option<String> {
                 .to_string()
         })
         .filter(|path| !path.is_empty())
+}
+
+fn go_import_package_segment(path: &str) -> String {
+    let segment = path.rsplit('/').next().unwrap_or(path);
+    segment
+        .split_once(".v")
+        .map(|(base, _)| base)
+        .unwrap_or(segment)
+        .to_string()
+}
+
+fn go_struct_field_suffix(node: Node<'_>, source: &str) -> String {
+    let mut cursor = node.walk();
+    let mut type_start = None;
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "field_identifier" {
+            continue;
+        }
+        type_start = Some(child.start_byte());
+        break;
+    }
+    type_start
+        .and_then(|start| source.get(start..node.end_byte()))
+        .map(|suffix| format!(" {}", suffix.trim()))
+        .unwrap_or_default()
+}
+
+fn go_value_is_simple_literal(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed == "iota"
+        || trimmed == "true"
+        || trimmed == "false"
+        || trimmed == "nil"
+        || trimmed.parse::<i128>().is_ok()
+        || trimmed.parse::<f64>().is_ok()
+        || (trimmed.starts_with('"') && trimmed.ends_with('"'))
+        || (trimmed.starts_with('`') && trimmed.ends_with('`'))
+        || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
 }
 
 fn weight_project_file_set(_key: &ProjectFile, value: &Arc<BTreeSet<ProjectFile>>) -> u32 {
