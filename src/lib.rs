@@ -1,5 +1,6 @@
 pub mod analyzer;
 pub mod mcp_server;
+mod project_watcher;
 pub mod searchtools;
 pub mod summary;
 mod text_utils;
@@ -13,4 +14,5 @@ pub use analyzer::{
     TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider, TypescriptAnalyzer,
     WorkspaceAnalyzer,
 };
+pub use project_watcher::{ChangeDelta, ProjectChangeWatcher};
 pub use summary::{RenderedSummary, SummaryInput, summarize_inputs};

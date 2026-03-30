@@ -3,7 +3,7 @@ use crate::analyzer::{
     JavaAnalyzer, JavascriptAnalyzer, Language, MultiAnalyzer, PhpAnalyzer, Project,
     PythonAnalyzer, RustAnalyzer, ScalaAnalyzer, TypescriptAnalyzer,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -233,6 +233,14 @@ impl WorkspaceAnalyzer {
                 AnalyzerDelegate::Scala(analyzer) => analyzer,
             },
             Self::Multi(analyzer) => analyzer.as_ref(),
+        }
+    }
+
+    pub fn update(&self, changed_files: &BTreeSet<crate::analyzer::ProjectFile>) -> Self {
+        match self {
+            Self::Empty(analyzer) => Self::Empty(analyzer.clone()),
+            Self::Single(delegate) => Self::Single(Box::new(delegate.update(changed_files))),
+            Self::Multi(analyzer) => Self::Multi(Box::new(analyzer.update(changed_files))),
         }
     }
 

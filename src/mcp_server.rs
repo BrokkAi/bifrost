@@ -1,5 +1,6 @@
 use crate::{
-    AnalyzerConfig, FilesystemProject, WorkspaceAnalyzer,
+    AnalyzerConfig, FilesystemProject, Project, ProjectChangeWatcher, ProjectFile,
+    WorkspaceAnalyzer,
     searchtools::{
         FilePatternsParams, RefreshParams, SearchSymbolsParams, SymbolNamesParams,
         get_file_summaries, get_symbol_locations, get_symbol_sources, get_symbol_summaries,
@@ -8,6 +9,7 @@ use crate::{
 };
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,11 +23,12 @@ const INVALID_PARAMS: i64 = -32602;
 const INTERNAL_ERROR: i64 = -32603;
 
 pub fn run_searchtools_stdio_server(root: PathBuf) -> Result<(), String> {
-    let project = Arc::new(
+    let project: Arc<dyn Project> = Arc::new(
         FilesystemProject::new(root)
             .map_err(|err| format!("Failed to initialize project root: {err}"))?,
     );
-    let mut workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+    let mut workspace = WorkspaceAnalyzer::build(Arc::clone(&project), AnalyzerConfig::default());
+    let watcher = ProjectChangeWatcher::start(project).ok();
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -40,7 +43,7 @@ pub fn run_searchtools_stdio_server(root: PathBuf) -> Result<(), String> {
         }
 
         let response = match serde_json::from_str::<Value>(&line) {
-            Ok(message) => dispatch_message(&mut workspace, message),
+            Ok(message) => dispatch_message(&mut workspace, watcher.as_ref(), message),
             Err(err) => Some(error_response(
                 Value::Null,
                 PARSE_ERROR,
@@ -60,7 +63,11 @@ pub fn run_searchtools_stdio_server(root: PathBuf) -> Result<(), String> {
     Ok(())
 }
 
-fn dispatch_message(workspace: &mut WorkspaceAnalyzer, message: Value) -> Option<Value> {
+fn dispatch_message(
+    workspace: &mut WorkspaceAnalyzer,
+    watcher: Option<&ProjectChangeWatcher>,
+    message: Value,
+) -> Option<Value> {
     let Some(object) = message.as_object() else {
         return Some(error_response(
             Value::Null,
@@ -95,7 +102,7 @@ fn dispatch_message(workspace: &mut WorkspaceAnalyzer, message: Value) -> Option
     let id = object.get("id").cloned();
 
     match id {
-        Some(id) => Some(dispatch_request(workspace, id, method, params)),
+        Some(id) => Some(dispatch_request(workspace, watcher, id, method, params)),
         None => {
             handle_notification(method, params);
             None
@@ -105,6 +112,7 @@ fn dispatch_message(workspace: &mut WorkspaceAnalyzer, message: Value) -> Option
 
 fn dispatch_request(
     workspace: &mut WorkspaceAnalyzer,
+    watcher: Option<&ProjectChangeWatcher>,
     id: Value,
     method: &str,
     params: Value,
@@ -113,7 +121,7 @@ fn dispatch_request(
         "initialize" => Ok(initialize_result()),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(list_tools_result()),
-        "tools/call" => handle_tool_call(workspace, params),
+        "tools/call" => handle_tool_call(workspace, watcher, params),
         _ => Err((METHOD_NOT_FOUND, format!("Unknown method: {method}"))),
     };
 
@@ -262,8 +270,11 @@ fn file_patterns_schema() -> Value {
 
 fn handle_tool_call(
     workspace: &mut WorkspaceAnalyzer,
+    watcher: Option<&ProjectChangeWatcher>,
     params: Value,
 ) -> Result<Value, (i64, String)> {
+    apply_watcher_delta(workspace, watcher);
+
     let Some(object) = params.as_object() else {
         return Err((
             INVALID_PARAMS,
@@ -310,6 +321,25 @@ fn handle_tool_call(
     tool_success_result(structured)
 }
 
+fn apply_watcher_delta(workspace: &mut WorkspaceAnalyzer, watcher: Option<&ProjectChangeWatcher>) {
+    let Some(watcher) = watcher else {
+        return;
+    };
+
+    let delta = watcher.take_changed_files();
+    if delta.requires_full_refresh {
+        *workspace = workspace.update_all();
+        return;
+    }
+
+    if delta.files.is_empty() {
+        return;
+    }
+
+    let changed_files: BTreeSet<ProjectFile> = delta.files.into_iter().collect();
+    *workspace = workspace.update(&changed_files);
+}
+
 fn decode_and_run<P, R>(
     arguments: Value,
     handler: impl FnOnce(P) -> R,
@@ -340,6 +370,38 @@ fn tool_success_result(structured: Value) -> Result<Value, (i64, String)> {
         "structuredContent": structured,
         "isError": false,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_watcher_delta;
+    use crate::{Language, ProjectChangeWatcher, ProjectFile, TestProject, WorkspaceAnalyzer};
+    use std::sync::Arc;
+
+    #[test]
+    fn apply_watcher_delta_updates_workspace_from_pending_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        std::fs::write(root.join("lib.rs"), "fn before() {}\n").unwrap();
+
+        let project = Arc::new(TestProject::new(root.clone(), Language::Rust));
+        let mut workspace =
+            WorkspaceAnalyzer::build(project.clone(), crate::AnalyzerConfig::default());
+        let watcher = ProjectChangeWatcher::start(project).unwrap();
+
+        std::fs::write(root.join("lib.rs"), "fn after() {}\n").unwrap();
+        for _ in 0..50 {
+            apply_watcher_delta(&mut workspace, Some(&watcher));
+            if workspace.analyzer().get_definitions("after").len() == 1 {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!(
+            "workspace did not see watcher-driven refresh for {}",
+            ProjectFile::new(root, "lib.rs").rel_path().display()
+        );
+    }
 }
 
 fn tool_error_result(message: String) -> Value {
