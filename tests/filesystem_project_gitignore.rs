@@ -5,7 +5,7 @@ use brokk_analyzer::{FilesystemProject, Language, Project, ProjectFile};
 
 #[test]
 fn filesystem_project_skips_gitignored_files() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
     let root = temp.path().join("repo");
     fs::create_dir_all(&root).unwrap();
     let root = root.canonicalize().unwrap();
@@ -64,4 +64,40 @@ ignored_dir/
     assert!(project.is_gitignored(std::path::Path::new("ignored.rs")));
     assert!(project.is_gitignored(std::path::Path::new("ignored_dir/lib.go")));
     assert!(!project.is_gitignored(std::path::Path::new("src/main.rs")));
+}
+
+#[test]
+fn filesystem_project_works_outside_git_repo() {
+    let temp = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let root = temp.path().join("plain-dir");
+    fs::create_dir_all(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+
+    ProjectFile::new(root.clone(), ".gitignore")
+        .write("ignored.rs\n")
+        .unwrap();
+    ProjectFile::new(root.clone(), "src/main.rs")
+        .write("fn main() {}\n")
+        .unwrap();
+    ProjectFile::new(root.clone(), "ignored.rs")
+        .write("fn ignored() {}\n")
+        .unwrap();
+
+    let project = FilesystemProject::new(root.clone()).unwrap();
+
+    let all_files = project.all_files().unwrap();
+    let all_rel_paths: BTreeSet<_> = all_files
+        .iter()
+        .map(|file| file.rel_path().to_string_lossy().to_string())
+        .collect();
+
+    assert!(all_rel_paths.contains("src/main.rs"));
+    assert!(!all_rel_paths.contains("ignored.rs"));
+
+    let rust_files = project.analyzable_files(Language::Rust).unwrap();
+    let rust_rel_paths: BTreeSet<_> = rust_files
+        .iter()
+        .map(|file| file.rel_path().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(rust_rel_paths, BTreeSet::from(["src/main.rs".to_string()]));
 }

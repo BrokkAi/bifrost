@@ -174,10 +174,10 @@ fn collect_project_files(root: &Path) -> io::Result<BTreeSet<ProjectFile>> {
         .hidden(false)
         .ignore(false)
         .git_ignore(true)
-        .git_global(false)
+        .git_global(true)
         .git_exclude(true)
         .parents(true)
-        .require_git(true)
+        .require_git(false)
         .build();
 
     for entry in walker {
