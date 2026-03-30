@@ -34,6 +34,28 @@ pub trait ImportAnalysisProvider: CapabilityProvider {
     }
 }
 
+pub(crate) fn referencing_files_via_imports<A, P>(
+    analyzer: &A,
+    provider: &P,
+    file: &ProjectFile,
+) -> BTreeSet<ProjectFile>
+where
+    A: IAnalyzer,
+    P: ImportAnalysisProvider + ?Sized,
+{
+    analyzer
+        .get_analyzed_files()
+        .into_iter()
+        .filter(|candidate| candidate != file)
+        .filter(|candidate| {
+            provider
+                .imported_code_units_of(candidate)
+                .into_iter()
+                .any(|code_unit| code_unit.source() == file)
+        })
+        .collect()
+}
+
 pub trait TypeAliasProvider: CapabilityProvider {
     fn is_type_alias(&self, _code_unit: &CodeUnit) -> bool {
         false
@@ -74,6 +96,29 @@ pub trait TypeHierarchyProvider: CapabilityProvider {
 
         self.get_descendants(&parent)
     }
+}
+
+pub(crate) fn direct_descendants_via_ancestors<A, P>(
+    analyzer: &A,
+    provider: &P,
+    code_unit: &CodeUnit,
+) -> BTreeSet<CodeUnit>
+where
+    A: IAnalyzer,
+    P: TypeHierarchyProvider + ?Sized,
+{
+    analyzer
+        .get_all_declarations()
+        .into_iter()
+        .filter(|candidate| candidate.is_class())
+        .filter(|candidate| candidate != code_unit)
+        .filter(|candidate| {
+            provider
+                .get_direct_ancestors(candidate)
+                .into_iter()
+                .any(|ancestor| ancestor.fq_name() == code_unit.fq_name())
+        })
+        .collect()
 }
 
 fn traverse_hierarchy<F>(root: &CodeUnit, mut next: F) -> Vec<CodeUnit>

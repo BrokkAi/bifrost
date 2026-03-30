@@ -1,7 +1,7 @@
 use crate::analyzer::{
     AnalyzerConfig, CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language,
     LanguageAdapter, Project, ProjectFile, TestDetectionProvider, TreeSitterAnalyzer,
-    TypeAliasProvider,
+    TypeAliasProvider, referencing_files_via_imports,
 };
 use moka::sync::Cache;
 use std::collections::BTreeSet;
@@ -218,17 +218,7 @@ impl ImportAnalysisProvider for RustAnalyzer {
             return (*cached).clone();
         }
 
-        let referencing: BTreeSet<_> = self
-            .inner
-            .all_files()
-            .into_iter()
-            .filter(|candidate| candidate != file)
-            .filter(|candidate| {
-                self.imported_code_units_of(candidate)
-                    .into_iter()
-                    .any(|code_unit| code_unit.source() == file)
-            })
-            .collect();
+        let referencing = referencing_files_via_imports(self, self, file);
         self.referencing_files
             .insert(file.clone(), Arc::new(referencing.clone()));
         referencing

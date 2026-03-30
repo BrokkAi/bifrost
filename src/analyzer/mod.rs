@@ -22,6 +22,7 @@ pub use capabilities::{
     CapabilityProvider, ImportAnalysisProvider, TestDetectionProvider, TypeAliasProvider,
     TypeHierarchyProvider,
 };
+pub(crate) use capabilities::{direct_descendants_via_ancestors, referencing_files_via_imports};
 pub use config::AnalyzerConfig;
 pub use cpp_analyzer::CppAnalyzer;
 pub use csharp_analyzer::CSharpAnalyzer;

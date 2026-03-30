@@ -1,6 +1,7 @@
 use crate::analyzer::{
     AnalyzerConfig, CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language,
     LanguageAdapter, Project, ProjectFile, TestDetectionProvider, TreeSitterAnalyzer,
+    referencing_files_via_imports,
 };
 use moka::sync::Cache;
 use std::collections::BTreeSet;
@@ -208,19 +209,7 @@ impl ImportAnalysisProvider for JavascriptAnalyzer {
             return (*cached).clone();
         }
 
-        let mut referencing = BTreeSet::new();
-        for candidate in self.inner.all_files() {
-            if &candidate == file {
-                continue;
-            }
-            if self
-                .imported_code_units_of(&candidate)
-                .into_iter()
-                .any(|code_unit| code_unit.source() == file)
-            {
-                referencing.insert(candidate);
-            }
-        }
+        let referencing = referencing_files_via_imports(self, self, file);
 
         self.memo_caches
             .referencing_files

@@ -1,7 +1,8 @@
 use crate::analyzer::{
     AnalyzerConfig, CodeUnit, DeclarationInfo, DeclarationKind, IAnalyzer, ImportAnalysisProvider,
     ImportInfo, Language, LanguageAdapter, Project, ProjectFile, TestDetectionProvider,
-    TreeSitterAnalyzer, TypeHierarchyProvider,
+    TreeSitterAnalyzer, TypeHierarchyProvider, direct_descendants_via_ancestors,
+    referencing_files_via_imports,
 };
 use moka::sync::Cache;
 use std::collections::{BTreeMap, BTreeSet};
@@ -266,17 +267,7 @@ impl ImportAnalysisProvider for JavaAnalyzer {
             return (*cached).clone();
         }
 
-        let mut result: BTreeSet<ProjectFile> = self
-            .inner
-            .all_files()
-            .into_iter()
-            .filter(|candidate| candidate != file)
-            .filter(|candidate| {
-                self.imported_code_units_of(candidate)
-                    .into_iter()
-                    .any(|code_unit| code_unit.source() == file)
-            })
-            .collect();
+        let mut result = referencing_files_via_imports(self, self, file);
 
         let target_identifiers: BTreeSet<String> = self
             .inner
@@ -1654,17 +1645,7 @@ impl TypeHierarchyProvider for JavaAnalyzer {
             return (*cached).clone();
         }
 
-        let descendants: BTreeSet<_> = self
-            .inner
-            .get_all_declarations()
-            .into_iter()
-            .filter(|candidate| candidate.is_class())
-            .filter(|candidate| {
-                self.get_direct_ancestors(candidate)
-                    .into_iter()
-                    .any(|ancestor| ancestor == *code_unit)
-            })
-            .collect();
+        let descendants = direct_descendants_via_ancestors(self, self, code_unit);
         self.memo_caches
             .direct_descendants
             .insert(code_unit.clone(), Arc::new(descendants.clone()));

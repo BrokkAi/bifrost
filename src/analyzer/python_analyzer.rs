@@ -1,7 +1,7 @@
 use crate::analyzer::{
     AnalyzerConfig, CodeUnit, CodeUnitType, IAnalyzer, ImportAnalysisProvider, ImportInfo,
     Language, LanguageAdapter, Project, ProjectFile, TestDetectionProvider, TreeSitterAnalyzer,
-    TypeHierarchyProvider,
+    TypeHierarchyProvider, direct_descendants_via_ancestors, referencing_files_via_imports,
 };
 use moka::sync::Cache;
 use regex::Regex;
@@ -360,17 +360,7 @@ impl ImportAnalysisProvider for PythonAnalyzer {
             return (*cached).clone();
         }
 
-        let referencing: BTreeSet<_> = self
-            .inner
-            .all_files()
-            .into_iter()
-            .filter(|candidate| candidate != file)
-            .filter(|candidate| {
-                self.imported_code_units_of(candidate)
-                    .into_iter()
-                    .any(|code_unit| code_unit.source() == file)
-            })
-            .collect();
+        let referencing = referencing_files_via_imports(self, self, file);
         self.referencing_files
             .insert(file.clone(), Arc::new(referencing.clone()));
         referencing
@@ -520,18 +510,7 @@ impl TypeHierarchyProvider for PythonAnalyzer {
             return (*cached).clone();
         }
 
-        let descendants: BTreeSet<_> = self
-            .inner
-            .get_all_declarations()
-            .into_iter()
-            .filter(|candidate| candidate.is_class())
-            .filter(|candidate| candidate != code_unit)
-            .filter(|candidate| {
-                self.get_direct_ancestors(candidate)
-                    .into_iter()
-                    .any(|ancestor| ancestor.fq_name() == code_unit.fq_name())
-            })
-            .collect();
+        let descendants = direct_descendants_via_ancestors(self, self, code_unit);
         self.direct_descendants
             .insert(code_unit.clone(), Arc::new(descendants.clone()));
         descendants
