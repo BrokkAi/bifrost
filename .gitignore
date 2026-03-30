@@ -1,2 +1,8 @@
 /target
 __pycache__/
+
+### BROKK'S CONFIGURATION ###
+**/.brokk/**
+!AGENTS.md
+!**/.brokk/style.md
+!**/.brokk/project.properties
