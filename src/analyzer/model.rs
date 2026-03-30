@@ -1,7 +1,9 @@
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::fmt;
+use std::fs::File;
 use std::io;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -110,6 +112,18 @@ impl ProjectFile {
 
     pub fn exists(&self) -> bool {
         self.abs_path().exists()
+    }
+
+    pub fn is_binary(&self) -> io::Result<bool> {
+        let path = self.abs_path();
+        if !path.exists() || !path.is_file() {
+            return Ok(false);
+        }
+
+        let mut file = File::open(path)?;
+        let mut buf = [0u8; 8192];
+        let read = file.read(&mut buf)?;
+        Ok(buf[..read].contains(&0))
     }
 
     pub fn read_to_string(&self) -> io::Result<String> {

@@ -1,6 +1,7 @@
 use crate::analyzer::{
     AnalyzerConfig, CodeUnit, DeclarationInfo, ImportInfo, Language, Project, ProjectFile, Range,
 };
+use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use rayon::prelude::*;
 use regex::RegexBuilder;
 use std::collections::{BTreeMap, BTreeSet};
@@ -295,6 +296,10 @@ where
     }
 
     fn analyze_file(parser: &mut Parser, adapter: &A, file: &ProjectFile) -> Option<FileState> {
+        if file.is_binary().ok()? {
+            return None;
+        }
+
         let source = file.read_to_string().ok()?;
         let tree = parser.parse(source.as_str(), None)?;
         let parsed = adapter.parse_file(file, &source, &tree);
@@ -881,17 +886,8 @@ fn node_range(node: Node<'_>) -> Range {
 }
 
 fn expanded_comment_start(source: &str, start_byte: usize) -> usize {
-    let mut line_starts = vec![0usize];
-    for (idx, ch) in source.char_indices() {
-        if ch == '\n' && idx + 1 < source.len() {
-            line_starts.push(idx + 1);
-        }
-    }
-
-    let line_index = match line_starts.binary_search(&start_byte) {
-        Ok(index) => index,
-        Err(index) => index.saturating_sub(1),
-    };
+    let line_starts = compute_line_starts(source);
+    let line_index = find_line_index_for_offset(&line_starts, start_byte);
 
     let mut comment_start = start_byte;
     for line_idx in (0..line_index).rev() {

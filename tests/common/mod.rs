@@ -73,7 +73,7 @@ pub fn assert_linewise_eq(expected: &str, actual: &str) {
 
 #[allow(dead_code)]
 pub fn normalize_code(value: &str) -> String {
-    let normalized = value.replace("\r\n", "\n");
+    let normalized = normalize_line_endings(value);
     let lines: Vec<_> = normalized.lines().collect();
     let start = lines
         .iter()
@@ -104,13 +104,17 @@ pub fn normalize_code(value: &str) -> String {
 
 #[allow(dead_code)]
 pub fn normalize_nonempty_lines(value: &str) -> String {
-    value
-        .replace("\r\n", "\n")
+    normalize_line_endings(value)
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[allow(dead_code)]
+pub fn normalize_line_endings(value: &str) -> String {
+    value.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 #[allow(dead_code)]

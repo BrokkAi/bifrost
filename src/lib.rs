@@ -2,6 +2,7 @@ pub mod analyzer;
 pub mod mcp_server;
 pub mod searchtools;
 pub mod summary;
+mod text_utils;
 
 pub use analyzer::{
     AnalyzerConfig, AnalyzerDelegate, CSharpAnalyzer, CapabilityProvider, CodeBaseMetrics,

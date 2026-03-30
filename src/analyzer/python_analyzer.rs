@@ -3,6 +3,7 @@ use crate::analyzer::{
     Language, LanguageAdapter, Project, ProjectFile, TestDetectionProvider, TreeSitterAnalyzer,
     TypeHierarchyProvider, direct_descendants_via_ancestors, referencing_files_via_imports,
 };
+use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use moka::sync::Cache;
 use regex::Regex;
 use std::collections::{BTreeMap, BTreeSet};
@@ -1070,17 +1071,8 @@ fn python_is_property_mutator(node: Node<'_>, source: &str) -> bool {
 }
 
 fn python_expanded_comment_start(source: &str, start_byte: usize) -> usize {
-    let mut line_starts = vec![0usize];
-    for (idx, ch) in source.char_indices() {
-        if ch == '\n' && idx + 1 < source.len() {
-            line_starts.push(idx + 1);
-        }
-    }
-
-    let line_index = match line_starts.binary_search(&start_byte) {
-        Ok(index) => index,
-        Err(index) => index.saturating_sub(1),
-    };
+    let line_starts = compute_line_starts(source);
+    let line_index = find_line_index_for_offset(&line_starts, start_byte);
 
     let mut comment_start = start_byte;
     for line_idx in (0..line_index).rev() {

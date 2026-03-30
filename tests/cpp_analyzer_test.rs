@@ -584,7 +584,9 @@ class AdaptiveIntBuilderBase {
 
     let declarations = analyzer.get_declarations(&file);
     assert!(
-        declarations.iter().any(|cu| cu.is_class() && cu.short_name().contains("AdaptiveIntBuilderBase"))
+        declarations
+            .iter()
+            .any(|cu| cu.is_class() && cu.short_name().contains("AdaptiveIntBuilderBase"))
     );
 
     let fields: BTreeSet<_> = declarations

@@ -182,7 +182,10 @@ fn collect_project_files(root: &Path) -> io::Result<BTreeSet<ProjectFile>> {
 
     for entry in walker {
         let entry = entry.map_err(|err| io::Error::other(err.to_string()))?;
-        if !entry.file_type().is_some_and(|file_type| file_type.is_file()) {
+        if !entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_file())
+        {
             continue;
         }
 

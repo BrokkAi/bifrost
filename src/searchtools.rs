@@ -1,4 +1,5 @@
 use crate::analyzer::{CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, Range};
+use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use glob::Pattern;
 use rayon::prelude::*;
 use regex::Regex;
@@ -665,11 +666,7 @@ fn line_count(content: &str) -> usize {
 
 fn line_number_at_offset(content: &str, offset: usize) -> usize {
     let bounded = offset.min(content.len());
-    content[..bounded]
-        .bytes()
-        .filter(|byte| *byte == b'\n')
-        .count()
-        + 1
+    find_line_index_for_offset(&compute_line_starts(content), bounded) + 1
 }
 
 fn expanded_comment_start(language: Language, source: &str, start_byte: usize) -> usize {
@@ -678,10 +675,7 @@ fn expanded_comment_start(language: Language, source: &str, start_byte: usize) -
     }
 
     let line_starts = line_starts(source);
-    let line_index = match line_starts.binary_search(&start_byte) {
-        Ok(index) => index,
-        Err(index) => index.saturating_sub(1),
-    };
+    let line_index = find_line_index_for_offset(&line_starts, start_byte);
 
     let mut comment_start = start_byte;
     for line_idx in (0..line_index).rev() {
@@ -714,10 +708,7 @@ fn expanded_comment_start(language: Language, source: &str, start_byte: usize) -
 
 fn python_expanded_comment_start(source: &str, start_byte: usize) -> usize {
     let line_starts = line_starts(source);
-    let line_index = match line_starts.binary_search(&start_byte) {
-        Ok(index) => index,
-        Err(index) => index.saturating_sub(1),
-    };
+    let line_index = find_line_index_for_offset(&line_starts, start_byte);
 
     let mut comment_start = start_byte;
     for line_idx in (0..line_index).rev() {
@@ -745,13 +736,7 @@ fn python_expanded_comment_start(source: &str, start_byte: usize) -> usize {
 }
 
 fn line_starts(source: &str) -> Vec<usize> {
-    let mut starts = vec![0usize];
-    for (index, ch) in source.char_indices() {
-        if ch == '\n' && index + 1 < source.len() {
-            starts.push(index + 1);
-        }
-    }
-    starts
+    compute_line_starts(source)
 }
 
 fn is_comment_like(trimmed_line: &str) -> bool {
