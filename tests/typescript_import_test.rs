@@ -140,12 +140,17 @@ fn test_resolve_imports_relevant_imports_and_could_import_file() {
     write_file(
         root,
         "lib/index.ts",
-        "export function libFunc(): string { return 'lib'; }\n",
+        "export function libFunc(): string { return 'lib'; }\nexport function otherFunc(): string { return 'other'; }\n",
     );
     write_file(
         root,
         "dir_main.ts",
         "import { libFunc } from './lib/index.ts';\nimport { libFunc as libFunc2 } from './lib';\nlibFunc();\n",
+    );
+    write_file(
+        root,
+        "dir_alias_only.ts",
+        "import { libFunc as libFuncAlias } from './lib';\nlibFuncAlias();\n",
     );
     write_file(
         root,
@@ -288,6 +293,15 @@ fn test_resolve_imports_relevant_imports_and_could_import_file() {
     assert!(
         analyzer
             .imported_code_units_of(&ProjectFile::new(root.to_path_buf(), "dir_main.ts"))
+            .iter()
+            .any(|code_unit| {
+                code_unit.identifier() == "libFunc"
+                    && code_unit.source().rel_path() == Path::new("lib/index.ts")
+            })
+    );
+    assert!(
+        analyzer
+            .imported_code_units_of(&ProjectFile::new(root.to_path_buf(), "dir_alias_only.ts"))
             .iter()
             .any(|code_unit| {
                 code_unit.identifier() == "libFunc"

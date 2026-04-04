@@ -4,10 +4,13 @@ use brokk_analyzer::{
     searchtools::{MostRelevantFilesParams, most_relevant_files},
 };
 use git2::{Repository, Signature};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use tempfile::TempDir;
 
 fn write_file(root: &Path, rel_path: &str, contents: &str) -> ProjectFile {
@@ -58,6 +61,103 @@ fn brokk_cli_result_lines(project_root: &Path, stdout: &str) -> Vec<String> {
         .filter(|line| project_root.join(line).is_file())
         .map(str::to_string)
         .collect()
+}
+
+fn brokk_cli_direct(project_root: &Path, seeds: &[String]) -> Vec<String> {
+    let classpath = format!(
+        "{}/app/build/classes/java/main:{}/app/build/resources/main:{}/app/build/install/app/lib/*",
+        project_root.display(),
+        project_root.display(),
+        project_root.display()
+    );
+    let output = Command::new("java")
+        .arg("-Djava.awt.headless=true")
+        .arg("-cp")
+        .arg(classpath)
+        .arg("ai.brokk.tools.MostRelevantFilesCli")
+        .arg("--root")
+        .arg(project_root)
+        .args(seeds)
+        .current_dir(project_root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    brokk_cli_result_lines(project_root, &String::from_utf8(output.stdout).unwrap())
+}
+
+fn tracked_files(project_root: &Path) -> Vec<String> {
+    let output = Command::new("git")
+        .arg("ls-files")
+        .current_dir(project_root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn deterministic_pair_sample(files: &[String], count: usize) -> Vec<[String; 2]> {
+    let mut state = 0_u64;
+    let mut seen = BTreeSet::new();
+    let mut pairs = Vec::new();
+    while pairs.len() < count {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let left = (state as usize) % files.len();
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let right = (state as usize) % files.len();
+        if left == right {
+            continue;
+        }
+
+        let mut key = [files[left].clone(), files[right].clone()];
+        key.sort();
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+
+        pairs.push([files[left].clone(), files[right].clone()]);
+    }
+    pairs
+}
+
+fn mismatch_summary(seeds: &[String], brokk: &[String], bifrost: &[String]) -> String {
+    let first_diff = brokk
+        .iter()
+        .zip(bifrost)
+        .position(|(left, right)| left != right)
+        .unwrap_or_else(|| brokk.len().min(bifrost.len()));
+    format!(
+        "seeds={:?} first_diff_rank={} brokk_at_diff={:?} bifrost_at_diff={:?} left_only={:?} right_only={:?}",
+        seeds,
+        first_diff + 1,
+        brokk.get(first_diff),
+        bifrost.get(first_diff),
+        brokk
+            .iter()
+            .filter(|file| !bifrost.contains(*file))
+            .take(10)
+            .cloned()
+            .collect::<Vec<_>>(),
+        bifrost
+            .iter()
+            .filter(|file| !brokk.contains(*file))
+            .take(10)
+            .cloned()
+            .collect::<Vec<_>>(),
+    )
 }
 
 #[test]
@@ -571,4 +671,144 @@ fn matches_brokk_reference_for_architect_agent_test_seed() {
     let expected = brokk_cli_result_lines(&brokk_root, &String::from_utf8(brokk.stdout).unwrap());
 
     assert_eq!(expected, bifrost.files);
+}
+
+#[test]
+fn matches_brokk_reference_for_history_store_and_console_logging_pair() {
+    let brokk_root = PathBuf::from("/home/jonathan/Projects/brokk");
+    if !brokk_root.is_dir() {
+        eprintln!("skipping brokk parity regression: sibling repo not present");
+        return;
+    }
+
+    let seeds = [
+        "frontend-mop/src/stores/historyStore.ts",
+        "app/src/main/resources/mop-webview-scripts/console-logging-interceptor.js",
+    ];
+    let project = Arc::new(FilesystemProject::new(&brokk_root).unwrap());
+    let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+    let bifrost = most_relevant_files(
+        workspace.analyzer(),
+        MostRelevantFilesParams {
+            seed_files: seeds.iter().map(|seed| (*seed).to_string()).collect(),
+            limit: 100,
+        },
+    );
+    assert!(bifrost.not_found.is_empty());
+
+    let brokk = Command::new("./gradlew")
+        .arg("-q")
+        .arg(":app:runMostRelevantFiles")
+        .arg(format!(
+            "-Pargs=--root {} {} {}",
+            brokk_root.display(),
+            seeds[0],
+            seeds[1]
+        ))
+        .current_dir(&brokk_root)
+        .output()
+        .unwrap();
+    assert!(
+        brokk.status.success(),
+        "{}",
+        String::from_utf8_lossy(&brokk.stderr)
+    );
+    let expected = brokk_cli_result_lines(&brokk_root, &String::from_utf8(brokk.stdout).unwrap());
+
+    assert_eq!(expected, bifrost.files);
+}
+
+#[test]
+#[ignore = "cross-repo parity batch"]
+fn matches_brokk_reference_for_100_random_seed_pairs() {
+    let brokk_root = PathBuf::from("/home/jonathan/Projects/brokk");
+    if !brokk_root.is_dir() {
+        eprintln!("skipping brokk parity regression: sibling repo not present");
+        return;
+    }
+
+    eprintln!("pair batch: building workspace analyzer");
+    let project = Arc::new(FilesystemProject::new(&brokk_root).unwrap());
+    let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+    eprintln!("pair batch: workspace analyzer ready");
+    let files = tracked_files(&brokk_root);
+    let seed_pairs = deterministic_pair_sample(&files, 100);
+    let mut cases = Vec::new();
+    for (index, pair) in seed_pairs.into_iter().enumerate() {
+        let seeds = vec![pair[0].clone(), pair[1].clone()];
+        let bifrost = most_relevant_files(
+            workspace.analyzer(),
+            MostRelevantFilesParams {
+                seed_files: seeds.clone(),
+                limit: 100,
+            },
+        );
+        assert!(bifrost.not_found.is_empty(), "{:?}", seeds);
+        cases.push((index, seeds, bifrost.files));
+
+        let done = index + 1;
+        if done == 1 || done % 10 == 0 || done == 100 {
+            eprintln!("pair precompute progress {}/100", done);
+        }
+    }
+
+    let cases = Arc::new(cases);
+    let next = AtomicUsize::new(0);
+    let completed = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+    let mismatch = Mutex::new(None::<String>);
+    let worker_count = thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(4)
+        .min(8)
+        .max(2);
+
+    thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let cases = Arc::clone(&cases);
+            let brokk_root = brokk_root.clone();
+            let mismatch = &mismatch;
+            let next = &next;
+            let completed = &completed;
+            let stop = &stop;
+            scope.spawn(move || loop {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                let idx = next.fetch_add(1, Ordering::Relaxed);
+                let Some((case_index, seeds, bifrost)) = cases.get(idx) else {
+                    break;
+                };
+
+                let brokk = brokk_cli_direct(&brokk_root, seeds);
+                if brokk != *bifrost {
+                    let mut slot = mismatch.lock().unwrap();
+                    if slot.is_none() {
+                        *slot = Some(mismatch_summary(seeds, &brokk, bifrost));
+                        eprintln!(
+                            "pair parity mismatch at case {}/{} seeds={:?}",
+                            case_index + 1,
+                            cases.len(),
+                            seeds
+                        );
+                    }
+                    stop.store(true, Ordering::Relaxed);
+                    break;
+                }
+
+                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                if done == 1 || done % 10 == 0 || done == cases.len() {
+                    eprintln!("pair parity progress {}/{}", done, cases.len());
+                }
+            });
+        }
+    });
+
+    let mismatch = mismatch.into_inner().unwrap();
+    assert!(
+        mismatch.is_none(),
+        "pair parity mismatch:\n{}",
+        mismatch.unwrap()
+    );
 }

@@ -127,12 +127,17 @@ fn test_resolve_imports_and_import_variants() {
     write_file(
         root,
         "lib/index.js",
-        "export function libFunc() { return 'lib'; }\n",
+        "export function libFunc() { return 'lib'; }\nexport function otherFunc() { return 'other'; }\n",
     );
     write_file(
         root,
         "dir_main.js",
         "import { libFunc } from './lib/index.js';\nimport { libFunc as libFunc2 } from './lib';\nlibFunc();\n",
+    );
+    write_file(
+        root,
+        "dir_alias_only.js",
+        "import { libFunc as libFuncAlias } from './lib';\nlibFuncAlias();\n",
     );
     write_file(
         root,
@@ -224,6 +229,15 @@ fn test_resolve_imports_and_import_variants() {
     assert!(
         analyzer
             .imported_code_units_of(&ProjectFile::new(root.to_path_buf(), "dir_main.js"))
+            .iter()
+            .any(|code_unit| {
+                code_unit.identifier() == "libFunc"
+                    && code_unit.source().rel_path() == Path::new("lib/index.js")
+            })
+    );
+    assert!(
+        analyzer
+            .imported_code_units_of(&ProjectFile::new(root.to_path_buf(), "dir_alias_only.js"))
             .iter()
             .any(|code_unit| {
                 code_unit.identifier() == "libFunc"

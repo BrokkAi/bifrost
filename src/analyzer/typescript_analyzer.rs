@@ -192,7 +192,7 @@ impl ImportAnalysisProvider for TypescriptAnalyzer {
                             .filter(|code_unit| !code_unit.is_module()),
                     );
                 } else if let Some(identifier) =
-                    import.alias.as_ref().or(import.identifier.as_ref())
+                    import.identifier.as_ref().or(import.alias.as_ref())
                 {
                     resolved.extend(
                         top_level
