@@ -720,6 +720,101 @@ fn matches_brokk_reference_for_history_store_and_console_logging_pair() {
 
 #[test]
 #[ignore = "cross-repo parity batch"]
+fn matches_brokk_reference_for_100_random_seed_files() {
+    let brokk_root = PathBuf::from("/home/jonathan/Projects/brokk");
+    if !brokk_root.is_dir() {
+        eprintln!("skipping brokk parity regression: sibling repo not present");
+        return;
+    }
+
+    eprintln!("single batch: building workspace analyzer");
+    let project = Arc::new(FilesystemProject::new(&brokk_root).unwrap());
+    let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+    eprintln!("single batch: workspace analyzer ready");
+    let files = tracked_files(&brokk_root);
+    let seed_files = files.into_iter().take(100).collect::<Vec<_>>();
+    let mut cases = Vec::new();
+    for (index, seed) in seed_files.into_iter().enumerate() {
+        let seeds = vec![seed];
+        let bifrost = most_relevant_files(
+            workspace.analyzer(),
+            MostRelevantFilesParams {
+                seed_files: seeds.clone(),
+                limit: 100,
+            },
+        );
+        assert!(bifrost.not_found.is_empty(), "{:?}", seeds);
+        cases.push((index, seeds, bifrost.files));
+
+        let done = index + 1;
+        if done == 1 || done % 10 == 0 || done == 100 {
+            eprintln!("single precompute progress {}/100", done);
+        }
+    }
+
+    let cases = Arc::new(cases);
+    let next = AtomicUsize::new(0);
+    let completed = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+    let mismatch = Mutex::new(None::<String>);
+    let worker_count = thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(4)
+        .min(8)
+        .max(2);
+
+    thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let cases = Arc::clone(&cases);
+            let brokk_root = brokk_root.clone();
+            let mismatch = &mismatch;
+            let next = &next;
+            let completed = &completed;
+            let stop = &stop;
+            scope.spawn(move || loop {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                let idx = next.fetch_add(1, Ordering::Relaxed);
+                let Some((case_index, seeds, bifrost)) = cases.get(idx) else {
+                    break;
+                };
+
+                let brokk = brokk_cli_direct(&brokk_root, seeds);
+                if brokk != *bifrost {
+                    let mut slot = mismatch.lock().unwrap();
+                    if slot.is_none() {
+                        *slot = Some(mismatch_summary(seeds, &brokk, bifrost));
+                        eprintln!(
+                            "single parity mismatch at case {}/{} seeds={:?}",
+                            case_index + 1,
+                            cases.len(),
+                            seeds
+                        );
+                    }
+                    stop.store(true, Ordering::Relaxed);
+                    break;
+                }
+
+                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                if done == 1 || done % 10 == 0 || done == cases.len() {
+                    eprintln!("single parity progress {}/{}", done, cases.len());
+                }
+            });
+        }
+    });
+
+    let mismatch = mismatch.into_inner().unwrap();
+    assert!(
+        mismatch.is_none(),
+        "single parity mismatch:\n{}",
+        mismatch.unwrap()
+    );
+}
+
+#[test]
+#[ignore = "cross-repo parity batch"]
 fn matches_brokk_reference_for_100_random_seed_pairs() {
     let brokk_root = PathBuf::from("/home/jonathan/Projects/brokk");
     if !brokk_root.is_dir() {
