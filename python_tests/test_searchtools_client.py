@@ -57,6 +57,18 @@ class SearchToolsClientTest(unittest.TestCase):
         self.assertEqual(1, text.count("A.method2 (A.java:8..10)"))
         self.assertEqual(1, text.count("A.method2 (A.java:12..15)"))
 
+    def test_summarize_symbols_matches_recursive_brokk_style_output(self) -> None:
+        with SearchToolsClient(
+            root=self.fixture_root, library_path=self.library_path
+        ) as client:
+            summaries = client.summarize_symbols(["A.java"])
+            text = summaries.render_text()
+
+        self.assertEqual(1, summaries.count)
+        self.assertIn("  - AInner", text)
+        self.assertIn("    - AInnerInner", text)
+        self.assertIn("      - method7", text)
+
     def test_native_errors_are_raised_as_searchtools_error(self) -> None:
         with SearchToolsClient(
             root=self.fixture_root, library_path=self.library_path

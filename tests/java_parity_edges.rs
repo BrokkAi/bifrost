@@ -191,3 +191,42 @@ fn resolves_relevant_wildcard_imports_to_known_project_types() {
     assert_eq!(1, relevant.len());
     assert!(relevant.contains("import internal.*;"));
 }
+
+#[test]
+fn summarize_symbols_renders_brokk_style_nested_output() {
+    let root = std::env::current_dir()
+        .unwrap()
+        .join("tests/fixtures/testcode-java")
+        .canonicalize()
+        .unwrap();
+    let project = TestProject::new(root, Language::Java);
+    let analyzer = JavaAnalyzer::from_project(project);
+    let file = ProjectFile::new(analyzer.project().root().to_path_buf(), "A.java");
+
+    let summary = analyzer.summarize_symbols(&file);
+
+    assert!(summary.starts_with("- A\n"));
+    assert!(summary.contains("  - method1"));
+    assert!(summary.contains("  - AInner\n    - AInnerInner\n      - method7"));
+    assert!(summary.contains("  - AInnerStatic"));
+    assert!(summary.contains("  - usesInnerClass"));
+}
+
+#[test]
+fn summarize_symbols_renders_brokk_style_package_headers() {
+    let root = std::env::current_dir()
+        .unwrap()
+        .join("tests/fixtures/testcode-java")
+        .canonicalize()
+        .unwrap();
+    let project = TestProject::new(root, Language::Java);
+    let analyzer = JavaAnalyzer::from_project(project);
+    let file = ProjectFile::new(analyzer.project().root().to_path_buf(), "Packaged.java");
+
+    let summary = analyzer.summarize_symbols(&file);
+    let lines: Vec<_> = summary.lines().collect();
+
+    assert_eq!(Some(&"# io.github.jbellis.brokk"), lines.first());
+    assert!(lines.contains(&"- Foo"));
+    assert!(lines.contains(&"  - bar"));
+}

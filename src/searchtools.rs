@@ -400,6 +400,10 @@ pub fn get_file_summaries(analyzer: &dyn IAnalyzer, params: FilePatternsParams) 
 }
 
 pub fn skim_files(analyzer: &dyn IAnalyzer, params: FilePatternsParams) -> SkimFilesResult {
+    summarize_symbols(analyzer, params)
+}
+
+pub fn summarize_symbols(analyzer: &dyn IAnalyzer, params: FilePatternsParams) -> SkimFilesResult {
     let expanded = expand_file_patterns(analyzer, &params.file_patterns);
     let truncated = expanded.len() > FILE_SKIM_LIMIT;
     let files: Vec<_> = expanded

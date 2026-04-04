@@ -1,6 +1,6 @@
 use crate::analyzer::{
-    CodeBaseMetrics, CodeUnit, DeclarationInfo, ImportAnalysisProvider, Language, Project,
-    ProjectFile, Range, TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider,
+    CodeBaseMetrics, CodeUnit, CodeUnitType, DeclarationInfo, ImportAnalysisProvider, Language,
+    Project, ProjectFile, Range, TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider,
     metrics_from_declarations,
 };
 use std::any::Any;
@@ -184,22 +184,15 @@ pub trait IAnalyzer: Send + Sync + Any {
     }
 
     fn summarize_symbols(&self, file: &ProjectFile) -> String {
-        let mut lines = Vec::new();
-        for code_unit in self.get_top_level_declarations(file) {
-            if code_unit.is_anonymous() {
-                continue;
-            }
-            lines.push(format!("- {}", code_unit.identifier()));
-            if code_unit.is_class() || code_unit.is_module() {
-                for child in self.get_direct_children(&code_unit) {
-                    if child.is_anonymous() {
-                        continue;
-                    }
-                    lines.push(format!("  - {}", child.identifier()));
-                }
-            }
-        }
-        lines.join("\n")
+        self.summarize_symbols_with_types(file, &all_code_unit_types())
+    }
+
+    fn summarize_symbols_with_types(
+        &self,
+        file: &ProjectFile,
+        types: &BTreeSet<CodeUnitType>,
+    ) -> String {
+        summarize_code_units_impl(self, &self.get_top_level_declarations(file), types, 0)
     }
 
     fn parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
@@ -219,6 +212,116 @@ pub trait IAnalyzer: Send + Sync + Any {
             .into_iter()
             .find(|candidate| candidate.is_class() || candidate.is_module())
     }
+}
+
+fn summarize_code_units_impl<A: IAnalyzer + ?Sized>(
+    analyzer: &A,
+    units: &[CodeUnit],
+    types: &BTreeSet<CodeUnitType>,
+    indent: usize,
+) -> String {
+    let indent_str = "  ".repeat(indent);
+    let mut summary = String::new();
+
+    if indent == 0 && !units.is_empty() {
+        let mut grouped: Vec<(String, Vec<CodeUnit>)> = Vec::new();
+        for code_unit in units {
+            if code_unit.is_anonymous() || code_unit.is_module() {
+                continue;
+            }
+
+            let fq_name = code_unit.fq_name();
+            let group_prefix = fq_name
+                .rfind('.')
+                .filter(|index| *index > 0)
+                .map(|index| fq_name[..index].to_string())
+                .unwrap_or_default();
+
+            if let Some((_, group_units)) = grouped
+                .iter_mut()
+                .find(|(prefix, _)| prefix == &group_prefix)
+            {
+                group_units.push(code_unit.clone());
+            } else {
+                grouped.push((group_prefix, vec![code_unit.clone()]));
+            }
+        }
+
+        for (group_prefix, group_units) in grouped {
+            if !group_prefix.is_empty() {
+                summary.push_str("# ");
+                summary.push_str(&group_prefix);
+                summary.push('\n');
+            }
+
+            for code_unit in group_units {
+                render_symbol_summary(
+                    analyzer,
+                    &mut summary,
+                    &code_unit,
+                    types,
+                    indent,
+                    &indent_str,
+                );
+            }
+        }
+    } else {
+        for code_unit in units {
+            if code_unit.is_anonymous() {
+                continue;
+            }
+            render_symbol_summary(
+                analyzer,
+                &mut summary,
+                code_unit,
+                types,
+                indent,
+                &indent_str,
+            );
+        }
+    }
+
+    summary.trim_end().to_string()
+}
+
+fn render_symbol_summary<A: IAnalyzer + ?Sized>(
+    analyzer: &A,
+    summary: &mut String,
+    code_unit: &CodeUnit,
+    types: &BTreeSet<CodeUnitType>,
+    indent: usize,
+    indent_str: &str,
+) {
+    summary.push_str(indent_str);
+    summary.push_str("- ");
+    summary.push_str(code_unit.identifier());
+
+    let children: Vec<_> = analyzer
+        .get_direct_children(code_unit)
+        .into_iter()
+        .filter(|child| types.contains(&child.kind()))
+        .collect();
+    if !children.is_empty() {
+        summary.push('\n');
+        summary.push_str(&summarize_code_units_impl(
+            analyzer,
+            &children,
+            types,
+            indent + 1,
+        ));
+    }
+    summary.push('\n');
+}
+
+fn all_code_unit_types() -> BTreeSet<CodeUnitType> {
+    [
+        CodeUnitType::Class,
+        CodeUnitType::Function,
+        CodeUnitType::Field,
+        CodeUnitType::Module,
+    ]
+    .into_iter()
+    .collect()
 }
 
 fn autocomplete_definitions_sort_comparator(left: &CodeUnit, right: &CodeUnit) -> Ordering {

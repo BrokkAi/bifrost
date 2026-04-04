@@ -92,12 +92,42 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     assert_eq!(3, structured["summaries"][0]["elements"][0]["start_line"]);
     assert_eq!(3, structured["summaries"][0]["elements"][0]["end_line"]);
 
-    let ping = round_trip(
+    let summarize_symbols = round_trip(
         &mut stdin,
         &mut reader,
         json!({
             "jsonrpc": "2.0",
             "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "summarize_symbols",
+                "arguments": {
+                    "file_patterns": ["A.java"]
+                }
+            }
+        }),
+    );
+    let skim = &summarize_symbols["result"]["structuredContent"];
+    assert_eq!("A.java", skim["files"][0]["path"]);
+    let lines = skim["files"][0]["lines"].as_array().expect("skim lines");
+    assert!(lines.iter().any(|line| line.as_str() == Some("  - AInner")));
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.as_str() == Some("    - AInnerInner"))
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.as_str() == Some("      - method7"))
+    );
+
+    let ping = round_trip(
+        &mut stdin,
+        &mut reader,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
             "method": "ping"
         }),
     );

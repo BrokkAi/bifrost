@@ -22,6 +22,29 @@ fn python_boundary_returns_structured_json() {
 }
 
 #[test]
+fn python_boundary_returns_summarize_symbols_json() {
+    let mut service = SearchToolsService::new_for_python(fixture_root()).unwrap();
+    let payload = service
+        .call_tool_json("summarize_symbols", r#"{"file_patterns":["A.java"]}"#)
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert_eq!(value["files"][0]["path"], "A.java");
+    let lines = value["files"][0]["lines"].as_array().unwrap();
+    assert!(lines.iter().any(|line| line.as_str() == Some("  - AInner")));
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.as_str() == Some("    - AInnerInner"))
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.as_str() == Some("      - method7"))
+    );
+}
+
+#[test]
 fn python_boundary_surfaces_invalid_params() {
     let mut service = SearchToolsService::new_for_python(fixture_root()).unwrap();
     let err = service

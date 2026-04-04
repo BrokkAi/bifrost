@@ -143,6 +143,11 @@ class SearchToolsClient:
             self._call_tool("get_file_summaries", {"file_patterns": file_patterns})
         )
 
+    def summarize_symbols(self, file_patterns: list[str]) -> SkimFilesResult:
+        return SkimFilesResult.from_dict(
+            self._call_tool("summarize_symbols", {"file_patterns": file_patterns})
+        )
+
     def skim_files(self, file_patterns: list[str]) -> SkimFilesResult:
         return SkimFilesResult.from_dict(
             self._call_tool("skim_files", {"file_patterns": file_patterns})
