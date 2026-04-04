@@ -535,3 +535,40 @@ fn matches_brokk_reference_for_typescript_lookup_seed() {
 
     assert_eq!(expected, bifrost.files);
 }
+
+#[test]
+fn matches_brokk_reference_for_architect_agent_test_seed() {
+    let brokk_root = PathBuf::from("/home/jonathan/Projects/brokk");
+    if !brokk_root.is_dir() {
+        eprintln!("skipping brokk parity regression: sibling repo not present");
+        return;
+    }
+
+    let seed = "app/src/test/java/ai/brokk/agents/ArchitectAgentTest.java";
+    let project = Arc::new(FilesystemProject::new(&brokk_root).unwrap());
+    let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+    let bifrost = most_relevant_files(
+        workspace.analyzer(),
+        MostRelevantFilesParams {
+            seed_files: vec![seed.to_string()],
+            limit: 100,
+        },
+    );
+    assert!(bifrost.not_found.is_empty());
+
+    let brokk = Command::new("./gradlew")
+        .arg("-q")
+        .arg(":app:runMostRelevantFiles")
+        .arg(format!("-Pargs=--root {} {}", brokk_root.display(), seed))
+        .current_dir(&brokk_root)
+        .output()
+        .unwrap();
+    assert!(
+        brokk.status.success(),
+        "{}",
+        String::from_utf8_lossy(&brokk.stderr)
+    );
+    let expected = brokk_cli_result_lines(&brokk_root, &String::from_utf8(brokk.stdout).unwrap());
+
+    assert_eq!(expected, bifrost.files);
+}

@@ -16,10 +16,14 @@ After this change, bifrost and Brokk will both expose a small command-line tool 
 - [x] (2026-04-03 20:58Z) Exposed `most_relevant_files` through `src/searchtools.rs`, `src/searchtools_service.rs`, `src/mcp_server.rs`, and the Python `bifrost_searchtools` client and model layer.
 - [x] (2026-04-03 21:06Z) Ported the relevant Brokk Java ranking cases into Rust tests, including hybrid Git fallback, reverse import traversal, multi-language import routing, and rename canonicalization. Added searchtools service, MCP, and Python client coverage for the new tool.
 - [x] (2026-04-03 21:12Z) Ran `cargo test`, `cargo fmt --check`, and `uv run python -m unittest discover -s python_tests -p 'test_*.py'` successfully after the new tool landed.
-- [x] (2026-04-04 15:32Z) Confirmed that `../brokk` is readable but still appears non-writable from the sandbox, so cross-repo edits may need to go through the escalated execution path even though the user launched Codex with `--add-dir`.
-- [ ] (2026-04-04 15:32Z) Add a CLI binary in bifrost that accepts project-relative filenames, prints the top 100 related files on stdout, and can be pointed at the Brokk repository root.
-- [ ] (2026-04-04 15:32Z) Add the matching Brokk CLI and a direct `Context` entrypoint that accepts `Collection<ProjectFile>` so the Java side can rank the same seed set without constructing synthetic context fragments.
-- [ ] (2026-04-04 15:32Z) Run both CLIs on 100 random files from the Brokk repository, capture mismatches, convert each confirmed algorithm bug into a failing automated test, and then fix the wrong side.
+- [x] (2026-04-04 15:32Z) Confirmed that `../brokk` was missing from the session sandbox policy, then fixed the session configuration so cross-repo edits are now writable without repeated approvals.
+- [x] (2026-04-04 17:05Z) Added the bifrost CLI in `src/bin/most_relevant_files.rs` and the Brokk CLI in `app/src/main/java/ai/brokk/tools/MostRelevantFilesCli.java`, plus the direct Brokk seed-file entrypoint and CLI coverage.
+- [x] (2026-04-04 18:40Z) Reproduced and fixed several confirmed parity bugs before broad reruns: Brokk reverse-import partial-cache reuse, bifrost TypeScript `import type` parsing, bifrost rename canonicalization over-joining file lineages, and a parity harness bug that was dropping `.github/...` result lines from the Brokk side.
+- [x] (2026-04-04 19:20Z) Ran multiple 100-seed single-file parity sweeps and reduced the survivor list from seven mismatches to one remaining Brokk-side divergence on `app/src/test/java/ai/brokk/agents/ArchitectAgentTest.java`.
+- [x] (2026-04-04 19:35Z) Committed the currently landed work before continuing: bifrost `2a599f1` (`summarize_symbols`), bifrost `dd61c92` (`most_relevant_files` and parity harness), and Brokk `abe4f1aa61` (`most relevant files CLI and analyzer parity fixes`).
+- [ ] (2026-04-04 19:35Z) Root-cause and fix the remaining Brokk cached-analyzer divergence so the headless CLI path matches a fresh analyzer build for `ArchitectAgentTest.java`.
+- [ ] (2026-04-04 19:35Z) After the divergence fix lands, rerun a fresh deterministic 100-file single-seed comparison and keep turning any real mismatch into a failing automated test before changing code.
+- [ ] (2026-04-04 19:35Z) Only after the single-seed sweep is clean, run the deterministic 100 two-file-pair comparison and repeat the same mismatch discipline there.
 
 ## Surprises & Discoveries
 
@@ -31,6 +35,21 @@ After this change, bifrost and Brokk will both expose a small command-line tool 
 
 - Observation: `FilesystemProject` respects ignore rules in a way that `TestProject` does not, which made ad hoc import-only temp-directory tests flaky depending on path and ignore configuration.
   Evidence: the first service-layer temp project returned empty relevance results under `FilesystemProject` while the equivalent `TestProject` parity cases passed; switching the JSON-boundary tests to explicit Git-backed root-level files removed that nondeterminism.
+
+- Observation: the first cross-repo parity harness bug was in the harness, not the algorithms. Filtering Brokk output with a tracked-file or hard-coded prefix allowlist drops legitimate live-workspace results such as `.github/workflows/...`.
+  Evidence: `ContentDiffUtils.java` initially looked mismatched until the raw Brokk CLI output was checked and shown to include the same `.github/workflows/daily-full-test.yml` and `.github/workflows/ci.yml` lines as bifrost.
+
+- Observation: Brokk's reverse-import cache was reusing partial reverse edges as if they were complete, which changed import PageRank results depending on prior lookup order.
+  Evidence: `JavaImportTest.testReferencingFilesOfDoesNotReusePartialReverseCacheFromOtherLookup` failed before the fix and passed after adding per-generation reverse-cache completeness tracking.
+
+- Observation: one of the surviving parity failures was a real bifrost parser bug. TypeScript `import type { Foo } ...` and mixed named imports like `import { type Foo, Bar } ...` were not being parsed as named imports.
+  Evidence: `frontend-mop/src/stores/lookup.ts` disagreed with Brokk until the parser tests in `src/analyzer/javascript_analyzer.rs` were added and the import parser was corrected.
+
+- Observation: bifrost's first rename-canonicalization implementation was too aggressive because it globally chained rename edges across time, which pulled unrelated history into the current path when an old filename was later reused.
+  Evidence: the `LutzAgentTest` parity reduction showed bifrost reporting a higher document frequency than Brokk; inspecting the commit history showed bifrost incorrectly connecting a delete/add path reuse into the later lineage.
+
+- Observation: the only known remaining parity mismatch is not in the ranking math when both sides run against a stable analyzer. It is in Brokk's cached headless analyzer path.
+  Evidence: for `ArchitectAgentTest.java`, fresh-analyzer Brokk import and Git results matched bifrost, but the headless CLI path still dropped the `ToolRegistry` / `dev.langchain4j.agent.tool.*` branch and emitted stale-analyzer warnings.
 
 ## Decision Log
 
@@ -46,13 +65,19 @@ After this change, bifrost and Brokk will both expose a small command-line tool 
   Rationale: the user explicitly wants the battle-scarred Java cases preserved because they encode known edge conditions around Git fallback, PageRank flow, and renames.
   Date/Author: 2026-04-03 / Codex + user
 
+- Decision: both implementations should use live-workspace semantics for import-based relevance instead of restricting the import graph to tracked files only.
+  Rationale: the user explicitly chose "what is relevant in the current working tree" over commit-stable reproducibility, so untracked but analyzable files should remain visible to the import side and final results.
+  Date/Author: 2026-04-04 / Codex + user
+
+- Decision: parity reruns proceed in phases: first 100 deterministic single-file seeds, then 100 deterministic two-file pairs only after singles are clean.
+  Rationale: the remaining work should isolate algorithm or analyzer problems with the smallest possible surface area before expanding to pair interactions.
+  Date/Author: 2026-04-04 / Codex + user
+
 ## Outcomes & Retrospective
 
-The repository now has a Brokk-style hybrid file-relevance stack instead of only symbol and summary searchtools. Rust callers can rank related files from a seed set of `ProjectFile`s, MCP clients can call `most_relevant_files`, and the Python `bifrost_searchtools` package exposes the same capability through a typed result model.
+The core feature is in place on both sides. bifrost exposes a Brokk-style hybrid relevance engine through Rust, MCP, Python, and a dedicated CLI. Brokk now exposes a matching CLI and a seed-file entrypoint that does not require synthetic `ContextFragment` setup. Several parity bugs have already been retired with regression tests, which means the remaining work is now concentrated instead of being spread across multiple independent causes.
 
-The parity coverage is deliberately split by concern. The new unit tests in `src/relevance.rs` preserve the upstream import-ranking edge cases that do not have to be public API, such as reverse traversal and multi-language delegate routing. The integration tests in `tests/most_relevant_files.rs` preserve the upstream hybrid behaviors that matter to the public tool, including no-Git fallback, under-filled Git results, untracked seeds, and rename canonicalization. The service, MCP, and Python boundary tests prove that the tool is actually reachable through the supported front doors.
-
-The next milestone is no longer just feature exposure. It is operational parity. The repository needs a tiny CLI surface that makes the ranking observable from a shell, plus evidence from a 100-file comparison against the Brokk implementation. That comparison is the acceptance driver for any further algorithm changes.
+The most important lesson so far is that parity problems have come from three distinct layers: ranking semantics, analyzer/input semantics, and the parity harness itself. Each required a different kind of fix. The current unresolved issue is firmly in the second category: Brokk's cached headless analyzer path still diverges from a fresh analyzer build. The plan therefore shifts from broad algorithm work to making that analyzer path deterministic before doing the final randomized parity sweeps.
 
 ## Context and Orientation
 
@@ -68,7 +93,9 @@ First, keep the already-landed Rust ranking implementation and add a dedicated C
 
 Next, update Brokk's `Context.java` so there is a direct overload that accepts a `Collection<ProjectFile>` seed set and computes the same hybrid ranking without requiring the caller to create `ContextFragment` objects. Then add a Java CLI under `app/src/main/java/ai/brokk/tools/` that accepts `--root` plus project-relative filenames, resolves them through `ContextManager.toFile`, invokes the new `Context` overload, and prints one result per line.
 
-After both CLIs exist, run them against the same 100 random filenames from the Brokk repository. Record any mismatches, reduce each mismatch to the smallest deterministic fixture that reproduces it, and add a failing automated test on the side that is wrong. Only after the test fails should the implementation be corrected.
+After both CLIs exist, the remaining work is a parity-debugging loop. First, root-cause the Brokk cached-analyzer divergence behind `ArchitectAgentTest.java`. The working hypothesis from the current evidence is that `ContextManager.createHeadlessInternal(...)` plus cached analyzer reuse still leaves the CLI on a stale or partially refreshed analyzer snapshot, even after the `AnalyzerWrapper.get()` barrier fix. That hypothesis must be tested by comparing three Brokk paths for the same seed: a fresh analyzer build, a loaded analyzer plus rebuild/update, and the actual headless CLI path. The first concrete deliverable is a failing Brokk automated test that proves the cached headless path can disagree with a fresh analyzer on import-based relevance for this seed or an equivalent reduced fixture.
+
+Once that Brokk divergence is fixed, rerun the deterministic 100-file single-seed sweep. Any survivor must again be reduced to a failing automated test before code changes. Only when the single-seed sweep is completely clean should the process expand to the deterministic 100 two-file-pair sweep.
 
 ## Concrete Steps
 
@@ -102,6 +129,15 @@ Then edit the Brokk repository:
     ../brokk/app/src/main/java/ai/brokk/tools/MostRelevantFilesCli.java
     ../brokk/app/src/test/java/ai/brokk/analyzer/ranking/...
 
+The currently active Brokk investigation files are:
+
+    ../brokk/app/src/main/java/ai/brokk/AnalyzerWrapper.java
+    ../brokk/app/src/main/java/ai/brokk/ContextManager.java
+    ../brokk/app/src/main/java/ai/brokk/tools/MostRelevantFilesCli.java
+    ../brokk/app/src/test/java/ai/brokk/AnalyzerWrapperTest.java
+    ../brokk/app/src/test/java/ai/brokk/analyzer/ranking/ContextNoGitFallbackTest.java
+    ../brokk/app/src/test/java/ai/brokk/...
+
 Run the CLI comparison after both binaries exist:
 
     cd /home/jonathan/Projects/bifrost
@@ -112,7 +148,19 @@ Run the CLI comparison after both binaries exist:
     java -cp app/build/classes/java/main:app/build/resources/main:<runtime-classpath> ai.brokk.tools.MostRelevantFilesCli --root /home/jonathan/Projects/brokk <seed-file>
 
     cd /home/jonathan/Projects/bifrost
-    shuf -n 100 <(find /home/jonathan/Projects/brokk/app/src/main/java -name '*.java' -printf '%P\n')
+    python3 - <<'PY'
+    import random
+    from pathlib import Path
+    root = Path('/home/jonathan/Projects/brokk')
+    files = sorted(
+        p.relative_to(root).as_posix()
+        for p in root.rglob('*')
+        if p.is_file() and '.git' not in p.parts
+    )
+    rng = random.Random(0)
+    for path in rng.sample(files, 100):
+        print(path)
+    PY
 
 The exact Java classpath assembly step must be documented with the final working command once the CLI is built.
 
@@ -121,6 +169,8 @@ Run focused validation from `/home/jonathan/Projects/bifrost`:
     cargo test --test most_relevant_files --test searchtools_service --test bifrost_mcp_server
     cargo test
     uv run python -m unittest discover -s python_tests -p 'test_*.py'
+
+After the Brokk divergence fix, run the parity sweeps from `/home/jonathan/Projects/bifrost` with the direct Brokk CLI in parallel. Keep the comparison deterministic by using `random.Random(0)` for both the single-file sample and the pair sample. Save the comparison summary to `/tmp/mrf_parity_summary.json` (single-file run) and `/tmp/mrf_pair_parity_summary.json` (pair run) so any later contributor can inspect the exact survivors.
 
 ## Validation and Acceptance
 
@@ -138,7 +188,7 @@ with only project-relative paths, never scores, never the seed file itself, and 
 
 Acceptance for the shared-service and Python boundaries is that `SearchToolsService::call_tool_json("most_relevant_files", ...)` and `SearchToolsClient.most_relevant_files(...)` both return the same ordered paths for the same fixture setup, and the MCP server publishes the tool in `tools/list`.
 
-Acceptance for this milestone is stronger than feature wiring. The Rust CLI and the Java CLI must both print the top 100 related files, one per line, for the same seed input. A 100-file random comparison over the Brokk repository must complete, and every observed mismatch must have an explanation backed by a failing test and a fix on the wrong side.
+Acceptance for this milestone is stronger than feature wiring. The Rust CLI and the Java CLI must both print the top 100 related files, one per line, for the same seed input. The Brokk cached headless analyzer path must match fresh-analyzer results on the reduced regression that currently represents the `ArchitectAgentTest.java` failure. Then a deterministic 100-file single-seed comparison over the Brokk repository must complete with zero unexplained mismatches. Only after that passes should the deterministic 100-pair comparison run, and it must also complete with zero unexplained mismatches.
 
 ## How To Run Tests
 
@@ -154,6 +204,8 @@ Run the Brokk-side targeted tests from `/home/jonathan/Projects/brokk`:
     ./gradlew :app:test --tests ai.brokk.analyzer.ranking.ContextNoGitFallbackTest.testTrackedSeedCanReturnUntrackedImportNeighbor
     ./gradlew :app:test --tests ai.brokk.analyzer.imports.JavaImportTest.testReferencingFilesOfDoesNotReusePartialReverseCacheFromOtherLookup
     ./gradlew :app:test --tests ai.brokk.analyzer.ranking.ImportPageRankerTest
+    ./gradlew :app:test --tests ai.brokk.AnalyzerWrapperTest.testGetWaitsForQueuedBackgroundRefresh
+    ./gradlew :app:test --tests ai.brokk.tools.MostRelevantFilesCliTest
 
 Prepare the Brokk direct Java CLI runtime once, then use it for parity checks without paying Gradle startup on every seed:
 
@@ -174,6 +226,15 @@ Use the bifrost CLI from `/home/jonathan/Projects/bifrost`:
       app/src/main/java/ai/brokk/gui/MergeDialogPanel.java
 
 When comparing outputs, filter both sides down to actual result lines before diffing. The robust rule is: keep only lines whose text resolves to an existing file under the project root. Do not use a tracked-file filter or a hard-coded prefix allowlist, because live-workspace semantics intentionally allow untracked files and paths such as `.github/workflows/...` to appear in the ranked results.
+
+The single-seed parity loop is:
+
+    1. Run the deterministic 100-file sample with the Brokk CLI invocations parallelized.
+    2. If a mismatch appears, inspect whether it is a harness bug, a ranking bug, or a Brokk analyzer-state bug.
+    3. Add a failing automated test on the wrong side before changing code.
+    4. Repeat until the single-seed sweep is clean.
+
+The pair-seed parity loop is the same, but only begins after the single-seed sweep is clean.
 
 ## Idempotence and Recovery
 
@@ -220,4 +281,4 @@ The new Cargo dependency is `git2`. The public Python client interface must incl
 
     def most_relevant_files(self, seed_files: list[str], *, limit: int = 20) -> MostRelevantFilesResult
 
-Revision note: on 2026-04-04 this ExecPlan was revised to add the cross-repo CLI requirement, the 100-file random comparison against the Brokk repository, and the rule that any observed mismatch must first be captured in a failing automated test before the implementation is changed.
+Revision note: on 2026-04-04 this ExecPlan was revised to reflect the work already landed, record the confirmed parity bugs already fixed, capture the remaining Brokk cached-analyzer divergence, document the commit points (`2a599f1`, `dd61c92`, `abe4f1aa61`), and make the execution order explicit: fix the Brokk analyzer divergence first, then rerun 100 deterministic single-file seeds, then 100 deterministic pairs only after singles are clean.
