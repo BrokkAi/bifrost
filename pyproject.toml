@@ -1,16 +1,18 @@
 [project]
 name = "bifrost-searchtools"
 version = "0.1.0"
-description = "Python client for the bifrost MCP searchtools server"
+description = "Python searchtools client backed by a native bifrost Rust extension"
 requires-python = ">=3.12"
-dependencies = ["mcp>=1.14.0"]
+dependencies = []
 
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
 
-[tool.hatch.build.targets.wheel]
-include = ["bifrost_searchtools/"]
+[tool.maturin]
+bindings = "pyo3"
+module-name = "bifrost_searchtools._native"
+python-source = "."
 
 [tool.uv]
 package = false

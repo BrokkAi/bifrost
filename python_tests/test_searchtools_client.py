@@ -8,19 +8,29 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from bifrost_searchtools import SearchToolsClient, SymbolKindFilter
+from bifrost_searchtools import SearchToolsClient, SearchToolsError, SymbolKindFilter
+
+
+def native_library_path() -> Path:
+    if sys.platform == "darwin":
+        name = "libbrokk_analyzer.dylib"
+    elif sys.platform == "win32":
+        name = "brokk_analyzer.dll"
+    else:
+        name = "libbrokk_analyzer.so"
+    return ROOT / "target" / "debug" / name
 
 
 class SearchToolsClientTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        subprocess.run(["cargo", "build", "--bin", "bifrost"], cwd=ROOT, check=True)
-        cls.server_path = ROOT / "target" / "debug" / "bifrost"
+        subprocess.run(["cargo", "build", "--lib"], cwd=ROOT, check=True)
+        cls.library_path = native_library_path()
         cls.fixture_root = ROOT / "tests" / "fixtures" / "testcode-java"
 
     def test_file_summary_uses_fixture_line_ranges(self) -> None:
         with SearchToolsClient(
-            root=self.fixture_root, server_path=self.server_path
+            root=self.fixture_root, library_path=self.library_path
         ) as client:
             summaries = client.get_file_summaries(["A.java"])
             text = summaries.render_text()
@@ -34,7 +44,7 @@ class SearchToolsClientTest(unittest.TestCase):
 
     def test_symbol_sources_use_original_file_line_numbers(self) -> None:
         with SearchToolsClient(
-            root=self.fixture_root, server_path=self.server_path
+            root=self.fixture_root, library_path=self.library_path
         ) as client:
             sources = client.get_symbol_sources(
                 ["A.method2"], kind_filter=SymbolKindFilter.FUNCTION
@@ -46,6 +56,13 @@ class SearchToolsClientTest(unittest.TestCase):
         self.assertIn("A.method2 (A.java:12..15)", text)
         self.assertEqual(1, text.count("A.method2 (A.java:8..10)"))
         self.assertEqual(1, text.count("A.method2 (A.java:12..15)"))
+
+    def test_native_errors_are_raised_as_searchtools_error(self) -> None:
+        with SearchToolsClient(
+            root=self.fixture_root, library_path=self.library_path
+        ) as client:
+            with self.assertRaisesRegex(SearchToolsError, "Unknown tool: nope"):
+                client._call_tool("nope", {})
 
 
 if __name__ == "__main__":

@@ -1,7 +1,9 @@
 pub mod analyzer;
 pub mod mcp_server;
 mod project_watcher;
+mod python_module;
 pub mod searchtools;
+pub mod searchtools_service;
 pub mod summary;
 mod text_utils;
 
@@ -15,4 +17,7 @@ pub use analyzer::{
     WorkspaceAnalyzer,
 };
 pub use project_watcher::{ChangeDelta, ProjectChangeWatcher};
+pub use searchtools_service::{
+    SearchToolsService, SearchToolsServiceError, SearchToolsServiceErrorCode,
+};
 pub use summary::{RenderedSummary, SummaryInput, summarize_inputs};
