@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 import unittest
 
@@ -75,6 +76,38 @@ class SearchToolsClientTest(unittest.TestCase):
         ) as client:
             with self.assertRaisesRegex(SearchToolsError, "Unknown tool: nope"):
                 client._call_tool("nope", {})
+
+    def test_most_relevant_files_returns_ranked_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "A.java").write_text("public class A { }\n")
+            (root / "B.java").write_text("public class B { }\n")
+            subprocess.run(["git", "init"], cwd=root, check=True)
+            subprocess.run(["git", "add", "A.java", "B.java"], cwd=root, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Test User",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "-m",
+                    "initial",
+                ],
+                cwd=root,
+                check=True,
+            )
+
+            with SearchToolsClient(
+                root=root, library_path=self.library_path
+            ) as client:
+                result = client.most_relevant_files(["A.java"], limit=5)
+                text = result.render_text()
+
+        self.assertIn("B.java", result.files)
+        self.assertEqual([], result.not_found)
+        self.assertIn("B.java", text)
 
 
 if __name__ == "__main__":

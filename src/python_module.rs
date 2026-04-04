@@ -13,8 +13,8 @@ pub struct SearchToolsNativeSession {
 impl SearchToolsNativeSession {
     #[new]
     fn new(root: &str) -> PyResult<Self> {
-        let service =
-            SearchToolsService::new_for_python(PathBuf::from(root)).map_err(PyRuntimeError::new_err)?;
+        let service = SearchToolsService::new_for_python(PathBuf::from(root))
+            .map_err(PyRuntimeError::new_err)?;
         Ok(Self {
             inner: Mutex::new(Some(service)),
         })

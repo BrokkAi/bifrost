@@ -1,6 +1,4 @@
-use crate::{
-    SearchToolsService, SearchToolsServiceErrorCode,
-};
+use crate::{SearchToolsService, SearchToolsServiceErrorCode};
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
@@ -49,10 +47,7 @@ pub fn run_searchtools_stdio_server(root: PathBuf) -> Result<(), String> {
     Ok(())
 }
 
-fn dispatch_message(
-    service: &mut SearchToolsService,
-    message: Value,
-) -> Option<Value> {
+fn dispatch_message(service: &mut SearchToolsService, message: Value) -> Option<Value> {
     let Some(object) = message.as_object() else {
         return Some(error_response(
             Value::Null,
@@ -196,6 +191,27 @@ fn list_tools_result() -> Value {
                 "skim_files",
                 "Return compact symbol skim output for matching files.",
                 file_patterns_schema(),
+            ),
+            tool_descriptor(
+                "most_relevant_files",
+                "Return related project files ranked by Git history and imports.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "seed_files": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Project-relative seed files used to rank related files."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "default": 20,
+                            "minimum": 0,
+                            "description": "Maximum number of related files to return."
+                        }
+                    },
+                    "required": ["seed_files"]
+                }),
             ),
         ]
     })

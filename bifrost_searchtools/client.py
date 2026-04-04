@@ -13,6 +13,7 @@ from typing import Any
 
 from .models import (
     FileSummariesResult,
+    MostRelevantFilesResult,
     SearchSymbolsResult,
     SkimFilesResult,
     SymbolLocationsResult,
@@ -151,6 +152,19 @@ class SearchToolsClient:
     def skim_files(self, file_patterns: list[str]) -> SkimFilesResult:
         return SkimFilesResult.from_dict(
             self._call_tool("skim_files", {"file_patterns": file_patterns})
+        )
+
+    def most_relevant_files(
+        self,
+        seed_files: list[str],
+        *,
+        limit: int = 20,
+    ) -> MostRelevantFilesResult:
+        return MostRelevantFilesResult.from_dict(
+            self._call_tool(
+                "most_relevant_files",
+                {"seed_files": seed_files, "limit": limit},
+            )
         )
 
     def _call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:

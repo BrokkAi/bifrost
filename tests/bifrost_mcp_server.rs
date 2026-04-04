@@ -71,6 +71,12 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             .iter()
             .any(|tool| tool["name"] == "get_file_summaries")
     );
+    assert!(tools.iter().any(|tool| tool["name"] == "summarize_symbols"));
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool["name"] == "most_relevant_files")
+    );
 
     let file_summaries = round_trip(
         &mut stdin,

@@ -7,6 +7,7 @@ edition = "2024"
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
+git2 = { version = "0.20.2", default-features = false }
 glob = "0.3.3"
 ignore = "0.4.24"
 indicatif = "0.18.0"

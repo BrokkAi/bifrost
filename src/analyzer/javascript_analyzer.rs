@@ -934,7 +934,7 @@ fn parse_es_import_infos(raw: &str) -> Vec<ImportInfo> {
             alias: None,
         }];
     };
-    let head = head.trim();
+    let head = strip_import_type_prefix(head.trim());
     if head.starts_with('*') {
         return vec![ImportInfo {
             raw_snippet: raw.trim().to_string(),
@@ -942,6 +942,9 @@ fn parse_es_import_infos(raw: &str) -> Vec<ImportInfo> {
             identifier: None,
             alias: head.split_whitespace().last().map(str::to_string),
         }];
+    }
+    if head.starts_with('{') {
+        return parse_named_imports(raw, head);
     }
     let mut imports = Vec::new();
     if let Some((default_import, named)) = head.split_once(',') {
@@ -956,9 +959,6 @@ fn parse_es_import_infos(raw: &str) -> Vec<ImportInfo> {
         }
         imports.extend(parse_named_imports(raw, named));
         return imports;
-    }
-    if head.starts_with('{') {
-        return parse_named_imports(raw, head);
     }
     vec![ImportInfo {
         raw_snippet: raw.trim().to_string(),
@@ -975,7 +975,7 @@ fn parse_named_imports(raw: &str, named: &str) -> Vec<ImportInfo> {
         .trim_end_matches('}')
         .split(',')
         .filter_map(|entry| {
-            let entry = entry.trim();
+            let entry = strip_import_type_prefix(entry.trim());
             if entry.is_empty() {
                 return None;
             }
@@ -991,6 +991,10 @@ fn parse_named_imports(raw: &str, named: &str) -> Vec<ImportInfo> {
             })
         })
         .collect()
+}
+
+fn strip_import_type_prefix(input: &str) -> &str {
+    input.strip_prefix("type ").unwrap_or(input)
 }
 
 fn parse_require_import_infos(raw: &str) -> Vec<ImportInfo> {
@@ -1205,6 +1209,29 @@ fn js_ts_contains_tests(file: &ProjectFile, source: &str) -> bool {
         || source.contains("describe(")
         || source.contains("test(")
         || source.contains("it(")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_js_import_infos;
+
+    #[test]
+    fn parses_typescript_type_only_named_imports() {
+        let imports = parse_js_import_infos("import type { BubbleState } from '../types';");
+        assert_eq!(1, imports.len());
+        assert_eq!(Some("BubbleState"), imports[0].identifier.as_deref());
+        assert_eq!(None, imports[0].alias.as_deref());
+    }
+
+    #[test]
+    fn parses_mixed_typescript_named_imports_with_inline_type_modifiers() {
+        let imports = parse_js_import_infos("import { type BubbleState, SummaryState } from '../types';");
+        let identifiers = imports
+            .into_iter()
+            .map(|import| import.identifier.unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(vec!["BubbleState", "SummaryState"], identifiers);
+    }
 }
 
 pub(crate) fn build_weighted_cache<K, V>(

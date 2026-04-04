@@ -2,8 +2,9 @@ use crate::{
     AnalyzerConfig, FilesystemProject, Project, ProjectChangeWatcher, ProjectFile,
     WorkspaceAnalyzer,
     searchtools::{
-        RefreshParams, get_file_summaries, get_symbol_locations, get_symbol_sources,
-        get_symbol_summaries, refresh_result, search_symbols, skim_files,
+        MostRelevantFilesParams, RefreshParams, get_file_summaries, get_symbol_locations,
+        get_symbol_sources, get_symbol_summaries, most_relevant_files, refresh_result,
+        search_symbols, skim_files, summarize_symbols,
     },
 };
 use serde::Serialize;
@@ -118,8 +119,16 @@ impl SearchToolsService {
             "get_file_summaries" => self.decode_and_run(arguments, |workspace, params| {
                 get_file_summaries(workspace.analyzer(), params)
             }),
-            "skim_files" => {
-                self.decode_and_run(arguments, |workspace, params| skim_files(workspace.analyzer(), params))
+            "summarize_symbols" => self.decode_and_run(arguments, |workspace, params| {
+                summarize_symbols(workspace.analyzer(), params)
+            }),
+            "skim_files" => self.decode_and_run(arguments, |workspace, params| {
+                skim_files(workspace.analyzer(), params)
+            }),
+            "most_relevant_files" => {
+                self.decode_and_run(arguments, |workspace, params: MostRelevantFilesParams| {
+                    most_relevant_files(workspace.analyzer(), params)
+                })
             }
             _ => Err(SearchToolsServiceError::unknown_tool(format!(
                 "Unknown tool: {name}"

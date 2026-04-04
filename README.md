@@ -129,6 +129,7 @@ This starts a stdio MCP server that publishes these tools:
 - `get_symbol_sources`
 - `get_file_summaries`
 - `skim_files`
+- `most_relevant_files`
 
 The intended external manual client is the official MCP Inspector.
 
@@ -145,6 +146,7 @@ from bifrost_searchtools import SearchToolsClient
 
 with SearchToolsClient("tests/fixtures/testcode-java") as client:
     print(client.get_file_summaries(["A.java"]).render_text())
+    print(client.most_relevant_files(["A.java"]).render_text())
 PY
 ```
 
@@ -157,6 +159,7 @@ The client exposes:
 - `get_symbol_sources(...)`
 - `get_file_summaries(...)`
 - `skim_files(...)`
+- `most_relevant_files(...)`
 
 The client talks directly to Rust through a native extension module. The Python/Rust boundary stays JSON-shaped: Python sends tool names plus JSON arguments and Rust returns JSON result objects. Rendering still lives in the Python package:
 

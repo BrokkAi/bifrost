@@ -268,3 +268,26 @@ class SkimFilesResult:
         if self.truncated:
             text += "\n\nResults truncated."
         return text
+
+
+@dataclass(frozen=True)
+class MostRelevantFilesResult:
+    files: list[str]
+    not_found: list[str]
+
+    @classmethod
+    def from_dict(cls, data: dict) -> MostRelevantFilesResult:
+        return cls(files=list(data["files"]), not_found=list(data["not_found"]))
+
+    @property
+    def count(self) -> int:
+        return len(self.files)
+
+    def render_text(self) -> str:
+        if not self.files and not self.not_found:
+            return "No related files found."
+
+        lines = list(self.files)
+        if self.not_found:
+            lines.append(f"Not found: {', '.join(self.not_found)}")
+        return "\n".join(lines)

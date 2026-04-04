@@ -1,6 +1,7 @@
 from .client import SearchToolsClient, SearchToolsError, SymbolKindFilter
 from .models import (
     FileSummariesResult,
+    MostRelevantFilesResult,
     SearchSymbolsFile,
     SearchSymbolsResult,
     SkimFile,
@@ -16,6 +17,7 @@ from .models import (
 
 __all__ = [
     "FileSummariesResult",
+    "MostRelevantFilesResult",
     "SearchSymbolsFile",
     "SearchSymbolsResult",
     "SearchToolsClient",

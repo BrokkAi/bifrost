@@ -1,10 +1,12 @@
 use crate::analyzer::{CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, Range};
+use crate::relevance::most_relevant_project_files;
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use glob::Pattern;
 use rayon::prelude::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 
 const FILE_SEARCH_LIMIT: usize = 100;
 const FILE_SKIM_LIMIT: usize = 20;
@@ -32,6 +34,13 @@ pub struct SymbolNamesParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FilePatternsParams {
     pub file_patterns: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MostRelevantFilesParams {
+    pub seed_files: Vec<String>,
+    #[serde(default = "default_limit")]
+    pub limit: usize,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -124,6 +133,12 @@ pub struct SourceBlock {
 pub struct SkimFilesResult {
     pub truncated: bool,
     pub files: Vec<SkimFile>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MostRelevantFilesResult {
+    pub files: Vec<String>,
+    pub not_found: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -430,6 +445,34 @@ pub fn summarize_symbols(analyzer: &dyn IAnalyzer, params: FilePatternsParams) -
         .collect();
 
     SkimFilesResult { truncated, files }
+}
+
+pub fn most_relevant_files(
+    analyzer: &dyn IAnalyzer,
+    params: MostRelevantFilesParams,
+) -> MostRelevantFilesResult {
+    let mut seeds = Vec::new();
+    let mut not_found = Vec::new();
+
+    for input in params.seed_files {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let rel_path = PathBuf::from(normalize_pattern(trimmed));
+        match analyzer.project().file_by_rel_path(&rel_path) {
+            Some(file) => seeds.push(file),
+            None => not_found.push(trimmed.to_string()),
+        }
+    }
+
+    let files = most_relevant_project_files(analyzer, &seeds, params.limit)
+        .into_iter()
+        .map(|file| rel_path_string(&file))
+        .collect();
+
+    MostRelevantFilesResult { files, not_found }
 }
 
 fn collect_kind_names(code_units: &[CodeUnit], kind: CodeUnitType) -> Vec<String> {
