@@ -4,6 +4,8 @@ This ExecPlan is a living document. The sections `Progress`, `Surprises & Discov
 
 This document must be maintained in accordance with `.agent/PLANS.md`.
 
+The shared Git-relevance design docs at the main entry points in bifrost and Brokk are part of the implementation contract for this work. Keep those docs in sync with each other and with the code whenever any shared ranking or canonicalization rule changes.
+
 ## Purpose / Big Picture
 
 After this change, bifrost and Brokk will both expose a small command-line tool that takes one or more project-relative filenames and prints the top 100 related files, one per line, in relevance order. A human can prove it works by running the Rust CLI against the Brokk repository, running the Java CLI against the same repository, and comparing the outputs for 100 random seed files. Any mismatch discovered during that comparison must be turned into a failing automated test before the incorrect implementation is fixed.
@@ -21,9 +23,14 @@ After this change, bifrost and Brokk will both expose a small command-line tool 
 - [x] (2026-04-04 18:40Z) Reproduced and fixed several confirmed parity bugs before broad reruns: Brokk reverse-import partial-cache reuse, bifrost TypeScript `import type` parsing, bifrost rename canonicalization over-joining file lineages, and a parity harness bug that was dropping `.github/...` result lines from the Brokk side.
 - [x] (2026-04-04 19:20Z) Ran multiple 100-seed single-file parity sweeps and reduced the survivor list from seven mismatches to one remaining Brokk-side divergence on `app/src/test/java/ai/brokk/agents/ArchitectAgentTest.java`.
 - [x] (2026-04-04 19:35Z) Committed the currently landed work before continuing: bifrost `2a599f1` (`summarize_symbols`), bifrost `dd61c92` (`most_relevant_files` and parity harness), and Brokk `abe4f1aa61` (`most relevant files CLI and analyzer parity fixes`).
-- [ ] (2026-04-04 19:35Z) Root-cause and fix the remaining Brokk cached-analyzer divergence so the headless CLI path matches a fresh analyzer build for `ArchitectAgentTest.java`.
-- [ ] (2026-04-04 19:35Z) After the divergence fix lands, rerun a fresh deterministic 100-file single-seed comparison and keep turning any real mismatch into a failing automated test before changing code.
-- [ ] (2026-04-04 19:35Z) Only after the single-seed sweep is clean, run the deterministic 100 two-file-pair comparison and repeat the same mismatch discipline there.
+- [x] (2026-04-04 22:40Z) Eliminated the remaining Brokk-repo parity survivors and validated the previously failing direct cases: Brokk reverse-import completeness, bifrost TypeScript import parsing, Brokk cached-analyzer freshness, Brokk rename canonicalization at plume/autogen, and the live-workspace parity harness all now agree on the targeted repros.
+- [x] (2026-04-04 22:50Z) Confirmed that the previously failing external-repo direct cases now match under the current built CLIs: `plume-merge` single and pair, `axios` single, and `microsoft/autogen` single.
+- [x] (2026-04-04 23:58Z) Root-caused the last plume Java single-file survivors to duplicate-definition ordering in bifrost's Tree-sitter definition index, not Git scoring. Ported Brokk-style definition ordering by priority, earliest range start, and path/FQN/signature, and added the `ImportsTest8Base.java` parity regression.
+- [x] (2026-04-05 00:06Z) Re-ran the deterministic 100-file `plume-merge` Java single-file sweep and confirmed it is now clean.
+- [x] (2026-04-05 16:20Z) Root-caused the remaining `microsoft/autogen` `Checker.cs` survivor to bifrost's commit-walk ordering, not another rename-threshold issue. The `AgentMetadata.cs` rename was already detectable, but a pure time-sorted walk let older pre-rename commits be processed before the later rename edge was recorded, collapsing the followed doc frequency from `5` to `2`. Switching the revwalk to `TOPOLOGICAL | TIME` fixed the regression and restored parity on the targeted autogen seed.
+- [x] (2026-04-05 22:05Z) Added synchronized design-doc comments at the main Git relevance entry points in bifrost and Brokk, documenting the shared parity-sensitive rules and the requirement to update both docs together with the code.
+- [ ] (2026-04-04 22:50Z) Rerun deterministic cross-language single-seed sweeps against representative repos for each supported language and turn any survivor into a failing automated test before changing code.
+- [ ] (2026-04-04 22:50Z) Only after the single-seed sweeps are clean, run the deterministic two-file-pair sweeps for the same repo set and repeat the same mismatch discipline there.
 
 ## Surprises & Discoveries
 
@@ -51,6 +58,18 @@ After this change, bifrost and Brokk will both expose a small command-line tool 
 - Observation: the only known remaining parity mismatch is not in the ranking math when both sides run against a stable analyzer. It is in Brokk's cached headless analyzer path.
   Evidence: for `ArchitectAgentTest.java`, fresh-analyzer Brokk import and Git results matched bifrost, but the headless CLI path still dropped the `ToolRegistry` / `dev.langchain4j.agent.tool.*` branch and emitted stale-analyzer warnings.
 
+- Observation: the external-repo autogen mismatch was resolved in code before it was resolved in the CLI, because the hand-built Java classpath being used for direct checks was stale.
+  Evidence: the targeted Brokk JUnit regression passed while the manual CLI still omitted the local `.csproj`; rerunning against the packaged `app/build/install/app/lib/*` classpath brought the CLI output into agreement with the test and with bifrost.
+
+- Observation: the last remaining plume Java single-file mismatches were not Git problems at all. They came from duplicate definitions of the same Java FQN being ordered differently between Brokk and bifrost.
+  Evidence: for `ImportsTest8Base.java`, both sides had no `ImportsTest9*` Git results, but Brokk resolved `tech.tablesaw.api.BooleanColumn` to `ImportsTest9Base.java` while bifrost resolved it to `ImportsTest9A.java`; Brokk's `getDefinitions(...)` ordering is based on priority plus earliest source range, while bifrost was using plain `CodeUnit::Ord`.
+
+- Observation: the Brokk autogen `.csproj` case needed canonicalizer fallback edges, not just a lower JGit rename score.
+  Evidence: after lowering JGit rename score the canonical-path test still failed; only after adding add/delete fallback rename inference to `GitRepo.buildCanonicalizer(...)` did the local `.csproj` path canonicalize forward and rank with the expected tied top set.
+
+- Observation: one recurring class of rename parity failures was not actually about rename thresholds. It was about commit-walk ordering. A canonicalizer that walks commits in pure time order can see an older pre-rename commit before the newer rename edge has been recorded, which silently truncates followed history even when rename detection itself is correct.
+  Evidence: bifrost detected the `b16b94...` `AgentMetadata.cs` rename in autogen, but still counted only `2` commits instead of `5` until the revwalk changed from `Sort::TIME` to `Sort::TOPOLOGICAL | Sort::TIME`.
+
 ## Decision Log
 
 - Decision: preserve Brokk's hybrid behavior instead of shipping an import-only first cut.
@@ -72,6 +91,10 @@ After this change, bifrost and Brokk will both expose a small command-line tool 
 - Decision: parity reruns proceed in phases: first 100 deterministic single-file seeds, then 100 deterministic two-file pairs only after singles are clean.
   Rationale: the remaining work should isolate algorithm or analyzer problems with the smallest possible surface area before expanding to pair interactions.
   Date/Author: 2026-04-04 / Codex + user
+
+- Decision: the shared Git-relevance design notes at the main entry points are part of the parity contract and must be kept in sync alongside the code.
+  Rationale: the recurring rename/tie-order regressions came from hidden assumptions drifting between implementations; keeping the code comments synchronized at the entry points makes those assumptions explicit and reviewable instead of leaving them scattered across bug-fix breadcrumbs.
+  Date/Author: 2026-04-05 / Codex + user
 
 ## Outcomes & Retrospective
 
@@ -190,6 +213,8 @@ Acceptance for the shared-service and Python boundaries is that `SearchToolsServ
 
 Acceptance for this milestone is stronger than feature wiring. The Rust CLI and the Java CLI must both print the top 100 related files, one per line, for the same seed input. The Brokk cached headless analyzer path must match fresh-analyzer results on the reduced regression that currently represents the `ArchitectAgentTest.java` failure. Then a deterministic 100-file single-seed comparison over the Brokk repository must complete with zero unexplained mismatches. Only after that passes should the deterministic 100-pair comparison run, and it must also complete with zero unexplained mismatches.
 
+Acceptance also requires that the shared design-doc comments at the bifrost and Brokk Git-relevance entry points remain aligned with each other and with the implemented ranking rules. A parity fix is not complete until both the code and those entry-point docs agree.
+
 ## How To Run Tests
 
 Run the bifrost-side tests from `/home/jonathan/Projects/bifrost`:
@@ -282,3 +307,12 @@ The new Cargo dependency is `git2`. The public Python client interface must incl
     def most_relevant_files(self, seed_files: list[str], *, limit: int = 20) -> MostRelevantFilesResult
 
 Revision note: on 2026-04-04 this ExecPlan was revised to reflect the work already landed, record the confirmed parity bugs already fixed, capture the remaining Brokk cached-analyzer divergence, document the commit points (`2a599f1`, `dd61c92`, `abe4f1aa61`), and make the execution order explicit: fix the Brokk analyzer divergence first, then rerun 100 deterministic single-file seeds, then 100 deterministic pairs only after singles are clean.
+
+Revision note: later on 2026-04-04 the cross-repo parity harness was extended to support arbitrary target repositories and language-specific seed pools. The ignored Rust batch tests now accept:
+
+    BROKK_APP_ROOT=/home/jonathan/Projects/brokk
+    BROKK_PARITY_PROJECT_ROOT=/path/to/target/repo
+    BROKK_PARITY_EXTENSIONS=java
+    BROKK_PARITY_SAMPLE_SIZE=100
+
+The Brokk app root stays fixed to the compiled Brokk checkout, while `BROKK_PARITY_PROJECT_ROOT` is the repo being compared and `BROKK_PARITY_EXTENSIONS` selects the seed language by file extension (for example `go`, `py`, `js`, `ts,tsx`, `cs`, `php`, `scala`, or `c,cc,cpp,cxx,h,hpp,hh,hxx`). This is the mechanism for running one 100-single-file batch and one 100-pair batch per supported language against external projects under `~/Projects` or `~/Projects/brokkbench/clones`.

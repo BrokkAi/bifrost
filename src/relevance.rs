@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 const ALPHA: f64 = 0.85;
 const CONVERGENCE_EPSILON: f64 = 1.0e-6;
+const SCORE_TIE_EPSILON: f64 = 1.0e-9;
 const MAX_ITERS: usize = 75;
 const IMPORT_DEPTH: usize = 2;
 const COMMITS_TO_PROCESS: usize = 1_000;
@@ -192,13 +193,7 @@ fn related_files_by_imports(
             })
         })
         .collect::<Vec<_>>();
-    ranked.sort_by(|left, right| {
-        right
-            .score
-            .partial_cmp(&left.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| normalized_rel_path(&left.file).cmp(&normalized_rel_path(&right.file)))
-    });
+    ranked.sort_by(compare_file_relevance);
     ranked.truncate(k);
     ranked
 }
@@ -329,6 +324,20 @@ fn referencing_files_for(
     resolved
 }
 
+/// Shared Git-relevance contract for bifrost and Brokk.
+///
+/// Keep this behavior in sync with Brokk's `GitDistance.getRelatedFiles`. The parity harness depends on
+/// these choices matching, not merely being "close enough":
+/// - walk the recent commit window in topology-preserving time order so canonicalization never sees an older
+///   pre-rename commit before the later rename edge that should rewrite it
+/// - use native rename detection with a 49% similarity threshold, but treat those as candidate edges only;
+///   canonicalization accepts an edge only if it also passes the shared stem+content continuation rule
+/// - infer add/delete continuation edges with the same continuation rule: same stem requires
+///   `stem >= 60 && content >= 25`, different stems require `stem >= 60 && content >= 50`
+/// - treat near-equal scores as ties using a relative epsilon of `1e-9 * max(1, |score|)` and break them by
+///   normalized path so ordering is stable across platforms and implementations
+///
+/// If any of those rules change here, change Brokk in the same way and rerun the external parity fixtures.
 fn related_files_by_git(
     analyzer: &dyn IAnalyzer,
     seed_weights: &HashMap<ProjectFile, f64>,
@@ -429,13 +438,7 @@ fn related_files_by_git(
         .into_iter()
         .map(|(file, score)| FileRelevance { file, score })
         .collect::<Vec<_>>();
-    ranked.sort_by(|left, right| {
-        right
-            .score
-            .partial_cmp(&left.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| normalized_rel_path(&left.file).cmp(&normalized_rel_path(&right.file)))
-    });
+    ranked.sort_by(compare_file_relevance);
     ranked.truncate(k);
     Ok(ranked)
 }
@@ -481,7 +484,7 @@ impl GitProjectContext {
         if walk.push_head().is_err() {
             return Ok(Vec::new());
         }
-        let _ = walk.set_sorting(Sort::TIME);
+        let _ = walk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME);
 
         let mut commits = Vec::new();
         for oid in walk.take(limit) {
@@ -504,29 +507,16 @@ impl GitProjectContext {
         let mut diff =
             self.repo
                 .diff_tree_to_tree(parent_tree.as_ref(), Some(&current_tree), None)?;
-        let mut raw_dir_change_counts = RawDirChangeCounts::default();
-        for delta in diff.deltas() {
-            match delta.status() {
-                git2::Delta::Added | git2::Delta::Copied => {
-                    if let Some(path) = delta.new_file().path() {
-                        raw_dir_change_counts.record_add(path);
-                    }
-                }
-                git2::Delta::Deleted => {
-                    if let Some(path) = delta.old_file().path() {
-                        raw_dir_change_counts.record_delete(path);
-                    }
-                }
-                _ => {}
-            }
-        }
 
         let mut find_options = DiffFindOptions::new();
         find_options.renames(true);
+        find_options.rename_threshold(49);
         diff.find_similar(Some(&mut find_options))?;
 
         let mut paths = Vec::new();
         let mut renames = Vec::new();
+        let mut unmatched_added = Vec::new();
+        let mut unmatched_deleted = Vec::new();
         for delta in diff.deltas() {
             match delta.status() {
                 git2::Delta::Added
@@ -535,11 +525,15 @@ impl GitProjectContext {
                 | git2::Delta::Renamed => {
                     if let Some(path) = delta.new_file().path() {
                         paths.push(path.to_path_buf());
+                        if delta.status() == git2::Delta::Added {
+                            unmatched_added.push(path.to_path_buf());
+                        }
                     }
                 }
                 git2::Delta::Deleted => {
                     if let Some(path) = delta.old_file().path() {
                         paths.push(path.to_path_buf());
+                        unmatched_deleted.push(path.to_path_buf());
                     }
                 }
                 _ => {}
@@ -549,12 +543,27 @@ impl GitProjectContext {
                 if let (Some(old_path), Some(new_path)) =
                     (delta.old_file().path(), delta.new_file().path())
                 {
-                    if raw_dir_change_counts.is_unambiguous_rename(old_path, new_path) {
+                    if rename_is_safe_to_canonicalize(
+                        &self.repo,
+                        parent_tree.as_ref(),
+                        &current_tree,
+                        old_path,
+                        new_path,
+                    ) {
                         renames.push((old_path.to_path_buf(), new_path.to_path_buf()));
                     }
                 }
             }
         }
+
+        renames.extend(infer_path_continuity_renames(
+            &self.repo,
+            parent_tree.as_ref(),
+            &current_tree,
+            &unmatched_deleted,
+            &unmatched_added,
+            &renames,
+        ));
 
         Ok(CommitChange { paths, renames })
     }
@@ -583,35 +592,190 @@ struct CommitChange {
     renames: Vec<(PathBuf, PathBuf)>,
 }
 
-#[derive(Default)]
-struct RawDirChangeCounts {
-    adds_by_dir: HashMap<PathBuf, usize>,
-    deletes_by_dir: HashMap<PathBuf, usize>,
+fn rename_is_safe_to_canonicalize(
+    repo: &Repository,
+    parent_tree: Option<&git2::Tree<'_>>,
+    current_tree: &git2::Tree<'_>,
+    old_path: &Path,
+    new_path: &Path,
+) -> bool {
+    let path_score = path_token_similarity_score(old_path, new_path);
+    let content_score =
+        content_token_similarity_score(repo, parent_tree, current_tree, old_path, new_path);
+    continuation_edge_is_safe(old_path, new_path, path_score, content_score)
 }
 
-impl RawDirChangeCounts {
-    fn record_add(&mut self, path: &Path) {
-        *self.adds_by_dir.entry(parent_dir(path)).or_insert(0) += 1;
-    }
+fn infer_path_continuity_renames(
+    repo: &Repository,
+    parent_tree: Option<&git2::Tree<'_>>,
+    current_tree: &git2::Tree<'_>,
+    deleted_paths: &[PathBuf],
+    added_paths: &[PathBuf],
+    detected_renames: &[(PathBuf, PathBuf)],
+) -> Vec<(PathBuf, PathBuf)> {
+    let renamed_old = detected_renames
+        .iter()
+        .map(|(old_path, _)| old_path.as_path())
+        .collect::<HashSet<_>>();
+    let renamed_new = detected_renames
+        .iter()
+        .map(|(_, new_path)| new_path.as_path())
+        .collect::<HashSet<_>>();
 
-    fn record_delete(&mut self, path: &Path) {
-        *self.deletes_by_dir.entry(parent_dir(path)).or_insert(0) += 1;
-    }
-
-    fn is_unambiguous_rename(&self, old_path: &Path, new_path: &Path) -> bool {
-        let old_dir = parent_dir(old_path);
-        let new_dir = parent_dir(new_path);
-        if old_dir != new_dir {
-            return true;
+    let mut candidates = Vec::new();
+    for old_path in deleted_paths {
+        if renamed_old.contains(old_path.as_path()) {
+            continue;
         }
+        for new_path in added_paths {
+            if renamed_new.contains(new_path.as_path()) {
+                continue;
+            }
+            if old_path.extension() != new_path.extension() {
+                continue;
+            }
 
-        self.adds_by_dir.get(&old_dir).copied().unwrap_or(0)
-            == self.deletes_by_dir.get(&old_dir).copied().unwrap_or(0)
+            let path_score = path_token_similarity_score(old_path, new_path);
+            let content_score =
+                content_token_similarity_score(repo, parent_tree, current_tree, old_path, new_path);
+            if continuation_edge_is_safe(old_path, new_path, path_score, content_score) {
+                candidates.push((content_score, path_score, old_path.clone(), new_path.clone()));
+            }
+        }
+    }
+
+    candidates.sort_by(|left, right| {
+        right
+            .0
+            .partial_cmp(&left.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                right.1
+                    .partial_cmp(&left.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| left.2.cmp(&right.2))
+            .then_with(|| left.3.cmp(&right.3))
+    });
+
+    let mut used_old = HashSet::new();
+    let mut used_new = HashSet::new();
+    let mut inferred = Vec::new();
+    for (_, _, old_path, new_path) in candidates {
+        if used_old.contains(&old_path) || used_new.contains(&new_path) {
+            continue;
+        }
+        used_old.insert(old_path.clone());
+        used_new.insert(new_path.clone());
+        inferred.push((old_path, new_path));
+    }
+    inferred
+}
+
+fn continuation_edge_is_safe(
+    old_path: &Path,
+    new_path: &Path,
+    path_score: f64,
+    content_score: f64,
+) -> bool {
+    let same_stem = normalized_stem(old_path) == normalized_stem(new_path);
+    if same_stem {
+        path_score >= 60.0 && content_score >= 25.0
+    } else {
+        path_score >= 60.0 && content_score >= 50.0
     }
 }
 
-fn parent_dir(path: &Path) -> PathBuf {
-    path.parent().map(Path::to_path_buf).unwrap_or_default()
+fn path_token_similarity_score(old_path: &Path, new_path: &Path) -> f64 {
+    let old_tokens = stem_tokens(old_path);
+    let new_tokens = stem_tokens(new_path);
+    if old_tokens.is_empty() || new_tokens.is_empty() {
+        return 0.0;
+    }
+
+    let overlap = old_tokens.intersection(&new_tokens).count() as f64;
+    (200.0 * overlap) / (old_tokens.len() + new_tokens.len()) as f64
+}
+
+fn stem_tokens(path: &Path) -> HashSet<String> {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return HashSet::new();
+    };
+
+    let stem = file_name
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(file_name);
+    let mut normalized = String::with_capacity(stem.len() + 8);
+    let mut prev: Option<char> = None;
+    for ch in stem.chars() {
+        let needs_split = prev.is_some_and(|prev| prev.is_ascii_lowercase() && ch.is_ascii_uppercase());
+        if needs_split {
+            normalized.push('-');
+        }
+        normalized.push(ch);
+        prev = Some(ch);
+    }
+    normalized
+        .split(&['/', '\\', '.', '_', '-'][..])
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_ascii_lowercase())
+        .collect()
+}
+
+fn normalized_stem(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+
+fn content_token_similarity_score(
+    repo: &Repository,
+    parent_tree: Option<&git2::Tree<'_>>,
+    current_tree: &git2::Tree<'_>,
+    old_path: &Path,
+    new_path: &Path,
+) -> f64 {
+    let Some(old_text) = file_text_at_path(repo, parent_tree, old_path) else {
+        return 0.0;
+    };
+    let Some(new_text) = file_text_at_path(repo, Some(current_tree), new_path) else {
+        return 0.0;
+    };
+    let old_tokens = content_tokens(&old_text);
+    let new_tokens = content_tokens(&new_text);
+    if old_tokens.is_empty() || new_tokens.is_empty() {
+        return 0.0;
+    }
+    let overlap = old_tokens.intersection(&new_tokens).count() as f64;
+    (200.0 * overlap) / (old_tokens.len() + new_tokens.len()) as f64
+}
+
+fn file_text_at_path(
+    repo: &Repository,
+    tree: Option<&git2::Tree<'_>>,
+    path: &Path,
+) -> Option<String> {
+    let entry = tree?.get_path(path).ok()?;
+    let blob = repo.find_blob(entry.id()).ok()?;
+    std::str::from_utf8(blob.content()).ok().map(str::to_string)
+}
+
+fn content_tokens(text: &str) -> HashSet<String> {
+    let mut tokens = HashSet::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() {
+            current.push(ch.to_ascii_lowercase());
+        } else if !current.is_empty() {
+            tokens.insert(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        tokens.insert(current);
+    }
+    tokens
 }
 
 #[derive(Default)]
@@ -647,15 +811,30 @@ fn normalized_rel_path(file: &ProjectFile) -> String {
         .to_ascii_lowercase()
 }
 
+fn compare_file_relevance(left: &FileRelevance, right: &FileRelevance) -> std::cmp::Ordering {
+    let score_gap = right.score - left.score;
+    let score_scale = 1.0_f64.max(left.score.abs()).max(right.score.abs());
+    if score_gap.abs() <= SCORE_TIE_EPSILON * score_scale {
+        normalized_rel_path(&left.file).cmp(&normalized_rel_path(&right.file))
+    } else {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| normalized_rel_path(&left.file).cmp(&normalized_rel_path(&right.file)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{FileRelevance, related_files_by_imports};
     use crate::analyzer::{
-        AnalyzerDelegate, JavaAnalyzer, Language, MultiAnalyzer, ProjectFile, PythonAnalyzer,
-        TestProject,
+        AnalyzerConfig, AnalyzerDelegate, FilesystemProject, JavaAnalyzer, Language,
+        MultiAnalyzer, ProjectFile, PythonAnalyzer, TestProject, WorkspaceAnalyzer,
     };
-    use std::collections::{BTreeMap, HashMap};
-    use std::path::Path;
+    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     fn write_file(root: &Path, rel_path: &str, contents: &str) -> ProjectFile {
@@ -664,8 +843,33 @@ mod tests {
         file
     }
 
+    #[test]
+    fn near_tie_scores_sort_by_normalized_path_name() {
+        let temp = TempDir::new().unwrap();
+        let left = write_file(temp.path(), "Zed.java", "class Zed {}");
+        let right = write_file(temp.path(), "Alpha.java", "class Alpha {}");
+
+        let ordering = super::compare_file_relevance(
+            &super::FileRelevance {
+                file: left,
+                score: 1.0,
+            },
+            &super::FileRelevance {
+                file: right,
+                score: 1.0 + 5.0e-10,
+            },
+        );
+
+        assert_eq!(std::cmp::Ordering::Greater, ordering);
+    }
+
     fn java_analyzer(root: &Path) -> JavaAnalyzer {
         JavaAnalyzer::from_project(TestProject::new(root.to_path_buf(), Language::Java))
+    }
+
+    fn workspace_analyzer(root: &Path) -> WorkspaceAnalyzer {
+        let project = Arc::new(FilesystemProject::new(root).unwrap());
+        WorkspaceAnalyzer::build(project, AnalyzerConfig::default())
     }
 
     fn file_by_name<'a>(result: &'a [FileRelevance], file_name: &str) -> Option<&'a FileRelevance> {
@@ -677,6 +881,1089 @@ mod tests {
                 .and_then(|value| value.to_str())
                 == Some(file_name)
         })
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn debug_git_scores_for_plume_merge_gitlibrary_seed() {
+        let workspace = workspace_analyzer(Path::new("/home/jonathan/Projects/plume-merge"));
+        let seed = ProjectFile::new(
+            workspace.analyzer().project().root().to_path_buf(),
+            "src/main/java/org/plumelib/merging/GitLibrary.java",
+        );
+        let results =
+            super::related_files_by_git(workspace.analyzer(), &HashMap::from([(seed, 1.0)]), 25)
+                .unwrap();
+        for entry in results {
+            eprintln!("{:.15} {}", entry.score, entry.file.rel_path().display());
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn debug_git_scores_for_plume_merge_pair() {
+        let workspace = workspace_analyzer(Path::new("/home/jonathan/Projects/plume-merge"));
+        let root = workspace.analyzer().project().root().to_path_buf();
+        let seeds = HashMap::from([
+            (
+                ProjectFile::new(
+                    root.clone(),
+                    "src/main/java/org/plumelib/merging/AdjacentDynamicProgramming.java",
+                ),
+                1.0,
+            ),
+            (
+                ProjectFile::new(root, "src/test/resources/AnnotationsTest1Base.java"),
+                1.0,
+            ),
+        ]);
+        let results = super::related_files_by_git(workspace.analyzer(), &seeds, 25).unwrap();
+        for entry in results {
+            eprintln!("{:.15} {}", entry.score, entry.file.rel_path().display());
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn debug_git_scores_for_axios_eslintrc_seed() {
+        let workspace = workspace_analyzer(Path::new("/home/jonathan/Projects/axios"));
+        let seed = ProjectFile::new(
+            workspace.analyzer().project().root().to_path_buf(),
+            ".eslintrc.cjs",
+        );
+        let results =
+            super::related_files_by_git(workspace.analyzer(), &HashMap::from([(seed, 1.0)]), 25)
+                .unwrap();
+        for entry in results {
+            eprintln!("{:.15} {}", entry.score, entry.file.rel_path().display());
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn debug_git_scores_for_autogen_program_seed() {
+        let workspace =
+            workspace_analyzer(Path::new("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen"));
+        let seed = ProjectFile::new(
+            workspace.analyzer().project().root().to_path_buf(),
+            "dotnet/samples/AgentChat/AutoGen.Anthropic.Sample/Program.cs",
+        );
+        let results =
+            super::related_files_by_git(workspace.analyzer(), &HashMap::from([(seed, 1.0)]), 25)
+                .unwrap();
+        for entry in results {
+            eprintln!("{:.15} {}", entry.score, entry.file.rel_path().display());
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn debug_git_scores_for_autogen_checker_seed() {
+        let workspace =
+            workspace_analyzer(Path::new("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen"));
+        let seed = ProjectFile::new(
+            workspace.analyzer().project().root().to_path_buf(),
+            "dotnet/samples/GettingStarted/Checker.cs",
+        );
+        let results =
+            super::related_files_by_git(workspace.analyzer(), &HashMap::from([(seed, 1.0)]), 30)
+                .unwrap();
+        for entry in results {
+            eprintln!("{:.15} {}", entry.score, entry.file.rel_path().display());
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn debug_git_scores_for_autogen_hello_ai_agents_program_seed() {
+        let workspace =
+            workspace_analyzer(Path::new("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen"));
+        let seed = ProjectFile::new(
+            workspace.analyzer().project().root().to_path_buf(),
+            "dotnet/samples/Hello/HelloAIAgents/Program.cs",
+        );
+        let results =
+            super::related_files_by_git(workspace.analyzer(), &HashMap::from([(seed, 1.0)]), 40)
+                .unwrap();
+        for entry in results {
+            eprintln!("{:.15} {}", entry.score, entry.file.rel_path().display());
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn debug_git_scores_for_autogen_hello_agent_program_seed() {
+        let workspace =
+            workspace_analyzer(Path::new("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen"));
+        let seed = ProjectFile::new(
+            workspace.analyzer().project().root().to_path_buf(),
+            "dotnet/samples/Hello/HelloAgent/Program.cs",
+        );
+        let results =
+            super::related_files_by_git(workspace.analyzer(), &HashMap::from([(seed, 1.0)]), 100)
+                .unwrap();
+        for entry in results {
+            eprintln!("{:.15} {}", entry.score, entry.file.rel_path().display());
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn debug_import_scores_for_autogen_hello_ai_agents_program_seed() {
+        let workspace =
+            workspace_analyzer(Path::new("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen"));
+        let seed = ProjectFile::new(
+            workspace.analyzer().project().root().to_path_buf(),
+            "dotnet/samples/Hello/HelloAIAgents/Program.cs",
+        );
+        let results =
+            super::related_files_by_imports(workspace.analyzer(), &HashMap::from([(seed, 1.0)]), 40, false);
+        for entry in results {
+            eprintln!("{:.15} {}", entry.score, entry.file.rel_path().display());
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn debug_git_scores_for_autogen_topicid_and_inmemoryruntime_pair() {
+        let workspace =
+            workspace_analyzer(Path::new("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen"));
+        let root = workspace.analyzer().project().root().to_path_buf();
+        let topic_id = ProjectFile::new(root.clone(), "dotnet/src/Microsoft.AutoGen/Contracts/TopicId.cs");
+        let inmemory = ProjectFile::new(
+            root,
+            "dotnet/test/Microsoft.AutoGen.Integration.Tests/InMemoryRuntimeIntegrationTests.cs",
+        );
+        let results = super::related_files_by_git(
+            workspace.analyzer(),
+            &HashMap::from([(topic_id, 1.0), (inmemory, 1.0)]),
+            100,
+        )
+        .unwrap();
+        for entry in results {
+            eprintln!("{:.15} {}", entry.score, entry.file.rel_path().display());
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn debug_import_scores_for_autogen_topicid_and_inmemoryruntime_pair() {
+        let workspace =
+            workspace_analyzer(Path::new("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen"));
+        let root = workspace.analyzer().project().root().to_path_buf();
+        let topic_id = ProjectFile::new(root.clone(), "dotnet/src/Microsoft.AutoGen/Contracts/TopicId.cs");
+        let inmemory = ProjectFile::new(
+            root,
+            "dotnet/test/Microsoft.AutoGen.Integration.Tests/InMemoryRuntimeIntegrationTests.cs",
+        );
+        let results = super::related_files_by_imports(
+            workspace.analyzer(),
+            &HashMap::from([(topic_id, 1.0), (inmemory, 1.0)]),
+            100,
+            false,
+        );
+        for entry in results {
+            eprintln!("{:.15} {}", entry.score, entry.file.rel_path().display());
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn debug_git_per_seed_terms_for_autogen_topicid_and_inmemoryruntime_pair() {
+        let root = Path::new("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
+        let context = super::GitProjectContext::discover(root).unwrap();
+        let topic_id = PathBuf::from("dotnet/src/Microsoft.AutoGen/Contracts/TopicId.cs");
+        let inmemory = PathBuf::from(
+            "dotnet/test/Microsoft.AutoGen.Integration.Tests/InMemoryRuntimeIntegrationTests.cs",
+        );
+        let seeds = [topic_id.clone(), inmemory.clone()];
+        let targets = [
+            PathBuf::from("dotnet/AutoGen.sln"),
+            PathBuf::from("dotnet/src/Microsoft.AutoGen/Contracts/KVStringParseHelper.cs"),
+            PathBuf::from("dotnet/src/Microsoft.AutoGen/Contracts/IAgentRuntime.cs"),
+            PathBuf::from("dotnet/src/Microsoft.AutoGen/Contracts/IHandle.cs"),
+            PathBuf::from("dotnet/src/Microsoft.AutoGen/Agents/IOAgent/ConsoleAgent/IHandleConsole.cs"),
+            PathBuf::from("dotnet/src/Microsoft.AutoGen/Core/AgentsApp.cs"),
+            PathBuf::from("dotnet/test/Microsoft.AutoGen.Core.Tests/InProcessRuntimeTests.cs"),
+        ];
+
+        let commits = context.recent_commit_ids(super::COMMITS_TO_PROCESS).unwrap();
+        let baseline_commit_count = commits.len() as f64;
+        let mut file_doc_freq: HashMap<PathBuf, usize> = HashMap::new();
+        let mut joint_mass: HashMap<(PathBuf, PathBuf), f64> = HashMap::new();
+        let mut seed_commit_count: HashMap<PathBuf, usize> = HashMap::new();
+        let mut canonicalizer = super::RenameCanonicalizer::default();
+
+        for oid in &commits {
+            let commit = context.repo.find_commit(*oid).unwrap();
+            let change = context.changed_repo_paths_for_commit(&commit).unwrap();
+            let changed_files = change
+                .paths
+                .into_iter()
+                .map(|path| canonicalizer.canonicalize(&path))
+                .filter_map(|path| context.repo_path_to_project_file(&path))
+                .map(|file| file.rel_path().to_path_buf())
+                .collect::<BTreeSet<_>>();
+            canonicalizer.record_renames(&change.renames);
+            if changed_files.is_empty() {
+                continue;
+            }
+
+            for path in &changed_files {
+                *file_doc_freq.entry(path.clone()).or_insert(0) += 1;
+            }
+
+            let seeds_in_commit = seeds
+                .iter()
+                .filter(|seed| changed_files.contains(*seed))
+                .cloned()
+                .collect::<Vec<_>>();
+            if seeds_in_commit.is_empty() {
+                continue;
+            }
+
+            for seed in &seeds_in_commit {
+                *seed_commit_count.entry(seed.clone()).or_insert(0) += 1;
+            }
+
+            let commit_pair_mass = 1.0 / changed_files.len() as f64;
+            for seed in &seeds_in_commit {
+                for target in &targets {
+                    if changed_files.contains(target) {
+                        *joint_mass
+                            .entry((seed.clone(), target.clone()))
+                            .or_insert(0.0) += commit_pair_mass;
+                    }
+                }
+            }
+        }
+
+        for target in &targets {
+            let df = file_doc_freq.get(target).copied().unwrap_or(0).max(1) as f64;
+            let idf = (1.0 + baseline_commit_count / df).ln();
+            eprintln!("target={} df={} idf={:.15}", target.display(), df as usize, idf);
+            let mut total = 0.0;
+            for seed in &seeds {
+                let joint = joint_mass
+                    .get(&(seed.clone(), target.clone()))
+                    .copied()
+                    .unwrap_or(0.0);
+                let seed_denom = seed_commit_count.get(seed).copied().unwrap_or(0);
+                let conditional = if seed_denom == 0 {
+                    0.0
+                } else {
+                    joint / seed_denom as f64
+                };
+                let contribution = conditional * idf;
+                total += contribution;
+                eprintln!(
+                    "  seed={} seed_den={} joint={:.15} conditional={:.15} contribution={:.15}",
+                    seed.display(),
+                    seed_denom,
+                    joint,
+                    conditional,
+                    contribution
+                );
+            }
+            eprintln!("  total={:.15}", total);
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn debug_git_contributing_commits_for_autogen_topicid_and_inmemoryruntime_pair() {
+        let root = Path::new("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
+        let context = super::GitProjectContext::discover(root).unwrap();
+        let topic_id = PathBuf::from("dotnet/src/Microsoft.AutoGen/Contracts/TopicId.cs");
+        let inmemory = PathBuf::from(
+            "dotnet/test/Microsoft.AutoGen.Integration.Tests/InMemoryRuntimeIntegrationTests.cs",
+        );
+        let pairs = [
+            (
+                topic_id.clone(),
+                PathBuf::from("dotnet/src/Microsoft.AutoGen/Contracts/KVStringParseHelper.cs"),
+            ),
+            (
+                inmemory.clone(),
+                PathBuf::from("dotnet/AutoGen.sln"),
+            ),
+        ];
+
+        let commits = context.recent_commit_ids(super::COMMITS_TO_PROCESS).unwrap();
+        let mut canonicalizer = super::RenameCanonicalizer::default();
+        for oid in &commits {
+            let commit = context.repo.find_commit(*oid).unwrap();
+            let change = context.changed_repo_paths_for_commit(&commit).unwrap();
+            let changed_files = change
+                .paths
+                .into_iter()
+                .map(|path| canonicalizer.canonicalize(&path))
+                .filter_map(|path| context.repo_path_to_project_file(&path))
+                .map(|file| file.rel_path().to_path_buf())
+                .collect::<BTreeSet<_>>();
+            canonicalizer.record_renames(&change.renames);
+            if changed_files.is_empty() {
+                continue;
+            }
+
+            for (seed, target) in &pairs {
+                if changed_files.contains(seed) && changed_files.contains(target) {
+                    eprintln!(
+                        "pair {} -> {} commit={} size={}",
+                        seed.display(),
+                        target.display(),
+                        commit.id(),
+                        changed_files.len()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn debug_changed_files_for_autogen_pair_commits() {
+        let root = Path::new("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
+        let context = super::GitProjectContext::discover(root).unwrap();
+        let interesting = BTreeSet::from([
+            git2::Oid::from_str("b16b94feb8bd89ef07c14fc7f34419490924b993").unwrap(),
+            git2::Oid::from_str("1a789dfcc44dc2f90b2bf2805a78a4e4f4112c4a").unwrap(),
+            git2::Oid::from_str("0100201dd41111473f8624cbf1ab1c2a926f8c93").unwrap(),
+            git2::Oid::from_str("7d01bc61368d912460e28daf8ea2edb228bfde24").unwrap(),
+            git2::Oid::from_str("ff7f863e739cd0339f54d460d2be8a79bcdd0231").unwrap(),
+        ]);
+
+        let commits = context.recent_commit_ids(super::COMMITS_TO_PROCESS).unwrap();
+        let mut canonicalizer = super::RenameCanonicalizer::default();
+        for oid in &commits {
+            let commit = context.repo.find_commit(*oid).unwrap();
+            let change = context.changed_repo_paths_for_commit(&commit).unwrap();
+            let changed_files = change
+                .paths
+                .into_iter()
+                .map(|path| canonicalizer.canonicalize(&path))
+                .filter_map(|path| context.repo_path_to_project_file(&path))
+                .map(|file| file.rel_path().to_path_buf())
+                .collect::<BTreeSet<_>>();
+            canonicalizer.record_renames(&change.renames);
+            if interesting.contains(oid) {
+                eprintln!("commit={} size={}", commit.id(), changed_files.len());
+                for path in changed_files {
+                    eprintln!("  {}", path.display());
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn debug_autogen_inprocess_runtime_counted_paths() {
+        let root = Path::new("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
+        let context = super::GitProjectContext::discover(root).unwrap();
+        let target = PathBuf::from("dotnet/test/Microsoft.AutoGen.Core.Tests/InProcessRuntimeTests.cs");
+        let interesting = git2::Oid::from_str("b16b94feb8bd89ef07c14fc7f34419490924b993").unwrap();
+
+        let commits = context.recent_commit_ids(super::COMMITS_TO_PROCESS).unwrap();
+        let mut canonicalizer = super::RenameCanonicalizer::default();
+        for oid in &commits {
+            let commit = context.repo.find_commit(*oid).unwrap();
+            let change = context.changed_repo_paths_for_commit(&commit).unwrap();
+            if *oid == interesting {
+                for path in &change.paths {
+                    let canonical = canonicalizer.canonicalize(path);
+                    if canonical == target {
+                        eprintln!("{} -> {}", path.display(), canonical.display());
+                    }
+                }
+                eprintln!("renames:");
+                for (old_path, new_path) in &change.renames {
+                    eprintln!("  {} -> {}", old_path.display(), new_path.display());
+                }
+            }
+            canonicalizer.record_renames(&change.renames);
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn debug_autogen_checker_git_stats() {
+        let root = Path::new("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
+        let context = super::GitProjectContext::discover(root).unwrap();
+        let seed = PathBuf::from("dotnet/samples/GettingStarted/Checker.cs");
+        let docfx = PathBuf::from("docs/dotnet/docfx.json");
+        let agent_metadata =
+            PathBuf::from("dotnet/src/Microsoft.AutoGen/Contracts/AgentMetadata.cs");
+
+        let commits = context.recent_commit_ids(super::COMMITS_TO_PROCESS).unwrap();
+        let mut file_doc_freq: HashMap<PathBuf, usize> = HashMap::new();
+        let mut joint_mass: HashMap<PathBuf, f64> = HashMap::new();
+        let mut seed_commit_count = 0usize;
+        let mut canonicalizer = super::RenameCanonicalizer::default();
+
+        for oid in &commits {
+            let commit = context.repo.find_commit(*oid).unwrap();
+            let change = context.changed_repo_paths_for_commit(&commit).unwrap();
+            let changed_files = change
+                .paths
+                .into_iter()
+                .map(|path| canonicalizer.canonicalize(&path))
+                .collect::<BTreeSet<_>>();
+            canonicalizer.record_renames(&change.renames);
+            if changed_files.is_empty() {
+                continue;
+            }
+
+            for path in &changed_files {
+                *file_doc_freq.entry(path.clone()).or_insert(0) += 1;
+            }
+
+            if !changed_files.contains(&seed) {
+                continue;
+            }
+            seed_commit_count += 1;
+            let commit_pair_mass = 1.0 / changed_files.len() as f64;
+            for target in [&docfx, &agent_metadata] {
+                if changed_files.contains(target) {
+                    *joint_mass.entry(target.clone()).or_insert(0.0) += commit_pair_mass;
+                    eprintln!(
+                        "{} shared {} size={}",
+                        commit.id(),
+                        target.display(),
+                        changed_files.len()
+                    );
+                }
+            }
+        }
+
+        for target in [&docfx, &agent_metadata] {
+            eprintln!(
+                "{} df={} seed_den={} joint={:.15}",
+                target.display(),
+                file_doc_freq.get(target).copied().unwrap_or(0),
+                seed_commit_count,
+                joint_mass.get(target).copied().unwrap_or(0.0)
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn debug_autogen_hello_ai_agents_git_stats() {
+        let root = Path::new("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
+        let context = super::GitProjectContext::discover(root).unwrap();
+        let seed = PathBuf::from("dotnet/samples/Hello/HelloAIAgents/Program.cs");
+        let add_subscription = PathBuf::from(
+            "dotnet/src/Microsoft.AutoGen/RuntimeGateway.Grpc/Services/Orleans/Surrogates/AddSubscriptionRequestSurrogate.cs",
+        );
+        let agent_host =
+            PathBuf::from("dotnet/src/Microsoft.AutoGen/AgentHost/Microsoft.AutoGen.AgentHost.csproj");
+
+        let commits = context.recent_commit_ids(super::COMMITS_TO_PROCESS).unwrap();
+        let mut file_doc_freq: HashMap<PathBuf, usize> = HashMap::new();
+        let mut joint_mass: HashMap<PathBuf, f64> = HashMap::new();
+        let mut seed_commit_count = 0usize;
+        let mut canonicalizer = super::RenameCanonicalizer::default();
+
+        for oid in &commits {
+            let commit = context.repo.find_commit(*oid).unwrap();
+            let change = context.changed_repo_paths_for_commit(&commit).unwrap();
+            let changed_files = change
+                .paths
+                .into_iter()
+                .map(|path| canonicalizer.canonicalize(&path))
+                .collect::<BTreeSet<_>>();
+            canonicalizer.record_renames(&change.renames);
+            if changed_files.is_empty() {
+                continue;
+            }
+
+            for path in &changed_files {
+                *file_doc_freq.entry(path.clone()).or_insert(0) += 1;
+            }
+
+            if !changed_files.contains(&seed) {
+                continue;
+            }
+            seed_commit_count += 1;
+            let commit_pair_mass = 1.0 / changed_files.len() as f64;
+            for target in [&add_subscription, &agent_host] {
+                if changed_files.contains(target) {
+                    *joint_mass.entry(target.clone()).or_insert(0.0) += commit_pair_mass;
+                    eprintln!(
+                        "{} shared {} size={}",
+                        commit.id(),
+                        target.display(),
+                        changed_files.len()
+                    );
+                }
+            }
+        }
+
+        for target in [&add_subscription, &agent_host] {
+            eprintln!(
+                "{} df={} seed_den={} joint={:.15}",
+                target.display(),
+                file_doc_freq.get(target).copied().unwrap_or(0),
+                seed_commit_count,
+                joint_mass.get(target).copied().unwrap_or(0.0)
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn debug_autogen_hello_ai_agents_contested_git_terms() {
+        let root = Path::new("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
+        let context = super::GitProjectContext::discover(root).unwrap();
+        let seed = PathBuf::from("dotnet/samples/Hello/HelloAIAgents/Program.cs");
+        let targets = [
+            PathBuf::from("dotnet/samples/Hello/HelloAgent/appsettings.json"),
+            PathBuf::from("dotnet/src/Microsoft.AutoGen/AgentHost/appsettings.json"),
+            PathBuf::from("dotnet/src/Microsoft.AutoGen/Agents/IOAgent/ConsoleAgent/IHandleConsole.cs"),
+            PathBuf::from("python/samples/core_xlang_hello_python_agent/protos/agent_events_pb2.py"),
+            PathBuf::from("dotnet/samples/dev-team/DevTeam.ServiceDefaults/DevTeam.ServiceDefaults.csproj"),
+            PathBuf::from("dotnet/test/Microsoft.AutoGen.Integration.Tests/HelloAppHostIntegrationTests.cs"),
+            PathBuf::from("dotnet/samples/dev-team/DevTeam.Backend/Program.cs"),
+            PathBuf::from("dotnet/test/Microsoft.AutoGen.Core.Tests/Microsoft.AutoGen.Core.Tests.csproj"),
+        ];
+
+        let commits = context.recent_commit_ids(super::COMMITS_TO_PROCESS).unwrap();
+        let baseline_commit_count = commits.len() as f64;
+        let mut file_doc_freq: HashMap<PathBuf, usize> = HashMap::new();
+        let mut joint_mass: HashMap<PathBuf, f64> = HashMap::new();
+        let mut seed_commit_count = 0usize;
+        let mut canonicalizer = super::RenameCanonicalizer::default();
+
+        for oid in &commits {
+            let commit = context.repo.find_commit(*oid).unwrap();
+            let change = context.changed_repo_paths_for_commit(&commit).unwrap();
+            let changed_files = change
+                .paths
+                .into_iter()
+                .map(|path| canonicalizer.canonicalize(&path))
+                .collect::<BTreeSet<_>>();
+            canonicalizer.record_renames(&change.renames);
+            if changed_files.is_empty() {
+                continue;
+            }
+
+            for path in &changed_files {
+                *file_doc_freq.entry(path.clone()).or_insert(0) += 1;
+            }
+
+            if !changed_files.contains(&seed) {
+                continue;
+            }
+            seed_commit_count += 1;
+            let commit_pair_mass = 1.0 / changed_files.len() as f64;
+            for target in &targets {
+                if changed_files.contains(target) {
+                    *joint_mass.entry(target.clone()).or_insert(0.0) += commit_pair_mass;
+                }
+            }
+        }
+
+        for target in &targets {
+            let df = file_doc_freq.get(target).copied().unwrap_or(0).max(1) as f64;
+            let joint = joint_mass.get(target).copied().unwrap_or(0.0);
+            let conditional = if seed_commit_count == 0 {
+                0.0
+            } else {
+                joint / seed_commit_count as f64
+            };
+            let idf = (1.0 + baseline_commit_count / df).ln();
+            let score = conditional * idf;
+            eprintln!(
+                "{} df={} seed_den={} joint={:.15} conditional={:.15} idf={:.15} score={:.15}",
+                target.display(),
+                file_doc_freq.get(target).copied().unwrap_or(0),
+                seed_commit_count,
+                joint,
+                conditional,
+                idf,
+                score
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn debug_autogen_hello_agent_contested_git_terms() {
+        let root = Path::new("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
+        let context = super::GitProjectContext::discover(root).unwrap();
+        let seed = PathBuf::from("dotnet/samples/Hello/HelloAgent/Program.cs");
+        let targets = [
+            PathBuf::from(
+                "dotnet/test/Microsoft.AutoGen.Integration.Tests.AppHosts/InMemoryTests.AppHost/InMemoryTests.AppHost.csproj",
+            ),
+            PathBuf::from(
+                "dotnet/src/Microsoft.AutoGen/RuntimeGateway.Grpc/Services/Orleans/Surrogates/AnySurrogate.cs",
+            ),
+            PathBuf::from(
+                "dotnet/src/Microsoft.AutoGen/RuntimeGateway.Grpc/Services/Orleans/Surrogates/AgentIdSurrogate.cs",
+            ),
+            PathBuf::from(
+                "dotnet/src/Microsoft.AutoGen/RuntimeGateway.Grpc/Services/Orleans/Surrogates/RpcRequestSurrogate.cs",
+            ),
+            PathBuf::from(
+                "dotnet/src/Microsoft.AutoGen/RuntimeGateway.Grpc/Services/Orleans/Surrogates/SubscriptionSurrogate.cs",
+            ),
+        ];
+
+        let commits = context.recent_commit_ids(super::COMMITS_TO_PROCESS).unwrap();
+        let baseline_commit_count = commits.len() as f64;
+        let mut file_doc_freq: HashMap<PathBuf, usize> = HashMap::new();
+        let mut joint_mass: HashMap<PathBuf, f64> = HashMap::new();
+        let mut seed_commit_count = 0usize;
+        let mut canonicalizer = super::RenameCanonicalizer::default();
+
+        for oid in &commits {
+            let commit = context.repo.find_commit(*oid).unwrap();
+            let change = context.changed_repo_paths_for_commit(&commit).unwrap();
+            let changed_files = change
+                .paths
+                .into_iter()
+                .map(|path| canonicalizer.canonicalize(&path))
+                .collect::<BTreeSet<_>>();
+            canonicalizer.record_renames(&change.renames);
+            if changed_files.is_empty() {
+                continue;
+            }
+
+            for path in &changed_files {
+                *file_doc_freq.entry(path.clone()).or_insert(0) += 1;
+            }
+
+            if !changed_files.contains(&seed) {
+                continue;
+            }
+            seed_commit_count += 1;
+            let commit_pair_mass = 1.0 / changed_files.len() as f64;
+            for target in &targets {
+                if changed_files.contains(target) {
+                    *joint_mass.entry(target.clone()).or_insert(0.0) += commit_pair_mass;
+                }
+            }
+        }
+
+        for target in &targets {
+            let df = file_doc_freq.get(target).copied().unwrap_or(0).max(1) as f64;
+            let joint = joint_mass.get(target).copied().unwrap_or(0.0);
+            let conditional = if seed_commit_count == 0 {
+                0.0
+            } else {
+                joint / seed_commit_count as f64
+            };
+            let idf = (1.0 + baseline_commit_count / df).ln();
+            let score = conditional * idf;
+            eprintln!(
+                "{} df={} seed_den={} joint={:.15} conditional={:.15} idf={:.15} score={:.15}",
+                target.display(),
+                file_doc_freq.get(target).copied().unwrap_or(0),
+                seed_commit_count,
+                joint,
+                conditional,
+                idf,
+                score
+            );
+        }
+    }
+
+    #[test]
+    fn autogen_add_subscription_follow_history_counts_runtime_gateway_rename() {
+        let root = Path::new("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
+        if !root.is_dir() {
+            eprintln!("skipping autogen rename regression: repo not present");
+            return;
+        }
+
+        let context = super::GitProjectContext::discover(root).unwrap();
+        let commits = context.recent_commit_ids(super::COMMITS_TO_PROCESS).unwrap();
+        let target = PathBuf::from(
+            "dotnet/src/Microsoft.AutoGen/RuntimeGateway.Grpc/Services/Orleans/Surrogates/AddSubscriptionRequestSurrogate.cs",
+        );
+        let mut canonicalizer = super::RenameCanonicalizer::default();
+        let mut doc_freq = 0usize;
+
+        for oid in commits {
+            let commit = context.repo.find_commit(oid).unwrap();
+            let change = context.changed_repo_paths_for_commit(&commit).unwrap();
+            let changed = change
+                .paths
+                .into_iter()
+                .map(|path| canonicalizer.canonicalize(&path))
+                .collect::<BTreeSet<_>>();
+            canonicalizer.record_renames(&change.renames);
+            if changed.contains(&target) {
+                doc_freq += 1;
+            }
+        }
+
+        assert_eq!(3, doc_freq);
+    }
+
+    #[test]
+    fn autogen_agent_host_follow_history_counts_case_rename() {
+        let root = Path::new("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
+        if !root.is_dir() {
+            eprintln!("skipping autogen rename regression: repo not present");
+            return;
+        }
+
+        let context = super::GitProjectContext::discover(root).unwrap();
+        let commits = context.recent_commit_ids(super::COMMITS_TO_PROCESS).unwrap();
+        let target =
+            PathBuf::from("dotnet/src/Microsoft.AutoGen/AgentHost/Microsoft.AutoGen.AgentHost.csproj");
+        let mut canonicalizer = super::RenameCanonicalizer::default();
+        let mut doc_freq = 0usize;
+
+        for oid in commits {
+            let commit = context.repo.find_commit(oid).unwrap();
+            let change = context.changed_repo_paths_for_commit(&commit).unwrap();
+            let changed = change
+                .paths
+                .into_iter()
+                .map(|path| canonicalizer.canonicalize(&path))
+                .collect::<BTreeSet<_>>();
+            canonicalizer.record_renames(&change.renames);
+            if changed.contains(&target) {
+                doc_freq += 1;
+            }
+        }
+
+        assert_eq!(4, doc_freq);
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn debug_autogen_agent_host_counted_commits() {
+        let root = Path::new("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
+        let context = super::GitProjectContext::discover(root).unwrap();
+        let commits = context.recent_commit_ids(super::COMMITS_TO_PROCESS).unwrap();
+        let target =
+            PathBuf::from("dotnet/src/Microsoft.AutoGen/AgentHost/Microsoft.AutoGen.AgentHost.csproj");
+        let mut canonicalizer = super::RenameCanonicalizer::default();
+
+        for oid in commits {
+            let commit = context.repo.find_commit(oid).unwrap();
+            let change = context.changed_repo_paths_for_commit(&commit).unwrap();
+            let changed = change
+                .paths
+                .into_iter()
+                .map(|path| canonicalizer.canonicalize(&path))
+                .collect::<BTreeSet<_>>();
+            canonicalizer.record_renames(&change.renames);
+            if changed.contains(&target) {
+                eprintln!("{}", commit.id());
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn debug_autogen_agent_host_counted_paths() {
+        let root = Path::new("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
+        let context = super::GitProjectContext::discover(root).unwrap();
+        let commits = context.recent_commit_ids(super::COMMITS_TO_PROCESS).unwrap();
+        let target =
+            PathBuf::from("dotnet/src/Microsoft.AutoGen/AgentHost/Microsoft.AutoGen.AgentHost.csproj");
+        let interesting = [
+            git2::Oid::from_str("c169df8b7b98687442ea6bbd7eb4efc7c4010610").unwrap(),
+            git2::Oid::from_str("6a9c14715b04de653b16a2d1376461e710b80179").unwrap(),
+        ]
+        .into_iter()
+        .collect::<HashSet<_>>();
+        let mut canonicalizer = super::RenameCanonicalizer::default();
+
+        for oid in commits {
+            let commit = context.repo.find_commit(oid).unwrap();
+            let change = context.changed_repo_paths_for_commit(&commit).unwrap();
+            let original_paths = change.paths.clone();
+            let changed = change
+                .paths
+                .into_iter()
+                .map(|path| canonicalizer.canonicalize(&path))
+                .collect::<BTreeSet<_>>();
+            canonicalizer.record_renames(&change.renames);
+            if interesting.contains(&oid) && changed.contains(&target) {
+                eprintln!("commit {}", oid);
+                for path in original_paths {
+                    let canonical = canonicalizer.canonicalize(&path);
+                    if canonical == target {
+                        eprintln!("  {} -> {}", path.display(), canonical.display());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn debug_autogen_service_defaults_counted_paths() {
+        let root = Path::new("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
+        let context = super::GitProjectContext::discover(root).unwrap();
+        let target =
+            PathBuf::from("dotnet/samples/dev-team/DevTeam.ServiceDefaults/DevTeam.ServiceDefaults.csproj");
+
+        let commits = context.recent_commit_ids(super::COMMITS_TO_PROCESS).unwrap();
+        let mut canonicalizer = super::RenameCanonicalizer::default();
+        for oid in &commits {
+            let commit = context.repo.find_commit(*oid).unwrap();
+            let change = context.changed_repo_paths_for_commit(&commit).unwrap();
+            let mut counted = BTreeSet::new();
+            for path in change.paths {
+                let canonical = canonicalizer.canonicalize(&path);
+                if canonical == target {
+                    counted.insert(path);
+                }
+            }
+            canonicalizer.record_renames(&change.renames);
+            if !counted.is_empty() {
+                eprintln!("{} {:?}", commit.id(), counted);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn debug_autogen_agent_host_appsettings_counted_paths() {
+        let root = Path::new("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
+        let context = super::GitProjectContext::discover(root).unwrap();
+        let target = PathBuf::from("dotnet/src/Microsoft.AutoGen/AgentHost/appsettings.json");
+
+        let commits = context.recent_commit_ids(super::COMMITS_TO_PROCESS).unwrap();
+        let mut canonicalizer = super::RenameCanonicalizer::default();
+        for oid in &commits {
+            let commit = context.repo.find_commit(*oid).unwrap();
+            let change = context.changed_repo_paths_for_commit(&commit).unwrap();
+            let mut counted = BTreeSet::new();
+            for path in change.paths {
+                let canonical = canonicalizer.canonicalize(&path);
+                if canonical == target {
+                    counted.insert(path);
+                }
+            }
+            canonicalizer.record_renames(&change.renames);
+            if !counted.is_empty() {
+                eprintln!("{} {:?}", commit.id(), counted);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn debug_autogen_checker_doc_canonicalized_commits() {
+        let root = Path::new("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
+        let context = super::GitProjectContext::discover(root).unwrap();
+        let commit_ids = context.recent_commit_ids(super::COMMITS_TO_PROCESS).unwrap();
+        let mut canonicalizer = super::RenameCanonicalizer::default();
+        for oid in commit_ids {
+            let commit = context.repo.find_commit(oid).unwrap();
+            let change = context.changed_repo_paths_for_commit(&commit).unwrap();
+            let canonicalized = change
+                .paths
+                .iter()
+                .map(|path| canonicalizer.canonicalize(path))
+                .filter(|path| {
+                    let path = path.to_string_lossy();
+                    path.ends_with("tutorial.md") || path.ends_with("protobuf-message-types.md")
+                })
+                .collect::<BTreeSet<_>>();
+            if !canonicalized.is_empty() {
+                eprintln!("{} {:?}", commit.id(), canonicalized);
+            }
+            canonicalizer.record_renames(&change.renames);
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn debug_git_scores_for_plume_imports_test2_goal_seed() {
+        let workspace = workspace_analyzer(Path::new("/home/jonathan/Projects/plume-merge"));
+        let seed = ProjectFile::new(
+            workspace.analyzer().project().root().to_path_buf(),
+            "src/test/resources/ImportsTest2Goal.java",
+        );
+        let results =
+            super::related_files_by_git(workspace.analyzer(), &HashMap::from([(seed, 1.0)]), 100)
+                .unwrap();
+        for entry in results {
+            eprintln!("{:.15} {}", entry.score, entry.file.rel_path().display());
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn debug_git_scores_for_plume_imports_test8_base_seed() {
+        let workspace = workspace_analyzer(Path::new("/home/jonathan/Projects/plume-merge"));
+        let seed = ProjectFile::new(
+            workspace.analyzer().project().root().to_path_buf(),
+            "src/test/resources/ImportsTest8Base.java",
+        );
+        let results =
+            super::related_files_by_git(workspace.analyzer(), &HashMap::from([(seed, 1.0)]), 100)
+                .unwrap();
+        for entry in results {
+            eprintln!("{:.15} {}", entry.score, entry.file.rel_path().display());
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn debug_import_resolution_for_plume_imports_test8_base_seed() {
+        let workspace = workspace_analyzer(Path::new("/home/jonathan/Projects/plume-merge"));
+        let seed = ProjectFile::new(
+            workspace.analyzer().project().root().to_path_buf(),
+            "src/test/resources/ImportsTest8Base.java",
+        );
+        let provider = workspace.analyzer().import_analysis_provider().unwrap();
+        for code_unit in provider.imported_code_units_of(&seed) {
+            eprintln!("{}", code_unit.source().rel_path().display());
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn debug_definitions_for_plume_boolean_column() {
+        let workspace = workspace_analyzer(Path::new("/home/jonathan/Projects/plume-merge"));
+        for code_unit in workspace
+            .analyzer()
+            .get_definitions("tech.tablesaw.api.BooleanColumn")
+        {
+            eprintln!("{}", code_unit.source().rel_path().display());
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn debug_git_rename_detection_for_external_repos() {
+        let autogen_root = Path::new("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
+        let autogen = super::GitProjectContext::discover(autogen_root).unwrap();
+        let autogen_commit = autogen
+            .repo
+            .find_commit(git2::Oid::from_str("850377c74a10e9d493de6dea1ed706333e05d146").unwrap())
+            .unwrap();
+        let autogen_change = autogen.changed_repo_paths_for_commit(&autogen_commit).unwrap();
+        eprintln!("autogen renames: {:?}", autogen_change.renames);
+        let mut autogen_canon = super::RenameCanonicalizer::default();
+        autogen_canon.record_renames(&autogen_change.renames);
+        eprintln!(
+            "autogen canonical old path -> {}",
+            autogen_canon
+                .canonicalize(Path::new(
+                    "dotnet/samples/AutoGen.Anthropic.Samples/Create_Anthropic_Agent.cs"
+                ))
+                .display()
+        );
+
+        let plume_root = Path::new("/home/jonathan/Projects/plume-merge");
+        let plume = super::GitProjectContext::discover(plume_root).unwrap();
+        let plume_commit = plume
+            .repo
+            .find_commit(git2::Oid::from_str("891e8540ab8a90195e231d1d9fdeed4e05ff044f").unwrap())
+            .unwrap();
+        let plume_change = plume.changed_repo_paths_for_commit(&plume_commit).unwrap();
+        eprintln!("plume renames: {:?}", plume_change.renames);
+        let mut plume_canon = super::RenameCanonicalizer::default();
+        plume_canon.record_renames(&plume_change.renames);
+        eprintln!(
+            "plume canonical old path -> {}",
+            plume_canon
+                .canonicalize(Path::new(
+                    "src/main/java/name/fraser/neil/plaintext/DmpLibrary.java"
+                ))
+                .display()
+        );
+    }
+
+    #[test]
+    fn autogen_large_rename_commit_detects_agent_metadata_move() {
+        let root = Path::new("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
+        if !root.is_dir() {
+            eprintln!("skipping autogen rename regression: repo not present");
+            return;
+        }
+
+        let context = super::GitProjectContext::discover(root).unwrap();
+        let commit = context
+            .repo
+            .find_commit(git2::Oid::from_str(
+                "b16b94feb8bd89ef07c14fc7f34419490924b993",
+            )
+            .unwrap())
+            .unwrap();
+        let change = context.changed_repo_paths_for_commit(&commit).unwrap();
+        let expected = (
+            PathBuf::from("dotnet/src/Microsoft.AutoGen/Contracts/PythonEquiv/AgentMetadata.cs"),
+            PathBuf::from("dotnet/src/Microsoft.AutoGen/Contracts/AgentMetadata.cs"),
+        );
+
+        assert!(
+            change.renames.contains(&expected),
+            "{:?}",
+            change.renames
+        );
+    }
+
+    #[test]
+    fn autogen_agent_metadata_follow_history_counts_python_equiv_commits() {
+        let root = Path::new("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
+        if !root.is_dir() {
+            eprintln!("skipping autogen rename regression: repo not present");
+            return;
+        }
+
+        let context = super::GitProjectContext::discover(root).unwrap();
+        let commits = context.recent_commit_ids(super::COMMITS_TO_PROCESS).unwrap();
+        let target = PathBuf::from("dotnet/src/Microsoft.AutoGen/Contracts/AgentMetadata.cs");
+        let mut canonicalizer = super::RenameCanonicalizer::default();
+        let mut doc_freq = 0usize;
+
+        for oid in commits {
+            let commit = context.repo.find_commit(oid).unwrap();
+            let change = context.changed_repo_paths_for_commit(&commit).unwrap();
+            let changed = change
+                .paths
+                .into_iter()
+                .map(|path| canonicalizer.canonicalize(&path))
+                .collect::<BTreeSet<_>>();
+            canonicalizer.record_renames(&change.renames);
+            if changed.contains(&target) {
+                doc_freq += 1;
+            }
+        }
+
+        assert_eq!(5, doc_freq);
+    }
+
+    #[test]
+    fn autogen_agent_runtime_tests_do_not_follow_to_inprocess_runtime_tests() {
+        let root = Path::new("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
+        if !root.is_dir() {
+            eprintln!("skipping autogen rename regression: repo not present");
+            return;
+        }
+
+        let context = super::GitProjectContext::discover(root).unwrap();
+        let commits = context.recent_commit_ids(super::COMMITS_TO_PROCESS).unwrap();
+        let old_path =
+            PathBuf::from("dotnet/test/Microsoft.AutoGen.Core.Tests/AgentRuntimeTests.cs");
+        let expected = old_path.clone();
+        let mut canonicalizer = super::RenameCanonicalizer::default();
+
+        for oid in commits {
+            let commit = context.repo.find_commit(oid).unwrap();
+            if commit.id()
+                == git2::Oid::from_str("b16b94feb8bd89ef07c14fc7f34419490924b993").unwrap()
+            {
+                assert_eq!(expected, canonicalizer.canonicalize(&old_path));
+                return;
+            }
+            let change = context.changed_repo_paths_for_commit(&commit).unwrap();
+            canonicalizer.record_renames(&change.renames);
+        }
+
+        panic!("autogen baseline window did not include target commit");
     }
 
     #[test]

@@ -5,6 +5,7 @@ use brokk_analyzer::{
 };
 use git2::{Repository, Signature};
 use std::collections::BTreeSet;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -63,13 +64,38 @@ fn brokk_cli_result_lines(project_root: &Path, stdout: &str) -> Vec<String> {
         .collect()
 }
 
-fn brokk_cli_direct(project_root: &Path, seeds: &[String]) -> Vec<String> {
-    let classpath = format!(
-        "{}/app/build/classes/java/main:{}/app/build/resources/main:{}/app/build/install/app/lib/*",
-        project_root.display(),
-        project_root.display(),
-        project_root.display()
-    );
+fn brokk_app_root() -> PathBuf {
+    env::var("BROKK_APP_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/home/jonathan/Projects/brokk"))
+}
+
+fn parity_project_root() -> PathBuf {
+    env::var("BROKK_PARITY_PROJECT_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/home/jonathan/Projects/brokk"))
+}
+
+fn parity_extensions() -> Option<BTreeSet<String>> {
+    let value = env::var("BROKK_PARITY_EXTENSIONS").ok()?;
+    let extensions = value
+        .split(',')
+        .map(|value| value.trim().trim_start_matches('.').to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect::<BTreeSet<_>>();
+    (!extensions.is_empty()).then_some(extensions)
+}
+
+fn parity_sample_size() -> usize {
+    env::var("BROKK_PARITY_SAMPLE_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(100)
+}
+
+fn brokk_cli_direct(brokk_root: &Path, project_root: &Path, seeds: &[String]) -> Vec<String> {
+    let classpath = format!("{}/app/build/install/app/lib/*", brokk_root.display());
     let output = Command::new("java")
         .arg("-Djava.awt.headless=true")
         .arg("-cp")
@@ -78,7 +104,7 @@ fn brokk_cli_direct(project_root: &Path, seeds: &[String]) -> Vec<String> {
         .arg("--root")
         .arg(project_root)
         .args(seeds)
-        .current_dir(project_root)
+        .current_dir(brokk_root)
         .output()
         .unwrap();
     assert!(
@@ -109,7 +135,23 @@ fn tracked_files(project_root: &Path) -> Vec<String> {
         .collect()
 }
 
+fn parity_seed_files(project_root: &Path) -> Vec<String> {
+    let mut files = tracked_files(project_root);
+    if let Some(extensions) = parity_extensions() {
+        files.retain(|path| {
+            Path::new(path)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .map(|extension| extensions.contains(&extension.to_ascii_lowercase()))
+                .unwrap_or(false)
+        });
+    }
+    files
+}
+
 fn deterministic_pair_sample(files: &[String], count: usize) -> Vec<[String; 2]> {
+    let max_pairs = files.len().saturating_mul(files.len().saturating_sub(1)) / 2;
+    let count = count.min(max_pairs);
     let mut state = 0_u64;
     let mut seen = BTreeSet::new();
     let mut pairs = Vec::new();
@@ -293,6 +335,59 @@ fn git_results_are_filled_with_import_ranking_when_needed() {
     );
 
     assert_eq!(vec!["test/B.java", "test/C.java"], results.files);
+}
+
+#[test]
+fn git_ties_are_sorted_by_normalized_path_name() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    write_file(root, "Seed.java", "public class Seed { }");
+    write_file(
+        root,
+        "AnthropicAgentWithPromptCaching.java",
+        "public class AnthropicAgentWithPromptCaching { }",
+    );
+    write_file(
+        root,
+        "AutoGenAnthropicSample.java",
+        "public class AutoGenAnthropicSample { }",
+    );
+    write_file(
+        root,
+        "CreateAnthropicAgent.java",
+        "public class CreateAnthropicAgent { }",
+    );
+
+    let repo = Repository::init(root).unwrap();
+    commit_paths(
+        &repo,
+        "single tied change",
+        &[
+            "Seed.java",
+            "AnthropicAgentWithPromptCaching.java",
+            "AutoGenAnthropicSample.java",
+            "CreateAnthropicAgent.java",
+        ],
+        &[],
+    );
+
+    let analyzer = java_analyzer(root);
+    let results = most_relevant_files(
+        &analyzer,
+        MostRelevantFilesParams {
+            seed_files: vec!["Seed.java".to_string()],
+            limit: 3,
+        },
+    );
+
+    assert_eq!(
+        vec![
+            "AnthropicAgentWithPromptCaching.java",
+            "AutoGenAnthropicSample.java",
+            "CreateAnthropicAgent.java",
+        ],
+        results.files
+    );
 }
 
 #[test]
@@ -719,20 +814,177 @@ fn matches_brokk_reference_for_history_store_and_console_logging_pair() {
 }
 
 #[test]
+fn matches_brokk_reference_for_plume_imports_test2_goal_seed() {
+    let project_root = PathBuf::from("/home/jonathan/Projects/plume-merge");
+    let brokk_root = brokk_app_root();
+    if !brokk_root.is_dir() || !project_root.is_dir() {
+        eprintln!("skipping plume parity regression: repo not present");
+        return;
+    }
+
+    let seed = "src/test/resources/ImportsTest2Goal.java";
+    let project = Arc::new(FilesystemProject::new(&project_root).unwrap());
+    let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+    let bifrost = most_relevant_files(
+        workspace.analyzer(),
+        MostRelevantFilesParams {
+            seed_files: vec![seed.to_string()],
+            limit: 100,
+        },
+    );
+    assert!(bifrost.not_found.is_empty());
+
+    let expected = brokk_cli_direct(&brokk_root, &project_root, &[seed.to_string()]);
+    assert_eq!(expected, bifrost.files);
+}
+
+#[test]
+fn matches_brokk_reference_for_plume_imports_test8_base_seed() {
+    let project_root = PathBuf::from("/home/jonathan/Projects/plume-merge");
+    let brokk_root = brokk_app_root();
+    if !brokk_root.is_dir() || !project_root.is_dir() {
+        eprintln!("skipping plume parity regression: repo not present");
+        return;
+    }
+
+    let seed = "src/test/resources/ImportsTest8Base.java";
+    let project = Arc::new(FilesystemProject::new(&project_root).unwrap());
+    let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+    let bifrost = most_relevant_files(
+        workspace.analyzer(),
+        MostRelevantFilesParams {
+            seed_files: vec![seed.to_string()],
+            limit: 100,
+        },
+    );
+    assert!(bifrost.not_found.is_empty());
+
+    let expected = brokk_cli_direct(&brokk_root, &project_root, &[seed.to_string()]);
+    assert_eq!(expected, bifrost.files);
+}
+
+#[test]
+fn matches_brokk_reference_for_autogen_checker_seed() {
+    let project_root = PathBuf::from("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
+    let brokk_root = brokk_app_root();
+    if !brokk_root.is_dir() || !project_root.is_dir() {
+        eprintln!("skipping autogen parity regression: repo not present");
+        return;
+    }
+
+    let seed = "dotnet/samples/GettingStarted/Checker.cs";
+    let project = Arc::new(FilesystemProject::new(&project_root).unwrap());
+    let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+    let bifrost = most_relevant_files(
+        workspace.analyzer(),
+        MostRelevantFilesParams {
+            seed_files: vec![seed.to_string()],
+            limit: 100,
+        },
+    );
+    assert!(bifrost.not_found.is_empty());
+
+    let expected = brokk_cli_direct(&brokk_root, &project_root, &[seed.to_string()]);
+    assert_eq!(expected, bifrost.files);
+}
+
+#[test]
+fn matches_brokk_reference_for_autogen_hello_ai_agents_program_seed() {
+    let project_root = PathBuf::from("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
+    let brokk_root = brokk_app_root();
+    if !brokk_root.is_dir() || !project_root.is_dir() {
+        eprintln!("skipping autogen parity regression: repo not present");
+        return;
+    }
+
+    let seed = "dotnet/samples/Hello/HelloAIAgents/Program.cs";
+    let project = Arc::new(FilesystemProject::new(&project_root).unwrap());
+    let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+    let bifrost = most_relevant_files(
+        workspace.analyzer(),
+        MostRelevantFilesParams {
+            seed_files: vec![seed.to_string()],
+            limit: 100,
+        },
+    );
+    assert!(bifrost.not_found.is_empty());
+
+    let expected = brokk_cli_direct(&brokk_root, &project_root, &[seed.to_string()]);
+    assert_eq!(expected, bifrost.files);
+}
+
+#[test]
+fn matches_brokk_reference_for_autogen_hello_agent_program_seed() {
+    let project_root = PathBuf::from("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
+    let brokk_root = brokk_app_root();
+    if !brokk_root.is_dir() || !project_root.is_dir() {
+        eprintln!("skipping autogen parity regression: repo not present");
+        return;
+    }
+
+    let seed = "dotnet/samples/Hello/HelloAgent/Program.cs";
+    let project = Arc::new(FilesystemProject::new(&project_root).unwrap());
+    let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+    let bifrost = most_relevant_files(
+        workspace.analyzer(),
+        MostRelevantFilesParams {
+            seed_files: vec![seed.to_string()],
+            limit: 100,
+        },
+    );
+    assert!(bifrost.not_found.is_empty());
+
+    let expected = brokk_cli_direct(&brokk_root, &project_root, &[seed.to_string()]);
+    assert_eq!(expected, bifrost.files);
+}
+
+#[test]
+fn matches_brokk_reference_for_autogen_topicid_and_inmemoryruntime_pair() {
+    let project_root = PathBuf::from("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
+    let brokk_root = brokk_app_root();
+    if !brokk_root.is_dir() || !project_root.is_dir() {
+        eprintln!("skipping autogen parity regression: repo not present");
+        return;
+    }
+
+    let seeds = vec![
+        "dotnet/src/Microsoft.AutoGen/Contracts/TopicId.cs".to_string(),
+        "dotnet/test/Microsoft.AutoGen.Integration.Tests/InMemoryRuntimeIntegrationTests.cs".to_string(),
+    ];
+    let project = Arc::new(FilesystemProject::new(&project_root).unwrap());
+    let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+    let bifrost = most_relevant_files(
+        workspace.analyzer(),
+        MostRelevantFilesParams {
+            seed_files: seeds.clone(),
+            limit: 100,
+        },
+    );
+    assert!(bifrost.not_found.is_empty());
+
+    let expected = brokk_cli_direct(&brokk_root, &project_root, &seeds);
+    assert_eq!(expected, bifrost.files);
+}
+
+#[test]
 #[ignore = "cross-repo parity batch"]
 fn matches_brokk_reference_for_100_random_seed_files() {
-    let brokk_root = PathBuf::from("/home/jonathan/Projects/brokk");
-    if !brokk_root.is_dir() {
+    let brokk_root = brokk_app_root();
+    let project_root = parity_project_root();
+    if !brokk_root.is_dir() || !project_root.is_dir() {
         eprintln!("skipping brokk parity regression: sibling repo not present");
         return;
     }
 
     eprintln!("single batch: building workspace analyzer");
-    let project = Arc::new(FilesystemProject::new(&brokk_root).unwrap());
+    let project = Arc::new(FilesystemProject::new(&project_root).unwrap());
     let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
     eprintln!("single batch: workspace analyzer ready");
-    let files = tracked_files(&brokk_root);
-    let seed_files = files.into_iter().take(100).collect::<Vec<_>>();
+    let sample_size = parity_sample_size();
+    let files = parity_seed_files(&project_root);
+    let seed_files = files.into_iter().take(sample_size).collect::<Vec<_>>();
+    let case_count = seed_files.len();
+    assert!(case_count > 0, "no seed files available");
     let mut cases = Vec::new();
     for (index, seed) in seed_files.into_iter().enumerate() {
         let seeds = vec![seed];
@@ -747,8 +999,8 @@ fn matches_brokk_reference_for_100_random_seed_files() {
         cases.push((index, seeds, bifrost.files));
 
         let done = index + 1;
-        if done == 1 || done % 10 == 0 || done == 100 {
-            eprintln!("single precompute progress {}/100", done);
+        if done == 1 || done % 10 == 0 || done == case_count {
+            eprintln!("single precompute progress {}/{}", done, case_count);
         }
     }
 
@@ -767,6 +1019,7 @@ fn matches_brokk_reference_for_100_random_seed_files() {
         for _ in 0..worker_count {
             let cases = Arc::clone(&cases);
             let brokk_root = brokk_root.clone();
+            let project_root = project_root.clone();
             let mismatch = &mismatch;
             let next = &next;
             let completed = &completed;
@@ -781,7 +1034,7 @@ fn matches_brokk_reference_for_100_random_seed_files() {
                     break;
                 };
 
-                let brokk = brokk_cli_direct(&brokk_root, seeds);
+                let brokk = brokk_cli_direct(&brokk_root, &project_root, seeds);
                 if brokk != *bifrost {
                     let mut slot = mismatch.lock().unwrap();
                     if slot.is_none() {
@@ -816,18 +1069,22 @@ fn matches_brokk_reference_for_100_random_seed_files() {
 #[test]
 #[ignore = "cross-repo parity batch"]
 fn matches_brokk_reference_for_100_random_seed_pairs() {
-    let brokk_root = PathBuf::from("/home/jonathan/Projects/brokk");
-    if !brokk_root.is_dir() {
+    let brokk_root = brokk_app_root();
+    let project_root = parity_project_root();
+    if !brokk_root.is_dir() || !project_root.is_dir() {
         eprintln!("skipping brokk parity regression: sibling repo not present");
         return;
     }
 
     eprintln!("pair batch: building workspace analyzer");
-    let project = Arc::new(FilesystemProject::new(&brokk_root).unwrap());
+    let project = Arc::new(FilesystemProject::new(&project_root).unwrap());
     let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
     eprintln!("pair batch: workspace analyzer ready");
-    let files = tracked_files(&brokk_root);
-    let seed_pairs = deterministic_pair_sample(&files, 100);
+    let sample_size = parity_sample_size();
+    let files = parity_seed_files(&project_root);
+    let seed_pairs = deterministic_pair_sample(&files, sample_size);
+    let case_count = seed_pairs.len();
+    assert!(case_count > 0, "no seed pairs available");
     let mut cases = Vec::new();
     for (index, pair) in seed_pairs.into_iter().enumerate() {
         let seeds = vec![pair[0].clone(), pair[1].clone()];
@@ -842,8 +1099,8 @@ fn matches_brokk_reference_for_100_random_seed_pairs() {
         cases.push((index, seeds, bifrost.files));
 
         let done = index + 1;
-        if done == 1 || done % 10 == 0 || done == 100 {
-            eprintln!("pair precompute progress {}/100", done);
+        if done == 1 || done % 10 == 0 || done == case_count {
+            eprintln!("pair precompute progress {}/{}", done, case_count);
         }
     }
 
@@ -862,6 +1119,7 @@ fn matches_brokk_reference_for_100_random_seed_pairs() {
         for _ in 0..worker_count {
             let cases = Arc::clone(&cases);
             let brokk_root = brokk_root.clone();
+            let project_root = project_root.clone();
             let mismatch = &mismatch;
             let next = &next;
             let completed = &completed;
@@ -876,7 +1134,7 @@ fn matches_brokk_reference_for_100_random_seed_pairs() {
                     break;
                 };
 
-                let brokk = brokk_cli_direct(&brokk_root, seeds);
+                let brokk = brokk_cli_direct(&brokk_root, &project_root, seeds);
                 if brokk != *bifrost {
                     let mut slot = mismatch.lock().unwrap();
                     if slot.is_none() {

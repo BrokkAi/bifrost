@@ -32,6 +32,9 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     }
     fn extract_call_receiver(&self, reference: &str) -> Option<String>;
     fn parse_file(&self, file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFile;
+    fn definition_priority(&self, _code_unit: &CodeUnit) -> i32 {
+        0
+    }
 }
 
 type BuildProgress = Arc<dyn Fn(usize, usize, &ProjectFile) + Send + Sync>;
@@ -207,6 +210,25 @@ impl<A> TreeSitterAnalyzer<A>
 where
     A: LanguageAdapter,
 {
+    fn definition_sort_key(
+        adapter: &A,
+        ranges: &BTreeMap<CodeUnit, Vec<Range>>,
+        code_unit: &CodeUnit,
+    ) -> (i32, usize, String, String, String, String) {
+        let first_start_byte = ranges
+            .get(code_unit)
+            .and_then(|entries| entries.iter().map(|range| range.start_byte).min())
+            .unwrap_or(usize::MAX);
+        (
+            adapter.definition_priority(code_unit),
+            first_start_byte,
+            code_unit.source().to_string().to_ascii_lowercase(),
+            code_unit.fq_name().to_ascii_lowercase(),
+            code_unit.signature().unwrap_or("").to_ascii_lowercase(),
+            format!("{:?}", code_unit.kind()),
+        )
+    }
+
     pub fn new(project: Arc<dyn Project>, adapter: A) -> Self {
         Self::new_with_config(project, adapter, AnalyzerConfig::default())
     }
@@ -445,7 +467,9 @@ where
         }
 
         for matches in definitions.values_mut() {
-            matches.sort();
+            matches.sort_by_cached_key(|code_unit| {
+                Self::definition_sort_key(adapter, &ranges, code_unit)
+            });
             matches.dedup();
         }
 
