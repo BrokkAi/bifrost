@@ -48,10 +48,12 @@ where
         .into_iter()
         .filter(|candidate| candidate != file)
         .filter(|candidate| {
-            provider
-                .imported_code_units_of(candidate)
-                .into_iter()
-                .any(|code_unit| code_unit.source() == file)
+            let imports = provider.import_info_of(candidate);
+            provider.could_import_file(candidate, &imports, file)
+                && provider
+                    .imported_code_units_of(candidate)
+                    .into_iter()
+                    .any(|code_unit| code_unit.source() == file)
         })
         .collect()
 }

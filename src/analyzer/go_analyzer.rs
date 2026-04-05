@@ -193,15 +193,14 @@ impl ImportAnalysisProvider for GoAnalyzer {
             let Some(path) = extract_go_import_path(&import.raw_snippet) else {
                 continue;
             };
-            let package_segment = go_import_package_segment(&path);
             let matching_files: Vec<_> = all_files
                 .iter()
                 .filter(|candidate| candidate != &file)
                 .filter(|candidate| {
                     let parent = candidate.parent().to_string_lossy().replace('\\', "/");
                     parent == path
+                        || path.ends_with(&format!("/{parent}"))
                         || parent.ends_with(&format!("/{path}"))
-                        || self.file_package_name(candidate) == package_segment
                 })
                 .cloned()
                 .collect();
@@ -264,15 +263,13 @@ impl ImportAnalysisProvider for GoAnalyzer {
         target: &ProjectFile,
     ) -> bool {
         let target_parent = target.parent().to_string_lossy().replace('\\', "/");
-        let target_package = self.file_package_name(target);
         imports.iter().any(|import| {
             let Some(path) = extract_go_import_path(&import.raw_snippet) else {
                 return false;
             };
-            let package_segment = go_import_package_segment(&path);
             target_parent == path
+                || path.ends_with(&format!("/{target_parent}"))
                 || target_parent.ends_with(&format!("/{path}"))
-                || target_package == package_segment
         }) || self
             .imported_code_units_of(source_file)
             .into_iter()
@@ -441,17 +438,6 @@ impl IAnalyzer for GoAnalyzer {
 
     fn get_test_modules(&self, files: &[ProjectFile]) -> Vec<String> {
         Self::get_test_modules_static(files)
-    }
-}
-
-impl GoAnalyzer {
-    fn file_package_name(&self, file: &ProjectFile) -> String {
-        self.inner
-            .get_top_level_declarations(file)
-            .into_iter()
-            .next()
-            .map(|code_unit| code_unit.package_name().to_string())
-            .unwrap_or_default()
     }
 }
 
@@ -1045,15 +1031,6 @@ fn extract_go_import_path(raw_import: &str) -> Option<String> {
                 .to_string()
         })
         .filter(|path| !path.is_empty())
-}
-
-fn go_import_package_segment(path: &str) -> String {
-    let segment = path.rsplit('/').next().unwrap_or(path);
-    segment
-        .split_once(".v")
-        .map(|(base, _)| base)
-        .unwrap_or(segment)
-        .to_string()
 }
 
 fn go_struct_field_suffix(node: Node<'_>, source: &str) -> String {

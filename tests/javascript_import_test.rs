@@ -267,6 +267,34 @@ fn test_resolve_imports_and_import_variants() {
 }
 
 #[test]
+fn default_import_of_aggregator_module_keeps_module_file() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    write_file(root, "lib/axios.js", "export default { create() { return {}; } };\n");
+    write_file(
+        root,
+        "index.js",
+        "import axios from './lib/axios.js';\nexport { axios as default, axios };\n",
+    );
+    write_file(
+        root,
+        "bin/githubAxios.js",
+        "import axios from '../index.js';\nexport default axios.create();\n",
+    );
+
+    let analyzer = analyzer_for(root);
+    let imports =
+        analyzer.imported_code_units_of(&ProjectFile::new(root.to_path_buf(), "bin/githubAxios.js"));
+
+    assert!(
+        imports
+            .iter()
+            .any(|code_unit| code_unit.source().rel_path() == Path::new("index.js")),
+        "default import should retain the aggregator module file when no exact declaration matches"
+    );
+}
+
+#[test]
 fn test_require_import() {
     let temp = tempdir().unwrap();
     let root = temp.path();

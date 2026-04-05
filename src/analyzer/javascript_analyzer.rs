@@ -179,14 +179,25 @@ impl ImportAnalysisProvider for JavascriptAnalyzer {
                 } else if let Some(identifier) =
                     import.identifier.as_ref().or(import.alias.as_ref())
                 {
-                    resolved.extend(
-                        top_level
+                    let mut matched = false;
+                    for code_unit in top_level
+                        .iter()
+                        .filter(|code_unit| code_unit.identifier() == identifier)
+                    {
+                        matched = true;
+                        resolved.insert(code_unit.clone());
+                    }
+                    if !matched {
+                        let module_units = top_level
                             .iter()
-                            .filter(|code_unit| code_unit.identifier() == identifier)
-                            .cloned(),
-                    );
-                    if resolved.is_empty() && top_level.len() == 1 && !top_level[0].is_module() {
-                        resolved.insert(top_level[0].clone());
+                            .filter(|code_unit| code_unit.is_module())
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        if !module_units.is_empty() {
+                            resolved.extend(module_units);
+                        } else if top_level.len() == 1 && !top_level[0].is_module() {
+                            resolved.insert(top_level[0].clone());
+                        }
                     }
                 } else {
                     resolved.extend(

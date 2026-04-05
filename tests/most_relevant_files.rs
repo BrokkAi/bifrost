@@ -1,6 +1,6 @@
 use brokk_analyzer::{
-    AnalyzerConfig, FilesystemProject, JavaAnalyzer, Language, ProjectFile, TestProject,
-    WorkspaceAnalyzer,
+    AnalyzerConfig, FilesystemProject, GoAnalyzer, ImportAnalysisProvider, JavaAnalyzer, Language,
+    ProjectFile, TestProject, WorkspaceAnalyzer,
     searchtools::{MostRelevantFilesParams, most_relevant_files},
 };
 use git2::{Repository, Signature};
@@ -246,6 +246,78 @@ fn no_git_fallback_uses_import_page_ranker() {
     assert!(!results.files.contains(&"test/A.java".to_string()));
     assert!(results.files.contains(&"test/B.java".to_string()));
     assert!(results.files.contains(&"test/C.java".to_string()));
+}
+
+#[test]
+fn go_stdlib_import_does_not_resolve_internal_package_by_last_segment() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    write_file(
+        root,
+        "go.mod",
+        r#"
+        module example.com/demo
+
+        go 1.23
+        "#,
+    );
+    write_file(
+        root,
+        "context.go",
+        r#"
+        package demo
+
+        import "io/fs"
+
+        type Context struct {
+            FS fs.FS
+        }
+        "#,
+    );
+    write_file(
+        root,
+        "internal/fs/fs.go",
+        r#"
+        package fs
+
+        type FileSystem struct{}
+        "#,
+    );
+    write_file(
+        root,
+        "internal/fs/fs_test.go",
+        r#"
+        package fs
+
+        import "testing"
+
+        func TestFileSystem(t *testing.T) {}
+        "#,
+    );
+
+    let project = Arc::new(FilesystemProject::new(root).unwrap());
+    let analyzer = GoAnalyzer::new(project);
+    let context = ProjectFile::new(root.to_path_buf(), "context.go");
+    let internal_fs = ProjectFile::new(root.to_path_buf(), "internal/fs/fs.go");
+    let internal_fs_test = ProjectFile::new(root.to_path_buf(), "internal/fs/fs_test.go");
+
+    let imported = analyzer.imported_code_units_of(&context);
+    assert!(
+        imported
+            .iter()
+            .all(|code_unit| code_unit.source() != &internal_fs && code_unit.source() != &internal_fs_test),
+        "stdlib import io/fs should not resolve to project internal/fs: {:?}",
+        imported
+            .iter()
+            .map(|code_unit| code_unit.source().rel_path().display().to_string())
+            .collect::<Vec<_>>()
+    );
+
+    let referencing = analyzer.referencing_files_of(&internal_fs);
+    assert!(
+        !referencing.contains(&context),
+        "context.go should not reverse-reference internal/fs/fs.go via io/fs"
+    );
 }
 
 #[test]
@@ -963,6 +1035,56 @@ fn matches_brokk_reference_for_autogen_topicid_and_inmemoryruntime_pair() {
     assert!(bifrost.not_found.is_empty());
 
     let expected = brokk_cli_direct(&brokk_root, &project_root, &seeds);
+    assert_eq!(expected, bifrost.files);
+}
+
+#[test]
+fn matches_brokk_reference_for_gin_context_go_seed() {
+    let project_root = PathBuf::from("/home/jonathan/Projects/brokkbench/clones/gin-gonic__gin");
+    let brokk_root = brokk_app_root();
+    if !brokk_root.is_dir() || !project_root.is_dir() {
+        eprintln!("skipping gin parity regression: repo not present");
+        return;
+    }
+
+    let seed = "context.go";
+    let project = Arc::new(FilesystemProject::new(&project_root).unwrap());
+    let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+    let bifrost = most_relevant_files(
+        workspace.analyzer(),
+        MostRelevantFilesParams {
+            seed_files: vec![seed.to_string()],
+            limit: 100,
+        },
+    );
+    assert!(bifrost.not_found.is_empty());
+
+    let expected = brokk_cli_direct(&brokk_root, &project_root, &[seed.to_string()]);
+    assert_eq!(expected, bifrost.files);
+}
+
+#[test]
+fn matches_brokk_reference_for_axios_github_api_seed() {
+    let project_root = PathBuf::from("/home/jonathan/Projects/axios");
+    let brokk_root = brokk_app_root();
+    if !brokk_root.is_dir() || !project_root.is_dir() {
+        eprintln!("skipping axios parity regression: repo not present");
+        return;
+    }
+
+    let seed = "bin/GithubAPI.js";
+    let project = Arc::new(FilesystemProject::new(&project_root).unwrap());
+    let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+    let bifrost = most_relevant_files(
+        workspace.analyzer(),
+        MostRelevantFilesParams {
+            seed_files: vec![seed.to_string()],
+            limit: 100,
+        },
+    );
+    assert!(bifrost.not_found.is_empty());
+
+    let expected = brokk_cli_direct(&brokk_root, &project_root, &[seed.to_string()]);
     assert_eq!(expected, bifrost.files);
 }
 
