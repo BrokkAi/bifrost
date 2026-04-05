@@ -1,6 +1,6 @@
 use brokk_analyzer::{
     AnalyzerConfig, FilesystemProject, GoAnalyzer, ImportAnalysisProvider, JavaAnalyzer, Language,
-    ProjectFile, TestProject, WorkspaceAnalyzer,
+    Project, ProjectFile, TestProject, WorkspaceAnalyzer,
     searchtools::{MostRelevantFilesParams, most_relevant_files},
 };
 use git2::{Repository, Signature};
@@ -9,6 +9,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -94,10 +95,64 @@ fn parity_sample_size() -> usize {
         .unwrap_or(100)
 }
 
+fn parity_language() -> Option<Language> {
+    let extensions = parity_extensions()?;
+    let mut languages = extensions
+        .into_iter()
+        .map(|extension| Language::from_extension(&extension))
+        .filter(|language| *language != Language::None)
+        .collect::<BTreeSet<_>>();
+    if languages.len() == 1 {
+        languages.pop_first()
+    } else {
+        None
+    }
+}
+
+fn parity_brokk_language_name() -> Option<&'static str> {
+    match parity_language()? {
+        Language::Java => Some("JAVA"),
+        Language::Go => Some("GO"),
+        Language::Cpp => Some("C_CPP"),
+        Language::JavaScript => Some("JAVASCRIPT"),
+        Language::TypeScript => Some("TYPESCRIPT"),
+        Language::Python => Some("PYTHON"),
+        Language::Rust => Some("RUST"),
+        Language::Php => Some("PHP"),
+        Language::Scala => Some("SCALA"),
+        Language::CSharp => Some("C_SHARP"),
+        Language::None => None,
+    }
+}
+
+fn parity_workspace_project(root: &Path) -> Arc<dyn Project> {
+    if let Some(language) = parity_language() {
+        Arc::new(TestProject::new(root.to_path_buf(), language))
+    } else {
+        Arc::new(FilesystemProject::new(root).unwrap())
+    }
+}
+
 fn brokk_cli_direct(brokk_root: &Path, project_root: &Path, seeds: &[String]) -> Vec<String> {
     let classpath = format!("{}/app/build/install/app/lib/*", brokk_root.display());
-    let output = Command::new("java")
-        .arg("-Djava.awt.headless=true")
+    let user_home = TempDir::new().unwrap();
+    static WARMED_PROJECTS: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
+    let warmed_projects = WARMED_PROJECTS.get_or_init(|| Mutex::new(BTreeSet::new()));
+    let use_fresh_start = {
+        let mut warmed = warmed_projects.lock().unwrap();
+        warmed.insert(project_root.to_path_buf())
+    };
+    let mut command = Command::new("java");
+    command
+        .arg(format!("-Duser.home={}", user_home.path().display()))
+        .arg("-Djava.awt.headless=true");
+    if use_fresh_start {
+        command.arg("-Dbrokk.mrf.fresh=true");
+    }
+    if let Some(language) = parity_brokk_language_name() {
+        command.arg(format!("-Dbrokk.mrf.languages={language}"));
+    }
+    let output = command
         .arg("-cp")
         .arg(classpath)
         .arg("ai.brokk.tools.MostRelevantFilesCli")
@@ -895,7 +950,7 @@ fn matches_brokk_reference_for_plume_imports_test2_goal_seed() {
     }
 
     let seed = "src/test/resources/ImportsTest2Goal.java";
-    let project = Arc::new(FilesystemProject::new(&project_root).unwrap());
+    let project = parity_workspace_project(&project_root);
     let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
     let bifrost = most_relevant_files(
         workspace.analyzer(),
@@ -920,7 +975,7 @@ fn matches_brokk_reference_for_plume_imports_test8_base_seed() {
     }
 
     let seed = "src/test/resources/ImportsTest8Base.java";
-    let project = Arc::new(FilesystemProject::new(&project_root).unwrap());
+    let project = parity_workspace_project(&project_root);
     let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
     let bifrost = most_relevant_files(
         workspace.analyzer(),
