@@ -297,6 +297,27 @@ fn test_cpp_include_resolution_and_c_file_support() {
 }
 
 #[test]
+fn test_cpp_imported_code_units_only_resolve_relative_quoted_includes() {
+    let project = inline_cpp_project(&[
+        (
+            "src/main.cpp",
+            r#"
+            #include "helper.h"
+
+            int main() { return 0; }
+            "#,
+        ),
+        ("include/helper.h", "struct Helper {};"),
+    ]);
+    let analyzer = CppAnalyzer::from_project(project.clone());
+    let main_cpp = ProjectFile::new(project.root().to_path_buf(), "src/main.cpp");
+
+    let imports = analyzer.imported_code_units_of(&main_cpp);
+
+    assert!(imports.is_empty(), "{imports:?}");
+}
+
+#[test]
 fn test_cpp_qualifiers_templates_and_operators() {
     let analyzer = fixture_analyzer();
     let qualifiers = ProjectFile::new(analyzer.project().root().to_path_buf(), "qualifiers.h");

@@ -1089,6 +1089,31 @@ fn matches_brokk_reference_for_axios_github_api_seed() {
 }
 
 #[test]
+fn matches_brokk_reference_for_vector_similarity_query_result_struct_seed() {
+    let project_root = PathBuf::from("/home/jonathan/Projects/VectorSimilarity");
+    let brokk_root = brokk_app_root();
+    if !brokk_root.is_dir() || !project_root.is_dir() {
+        eprintln!("skipping VectorSimilarity parity regression: repo not present");
+        return;
+    }
+
+    let seed = "src/VecSim/query_result_struct.cpp";
+    let project = Arc::new(FilesystemProject::new(&project_root).unwrap());
+    let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+    let bifrost = most_relevant_files(
+        workspace.analyzer(),
+        MostRelevantFilesParams {
+            seed_files: vec![seed.to_string()],
+            limit: 100,
+        },
+    );
+    assert!(bifrost.not_found.is_empty());
+
+    let expected = brokk_cli_direct(&brokk_root, &project_root, &[seed.to_string()]);
+    assert_eq!(expected, bifrost.files);
+}
+
+#[test]
 #[ignore = "cross-repo parity batch"]
 fn matches_brokk_reference_for_100_random_seed_files() {
     let brokk_root = brokk_app_root();

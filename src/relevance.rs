@@ -332,8 +332,16 @@ fn referencing_files_for(
 ///   pre-rename commit before the later rename edge that should rewrite it
 /// - use native rename detection with a 49% similarity threshold, but treat those as candidate edges only;
 ///   canonicalization accepts an edge only if it also passes the shared stem+content continuation rule
-/// - infer add/delete continuation edges with the same continuation rule: same stem requires
-///   `stem >= 60 && content >= 25`, different stems require `stem >= 60 && content >= 50`
+/// - native rename candidates and add/delete continuation candidates are pooled together and resolved by the same
+///   scorer; choose the best non-conflicting edges by content similarity first and path similarity second, rather
+///   than letting native rename detections win by default
+/// - the shared continuation rule is: same stem requires `stem >= 60`; multi-token same stems use `content >= 25`,
+///   but single-token same stems use `content >= 35` to avoid short-name role changes like `L2.h -> L2/L2.h`.
+///   Different stems require at least two shared stem tokens plus `stem >= 60 && content >= 50`
+/// - extension changes are allowed when they satisfy that shared continuation rule; do not reject a higher-evidence
+///   `.cpp -> .h` or similar split/templating continuation just because the suffix changed
+/// - candidate continuation edges are best-effort evidence only; if historical content for either side cannot be
+///   read, skip that edge instead of failing Git relevance for the whole repo
 /// - treat near-equal scores as ties using a relative epsilon of `1e-9 * max(1, |score|)` and break them by
 ///   normalized path so ordering is stable across platforms and implementations
 ///
@@ -514,9 +522,9 @@ impl GitProjectContext {
         diff.find_similar(Some(&mut find_options))?;
 
         let mut paths = Vec::new();
-        let mut renames = Vec::new();
-        let mut unmatched_added = Vec::new();
-        let mut unmatched_deleted = Vec::new();
+        let mut rename_candidates = Vec::new();
+        let mut candidate_old_paths = Vec::new();
+        let mut candidate_new_paths = Vec::new();
         for delta in diff.deltas() {
             match delta.status() {
                 git2::Delta::Added
@@ -525,45 +533,51 @@ impl GitProjectContext {
                 | git2::Delta::Renamed => {
                     if let Some(path) = delta.new_file().path() {
                         paths.push(path.to_path_buf());
-                        if delta.status() == git2::Delta::Added {
-                            unmatched_added.push(path.to_path_buf());
+                        if matches!(delta.status(), git2::Delta::Added | git2::Delta::Renamed) {
+                            candidate_new_paths.push(path.to_path_buf());
                         }
                     }
                 }
                 git2::Delta::Deleted => {
                     if let Some(path) = delta.old_file().path() {
                         paths.push(path.to_path_buf());
-                        unmatched_deleted.push(path.to_path_buf());
+                        candidate_old_paths.push(path.to_path_buf());
                     }
                 }
                 _ => {}
             }
 
             if delta.status() == git2::Delta::Renamed {
+                if let Some(path) = delta.old_file().path() {
+                    candidate_old_paths.push(path.to_path_buf());
+                }
+            }
+
+            if delta.status() == git2::Delta::Renamed {
                 if let (Some(old_path), Some(new_path)) =
                     (delta.old_file().path(), delta.new_file().path())
                 {
-                    if rename_is_safe_to_canonicalize(
+                    if let Some(candidate) = rename_candidate(
                         &self.repo,
                         parent_tree.as_ref(),
                         &current_tree,
                         old_path,
                         new_path,
                     ) {
-                        renames.push((old_path.to_path_buf(), new_path.to_path_buf()));
+                        rename_candidates.push(candidate);
                     }
                 }
             }
         }
 
-        renames.extend(infer_path_continuity_renames(
+        rename_candidates.extend(infer_path_continuity_renames(
             &self.repo,
             parent_tree.as_ref(),
             &current_tree,
-            &unmatched_deleted,
-            &unmatched_added,
-            &renames,
+            &candidate_old_paths,
+            &candidate_new_paths,
         ));
+        let renames = pick_best_rename_edges(rename_candidates);
 
         Ok(CommitChange { paths, renames })
     }
@@ -592,17 +606,30 @@ struct CommitChange {
     renames: Vec<(PathBuf, PathBuf)>,
 }
 
-fn rename_is_safe_to_canonicalize(
+#[derive(Clone)]
+struct RenameCandidate {
+    content_score: f64,
+    path_score: f64,
+    old_path: PathBuf,
+    new_path: PathBuf,
+}
+
+fn rename_candidate(
     repo: &Repository,
     parent_tree: Option<&git2::Tree<'_>>,
     current_tree: &git2::Tree<'_>,
     old_path: &Path,
     new_path: &Path,
-) -> bool {
+) -> Option<RenameCandidate> {
     let path_score = path_token_similarity_score(old_path, new_path);
     let content_score =
         content_token_similarity_score(repo, parent_tree, current_tree, old_path, new_path);
-    continuation_edge_is_safe(old_path, new_path, path_score, content_score)
+    continuation_edge_is_safe(old_path, new_path, path_score, content_score).then(|| RenameCandidate {
+        content_score,
+        path_score,
+        old_path: old_path.to_path_buf(),
+        new_path: new_path.to_path_buf(),
+    })
 }
 
 fn infer_path_continuity_renames(
@@ -611,65 +638,54 @@ fn infer_path_continuity_renames(
     current_tree: &git2::Tree<'_>,
     deleted_paths: &[PathBuf],
     added_paths: &[PathBuf],
-    detected_renames: &[(PathBuf, PathBuf)],
-) -> Vec<(PathBuf, PathBuf)> {
-    let renamed_old = detected_renames
-        .iter()
-        .map(|(old_path, _)| old_path.as_path())
-        .collect::<HashSet<_>>();
-    let renamed_new = detected_renames
-        .iter()
-        .map(|(_, new_path)| new_path.as_path())
-        .collect::<HashSet<_>>();
-
+) -> Vec<RenameCandidate> {
     let mut candidates = Vec::new();
     for old_path in deleted_paths {
-        if renamed_old.contains(old_path.as_path()) {
-            continue;
-        }
         for new_path in added_paths {
-            if renamed_new.contains(new_path.as_path()) {
-                continue;
-            }
-            if old_path.extension() != new_path.extension() {
-                continue;
-            }
-
             let path_score = path_token_similarity_score(old_path, new_path);
             let content_score =
                 content_token_similarity_score(repo, parent_tree, current_tree, old_path, new_path);
             if continuation_edge_is_safe(old_path, new_path, path_score, content_score) {
-                candidates.push((content_score, path_score, old_path.clone(), new_path.clone()));
+                candidates.push(RenameCandidate {
+                    content_score,
+                    path_score,
+                    old_path: old_path.clone(),
+                    new_path: new_path.clone(),
+                });
             }
         }
     }
+    candidates
+}
 
+fn pick_best_rename_edges(mut candidates: Vec<RenameCandidate>) -> Vec<(PathBuf, PathBuf)> {
     candidates.sort_by(|left, right| {
         right
-            .0
-            .partial_cmp(&left.0)
+            .content_score
+            .partial_cmp(&left.content_score)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| {
-                right.1
-                    .partial_cmp(&left.1)
+                right
+                    .path_score
+                    .partial_cmp(&left.path_score)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
-            .then_with(|| left.2.cmp(&right.2))
-            .then_with(|| left.3.cmp(&right.3))
+            .then_with(|| left.old_path.cmp(&right.old_path))
+            .then_with(|| left.new_path.cmp(&right.new_path))
     });
 
     let mut used_old = HashSet::new();
     let mut used_new = HashSet::new();
-    let mut inferred = Vec::new();
-    for (_, _, old_path, new_path) in candidates {
-        if used_old.contains(&old_path) || used_new.contains(&new_path) {
+    let mut edges = Vec::new();
+    for candidate in candidates {
+        if used_old.contains(&candidate.old_path) || used_new.contains(&candidate.new_path) {
             continue;
         }
-        used_old.insert(old_path.clone());
-        used_new.insert(new_path.clone());
-        inferred.push((old_path, new_path));
+        used_old.insert(candidate.old_path.clone());
+        used_new.insert(candidate.new_path.clone());
+        edges.push((candidate.old_path, candidate.new_path));
     }
-    inferred
+    edges
 }
 
 fn continuation_edge_is_safe(
@@ -679,11 +695,19 @@ fn continuation_edge_is_safe(
     content_score: f64,
 ) -> bool {
     let same_stem = normalized_stem(old_path) == normalized_stem(new_path);
+    let shared_tokens = shared_stem_token_count(old_path, new_path);
     if same_stem {
-        path_score >= 60.0 && content_score >= 25.0
+        let min_content = if shared_tokens <= 1 { 35.0 } else { 25.0 };
+        return path_score >= 60.0 && content_score >= min_content;
     } else {
-        path_score >= 60.0 && content_score >= 50.0
+        shared_tokens >= 2 && path_score >= 60.0 && content_score >= 50.0
     }
+}
+
+fn shared_stem_token_count(old_path: &Path, new_path: &Path) -> usize {
+    let old_tokens = stem_tokens(old_path);
+    let new_tokens = stem_tokens(new_path);
+    old_tokens.intersection(&new_tokens).count()
 }
 
 fn path_token_similarity_score(old_path: &Path, new_path: &Path) -> f64 {
@@ -921,6 +945,248 @@ mod tests {
         for entry in results {
             eprintln!("{:.15} {}", entry.score, entry.file.rel_path().display());
         }
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn debug_vector_similarity_query_result_struct_rankers() {
+        let workspace = workspace_analyzer(Path::new("/home/jonathan/Projects/VectorSimilarity"));
+        let root = workspace.analyzer().project().root().to_path_buf();
+        let seed = ProjectFile::new(root.clone(), "src/VecSim/query_result_struct.cpp");
+        let targets = [
+            ProjectFile::new(
+                root.clone(),
+                "tests/benchmark/spaces_benchmarks/bm_spaces_class_fp32.cpp",
+            ),
+            ProjectFile::new(
+                root.clone(),
+                "src/VecSim/utils/arr_cpp.h",
+            ),
+            ProjectFile::new(
+                root.clone(),
+                "src/VecSim/algorithms/hnsw/hnsw.h",
+            ),
+            ProjectFile::new(
+                root.clone(),
+                "src/VecSim/algorithms/brute_force/brute_force_multi.h",
+            ),
+        ];
+
+        let git = super::related_files_by_git(workspace.analyzer(), &HashMap::from([(seed.clone(), 1.0)]), 100)
+            .unwrap();
+        eprintln!("git top 100");
+        for entry in &git {
+            if targets.iter().any(|target| *target == entry.file) {
+                eprintln!("  target git {:.15} {}", entry.score, entry.file.rel_path().display());
+            }
+        }
+
+        let imports =
+            super::related_files_by_imports(workspace.analyzer(), &HashMap::from([(seed, 1.0)]), 100, false);
+        eprintln!("imports top 100");
+        for entry in &imports {
+            if targets.iter().any(|target| *target == entry.file) {
+                eprintln!(
+                    "  target import {:.15} {}",
+                    entry.score,
+                    entry.file.rel_path().display()
+                );
+            }
+        }
+        for target in &targets {
+            let git_index = git.iter().position(|entry| entry.file == *target);
+            let import_index = imports.iter().position(|entry| entry.file == *target);
+            eprintln!(
+                "target {} git_rank={:?} import_rank={:?}",
+                target.rel_path().display(),
+                git_index.map(|index| index + 1),
+                import_index.map(|index| index + 1)
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn debug_vector_similarity_query_result_struct_git_commits() {
+        let workspace = workspace_analyzer(Path::new("/home/jonathan/Projects/VectorSimilarity"));
+        let root = workspace.analyzer().project().root().to_path_buf();
+        let seed = ProjectFile::new(root.clone(), "src/VecSim/query_result_struct.cpp");
+        let fp32 = ProjectFile::new(
+            root.clone(),
+            "tests/benchmark/spaces_benchmarks/bm_spaces_class_fp32.cpp",
+        );
+        let definitions = ProjectFile::new(
+            root,
+            "tests/benchmark/spaces_benchmarks/bm_spaces_class_definitions.h",
+        );
+
+        let repo = super::GitProjectContext::discover(workspace.analyzer().project().root()).unwrap();
+        let commit_ids = repo.recent_commit_ids(super::COMMITS_TO_PROCESS).unwrap();
+        let mut canonicalizer = super::RenameCanonicalizer::default();
+        for oid in &commit_ids {
+            let commit = repo.repo.find_commit(*oid).unwrap();
+            let change = repo.changed_repo_paths_for_commit(&commit).unwrap();
+            canonicalizer.record_renames(&change.renames);
+
+            let changed_files = change
+                .paths
+                .iter()
+                .map(|path| canonicalizer.canonicalize(path))
+                .filter_map(|repo_rel| repo.repo_path_to_project_file(&repo_rel))
+                .collect::<Vec<_>>();
+            if changed_files.contains(&seed) {
+                if changed_files.contains(&fp32) || changed_files.contains(&definitions) {
+                    eprintln!("commit {} size={}", oid, changed_files.len());
+                    for file in &changed_files {
+                        if *file == seed || *file == fp32 || *file == definitions {
+                            eprintln!("  {}", file.rel_path().display());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn debug_vector_similarity_query_result_struct_git_scores() {
+        let workspace = workspace_analyzer(Path::new("/home/jonathan/Projects/VectorSimilarity"));
+        let context = super::GitProjectContext::discover(workspace.analyzer().project().root()).unwrap();
+        let seed = PathBuf::from("src/VecSim/query_result_struct.cpp");
+        let targets = [
+            PathBuf::from("src/VecSim/utils/arr_cpp.h"),
+            PathBuf::from("src/VecSim/algorithms/hnsw/hnsw.h"),
+            PathBuf::from("src/VecSim/memory/vecsim_malloc.cpp"),
+            PathBuf::from("src/VecSim/spaces/L2/L2.cpp"),
+            PathBuf::from("src/VecSim/spaces/L2/L2.h"),
+            PathBuf::from("src/VecSim/spaces/IP/IP_AVX512_FP32.cpp"),
+        ];
+
+        let commits = context.recent_commit_ids(super::COMMITS_TO_PROCESS).unwrap();
+        let baseline_commit_count = commits.len() as f64;
+        let mut file_doc_freq: HashMap<PathBuf, usize> = HashMap::new();
+        let mut joint_mass: HashMap<PathBuf, f64> = HashMap::new();
+        let mut seed_commit_count = 0usize;
+        let mut canonicalizer = super::RenameCanonicalizer::default();
+
+        for oid in &commits {
+            let commit = context.repo.find_commit(*oid).unwrap();
+            let change = context.changed_repo_paths_for_commit(&commit).unwrap();
+            let changed_files = change
+                .paths
+                .into_iter()
+                .map(|path| canonicalizer.canonicalize(&path))
+                .collect::<BTreeSet<_>>();
+            canonicalizer.record_renames(&change.renames);
+            if changed_files.is_empty() {
+                continue;
+            }
+
+            for path in &changed_files {
+                *file_doc_freq.entry(path.clone()).or_insert(0) += 1;
+            }
+
+            if !changed_files.contains(&seed) {
+                continue;
+            }
+            seed_commit_count += 1;
+            let commit_pair_mass = 1.0 / changed_files.len() as f64;
+            for target in &targets {
+                if changed_files.contains(target) {
+                    *joint_mass.entry(target.clone()).or_insert(0.0) += commit_pair_mass;
+                }
+            }
+        }
+
+        for target in &targets {
+            let df = file_doc_freq.get(target).copied().unwrap_or(0).max(1) as f64;
+            let joint = joint_mass.get(target).copied().unwrap_or(0.0);
+            let conditional = if seed_commit_count == 0 {
+                0.0
+            } else {
+                joint / seed_commit_count as f64
+            };
+            let idf = (1.0 + baseline_commit_count / df).ln();
+            let score = conditional * idf;
+            eprintln!(
+                "{} df={} seed_den={} joint={:.15} conditional={:.15} idf={:.15} score={:.15}",
+                target.display(),
+                file_doc_freq.get(target).copied().unwrap_or(0),
+                seed_commit_count,
+                joint,
+                conditional,
+                idf,
+                score
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn debug_vector_similarity_problematic_commit_renames() {
+        let workspace = workspace_analyzer(Path::new("/home/jonathan/Projects/VectorSimilarity"));
+        let repo = super::GitProjectContext::discover(workspace.analyzer().project().root()).unwrap();
+        let oid = git2::Oid::from_str("493c78d1ef6035c27067137f3ab02d280f67cac2").unwrap();
+        let commit = repo.repo.find_commit(oid).unwrap();
+        let change = repo.changed_repo_paths_for_commit(&commit).unwrap();
+        eprintln!("renames:");
+        for (old_path, new_path) in &change.renames {
+            eprintln!("  {} -> {}", old_path.display(), new_path.display());
+        }
+        eprintln!("paths:");
+        for path in &change.paths {
+            if path.to_string_lossy().contains("version")
+                || path.to_string_lossy().contains("bm_spaces_class")
+            {
+                eprintln!("  {}", path.display());
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn debug_vector_similarity_l2_move_commit_renames() {
+        let workspace = workspace_analyzer(Path::new("/home/jonathan/Projects/VectorSimilarity"));
+        let repo = super::GitProjectContext::discover(workspace.analyzer().project().root()).unwrap();
+        let oid = git2::Oid::from_str("17985eda88a0fa9da910d346aa0f3656f419f2b5").unwrap();
+        let commit = repo.repo.find_commit(oid).unwrap();
+        let change = repo.changed_repo_paths_for_commit(&commit).unwrap();
+        eprintln!("renames:");
+        for (old_path, new_path) in &change.renames {
+            eprintln!("  {} -> {}", old_path.display(), new_path.display());
+        }
+        eprintln!("paths:");
+        for path in &change.paths {
+            if path.to_string_lossy().contains("L2") || path.to_string_lossy().contains("internal_product") {
+                eprintln!("  {}", path.display());
+            }
+        }
+    }
+
+    #[test]
+    fn pick_best_rename_edges_prefers_higher_content_candidate() {
+        let edges = super::pick_best_rename_edges(vec![
+            super::RenameCandidate {
+                content_score: 40.0,
+                path_score: 95.0,
+                old_path: PathBuf::from("old/bm_spaces_class.cpp"),
+                new_path: PathBuf::from("new/bm_spaces_class_fp32.cpp"),
+            },
+            super::RenameCandidate {
+                content_score: 85.0,
+                path_score: 80.0,
+                old_path: PathBuf::from("old/bm_spaces_class.cpp"),
+                new_path: PathBuf::from("new/bm_spaces_class_definitions.h"),
+            },
+        ]);
+
+        assert_eq!(
+            vec![(
+                PathBuf::from("old/bm_spaces_class.cpp"),
+                PathBuf::from("new/bm_spaces_class_definitions.h"),
+            )],
+            edges
+        );
     }
 
     #[test]

@@ -1262,7 +1262,7 @@ fn parse_quoted_include(line: &str) -> Option<String> {
 }
 
 fn resolve_include_targets(
-    project: &dyn Project,
+    _project: &dyn Project,
     source_file: &ProjectFile,
     include: &str,
 ) -> Vec<ProjectFile> {
@@ -1273,17 +1273,6 @@ fn resolve_include_targets(
     let relative_file = ProjectFile::new(source_root.clone(), relative_path);
     if relative_file.exists() {
         candidates.push(relative_file);
-    }
-
-    if let Some(project_file) = project.file_by_rel_path(include_path) {
-        candidates.push(project_file);
-    }
-
-    let include_name = include_path.file_name();
-    for file in project.all_files().unwrap_or_default() {
-        if include_name.is_some() && file.rel_path().file_name() == include_name {
-            candidates.push(file);
-        }
     }
 
     candidates.sort();
