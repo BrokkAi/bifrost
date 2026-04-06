@@ -1,4 +1,7 @@
-use brokk_analyzer::{IAnalyzer, ProjectFile, PythonAnalyzer, TestProject};
+use brokk_analyzer::{
+    IAnalyzer, ImportAnalysisProvider, Project, ProjectFile, PythonAnalyzer, TestProject,
+};
+use std::collections::BTreeSet;
 
 fn inline_project(files: &[(&str, &str)]) -> TestProject {
     let temp = tempfile::tempdir().unwrap();
@@ -138,4 +141,31 @@ fn module_code_units_use_python_src_layout_import_root() {
         .collect();
 
     assert_eq!(vec!["pkg.mod.Thing"], children);
+}
+
+#[test]
+fn referencing_files_resolve_python_src_layout_modules() {
+    let project = inline_project(&[
+        ("src/pkg/__init__.py", ""),
+        (
+            "src/pkg/mod.py",
+            r#"
+            VALUE = 1
+            "#,
+        ),
+        (
+            "src/pkg/consumer.py",
+            r#"
+            from pkg import mod
+            "#,
+        ),
+    ]);
+    let root = project.root().to_path_buf();
+    let analyzer = PythonAnalyzer::from_project(project);
+    let mod_file = ProjectFile::new(root.clone(), "src/pkg/mod.py");
+    let consumer_file = ProjectFile::new(root, "src/pkg/consumer.py");
+
+    let referencing = analyzer.referencing_files_of(&mod_file);
+
+    assert_eq!(BTreeSet::from([consumer_file]), referencing);
 }

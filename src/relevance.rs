@@ -262,10 +262,17 @@ fn build_import_graph(
     analyzer: &dyn IAnalyzer,
     seed_weights: &HashMap<ProjectFile, f64>,
 ) -> ImportGraph {
+    let _scope = profiling::scope("relevance::build_import_graph");
     let mut graph = ImportGraph::default();
     let mut import_cache = HashMap::new();
     let mut reverse_cache = HashMap::new();
     let mut frontier: VecDeque<_> = seed_weights.keys().cloned().collect();
+    let mut expanded_nodes = 0usize;
+    let mut forward_edges = 0usize;
+    let mut reverse_edges = 0usize;
+    let mut import_lookup_ms = 0.0;
+    let mut reverse_lookup_ms = 0.0;
+    let mut depth = 0usize;
 
     for seed in seed_weights.keys() {
         graph.forward.entry(seed.clone()).or_default();
@@ -276,10 +283,38 @@ fn build_import_graph(
         if frontier.is_empty() {
             break;
         }
+        depth += 1;
+        let frontier_len = frontier.len();
 
         let mut next = VecDeque::new();
         while let Some(file) = frontier.pop_front() {
-            for target in imported_files_for(analyzer, &file, &mut import_cache) {
+            expanded_nodes += 1;
+            if profiling::enabled() {
+                profiling::note(format!(
+                    "relevance::build_import_graph expand file={}",
+                    normalized_rel_path(&file)
+                ));
+            }
+
+            if profiling::enabled() {
+                profiling::note(format!(
+                    "relevance::build_import_graph import_start file={}",
+                    normalized_rel_path(&file)
+                ));
+            }
+            let import_started = Instant::now();
+            let imported = imported_files_for(analyzer, &file, &mut import_cache);
+            let import_elapsed_ms = import_started.elapsed().as_secs_f64() * 1000.0;
+            import_lookup_ms += import_elapsed_ms;
+            if profiling::enabled() && (import_elapsed_ms >= 100.0 || imported.len() >= 100) {
+                profiling::note(format!(
+                    "relevance::build_import_graph import file={} imported={} elapsed_ms={:.1}",
+                    normalized_rel_path(&file),
+                    imported.len(),
+                    import_elapsed_ms
+                ));
+            }
+            for target in imported {
                 if !graph.forward.contains_key(&target) {
                     graph.forward.entry(target.clone()).or_default();
                     graph.reverse.entry(target.clone()).or_default();
@@ -290,6 +325,7 @@ fn build_import_graph(
                     .entry(file.clone())
                     .or_default()
                     .insert(target.clone());
+                forward_edges += 1;
                 graph
                     .reverse
                     .entry(target)
@@ -297,7 +333,25 @@ fn build_import_graph(
                     .insert(file.clone());
             }
 
-            for source in referencing_files_for(analyzer, &file, &mut reverse_cache) {
+            if profiling::enabled() {
+                profiling::note(format!(
+                    "relevance::build_import_graph reverse_start file={}",
+                    normalized_rel_path(&file)
+                ));
+            }
+            let reverse_started = Instant::now();
+            let referencing = referencing_files_for(analyzer, &file, &mut reverse_cache);
+            let reverse_elapsed_ms = reverse_started.elapsed().as_secs_f64() * 1000.0;
+            reverse_lookup_ms += reverse_elapsed_ms;
+            if profiling::enabled() && (reverse_elapsed_ms >= 100.0 || referencing.len() >= 100) {
+                profiling::note(format!(
+                    "relevance::build_import_graph reverse file={} referencing={} elapsed_ms={:.1}",
+                    normalized_rel_path(&file),
+                    referencing.len(),
+                    reverse_elapsed_ms
+                ));
+            }
+            for source in referencing {
                 if !graph.forward.contains_key(&source) {
                     graph.forward.entry(source.clone()).or_default();
                     graph.reverse.entry(source.clone()).or_default();
@@ -308,12 +362,25 @@ fn build_import_graph(
                     .entry(source.clone())
                     .or_default()
                     .insert(file.clone());
+                reverse_edges += 1;
                 graph
                     .reverse
                     .entry(file.clone())
                     .or_default()
                     .insert(source);
             }
+        }
+        if profiling::enabled() {
+            profiling::note(format!(
+                "relevance::build_import_graph depth={} frontier={} expanded_nodes={} forward_edges={} reverse_edges={} import_lookup_ms={:.1} reverse_lookup_ms={:.1}",
+                depth,
+                frontier_len,
+                expanded_nodes,
+                forward_edges,
+                reverse_edges,
+                import_lookup_ms,
+                reverse_lookup_ms
+            ));
         }
         frontier = next;
     }

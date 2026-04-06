@@ -1,15 +1,17 @@
 use crate::analyzer::{
     AnalyzerConfig, CodeUnit, CodeUnitType, IAnalyzer, ImportAnalysisProvider, ImportInfo,
     Language, LanguageAdapter, Project, ProjectFile, TestDetectionProvider, TreeSitterAnalyzer,
-    TypeHierarchyProvider, direct_descendants_via_ancestors, referencing_files_via_imports,
+    TypeHierarchyProvider, direct_descendants_via_ancestors,
 };
+use crate::profiling;
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use moka::sync::Cache;
+use rayon::prelude::*;
 use regex::Regex;
 use std::collections::{BTreeMap, BTreeSet};
 use std::mem::size_of;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
 
 use super::javascript_analyzer::build_weighted_cache;
@@ -93,6 +95,8 @@ pub struct PythonAnalyzer {
     referencing_files: Cache<ProjectFile, Arc<BTreeSet<ProjectFile>>>,
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
     direct_descendants: Cache<CodeUnit, Arc<BTreeSet<CodeUnit>>>,
+    module_code_units: Arc<BTreeMap<String, CodeUnit>>,
+    reverse_import_index: Arc<OnceLock<BTreeMap<ProjectFile, Arc<BTreeSet<ProjectFile>>>>>,
 }
 
 impl PythonAnalyzer {
@@ -102,13 +106,16 @@ impl PythonAnalyzer {
 
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
+        let inner = TreeSitterAnalyzer::new_with_config(project, PythonAdapter, config);
         Self {
-            inner: TreeSitterAnalyzer::new_with_config(project, PythonAdapter, config),
+            module_code_units: Arc::new(build_python_module_code_units(&inner)),
+            inner,
             memo_budget,
             imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
             direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec),
             direct_descendants: build_weighted_cache(memo_budget / 8, weight_code_unit_set_by_unit),
+            reverse_import_index: Arc::new(OnceLock::new()),
         }
     }
 
@@ -211,13 +218,50 @@ impl PythonAnalyzer {
             .get_definitions(module_fq)
             .into_iter()
             .find(|code_unit| code_unit.is_module())
-            .or_else(|| {
-                self.inner
-                    .all_files()
-                    .into_iter()
-                    .find(|file| python_module_name(file) == module_fq)
-                    .and_then(|file| module_code_unit(&file, module_fq))
-            })
+            .or_else(|| self.module_code_units.get(module_fq).cloned())
+    }
+
+    fn build_reverse_import_index(&self) -> &BTreeMap<ProjectFile, Arc<BTreeSet<ProjectFile>>> {
+        self.reverse_import_index.get_or_init(|| {
+            let _scope = profiling::scope("PythonAnalyzer::build_reverse_import_index");
+            let files: Vec<_> = self.inner.get_analyzed_files().into_iter().collect();
+            let imported_by_file: Vec<_> = files
+                .par_iter()
+                .map(|file| {
+                    let resolved: BTreeSet<_> =
+                        self.resolve_import_bindings(file).into_values().collect();
+                    (file.clone(), resolved)
+                })
+                .collect();
+
+            let mut reverse: BTreeMap<ProjectFile, BTreeSet<ProjectFile>> = BTreeMap::new();
+            for (file, imported) in imported_by_file {
+                self.imported_code_units
+                    .insert(file.clone(), Arc::new(imported.clone()));
+                for code_unit in imported {
+                    let target = code_unit.source();
+                    if target != &file {
+                        reverse
+                            .entry(target.clone())
+                            .or_default()
+                            .insert(file.clone());
+                    }
+                }
+            }
+
+            if profiling::enabled() {
+                profiling::note(format!(
+                    "PythonAnalyzer::build_reverse_import_index files={} indexed_targets={}",
+                    files.len(),
+                    reverse.len()
+                ));
+            }
+
+            reverse
+                .into_iter()
+                .map(|(file, refs)| (file, Arc::new(refs)))
+                .collect()
+        })
     }
 
     fn public_declarations_in_module(&self, module_fq: &str) -> Vec<CodeUnit> {
@@ -361,7 +405,11 @@ impl ImportAnalysisProvider for PythonAnalyzer {
             return (*cached).clone();
         }
 
-        let referencing = referencing_files_via_imports(self, self, file);
+        let referencing = self
+            .build_reverse_import_index()
+            .get(file)
+            .map(|files| (**files).clone())
+            .unwrap_or_default();
         self.referencing_files
             .insert(file.clone(), Arc::new(referencing.clone()));
         referencing
@@ -534,8 +582,10 @@ impl IAnalyzer for PythonAnalyzer {
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
+        let inner = self.inner.update(changed_files);
         Self {
-            inner: self.inner.update(changed_files),
+            module_code_units: Arc::new(build_python_module_code_units(&inner)),
+            inner,
             memo_budget: self.memo_budget,
             imported_code_units: build_weighted_cache(self.memo_budget / 4, weight_code_unit_set),
             referencing_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
@@ -544,12 +594,15 @@ impl IAnalyzer for PythonAnalyzer {
                 self.memo_budget / 8,
                 weight_code_unit_set_by_unit,
             ),
+            reverse_import_index: Arc::new(OnceLock::new()),
         }
     }
 
     fn update_all(&self) -> Self {
+        let inner = self.inner.update_all();
         Self {
-            inner: self.inner.update_all(),
+            module_code_units: Arc::new(build_python_module_code_units(&inner)),
+            inner,
             memo_budget: self.memo_budget,
             imported_code_units: build_weighted_cache(self.memo_budget / 4, weight_code_unit_set),
             referencing_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
@@ -558,6 +611,7 @@ impl IAnalyzer for PythonAnalyzer {
                 self.memo_budget / 8,
                 weight_code_unit_set_by_unit,
             ),
+            reverse_import_index: Arc::new(OnceLock::new()),
         }
     }
 
@@ -1017,6 +1071,19 @@ impl PythonModuleInfo {
 
 fn python_module_name(file: &ProjectFile) -> String {
     python_module_info(file).module_qualified_package()
+}
+
+fn build_python_module_code_units(
+    inner: &TreeSitterAnalyzer<PythonAdapter>,
+) -> BTreeMap<String, CodeUnit> {
+    inner
+        .get_analyzed_files()
+        .into_iter()
+        .filter_map(|file| {
+            let module_fq = python_module_name(&file);
+            module_code_unit(&file, &module_fq).map(|code_unit| (module_fq, code_unit))
+        })
+        .collect()
 }
 
 fn python_module_info(file: &ProjectFile) -> PythonModuleInfo {
