@@ -12,7 +12,8 @@ const SCORE_TIE_EPSILON: f64 = 1.0e-9;
 const MAX_ITERS: usize = 75;
 const IMPORT_DEPTH: usize = 2;
 const COMMITS_TO_PROCESS: usize = 1_000;
-
+const NATIVE_RENAME_THRESHOLD: u16 = 50;
+const NATIVE_RENAME_TOKEN_OVERLAP_THRESHOLD: f64 = 0.90;
 static GIT_COMMITS_SCANNED: AtomicUsize = AtomicUsize::new(0);
 static GIT_COMMITS_WITH_CHURN: AtomicUsize = AtomicUsize::new(0);
 static GIT_STATUS_ADDED: AtomicUsize = AtomicUsize::new(0);
@@ -20,10 +21,6 @@ static GIT_STATUS_DELETED: AtomicUsize = AtomicUsize::new(0);
 static GIT_STATUS_RENAMED: AtomicUsize = AtomicUsize::new(0);
 static GIT_STATUS_COPIED: AtomicUsize = AtomicUsize::new(0);
 static GIT_NATIVE_RENAME_CANDIDATES: AtomicUsize = AtomicUsize::new(0);
-static GIT_FALLBACK_PAIR_CANDIDATES: AtomicUsize = AtomicUsize::new(0);
-static GIT_CONTENT_SIM_CALLS: AtomicUsize = AtomicUsize::new(0);
-static GIT_CONTENT_TOKEN_CALLS: AtomicUsize = AtomicUsize::new(0);
-static GIT_FIND_BLOB_CALLS: AtomicUsize = AtomicUsize::new(0);
 static GIT_FIND_SIMILAR_MICROS: AtomicU64 = AtomicU64::new(0);
 
 fn reset_git_counters() {
@@ -34,10 +31,6 @@ fn reset_git_counters() {
     GIT_STATUS_RENAMED.store(0, Ordering::Relaxed);
     GIT_STATUS_COPIED.store(0, Ordering::Relaxed);
     GIT_NATIVE_RENAME_CANDIDATES.store(0, Ordering::Relaxed);
-    GIT_FALLBACK_PAIR_CANDIDATES.store(0, Ordering::Relaxed);
-    GIT_CONTENT_SIM_CALLS.store(0, Ordering::Relaxed);
-    GIT_CONTENT_TOKEN_CALLS.store(0, Ordering::Relaxed);
-    GIT_FIND_BLOB_CALLS.store(0, Ordering::Relaxed);
     GIT_FIND_SIMILAR_MICROS.store(0, Ordering::Relaxed);
 }
 
@@ -46,8 +39,7 @@ fn git_counters_note() -> String {
         concat!(
             "git-counters commits_scanned={} commits_with_churn={} ",
             "A={} D={} R={} C={} native_rename_candidates={} ",
-            "fallback_pairs={} content_similarity_calls={} content_token_calls={} ",
-            "find_blob_calls={} find_similar_ms={:.1}"
+            "find_similar_ms={:.1}"
         ),
         GIT_COMMITS_SCANNED.load(Ordering::Relaxed),
         GIT_COMMITS_WITH_CHURN.load(Ordering::Relaxed),
@@ -56,10 +48,6 @@ fn git_counters_note() -> String {
         GIT_STATUS_RENAMED.load(Ordering::Relaxed),
         GIT_STATUS_COPIED.load(Ordering::Relaxed),
         GIT_NATIVE_RENAME_CANDIDATES.load(Ordering::Relaxed),
-        GIT_FALLBACK_PAIR_CANDIDATES.load(Ordering::Relaxed),
-        GIT_CONTENT_SIM_CALLS.load(Ordering::Relaxed),
-        GIT_CONTENT_TOKEN_CALLS.load(Ordering::Relaxed),
-        GIT_FIND_BLOB_CALLS.load(Ordering::Relaxed),
         GIT_FIND_SIMILAR_MICROS.load(Ordering::Relaxed) as f64 / 1000.0
     )
 }
@@ -405,9 +393,9 @@ fn referencing_files_for(
 /// - use native Git rename detection only, with a 50% similarity threshold and no extra add/delete continuation
 ///   inference layered on top. If Git does not label an edge as `Renamed`, this scorer treats the old/new paths as
 ///   unrelated for lineage purposes
-/// - native rename labels still pass a cheap filename-stem sanity check before they become lineage edges: the compact
-///   stem key (lowercased stem with separators removed) must match, so libgit/JGit false positives are treated as
-///   add+delete rather than rewritten history
+/// - native rename labels still pass cheap sanity checks before they become lineage edges: the compact stem key
+///   (lowercased stem with separators removed) must match, and the directly compared old/new blobs must still have
+///   near-exact token overlap, so libgit/JGit false positives become add+delete rather than rewritten history
 /// - canonicalization follows only those accepted native rename labels; copy/split history is intentionally not
 ///   recovered by custom blob-similarity heuristics
 /// - treat near-equal scores as ties using a relative epsilon of `1e-9 * max(1, |score|)` and break them by
@@ -468,13 +456,13 @@ fn related_files_by_git(
             change_ms += started.elapsed().as_secs_f64() * 1000.0;
 
             let started = Instant::now();
+            canonicalizer.record_renames(&change.renames);
             let changed_files: BTreeSet<_> = change
                 .paths
                 .into_iter()
                 .map(|path| canonicalizer.canonicalize(&path))
                 .filter_map(|path| repo.repo_path_to_project_file(&path))
                 .collect();
-            canonicalizer.record_renames(&change.renames);
             canonicalize_ms += started.elapsed().as_secs_f64() * 1000.0;
             processed_commits += 1;
             if profiling::enabled() && processed_commits % 5 == 0 {
@@ -626,7 +614,8 @@ impl GitProjectContext {
 
         let mut find_options = DiffFindOptions::new();
         find_options.renames(true);
-        find_options.rename_threshold(50);
+        find_options.rename_threshold(NATIVE_RENAME_THRESHOLD);
+        find_options.dont_ignore_whitespace(true);
         let find_similar_started = Instant::now();
         diff.find_similar(Some(&mut find_options))?;
         GIT_FIND_SIMILAR_MICROS.fetch_add(
@@ -667,7 +656,7 @@ impl GitProjectContext {
                         GIT_NATIVE_RENAME_CANDIDATES.fetch_add(1, Ordering::Relaxed);
                         let old_path = old_path.to_path_buf();
                         let new_path = new_path.to_path_buf();
-                        if native_rename_is_safe(&old_path, &new_path) {
+                        if native_rename_delta_is_safe(&self.repo, &delta, &old_path, &new_path) {
                             paths.push(new_path.clone());
                             renames.push((old_path, new_path));
                         } else {
@@ -710,10 +699,45 @@ struct CommitChange {
     renames: Vec<(PathBuf, PathBuf)>,
 }
 
-fn native_rename_is_safe(old_path: &Path, new_path: &Path) -> bool {
+fn native_rename_delta_is_safe(
+    repo: &Repository,
+    delta: &git2::DiffDelta<'_>,
+    old_path: &Path,
+    new_path: &Path,
+) -> bool {
+    native_rename_path_keys_match(old_path, new_path)
+        && native_rename_token_overlap_ratio(repo, delta)
+            .is_some_and(|ratio| ratio >= NATIVE_RENAME_TOKEN_OVERLAP_THRESHOLD)
+}
+
+fn native_rename_path_keys_match(old_path: &Path, new_path: &Path) -> bool {
     let old_key = compact_stem_key(old_path);
     let new_key = compact_stem_key(new_path);
     !old_key.is_empty() && old_key == new_key
+}
+
+fn native_rename_token_overlap_ratio(
+    repo: &Repository,
+    delta: &git2::DiffDelta<'_>,
+) -> Option<f64> {
+    let old_blob = repo.find_blob(delta.old_file().id()).ok()?;
+    let new_blob = repo.find_blob(delta.new_file().id()).ok()?;
+    let old_tokens = blob_token_set(&old_blob);
+    let new_tokens = blob_token_set(&new_blob);
+    let max_tokens = old_tokens.len().max(new_tokens.len());
+    if max_tokens == 0 {
+        return Some(1.0);
+    }
+    let overlap = old_tokens.intersection(&new_tokens).count();
+    Some(overlap as f64 / max_tokens as f64)
+}
+
+fn blob_token_set(blob: &git2::Blob<'_>) -> HashSet<String> {
+    String::from_utf8_lossy(blob.content())
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_ascii_lowercase())
+        .collect()
 }
 
 fn compact_stem_key(path: &Path) -> String {
@@ -727,32 +751,6 @@ fn compact_stem_key(path: &Path) -> String {
     stem.chars()
         .filter(|ch| ch.is_ascii_alphanumeric())
         .flat_map(char::to_lowercase)
-        .collect()
-}
-
-fn stem_tokens(path: &Path) -> HashSet<String> {
-    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-        return HashSet::new();
-    };
-
-    let stem = file_name
-        .rsplit_once('.')
-        .map(|(stem, _)| stem)
-        .unwrap_or(file_name);
-    let mut normalized = String::with_capacity(stem.len() + 8);
-    let mut prev: Option<char> = None;
-    for ch in stem.chars() {
-        let needs_split = prev.is_some_and(|prev| prev.is_ascii_lowercase() && ch.is_ascii_uppercase());
-        if needs_split {
-            normalized.push('-');
-        }
-        normalized.push(ch);
-        prev = Some(ch);
-    }
-    normalized
-        .split(&['/', '\\', '.', '_', '-'][..])
-        .filter(|token| !token.is_empty())
-        .map(|token| token.to_ascii_lowercase())
         .collect()
 }
 
@@ -908,6 +906,11 @@ mod tests {
         let root = workspace.analyzer().project().root().to_path_buf();
         let seed = ProjectFile::new(root.clone(), "src/VecSim/query_result_struct.cpp");
         let targets = [
+            ProjectFile::new(root.clone(), "tests/unit/test_bruteforce.cpp"),
+            ProjectFile::new(root.clone(), "src/VecSim/vec_sim.cpp"),
+            ProjectFile::new(root.clone(), "src/VecSim/vec_sim.h"),
+            ProjectFile::new(root.clone(), "src/python_bindings/bindings.cpp"),
+            ProjectFile::new(root.clone(), "tests/flow/test_bruteforce.py"),
             ProjectFile::new(
                 root.clone(),
                 "tests/benchmark/spaces_benchmarks/bm_spaces_class_fp32.cpp",
@@ -985,10 +988,20 @@ mod tests {
             root.clone(),
             "tests/benchmark/spaces_benchmarks/bm_spaces_class_fp32.cpp",
         );
+        let test_bruteforce = ProjectFile::new(root.clone(), "tests/unit/test_bruteforce.cpp");
+        let vec_sim_cpp = ProjectFile::new(root.clone(), "src/VecSim/vec_sim.cpp");
+        let vec_sim_h = ProjectFile::new(root.clone(), "src/VecSim/vec_sim.h");
+        let bindings = ProjectFile::new(root.clone(), "src/python_bindings/bindings.cpp");
+        let flow_test = ProjectFile::new(root.clone(), "tests/flow/test_bruteforce.py");
         let definitions = ProjectFile::new(
-            root,
+            root.clone(),
             "tests/benchmark/spaces_benchmarks/bm_spaces_class_definitions.h",
         );
+        let brute_force_factory = ProjectFile::new(
+            root.clone(),
+            "src/VecSim/index_factories/brute_force_factory.cpp",
+        );
+        let l2_space = ProjectFile::new(root, "src/VecSim/spaces/L2_space.h");
 
         let repo = super::GitProjectContext::discover(workspace.analyzer().project().root()).unwrap();
         let commit_ids = repo.recent_commit_ids(super::COMMITS_TO_PROCESS).unwrap();
@@ -1005,10 +1018,29 @@ mod tests {
                 .filter_map(|repo_rel| repo.repo_path_to_project_file(&repo_rel))
                 .collect::<Vec<_>>();
             if changed_files.contains(&seed) {
-                if changed_files.contains(&fp32) || changed_files.contains(&definitions) {
+                if changed_files.contains(&fp32)
+                    || changed_files.contains(&definitions)
+                    || changed_files.contains(&brute_force_factory)
+                    || changed_files.contains(&l2_space)
+                    || changed_files.contains(&test_bruteforce)
+                    || changed_files.contains(&vec_sim_cpp)
+                    || changed_files.contains(&vec_sim_h)
+                    || changed_files.contains(&bindings)
+                    || changed_files.contains(&flow_test)
+                {
                     eprintln!("commit {} size={}", oid, changed_files.len());
                     for file in &changed_files {
-                        if *file == seed || *file == fp32 || *file == definitions {
+                        if *file == seed
+                            || *file == fp32
+                            || *file == definitions
+                            || *file == brute_force_factory
+                            || *file == l2_space
+                            || *file == test_bruteforce
+                            || *file == vec_sim_cpp
+                            || *file == vec_sim_h
+                            || *file == bindings
+                            || *file == flow_test
+                        {
                             eprintln!("  {}", file.rel_path().display());
                         }
                     }
@@ -1022,32 +1054,41 @@ mod tests {
     fn debug_vector_similarity_query_result_struct_git_scores() {
         let workspace = workspace_analyzer(Path::new("/home/jonathan/Projects/VectorSimilarity"));
         let context = super::GitProjectContext::discover(workspace.analyzer().project().root()).unwrap();
-        let seed = PathBuf::from("src/VecSim/query_result_struct.cpp");
+        let root = workspace.analyzer().project().root().to_path_buf();
+        let seed = ProjectFile::new(root.clone(), "src/VecSim/query_result_struct.cpp");
         let targets = [
-            PathBuf::from("src/VecSim/utils/arr_cpp.h"),
-            PathBuf::from("src/VecSim/algorithms/hnsw/hnsw.h"),
-            PathBuf::from("src/VecSim/memory/vecsim_malloc.cpp"),
-            PathBuf::from("src/VecSim/spaces/L2/L2.cpp"),
-            PathBuf::from("src/VecSim/spaces/L2/L2.h"),
-            PathBuf::from("src/VecSim/spaces/IP/IP_AVX512_FP32.cpp"),
+            ProjectFile::new(root.clone(), "tests/unit/test_bruteforce.cpp"),
+            ProjectFile::new(root.clone(), "src/VecSim/vec_sim.cpp"),
+            ProjectFile::new(root.clone(), "src/VecSim/vec_sim.h"),
+            ProjectFile::new(root.clone(), "src/python_bindings/bindings.cpp"),
+            ProjectFile::new(root.clone(), "tests/flow/test_bruteforce.py"),
+            ProjectFile::new(root.clone(), "src/VecSim/utils/arr_cpp.h"),
+            ProjectFile::new(root.clone(), "src/VecSim/algorithms/hnsw/hnsw.h"),
+            ProjectFile::new(root.clone(), "src/VecSim/memory/vecsim_malloc.cpp"),
+            ProjectFile::new(root.clone(), "src/VecSim/spaces/L2/L2.cpp"),
+            ProjectFile::new(root.clone(), "src/VecSim/spaces/L2/L2.h"),
+            ProjectFile::new(root.clone(), "src/VecSim/spaces/IP/IP_AVX512_FP32.cpp"),
+            ProjectFile::new(root.clone(), "src/VecSim/spaces/L2_space.h"),
+            ProjectFile::new(root, "src/VecSim/index_factories/brute_force_factory.cpp"),
         ];
 
         let commits = context.recent_commit_ids(super::COMMITS_TO_PROCESS).unwrap();
         let baseline_commit_count = commits.len() as f64;
-        let mut file_doc_freq: HashMap<PathBuf, usize> = HashMap::new();
-        let mut joint_mass: HashMap<PathBuf, f64> = HashMap::new();
+        let mut file_doc_freq: HashMap<ProjectFile, usize> = HashMap::new();
+        let mut joint_mass: HashMap<ProjectFile, f64> = HashMap::new();
         let mut seed_commit_count = 0usize;
         let mut canonicalizer = super::RenameCanonicalizer::default();
 
         for oid in &commits {
             let commit = context.repo.find_commit(*oid).unwrap();
             let change = context.changed_repo_paths_for_commit(&commit).unwrap();
+            canonicalizer.record_renames(&change.renames);
             let changed_files = change
                 .paths
                 .into_iter()
                 .map(|path| canonicalizer.canonicalize(&path))
+                .filter_map(|path| context.repo_path_to_project_file(&path))
                 .collect::<BTreeSet<_>>();
-            canonicalizer.record_renames(&change.renames);
             if changed_files.is_empty() {
                 continue;
             }
@@ -1080,7 +1121,7 @@ mod tests {
             let score = conditional * idf;
             eprintln!(
                 "{} df={} seed_den={} joint={:.15} conditional={:.15} idf={:.15} score={:.15}",
-                target.display(),
+                target.rel_path().display(),
                 file_doc_freq.get(target).copied().unwrap_or(0),
                 seed_commit_count,
                 joint,
@@ -1128,6 +1169,28 @@ mod tests {
         eprintln!("paths:");
         for path in &change.paths {
             if path.to_string_lossy().contains("L2") || path.to_string_lossy().contains("internal_product") {
+                eprintln!("  {}", path.display());
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn debug_vector_similarity_bruteforce_move_commit_renames() {
+        let workspace = workspace_analyzer(Path::new("/home/jonathan/Projects/VectorSimilarity"));
+        let repo = super::GitProjectContext::discover(workspace.analyzer().project().root()).unwrap();
+        let oid = git2::Oid::from_str("e2f3da57fe43ce500f58e4dbe5291e35ada31bee").unwrap();
+        let commit = repo.repo.find_commit(oid).unwrap();
+        let change = repo.changed_repo_paths_for_commit(&commit).unwrap();
+        eprintln!("renames:");
+        for (old_path, new_path) in &change.renames {
+            eprintln!("  {} -> {}", old_path.display(), new_path.display());
+        }
+        eprintln!("paths:");
+        for path in &change.paths {
+            if path.to_string_lossy().contains("brute_force_factory")
+                || path.to_string_lossy().contains("index_factories")
+            {
                 eprintln!("  {}", path.display());
             }
         }
@@ -1914,7 +1977,7 @@ mod tests {
 
     #[test]
     fn native_rename_sanity_accepts_installation_doc_rename() {
-        assert!(super::native_rename_is_safe(
+        assert!(super::native_rename_path_keys_match(
             Path::new("docs/dotnet/user-guide/core-user-guide/installation.md"),
             Path::new("docs/dotnet/core/installation.md"),
         ));
@@ -1922,7 +1985,7 @@ mod tests {
 
     #[test]
     fn native_rename_sanity_accepts_agent_host_casing_rename() {
-        assert!(super::native_rename_is_safe(
+        assert!(super::native_rename_path_keys_match(
             Path::new("dotnet/src/Microsoft.AutoGen/AgentHost/Microsoft.Autogen.AgentHost.csproj"),
             Path::new("dotnet/src/Microsoft.AutoGen/AgentHost/Microsoft.AutoGen.AgentHost.csproj"),
         ));
@@ -1930,7 +1993,7 @@ mod tests {
 
     #[test]
     fn native_rename_sanity_rejects_agent_runtime_to_inprocess() {
-        assert!(!super::native_rename_is_safe(
+        assert!(!super::native_rename_path_keys_match(
             Path::new("dotnet/test/Microsoft.AutoGen.Core.Tests/AgentRuntimeTests.cs"),
             Path::new("dotnet/test/Microsoft.AutoGen.Core.Tests/InProcessRuntimeTests.cs"),
         ));
@@ -1938,7 +2001,7 @@ mod tests {
 
     #[test]
     fn native_rename_sanity_rejects_anthropic_samples_pluralization() {
-        assert!(!super::native_rename_is_safe(
+        assert!(!super::native_rename_path_keys_match(
             Path::new("dotnet/samples/AutoGen.Anthropic.Samples/AutoGen.Anthropic.Samples.csproj"),
             Path::new("dotnet/samples/AgentChat/AutoGen.Anthropic.Sample/AutoGen.Anthropic.Sample.csproj"),
         ));
@@ -1946,10 +2009,38 @@ mod tests {
 
     #[test]
     fn native_rename_sanity_rejects_vector_similarity_definitions_suffix() {
-        assert!(!super::native_rename_is_safe(
+        assert!(!super::native_rename_path_keys_match(
             Path::new("tests/benchmark/bm_spaces_class.cpp"),
             Path::new("tests/benchmark/spaces_benchmarks/bm_spaces_class_definitions.h"),
         ));
+    }
+
+    #[test]
+    fn native_rename_sanity_rejects_vector_similarity_bruteforce_factory_move() {
+        let root = Path::new("/home/jonathan/Projects/VectorSimilarity");
+        if !root.is_dir() {
+            eprintln!("skipping vectorsim rename threshold regression: repo not present");
+            return;
+        }
+
+        let context = super::GitProjectContext::discover(root).unwrap();
+        let oid = git2::Oid::from_str("e2f3da57fe43ce500f58e4dbe5291e35ada31bee").unwrap();
+        let commit = context.repo.find_commit(oid).unwrap();
+        let change = context.changed_repo_paths_for_commit(&commit).unwrap();
+
+        assert!(
+            !change.renames.iter().any(|(old_path, new_path)| {
+                old_path == Path::new("src/VecSim/algorithms/brute_force/brute_force_factory.cpp")
+                    && new_path == Path::new("src/VecSim/index_factories/brute_force_factory.cpp")
+            }),
+            "native rename should be rejected by the shared stem-only guard"
+        );
+        assert!(change.paths.contains(&PathBuf::from(
+            "src/VecSim/algorithms/brute_force/brute_force_factory.cpp"
+        )));
+        assert!(change
+            .paths
+            .contains(&PathBuf::from("src/VecSim/index_factories/brute_force_factory.cpp")));
     }
 
     #[test]
