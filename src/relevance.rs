@@ -405,6 +405,9 @@ fn referencing_files_for(
 /// - use native Git rename detection only, with a 50% similarity threshold and no extra add/delete continuation
 ///   inference layered on top. If Git does not label an edge as `Renamed`, this scorer treats the old/new paths as
 ///   unrelated for lineage purposes
+/// - native rename labels still pass a cheap filename-stem sanity check before they become lineage edges: the compact
+///   stem key (lowercased stem with separators removed) must match, so libgit/JGit false positives are treated as
+///   add+delete rather than rewritten history
 /// - canonicalization follows only those accepted native rename labels; copy/split history is intentionally not
 ///   recovered by custom blob-similarity heuristics
 /// - treat near-equal scores as ties using a relative epsilon of `1e-9 * max(1, |score|)` and break them by
@@ -664,8 +667,13 @@ impl GitProjectContext {
                         GIT_NATIVE_RENAME_CANDIDATES.fetch_add(1, Ordering::Relaxed);
                         let old_path = old_path.to_path_buf();
                         let new_path = new_path.to_path_buf();
-                        paths.push(new_path.clone());
-                        renames.push((old_path, new_path));
+                        if native_rename_is_safe(&old_path, &new_path) {
+                            paths.push(new_path.clone());
+                            renames.push((old_path, new_path));
+                        } else {
+                            paths.push(old_path);
+                            paths.push(new_path);
+                        }
                     }
                 }
                 _ => {}
@@ -702,151 +710,24 @@ struct CommitChange {
     renames: Vec<(PathBuf, PathBuf)>,
 }
 
-#[derive(Clone)]
-struct RenameCandidate {
-    content_score: f64,
-    native_rename: bool,
-    directory_prefix_len: usize,
-    path_score: f64,
-    old_path: PathBuf,
-    new_path: PathBuf,
+fn native_rename_is_safe(old_path: &Path, new_path: &Path) -> bool {
+    let old_key = compact_stem_key(old_path);
+    let new_key = compact_stem_key(new_path);
+    !old_key.is_empty() && old_key == new_key
 }
 
-fn rename_candidate(
-    repo: &Repository,
-    parent_tree: Option<&git2::Tree<'_>>,
-    current_tree: &git2::Tree<'_>,
-    old_path: &Path,
-    new_path: &Path,
-) -> Option<RenameCandidate> {
-    let path_score = path_token_similarity_score(old_path, new_path);
-    let content_score =
-        content_token_similarity_score(repo, parent_tree, current_tree, old_path, new_path);
-    continuation_edge_is_safe(old_path, new_path, path_score, content_score, true).then(|| RenameCandidate {
-        content_score,
-        native_rename: true,
-        directory_prefix_len: shared_directory_prefix_len(old_path, new_path),
-        path_score,
-        old_path: old_path.to_path_buf(),
-        new_path: new_path.to_path_buf(),
-    })
-}
-
-fn infer_path_continuity_renames(
-    repo: &Repository,
-    parent_tree: Option<&git2::Tree<'_>>,
-    current_tree: &git2::Tree<'_>,
-    deleted_paths: &[PathBuf],
-    added_paths: &[PathBuf],
-) -> Vec<RenameCandidate> {
-    let mut candidates = Vec::new();
-    for old_path in deleted_paths {
-        for new_path in added_paths {
-            let path_score = path_token_similarity_score(old_path, new_path);
-            let content_score =
-                content_token_similarity_score(repo, parent_tree, current_tree, old_path, new_path);
-            if continuation_edge_is_safe(old_path, new_path, path_score, content_score, false) {
-                candidates.push(RenameCandidate {
-                    content_score,
-                    native_rename: false,
-                    directory_prefix_len: shared_directory_prefix_len(old_path, new_path),
-                    path_score,
-                    old_path: old_path.clone(),
-                    new_path: new_path.clone(),
-                });
-            }
-        }
-    }
-    candidates
-}
-
-fn pick_best_rename_edges(mut candidates: Vec<RenameCandidate>) -> Vec<(PathBuf, PathBuf)> {
-    candidates.sort_by(|left, right| {
-        right
-            .content_score
-            .partial_cmp(&left.content_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| {
-                right.native_rename.cmp(&left.native_rename)
-            })
-            .then_with(|| {
-                right
-                    .directory_prefix_len
-                    .cmp(&left.directory_prefix_len)
-            })
-            .then_with(|| {
-                right
-                    .path_score
-                    .partial_cmp(&left.path_score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .then_with(|| left.old_path.cmp(&right.old_path))
-            .then_with(|| left.new_path.cmp(&right.new_path))
-    });
-
-    let mut used_old = HashSet::new();
-    let mut used_new = HashSet::new();
-    let mut edges = Vec::new();
-    for candidate in candidates {
-        if used_old.contains(&candidate.old_path) || used_new.contains(&candidate.new_path) {
-            continue;
-        }
-        used_old.insert(candidate.old_path.clone());
-        used_new.insert(candidate.new_path.clone());
-        edges.push((candidate.old_path, candidate.new_path));
-    }
-    edges
-}
-
-fn continuation_edge_is_safe(
-    old_path: &Path,
-    new_path: &Path,
-    path_score: f64,
-    content_score: f64,
-    _native_rename: bool,
-) -> bool {
-    let same_stem = normalized_stem(old_path) == normalized_stem(new_path);
-    let shared_tokens = shared_stem_token_count(old_path, new_path);
-    if same_stem {
-        let min_content = if shared_tokens <= 1 { 35.0 } else { 25.0 };
-        let single_token_ok =
-            shared_tokens > 1 || shared_directory_prefix_len(old_path, new_path) > 0;
-        return path_score >= 60.0 && content_score >= min_content && single_token_ok;
-    } else {
-        shared_tokens >= 2 && path_score >= 60.0 && content_score >= 50.0
-    }
-}
-
-fn shared_directory_prefix_len(old_path: &Path, new_path: &Path) -> usize {
-    old_path
-        .parent()
-        .into_iter()
-        .flat_map(Path::components)
-        .zip(
-            new_path
-                .parent()
-                .into_iter()
-                .flat_map(Path::components),
-        )
-        .take_while(|(left, right)| left == right)
-        .count()
-}
-
-fn shared_stem_token_count(old_path: &Path, new_path: &Path) -> usize {
-    let old_tokens = stem_tokens(old_path);
-    let new_tokens = stem_tokens(new_path);
-    old_tokens.intersection(&new_tokens).count()
-}
-
-fn path_token_similarity_score(old_path: &Path, new_path: &Path) -> f64 {
-    let old_tokens = stem_tokens(old_path);
-    let new_tokens = stem_tokens(new_path);
-    if old_tokens.is_empty() || new_tokens.is_empty() {
-        return 0.0;
-    }
-
-    let overlap = old_tokens.intersection(&new_tokens).count() as f64;
-    (200.0 * overlap) / (old_tokens.len() + new_tokens.len()) as f64
+fn compact_stem_key(path: &Path) -> String {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return String::new();
+    };
+    let stem = file_name
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(file_name);
+    stem.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 fn stem_tokens(path: &Path) -> HashSet<String> {
@@ -873,64 +754,6 @@ fn stem_tokens(path: &Path) -> HashSet<String> {
         .filter(|token| !token.is_empty())
         .map(|token| token.to_ascii_lowercase())
         .collect()
-}
-
-fn normalized_stem(path: &Path) -> String {
-    path.file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-}
-
-fn content_token_similarity_score(
-    repo: &Repository,
-    parent_tree: Option<&git2::Tree<'_>>,
-    current_tree: &git2::Tree<'_>,
-    old_path: &Path,
-    new_path: &Path,
-) -> f64 {
-    GIT_CONTENT_SIM_CALLS.fetch_add(1, Ordering::Relaxed);
-    let Some(old_text) = file_text_at_path(repo, parent_tree, old_path) else {
-        return 0.0;
-    };
-    let Some(new_text) = file_text_at_path(repo, Some(current_tree), new_path) else {
-        return 0.0;
-    };
-    let old_tokens = content_tokens(&old_text);
-    let new_tokens = content_tokens(&new_text);
-    if old_tokens.is_empty() || new_tokens.is_empty() {
-        return 0.0;
-    }
-    let overlap = old_tokens.intersection(&new_tokens).count() as f64;
-    (200.0 * overlap) / (old_tokens.len() + new_tokens.len()) as f64
-}
-
-fn file_text_at_path(
-    repo: &Repository,
-    tree: Option<&git2::Tree<'_>>,
-    path: &Path,
-) -> Option<String> {
-    let entry = tree?.get_path(path).ok()?;
-    GIT_FIND_BLOB_CALLS.fetch_add(1, Ordering::Relaxed);
-    let blob = repo.find_blob(entry.id()).ok()?;
-    std::str::from_utf8(blob.content()).ok().map(str::to_string)
-}
-
-fn content_tokens(text: &str) -> HashSet<String> {
-    GIT_CONTENT_TOKEN_CALLS.fetch_add(1, Ordering::Relaxed);
-    let mut tokens = HashSet::new();
-    let mut current = String::new();
-    for ch in text.chars() {
-        if ch.is_ascii_alphanumeric() {
-            current.push(ch.to_ascii_lowercase());
-        } else if !current.is_empty() {
-            tokens.insert(std::mem::take(&mut current));
-        }
-    }
-    if !current.is_empty() {
-        tokens.insert(current);
-    }
-    tokens
 }
 
 #[derive(Default)]
@@ -1101,23 +924,39 @@ mod tests {
                 root.clone(),
                 "src/VecSim/algorithms/brute_force/brute_force_multi.h",
             ),
+            ProjectFile::new(
+                root.clone(),
+                "src/VecSim/spaces/IP/IP_AVX512_FP32.cpp",
+            ),
+            ProjectFile::new(
+                root.clone(),
+                "src/VecSim/spaces/L2_space.h",
+            ),
+            ProjectFile::new(
+                root.clone(),
+                "src/VecSim/index_factories/brute_force_factory.cpp",
+            ),
+            ProjectFile::new(
+                root.clone(),
+                "tests/benchmark/spaces_benchmarks/bm_spaces_class_definitions.h",
+            ),
         ];
 
         let git = super::related_files_by_git(workspace.analyzer(), &HashMap::from([(seed.clone(), 1.0)]), 100)
             .unwrap();
-        eprintln!("git top 100");
+        println!("git top 100");
         for entry in &git {
             if targets.iter().any(|target| *target == entry.file) {
-                eprintln!("  target git {:.15} {}", entry.score, entry.file.rel_path().display());
+                println!("  target git {:.15} {}", entry.score, entry.file.rel_path().display());
             }
         }
 
         let imports =
             super::related_files_by_imports(workspace.analyzer(), &HashMap::from([(seed, 1.0)]), 100, false);
-        eprintln!("imports top 100");
+        println!("imports top 100");
         for entry in &imports {
             if targets.iter().any(|target| *target == entry.file) {
-                eprintln!(
+                println!(
                     "  target import {:.15} {}",
                     entry.score,
                     entry.file.rel_path().display()
@@ -1127,7 +966,7 @@ mod tests {
         for target in &targets {
             let git_index = git.iter().position(|entry| entry.file == *target);
             let import_index = imports.iter().position(|entry| entry.file == *target);
-            eprintln!(
+            println!(
                 "target {} git_rank={:?} import_rank={:?}",
                 target.rel_path().display(),
                 git_index.map(|index| index + 1),
@@ -1295,160 +1134,6 @@ mod tests {
     }
 
     #[test]
-    fn pick_best_rename_edges_prefers_higher_content_candidate() {
-        let edges = super::pick_best_rename_edges(vec![
-            super::RenameCandidate {
-                content_score: 40.0,
-                native_rename: false,
-                directory_prefix_len: 1,
-                path_score: 95.0,
-                old_path: PathBuf::from("old/bm_spaces_class.cpp"),
-                new_path: PathBuf::from("new/bm_spaces_class_fp32.cpp"),
-            },
-            super::RenameCandidate {
-                content_score: 85.0,
-                native_rename: false,
-                directory_prefix_len: 1,
-                path_score: 80.0,
-                old_path: PathBuf::from("old/bm_spaces_class.cpp"),
-                new_path: PathBuf::from("new/bm_spaces_class_definitions.h"),
-            },
-        ]);
-
-        assert_eq!(
-            vec![(
-                PathBuf::from("old/bm_spaces_class.cpp"),
-                PathBuf::from("new/bm_spaces_class_definitions.h"),
-            )],
-            edges
-        );
-    }
-
-    #[test]
-    fn pick_best_rename_edges_prefers_longer_directory_prefix_on_content_tie() {
-        let edges = super::pick_best_rename_edges(vec![
-            super::RenameCandidate {
-                content_score: 100.0,
-                native_rename: false,
-                directory_prefix_len: 0,
-                path_score: 100.0,
-                old_path: PathBuf::from("tests/astrapy/__init__.py"),
-                new_path: PathBuf::from("astrapy/core/__init__.py"),
-            },
-            super::RenameCandidate {
-                content_score: 100.0,
-                native_rename: false,
-                directory_prefix_len: 1,
-                path_score: 100.0,
-                old_path: PathBuf::from("tests/astrapy/__init__.py"),
-                new_path: PathBuf::from("tests/core/__init__.py"),
-            },
-        ]);
-
-        assert_eq!(
-            vec![(
-                PathBuf::from("tests/astrapy/__init__.py"),
-                PathBuf::from("tests/core/__init__.py"),
-            )],
-            edges
-        );
-    }
-
-    #[test]
-    fn pick_best_rename_edges_prefers_native_rename_on_content_tie() {
-        let edges = super::pick_best_rename_edges(vec![
-            super::RenameCandidate {
-                content_score: 100.0,
-                native_rename: false,
-                directory_prefix_len: 1,
-                path_score: 100.0,
-                old_path: PathBuf::from("tests/astrapy/__init__.py"),
-                new_path: PathBuf::from("tests/core/__init__.py"),
-            },
-            super::RenameCandidate {
-                content_score: 100.0,
-                native_rename: true,
-                directory_prefix_len: 0,
-                path_score: 100.0,
-                old_path: PathBuf::from("tests/astrapy/__init__.py"),
-                new_path: PathBuf::from("astrapy/core/__init__.py"),
-            },
-        ]);
-
-        assert_eq!(
-            vec![(
-                PathBuf::from("tests/astrapy/__init__.py"),
-                PathBuf::from("astrapy/core/__init__.py"),
-            )],
-            edges
-        );
-    }
-
-    #[test]
-    fn pick_best_rename_edges_skips_ambiguous_split_history() {
-        let mut candidates = vec![
-            super::RenameCandidate {
-                content_score: 71.0,
-                native_rename: true,
-                directory_prefix_len: 1,
-                path_score: 100.0,
-                old_path: PathBuf::from("astrapy/idiomatic/__init__.py"),
-                new_path: PathBuf::from("astrapy/core/__init__.py"),
-            },
-            super::RenameCandidate {
-                content_score: 73.0,
-                native_rename: false,
-                directory_prefix_len: 1,
-                path_score: 100.0,
-                old_path: PathBuf::from("astrapy/idiomatic/__init__.py"),
-                new_path: PathBuf::from("astrapy/api/__init__.py"),
-            },
-        ];
-        let ambiguous = [PathBuf::from("astrapy/idiomatic/__init__.py")]
-            .into_iter()
-            .collect::<HashSet<_>>();
-        candidates.retain(|candidate| !ambiguous.contains(&candidate.old_path));
-        let edges = super::pick_best_rename_edges(candidates);
-        assert!(edges.is_empty());
-    }
-
-    #[test]
-    fn fallback_single_token_same_stem_requires_shared_directory_prefix() {
-        assert!(!super::continuation_edge_is_safe(
-            Path::new("astrapy/idiomatic/__init__.py"),
-            Path::new("tests/core/__init__.py"),
-            100.0,
-            100.0,
-            false,
-        ));
-        assert!(super::continuation_edge_is_safe(
-            Path::new("tests/astrapy/__init__.py"),
-            Path::new("tests/core/__init__.py"),
-            100.0,
-            100.0,
-            false,
-        ));
-    }
-
-    #[test]
-    fn native_rename_allows_single_token_same_stem_across_directory_trees() {
-        assert!(super::continuation_edge_is_safe(
-            Path::new("astrapy/idiomatic/__init__.py"),
-            Path::new("astrapy/api/__init__.py"),
-            100.0,
-            40.0,
-            true,
-        ));
-        assert!(!super::continuation_edge_is_safe(
-            Path::new("tests/astrapy/__init__.py"),
-            Path::new("astrapy/core/__init__.py"),
-            100.0,
-            100.0,
-            true,
-        ));
-    }
-
-    #[test]
     #[ignore = "diagnostic"]
     fn debug_git_scores_for_axios_eslintrc_seed() {
         let workspace = workspace_analyzer(Path::new("/home/jonathan/Projects/axios"));
@@ -1545,6 +1230,32 @@ mod tests {
             super::related_files_by_imports(workspace.analyzer(), &HashMap::from([(seed, 1.0)]), 40, false);
         for entry in results {
             eprintln!("{:.15} {}", entry.score, entry.file.rel_path().display());
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn debug_import_scores_for_autogen_checker_seed() {
+        let workspace =
+            workspace_analyzer(Path::new("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen"));
+        let seed = ProjectFile::new(
+            workspace.analyzer().project().root().to_path_buf(),
+            "dotnet/samples/GettingStarted/Checker.cs",
+        );
+        let results =
+            super::related_files_by_imports(workspace.analyzer(), &HashMap::from([(seed, 1.0)]), 100, false);
+        for entry in &results {
+            let path = entry.file.rel_path();
+            if path == Path::new(
+                "dotnet/samples/AgentChat/AutoGen.Anthropic.Sample/Anthropic_Agent_With_Prompt_Caching.cs",
+            ) || path
+                == Path::new("dotnet/samples/AgentChat/AutoGen.Anthropic.Sample/AutoGen.Anthropic.Sample.csproj")
+            {
+                println!("target {:.15} {}", entry.score, entry.file.rel_path().display());
+            }
+        }
+        for entry in results {
+            println!("{:.15} {}", entry.score, entry.file.rel_path().display());
         }
     }
 
@@ -1873,6 +1584,80 @@ mod tests {
 
     #[test]
     #[ignore = "diagnostic"]
+    fn debug_autogen_checker_anthropic_git_terms() {
+        let root = Path::new("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
+        let context = super::GitProjectContext::discover(root).unwrap();
+        let seed = PathBuf::from("dotnet/samples/GettingStarted/Checker.cs");
+        let targets = [
+            PathBuf::from(
+                "dotnet/samples/AgentChat/AutoGen.Anthropic.Sample/Anthropic_Agent_With_Prompt_Caching.cs",
+            ),
+            PathBuf::from(
+                "dotnet/samples/AgentChat/AutoGen.Anthropic.Sample/AutoGen.Anthropic.Sample.csproj",
+            ),
+        ];
+
+        let commits = context.recent_commit_ids(super::COMMITS_TO_PROCESS).unwrap();
+        let baseline_commit_count = commits.len() as f64;
+        let mut file_doc_freq: HashMap<PathBuf, usize> = HashMap::new();
+        let mut joint_mass: HashMap<PathBuf, f64> = HashMap::new();
+        let mut seed_commit_count = 0usize;
+        let mut canonicalizer = super::RenameCanonicalizer::default();
+
+        for oid in &commits {
+            let commit = context.repo.find_commit(*oid).unwrap();
+            let change = context.changed_repo_paths_for_commit(&commit).unwrap();
+            let changed_files = change
+                .paths
+                .into_iter()
+                .map(|path| canonicalizer.canonicalize(&path))
+                .collect::<BTreeSet<_>>();
+            canonicalizer.record_renames(&change.renames);
+            if changed_files.is_empty() {
+                continue;
+            }
+
+            for path in &changed_files {
+                *file_doc_freq.entry(path.clone()).or_insert(0) += 1;
+            }
+
+            if !changed_files.contains(&seed) {
+                continue;
+            }
+            seed_commit_count += 1;
+            let commit_pair_mass = 1.0 / changed_files.len() as f64;
+            for target in &targets {
+                if changed_files.contains(target) {
+                    *joint_mass.entry(target.clone()).or_insert(0.0) += commit_pair_mass;
+                }
+            }
+        }
+
+        for target in &targets {
+            let df = file_doc_freq.get(target).copied().unwrap_or(0).max(1) as f64;
+            let joint = joint_mass.get(target).copied().unwrap_or(0.0);
+            let conditional = if seed_commit_count == 0 {
+                0.0
+            } else {
+                joint / seed_commit_count as f64
+            };
+            let idf = (1.0 + baseline_commit_count / df).ln();
+            let score = conditional * idf;
+            println!(
+                "{} df={} seed_den={} joint={:.15} conditional={:.15} idf={:.15} score={:.15}",
+                target.display(),
+                df as usize,
+                seed_commit_count,
+                joint,
+                conditional,
+                idf,
+                score
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
     fn debug_autogen_hello_ai_agents_git_stats() {
         let root = Path::new("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
         let context = super::GitProjectContext::discover(root).unwrap();
@@ -2125,6 +1910,46 @@ mod tests {
         }
 
         assert_eq!(3, doc_freq);
+    }
+
+    #[test]
+    fn native_rename_sanity_accepts_installation_doc_rename() {
+        assert!(super::native_rename_is_safe(
+            Path::new("docs/dotnet/user-guide/core-user-guide/installation.md"),
+            Path::new("docs/dotnet/core/installation.md"),
+        ));
+    }
+
+    #[test]
+    fn native_rename_sanity_accepts_agent_host_casing_rename() {
+        assert!(super::native_rename_is_safe(
+            Path::new("dotnet/src/Microsoft.AutoGen/AgentHost/Microsoft.Autogen.AgentHost.csproj"),
+            Path::new("dotnet/src/Microsoft.AutoGen/AgentHost/Microsoft.AutoGen.AgentHost.csproj"),
+        ));
+    }
+
+    #[test]
+    fn native_rename_sanity_rejects_agent_runtime_to_inprocess() {
+        assert!(!super::native_rename_is_safe(
+            Path::new("dotnet/test/Microsoft.AutoGen.Core.Tests/AgentRuntimeTests.cs"),
+            Path::new("dotnet/test/Microsoft.AutoGen.Core.Tests/InProcessRuntimeTests.cs"),
+        ));
+    }
+
+    #[test]
+    fn native_rename_sanity_rejects_anthropic_samples_pluralization() {
+        assert!(!super::native_rename_is_safe(
+            Path::new("dotnet/samples/AutoGen.Anthropic.Samples/AutoGen.Anthropic.Samples.csproj"),
+            Path::new("dotnet/samples/AgentChat/AutoGen.Anthropic.Sample/AutoGen.Anthropic.Sample.csproj"),
+        ));
+    }
+
+    #[test]
+    fn native_rename_sanity_rejects_vector_similarity_definitions_suffix() {
+        assert!(!super::native_rename_is_safe(
+            Path::new("tests/benchmark/bm_spaces_class.cpp"),
+            Path::new("tests/benchmark/spaces_benchmarks/bm_spaces_class_definitions.h"),
+        ));
     }
 
     #[test]
