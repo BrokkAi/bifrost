@@ -8,7 +8,6 @@ At the tool level, this repository also provides:
 
 - `bifrost`, a stdio MCP server that exposes analyzer-backed search tools
 - `bifrost_searchtools`, a Python client package backed by a native Rust extension
-- `summarize`, a small Java-only CLI for Brokk-style summary output
 
 ## Status
 
@@ -34,7 +33,6 @@ The repository vendors Brokk's Tree-sitter query files under [resources/treesitt
 - [src/searchtools_service.rs](/home/jonathan/Projects/bifrost/src/searchtools_service.rs): shared JSON tool service used by both MCP and Python FFI
 - [src/mcp_server.rs](/home/jonathan/Projects/bifrost/src/mcp_server.rs): MCP stdio server implementation for `bifrost --server searchtools`
 - [src/bin/bifrost.rs](/home/jonathan/Projects/bifrost/src/bin/bifrost.rs): `bifrost` binary entrypoint
-- [src/bin/summarize.rs](/home/jonathan/Projects/bifrost/src/bin/summarize.rs): Java summary CLI
 - [bifrost_searchtools](/home/jonathan/Projects/bifrost/bifrost_searchtools): Python FFI client and renderers
 - [python_tests](/home/jonathan/Projects/bifrost/python_tests): Python client tests
 - [tests](/home/jonathan/Projects/bifrost/tests): Rust integration tests
@@ -167,24 +165,6 @@ The client talks directly to Rust through a native extension module. The Python/
 - summaries use original line ranges in `N..M: ...` form on the first line
 
 For repo-local development without installing the package, `SearchToolsClient(..., library_path=...)` can load a built debug library such as `target/debug/libbrokk_analyzer.so`.
-
-## `summarize` CLI
-
-The `summarize` binary is currently Java-only.
-
-Build and run:
-
-```bash
-cargo build --bin summarize
-./target/debug/summarize --root tests/fixtures/testcode-java A
-```
-
-It accepts:
-
-- absolute file paths under the chosen root
-- Java FQCNs
-
-and prints Brokk-style summaries using the Rust analyzer implementation.
 
 ## Notes
 
