@@ -566,11 +566,19 @@ fn signature_elements(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> Vec<Sum
                 return None;
             }
 
-            let line_count = text.lines().count().max(1);
             let start_line = ranges
                 .get(index)
                 .map(|range| range.start_line)
                 .unwrap_or(fallback_start);
+            let signature_line_count = text.lines().count().max(1);
+            let range_line_count = ranges
+                .get(index)
+                .map(|range| range
+                    .end_line
+                    .saturating_sub(range.start_line)
+                    .saturating_add(1))
+                .unwrap_or(1);
+            let line_count = signature_line_count.max(range_line_count);
             let end_line = start_line + line_count.saturating_sub(1);
             Some(SummaryElement {
                 path: path.clone(),

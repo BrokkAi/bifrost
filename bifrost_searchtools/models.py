@@ -135,7 +135,10 @@ class SummaryElement:
         lines = self.text.splitlines()
         if not lines:
             return ""
-        prefix = f"{self.start_line}..{self.end_line}: {lines[0]}"
+        if self.start_line == self.end_line:
+            prefix = f"{self.start_line}: {lines[0]}"
+        else:
+            prefix = f"{self.start_line}..{self.end_line}: {lines[0]}"
         return "\n".join([prefix, *lines[1:]])
 
 

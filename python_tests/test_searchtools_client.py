@@ -37,9 +37,9 @@ class SearchToolsClientTest(unittest.TestCase):
             text = summaries.render_text()
 
         self.assertIn("A.java", text)
-        self.assertIn("3..3: public class A", text)
-        self.assertIn("8..8: public String method2(String input)", text)
-        self.assertIn("41..41: public void method7()", text)
+        self.assertIn("3..52: public class A", text)
+        self.assertIn("8..10: public String method2(String input)", text)
+        self.assertIn("41..43: public void method7()", text)
         self.assertNotIn("[...]", text)
         self.assertNotIn("{", text)
 

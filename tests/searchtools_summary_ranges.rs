@@ -1,9 +1,9 @@
 use brokk_analyzer::{
-    JavaAnalyzer, Language, TestProject,
+    GoAnalyzer, JavaAnalyzer, Language, TestProject,
     searchtools::{FilePatternsParams, SummaryElement, get_file_summaries},
 };
 
-fn fixture_analyzer() -> JavaAnalyzer {
+fn java_fixture_analyzer() -> JavaAnalyzer {
     let root = std::env::current_dir()
         .unwrap()
         .join("tests/fixtures/testcode-java")
@@ -13,13 +13,24 @@ fn fixture_analyzer() -> JavaAnalyzer {
     JavaAnalyzer::from_project(project)
 }
 
+fn go_fixture_analyzer() -> GoAnalyzer {
+    let root = std::env::current_dir()
+        .unwrap()
+        .join("tests/fixtures/testcode-go")
+        .canonicalize()
+        .unwrap();
+    let project = TestProject::new(root, Language::Go);
+    GoAnalyzer::from_project(project)
+}
+
 fn render_summary_element(element: &SummaryElement) -> String {
     let mut lines = element.text.lines();
     let first_line = lines.next().unwrap_or_default();
-    let prefix = format!(
-        "{}..{}: {}",
-        element.start_line, element.end_line, first_line
-    );
+    let prefix = if element.start_line == element.end_line {
+        format!("{}: {}", element.start_line, first_line)
+    } else {
+        format!("{}..{}: {}", element.start_line, element.end_line, first_line)
+    };
 
     std::iter::once(prefix)
         .chain(lines.map(str::to_string))
@@ -29,7 +40,7 @@ fn render_summary_element(element: &SummaryElement) -> String {
 
 #[test]
 fn file_summaries_preserve_fixture_line_numbers() {
-    let analyzer = fixture_analyzer();
+    let analyzer = java_fixture_analyzer();
     let result = get_file_summaries(
         &analyzer,
         FilePatternsParams {
@@ -49,23 +60,21 @@ fn file_summaries_preserve_fixture_line_numbers() {
         .iter()
         .map(render_summary_element)
         .collect();
-    assert!(rendered.contains(&"3..3: public class A".to_string()));
-    assert!(rendered.contains(&"4..4: void method1()".to_string()));
-    assert!(rendered.contains(&"8..8: public String method2(String input)".to_string()));
+    assert!(rendered.contains(&"3..52: public class A".to_string()));
+    assert!(rendered.contains(&"4..6: void method1()".to_string()));
+    assert!(rendered.contains(&"8..10: public String method2(String input)".to_string()));
     assert!(
-        rendered
-            .contains(&"12..12: public String method2(String input, int otherInput)".to_string())
+        rendered.contains(&"12..15: public String method2(String input, int otherInput)".to_string())
     );
-    assert!(rendered.contains(&"17..17: public Function<Integer, Integer> method3()".to_string()));
+    assert!(rendered.contains(&"17..19: public Function<Integer, Integer> method3()".to_string()));
     assert!(
-        rendered
-            .contains(&"21..21: public static int method4(double foo, Integer bar)".to_string())
+        rendered.contains(&"21..23: public static int method4(double foo, Integer bar)".to_string())
     );
-    assert!(rendered.contains(&"39..39: public class AInner".to_string()));
-    assert!(rendered.contains(&"40..40: public class AInnerInner".to_string()));
-    assert!(rendered.contains(&"41..41: public void method7()".to_string()));
-    assert!(rendered.contains(&"47..47: public static class AInnerStatic".to_string()));
-    assert!(rendered.contains(&"49..49: private void usesInnerClass()".to_string()));
+    assert!(rendered.contains(&"39..45: public class AInner".to_string()));
+    assert!(rendered.contains(&"40..44: public class AInnerInner".to_string()));
+    assert!(rendered.contains(&"41..43: public void method7()".to_string()));
+    assert!(rendered.contains(&"47: public static class AInnerStatic".to_string()));
+    assert!(rendered.contains(&"49..51: private void usesInnerClass()".to_string()));
 
     assert!(
         summary
@@ -79,6 +88,36 @@ fn file_summaries_preserve_fixture_line_numbers() {
             .iter()
             .all(|element| !element.text.lines().any(|line| line.trim() == "}"))
     );
+}
+
+#[test]
+fn go_file_summaries_use_full_declaration_ranges() {
+    let analyzer = go_fixture_analyzer();
+    let result = get_file_summaries(
+        &analyzer,
+        FilePatternsParams {
+            file_patterns: vec!["declarations.go".to_string()],
+        },
+    );
+
+    assert!(result.not_found.is_empty());
+    assert_eq!(1, result.summaries.len());
+
+    let summary = &result.summaries[0];
+    assert_eq!("declarations.go", summary.path);
+    assert_eq!("declarations.go", summary.label);
+
+    let rendered: Vec<_> = summary
+        .elements
+        .iter()
+        .map(render_summary_element)
+        .collect();
+
+    assert!(rendered.contains(&"6..8: func MyTopLevelFunction(param int) string".to_string()));
+    assert!(rendered.contains(&"10..12: type MyStruct struct".to_string()));
+    assert!(rendered.contains(&"14..16: type MyInterface interface".to_string()));
+    assert!(rendered.contains(&"19..21: func (s MyStruct) GetFieldA() int".to_string()));
+    assert!(rendered.contains(&"34: func anotherFunc()".to_string()));
 }
 
 #[test]
