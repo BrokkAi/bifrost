@@ -61,7 +61,10 @@ struct FileState {
 struct AnalyzerState {
     files: BTreeMap<ProjectFile, FileState>,
     definitions: BTreeMap<String, Vec<CodeUnit>>,
+    // Child lists are canonicalized here once during indexing so every
+    // `get_direct_children` caller sees the same deduped, source-ordered view.
     children: BTreeMap<CodeUnit, Vec<CodeUnit>>,
+    module_children: BTreeMap<String, Vec<CodeUnit>>,
     ranges: BTreeMap<CodeUnit, Vec<Range>>,
     raw_supertypes: BTreeMap<CodeUnit, Vec<String>>,
     signatures: BTreeMap<CodeUnit, Vec<String>>,
@@ -211,6 +214,25 @@ impl<A> TreeSitterAnalyzer<A>
 where
     A: LanguageAdapter,
 {
+    fn child_order_key(ranges: &BTreeMap<CodeUnit, Vec<Range>>, code_unit: &CodeUnit) -> usize {
+        ranges
+            .get(code_unit)
+            .into_iter()
+            .flatten()
+            .map(|range| range.start_byte)
+            .min()
+            .unwrap_or(usize::MAX)
+    }
+
+    fn canonicalize_children(
+        descendants: &mut Vec<CodeUnit>,
+        ranges: &BTreeMap<CodeUnit, Vec<Range>>,
+    ) {
+        descendants.sort();
+        descendants.dedup();
+        descendants.sort_by_key(|child| Self::child_order_key(ranges, child));
+    }
+
     fn definition_sort_key(
         adapter: &A,
         ranges: &BTreeMap<CodeUnit, Vec<Range>>,
@@ -237,8 +259,10 @@ where
     pub fn new_with_config(project: Arc<dyn Project>, adapter: A, config: AnalyzerConfig) -> Self {
         let adapter = Arc::new(adapter);
         let state = {
-            let _scope =
-                profiling::scope(format!("TreeSitterAnalyzer::{:?}::new_with_config", adapter.language()));
+            let _scope = profiling::scope(format!(
+                "TreeSitterAnalyzer::{:?}::new_with_config",
+                adapter.language()
+            ));
             Arc::new(Self::build_state(
                 project.as_ref(),
                 adapter.as_ref(),
@@ -399,7 +423,10 @@ where
         existing: Option<&AnalyzerState>,
         progress: Option<BuildProgress>,
     ) -> AnalyzerState {
-        let _scope = profiling::scope(format!("TreeSitterAnalyzer::{:?}::build_state", adapter.language()));
+        let _scope = profiling::scope(format!(
+            "TreeSitterAnalyzer::{:?}::build_state",
+            adapter.language()
+        ));
         let mut files = existing
             .map(|state| state.files.clone())
             .unwrap_or_default();
@@ -428,8 +455,10 @@ where
         }
 
         {
-            let _scope =
-                profiling::scope(format!("TreeSitterAnalyzer::{:?}::index_state", adapter.language()));
+            let _scope = profiling::scope(format!(
+                "TreeSitterAnalyzer::{:?}::index_state",
+                adapter.language()
+            ));
             Self::index_state(files, project, adapter)
         }
     }
@@ -441,6 +470,7 @@ where
     ) -> AnalyzerState {
         let mut definitions = BTreeMap::<String, Vec<CodeUnit>>::new();
         let mut children = BTreeMap::<CodeUnit, Vec<CodeUnit>>::new();
+        let mut module_children = BTreeMap::<String, Vec<CodeUnit>>::new();
         let mut ranges = BTreeMap::<CodeUnit, Vec<Range>>::new();
         let mut raw_supertypes = BTreeMap::<CodeUnit, Vec<String>>::new();
         let mut signatures = BTreeMap::<CodeUnit, Vec<String>>::new();
@@ -482,9 +512,18 @@ where
             type_aliases.extend(state.type_aliases.iter().cloned());
         }
 
-        for descendants in children.values_mut() {
-            descendants.sort();
-            descendants.dedup();
+        for (parent, descendants) in children.iter_mut() {
+            Self::canonicalize_children(descendants, &ranges);
+            if parent.is_module() {
+                module_children
+                    .entry(adapter.normalize_full_name(&parent.fq_name()))
+                    .or_default()
+                    .extend(descendants.iter().cloned());
+            }
+        }
+
+        for descendants in module_children.values_mut() {
+            Self::canonicalize_children(descendants, &ranges);
         }
 
         for matches in definitions.values_mut() {
@@ -500,6 +539,7 @@ where
             files,
             definitions,
             children,
+            module_children,
             ranges,
             raw_supertypes,
             signatures,
@@ -736,35 +776,20 @@ where
     }
 
     fn get_direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        let mut children = if code_unit.is_module() {
+        if code_unit.is_module() {
             let target_name = self.adapter.normalize_full_name(&code_unit.fq_name());
             self.state
-                .children
-                .iter()
-                .filter(|(parent, _)| {
-                    parent.is_module()
-                        && self.adapter.normalize_full_name(&parent.fq_name()) == target_name
-                })
-                .flat_map(|(_, descendants)| descendants.iter().cloned())
-                .collect::<Vec<_>>()
+                .module_children
+                .get(&target_name)
+                .cloned()
+                .unwrap_or_default()
         } else {
             self.state
                 .children
                 .get(code_unit)
                 .cloned()
                 .unwrap_or_default()
-        };
-
-        children.sort();
-        children.dedup();
-        children.sort_by_key(|child| {
-            self.ranges_of(child)
-                .into_iter()
-                .map(|range| range.start_byte)
-                .min()
-                .unwrap_or(usize::MAX)
-        });
-        children
+        }
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {

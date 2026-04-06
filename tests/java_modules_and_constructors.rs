@@ -35,6 +35,28 @@ fn creates_package_module_with_top_level_children() {
 }
 
 #[test]
+fn merges_package_module_children_once_in_canonical_order() {
+    let analyzer = analyzer_for(&[
+        ("p1/A.java", "package p1; class A {}"),
+        ("p1/B.java", "\n\npackage p1; class B {}"),
+        ("p1/C.java", "package p1; class C {}"),
+    ]);
+
+    let module = analyzer.get_definitions("p1").into_iter().next().unwrap();
+    assert!(module.is_module());
+
+    let children: Vec<_> = analyzer
+        .get_direct_children(&module)
+        .into_iter()
+        .map(|code_unit| code_unit.fq_name())
+        .collect();
+    assert_eq!(
+        vec!["p1.A".to_string(), "p1.C".to_string(), "p1.B".to_string()],
+        children
+    );
+}
+
+#[test]
 fn synthesizes_implicit_constructor_for_plain_class_only() {
     let analyzer = analyzer_for(&[
         ("Foo.java", "public class Foo {}"),
