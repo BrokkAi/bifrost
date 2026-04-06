@@ -39,12 +39,12 @@ impl SearchToolsNativeSession {
 
         match result {
             Ok(payload) => Ok(payload),
-            Err(CallToolError::Closed) => {
-                Err(PyRuntimeError::new_err("SearchToolsNativeSession is closed"))
-            }
-            Err(CallToolError::LockPoisoned) => {
-                Err(PyRuntimeError::new_err("SearchToolsNativeSession lock poisoned"))
-            }
+            Err(CallToolError::Closed) => Err(PyRuntimeError::new_err(
+                "SearchToolsNativeSession is closed",
+            )),
+            Err(CallToolError::LockPoisoned) => Err(PyRuntimeError::new_err(
+                "SearchToolsNativeSession lock poisoned",
+            )),
             Err(CallToolError::Service(err)) => Err(service_error_to_py(err)),
         }
     }

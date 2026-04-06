@@ -161,7 +161,10 @@ fn test_rust_referencing_files_uses_resolved_import_targets() {
             "#,
         ),
     ]));
-    let target = ProjectFile::new(analyzer.project().root().to_path_buf(), "src/shared/models.rs");
+    let target = ProjectFile::new(
+        analyzer.project().root().to_path_buf(),
+        "src/shared/models.rs",
+    );
     let consumer = ProjectFile::new(analyzer.project().root().to_path_buf(), "src/main.rs");
 
     assert_eq!(

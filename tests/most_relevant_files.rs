@@ -360,7 +360,8 @@ fn go_stdlib_import_does_not_resolve_internal_package_by_last_segment() {
     assert!(
         imported
             .iter()
-            .all(|code_unit| code_unit.source() != &internal_fs && code_unit.source() != &internal_fs_test),
+            .all(|code_unit| code_unit.source() != &internal_fs
+                && code_unit.source() != &internal_fs_test),
         "stdlib import io/fs should not resolve to project internal/fs: {:?}",
         imported
             .iter()
@@ -654,15 +655,29 @@ fn consolidation_commit_does_not_merge_deleted_file_history_into_new_file() {
     );
 
     let repo = Repository::init(root).unwrap();
-    commit_paths(&repo, "initial", &["Seed.java", "OldA.java", "OldB.java"], &[]);
+    commit_paths(
+        &repo,
+        "initial",
+        &["Seed.java", "OldA.java", "OldB.java"],
+        &[],
+    );
 
-    fs::write(root.join("Seed.java"), "public class Seed { int use() { return 1; } }").unwrap();
+    fs::write(
+        root.join("Seed.java"),
+        "public class Seed { int use() { return 1; } }",
+    )
+    .unwrap();
     fs::write(
         root.join("OldA.java"),
         "public class OldA { int value() { return 10; } }",
     )
     .unwrap();
-    commit_paths(&repo, "seed cochanges with old a", &["Seed.java", "OldA.java"], &[]);
+    commit_paths(
+        &repo,
+        "seed cochanges with old a",
+        &["Seed.java", "OldA.java"],
+        &[],
+    );
 
     let old_a_contents = fs::read_to_string(root.join("OldA.java")).unwrap();
     fs::remove_file(root.join("OldA.java")).unwrap();
@@ -992,7 +1007,8 @@ fn matches_brokk_reference_for_plume_imports_test8_base_seed() {
 
 #[test]
 fn matches_brokk_reference_for_autogen_checker_seed() {
-    let project_root = PathBuf::from("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
+    let project_root =
+        PathBuf::from("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
     let brokk_root = brokk_app_root();
     if !brokk_root.is_dir() || !project_root.is_dir() {
         eprintln!("skipping autogen parity regression: repo not present");
@@ -1017,7 +1033,8 @@ fn matches_brokk_reference_for_autogen_checker_seed() {
 
 #[test]
 fn matches_brokk_reference_for_autogen_hello_ai_agents_program_seed() {
-    let project_root = PathBuf::from("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
+    let project_root =
+        PathBuf::from("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
     let brokk_root = brokk_app_root();
     if !brokk_root.is_dir() || !project_root.is_dir() {
         eprintln!("skipping autogen parity regression: repo not present");
@@ -1042,7 +1059,8 @@ fn matches_brokk_reference_for_autogen_hello_ai_agents_program_seed() {
 
 #[test]
 fn matches_brokk_reference_for_autogen_hello_agent_program_seed() {
-    let project_root = PathBuf::from("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
+    let project_root =
+        PathBuf::from("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
     let brokk_root = brokk_app_root();
     if !brokk_root.is_dir() || !project_root.is_dir() {
         eprintln!("skipping autogen parity regression: repo not present");
@@ -1067,7 +1085,8 @@ fn matches_brokk_reference_for_autogen_hello_agent_program_seed() {
 
 #[test]
 fn matches_brokk_reference_for_autogen_topicid_and_inmemoryruntime_pair() {
-    let project_root = PathBuf::from("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
+    let project_root =
+        PathBuf::from("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
     let brokk_root = brokk_app_root();
     if !brokk_root.is_dir() || !project_root.is_dir() {
         eprintln!("skipping autogen parity regression: repo not present");
@@ -1076,7 +1095,8 @@ fn matches_brokk_reference_for_autogen_topicid_and_inmemoryruntime_pair() {
 
     let seeds = vec![
         "dotnet/src/Microsoft.AutoGen/Contracts/TopicId.cs".to_string(),
-        "dotnet/test/Microsoft.AutoGen.Integration.Tests/InMemoryRuntimeIntegrationTests.cs".to_string(),
+        "dotnet/test/Microsoft.AutoGen.Integration.Tests/InMemoryRuntimeIntegrationTests.cs"
+            .to_string(),
     ];
     let project = Arc::new(FilesystemProject::new(&project_root).unwrap());
     let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
@@ -1251,35 +1271,37 @@ fn matches_brokk_reference_for_100_random_seed_files() {
             let next = &next;
             let completed = &completed;
             let stop = &stop;
-            scope.spawn(move || loop {
-                if stop.load(Ordering::Relaxed) {
-                    break;
-                }
-
-                let idx = next.fetch_add(1, Ordering::Relaxed);
-                let Some((case_index, seeds, bifrost)) = cases.get(idx) else {
-                    break;
-                };
-
-                let brokk = brokk_cli_direct(&brokk_root, &project_root, seeds);
-                if brokk != *bifrost {
-                    let mut slot = mismatch.lock().unwrap();
-                    if slot.is_none() {
-                        *slot = Some(mismatch_summary(seeds, &brokk, bifrost));
-                        eprintln!(
-                            "single parity mismatch at case {}/{} seeds={:?}",
-                            case_index + 1,
-                            cases.len(),
-                            seeds
-                        );
+            scope.spawn(move || {
+                loop {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
                     }
-                    stop.store(true, Ordering::Relaxed);
-                    break;
-                }
 
-                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                if done == 1 || done % 10 == 0 || done == cases.len() {
-                    eprintln!("single parity progress {}/{}", done, cases.len());
+                    let idx = next.fetch_add(1, Ordering::Relaxed);
+                    let Some((case_index, seeds, bifrost)) = cases.get(idx) else {
+                        break;
+                    };
+
+                    let brokk = brokk_cli_direct(&brokk_root, &project_root, seeds);
+                    if brokk != *bifrost {
+                        let mut slot = mismatch.lock().unwrap();
+                        if slot.is_none() {
+                            *slot = Some(mismatch_summary(seeds, &brokk, bifrost));
+                            eprintln!(
+                                "single parity mismatch at case {}/{} seeds={:?}",
+                                case_index + 1,
+                                cases.len(),
+                                seeds
+                            );
+                        }
+                        stop.store(true, Ordering::Relaxed);
+                        break;
+                    }
+
+                    let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                    if done == 1 || done % 10 == 0 || done == cases.len() {
+                        eprintln!("single parity progress {}/{}", done, cases.len());
+                    }
                 }
             });
         }
@@ -1351,35 +1373,37 @@ fn matches_brokk_reference_for_100_random_seed_pairs() {
             let next = &next;
             let completed = &completed;
             let stop = &stop;
-            scope.spawn(move || loop {
-                if stop.load(Ordering::Relaxed) {
-                    break;
-                }
-
-                let idx = next.fetch_add(1, Ordering::Relaxed);
-                let Some((case_index, seeds, bifrost)) = cases.get(idx) else {
-                    break;
-                };
-
-                let brokk = brokk_cli_direct(&brokk_root, &project_root, seeds);
-                if brokk != *bifrost {
-                    let mut slot = mismatch.lock().unwrap();
-                    if slot.is_none() {
-                        *slot = Some(mismatch_summary(seeds, &brokk, bifrost));
-                        eprintln!(
-                            "pair parity mismatch at case {}/{} seeds={:?}",
-                            case_index + 1,
-                            cases.len(),
-                            seeds
-                        );
+            scope.spawn(move || {
+                loop {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
                     }
-                    stop.store(true, Ordering::Relaxed);
-                    break;
-                }
 
-                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                if done == 1 || done % 10 == 0 || done == cases.len() {
-                    eprintln!("pair parity progress {}/{}", done, cases.len());
+                    let idx = next.fetch_add(1, Ordering::Relaxed);
+                    let Some((case_index, seeds, bifrost)) = cases.get(idx) else {
+                        break;
+                    };
+
+                    let brokk = brokk_cli_direct(&brokk_root, &project_root, seeds);
+                    if brokk != *bifrost {
+                        let mut slot = mismatch.lock().unwrap();
+                        if slot.is_none() {
+                            *slot = Some(mismatch_summary(seeds, &brokk, bifrost));
+                            eprintln!(
+                                "pair parity mismatch at case {}/{} seeds={:?}",
+                                case_index + 1,
+                                cases.len(),
+                                seeds
+                            );
+                        }
+                        stop.store(true, Ordering::Relaxed);
+                        break;
+                    }
+
+                    let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                    if done == 1 || done % 10 == 0 || done == cases.len() {
+                        eprintln!("pair parity progress {}/{}", done, cases.len());
+                    }
                 }
             });
         }

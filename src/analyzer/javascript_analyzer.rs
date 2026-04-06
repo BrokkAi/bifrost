@@ -1247,7 +1247,8 @@ mod tests {
 
     #[test]
     fn parses_mixed_typescript_named_imports_with_inline_type_modifiers() {
-        let imports = parse_js_import_infos("import { type BubbleState, SummaryState } from '../types';");
+        let imports =
+            parse_js_import_infos("import { type BubbleState, SummaryState } from '../types';");
         let identifiers = imports
             .into_iter()
             .map(|import| import.identifier.unwrap_or_default())

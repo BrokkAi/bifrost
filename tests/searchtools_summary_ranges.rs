@@ -29,7 +29,10 @@ fn render_summary_element(element: &SummaryElement) -> String {
     let prefix = if element.start_line == element.end_line {
         format!("{}: {}", element.start_line, first_line)
     } else {
-        format!("{}..{}: {}", element.start_line, element.end_line, first_line)
+        format!(
+            "{}..{}: {}",
+            element.start_line, element.end_line, first_line
+        )
     };
 
     std::iter::once(prefix)
@@ -64,11 +67,13 @@ fn file_summaries_preserve_fixture_line_numbers() {
     assert!(rendered.contains(&"4..6: void method1()".to_string()));
     assert!(rendered.contains(&"8..10: public String method2(String input)".to_string()));
     assert!(
-        rendered.contains(&"12..15: public String method2(String input, int otherInput)".to_string())
+        rendered
+            .contains(&"12..15: public String method2(String input, int otherInput)".to_string())
     );
     assert!(rendered.contains(&"17..19: public Function<Integer, Integer> method3()".to_string()));
     assert!(
-        rendered.contains(&"21..23: public static int method4(double foo, Integer bar)".to_string())
+        rendered
+            .contains(&"21..23: public static int method4(double foo, Integer bar)".to_string())
     );
     assert!(rendered.contains(&"39..45: public class AInner".to_string()));
     assert!(rendered.contains(&"40..44: public class AInnerInner".to_string()));

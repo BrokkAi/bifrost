@@ -15,5 +15,8 @@ fn workspace_build_for_languages_limits_analyzer_set() {
         &BTreeSet::from([Language::Python]),
     );
 
-    assert_eq!(BTreeSet::from([Language::Python]), workspace.analyzer().languages());
+    assert_eq!(
+        BTreeSet::from([Language::Python]),
+        workspace.analyzer().languages()
+    );
 }

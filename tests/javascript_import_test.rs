@@ -270,7 +270,11 @@ fn test_resolve_imports_and_import_variants() {
 fn default_import_of_aggregator_module_keeps_module_file() {
     let temp = tempdir().unwrap();
     let root = temp.path();
-    write_file(root, "lib/axios.js", "export default { create() { return {}; } };\n");
+    write_file(
+        root,
+        "lib/axios.js",
+        "export default { create() { return {}; } };\n",
+    );
     write_file(
         root,
         "index.js",
@@ -283,8 +287,8 @@ fn default_import_of_aggregator_module_keeps_module_file() {
     );
 
     let analyzer = analyzer_for(root);
-    let imports =
-        analyzer.imported_code_units_of(&ProjectFile::new(root.to_path_buf(), "bin/githubAxios.js"));
+    let imports = analyzer
+        .imported_code_units_of(&ProjectFile::new(root.to_path_buf(), "bin/githubAxios.js"));
 
     assert!(
         imports
@@ -517,7 +521,11 @@ fn test_extract_type_identifiers_and_relevant_imports() {
 fn test_referencing_files_uses_resolved_import_targets() {
     let temp = tempdir().unwrap();
     let root = temp.path();
-    write_file(root, "lib/index.js", "export function libFunc() { return 'lib'; }\n");
+    write_file(
+        root,
+        "lib/index.js",
+        "export function libFunc() { return 'lib'; }\n",
+    );
     write_file(
         root,
         "consumer.js",
