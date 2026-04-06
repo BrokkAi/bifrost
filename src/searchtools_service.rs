@@ -61,7 +61,6 @@ impl std::error::Error for SearchToolsServiceError {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UpdateStrategy {
     WatchFiles,
-    RefreshBeforeEachCall,
 }
 
 pub struct SearchToolsService {
@@ -76,7 +75,7 @@ impl SearchToolsService {
     }
 
     pub fn new_for_python(root: PathBuf) -> Result<Self, String> {
-        Self::new_with_strategy(root, UpdateStrategy::RefreshBeforeEachCall)
+        Self::new_with_strategy(root, UpdateStrategy::WatchFiles)
     }
 
     pub fn call_tool_json(
@@ -144,7 +143,6 @@ impl SearchToolsService {
         let workspace = WorkspaceAnalyzer::build(Arc::clone(&project), AnalyzerConfig::default());
         let watcher = match update_strategy {
             UpdateStrategy::WatchFiles => ProjectChangeWatcher::start(project).ok(),
-            UpdateStrategy::RefreshBeforeEachCall => None,
         };
 
         Ok(Self {
@@ -167,9 +165,6 @@ impl SearchToolsService {
     fn prepare_for_call(&mut self) {
         match self.update_strategy {
             UpdateStrategy::WatchFiles => self.apply_watcher_delta(),
-            UpdateStrategy::RefreshBeforeEachCall => {
-                self.workspace = self.workspace.update_all();
-            }
         }
     }
 
