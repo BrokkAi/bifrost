@@ -163,9 +163,33 @@ pub enum WorkspaceAnalyzer {
 
 impl WorkspaceAnalyzer {
     pub fn build(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
+        Self::build_filtered(project, config, None)
+    }
+
+    pub fn build_for_languages(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        languages: &BTreeSet<Language>,
+    ) -> Self {
+        Self::build_filtered(project, config, Some(languages))
+    }
+
+    fn build_filtered(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        requested_languages: Option<&BTreeSet<Language>>,
+    ) -> Self {
         let _scope = profiling::scope("WorkspaceAnalyzer::build");
         let mut delegates = BTreeMap::new();
-        for language in project.analyzer_languages() {
+        let project_languages = project.analyzer_languages();
+        let selected_languages: Vec<_> = match requested_languages {
+            Some(requested) if !requested.is_empty() => project_languages
+                .into_iter()
+                .filter(|language| requested.contains(language))
+                .collect(),
+            _ => project_languages.into_iter().collect(),
+        };
+        for language in selected_languages {
             let delegate = {
                 let _scope = profiling::scope(format!("WorkspaceAnalyzer::build[{language:?}]"));
                 match language {

@@ -31,6 +31,7 @@ After this change, bifrost and Brokk will both expose a small command-line tool 
 - [x] (2026-04-05 22:05Z) Added synchronized design-doc comments at the main Git relevance entry points in bifrost and Brokk, documenting the shared parity-sensitive rules and the requirement to update both docs together with the code.
 - [x] (2026-04-05 23:35Z) Simplified the shared post-continuation Git lineage contract: no add/delete continuation inference, and lineage now starts only from native `RENAME` labels. The remaining cross-library drift was narrowed to borderline rename labels, so the shared rule is now: native rename only, plus cheap synchronizers on that same edge only. A native rename becomes lineage only if it actually replaces the old path with the new path across the commit boundary, and the old/new files still pass the shared compact-stem plus direct token-overlap sanity check.
 - [x] (2026-04-06 04:10Z) Root-caused the remaining large-repo Python timeout in bifrost to Python reverse-import lookup, not analyzer build or Git. `django/__init__.py` was stalling because the first reverse lookup scanned every analyzed Python file and re-resolved imports on demand. Replacing that scan with a one-time reverse-import index and a precomputed module-name map brought `django/__init__.py` down to about `9.2s` cold and `litellm/__init__.py` down to about `6.9s` cold under the current native-rename-only Git contract.
+- [x] (2026-04-06 04:35Z) Reduced direct CLI cold-start overhead on mixed-language repos by letting `src/bin/most_relevant_files.rs` build only the analyzer languages implied by the seed files. For pure-Python seeds in `litellm`, that removes unnecessary JavaScript and TypeScript analyzer startup and drops the cold run from about `6.9s` to about `5.4s`.
 - [ ] (2026-04-04 22:50Z) Rerun deterministic cross-language single-seed sweeps against representative repos for each supported language and turn any survivor into a failing automated test before changing code.
 - [ ] (2026-04-04 22:50Z) Only after the single-seed sweeps are clean, run the deterministic two-file-pair sweeps for the same repo set and repeat the same mismatch discipline there.
 
@@ -74,6 +75,9 @@ After this change, bifrost and Brokk will both expose a small command-line tool 
 
 - Observation: the large-repo Python timeout in bifrost was not primarily analyzer build and not Git once add/delete continuation scoring was removed. The remaining blocker was Python reverse-import lookup doing a repo-wide scan and import re-resolution on the first `referencing_files_of(...)` call.
   Evidence: `django/__init__.py` profiling showed analyzer build at about `4.1s`, Git at about `4.5s`, and then a stall immediately after `relevance::build_import_graph reverse_start file=django/__init__.py`. After adding a module-name map and a one-time reverse-import index in `PythonAnalyzer`, the same cold run completed in about `9.2s`, with import graph construction dropping to about `0.1s`.
+
+- Observation: after the Python reverse-index fix, mixed-language analyzer startup became the next obvious cold-run tax for the direct CLI on repos such as `litellm`.
+  Evidence: `litellm/__init__.py` still spent about `1.5s` building JavaScript and TypeScript analyzers for a pure-Python seed. Restricting the CLI workspace build to the languages implied by the seed files reduced the same cold run to about `5.4s`.
 
 ## Decision Log
 

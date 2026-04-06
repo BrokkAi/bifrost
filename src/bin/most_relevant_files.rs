@@ -1,8 +1,9 @@
 use brokk_analyzer::{
-    AnalyzerConfig, FilesystemProject, WorkspaceAnalyzer,
+    AnalyzerConfig, FilesystemProject, Language, WorkspaceAnalyzer,
     searchtools::{MostRelevantFilesParams, most_relevant_files},
 };
 use std::env;
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -55,7 +56,25 @@ fn run() -> Result<(), String> {
     };
     let workspace = {
         let _scope = brokk_analyzer::profiling::scope("cli.workspace_build");
-        WorkspaceAnalyzer::build(project, AnalyzerConfig::default())
+        let seed_languages: std::collections::BTreeSet<_> = seed_files
+            .iter()
+            .filter_map(|seed| {
+                Path::new(seed)
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(Language::from_extension)
+                    .filter(|language| *language != Language::None)
+            })
+            .collect();
+        if seed_languages.is_empty() {
+            WorkspaceAnalyzer::build(project, AnalyzerConfig::default())
+        } else {
+            WorkspaceAnalyzer::build_for_languages(
+                project,
+                AnalyzerConfig::default(),
+                &seed_languages,
+            )
+        }
     };
     let result = {
         let _scope = brokk_analyzer::profiling::scope("cli.rank");
