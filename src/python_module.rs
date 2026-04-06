@@ -9,6 +9,12 @@ pub struct SearchToolsNativeSession {
     inner: Mutex<Option<SearchToolsService>>,
 }
 
+enum CallToolError {
+    Closed,
+    LockPoisoned,
+    Service(SearchToolsServiceError),
+}
+
 #[pymethods]
 impl SearchToolsNativeSession {
     #[new]
@@ -20,14 +26,27 @@ impl SearchToolsNativeSession {
         })
     }
 
-    fn call_tool_json(&self, name: &str, arguments_json: &str) -> PyResult<String> {
-        let mut inner = self.lock_inner()?;
-        let service = inner
-            .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("SearchToolsNativeSession is closed"))?;
-        service
-            .call_tool_json(name, arguments_json)
-            .map_err(service_error_to_py)
+    fn call_tool_json(&self, py: Python<'_>, name: &str, arguments_json: &str) -> PyResult<String> {
+        let name = name.to_owned();
+        let arguments_json = arguments_json.to_owned();
+        let result = py.allow_threads(|| {
+            let mut inner = self.inner.lock().map_err(|_| CallToolError::LockPoisoned)?;
+            let service = inner.as_mut().ok_or(CallToolError::Closed)?;
+            service
+                .call_tool_json(&name, &arguments_json)
+                .map_err(CallToolError::Service)
+        });
+
+        match result {
+            Ok(payload) => Ok(payload),
+            Err(CallToolError::Closed) => {
+                Err(PyRuntimeError::new_err("SearchToolsNativeSession is closed"))
+            }
+            Err(CallToolError::LockPoisoned) => {
+                Err(PyRuntimeError::new_err("SearchToolsNativeSession lock poisoned"))
+            }
+            Err(CallToolError::Service(err)) => Err(service_error_to_py(err)),
+        }
     }
 
     fn close(&self) -> PyResult<()> {
