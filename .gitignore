@@ -1,5 +1,7 @@
 /target
 __pycache__/
+.codex
+bifrost_searchtools/*.so
 
 ### BROKK'S CONFIGURATION ###
 **/.brokk/**
