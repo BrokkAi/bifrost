@@ -405,3 +405,28 @@ fn test_resolve_imports_relevant_imports_and_could_import_file() {
         &ProjectFile::new(root.to_path_buf(), "src/utils/index.ts")
     ));
 }
+
+#[test]
+fn test_referencing_files_uses_resolved_typescript_import_targets() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    write_file(
+        root,
+        "src/utils/index.ts",
+        "export function libFunc(): string { return 'lib'; }\n",
+    );
+    write_file(
+        root,
+        "src/consumer.ts",
+        "import { libFunc as libFuncAlias } from './utils';\nlibFuncAlias();\n",
+    );
+
+    let analyzer = analyzer_for(root);
+    let target = ProjectFile::new(root.to_path_buf(), "src/utils/index.ts");
+    let consumer = ProjectFile::new(root.to_path_buf(), "src/consumer.ts");
+
+    assert_eq!(
+        BTreeSet::from([consumer]),
+        analyzer.referencing_files_of(&target)
+    );
+}

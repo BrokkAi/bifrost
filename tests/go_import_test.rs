@@ -132,3 +132,26 @@ fn test_go_relevant_imports_and_could_import_file() {
     let imports = analyzer.import_info_of(&importer);
     assert!(analyzer.could_import_file(&importer, &imports, &target));
 }
+
+#[test]
+fn test_go_referencing_files_uses_resolved_import_targets() {
+    let project = inline_project(&[
+        ("pkg/utils/helper.go", "package utils\nfunc Helper() {}\n"),
+        (
+            "main.go",
+            r#"
+            package main
+            import f "pkg/utils"
+            func main() { f.Helper() }
+            "#,
+        ),
+    ]);
+    let analyzer = GoAnalyzer::from_project(project.clone());
+    let target = ProjectFile::new(project.root().to_path_buf(), "pkg/utils/helper.go");
+    let consumer = ProjectFile::new(project.root().to_path_buf(), "main.go");
+
+    assert_eq!(
+        std::collections::BTreeSet::from([consumer]),
+        analyzer.referencing_files_of(&target)
+    );
+}

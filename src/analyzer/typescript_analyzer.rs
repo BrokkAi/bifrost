@@ -1,12 +1,12 @@
 use crate::analyzer::{
     AnalyzerConfig, CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language, Project,
     ProjectFile, TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider,
-    referencing_files_via_imports,
+    build_reverse_import_index,
 };
 use moka::sync::Cache;
 use std::collections::BTreeSet;
 use std::mem::size_of;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
 
 use super::javascript_analyzer::{
@@ -126,6 +126,8 @@ pub struct TypescriptAnalyzer {
     imported_code_units: Cache<ProjectFile, Arc<BTreeSet<CodeUnit>>>,
     referencing_files: Cache<ProjectFile, Arc<BTreeSet<ProjectFile>>>,
     relevant_imports: Cache<CodeUnit, Arc<BTreeSet<String>>>,
+    reverse_import_index:
+        Arc<OnceLock<std::collections::BTreeMap<ProjectFile, Arc<BTreeSet<ProjectFile>>>>>,
 }
 
 impl TypescriptAnalyzer {
@@ -141,6 +143,7 @@ impl TypescriptAnalyzer {
             imported_code_units: build_weighted_cache(memo_budget / 3, weight_code_unit_set),
             referencing_files: build_weighted_cache(memo_budget / 6, weight_project_file_set),
             relevant_imports: build_weighted_cache(memo_budget / 6, weight_string_set),
+            reverse_import_index: Arc::new(OnceLock::new()),
         }
     }
 
@@ -234,7 +237,15 @@ impl ImportAnalysisProvider for TypescriptAnalyzer {
             return (*cached).clone();
         }
 
-        let referencing = referencing_files_via_imports(self, self, file);
+        let reverse_index = self.reverse_import_index.get_or_init(|| {
+            build_reverse_import_index(&self.inner.get_analyzed_files(), |candidate| {
+                self.imported_code_units_of(candidate)
+            })
+        });
+        let referencing = reverse_index
+            .get(file)
+            .map(|files| (**files).clone())
+            .unwrap_or_default();
         self.referencing_files
             .insert(file.clone(), Arc::new(referencing.clone()));
         referencing
@@ -303,6 +314,7 @@ impl IAnalyzer for TypescriptAnalyzer {
             imported_code_units: build_weighted_cache(self.memo_budget / 3, weight_code_unit_set),
             referencing_files: build_weighted_cache(self.memo_budget / 6, weight_project_file_set),
             relevant_imports: build_weighted_cache(self.memo_budget / 6, weight_string_set),
+            reverse_import_index: Arc::new(OnceLock::new()),
         }
     }
     fn update_all(&self) -> Self {
@@ -312,6 +324,7 @@ impl IAnalyzer for TypescriptAnalyzer {
             imported_code_units: build_weighted_cache(self.memo_budget / 3, weight_code_unit_set),
             referencing_files: build_weighted_cache(self.memo_budget / 6, weight_project_file_set),
             relevant_imports: build_weighted_cache(self.memo_budget / 6, weight_string_set),
+            reverse_import_index: Arc::new(OnceLock::new()),
         }
     }
     fn project(&self) -> &dyn Project {

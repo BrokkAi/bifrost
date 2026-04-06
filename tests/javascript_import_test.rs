@@ -512,3 +512,24 @@ fn test_extract_type_identifiers_and_relevant_imports() {
             .any(|line| line.contains("const path = require('path')"))
     );
 }
+
+#[test]
+fn test_referencing_files_uses_resolved_import_targets() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    write_file(root, "lib/index.js", "export function libFunc() { return 'lib'; }\n");
+    write_file(
+        root,
+        "consumer.js",
+        "import { libFunc as libFuncAlias } from './lib';\nlibFuncAlias();\n",
+    );
+
+    let analyzer = analyzer_for(root);
+    let target = ProjectFile::new(root.to_path_buf(), "lib/index.js");
+    let consumer = ProjectFile::new(root.to_path_buf(), "consumer.js");
+
+    assert_eq!(
+        BTreeSet::from([consumer]),
+        analyzer.referencing_files_of(&target)
+    );
+}

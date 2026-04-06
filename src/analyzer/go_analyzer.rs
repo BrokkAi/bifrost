@@ -1,14 +1,14 @@
 use crate::analyzer::{
     AnalyzerConfig, CodeUnit, CodeUnitType, IAnalyzer, ImportAnalysisProvider, ImportInfo,
     Language, LanguageAdapter, Project, ProjectFile, TestDetectionProvider, TreeSitterAnalyzer,
-    TypeAliasProvider, referencing_files_via_imports,
+    TypeAliasProvider, build_reverse_import_index,
 };
 use moka::sync::Cache;
 use regex::Regex;
 use std::collections::BTreeSet;
 use std::mem::size_of;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tree_sitter::{Language as TsLanguage, Node, Tree};
 
 use super::javascript_analyzer::build_weighted_cache;
@@ -112,6 +112,8 @@ pub struct GoAnalyzer {
     memo_budget: u64,
     imported_code_units: Cache<ProjectFile, Arc<BTreeSet<CodeUnit>>>,
     referencing_files: Cache<ProjectFile, Arc<BTreeSet<ProjectFile>>>,
+    reverse_import_index:
+        Arc<OnceLock<std::collections::BTreeMap<ProjectFile, Arc<BTreeSet<ProjectFile>>>>>,
 }
 
 impl GoAnalyzer {
@@ -126,6 +128,7 @@ impl GoAnalyzer {
             memo_budget,
             imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
+            reverse_import_index: Arc::new(OnceLock::new()),
         }
     }
 
@@ -224,7 +227,15 @@ impl ImportAnalysisProvider for GoAnalyzer {
             return (*cached).clone();
         }
 
-        let referencing = referencing_files_via_imports(self, self, file);
+        let reverse_index = self.reverse_import_index.get_or_init(|| {
+            build_reverse_import_index(&self.inner.get_analyzed_files(), |candidate| {
+                self.imported_code_units_of(candidate)
+            })
+        });
+        let referencing = reverse_index
+            .get(file)
+            .map(|files| (**files).clone())
+            .unwrap_or_default();
         self.referencing_files
             .insert(file.clone(), Arc::new(referencing.clone()));
         referencing
@@ -304,6 +315,7 @@ impl IAnalyzer for GoAnalyzer {
             memo_budget: self.memo_budget,
             imported_code_units: build_weighted_cache(self.memo_budget / 4, weight_code_unit_set),
             referencing_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
+            reverse_import_index: Arc::new(OnceLock::new()),
         }
     }
 
@@ -313,6 +325,7 @@ impl IAnalyzer for GoAnalyzer {
             memo_budget: self.memo_budget,
             imported_code_units: build_weighted_cache(self.memo_budget / 4, weight_code_unit_set),
             referencing_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
+            reverse_import_index: Arc::new(OnceLock::new()),
         }
     }
 

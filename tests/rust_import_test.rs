@@ -148,3 +148,24 @@ fn test_resolve_imports_semantic_cases() {
             .any(|cu| cu.identifier() == "ExternalStruct")
     );
 }
+
+#[test]
+fn test_rust_referencing_files_uses_resolved_import_targets() {
+    let analyzer = RustAnalyzer::from_project(rust_project(&[
+        ("src/shared/models.rs", "pub struct TargetStruct;"),
+        (
+            "src/main.rs",
+            r#"
+            use crate::shared::models::TargetStruct;
+            fn main() { let _t = TargetStruct; }
+            "#,
+        ),
+    ]));
+    let target = ProjectFile::new(analyzer.project().root().to_path_buf(), "src/shared/models.rs");
+    let consumer = ProjectFile::new(analyzer.project().root().to_path_buf(), "src/main.rs");
+
+    assert_eq!(
+        std::collections::BTreeSet::from([consumer]),
+        analyzer.referencing_files_of(&target)
+    );
+}

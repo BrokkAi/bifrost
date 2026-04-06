@@ -1,6 +1,9 @@
 use crate::analyzer::{CodeUnit, IAnalyzer, ImportInfo, ProjectFile};
 use std::any::Any;
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::Arc;
+
+use rayon::prelude::*;
 
 pub trait CapabilityProvider: Any {
     fn as_any(&self) -> &dyn Any;
@@ -55,6 +58,37 @@ where
                     .into_iter()
                     .any(|code_unit| code_unit.source() == file)
         })
+        .collect()
+}
+
+pub(crate) fn build_reverse_import_index<F>(
+    files: &BTreeSet<ProjectFile>,
+    resolve_imported: F,
+) -> BTreeMap<ProjectFile, Arc<BTreeSet<ProjectFile>>>
+where
+    F: Fn(&ProjectFile) -> BTreeSet<CodeUnit> + Sync,
+{
+    let imported_by_file: Vec<_> = files
+        .par_iter()
+        .map(|file| (file.clone(), resolve_imported(file)))
+        .collect();
+
+    let mut reverse: BTreeMap<ProjectFile, BTreeSet<ProjectFile>> = BTreeMap::new();
+    for (file, imported) in imported_by_file {
+        for code_unit in imported {
+            let target = code_unit.source();
+            if target != &file {
+                reverse
+                    .entry(target.clone())
+                    .or_default()
+                    .insert(file.clone());
+            }
+        }
+    }
+
+    reverse
+        .into_iter()
+        .map(|(file, refs)| (file, Arc::new(refs)))
         .collect()
 }
 

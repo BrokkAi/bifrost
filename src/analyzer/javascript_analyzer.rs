@@ -1,13 +1,13 @@
 use crate::analyzer::{
     AnalyzerConfig, CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language,
     LanguageAdapter, Project, ProjectFile, TestDetectionProvider, TreeSitterAnalyzer,
-    referencing_files_via_imports,
+    build_reverse_import_index,
 };
 use moka::sync::Cache;
 use std::collections::BTreeSet;
 use std::mem::size_of;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
 
 #[derive(Debug, Clone, Default)]
@@ -116,6 +116,8 @@ struct JsMemoCaches {
     imported_code_units: Cache<ProjectFile, Arc<BTreeSet<CodeUnit>>>,
     referencing_files: Cache<ProjectFile, Arc<BTreeSet<ProjectFile>>>,
     relevant_imports: Cache<CodeUnit, Arc<BTreeSet<String>>>,
+    reverse_import_index:
+        OnceLock<std::collections::BTreeMap<ProjectFile, Arc<BTreeSet<ProjectFile>>>>,
 }
 
 impl JsMemoCaches {
@@ -124,6 +126,7 @@ impl JsMemoCaches {
             imported_code_units: build_weighted_cache(budget_bytes / 3, weight_code_unit_set),
             referencing_files: build_weighted_cache(budget_bytes / 6, weight_project_file_set),
             relevant_imports: build_weighted_cache(budget_bytes / 6, weight_string_set),
+            reverse_import_index: OnceLock::new(),
         }
     }
 }
@@ -220,7 +223,15 @@ impl ImportAnalysisProvider for JavascriptAnalyzer {
             return (*cached).clone();
         }
 
-        let referencing = referencing_files_via_imports(self, self, file);
+        let reverse_index = self.memo_caches.reverse_import_index.get_or_init(|| {
+            build_reverse_import_index(&self.inner.get_analyzed_files(), |candidate| {
+                self.imported_code_units_of(candidate)
+            })
+        });
+        let referencing = reverse_index
+            .get(file)
+            .map(|files| (**files).clone())
+            .unwrap_or_default();
 
         self.memo_caches
             .referencing_files
