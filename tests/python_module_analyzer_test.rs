@@ -111,3 +111,31 @@ fn module_code_units_are_per_file_in_packaged_directory() {
     assert_eq!(vec!["pkg.a.A"], children_a);
     assert_eq!(vec!["pkg.b.f"], children_b);
 }
+
+#[test]
+fn module_code_units_use_python_src_layout_import_root() {
+    let project = inline_project(&[
+        ("src/pkg/__init__.py", ""),
+        (
+            "src/pkg/mod.py",
+            r#"
+            class Thing:
+                pass
+            "#,
+        ),
+    ]);
+    let analyzer = PythonAnalyzer::from_project(project);
+
+    let module = analyzer
+        .get_definitions("pkg.mod")
+        .into_iter()
+        .find(|code_unit| code_unit.is_module())
+        .unwrap();
+    let children: Vec<_> = analyzer
+        .get_direct_children(&module)
+        .into_iter()
+        .map(|code_unit| code_unit.fq_name())
+        .collect();
+
+    assert_eq!(vec!["pkg.mod.Thing"], children);
+}

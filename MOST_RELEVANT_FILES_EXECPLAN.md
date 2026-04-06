@@ -96,6 +96,10 @@ After this change, bifrost and Brokk will both expose a small command-line tool 
   Rationale: the recurring rename/tie-order regressions came from hidden assumptions drifting between implementations; keeping the code comments synchronized at the entry points makes those assumptions explicit and reviewable instead of leaving them scattered across bug-fix breadcrumbs.
   Date/Author: 2026-04-05 / Codex + user
 
+- Decision: stop using custom add/delete "continuation scoring" as part of the shared Git relevance contract. Git relevance should follow standard Git-native rename labels only, with synchronized thresholds/order between Brokk and bifrost, and no extra blob-token lineage inference layered on top.
+  Rationale: the fallback continuation heuristic became both the dominant large-repo Python performance cost and the main source of parity drift. The user explicitly prefers living with Git heuristic boundaries over maintaining a second homegrown lineage oracle. Keep the bifrost and Brokk entry-point docs in sync with this simpler contract as code changes land.
+  Date/Author: 2026-04-05 / Codex + user
+
 ## Outcomes & Retrospective
 
 The core feature is in place on both sides. bifrost exposes a Brokk-style hybrid relevance engine through Rust, MCP, Python, and a dedicated CLI. Brokk now exposes a matching CLI and a seed-file entrypoint that does not require synthetic `ContextFragment` setup. Several parity bugs have already been retired with regression tests, which means the remaining work is now concentrated instead of being spread across multiple independent causes.
@@ -214,6 +218,13 @@ Acceptance for the shared-service and Python boundaries is that `SearchToolsServ
 Acceptance for this milestone is stronger than feature wiring. The Rust CLI and the Java CLI must both print the top 100 related files, one per line, for the same seed input. The Brokk cached headless analyzer path must match fresh-analyzer results on the reduced regression that currently represents the `ArchitectAgentTest.java` failure. Then a deterministic 100-file single-seed comparison over the Brokk repository must complete with zero unexplained mismatches. Only after that passes should the deterministic 100-pair comparison run, and it must also complete with zero unexplained mismatches.
 
 Acceptance also requires that the shared design-doc comments at the bifrost and Brokk Git-relevance entry points remain aligned with each other and with the implemented ranking rules. A parity fix is not complete until both the code and those entry-point docs agree.
+
+The current follow-up performance/correctness track is to simplify the Git contract rather than keep tuning continuation heuristics. Acceptance for that simplification is:
+
+    1. Bifrost and Brokk both use Git-native rename labels only, with the same rename threshold and commit-walk ordering.
+    2. Neither side performs extra add/delete content-token continuation scoring during Git relevance.
+    3. The shared entry-point docs in `src/relevance.rs` and `app/src/main/java/ai/brokk/git/GitDistance.java` describe that contract plainly and remain in sync.
+    4. Large-repo Python timing is re-measured afterward to confirm the custom continuation path was the dominant cold-run Git cost.
 
 ## How To Run Tests
 

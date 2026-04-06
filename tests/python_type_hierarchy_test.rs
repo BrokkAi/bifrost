@@ -163,3 +163,49 @@ fn test_packaged_function_local_classes_and_top_level_names() {
             .any(|cu| cu.fq_name() == "tests.units.utils.test_utils.DataFrame")
     );
 }
+
+#[test]
+fn test_nested_function_imports_contribute_to_import_graph() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+
+    ProjectFile::new(root.to_path_buf(), "pkg/__init__.py")
+        .write("from .language_server import LanguageServer\n")
+        .unwrap();
+    ProjectFile::new(root.to_path_buf(), "pkg/language_server.py")
+        .write(
+            r#"
+class LanguageServer:
+    @classmethod
+    def create(cls):
+        from pkg.backends.typescript_server import (
+            TypeScriptLanguageServer,
+        )
+        return TypeScriptLanguageServer
+"#,
+        )
+        .unwrap();
+    ProjectFile::new(root.to_path_buf(), "pkg/backends/__init__.py")
+        .write("")
+        .unwrap();
+    ProjectFile::new(root.to_path_buf(), "pkg/backends/typescript_server.py")
+        .write(
+            r#"
+class TypeScriptLanguageServer:
+    pass
+"#,
+        )
+        .unwrap();
+
+    let analyzer =
+        PythonAnalyzer::from_project(TestProject::new(root, brokk_analyzer::Language::Python));
+    let language_server = ProjectFile::new(root.to_path_buf(), "pkg/language_server.py");
+    let imports = analyzer.imported_code_units_of(&language_server);
+
+    assert!(
+        imports
+            .iter()
+            .any(|cu| cu.fq_name() == "pkg.backends.typescript_server.TypeScriptLanguageServer"),
+        "nested import should resolve the imported symbol"
+    );
+}

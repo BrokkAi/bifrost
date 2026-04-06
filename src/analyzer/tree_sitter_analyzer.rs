@@ -1,6 +1,7 @@
 use crate::analyzer::{
     AnalyzerConfig, CodeUnit, DeclarationInfo, ImportInfo, Language, Project, ProjectFile, Range,
 };
+use crate::profiling;
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use rayon::prelude::*;
 use regex::RegexBuilder;
@@ -235,13 +236,17 @@ where
 
     pub fn new_with_config(project: Arc<dyn Project>, adapter: A, config: AnalyzerConfig) -> Self {
         let adapter = Arc::new(adapter);
-        let state = Arc::new(Self::build_state(
-            project.as_ref(),
-            adapter.as_ref(),
-            &config,
-            None,
-            None,
-        ));
+        let state = {
+            let _scope =
+                profiling::scope(format!("TreeSitterAnalyzer::{:?}::new_with_config", adapter.language()));
+            Arc::new(Self::build_state(
+                project.as_ref(),
+                adapter.as_ref(),
+                &config,
+                None,
+                None,
+            ))
+        };
 
         Self {
             project,
@@ -350,6 +355,11 @@ where
         files: Vec<ProjectFile>,
         progress: Option<BuildProgress>,
     ) -> Vec<(ProjectFile, Option<FileState>)> {
+        let _scope = profiling::scope(format!(
+            "TreeSitterAnalyzer::{:?}::analyze_files[{}]",
+            adapter.language(),
+            files.len()
+        ));
         if files.is_empty() {
             return Vec::new();
         }
@@ -389,15 +399,22 @@ where
         existing: Option<&AnalyzerState>,
         progress: Option<BuildProgress>,
     ) -> AnalyzerState {
+        let _scope = profiling::scope(format!("TreeSitterAnalyzer::{:?}::build_state", adapter.language()));
         let mut files = existing
             .map(|state| state.files.clone())
             .unwrap_or_default();
 
-        let analyzable_files: Vec<_> = project
-            .analyzable_files(adapter.language())
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
+        let analyzable_files: Vec<_> = {
+            let _scope = profiling::scope(format!(
+                "TreeSitterAnalyzer::{:?}::enumerate_files",
+                adapter.language()
+            ));
+            project
+                .analyzable_files(adapter.language())
+                .unwrap_or_default()
+                .into_iter()
+                .collect()
+        };
         let analyzable_set: BTreeSet<_> = analyzable_files.iter().cloned().collect();
 
         files.retain(|file, _| analyzable_set.contains(file));
@@ -410,7 +427,11 @@ where
             }
         }
 
-        Self::index_state(files, project, adapter)
+        {
+            let _scope =
+                profiling::scope(format!("TreeSitterAnalyzer::{:?}::index_state", adapter.language()));
+            Self::index_state(files, project, adapter)
+        }
     }
 
     fn index_state(

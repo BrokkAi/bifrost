@@ -1,6 +1,7 @@
 pub mod analyzer;
 pub mod mcp_server;
 mod project_watcher;
+pub mod profiling;
 mod python_module;
 mod relevance;
 pub mod searchtools;

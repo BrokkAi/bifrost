@@ -1,7 +1,10 @@
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
+use crate::profiling;
 use git2::{DiffFindOptions, Oid, Repository, Sort};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Instant;
 
 const ALPHA: f64 = 0.85;
 const CONVERGENCE_EPSILON: f64 = 1.0e-6;
@@ -9,6 +12,64 @@ const SCORE_TIE_EPSILON: f64 = 1.0e-9;
 const MAX_ITERS: usize = 75;
 const IMPORT_DEPTH: usize = 2;
 const COMMITS_TO_PROCESS: usize = 1_000;
+
+static GIT_COMMITS_SCANNED: AtomicUsize = AtomicUsize::new(0);
+static GIT_COMMITS_WITH_CHURN: AtomicUsize = AtomicUsize::new(0);
+static GIT_STATUS_ADDED: AtomicUsize = AtomicUsize::new(0);
+static GIT_STATUS_DELETED: AtomicUsize = AtomicUsize::new(0);
+static GIT_STATUS_RENAMED: AtomicUsize = AtomicUsize::new(0);
+static GIT_STATUS_COPIED: AtomicUsize = AtomicUsize::new(0);
+static GIT_NATIVE_RENAME_CANDIDATES: AtomicUsize = AtomicUsize::new(0);
+static GIT_FALLBACK_PAIR_CANDIDATES: AtomicUsize = AtomicUsize::new(0);
+static GIT_CONTENT_SIM_CALLS: AtomicUsize = AtomicUsize::new(0);
+static GIT_CONTENT_TOKEN_CALLS: AtomicUsize = AtomicUsize::new(0);
+static GIT_FIND_BLOB_CALLS: AtomicUsize = AtomicUsize::new(0);
+static GIT_FIND_SIMILAR_MICROS: AtomicU64 = AtomicU64::new(0);
+
+fn reset_git_counters() {
+    GIT_COMMITS_SCANNED.store(0, Ordering::Relaxed);
+    GIT_COMMITS_WITH_CHURN.store(0, Ordering::Relaxed);
+    GIT_STATUS_ADDED.store(0, Ordering::Relaxed);
+    GIT_STATUS_DELETED.store(0, Ordering::Relaxed);
+    GIT_STATUS_RENAMED.store(0, Ordering::Relaxed);
+    GIT_STATUS_COPIED.store(0, Ordering::Relaxed);
+    GIT_NATIVE_RENAME_CANDIDATES.store(0, Ordering::Relaxed);
+    GIT_FALLBACK_PAIR_CANDIDATES.store(0, Ordering::Relaxed);
+    GIT_CONTENT_SIM_CALLS.store(0, Ordering::Relaxed);
+    GIT_CONTENT_TOKEN_CALLS.store(0, Ordering::Relaxed);
+    GIT_FIND_BLOB_CALLS.store(0, Ordering::Relaxed);
+    GIT_FIND_SIMILAR_MICROS.store(0, Ordering::Relaxed);
+}
+
+fn git_counters_note() -> String {
+    format!(
+        concat!(
+            "git-counters commits_scanned={} commits_with_churn={} ",
+            "A={} D={} R={} C={} native_rename_candidates={} ",
+            "fallback_pairs={} content_similarity_calls={} content_token_calls={} ",
+            "find_blob_calls={} find_similar_ms={:.1}"
+        ),
+        GIT_COMMITS_SCANNED.load(Ordering::Relaxed),
+        GIT_COMMITS_WITH_CHURN.load(Ordering::Relaxed),
+        GIT_STATUS_ADDED.load(Ordering::Relaxed),
+        GIT_STATUS_DELETED.load(Ordering::Relaxed),
+        GIT_STATUS_RENAMED.load(Ordering::Relaxed),
+        GIT_STATUS_COPIED.load(Ordering::Relaxed),
+        GIT_NATIVE_RENAME_CANDIDATES.load(Ordering::Relaxed),
+        GIT_FALLBACK_PAIR_CANDIDATES.load(Ordering::Relaxed),
+        GIT_CONTENT_SIM_CALLS.load(Ordering::Relaxed),
+        GIT_CONTENT_TOKEN_CALLS.load(Ordering::Relaxed),
+        GIT_FIND_BLOB_CALLS.load(Ordering::Relaxed),
+        GIT_FIND_SIMILAR_MICROS.load(Ordering::Relaxed) as f64 / 1000.0
+    )
+}
+
+fn note_git_counters() {
+    if !profiling::enabled() {
+        return;
+    }
+    profiling::note(git_counters_note());
+}
 
 #[derive(Debug, Clone, PartialEq)]
 struct FileRelevance {
@@ -21,6 +82,7 @@ pub(crate) fn most_relevant_project_files(
     seeds: &[ProjectFile],
     top_k: usize,
 ) -> Vec<ProjectFile> {
+    let _scope = profiling::scope("relevance::most_relevant_project_files");
     if top_k == 0 {
         return Vec::new();
     }
@@ -34,15 +96,21 @@ pub(crate) fn most_relevant_project_files(
     let mut results = Vec::new();
     let mut seen = BTreeSet::new();
 
-    for candidate in related_files_by_git(analyzer, &seed_weights, top_k).unwrap_or_default() {
-        if append_candidate(&mut results, &mut seen, &excluded, candidate.file, top_k) {
-            return results;
+    {
+        let _scope = profiling::scope("relevance::git");
+        for candidate in related_files_by_git(analyzer, &seed_weights, top_k).unwrap_or_default() {
+            if append_candidate(&mut results, &mut seen, &excluded, candidate.file, top_k) {
+                return results;
+            }
         }
     }
 
-    for candidate in related_files_by_imports(analyzer, &seed_weights, top_k, false) {
-        if append_candidate(&mut results, &mut seen, &excluded, candidate.file, top_k) {
-            return results;
+    {
+        let _scope = profiling::scope("relevance::imports");
+        for candidate in related_files_by_imports(analyzer, &seed_weights, top_k, false) {
+            if append_candidate(&mut results, &mut seen, &excluded, candidate.file, top_k) {
+                return results;
+            }
         }
     }
 
@@ -84,6 +152,7 @@ fn related_files_by_imports(
     k: usize,
     reversed: bool,
 ) -> Vec<FileRelevance> {
+    let _scope = profiling::scope("relevance::related_files_by_imports");
     if k == 0 {
         return Vec::new();
     }
@@ -97,7 +166,10 @@ fn related_files_by_imports(
         return Vec::new();
     }
 
-    let graph = build_import_graph(analyzer, &positive_seeds);
+    let graph = {
+        let _scope = profiling::scope("relevance::build_import_graph");
+        build_import_graph(analyzer, &positive_seeds)
+    };
     let adjacency = if reversed {
         &graph.reverse
     } else {
@@ -330,18 +402,11 @@ fn referencing_files_for(
 /// these choices matching, not merely being "close enough":
 /// - walk the recent commit window in topology-preserving time order so canonicalization never sees an older
 ///   pre-rename commit before the later rename edge that should rewrite it
-/// - use native rename detection with a 49% similarity threshold, but treat those as candidate edges only;
-///   canonicalization accepts an edge only if it also passes the shared stem+content continuation rule
-/// - native rename candidates and add/delete continuation candidates are pooled together and resolved by the same
-///   scorer; choose the best non-conflicting edges by content similarity first and path similarity second, rather
-///   than letting native rename detections win by default
-/// - the shared continuation rule is: same stem requires `stem >= 60`; multi-token same stems use `content >= 25`,
-///   but single-token same stems use `content >= 35` to avoid short-name role changes like `L2.h -> L2/L2.h`.
-///   Different stems require at least two shared stem tokens plus `stem >= 60 && content >= 50`
-/// - extension changes are allowed when they satisfy that shared continuation rule; do not reject a higher-evidence
-///   `.cpp -> .h` or similar split/templating continuation just because the suffix changed
-/// - candidate continuation edges are best-effort evidence only; if historical content for either side cannot be
-///   read, skip that edge instead of failing Git relevance for the whole repo
+/// - use native Git rename detection only, with a 50% similarity threshold and no extra add/delete continuation
+///   inference layered on top. If Git does not label an edge as `Renamed`, this scorer treats the old/new paths as
+///   unrelated for lineage purposes
+/// - canonicalization follows only those accepted native rename labels; copy/split history is intentionally not
+///   recovered by custom blob-similarity heuristics
 /// - treat near-equal scores as ties using a relative epsilon of `1e-9 * max(1, |score|)` and break them by
 ///   normalized path so ordering is stable across platforms and implementations
 ///
@@ -351,11 +416,16 @@ fn related_files_by_git(
     seed_weights: &HashMap<ProjectFile, f64>,
     k: usize,
 ) -> Result<Vec<FileRelevance>, git2::Error> {
+    let _scope = profiling::scope("relevance::related_files_by_git");
+    reset_git_counters();
     if k == 0 || seed_weights.is_empty() {
         return Ok(Vec::new());
     }
 
-    let Some(repo) = GitProjectContext::discover(analyzer.project().root()) else {
+    let Some(repo) = ({
+        let _scope = profiling::scope("relevance::git.discover");
+        GitProjectContext::discover(analyzer.project().root())
+    }) else {
         return Ok(Vec::new());
     };
     if !seed_weights
@@ -365,7 +435,10 @@ fn related_files_by_git(
         return Ok(Vec::new());
     }
 
-    let commits = repo.recent_commit_ids(COMMITS_TO_PROCESS)?;
+    let commits = {
+        let _scope = profiling::scope("relevance::git.recent_commit_ids");
+        repo.recent_commit_ids(COMMITS_TO_PROCESS)?
+    };
     if commits.is_empty() {
         return Ok(Vec::new());
     }
@@ -374,52 +447,83 @@ fn related_files_by_git(
     let mut joint_mass: HashMap<(ProjectFile, ProjectFile), f64> = HashMap::new();
     let mut seed_commit_count: HashMap<ProjectFile, usize> = HashMap::new();
     let mut canonicalizer = RenameCanonicalizer::default();
+    let mut find_commit_ms = 0.0;
+    let mut change_ms = 0.0;
+    let mut canonicalize_ms = 0.0;
+    let mut processed_commits = 0usize;
 
     let baseline_commit_count = commits.len() as f64;
-    for oid in &commits {
-        let commit = repo.repo.find_commit(*oid)?;
-        let change = repo.changed_repo_paths_for_commit(&commit)?;
+    {
+        let _scope = profiling::scope("relevance::git.score_commits");
+        for oid in &commits {
+            let started = Instant::now();
+            let commit = repo.repo.find_commit(*oid)?;
+            find_commit_ms += started.elapsed().as_secs_f64() * 1000.0;
 
-        let changed_files: BTreeSet<_> = change
-            .paths
-            .into_iter()
-            .map(|path| canonicalizer.canonicalize(&path))
-            .filter_map(|path| repo.repo_path_to_project_file(&path))
-            .collect();
-        canonicalizer.record_renames(&change.renames);
-        if changed_files.is_empty() {
-            continue;
-        }
+            let started = Instant::now();
+            let change = repo.changed_repo_paths_for_commit(&commit)?;
+            change_ms += started.elapsed().as_secs_f64() * 1000.0;
 
-        for file in &changed_files {
-            *file_doc_freq.entry(file.clone()).or_insert(0) += 1;
-        }
+            let started = Instant::now();
+            let changed_files: BTreeSet<_> = change
+                .paths
+                .into_iter()
+                .map(|path| canonicalizer.canonicalize(&path))
+                .filter_map(|path| repo.repo_path_to_project_file(&path))
+                .collect();
+            canonicalizer.record_renames(&change.renames);
+            canonicalize_ms += started.elapsed().as_secs_f64() * 1000.0;
+            processed_commits += 1;
+            if profiling::enabled() && processed_commits % 5 == 0 {
+                profiling::note(format!(
+                    "relevance::git.score_commits progress processed_commits={} find_commit_ms={:.1} change_ms={:.1} canonicalize_ms={:.1} {}",
+                    processed_commits,
+                    find_commit_ms,
+                    change_ms,
+                    canonicalize_ms,
+                    git_counters_note()
+                ));
+            }
+            if changed_files.is_empty() {
+                continue;
+            }
 
-        let seeds_in_commit: Vec<_> = changed_files
-            .iter()
-            .filter(|file| seed_weights.contains_key(*file))
-            .cloned()
-            .collect();
-        if seeds_in_commit.is_empty() {
-            continue;
-        }
+            for file in &changed_files {
+                *file_doc_freq.entry(file.clone()).or_insert(0) += 1;
+            }
 
-        for seed in &seeds_in_commit {
-            *seed_commit_count.entry(seed.clone()).or_insert(0) += 1;
-        }
+            let seeds_in_commit: Vec<_> = changed_files
+                .iter()
+                .filter(|file| seed_weights.contains_key(*file))
+                .cloned()
+                .collect();
+            if seeds_in_commit.is_empty() {
+                continue;
+            }
 
-        let commit_pair_mass = 1.0 / changed_files.len() as f64;
-        for seed in &seeds_in_commit {
-            for target in &changed_files {
-                if seed_weights.contains_key(target) {
-                    continue;
+            for seed in &seeds_in_commit {
+                *seed_commit_count.entry(seed.clone()).or_insert(0) += 1;
+            }
+
+            let commit_pair_mass = 1.0 / changed_files.len() as f64;
+            for seed in &seeds_in_commit {
+                for target in &changed_files {
+                    if seed_weights.contains_key(target) {
+                        continue;
+                    }
+                    *joint_mass
+                        .entry((seed.clone(), target.clone()))
+                        .or_insert(0.0) += commit_pair_mass;
                 }
-                *joint_mass
-                    .entry((seed.clone(), target.clone()))
-                    .or_insert(0.0) += commit_pair_mass;
             }
         }
     }
+    if profiling::enabled() {
+        profiling::note(format!(
+            "relevance::git.score_commits processed_commits={processed_commits} find_commit_ms={find_commit_ms:.1} change_ms={change_ms:.1} canonicalize_ms={canonicalize_ms:.1}"
+        ));
+    }
+    note_git_counters();
 
     if joint_mass.is_empty() {
         return Ok(Vec::new());
@@ -505,6 +609,7 @@ impl GitProjectContext {
         &self,
         commit: &git2::Commit<'_>,
     ) -> Result<CommitChange, git2::Error> {
+        GIT_COMMITS_SCANNED.fetch_add(1, Ordering::Relaxed);
         let current_tree = commit.tree()?;
         let parent_tree = if commit.parent_count() > 0 {
             Some(commit.parent(0)?.tree()?)
@@ -518,66 +623,57 @@ impl GitProjectContext {
 
         let mut find_options = DiffFindOptions::new();
         find_options.renames(true);
-        find_options.rename_threshold(49);
+        find_options.rename_threshold(50);
+        let find_similar_started = Instant::now();
         diff.find_similar(Some(&mut find_options))?;
+        GIT_FIND_SIMILAR_MICROS.fetch_add(
+            find_similar_started.elapsed().as_micros() as u64,
+            Ordering::Relaxed,
+        );
 
         let mut paths = Vec::new();
-        let mut rename_candidates = Vec::new();
-        let mut candidate_old_paths = Vec::new();
-        let mut candidate_new_paths = Vec::new();
+        let mut renames = Vec::new();
+        let mut commit_has_churn = false;
         for delta in diff.deltas() {
             match delta.status() {
-                git2::Delta::Added
-                | git2::Delta::Copied
-                | git2::Delta::Modified
-                | git2::Delta::Renamed => {
+                git2::Delta::Added | git2::Delta::Copied | git2::Delta::Modified => {
                     if let Some(path) = delta.new_file().path() {
                         paths.push(path.to_path_buf());
-                        if matches!(delta.status(), git2::Delta::Added | git2::Delta::Renamed) {
-                            candidate_new_paths.push(path.to_path_buf());
+                        if delta.status() == git2::Delta::Added {
+                            commit_has_churn = true;
+                            GIT_STATUS_ADDED.fetch_add(1, Ordering::Relaxed);
+                        } else if delta.status() == git2::Delta::Copied {
+                            commit_has_churn = true;
+                            GIT_STATUS_COPIED.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
                 git2::Delta::Deleted => {
                     if let Some(path) = delta.old_file().path() {
+                        commit_has_churn = true;
+                        GIT_STATUS_DELETED.fetch_add(1, Ordering::Relaxed);
                         paths.push(path.to_path_buf());
-                        candidate_old_paths.push(path.to_path_buf());
+                    }
+                }
+                git2::Delta::Renamed => {
+                    commit_has_churn = true;
+                    GIT_STATUS_RENAMED.fetch_add(1, Ordering::Relaxed);
+                    if let (Some(old_path), Some(new_path)) =
+                        (delta.old_file().path(), delta.new_file().path())
+                    {
+                        GIT_NATIVE_RENAME_CANDIDATES.fetch_add(1, Ordering::Relaxed);
+                        let old_path = old_path.to_path_buf();
+                        let new_path = new_path.to_path_buf();
+                        paths.push(new_path.clone());
+                        renames.push((old_path, new_path));
                     }
                 }
                 _ => {}
             }
-
-            if delta.status() == git2::Delta::Renamed {
-                if let Some(path) = delta.old_file().path() {
-                    candidate_old_paths.push(path.to_path_buf());
-                }
-            }
-
-            if delta.status() == git2::Delta::Renamed {
-                if let (Some(old_path), Some(new_path)) =
-                    (delta.old_file().path(), delta.new_file().path())
-                {
-                    if let Some(candidate) = rename_candidate(
-                        &self.repo,
-                        parent_tree.as_ref(),
-                        &current_tree,
-                        old_path,
-                        new_path,
-                    ) {
-                        rename_candidates.push(candidate);
-                    }
-                }
-            }
         }
-
-        rename_candidates.extend(infer_path_continuity_renames(
-            &self.repo,
-            parent_tree.as_ref(),
-            &current_tree,
-            &candidate_old_paths,
-            &candidate_new_paths,
-        ));
-        let renames = pick_best_rename_edges(rename_candidates);
+        if commit_has_churn {
+            GIT_COMMITS_WITH_CHURN.fetch_add(1, Ordering::Relaxed);
+        }
 
         Ok(CommitChange { paths, renames })
     }
@@ -609,6 +705,8 @@ struct CommitChange {
 #[derive(Clone)]
 struct RenameCandidate {
     content_score: f64,
+    native_rename: bool,
+    directory_prefix_len: usize,
     path_score: f64,
     old_path: PathBuf,
     new_path: PathBuf,
@@ -624,8 +722,10 @@ fn rename_candidate(
     let path_score = path_token_similarity_score(old_path, new_path);
     let content_score =
         content_token_similarity_score(repo, parent_tree, current_tree, old_path, new_path);
-    continuation_edge_is_safe(old_path, new_path, path_score, content_score).then(|| RenameCandidate {
+    continuation_edge_is_safe(old_path, new_path, path_score, content_score, true).then(|| RenameCandidate {
         content_score,
+        native_rename: true,
+        directory_prefix_len: shared_directory_prefix_len(old_path, new_path),
         path_score,
         old_path: old_path.to_path_buf(),
         new_path: new_path.to_path_buf(),
@@ -645,9 +745,11 @@ fn infer_path_continuity_renames(
             let path_score = path_token_similarity_score(old_path, new_path);
             let content_score =
                 content_token_similarity_score(repo, parent_tree, current_tree, old_path, new_path);
-            if continuation_edge_is_safe(old_path, new_path, path_score, content_score) {
+            if continuation_edge_is_safe(old_path, new_path, path_score, content_score, false) {
                 candidates.push(RenameCandidate {
                     content_score,
+                    native_rename: false,
+                    directory_prefix_len: shared_directory_prefix_len(old_path, new_path),
                     path_score,
                     old_path: old_path.clone(),
                     new_path: new_path.clone(),
@@ -664,6 +766,14 @@ fn pick_best_rename_edges(mut candidates: Vec<RenameCandidate>) -> Vec<(PathBuf,
             .content_score
             .partial_cmp(&left.content_score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                right.native_rename.cmp(&left.native_rename)
+            })
+            .then_with(|| {
+                right
+                    .directory_prefix_len
+                    .cmp(&left.directory_prefix_len)
+            })
             .then_with(|| {
                 right
                     .path_score
@@ -693,15 +803,33 @@ fn continuation_edge_is_safe(
     new_path: &Path,
     path_score: f64,
     content_score: f64,
+    _native_rename: bool,
 ) -> bool {
     let same_stem = normalized_stem(old_path) == normalized_stem(new_path);
     let shared_tokens = shared_stem_token_count(old_path, new_path);
     if same_stem {
         let min_content = if shared_tokens <= 1 { 35.0 } else { 25.0 };
-        return path_score >= 60.0 && content_score >= min_content;
+        let single_token_ok =
+            shared_tokens > 1 || shared_directory_prefix_len(old_path, new_path) > 0;
+        return path_score >= 60.0 && content_score >= min_content && single_token_ok;
     } else {
         shared_tokens >= 2 && path_score >= 60.0 && content_score >= 50.0
     }
+}
+
+fn shared_directory_prefix_len(old_path: &Path, new_path: &Path) -> usize {
+    old_path
+        .parent()
+        .into_iter()
+        .flat_map(Path::components)
+        .zip(
+            new_path
+                .parent()
+                .into_iter()
+                .flat_map(Path::components),
+        )
+        .take_while(|(left, right)| left == right)
+        .count()
 }
 
 fn shared_stem_token_count(old_path: &Path, new_path: &Path) -> usize {
@@ -761,6 +889,7 @@ fn content_token_similarity_score(
     old_path: &Path,
     new_path: &Path,
 ) -> f64 {
+    GIT_CONTENT_SIM_CALLS.fetch_add(1, Ordering::Relaxed);
     let Some(old_text) = file_text_at_path(repo, parent_tree, old_path) else {
         return 0.0;
     };
@@ -782,11 +911,13 @@ fn file_text_at_path(
     path: &Path,
 ) -> Option<String> {
     let entry = tree?.get_path(path).ok()?;
+    GIT_FIND_BLOB_CALLS.fetch_add(1, Ordering::Relaxed);
     let blob = repo.find_blob(entry.id()).ok()?;
     std::str::from_utf8(blob.content()).ok().map(str::to_string)
 }
 
 fn content_tokens(text: &str) -> HashSet<String> {
+    GIT_CONTENT_TOKEN_CALLS.fetch_add(1, Ordering::Relaxed);
     let mut tokens = HashSet::new();
     let mut current = String::new();
     for ch in text.chars() {
@@ -1168,12 +1299,16 @@ mod tests {
         let edges = super::pick_best_rename_edges(vec![
             super::RenameCandidate {
                 content_score: 40.0,
+                native_rename: false,
+                directory_prefix_len: 1,
                 path_score: 95.0,
                 old_path: PathBuf::from("old/bm_spaces_class.cpp"),
                 new_path: PathBuf::from("new/bm_spaces_class_fp32.cpp"),
             },
             super::RenameCandidate {
                 content_score: 85.0,
+                native_rename: false,
+                directory_prefix_len: 1,
                 path_score: 80.0,
                 old_path: PathBuf::from("old/bm_spaces_class.cpp"),
                 new_path: PathBuf::from("new/bm_spaces_class_definitions.h"),
@@ -1187,6 +1322,130 @@ mod tests {
             )],
             edges
         );
+    }
+
+    #[test]
+    fn pick_best_rename_edges_prefers_longer_directory_prefix_on_content_tie() {
+        let edges = super::pick_best_rename_edges(vec![
+            super::RenameCandidate {
+                content_score: 100.0,
+                native_rename: false,
+                directory_prefix_len: 0,
+                path_score: 100.0,
+                old_path: PathBuf::from("tests/astrapy/__init__.py"),
+                new_path: PathBuf::from("astrapy/core/__init__.py"),
+            },
+            super::RenameCandidate {
+                content_score: 100.0,
+                native_rename: false,
+                directory_prefix_len: 1,
+                path_score: 100.0,
+                old_path: PathBuf::from("tests/astrapy/__init__.py"),
+                new_path: PathBuf::from("tests/core/__init__.py"),
+            },
+        ]);
+
+        assert_eq!(
+            vec![(
+                PathBuf::from("tests/astrapy/__init__.py"),
+                PathBuf::from("tests/core/__init__.py"),
+            )],
+            edges
+        );
+    }
+
+    #[test]
+    fn pick_best_rename_edges_prefers_native_rename_on_content_tie() {
+        let edges = super::pick_best_rename_edges(vec![
+            super::RenameCandidate {
+                content_score: 100.0,
+                native_rename: false,
+                directory_prefix_len: 1,
+                path_score: 100.0,
+                old_path: PathBuf::from("tests/astrapy/__init__.py"),
+                new_path: PathBuf::from("tests/core/__init__.py"),
+            },
+            super::RenameCandidate {
+                content_score: 100.0,
+                native_rename: true,
+                directory_prefix_len: 0,
+                path_score: 100.0,
+                old_path: PathBuf::from("tests/astrapy/__init__.py"),
+                new_path: PathBuf::from("astrapy/core/__init__.py"),
+            },
+        ]);
+
+        assert_eq!(
+            vec![(
+                PathBuf::from("tests/astrapy/__init__.py"),
+                PathBuf::from("astrapy/core/__init__.py"),
+            )],
+            edges
+        );
+    }
+
+    #[test]
+    fn pick_best_rename_edges_skips_ambiguous_split_history() {
+        let mut candidates = vec![
+            super::RenameCandidate {
+                content_score: 71.0,
+                native_rename: true,
+                directory_prefix_len: 1,
+                path_score: 100.0,
+                old_path: PathBuf::from("astrapy/idiomatic/__init__.py"),
+                new_path: PathBuf::from("astrapy/core/__init__.py"),
+            },
+            super::RenameCandidate {
+                content_score: 73.0,
+                native_rename: false,
+                directory_prefix_len: 1,
+                path_score: 100.0,
+                old_path: PathBuf::from("astrapy/idiomatic/__init__.py"),
+                new_path: PathBuf::from("astrapy/api/__init__.py"),
+            },
+        ];
+        let ambiguous = [PathBuf::from("astrapy/idiomatic/__init__.py")]
+            .into_iter()
+            .collect::<HashSet<_>>();
+        candidates.retain(|candidate| !ambiguous.contains(&candidate.old_path));
+        let edges = super::pick_best_rename_edges(candidates);
+        assert!(edges.is_empty());
+    }
+
+    #[test]
+    fn fallback_single_token_same_stem_requires_shared_directory_prefix() {
+        assert!(!super::continuation_edge_is_safe(
+            Path::new("astrapy/idiomatic/__init__.py"),
+            Path::new("tests/core/__init__.py"),
+            100.0,
+            100.0,
+            false,
+        ));
+        assert!(super::continuation_edge_is_safe(
+            Path::new("tests/astrapy/__init__.py"),
+            Path::new("tests/core/__init__.py"),
+            100.0,
+            100.0,
+            false,
+        ));
+    }
+
+    #[test]
+    fn native_rename_allows_single_token_same_stem_across_directory_trees() {
+        assert!(super::continuation_edge_is_safe(
+            Path::new("astrapy/idiomatic/__init__.py"),
+            Path::new("astrapy/api/__init__.py"),
+            100.0,
+            40.0,
+            true,
+        ));
+        assert!(!super::continuation_edge_is_safe(
+            Path::new("tests/astrapy/__init__.py"),
+            Path::new("astrapy/core/__init__.py"),
+            100.0,
+            100.0,
+            true,
+        ));
     }
 
     #[test]

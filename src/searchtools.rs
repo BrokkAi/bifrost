@@ -1,4 +1,5 @@
 use crate::analyzer::{CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, Range};
+use crate::profiling;
 use crate::relevance::most_relevant_project_files;
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use glob::Pattern;
@@ -451,26 +452,33 @@ pub fn most_relevant_files(
     analyzer: &dyn IAnalyzer,
     params: MostRelevantFilesParams,
 ) -> MostRelevantFilesResult {
+    let _scope = profiling::scope("searchtools::most_relevant_files");
     let mut seeds = Vec::new();
     let mut not_found = Vec::new();
 
-    for input in params.seed_files {
-        let trimmed = input.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
+    {
+        let _scope = profiling::scope("searchtools::most_relevant_files.resolve_seeds");
+        for input in params.seed_files {
+            let trimmed = input.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
 
-        let rel_path = PathBuf::from(normalize_pattern(trimmed));
-        match analyzer.project().file_by_rel_path(&rel_path) {
-            Some(file) => seeds.push(file),
-            None => not_found.push(trimmed.to_string()),
+            let rel_path = PathBuf::from(normalize_pattern(trimmed));
+            match analyzer.project().file_by_rel_path(&rel_path) {
+                Some(file) => seeds.push(file),
+                None => not_found.push(trimmed.to_string()),
+            }
         }
     }
 
-    let files = most_relevant_project_files(analyzer, &seeds, params.limit)
-        .into_iter()
-        .map(|file| rel_path_string(&file))
-        .collect();
+    let files = {
+        let _scope = profiling::scope("searchtools::most_relevant_files.rank");
+        most_relevant_project_files(analyzer, &seeds, params.limit)
+            .into_iter()
+            .map(|file| rel_path_string(&file))
+            .collect()
+    };
 
     MostRelevantFilesResult { files, not_found }
 }

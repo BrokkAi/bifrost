@@ -747,11 +747,7 @@ impl<'a> PythonVisitor<'a> {
             "expression_statement" => {
                 self.visit_expression_statement(node, scope, module_control_depth)
             }
-            "import_statement" | "import_from_statement" => {
-                if scope.is_empty() {
-                    self.visit_import_statement(node);
-                }
-            }
+            "import_statement" | "import_from_statement" => self.visit_import_statement(node),
             "if_statement" | "try_statement" | "with_statement" | "for_statement"
             | "while_statement" => {
                 let next_depth = if scope.is_empty() {
@@ -1004,34 +1000,93 @@ fn py_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     source.get(node.start_byte()..node.end_byte()).unwrap_or("")
 }
 
-fn python_module_name(file: &ProjectFile) -> String {
-    let rel = file.rel_path();
-    let mut components: Vec<_> = rel
-        .components()
-        .map(|component| component.as_os_str().to_string_lossy().to_string())
-        .collect();
-    if components.is_empty() {
-        return String::new();
+struct PythonModuleInfo {
+    package_name: String,
+    module_name: String,
+}
+
+impl PythonModuleInfo {
+    fn module_qualified_package(&self) -> String {
+        if self.package_name.is_empty() {
+            self.module_name.clone()
+        } else {
+            format!("{}.{}", self.package_name, self.module_name)
+        }
     }
-    let file_name = components.pop().unwrap_or_default();
-    let stem = Path::new(&file_name)
+}
+
+fn python_module_name(file: &ProjectFile) -> String {
+    python_module_info(file).module_qualified_package()
+}
+
+fn python_module_info(file: &ProjectFile) -> PythonModuleInfo {
+    let raw_package = python_package_name_for_file(file);
+    let module_name = file
+        .rel_path()
         .file_stem()
         .and_then(|stem| stem.to_str())
-        .unwrap_or_default();
-    if stem == "__init__" {
-        components
-            .into_iter()
-            .filter(|component| !component.is_empty())
-            .collect::<Vec<_>>()
-            .join(".")
-    } else {
-        components
-            .into_iter()
-            .chain(std::iter::once(stem.to_string()))
-            .filter(|component| !component.is_empty())
-            .collect::<Vec<_>>()
-            .join(".")
+        .unwrap_or_default()
+        .to_string();
+
+    if module_name == "__init__" && !raw_package.is_empty() {
+        if let Some((package_name, last_segment)) = raw_package.rsplit_once('.') {
+            return PythonModuleInfo {
+                package_name: package_name.to_string(),
+                module_name: last_segment.to_string(),
+            };
+        }
+        return PythonModuleInfo {
+            package_name: String::new(),
+            module_name: raw_package,
+        };
     }
+
+    PythonModuleInfo {
+        package_name: raw_package,
+        module_name,
+    }
+}
+
+fn python_package_name_for_file(file: &ProjectFile) -> String {
+    let Some(parent_rel) = file.rel_path().parent() else {
+        return String::new();
+    };
+    if parent_rel.as_os_str().is_empty() {
+        return String::new();
+    }
+
+    let mut effective_package_root_rel: Option<&Path> = None;
+    let mut current_rel = Some(parent_rel);
+    while let Some(path) = current_rel {
+        if file.root().join(path).join("__init__.py").exists() {
+            effective_package_root_rel = Some(path);
+        }
+        current_rel = path.parent();
+    }
+
+    let Some(package_root_rel) = effective_package_root_rel else {
+        return dotted_path(parent_rel);
+    };
+
+    let Some(import_root_rel) = package_root_rel.parent() else {
+        return dotted_path(parent_rel);
+    };
+
+    dotted_path(
+        import_root_rel
+            .strip_prefix("")
+            .ok()
+            .and_then(|_| parent_rel.strip_prefix(import_root_rel).ok())
+            .unwrap_or(parent_rel),
+    )
+}
+
+fn dotted_path(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy().to_string())
+        .filter(|component| !component.is_empty())
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 fn module_code_unit(file: &ProjectFile, module_fq: &str) -> Option<CodeUnit> {
@@ -1288,10 +1343,18 @@ fn parse_python_import_details(raw: &str) -> Option<PythonImportDetails> {
 fn split_top_level_commas(input: &str) -> Vec<String> {
     input
         .split(',')
-        .map(str::trim)
+        .map(normalize_python_import_part)
         .filter(|part| !part.is_empty())
-        .map(str::to_string)
         .collect()
+}
+
+fn normalize_python_import_part(input: &str) -> String {
+    input
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .trim()
+        .to_string()
 }
 
 fn split_alias(input: &str) -> (String, Option<String>) {
