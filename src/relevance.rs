@@ -393,11 +393,13 @@ fn referencing_files_for(
 /// - use native Git rename detection only, with a 50% similarity threshold and no extra add/delete continuation
 ///   inference layered on top. If Git does not label an edge as `Renamed`, this scorer treats the old/new paths as
 ///   unrelated for lineage purposes
-/// - native rename labels still pass cheap sanity checks before they become lineage edges: the compact stem key
-///   (lowercased stem with separators removed) must match, and the directly compared old/new blobs must still have
-///   near-exact token overlap, so libgit/JGit false positives become add+delete rather than rewritten history
-/// - canonicalization follows only those accepted native rename labels; copy/split history is intentionally not
-///   recovered by custom blob-similarity heuristics
+/// - canonicalization follows only those native rename labels that actually replace the old path with the new path
+///   across the commit boundary; if both paths survive across that boundary, treat the change as ordinary path churn
+///   instead of lineage
+/// - accepted native rename labels also pass one cheap synchronizer shared with Brokk: compact filename stems must
+///   match and the directly compared old/new blobs must retain near-exact token overlap. This keeps libgit2/JGit
+///   aligned on borderline rename scores without reintroducing add/delete continuation scoring
+/// - copy/split history is intentionally not recovered by custom blob-similarity heuristics
 /// - treat near-equal scores as ties using a relative epsilon of `1e-9 * max(1, |score|)` and break them by
 ///   normalized path so ordering is stable across platforms and implementations
 ///
@@ -614,6 +616,10 @@ impl GitProjectContext {
 
         let mut find_options = DiffFindOptions::new();
         find_options.renames(true);
+        find_options.renames_from_rewrites(false);
+        find_options.rewrites(false);
+        find_options.break_rewrites(false);
+        find_options.copies(false);
         find_options.rename_threshold(NATIVE_RENAME_THRESHOLD);
         find_options.dont_ignore_whitespace(true);
         let find_similar_started = Instant::now();
@@ -656,7 +662,13 @@ impl GitProjectContext {
                         GIT_NATIVE_RENAME_CANDIDATES.fetch_add(1, Ordering::Relaxed);
                         let old_path = old_path.to_path_buf();
                         let new_path = new_path.to_path_buf();
-                        if native_rename_delta_is_safe(&self.repo, &delta, &old_path, &new_path) {
+                        if native_rename_replaces_path(
+                            parent_tree.as_ref(),
+                            &current_tree,
+                            &old_path,
+                            &new_path,
+                        ) && native_rename_delta_is_safe(&self.repo, &delta, &old_path, &new_path)
+                        {
                             paths.push(new_path.clone());
                             renames.push((old_path, new_path));
                         } else {
@@ -697,6 +709,17 @@ impl GitProjectContext {
 struct CommitChange {
     paths: Vec<PathBuf>,
     renames: Vec<(PathBuf, PathBuf)>,
+}
+
+fn native_rename_replaces_path(
+    parent_tree: Option<&git2::Tree<'_>>,
+    current_tree: &git2::Tree<'_>,
+    old_path: &Path,
+    new_path: &Path,
+) -> bool {
+    let old_survives = current_tree.get_path(old_path).is_ok();
+    let new_preexisted = parent_tree.is_some_and(|tree| tree.get_path(new_path).is_ok());
+    !old_survives && !new_preexisted
 }
 
 fn native_rename_delta_is_safe(
@@ -1976,47 +1999,7 @@ mod tests {
     }
 
     #[test]
-    fn native_rename_sanity_accepts_installation_doc_rename() {
-        assert!(super::native_rename_path_keys_match(
-            Path::new("docs/dotnet/user-guide/core-user-guide/installation.md"),
-            Path::new("docs/dotnet/core/installation.md"),
-        ));
-    }
-
-    #[test]
-    fn native_rename_sanity_accepts_agent_host_casing_rename() {
-        assert!(super::native_rename_path_keys_match(
-            Path::new("dotnet/src/Microsoft.AutoGen/AgentHost/Microsoft.Autogen.AgentHost.csproj"),
-            Path::new("dotnet/src/Microsoft.AutoGen/AgentHost/Microsoft.AutoGen.AgentHost.csproj"),
-        ));
-    }
-
-    #[test]
-    fn native_rename_sanity_rejects_agent_runtime_to_inprocess() {
-        assert!(!super::native_rename_path_keys_match(
-            Path::new("dotnet/test/Microsoft.AutoGen.Core.Tests/AgentRuntimeTests.cs"),
-            Path::new("dotnet/test/Microsoft.AutoGen.Core.Tests/InProcessRuntimeTests.cs"),
-        ));
-    }
-
-    #[test]
-    fn native_rename_sanity_rejects_anthropic_samples_pluralization() {
-        assert!(!super::native_rename_path_keys_match(
-            Path::new("dotnet/samples/AutoGen.Anthropic.Samples/AutoGen.Anthropic.Samples.csproj"),
-            Path::new("dotnet/samples/AgentChat/AutoGen.Anthropic.Sample/AutoGen.Anthropic.Sample.csproj"),
-        ));
-    }
-
-    #[test]
-    fn native_rename_sanity_rejects_vector_similarity_definitions_suffix() {
-        assert!(!super::native_rename_path_keys_match(
-            Path::new("tests/benchmark/bm_spaces_class.cpp"),
-            Path::new("tests/benchmark/spaces_benchmarks/bm_spaces_class_definitions.h"),
-        ));
-    }
-
-    #[test]
-    fn native_rename_sanity_rejects_vector_similarity_bruteforce_factory_move() {
+    fn native_rename_requires_path_replacement_for_vector_similarity_bruteforce_factory_move() {
         let root = Path::new("/home/jonathan/Projects/VectorSimilarity");
         if !root.is_dir() {
             eprintln!("skipping vectorsim rename threshold regression: repo not present");
@@ -2032,8 +2015,7 @@ mod tests {
             !change.renames.iter().any(|(old_path, new_path)| {
                 old_path == Path::new("src/VecSim/algorithms/brute_force/brute_force_factory.cpp")
                     && new_path == Path::new("src/VecSim/index_factories/brute_force_factory.cpp")
-            }),
-            "native rename should be rejected by the shared stem-only guard"
+            })
         );
         assert!(change.paths.contains(&PathBuf::from(
             "src/VecSim/algorithms/brute_force/brute_force_factory.cpp"
