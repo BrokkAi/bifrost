@@ -57,12 +57,21 @@ fn file_summaries_preserve_fixture_line_numbers() {
     let summary = &result.summaries[0];
     assert_eq!("A.java", summary.path);
     assert_eq!("A.java", summary.label);
+    assert_eq!("import java.util.function.Function;", summary.preamble);
 
     let rendered: Vec<_> = summary
         .elements
         .iter()
         .map(render_summary_element)
         .collect();
+    assert!(summary
+        .elements
+        .iter()
+        .any(|element| element.symbol == "A" && element.kind == "class"));
+    assert!(summary
+        .elements
+        .iter()
+        .any(|element| element.symbol == "A.method2" && element.kind == "function"));
     assert!(rendered.contains(&"3..52: public class A".to_string()));
     assert!(rendered.contains(&"4..6: void method1()".to_string()));
     assert!(rendered.contains(&"8..10: public String method2(String input)".to_string()));
@@ -111,24 +120,35 @@ fn go_file_summaries_use_full_declaration_ranges() {
     let summary = &result.summaries[0];
     assert_eq!("declarations.go", summary.path);
     assert_eq!("declarations.go", summary.label);
+    assert_eq!("package declpkg", summary.preamble);
 
     let rendered: Vec<_> = summary
         .elements
         .iter()
         .map(render_summary_element)
         .collect();
+    assert!(summary
+        .elements
+        .iter()
+        .any(|element| element.symbol.ends_with("MyTopLevelFunction") && element.kind == "function"));
+    assert!(summary
+        .elements
+        .iter()
+        .any(|element| element.symbol.ends_with("MyStruct") && element.kind == "class"));
 
-    assert!(rendered.contains(&"6..8: func MyTopLevelFunction(param int) string".to_string()));
-    assert!(rendered.contains(&"10..12: type MyStruct struct".to_string()));
-    assert!(rendered.contains(&"14..16: type MyInterface interface".to_string()));
-    assert!(rendered.contains(&"19..21: func (s MyStruct) GetFieldA() int".to_string()));
-    assert!(rendered.contains(&"34: func anotherFunc()".to_string()));
+    assert!(rendered.contains(&"6..8: func MyTopLevelFunction(param int) string { ... }".to_string()));
+    assert!(rendered.contains(&"10..12: MyStruct struct".to_string()));
+    assert!(rendered.contains(&"14..16: MyInterface interface".to_string()));
+    assert!(rendered.contains(&"19..21: func (s MyStruct) GetFieldA() int { ... }".to_string()));
+    assert!(rendered.contains(&"34: func anotherFunc() { ... }".to_string()));
 }
 
 #[test]
 fn summary_renderer_uses_ranges_for_multiline_elements() {
     let rendered = render_summary_element(&SummaryElement {
         path: "A.java".to_string(),
+        symbol: "Foo".to_string(),
+        kind: "class".to_string(),
         start_line: 12,
         end_line: 14,
         text: "class Foo(\n  x: int,\n  y: int".to_string(),

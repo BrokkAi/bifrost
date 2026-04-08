@@ -37,6 +37,9 @@ class SearchToolsClientTest(unittest.TestCase):
             text = summaries.render_text()
 
         self.assertIn("A.java", text)
+        self.assertEqual("import java.util.function.Function;", summaries.summaries[0].preamble)
+        self.assertEqual("A", summaries.summaries[0].elements[0].symbol)
+        self.assertEqual("class", summaries.summaries[0].elements[0].kind)
         self.assertIn("3..52: public class A", text)
         self.assertIn("8..10: public String method2(String input)", text)
         self.assertIn("41..43: public void method7()", text)

@@ -118,6 +118,8 @@ class SymbolLocationsResult:
 @dataclass(frozen=True)
 class SummaryElement:
     path: str
+    symbol: str
+    kind: str
     start_line: int
     end_line: int
     text: str
@@ -126,6 +128,8 @@ class SummaryElement:
     def from_dict(cls, data: dict) -> SummaryElement:
         return cls(
             path=data["path"],
+            symbol=data["symbol"],
+            kind=data["kind"],
             start_line=data["start_line"],
             end_line=data["end_line"],
             text=data["text"],
@@ -146,6 +150,7 @@ class SummaryElement:
 class SummaryBlock:
     label: str
     path: str
+    preamble: str
     elements: list[SummaryElement]
 
     @classmethod
@@ -153,12 +158,17 @@ class SummaryBlock:
         return cls(
             label=data["label"],
             path=data["path"],
+            preamble=data.get("preamble", ""),
             elements=[SummaryElement.from_dict(item) for item in data["elements"]],
         )
 
     def render_text(self) -> str:
+        blocks: list[str] = [self.path]
+        if self.preamble:
+            blocks.append(self.preamble)
         rendered_elements = [element.render_text() for element in self.elements if element.text]
-        return "\n".join([self.path, *rendered_elements]).strip()
+        blocks.extend(rendered_elements)
+        return "\n".join(blocks).strip()
 
 
 @dataclass(frozen=True)

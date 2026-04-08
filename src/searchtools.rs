@@ -104,12 +104,15 @@ pub struct SummaryResult {
 pub struct SummaryBlock {
     pub label: String,
     pub path: String,
+    pub preamble: String,
     pub elements: Vec<SummaryElement>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SummaryElement {
     pub path: String,
+    pub symbol: String,
+    pub kind: String,
     pub start_line: usize,
     pub end_line: usize,
     pub text: String,
@@ -302,6 +305,7 @@ pub fn get_symbol_summaries(analyzer: &dyn IAnalyzer, params: SymbolNamesParams)
                     Some(SummaryBlock {
                         label: code_unit.fq_name(),
                         path: rel_path_string(code_unit.source()),
+                        preamble: file_preamble(code_unit.source(), &elements),
                         elements,
                     })
                 })
@@ -399,6 +403,7 @@ pub fn get_file_summaries(analyzer: &dyn IAnalyzer, params: FilePatternsParams) 
             Some(SummaryBlock {
                 label: rel_path_string(&file),
                 path: rel_path_string(&file),
+                preamble: file_preamble(&file, &elements),
                 elements,
             })
         })
@@ -584,12 +589,42 @@ fn signature_elements(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> Vec<Sum
             let end_line = start_line + line_count.saturating_sub(1);
             Some(SummaryElement {
                 path: path.clone(),
+                symbol: code_unit.fq_name(),
+                kind: code_unit_kind_name(code_unit.kind()).to_string(),
                 start_line,
                 end_line,
                 text,
             })
         })
         .collect()
+}
+
+fn code_unit_kind_name(kind: CodeUnitType) -> &'static str {
+    match kind {
+        CodeUnitType::Class => "class",
+        CodeUnitType::Function => "function",
+        CodeUnitType::Field => "field",
+        CodeUnitType::Module => "module",
+    }
+}
+
+fn file_preamble(file: &ProjectFile, elements: &[SummaryElement]) -> String {
+    let Some(first_start_line) = elements.iter().map(|element| element.start_line).min() else {
+        return String::new();
+    };
+    if first_start_line <= 1 {
+        return String::new();
+    }
+    let Ok(content) = file.read_to_string() else {
+        return String::new();
+    };
+    content
+        .lines()
+        .take(first_start_line.saturating_sub(1))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim_end()
+        .to_string()
 }
 
 fn trim_summary_signature(signature: &str) -> String {
