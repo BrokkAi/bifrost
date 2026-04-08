@@ -643,6 +643,11 @@ where
             .filter(|child| child.is_field())
             .cloned()
             .collect();
+        let parent_start = crate::analyzer::IAnalyzer::ranges_of(self, code_unit)
+            .into_iter()
+            .map(|range| range.start_byte)
+            .min()
+            .unwrap_or(usize::MAX);
         let non_field_children: Vec<_> = all_children
             .iter()
             .filter(|child| !child.is_field())
@@ -653,7 +658,16 @@ where
         } else {
             field_children
                 .iter()
-                .chain(non_field_children.iter())
+                .chain(
+                    non_field_children
+                        .iter()
+                        .filter(|child| Self::child_first_start(self, child) >= parent_start),
+                )
+                .chain(
+                    non_field_children
+                        .iter()
+                        .filter(|child| Self::child_first_start(self, child) < parent_start),
+                )
                 .cloned()
                 .collect()
         };
@@ -672,6 +686,19 @@ where
                 out.push_str("}\n");
             }
         }
+    }
+}
+
+impl<A> TreeSitterAnalyzer<A>
+where
+    A: LanguageAdapter,
+{
+    fn child_first_start(&self, child: &CodeUnit) -> usize {
+        crate::analyzer::IAnalyzer::ranges_of(self, child)
+            .into_iter()
+            .map(|range| range.start_byte)
+            .min()
+            .unwrap_or(usize::MAX)
     }
 }
 

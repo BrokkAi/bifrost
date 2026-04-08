@@ -8,6 +8,9 @@ use common::{assert_code_eq, go_fixture_project, normalize_nonempty_lines};
 use std::collections::BTreeSet;
 use tempfile::tempdir;
 
+const PROXYGROUP_TEST_REGRESSION_SOURCE: &str =
+    include_str!("fixtures/proxygroup_test_regression.go");
+
 fn fixture_analyzer() -> GoAnalyzer {
     GoAnalyzer::from_project(go_fixture_project())
 }
@@ -178,6 +181,10 @@ fn test_go_summary_orders_same_file_receiver_methods_after_fields() {
             nativeAddr4 int
             nativeAddr6 int
         }
+
+        func (pc *peerConfigTable) String() string {
+            return ""
+        }
         "#,
     )]));
     let file = ProjectFile::new(analyzer.project().root().to_path_buf(), "wrap.go");
@@ -188,10 +195,24 @@ fn test_go_summary_orders_same_file_receiver_methods_after_fields() {
         - peerConfigTable
           - nativeAddr4
           - nativeAddr6
+          - String
           - snat
           - dnat
         "#,
         &analyzer.summarize_symbols(&file),
+    );
+}
+
+#[test]
+fn test_go_summary_recovers_top_level_functions_from_error_nodes() {
+    let analyzer =
+        GoAnalyzer::from_project(inline_project(&[("proxygroup_test.go", PROXYGROUP_TEST_REGRESSION_SOURCE)]));
+    let file = ProjectFile::new(analyzer.project().root().to_path_buf(), "proxygroup_test.go");
+    let summary = analyzer.summarize_symbols(&file);
+
+    assert!(
+        summary.contains("- TestProxyGroup\n"),
+        "Expected TestProxyGroup to appear in the summary. Summary was:\n{summary}"
     );
 }
 

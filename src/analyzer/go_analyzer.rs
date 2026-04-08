@@ -70,36 +70,7 @@ impl LanguageAdapter for GoAdapter {
             let Some(child) = root.named_child(index) else {
                 continue;
             };
-            let package_name = parsed.package_name.clone();
-            match child.kind() {
-                "import_declaration" => visit_go_imports(child, source, &mut parsed),
-                "function_declaration" => {
-                    visit_go_function(file, source, child, None, package_name, &mut parsed);
-                }
-                "method_declaration" => {
-                    visit_go_method(file, source, child, &package_name, &mut parsed)
-                }
-                "type_declaration" => {
-                    visit_go_type_declaration(file, source, child, &package_name, &mut parsed)
-                }
-                "var_declaration" => visit_go_value_declaration(
-                    file,
-                    source,
-                    child,
-                    &package_name,
-                    "var",
-                    &mut parsed,
-                ),
-                "const_declaration" => visit_go_value_declaration(
-                    file,
-                    source,
-                    child,
-                    &package_name,
-                    "const",
-                    &mut parsed,
-                ),
-                _ => {}
-            }
+            visit_go_top_level_node(file, source, child, &mut parsed);
         }
 
         parsed
@@ -576,6 +547,34 @@ fn visit_go_function(
     );
     parsed.add_signature(code_unit.clone(), go_function_signature(node, source));
     Some(code_unit)
+}
+
+fn visit_go_top_level_node(
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+) {
+    let package_name = parsed.package_name.clone();
+    match node.kind() {
+        "import_declaration" => visit_go_imports(node, source, parsed),
+        "function_declaration" => {
+            visit_go_function(file, source, node, None, package_name, parsed);
+        }
+        "method_declaration" => visit_go_method(file, source, node, &package_name, parsed),
+        "type_declaration" => visit_go_type_declaration(file, source, node, &package_name, parsed),
+        "var_declaration" => visit_go_value_declaration(file, source, node, &package_name, "var", parsed),
+        "const_declaration" => {
+            visit_go_value_declaration(file, source, node, &package_name, "const", parsed)
+        }
+        "ERROR" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                visit_go_top_level_node(file, source, child, parsed);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn visit_go_method(

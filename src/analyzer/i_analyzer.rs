@@ -323,11 +323,13 @@ fn render_symbol_summary<A: IAnalyzer + ?Sized>(
     summary.push_str(code_unit.identifier());
 
     let children: Vec<_> = ordered_summary_children(
+        analyzer,
+        code_unit,
         analyzer
-        .get_direct_children(code_unit)
-        .into_iter()
-        .filter(|child| types.contains(&child.kind()))
-        .collect(),
+            .get_direct_children(code_unit)
+            .into_iter()
+            .filter(|child| types.contains(&child.kind()))
+            .collect(),
     );
     if !children.is_empty() {
         summary.push('\n');
@@ -341,15 +343,45 @@ fn render_symbol_summary<A: IAnalyzer + ?Sized>(
     summary.push('\n');
 }
 
-fn ordered_summary_children(children: Vec<CodeUnit>) -> Vec<CodeUnit> {
+fn ordered_summary_children<A: IAnalyzer + ?Sized>(
+    analyzer: &A,
+    parent: &CodeUnit,
+    children: Vec<CodeUnit>,
+) -> Vec<CodeUnit> {
     if children.len() < 2 {
         return children;
     }
 
+    let parent_start = analyzer
+        .ranges_of(parent)
+        .into_iter()
+        .map(|range| range.start_byte)
+        .min()
+        .unwrap_or(usize::MAX);
     let mut ordered = Vec::with_capacity(children.len());
     ordered.extend(children.iter().filter(|child| child.is_field()).cloned());
-    ordered.extend(children.iter().filter(|child| !child.is_field()).cloned());
+    ordered.extend(
+        children
+            .iter()
+            .filter(|child| !child.is_field() && child_first_start(analyzer, child) >= parent_start)
+            .cloned(),
+    );
+    ordered.extend(
+        children
+            .iter()
+            .filter(|child| !child.is_field() && child_first_start(analyzer, child) < parent_start)
+            .cloned(),
+    );
     ordered
+}
+
+fn child_first_start<A: IAnalyzer + ?Sized>(analyzer: &A, child: &CodeUnit) -> usize {
+    analyzer
+        .ranges_of(child)
+        .into_iter()
+        .map(|range| range.start_byte)
+        .min()
+        .unwrap_or(usize::MAX)
 }
 
 fn all_code_unit_types() -> BTreeSet<CodeUnitType> {
