@@ -643,10 +643,19 @@ where
             .filter(|child| child.is_field())
             .cloned()
             .collect();
+        let non_field_children: Vec<_> = all_children
+            .iter()
+            .filter(|child| !child.is_field())
+            .cloned()
+            .collect();
         let children = if header_only {
             field_children.clone()
         } else {
-            all_children.clone()
+            field_children
+                .iter()
+                .chain(non_field_children.iter())
+                .cloned()
+                .collect()
         };
 
         if !children.is_empty() || code_unit.is_class() {
@@ -654,7 +663,7 @@ where
             for child in children {
                 self.render_skeleton_recursive(&child, &child_indent, header_only, out);
             }
-            if header_only && all_children.len() > field_children.len() {
+            if header_only && !non_field_children.is_empty() {
                 out.push_str(&child_indent);
                 out.push_str("[...]\n");
             }

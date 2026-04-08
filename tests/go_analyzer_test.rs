@@ -165,6 +165,37 @@ fn test_go_summary_includes_methods_for_external_receiver_types() {
 }
 
 #[test]
+fn test_go_summary_orders_same_file_receiver_methods_after_fields() {
+    let analyzer = GoAnalyzer::from_project(inline_project(&[(
+        "wrap.go",
+        r#"
+        package tstun
+
+        func (pc *peerConfigTable) snat() {}
+        func (pc *peerConfigTable) dnat() {}
+
+        type peerConfigTable struct {
+            nativeAddr4 int
+            nativeAddr6 int
+        }
+        "#,
+    )]));
+    let file = ProjectFile::new(analyzer.project().root().to_path_buf(), "wrap.go");
+
+    assert_code_eq(
+        r#"
+        # tstun
+        - peerConfigTable
+          - nativeAddr4
+          - nativeAddr6
+          - snat
+          - dnat
+        "#,
+        &analyzer.summarize_symbols(&file),
+    );
+}
+
+#[test]
 fn test_go_definitions_skeletons_and_members() {
     let analyzer = fixture_analyzer();
     let file = ProjectFile::new(analyzer.project().root().to_path_buf(), "declarations.go");

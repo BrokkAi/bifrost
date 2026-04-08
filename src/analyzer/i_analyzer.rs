@@ -322,11 +322,13 @@ fn render_symbol_summary<A: IAnalyzer + ?Sized>(
     summary.push_str("- ");
     summary.push_str(code_unit.identifier());
 
-    let children: Vec<_> = analyzer
+    let children: Vec<_> = ordered_summary_children(
+        analyzer
         .get_direct_children(code_unit)
         .into_iter()
         .filter(|child| types.contains(&child.kind()))
-        .collect();
+        .collect(),
+    );
     if !children.is_empty() {
         summary.push('\n');
         summary.push_str(&summarize_code_units_impl(
@@ -337,6 +339,17 @@ fn render_symbol_summary<A: IAnalyzer + ?Sized>(
         ));
     }
     summary.push('\n');
+}
+
+fn ordered_summary_children(children: Vec<CodeUnit>) -> Vec<CodeUnit> {
+    if children.len() < 2 {
+        return children;
+    }
+
+    let mut ordered = Vec::with_capacity(children.len());
+    ordered.extend(children.iter().filter(|child| child.is_field()).cloned());
+    ordered.extend(children.iter().filter(|child| !child.is_field()).cloned());
+    ordered
 }
 
 fn all_code_unit_types() -> BTreeSet<CodeUnitType> {
