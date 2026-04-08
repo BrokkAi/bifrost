@@ -208,9 +208,7 @@ pub trait IAnalyzer: Send + Sync + Any {
         }
 
         let parent_name = fq_name.get(..last_index?)?;
-        self.get_definitions(parent_name)
-            .into_iter()
-            .find(|candidate| candidate.is_class() || candidate.is_module())
+        self.get_definitions(parent_name).into_iter().next()
     }
 }
 

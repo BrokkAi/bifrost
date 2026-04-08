@@ -762,6 +762,37 @@ fn visit_go_struct_fields(
                     Some(parent.clone()),
                 );
                 parsed.add_signature(code_unit, format!("{field_name}{suffix}"));
+                if let Some(nested_type) = go_field_inline_container_type(field) {
+                    match nested_type.kind() {
+                        "struct_type" => visit_go_struct_fields(
+                            file,
+                            source,
+                            nested_type,
+                            &CodeUnit::new(
+                                file.clone(),
+                                CodeUnitType::Field,
+                                package_name.to_string(),
+                                format!("{}.{}", parent.short_name(), field_name),
+                            ),
+                            package_name,
+                            parsed,
+                        ),
+                        "interface_type" => visit_go_interface_methods(
+                            file,
+                            source,
+                            nested_type,
+                            &CodeUnit::new(
+                                file.clone(),
+                                CodeUnitType::Field,
+                                package_name.to_string(),
+                                format!("{}.{}", parent.short_name(), field_name),
+                            ),
+                            package_name,
+                            parsed,
+                        ),
+                        _ => {}
+                    }
+                }
             }
         }
     }
@@ -1059,6 +1090,12 @@ fn go_struct_field_suffix(node: Node<'_>, source: &str) -> String {
         .and_then(|start| source.get(start..node.end_byte()))
         .map(|suffix| format!(" {}", suffix.trim()))
         .unwrap_or_default()
+}
+
+fn go_field_inline_container_type(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| matches!(child.kind(), "struct_type" | "interface_type"))
 }
 
 fn go_value_is_simple_literal(value: &str) -> bool {

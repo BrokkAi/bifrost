@@ -217,6 +217,41 @@ fn test_go_summary_recovers_top_level_functions_from_error_nodes() {
 }
 
 #[test]
+fn test_go_summary_includes_nested_anonymous_struct_fields() {
+    let analyzer = GoAnalyzer::from_project(inline_project(&[(
+        "tsrecorder.go",
+        r#"
+        package main
+
+        type prefs struct {
+            Config struct {
+                NodeID string
+                UserProfile struct {
+                    LoginName string
+                }
+            }
+
+            AdvertiseServices []string
+        }
+        "#,
+    )]));
+    let file = ProjectFile::new(analyzer.project().root().to_path_buf(), "tsrecorder.go");
+
+    assert_code_eq(
+        r#"
+        # main
+        - prefs
+          - Config
+            - NodeID
+            - UserProfile
+              - LoginName
+          - AdvertiseServices
+        "#,
+        &analyzer.summarize_symbols(&file),
+    );
+}
+
+#[test]
 fn test_go_definitions_skeletons_and_members() {
     let analyzer = fixture_analyzer();
     let file = ProjectFile::new(analyzer.project().root().to_path_buf(), "declarations.go");
