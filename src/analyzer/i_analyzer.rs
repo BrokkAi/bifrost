@@ -192,7 +192,7 @@ pub trait IAnalyzer: Send + Sync + Any {
         file: &ProjectFile,
         types: &BTreeSet<CodeUnitType>,
     ) -> String {
-        summarize_code_units_impl(self, &self.get_top_level_declarations(file), types, 0)
+        summarize_code_units_impl(self, &summary_root_units(self, file), types, 0)
     }
 
     fn parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
@@ -212,6 +212,32 @@ pub trait IAnalyzer: Send + Sync + Any {
             .into_iter()
             .find(|candidate| candidate.is_class() || candidate.is_module())
     }
+}
+
+fn summary_root_units<A: IAnalyzer + ?Sized>(analyzer: &A, file: &ProjectFile) -> Vec<CodeUnit> {
+    let declarations: Vec<_> = analyzer.get_declarations(file).into_iter().collect();
+    let declaration_set: BTreeSet<_> = declarations.iter().cloned().collect();
+    let mut roots: Vec<_> = declarations
+        .into_iter()
+        .filter(|code_unit| {
+            analyzer
+                .parent_of(code_unit)
+                .map(|parent| !declaration_set.contains(&parent))
+                .unwrap_or(true)
+        })
+        .collect();
+    roots.sort_by(|left, right| summary_root_order(analyzer, left, right));
+    roots
+}
+
+fn summary_root_order<A: IAnalyzer + ?Sized>(
+    analyzer: &A,
+    left: &CodeUnit,
+    right: &CodeUnit,
+) -> Ordering {
+    let left_range = analyzer.ranges_of(left).into_iter().min();
+    let right_range = analyzer.ranges_of(right).into_iter().min();
+    left_range.cmp(&right_range).then_with(|| left.cmp(right))
 }
 
 fn summarize_code_units_impl<A: IAnalyzer + ?Sized>(

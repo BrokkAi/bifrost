@@ -131,6 +131,40 @@ fn test_go_declarations_and_fq_names() {
 }
 
 #[test]
+fn test_go_summary_includes_methods_for_external_receiver_types() {
+    let analyzer = GoAnalyzer::from_project(inline_project(&[(
+        "diskcache.go",
+        r#"
+        package ipnlocal
+
+        type diskCache struct {
+            dir string
+            cache int
+        }
+
+        func (b *LocalBackend) writeNetmapToDiskLocked() {}
+        func (b *LocalBackend) loadDiskCacheLocked() {}
+        func (b *LocalBackend) discardDiskCacheLocked() {}
+        "#,
+    )]));
+    let file = ProjectFile::new(analyzer.project().root().to_path_buf(), "diskcache.go");
+
+    assert_code_eq(
+        r#"
+        # ipnlocal
+        - diskCache
+          - dir
+          - cache
+        # ipnlocal.LocalBackend
+        - writeNetmapToDiskLocked
+        - loadDiskCacheLocked
+        - discardDiskCacheLocked
+        "#,
+        &analyzer.summarize_symbols(&file),
+    );
+}
+
+#[test]
 fn test_go_definitions_skeletons_and_members() {
     let analyzer = fixture_analyzer();
     let file = ProjectFile::new(analyzer.project().root().to_path_buf(), "declarations.go");
