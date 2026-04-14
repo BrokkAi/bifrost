@@ -2,16 +2,19 @@
 
 `bifrost` is a Rust port of Brokk's Tree-sitter-backed analyzer suite.
 
-At the library level, this repository builds the `brokk_analyzer` crate. It provides single-language analyzers, a `MultiAnalyzer`, snapshot-style updates, import analysis, type hierarchy queries where supported, test-file detection, and source/skeleton extraction across a set of vendored fixture corpora copied from Brokk.
+At the library level, this repository builds the `brokk_analyzer` crate. It provides single-language analyzers, a `MultiAnalyzer`, snapshot-style updates, import analysis, type hierarchy queries, test-file detection, and source/skeleton extraction.
 
 At the tool level, this repository also provides:
 
 - `bifrost`, a stdio MCP server that exposes analyzer-backed search tools
 - `bifrost_searchtools`, a Python client package backed by a native Rust extension
 
+Experimental:
+- `bifrost-search`, a semantic method/function indexer and search CLI backed by rvector.
+
 ## Status
 
-The analyzer port is substantial rather than minimal. The current tree includes analyzers for:
+The current tree includes analyzers for:
 
 - Java
 - JavaScript
@@ -23,19 +26,6 @@ The analyzer port is substantial rather than minimal. The current tree includes 
 - C#
 - PHP
 - Scala
-
-The repository vendors Brokk's Tree-sitter query files under [resources/treesitter](/home/jonathan/Projects/bifrost/resources/treesitter) and fixture projects under [tests/fixtures](/home/jonathan/Projects/bifrost/tests/fixtures).
-
-## Repository Layout
-
-- [src/analyzer](/home/jonathan/Projects/bifrost/src/analyzer): core analyzer library
-- [src/searchtools.rs](/home/jonathan/Projects/bifrost/src/searchtools.rs): analyzer-backed searchtools result layer
-- [src/searchtools_service.rs](/home/jonathan/Projects/bifrost/src/searchtools_service.rs): shared JSON tool service used by both MCP and Python FFI
-- [src/mcp_server.rs](/home/jonathan/Projects/bifrost/src/mcp_server.rs): MCP stdio server implementation for `bifrost --server searchtools`
-- [src/bin/bifrost.rs](/home/jonathan/Projects/bifrost/src/bin/bifrost.rs): `bifrost` binary entrypoint
-- [bifrost_searchtools](/home/jonathan/Projects/bifrost/bifrost_searchtools): Python FFI client and renderers
-- [python_tests](/home/jonathan/Projects/bifrost/python_tests): Python client tests
-- [tests](/home/jonathan/Projects/bifrost/tests): Rust integration tests
 
 ## Build
 
@@ -51,7 +41,7 @@ Python client build/install:
 maturin develop
 ```
 
-This repository has a mixed Python/Rust [pyproject.toml](/home/jonathan/Projects/bifrost/pyproject.toml) so `bifrost_searchtools` can be installed as a normal Python package while loading the native `bifrost_searchtools._native` PyO3 extension.
+This repository has a minimal pyproject.toml so `uv run python ...` can execute the `bifrost_searchtools` client against the official Python MCP SDK dependency.
 
 ## Test
 
@@ -92,7 +82,7 @@ fn main() -> Result<(), String> {
 }
 ```
 
-The main public exports are re-exported from [src/lib.rs](/home/jonathan/Projects/bifrost/src/lib.rs), including:
+The main public exports are re-exported from src/lib.rs, including:
 
 - `WorkspaceAnalyzer`
 - `MultiAnalyzer`
@@ -168,6 +158,4 @@ For repo-local development without installing the package, `SearchToolsClient(..
 
 ## Notes
 
-- The repository contains living implementation plans in [EXECPLAN.md](/home/jonathan/Projects/bifrost/EXECPLAN.md), [SEARCHTOOLS_MCP_EXECPLAN.md](/home/jonathan/Projects/bifrost/SEARCHTOOLS_MCP_EXECPLAN.md), and [SEARCHTOOLS_PYO3_EXECPLAN.md](/home/jonathan/Projects/bifrost/SEARCHTOOLS_PYO3_EXECPLAN.md).
 - The Tree-sitter grammar crate versions are intentionally not forced to share the same numeric version. The policy is documented in [Cargo.toml](/home/jonathan/Projects/bifrost/Cargo.toml).
-- The standalone MCP server remains available for external clients even though the Python client no longer uses MCP internally.
