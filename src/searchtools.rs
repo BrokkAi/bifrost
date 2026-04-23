@@ -7,7 +7,7 @@ use rayon::prelude::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const FILE_SEARCH_LIMIT: usize = 100;
 const FILE_SKIM_LIMIT: usize = 20;
@@ -388,7 +388,7 @@ pub fn get_symbol_sources(
 }
 
 pub fn get_file_summaries(analyzer: &dyn IAnalyzer, params: FilePatternsParams) -> SummaryResult {
-    let files = expand_file_patterns(analyzer, &params.file_patterns);
+    let files = resolve_file_patterns(analyzer, &params.file_patterns);
     let mut summaries: Vec<_> = files
         .into_par_iter()
         .filter_map(|file| {
@@ -426,7 +426,7 @@ pub fn skim_files(analyzer: &dyn IAnalyzer, params: FilePatternsParams) -> SkimF
 }
 
 pub fn summarize_symbols(analyzer: &dyn IAnalyzer, params: FilePatternsParams) -> SkimFilesResult {
-    let expanded = expand_file_patterns(analyzer, &params.file_patterns);
+    let expanded = resolve_file_patterns(analyzer, &params.file_patterns);
     let truncated = expanded.len() > FILE_SKIM_LIMIT;
     let files: Vec<_> = expanded
         .into_iter()
@@ -726,31 +726,54 @@ fn primary_range(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> Option<Range
         .min_by_key(|range| (range.start_line, range.start_byte))
 }
 
-fn expand_file_patterns(analyzer: &dyn IAnalyzer, patterns: &[String]) -> Vec<ProjectFile> {
-    let globs: Vec<_> = patterns
-        .iter()
-        .filter_map(|pattern| Pattern::new(&normalize_pattern(pattern)).ok())
-        .collect();
-    if globs.is_empty() {
-        return Vec::new();
+fn resolve_file_patterns(analyzer: &dyn IAnalyzer, patterns: &[String]) -> Vec<ProjectFile> {
+    let mut matched = BTreeSet::new();
+    let mut globs = Vec::new();
+
+    for pattern in patterns {
+        let normalized = normalize_pattern(pattern.trim());
+        if normalized.is_empty() {
+            continue;
+        }
+
+        if is_glob_pattern(&normalized) {
+            if let Ok(glob) = Pattern::new(&normalized) {
+                globs.push(glob);
+            }
+            continue;
+        }
+
+        let rel_path = Path::new(&normalized);
+        if !rel_path.is_absolute()
+            && let Some(file) = analyzer.project().file_by_rel_path(rel_path)
+        {
+            matched.insert(file);
+        }
     }
 
-    let mut matched: Vec<_> = analyzer
-        .get_analyzed_files()
-        .into_iter()
-        .collect::<Vec<_>>()
-        .into_par_iter()
-        .filter(|file| {
-            let path = rel_path_string(file);
-            globs.iter().any(|glob| glob.matches(&path))
-        })
-        .collect();
-    matched.sort();
-    matched
+    if !globs.is_empty() {
+        let glob_matches: BTreeSet<_> = analyzer
+            .get_analyzed_files()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .filter(|file| {
+                let path = rel_path_string(file);
+                globs.iter().any(|glob| glob.matches(&path))
+            })
+            .collect();
+        matched.extend(glob_matches);
+    }
+
+    matched.into_iter().collect()
 }
 
 fn normalize_pattern(pattern: &str) -> String {
     pattern.replace('\\', "/")
+}
+
+fn is_glob_pattern(pattern: &str) -> bool {
+    pattern.contains(['*', '?', '['])
 }
 
 fn rel_path_string(file: &ProjectFile) -> String {
@@ -931,7 +954,193 @@ fn language_name(language: Language) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{SourceBlock, SummaryElement, trim_summary_signature};
+    use super::{
+        SourceBlock, SummaryElement, resolve_file_patterns, skim_files, summarize_symbols,
+        trim_summary_signature,
+    };
+    use crate::analyzer::{
+        CodeUnit, DeclarationInfo, IAnalyzer, Language, Project, ProjectFile, Range,
+    };
+    use std::collections::BTreeSet;
+    use std::io;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug)]
+    struct CountingProject {
+        root: PathBuf,
+        files: BTreeSet<ProjectFile>,
+    }
+
+    impl CountingProject {
+        fn new(root: PathBuf, files: BTreeSet<ProjectFile>) -> Self {
+            Self { root, files }
+        }
+    }
+
+    impl Project for CountingProject {
+        fn root(&self) -> &Path {
+            &self.root
+        }
+
+        fn analyzer_languages(&self) -> BTreeSet<Language> {
+            BTreeSet::from([Language::Java])
+        }
+
+        fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>> {
+            Ok(self.files.clone())
+        }
+
+        fn analyzable_files(&self, _language: Language) -> io::Result<BTreeSet<ProjectFile>> {
+            Ok(self.files.clone())
+        }
+
+        fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile> {
+            let file = ProjectFile::new(self.root.clone(), rel_path.to_path_buf());
+            self.files.contains(&file).then_some(file)
+        }
+    }
+
+    struct CountingAnalyzer {
+        project: CountingProject,
+        analyzed_files_calls: AtomicUsize,
+    }
+
+    impl CountingAnalyzer {
+        fn new(root: PathBuf, rel_paths: &[&str]) -> Self {
+            let files = rel_paths
+                .iter()
+                .map(|rel_path| ProjectFile::new(root.clone(), *rel_path))
+                .collect();
+            Self {
+                project: CountingProject::new(root, files),
+                analyzed_files_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn analyzed_files_calls(&self) -> usize {
+            self.analyzed_files_calls.load(Ordering::Relaxed)
+        }
+    }
+
+    impl IAnalyzer for CountingAnalyzer {
+        fn get_top_level_declarations(&self, _file: &ProjectFile) -> Vec<CodeUnit> {
+            Vec::new()
+        }
+
+        fn get_analyzed_files(&self) -> BTreeSet<ProjectFile> {
+            self.analyzed_files_calls.fetch_add(1, Ordering::Relaxed);
+            self.project.files.clone()
+        }
+
+        fn languages(&self) -> BTreeSet<Language> {
+            BTreeSet::from([Language::Java])
+        }
+
+        fn update(&self, _changed_files: &BTreeSet<ProjectFile>) -> Self {
+            Self {
+                project: CountingProject::new(
+                    self.project.root.clone(),
+                    self.project.files.clone(),
+                ),
+                analyzed_files_calls: AtomicUsize::new(self.analyzed_files_calls()),
+            }
+        }
+
+        fn update_all(&self) -> Self {
+            Self {
+                project: CountingProject::new(
+                    self.project.root.clone(),
+                    self.project.files.clone(),
+                ),
+                analyzed_files_calls: AtomicUsize::new(self.analyzed_files_calls()),
+            }
+        }
+
+        fn project(&self) -> &dyn Project {
+            &self.project
+        }
+
+        fn get_all_declarations(&self) -> Vec<CodeUnit> {
+            Vec::new()
+        }
+
+        fn get_declarations(&self, _file: &ProjectFile) -> BTreeSet<CodeUnit> {
+            BTreeSet::new()
+        }
+
+        fn get_definitions(&self, _fq_name: &str) -> Vec<CodeUnit> {
+            Vec::new()
+        }
+
+        fn get_direct_children(&self, _code_unit: &CodeUnit) -> Vec<CodeUnit> {
+            Vec::new()
+        }
+
+        fn extract_call_receiver(&self, _reference: &str) -> Option<String> {
+            None
+        }
+
+        fn import_statements_of(&self, _file: &ProjectFile) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn enclosing_code_unit(&self, _file: &ProjectFile, _range: &Range) -> Option<CodeUnit> {
+            None
+        }
+
+        fn enclosing_code_unit_for_lines(
+            &self,
+            _file: &ProjectFile,
+            _start_line: usize,
+            _end_line: usize,
+        ) -> Option<CodeUnit> {
+            None
+        }
+
+        fn is_access_expression(
+            &self,
+            _file: &ProjectFile,
+            _start_byte: usize,
+            _end_byte: usize,
+        ) -> bool {
+            false
+        }
+
+        fn find_nearest_declaration(
+            &self,
+            _file: &ProjectFile,
+            _start_byte: usize,
+            _end_byte: usize,
+            _ident: &str,
+        ) -> Option<DeclarationInfo> {
+            None
+        }
+
+        fn ranges_of(&self, _code_unit: &CodeUnit) -> Vec<Range> {
+            Vec::new()
+        }
+
+        fn get_skeleton(&self, _code_unit: &CodeUnit) -> Option<String> {
+            None
+        }
+
+        fn get_skeleton_header(&self, _code_unit: &CodeUnit) -> Option<String> {
+            None
+        }
+
+        fn get_source(&self, _code_unit: &CodeUnit, _include_comments: bool) -> Option<String> {
+            None
+        }
+
+        fn get_sources(&self, _code_unit: &CodeUnit, _include_comments: bool) -> BTreeSet<String> {
+            BTreeSet::new()
+        }
+
+        fn search_definitions(&self, _pattern: &str, _auto_quote: bool) -> BTreeSet<CodeUnit> {
+            BTreeSet::new()
+        }
+    }
 
     #[test]
     fn trims_synthetic_summary_lines() {
@@ -956,5 +1165,70 @@ mod tests {
             end_line: 10,
             text: "class A {".to_string(),
         };
+    }
+
+    #[test]
+    fn literal_file_pattern_uses_project_lookup_without_scanning_analyzed_files() {
+        let root = std::env::current_dir().unwrap();
+        let analyzer = CountingAnalyzer::new(root, &["A.java", "nested/B.java"]);
+        let files = resolve_file_patterns(&analyzer, &["nested/B.java".to_string()]);
+
+        assert_eq!(vec!["nested/B.java"], rel_paths(&files));
+        assert_eq!(0, analyzer.analyzed_files_calls());
+    }
+
+    #[test]
+    fn glob_file_pattern_scans_analyzed_files() {
+        let root = std::env::current_dir().unwrap();
+        let analyzer = CountingAnalyzer::new(root, &["A.java", "nested/B.java", "notes.txt"]);
+        let files = resolve_file_patterns(&analyzer, &["nested/*.java".to_string()]);
+
+        assert_eq!(vec!["nested/B.java"], rel_paths(&files));
+        assert_eq!(1, analyzer.analyzed_files_calls());
+    }
+
+    #[test]
+    fn file_pattern_resolution_deduplicates_literal_and_glob_matches() {
+        let root = std::env::current_dir().unwrap();
+        let analyzer = CountingAnalyzer::new(root, &["A.java", "nested/B.java"]);
+        let files = resolve_file_patterns(
+            &analyzer,
+            &[
+                "nested/B.java".to_string(),
+                "nested/*.java".to_string(),
+                "nested/B.java".to_string(),
+            ],
+        );
+
+        assert_eq!(vec!["nested/B.java"], rel_paths(&files));
+        assert_eq!(1, analyzer.analyzed_files_calls());
+    }
+
+    #[test]
+    fn skim_file_tools_share_fast_literal_resolution() {
+        let root = std::env::current_dir().unwrap();
+        let analyzer = CountingAnalyzer::new(root, &["A.java"]);
+
+        let _ = summarize_symbols(
+            &analyzer,
+            super::FilePatternsParams {
+                file_patterns: vec!["A.java".to_string()],
+            },
+        );
+        let _ = skim_files(
+            &analyzer,
+            super::FilePatternsParams {
+                file_patterns: vec!["A.java".to_string()],
+            },
+        );
+
+        assert_eq!(0, analyzer.analyzed_files_calls());
+    }
+
+    fn rel_paths(files: &[ProjectFile]) -> Vec<String> {
+        files
+            .iter()
+            .map(|file| file.rel_path().to_string_lossy().replace('\\', "/"))
+            .collect()
     }
 }

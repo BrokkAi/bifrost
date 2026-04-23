@@ -266,7 +266,7 @@ fn file_patterns_schema() -> Value {
             "file_patterns": {
                 "type": "array",
                 "items": { "type": "string" },
-                "description": "Glob-style project-relative file patterns."
+                "description": "Project-relative file paths or glob patterns."
             }
         },
         "required": ["file_patterns"]
