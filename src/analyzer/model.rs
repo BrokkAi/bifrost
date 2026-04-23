@@ -2,9 +2,11 @@ use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::File;
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Language {
@@ -68,11 +70,14 @@ pub enum CodeUnitType {
     Module,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ProjectFile {
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct ProjectFileInner {
     root: PathBuf,
     rel_path: PathBuf,
 }
+
+#[derive(Clone)]
+pub struct ProjectFile(Arc<ProjectFileInner>);
 
 impl ProjectFile {
     pub fn new(root: impl Into<PathBuf>, rel_path: impl Into<PathBuf>) -> Self {
@@ -85,26 +90,27 @@ impl ProjectFile {
             "project file path must be relative"
         );
 
-        Self {
+        Self(Arc::new(ProjectFileInner {
             root: root.normalize(),
             rel_path: rel_path.normalize(),
-        }
+        }))
     }
 
     pub fn root(&self) -> &Path {
-        &self.root
+        &self.0.root
     }
 
     pub fn rel_path(&self) -> &Path {
-        &self.rel_path
+        &self.0.rel_path
     }
 
     pub fn abs_path(&self) -> PathBuf {
-        self.root.join(&self.rel_path)
+        self.0.root.join(&self.0.rel_path)
     }
 
     pub fn parent(&self) -> PathBuf {
-        self.rel_path
+        self.0
+            .rel_path
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_default()
@@ -138,10 +144,34 @@ impl ProjectFile {
     }
 }
 
+impl fmt::Debug for ProjectFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProjectFile")
+            .field("root", &self.0.root)
+            .field("rel_path", &self.0.rel_path)
+            .finish()
+    }
+}
+
+impl PartialEq for ProjectFile {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.root == other.0.root && self.0.rel_path == other.0.rel_path
+    }
+}
+
+impl Eq for ProjectFile {}
+
+impl Hash for ProjectFile {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.root.hash(state);
+        self.0.rel_path.hash(state);
+    }
+}
+
 impl Ord for ProjectFile {
     fn cmp(&self, other: &Self) -> Ordering {
-        match self.root.cmp(&other.root) {
-            Ordering::Equal => self.rel_path.cmp(&other.rel_path),
+        match self.0.root.cmp(&other.0.root) {
+            Ordering::Equal => self.0.rel_path.cmp(&other.0.rel_path),
             ordering => ordering,
         }
     }
@@ -155,12 +185,12 @@ impl PartialOrd for ProjectFile {
 
 impl fmt::Display for ProjectFile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.rel_path.display())
+        write!(f, "{}", self.0.rel_path.display())
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct CodeUnit {
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct CodeUnitInner {
     source: ProjectFile,
     kind: CodeUnitType,
     package_name: String,
@@ -168,6 +198,9 @@ pub struct CodeUnit {
     signature: Option<String>,
     synthetic: bool,
 }
+
+#[derive(Clone)]
+pub struct CodeUnit(Arc<CodeUnitInner>);
 
 impl CodeUnit {
     pub fn new(
@@ -194,60 +227,61 @@ impl CodeUnit {
             "short_name must not be empty (kind={kind:?}, package_name={package_name:?}, source={source}, signature={signature:?}, synthetic={synthetic})"
         );
 
-        Self {
+        Self(Arc::new(CodeUnitInner {
             source,
             kind,
             package_name,
             short_name,
             signature,
             synthetic,
-        }
+        }))
     }
 
     pub fn source(&self) -> &ProjectFile {
-        &self.source
+        &self.0.source
     }
 
     pub fn kind(&self) -> CodeUnitType {
-        self.kind
+        self.0.kind
     }
 
     pub fn package_name(&self) -> &str {
-        &self.package_name
+        &self.0.package_name
     }
 
     pub fn short_name(&self) -> &str {
-        &self.short_name
+        &self.0.short_name
     }
 
     pub fn signature(&self) -> Option<&str> {
-        self.signature.as_deref()
+        self.0.signature.as_deref()
     }
 
     pub fn is_synthetic(&self) -> bool {
-        self.synthetic
+        self.0.synthetic
     }
 
     pub fn is_anonymous(&self) -> bool {
-        self.short_name.contains("$anon$")
+        self.0.short_name.contains("$anon$")
     }
 
     pub fn fq_name(&self) -> String {
-        if self.package_name.is_empty() {
-            self.short_name.clone()
+        if self.0.package_name.is_empty() {
+            self.0.short_name.clone()
         } else {
-            format!("{}.{}", self.package_name, self.short_name)
+            format!("{}.{}", self.0.package_name, self.0.short_name)
         }
     }
 
     pub fn identifier(&self) -> &str {
         let name = self
+            .0
             .short_name
             .rsplit(['.', '$'])
             .next()
-            .unwrap_or(&self.short_name);
-        if matches!(self.kind, CodeUnitType::Function | CodeUnitType::Field) {
-            self.short_name.rsplit('.').next().unwrap_or(name)
+            .unwrap_or(&self.0.short_name);
+        if matches!(self.0.kind, CodeUnitType::Function | CodeUnitType::Field) {
+            self.0.short_name.rsplit('.').next().unwrap_or(name)
         } else {
             name
         }
@@ -255,65 +289,157 @@ impl CodeUnit {
 
     pub fn without_signature(&self) -> Self {
         Self::with_signature(
-            self.source.clone(),
-            self.kind,
-            self.package_name.clone(),
-            self.short_name.clone(),
+            self.0.source.clone(),
+            self.0.kind,
+            self.0.package_name.clone(),
+            self.0.short_name.clone(),
             None,
-            self.synthetic,
+            self.0.synthetic,
         )
     }
 
     pub fn with_synthetic(&self, synthetic: bool) -> Self {
         Self::with_signature(
-            self.source.clone(),
-            self.kind,
-            self.package_name.clone(),
-            self.short_name.clone(),
-            self.signature.clone(),
+            self.0.source.clone(),
+            self.0.kind,
+            self.0.package_name.clone(),
+            self.0.short_name.clone(),
+            self.0.signature.clone(),
             synthetic,
         )
     }
 
     pub fn is_class(&self) -> bool {
-        self.kind == CodeUnitType::Class
+        self.0.kind == CodeUnitType::Class
     }
 
     pub fn is_function(&self) -> bool {
-        self.kind == CodeUnitType::Function
+        self.0.kind == CodeUnitType::Function
     }
 
     pub fn is_field(&self) -> bool {
-        self.kind == CodeUnitType::Field
+        self.0.kind == CodeUnitType::Field
     }
 
     pub fn is_module(&self) -> bool {
-        self.kind == CodeUnitType::Module
+        self.0.kind == CodeUnitType::Module
+    }
+}
+
+impl fmt::Debug for CodeUnit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CodeUnit")
+            .field("source", &self.0.source)
+            .field("kind", &self.0.kind)
+            .field("package_name", &self.0.package_name)
+            .field("short_name", &self.0.short_name)
+            .field("signature", &self.0.signature)
+            .field("synthetic", &self.0.synthetic)
+            .finish()
+    }
+}
+
+impl PartialEq for CodeUnit {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.source == other.0.source
+            && self.0.kind == other.0.kind
+            && self.0.package_name == other.0.package_name
+            && self.0.short_name == other.0.short_name
+            && self.0.signature == other.0.signature
+            && self.0.synthetic == other.0.synthetic
+    }
+}
+
+impl Eq for CodeUnit {}
+
+impl Hash for CodeUnit {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.source.hash(state);
+        self.0.kind.hash(state);
+        self.0.package_name.hash(state);
+        self.0.short_name.hash(state);
+        self.0.signature.hash(state);
+        self.0.synthetic.hash(state);
     }
 }
 
 impl Ord for CodeUnit {
     fn cmp(&self, other: &Self) -> Ordering {
-        (
-            self.fq_name(),
-            self.kind,
-            self.source.clone(),
-            self.signature.clone(),
-            self.synthetic,
+        cmp_fq_name_parts(
+            &self.0.package_name,
+            &self.0.short_name,
+            &other.0.package_name,
+            &other.0.short_name,
         )
-            .cmp(&(
-                other.fq_name(),
-                other.kind,
-                other.source.clone(),
-                other.signature.clone(),
-                other.synthetic,
-            ))
+        .then_with(|| self.0.kind.cmp(&other.0.kind))
+        .then_with(|| self.0.source.cmp(&other.0.source))
+        .then_with(|| self.0.signature.cmp(&other.0.signature))
+        .then_with(|| self.0.synthetic.cmp(&other.0.synthetic))
+        .then_with(|| self.0.package_name.cmp(&other.0.package_name))
+        .then_with(|| self.0.short_name.cmp(&other.0.short_name))
     }
 }
 
 impl PartialOrd for CodeUnit {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
+    }
+}
+
+fn cmp_fq_name_parts(
+    left_package: &str,
+    left_short: &str,
+    right_package: &str,
+    right_short: &str,
+) -> Ordering {
+    let mut left = FqNameBytes::new(left_package, left_short);
+    let mut right = FqNameBytes::new(right_package, right_short);
+    loop {
+        match (left.next(), right.next()) {
+            (Some(left), Some(right)) => match left.cmp(&right) {
+                Ordering::Equal => {}
+                ordering => return ordering,
+            },
+            (Some(_), None) => return Ordering::Greater,
+            (None, Some(_)) => return Ordering::Less,
+            (None, None) => return Ordering::Equal,
+        }
+    }
+}
+
+struct FqNameBytes<'a> {
+    package: &'a [u8],
+    short: &'a [u8],
+    position: usize,
+}
+
+impl<'a> FqNameBytes<'a> {
+    fn new(package: &'a str, short: &'a str) -> Self {
+        Self {
+            package: package.as_bytes(),
+            short: short.as_bytes(),
+            position: 0,
+        }
+    }
+}
+
+impl Iterator for FqNameBytes<'_> {
+    type Item = u8;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let value = if self.package.is_empty() {
+            self.short.get(self.position).copied()
+        } else if self.position < self.package.len() {
+            self.package.get(self.position).copied()
+        } else if self.position == self.package.len() {
+            Some(b'.')
+        } else {
+            self.short
+                .get(self.position - self.package.len() - 1)
+                .copied()
+        };
+        self.position += usize::from(value.is_some());
+        value
     }
 }
 

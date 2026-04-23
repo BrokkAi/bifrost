@@ -1,5 +1,6 @@
 use crate::analyzer::{
-    AnalyzerConfig, CodeUnit, DeclarationInfo, ImportInfo, Language, Project, ProjectFile, Range,
+    AnalyzerConfig, CodeBaseMetrics, CodeUnit, DeclarationInfo, ImportInfo, Language, Project,
+    ProjectFile, Range,
 };
 use crate::profiling;
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
@@ -68,6 +69,7 @@ struct AnalyzerState {
     ranges: BTreeMap<CodeUnit, Vec<Range>>,
     raw_supertypes: BTreeMap<CodeUnit, Vec<String>>,
     signatures: BTreeMap<CodeUnit, Vec<String>>,
+    classes_by_package: BTreeMap<String, Vec<CodeUnit>>,
     #[allow(dead_code)]
     type_aliases: BTreeSet<CodeUnit>,
 }
@@ -474,6 +476,7 @@ where
         let mut ranges = BTreeMap::<CodeUnit, Vec<Range>>::new();
         let mut raw_supertypes = BTreeMap::<CodeUnit, Vec<String>>::new();
         let mut signatures = BTreeMap::<CodeUnit, Vec<String>>::new();
+        let mut classes_by_package = BTreeMap::<String, Vec<CodeUnit>>::new();
         let mut type_aliases = BTreeSet::<CodeUnit>::new();
 
         for state in files.values() {
@@ -482,6 +485,12 @@ where
                     .entry(adapter.normalize_full_name(&declaration.fq_name()))
                     .or_default()
                     .push(declaration.clone());
+                if declaration.is_class() {
+                    classes_by_package
+                        .entry(declaration.package_name().to_string())
+                        .or_default()
+                        .push(declaration.clone());
+                }
             }
 
             for (parent, descendants) in &state.children {
@@ -533,6 +542,13 @@ where
             matches.dedup();
         }
 
+        for matches in classes_by_package.values_mut() {
+            matches.sort_by_cached_key(|code_unit| {
+                Self::definition_sort_key(adapter, &ranges, code_unit)
+            });
+            matches.dedup();
+        }
+
         let _ = project;
 
         AnalyzerState {
@@ -543,6 +559,7 @@ where
             ranges,
             raw_supertypes,
             signatures,
+            classes_by_package,
             type_aliases,
         }
     }
@@ -582,6 +599,14 @@ where
 
     pub(crate) fn all_files(&self) -> BTreeSet<ProjectFile> {
         self.state.files.keys().cloned().collect()
+    }
+
+    pub(crate) fn class_declarations_in_package(&self, package_name: &str) -> Vec<CodeUnit> {
+        self.state
+            .classes_by_package
+            .get(package_name)
+            .cloned()
+            .unwrap_or_default()
     }
 
     #[allow(dead_code)]
@@ -968,11 +993,25 @@ where
             return BTreeSet::new();
         };
 
-        self.get_all_declarations()
-            .into_par_iter()
-            .filter(|code_unit| !self.adapter.is_anonymous_structure(&code_unit.fq_name()))
-            .filter(|code_unit| compiled.is_match(&code_unit.fq_name()))
+        self.state
+            .definitions
+            .par_iter()
+            .filter(|(fq_name, _)| {
+                !self.adapter.is_anonymous_structure(fq_name) && compiled.is_match(fq_name)
+            })
+            .flat_map(|(_, definitions)| definitions.iter().cloned().collect::<Vec<_>>())
             .collect()
+    }
+
+    fn metrics(&self) -> CodeBaseMetrics {
+        CodeBaseMetrics::new(
+            self.state.files.len(),
+            self.state
+                .files
+                .values()
+                .map(|state| state.declarations.len())
+                .sum(),
+        )
     }
 
     fn contains_tests(&self, file: &ProjectFile) -> bool {

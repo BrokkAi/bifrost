@@ -160,10 +160,11 @@ pub fn refresh_result(analyzer: &dyn IAnalyzer) -> RefreshResult {
         .collect();
     languages.sort();
 
+    let metrics = analyzer.metrics();
     RefreshResult {
         languages,
-        analyzed_files: analyzer.get_analyzed_files().len(),
-        declarations: analyzer.get_all_declarations().len(),
+        analyzed_files: metrics.file_count,
+        declarations: metrics.declaration_count,
     }
 }
 
@@ -949,6 +950,8 @@ mod tests {
         };
         let _element = SummaryElement {
             path: "A.java".to_string(),
+            symbol: "A".to_string(),
+            kind: "class".to_string(),
             start_line: 10,
             end_line: 10,
             text: "class A {".to_string(),

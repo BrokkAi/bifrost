@@ -536,10 +536,7 @@ impl JavaAnalyzer {
             }
 
             let package_name = import_path.trim_end_matches(".*");
-            for code_unit in self.inner.get_all_declarations() {
-                if !code_unit.is_class() || code_unit.package_name() != package_name {
-                    continue;
-                }
+            for code_unit in self.inner.class_declarations_in_package(package_name) {
                 resolved
                     .entry(code_unit.identifier().to_string())
                     .or_insert(code_unit);

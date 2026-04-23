@@ -96,7 +96,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     let structured = &file_summaries["result"]["structuredContent"];
     assert_eq!("A.java", structured["summaries"][0]["path"]);
     assert_eq!(3, structured["summaries"][0]["elements"][0]["start_line"]);
-    assert_eq!(3, structured["summaries"][0]["elements"][0]["end_line"]);
+    assert_eq!(52, structured["summaries"][0]["elements"][0]["end_line"]);
 
     let summarize_symbols = round_trip(
         &mut stdin,

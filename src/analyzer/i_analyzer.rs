@@ -220,7 +220,7 @@ fn summary_root_units<A: IAnalyzer + ?Sized>(analyzer: &A, file: &ProjectFile) -
         .filter(|code_unit| {
             analyzer
                 .parent_of(code_unit)
-                .map(|parent| !declaration_set.contains(&parent))
+                .map(|parent| parent.is_module() || !declaration_set.contains(&parent))
                 .unwrap_or(true)
         })
         .collect();
