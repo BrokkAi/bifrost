@@ -205,9 +205,14 @@ fn test_go_summary_orders_same_file_receiver_methods_after_fields() {
 
 #[test]
 fn test_go_summary_recovers_top_level_functions_from_error_nodes() {
-    let analyzer =
-        GoAnalyzer::from_project(inline_project(&[("proxygroup_test.go", PROXYGROUP_TEST_REGRESSION_SOURCE)]));
-    let file = ProjectFile::new(analyzer.project().root().to_path_buf(), "proxygroup_test.go");
+    let analyzer = GoAnalyzer::from_project(inline_project(&[(
+        "proxygroup_test.go",
+        PROXYGROUP_TEST_REGRESSION_SOURCE,
+    )]));
+    let file = ProjectFile::new(
+        analyzer.project().root().to_path_buf(),
+        "proxygroup_test.go",
+    );
     let summary = analyzer.summarize_symbols(&file);
 
     assert!(

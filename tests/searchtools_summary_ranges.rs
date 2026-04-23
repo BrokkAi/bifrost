@@ -64,14 +64,18 @@ fn file_summaries_preserve_fixture_line_numbers() {
         .iter()
         .map(render_summary_element)
         .collect();
-    assert!(summary
-        .elements
-        .iter()
-        .any(|element| element.symbol == "A" && element.kind == "class"));
-    assert!(summary
-        .elements
-        .iter()
-        .any(|element| element.symbol == "A.method2" && element.kind == "function"));
+    assert!(
+        summary
+            .elements
+            .iter()
+            .any(|element| element.symbol == "A" && element.kind == "class")
+    );
+    assert!(
+        summary
+            .elements
+            .iter()
+            .any(|element| element.symbol == "A.method2" && element.kind == "function")
+    );
     assert!(rendered.contains(&"3..52: public class A".to_string()));
     assert!(rendered.contains(&"4..6: void method1()".to_string()));
     assert!(rendered.contains(&"8..10: public String method2(String input)".to_string()));
@@ -127,16 +131,19 @@ fn go_file_summaries_use_full_declaration_ranges() {
         .iter()
         .map(render_summary_element)
         .collect();
-    assert!(summary
-        .elements
-        .iter()
-        .any(|element| element.symbol.ends_with("MyTopLevelFunction") && element.kind == "function"));
-    assert!(summary
-        .elements
-        .iter()
-        .any(|element| element.symbol.ends_with("MyStruct") && element.kind == "class"));
+    assert!(summary.elements.iter().any(
+        |element| element.symbol.ends_with("MyTopLevelFunction") && element.kind == "function"
+    ));
+    assert!(
+        summary
+            .elements
+            .iter()
+            .any(|element| element.symbol.ends_with("MyStruct") && element.kind == "class")
+    );
 
-    assert!(rendered.contains(&"6..8: func MyTopLevelFunction(param int) string { ... }".to_string()));
+    assert!(
+        rendered.contains(&"6..8: func MyTopLevelFunction(param int) string { ... }".to_string())
+    );
     assert!(rendered.contains(&"10..12: MyStruct struct".to_string()));
     assert!(rendered.contains(&"14..16: MyInterface interface".to_string()));
     assert!(rendered.contains(&"19..21: func (s MyStruct) GetFieldA() int { ... }".to_string()));

@@ -563,7 +563,9 @@ fn visit_go_top_level_node(
         }
         "method_declaration" => visit_go_method(file, source, node, &package_name, parsed),
         "type_declaration" => visit_go_type_declaration(file, source, node, &package_name, parsed),
-        "var_declaration" => visit_go_value_declaration(file, source, node, &package_name, "var", parsed),
+        "var_declaration" => {
+            visit_go_value_declaration(file, source, node, &package_name, "var", parsed)
+        }
         "const_declaration" => {
             visit_go_value_declaration(file, source, node, &package_name, "const", parsed)
         }
