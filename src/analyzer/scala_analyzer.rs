@@ -718,12 +718,11 @@ fn last_segment(name: &str) -> &str {
 }
 
 fn scala_contains_tests(source: &str) -> bool {
-    let normalized = source.replace("\r\n", "\n");
-    normalized.contains("@Test")
-        || normalized.contains("@org.junit.Test")
-        || normalized.contains("test(\"")
-        || normalized.contains("test (\"")
-        || (normalized.contains(" should ") && normalized.contains(" in {"))
+    source.contains("@Test")
+        || source.contains("@org.junit.Test")
+        || source.contains("test(\"")
+        || source.contains("test (\"")
+        || (source.contains(" should ") && source.contains(" in {"))
 }
 
 fn strip_declaration_indent(text: &str, declaration_indent: usize) -> String {
