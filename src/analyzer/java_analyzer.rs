@@ -687,18 +687,18 @@ fn normalize_java_full_name(fq_name: &str) -> String {
 
     if normalized.contains("$anon$") {
         let mut out = String::with_capacity(normalized.len());
-        let mut index = 0usize;
+        let mut chars = normalized.char_indices();
 
-        while index < normalized.len() {
+        while let Some((index, ch)) = chars.next() {
             if normalized[index..].starts_with("$anon$") {
                 out.push_str("$anon$");
-                index += 6;
+                for _ in 0.."anon$".len() {
+                    chars.next();
+                }
                 continue;
             }
 
-            let ch = normalized.as_bytes()[index] as char;
             out.push(if ch == '$' { '.' } else { ch });
-            index += 1;
         }
 
         return out;
