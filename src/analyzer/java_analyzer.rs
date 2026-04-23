@@ -1966,14 +1966,39 @@ fn estimate_code_unit_set(values: &HashSet<CodeUnit>) -> u64 {
 }
 
 fn java_source_contains_tests(source: &str) -> bool {
-    let compact = source.replace(char::is_whitespace, "");
-    compact.contains("@Test")
-        || compact.contains(".Test")
-        || compact.contains("@ParameterizedTest")
-        || compact.contains("@RepeatedTest")
-        || compact.contains("@Rule")
-        || compact.contains("@ClassRule")
-        || compact.contains("@Ignore")
-        || compact.contains("extendsTestCase")
-        || compact.contains("extendsjunit.framework.TestCase")
+    source.contains("@Test")
+        || source.contains(".Test")
+        || source.contains("@ParameterizedTest")
+        || source.contains("@RepeatedTest")
+        || source.contains("@Rule")
+        || source.contains("@ClassRule")
+        || source.contains("@Ignore")
+        || (source.contains("TestCase")
+            && (contains_ignoring_whitespace(source, "extendsTestCase")
+                || contains_ignoring_whitespace(source, "extendsjunit.framework.TestCase")))
+}
+
+fn contains_ignoring_whitespace(source: &str, needle: &str) -> bool {
+    let mut needle_chars = needle.chars();
+    let Some(first) = needle_chars.next() else {
+        return true;
+    };
+
+    for (start, ch) in source.char_indices() {
+        if ch.is_whitespace() || ch != first {
+            continue;
+        }
+
+        let mut chars = source[start + ch.len_utf8()..]
+            .chars()
+            .filter(|ch| !ch.is_whitespace());
+        if needle_chars
+            .clone()
+            .all(|expected| chars.next() == Some(expected))
+        {
+            return true;
+        }
+    }
+
+    false
 }

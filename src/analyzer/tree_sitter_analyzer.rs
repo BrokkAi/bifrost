@@ -377,11 +377,12 @@ where
     }
 
     fn analyze_file(parser: &mut Parser, adapter: &A, file: &ProjectFile) -> Option<FileState> {
-        if file.is_binary().ok()? {
+        let bytes = std::fs::read(file.abs_path()).ok()?;
+        if bytes.contains(&0) {
             return None;
         }
 
-        let source = file.read_to_string().ok()?;
+        let source = String::from_utf8(bytes).ok()?;
         let tree = parser.parse(source.as_str(), None)?;
         let parsed = adapter.parse_file(file, &source, &tree);
         let contains_tests = adapter.contains_tests(file, &source, &tree, &parsed);
