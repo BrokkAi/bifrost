@@ -80,9 +80,9 @@ pub(crate) fn most_relevant_project_files(
         return Vec::new();
     }
 
-    let excluded: BTreeSet<_> = seed_weights.keys().cloned().collect();
+    let excluded: HashSet<_> = seed_weights.keys().cloned().collect();
     let mut results = Vec::new();
-    let mut seen = BTreeSet::new();
+    let mut seen = HashSet::new();
 
     {
         let _scope = profiling::scope("relevance::git");
@@ -107,8 +107,8 @@ pub(crate) fn most_relevant_project_files(
 
 fn append_candidate(
     results: &mut Vec<ProjectFile>,
-    seen: &mut BTreeSet<ProjectFile>,
-    excluded: &BTreeSet<ProjectFile>,
+    seen: &mut HashSet<ProjectFile>,
+    excluded: &HashSet<ProjectFile>,
     candidate: ProjectFile,
     top_k: usize,
 ) -> bool {
