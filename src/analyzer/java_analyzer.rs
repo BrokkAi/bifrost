@@ -1,14 +1,14 @@
 use crate::analyzer::{
     AnalyzerConfig, CodeUnit, DeclarationInfo, DeclarationKind, IAnalyzer, ImportAnalysisProvider,
     ImportInfo, Language, LanguageAdapter, Project, ProjectFile, TestDetectionProvider,
-    TreeSitterAnalyzer, TypeHierarchyProvider, direct_descendants_via_ancestors,
-    referencing_files_via_imports,
+    TreeSitterAnalyzer, TypeHierarchyProvider, build_reverse_import_index,
+    direct_descendants_via_ancestors,
 };
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
 use std::collections::BTreeSet;
 use std::mem::size_of;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
 
 #[derive(Debug, Clone, Default)]
@@ -126,6 +126,7 @@ struct JavaMemoCaches {
     relevant_imports: Cache<CodeUnit, Arc<HashSet<String>>>,
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
     direct_descendants: Cache<CodeUnit, Arc<HashSet<CodeUnit>>>,
+    reverse_import_index: OnceLock<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
 }
 
 impl JavaMemoCaches {
@@ -137,6 +138,7 @@ impl JavaMemoCaches {
             relevant_imports: Self::build_cache(budget_bytes / 8, weight_string_set),
             direct_ancestors: Self::build_cache(budget_bytes / 8, weight_code_unit_vec),
             direct_descendants: Self::build_cache(budget_bytes / 8, weight_code_unit_set),
+            reverse_import_index: OnceLock::new(),
         }
     }
 
@@ -268,7 +270,14 @@ impl ImportAnalysisProvider for JavaAnalyzer {
             return (*cached).clone();
         }
 
-        let mut result = referencing_files_via_imports(self, self, file);
+        let reverse_index = self.memo_caches.reverse_import_index.get_or_init(|| {
+            let files: Vec<_> = self.inner.all_files().cloned().collect();
+            build_reverse_import_index(&files, |candidate| self.imported_code_units_of(candidate))
+        });
+        let mut result = reverse_index
+            .get(file)
+            .map(|files| (**files).clone())
+            .unwrap_or_default();
 
         let target_identifiers: HashSet<String> = self
             .inner

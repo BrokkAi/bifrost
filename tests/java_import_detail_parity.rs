@@ -93,11 +93,12 @@ fn resolved_imports_exclude_static_imports_and_keep_mixed_resolution() {
         .unwrap()
         .source()
         .clone();
-    let resolved: Vec<_> = analyzer
+    let mut resolved: Vec<_> = analyzer
         .imported_code_units_of(&consumer_file)
         .into_iter()
         .map(|code_unit| code_unit.fq_name())
         .collect();
+    resolved.sort();
 
     assert_eq!(
         vec![

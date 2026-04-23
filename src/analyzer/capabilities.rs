@@ -38,30 +38,6 @@ pub trait ImportAnalysisProvider: CapabilityProvider {
     }
 }
 
-pub(crate) fn referencing_files_via_imports<A, P>(
-    analyzer: &A,
-    provider: &P,
-    file: &ProjectFile,
-) -> HashSet<ProjectFile>
-where
-    A: IAnalyzer,
-    P: ImportAnalysisProvider + ?Sized,
-{
-    analyzer
-        .analyzed_files()
-        .filter(|candidate| *candidate != file)
-        .filter(|candidate| {
-            let imports = provider.import_info_of(candidate);
-            provider.could_import_file(candidate, imports, file)
-                && provider
-                    .imported_code_units_of(candidate)
-                    .into_iter()
-                    .any(|code_unit| code_unit.source() == file)
-        })
-        .cloned()
-        .collect()
-}
-
 pub(crate) fn build_reverse_import_index<F>(
     files: &[ProjectFile],
     resolve_imported: F,

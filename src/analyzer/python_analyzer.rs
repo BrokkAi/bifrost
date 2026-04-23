@@ -1,13 +1,12 @@
 use crate::analyzer::{
     AnalyzerConfig, CodeUnit, CodeUnitType, IAnalyzer, ImportAnalysisProvider, ImportInfo,
     Language, LanguageAdapter, Project, ProjectFile, TestDetectionProvider, TreeSitterAnalyzer,
-    TypeHierarchyProvider, direct_descendants_via_ancestors,
+    TypeHierarchyProvider, build_reverse_import_index, direct_descendants_via_ancestors,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::profiling;
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use moka::sync::Cache;
-use rayon::prelude::*;
 use regex::Regex;
 use std::collections::BTreeSet;
 use std::mem::size_of;
@@ -229,29 +228,8 @@ impl PythonAnalyzer {
         self.reverse_import_index.get_or_init(|| {
             let _scope = profiling::scope("PythonAnalyzer::build_reverse_import_index");
             let files: Vec<_> = self.inner.all_files().cloned().collect();
-            let imported_by_file: Vec<_> = files
-                .par_iter()
-                .map(|file| {
-                    let resolved: HashSet<_> =
-                        self.resolve_import_bindings(file).into_values().collect();
-                    (file.clone(), resolved)
-                })
-                .collect();
-
-            let mut reverse: HashMap<ProjectFile, HashSet<ProjectFile>> = HashMap::default();
-            for (file, imported) in imported_by_file {
-                self.imported_code_units
-                    .insert(file.clone(), Arc::new(imported.clone()));
-                for code_unit in imported {
-                    let target = code_unit.source();
-                    if target != &file {
-                        reverse
-                            .entry(target.clone())
-                            .or_default()
-                            .insert(file.clone());
-                    }
-                }
-            }
+            let reverse =
+                build_reverse_import_index(&files, |file| self.imported_code_units_of(file));
 
             if profiling::enabled() {
                 profiling::note(format!(
@@ -262,9 +240,6 @@ impl PythonAnalyzer {
             }
 
             reverse
-                .into_iter()
-                .map(|(file, refs)| (file, Arc::new(refs)))
-                .collect()
         })
     }
 
