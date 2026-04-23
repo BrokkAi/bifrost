@@ -14,8 +14,9 @@ The current Rust port exposes many immutable analyzer collections as owned `Vec`
 - [x] (2026-04-23T07:22:28Z) Recorded the implementation strategy and API shape in this ExecPlan.
 - [x] (2026-04-23T07:26:50Z) Converted `IAnalyzer` and `ImportAnalysisProvider` to include borrowed state-view methods while keeping owned adapter methods for compatibility.
 - [x] (2026-04-23T07:26:50Z) Updated `TreeSitterAnalyzer`, language analyzer wrappers, `MultiAnalyzer`, `WorkspaceAnalyzer`, and the searchtools test helper to compile against the borrowed-view API.
-- [ ] Replace internal sorted maps/sets with hash maps/sets where sorting is not inherent.
-- [ ] Run formatting and tests, record any ordering-sensitive tests that require caller-owned sorting.
+- [x] (2026-04-23T08:05:12Z) Replaced internal analyzer state maps/sets and language capability caches with `HashMap`/`HashSet` where order is not semantic.
+- [x] (2026-04-23T08:05:12Z) Migrated hot internal callers in analyzer helpers, searchtools, summary, and relevance to borrowed iterator/slice APIs.
+- [x] (2026-04-23T08:05:12Z) Ran formatting and validation; updated tests that require deterministic comparison to sort/collect at the assertion boundary.
 
 ## Surprises & Discoveries
 
@@ -24,6 +25,12 @@ The current Rust port exposes many immutable analyzer collections as owned `Vec`
 
 - Observation: The borrowed-view compatibility layer compiles and passes the library test suite before changing storage types.
   Evidence: `cargo check` finished successfully; `cargo test --lib` reported `27 passed; 0 failed; 36 ignored`.
+
+- Observation: The storage and capability cache conversion compiles without any analyzer-order regressions in the local suites.
+  Evidence: `cargo check`, `cargo fmt --check`, `cargo test --lib`, `cargo test --test model_handle_semantics`, and focused import/hierarchy integration tests all passed.
+
+- Observation: The `most_relevant_files` integration binary compiles and its local tests pass, but Brokk-reference cases cannot run in this checkout.
+  Evidence: `cargo test --test most_relevant_files` failed only in reference invocations with `ClassNotFoundException: ai.brokk.tools.MostRelevantFilesCli` or missing Gradle task `:app:runMostRelevantFiles`.
 
 ## Decision Log
 
@@ -39,11 +46,17 @@ The current Rust port exposes many immutable analyzer collections as owned `Vec`
   Rationale: Source blocks and skeletons are derived strings, not stored state. Import/reference/hierarchy/search result sets are computed outputs and can be optimized separately after the state-view refactor lands.
   Date/Author: 2026-04-23 / Codex.
 
+- Decision: Change set-valued capability results and their caches to `HashSet`, while sorting only at tests or ranking/rendering code that has an explicit deterministic need.
+  Rationale: Import/reference/relevant-import/direct-descendant APIs express uniqueness, not sorted order. Tests that compared against `BTreeSet` now collect into `BTreeSet` at the assertion boundary.
+  Date/Author: 2026-04-23 / Codex.
+
 ## Outcomes & Retrospective
 
-No implementation outcome yet. This section must be updated after each major milestone and at completion.
-
 Milestone outcome 2026-04-23: The analyzer trait now has borrowed-view accessors and implementations delegate through them. Existing owned `get_*` methods remain as compatibility adapters so callers can be migrated incrementally.
+
+Milestone outcome 2026-04-23: `TreeSitterAnalyzer` now stores file/index state in hash maps and hash sets where no ordering contract exists. Language analyzer import/reference/type-hierarchy caches also use hash sets for uniqueness. Searchtools, summary, relevance, Java/Python/JS/TS/Go/Rust/C++ import resolution, and shared analyzer helpers iterate borrowed analyzer state directly and clone only when they need owned return values.
+
+Validation outcome 2026-04-23: `cargo fmt --check`, `cargo check`, `cargo test --lib`, `cargo test --test model_handle_semantics`, `cargo test --tests --no-run`, and focused import/hierarchy integration tests passed. `cargo test --test most_relevant_files` was attempted; non-reference tests passed, while reference parity tests failed because the Java Brokk reference CLI/task is unavailable in this workspace.
 
 ## Context and Orientation
 

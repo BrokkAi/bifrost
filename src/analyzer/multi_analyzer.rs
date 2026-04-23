@@ -5,7 +5,7 @@ use crate::analyzer::{
     TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider, TypescriptAnalyzer,
 };
 use rayon::prelude::*;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 #[derive(Clone)]
 pub enum AnalyzerDelegate {
@@ -161,14 +161,14 @@ impl MultiAnalyzer {
 }
 
 impl ImportAnalysisProvider for MultiAnalyzer {
-    fn imported_code_units_of(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
+    fn imported_code_units_of(&self, file: &ProjectFile) -> HashSet<CodeUnit> {
         self.delegate_for_file(file)
             .and_then(AnalyzerDelegate::import_analysis_provider)
             .map(|provider| provider.imported_code_units_of(file))
             .unwrap_or_default()
     }
 
-    fn referencing_files_of(&self, file: &ProjectFile) -> BTreeSet<ProjectFile> {
+    fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
         self.delegates
             .values()
             .filter_map(AnalyzerDelegate::import_analysis_provider)
@@ -183,7 +183,7 @@ impl ImportAnalysisProvider for MultiAnalyzer {
             .unwrap_or(&[])
     }
 
-    fn relevant_imports_for(&self, code_unit: &CodeUnit) -> BTreeSet<String> {
+    fn relevant_imports_for(&self, code_unit: &CodeUnit) -> HashSet<String> {
         self.delegate_for_code_unit(code_unit)
             .and_then(AnalyzerDelegate::import_analysis_provider)
             .map(|provider| provider.relevant_imports_for(code_unit))
@@ -211,7 +211,7 @@ impl TypeHierarchyProvider for MultiAnalyzer {
             .unwrap_or_default()
     }
 
-    fn get_direct_descendants(&self, code_unit: &CodeUnit) -> BTreeSet<CodeUnit> {
+    fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
         self.delegate_for_code_unit(code_unit)
             .and_then(AnalyzerDelegate::type_hierarchy_provider)
             .map(|provider| provider.get_direct_descendants(code_unit))

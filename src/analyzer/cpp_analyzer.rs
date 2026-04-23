@@ -4,7 +4,7 @@ use crate::analyzer::{
 };
 use moka::sync::Cache;
 use regex::Regex;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeSet, HashSet};
 use std::mem::size_of;
 use std::path::Path;
 use std::sync::Arc;
@@ -66,8 +66,8 @@ impl LanguageAdapter for CppAdapter {
 #[derive(Clone)]
 pub struct CppAnalyzer {
     inner: TreeSitterAnalyzer<CppAdapter>,
-    imported_code_units: Cache<ProjectFile, Arc<BTreeSet<CodeUnit>>>,
-    referencing_files: Cache<ProjectFile, Arc<BTreeSet<ProjectFile>>>,
+    imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
+    referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
 }
 
 impl CppAnalyzer {
@@ -93,16 +93,16 @@ impl CppAnalyzer {
 }
 
 impl ImportAnalysisProvider for CppAnalyzer {
-    fn imported_code_units_of(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
+    fn imported_code_units_of(&self, file: &ProjectFile) -> HashSet<CodeUnit> {
         if let Some(cached) = self.imported_code_units.get(file) {
             return (*cached).clone();
         }
 
-        let mut resolved = BTreeSet::new();
-        for line in self.inner.import_statements_of(file) {
-            if let Some(path) = parse_quoted_include(&line) {
+        let mut resolved = HashSet::new();
+        for line in self.inner.import_statements(file) {
+            if let Some(path) = parse_quoted_include(line) {
                 for target in resolve_include_targets(self.inner.project(), file, &path) {
-                    resolved.extend(self.inner.get_top_level_declarations(&target));
+                    resolved.extend(self.inner.top_level_declarations(&target).cloned());
                 }
             }
         }
@@ -112,28 +112,23 @@ impl ImportAnalysisProvider for CppAnalyzer {
         resolved
     }
 
-    fn referencing_files_of(&self, file: &ProjectFile) -> BTreeSet<ProjectFile> {
+    fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
         if let Some(cached) = self.referencing_files.get(file) {
             return (*cached).clone();
         }
 
         let file_name = file.rel_path().file_name().and_then(|value| value.to_str());
-        let mut references = BTreeSet::new();
+        let mut references = HashSet::new();
         for candidate in self.inner.all_files() {
             if candidate == file {
                 continue;
             }
-            if self
-                .inner
-                .import_statements_of(&candidate)
-                .into_iter()
-                .any(|line| {
-                    parse_quoted_include(&line).is_some_and(|include| {
-                        file.rel_path() == Path::new(&include)
-                            || file_name.is_some_and(|name| include.ends_with(name))
-                    })
+            if self.inner.import_statements(candidate).iter().any(|line| {
+                parse_quoted_include(line).is_some_and(|include| {
+                    file.rel_path() == Path::new(&include)
+                        || file_name.is_some_and(|name| include.ends_with(name))
                 })
-            {
+            }) {
                 references.insert(candidate.clone());
             }
         }
@@ -147,13 +142,13 @@ impl ImportAnalysisProvider for CppAnalyzer {
         self.inner.import_info_of(file)
     }
 
-    fn relevant_imports_for(&self, code_unit: &CodeUnit) -> BTreeSet<String> {
+    fn relevant_imports_for(&self, code_unit: &CodeUnit) -> HashSet<String> {
         let source = code_unit.source();
         let identifiers = self
             .extract_type_identifiers(&self.inner.get_source(code_unit, true).unwrap_or_default());
         self.inner
-            .import_statements_of(source)
-            .into_iter()
+            .import_statements(source)
+            .iter()
             .filter(|line| {
                 parse_quoted_include(line).is_some_and(|path| {
                     let stem = Path::new(&path)
@@ -163,6 +158,7 @@ impl ImportAnalysisProvider for CppAnalyzer {
                     identifiers.contains(stem)
                 })
             })
+            .cloned()
             .collect()
     }
 
@@ -1271,7 +1267,11 @@ fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     source.get(node.start_byte()..node.end_byte()).unwrap_or("")
 }
 
-fn collect_cpp_identifiers(node: Node<'_>, source: &str, identifiers: &mut BTreeSet<String>) {
+fn collect_cpp_identifiers(
+    node: Node<'_>,
+    source: &str,
+    identifiers: &mut std::collections::HashSet<String>,
+) {
     match node.kind() {
         "type_identifier" | "identifier" | "qualified_identifier" => {
             let text = node_text(node, source).trim();
@@ -1325,7 +1325,7 @@ fn resolve_include_targets(
     candidates
 }
 
-fn weight_code_unit_set(_key: &ProjectFile, value: &Arc<BTreeSet<CodeUnit>>) -> u32 {
+fn weight_code_unit_set(_key: &ProjectFile, value: &Arc<HashSet<CodeUnit>>) -> u32 {
     let size = value.iter().fold(0usize, |acc, item| {
         acc + size_of::<CodeUnit>()
             + item.fq_name().len()
@@ -1333,14 +1333,14 @@ fn weight_code_unit_set(_key: &ProjectFile, value: &Arc<BTreeSet<CodeUnit>>) -> 
             + item.package_name().len()
             + item.signature().map_or(0, str::len)
     });
-    size.saturating_add(size_of::<BTreeSet<CodeUnit>>()) as u32
+    size.saturating_add(size_of::<HashSet<CodeUnit>>()) as u32
 }
 
-fn weight_project_file_set(_key: &ProjectFile, value: &Arc<BTreeSet<ProjectFile>>) -> u32 {
+fn weight_project_file_set(_key: &ProjectFile, value: &Arc<HashSet<ProjectFile>>) -> u32 {
     let size = value.iter().fold(0usize, |acc, item| {
         acc + size_of::<ProjectFile>()
             + item.root().as_os_str().len()
             + item.rel_path().as_os_str().len()
     });
-    size.saturating_add(size_of::<BTreeMap<ProjectFile, ProjectFile>>()) as u32
+    size.saturating_add(size_of::<HashSet<ProjectFile>>()) as u32
 }

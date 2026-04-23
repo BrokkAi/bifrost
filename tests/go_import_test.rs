@@ -152,6 +152,6 @@ fn test_go_referencing_files_uses_resolved_import_targets() {
 
     assert_eq!(
         std::collections::BTreeSet::from([consumer]),
-        analyzer.referencing_files_of(&target)
+        analyzer.referencing_files_of(&target).into_iter().collect()
     );
 }

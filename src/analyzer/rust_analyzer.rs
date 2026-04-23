@@ -4,7 +4,7 @@ use crate::analyzer::{
     TypeAliasProvider, build_reverse_import_index,
 };
 use moka::sync::Cache;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::mem::size_of;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
@@ -148,10 +148,10 @@ impl LanguageAdapter for RustAdapter {
 pub struct RustAnalyzer {
     inner: TreeSitterAnalyzer<RustAdapter>,
     memo_budget: u64,
-    imported_code_units: Cache<ProjectFile, Arc<BTreeSet<CodeUnit>>>,
-    referencing_files: Cache<ProjectFile, Arc<BTreeSet<ProjectFile>>>,
+    imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
+    referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     reverse_import_index:
-        Arc<OnceLock<std::collections::BTreeMap<ProjectFile, Arc<BTreeSet<ProjectFile>>>>>,
+        Arc<OnceLock<std::collections::HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
 }
 
 impl RustAnalyzer {
@@ -189,25 +189,25 @@ impl RustAnalyzer {
         let Some(tree) = parser.parse(source, None) else {
             return BTreeSet::new();
         };
-        let mut identifiers = BTreeSet::new();
+        let mut identifiers = std::collections::HashSet::new();
         collect_rust_type_identifiers(tree.root_node(), source, &mut identifiers);
-        identifiers
+        identifiers.into_iter().collect()
     }
 }
 
 impl ImportAnalysisProvider for RustAnalyzer {
-    fn imported_code_units_of(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
+    fn imported_code_units_of(&self, file: &ProjectFile) -> HashSet<CodeUnit> {
         if let Some(cached) = self.imported_code_units.get(file) {
             return (*cached).clone();
         }
 
         let package = rust_package_name(file);
-        let mut resolved = BTreeSet::new();
+        let mut resolved = HashSet::new();
         for import in self.inner.import_info_of(file) {
             if let Some(target_fq_name) =
                 resolve_rust_import_fq_name(file, &package, &import.raw_snippet)
             {
-                resolved.extend(self.inner.get_definitions(&target_fq_name));
+                resolved.extend(self.inner.definitions(&target_fq_name).cloned());
             }
         }
 
@@ -216,15 +216,14 @@ impl ImportAnalysisProvider for RustAnalyzer {
         resolved
     }
 
-    fn referencing_files_of(&self, file: &ProjectFile) -> BTreeSet<ProjectFile> {
+    fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
         if let Some(cached) = self.referencing_files.get(file) {
             return (*cached).clone();
         }
 
         let reverse_index = self.reverse_import_index.get_or_init(|| {
-            build_reverse_import_index(&self.inner.get_analyzed_files(), |candidate| {
-                self.imported_code_units_of(candidate)
-            })
+            let files: Vec<_> = self.inner.all_files().cloned().collect();
+            build_reverse_import_index(&files, |candidate| self.imported_code_units_of(candidate))
         });
         let referencing = reverse_index
             .get(file)
@@ -249,8 +248,11 @@ impl ImportAnalysisProvider for RustAnalyzer {
         imports.iter().any(|import| {
             resolve_rust_import_fq_name(source_file, &package, &import.raw_snippet)
                 .into_iter()
-                .flat_map(|fq_name| self.inner.get_definitions(&fq_name))
-                .any(|code_unit| code_unit.source() == target)
+                .any(|fq_name| {
+                    self.inner
+                        .definitions(&fq_name)
+                        .any(|code_unit| code_unit.source() == target)
+                })
         })
     }
 }
@@ -810,7 +812,11 @@ fn rust_function_signature(node: Node<'_>, source: &str) -> String {
     }
 }
 
-fn collect_rust_type_identifiers(node: Node<'_>, source: &str, identifiers: &mut BTreeSet<String>) {
+fn collect_rust_type_identifiers(
+    node: Node<'_>,
+    source: &str,
+    identifiers: &mut std::collections::HashSet<String>,
+) {
     match node.kind() {
         "identifier" | "type_identifier" | "field_identifier" => {
             let text = rust_node_text(node, source).trim();
@@ -1003,20 +1009,20 @@ fn extract_rust_impl_target_name(node: Node<'_>, source: &str) -> Option<String>
     }
 }
 
-fn weight_project_file_set(_key: &ProjectFile, value: &Arc<BTreeSet<ProjectFile>>) -> u32 {
+fn weight_project_file_set(_key: &ProjectFile, value: &Arc<HashSet<ProjectFile>>) -> u32 {
     let size = value
         .iter()
         .map(|item| item.rel_path().to_string_lossy().len() + size_of::<ProjectFile>())
         .sum::<usize>()
-        + size_of::<BTreeSet<ProjectFile>>();
+        + size_of::<HashSet<ProjectFile>>();
     size.min(u32::MAX as usize) as u32
 }
 
-fn weight_code_unit_set(_key: &ProjectFile, value: &Arc<BTreeSet<CodeUnit>>) -> u32 {
+fn weight_code_unit_set(_key: &ProjectFile, value: &Arc<HashSet<CodeUnit>>) -> u32 {
     let size = value
         .iter()
         .map(|item| item.fq_name().len() + size_of::<CodeUnit>())
         .sum::<usize>()
-        + size_of::<BTreeSet<CodeUnit>>();
+        + size_of::<HashSet<CodeUnit>>();
     size.min(u32::MAX as usize) as u32
 }

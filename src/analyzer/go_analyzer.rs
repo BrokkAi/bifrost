@@ -5,7 +5,7 @@ use crate::analyzer::{
 };
 use moka::sync::Cache;
 use regex::Regex;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::mem::size_of;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
@@ -81,10 +81,10 @@ impl LanguageAdapter for GoAdapter {
 pub struct GoAnalyzer {
     inner: TreeSitterAnalyzer<GoAdapter>,
     memo_budget: u64,
-    imported_code_units: Cache<ProjectFile, Arc<BTreeSet<CodeUnit>>>,
-    referencing_files: Cache<ProjectFile, Arc<BTreeSet<ProjectFile>>>,
+    imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
+    referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     reverse_import_index:
-        Arc<OnceLock<std::collections::BTreeMap<ProjectFile, Arc<BTreeSet<ProjectFile>>>>>,
+        Arc<OnceLock<std::collections::HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
 }
 
 impl GoAnalyzer {
@@ -153,12 +153,12 @@ impl GoAnalyzer {
 }
 
 impl ImportAnalysisProvider for GoAnalyzer {
-    fn imported_code_units_of(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
+    fn imported_code_units_of(&self, file: &ProjectFile) -> HashSet<CodeUnit> {
         if let Some(cached) = self.imported_code_units.get(file) {
             return (*cached).clone();
         }
 
-        let mut resolved = BTreeSet::new();
+        let mut resolved = HashSet::new();
         for import in self.inner.import_info_of(file) {
             if import.alias.as_deref() == Some("_") {
                 continue;
@@ -181,9 +181,9 @@ impl ImportAnalysisProvider for GoAnalyzer {
             for target_file in matching_files {
                 resolved.extend(
                     self.inner
-                        .get_top_level_declarations(&target_file)
-                        .into_iter()
-                        .filter(|code_unit| !code_unit.is_module()),
+                        .top_level_declarations(&target_file)
+                        .filter(|code_unit| !code_unit.is_module())
+                        .cloned(),
                 );
             }
         }
@@ -193,15 +193,14 @@ impl ImportAnalysisProvider for GoAnalyzer {
         resolved
     }
 
-    fn referencing_files_of(&self, file: &ProjectFile) -> BTreeSet<ProjectFile> {
+    fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
         if let Some(cached) = self.referencing_files.get(file) {
             return (*cached).clone();
         }
 
         let reverse_index = self.reverse_import_index.get_or_init(|| {
-            build_reverse_import_index(&self.inner.get_analyzed_files(), |candidate| {
-                self.imported_code_units_of(candidate)
-            })
+            let files: Vec<_> = self.inner.all_files().cloned().collect();
+            build_reverse_import_index(&files, |candidate| self.imported_code_units_of(candidate))
         });
         let referencing = reverse_index
             .get(file)
@@ -216,9 +215,9 @@ impl ImportAnalysisProvider for GoAnalyzer {
         self.inner.import_info_of(file)
     }
 
-    fn relevant_imports_for(&self, code_unit: &CodeUnit) -> BTreeSet<String> {
+    fn relevant_imports_for(&self, code_unit: &CodeUnit) -> HashSet<String> {
         let source = self.inner.get_source(code_unit, false).unwrap_or_default();
-        let mut relevant = BTreeSet::new();
+        let mut relevant = HashSet::new();
         for import in self.inner.import_info_of(code_unit.source()) {
             if import.alias.as_deref() == Some("_") {
                 continue;
@@ -1061,7 +1060,11 @@ fn extract_go_type_name(node: Node<'_>, source: &str) -> Option<String> {
     }
 }
 
-fn collect_go_type_identifiers(node: Node<'_>, source: &str, identifiers: &mut BTreeSet<String>) {
+fn collect_go_type_identifiers(
+    node: Node<'_>,
+    source: &str,
+    identifiers: &mut std::collections::HashSet<String>,
+) {
     match node.kind() {
         "identifier" | "type_identifier" | "field_identifier" | "package_identifier" => {
             let text = go_node_text(node, source).trim();
@@ -1158,20 +1161,20 @@ fn go_value_is_simple_literal(value: &str) -> bool {
         || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
 }
 
-fn weight_project_file_set(_key: &ProjectFile, value: &Arc<BTreeSet<ProjectFile>>) -> u32 {
+fn weight_project_file_set(_key: &ProjectFile, value: &Arc<HashSet<ProjectFile>>) -> u32 {
     let size = value
         .iter()
         .map(|item| item.rel_path().to_string_lossy().len() + size_of::<ProjectFile>())
         .sum::<usize>()
-        + size_of::<BTreeSet<ProjectFile>>();
+        + size_of::<HashSet<ProjectFile>>();
     size.min(u32::MAX as usize) as u32
 }
 
-fn weight_code_unit_set(_key: &ProjectFile, value: &Arc<BTreeSet<CodeUnit>>) -> u32 {
+fn weight_code_unit_set(_key: &ProjectFile, value: &Arc<HashSet<CodeUnit>>) -> u32 {
     let size = value
         .iter()
         .map(|item| item.fq_name().len() + size_of::<CodeUnit>())
         .sum::<usize>()
-        + size_of::<BTreeSet<CodeUnit>>();
+        + size_of::<HashSet<CodeUnit>>();
     size.min(u32::MAX as usize) as u32
 }

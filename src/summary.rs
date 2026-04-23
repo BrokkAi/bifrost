@@ -79,7 +79,7 @@ fn resolve_input(
             .strip_prefix(&root)
             .map_err(|_| format!("Path is outside the project root: {}", canonical.display()))?;
         let file = ProjectFile::new(root, rel_path.to_path_buf());
-        if !analyzer.get_analyzed_files().contains(&file) {
+        if !analyzer.analyzed_files().any(|analyzed| analyzed == &file) {
             return Err(format!(
                 "File is not analyzable by the Java analyzer: {}",
                 canonical.display()
@@ -88,7 +88,7 @@ fn resolve_input(
         return Ok(SummaryInput::File(file));
     }
 
-    if analyzer.get_definitions(input).is_empty() {
+    if analyzer.definitions(input).next().is_none() {
         Err(format!("Unknown symbol or file: {input}"))
     } else {
         Ok(SummaryInput::CodeUnit(input.to_string()))
@@ -97,14 +97,13 @@ fn resolve_input(
 
 fn render_file_summary(analyzer: &JavaAnalyzer, file: &ProjectFile) -> Option<String> {
     let skeletons: BTreeMap<CodeUnit, String> = analyzer
-        .get_top_level_declarations(file)
-        .into_iter()
+        .top_level_declarations(file)
         .filter(|code_unit| !code_unit.is_anonymous())
         .filter_map(|code_unit| {
             analyzer
-                .get_skeleton(&code_unit)
+                .get_skeleton(code_unit)
                 .filter(|skeleton| !skeleton.trim().is_empty())
-                .map(|skeleton| (code_unit, skeleton))
+                .map(|skeleton| (code_unit.clone(), skeleton))
         })
         .collect();
     let rendered = format_skeletons_by_package(&skeletons);
@@ -112,7 +111,7 @@ fn render_file_summary(analyzer: &JavaAnalyzer, file: &ProjectFile) -> Option<St
 }
 
 fn render_code_unit_summary(analyzer: &JavaAnalyzer, fq_name: &str) -> Option<String> {
-    let primary_targets = analyzer.get_definitions(fq_name);
+    let primary_targets: Vec<_> = analyzer.definitions(fq_name).cloned().collect();
     if primary_targets.is_empty() {
         return None;
     }

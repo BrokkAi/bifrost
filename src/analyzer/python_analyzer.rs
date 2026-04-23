@@ -8,7 +8,7 @@ use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use moka::sync::Cache;
 use rayon::prelude::*;
 use regex::Regex;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::mem::size_of;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
@@ -91,12 +91,12 @@ impl LanguageAdapter for PythonAdapter {
 pub struct PythonAnalyzer {
     inner: TreeSitterAnalyzer<PythonAdapter>,
     memo_budget: u64,
-    imported_code_units: Cache<ProjectFile, Arc<BTreeSet<CodeUnit>>>,
-    referencing_files: Cache<ProjectFile, Arc<BTreeSet<ProjectFile>>>,
+    imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
+    referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
-    direct_descendants: Cache<CodeUnit, Arc<BTreeSet<CodeUnit>>>,
-    module_code_units: Arc<BTreeMap<String, CodeUnit>>,
-    reverse_import_index: Arc<OnceLock<BTreeMap<ProjectFile, Arc<BTreeSet<ProjectFile>>>>>,
+    direct_descendants: Cache<CodeUnit, Arc<HashSet<CodeUnit>>>,
+    module_code_units: Arc<HashMap<String, CodeUnit>>,
+    reverse_import_index: Arc<OnceLock<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
 }
 
 impl PythonAnalyzer {
@@ -134,13 +134,13 @@ impl PythonAnalyzer {
         let Some(tree) = parser.parse(source, None) else {
             return BTreeSet::new();
         };
-        let mut identifiers = BTreeSet::new();
+        let mut identifiers = std::collections::HashSet::new();
         collect_python_identifiers(tree.root_node(), source, &mut identifiers);
-        identifiers
+        identifiers.into_iter().collect()
     }
 
-    fn resolve_import_bindings(&self, file: &ProjectFile) -> BTreeMap<String, CodeUnit> {
-        let mut bindings = BTreeMap::new();
+    fn resolve_import_bindings(&self, file: &ProjectFile) -> HashMap<String, CodeUnit> {
+        let mut bindings = HashMap::new();
         for import in self.inner.import_info_of(file) {
             for (binding, code_unit) in self.resolve_import(file, &import) {
                 bindings.insert(binding, code_unit);
@@ -191,16 +191,19 @@ impl PythonAnalyzer {
                     if let Some(code_unit) = self.resolve_module_code_unit(&module_candidate) {
                         return vec![(binding, code_unit)];
                     }
-                    let definitions = self.inner.get_definitions(&module_candidate);
+                    let definitions: Vec<_> =
+                        self.inner.definitions(&module_candidate).cloned().collect();
                     if !definitions.is_empty() {
                         return definitions
                             .into_iter()
                             .map(|code_unit| (binding.clone(), code_unit))
                             .collect();
                     }
-                    let package_candidate = self
+                    let package_candidate: Vec<_> = self
                         .inner
-                        .get_definitions(&format!("{resolved_module}.{name}"));
+                        .definitions(&format!("{resolved_module}.{name}"))
+                        .cloned()
+                        .collect();
                     if !package_candidate.is_empty() {
                         return package_candidate
                             .into_iter()
@@ -215,26 +218,26 @@ impl PythonAnalyzer {
 
     fn resolve_module_code_unit(&self, module_fq: &str) -> Option<CodeUnit> {
         self.inner
-            .get_definitions(module_fq)
-            .into_iter()
+            .definitions(module_fq)
             .find(|code_unit| code_unit.is_module())
+            .cloned()
             .or_else(|| self.module_code_units.get(module_fq).cloned())
     }
 
-    fn build_reverse_import_index(&self) -> &BTreeMap<ProjectFile, Arc<BTreeSet<ProjectFile>>> {
+    fn build_reverse_import_index(&self) -> &HashMap<ProjectFile, Arc<HashSet<ProjectFile>>> {
         self.reverse_import_index.get_or_init(|| {
             let _scope = profiling::scope("PythonAnalyzer::build_reverse_import_index");
-            let files: Vec<_> = self.inner.get_analyzed_files().into_iter().collect();
+            let files: Vec<_> = self.inner.all_files().cloned().collect();
             let imported_by_file: Vec<_> = files
                 .par_iter()
                 .map(|file| {
-                    let resolved: BTreeSet<_> =
+                    let resolved: HashSet<_> =
                         self.resolve_import_bindings(file).into_values().collect();
                     (file.clone(), resolved)
                 })
                 .collect();
 
-            let mut reverse: BTreeMap<ProjectFile, BTreeSet<ProjectFile>> = BTreeMap::new();
+            let mut reverse: HashMap<ProjectFile, HashSet<ProjectFile>> = HashMap::new();
             for (file, imported) in imported_by_file {
                 self.imported_code_units
                     .insert(file.clone(), Arc::new(imported.clone()));
@@ -269,9 +272,9 @@ impl PythonAnalyzer {
             return Vec::new();
         };
         self.inner
-            .get_direct_children(&module_code_unit)
-            .into_iter()
+            .direct_children(&module_code_unit)
             .filter(|code_unit| !code_unit.identifier().starts_with('_'))
+            .cloned()
             .collect()
     }
 
@@ -287,9 +290,9 @@ impl PythonAnalyzer {
                 && bound.is_module()
             {
                 let fq_name = format!("{}.{}", bound.fq_name(), tail);
-                return self.inner.get_definitions(&fq_name).into_iter().next();
+                return self.inner.definitions(&fq_name).next().cloned();
             }
-            return self.inner.get_definitions(trimmed).into_iter().next();
+            return self.inner.definitions(trimmed).next().cloned();
         }
 
         if let Some(bound) = bindings.get(trimmed) {
@@ -298,10 +301,10 @@ impl PythonAnalyzer {
 
         let local_fq_name = format!("{}.{}", code_unit.package_name(), trimmed);
         self.inner
-            .get_definitions(&local_fq_name)
-            .into_iter()
+            .definitions(&local_fq_name)
             .next()
-            .or_else(|| self.inner.get_definitions(trimmed).into_iter().next())
+            .cloned()
+            .or_else(|| self.inner.definitions(trimmed).next().cloned())
     }
 
     fn render_skeleton_recursive(
@@ -319,11 +322,11 @@ impl PythonAnalyzer {
             }
         }
 
-        let all_children = self.inner.get_direct_children(code_unit);
+        let all_children: Vec<_> = self.inner.direct_children(code_unit).collect();
         let field_children: Vec<_> = all_children
             .iter()
+            .copied()
             .filter(|child| child.is_field())
-            .cloned()
             .collect();
         let children = if header_only {
             field_children.clone()
@@ -333,7 +336,7 @@ impl PythonAnalyzer {
         if !children.is_empty() || code_unit.is_class() || code_unit.is_module() {
             let child_indent = format!("{indent}  ");
             for child in children {
-                self.render_skeleton_recursive(&child, &child_indent, header_only, out);
+                self.render_skeleton_recursive(child, &child_indent, header_only, out);
             }
             if header_only && all_children.len() > field_children.len() {
                 out.push_str(&child_indent);
@@ -389,18 +392,18 @@ impl PythonAnalyzer {
 }
 
 impl ImportAnalysisProvider for PythonAnalyzer {
-    fn imported_code_units_of(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
+    fn imported_code_units_of(&self, file: &ProjectFile) -> HashSet<CodeUnit> {
         if let Some(cached) = self.imported_code_units.get(file) {
             return (*cached).clone();
         }
 
-        let resolved: BTreeSet<_> = self.resolve_import_bindings(file).into_values().collect();
+        let resolved: HashSet<_> = self.resolve_import_bindings(file).into_values().collect();
         self.imported_code_units
             .insert(file.clone(), Arc::new(resolved.clone()));
         resolved
     }
 
-    fn referencing_files_of(&self, file: &ProjectFile) -> BTreeSet<ProjectFile> {
+    fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
         if let Some(cached) = self.referencing_files.get(file) {
             return (*cached).clone();
         }
@@ -419,23 +422,23 @@ impl ImportAnalysisProvider for PythonAnalyzer {
         self.inner.import_info_of(file)
     }
 
-    fn relevant_imports_for(&self, code_unit: &CodeUnit) -> BTreeSet<String> {
+    fn relevant_imports_for(&self, code_unit: &CodeUnit) -> HashSet<String> {
         let Some(source) = self.inner.get_source(code_unit, false) else {
-            return BTreeSet::new();
+            return HashSet::new();
         };
 
         let extracted = self.extract_type_identifiers(&source);
         if extracted.is_empty() {
-            return BTreeSet::new();
+            return HashSet::new();
         }
 
         let imports = self.inner.import_info_of(code_unit.source());
         if imports.is_empty() {
-            return BTreeSet::new();
+            return HashSet::new();
         }
 
-        let mut matched = BTreeSet::new();
-        let mut resolved = BTreeSet::new();
+        let mut matched = HashSet::new();
+        let mut resolved = HashSet::new();
         let mut wildcard_imports = Vec::new();
 
         for info in imports {
@@ -459,13 +462,16 @@ impl ImportAnalysisProvider for PythonAnalyzer {
             }
         }
 
-        let unresolved: BTreeSet<_> = extracted.difference(&resolved).cloned().collect();
+        let unresolved: HashSet<_> = extracted
+            .into_iter()
+            .filter(|identifier| !resolved.contains(identifier))
+            .collect();
         if unresolved.is_empty() || wildcard_imports.is_empty() {
             return matched;
         }
 
-        let mut resolved_via_wildcard = BTreeSet::new();
-        let mut used_wildcards = BTreeSet::new();
+        let mut resolved_via_wildcard = HashSet::new();
+        let mut used_wildcards = HashSet::new();
         for ident in &unresolved {
             for wildcard in &wildcard_imports {
                 let Some(package_name) =
@@ -474,10 +480,11 @@ impl ImportAnalysisProvider for PythonAnalyzer {
                     continue;
                 };
 
-                if !self
+                if self
                     .inner
-                    .get_definitions(&format!("{package_name}.{ident}"))
-                    .is_empty()
+                    .definitions(&format!("{package_name}.{ident}"))
+                    .next()
+                    .is_some()
                 {
                     used_wildcards.insert(wildcard.raw_snippet.clone());
                     resolved_via_wildcard.insert(ident.clone());
@@ -487,7 +494,7 @@ impl ImportAnalysisProvider for PythonAnalyzer {
 
         matched.extend(used_wildcards);
 
-        let remaining: BTreeSet<_> = unresolved
+        let remaining: HashSet<_> = unresolved
             .difference(&resolved_via_wildcard)
             .cloned()
             .collect();
@@ -554,7 +561,7 @@ impl TypeHierarchyProvider for PythonAnalyzer {
         ancestors
     }
 
-    fn get_direct_descendants(&self, code_unit: &CodeUnit) -> BTreeSet<CodeUnit> {
+    fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
         if let Some(cached) = self.direct_descendants.get(code_unit) {
             return (*cached).clone();
         }
@@ -755,14 +762,14 @@ impl IAnalyzer for PythonAnalyzer {
 
         let mut ranges = if code_unit.is_function() {
             let mut grouped = Vec::new();
-            for candidate in self.inner.get_definitions(&code_unit.fq_name()) {
+            for candidate in self.inner.definitions(&code_unit.fq_name()) {
                 if candidate.source() == code_unit.source() {
-                    grouped.extend(self.inner.ranges_of(&candidate));
+                    grouped.extend(self.inner.ranges(candidate).iter().copied());
                 }
             }
             grouped
         } else {
-            self.inner.ranges_of(code_unit)
+            self.inner.ranges(code_unit).to_vec()
         };
 
         let Ok(source) = code_unit.source().read_to_string() else {
@@ -1120,13 +1127,12 @@ fn python_module_name(file: &ProjectFile) -> String {
 
 fn build_python_module_code_units(
     inner: &TreeSitterAnalyzer<PythonAdapter>,
-) -> BTreeMap<String, CodeUnit> {
+) -> HashMap<String, CodeUnit> {
     inner
-        .get_analyzed_files()
-        .into_iter()
+        .all_files()
         .filter_map(|file| {
-            let module_fq = python_module_name(&file);
-            module_code_unit(&file, &module_fq).map(|code_unit| (module_fq, code_unit))
+            let module_fq = python_module_name(file);
+            module_code_unit(file, &module_fq).map(|code_unit| (module_fq, code_unit))
         })
         .collect()
 }
@@ -1332,7 +1338,11 @@ fn collect_assigned_names(node: Node<'_>, source: &str) -> Vec<String> {
     names
 }
 
-fn collect_python_identifiers(node: Node<'_>, source: &str, identifiers: &mut BTreeSet<String>) {
+fn collect_python_identifiers(
+    node: Node<'_>,
+    source: &str,
+    identifiers: &mut std::collections::HashSet<String>,
+) {
     if node.kind() == "identifier" {
         let text = py_node_text(node, source).trim();
         if !text.is_empty() {
@@ -1517,21 +1527,21 @@ fn python_current_package(source_file: &ProjectFile) -> String {
     }
 }
 
-fn weight_project_file_set(_key: &ProjectFile, value: &Arc<BTreeSet<ProjectFile>>) -> u32 {
+fn weight_project_file_set(_key: &ProjectFile, value: &Arc<HashSet<ProjectFile>>) -> u32 {
     let size = value
         .iter()
         .map(|item| item.rel_path().to_string_lossy().len() + size_of::<ProjectFile>())
         .sum::<usize>()
-        + size_of::<BTreeSet<ProjectFile>>();
+        + size_of::<HashSet<ProjectFile>>();
     size.min(u32::MAX as usize) as u32
 }
 
-fn weight_code_unit_set(_key: &ProjectFile, value: &Arc<BTreeSet<CodeUnit>>) -> u32 {
+fn weight_code_unit_set(_key: &ProjectFile, value: &Arc<HashSet<CodeUnit>>) -> u32 {
     let size = value
         .iter()
         .map(|item| item.fq_name().len() + size_of::<CodeUnit>())
         .sum::<usize>()
-        + size_of::<BTreeSet<CodeUnit>>();
+        + size_of::<HashSet<CodeUnit>>();
     size.min(u32::MAX as usize) as u32
 }
 
@@ -1544,11 +1554,11 @@ fn weight_code_unit_vec(_key: &CodeUnit, value: &Arc<Vec<CodeUnit>>) -> u32 {
     size.min(u32::MAX as usize) as u32
 }
 
-fn weight_code_unit_set_by_unit(_key: &CodeUnit, value: &Arc<BTreeSet<CodeUnit>>) -> u32 {
+fn weight_code_unit_set_by_unit(_key: &CodeUnit, value: &Arc<HashSet<CodeUnit>>) -> u32 {
     let size = value
         .iter()
         .map(|item| item.fq_name().len() + size_of::<CodeUnit>())
         .sum::<usize>()
-        + size_of::<BTreeSet<CodeUnit>>();
+        + size_of::<HashSet<CodeUnit>>();
     size.min(u32::MAX as usize) as u32
 }

@@ -6,7 +6,7 @@ use crate::profiling;
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use rayon::prelude::*;
 use regex::RegexBuilder;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -46,47 +46,47 @@ struct FileState {
     source: String,
     package_name: String,
     top_level_declarations: Vec<CodeUnit>,
-    declarations: BTreeSet<CodeUnit>,
+    declarations: HashSet<CodeUnit>,
     import_statements: Vec<String>,
     imports: Vec<ImportInfo>,
-    raw_supertypes: BTreeMap<CodeUnit, Vec<String>>,
-    type_identifiers: BTreeSet<String>,
-    signatures: BTreeMap<CodeUnit, Vec<String>>,
-    ranges: BTreeMap<CodeUnit, Vec<Range>>,
-    children: BTreeMap<CodeUnit, Vec<CodeUnit>>,
-    type_aliases: BTreeSet<CodeUnit>,
+    raw_supertypes: HashMap<CodeUnit, Vec<String>>,
+    type_identifiers: HashSet<String>,
+    signatures: HashMap<CodeUnit, Vec<String>>,
+    ranges: HashMap<CodeUnit, Vec<Range>>,
+    children: HashMap<CodeUnit, Vec<CodeUnit>>,
+    type_aliases: HashSet<CodeUnit>,
     contains_tests: bool,
 }
 
 #[derive(Debug, Clone, Default)]
 struct AnalyzerState {
-    files: BTreeMap<ProjectFile, FileState>,
-    definitions: BTreeMap<String, Vec<CodeUnit>>,
+    files: HashMap<ProjectFile, FileState>,
+    definitions: HashMap<String, Vec<CodeUnit>>,
     // Child lists are canonicalized here once during indexing so every
     // `get_direct_children` caller sees the same deduped, source-ordered view.
-    children: BTreeMap<CodeUnit, Vec<CodeUnit>>,
-    module_children: BTreeMap<String, Vec<CodeUnit>>,
-    ranges: BTreeMap<CodeUnit, Vec<Range>>,
-    raw_supertypes: BTreeMap<CodeUnit, Vec<String>>,
-    signatures: BTreeMap<CodeUnit, Vec<String>>,
-    classes_by_package: BTreeMap<String, Vec<CodeUnit>>,
+    children: HashMap<CodeUnit, Vec<CodeUnit>>,
+    module_children: HashMap<String, Vec<CodeUnit>>,
+    ranges: HashMap<CodeUnit, Vec<Range>>,
+    raw_supertypes: HashMap<CodeUnit, Vec<String>>,
+    signatures: HashMap<CodeUnit, Vec<String>>,
+    classes_by_package: HashMap<String, Vec<CodeUnit>>,
     #[allow(dead_code)]
-    type_aliases: BTreeSet<CodeUnit>,
+    type_aliases: HashSet<CodeUnit>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ParsedFile {
     pub package_name: String,
     pub top_level_declarations: Vec<CodeUnit>,
-    pub declarations: BTreeSet<CodeUnit>,
+    pub declarations: HashSet<CodeUnit>,
     pub import_statements: Vec<String>,
     pub imports: Vec<ImportInfo>,
-    pub raw_supertypes: BTreeMap<CodeUnit, Vec<String>>,
-    pub type_identifiers: BTreeSet<String>,
-    pub signatures: BTreeMap<CodeUnit, Vec<String>>,
-    pub type_aliases: BTreeSet<CodeUnit>,
-    ranges: BTreeMap<CodeUnit, Vec<Range>>,
-    children: BTreeMap<CodeUnit, Vec<CodeUnit>>,
+    pub raw_supertypes: HashMap<CodeUnit, Vec<String>>,
+    pub type_identifiers: HashSet<String>,
+    pub signatures: HashMap<CodeUnit, Vec<String>>,
+    pub type_aliases: HashSet<CodeUnit>,
+    ranges: HashMap<CodeUnit, Vec<Range>>,
+    children: HashMap<CodeUnit, Vec<CodeUnit>>,
 }
 
 impl ParsedFile {
@@ -94,15 +94,15 @@ impl ParsedFile {
         Self {
             package_name,
             top_level_declarations: Vec::new(),
-            declarations: BTreeSet::new(),
+            declarations: HashSet::new(),
             import_statements: Vec::new(),
             imports: Vec::new(),
-            raw_supertypes: BTreeMap::new(),
-            type_identifiers: BTreeSet::new(),
-            signatures: BTreeMap::new(),
-            type_aliases: BTreeSet::new(),
-            ranges: BTreeMap::new(),
-            children: BTreeMap::new(),
+            raw_supertypes: HashMap::new(),
+            type_identifiers: HashSet::new(),
+            signatures: HashMap::new(),
+            type_aliases: HashSet::new(),
+            ranges: HashMap::new(),
+            children: HashMap::new(),
         }
     }
 
@@ -216,7 +216,7 @@ impl<A> TreeSitterAnalyzer<A>
 where
     A: LanguageAdapter,
 {
-    fn child_order_key(ranges: &BTreeMap<CodeUnit, Vec<Range>>, code_unit: &CodeUnit) -> usize {
+    fn child_order_key(ranges: &HashMap<CodeUnit, Vec<Range>>, code_unit: &CodeUnit) -> usize {
         ranges
             .get(code_unit)
             .into_iter()
@@ -228,7 +228,7 @@ where
 
     fn canonicalize_children(
         descendants: &mut Vec<CodeUnit>,
-        ranges: &BTreeMap<CodeUnit, Vec<Range>>,
+        ranges: &HashMap<CodeUnit, Vec<Range>>,
     ) {
         descendants.sort();
         descendants.dedup();
@@ -237,7 +237,7 @@ where
 
     fn definition_sort_key(
         adapter: &A,
-        ranges: &BTreeMap<CodeUnit, Vec<Range>>,
+        ranges: &HashMap<CodeUnit, Vec<Range>>,
         code_unit: &CodeUnit,
     ) -> (i32, usize, String, String, String, String) {
         let first_start_byte = ranges
@@ -398,7 +398,7 @@ where
             .build()
             .expect("failed to build analyzer thread pool");
 
-        let mut analyzed = pool.install(|| {
+        let analyzed = pool.install(|| {
             files
                 .into_par_iter()
                 .map_init(
@@ -414,7 +414,6 @@ where
                 )
                 .collect::<Vec<_>>()
         });
-        analyzed.sort_by(|(left, _), (right, _)| left.cmp(right));
         analyzed
     }
 
@@ -444,7 +443,7 @@ where
                 .into_iter()
                 .collect()
         };
-        let analyzable_set: BTreeSet<_> = analyzable_files.iter().cloned().collect();
+        let analyzable_set: HashSet<_> = analyzable_files.iter().cloned().collect();
 
         files.retain(|file, _| analyzable_set.contains(file));
 
@@ -466,18 +465,18 @@ where
     }
 
     fn index_state(
-        files: BTreeMap<ProjectFile, FileState>,
+        files: HashMap<ProjectFile, FileState>,
         project: &dyn Project,
         adapter: &A,
     ) -> AnalyzerState {
-        let mut definitions = BTreeMap::<String, Vec<CodeUnit>>::new();
-        let mut children = BTreeMap::<CodeUnit, Vec<CodeUnit>>::new();
-        let mut module_children = BTreeMap::<String, Vec<CodeUnit>>::new();
-        let mut ranges = BTreeMap::<CodeUnit, Vec<Range>>::new();
-        let mut raw_supertypes = BTreeMap::<CodeUnit, Vec<String>>::new();
-        let mut signatures = BTreeMap::<CodeUnit, Vec<String>>::new();
-        let mut classes_by_package = BTreeMap::<String, Vec<CodeUnit>>::new();
-        let mut type_aliases = BTreeSet::<CodeUnit>::new();
+        let mut definitions = HashMap::<String, Vec<CodeUnit>>::new();
+        let mut children = HashMap::<CodeUnit, Vec<CodeUnit>>::new();
+        let mut module_children = HashMap::<String, Vec<CodeUnit>>::new();
+        let mut ranges = HashMap::<CodeUnit, Vec<Range>>::new();
+        let mut raw_supertypes = HashMap::<CodeUnit, Vec<String>>::new();
+        let mut signatures = HashMap::<CodeUnit, Vec<String>>::new();
+        let mut classes_by_package = HashMap::<String, Vec<CodeUnit>>::new();
+        let mut type_aliases = HashSet::<CodeUnit>::new();
 
         for state in files.values() {
             for declaration in &state.declarations {
@@ -591,10 +590,8 @@ where
             .unwrap_or(&[])
     }
 
-    pub(crate) fn type_identifiers_of(&self, file: &ProjectFile) -> BTreeSet<String> {
-        self.file_state(file)
-            .map(|state| state.type_identifiers.clone())
-            .unwrap_or_default()
+    pub(crate) fn type_identifiers_of(&self, file: &ProjectFile) -> Option<&HashSet<String>> {
+        self.file_state(file).map(|state| &state.type_identifiers)
     }
 
     pub(crate) fn all_files<'a>(&'a self) -> impl Iterator<Item = &'a ProjectFile> + 'a {
@@ -665,21 +662,22 @@ where
             }
         }
 
-        let all_children = crate::analyzer::IAnalyzer::get_direct_children(self, code_unit);
+        let all_children: Vec<_> =
+            crate::analyzer::IAnalyzer::direct_children(self, code_unit).collect();
         let field_children: Vec<_> = all_children
             .iter()
+            .copied()
             .filter(|child| child.is_field())
-            .cloned()
             .collect();
-        let parent_start = crate::analyzer::IAnalyzer::ranges_of(self, code_unit)
-            .into_iter()
+        let parent_start = crate::analyzer::IAnalyzer::ranges(self, code_unit)
+            .iter()
             .map(|range| range.start_byte)
             .min()
             .unwrap_or(usize::MAX);
         let non_field_children: Vec<_> = all_children
             .iter()
+            .copied()
             .filter(|child| !child.is_field())
-            .cloned()
             .collect();
         let children = if header_only {
             field_children.clone()
@@ -696,14 +694,14 @@ where
                         .iter()
                         .filter(|child| Self::child_first_start(self, child) < parent_start),
                 )
-                .cloned()
+                .copied()
                 .collect()
         };
 
         if !children.is_empty() || code_unit.is_class() {
             let child_indent = format!("{indent}  ");
             for child in children {
-                self.render_skeleton_recursive(&child, &child_indent, header_only, out);
+                self.render_skeleton_recursive(child, &child_indent, header_only, out);
             }
             if header_only && !non_field_children.is_empty() {
                 out.push_str(&child_indent);
@@ -722,8 +720,8 @@ where
     A: LanguageAdapter,
 {
     fn child_first_start(&self, child: &CodeUnit) -> usize {
-        crate::analyzer::IAnalyzer::ranges_of(self, child)
-            .into_iter()
+        crate::analyzer::IAnalyzer::ranges(self, child)
+            .iter()
             .map(|range| range.start_byte)
             .min()
             .unwrap_or(usize::MAX)
@@ -883,14 +881,16 @@ where
             return None;
         }
 
-        self.get_declarations(file)
-            .into_iter()
+        self.declarations(file)
             .filter_map(|code_unit| {
                 let best_range = self
-                    .ranges_of(&code_unit)
-                    .into_iter()
+                    .ranges(code_unit)
+                    .iter()
                     .find(|candidate| candidate.contains(range))?;
-                Some((best_range.end_byte - best_range.start_byte, code_unit))
+                Some((
+                    best_range.end_byte - best_range.start_byte,
+                    code_unit.clone(),
+                ))
             })
             .min_by_key(|(span, _)| *span)
             .map(|(_, code_unit)| code_unit)
@@ -908,14 +908,16 @@ where
             start_line,
             end_line,
         };
-        self.get_declarations(file)
-            .into_iter()
+        self.declarations(file)
             .filter_map(|code_unit| {
-                let best_range = self.ranges_of(&code_unit).into_iter().find(|candidate| {
+                let best_range = self.ranges(code_unit).iter().find(|candidate| {
                     candidate.start_line <= line_range.start_line
                         && candidate.end_line >= line_range.end_line
                 })?;
-                Some((best_range.end_line - best_range.start_line, code_unit))
+                Some((
+                    best_range.end_line - best_range.start_line,
+                    code_unit.clone(),
+                ))
             })
             .min_by_key(|(span, _)| *span)
             .map(|(_, code_unit)| code_unit)

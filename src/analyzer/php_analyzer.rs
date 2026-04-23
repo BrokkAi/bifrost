@@ -239,7 +239,7 @@ impl IAnalyzer for PhpAnalyzer {
 
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
         let skeleton = self.inner.get_skeleton(code_unit)?;
-        if code_unit.is_class() && self.inner.get_direct_children(code_unit).is_empty() {
+        if code_unit.is_class() && self.inner.direct_children(code_unit).next().is_none() {
             let trimmed = skeleton.trim();
             if trimmed.ends_with("{\n}") || trimmed.ends_with("{\r\n}") {
                 let compact = trimmed.trim_end_matches('}').trim_end().to_string();

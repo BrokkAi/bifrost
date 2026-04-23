@@ -165,7 +165,10 @@ fn referencing_files_resolve_python_src_layout_modules() {
     let mod_file = ProjectFile::new(root.clone(), "src/pkg/mod.py");
     let consumer_file = ProjectFile::new(root, "src/pkg/consumer.py");
 
-    let referencing = analyzer.referencing_files_of(&mod_file);
+    let referencing: BTreeSet<_> = analyzer
+        .referencing_files_of(&mod_file)
+        .into_iter()
+        .collect();
 
     assert_eq!(BTreeSet::from([consumer_file]), referencing);
 }

@@ -105,11 +105,11 @@ impl ScalaAnalyzer {
             }
         }
 
-        let all_children = self.get_direct_children(code_unit);
+        let all_children: Vec<_> = self.direct_children(code_unit).collect();
         let field_children: Vec<_> = all_children
             .iter()
+            .copied()
             .filter(|child| child.is_field())
-            .cloned()
             .collect();
         let children = if header_only {
             field_children.clone()
@@ -120,7 +120,7 @@ impl ScalaAnalyzer {
         if !children.is_empty() || code_unit.is_class() {
             let child_indent = format!("{indent}  ");
             for child in children {
-                self.render_skeleton_recursive(&child, &child_indent, header_only, out);
+                self.render_skeleton_recursive(child, &child_indent, header_only, out);
             }
             if header_only && all_children.len() > field_children.len() {
                 out.push_str(&child_indent);
@@ -167,7 +167,11 @@ impl IAnalyzer for ScalaAnalyzer {
         &'a self,
         code_unit: &CodeUnit,
     ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
-        self.inner.direct_children(code_unit)
+        Box::new(
+            self.inner
+                .direct_children(code_unit)
+                .filter(|child| !child.is_synthetic()),
+        )
     }
 
     fn import_statements<'a>(&'a self, file: &ProjectFile) -> &'a [String] {

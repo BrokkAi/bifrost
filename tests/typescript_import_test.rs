@@ -334,7 +334,10 @@ fn test_resolve_imports_relevant_imports_and_could_import_file() {
         .into_iter()
         .next()
         .unwrap();
-    let relevant = analyzer.relevant_imports_for(&do_work);
+    let relevant: BTreeSet<_> = analyzer
+        .relevant_imports_for(&do_work)
+        .into_iter()
+        .collect();
     assert_eq!(
         BTreeSet::from(["import { Used } from './used';".to_string()]),
         relevant
@@ -427,6 +430,6 @@ fn test_referencing_files_uses_resolved_typescript_import_targets() {
 
     assert_eq!(
         BTreeSet::from([consumer]),
-        analyzer.referencing_files_of(&target)
+        analyzer.referencing_files_of(&target).into_iter().collect()
     );
 }

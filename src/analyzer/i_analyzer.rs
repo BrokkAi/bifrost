@@ -167,11 +167,11 @@ pub trait IAnalyzer: Send + Sync + Any {
     }
 
     fn metrics(&self) -> CodeBaseMetrics {
-        metrics_from_declarations(self.get_all_declarations())
+        metrics_from_declarations(self.all_declarations().cloned())
     }
 
     fn is_empty(&self) -> bool {
-        self.get_all_declarations().is_empty()
+        self.all_declarations().next().is_none()
     }
 
     fn contains_tests(&self, _file: &ProjectFile) -> bool {
@@ -180,9 +180,9 @@ pub trait IAnalyzer: Send + Sync + Any {
 
     fn get_skeletons(&self, file: &ProjectFile) -> BTreeMap<CodeUnit, String> {
         let mut skeletons = BTreeMap::new();
-        for symbol in self.get_top_level_declarations(file) {
-            if let Some(skeleton) = self.get_skeleton(&symbol) {
-                skeletons.insert(symbol, skeleton);
+        for symbol in self.top_level_declarations(file) {
+            if let Some(skeleton) = self.get_skeleton(symbol) {
+                skeletons.insert(symbol.clone(), skeleton);
             }
         }
         skeletons
@@ -193,16 +193,16 @@ pub trait IAnalyzer: Send + Sync + Any {
             return Vec::new();
         }
 
-        self.get_direct_children(class_unit)
-            .into_iter()
+        self.direct_children(class_unit)
             .filter(|child| child.is_class() || child.is_function() || child.is_field())
+            .cloned()
             .collect()
     }
 
     fn get_test_modules(&self, files: &[ProjectFile]) -> Vec<String> {
         let mut modules: Vec<_> = files
             .iter()
-            .flat_map(|file| self.get_top_level_declarations(file))
+            .flat_map(|file| self.top_level_declarations(file))
             .map(|code_unit| {
                 if code_unit.is_module() {
                     code_unit.fq_name()
@@ -220,10 +220,11 @@ pub trait IAnalyzer: Send + Sync + Any {
     fn test_files_to_code_units(&self, files: &[ProjectFile]) -> BTreeSet<CodeUnit> {
         files
             .iter()
-            .flat_map(|file| self.get_top_level_declarations(file))
+            .flat_map(|file| self.top_level_declarations(file))
             .filter(|code_unit| {
                 code_unit.is_class() || code_unit.is_function() || code_unit.is_module()
             })
+            .cloned()
             .collect()
     }
 
@@ -232,7 +233,7 @@ pub trait IAnalyzer: Send + Sync + Any {
         for source in sources {
             symbols.insert(source.identifier().to_string());
             if source.is_class() || source.is_module() {
-                for child in self.get_direct_children(source) {
+                for child in self.direct_children(source) {
                     symbols.insert(child.identifier().to_string());
                 }
             }
@@ -265,12 +266,12 @@ pub trait IAnalyzer: Send + Sync + Any {
         }
 
         let parent_name = fq_name.get(..last_index?)?;
-        self.get_definitions(parent_name).into_iter().next()
+        self.definitions(parent_name).next().cloned()
     }
 }
 
 fn summary_root_units<A: IAnalyzer + ?Sized>(analyzer: &A, file: &ProjectFile) -> Vec<CodeUnit> {
-    let declarations: Vec<_> = analyzer.get_declarations(file).into_iter().collect();
+    let declarations: Vec<_> = analyzer.declarations(file).cloned().collect();
     let declaration_set: BTreeSet<_> = declarations.iter().cloned().collect();
     let mut roots: Vec<_> = declarations
         .into_iter()
@@ -290,8 +291,8 @@ fn summary_root_order<A: IAnalyzer + ?Sized>(
     left: &CodeUnit,
     right: &CodeUnit,
 ) -> Ordering {
-    let left_range = analyzer.ranges_of(left).into_iter().min();
-    let right_range = analyzer.ranges_of(right).into_iter().min();
+    let left_range = analyzer.ranges(left).iter().min();
+    let right_range = analyzer.ranges(right).iter().min();
     left_range.cmp(&right_range).then_with(|| left.cmp(right))
 }
 
@@ -381,9 +382,9 @@ fn render_symbol_summary<A: IAnalyzer + ?Sized>(
         analyzer,
         code_unit,
         analyzer
-            .get_direct_children(code_unit)
-            .into_iter()
+            .direct_children(code_unit)
             .filter(|child| types.contains(&child.kind()))
+            .cloned()
             .collect(),
     );
     if !children.is_empty() {
@@ -408,8 +409,8 @@ fn ordered_summary_children<A: IAnalyzer + ?Sized>(
     }
 
     let parent_start = analyzer
-        .ranges_of(parent)
-        .into_iter()
+        .ranges(parent)
+        .iter()
         .map(|range| range.start_byte)
         .min()
         .unwrap_or(usize::MAX);
@@ -432,8 +433,8 @@ fn ordered_summary_children<A: IAnalyzer + ?Sized>(
 
 fn child_first_start<A: IAnalyzer + ?Sized>(analyzer: &A, child: &CodeUnit) -> usize {
     analyzer
-        .ranges_of(child)
-        .into_iter()
+        .ranges(child)
+        .iter()
         .map(|range| range.start_byte)
         .min()
         .unwrap_or(usize::MAX)

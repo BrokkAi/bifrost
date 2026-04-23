@@ -410,11 +410,12 @@ fn imported_files_for(
     }
 
     if resolved.is_empty() {
-        for import in analyzer.import_statements_of(file) {
+        for import in analyzer.import_statements(file) {
             let before = resolved.len();
-            add_definitions_to_files(analyzer.get_definitions(&import), &mut resolved);
+            add_definitions_to_files(analyzer.definitions(import), &mut resolved);
             if resolved.len() == before {
-                add_definitions_to_files(analyzer.search_definitions(&import, true), &mut resolved);
+                let matches = analyzer.search_definitions(import, true);
+                add_definitions_to_files(matches.iter(), &mut resolved);
             }
         }
     }
@@ -423,8 +424,8 @@ fn imported_files_for(
     resolved
 }
 
-fn add_definitions_to_files(
-    definitions: impl IntoIterator<Item = CodeUnit>,
+fn add_definitions_to_files<'a>(
+    definitions: impl IntoIterator<Item = &'a CodeUnit>,
     out: &mut BTreeSet<ProjectFile>,
 ) {
     out.extend(
@@ -443,9 +444,9 @@ fn referencing_files_for(
         return cached.clone();
     }
 
-    let resolved = analyzer
+    let resolved: BTreeSet<ProjectFile> = analyzer
         .import_analysis_provider()
-        .map(|provider| provider.referencing_files_of(file))
+        .map(|provider| provider.referencing_files_of(file).into_iter().collect())
         .unwrap_or_default();
     cache.insert(file.clone(), resolved.clone());
     resolved
@@ -2434,7 +2435,7 @@ mod tests {
         let workspace = workspace_analyzer(Path::new("/home/jonathan/Projects/plume-merge"));
         for code_unit in workspace
             .analyzer()
-            .get_definitions("tech.tablesaw.api.BooleanColumn")
+            .definitions("tech.tablesaw.api.BooleanColumn")
         {
             eprintln!("{}", code_unit.source().rel_path().display());
         }

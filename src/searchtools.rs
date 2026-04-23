@@ -393,8 +393,8 @@ pub fn get_file_summaries(analyzer: &dyn IAnalyzer, params: FilePatternsParams) 
         .into_par_iter()
         .filter_map(|file| {
             let mut elements = Vec::new();
-            for code_unit in analyzer.get_top_level_declarations(&file) {
-                elements.extend(summary_elements_for_code_unit(analyzer, &code_unit));
+            for code_unit in analyzer.top_level_declarations(&file) {
+                elements.extend(summary_elements_for_code_unit(analyzer, code_unit));
             }
 
             if elements.is_empty() {
@@ -506,9 +506,9 @@ fn matching_definitions(
     kind_filter: SymbolKindFilter,
 ) -> Vec<CodeUnit> {
     analyzer
-        .get_definitions(symbol)
-        .into_iter()
+        .definitions(symbol)
         .filter(|code_unit| matches_kind_filter(code_unit, kind_filter))
+        .cloned()
         .collect()
 }
 
@@ -542,23 +542,23 @@ fn summary_elements_for_code_unit(
     // formatted skeleton text.
     let mut elements = signature_elements(analyzer, code_unit);
     if code_unit.is_class() || code_unit.is_module() {
-        for child in analyzer.get_direct_children(code_unit) {
+        for child in analyzer.direct_children(code_unit) {
             if child.is_anonymous() {
                 continue;
             }
-            elements.extend(summary_elements_for_code_unit(analyzer, &child));
+            elements.extend(summary_elements_for_code_unit(analyzer, child));
         }
     }
     elements
 }
 
 fn signature_elements(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> Vec<SummaryElement> {
-    let signatures = analyzer.signatures_of(code_unit);
+    let signatures = analyzer.signatures(code_unit);
     if signatures.is_empty() {
         return Vec::new();
     }
 
-    let mut ranges = analyzer.ranges_of(code_unit);
+    let mut ranges = analyzer.ranges(code_unit).to_vec();
     ranges.sort_by_key(|range| (range.start_line, range.start_byte));
     let path = rel_path_string(code_unit.source());
     let fallback_start = ranges.first().map(|range| range.start_line).unwrap_or(1);
@@ -567,7 +567,7 @@ fn signature_elements(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> Vec<Sum
         .into_iter()
         .enumerate()
         .filter_map(|(index, signature)| {
-            let text = trim_summary_signature(&signature);
+            let text = trim_summary_signature(signature);
             if text.is_empty() {
                 return None;
             }
@@ -666,14 +666,14 @@ fn source_blocks_for_code_unit(
 
     let mut ranges = if code_unit.is_function() {
         let mut grouped = Vec::new();
-        for candidate in analyzer.get_definitions(&code_unit.fq_name()) {
+        for candidate in analyzer.definitions(&code_unit.fq_name()) {
             if candidate.source() == code_unit.source() {
-                grouped.extend(analyzer.ranges_of(&candidate));
+                grouped.extend(analyzer.ranges(candidate).iter().copied());
             }
         }
         grouped
     } else {
-        analyzer.ranges_of(code_unit)
+        analyzer.ranges(code_unit).to_vec()
     };
     ranges.sort_by_key(|range| range.start_byte);
 
@@ -721,8 +721,9 @@ fn dedup_source_blocks(blocks: Vec<SourceBlock>) -> Vec<SourceBlock> {
 
 fn primary_range(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> Option<Range> {
     analyzer
-        .ranges_of(code_unit)
-        .into_iter()
+        .ranges(code_unit)
+        .iter()
+        .copied()
         .min_by_key(|range| (range.start_line, range.start_byte))
 }
 
@@ -753,8 +754,8 @@ fn resolve_file_patterns(analyzer: &dyn IAnalyzer, patterns: &[String]) -> Vec<P
 
     if !globs.is_empty() {
         let glob_matches: BTreeSet<_> = analyzer
-            .get_analyzed_files()
-            .into_iter()
+            .analyzed_files()
+            .cloned()
             .collect::<Vec<_>>()
             .into_par_iter()
             .filter(|file| {

@@ -1,6 +1,6 @@
 use crate::analyzer::{CodeUnit, IAnalyzer, ImportInfo, ProjectFile};
 use std::any::Any;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use rayon::prelude::*;
@@ -16,15 +16,15 @@ impl<T: Any> CapabilityProvider for T {
 }
 
 pub trait ImportAnalysisProvider: CapabilityProvider {
-    fn imported_code_units_of(&self, file: &ProjectFile) -> BTreeSet<CodeUnit>;
-    fn referencing_files_of(&self, file: &ProjectFile) -> BTreeSet<ProjectFile>;
+    fn imported_code_units_of(&self, file: &ProjectFile) -> HashSet<CodeUnit>;
+    fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile>;
 
     fn import_info_of<'a>(&'a self, _file: &ProjectFile) -> &'a [ImportInfo] {
         &[]
     }
 
-    fn relevant_imports_for(&self, _code_unit: &CodeUnit) -> BTreeSet<String> {
-        BTreeSet::new()
+    fn relevant_imports_for(&self, _code_unit: &CodeUnit) -> HashSet<String> {
+        HashSet::new()
     }
 
     fn could_import_file(
@@ -41,39 +41,39 @@ pub(crate) fn referencing_files_via_imports<A, P>(
     analyzer: &A,
     provider: &P,
     file: &ProjectFile,
-) -> BTreeSet<ProjectFile>
+) -> HashSet<ProjectFile>
 where
     A: IAnalyzer,
     P: ImportAnalysisProvider + ?Sized,
 {
     analyzer
-        .get_analyzed_files()
-        .into_iter()
-        .filter(|candidate| candidate != file)
+        .analyzed_files()
+        .filter(|candidate| *candidate != file)
         .filter(|candidate| {
             let imports = provider.import_info_of(candidate);
-            provider.could_import_file(candidate, &imports, file)
+            provider.could_import_file(candidate, imports, file)
                 && provider
                     .imported_code_units_of(candidate)
                     .into_iter()
                     .any(|code_unit| code_unit.source() == file)
         })
+        .cloned()
         .collect()
 }
 
 pub(crate) fn build_reverse_import_index<F>(
-    files: &BTreeSet<ProjectFile>,
+    files: &[ProjectFile],
     resolve_imported: F,
-) -> BTreeMap<ProjectFile, Arc<BTreeSet<ProjectFile>>>
+) -> HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>
 where
-    F: Fn(&ProjectFile) -> BTreeSet<CodeUnit> + Sync,
+    F: Fn(&ProjectFile) -> HashSet<CodeUnit> + Sync,
 {
     let imported_by_file: Vec<_> = files
         .par_iter()
         .map(|file| (file.clone(), resolve_imported(file)))
         .collect();
 
-    let mut reverse: BTreeMap<ProjectFile, BTreeSet<ProjectFile>> = BTreeMap::new();
+    let mut reverse: HashMap<ProjectFile, HashSet<ProjectFile>> = HashMap::new();
     for (file, imported) in imported_by_file {
         for code_unit in imported {
             let target = code_unit.source();
@@ -102,7 +102,7 @@ pub trait TestDetectionProvider: CapabilityProvider {}
 
 pub trait TypeHierarchyProvider: CapabilityProvider {
     fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit>;
-    fn get_direct_descendants(&self, code_unit: &CodeUnit) -> BTreeSet<CodeUnit>;
+    fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit>;
 
     fn get_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         traverse_hierarchy(code_unit, |next| self.get_direct_ancestors(next))
@@ -138,22 +138,22 @@ pub(crate) fn direct_descendants_via_ancestors<A, P>(
     analyzer: &A,
     provider: &P,
     code_unit: &CodeUnit,
-) -> BTreeSet<CodeUnit>
+) -> HashSet<CodeUnit>
 where
     A: IAnalyzer,
     P: TypeHierarchyProvider + ?Sized,
 {
     analyzer
-        .get_all_declarations()
-        .into_iter()
+        .all_declarations()
         .filter(|candidate| candidate.is_class())
-        .filter(|candidate| candidate != code_unit)
+        .filter(|candidate| *candidate != code_unit)
         .filter(|candidate| {
             provider
                 .get_direct_ancestors(candidate)
                 .into_iter()
                 .any(|ancestor| ancestor.fq_name() == code_unit.fq_name())
         })
+        .cloned()
         .collect()
 }
 

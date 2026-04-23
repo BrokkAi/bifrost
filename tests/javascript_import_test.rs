@@ -450,7 +450,10 @@ fn test_extract_type_identifiers_and_relevant_imports() {
         .into_iter()
         .next()
         .unwrap();
-    let work_relevant = analyzer.relevant_imports_for(&do_work);
+    let work_relevant: BTreeSet<_> = analyzer
+        .relevant_imports_for(&do_work)
+        .into_iter()
+        .collect();
     assert_eq!(
         BTreeSet::from(["import { Used } from './used';".to_string()]),
         work_relevant
@@ -538,6 +541,6 @@ fn test_referencing_files_uses_resolved_import_targets() {
 
     assert_eq!(
         BTreeSet::from([consumer]),
-        analyzer.referencing_files_of(&target)
+        analyzer.referencing_files_of(&target).into_iter().collect()
     );
 }

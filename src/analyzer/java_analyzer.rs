@@ -5,7 +5,7 @@ use crate::analyzer::{
     referencing_files_via_imports,
 };
 use moka::sync::Cache;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::mem::size_of;
 use std::sync::Arc;
 use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
@@ -120,11 +120,11 @@ pub struct JavaAnalyzer {
 #[derive(Clone)]
 struct JavaMemoCaches {
     budget_bytes: u64,
-    resolved_imports: Cache<ProjectFile, Arc<BTreeMap<String, CodeUnit>>>,
-    referencing_files: Cache<ProjectFile, Arc<BTreeSet<ProjectFile>>>,
-    relevant_imports: Cache<CodeUnit, Arc<BTreeSet<String>>>,
+    resolved_imports: Cache<ProjectFile, Arc<HashMap<String, CodeUnit>>>,
+    referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
+    relevant_imports: Cache<CodeUnit, Arc<HashSet<String>>>,
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
-    direct_descendants: Cache<CodeUnit, Arc<BTreeSet<CodeUnit>>>,
+    direct_descendants: Cache<CodeUnit, Arc<HashSet<CodeUnit>>>,
 }
 
 impl JavaMemoCaches {
@@ -251,28 +251,27 @@ impl JavaAnalyzer {
         let Some(tree) = parse_tree(source) else {
             return BTreeSet::new();
         };
-        let mut identifiers = BTreeSet::new();
+        let mut identifiers = std::collections::HashSet::new();
         collect_type_identifiers(tree.root_node(), source, &mut identifiers);
-        identifiers
+        identifiers.into_iter().collect()
     }
 }
 
 impl ImportAnalysisProvider for JavaAnalyzer {
-    fn imported_code_units_of(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
+    fn imported_code_units_of(&self, file: &ProjectFile) -> HashSet<CodeUnit> {
         self.resolve_imports(file).into_values().collect()
     }
 
-    fn referencing_files_of(&self, file: &ProjectFile) -> BTreeSet<ProjectFile> {
+    fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
         if let Some(cached) = self.memo_caches.referencing_files.get(file) {
             return (*cached).clone();
         }
 
         let mut result = referencing_files_via_imports(self, self, file);
 
-        let target_identifiers: BTreeSet<String> = self
+        let target_identifiers: HashSet<String> = self
             .inner
-            .get_top_level_declarations(file)
-            .into_iter()
+            .top_level_declarations(file)
             .filter(|code_unit| code_unit.is_class() || code_unit.is_module())
             .map(|code_unit| code_unit.identifier().to_string())
             .collect();
@@ -282,14 +281,18 @@ impl ImportAnalysisProvider for JavaAnalyzer {
             if candidate == file || result.contains(candidate) {
                 continue;
             }
-            if self.inner.package_name_of(&candidate).unwrap_or("") != target_package {
+            if self.inner.package_name_of(candidate).unwrap_or("") != target_package {
                 continue;
             }
 
-            let candidate_identifiers = self.inner.type_identifiers_of(candidate);
-            if candidate_identifiers
-                .iter()
-                .any(|identifier| target_identifiers.contains(identifier))
+            if self
+                .inner
+                .type_identifiers_of(candidate)
+                .is_some_and(|candidate_identifiers| {
+                    candidate_identifiers
+                        .iter()
+                        .any(|identifier| target_identifiers.contains(identifier))
+                })
             {
                 result.insert(candidate.clone());
             }
@@ -305,18 +308,18 @@ impl ImportAnalysisProvider for JavaAnalyzer {
         self.inner.import_info_of(file)
     }
 
-    fn relevant_imports_for(&self, code_unit: &CodeUnit) -> BTreeSet<String> {
+    fn relevant_imports_for(&self, code_unit: &CodeUnit) -> HashSet<String> {
         if let Some(cached) = self.memo_caches.relevant_imports.get(code_unit) {
             return (*cached).clone();
         }
 
         let Some(source) = self.get_source(code_unit, false) else {
-            return BTreeSet::new();
+            return HashSet::new();
         };
 
         let all_imports = self.import_info_of(code_unit.source());
         if all_imports.is_empty() {
-            let empty = BTreeSet::new();
+            let empty = HashSet::new();
             self.memo_caches
                 .relevant_imports
                 .insert(code_unit.clone(), Arc::new(empty.clone()));
@@ -325,7 +328,7 @@ impl ImportAnalysisProvider for JavaAnalyzer {
 
         let type_identifiers = self.extract_type_identifiers(&source);
         if type_identifiers.is_empty() {
-            let empty = BTreeSet::new();
+            let empty = HashSet::new();
             self.memo_caches
                 .relevant_imports
                 .insert(code_unit.clone(), Arc::new(empty.clone()));
@@ -341,8 +344,8 @@ impl ImportAnalysisProvider for JavaAnalyzer {
             .filter(|import| import.is_wildcard)
             .collect();
 
-        let mut matched_imports = BTreeSet::new();
-        let mut resolved_identifiers = BTreeSet::new();
+        let mut matched_imports = HashSet::new();
+        let mut resolved_identifiers = HashSet::new();
 
         for import in explicit_imports {
             let Some(identifier) = import.identifier.as_deref() else {
@@ -355,7 +358,7 @@ impl ImportAnalysisProvider for JavaAnalyzer {
             }
         }
 
-        let mut unresolved_identifiers: BTreeSet<String> = type_identifiers
+        let mut unresolved_identifiers: HashSet<String> = type_identifiers
             .into_iter()
             .filter(|identifier| !resolved_identifiers.contains(identifier))
             .collect();
@@ -366,7 +369,7 @@ impl ImportAnalysisProvider for JavaAnalyzer {
             return matched_imports;
         }
 
-        let import_packages: BTreeSet<String> = all_imports
+        let import_packages: HashSet<String> = all_imports
             .iter()
             .map(|import| extract_package_from_import(&import.raw_snippet))
             .filter(|package| !package.is_empty())
@@ -385,7 +388,7 @@ impl ImportAnalysisProvider for JavaAnalyzer {
             return matched_imports;
         }
 
-        let mut resolved_via_wildcard = BTreeSet::new();
+        let mut resolved_via_wildcard = HashSet::new();
         for identifier in &unresolved_identifiers {
             for import in &wildcard_imports {
                 let package = extract_package_from_import(&import.raw_snippet);
@@ -395,8 +398,7 @@ impl ImportAnalysisProvider for JavaAnalyzer {
 
                 let lookup_name = format!("{package}.{identifier}");
                 if self
-                    .get_definitions(&lookup_name)
-                    .into_iter()
+                    .definitions(&lookup_name)
                     .any(|code_unit| code_unit.is_class())
                 {
                     matched_imports.insert(import.raw_snippet.clone());
@@ -490,7 +492,7 @@ impl JavaAnalyzer {
         false
     }
 
-    fn resolve_imports(&self, file: &ProjectFile) -> BTreeMap<String, CodeUnit> {
+    fn resolve_imports(&self, file: &ProjectFile) -> HashMap<String, CodeUnit> {
         if let Some(cached) = self.memo_caches.resolved_imports.get(file) {
             return (*cached).clone();
         }
@@ -502,8 +504,8 @@ impl JavaAnalyzer {
         resolved
     }
 
-    fn resolve_imports_uncached(&self, file: &ProjectFile) -> BTreeMap<String, CodeUnit> {
-        let mut resolved = BTreeMap::new();
+    fn resolve_imports_uncached(&self, file: &ProjectFile) -> HashMap<String, CodeUnit> {
+        let mut resolved = HashMap::new();
 
         for import in self.inner.import_info_of(file) {
             if import
@@ -526,9 +528,9 @@ impl JavaAnalyzer {
             if !import.is_wildcard {
                 if let Some(code_unit) = self
                     .inner
-                    .get_definitions(import_path)
-                    .into_iter()
+                    .definitions(import_path)
                     .find(|code_unit| code_unit.is_class())
+                    .cloned()
                 {
                     resolved.insert(code_unit.identifier().to_string(), code_unit);
                 }
@@ -555,9 +557,9 @@ impl JavaAnalyzer {
         if normalized.contains('.')
             && let Some(code_unit) = self
                 .inner
-                .get_definitions(normalized)
-                .into_iter()
+                .definitions(normalized)
                 .find(|code_unit| code_unit.is_class())
+                .cloned()
         {
             return Some(code_unit);
         }
@@ -575,17 +577,17 @@ impl JavaAnalyzer {
         };
         if let Some(code_unit) = self
             .inner
-            .get_definitions(&same_package_fqn)
-            .into_iter()
+            .definitions(&same_package_fqn)
             .find(|code_unit| code_unit.is_class())
+            .cloned()
         {
             return Some(code_unit);
         }
 
         self.inner
-            .get_definitions(normalized)
-            .into_iter()
+            .definitions(normalized)
             .find(|code_unit| code_unit.is_class())
+            .cloned()
     }
 }
 
@@ -811,7 +813,11 @@ fn is_java_anonymous_structure(fq_name: &str) -> bool {
             .unwrap_or(false)
 }
 
-fn collect_type_identifiers(node: Node<'_>, source: &str, identifiers: &mut BTreeSet<String>) {
+fn collect_type_identifiers(
+    node: Node<'_>,
+    source: &str,
+    identifiers: &mut std::collections::HashSet<String>,
+) {
     match node.kind() {
         "type_identifier" | "scoped_type_identifier" => {
             let text = node_text(node, source).trim();
@@ -1637,7 +1643,7 @@ impl TypeHierarchyProvider for JavaAnalyzer {
         ancestors
     }
 
-    fn get_direct_descendants(&self, code_unit: &CodeUnit) -> BTreeSet<CodeUnit> {
+    fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
         if let Some(cached) = self.memo_caches.direct_descendants.get(code_unit) {
             return (*cached).clone();
         }
@@ -1896,15 +1902,15 @@ impl IAnalyzer for JavaAnalyzer {
     }
 }
 
-fn weight_import_map(key: &ProjectFile, value: &Arc<BTreeMap<String, CodeUnit>>) -> u32 {
+fn weight_import_map(key: &ProjectFile, value: &Arc<HashMap<String, CodeUnit>>) -> u32 {
     weight_bytes(estimate_project_file(key) + estimate_import_map(value.as_ref()))
 }
 
-fn weight_project_file_set(key: &ProjectFile, value: &Arc<BTreeSet<ProjectFile>>) -> u32 {
+fn weight_project_file_set(key: &ProjectFile, value: &Arc<HashSet<ProjectFile>>) -> u32 {
     weight_bytes(estimate_project_file(key) + estimate_project_file_set(value.as_ref()))
 }
 
-fn weight_string_set(key: &CodeUnit, value: &Arc<BTreeSet<String>>) -> u32 {
+fn weight_string_set(key: &CodeUnit, value: &Arc<HashSet<String>>) -> u32 {
     weight_bytes(estimate_code_unit(key) + estimate_string_set(value.as_ref()))
 }
 
@@ -1912,7 +1918,7 @@ fn weight_code_unit_vec(key: &CodeUnit, value: &Arc<Vec<CodeUnit>>) -> u32 {
     weight_bytes(estimate_code_unit(key) + estimate_code_unit_vec(value.as_ref()))
 }
 
-fn weight_code_unit_set(key: &CodeUnit, value: &Arc<BTreeSet<CodeUnit>>) -> u32 {
+fn weight_code_unit_set(key: &CodeUnit, value: &Arc<HashSet<CodeUnit>>) -> u32 {
     weight_bytes(estimate_code_unit(key) + estimate_code_unit_set(value.as_ref()))
 }
 
@@ -1938,29 +1944,28 @@ fn estimate_code_unit(code_unit: &CodeUnit) -> u64 {
             .map_or(0, |signature| signature.len() as u64)
 }
 
-fn estimate_import_map(imports: &BTreeMap<String, CodeUnit>) -> u64 {
-    size_of::<BTreeMap<String, CodeUnit>>() as u64
+fn estimate_import_map(imports: &HashMap<String, CodeUnit>) -> u64 {
+    size_of::<HashMap<String, CodeUnit>>() as u64
         + imports
             .iter()
             .map(|(name, code_unit)| name.len() as u64 + estimate_code_unit(code_unit))
             .sum::<u64>()
 }
 
-fn estimate_project_file_set(files: &BTreeSet<ProjectFile>) -> u64 {
-    size_of::<BTreeSet<ProjectFile>>() as u64 + files.iter().map(estimate_project_file).sum::<u64>()
+fn estimate_project_file_set(files: &HashSet<ProjectFile>) -> u64 {
+    size_of::<HashSet<ProjectFile>>() as u64 + files.iter().map(estimate_project_file).sum::<u64>()
 }
 
-fn estimate_string_set(values: &BTreeSet<String>) -> u64 {
-    size_of::<BTreeSet<String>>() as u64
-        + values.iter().map(|value| value.len() as u64).sum::<u64>()
+fn estimate_string_set(values: &HashSet<String>) -> u64 {
+    size_of::<HashSet<String>>() as u64 + values.iter().map(|value| value.len() as u64).sum::<u64>()
 }
 
 fn estimate_code_unit_vec(values: &[CodeUnit]) -> u64 {
     size_of::<Vec<CodeUnit>>() as u64 + values.iter().map(estimate_code_unit).sum::<u64>()
 }
 
-fn estimate_code_unit_set(values: &BTreeSet<CodeUnit>) -> u64 {
-    size_of::<BTreeSet<CodeUnit>>() as u64 + values.iter().map(estimate_code_unit).sum::<u64>()
+fn estimate_code_unit_set(values: &HashSet<CodeUnit>) -> u64 {
+    size_of::<HashSet<CodeUnit>>() as u64 + values.iter().map(estimate_code_unit).sum::<u64>()
 }
 
 fn java_source_contains_tests(source: &str) -> bool {

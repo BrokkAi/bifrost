@@ -4,7 +4,7 @@ use crate::analyzer::{
     build_reverse_import_index,
 };
 use moka::sync::Cache;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::mem::size_of;
 use std::sync::{Arc, OnceLock};
 use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
@@ -123,11 +123,11 @@ impl crate::analyzer::LanguageAdapter for TypescriptAdapter {
 pub struct TypescriptAnalyzer {
     inner: TreeSitterAnalyzer<TypescriptAdapter>,
     memo_budget: u64,
-    imported_code_units: Cache<ProjectFile, Arc<BTreeSet<CodeUnit>>>,
-    referencing_files: Cache<ProjectFile, Arc<BTreeSet<ProjectFile>>>,
-    relevant_imports: Cache<CodeUnit, Arc<BTreeSet<String>>>,
+    imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
+    referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
+    relevant_imports: Cache<CodeUnit, Arc<HashSet<String>>>,
     reverse_import_index:
-        Arc<OnceLock<std::collections::BTreeMap<ProjectFile, Arc<BTreeSet<ProjectFile>>>>>,
+        Arc<OnceLock<std::collections::HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
 }
 
 impl TypescriptAnalyzer {
@@ -166,33 +166,35 @@ impl TypescriptAnalyzer {
         let Some(tree) = parser.parse(source, None) else {
             return BTreeSet::new();
         };
-        let mut identifiers = BTreeSet::new();
+        let mut identifiers = std::collections::HashSet::new();
         super::javascript_analyzer::collect_js_ts_identifiers(
             tree.root_node(),
             source,
             &mut identifiers,
         );
-        identifiers
+        identifiers.into_iter().collect()
     }
 }
 
 impl ImportAnalysisProvider for TypescriptAnalyzer {
-    fn imported_code_units_of(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
+    fn imported_code_units_of(&self, file: &ProjectFile) -> HashSet<CodeUnit> {
         if let Some(cached) = self.imported_code_units.get(file) {
             return (*cached).clone();
         }
 
-        let mut resolved = BTreeSet::new();
+        let mut resolved = HashSet::new();
         for import in self.inner.import_info_of(file) {
             for target in
                 resolve_js_ts_import_paths(file, &import.raw_snippet, Language::TypeScript)
             {
-                let top_level = self.inner.get_top_level_declarations(&target);
+                let top_level: Vec<_> = self.inner.top_level_declarations(&target).collect();
                 if import.is_wildcard {
                     resolved.extend(
                         top_level
-                            .into_iter()
-                            .filter(|code_unit| !code_unit.is_module()),
+                            .iter()
+                            .copied()
+                            .filter(|code_unit| !code_unit.is_module())
+                            .cloned(),
                     );
                 } else if let Some(identifier) =
                     import.identifier.as_ref().or(import.alias.as_ref())
@@ -200,6 +202,7 @@ impl ImportAnalysisProvider for TypescriptAnalyzer {
                     let mut matched = false;
                     for code_unit in top_level
                         .iter()
+                        .copied()
                         .filter(|code_unit| code_unit.identifier() == identifier)
                     {
                         matched = true;
@@ -208,6 +211,7 @@ impl ImportAnalysisProvider for TypescriptAnalyzer {
                     if !matched {
                         let module_units = top_level
                             .iter()
+                            .copied()
                             .filter(|code_unit| code_unit.is_module())
                             .cloned()
                             .collect::<Vec<_>>();
@@ -220,8 +224,10 @@ impl ImportAnalysisProvider for TypescriptAnalyzer {
                 } else {
                     resolved.extend(
                         top_level
-                            .into_iter()
-                            .filter(|code_unit| !code_unit.is_module()),
+                            .iter()
+                            .copied()
+                            .filter(|code_unit| !code_unit.is_module())
+                            .cloned(),
                     );
                 }
             }
@@ -232,15 +238,14 @@ impl ImportAnalysisProvider for TypescriptAnalyzer {
         resolved
     }
 
-    fn referencing_files_of(&self, file: &ProjectFile) -> BTreeSet<ProjectFile> {
+    fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
         if let Some(cached) = self.referencing_files.get(file) {
             return (*cached).clone();
         }
 
         let reverse_index = self.reverse_import_index.get_or_init(|| {
-            build_reverse_import_index(&self.inner.get_analyzed_files(), |candidate| {
-                self.imported_code_units_of(candidate)
-            })
+            let files: Vec<_> = self.inner.all_files().cloned().collect();
+            build_reverse_import_index(&files, |candidate| self.imported_code_units_of(candidate))
         });
         let referencing = reverse_index
             .get(file)
@@ -255,12 +260,12 @@ impl ImportAnalysisProvider for TypescriptAnalyzer {
         self.inner.import_info_of(file)
     }
 
-    fn relevant_imports_for(&self, code_unit: &CodeUnit) -> BTreeSet<String> {
+    fn relevant_imports_for(&self, code_unit: &CodeUnit) -> HashSet<String> {
         if let Some(cached) = self.relevant_imports.get(code_unit) {
             return (*cached).clone();
         }
         let source = self.inner.get_source(code_unit, false).unwrap_or_default();
-        let relevant: BTreeSet<_> = self
+        let relevant: HashSet<_> = self
             .inner
             .import_info_of(code_unit.source())
             .into_iter()
@@ -1022,29 +1027,29 @@ fn is_static_ts_member(node: Node<'_>, source: &str) -> bool {
     head.split_whitespace().any(|token| token == "static")
 }
 
-fn weight_string_set(_key: &CodeUnit, value: &Arc<BTreeSet<String>>) -> u32 {
+fn weight_string_set(_key: &CodeUnit, value: &Arc<HashSet<String>>) -> u32 {
     let size = value
         .iter()
         .map(|item| item.len() + size_of::<String>())
         .sum::<usize>()
-        + size_of::<BTreeSet<String>>();
+        + size_of::<HashSet<String>>();
     size.min(u32::MAX as usize) as u32
 }
 
-fn weight_project_file_set(_key: &ProjectFile, value: &Arc<BTreeSet<ProjectFile>>) -> u32 {
+fn weight_project_file_set(_key: &ProjectFile, value: &Arc<HashSet<ProjectFile>>) -> u32 {
     let size = value
         .iter()
         .map(|item| item.rel_path().to_string_lossy().len() + size_of::<ProjectFile>())
         .sum::<usize>()
-        + size_of::<BTreeSet<ProjectFile>>();
+        + size_of::<HashSet<ProjectFile>>();
     size.min(u32::MAX as usize) as u32
 }
 
-fn weight_code_unit_set(_key: &ProjectFile, value: &Arc<BTreeSet<CodeUnit>>) -> u32 {
+fn weight_code_unit_set(_key: &ProjectFile, value: &Arc<HashSet<CodeUnit>>) -> u32 {
     let size = value
         .iter()
         .map(|item| item.fq_name().len() + size_of::<CodeUnit>())
         .sum::<usize>()
-        + size_of::<BTreeSet<CodeUnit>>();
+        + size_of::<HashSet<CodeUnit>>();
     size.min(u32::MAX as usize) as u32
 }

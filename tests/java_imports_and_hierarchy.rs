@@ -170,7 +170,7 @@ fn resolves_direct_and_transitive_descendants() {
     let b = analyzer.get_definitions("B").into_iter().next().unwrap();
     let c = analyzer.get_definitions("C").into_iter().next().unwrap();
 
-    let direct = analyzer.get_direct_descendants(&a);
+    let direct: BTreeSet<_> = analyzer.get_direct_descendants(&a).into_iter().collect();
     let transitive = analyzer.get_descendants(&a);
 
     assert_eq!(BTreeSet::from([b.clone()]), direct);
@@ -201,6 +201,6 @@ fn resolves_fully_qualified_extends() {
 
     assert_eq!(
         BTreeSet::from([child]),
-        analyzer.get_direct_descendants(&base)
+        analyzer.get_direct_descendants(&base).into_iter().collect()
     );
 }
