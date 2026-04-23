@@ -8,3 +8,11 @@
 
 pub type HashMap<K, V> = std::collections::HashMap<K, V, rustc_hash::FxBuildHasher>;
 pub type HashSet<T> = std::collections::HashSet<T, rustc_hash::FxBuildHasher>;
+
+pub fn map_with_capacity<K, V>(capacity: usize) -> HashMap<K, V> {
+    HashMap::with_capacity_and_hasher(capacity, Default::default())
+}
+
+pub fn set_with_capacity<T>(capacity: usize) -> HashSet<T> {
+    HashSet::with_capacity_and_hasher(capacity, Default::default())
+}

@@ -2,7 +2,7 @@ use crate::analyzer::{
     AnalyzerConfig, CodeBaseMetrics, CodeUnit, DeclarationInfo, ImportInfo, Language, Project,
     ProjectFile, Range,
 };
-use crate::hash::{HashMap, HashSet};
+use crate::hash::{HashMap, HashSet, map_with_capacity, set_with_capacity};
 use crate::profiling;
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use rayon::prelude::*;
@@ -75,6 +75,18 @@ struct AnalyzerState {
     classes_by_package: HashMap<String, Vec<CodeUnit>>,
     #[allow(dead_code)]
     type_aliases: HashSet<CodeUnit>,
+}
+
+#[derive(Debug, Default)]
+struct IndexCapacities {
+    definitions: usize,
+    children: usize,
+    module_children: usize,
+    ranges: usize,
+    raw_supertypes: usize,
+    signatures: usize,
+    classes_by_package: usize,
+    type_aliases: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -237,7 +249,7 @@ where
             return;
         }
 
-        let mut seen = HashSet::with_capacity_and_hasher(descendants.len(), Default::default());
+        let mut seen = set_with_capacity(descendants.len());
         let mut keyed = Vec::with_capacity(descendants.len());
         for child in descendants.drain(..) {
             if seen.insert(child.clone()) {
@@ -485,14 +497,20 @@ where
         project: &dyn Project,
         adapter: &A,
     ) -> AnalyzerState {
-        let mut definitions = HashMap::<String, Vec<CodeUnit>>::default();
-        let mut children = HashMap::<CodeUnit, Vec<CodeUnit>>::default();
-        let mut module_children = HashMap::<String, Vec<CodeUnit>>::default();
-        let mut ranges = HashMap::<CodeUnit, Vec<Range>>::default();
-        let mut raw_supertypes = HashMap::<CodeUnit, Vec<String>>::default();
-        let mut signatures = HashMap::<CodeUnit, Vec<String>>::default();
-        let mut classes_by_package = HashMap::<String, Vec<CodeUnit>>::default();
-        let mut type_aliases = HashSet::<CodeUnit>::default();
+        // The immutable index merges every per-file declaration table once; pre-sizing
+        // these maps avoids repeated growth while building large workspaces.
+        let capacities = Self::index_capacities(&files);
+        let mut definitions = map_with_capacity::<String, Vec<CodeUnit>>(capacities.definitions);
+        let mut children = map_with_capacity::<CodeUnit, Vec<CodeUnit>>(capacities.children);
+        let mut module_children =
+            map_with_capacity::<String, Vec<CodeUnit>>(capacities.module_children);
+        let mut ranges = map_with_capacity::<CodeUnit, Vec<Range>>(capacities.ranges);
+        let mut raw_supertypes =
+            map_with_capacity::<CodeUnit, Vec<String>>(capacities.raw_supertypes);
+        let mut signatures = map_with_capacity::<CodeUnit, Vec<String>>(capacities.signatures);
+        let mut classes_by_package =
+            map_with_capacity::<String, Vec<CodeUnit>>(capacities.classes_by_package);
+        let mut type_aliases = set_with_capacity::<CodeUnit>(capacities.type_aliases);
 
         for state in files.values() {
             for declaration in &state.declarations {
@@ -577,6 +595,33 @@ where
             classes_by_package,
             type_aliases,
         }
+    }
+
+    fn index_capacities(files: &HashMap<ProjectFile, FileState>) -> IndexCapacities {
+        let mut capacities = IndexCapacities::default();
+        let mut class_declarations = 0usize;
+
+        for state in files.values() {
+            capacities.definitions += state.declarations.len();
+            capacities.children += state.children.len();
+            capacities.module_children += state
+                .children
+                .keys()
+                .filter(|parent| parent.is_module())
+                .count();
+            capacities.ranges += state.ranges.len();
+            capacities.raw_supertypes += state.raw_supertypes.len();
+            capacities.signatures += state.signatures.len();
+            capacities.type_aliases += state.type_aliases.len();
+            class_declarations += state
+                .declarations
+                .iter()
+                .filter(|declaration| declaration.is_class())
+                .count();
+        }
+
+        capacities.classes_by_package = class_declarations.min(files.len());
+        capacities
     }
 
     fn file_state(&self, file: &ProjectFile) -> Option<&FileState> {
