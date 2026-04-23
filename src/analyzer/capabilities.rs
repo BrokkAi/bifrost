@@ -19,8 +19,8 @@ pub trait ImportAnalysisProvider: CapabilityProvider {
     fn imported_code_units_of(&self, file: &ProjectFile) -> BTreeSet<CodeUnit>;
     fn referencing_files_of(&self, file: &ProjectFile) -> BTreeSet<ProjectFile>;
 
-    fn import_info_of(&self, _file: &ProjectFile) -> Vec<ImportInfo> {
-        Vec::new()
+    fn import_info_of<'a>(&'a self, _file: &ProjectFile) -> &'a [ImportInfo] {
+        &[]
     }
 
     fn relevant_imports_for(&self, _code_unit: &CodeUnit) -> BTreeSet<String> {

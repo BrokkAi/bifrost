@@ -251,7 +251,7 @@ impl ImportAnalysisProvider for TypescriptAnalyzer {
         referencing
     }
 
-    fn import_info_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
+    fn import_info_of<'a>(&'a self, file: &ProjectFile) -> &'a [ImportInfo] {
         self.inner.import_info_of(file)
     }
 
@@ -268,7 +268,7 @@ impl ImportAnalysisProvider for TypescriptAnalyzer {
                 let tokens = imported_tokens(&import.raw_snippet);
                 tokens.is_empty() || tokens.iter().any(|token| source.contains(token))
             })
-            .map(|import| import.raw_snippet)
+            .map(|import| import.raw_snippet.clone())
             .collect();
         self.relevant_imports
             .insert(code_unit.clone(), Arc::new(relevant.clone()));
@@ -298,6 +298,51 @@ impl TypeAliasProvider for TypescriptAnalyzer {
 impl TestDetectionProvider for TypescriptAnalyzer {}
 
 impl IAnalyzer for TypescriptAnalyzer {
+    fn top_level_declarations<'a>(
+        &'a self,
+        file: &ProjectFile,
+    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+        self.inner.top_level_declarations(file)
+    }
+
+    fn analyzed_files<'a>(&'a self) -> Box<dyn Iterator<Item = &'a ProjectFile> + 'a> {
+        self.inner.analyzed_files()
+    }
+
+    fn all_declarations<'a>(&'a self) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+        self.inner.all_declarations()
+    }
+
+    fn declarations<'a>(
+        &'a self,
+        file: &ProjectFile,
+    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+        self.inner.declarations(file)
+    }
+
+    fn definitions<'a>(&'a self, fq_name: &'a str) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+        self.inner.definitions(fq_name)
+    }
+
+    fn direct_children<'a>(
+        &'a self,
+        code_unit: &CodeUnit,
+    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+        self.inner.direct_children(code_unit)
+    }
+
+    fn import_statements<'a>(&'a self, file: &ProjectFile) -> &'a [String] {
+        self.inner.import_statements(file)
+    }
+
+    fn ranges<'a>(&'a self, code_unit: &CodeUnit) -> &'a [crate::analyzer::Range] {
+        self.inner.ranges(code_unit)
+    }
+
+    fn signatures<'a>(&'a self, code_unit: &CodeUnit) -> &'a [String] {
+        self.inner.signatures(code_unit)
+    }
+
     fn get_top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
         self.inner.get_top_level_declarations(file)
     }
@@ -403,7 +448,7 @@ impl IAnalyzer for TypescriptAnalyzer {
                 if self.inner.is_type_alias(code_unit) && !signature.ends_with(';') {
                     format!("{signature};")
                 } else {
-                    signature
+                    signature.clone()
                 }
             })
             .collect()

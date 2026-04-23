@@ -176,11 +176,11 @@ impl ImportAnalysisProvider for MultiAnalyzer {
             .collect()
     }
 
-    fn import_info_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
+    fn import_info_of<'a>(&'a self, file: &ProjectFile) -> &'a [ImportInfo] {
         self.delegate_for_file(file)
             .and_then(AnalyzerDelegate::import_analysis_provider)
             .map(|provider| provider.import_info_of(file))
-            .unwrap_or_default()
+            .unwrap_or(&[])
     }
 
     fn relevant_imports_for(&self, code_unit: &CodeUnit) -> BTreeSet<String> {
@@ -231,22 +231,22 @@ impl TypeAliasProvider for MultiAnalyzer {
 impl TestDetectionProvider for MultiAnalyzer {}
 
 impl IAnalyzer for MultiAnalyzer {
-    fn get_top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
-        self.delegate_for_file(file)
-            .map(|delegate| delegate.analyzer().get_top_level_declarations(file))
-            .unwrap_or_default()
+    fn top_level_declarations<'a>(
+        &'a self,
+        file: &ProjectFile,
+    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+        match self.delegate_for_file(file) {
+            Some(delegate) => delegate.analyzer().top_level_declarations(file),
+            None => Box::new(std::iter::empty()),
+        }
     }
 
-    fn get_analyzed_files(&self) -> BTreeSet<ProjectFile> {
-        self.delegates
-            .values()
-            .collect::<Vec<_>>()
-            .into_par_iter()
-            .map(|delegate| delegate.analyzer().get_analyzed_files())
-            .reduce(BTreeSet::new, |mut acc, files| {
-                acc.extend(files);
-                acc
-            })
+    fn analyzed_files<'a>(&'a self) -> Box<dyn Iterator<Item = &'a ProjectFile> + 'a> {
+        Box::new(
+            self.delegates
+                .values()
+                .flat_map(|delegate| delegate.analyzer().analyzed_files()),
+        )
     }
 
     fn languages(&self) -> BTreeSet<Language> {
@@ -284,42 +284,40 @@ impl IAnalyzer for MultiAnalyzer {
             .project()
     }
 
-    fn get_all_declarations(&self) -> Vec<CodeUnit> {
-        let mut declarations: Vec<_> = self
-            .delegates
-            .values()
-            .collect::<Vec<_>>()
-            .into_par_iter()
-            .flat_map_iter(|delegate| delegate.analyzer().get_all_declarations())
-            .collect();
-        declarations.sort();
-        declarations.dedup();
-        declarations
+    fn all_declarations<'a>(&'a self) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+        Box::new(
+            self.delegates
+                .values()
+                .flat_map(|delegate| delegate.analyzer().all_declarations()),
+        )
     }
 
-    fn get_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
-        self.delegate_for_file(file)
-            .map(|delegate| delegate.analyzer().get_declarations(file))
-            .unwrap_or_default()
+    fn declarations<'a>(
+        &'a self,
+        file: &ProjectFile,
+    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+        match self.delegate_for_file(file) {
+            Some(delegate) => delegate.analyzer().declarations(file),
+            None => Box::new(std::iter::empty()),
+        }
     }
 
-    fn get_definitions(&self, fq_name: &str) -> Vec<CodeUnit> {
-        let mut definitions: Vec<_> = self
-            .delegates
-            .values()
-            .collect::<Vec<_>>()
-            .into_par_iter()
-            .flat_map_iter(|delegate| delegate.analyzer().get_definitions(fq_name))
-            .collect();
-        definitions.sort();
-        definitions.dedup();
-        definitions
+    fn definitions<'a>(&'a self, fq_name: &'a str) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+        Box::new(
+            self.delegates
+                .values()
+                .flat_map(move |delegate| delegate.analyzer().definitions(fq_name)),
+        )
     }
 
-    fn get_direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        self.delegate_for_code_unit(code_unit)
-            .map(|delegate| delegate.analyzer().get_direct_children(code_unit))
-            .unwrap_or_default()
+    fn direct_children<'a>(
+        &'a self,
+        code_unit: &CodeUnit,
+    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+        match self.delegate_for_code_unit(code_unit) {
+            Some(delegate) => delegate.analyzer().direct_children(code_unit),
+            None => Box::new(std::iter::empty()),
+        }
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {
@@ -328,10 +326,10 @@ impl IAnalyzer for MultiAnalyzer {
             .find_map(|delegate| delegate.analyzer().extract_call_receiver(reference))
     }
 
-    fn import_statements_of(&self, file: &ProjectFile) -> Vec<String> {
+    fn import_statements<'a>(&'a self, file: &ProjectFile) -> &'a [String] {
         self.delegate_for_file(file)
-            .map(|delegate| delegate.analyzer().import_statements_of(file))
-            .unwrap_or_default()
+            .map(|delegate| delegate.analyzer().import_statements(file))
+            .unwrap_or(&[])
     }
 
     fn enclosing_code_unit(&self, file: &ProjectFile, range: &Range) -> Option<CodeUnit> {
@@ -376,10 +374,10 @@ impl IAnalyzer for MultiAnalyzer {
         })
     }
 
-    fn ranges_of(&self, code_unit: &CodeUnit) -> Vec<Range> {
+    fn ranges<'a>(&'a self, code_unit: &CodeUnit) -> &'a [Range] {
         self.delegate_for_code_unit(code_unit)
-            .map(|delegate| delegate.analyzer().ranges_of(code_unit))
-            .unwrap_or_default()
+            .map(|delegate| delegate.analyzer().ranges(code_unit))
+            .unwrap_or(&[])
     }
 
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
@@ -415,10 +413,10 @@ impl IAnalyzer for MultiAnalyzer {
             })
     }
 
-    fn signatures_of(&self, code_unit: &CodeUnit) -> Vec<String> {
+    fn signatures<'a>(&'a self, code_unit: &CodeUnit) -> &'a [String] {
         self.delegate_for_code_unit(code_unit)
-            .map(|delegate| delegate.analyzer().signatures_of(code_unit))
-            .unwrap_or_default()
+            .map(|delegate| delegate.analyzer().signatures(code_unit))
+            .unwrap_or(&[])
     }
 
     fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {

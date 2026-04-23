@@ -120,7 +120,7 @@ impl ImportAnalysisProvider for CppAnalyzer {
         let file_name = file.rel_path().file_name().and_then(|value| value.to_str());
         let mut references = BTreeSet::new();
         for candidate in self.inner.all_files() {
-            if candidate == *file {
+            if candidate == file {
                 continue;
             }
             if self
@@ -134,7 +134,7 @@ impl ImportAnalysisProvider for CppAnalyzer {
                     })
                 })
             {
-                references.insert(candidate);
+                references.insert(candidate.clone());
             }
         }
 
@@ -143,7 +143,7 @@ impl ImportAnalysisProvider for CppAnalyzer {
         references
     }
 
-    fn import_info_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
+    fn import_info_of<'a>(&'a self, file: &ProjectFile) -> &'a [ImportInfo] {
         self.inner.import_info_of(file)
     }
 
@@ -206,6 +206,51 @@ impl CppAnalyzer {
 }
 
 impl IAnalyzer for CppAnalyzer {
+    fn top_level_declarations<'a>(
+        &'a self,
+        file: &ProjectFile,
+    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+        self.inner.top_level_declarations(file)
+    }
+
+    fn analyzed_files<'a>(&'a self) -> Box<dyn Iterator<Item = &'a ProjectFile> + 'a> {
+        self.inner.analyzed_files()
+    }
+
+    fn all_declarations<'a>(&'a self) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+        self.inner.all_declarations()
+    }
+
+    fn declarations<'a>(
+        &'a self,
+        file: &ProjectFile,
+    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+        self.inner.declarations(file)
+    }
+
+    fn definitions<'a>(&'a self, fq_name: &'a str) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+        self.inner.definitions(fq_name)
+    }
+
+    fn direct_children<'a>(
+        &'a self,
+        code_unit: &CodeUnit,
+    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+        self.inner.direct_children(code_unit)
+    }
+
+    fn import_statements<'a>(&'a self, file: &ProjectFile) -> &'a [String] {
+        self.inner.import_statements(file)
+    }
+
+    fn ranges<'a>(&'a self, code_unit: &CodeUnit) -> &'a [crate::analyzer::Range] {
+        self.inner.ranges(code_unit)
+    }
+
+    fn signatures<'a>(&'a self, code_unit: &CodeUnit) -> &'a [String] {
+        self.inner.signatures(code_unit)
+    }
+
     fn get_top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
         self.inner.get_top_level_declarations(file)
     }
@@ -320,7 +365,7 @@ impl IAnalyzer for CppAnalyzer {
     }
 
     fn signatures_of(&self, code_unit: &CodeUnit) -> Vec<String> {
-        self.inner.signatures_of(code_unit)
+        self.inner.signatures_of(code_unit).to_vec()
     }
 
     fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {

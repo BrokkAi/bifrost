@@ -415,7 +415,7 @@ impl ImportAnalysisProvider for PythonAnalyzer {
         referencing
     }
 
-    fn import_info_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
+    fn import_info_of<'a>(&'a self, file: &ProjectFile) -> &'a [ImportInfo] {
         self.inner.import_info_of(file)
     }
 
@@ -438,7 +438,7 @@ impl ImportAnalysisProvider for PythonAnalyzer {
         let mut resolved = BTreeSet::new();
         let mut wildcard_imports = Vec::new();
 
-        for info in &imports {
+        for info in imports {
             if info.is_wildcard {
                 wildcard_imports.push(info.clone());
                 continue;
@@ -569,6 +569,51 @@ impl TypeHierarchyProvider for PythonAnalyzer {
 impl TestDetectionProvider for PythonAnalyzer {}
 
 impl IAnalyzer for PythonAnalyzer {
+    fn top_level_declarations<'a>(
+        &'a self,
+        file: &ProjectFile,
+    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+        self.inner.top_level_declarations(file)
+    }
+
+    fn analyzed_files<'a>(&'a self) -> Box<dyn Iterator<Item = &'a ProjectFile> + 'a> {
+        self.inner.analyzed_files()
+    }
+
+    fn all_declarations<'a>(&'a self) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+        self.inner.all_declarations()
+    }
+
+    fn declarations<'a>(
+        &'a self,
+        file: &ProjectFile,
+    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+        self.inner.declarations(file)
+    }
+
+    fn definitions<'a>(&'a self, fq_name: &'a str) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+        self.inner.definitions(fq_name)
+    }
+
+    fn direct_children<'a>(
+        &'a self,
+        code_unit: &CodeUnit,
+    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+        self.inner.direct_children(code_unit)
+    }
+
+    fn import_statements<'a>(&'a self, file: &ProjectFile) -> &'a [String] {
+        self.inner.import_statements(file)
+    }
+
+    fn ranges<'a>(&'a self, code_unit: &CodeUnit) -> &'a [crate::analyzer::Range] {
+        self.inner.ranges(code_unit)
+    }
+
+    fn signatures<'a>(&'a self, code_unit: &CodeUnit) -> &'a [String] {
+        self.inner.signatures(code_unit)
+    }
+
     fn get_top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
         self.inner.get_top_level_declarations(file)
     }
@@ -739,7 +784,7 @@ impl IAnalyzer for PythonAnalyzer {
     }
 
     fn signatures_of(&self, code_unit: &CodeUnit) -> Vec<String> {
-        self.inner.signatures_of(code_unit)
+        self.inner.signatures_of(code_unit).to_vec()
     }
 
     fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {

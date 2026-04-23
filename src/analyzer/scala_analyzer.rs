@@ -137,6 +137,51 @@ impl ScalaAnalyzer {
 impl TestDetectionProvider for ScalaAnalyzer {}
 
 impl IAnalyzer for ScalaAnalyzer {
+    fn top_level_declarations<'a>(
+        &'a self,
+        file: &ProjectFile,
+    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+        self.inner.top_level_declarations(file)
+    }
+
+    fn analyzed_files<'a>(&'a self) -> Box<dyn Iterator<Item = &'a ProjectFile> + 'a> {
+        self.inner.analyzed_files()
+    }
+
+    fn all_declarations<'a>(&'a self) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+        self.inner.all_declarations()
+    }
+
+    fn declarations<'a>(
+        &'a self,
+        file: &ProjectFile,
+    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+        self.inner.declarations(file)
+    }
+
+    fn definitions<'a>(&'a self, fq_name: &'a str) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+        self.inner.definitions(fq_name)
+    }
+
+    fn direct_children<'a>(
+        &'a self,
+        code_unit: &CodeUnit,
+    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+        self.inner.direct_children(code_unit)
+    }
+
+    fn import_statements<'a>(&'a self, file: &ProjectFile) -> &'a [String] {
+        self.inner.import_statements(file)
+    }
+
+    fn ranges<'a>(&'a self, code_unit: &CodeUnit) -> &'a [crate::analyzer::Range] {
+        self.inner.ranges(code_unit)
+    }
+
+    fn signatures<'a>(&'a self, code_unit: &CodeUnit) -> &'a [String] {
+        self.inner.signatures(code_unit)
+    }
+
     fn get_top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
         self.inner.get_top_level_declarations(file)
     }
@@ -255,7 +300,7 @@ impl IAnalyzer for ScalaAnalyzer {
     }
 
     fn signatures_of(&self, code_unit: &CodeUnit) -> Vec<String> {
-        self.inner.signatures_of(code_unit)
+        self.inner.signatures_of(code_unit).to_vec()
     }
 
     fn contains_tests(&self, file: &ProjectFile) -> bool {

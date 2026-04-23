@@ -1024,13 +1024,9 @@ mod tests {
     }
 
     impl IAnalyzer for CountingAnalyzer {
-        fn get_top_level_declarations(&self, _file: &ProjectFile) -> Vec<CodeUnit> {
-            Vec::new()
-        }
-
-        fn get_analyzed_files(&self) -> BTreeSet<ProjectFile> {
+        fn analyzed_files<'a>(&'a self) -> Box<dyn Iterator<Item = &'a ProjectFile> + 'a> {
             self.analyzed_files_calls.fetch_add(1, Ordering::Relaxed);
-            self.project.files.clone()
+            Box::new(self.project.files.iter())
         }
 
         fn languages(&self) -> BTreeSet<Language> {
@@ -1061,8 +1057,8 @@ mod tests {
             &self.project
         }
 
-        fn get_all_declarations(&self) -> Vec<CodeUnit> {
-            Vec::new()
+        fn all_declarations<'a>(&'a self) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+            Box::new(std::iter::empty())
         }
 
         fn get_declarations(&self, _file: &ProjectFile) -> BTreeSet<CodeUnit> {

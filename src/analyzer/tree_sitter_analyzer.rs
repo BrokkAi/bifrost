@@ -573,22 +573,22 @@ where
             .map(|state| state.package_name.as_str())
     }
 
-    pub(crate) fn import_info_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
+    pub(crate) fn import_info_of<'a>(&'a self, file: &ProjectFile) -> &'a [ImportInfo] {
         self.file_state(file)
-            .map(|state| state.imports.clone())
-            .unwrap_or_default()
+            .map(|state| state.imports.as_slice())
+            .unwrap_or(&[])
     }
 
-    pub(crate) fn raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String> {
+    pub(crate) fn raw_supertypes_of<'a>(&'a self, code_unit: &CodeUnit) -> &'a [String] {
         self.state
             .raw_supertypes
             .get(code_unit)
-            .cloned()
+            .map(Vec::as_slice)
             .or_else(|| {
                 self.file_state(code_unit.source())
-                    .and_then(|state| state.raw_supertypes.get(code_unit).cloned())
+                    .and_then(|state| state.raw_supertypes.get(code_unit).map(Vec::as_slice))
             })
-            .unwrap_or_default()
+            .unwrap_or(&[])
     }
 
     pub(crate) fn type_identifiers_of(&self, file: &ProjectFile) -> BTreeSet<String> {
@@ -597,16 +597,19 @@ where
             .unwrap_or_default()
     }
 
-    pub(crate) fn all_files(&self) -> BTreeSet<ProjectFile> {
-        self.state.files.keys().cloned().collect()
+    pub(crate) fn all_files<'a>(&'a self) -> impl Iterator<Item = &'a ProjectFile> + 'a {
+        self.state.files.keys()
     }
 
-    pub(crate) fn class_declarations_in_package(&self, package_name: &str) -> Vec<CodeUnit> {
+    pub(crate) fn class_declarations_in_package<'a>(
+        &'a self,
+        package_name: &str,
+    ) -> &'a [CodeUnit] {
         self.state
             .classes_by_package
             .get(package_name)
-            .cloned()
-            .unwrap_or_default()
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     #[allow(dead_code)]
@@ -614,16 +617,16 @@ where
         self.state.type_aliases.contains(code_unit)
     }
 
-    pub(crate) fn signatures_of(&self, code_unit: &CodeUnit) -> Vec<String> {
+    pub(crate) fn signatures_of<'a>(&'a self, code_unit: &CodeUnit) -> &'a [String] {
         self.state
             .signatures
             .get(code_unit)
-            .cloned()
+            .map(Vec::as_slice)
             .or_else(|| {
                 self.file_state(code_unit.source())
-                    .and_then(|state| state.signatures.get(code_unit).cloned())
+                    .and_then(|state| state.signatures.get(code_unit).map(Vec::as_slice))
             })
-            .unwrap_or_default()
+            .unwrap_or(&[])
     }
 
     fn source_slice(
@@ -731,14 +734,18 @@ impl<A> crate::analyzer::IAnalyzer for TreeSitterAnalyzer<A>
 where
     A: LanguageAdapter,
 {
-    fn get_top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
-        self.file_state(file)
-            .map(|state| state.top_level_declarations.clone())
-            .unwrap_or_default()
+    fn top_level_declarations<'a>(
+        &'a self,
+        file: &ProjectFile,
+    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+        match self.file_state(file) {
+            Some(state) => Box::new(state.top_level_declarations.iter()),
+            None => Box::new(std::iter::empty()),
+        }
     }
 
-    fn get_analyzed_files(&self) -> BTreeSet<ProjectFile> {
-        self.state.files.keys().cloned().collect()
+    fn analyzed_files<'a>(&'a self) -> Box<dyn Iterator<Item = &'a ProjectFile> + 'a> {
+        Box::new(self.state.files.keys())
     }
 
     fn languages(&self) -> BTreeSet<Language> {
@@ -800,56 +807,64 @@ where
         self.project()
     }
 
-    fn get_all_declarations(&self) -> Vec<CodeUnit> {
-        self.state
-            .files
-            .values()
-            .flat_map(|state| state.declarations.iter().cloned())
-            .collect()
+    fn all_declarations<'a>(&'a self) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+        Box::new(
+            self.state
+                .files
+                .values()
+                .flat_map(|state| state.declarations.iter()),
+        )
     }
 
-    fn get_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
-        self.file_state(file)
-            .map(|state| state.declarations.clone())
-            .unwrap_or_default()
-    }
-
-    fn get_definitions(&self, fq_name: &str) -> Vec<CodeUnit> {
-        let matches = self
-            .state
-            .definitions
-            .get(&self.adapter.normalize_full_name(fq_name))
-            .cloned()
-            .unwrap_or_default();
-
-        let mut result = Vec::new();
-        let mut saw_module = false;
-        for code_unit in matches {
-            if code_unit.is_module() {
-                if saw_module {
-                    continue;
-                }
-                saw_module = true;
-            }
-            result.push(code_unit);
+    fn declarations<'a>(
+        &'a self,
+        file: &ProjectFile,
+    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+        match self.file_state(file) {
+            Some(state) => Box::new(state.declarations.iter()),
+            None => Box::new(std::iter::empty()),
         }
-        result
     }
 
-    fn get_direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+    fn definitions<'a>(&'a self, fq_name: &'a str) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+        let normalized = self.adapter.normalize_full_name(fq_name);
+        let Some(matches) = self.state.definitions.get(&normalized) else {
+            return Box::new(std::iter::empty());
+        };
+        Box::new(
+            matches
+                .iter()
+                .scan(false, |saw_module, code_unit| {
+                    if code_unit.is_module() {
+                        if *saw_module {
+                            Some(None)
+                        } else {
+                            *saw_module = true;
+                            Some(Some(code_unit))
+                        }
+                    } else {
+                        Some(Some(code_unit))
+                    }
+                })
+                .flatten(),
+        )
+    }
+
+    fn direct_children<'a>(
+        &'a self,
+        code_unit: &CodeUnit,
+    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
         if code_unit.is_module() {
             let target_name = self.adapter.normalize_full_name(&code_unit.fq_name());
-            self.state
-                .module_children
-                .get(&target_name)
-                .cloned()
-                .unwrap_or_default()
+            match self.state.module_children.get(&target_name) {
+                Some(children) => Box::new(children.iter()),
+                None => Box::new(std::iter::empty()),
+            }
         } else {
-            self.state
-                .children
-                .get(code_unit)
-                .cloned()
-                .unwrap_or_default()
+            match self.state.children.get(code_unit) {
+                Some(children) => Box::new(children.iter()),
+                None => Box::new(std::iter::empty()),
+            }
         }
     }
 
@@ -857,10 +872,10 @@ where
         self.adapter.extract_call_receiver(reference)
     }
 
-    fn import_statements_of(&self, file: &ProjectFile) -> Vec<String> {
+    fn import_statements<'a>(&'a self, file: &ProjectFile) -> &'a [String] {
         self.file_state(file)
-            .map(|state| state.import_statements.clone())
-            .unwrap_or_default()
+            .map(|state| state.import_statements.as_slice())
+            .unwrap_or(&[])
     }
 
     fn enclosing_code_unit(&self, file: &ProjectFile, range: &Range) -> Option<CodeUnit> {
@@ -925,12 +940,12 @@ where
         None
     }
 
-    fn ranges_of(&self, code_unit: &CodeUnit) -> Vec<Range> {
+    fn ranges<'a>(&'a self, code_unit: &CodeUnit) -> &'a [Range] {
         self.state
             .ranges
             .get(code_unit)
-            .cloned()
-            .unwrap_or_default()
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
@@ -957,14 +972,14 @@ where
     fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String> {
         let mut ranges = if code_unit.is_function() {
             let mut grouped = Vec::new();
-            for candidate in self.get_definitions(&code_unit.fq_name()) {
+            for candidate in self.definitions(&code_unit.fq_name()) {
                 if candidate.source() == code_unit.source() {
-                    grouped.extend(self.ranges_of(&candidate));
+                    grouped.extend(self.ranges(candidate).iter().copied());
                 }
             }
             grouped
         } else {
-            self.ranges_of(code_unit)
+            self.ranges(code_unit).to_vec()
         };
 
         ranges.sort_by_key(|range| range.start_byte);
@@ -1018,6 +1033,10 @@ where
         self.file_state(file)
             .map(|state| state.contains_tests)
             .unwrap_or(false)
+    }
+
+    fn signatures<'a>(&'a self, code_unit: &CodeUnit) -> &'a [String] {
+        self.signatures_of(code_unit)
     }
 }
 

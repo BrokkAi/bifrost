@@ -8,9 +8,14 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub trait IAnalyzer: Send + Sync + Any {
-    fn get_top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit>;
-    fn get_analyzed_files(&self) -> BTreeSet<ProjectFile> {
-        BTreeSet::new()
+    fn top_level_declarations<'a>(
+        &'a self,
+        _file: &ProjectFile,
+    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+        Box::new(std::iter::empty())
+    }
+    fn analyzed_files<'a>(&'a self) -> Box<dyn Iterator<Item = &'a ProjectFile> + 'a> {
+        Box::new(std::iter::empty())
     }
     fn languages(&self) -> BTreeSet<Language>;
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self
@@ -20,12 +25,26 @@ pub trait IAnalyzer: Send + Sync + Any {
     where
         Self: Sized;
     fn project(&self) -> &dyn Project;
-    fn get_all_declarations(&self) -> Vec<CodeUnit>;
-    fn get_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit>;
-    fn get_definitions(&self, fq_name: &str) -> Vec<CodeUnit>;
-    fn get_direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit>;
+    fn all_declarations<'a>(&'a self) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a>;
+    fn declarations<'a>(
+        &'a self,
+        _file: &ProjectFile,
+    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+        Box::new(std::iter::empty())
+    }
+    fn definitions<'a>(&'a self, _fq_name: &'a str) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+        Box::new(std::iter::empty())
+    }
+    fn direct_children<'a>(
+        &'a self,
+        _code_unit: &CodeUnit,
+    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+        Box::new(std::iter::empty())
+    }
     fn extract_call_receiver(&self, reference: &str) -> Option<String>;
-    fn import_statements_of(&self, file: &ProjectFile) -> Vec<String>;
+    fn import_statements<'a>(&'a self, _file: &ProjectFile) -> &'a [String] {
+        &[]
+    }
     fn enclosing_code_unit(&self, file: &ProjectFile, range: &Range) -> Option<CodeUnit>;
     fn enclosing_code_unit_for_lines(
         &self,
@@ -41,14 +60,52 @@ pub trait IAnalyzer: Send + Sync + Any {
         end_byte: usize,
         ident: &str,
     ) -> Option<DeclarationInfo>;
-    fn ranges_of(&self, code_unit: &CodeUnit) -> Vec<Range>;
+    fn ranges<'a>(&'a self, _code_unit: &CodeUnit) -> &'a [Range] {
+        &[]
+    }
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String>;
     fn get_skeleton_header(&self, code_unit: &CodeUnit) -> Option<String>;
     fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String>;
     fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String>;
     fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit>;
-    fn signatures_of(&self, _code_unit: &CodeUnit) -> Vec<String> {
-        Vec::new()
+    fn signatures<'a>(&'a self, _code_unit: &CodeUnit) -> &'a [String] {
+        &[]
+    }
+
+    fn get_top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
+        self.top_level_declarations(file).cloned().collect()
+    }
+
+    fn get_analyzed_files(&self) -> BTreeSet<ProjectFile> {
+        self.analyzed_files().cloned().collect()
+    }
+
+    fn get_all_declarations(&self) -> Vec<CodeUnit> {
+        self.all_declarations().cloned().collect()
+    }
+
+    fn get_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
+        self.declarations(file).cloned().collect()
+    }
+
+    fn get_definitions(&self, fq_name: &str) -> Vec<CodeUnit> {
+        self.definitions(fq_name).cloned().collect()
+    }
+
+    fn get_direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+        self.direct_children(code_unit).cloned().collect()
+    }
+
+    fn import_statements_of(&self, file: &ProjectFile) -> Vec<String> {
+        self.import_statements(file).to_vec()
+    }
+
+    fn ranges_of(&self, code_unit: &CodeUnit) -> Vec<Range> {
+        self.ranges(code_unit).to_vec()
+    }
+
+    fn signatures_of(&self, code_unit: &CodeUnit) -> Vec<String> {
+        self.signatures(code_unit).to_vec()
     }
 
     fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {

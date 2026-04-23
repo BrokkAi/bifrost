@@ -19,11 +19,10 @@ impl EmptyAnalyzer {
 }
 
 impl IAnalyzer for EmptyAnalyzer {
-    fn get_top_level_declarations(
-        &self,
-        _file: &crate::analyzer::ProjectFile,
-    ) -> Vec<crate::analyzer::CodeUnit> {
-        Vec::new()
+    fn all_declarations<'a>(
+        &'a self,
+    ) -> Box<dyn Iterator<Item = &'a crate::analyzer::CodeUnit> + 'a> {
+        Box::new(std::iter::empty())
     }
 
     fn languages(&self) -> std::collections::BTreeSet<Language> {

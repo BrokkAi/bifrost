@@ -159,7 +159,6 @@ impl ImportAnalysisProvider for GoAnalyzer {
         }
 
         let mut resolved = BTreeSet::new();
-        let all_files = self.inner.all_files();
         for import in self.inner.import_info_of(file) {
             if import.alias.as_deref() == Some("_") {
                 continue;
@@ -167,9 +166,10 @@ impl ImportAnalysisProvider for GoAnalyzer {
             let Some(path) = extract_go_import_path(&import.raw_snippet) else {
                 continue;
             };
-            let matching_files: Vec<_> = all_files
-                .iter()
-                .filter(|candidate| candidate != &file)
+            let matching_files: Vec<_> = self
+                .inner
+                .all_files()
+                .filter(|candidate| *candidate != file)
                 .filter(|candidate| {
                     let parent = candidate.parent().to_string_lossy().replace('\\', "/");
                     parent == path
@@ -212,7 +212,7 @@ impl ImportAnalysisProvider for GoAnalyzer {
         referencing
     }
 
-    fn import_info_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
+    fn import_info_of<'a>(&'a self, file: &ProjectFile) -> &'a [ImportInfo] {
         self.inner.import_info_of(file)
     }
 
@@ -268,6 +268,51 @@ impl TypeAliasProvider for GoAnalyzer {
 impl TestDetectionProvider for GoAnalyzer {}
 
 impl IAnalyzer for GoAnalyzer {
+    fn top_level_declarations<'a>(
+        &'a self,
+        file: &ProjectFile,
+    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+        self.inner.top_level_declarations(file)
+    }
+
+    fn analyzed_files<'a>(&'a self) -> Box<dyn Iterator<Item = &'a ProjectFile> + 'a> {
+        self.inner.analyzed_files()
+    }
+
+    fn all_declarations<'a>(&'a self) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+        self.inner.all_declarations()
+    }
+
+    fn declarations<'a>(
+        &'a self,
+        file: &ProjectFile,
+    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+        self.inner.declarations(file)
+    }
+
+    fn definitions<'a>(&'a self, fq_name: &'a str) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+        self.inner.definitions(fq_name)
+    }
+
+    fn direct_children<'a>(
+        &'a self,
+        code_unit: &CodeUnit,
+    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+        self.inner.direct_children(code_unit)
+    }
+
+    fn import_statements<'a>(&'a self, file: &ProjectFile) -> &'a [String] {
+        self.inner.import_statements(file)
+    }
+
+    fn ranges<'a>(&'a self, code_unit: &CodeUnit) -> &'a [crate::analyzer::Range] {
+        self.inner.ranges(code_unit)
+    }
+
+    fn signatures<'a>(&'a self, code_unit: &CodeUnit) -> &'a [String] {
+        self.inner.signatures(code_unit)
+    }
+
     fn get_top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
         self.inner.get_top_level_declarations(file)
     }
@@ -401,7 +446,7 @@ impl IAnalyzer for GoAnalyzer {
     }
 
     fn signatures_of(&self, code_unit: &CodeUnit) -> Vec<String> {
-        self.inner.signatures_of(code_unit)
+        self.inner.signatures_of(code_unit).to_vec()
     }
 
     fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {
