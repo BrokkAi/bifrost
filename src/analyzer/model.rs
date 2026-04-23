@@ -365,81 +365,20 @@ impl Hash for CodeUnit {
 
 impl Ord for CodeUnit {
     fn cmp(&self, other: &Self) -> Ordering {
-        cmp_fq_name_parts(
-            &self.0.package_name,
-            &self.0.short_name,
-            &other.0.package_name,
-            &other.0.short_name,
-        )
-        .then_with(|| self.0.kind.cmp(&other.0.kind))
-        .then_with(|| self.0.source.cmp(&other.0.source))
-        .then_with(|| self.0.signature.cmp(&other.0.signature))
-        .then_with(|| self.0.synthetic.cmp(&other.0.synthetic))
-        .then_with(|| self.0.package_name.cmp(&other.0.package_name))
-        .then_with(|| self.0.short_name.cmp(&other.0.short_name))
+        self.0
+            .package_name
+            .cmp(&other.0.package_name)
+            .then_with(|| self.0.short_name.cmp(&other.0.short_name))
+            .then_with(|| self.0.kind.cmp(&other.0.kind))
+            .then_with(|| self.0.source.cmp(&other.0.source))
+            .then_with(|| self.0.signature.cmp(&other.0.signature))
+            .then_with(|| self.0.synthetic.cmp(&other.0.synthetic))
     }
 }
 
 impl PartialOrd for CodeUnit {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
-    }
-}
-
-fn cmp_fq_name_parts(
-    left_package: &str,
-    left_short: &str,
-    right_package: &str,
-    right_short: &str,
-) -> Ordering {
-    let mut left = FqNameBytes::new(left_package, left_short);
-    let mut right = FqNameBytes::new(right_package, right_short);
-    loop {
-        match (left.next(), right.next()) {
-            (Some(left), Some(right)) => match left.cmp(&right) {
-                Ordering::Equal => {}
-                ordering => return ordering,
-            },
-            (Some(_), None) => return Ordering::Greater,
-            (None, Some(_)) => return Ordering::Less,
-            (None, None) => return Ordering::Equal,
-        }
-    }
-}
-
-struct FqNameBytes<'a> {
-    package: &'a [u8],
-    short: &'a [u8],
-    position: usize,
-}
-
-impl<'a> FqNameBytes<'a> {
-    fn new(package: &'a str, short: &'a str) -> Self {
-        Self {
-            package: package.as_bytes(),
-            short: short.as_bytes(),
-            position: 0,
-        }
-    }
-}
-
-impl Iterator for FqNameBytes<'_> {
-    type Item = u8;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let value = if self.package.is_empty() {
-            self.short.get(self.position).copied()
-        } else if self.position < self.package.len() {
-            self.package.get(self.position).copied()
-        } else if self.position == self.package.len() {
-            Some(b'.')
-        } else {
-            self.short
-                .get(self.position - self.package.len() - 1)
-                .copied()
-        };
-        self.position += usize::from(value.is_some());
-        value
     }
 }
 
