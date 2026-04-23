@@ -2,11 +2,12 @@ use crate::analyzer::{
     AnalyzerConfig, CodeBaseMetrics, CodeUnit, DeclarationInfo, ImportInfo, Language, Project,
     ProjectFile, Range,
 };
+use crate::hash::{HashMap, HashSet};
 use crate::profiling;
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use rayon::prelude::*;
 use regex::RegexBuilder;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::BTreeSet;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -96,15 +97,15 @@ impl ParsedFile {
         Self {
             package_name,
             top_level_declarations: Vec::new(),
-            declarations: HashSet::new(),
+            declarations: HashSet::default(),
             import_statements: Vec::new(),
             imports: Vec::new(),
-            raw_supertypes: HashMap::new(),
-            type_identifiers: HashSet::new(),
-            signatures: HashMap::new(),
-            type_aliases: HashSet::new(),
-            ranges: HashMap::new(),
-            children: HashMap::new(),
+            raw_supertypes: HashMap::default(),
+            type_identifiers: HashSet::default(),
+            signatures: HashMap::default(),
+            type_aliases: HashSet::default(),
+            ranges: HashMap::default(),
+            children: HashMap::default(),
         }
     }
 
@@ -236,7 +237,7 @@ where
             return;
         }
 
-        let mut seen = HashSet::with_capacity(descendants.len());
+        let mut seen = HashSet::with_capacity_and_hasher(descendants.len(), Default::default());
         let mut keyed = Vec::with_capacity(descendants.len());
         for child in descendants.drain(..) {
             if seen.insert(child.clone()) {
@@ -484,14 +485,14 @@ where
         project: &dyn Project,
         adapter: &A,
     ) -> AnalyzerState {
-        let mut definitions = HashMap::<String, Vec<CodeUnit>>::new();
-        let mut children = HashMap::<CodeUnit, Vec<CodeUnit>>::new();
-        let mut module_children = HashMap::<String, Vec<CodeUnit>>::new();
-        let mut ranges = HashMap::<CodeUnit, Vec<Range>>::new();
-        let mut raw_supertypes = HashMap::<CodeUnit, Vec<String>>::new();
-        let mut signatures = HashMap::<CodeUnit, Vec<String>>::new();
-        let mut classes_by_package = HashMap::<String, Vec<CodeUnit>>::new();
-        let mut type_aliases = HashSet::<CodeUnit>::new();
+        let mut definitions = HashMap::<String, Vec<CodeUnit>>::default();
+        let mut children = HashMap::<CodeUnit, Vec<CodeUnit>>::default();
+        let mut module_children = HashMap::<String, Vec<CodeUnit>>::default();
+        let mut ranges = HashMap::<CodeUnit, Vec<Range>>::default();
+        let mut raw_supertypes = HashMap::<CodeUnit, Vec<String>>::default();
+        let mut signatures = HashMap::<CodeUnit, Vec<String>>::default();
+        let mut classes_by_package = HashMap::<String, Vec<CodeUnit>>::default();
+        let mut type_aliases = HashSet::<CodeUnit>::default();
 
         for state in files.values() {
             for declaration in &state.declarations {

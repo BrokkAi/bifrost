@@ -1,8 +1,8 @@
+use crate::hash::HashSet;
 use crate::{Project, ProjectFile};
 use notify::{
     Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher, recommended_watcher,
 };
-use std::collections::HashSet;
 use std::mem;
 use std::path::Path;
 use std::sync::{Arc, Mutex};

@@ -3,8 +3,9 @@ use crate::analyzer::{
     LanguageAdapter, Project, ProjectFile, TestDetectionProvider, TreeSitterAnalyzer,
     TypeAliasProvider, build_reverse_import_index,
 };
+use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 use std::mem::size_of;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
@@ -150,8 +151,7 @@ pub struct RustAnalyzer {
     memo_budget: u64,
     imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
-    reverse_import_index:
-        Arc<OnceLock<std::collections::HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
+    reverse_import_index: Arc<OnceLock<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
 }
 
 impl RustAnalyzer {
@@ -189,7 +189,7 @@ impl RustAnalyzer {
         let Some(tree) = parser.parse(source, None) else {
             return BTreeSet::new();
         };
-        let mut identifiers = std::collections::HashSet::new();
+        let mut identifiers = HashSet::default();
         collect_rust_type_identifiers(tree.root_node(), source, &mut identifiers);
         identifiers.into_iter().collect()
     }
@@ -202,7 +202,7 @@ impl ImportAnalysisProvider for RustAnalyzer {
         }
 
         let package = rust_package_name(file);
-        let mut resolved = HashSet::new();
+        let mut resolved = HashSet::default();
         for import in self.inner.import_info_of(file) {
             if let Some(target_fq_name) =
                 resolve_rust_import_fq_name(file, &package, &import.raw_snippet)
@@ -812,11 +812,7 @@ fn rust_function_signature(node: Node<'_>, source: &str) -> String {
     }
 }
 
-fn collect_rust_type_identifiers(
-    node: Node<'_>,
-    source: &str,
-    identifiers: &mut std::collections::HashSet<String>,
-) {
+fn collect_rust_type_identifiers(node: Node<'_>, source: &str, identifiers: &mut HashSet<String>) {
     match node.kind() {
         "identifier" | "type_identifier" | "field_identifier" => {
             let text = rust_node_text(node, source).trim();

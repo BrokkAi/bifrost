@@ -4,8 +4,9 @@ use crate::analyzer::{
     TreeSitterAnalyzer, TypeHierarchyProvider, direct_descendants_via_ancestors,
     referencing_files_via_imports,
 };
+use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::BTreeSet;
 use std::mem::size_of;
 use std::sync::Arc;
 use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
@@ -251,7 +252,7 @@ impl JavaAnalyzer {
         let Some(tree) = parse_tree(source) else {
             return BTreeSet::new();
         };
-        let mut identifiers = std::collections::HashSet::new();
+        let mut identifiers = HashSet::default();
         collect_type_identifiers(tree.root_node(), source, &mut identifiers);
         identifiers.into_iter().collect()
     }
@@ -314,12 +315,12 @@ impl ImportAnalysisProvider for JavaAnalyzer {
         }
 
         let Some(source) = self.get_source(code_unit, false) else {
-            return HashSet::new();
+            return HashSet::default();
         };
 
         let all_imports = self.import_info_of(code_unit.source());
         if all_imports.is_empty() {
-            let empty = HashSet::new();
+            let empty = HashSet::default();
             self.memo_caches
                 .relevant_imports
                 .insert(code_unit.clone(), Arc::new(empty.clone()));
@@ -328,7 +329,7 @@ impl ImportAnalysisProvider for JavaAnalyzer {
 
         let type_identifiers = self.extract_type_identifiers(&source);
         if type_identifiers.is_empty() {
-            let empty = HashSet::new();
+            let empty = HashSet::default();
             self.memo_caches
                 .relevant_imports
                 .insert(code_unit.clone(), Arc::new(empty.clone()));
@@ -344,8 +345,8 @@ impl ImportAnalysisProvider for JavaAnalyzer {
             .filter(|import| import.is_wildcard)
             .collect();
 
-        let mut matched_imports = HashSet::new();
-        let mut resolved_identifiers = HashSet::new();
+        let mut matched_imports = HashSet::default();
+        let mut resolved_identifiers = HashSet::default();
 
         for import in explicit_imports {
             let Some(identifier) = import.identifier.as_deref() else {
@@ -388,7 +389,7 @@ impl ImportAnalysisProvider for JavaAnalyzer {
             return matched_imports;
         }
 
-        let mut resolved_via_wildcard = HashSet::new();
+        let mut resolved_via_wildcard = HashSet::default();
         for identifier in &unresolved_identifiers {
             for import in &wildcard_imports {
                 let package = extract_package_from_import(&import.raw_snippet);
@@ -505,7 +506,7 @@ impl JavaAnalyzer {
     }
 
     fn resolve_imports_uncached(&self, file: &ProjectFile) -> HashMap<String, CodeUnit> {
-        let mut resolved = HashMap::new();
+        let mut resolved = HashMap::default();
 
         for import in self.inner.import_info_of(file) {
             if import
@@ -813,11 +814,7 @@ fn is_java_anonymous_structure(fq_name: &str) -> bool {
             .unwrap_or(false)
 }
 
-fn collect_type_identifiers(
-    node: Node<'_>,
-    source: &str,
-    identifiers: &mut std::collections::HashSet<String>,
-) {
+fn collect_type_identifiers(node: Node<'_>, source: &str, identifiers: &mut HashSet<String>) {
     match node.kind() {
         "type_identifier" | "scoped_type_identifier" => {
             let text = node_text(node, source).trim();

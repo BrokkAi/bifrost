@@ -1,5 +1,5 @@
+use brokk_analyzer::hash::HashSet;
 use brokk_analyzer::{FilesystemProject, ProjectChangeWatcher, ProjectFile};
-use std::collections::HashSet;
 use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,7 +22,7 @@ fn watcher_reports_create_modify_delete_since_last_poll() {
     file.write("fn one() {}\n").unwrap();
     wait_for_expected_file(&watcher, &file);
     let empty = watcher.take_changed_files();
-    assert_eq!(empty.files, HashSet::new());
+    assert_eq!(empty.files, HashSet::default());
     assert!(!empty.requires_full_refresh);
 
     file.write("fn two() {}\n").unwrap();

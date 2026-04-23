@@ -1,6 +1,7 @@
 use crate::analyzer::{CodeUnit, IAnalyzer, ImportInfo, ProjectFile};
+use crate::hash::{HashMap, HashSet};
 use std::any::Any;
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use rayon::prelude::*;
@@ -24,7 +25,7 @@ pub trait ImportAnalysisProvider: CapabilityProvider {
     }
 
     fn relevant_imports_for(&self, _code_unit: &CodeUnit) -> HashSet<String> {
-        HashSet::new()
+        HashSet::default()
     }
 
     fn could_import_file(
@@ -73,7 +74,7 @@ where
         .map(|file| (file.clone(), resolve_imported(file)))
         .collect();
 
-    let mut reverse: HashMap<ProjectFile, HashSet<ProjectFile>> = HashMap::new();
+    let mut reverse: HashMap<ProjectFile, HashSet<ProjectFile>> = HashMap::default();
     for (file, imported) in imported_by_file {
         for code_unit in imported {
             let target = code_unit.source();

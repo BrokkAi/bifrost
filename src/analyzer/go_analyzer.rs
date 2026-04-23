@@ -3,9 +3,10 @@ use crate::analyzer::{
     Language, LanguageAdapter, Project, ProjectFile, TestDetectionProvider, TreeSitterAnalyzer,
     TypeAliasProvider, build_reverse_import_index,
 };
+use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
 use regex::Regex;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 use std::mem::size_of;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
@@ -83,8 +84,7 @@ pub struct GoAnalyzer {
     memo_budget: u64,
     imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
-    reverse_import_index:
-        Arc<OnceLock<std::collections::HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
+    reverse_import_index: Arc<OnceLock<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
 }
 
 impl GoAnalyzer {
@@ -158,7 +158,7 @@ impl ImportAnalysisProvider for GoAnalyzer {
             return (*cached).clone();
         }
 
-        let mut resolved = HashSet::new();
+        let mut resolved = HashSet::default();
         for import in self.inner.import_info_of(file) {
             if import.alias.as_deref() == Some("_") {
                 continue;
@@ -217,7 +217,7 @@ impl ImportAnalysisProvider for GoAnalyzer {
 
     fn relevant_imports_for(&self, code_unit: &CodeUnit) -> HashSet<String> {
         let source = self.inner.get_source(code_unit, false).unwrap_or_default();
-        let mut relevant = HashSet::new();
+        let mut relevant = HashSet::default();
         for import in self.inner.import_info_of(code_unit.source()) {
             if import.alias.as_deref() == Some("_") {
                 continue;
@@ -1060,11 +1060,7 @@ fn extract_go_type_name(node: Node<'_>, source: &str) -> Option<String> {
     }
 }
 
-fn collect_go_type_identifiers(
-    node: Node<'_>,
-    source: &str,
-    identifiers: &mut std::collections::HashSet<String>,
-) {
+fn collect_go_type_identifiers(node: Node<'_>, source: &str, identifiers: &mut HashSet<String>) {
     match node.kind() {
         "identifier" | "type_identifier" | "field_identifier" | "package_identifier" => {
             let text = go_node_text(node, source).trim();

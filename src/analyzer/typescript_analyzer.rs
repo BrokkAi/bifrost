@@ -3,8 +3,9 @@ use crate::analyzer::{
     ProjectFile, TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider,
     build_reverse_import_index,
 };
+use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 use std::mem::size_of;
 use std::sync::{Arc, OnceLock};
 use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
@@ -126,8 +127,7 @@ pub struct TypescriptAnalyzer {
     imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     relevant_imports: Cache<CodeUnit, Arc<HashSet<String>>>,
-    reverse_import_index:
-        Arc<OnceLock<std::collections::HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
+    reverse_import_index: Arc<OnceLock<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
 }
 
 impl TypescriptAnalyzer {
@@ -166,7 +166,7 @@ impl TypescriptAnalyzer {
         let Some(tree) = parser.parse(source, None) else {
             return BTreeSet::new();
         };
-        let mut identifiers = std::collections::HashSet::new();
+        let mut identifiers = HashSet::default();
         super::javascript_analyzer::collect_js_ts_identifiers(
             tree.root_node(),
             source,
@@ -182,7 +182,7 @@ impl ImportAnalysisProvider for TypescriptAnalyzer {
             return (*cached).clone();
         }
 
-        let mut resolved = HashSet::new();
+        let mut resolved = HashSet::default();
         for import in self.inner.import_info_of(file) {
             for target in
                 resolve_js_ts_import_paths(file, &import.raw_snippet, Language::TypeScript)

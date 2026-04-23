@@ -1,7 +1,8 @@
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
+use crate::hash::{HashMap, HashSet};
 use crate::profiling;
 use git2::{DiffFindOptions, Oid, Repository, Sort};
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
@@ -82,7 +83,7 @@ pub(crate) fn most_relevant_project_files(
 
     let excluded: HashSet<_> = seed_weights.keys().cloned().collect();
     let mut results = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
 
     {
         let _scope = profiling::scope("relevance::git");
@@ -121,7 +122,7 @@ fn append_candidate(
 }
 
 fn normalized_seed_weights(seeds: &[ProjectFile]) -> HashMap<ProjectFile, f64> {
-    let mut weights = HashMap::new();
+    let mut weights = HashMap::default();
     for seed in seeds.iter().filter(|seed| seed.exists()) {
         *weights.entry(seed.clone()).or_insert(0.0) += 1.0;
     }
@@ -264,8 +265,8 @@ fn build_import_graph(
 ) -> ImportGraph {
     let _scope = profiling::scope("relevance::build_import_graph");
     let mut graph = ImportGraph::default();
-    let mut import_cache = HashMap::new();
-    let mut reverse_cache = HashMap::new();
+    let mut import_cache = HashMap::default();
+    let mut reverse_cache = HashMap::default();
     let mut frontier: VecDeque<_> = seed_weights.keys().cloned().collect();
     let mut expanded_nodes = 0usize;
     let mut forward_edges = 0usize;
@@ -504,9 +505,9 @@ fn related_files_by_git(
         return Ok(Vec::new());
     }
 
-    let mut file_doc_freq: HashMap<ProjectFile, usize> = HashMap::new();
-    let mut joint_mass: HashMap<(ProjectFile, ProjectFile), f64> = HashMap::new();
-    let mut seed_commit_count: HashMap<ProjectFile, usize> = HashMap::new();
+    let mut file_doc_freq: HashMap<ProjectFile, usize> = HashMap::default();
+    let mut joint_mass: HashMap<(ProjectFile, ProjectFile), f64> = HashMap::default();
+    let mut seed_commit_count: HashMap<ProjectFile, usize> = HashMap::default();
     let mut canonicalizer = RenameCanonicalizer::default();
     let mut find_commit_ms = 0.0;
     let mut change_ms = 0.0;
@@ -590,7 +591,7 @@ fn related_files_by_git(
         return Ok(Vec::new());
     }
 
-    let mut scores = HashMap::new();
+    let mut scores = HashMap::default();
     for ((seed, target), joint) in joint_mass {
         let seed_denom = seed_commit_count.get(&seed).copied().unwrap_or(0);
         if seed_denom == 0 {
@@ -861,7 +862,7 @@ impl RenameCanonicalizer {
 
     fn canonicalize(&self, path: &Path) -> PathBuf {
         let mut current = path.to_path_buf();
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         while seen.insert(current.clone()) {
             let Some(next) = self.repo_rel_map.get(&current) else {
                 break;
@@ -896,7 +897,8 @@ mod tests {
         AnalyzerConfig, AnalyzerDelegate, FilesystemProject, JavaAnalyzer, Language, MultiAnalyzer,
         ProjectFile, PythonAnalyzer, TestProject, WorkspaceAnalyzer,
     };
-    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+    use crate::hash::{HashMap, HashSet};
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -905,6 +907,13 @@ mod tests {
         let file = ProjectFile::new(root.to_path_buf(), rel_path);
         file.write(contents).unwrap();
         file
+    }
+
+    fn hash_map<K, V, const N: usize>(entries: [(K, V); N]) -> HashMap<K, V>
+    where
+        K: Eq + std::hash::Hash,
+    {
+        entries.into_iter().collect()
     }
 
     #[test]
@@ -986,7 +995,7 @@ mod tests {
             "src/main/java/org/plumelib/merging/GitLibrary.java",
         );
         let results =
-            super::related_files_by_git(workspace.analyzer(), &HashMap::from([(seed, 1.0)]), 25)
+            super::related_files_by_git(workspace.analyzer(), &hash_map([(seed, 1.0)]), 25)
                 .unwrap();
         for entry in results {
             eprintln!("{:.15} {}", entry.score, entry.file.rel_path().display());
@@ -998,7 +1007,7 @@ mod tests {
     fn debug_git_scores_for_plume_merge_pair() {
         let workspace = workspace_analyzer(Path::new("/home/jonathan/Projects/plume-merge"));
         let root = workspace.analyzer().project().root().to_path_buf();
-        let seeds = HashMap::from([
+        let seeds = hash_map([
             (
                 ProjectFile::new(
                     root.clone(),
@@ -1053,7 +1062,7 @@ mod tests {
 
         let git = super::related_files_by_git(
             workspace.analyzer(),
-            &HashMap::from([(seed.clone(), 1.0)]),
+            &hash_map([(seed.clone(), 1.0)]),
             100,
         )
         .unwrap();
@@ -1070,7 +1079,7 @@ mod tests {
 
         let imports = super::related_files_by_imports(
             workspace.analyzer(),
-            &HashMap::from([(seed, 1.0)]),
+            &hash_map([(seed, 1.0)]),
             100,
             false,
         );
@@ -1196,8 +1205,8 @@ mod tests {
             .recent_commit_ids(super::COMMITS_TO_PROCESS)
             .unwrap();
         let baseline_commit_count = commits.len() as f64;
-        let mut file_doc_freq: HashMap<ProjectFile, usize> = HashMap::new();
-        let mut joint_mass: HashMap<ProjectFile, f64> = HashMap::new();
+        let mut file_doc_freq: HashMap<ProjectFile, usize> = HashMap::default();
+        let mut joint_mass: HashMap<ProjectFile, f64> = HashMap::default();
         let mut seed_commit_count = 0usize;
         let mut canonicalizer = super::RenameCanonicalizer::default();
 
@@ -1332,7 +1341,7 @@ mod tests {
             ".eslintrc.cjs",
         );
         let results =
-            super::related_files_by_git(workspace.analyzer(), &HashMap::from([(seed, 1.0)]), 25)
+            super::related_files_by_git(workspace.analyzer(), &hash_map([(seed, 1.0)]), 25)
                 .unwrap();
         for entry in results {
             eprintln!("{:.15} {}", entry.score, entry.file.rel_path().display());
@@ -1350,7 +1359,7 @@ mod tests {
             "dotnet/samples/AgentChat/AutoGen.Anthropic.Sample/Program.cs",
         );
         let results =
-            super::related_files_by_git(workspace.analyzer(), &HashMap::from([(seed, 1.0)]), 25)
+            super::related_files_by_git(workspace.analyzer(), &hash_map([(seed, 1.0)]), 25)
                 .unwrap();
         for entry in results {
             eprintln!("{:.15} {}", entry.score, entry.file.rel_path().display());
@@ -1368,7 +1377,7 @@ mod tests {
             "dotnet/samples/GettingStarted/Checker.cs",
         );
         let results =
-            super::related_files_by_git(workspace.analyzer(), &HashMap::from([(seed, 1.0)]), 30)
+            super::related_files_by_git(workspace.analyzer(), &hash_map([(seed, 1.0)]), 30)
                 .unwrap();
         for entry in results {
             eprintln!("{:.15} {}", entry.score, entry.file.rel_path().display());
@@ -1386,7 +1395,7 @@ mod tests {
             "dotnet/samples/Hello/HelloAIAgents/Program.cs",
         );
         let results =
-            super::related_files_by_git(workspace.analyzer(), &HashMap::from([(seed, 1.0)]), 40)
+            super::related_files_by_git(workspace.analyzer(), &hash_map([(seed, 1.0)]), 40)
                 .unwrap();
         for entry in results {
             eprintln!("{:.15} {}", entry.score, entry.file.rel_path().display());
@@ -1404,7 +1413,7 @@ mod tests {
             "dotnet/samples/Hello/HelloAgent/Program.cs",
         );
         let results =
-            super::related_files_by_git(workspace.analyzer(), &HashMap::from([(seed, 1.0)]), 100)
+            super::related_files_by_git(workspace.analyzer(), &hash_map([(seed, 1.0)]), 100)
                 .unwrap();
         for entry in results {
             eprintln!("{:.15} {}", entry.score, entry.file.rel_path().display());
@@ -1423,7 +1432,7 @@ mod tests {
         );
         let results = super::related_files_by_imports(
             workspace.analyzer(),
-            &HashMap::from([(seed, 1.0)]),
+            &hash_map([(seed, 1.0)]),
             40,
             false,
         );
@@ -1444,7 +1453,7 @@ mod tests {
         );
         let results = super::related_files_by_imports(
             workspace.analyzer(),
-            &HashMap::from([(seed, 1.0)]),
+            &hash_map([(seed, 1.0)]),
             100,
             false,
         );
@@ -1488,7 +1497,7 @@ mod tests {
         );
         let results = super::related_files_by_git(
             workspace.analyzer(),
-            &HashMap::from([(topic_id, 1.0), (inmemory, 1.0)]),
+            &hash_map([(topic_id, 1.0), (inmemory, 1.0)]),
             100,
         )
         .unwrap();
@@ -1514,7 +1523,7 @@ mod tests {
         );
         let results = super::related_files_by_imports(
             workspace.analyzer(),
-            &HashMap::from([(topic_id, 1.0), (inmemory, 1.0)]),
+            &hash_map([(topic_id, 1.0), (inmemory, 1.0)]),
             100,
             false,
         );
@@ -1549,9 +1558,9 @@ mod tests {
             .recent_commit_ids(super::COMMITS_TO_PROCESS)
             .unwrap();
         let baseline_commit_count = commits.len() as f64;
-        let mut file_doc_freq: HashMap<PathBuf, usize> = HashMap::new();
-        let mut joint_mass: HashMap<(PathBuf, PathBuf), f64> = HashMap::new();
-        let mut seed_commit_count: HashMap<PathBuf, usize> = HashMap::new();
+        let mut file_doc_freq: HashMap<PathBuf, usize> = HashMap::default();
+        let mut joint_mass: HashMap<(PathBuf, PathBuf), f64> = HashMap::default();
+        let mut seed_commit_count: HashMap<PathBuf, usize> = HashMap::default();
         let mut canonicalizer = super::RenameCanonicalizer::default();
 
         for oid in &commits {
@@ -1766,8 +1775,8 @@ mod tests {
         let commits = context
             .recent_commit_ids(super::COMMITS_TO_PROCESS)
             .unwrap();
-        let mut file_doc_freq: HashMap<PathBuf, usize> = HashMap::new();
-        let mut joint_mass: HashMap<PathBuf, f64> = HashMap::new();
+        let mut file_doc_freq: HashMap<PathBuf, usize> = HashMap::default();
+        let mut joint_mass: HashMap<PathBuf, f64> = HashMap::default();
         let mut seed_commit_count = 0usize;
         let mut canonicalizer = super::RenameCanonicalizer::default();
 
@@ -1836,8 +1845,8 @@ mod tests {
             .recent_commit_ids(super::COMMITS_TO_PROCESS)
             .unwrap();
         let baseline_commit_count = commits.len() as f64;
-        let mut file_doc_freq: HashMap<PathBuf, usize> = HashMap::new();
-        let mut joint_mass: HashMap<PathBuf, f64> = HashMap::new();
+        let mut file_doc_freq: HashMap<PathBuf, usize> = HashMap::default();
+        let mut joint_mass: HashMap<PathBuf, f64> = HashMap::default();
         let mut seed_commit_count = 0usize;
         let mut canonicalizer = super::RenameCanonicalizer::default();
 
@@ -1909,8 +1918,8 @@ mod tests {
         let commits = context
             .recent_commit_ids(super::COMMITS_TO_PROCESS)
             .unwrap();
-        let mut file_doc_freq: HashMap<PathBuf, usize> = HashMap::new();
-        let mut joint_mass: HashMap<PathBuf, f64> = HashMap::new();
+        let mut file_doc_freq: HashMap<PathBuf, usize> = HashMap::default();
+        let mut joint_mass: HashMap<PathBuf, f64> = HashMap::default();
         let mut seed_commit_count = 0usize;
         let mut canonicalizer = super::RenameCanonicalizer::default();
 
@@ -1991,8 +2000,8 @@ mod tests {
             .recent_commit_ids(super::COMMITS_TO_PROCESS)
             .unwrap();
         let baseline_commit_count = commits.len() as f64;
-        let mut file_doc_freq: HashMap<PathBuf, usize> = HashMap::new();
-        let mut joint_mass: HashMap<PathBuf, f64> = HashMap::new();
+        let mut file_doc_freq: HashMap<PathBuf, usize> = HashMap::default();
+        let mut joint_mass: HashMap<PathBuf, f64> = HashMap::default();
         let mut seed_commit_count = 0usize;
         let mut canonicalizer = super::RenameCanonicalizer::default();
 
@@ -2076,8 +2085,8 @@ mod tests {
             .recent_commit_ids(super::COMMITS_TO_PROCESS)
             .unwrap();
         let baseline_commit_count = commits.len() as f64;
-        let mut file_doc_freq: HashMap<PathBuf, usize> = HashMap::new();
-        let mut joint_mass: HashMap<PathBuf, f64> = HashMap::new();
+        let mut file_doc_freq: HashMap<PathBuf, usize> = HashMap::default();
+        let mut joint_mass: HashMap<PathBuf, f64> = HashMap::default();
         let mut seed_commit_count = 0usize;
         let mut canonicalizer = super::RenameCanonicalizer::default();
 
@@ -2392,7 +2401,7 @@ mod tests {
             "src/test/resources/ImportsTest2Goal.java",
         );
         let results =
-            super::related_files_by_git(workspace.analyzer(), &HashMap::from([(seed, 1.0)]), 100)
+            super::related_files_by_git(workspace.analyzer(), &hash_map([(seed, 1.0)]), 100)
                 .unwrap();
         for entry in results {
             eprintln!("{:.15} {}", entry.score, entry.file.rel_path().display());
@@ -2408,7 +2417,7 @@ mod tests {
             "src/test/resources/ImportsTest8Base.java",
         );
         let results =
-            super::related_files_by_git(workspace.analyzer(), &HashMap::from([(seed, 1.0)]), 100)
+            super::related_files_by_git(workspace.analyzer(), &hash_map([(seed, 1.0)]), 100)
                 .unwrap();
         for entry in results {
             eprintln!("{:.15} {}", entry.score, entry.file.rel_path().display());
@@ -2599,8 +2608,7 @@ mod tests {
         );
 
         let analyzer = java_analyzer(root);
-        let results =
-            related_files_by_imports(&analyzer, &HashMap::from([(a.clone(), 1.0)]), 10, false);
+        let results = related_files_by_imports(&analyzer, &hash_map([(a.clone(), 1.0)]), 10, false);
 
         assert!(results.iter().all(|result| result.file != a));
         assert!(results.len() >= 2);
@@ -2640,7 +2648,7 @@ mod tests {
         );
 
         let analyzer = java_analyzer(root);
-        let results = related_files_by_imports(&analyzer, &HashMap::from([(leaf, 1.0)]), 10, false);
+        let results = related_files_by_imports(&analyzer, &hash_map([(leaf, 1.0)]), 10, false);
 
         assert_eq!(Some(&hub), results.first().map(|entry| &entry.file));
     }
@@ -2667,7 +2675,7 @@ mod tests {
         let d = write_file(root, "test/D.java", "package test; public class D {}");
 
         let analyzer = java_analyzer(root);
-        let results = related_files_by_imports(&analyzer, &HashMap::from([(a, 1.0)]), 10, false);
+        let results = related_files_by_imports(&analyzer, &hash_map([(a, 1.0)]), 10, false);
         let result_files = results
             .iter()
             .map(|entry| entry.file.clone())
@@ -2702,8 +2710,7 @@ mod tests {
         );
 
         let analyzer = java_analyzer(root);
-        let results =
-            related_files_by_imports(&analyzer, &HashMap::from([(a.clone(), 1.0)]), 10, false);
+        let results = related_files_by_imports(&analyzer, &hash_map([(a.clone(), 1.0)]), 10, false);
         let result_files = results
             .iter()
             .map(|entry| entry.file.clone())
@@ -2735,8 +2742,7 @@ mod tests {
         );
 
         let analyzer = java_analyzer(root);
-        let results =
-            related_files_by_imports(&analyzer, &HashMap::from([(a.clone(), 1.0)]), 10, false);
+        let results = related_files_by_imports(&analyzer, &hash_map([(a.clone(), 1.0)]), 10, false);
 
         assert!(results.iter().all(|entry| entry.file != a));
         assert!(results.is_empty());
@@ -2758,8 +2764,7 @@ mod tests {
         );
 
         let analyzer = java_analyzer(root);
-        let results =
-            related_files_by_imports(&analyzer, &HashMap::from([(imported, 1.0)]), 10, true);
+        let results = related_files_by_imports(&analyzer, &hash_map([(imported, 1.0)]), 10, true);
 
         assert!(results.iter().any(|entry| entry.file == importer));
     }
@@ -2785,14 +2790,9 @@ mod tests {
         );
 
         let analyzer = java_analyzer(root);
-        let forward = related_files_by_imports(
-            &analyzer,
-            &HashMap::from([(middle.clone(), 1.0)]),
-            10,
-            false,
-        );
-        let reverse =
-            related_files_by_imports(&analyzer, &HashMap::from([(middle, 1.0)]), 10, true);
+        let forward =
+            related_files_by_imports(&analyzer, &hash_map([(middle.clone(), 1.0)]), 10, false);
+        let reverse = related_files_by_imports(&analyzer, &hash_map([(middle, 1.0)]), 10, true);
 
         assert!(forward.iter().any(|entry| entry.file == upstream));
         assert!(!forward.iter().any(|entry| entry.file == downstream));
@@ -2834,12 +2834,11 @@ mod tests {
         ]));
 
         let java_results =
-            related_files_by_imports(&multi, &HashMap::from([(java_source, 1.0)]), 10, false);
+            related_files_by_imports(&multi, &hash_map([(java_source, 1.0)]), 10, false);
         assert!(java_results.iter().any(|entry| entry.file == java_target));
         assert!(!java_results.iter().any(|entry| entry.file == py_target));
 
-        let py_results =
-            related_files_by_imports(&multi, &HashMap::from([(py_source, 1.0)]), 10, false);
+        let py_results = related_files_by_imports(&multi, &hash_map([(py_source, 1.0)]), 10, false);
         assert!(py_results.iter().any(|entry| entry.file == py_target));
         assert!(!py_results.iter().any(|entry| entry.file == java_target));
     }
@@ -2861,7 +2860,7 @@ mod tests {
         write_file(root, "test/C.java", "package test; public class C {}");
 
         let analyzer = java_analyzer(root);
-        let results = related_files_by_imports(&analyzer, &HashMap::from([(a, 1.0)]), 10, false);
+        let results = related_files_by_imports(&analyzer, &hash_map([(a, 1.0)]), 10, false);
 
         assert!(file_by_name(&results, "B.java").is_some());
         assert!(file_by_name(&results, "C.java").is_some());

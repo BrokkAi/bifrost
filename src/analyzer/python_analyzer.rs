@@ -3,12 +3,13 @@ use crate::analyzer::{
     Language, LanguageAdapter, Project, ProjectFile, TestDetectionProvider, TreeSitterAnalyzer,
     TypeHierarchyProvider, direct_descendants_via_ancestors,
 };
+use crate::hash::{HashMap, HashSet};
 use crate::profiling;
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use moka::sync::Cache;
 use rayon::prelude::*;
 use regex::Regex;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::BTreeSet;
 use std::mem::size_of;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
@@ -134,13 +135,13 @@ impl PythonAnalyzer {
         let Some(tree) = parser.parse(source, None) else {
             return BTreeSet::new();
         };
-        let mut identifiers = std::collections::HashSet::new();
+        let mut identifiers = HashSet::default();
         collect_python_identifiers(tree.root_node(), source, &mut identifiers);
         identifiers.into_iter().collect()
     }
 
     fn resolve_import_bindings(&self, file: &ProjectFile) -> HashMap<String, CodeUnit> {
-        let mut bindings = HashMap::new();
+        let mut bindings = HashMap::default();
         for import in self.inner.import_info_of(file) {
             for (binding, code_unit) in self.resolve_import(file, &import) {
                 bindings.insert(binding, code_unit);
@@ -237,7 +238,7 @@ impl PythonAnalyzer {
                 })
                 .collect();
 
-            let mut reverse: HashMap<ProjectFile, HashSet<ProjectFile>> = HashMap::new();
+            let mut reverse: HashMap<ProjectFile, HashSet<ProjectFile>> = HashMap::default();
             for (file, imported) in imported_by_file {
                 self.imported_code_units
                     .insert(file.clone(), Arc::new(imported.clone()));
@@ -424,21 +425,21 @@ impl ImportAnalysisProvider for PythonAnalyzer {
 
     fn relevant_imports_for(&self, code_unit: &CodeUnit) -> HashSet<String> {
         let Some(source) = self.inner.get_source(code_unit, false) else {
-            return HashSet::new();
+            return HashSet::default();
         };
 
         let extracted = self.extract_type_identifiers(&source);
         if extracted.is_empty() {
-            return HashSet::new();
+            return HashSet::default();
         }
 
         let imports = self.inner.import_info_of(code_unit.source());
         if imports.is_empty() {
-            return HashSet::new();
+            return HashSet::default();
         }
 
-        let mut matched = HashSet::new();
-        let mut resolved = HashSet::new();
+        let mut matched = HashSet::default();
+        let mut resolved = HashSet::default();
         let mut wildcard_imports = Vec::new();
 
         for info in imports {
@@ -470,8 +471,8 @@ impl ImportAnalysisProvider for PythonAnalyzer {
             return matched;
         }
 
-        let mut resolved_via_wildcard = HashSet::new();
-        let mut used_wildcards = HashSet::new();
+        let mut resolved_via_wildcard = HashSet::default();
+        let mut used_wildcards = HashSet::default();
         for ident in &unresolved {
             for wildcard in &wildcard_imports {
                 let Some(package_name) =
@@ -1338,11 +1339,7 @@ fn collect_assigned_names(node: Node<'_>, source: &str) -> Vec<String> {
     names
 }
 
-fn collect_python_identifiers(
-    node: Node<'_>,
-    source: &str,
-    identifiers: &mut std::collections::HashSet<String>,
-) {
+fn collect_python_identifiers(node: Node<'_>, source: &str, identifiers: &mut HashSet<String>) {
     if node.kind() == "identifier" {
         let text = py_node_text(node, source).trim();
         if !text.is_empty() {

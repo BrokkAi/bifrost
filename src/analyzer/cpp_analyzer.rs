@@ -2,9 +2,10 @@ use crate::analyzer::{
     AnalyzerConfig, CodeUnit, CodeUnitType, IAnalyzer, ImportAnalysisProvider, ImportInfo,
     Language, LanguageAdapter, Project, ProjectFile, TreeSitterAnalyzer,
 };
+use crate::hash::HashSet;
 use moka::sync::Cache;
 use regex::Regex;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 use std::mem::size_of;
 use std::path::Path;
 use std::sync::Arc;
@@ -98,7 +99,7 @@ impl ImportAnalysisProvider for CppAnalyzer {
             return (*cached).clone();
         }
 
-        let mut resolved = HashSet::new();
+        let mut resolved = HashSet::default();
         for line in self.inner.import_statements(file) {
             if let Some(path) = parse_quoted_include(line) {
                 for target in resolve_include_targets(self.inner.project(), file, &path) {
@@ -118,7 +119,7 @@ impl ImportAnalysisProvider for CppAnalyzer {
         }
 
         let file_name = file.rel_path().file_name().and_then(|value| value.to_str());
-        let mut references = HashSet::new();
+        let mut references = HashSet::default();
         for candidate in self.inner.all_files() {
             if candidate == file {
                 continue;
@@ -1267,11 +1268,7 @@ fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     source.get(node.start_byte()..node.end_byte()).unwrap_or("")
 }
 
-fn collect_cpp_identifiers(
-    node: Node<'_>,
-    source: &str,
-    identifiers: &mut std::collections::HashSet<String>,
-) {
+fn collect_cpp_identifiers(node: Node<'_>, source: &str, identifiers: &mut HashSet<String>) {
     match node.kind() {
         "type_identifier" | "identifier" | "qualified_identifier" => {
             let text = node_text(node, source).trim();

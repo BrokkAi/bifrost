@@ -3,8 +3,9 @@ use crate::analyzer::{
     LanguageAdapter, Project, ProjectFile, TestDetectionProvider, TreeSitterAnalyzer,
     build_reverse_import_index,
 };
+use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 use std::mem::size_of;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
@@ -116,8 +117,7 @@ struct JsMemoCaches {
     imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     relevant_imports: Cache<CodeUnit, Arc<HashSet<String>>>,
-    reverse_import_index:
-        OnceLock<std::collections::HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
+    reverse_import_index: OnceLock<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
 }
 
 impl JsMemoCaches {
@@ -167,7 +167,7 @@ impl ImportAnalysisProvider for JavascriptAnalyzer {
             return (*cached).clone();
         }
 
-        let mut resolved = HashSet::new();
+        let mut resolved = HashSet::default();
         for import in self.inner.import_info_of(file) {
             for target in
                 resolve_js_ts_import_paths(file, &import.raw_snippet, Language::JavaScript)
@@ -254,7 +254,7 @@ impl ImportAnalysisProvider for JavascriptAnalyzer {
         }
 
         let source = self.inner.get_source(code_unit, false).unwrap_or_default();
-        let mut relevant = HashSet::new();
+        let mut relevant = HashSet::default();
         for import in self.inner.import_info_of(code_unit.source()) {
             let tokens = imported_tokens(&import.raw_snippet);
             if tokens.is_empty() || tokens.iter().any(|token| source.contains(token)) {
@@ -1217,7 +1217,7 @@ fn extract_js_type_identifiers(source: &str) -> BTreeSet<String> {
     let Some(tree) = parser.parse(source, None) else {
         return BTreeSet::new();
     };
-    let mut identifiers = std::collections::HashSet::new();
+    let mut identifiers = HashSet::default();
     collect_js_ts_identifiers(tree.root_node(), source, &mut identifiers);
     identifiers.into_iter().collect()
 }
@@ -1225,7 +1225,7 @@ fn extract_js_type_identifiers(source: &str) -> BTreeSet<String> {
 pub(crate) fn collect_js_ts_identifiers(
     node: Node<'_>,
     source: &str,
-    identifiers: &mut std::collections::HashSet<String>,
+    identifiers: &mut HashSet<String>,
 ) {
     match node.kind() {
         "identifier" | "type_identifier" | "property_identifier" => {

@@ -4,8 +4,9 @@ use crate::analyzer::{
     Project, ProjectFile, PythonAnalyzer, Range, RustAnalyzer, ScalaAnalyzer,
     TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider, TypescriptAnalyzer,
 };
+use crate::hash::HashSet;
 use rayon::prelude::*;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone)]
 pub enum AnalyzerDelegate {
