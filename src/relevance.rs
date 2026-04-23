@@ -1,9 +1,10 @@
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use crate::profiling;
-use git2::{DiffFindOptions, Oid, Repository, Sort};
+use git2::{Oid, Repository};
 use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -497,11 +498,12 @@ fn related_files_by_git(
         return Ok(Vec::new());
     }
 
-    let commits = {
-        let _scope = profiling::scope("relevance::git.recent_commit_ids");
-        repo.recent_commit_ids(COMMITS_TO_PROCESS)?
+    let changes = {
+        let _scope = profiling::scope("relevance::git.recent_commit_changes");
+        repo.recent_commit_changes(COMMITS_TO_PROCESS)
+            .map_err(|err| git2::Error::from_str(&err))?
     };
-    if commits.is_empty() {
+    if changes.is_empty() {
         return Ok(Vec::new());
     }
 
@@ -509,28 +511,20 @@ fn related_files_by_git(
     let mut joint_mass: HashMap<(ProjectFile, ProjectFile), f64> = HashMap::default();
     let mut seed_commit_count: HashMap<ProjectFile, usize> = HashMap::default();
     let mut canonicalizer = RenameCanonicalizer::default();
-    let mut find_commit_ms = 0.0;
-    let mut change_ms = 0.0;
+    let find_commit_ms = 0.0;
+    let change_ms = 0.0;
     let mut canonicalize_ms = 0.0;
     let mut processed_commits = 0usize;
 
-    let baseline_commit_count = commits.len() as f64;
+    let baseline_commit_count = changes.len() as f64;
     {
         let _scope = profiling::scope("relevance::git.score_commits");
-        for oid in &commits {
-            let started = Instant::now();
-            let commit = repo.repo.find_commit(*oid)?;
-            find_commit_ms += started.elapsed().as_secs_f64() * 1000.0;
-
-            let started = Instant::now();
-            let change = repo.changed_repo_paths_for_commit(&commit)?;
-            change_ms += started.elapsed().as_secs_f64() * 1000.0;
-
+        for change in changes {
             let started = Instant::now();
             canonicalizer.record_renames(&change.renames);
             let changed_files: BTreeSet<_> = change
                 .paths
-                .into_iter()
+                .iter()
                 .map(|path| canonicalizer.canonicalize(&path))
                 .filter_map(|path| repo.repo_path_to_project_file(&path))
                 .collect();
@@ -619,6 +613,7 @@ fn related_files_by_git(
 
 struct GitProjectContext {
     repo: Repository,
+    repo_root: PathBuf,
     project_root: PathBuf,
     repo_prefix: PathBuf,
 }
@@ -635,6 +630,7 @@ impl GitProjectContext {
         let repo_prefix = project_root.strip_prefix(&repo_root).ok()?.to_path_buf();
         Some(Self {
             repo,
+            repo_root,
             project_root,
             repo_prefix,
         })
@@ -650,111 +646,129 @@ impl GitProjectContext {
             .is_some()
     }
 
-    fn recent_commit_ids(&self, limit: usize) -> Result<Vec<Oid>, git2::Error> {
-        let mut walk = match self.repo.revwalk() {
-            Ok(walk) => walk,
-            Err(err) => return Err(err),
-        };
-        if walk.push_head().is_err() {
-            return Ok(Vec::new());
-        }
-        let _ = walk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME);
+    fn recent_commit_changes(&self, limit: usize) -> Result<Vec<CommitChange>, String> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.repo_root)
+            .arg("log")
+            .arg("--topo-order")
+            .arg("--no-color")
+            .arg("--diff-merges=first-parent")
+            .arg("--root")
+            .arg(format!("-M{NATIVE_RENAME_THRESHOLD}"))
+            .arg("--name-status")
+            .arg("-z")
+            .arg("--format=format:%x1e%H")
+            .arg("-n")
+            .arg(limit.to_string())
+            .output()
+            .map_err(|err| format!("failed to run git log: {err}"))?;
 
-        let mut commits = Vec::new();
-        for oid in walk.take(limit) {
-            commits.push(oid?);
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("git log exited with {}: {stderr}", output.status));
         }
-        Ok(commits)
+
+        Ok(self.parse_git_log_name_status(&output.stdout))
     }
 
-    fn changed_repo_paths_for_commit(
-        &self,
-        commit: &git2::Commit<'_>,
-    ) -> Result<CommitChange, git2::Error> {
+    fn parse_git_log_name_status(&self, output: &[u8]) -> Vec<CommitChange> {
+        output
+            .split(|byte| *byte == 0x1e)
+            .filter_map(|record| self.parse_git_log_record(record))
+            .collect()
+    }
+
+    fn parse_git_log_record(&self, mut record: &[u8]) -> Option<CommitChange> {
+        while matches!(record.first(), Some(b'\0' | b'\n' | b'\r')) {
+            record = &record[1..];
+        }
+        if record.len() < 40 {
+            return None;
+        }
+
+        let oid_text = std::str::from_utf8(&record[..40]).ok()?;
+        let oid = Oid::from_str(oid_text).ok()?;
         GIT_COMMITS_SCANNED.fetch_add(1, Ordering::Relaxed);
-        let current_tree = commit.tree()?;
-        let parent_tree = if commit.parent_count() > 0 {
-            Some(commit.parent(0)?.tree()?)
-        } else {
-            None
-        };
 
-        let mut diff =
-            self.repo
-                .diff_tree_to_tree(parent_tree.as_ref(), Some(&current_tree), None)?;
-
-        let mut find_options = DiffFindOptions::new();
-        find_options.renames(true);
-        find_options.renames_from_rewrites(false);
-        find_options.rewrites(false);
-        find_options.break_rewrites(false);
-        find_options.copies(false);
-        find_options.rename_threshold(NATIVE_RENAME_THRESHOLD);
-        find_options.dont_ignore_whitespace(true);
-        let find_similar_started = Instant::now();
-        diff.find_similar(Some(&mut find_options))?;
-        GIT_FIND_SIMILAR_MICROS.fetch_add(
-            find_similar_started.elapsed().as_micros() as u64,
-            Ordering::Relaxed,
-        );
+        let mut rest = &record[40..];
+        while matches!(rest.first(), Some(b'\0' | b'\n' | b'\r')) {
+            rest = &rest[1..];
+        }
 
         let mut paths = Vec::new();
         let mut renames = Vec::new();
         let mut commit_has_churn = false;
-        for delta in diff.deltas() {
-            match delta.status() {
-                git2::Delta::Added | git2::Delta::Copied | git2::Delta::Modified => {
-                    if let Some(path) = delta.new_file().path() {
-                        paths.push(path.to_path_buf());
-                        if delta.status() == git2::Delta::Added {
-                            commit_has_churn = true;
-                            GIT_STATUS_ADDED.fetch_add(1, Ordering::Relaxed);
-                        } else if delta.status() == git2::Delta::Copied {
-                            commit_has_churn = true;
-                            GIT_STATUS_COPIED.fetch_add(1, Ordering::Relaxed);
-                        }
+        let mut tokens = rest
+            .split(|byte| *byte == b'\0')
+            .filter(|token| !token.is_empty());
+
+        while let Some(status_token) = tokens.next() {
+            let status_token = strip_git_log_token_prefix(status_token);
+            if status_token.is_empty() {
+                continue;
+            }
+            match status_token[0] {
+                b'A' => {
+                    if let Some(path) = tokens.next().map(pathbuf_from_git_log_token) {
+                        commit_has_churn = true;
+                        GIT_STATUS_ADDED.fetch_add(1, Ordering::Relaxed);
+                        paths.push(path);
                     }
                 }
-                git2::Delta::Deleted => {
-                    if let Some(path) = delta.old_file().path() {
+                b'C' => {
+                    let _old_path = tokens.next();
+                    if let Some(path) = tokens.next().map(pathbuf_from_git_log_token) {
+                        commit_has_churn = true;
+                        GIT_STATUS_COPIED.fetch_add(1, Ordering::Relaxed);
+                        paths.push(path);
+                    }
+                }
+                b'D' => {
+                    if let Some(path) = tokens.next().map(pathbuf_from_git_log_token) {
                         commit_has_churn = true;
                         GIT_STATUS_DELETED.fetch_add(1, Ordering::Relaxed);
-                        paths.push(path.to_path_buf());
+                        paths.push(path);
                     }
                 }
-                git2::Delta::Renamed => {
+                b'M' | b'T' => {
+                    if let Some(path) = tokens.next().map(pathbuf_from_git_log_token) {
+                        paths.push(path);
+                    }
+                }
+                b'R' => {
+                    let Some(old_path) = tokens.next().map(pathbuf_from_git_log_token) else {
+                        continue;
+                    };
+                    let Some(new_path) = tokens.next().map(pathbuf_from_git_log_token) else {
+                        continue;
+                    };
                     commit_has_churn = true;
                     GIT_STATUS_RENAMED.fetch_add(1, Ordering::Relaxed);
-                    if let (Some(old_path), Some(new_path)) =
-                        (delta.old_file().path(), delta.new_file().path())
-                    {
-                        GIT_NATIVE_RENAME_CANDIDATES.fetch_add(1, Ordering::Relaxed);
-                        let old_path = old_path.to_path_buf();
-                        let new_path = new_path.to_path_buf();
-                        if native_rename_replaces_path(
-                            parent_tree.as_ref(),
-                            &current_tree,
-                            &old_path,
-                            &new_path,
-                        ) && native_rename_delta_is_safe(
-                            &self.repo, &delta, &old_path, &new_path,
-                        ) {
-                            paths.push(new_path.clone());
-                            renames.push((old_path, new_path));
-                        } else {
-                            paths.push(old_path);
-                            paths.push(new_path);
-                        }
+                    GIT_NATIVE_RENAME_CANDIDATES.fetch_add(1, Ordering::Relaxed);
+                    if self.native_rename_paths_are_safe(oid, &old_path, &new_path) {
+                        paths.push(new_path.clone());
+                        renames.push((old_path, new_path));
+                    } else {
+                        paths.push(old_path);
+                        paths.push(new_path);
                     }
                 }
-                _ => {}
+                _ => {
+                    let _ = tokens.next();
+                }
             }
         }
+
         if commit_has_churn {
             GIT_COMMITS_WITH_CHURN.fetch_add(1, Ordering::Relaxed);
         }
 
-        Ok(CommitChange { paths, renames })
+        Some(CommitChange {
+            id: oid,
+            paths,
+            renames,
+        })
     }
 
     fn repo_path_to_project_file(&self, repo_rel: &Path) -> Option<ProjectFile> {
@@ -774,9 +788,41 @@ impl GitProjectContext {
             self.repo_prefix.join(project_rel)
         }
     }
+
+    fn native_rename_paths_are_safe(&self, oid: Oid, old_path: &Path, new_path: &Path) -> bool {
+        let Some((parent_tree, current_tree)) = self.commit_parent_and_current_trees(oid) else {
+            return false;
+        };
+        native_rename_replaces_path(Some(&parent_tree), &current_tree, old_path, new_path)
+            && native_rename_path_keys_match(old_path, new_path)
+            && tree_path_token_overlap_ratio(
+                &self.repo,
+                &parent_tree,
+                &current_tree,
+                old_path,
+                new_path,
+            )
+            .is_some_and(|ratio| ratio >= NATIVE_RENAME_TOKEN_OVERLAP_THRESHOLD)
+    }
+
+    fn commit_parent_and_current_trees(
+        &self,
+        oid: Oid,
+    ) -> Option<(git2::Tree<'_>, git2::Tree<'_>)> {
+        let commit = self.repo.find_commit(oid).ok()?;
+        if commit.parent_count() == 0 {
+            return None;
+        }
+        let parent_tree = commit.parent(0).ok()?.tree().ok()?;
+        let current_tree = commit.tree().ok()?;
+        Some((parent_tree, current_tree))
+    }
 }
 
+#[derive(Clone, Debug)]
 struct CommitChange {
+    #[allow(dead_code)]
+    id: Oid,
     paths: Vec<PathBuf>,
     renames: Vec<(PathBuf, PathBuf)>,
 }
@@ -792,29 +838,37 @@ fn native_rename_replaces_path(
     !old_survives && !new_preexisted
 }
 
-fn native_rename_delta_is_safe(
-    repo: &Repository,
-    delta: &git2::DiffDelta<'_>,
-    old_path: &Path,
-    new_path: &Path,
-) -> bool {
-    native_rename_path_keys_match(old_path, new_path)
-        && native_rename_token_overlap_ratio(repo, delta)
-            .is_some_and(|ratio| ratio >= NATIVE_RENAME_TOKEN_OVERLAP_THRESHOLD)
-}
-
 fn native_rename_path_keys_match(old_path: &Path, new_path: &Path) -> bool {
     let old_key = compact_stem_key(old_path);
     let new_key = compact_stem_key(new_path);
     !old_key.is_empty() && old_key == new_key
 }
 
-fn native_rename_token_overlap_ratio(
+fn tree_path_token_overlap_ratio(
     repo: &Repository,
-    delta: &git2::DiffDelta<'_>,
+    parent_tree: &git2::Tree<'_>,
+    current_tree: &git2::Tree<'_>,
+    old_path: &Path,
+    new_path: &Path,
 ) -> Option<f64> {
-    let old_blob = repo.find_blob(delta.old_file().id()).ok()?;
-    let new_blob = repo.find_blob(delta.new_file().id()).ok()?;
+    let old_blob = parent_tree
+        .get_path(old_path)
+        .ok()?
+        .to_object(repo)
+        .ok()?
+        .peel_to_blob()
+        .ok()?;
+    let new_blob = current_tree
+        .get_path(new_path)
+        .ok()?
+        .to_object(repo)
+        .ok()?
+        .peel_to_blob()
+        .ok()?;
+    blob_token_overlap_ratio(&old_blob, &new_blob)
+}
+
+fn blob_token_overlap_ratio(old_blob: &git2::Blob<'_>, new_blob: &git2::Blob<'_>) -> Option<f64> {
     let old_tokens = blob_token_set(&old_blob);
     let new_tokens = blob_token_set(&new_blob);
     let max_tokens = old_tokens.len().max(new_tokens.len());
@@ -823,6 +877,17 @@ fn native_rename_token_overlap_ratio(
     }
     let overlap = old_tokens.intersection(&new_tokens).count();
     Some(overlap as f64 / max_tokens as f64)
+}
+
+fn strip_git_log_token_prefix(mut token: &[u8]) -> &[u8] {
+    while matches!(token.first(), Some(b'\0' | b'\n' | b'\r')) {
+        token = &token[1..];
+    }
+    token
+}
+
+fn pathbuf_from_git_log_token(token: &[u8]) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(strip_git_log_token_prefix(token)).into_owned())
 }
 
 fn blob_token_set(blob: &git2::Blob<'_>) -> HashSet<String> {
@@ -973,6 +1038,15 @@ mod tests {
     fn workspace_analyzer(root: &Path) -> WorkspaceAnalyzer {
         let project = Arc::new(FilesystemProject::new(root).unwrap());
         WorkspaceAnalyzer::build(project, AnalyzerConfig::default())
+    }
+
+    fn change_by_id(context: &super::GitProjectContext, oid: git2::Oid) -> super::CommitChange {
+        context
+            .recent_commit_changes(super::COMMITS_TO_PROCESS)
+            .unwrap()
+            .into_iter()
+            .find(|change| change.id == oid)
+            .unwrap_or_else(|| panic!("commit {oid} not found in native git log window"))
     }
 
     fn file_by_name<'a>(result: &'a [FileRelevance], file_name: &str) -> Option<&'a FileRelevance> {
@@ -1132,11 +1206,11 @@ mod tests {
 
         let repo =
             super::GitProjectContext::discover(workspace.analyzer().project().root()).unwrap();
-        let commit_ids = repo.recent_commit_ids(super::COMMITS_TO_PROCESS).unwrap();
+        let commit_ids = repo
+            .recent_commit_changes(super::COMMITS_TO_PROCESS)
+            .unwrap();
         let mut canonicalizer = super::RenameCanonicalizer::default();
-        for oid in &commit_ids {
-            let commit = repo.repo.find_commit(*oid).unwrap();
-            let change = repo.changed_repo_paths_for_commit(&commit).unwrap();
+        for change in &commit_ids {
             canonicalizer.record_renames(&change.renames);
 
             let changed_files = change
@@ -1156,7 +1230,7 @@ mod tests {
                     || changed_files.contains(&bindings)
                     || changed_files.contains(&flow_test)
                 {
-                    eprintln!("commit {} size={}", oid, changed_files.len());
+                    eprintln!("commit {} size={}", change.id, changed_files.len());
                     for file in &changed_files {
                         if *file == seed
                             || *file == fp32
@@ -1202,7 +1276,7 @@ mod tests {
         ];
 
         let commits = context
-            .recent_commit_ids(super::COMMITS_TO_PROCESS)
+            .recent_commit_changes(super::COMMITS_TO_PROCESS)
             .unwrap();
         let baseline_commit_count = commits.len() as f64;
         let mut file_doc_freq: HashMap<ProjectFile, usize> = HashMap::default();
@@ -1210,13 +1284,11 @@ mod tests {
         let mut seed_commit_count = 0usize;
         let mut canonicalizer = super::RenameCanonicalizer::default();
 
-        for oid in &commits {
-            let commit = context.repo.find_commit(*oid).unwrap();
-            let change = context.changed_repo_paths_for_commit(&commit).unwrap();
+        for change in &commits {
             canonicalizer.record_renames(&change.renames);
             let changed_files = change
                 .paths
-                .into_iter()
+                .iter()
                 .map(|path| canonicalizer.canonicalize(&path))
                 .filter_map(|path| context.repo_path_to_project_file(&path))
                 .collect::<BTreeSet<_>>();
@@ -1270,8 +1342,7 @@ mod tests {
         let repo =
             super::GitProjectContext::discover(workspace.analyzer().project().root()).unwrap();
         let oid = git2::Oid::from_str("493c78d1ef6035c27067137f3ab02d280f67cac2").unwrap();
-        let commit = repo.repo.find_commit(oid).unwrap();
-        let change = repo.changed_repo_paths_for_commit(&commit).unwrap();
+        let change = change_by_id(&repo, oid);
         eprintln!("renames:");
         for (old_path, new_path) in &change.renames {
             eprintln!("  {} -> {}", old_path.display(), new_path.display());
@@ -1293,8 +1364,7 @@ mod tests {
         let repo =
             super::GitProjectContext::discover(workspace.analyzer().project().root()).unwrap();
         let oid = git2::Oid::from_str("17985eda88a0fa9da910d346aa0f3656f419f2b5").unwrap();
-        let commit = repo.repo.find_commit(oid).unwrap();
-        let change = repo.changed_repo_paths_for_commit(&commit).unwrap();
+        let change = change_by_id(&repo, oid);
         eprintln!("renames:");
         for (old_path, new_path) in &change.renames {
             eprintln!("  {} -> {}", old_path.display(), new_path.display());
@@ -1316,8 +1386,7 @@ mod tests {
         let repo =
             super::GitProjectContext::discover(workspace.analyzer().project().root()).unwrap();
         let oid = git2::Oid::from_str("e2f3da57fe43ce500f58e4dbe5291e35ada31bee").unwrap();
-        let commit = repo.repo.find_commit(oid).unwrap();
-        let change = repo.changed_repo_paths_for_commit(&commit).unwrap();
+        let change = change_by_id(&repo, oid);
         eprintln!("renames:");
         for (old_path, new_path) in &change.renames {
             eprintln!("  {} -> {}", old_path.display(), new_path.display());
@@ -1555,7 +1624,7 @@ mod tests {
         ];
 
         let commits = context
-            .recent_commit_ids(super::COMMITS_TO_PROCESS)
+            .recent_commit_changes(super::COMMITS_TO_PROCESS)
             .unwrap();
         let baseline_commit_count = commits.len() as f64;
         let mut file_doc_freq: HashMap<PathBuf, usize> = HashMap::default();
@@ -1563,12 +1632,10 @@ mod tests {
         let mut seed_commit_count: HashMap<PathBuf, usize> = HashMap::default();
         let mut canonicalizer = super::RenameCanonicalizer::default();
 
-        for oid in &commits {
-            let commit = context.repo.find_commit(*oid).unwrap();
-            let change = context.changed_repo_paths_for_commit(&commit).unwrap();
+        for change in &commits {
             let changed_files = change
                 .paths
-                .into_iter()
+                .iter()
                 .map(|path| canonicalizer.canonicalize(&path))
                 .filter_map(|path| context.repo_path_to_project_file(&path))
                 .map(|file| file.rel_path().to_path_buf())
@@ -1661,15 +1728,13 @@ mod tests {
         ];
 
         let commits = context
-            .recent_commit_ids(super::COMMITS_TO_PROCESS)
+            .recent_commit_changes(super::COMMITS_TO_PROCESS)
             .unwrap();
         let mut canonicalizer = super::RenameCanonicalizer::default();
-        for oid in &commits {
-            let commit = context.repo.find_commit(*oid).unwrap();
-            let change = context.changed_repo_paths_for_commit(&commit).unwrap();
+        for change in &commits {
             let changed_files = change
                 .paths
-                .into_iter()
+                .iter()
                 .map(|path| canonicalizer.canonicalize(&path))
                 .filter_map(|path| context.repo_path_to_project_file(&path))
                 .map(|file| file.rel_path().to_path_buf())
@@ -1685,7 +1750,7 @@ mod tests {
                         "pair {} -> {} commit={} size={}",
                         seed.display(),
                         target.display(),
-                        commit.id(),
+                        change.id,
                         changed_files.len()
                     );
                 }
@@ -1707,22 +1772,20 @@ mod tests {
         ]);
 
         let commits = context
-            .recent_commit_ids(super::COMMITS_TO_PROCESS)
+            .recent_commit_changes(super::COMMITS_TO_PROCESS)
             .unwrap();
         let mut canonicalizer = super::RenameCanonicalizer::default();
-        for oid in &commits {
-            let commit = context.repo.find_commit(*oid).unwrap();
-            let change = context.changed_repo_paths_for_commit(&commit).unwrap();
+        for change in &commits {
             let changed_files = change
                 .paths
-                .into_iter()
+                .iter()
                 .map(|path| canonicalizer.canonicalize(&path))
                 .filter_map(|path| context.repo_path_to_project_file(&path))
                 .map(|file| file.rel_path().to_path_buf())
                 .collect::<BTreeSet<_>>();
             canonicalizer.record_renames(&change.renames);
-            if interesting.contains(oid) {
-                eprintln!("commit={} size={}", commit.id(), changed_files.len());
+            if interesting.contains(&change.id) {
+                eprintln!("commit={} size={}", change.id, changed_files.len());
                 for path in changed_files {
                     eprintln!("  {}", path.display());
                 }
@@ -1740,13 +1803,11 @@ mod tests {
         let interesting = git2::Oid::from_str("b16b94feb8bd89ef07c14fc7f34419490924b993").unwrap();
 
         let commits = context
-            .recent_commit_ids(super::COMMITS_TO_PROCESS)
+            .recent_commit_changes(super::COMMITS_TO_PROCESS)
             .unwrap();
         let mut canonicalizer = super::RenameCanonicalizer::default();
-        for oid in &commits {
-            let commit = context.repo.find_commit(*oid).unwrap();
-            let change = context.changed_repo_paths_for_commit(&commit).unwrap();
-            if *oid == interesting {
+        for change in &commits {
+            if change.id == interesting {
                 for path in &change.paths {
                     let canonical = canonicalizer.canonicalize(path);
                     if canonical == target {
@@ -1773,19 +1834,17 @@ mod tests {
             PathBuf::from("dotnet/src/Microsoft.AutoGen/Contracts/AgentMetadata.cs");
 
         let commits = context
-            .recent_commit_ids(super::COMMITS_TO_PROCESS)
+            .recent_commit_changes(super::COMMITS_TO_PROCESS)
             .unwrap();
         let mut file_doc_freq: HashMap<PathBuf, usize> = HashMap::default();
         let mut joint_mass: HashMap<PathBuf, f64> = HashMap::default();
         let mut seed_commit_count = 0usize;
         let mut canonicalizer = super::RenameCanonicalizer::default();
 
-        for oid in &commits {
-            let commit = context.repo.find_commit(*oid).unwrap();
-            let change = context.changed_repo_paths_for_commit(&commit).unwrap();
+        for change in &commits {
             let changed_files = change
                 .paths
-                .into_iter()
+                .iter()
                 .map(|path| canonicalizer.canonicalize(&path))
                 .collect::<BTreeSet<_>>();
             canonicalizer.record_renames(&change.renames);
@@ -1807,7 +1866,7 @@ mod tests {
                     *joint_mass.entry(target.clone()).or_insert(0.0) += commit_pair_mass;
                     eprintln!(
                         "{} shared {} size={}",
-                        commit.id(),
+                        change.id,
                         target.display(),
                         changed_files.len()
                     );
@@ -1842,7 +1901,7 @@ mod tests {
         ];
 
         let commits = context
-            .recent_commit_ids(super::COMMITS_TO_PROCESS)
+            .recent_commit_changes(super::COMMITS_TO_PROCESS)
             .unwrap();
         let baseline_commit_count = commits.len() as f64;
         let mut file_doc_freq: HashMap<PathBuf, usize> = HashMap::default();
@@ -1850,12 +1909,10 @@ mod tests {
         let mut seed_commit_count = 0usize;
         let mut canonicalizer = super::RenameCanonicalizer::default();
 
-        for oid in &commits {
-            let commit = context.repo.find_commit(*oid).unwrap();
-            let change = context.changed_repo_paths_for_commit(&commit).unwrap();
+        for change in &commits {
             let changed_files = change
                 .paths
-                .into_iter()
+                .iter()
                 .map(|path| canonicalizer.canonicalize(&path))
                 .collect::<BTreeSet<_>>();
             canonicalizer.record_renames(&change.renames);
@@ -1916,19 +1973,17 @@ mod tests {
         );
 
         let commits = context
-            .recent_commit_ids(super::COMMITS_TO_PROCESS)
+            .recent_commit_changes(super::COMMITS_TO_PROCESS)
             .unwrap();
         let mut file_doc_freq: HashMap<PathBuf, usize> = HashMap::default();
         let mut joint_mass: HashMap<PathBuf, f64> = HashMap::default();
         let mut seed_commit_count = 0usize;
         let mut canonicalizer = super::RenameCanonicalizer::default();
 
-        for oid in &commits {
-            let commit = context.repo.find_commit(*oid).unwrap();
-            let change = context.changed_repo_paths_for_commit(&commit).unwrap();
+        for change in &commits {
             let changed_files = change
                 .paths
-                .into_iter()
+                .iter()
                 .map(|path| canonicalizer.canonicalize(&path))
                 .collect::<BTreeSet<_>>();
             canonicalizer.record_renames(&change.renames);
@@ -1950,7 +2005,7 @@ mod tests {
                     *joint_mass.entry(target.clone()).or_insert(0.0) += commit_pair_mass;
                     eprintln!(
                         "{} shared {} size={}",
-                        commit.id(),
+                        change.id,
                         target.display(),
                         changed_files.len()
                     );
@@ -1997,7 +2052,7 @@ mod tests {
         ];
 
         let commits = context
-            .recent_commit_ids(super::COMMITS_TO_PROCESS)
+            .recent_commit_changes(super::COMMITS_TO_PROCESS)
             .unwrap();
         let baseline_commit_count = commits.len() as f64;
         let mut file_doc_freq: HashMap<PathBuf, usize> = HashMap::default();
@@ -2005,12 +2060,10 @@ mod tests {
         let mut seed_commit_count = 0usize;
         let mut canonicalizer = super::RenameCanonicalizer::default();
 
-        for oid in &commits {
-            let commit = context.repo.find_commit(*oid).unwrap();
-            let change = context.changed_repo_paths_for_commit(&commit).unwrap();
+        for change in &commits {
             let changed_files = change
                 .paths
-                .into_iter()
+                .iter()
                 .map(|path| canonicalizer.canonicalize(&path))
                 .collect::<BTreeSet<_>>();
             canonicalizer.record_renames(&change.renames);
@@ -2082,7 +2135,7 @@ mod tests {
         ];
 
         let commits = context
-            .recent_commit_ids(super::COMMITS_TO_PROCESS)
+            .recent_commit_changes(super::COMMITS_TO_PROCESS)
             .unwrap();
         let baseline_commit_count = commits.len() as f64;
         let mut file_doc_freq: HashMap<PathBuf, usize> = HashMap::default();
@@ -2090,12 +2143,10 @@ mod tests {
         let mut seed_commit_count = 0usize;
         let mut canonicalizer = super::RenameCanonicalizer::default();
 
-        for oid in &commits {
-            let commit = context.repo.find_commit(*oid).unwrap();
-            let change = context.changed_repo_paths_for_commit(&commit).unwrap();
+        for change in &commits {
             let changed_files = change
                 .paths
-                .into_iter()
+                .iter()
                 .map(|path| canonicalizer.canonicalize(&path))
                 .collect::<BTreeSet<_>>();
             canonicalizer.record_renames(&change.renames);
@@ -2143,124 +2194,27 @@ mod tests {
     }
 
     #[test]
-    fn autogen_add_subscription_follow_history_counts_runtime_gateway_rename() {
-        let root = Path::new("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
-        if !root.is_dir() {
-            eprintln!("skipping autogen rename regression: repo not present");
-            return;
-        }
-
-        let context = super::GitProjectContext::discover(root).unwrap();
-        let commits = context
-            .recent_commit_ids(super::COMMITS_TO_PROCESS)
-            .unwrap();
-        let target = PathBuf::from(
-            "dotnet/src/Microsoft.AutoGen/RuntimeGateway.Grpc/Services/Orleans/Surrogates/AddSubscriptionRequestSurrogate.cs",
-        );
-        let mut canonicalizer = super::RenameCanonicalizer::default();
-        let mut doc_freq = 0usize;
-
-        for oid in commits {
-            let commit = context.repo.find_commit(oid).unwrap();
-            let change = context.changed_repo_paths_for_commit(&commit).unwrap();
-            let changed = change
-                .paths
-                .into_iter()
-                .map(|path| canonicalizer.canonicalize(&path))
-                .collect::<BTreeSet<_>>();
-            canonicalizer.record_renames(&change.renames);
-            if changed.contains(&target) {
-                doc_freq += 1;
-            }
-        }
-
-        assert_eq!(3, doc_freq);
-    }
-
-    #[test]
-    fn native_rename_requires_path_replacement_for_vector_similarity_bruteforce_factory_move() {
-        let root = Path::new("/home/jonathan/Projects/VectorSimilarity");
-        if !root.is_dir() {
-            eprintln!("skipping vectorsim rename threshold regression: repo not present");
-            return;
-        }
-
-        let context = super::GitProjectContext::discover(root).unwrap();
-        let oid = git2::Oid::from_str("e2f3da57fe43ce500f58e4dbe5291e35ada31bee").unwrap();
-        let commit = context.repo.find_commit(oid).unwrap();
-        let change = context.changed_repo_paths_for_commit(&commit).unwrap();
-
-        assert!(!change.renames.iter().any(|(old_path, new_path)| {
-            old_path == Path::new("src/VecSim/algorithms/brute_force/brute_force_factory.cpp")
-                && new_path == Path::new("src/VecSim/index_factories/brute_force_factory.cpp")
-        }));
-        assert!(change.paths.contains(&PathBuf::from(
-            "src/VecSim/algorithms/brute_force/brute_force_factory.cpp"
-        )));
-        assert!(change.paths.contains(&PathBuf::from(
-            "src/VecSim/index_factories/brute_force_factory.cpp"
-        )));
-    }
-
-    #[test]
-    fn autogen_agent_host_follow_history_counts_case_rename() {
-        let root = Path::new("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
-        if !root.is_dir() {
-            eprintln!("skipping autogen rename regression: repo not present");
-            return;
-        }
-
-        let context = super::GitProjectContext::discover(root).unwrap();
-        let commits = context
-            .recent_commit_ids(super::COMMITS_TO_PROCESS)
-            .unwrap();
-        let target = PathBuf::from(
-            "dotnet/src/Microsoft.AutoGen/AgentHost/Microsoft.AutoGen.AgentHost.csproj",
-        );
-        let mut canonicalizer = super::RenameCanonicalizer::default();
-        let mut doc_freq = 0usize;
-
-        for oid in commits {
-            let commit = context.repo.find_commit(oid).unwrap();
-            let change = context.changed_repo_paths_for_commit(&commit).unwrap();
-            let changed = change
-                .paths
-                .into_iter()
-                .map(|path| canonicalizer.canonicalize(&path))
-                .collect::<BTreeSet<_>>();
-            canonicalizer.record_renames(&change.renames);
-            if changed.contains(&target) {
-                doc_freq += 1;
-            }
-        }
-
-        assert_eq!(4, doc_freq);
-    }
-
-    #[test]
     #[ignore = "diagnostic"]
     fn debug_autogen_agent_host_counted_commits() {
         let root = Path::new("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
         let context = super::GitProjectContext::discover(root).unwrap();
         let commits = context
-            .recent_commit_ids(super::COMMITS_TO_PROCESS)
+            .recent_commit_changes(super::COMMITS_TO_PROCESS)
             .unwrap();
         let target = PathBuf::from(
             "dotnet/src/Microsoft.AutoGen/AgentHost/Microsoft.AutoGen.AgentHost.csproj",
         );
         let mut canonicalizer = super::RenameCanonicalizer::default();
 
-        for oid in commits {
-            let commit = context.repo.find_commit(oid).unwrap();
-            let change = context.changed_repo_paths_for_commit(&commit).unwrap();
+        for change in commits {
             let changed = change
                 .paths
-                .into_iter()
+                .iter()
                 .map(|path| canonicalizer.canonicalize(&path))
                 .collect::<BTreeSet<_>>();
             canonicalizer.record_renames(&change.renames);
             if changed.contains(&target) {
-                eprintln!("{}", commit.id());
+                eprintln!("{}", change.id);
             }
         }
     }
@@ -2271,7 +2225,7 @@ mod tests {
         let root = Path::new("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
         let context = super::GitProjectContext::discover(root).unwrap();
         let commits = context
-            .recent_commit_ids(super::COMMITS_TO_PROCESS)
+            .recent_commit_changes(super::COMMITS_TO_PROCESS)
             .unwrap();
         let target = PathBuf::from(
             "dotnet/src/Microsoft.AutoGen/AgentHost/Microsoft.AutoGen.AgentHost.csproj",
@@ -2284,18 +2238,16 @@ mod tests {
         .collect::<HashSet<_>>();
         let mut canonicalizer = super::RenameCanonicalizer::default();
 
-        for oid in commits {
-            let commit = context.repo.find_commit(oid).unwrap();
-            let change = context.changed_repo_paths_for_commit(&commit).unwrap();
+        for change in commits {
             let original_paths = change.paths.clone();
             let changed = change
                 .paths
-                .into_iter()
+                .iter()
                 .map(|path| canonicalizer.canonicalize(&path))
                 .collect::<BTreeSet<_>>();
             canonicalizer.record_renames(&change.renames);
-            if interesting.contains(&oid) && changed.contains(&target) {
-                eprintln!("commit {}", oid);
+            if interesting.contains(&change.id) && changed.contains(&target) {
+                eprintln!("commit {}", change.id);
                 for path in original_paths {
                     let canonical = canonicalizer.canonicalize(&path);
                     if canonical == target {
@@ -2316,14 +2268,12 @@ mod tests {
         );
 
         let commits = context
-            .recent_commit_ids(super::COMMITS_TO_PROCESS)
+            .recent_commit_changes(super::COMMITS_TO_PROCESS)
             .unwrap();
         let mut canonicalizer = super::RenameCanonicalizer::default();
-        for oid in &commits {
-            let commit = context.repo.find_commit(*oid).unwrap();
-            let change = context.changed_repo_paths_for_commit(&commit).unwrap();
+        for change in &commits {
             let mut counted = BTreeSet::new();
-            for path in change.paths {
+            for path in &change.paths {
                 let canonical = canonicalizer.canonicalize(&path);
                 if canonical == target {
                     counted.insert(path);
@@ -2331,7 +2281,7 @@ mod tests {
             }
             canonicalizer.record_renames(&change.renames);
             if !counted.is_empty() {
-                eprintln!("{} {:?}", commit.id(), counted);
+                eprintln!("{} {:?}", change.id, counted);
             }
         }
     }
@@ -2344,14 +2294,12 @@ mod tests {
         let target = PathBuf::from("dotnet/src/Microsoft.AutoGen/AgentHost/appsettings.json");
 
         let commits = context
-            .recent_commit_ids(super::COMMITS_TO_PROCESS)
+            .recent_commit_changes(super::COMMITS_TO_PROCESS)
             .unwrap();
         let mut canonicalizer = super::RenameCanonicalizer::default();
-        for oid in &commits {
-            let commit = context.repo.find_commit(*oid).unwrap();
-            let change = context.changed_repo_paths_for_commit(&commit).unwrap();
+        for change in &commits {
             let mut counted = BTreeSet::new();
-            for path in change.paths {
+            for path in &change.paths {
                 let canonical = canonicalizer.canonicalize(&path);
                 if canonical == target {
                     counted.insert(path);
@@ -2359,7 +2307,7 @@ mod tests {
             }
             canonicalizer.record_renames(&change.renames);
             if !counted.is_empty() {
-                eprintln!("{} {:?}", commit.id(), counted);
+                eprintln!("{} {:?}", change.id, counted);
             }
         }
     }
@@ -2370,12 +2318,10 @@ mod tests {
         let root = Path::new("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
         let context = super::GitProjectContext::discover(root).unwrap();
         let commit_ids = context
-            .recent_commit_ids(super::COMMITS_TO_PROCESS)
+            .recent_commit_changes(super::COMMITS_TO_PROCESS)
             .unwrap();
         let mut canonicalizer = super::RenameCanonicalizer::default();
-        for oid in commit_ids {
-            let commit = context.repo.find_commit(oid).unwrap();
-            let change = context.changed_repo_paths_for_commit(&commit).unwrap();
+        for change in commit_ids {
             let canonicalized = change
                 .paths
                 .iter()
@@ -2386,7 +2332,7 @@ mod tests {
                 })
                 .collect::<BTreeSet<_>>();
             if !canonicalized.is_empty() {
-                eprintln!("{} {:?}", commit.id(), canonicalized);
+                eprintln!("{} {:?}", change.id, canonicalized);
             }
             canonicalizer.record_renames(&change.renames);
         }
@@ -2456,13 +2402,10 @@ mod tests {
         let autogen_root =
             Path::new("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
         let autogen = super::GitProjectContext::discover(autogen_root).unwrap();
-        let autogen_commit = autogen
-            .repo
-            .find_commit(git2::Oid::from_str("850377c74a10e9d493de6dea1ed706333e05d146").unwrap())
-            .unwrap();
-        let autogen_change = autogen
-            .changed_repo_paths_for_commit(&autogen_commit)
-            .unwrap();
+        let autogen_change = change_by_id(
+            &autogen,
+            git2::Oid::from_str("850377c74a10e9d493de6dea1ed706333e05d146").unwrap(),
+        );
         eprintln!("autogen renames: {:?}", autogen_change.renames);
         let mut autogen_canon = super::RenameCanonicalizer::default();
         autogen_canon.record_renames(&autogen_change.renames);
@@ -2477,11 +2420,10 @@ mod tests {
 
         let plume_root = Path::new("/home/jonathan/Projects/plume-merge");
         let plume = super::GitProjectContext::discover(plume_root).unwrap();
-        let plume_commit = plume
-            .repo
-            .find_commit(git2::Oid::from_str("891e8540ab8a90195e231d1d9fdeed4e05ff044f").unwrap())
-            .unwrap();
-        let plume_change = plume.changed_repo_paths_for_commit(&plume_commit).unwrap();
+        let plume_change = change_by_id(
+            &plume,
+            git2::Oid::from_str("891e8540ab8a90195e231d1d9fdeed4e05ff044f").unwrap(),
+        );
         eprintln!("plume renames: {:?}", plume_change.renames);
         let mut plume_canon = super::RenameCanonicalizer::default();
         plume_canon.record_renames(&plume_change.renames);
@@ -2493,93 +2435,6 @@ mod tests {
                 ))
                 .display()
         );
-    }
-
-    #[test]
-    fn autogen_large_rename_commit_detects_agent_metadata_move() {
-        let root = Path::new("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
-        if !root.is_dir() {
-            eprintln!("skipping autogen rename regression: repo not present");
-            return;
-        }
-
-        let context = super::GitProjectContext::discover(root).unwrap();
-        let commit = context
-            .repo
-            .find_commit(git2::Oid::from_str("b16b94feb8bd89ef07c14fc7f34419490924b993").unwrap())
-            .unwrap();
-        let change = context.changed_repo_paths_for_commit(&commit).unwrap();
-        let expected = (
-            PathBuf::from("dotnet/src/Microsoft.AutoGen/Contracts/PythonEquiv/AgentMetadata.cs"),
-            PathBuf::from("dotnet/src/Microsoft.AutoGen/Contracts/AgentMetadata.cs"),
-        );
-
-        assert!(change.renames.contains(&expected), "{:?}", change.renames);
-    }
-
-    #[test]
-    fn autogen_agent_metadata_follow_history_counts_python_equiv_commits() {
-        let root = Path::new("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
-        if !root.is_dir() {
-            eprintln!("skipping autogen rename regression: repo not present");
-            return;
-        }
-
-        let context = super::GitProjectContext::discover(root).unwrap();
-        let commits = context
-            .recent_commit_ids(super::COMMITS_TO_PROCESS)
-            .unwrap();
-        let target = PathBuf::from("dotnet/src/Microsoft.AutoGen/Contracts/AgentMetadata.cs");
-        let mut canonicalizer = super::RenameCanonicalizer::default();
-        let mut doc_freq = 0usize;
-
-        for oid in commits {
-            let commit = context.repo.find_commit(oid).unwrap();
-            let change = context.changed_repo_paths_for_commit(&commit).unwrap();
-            let changed = change
-                .paths
-                .into_iter()
-                .map(|path| canonicalizer.canonicalize(&path))
-                .collect::<BTreeSet<_>>();
-            canonicalizer.record_renames(&change.renames);
-            if changed.contains(&target) {
-                doc_freq += 1;
-            }
-        }
-
-        assert_eq!(5, doc_freq);
-    }
-
-    #[test]
-    fn autogen_agent_runtime_tests_do_not_follow_to_inprocess_runtime_tests() {
-        let root = Path::new("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
-        if !root.is_dir() {
-            eprintln!("skipping autogen rename regression: repo not present");
-            return;
-        }
-
-        let context = super::GitProjectContext::discover(root).unwrap();
-        let commits = context
-            .recent_commit_ids(super::COMMITS_TO_PROCESS)
-            .unwrap();
-        let old_path =
-            PathBuf::from("dotnet/test/Microsoft.AutoGen.Core.Tests/AgentRuntimeTests.cs");
-        let expected = old_path.clone();
-        let mut canonicalizer = super::RenameCanonicalizer::default();
-
-        for oid in commits {
-            let commit = context.repo.find_commit(oid).unwrap();
-            if commit.id()
-                == git2::Oid::from_str("b16b94feb8bd89ef07c14fc7f34419490924b993").unwrap()
-            {
-                assert_eq!(expected, canonicalizer.canonicalize(&old_path));
-                return;
-            }
-            let change = context.changed_repo_paths_for_commit(&commit).unwrap();
-            canonicalizer.record_renames(&change.renames);
-        }
-
-        panic!("autogen baseline window did not include target commit");
     }
 
     #[test]
