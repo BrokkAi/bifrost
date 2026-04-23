@@ -18,8 +18,10 @@ enum CallToolError {
 #[pymethods]
 impl SearchToolsNativeSession {
     #[new]
-    fn new(root: &str) -> PyResult<Self> {
-        let service = SearchToolsService::new_for_python(PathBuf::from(root))
+    fn new(py: Python<'_>, root: &str) -> PyResult<Self> {
+        let root = PathBuf::from(root);
+        let service = py
+            .allow_threads(|| SearchToolsService::new_for_python(root))
             .map_err(PyRuntimeError::new_err)?;
         Ok(Self {
             inner: Mutex::new(Some(service)),
