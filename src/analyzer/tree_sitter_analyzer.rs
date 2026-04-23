@@ -62,8 +62,10 @@ struct FileState {
 struct AnalyzerState {
     files: HashMap<ProjectFile, FileState>,
     definitions: HashMap<String, Vec<CodeUnit>>,
-    // Child lists are canonicalized here once during indexing so every
-    // `get_direct_children` caller sees the same deduped, source-ordered view.
+    // Child lists are canonicalized once while building immutable analyzer
+    // state. `direct_children` intentionally exposes this deduped, source-
+    // ordered contract; callers only reorder when they need a presentation-
+    // specific view such as fields-first skeleton rendering.
     children: HashMap<CodeUnit, Vec<CodeUnit>>,
     module_children: HashMap<String, Vec<CodeUnit>>,
     ranges: HashMap<CodeUnit, Vec<Range>>,
@@ -230,9 +232,22 @@ where
         descendants: &mut Vec<CodeUnit>,
         ranges: &HashMap<CodeUnit, Vec<Range>>,
     ) {
-        descendants.sort();
-        descendants.dedup();
-        descendants.sort_by_key(|child| Self::child_order_key(ranges, child));
+        if descendants.len() < 2 {
+            return;
+        }
+
+        let mut seen = HashSet::with_capacity(descendants.len());
+        let mut keyed = Vec::with_capacity(descendants.len());
+        for child in descendants.drain(..) {
+            if seen.insert(child.clone()) {
+                keyed.push((Self::child_order_key(ranges, &child), child));
+            }
+        }
+
+        keyed.sort_by(|(left_start, left), (right_start, right)| {
+            left_start.cmp(right_start).then_with(|| left.cmp(right))
+        });
+        descendants.extend(keyed.into_iter().map(|(_, child)| child));
     }
 
     fn definition_sort_key(
