@@ -8,7 +8,7 @@ use std::time::Instant;
 
 const ALPHA: f64 = 0.85;
 const CONVERGENCE_EPSILON: f64 = 1.0e-6;
-const SCORE_TIE_EPSILON: f64 = 1.0e-9;
+const SCORE_BUCKET_SCALE: f64 = 1.0e9;
 const MAX_ITERS: usize = 75;
 const IMPORT_DEPTH: usize = 2;
 const COMMITS_TO_PROCESS: usize = 1_000;
@@ -878,18 +878,14 @@ fn normalized_rel_path(file: &ProjectFile) -> String {
         .to_ascii_lowercase()
 }
 
+fn score_bucket(score: f64) -> i64 {
+    (score * SCORE_BUCKET_SCALE).round() as i64
+}
+
 fn compare_file_relevance(left: &FileRelevance, right: &FileRelevance) -> std::cmp::Ordering {
-    let score_gap = right.score - left.score;
-    let score_scale = 1.0_f64.max(left.score.abs()).max(right.score.abs());
-    if score_gap.abs() <= SCORE_TIE_EPSILON * score_scale {
-        normalized_rel_path(&left.file).cmp(&normalized_rel_path(&right.file))
-    } else {
-        right
-            .score
-            .partial_cmp(&left.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| normalized_rel_path(&left.file).cmp(&normalized_rel_path(&right.file)))
-    }
+    score_bucket(right.score)
+        .cmp(&score_bucket(left.score))
+        .then_with(|| normalized_rel_path(&left.file).cmp(&normalized_rel_path(&right.file)))
 }
 
 #[cfg(test)]
@@ -928,6 +924,36 @@ mod tests {
         );
 
         assert_eq!(std::cmp::Ordering::Greater, ordering);
+    }
+
+    #[test]
+    fn score_bucket_order_is_transitive_for_near_tie_chain() {
+        let temp = TempDir::new().unwrap();
+        let alpha = write_file(temp.path(), "Alpha.java", "class Alpha {}");
+        let beta = write_file(temp.path(), "Beta.java", "class Beta {}");
+        let zed = write_file(temp.path(), "Zed.java", "class Zed {}");
+        let mut ranked = vec![
+            super::FileRelevance {
+                file: zed,
+                score: 1.0 + 1.4e-10,
+            },
+            super::FileRelevance {
+                file: beta,
+                score: 1.0 + 0.9e-10,
+            },
+            super::FileRelevance {
+                file: alpha,
+                score: 1.0,
+            },
+        ];
+
+        ranked.sort_by(super::compare_file_relevance);
+
+        let paths = ranked
+            .iter()
+            .map(|item| item.file.rel_path().to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(vec!["Alpha.java", "Beta.java", "Zed.java"], paths);
     }
 
     fn java_analyzer(root: &Path) -> JavaAnalyzer {
