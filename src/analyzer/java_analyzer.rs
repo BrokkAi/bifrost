@@ -1640,8 +1640,8 @@ impl TypeHierarchyProvider for JavaAnalyzer {
         let ancestors: Vec<_> = self
             .inner
             .raw_supertypes_of(code_unit)
-            .into_iter()
-            .filter_map(|raw_name| self.resolve_type_name(code_unit.source(), &raw_name))
+            .iter()
+            .filter_map(|raw_name| self.resolve_type_name(code_unit.source(), raw_name))
             .collect();
         self.memo_caches
             .direct_ancestors

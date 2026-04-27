@@ -1283,30 +1283,6 @@ fn js_ts_contains_tests(file: &ProjectFile, source: &str) -> bool {
         || source.contains("it(")
 }
 
-#[cfg(test)]
-mod tests {
-    use super::parse_js_import_infos;
-
-    #[test]
-    fn parses_typescript_type_only_named_imports() {
-        let imports = parse_js_import_infos("import type { BubbleState } from '../types';");
-        assert_eq!(1, imports.len());
-        assert_eq!(Some("BubbleState"), imports[0].identifier.as_deref());
-        assert_eq!(None, imports[0].alias.as_deref());
-    }
-
-    #[test]
-    fn parses_mixed_typescript_named_imports_with_inline_type_modifiers() {
-        let imports =
-            parse_js_import_infos("import { type BubbleState, SummaryState } from '../types';");
-        let identifiers = imports
-            .into_iter()
-            .map(|import| import.identifier.unwrap_or_default())
-            .collect::<Vec<_>>();
-        assert_eq!(vec!["BubbleState", "SummaryState"], identifiers);
-    }
-}
-
 pub(crate) fn build_weighted_cache<K, V>(
     budget_bytes: u64,
     weigher: impl Fn(&K, &V) -> u32 + Send + Sync + 'static,
@@ -1346,4 +1322,28 @@ fn weight_code_unit_set(_key: &ProjectFile, value: &Arc<HashSet<CodeUnit>>) -> u
         .sum::<usize>()
         + size_of::<HashSet<CodeUnit>>();
     size.min(u32::MAX as usize) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_js_import_infos;
+
+    #[test]
+    fn parses_typescript_type_only_named_imports() {
+        let imports = parse_js_import_infos("import type { BubbleState } from '../types';");
+        assert_eq!(1, imports.len());
+        assert_eq!(Some("BubbleState"), imports[0].identifier.as_deref());
+        assert_eq!(None, imports[0].alias.as_deref());
+    }
+
+    #[test]
+    fn parses_mixed_typescript_named_imports_with_inline_type_modifiers() {
+        let imports =
+            parse_js_import_infos("import { type BubbleState, SummaryState } from '../types';");
+        let identifiers = imports
+            .into_iter()
+            .map(|import| import.identifier.unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(vec!["BubbleState", "SummaryState"], identifiers);
+    }
 }

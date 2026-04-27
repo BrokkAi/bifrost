@@ -171,11 +171,11 @@ fn could_import_file_matches_java_specific_cases() {
         .clone();
 
     let imports = analyzer.import_info_of(&bar_file);
-    assert!(analyzer.could_import_file_without_source(&imports, &foo_file));
-    assert!(analyzer.could_import_file(&bar_file, &imports, &foo_file));
-    assert!(!analyzer.could_import_file_without_source(&imports, &baz_file));
+    assert!(analyzer.could_import_file_without_source(imports, &foo_file));
+    assert!(analyzer.could_import_file(&bar_file, imports, &foo_file));
+    assert!(!analyzer.could_import_file_without_source(imports, &baz_file));
 
     let same_package_imports = analyzer.import_info_of(&baz_file);
     assert!(same_package_imports.is_empty());
-    assert!(analyzer.could_import_file(&baz_file, &same_package_imports, &foo_file));
+    assert!(analyzer.could_import_file(&baz_file, same_package_imports, &foo_file));
 }

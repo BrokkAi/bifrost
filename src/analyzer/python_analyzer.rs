@@ -142,7 +142,7 @@ impl PythonAnalyzer {
     fn resolve_import_bindings(&self, file: &ProjectFile) -> HashMap<String, CodeUnit> {
         let mut bindings = HashMap::default();
         for import in self.inner.import_info_of(file) {
-            for (binding, code_unit) in self.resolve_import(file, &import) {
+            for (binding, code_unit) in self.resolve_import(file, import) {
                 bindings.insert(binding, code_unit);
             }
         }
@@ -529,8 +529,8 @@ impl TypeHierarchyProvider for PythonAnalyzer {
         let ancestors: Vec<_> = self
             .inner
             .raw_supertypes_of(code_unit)
-            .into_iter()
-            .filter_map(|raw| self.resolve_base_class(code_unit, &raw))
+            .iter()
+            .filter_map(|raw| self.resolve_base_class(code_unit, raw))
             .collect();
         self.direct_ancestors
             .insert(code_unit.clone(), Arc::new(ancestors.clone()));

@@ -143,7 +143,7 @@ pub trait IAnalyzer: Send + Sync + Any {
         };
 
         let mut by_fq_name: BTreeMap<String, BTreeSet<CodeUnit>> = BTreeMap::new();
-        for code_unit in base_results.into_iter().chain(fuzzy_results.into_iter()) {
+        for code_unit in base_results.into_iter().chain(fuzzy_results) {
             by_fq_name
                 .entry(code_unit.fq_name())
                 .or_default()

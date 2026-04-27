@@ -525,12 +525,12 @@ fn related_files_by_git(
             let changed_files: BTreeSet<_> = change
                 .paths
                 .iter()
-                .map(|path| canonicalizer.canonicalize(&path))
+                .map(|path| canonicalizer.canonicalize(path))
                 .filter_map(|path| repo.repo_path_to_project_file(&path))
                 .collect();
             canonicalize_ms += started.elapsed().as_secs_f64() * 1000.0;
             processed_commits += 1;
-            if profiling::enabled() && processed_commits % 5 == 0 {
+            if profiling::enabled() && processed_commits.is_multiple_of(5) {
                 profiling::note(format!(
                     "relevance::git.score_commits progress processed_commits={} find_commit_ms={:.1} change_ms={:.1} canonicalize_ms={:.1} {}",
                     processed_commits,
@@ -869,8 +869,8 @@ fn tree_path_token_overlap_ratio(
 }
 
 fn blob_token_overlap_ratio(old_blob: &git2::Blob<'_>, new_blob: &git2::Blob<'_>) -> Option<f64> {
-    let old_tokens = blob_token_set(&old_blob);
-    let new_tokens = blob_token_set(&new_blob);
+    let old_tokens = blob_token_set(old_blob);
+    let new_tokens = blob_token_set(new_blob);
     let max_tokens = old_tokens.len().max(new_tokens.len());
     if max_tokens == 0 {
         return Some(1.0);
@@ -1007,7 +1007,7 @@ mod tests {
         let alpha = write_file(temp.path(), "Alpha.java", "class Alpha {}");
         let beta = write_file(temp.path(), "Beta.java", "class Beta {}");
         let zed = write_file(temp.path(), "Zed.java", "class Zed {}");
-        let mut ranked = vec![
+        let mut ranked = [
             super::FileRelevance {
                 file: zed,
                 score: 1.0 + 1.4e-10,
@@ -1142,7 +1142,7 @@ mod tests {
         .unwrap();
         println!("git top 100");
         for entry in &git {
-            if targets.iter().any(|target| *target == entry.file) {
+            if targets.contains(&entry.file) {
                 println!(
                     "  target git {:.15} {}",
                     entry.score,
@@ -1159,7 +1159,7 @@ mod tests {
         );
         println!("imports top 100");
         for entry in &imports {
-            if targets.iter().any(|target| *target == entry.file) {
+            if targets.contains(&entry.file) {
                 println!(
                     "  target import {:.15} {}",
                     entry.score,
@@ -1219,8 +1219,8 @@ mod tests {
                 .map(|path| canonicalizer.canonicalize(path))
                 .filter_map(|repo_rel| repo.repo_path_to_project_file(&repo_rel))
                 .collect::<Vec<_>>();
-            if changed_files.contains(&seed) {
-                if changed_files.contains(&fp32)
+            if changed_files.contains(&seed)
+                && (changed_files.contains(&fp32)
                     || changed_files.contains(&definitions)
                     || changed_files.contains(&brute_force_factory)
                     || changed_files.contains(&l2_space)
@@ -1228,23 +1228,22 @@ mod tests {
                     || changed_files.contains(&vec_sim_cpp)
                     || changed_files.contains(&vec_sim_h)
                     || changed_files.contains(&bindings)
-                    || changed_files.contains(&flow_test)
-                {
-                    eprintln!("commit {} size={}", change.id, changed_files.len());
-                    for file in &changed_files {
-                        if *file == seed
-                            || *file == fp32
-                            || *file == definitions
-                            || *file == brute_force_factory
-                            || *file == l2_space
-                            || *file == test_bruteforce
-                            || *file == vec_sim_cpp
-                            || *file == vec_sim_h
-                            || *file == bindings
-                            || *file == flow_test
-                        {
-                            eprintln!("  {}", file.rel_path().display());
-                        }
+                    || changed_files.contains(&flow_test))
+            {
+                eprintln!("commit {} size={}", change.id, changed_files.len());
+                for file in &changed_files {
+                    if *file == seed
+                        || *file == fp32
+                        || *file == definitions
+                        || *file == brute_force_factory
+                        || *file == l2_space
+                        || *file == test_bruteforce
+                        || *file == vec_sim_cpp
+                        || *file == vec_sim_h
+                        || *file == bindings
+                        || *file == flow_test
+                    {
+                        eprintln!("  {}", file.rel_path().display());
                     }
                 }
             }
@@ -1289,7 +1288,7 @@ mod tests {
             let changed_files = change
                 .paths
                 .iter()
-                .map(|path| canonicalizer.canonicalize(&path))
+                .map(|path| canonicalizer.canonicalize(path))
                 .filter_map(|path| context.repo_path_to_project_file(&path))
                 .collect::<BTreeSet<_>>();
             if changed_files.is_empty() {
@@ -1636,7 +1635,7 @@ mod tests {
             let changed_files = change
                 .paths
                 .iter()
-                .map(|path| canonicalizer.canonicalize(&path))
+                .map(|path| canonicalizer.canonicalize(path))
                 .filter_map(|path| context.repo_path_to_project_file(&path))
                 .map(|file| file.rel_path().to_path_buf())
                 .collect::<BTreeSet<_>>();
@@ -1735,7 +1734,7 @@ mod tests {
             let changed_files = change
                 .paths
                 .iter()
-                .map(|path| canonicalizer.canonicalize(&path))
+                .map(|path| canonicalizer.canonicalize(path))
                 .filter_map(|path| context.repo_path_to_project_file(&path))
                 .map(|file| file.rel_path().to_path_buf())
                 .collect::<BTreeSet<_>>();
@@ -1779,7 +1778,7 @@ mod tests {
             let changed_files = change
                 .paths
                 .iter()
-                .map(|path| canonicalizer.canonicalize(&path))
+                .map(|path| canonicalizer.canonicalize(path))
                 .filter_map(|path| context.repo_path_to_project_file(&path))
                 .map(|file| file.rel_path().to_path_buf())
                 .collect::<BTreeSet<_>>();
@@ -1845,7 +1844,7 @@ mod tests {
             let changed_files = change
                 .paths
                 .iter()
-                .map(|path| canonicalizer.canonicalize(&path))
+                .map(|path| canonicalizer.canonicalize(path))
                 .collect::<BTreeSet<_>>();
             canonicalizer.record_renames(&change.renames);
             if changed_files.is_empty() {
@@ -1913,7 +1912,7 @@ mod tests {
             let changed_files = change
                 .paths
                 .iter()
-                .map(|path| canonicalizer.canonicalize(&path))
+                .map(|path| canonicalizer.canonicalize(path))
                 .collect::<BTreeSet<_>>();
             canonicalizer.record_renames(&change.renames);
             if changed_files.is_empty() {
@@ -1984,7 +1983,7 @@ mod tests {
             let changed_files = change
                 .paths
                 .iter()
-                .map(|path| canonicalizer.canonicalize(&path))
+                .map(|path| canonicalizer.canonicalize(path))
                 .collect::<BTreeSet<_>>();
             canonicalizer.record_renames(&change.renames);
             if changed_files.is_empty() {
@@ -2064,7 +2063,7 @@ mod tests {
             let changed_files = change
                 .paths
                 .iter()
-                .map(|path| canonicalizer.canonicalize(&path))
+                .map(|path| canonicalizer.canonicalize(path))
                 .collect::<BTreeSet<_>>();
             canonicalizer.record_renames(&change.renames);
             if changed_files.is_empty() {
@@ -2147,7 +2146,7 @@ mod tests {
             let changed_files = change
                 .paths
                 .iter()
-                .map(|path| canonicalizer.canonicalize(&path))
+                .map(|path| canonicalizer.canonicalize(path))
                 .collect::<BTreeSet<_>>();
             canonicalizer.record_renames(&change.renames);
             if changed_files.is_empty() {
@@ -2210,7 +2209,7 @@ mod tests {
             let changed = change
                 .paths
                 .iter()
-                .map(|path| canonicalizer.canonicalize(&path))
+                .map(|path| canonicalizer.canonicalize(path))
                 .collect::<BTreeSet<_>>();
             canonicalizer.record_renames(&change.renames);
             if changed.contains(&target) {
@@ -2243,7 +2242,7 @@ mod tests {
             let changed = change
                 .paths
                 .iter()
-                .map(|path| canonicalizer.canonicalize(&path))
+                .map(|path| canonicalizer.canonicalize(path))
                 .collect::<BTreeSet<_>>();
             canonicalizer.record_renames(&change.renames);
             if interesting.contains(&change.id) && changed.contains(&target) {
@@ -2274,7 +2273,7 @@ mod tests {
         for change in &commits {
             let mut counted = BTreeSet::new();
             for path in &change.paths {
-                let canonical = canonicalizer.canonicalize(&path);
+                let canonical = canonicalizer.canonicalize(path);
                 if canonical == target {
                     counted.insert(path);
                 }
@@ -2300,7 +2299,7 @@ mod tests {
         for change in &commits {
             let mut counted = BTreeSet::new();
             for path in &change.paths {
-                let canonical = canonicalizer.canonicalize(&path);
+                let canonical = canonicalizer.canonicalize(path);
                 if canonical == target {
                     counted.insert(path);
                 }

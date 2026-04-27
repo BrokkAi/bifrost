@@ -427,7 +427,7 @@ where
             .build()
             .expect("failed to build analyzer thread pool");
 
-        let analyzed = pool.install(|| {
+        pool.install(|| {
             files
                 .into_par_iter()
                 .map_init(
@@ -442,8 +442,7 @@ where
                     },
                 )
                 .collect::<Vec<_>>()
-        });
-        analyzed
+        })
     }
 
     fn build_state(
@@ -1078,7 +1077,7 @@ where
             .filter(|(fq_name, _)| {
                 !self.adapter.is_anonymous_structure(fq_name) && compiled.is_match(fq_name)
             })
-            .flat_map(|(_, definitions)| definitions.iter().cloned().collect::<Vec<_>>())
+            .flat_map(|(_, definitions)| definitions.to_vec())
             .collect()
     }
 

@@ -130,7 +130,7 @@ fn test_go_relevant_imports_and_could_import_file() {
     let importer = ProjectFile::new(project.root().to_path_buf(), "importer.go");
     let target = ProjectFile::new(project.root().to_path_buf(), "pkg/utils/helper.go");
     let imports = analyzer.import_info_of(&importer);
-    assert!(analyzer.could_import_file(&importer, &imports, &target));
+    assert!(analyzer.could_import_file(&importer, imports, &target));
 }
 
 #[test]

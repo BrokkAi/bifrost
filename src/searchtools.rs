@@ -564,7 +564,7 @@ fn signature_elements(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> Vec<Sum
     let fallback_start = ranges.first().map(|range| range.start_line).unwrap_or(1);
 
     signatures
-        .into_iter()
+        .iter()
         .enumerate()
         .filter_map(|(index, signature)| {
             let text = trim_summary_signature(signature);

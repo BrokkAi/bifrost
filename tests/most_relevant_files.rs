@@ -1259,8 +1259,7 @@ fn matches_brokk_reference_for_100_random_seed_files() {
     let worker_count = thread::available_parallelism()
         .map(|value| value.get())
         .unwrap_or(4)
-        .min(8)
-        .max(2);
+        .clamp(2, 8);
 
     thread::scope(|scope| {
         for _ in 0..worker_count {
@@ -1299,7 +1298,7 @@ fn matches_brokk_reference_for_100_random_seed_files() {
                     }
 
                     let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                    if done == 1 || done % 10 == 0 || done == cases.len() {
+                    if done == 1 || done.is_multiple_of(10) || done == cases.len() {
                         eprintln!("single parity progress {}/{}", done, cases.len());
                     }
                 }
@@ -1361,8 +1360,7 @@ fn matches_brokk_reference_for_100_random_seed_pairs() {
     let worker_count = thread::available_parallelism()
         .map(|value| value.get())
         .unwrap_or(4)
-        .min(8)
-        .max(2);
+        .clamp(2, 8);
 
     thread::scope(|scope| {
         for _ in 0..worker_count {
@@ -1401,7 +1399,7 @@ fn matches_brokk_reference_for_100_random_seed_pairs() {
                     }
 
                     let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                    if done == 1 || done % 10 == 0 || done == cases.len() {
+                    if done == 1 || done.is_multiple_of(10) || done == cases.len() {
                         eprintln!("pair parity progress {}/{}", done, cases.len());
                     }
                 }

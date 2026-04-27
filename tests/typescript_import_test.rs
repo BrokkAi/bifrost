@@ -380,7 +380,7 @@ fn test_resolve_imports_relevant_imports_and_could_import_file() {
     let rel_imports = analyzer.import_info_of(&rel_main);
     assert!(analyzer.could_import_file(
         &rel_main,
-        &rel_imports,
+        rel_imports,
         &ProjectFile::new(root.to_path_buf(), "src/utils/helper.ts")
     ));
 
@@ -388,7 +388,7 @@ fn test_resolve_imports_relevant_imports_and_could_import_file() {
     let component_imports = analyzer.import_info_of(&component_file);
     assert!(analyzer.could_import_file(
         &component_file,
-        &component_imports,
+        component_imports,
         &ProjectFile::new(root.to_path_buf(), "src/models/User.ts")
     ));
 
@@ -396,7 +396,7 @@ fn test_resolve_imports_relevant_imports_and_could_import_file() {
     let external_imports = analyzer.import_info_of(&external_file);
     assert!(!analyzer.could_import_file(
         &external_file,
-        &external_imports,
+        external_imports,
         &ProjectFile::new(root.to_path_buf(), "src/utils/helper.ts")
     ));
 
@@ -404,7 +404,7 @@ fn test_resolve_imports_relevant_imports_and_could_import_file() {
     let index_imports = analyzer.import_info_of(&index_main);
     assert!(analyzer.could_import_file(
         &index_main,
-        &index_imports,
+        index_imports,
         &ProjectFile::new(root.to_path_buf(), "src/utils/index.ts")
     ));
 }

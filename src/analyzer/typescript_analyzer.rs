@@ -268,7 +268,7 @@ impl ImportAnalysisProvider for TypescriptAnalyzer {
         let relevant: HashSet<_> = self
             .inner
             .import_info_of(code_unit.source())
-            .into_iter()
+            .iter()
             .filter(|import| {
                 let tokens = imported_tokens(&import.raw_snippet);
                 tokens.is_empty() || tokens.iter().any(|token| source.contains(token))
@@ -448,7 +448,7 @@ impl IAnalyzer for TypescriptAnalyzer {
     fn signatures_of(&self, code_unit: &CodeUnit) -> Vec<String> {
         self.inner
             .signatures_of(code_unit)
-            .into_iter()
+            .iter()
             .map(|signature| {
                 if self.inner.is_type_alias(code_unit) && !signature.ends_with(';') {
                     format!("{signature};")
