@@ -1149,7 +1149,10 @@ mod tests {
 
     #[test]
     fn split_logical_lines_handles_crlf_lf_and_lone_cr() {
-        assert_eq!(super::split_logical_lines("a\r\nb\r\nc"), vec!["a", "b", "c"]);
+        assert_eq!(
+            super::split_logical_lines("a\r\nb\r\nc"),
+            vec!["a", "b", "c"]
+        );
         assert_eq!(super::split_logical_lines("a\nb\nc"), vec!["a", "b", "c"]);
         assert_eq!(super::split_logical_lines("a\rb\rc"), vec!["a", "b", "c"]);
         assert_eq!(super::split_logical_lines("a\r\n"), vec!["a"]);
