@@ -3,7 +3,7 @@ use brokk_analyzer::{
     Project, ProjectFile, TestProject, TypeAliasProvider,
 };
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tempfile::tempdir;
 
 fn go_fixture_project() -> TestProject {
@@ -188,10 +188,14 @@ fn go_module_helpers_and_updates_match_expected_behavior() {
         GoAnalyzer::format_test_module(Path::new("a\\b\\c"))
     );
 
-    let root = Path::new("/tmp/go-modules");
+    let root: PathBuf = if cfg!(windows) {
+        PathBuf::from("C:\\tmp\\go-modules")
+    } else {
+        PathBuf::from("/tmp/go-modules")
+    };
     let modules = GoAnalyzer::get_test_modules_static(&[
-        ProjectFile::new(root, "callbacks/test.go"),
-        ProjectFile::new(root, "main_test.go"),
+        ProjectFile::new(root.clone(), "callbacks/test.go"),
+        ProjectFile::new(root.clone(), "main_test.go"),
     ]);
     assert_eq!(vec![".".to_string(), "./callbacks".to_string()], modules);
 
