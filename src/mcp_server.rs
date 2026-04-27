@@ -178,9 +178,9 @@ fn list_tools_result() -> Value {
                 symbol_names_schema(),
             ),
             tool_descriptor(
-                "get_file_summaries",
-                "Return ranged summaries for matching files.",
-                file_patterns_schema(),
+                "get_summaries",
+                "Return ranged summaries for matching files, globs, or class targets.",
+                summaries_schema(),
             ),
             tool_descriptor(
                 "summarize_symbols",
@@ -270,6 +270,20 @@ fn file_patterns_schema() -> Value {
             }
         },
         "required": ["file_patterns"]
+    })
+}
+
+fn summaries_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "targets": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Project-relative file paths, glob patterns, or class names."
+            }
+        },
+        "required": ["targets"]
     })
 }
 

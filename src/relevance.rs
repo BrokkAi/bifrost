@@ -107,6 +107,59 @@ pub(crate) fn most_relevant_project_files(
     results
 }
 
+pub(crate) fn most_important_project_files(
+    analyzer: &dyn IAnalyzer,
+    candidates: &[ProjectFile],
+    top_k: usize,
+) -> Vec<ProjectFile> {
+    let _scope = profiling::scope("relevance::most_important_project_files");
+    if top_k == 0 || candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let Some(repo) = GitProjectContext::discover(analyzer.project().root()) else {
+        return Vec::new();
+    };
+    let candidate_set: HashSet<_> = candidates.iter().cloned().collect();
+    if !candidate_set
+        .iter()
+        .any(|file| repo.is_tracked_in_head(file))
+    {
+        return Vec::new();
+    }
+
+    let Ok(changes) = repo.recent_commit_changes(COMMITS_TO_PROCESS) else {
+        return Vec::new();
+    };
+    if changes.is_empty() {
+        return Vec::new();
+    }
+
+    let mut scores: HashMap<ProjectFile, f64> = HashMap::default();
+    let mut canonicalizer = RenameCanonicalizer::default();
+    for (index, change) in changes.into_iter().enumerate() {
+        canonicalizer.record_renames(&change.renames);
+        let age_weight = 1.0 / ((index + 1) as f64);
+        for path in change.paths {
+            let canonical = canonicalizer.canonicalize(&path);
+            let Some(file) = repo.repo_path_to_project_file(&canonical) else {
+                continue;
+            };
+            if candidate_set.contains(&file) {
+                *scores.entry(file).or_insert(0.0) += age_weight;
+            }
+        }
+    }
+
+    let mut ranked = scores
+        .into_iter()
+        .map(|(file, score)| FileRelevance { file, score })
+        .collect::<Vec<_>>();
+    ranked.sort_by(compare_file_relevance);
+    ranked.truncate(top_k);
+    ranked.into_iter().map(|item| item.file).collect()
+}
+
 fn append_candidate(
     results: &mut Vec<ProjectFile>,
     seen: &mut HashSet<ProjectFile>,

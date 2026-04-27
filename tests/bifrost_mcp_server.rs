@@ -66,8 +66,9 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
         .as_array()
         .expect("tools array");
     assert!(tools.iter().any(|tool| tool["name"] == "search_symbols"));
+    assert!(tools.iter().any(|tool| tool["name"] == "get_summaries"));
     assert!(
-        tools
+        !tools
             .iter()
             .any(|tool| tool["name"] == "get_file_summaries")
     );
@@ -86,9 +87,9 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "id": 2,
             "method": "tools/call",
             "params": {
-                "name": "get_file_summaries",
+                "name": "get_summaries",
                 "arguments": {
-                    "file_patterns": ["A.java"]
+                    "targets": ["A.java"]
                 }
             }
         }),

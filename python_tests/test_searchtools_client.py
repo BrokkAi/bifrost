@@ -33,7 +33,7 @@ class SearchToolsClientTest(unittest.TestCase):
         with SearchToolsClient(
             root=self.fixture_root, library_path=self.library_path
         ) as client:
-            summaries = client.get_file_summaries(["A.java"])
+            summaries = client.get_summaries(["A.java"])
             text = summaries.render_text()
 
         self.assertIn("A.java", text)

@@ -16,7 +16,7 @@ fn fixture_root() -> PathBuf {
 fn python_boundary_returns_structured_json() {
     let mut service = SearchToolsService::new_for_python(fixture_root()).unwrap();
     let payload = service
-        .call_tool_json("get_file_summaries", r#"{"file_patterns":["A.java"]}"#)
+        .call_tool_json("get_summaries", r#"{"targets":["A.java"]}"#)
         .unwrap();
     let value: Value = serde_json::from_str(&payload).unwrap();
 
@@ -89,4 +89,62 @@ fn python_boundary_returns_most_relevant_files_json() {
         "payload: {value}"
     );
     assert_eq!(0, value["not_found"].as_array().unwrap().len());
+}
+
+#[test]
+fn search_symbols_limit_selects_git_important_file_then_renders_alphabetically() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("a_low.java"), "class ALow {}\n").unwrap();
+    fs::write(temp.path().join("z_high.java"), "class ZHigh {}\n").unwrap();
+    let repo = Repository::init(temp.path()).unwrap();
+    commit_paths(&repo, &["a_low.java"], "add low");
+    commit_paths(&repo, &["z_high.java"], "add high");
+    fs::write(
+        temp.path().join("z_high.java"),
+        "class ZHigh { int value; }\n",
+    )
+    .unwrap();
+    commit_paths(&repo, &["z_high.java"], "update high");
+
+    let mut service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "search_symbols",
+            r#"{"patterns":[".*"],"include_tests":true,"limit":1}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert_eq!(true, value["truncated"]);
+    let files = value["files"].as_array().unwrap();
+    assert_eq!(1, files.len(), "payload: {value}");
+    assert_eq!("z_high.java", files[0]["path"]);
+    assert_eq!("class ZHigh", files[0]["classes"][0]["signature"]);
+    assert_eq!(1, files[0]["classes"][0]["line"]);
+}
+
+fn commit_paths(repo: &Repository, paths: &[&str], message: &str) {
+    let mut index = repo.index().unwrap();
+    for path in paths {
+        index.add_path(std::path::Path::new(path)).unwrap();
+    }
+    index.write().unwrap();
+    let tree_id = index.write_tree().unwrap();
+    let tree = repo.find_tree(tree_id).unwrap();
+    let signature = Signature::now("Test User", "test@example.com").unwrap();
+    let parent = repo
+        .head()
+        .ok()
+        .and_then(|head| head.target())
+        .and_then(|oid| repo.find_commit(oid).ok());
+    let parents = parent.iter().collect::<Vec<_>>();
+    repo.commit(
+        Some("HEAD"),
+        &signature,
+        &signature,
+        message,
+        &tree,
+        &parents,
+    )
+    .unwrap();
 }

@@ -1,6 +1,6 @@
 use crate::analyzer::{CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, Range};
 use crate::profiling;
-use crate::relevance::most_relevant_project_files;
+use crate::relevance::{most_important_project_files, most_relevant_project_files};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use glob::Pattern;
 use rayon::prelude::*;
@@ -35,6 +35,11 @@ pub struct SymbolNamesParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FilePatternsParams {
     pub file_patterns: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SummariesParams {
+    pub targets: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,10 +78,17 @@ pub struct SearchSymbolsResult {
 pub struct SearchSymbolsFile {
     pub path: String,
     pub loc: usize,
-    pub classes: Vec<String>,
-    pub functions: Vec<String>,
-    pub fields: Vec<String>,
-    pub modules: Vec<String>,
+    pub classes: Vec<SearchSymbolHit>,
+    pub functions: Vec<SearchSymbolHit>,
+    pub fields: Vec<SearchSymbolHit>,
+    pub modules: Vec<SearchSymbolHit>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchSymbolHit {
+    pub symbol: String,
+    pub signature: String,
+    pub line: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -98,6 +110,13 @@ pub struct SymbolLocation {
 pub struct SummaryResult {
     pub summaries: Vec<SummaryBlock>,
     pub not_found: Vec<String>,
+    pub ambiguous: Vec<AmbiguousSymbol>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AmbiguousSymbol {
+    pub target: String,
+    pub matches: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -122,6 +141,7 @@ pub struct SummaryElement {
 pub struct SymbolSourcesResult {
     pub sources: Vec<SourceBlock>,
     pub not_found: Vec<String>,
+    pub ambiguous: Vec<AmbiguousSymbol>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -202,19 +222,21 @@ pub fn search_symbols(
 
     let effective_limit = params.limit.clamp(1, FILE_SEARCH_LIMIT);
     let truncated = grouped.len() > effective_limit;
-    let files = grouped
+    let selected_files =
+        select_files_for_display(analyzer, grouped.keys().cloned().collect(), effective_limit);
+    let files = selected_files
         .into_iter()
-        .take(effective_limit)
+        .filter_map(|file| grouped.remove(&file).map(|code_units| (file, code_units)))
         .map(|(file, code_units)| SearchSymbolsFile {
             path: rel_path_string(&file),
             loc: file
                 .read_to_string()
                 .map(|content| line_count(&content))
                 .unwrap_or(0),
-            classes: collect_kind_names(&code_units, CodeUnitType::Class),
-            functions: collect_kind_names(&code_units, CodeUnitType::Function),
-            fields: collect_kind_names(&code_units, CodeUnitType::Field),
-            modules: collect_kind_names(&code_units, CodeUnitType::Module),
+            classes: collect_kind_names(analyzer, &code_units, CodeUnitType::Class),
+            functions: collect_kind_names(analyzer, &code_units, CodeUnitType::Function),
+            fields: collect_kind_names(analyzer, &code_units, CodeUnitType::Field),
+            modules: collect_kind_names(analyzer, &code_units, CodeUnitType::Module),
         })
         .collect();
 
@@ -333,6 +355,85 @@ pub fn get_symbol_summaries(analyzer: &dyn IAnalyzer, params: SymbolNamesParams)
     SummaryResult {
         summaries,
         not_found,
+        ambiguous: Vec::new(),
+    }
+}
+
+#[derive(Debug)]
+struct SummaryTargets {
+    file_targets: Vec<ProjectFile>,
+    unmatched_file_targets: Vec<String>,
+    symbol_targets: Vec<String>,
+}
+
+enum SourceLookupOutcome {
+    Found(Vec<SourceBlock>),
+    NotFound(String),
+    Ambiguous(AmbiguousSymbol),
+}
+
+fn route_summary_targets(analyzer: &dyn IAnalyzer, targets: &[String]) -> SummaryTargets {
+    let mut file_targets = BTreeSet::new();
+    let mut unmatched_file_targets = Vec::new();
+    let mut symbol_targets = Vec::new();
+
+    for target in targets
+        .iter()
+        .map(|target| target.trim())
+        .filter(|target| !target.is_empty())
+    {
+        let matches = resolve_file_patterns(analyzer, &[target.to_string()]);
+        if !matches.is_empty() {
+            file_targets.extend(matches);
+            continue;
+        }
+
+        if looks_like_file_target(target) {
+            unmatched_file_targets.push(target.to_string());
+            continue;
+        }
+
+        symbol_targets.push(target.to_string());
+    }
+
+    SummaryTargets {
+        file_targets: file_targets.into_iter().collect(),
+        unmatched_file_targets,
+        symbol_targets,
+    }
+}
+
+fn summarize_symbol_targets(analyzer: &dyn IAnalyzer, targets: Vec<String>) -> SummaryResult {
+    let lookups = resolve_relaxed_lookups(analyzer, &targets, SymbolKindFilter::Class);
+    let mut summaries = Vec::new();
+    let mut not_found = Vec::new();
+    let mut ambiguous = Vec::new();
+
+    for target in targets {
+        match lookups.get(&target) {
+            Some(RelaxedLookup::Resolved(code_units)) => {
+                let start_len = summaries.len();
+                for code_unit in code_units {
+                    if let Some(block) = summary_block_for_code_unit(analyzer, code_unit) {
+                        summaries.push(block);
+                    }
+                }
+                if summaries.len() == start_len {
+                    not_found.push(target);
+                }
+            }
+            Some(RelaxedLookup::Ambiguous(matches)) => ambiguous.push(AmbiguousSymbol {
+                target,
+                matches: matches.clone(),
+            }),
+            Some(RelaxedLookup::NotFound) | None => not_found.push(target),
+        }
+    }
+
+    SummaryResult {
+        summaries,
+        not_found,
+        ambiguous,
     }
 }
 
@@ -352,43 +453,73 @@ pub fn get_symbol_sources(
         .take(max_symbols)
         .collect();
 
+    let lookups = resolve_relaxed_lookups(analyzer, &selected_symbols, params.kind_filter);
     let mut outcomes: Vec<_> = selected_symbols
         .into_par_iter()
         .enumerate()
-        .map(|(index, symbol)| {
-            let definitions = matching_definitions(analyzer, &symbol, params.kind_filter);
-            if definitions.is_empty() {
-                return (index, Err(symbol));
+        .map(|(index, symbol)| match lookups.get(&symbol) {
+            Some(RelaxedLookup::Resolved(code_units)) => {
+                let sources = code_units
+                    .iter()
+                    .flat_map(|code_unit| source_blocks_for_code_unit(analyzer, code_unit, true))
+                    .collect::<Vec<_>>();
+                if sources.is_empty() {
+                    (index, SourceLookupOutcome::NotFound(symbol))
+                } else {
+                    (index, SourceLookupOutcome::Found(sources))
+                }
             }
-
-            let sources = definitions
-                .into_iter()
-                .flat_map(|code_unit| source_blocks_for_code_unit(analyzer, &code_unit, true))
-                .collect::<Vec<_>>();
-
-            if sources.is_empty() {
-                (index, Err(symbol))
-            } else {
-                (index, Ok(sources))
-            }
+            Some(RelaxedLookup::Ambiguous(matches)) => (
+                index,
+                SourceLookupOutcome::Ambiguous(AmbiguousSymbol {
+                    target: symbol,
+                    matches: matches.clone(),
+                }),
+            ),
+            Some(RelaxedLookup::NotFound) | None => (index, SourceLookupOutcome::NotFound(symbol)),
         })
         .collect();
     outcomes.sort_by_key(|(index, _)| *index);
 
     let mut sources = Vec::new();
     let mut not_found = Vec::new();
+    let mut ambiguous = Vec::new();
     for (_, outcome) in outcomes {
         match outcome {
-            Ok(blocks) => sources.extend(dedup_source_blocks(blocks)),
-            Err(symbol) => not_found.push(symbol),
+            SourceLookupOutcome::Found(blocks) => sources.extend(dedup_source_blocks(blocks)),
+            SourceLookupOutcome::NotFound(symbol) => not_found.push(symbol),
+            SourceLookupOutcome::Ambiguous(item) => ambiguous.push(item),
         }
     }
 
-    SymbolSourcesResult { sources, not_found }
+    SymbolSourcesResult {
+        sources,
+        not_found,
+        ambiguous,
+    }
 }
 
-pub fn get_file_summaries(analyzer: &dyn IAnalyzer, params: FilePatternsParams) -> SummaryResult {
-    let files = resolve_file_patterns(analyzer, &params.file_patterns);
+pub fn get_summaries(analyzer: &dyn IAnalyzer, params: SummariesParams) -> SummaryResult {
+    let targets = strip_params(params.targets);
+    let summary_targets = route_summary_targets(analyzer, &targets);
+    let mut file_output = summarize_files(analyzer, summary_targets.file_targets);
+    let symbol_output = summarize_symbol_targets(analyzer, summary_targets.symbol_targets);
+
+    file_output.summaries.extend(symbol_output.summaries);
+    file_output
+        .not_found
+        .extend(summary_targets.unmatched_file_targets);
+    file_output.not_found.extend(symbol_output.not_found);
+    file_output.ambiguous.extend(symbol_output.ambiguous);
+    file_output.summaries.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then(left.label.cmp(&right.label))
+    });
+    file_output
+}
+
+fn summarize_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>) -> SummaryResult {
     let mut summaries: Vec<_> = files
         .into_par_iter()
         .filter_map(|file| {
@@ -418,6 +549,7 @@ pub fn get_file_summaries(analyzer: &dyn IAnalyzer, params: FilePatternsParams) 
     SummaryResult {
         summaries,
         not_found: Vec::new(),
+        ambiguous: Vec::new(),
     }
 }
 
@@ -428,10 +560,8 @@ pub fn skim_files(analyzer: &dyn IAnalyzer, params: FilePatternsParams) -> SkimF
 pub fn summarize_symbols(analyzer: &dyn IAnalyzer, params: FilePatternsParams) -> SkimFilesResult {
     let expanded = resolve_file_patterns(analyzer, &params.file_patterns);
     let truncated = expanded.len() > FILE_SKIM_LIMIT;
-    let files: Vec<_> = expanded
-        .into_iter()
-        .take(FILE_SKIM_LIMIT)
-        .collect::<Vec<_>>()
+    let selected = select_files_for_display(analyzer, expanded, FILE_SKIM_LIMIT);
+    let files: Vec<_> = selected
         .into_par_iter()
         .map(|file| {
             let loc = file
@@ -489,15 +619,38 @@ pub fn most_relevant_files(
     MostRelevantFilesResult { files, not_found }
 }
 
-fn collect_kind_names(code_units: &[CodeUnit], kind: CodeUnitType) -> Vec<String> {
-    let mut names: Vec<_> = code_units
+fn collect_kind_names(
+    analyzer: &dyn IAnalyzer,
+    code_units: &[CodeUnit],
+    kind: CodeUnitType,
+) -> Vec<SearchSymbolHit> {
+    let mut hits: Vec<_> = code_units
         .iter()
         .filter(|code_unit| code_unit.kind() == kind)
-        .map(CodeUnit::fq_name)
+        .flat_map(|code_unit| {
+            let line = primary_range(analyzer, code_unit)
+                .map(|range| range.start_line)
+                .unwrap_or(0);
+            display_signatures(analyzer, code_unit)
+                .into_iter()
+                .map(move |signature| SearchSymbolHit {
+                    symbol: code_unit.fq_name(),
+                    signature,
+                    line,
+                })
+        })
         .collect();
-    names.sort();
-    names.dedup();
-    names
+    hits.sort_by(|left, right| {
+        left.signature
+            .to_ascii_lowercase()
+            .cmp(&right.signature.to_ascii_lowercase())
+            .then(left.line.cmp(&right.line))
+            .then(left.symbol.cmp(&right.symbol))
+    });
+    hits.dedup_by(|left, right| {
+        left.symbol == right.symbol && left.signature == right.signature && left.line == right.line
+    });
+    hits
 }
 
 fn matching_definitions(
@@ -522,6 +675,119 @@ fn first_matching_definition(
         .next()
 }
 
+#[derive(Debug, Clone)]
+enum RelaxedLookup {
+    Resolved(Vec<CodeUnit>),
+    Ambiguous(Vec<String>),
+    NotFound,
+}
+
+fn resolve_relaxed_lookups(
+    analyzer: &dyn IAnalyzer,
+    symbols: &[String],
+    kind_filter: SymbolKindFilter,
+) -> BTreeMap<String, RelaxedLookup> {
+    let mut results = BTreeMap::new();
+    let mut unresolved = Vec::new();
+
+    for symbol in symbols {
+        if results.contains_key(symbol) {
+            continue;
+        }
+        let trimmed = symbol.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let definitions = matching_definitions(analyzer, trimmed, kind_filter);
+        if !definitions.is_empty() {
+            results.insert(symbol.clone(), RelaxedLookup::Resolved(definitions));
+            continue;
+        }
+
+        unresolved.push(symbol.clone());
+    }
+
+    if unresolved.is_empty() {
+        return results;
+    }
+
+    let declarations = analyzer.get_all_declarations();
+    for requested in unresolved {
+        let normalized = normalize_lookup_name(requested.trim());
+        if normalized.is_empty() {
+            results.insert(requested, RelaxedLookup::NotFound);
+            continue;
+        }
+
+        let mut matches = BTreeMap::new();
+        for candidate in &declarations {
+            collect_relaxed_match(&normalized, candidate, kind_filter, &mut matches);
+            if candidate.is_class() || candidate.is_module() {
+                for member in analyzer.get_members_in_class(candidate) {
+                    collect_relaxed_match(&normalized, &member, kind_filter, &mut matches);
+                }
+            }
+        }
+
+        let lookup = match matches.len() {
+            0 => RelaxedLookup::NotFound,
+            1 => RelaxedLookup::Resolved(vec![matches.into_values().next().expect("one match")]),
+            _ => RelaxedLookup::Ambiguous(matches.into_keys().collect()),
+        };
+        results.insert(requested, lookup);
+    }
+
+    results
+}
+
+fn collect_relaxed_match(
+    normalized_requested: &str,
+    candidate: &CodeUnit,
+    kind_filter: SymbolKindFilter,
+    matches: &mut BTreeMap<String, CodeUnit>,
+) {
+    if !matches_kind_filter(candidate, kind_filter) {
+        return;
+    }
+    if lookup_keys_for(candidate)
+        .iter()
+        .any(|key| key == normalized_requested)
+    {
+        matches
+            .entry(candidate.fq_name())
+            .or_insert_with(|| candidate.clone());
+    }
+}
+
+fn lookup_keys_for(code_unit: &CodeUnit) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    let normalized_fq_name = normalize_lookup_name(&code_unit.fq_name());
+    if !normalized_fq_name.is_empty() {
+        keys.insert(normalized_fq_name.clone());
+        for (index, _) in normalized_fq_name.match_indices('.') {
+            if index + 1 < normalized_fq_name.len() {
+                keys.insert(normalized_fq_name[index + 1..].to_string());
+            }
+        }
+    }
+
+    let normalized_short_name = normalize_lookup_name(code_unit.short_name());
+    if !normalized_short_name.is_empty() {
+        keys.insert(normalized_short_name);
+    }
+    let normalized_identifier = normalize_lookup_name(code_unit.identifier());
+    if !normalized_identifier.is_empty() {
+        keys.insert(normalized_identifier);
+    }
+
+    keys
+}
+
+fn normalize_lookup_name(name: &str) -> String {
+    name.replace('$', ".")
+}
+
 fn matches_kind_filter(code_unit: &CodeUnit, filter: SymbolKindFilter) -> bool {
     match filter {
         SymbolKindFilter::Any => true,
@@ -530,6 +796,23 @@ fn matches_kind_filter(code_unit: &CodeUnit, filter: SymbolKindFilter) -> bool {
         SymbolKindFilter::Field => code_unit.is_field(),
         SymbolKindFilter::Module => code_unit.is_module(),
     }
+}
+
+fn summary_block_for_code_unit(
+    analyzer: &dyn IAnalyzer,
+    code_unit: &CodeUnit,
+) -> Option<SummaryBlock> {
+    let elements = summary_elements_for_code_unit(analyzer, code_unit);
+    if elements.is_empty() {
+        return None;
+    }
+
+    Some(SummaryBlock {
+        label: code_unit.fq_name(),
+        path: rel_path_string(code_unit.source()),
+        preamble: file_preamble(code_unit.source(), &elements),
+        elements,
+    })
 }
 
 fn summary_elements_for_code_unit(
@@ -550,6 +833,48 @@ fn summary_elements_for_code_unit(
         }
     }
     elements
+}
+
+fn display_signatures(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> Vec<String> {
+    let signatures: Vec<_> = analyzer
+        .signatures(code_unit)
+        .iter()
+        .filter_map(|signature| {
+            let normalized = normalize_display_signature(signature);
+            (!normalized.is_empty()).then_some(normalized)
+        })
+        .collect();
+    if !signatures.is_empty() {
+        return signatures;
+    }
+
+    let fallback = match code_unit.kind() {
+        CodeUnitType::Class => format!("class {}", code_unit.identifier()),
+        CodeUnitType::Function => code_unit
+            .signature()
+            .map(|signature| format!("{}{}", code_unit.identifier(), signature))
+            .unwrap_or_else(|| format!("{}()", code_unit.identifier())),
+        CodeUnitType::Field => code_unit.identifier().to_string(),
+        CodeUnitType::Module => code_unit.short_name().to_string(),
+    };
+    vec![fallback]
+}
+
+fn normalize_display_signature(signature: &str) -> String {
+    let mut normalized = signature
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    while normalized.ends_with('{') {
+        normalized.pop();
+        normalized = normalized.trim_end().to_string();
+    }
+    normalized
 }
 
 fn signature_elements(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> Vec<SummaryElement> {
@@ -767,6 +1092,100 @@ fn resolve_file_patterns(analyzer: &dyn IAnalyzer, patterns: &[String]) -> Vec<P
     }
 
     matched.into_iter().collect()
+}
+
+fn select_files_for_display(
+    analyzer: &dyn IAnalyzer,
+    mut files: Vec<ProjectFile>,
+    limit: usize,
+) -> Vec<ProjectFile> {
+    files.sort();
+    files.dedup();
+    if files.len() <= limit {
+        return files;
+    }
+
+    let mut selected = most_important_project_files(analyzer, &files, limit);
+    let mut seen: BTreeSet<_> = selected.iter().cloned().collect();
+    if selected.len() < limit {
+        for file in &files {
+            if selected.len() >= limit {
+                break;
+            }
+            if seen.insert(file.clone()) {
+                selected.push(file.clone());
+            }
+        }
+    }
+    selected.sort();
+    selected.truncate(limit);
+    selected
+}
+
+fn looks_like_file_target(target: &str) -> bool {
+    if target == "."
+        || target.starts_with('.')
+        || target.contains('/')
+        || target.contains('\\')
+        || target.contains('*')
+        || target.contains('?')
+    {
+        return true;
+    }
+
+    let Some((_, extension)) = target.rsplit_once('.') else {
+        return false;
+    };
+    !extension.is_empty() && likely_file_target_extension(extension)
+}
+
+fn likely_file_target_extension(extension: &str) -> bool {
+    matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "c" | "cc"
+            | "cpp"
+            | "cs"
+            | "css"
+            | "cxx"
+            | "dart"
+            | "go"
+            | "gradle"
+            | "groovy"
+            | "h"
+            | "hpp"
+            | "htm"
+            | "html"
+            | "java"
+            | "js"
+            | "json"
+            | "jsx"
+            | "kt"
+            | "kts"
+            | "less"
+            | "m"
+            | "md"
+            | "mm"
+            | "php"
+            | "properties"
+            | "py"
+            | "rb"
+            | "rs"
+            | "sass"
+            | "scala"
+            | "scss"
+            | "sh"
+            | "sql"
+            | "svelte"
+            | "swift"
+            | "toml"
+            | "ts"
+            | "tsx"
+            | "txt"
+            | "vue"
+            | "xml"
+            | "yaml"
+            | "yml"
+    )
 }
 
 fn normalize_pattern(pattern: &str) -> String {

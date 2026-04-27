@@ -2,7 +2,7 @@ use crate::{
     AnalyzerConfig, FilesystemProject, Project, ProjectChangeWatcher, ProjectFile,
     WorkspaceAnalyzer,
     searchtools::{
-        MostRelevantFilesParams, RefreshParams, get_file_summaries, get_symbol_locations,
+        MostRelevantFilesParams, RefreshParams, get_summaries, get_symbol_locations,
         get_symbol_sources, get_symbol_summaries, most_relevant_files, refresh_result,
         search_symbols, skim_files, summarize_symbols,
     },
@@ -115,8 +115,8 @@ impl SearchToolsService {
             "get_symbol_sources" => self.decode_and_run(arguments, |workspace, params| {
                 get_symbol_sources(workspace.analyzer(), params)
             }),
-            "get_file_summaries" => self.decode_and_run(arguments, |workspace, params| {
-                get_file_summaries(workspace.analyzer(), params)
+            "get_summaries" => self.decode_and_run(arguments, |workspace, params| {
+                get_summaries(workspace.analyzer(), params)
             }),
             "summarize_symbols" => self.decode_and_run(arguments, |workspace, params| {
                 summarize_symbols(workspace.analyzer(), params)

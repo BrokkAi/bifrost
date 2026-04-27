@@ -1,6 +1,6 @@
 use brokk_analyzer::{
     GoAnalyzer, JavaAnalyzer, Language, TestProject,
-    searchtools::{FilePatternsParams, SummaryElement, get_file_summaries},
+    searchtools::{SummariesParams, SummaryElement, get_summaries},
 };
 
 fn java_fixture_analyzer() -> JavaAnalyzer {
@@ -44,10 +44,10 @@ fn render_summary_element(element: &SummaryElement) -> String {
 #[test]
 fn file_summaries_preserve_fixture_line_numbers() {
     let analyzer = java_fixture_analyzer();
-    let result = get_file_summaries(
+    let result = get_summaries(
         &analyzer,
-        FilePatternsParams {
-            file_patterns: vec!["A.java".to_string()],
+        SummariesParams {
+            targets: vec!["A.java".to_string()],
         },
     );
 
@@ -109,12 +109,53 @@ fn file_summaries_preserve_fixture_line_numbers() {
 }
 
 #[test]
+fn get_summaries_accepts_mixed_file_and_class_targets() {
+    let analyzer = java_fixture_analyzer();
+    let result = get_summaries(
+        &analyzer,
+        SummariesParams {
+            targets: vec!["A.java".to_string(), "A.AInner".to_string()],
+        },
+    );
+
+    assert!(result.not_found.is_empty(), "{:?}", result.not_found);
+    assert!(result.ambiguous.is_empty(), "{:?}", result.ambiguous);
+    assert!(
+        result
+            .summaries
+            .iter()
+            .any(|summary| summary.label == "A.java" && summary.path == "A.java")
+    );
+    assert!(
+        result
+            .summaries
+            .iter()
+            .any(|summary| summary.label == "A.AInner" && summary.path == "A.java")
+    );
+}
+
+#[test]
+fn get_summaries_reports_unmatched_file_like_targets() {
+    let analyzer = java_fixture_analyzer();
+    let result = get_summaries(
+        &analyzer,
+        SummariesParams {
+            targets: vec!["Missing.java".to_string()],
+        },
+    );
+
+    assert!(result.summaries.is_empty());
+    assert_eq!(vec!["Missing.java"], result.not_found);
+    assert!(result.ambiguous.is_empty());
+}
+
+#[test]
 fn go_file_summaries_use_full_declaration_ranges() {
     let analyzer = go_fixture_analyzer();
-    let result = get_file_summaries(
+    let result = get_summaries(
         &analyzer,
-        FilePatternsParams {
-            file_patterns: vec!["declarations.go".to_string()],
+        SummariesParams {
+            targets: vec!["declarations.go".to_string()],
         },
     );
 

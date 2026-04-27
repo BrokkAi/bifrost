@@ -115,7 +115,7 @@ This starts a stdio MCP server that publishes these tools:
 - `get_symbol_locations`
 - `get_symbol_summaries`
 - `get_symbol_sources`
-- `get_file_summaries`
+- `get_summaries`
 - `skim_files`
 - `most_relevant_files`
 
@@ -133,7 +133,7 @@ python - <<'PY'
 from bifrost_searchtools import SearchToolsClient
 
 with SearchToolsClient("tests/fixtures/testcode-java") as client:
-    print(client.get_file_summaries(["A.java"]).render_text())
+    print(client.get_summaries(["A.java"]).render_text())
     print(client.most_relevant_files(["A.java"]).render_text())
 PY
 ```
@@ -145,7 +145,7 @@ The client exposes:
 - `get_symbol_locations(...)`
 - `get_symbol_summaries(...)`
 - `get_symbol_sources(...)`
-- `get_file_summaries(...)`
+- `get_summaries(...)`
 - `skim_files(...)`
 - `most_relevant_files(...)`
 

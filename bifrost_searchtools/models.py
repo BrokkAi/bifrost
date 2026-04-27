@@ -10,35 +10,53 @@ def _render_numbered_block(text: str, start_line: int) -> str:
 
 
 @dataclass(frozen=True)
+class SearchSymbolHit:
+    symbol: str
+    signature: str
+    line: int
+
+    @classmethod
+    def from_dict(cls, data: dict) -> SearchSymbolHit:
+        return cls(
+            symbol=data["symbol"],
+            signature=data["signature"],
+            line=int(data["line"]),
+        )
+
+    def render_text(self) -> str:
+        return f"{self.line}: {self.signature}" if self.line > 0 else self.signature
+
+
+@dataclass(frozen=True)
 class SearchSymbolsFile:
     path: str
     loc: int
-    classes: list[str]
-    functions: list[str]
-    fields: list[str]
-    modules: list[str]
+    classes: list[SearchSymbolHit]
+    functions: list[SearchSymbolHit]
+    fields: list[SearchSymbolHit]
+    modules: list[SearchSymbolHit]
 
     @classmethod
     def from_dict(cls, data: dict) -> SearchSymbolsFile:
         return cls(
             path=data["path"],
             loc=data["loc"],
-            classes=list(data["classes"]),
-            functions=list(data["functions"]),
-            fields=list(data["fields"]),
-            modules=list(data["modules"]),
+            classes=[SearchSymbolHit.from_dict(item) for item in data["classes"]],
+            functions=[SearchSymbolHit.from_dict(item) for item in data["functions"]],
+            fields=[SearchSymbolHit.from_dict(item) for item in data["fields"]],
+            modules=[SearchSymbolHit.from_dict(item) for item in data["modules"]],
         )
 
     def render_text(self) -> str:
         lines = [f"{self.path} ({self.loc} lines)"]
         if self.classes:
-            lines.append(f"  classes: {', '.join(self.classes)}")
+            lines.extend(["  classes:", *[f"    {hit.render_text()}" for hit in self.classes]])
         if self.functions:
-            lines.append(f"  functions: {', '.join(self.functions)}")
+            lines.extend(["  functions:", *[f"    {hit.render_text()}" for hit in self.functions]])
         if self.fields:
-            lines.append(f"  fields: {', '.join(self.fields)}")
+            lines.extend(["  fields:", *[f"    {hit.render_text()}" for hit in self.fields]])
         if self.modules:
-            lines.append(f"  modules: {', '.join(self.modules)}")
+            lines.extend(["  modules:", *[f"    {hit.render_text()}" for hit in self.modules]])
         return "\n".join(lines)
 
 
@@ -116,6 +134,19 @@ class SymbolLocationsResult:
 
 
 @dataclass(frozen=True)
+class AmbiguousSymbol:
+    target: str
+    matches: list[str]
+
+    @classmethod
+    def from_dict(cls, data: dict) -> AmbiguousSymbol:
+        return cls(target=data["target"], matches=list(data["matches"]))
+
+    def render_text(self) -> str:
+        return f"Ambiguous {self.target}: {', '.join(self.matches)}"
+
+
+@dataclass(frozen=True)
 class SummaryElement:
     path: str
     symbol: str
@@ -175,12 +206,16 @@ class SummaryBlock:
 class SymbolSummariesResult:
     summaries: list[SummaryBlock]
     not_found: list[str]
+    ambiguous: list[AmbiguousSymbol]
 
     @classmethod
     def from_dict(cls, data: dict) -> SymbolSummariesResult:
         return cls(
             summaries=[SummaryBlock.from_dict(item) for item in data["summaries"]],
             not_found=list(data["not_found"]),
+            ambiguous=[
+                AmbiguousSymbol.from_dict(item) for item in data.get("ambiguous", [])
+            ],
         )
 
     @property
@@ -191,6 +226,7 @@ class SymbolSummariesResult:
         blocks = [summary.render_text() for summary in self.summaries]
         if self.not_found:
             blocks.append(f"Not found: {', '.join(self.not_found)}")
+        blocks.extend(item.render_text() for item in self.ambiguous)
         return "\n\n".join(blocks) if blocks else "No matching summaries found."
 
 
@@ -224,12 +260,16 @@ class SourceBlock:
 class SymbolSourcesResult:
     sources: list[SourceBlock]
     not_found: list[str]
+    ambiguous: list[AmbiguousSymbol]
 
     @classmethod
     def from_dict(cls, data: dict) -> SymbolSourcesResult:
         return cls(
             sources=[SourceBlock.from_dict(item) for item in data["sources"]],
             not_found=list(data["not_found"]),
+            ambiguous=[
+                AmbiguousSymbol.from_dict(item) for item in data.get("ambiguous", [])
+            ],
         )
 
     @property
@@ -240,6 +280,7 @@ class SymbolSourcesResult:
         blocks = [source.render_text() for source in self.sources]
         if self.not_found:
             blocks.append(f"Not found: {', '.join(self.not_found)}")
+        blocks.extend(item.render_text() for item in self.ambiguous)
         return "\n\n".join(blocks) if blocks else "No matching sources found."
 
 
