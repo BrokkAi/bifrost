@@ -43,7 +43,7 @@ This pass focused on targeted Analyzer changes discovered after the initial impl
 - `1e5e8cee1f` (2026-04-08) `fix: cover Go summary edge cases`
 - `fbbbe27f21` (2026-04-08) `fix: avoid bogus ranges on replicated Go members`
 
-The corresponding Bifrost commits include `2a599f1`, `6f9a265`, `3597cd0`, `d5efa5d`, `248b21d`, `2df819c`, `e71843f`, and `1b41e3f`. The Go summary edge-case port appears partial: Bifrost has receiver nesting, error-node recovery, external receiver methods, field ordering, preambles, and nested anonymous fields, but I did not find clear coverage for Brokk's grouped function-typed Go variable fix (`d0f073e4f2`) or the replicated-member range regression (`fbbbe27f21`).
+The corresponding Bifrost commits include `2a599f1`, `6f9a265`, `3597cd0`, `d5efa5d`, `248b21d`, `2df819c`, `e71843f`, and `1b41e3f`. The grouped function-typed Go variable behavior from `d0f073e4f2` is now covered by `test_grouped_function_typed_go_vars_are_reported_as_declarations`. The replicated-member range behavior from `fbbbe27f21` is now ported by keeping synthesized nested inline Go struct/interface members range-less, with coverage in `test_replicated_anonymous_go_struct_members_do_not_copy_source_ranges`.
 
 ### 3. SearchTools pass, 2026-04-27
 
@@ -64,8 +64,8 @@ The corresponding Bifrost commits are:
 Brokk Analyzer commits reviewed from after the 2026-04-08 targeted pass through 2026-04-27:
 
 - Already represented or Bifrost-local equivalent exists: Bifrost has its own 2026-04-23 analyzer performance pass (`c3a940a` through `04f4b4c`) covering clone allocation pressure, shared reverse import indexing, hash-backed state, child canonicalization, and file-read reductions.
-- Worth incorporating: `d0f073e4f2` if grouped function-typed Go vars should appear in summaries. This is small and directly in the Analyzer/SearchTools summary surface.
-- Worth incorporating: `fbbbe27f21` if Bifrost replicates source ranges onto synthesized sibling Go struct-field declarations. This should be verified with a focused Rust regression before porting because Bifrost's Go extraction is not a direct Java translation.
+- Incorporated after this review: `d0f073e4f2` is covered by a focused Go analyzer regression. Bifrost already discovered grouped `var (...)` function-typed declarations through its Rust parser path.
+- Incorporated after this review: `fbbbe27f21` is ported for inline Go struct/interface members. When a single inline container is shared by multiple field names, only the first branch keeps real source ranges; sibling synthesized nested members keep signatures and summary shape but have no misleading range.
 - Worth evaluating for feature parity, larger scope: `693d7a5909` adds JS/TS reference-graph usages with TSConfig alias resolution. This is relevant if Bifrost intends to grow `scan_usages`/usage-reference behavior, but it is not required for current SearchTools summary/source parity.
 - Worth evaluating for feature parity, larger scope: Brokk's code-quality series (`b1124b2df4`, `4a3e862b0e`, `1f54234ee1`, `6b55d10f20`, `251bdbdc93`, `5033ee30e8`, `5d0f8b63c7`, `e1441ff258`, `1311bc8c07`, `7245523a17`, `ef2ecd91f8`, `99eb85a22a`, `91b8187479`, `e44c78d490`, `d241605e50`, `4a0049f240`, `321d7b753c`) adds comment-density, complexity, exception-smell, low-value-test, assertion-smell, and clone-detection APIs. These are Analyzer-adjacent but outside Bifrost's current analyzer-backed SearchTools surface.
 - Probably not worth porting now: constant-extraction/refactor-only commits (`7ccee9dce3`, `8aa6facd12`, `ee6e4158ff`, `6c11f62326`, `de02db68aa`, `65bade94d7`) unless needed as prerequisites for a later behavior port.
@@ -84,9 +84,8 @@ Brokk SearchTools commits reviewed from after the 2026-03-24 initial implementat
 
 ## Recommended Follow-Ups
 
-1. Add a focused Go analyzer regression for grouped function-typed `var` declarations, then port the `d0f073e4f2` behavior if the regression currently fails.
-2. Add a focused Go analyzer regression for replicated anonymous struct-field sibling ranges, then port the `fbbbe27f21` behavior only if Bifrost currently assigns misleading ranges.
-3. Treat JS/TS reference-graph usages and code-quality APIs as separate feature ExecPlans, not as parity cleanup for the current SearchTools surface.
+1. Treat JS/TS reference-graph usages and code-quality APIs as separate feature ExecPlans, not as parity cleanup for the current SearchTools surface.
+2. If Bifrost grows a usage/search API beyond the current summary/source surface, re-evaluate Brokk `693d7a5909` first because it is the largest post-merge Analyzer behavior change that affects code navigation quality.
 
 ## Evidence Commands
 

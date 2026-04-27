@@ -151,6 +151,30 @@ impl ParsedFile {
         }
     }
 
+    pub fn add_code_unit_without_range(
+        &mut self,
+        code_unit: CodeUnit,
+        parent: Option<CodeUnit>,
+        top_level: Option<CodeUnit>,
+    ) {
+        if parent.is_none() {
+            self.top_level_declarations.push(code_unit.clone());
+        }
+
+        self.declarations.insert(code_unit.clone());
+
+        if let Some(parent) = parent {
+            self.children
+                .entry(parent)
+                .or_default()
+                .push(code_unit.clone());
+        }
+
+        if let Some(top_level) = top_level {
+            self.children.entry(top_level).or_default();
+        }
+    }
+
     pub fn replace_code_unit(
         &mut self,
         code_unit: CodeUnit,

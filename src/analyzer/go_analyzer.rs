@@ -716,11 +716,25 @@ fn visit_go_type_spec(
     parsed.add_signature(code_unit.clone(), go_type_signature(node, source));
 
     match type_node.kind() {
-        "struct_type" => {
-            visit_go_struct_fields(file, source, type_node, &code_unit, package_name, parsed)
-        }
+        "struct_type" => visit_go_struct_fields(
+            file,
+            source,
+            type_node,
+            &code_unit,
+            package_name,
+            parsed,
+            true,
+        ),
         "interface_type" => {
-            visit_go_interface_methods(file, source, type_node, &code_unit, package_name, parsed);
+            visit_go_interface_methods(
+                file,
+                source,
+                type_node,
+                &code_unit,
+                package_name,
+                parsed,
+                true,
+            );
         }
         _ => {}
     }
@@ -773,6 +787,7 @@ fn visit_go_struct_fields(
     parent: &CodeUnit,
     package_name: &str,
     parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+    record_ranges: bool,
 ) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
@@ -785,11 +800,14 @@ fn visit_go_struct_fields(
                 continue;
             }
             let suffix = go_struct_field_suffix(field, source);
-            let mut name_cursor = field.walk();
-            for name in field.named_children(&mut name_cursor) {
-                if name.kind() != "field_identifier" {
-                    continue;
-                }
+            let field_names: Vec<_> = {
+                let mut name_cursor = field.walk();
+                field
+                    .named_children(&mut name_cursor)
+                    .filter(|name| name.kind() == "field_identifier")
+                    .collect()
+            };
+            for (index, name) in field_names.into_iter().enumerate() {
                 let field_name = go_node_text(name, source).trim();
                 if field_name.is_empty() {
                     continue;
@@ -800,15 +818,24 @@ fn visit_go_struct_fields(
                     package_name.to_string(),
                     format!("{}.{}", parent.short_name(), field_name),
                 );
-                parsed.add_code_unit(
-                    code_unit.clone(),
-                    name,
-                    source,
-                    Some(parent.clone()),
-                    Some(parent.clone()),
-                );
+                if record_ranges {
+                    parsed.add_code_unit(
+                        code_unit.clone(),
+                        name,
+                        source,
+                        Some(parent.clone()),
+                        Some(parent.clone()),
+                    );
+                } else {
+                    parsed.add_code_unit_without_range(
+                        code_unit.clone(),
+                        Some(parent.clone()),
+                        Some(parent.clone()),
+                    );
+                }
                 parsed.add_signature(code_unit, format!("{field_name}{suffix}"));
                 if let Some(nested_type) = go_field_inline_container_type(field) {
+                    let nested_has_source_range = record_ranges && index == 0;
                     match nested_type.kind() {
                         "struct_type" => visit_go_struct_fields(
                             file,
@@ -822,6 +849,7 @@ fn visit_go_struct_fields(
                             ),
                             package_name,
                             parsed,
+                            nested_has_source_range,
                         ),
                         "interface_type" => visit_go_interface_methods(
                             file,
@@ -835,6 +863,7 @@ fn visit_go_struct_fields(
                             ),
                             package_name,
                             parsed,
+                            nested_has_source_range,
                         ),
                         _ => {}
                     }
@@ -851,6 +880,7 @@ fn visit_go_interface_methods(
     parent: &CodeUnit,
     package_name: &str,
     parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+    record_ranges: bool,
 ) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
@@ -875,13 +905,21 @@ fn visit_go_interface_methods(
             signature,
             false,
         );
-        parsed.add_code_unit(
-            code_unit.clone(),
-            child,
-            source,
-            Some(parent.clone()),
-            Some(parent.clone()),
-        );
+        if record_ranges {
+            parsed.add_code_unit(
+                code_unit.clone(),
+                child,
+                source,
+                Some(parent.clone()),
+                Some(parent.clone()),
+            );
+        } else {
+            parsed.add_code_unit_without_range(
+                code_unit.clone(),
+                Some(parent.clone()),
+                Some(parent.clone()),
+            );
+        }
         parsed.add_signature(code_unit, go_node_text(child, source).trim().to_string());
     }
 }

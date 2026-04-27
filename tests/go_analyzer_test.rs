@@ -257,6 +257,65 @@ fn test_go_summary_includes_nested_anonymous_struct_fields() {
 }
 
 #[test]
+fn test_grouped_function_typed_go_vars_are_reported_as_declarations() {
+    let analyzer = GoAnalyzer::from_project(inline_project(&[(
+        "debug.go",
+        r#"
+        package cli
+
+        var (
+            debugCaptureCmd   func() error
+            debugPortmapCmd   func() error
+            debugPeerRelayCmd func() error
+        )
+        "#,
+    )]));
+    let file = ProjectFile::new(analyzer.project().root().to_path_buf(), "debug.go");
+    let fq_names: BTreeSet<_> = analyzer
+        .get_declarations(&file)
+        .iter()
+        .map(CodeUnit::fq_name)
+        .collect();
+
+    assert_eq!(
+        BTreeSet::from([
+            "cli._module_.debugCaptureCmd".to_string(),
+            "cli._module_.debugPortmapCmd".to_string(),
+            "cli._module_.debugPeerRelayCmd".to_string(),
+        ]),
+        fq_names
+    );
+}
+
+#[test]
+fn test_replicated_anonymous_go_struct_members_do_not_copy_source_ranges() {
+    let analyzer = GoAnalyzer::from_project(inline_project(&[(
+        "settings.go",
+        r#"
+        package main
+
+        type prefs struct {
+            Config, OldConfig struct {
+                NodeID string
+            }
+        }
+        "#,
+    )]));
+
+    let original = definition(&analyzer, "main.prefs.Config.NodeID");
+    let replicated = definition(&analyzer, "main.prefs.OldConfig.NodeID");
+
+    assert!(
+        !analyzer.ranges_of(&original).is_empty(),
+        "the first inline member keeps the real source range"
+    );
+    assert!(
+        analyzer.ranges_of(&replicated).is_empty(),
+        "replicated sibling members should not reuse the first member's source range"
+    );
+}
+
+#[test]
 fn test_go_definitions_skeletons_and_members() {
     let analyzer = fixture_analyzer();
     let file = ProjectFile::new(analyzer.project().root().to_path_buf(), "declarations.go");
