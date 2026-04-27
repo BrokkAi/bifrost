@@ -83,18 +83,24 @@ jobs:
     name: python (${{ matrix.target }})
     needs: rust
     runs-on: ${{ matrix.runner }}
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
+            rustflags: ''
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
+            rustflags: ''
           - target: aarch64-apple-darwin
             runner: macos-latest
+            rustflags: '-C link-arg=-undefined -C link-arg=dynamic_lookup'
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
+            rustflags: ''
     steps:
       - uses: actions/checkout@v4
 
