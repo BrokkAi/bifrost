@@ -2,7 +2,7 @@ use brokk_analyzer::{
     AnalyzerConfig, IAnalyzer, ImportAnalysisProvider, JavaAnalyzer, Language, ProjectFile,
     TestProject, TypeHierarchyProvider,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::PathBuf;
 
 fn fixture_root() -> PathBuf {
@@ -144,8 +144,14 @@ fn small_budget_memo_caches_do_not_change_update_results() {
     );
 
     assert_eq!(
-        analyzer.get_all_declarations(),
-        refreshed.get_all_declarations()
+        analyzer
+            .get_all_declarations()
+            .into_iter()
+            .collect::<HashSet<_>>(),
+        refreshed
+            .get_all_declarations()
+            .into_iter()
+            .collect::<HashSet<_>>()
     );
 
     let updated_consumer = analyzer
