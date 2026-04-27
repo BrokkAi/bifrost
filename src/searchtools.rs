@@ -71,6 +71,7 @@ pub struct RefreshResult {
 pub struct SearchSymbolsResult {
     pub patterns: Vec<String>,
     pub truncated: bool,
+    pub total_files: usize,
     pub files: Vec<SearchSymbolsFile>,
 }
 
@@ -156,6 +157,7 @@ pub struct SourceBlock {
 #[derive(Debug, Clone, Serialize)]
 pub struct SkimFilesResult {
     pub truncated: bool,
+    pub total_files: usize,
     pub files: Vec<SkimFile>,
 }
 
@@ -221,7 +223,8 @@ pub fn search_symbols(
     }
 
     let effective_limit = params.limit.clamp(1, FILE_SEARCH_LIMIT);
-    let truncated = grouped.len() > effective_limit;
+    let total_files = grouped.len();
+    let truncated = total_files > effective_limit;
     let selected_files =
         select_files_for_display(analyzer, grouped.keys().cloned().collect(), effective_limit);
     let files = selected_files
@@ -243,6 +246,7 @@ pub fn search_symbols(
     SearchSymbolsResult {
         patterns,
         truncated,
+        total_files,
         files,
     }
 }
@@ -559,7 +563,8 @@ pub fn skim_files(analyzer: &dyn IAnalyzer, params: FilePatternsParams) -> SkimF
 
 pub fn summarize_symbols(analyzer: &dyn IAnalyzer, params: FilePatternsParams) -> SkimFilesResult {
     let expanded = resolve_file_patterns(analyzer, &params.file_patterns);
-    let truncated = expanded.len() > FILE_SKIM_LIMIT;
+    let total_files = expanded.len();
+    let truncated = total_files > FILE_SKIM_LIMIT;
     let selected = select_files_for_display(analyzer, expanded, FILE_SKIM_LIMIT);
     let files: Vec<_> = selected
         .into_par_iter()
@@ -581,7 +586,11 @@ pub fn summarize_symbols(analyzer: &dyn IAnalyzer, params: FilePatternsParams) -
         })
         .collect();
 
-    SkimFilesResult { truncated, files }
+    SkimFilesResult {
+        truncated,
+        total_files,
+        files,
+    }
 }
 
 pub fn most_relevant_files(

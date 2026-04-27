@@ -16,6 +16,7 @@ Bifrost is the Rust implementation of analyzer-backed search tools used by downs
 - [x] (2026-04-27T17:04Z) Updated `search_symbols` output and limited-result sorting.
 - [x] (2026-04-27T17:04Z) Updated MCP, service, Python client, README, and tests from `get_file_summaries` to `get_summaries`.
 - [x] (2026-04-27T17:04Z) Ran focused Rust validation and Python client validation. Full `cargo test` still reaches pre-existing external Brokk parity harness failures because the Brokk CLI/Gradle task is unavailable in this environment.
+- [x] (2026-04-27T18:21Z) Integrated `origin/optimize_selectFilesForDisplay` prompting improvements by adding total matched file counts to structured truncated results and updating Python renderers to explain recent-activity selection plus alphabetical display order.
 
 ## Surprises & Discoveries
 
@@ -27,6 +28,9 @@ Bifrost is the Rust implementation of analyzer-backed search tools used by downs
 
 - Observation: The broad Rust suite is blocked by the existing external Brokk reference harness, not by this searchtools change.
   Evidence: `cargo test` fails in `tests/most_relevant_files.rs` with `ClassNotFoundException: ai.brokk.tools.MostRelevantFilesCli` and missing Gradle task `:app:runMostRelevantFiles`.
+
+- Observation: The `origin/optimize_selectFilesForDisplay` prompting changes are Java text-output warnings, while Bifrost is structured-result-first.
+  Evidence: Bifrost exposes `truncated` booleans and Python renderers; the port adds `total_files` so renderers can say "showing N of M files selected by recent activity when available."
 
 ## Decision Log
 
@@ -41,6 +45,8 @@ Bifrost is the Rust implementation of analyzer-backed search tools used by downs
 ## Outcomes & Retrospective
 
 Implemented the revised Bifrost searchtools surface. `get_summaries` is now the public mixed target summary tool; `get_file_summaries` is no longer advertised by the MCP/service/Python surface. Search symbol results now return structured display signatures with line numbers, and limited file displays select by Git importance before stable alphabetical rendering. Focused Rust tests and Python client tests pass. Full `cargo test` remains blocked by the known external Brokk most-relevant-files parity harness dependency.
+
+Follow-up update: Bifrost now also carries the truncation prompting improvements from `origin/optimize_selectFilesForDisplay` through structured `total_files` metadata and Python text rendering.
 
 ## Context and Orientation
 

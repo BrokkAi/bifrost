@@ -64,6 +64,7 @@ class SearchSymbolsFile:
 class SearchSymbolsResult:
     patterns: list[str]
     truncated: bool
+    total_files: int
     files: list[SearchSymbolsFile]
 
     @classmethod
@@ -71,6 +72,7 @@ class SearchSymbolsResult:
         return cls(
             patterns=list(data["patterns"]),
             truncated=bool(data["truncated"]),
+            total_files=int(data.get("total_files", len(data["files"]))),
             files=[SearchSymbolsFile.from_dict(item) for item in data["files"]],
         )
 
@@ -84,7 +86,10 @@ class SearchSymbolsResult:
             return "No matching symbols found."
         text = "\n\n".join(blocks)
         if self.truncated:
-            text += "\n\nResults truncated."
+            text += (
+                f"\n\nResults truncated: showing {len(self.files)} of {self.total_files} "
+                "files selected by recent activity when available. Results are displayed alphabetically."
+            )
         return text
 
 
@@ -301,12 +306,14 @@ class SkimFile:
 @dataclass(frozen=True)
 class SkimFilesResult:
     truncated: bool
+    total_files: int
     files: list[SkimFile]
 
     @classmethod
     def from_dict(cls, data: dict) -> SkimFilesResult:
         return cls(
             truncated=bool(data["truncated"]),
+            total_files=int(data.get("total_files", len(data["files"]))),
             files=[SkimFile.from_dict(item) for item in data["files"]],
         )
 
@@ -320,7 +327,10 @@ class SkimFilesResult:
             return "No matching files found."
         text = "\n\n".join(blocks)
         if self.truncated:
-            text += "\n\nResults truncated."
+            text += (
+                f"\n\nResults truncated: showing {len(self.files)} of {self.total_files} "
+                "files selected by recent activity when available. Results are displayed alphabetically."
+            )
         return text
 
 
