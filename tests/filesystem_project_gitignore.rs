@@ -47,7 +47,7 @@ ignored_dir/
     let all_files = project.all_files().unwrap();
     let all_rel_paths: BTreeSet<_> = all_files
         .iter()
-        .map(|file| rel_path_forward_slash(file))
+        .map(rel_path_forward_slash)
         .collect();
     assert!(all_rel_paths.contains("src/main.rs"));
     assert!(all_rel_paths.contains("src/keep.py"));
@@ -58,7 +58,7 @@ ignored_dir/
     let rust_files = project.analyzable_files(Language::Rust).unwrap();
     let rust_rel_paths: BTreeSet<_> = rust_files
         .iter()
-        .map(|file| rel_path_forward_slash(file))
+        .map(rel_path_forward_slash)
         .collect();
     assert_eq!(rust_rel_paths, BTreeSet::from(["src/main.rs".to_string()]));
 
@@ -94,7 +94,7 @@ fn filesystem_project_works_outside_git_repo() {
     let all_files = project.all_files().unwrap();
     let all_rel_paths: BTreeSet<_> = all_files
         .iter()
-        .map(|file| rel_path_forward_slash(file))
+        .map(rel_path_forward_slash)
         .collect();
 
     assert!(all_rel_paths.contains("src/main.rs"));
@@ -103,7 +103,7 @@ fn filesystem_project_works_outside_git_repo() {
     let rust_files = project.analyzable_files(Language::Rust).unwrap();
     let rust_rel_paths: BTreeSet<_> = rust_files
         .iter()
-        .map(|file| rel_path_forward_slash(file))
+        .map(rel_path_forward_slash)
         .collect();
     assert_eq!(rust_rel_paths, BTreeSet::from(["src/main.rs".to_string()]));
 }
