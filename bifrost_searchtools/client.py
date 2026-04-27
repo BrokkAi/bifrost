@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 import importlib
+import importlib.machinery
 import importlib.util
 import json
 from pathlib import Path
@@ -221,7 +222,12 @@ def _load_native_module(library_path: Path | None) -> ModuleType:
                 "A different bifrost native library is already loaded in this process"
             )
 
-        spec = importlib.util.spec_from_file_location(_NATIVE_MODULE_NAME, library_path)
+        loader = importlib.machinery.ExtensionFileLoader(
+            _NATIVE_MODULE_NAME, str(library_path)
+        )
+        spec = importlib.util.spec_from_file_location(
+            _NATIVE_MODULE_NAME, library_path, loader=loader
+        )
         if spec is None or spec.loader is None:
             raise SearchToolsError(f"Could not load native module from {library_path}")
 
