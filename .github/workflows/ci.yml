@@ -10,8 +10,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  rust:
-    name: rust
+  fmt:
+    name: fmt
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -19,32 +19,100 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
-
-      - name: Cache cargo + target
-        uses: Swatinem/rust-cache@v2
+          components: rustfmt
 
       - name: cargo fmt --check
         run: cargo fmt --check
 
+  rust:
+    name: rust (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            can-test: true
+            rustflags: ''
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            can-test: true
+            rustflags: ''
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            can-test: true
+            rustflags: '-C link-arg=-undefined -C link-arg=dynamic_lookup'
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            can-test: true
+            rustflags: ''
+          - target: aarch64-pc-windows-msvc
+            runner: windows-latest
+            can-test: false
+            rustflags: ''
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
       - name: cargo clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features --target ${{ matrix.target }} -- -D warnings
 
       - name: cargo test
-        run: cargo test
+        if: matrix.can-test
+        run: cargo test --target ${{ matrix.target }}
 
   python:
-    name: python
-    runs-on: ubuntu-latest
+    name: python (${{ matrix.target }})
     needs: rust
+    runs-on: ${{ matrix.runner }}
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            rustflags: ''
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            rustflags: ''
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            rustflags: '-C link-arg=-undefined -C link-arg=dynamic_lookup'
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            rustflags: ''
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - name: Cache cargo + target
         uses: Swatinem/rust-cache@v2
+        with:
+          key: python-${{ matrix.target }}
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5

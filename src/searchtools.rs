@@ -1314,11 +1314,13 @@ fn split_logical_lines(content: &str) -> Vec<&str> {
 
     let mut lines = Vec::new();
     let mut start = 0usize;
-    for (index, ch) in content.char_indices() {
+    let mut iter = content.char_indices().peekable();
+    while let Some((index, ch)) = iter.next() {
         if ch == '\n' || ch == '\r' {
             lines.push(&content[start..index]);
-            if ch == '\r' && content[index + 1..].starts_with('\n') {
-                start = index + 2;
+            if ch == '\r' && matches!(iter.peek(), Some((_, '\n'))) {
+                let (next_index, _) = iter.next().unwrap();
+                start = next_index + 1;
             } else {
                 start = index + 1;
             }
@@ -1571,6 +1573,18 @@ mod tests {
     fn trims_synthetic_summary_lines() {
         assert_eq!(trim_summary_signature("class A {\n}\n"), "class A");
         assert_eq!(trim_summary_signature("[...]\n"), "");
+    }
+
+    #[test]
+    fn split_logical_lines_handles_crlf_lf_and_lone_cr() {
+        assert_eq!(
+            super::split_logical_lines("a\r\nb\r\nc"),
+            vec!["a", "b", "c"]
+        );
+        assert_eq!(super::split_logical_lines("a\nb\nc"), vec!["a", "b", "c"]);
+        assert_eq!(super::split_logical_lines("a\rb\rc"), vec!["a", "b", "c"]);
+        assert_eq!(super::split_logical_lines("a\r\n"), vec!["a"]);
+        assert_eq!(super::split_logical_lines(""), Vec::<&str>::new());
     }
 
     #[test]

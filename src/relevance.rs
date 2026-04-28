@@ -673,14 +673,22 @@ struct GitProjectContext {
 
 impl GitProjectContext {
     fn discover(project_root: &Path) -> Option<Self> {
-        let project_root = project_root.canonicalize().ok()?;
-        let repo = Repository::discover(&project_root).ok()?;
+        // Keep the caller's project_root as-given so ProjectFiles we build from
+        // git output compare equal to ProjectFiles supplied by the analyzer.
+        // Canonicalize only for repo discovery / prefix computation, since on
+        // macOS temp dirs come in via /var -> /private/var symlinks.
+        let project_root = project_root.to_path_buf();
+        let canonical_project = project_root.canonicalize().ok()?;
+        let repo = Repository::discover(&canonical_project).ok()?;
         let repo_root = repo.workdir()?.canonicalize().ok()?;
-        if !project_root.starts_with(&repo_root) {
+        if !canonical_project.starts_with(&repo_root) {
             return None;
         }
 
-        let repo_prefix = project_root.strip_prefix(&repo_root).ok()?.to_path_buf();
+        let repo_prefix = canonical_project
+            .strip_prefix(&repo_root)
+            .ok()?
+            .to_path_buf();
         Some(Self {
             repo,
             repo_root,

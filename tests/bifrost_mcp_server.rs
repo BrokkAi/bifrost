@@ -1,5 +1,5 @@
 use serde_json::{Value, json};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
 
 #[test]
@@ -22,11 +22,13 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
 
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
     let mut reader = BufReader::new(stdout);
 
     let initialize = round_trip(
         &mut stdin,
         &mut reader,
+        &mut stderr,
         json!({
             "jsonrpc": "2.0",
             "id": 0,
@@ -56,6 +58,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     let list_tools = round_trip(
         &mut stdin,
         &mut reader,
+        &mut stderr,
         json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -82,6 +85,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     let file_summaries = round_trip(
         &mut stdin,
         &mut reader,
+        &mut stderr,
         json!({
             "jsonrpc": "2.0",
             "id": 2,
@@ -102,6 +106,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     let summarize_symbols = round_trip(
         &mut stdin,
         &mut reader,
+        &mut stderr,
         json!({
             "jsonrpc": "2.0",
             "id": 3,
@@ -132,6 +137,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     let ping = round_trip(
         &mut stdin,
         &mut reader,
+        &mut stderr,
         json!({
             "jsonrpc": "2.0",
             "id": 4,
@@ -145,9 +151,14 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");
 }
 
-fn round_trip(stdin: &mut impl Write, reader: &mut impl BufRead, payload: Value) -> Value {
+fn round_trip(
+    stdin: &mut impl Write,
+    reader: &mut impl BufRead,
+    stderr: &mut impl Read,
+    payload: Value,
+) -> Value {
     write_line(stdin, payload);
-    read_line(reader)
+    read_line(reader, stderr)
 }
 
 fn write_line(stdin: &mut impl Write, payload: Value) {
@@ -155,9 +166,13 @@ fn write_line(stdin: &mut impl Write, payload: Value) {
     stdin.flush().expect("flush request");
 }
 
-fn read_line(reader: &mut impl BufRead) -> Value {
+fn read_line(reader: &mut impl BufRead, stderr: &mut impl Read) -> Value {
     let mut line = String::new();
     let bytes = reader.read_line(&mut line).expect("read response");
-    assert!(bytes > 0, "server closed before responding");
+    if bytes == 0 {
+        let mut buf = String::new();
+        let _ = stderr.read_to_string(&mut buf);
+        panic!("server closed before responding; stderr:\n{buf}");
+    }
     serde_json::from_str(&line).expect("valid json response")
 }
