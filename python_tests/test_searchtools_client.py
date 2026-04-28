@@ -25,7 +25,9 @@ def native_library_path() -> Path:
 class SearchToolsClientTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        subprocess.run(["cargo", "build", "--lib"], cwd=ROOT, check=True)
+        subprocess.run(
+            ["cargo", "build", "--lib", "--features", "python"], cwd=ROOT, check=True
+        )
         cls.library_path = native_library_path()
         cls.fixture_root = ROOT / "tests" / "fixtures" / "testcode-java"
 

@@ -13,6 +13,7 @@ build-backend = "maturin"
 bindings = "pyo3"
 module-name = "bifrost_searchtools._native"
 python-source = "."
+features = ["python"]
 
 [tool.uv]
 package = false

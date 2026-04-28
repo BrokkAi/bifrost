@@ -3,6 +3,7 @@ pub mod hash;
 pub mod mcp_server;
 pub mod profiling;
 mod project_watcher;
+#[cfg(feature = "python")]
 mod python_module;
 mod relevance;
 pub mod searchtools;
