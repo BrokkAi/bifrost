@@ -90,11 +90,11 @@ class SearchToolsClientTest(unittest.TestCase):
         self.assertNotIn("8: ", text_without_lines)
         self.assertNotIn("12: ", text_without_lines)
 
-    def test_summarize_symbols_matches_recursive_brokk_style_output(self) -> None:
+    def test_list_symbols_matches_recursive_brokk_style_output(self) -> None:
         with SearchToolsClient(
             root=self.fixture_root, library_path=self.library_path
         ) as client:
-            summaries = client.summarize_symbols(["A.java"])
+            summaries = client.list_symbols(["A.java"])
             text = summaries.render_text()
 
         self.assertEqual(1, summaries.count)

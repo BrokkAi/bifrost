@@ -241,11 +241,11 @@ pub trait IAnalyzer: Send + Sync + Any {
         symbols
     }
 
-    fn summarize_symbols(&self, file: &ProjectFile) -> String {
-        self.summarize_symbols_with_types(file, &all_code_unit_types())
+    fn list_symbols(&self, file: &ProjectFile) -> String {
+        self.list_symbols_with_types(file, &all_code_unit_types())
     }
 
-    fn summarize_symbols_with_types(
+    fn list_symbols_with_types(
         &self,
         file: &ProjectFile,
         types: &BTreeSet<CodeUnitType>,

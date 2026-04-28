@@ -570,11 +570,7 @@ fn summarize_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>) -> Summary
     }
 }
 
-pub fn skim_files(analyzer: &dyn IAnalyzer, params: FilePatternsParams) -> SkimFilesResult {
-    summarize_symbols(analyzer, params)
-}
-
-pub fn summarize_symbols(analyzer: &dyn IAnalyzer, params: FilePatternsParams) -> SkimFilesResult {
+pub fn list_symbols(analyzer: &dyn IAnalyzer, params: FilePatternsParams) -> SkimFilesResult {
     let expanded = resolve_file_patterns(analyzer, &params.file_patterns);
     let total_files = expanded.len();
     let truncated = total_files > FILE_SKIM_LIMIT;
@@ -587,7 +583,7 @@ pub fn summarize_symbols(analyzer: &dyn IAnalyzer, params: FilePatternsParams) -
                 .map(|content| line_count(&content))
                 .unwrap_or(0);
             let lines = analyzer
-                .summarize_symbols(&file)
+                .list_symbols(&file)
                 .lines()
                 .map(str::to_string)
                 .collect();
@@ -1399,8 +1395,7 @@ fn language_name(language: Language) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        SourceBlock, SummaryElement, resolve_file_patterns, skim_files, summarize_symbols,
-        trim_summary_signature,
+        SourceBlock, SummaryElement, list_symbols, resolve_file_patterns, trim_summary_signature,
     };
     use crate::analyzer::{
         CodeUnit, DeclarationInfo, IAnalyzer, Language, Project, ProjectFile, Range,
@@ -1657,17 +1652,11 @@ mod tests {
     }
 
     #[test]
-    fn skim_file_tools_share_fast_literal_resolution() {
+    fn list_symbols_uses_fast_literal_resolution() {
         let root = std::env::current_dir().unwrap();
         let analyzer = CountingAnalyzer::new(root, &["A.java"]);
 
-        let _ = summarize_symbols(
-            &analyzer,
-            super::FilePatternsParams {
-                file_patterns: vec!["A.java".to_string()],
-            },
-        );
-        let _ = skim_files(
+        let _ = list_symbols(
             &analyzer,
             super::FilePatternsParams {
                 file_patterns: vec!["A.java".to_string()],

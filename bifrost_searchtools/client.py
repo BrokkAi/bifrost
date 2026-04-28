@@ -152,15 +152,9 @@ class SearchToolsClient:
             render_line_numbers=self._render_line_numbers,
         )
 
-    def summarize_symbols(self, file_patterns: list[str]) -> SkimFilesResult:
+    def list_symbols(self, file_patterns: list[str]) -> SkimFilesResult:
         return SkimFilesResult.from_dict(
-            self._call_tool("summarize_symbols", {"file_patterns": file_patterns}),
-            render_line_numbers=self._render_line_numbers,
-        )
-
-    def skim_files(self, file_patterns: list[str]) -> SkimFilesResult:
-        return SkimFilesResult.from_dict(
-            self._call_tool("skim_files", {"file_patterns": file_patterns}),
+            self._call_tool("list_symbols", {"file_patterns": file_patterns}),
             render_line_numbers=self._render_line_numbers,
         )
 

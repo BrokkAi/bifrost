@@ -202,13 +202,8 @@ fn list_tools_result() -> Value {
                 summaries_schema(),
             ),
             tool_descriptor(
-                "summarize_symbols",
-                "Return compact recursive symbol summaries for matching files.",
-                file_patterns_schema(),
-            ),
-            tool_descriptor(
-                "skim_files",
-                "Return compact symbol skim output for matching files.",
+                "list_symbols",
+                "Return compact recursive symbol outlines for matching files.",
                 file_patterns_schema(),
             ),
             tool_descriptor(

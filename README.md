@@ -118,7 +118,7 @@ This starts a stdio MCP server that publishes these tools:
 - `get_symbol_summaries`
 - `get_symbol_sources`
 - `get_summaries`
-- `skim_files`
+- `list_symbols`
 - `most_relevant_files`
 
 `activate_workspace` lets a host swap the analyzer's root mid-session without respawning the subprocess. The path must be absolute and is normalized to the nearest enclosing git root when one exists.
@@ -152,7 +152,7 @@ The client exposes:
 - `get_symbol_summaries(...)`
 - `get_symbol_sources(...)`
 - `get_summaries(...)`
-- `skim_files(...)`
+- `list_symbols(...)`
 - `most_relevant_files(...)`
 
 The client talks directly to Rust through a native extension module. The Python/Rust boundary stays JSON-shaped: Python sends tool names plus JSON arguments and Rust returns JSON result objects. Rendering still lives in the Python package:

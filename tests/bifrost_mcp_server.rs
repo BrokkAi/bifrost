@@ -77,7 +77,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             .iter()
             .any(|tool| tool["name"] == "get_file_summaries")
     );
-    assert!(tools.iter().any(|tool| tool["name"] == "summarize_symbols"));
+    assert!(tools.iter().any(|tool| tool["name"] == "list_symbols"));
     assert!(
         tools
             .iter()
@@ -105,7 +105,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     assert_eq!(3, structured["summaries"][0]["elements"][0]["start_line"]);
     assert_eq!(52, structured["summaries"][0]["elements"][0]["end_line"]);
 
-    let summarize_symbols = round_trip(
+    let list_symbols = round_trip(
         &mut stdin,
         &mut reader,
         &mut stderr,
@@ -114,14 +114,14 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "id": 3,
             "method": "tools/call",
             "params": {
-                "name": "summarize_symbols",
+                "name": "list_symbols",
                 "arguments": {
                     "file_patterns": ["A.java"]
                 }
             }
         }),
     );
-    let skim = &summarize_symbols["result"]["structuredContent"];
+    let skim = &list_symbols["result"]["structuredContent"];
     assert_eq!("A.java", skim["files"][0]["path"]);
     let lines = skim["files"][0]["lines"].as_array().expect("skim lines");
     assert!(lines.iter().any(|line| line.as_str() == Some("  - AInner")));

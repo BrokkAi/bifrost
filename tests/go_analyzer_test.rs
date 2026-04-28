@@ -163,7 +163,7 @@ fn test_go_summary_includes_methods_for_external_receiver_types() {
         - loadDiskCacheLocked
         - discardDiskCacheLocked
         "#,
-        &analyzer.summarize_symbols(&file),
+        &analyzer.list_symbols(&file),
     );
 }
 
@@ -199,7 +199,7 @@ fn test_go_summary_orders_same_file_receiver_methods_after_fields() {
           - snat
           - dnat
         "#,
-        &analyzer.summarize_symbols(&file),
+        &analyzer.list_symbols(&file),
     );
 }
 
@@ -213,7 +213,7 @@ fn test_go_summary_recovers_top_level_functions_from_error_nodes() {
         analyzer.project().root().to_path_buf(),
         "proxygroup_test.go",
     );
-    let summary = analyzer.summarize_symbols(&file);
+    let summary = analyzer.list_symbols(&file);
 
     assert!(
         summary.contains("- TestProxyGroup\n"),
@@ -252,7 +252,7 @@ fn test_go_summary_includes_nested_anonymous_struct_fields() {
               - LoginName
           - AdvertiseServices
         "#,
-        &analyzer.summarize_symbols(&file),
+        &analyzer.list_symbols(&file),
     );
 }
 

@@ -25,10 +25,10 @@ fn python_boundary_returns_structured_json() {
 }
 
 #[test]
-fn python_boundary_returns_summarize_symbols_json() {
+fn python_boundary_returns_list_symbols_json() {
     let mut service = SearchToolsService::new_for_python(fixture_root()).unwrap();
     let payload = service
-        .call_tool_json("summarize_symbols", r#"{"file_patterns":["A.java"]}"#)
+        .call_tool_json("list_symbols", r#"{"file_patterns":["A.java"]}"#)
         .unwrap();
     let value: Value = serde_json::from_str(&payload).unwrap();
 

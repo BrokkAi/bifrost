@@ -4,8 +4,8 @@ use crate::{
     searchtools::{
         ActivateWorkspaceParams, ActiveWorkspaceResult, GetActiveWorkspaceParams,
         MostRelevantFilesParams, RefreshParams, get_summaries, get_symbol_locations,
-        get_symbol_sources, get_symbol_summaries, most_relevant_files, refresh_result,
-        search_symbols, skim_files, summarize_symbols,
+        get_symbol_sources, get_symbol_summaries, list_symbols, most_relevant_files,
+        refresh_result, search_symbols,
     },
 };
 use serde::Serialize;
@@ -124,11 +124,8 @@ impl SearchToolsService {
             "get_summaries" => self.decode_and_run(arguments, |workspace, params| {
                 get_summaries(workspace.analyzer(), params)
             }),
-            "summarize_symbols" => self.decode_and_run(arguments, |workspace, params| {
-                summarize_symbols(workspace.analyzer(), params)
-            }),
-            "skim_files" => self.decode_and_run(arguments, |workspace, params| {
-                skim_files(workspace.analyzer(), params)
+            "list_symbols" => self.decode_and_run(arguments, |workspace, params| {
+                list_symbols(workspace.analyzer(), params)
             }),
             "most_relevant_files" => {
                 self.decode_and_run(arguments, |workspace, params: MostRelevantFilesParams| {

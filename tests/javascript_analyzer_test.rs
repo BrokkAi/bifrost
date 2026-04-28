@@ -482,7 +482,7 @@ fn test_build_related_identifiers_module_cu_and_field_signatures() {
           - greet
         - util
         "#,
-        &analyzer.summarize_symbols(&hello_file),
+        &analyzer.list_symbols(&hello_file),
     );
 
     let temp = tempdir().unwrap();

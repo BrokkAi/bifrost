@@ -193,7 +193,7 @@ fn resolves_relevant_wildcard_imports_to_known_project_types() {
 }
 
 #[test]
-fn summarize_symbols_renders_brokk_style_nested_output() {
+fn list_symbols_renders_brokk_style_nested_output() {
     let root = std::env::current_dir()
         .unwrap()
         .join("tests/fixtures/testcode-java")
@@ -203,7 +203,7 @@ fn summarize_symbols_renders_brokk_style_nested_output() {
     let analyzer = JavaAnalyzer::from_project(project);
     let file = ProjectFile::new(analyzer.project().root().to_path_buf(), "A.java");
 
-    let summary = analyzer.summarize_symbols(&file);
+    let summary = analyzer.list_symbols(&file);
 
     assert!(summary.starts_with("- A\n"));
     assert!(summary.contains("  - method1"));
@@ -213,7 +213,7 @@ fn summarize_symbols_renders_brokk_style_nested_output() {
 }
 
 #[test]
-fn summarize_symbols_renders_brokk_style_package_headers() {
+fn list_symbols_renders_brokk_style_package_headers() {
     let root = std::env::current_dir()
         .unwrap()
         .join("tests/fixtures/testcode-java")
@@ -223,7 +223,7 @@ fn summarize_symbols_renders_brokk_style_package_headers() {
     let analyzer = JavaAnalyzer::from_project(project);
     let file = ProjectFile::new(analyzer.project().root().to_path_buf(), "Packaged.java");
 
-    let summary = analyzer.summarize_symbols(&file);
+    let summary = analyzer.list_symbols(&file);
     let lines: Vec<_> = summary.lines().collect();
 
     assert_eq!(Some(&"# io.github.jbellis.brokk"), lines.first());
