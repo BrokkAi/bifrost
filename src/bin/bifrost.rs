@@ -37,6 +37,10 @@ fn run() -> Result<(), String> {
                 print_help();
                 return Ok(());
             }
+            "--version" | "-V" => {
+                println!("bifrost {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
             other => {
                 return Err(format!("Unknown argument: {other}"));
             }
@@ -55,4 +59,5 @@ fn run() -> Result<(), String> {
 
 fn print_help() {
     println!("Usage: bifrost --root PROJECT_ROOT --server searchtools");
+    println!("       bifrost --version");
 }
