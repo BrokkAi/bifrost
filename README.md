@@ -138,6 +138,8 @@ with SearchToolsClient("tests/fixtures/testcode-java") as client:
 PY
 ```
 
+Pass `render_line_numbers=False` to `SearchToolsClient(...)` to omit line numbers from rendered text while keeping the structured line metadata in the result objects.
+
 The client exposes:
 
 - `refresh()`

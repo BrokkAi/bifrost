@@ -38,6 +38,14 @@ class SearchToolsClientTest(unittest.TestCase):
             summaries = client.get_summaries(["A.java"])
             text = summaries.render_text()
 
+        with SearchToolsClient(
+            root=self.fixture_root,
+            library_path=self.library_path,
+            render_line_numbers=False,
+        ) as client:
+            summaries_without_lines = client.get_summaries(["A.java"])
+            text_without_lines = summaries_without_lines.render_text()
+
         self.assertIn("A.java", text)
         self.assertEqual("import java.util.function.Function;", summaries.summaries[0].preamble)
         self.assertEqual("A", summaries.summaries[0].elements[0].symbol)
@@ -47,6 +55,10 @@ class SearchToolsClientTest(unittest.TestCase):
         self.assertIn("41..43: public void method7()", text)
         self.assertNotIn("[...]", text)
         self.assertNotIn("{", text)
+        self.assertIn("public class A", text_without_lines)
+        self.assertNotIn("3..52:", text_without_lines)
+        self.assertNotIn("8..10:", text_without_lines)
+        self.assertNotIn("41..43:", text_without_lines)
 
     def test_symbol_sources_use_original_file_line_numbers(self) -> None:
         with SearchToolsClient(
@@ -57,11 +69,26 @@ class SearchToolsClientTest(unittest.TestCase):
             )
             text = sources.render_text()
 
+        with SearchToolsClient(
+            root=self.fixture_root,
+            library_path=self.library_path,
+            render_line_numbers=False,
+        ) as client:
+            sources_without_lines = client.get_symbol_sources(
+                ["A.method2"], kind_filter=SymbolKindFilter.FUNCTION
+            )
+            text_without_lines = sources_without_lines.render_text()
+
         self.assertEqual(2, sources.count)
         self.assertIn("A.method2 (A.java:8..10)", text)
         self.assertIn("A.method2 (A.java:12..15)", text)
         self.assertEqual(1, text.count("A.method2 (A.java:8..10)"))
         self.assertEqual(1, text.count("A.method2 (A.java:12..15)"))
+        self.assertIn("A.method2 (A.java)", text_without_lines)
+        self.assertNotIn(":8..10", text_without_lines)
+        self.assertNotIn(":12..15", text_without_lines)
+        self.assertNotIn("8: ", text_without_lines)
+        self.assertNotIn("12: ", text_without_lines)
 
     def test_summarize_symbols_matches_recursive_brokk_style_output(self) -> None:
         with SearchToolsClient(

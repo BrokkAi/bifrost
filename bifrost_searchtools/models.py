@@ -9,22 +9,32 @@ def _render_numbered_block(text: str, start_line: int) -> str:
     )
 
 
+def _render_block(text: str, start_line: int, render_line_numbers: bool) -> str:
+    if not render_line_numbers:
+        return text
+    return _render_numbered_block(text, start_line)
+
+
 @dataclass(frozen=True)
 class SearchSymbolHit:
     symbol: str
     signature: str
     line: int
+    render_line_numbers: bool = True
 
     @classmethod
-    def from_dict(cls, data: dict) -> SearchSymbolHit:
+    def from_dict(cls, data: dict, render_line_numbers: bool = True) -> SearchSymbolHit:
         return cls(
             symbol=data["symbol"],
             signature=data["signature"],
             line=int(data["line"]),
+            render_line_numbers=render_line_numbers,
         )
 
     def render_text(self) -> str:
-        return f"{self.line}: {self.signature}" if self.line > 0 else self.signature
+        if self.render_line_numbers and self.line > 0:
+            return f"{self.line}: {self.signature}"
+        return self.signature
 
 
 @dataclass(frozen=True)
@@ -35,28 +45,64 @@ class SearchSymbolsFile:
     functions: list[SearchSymbolHit]
     fields: list[SearchSymbolHit]
     modules: list[SearchSymbolHit]
+    render_line_numbers: bool = True
 
     @classmethod
-    def from_dict(cls, data: dict) -> SearchSymbolsFile:
+    def from_dict(
+        cls, data: dict, render_line_numbers: bool = True
+    ) -> SearchSymbolsFile:
         return cls(
             path=data["path"],
             loc=data["loc"],
-            classes=[SearchSymbolHit.from_dict(item) for item in data["classes"]],
-            functions=[SearchSymbolHit.from_dict(item) for item in data["functions"]],
-            fields=[SearchSymbolHit.from_dict(item) for item in data["fields"]],
-            modules=[SearchSymbolHit.from_dict(item) for item in data["modules"]],
+            classes=[
+                SearchSymbolHit.from_dict(item, render_line_numbers)
+                for item in data["classes"]
+            ],
+            functions=[
+                SearchSymbolHit.from_dict(item, render_line_numbers)
+                for item in data["functions"]
+            ],
+            fields=[
+                SearchSymbolHit.from_dict(item, render_line_numbers)
+                for item in data["fields"]
+            ],
+            modules=[
+                SearchSymbolHit.from_dict(item, render_line_numbers)
+                for item in data["modules"]
+            ],
+            render_line_numbers=render_line_numbers,
         )
 
     def render_text(self) -> str:
         lines = [f"{self.path} ({self.loc} lines)"]
         if self.classes:
-            lines.extend(["  classes:", *[f"    {hit.render_text()}" for hit in self.classes]])
+            lines.extend(
+                [
+                    "  classes:",
+                    *[f"    {hit.render_text()}" for hit in self.classes],
+                ]
+            )
         if self.functions:
-            lines.extend(["  functions:", *[f"    {hit.render_text()}" for hit in self.functions]])
+            lines.extend(
+                [
+                    "  functions:",
+                    *[f"    {hit.render_text()}" for hit in self.functions],
+                ]
+            )
         if self.fields:
-            lines.extend(["  fields:", *[f"    {hit.render_text()}" for hit in self.fields]])
+            lines.extend(
+                [
+                    "  fields:",
+                    *[f"    {hit.render_text()}" for hit in self.fields],
+                ]
+            )
         if self.modules:
-            lines.extend(["  modules:", *[f"    {hit.render_text()}" for hit in self.modules]])
+            lines.extend(
+                [
+                    "  modules:",
+                    *[f"    {hit.render_text()}" for hit in self.modules],
+                ]
+            )
         return "\n".join(lines)
 
 
@@ -66,14 +112,21 @@ class SearchSymbolsResult:
     truncated: bool
     total_files: int
     files: list[SearchSymbolsFile]
+    render_line_numbers: bool = True
 
     @classmethod
-    def from_dict(cls, data: dict) -> SearchSymbolsResult:
+    def from_dict(
+        cls, data: dict, render_line_numbers: bool = True
+    ) -> SearchSymbolsResult:
         return cls(
             patterns=list(data["patterns"]),
             truncated=bool(data["truncated"]),
             total_files=int(data.get("total_files", len(data["files"]))),
-            files=[SearchSymbolsFile.from_dict(item) for item in data["files"]],
+            files=[
+                SearchSymbolsFile.from_dict(item, render_line_numbers)
+                for item in data["files"]
+            ],
+            render_line_numbers=render_line_numbers,
         )
 
     @property
@@ -100,31 +153,42 @@ class SymbolLocation:
     loc: int
     start_line: int
     end_line: int
+    render_line_numbers: bool = True
 
     @classmethod
-    def from_dict(cls, data: dict) -> SymbolLocation:
+    def from_dict(cls, data: dict, render_line_numbers: bool = True) -> SymbolLocation:
         return cls(
             symbol=data["symbol"],
             path=data["path"],
             loc=data["loc"],
             start_line=data["start_line"],
             end_line=data["end_line"],
+            render_line_numbers=render_line_numbers,
         )
 
     def render_text(self) -> str:
-        return f"{self.symbol}: {self.path}:{self.start_line}..{self.end_line}"
+        if self.render_line_numbers:
+            return f"{self.symbol}: {self.path}:{self.start_line}..{self.end_line}"
+        return f"{self.symbol}: {self.path}"
 
 
 @dataclass(frozen=True)
 class SymbolLocationsResult:
     locations: list[SymbolLocation]
     not_found: list[str]
+    render_line_numbers: bool = True
 
     @classmethod
-    def from_dict(cls, data: dict) -> SymbolLocationsResult:
+    def from_dict(
+        cls, data: dict, render_line_numbers: bool = True
+    ) -> SymbolLocationsResult:
         return cls(
-            locations=[SymbolLocation.from_dict(item) for item in data["locations"]],
+            locations=[
+                SymbolLocation.from_dict(item, render_line_numbers)
+                for item in data["locations"]
+            ],
             not_found=list(data["not_found"]),
+            render_line_numbers=render_line_numbers,
         )
 
     @property
@@ -159,9 +223,10 @@ class SummaryElement:
     start_line: int
     end_line: int
     text: str
+    render_line_numbers: bool = True
 
     @classmethod
-    def from_dict(cls, data: dict) -> SummaryElement:
+    def from_dict(cls, data: dict, render_line_numbers: bool = True) -> SummaryElement:
         return cls(
             path=data["path"],
             symbol=data["symbol"],
@@ -169,12 +234,15 @@ class SummaryElement:
             start_line=data["start_line"],
             end_line=data["end_line"],
             text=data["text"],
+            render_line_numbers=render_line_numbers,
         )
 
     def render_text(self) -> str:
         lines = self.text.splitlines()
         if not lines:
             return ""
+        if not self.render_line_numbers:
+            return self.text
         if self.start_line == self.end_line:
             prefix = f"{self.start_line}: {lines[0]}"
         else:
@@ -188,21 +256,28 @@ class SummaryBlock:
     path: str
     preamble: str
     elements: list[SummaryElement]
+    render_line_numbers: bool = True
 
     @classmethod
-    def from_dict(cls, data: dict) -> SummaryBlock:
+    def from_dict(cls, data: dict, render_line_numbers: bool = True) -> SummaryBlock:
         return cls(
             label=data["label"],
             path=data["path"],
             preamble=data.get("preamble", ""),
-            elements=[SummaryElement.from_dict(item) for item in data["elements"]],
+            elements=[
+                SummaryElement.from_dict(item, render_line_numbers)
+                for item in data["elements"]
+            ],
+            render_line_numbers=render_line_numbers,
         )
 
     def render_text(self) -> str:
         blocks: list[str] = [self.path]
         if self.preamble:
             blocks.append(self.preamble)
-        rendered_elements = [element.render_text() for element in self.elements if element.text]
+        rendered_elements = [
+            element.render_text() for element in self.elements if element.text
+        ]
         blocks.extend(rendered_elements)
         return "\n".join(blocks).strip()
 
@@ -212,15 +287,22 @@ class SymbolSummariesResult:
     summaries: list[SummaryBlock]
     not_found: list[str]
     ambiguous: list[AmbiguousSymbol]
+    render_line_numbers: bool = True
 
     @classmethod
-    def from_dict(cls, data: dict) -> SymbolSummariesResult:
+    def from_dict(
+        cls, data: dict, render_line_numbers: bool = True
+    ) -> SymbolSummariesResult:
         return cls(
-            summaries=[SummaryBlock.from_dict(item) for item in data["summaries"]],
+            summaries=[
+                SummaryBlock.from_dict(item, render_line_numbers)
+                for item in data["summaries"]
+            ],
             not_found=list(data["not_found"]),
             ambiguous=[
                 AmbiguousSymbol.from_dict(item) for item in data.get("ambiguous", [])
             ],
+            render_line_numbers=render_line_numbers,
         )
 
     @property
@@ -245,20 +327,28 @@ class SourceBlock:
     start_line: int
     end_line: int
     text: str
+    render_line_numbers: bool = True
 
     @classmethod
-    def from_dict(cls, data: dict) -> SourceBlock:
+    def from_dict(cls, data: dict, render_line_numbers: bool = True) -> SourceBlock:
         return cls(
             label=data["label"],
             path=data["path"],
             start_line=data["start_line"],
             end_line=data["end_line"],
             text=data["text"],
+            render_line_numbers=render_line_numbers,
         )
 
     def render_text(self) -> str:
-        header = f"{self.label} ({self.path}:{self.start_line}..{self.end_line})"
-        return "\n".join([header, _render_numbered_block(self.text, self.start_line)])
+        header = (
+            f"{self.label} ({self.path}:{self.start_line}..{self.end_line})"
+            if self.render_line_numbers
+            else f"{self.label} ({self.path})"
+        )
+        return "\n".join(
+            [header, _render_block(self.text, self.start_line, self.render_line_numbers)]
+        )
 
 
 @dataclass(frozen=True)
@@ -266,15 +356,22 @@ class SymbolSourcesResult:
     sources: list[SourceBlock]
     not_found: list[str]
     ambiguous: list[AmbiguousSymbol]
+    render_line_numbers: bool = True
 
     @classmethod
-    def from_dict(cls, data: dict) -> SymbolSourcesResult:
+    def from_dict(
+        cls, data: dict, render_line_numbers: bool = True
+    ) -> SymbolSourcesResult:
         return cls(
-            sources=[SourceBlock.from_dict(item) for item in data["sources"]],
+            sources=[
+                SourceBlock.from_dict(item, render_line_numbers)
+                for item in data["sources"]
+            ],
             not_found=list(data["not_found"]),
             ambiguous=[
                 AmbiguousSymbol.from_dict(item) for item in data.get("ambiguous", [])
             ],
+            render_line_numbers=render_line_numbers,
         )
 
     @property
@@ -294,10 +391,16 @@ class SkimFile:
     path: str
     loc: int
     lines: list[str]
+    render_line_numbers: bool = True
 
     @classmethod
-    def from_dict(cls, data: dict) -> SkimFile:
-        return cls(path=data["path"], loc=data["loc"], lines=list(data["lines"]))
+    def from_dict(cls, data: dict, render_line_numbers: bool = True) -> SkimFile:
+        return cls(
+            path=data["path"],
+            loc=data["loc"],
+            lines=list(data["lines"]),
+            render_line_numbers=render_line_numbers,
+        )
 
     def render_text(self) -> str:
         return "\n".join([f"{self.path} ({self.loc} lines)", *self.lines])
@@ -308,13 +411,20 @@ class SkimFilesResult:
     truncated: bool
     total_files: int
     files: list[SkimFile]
+    render_line_numbers: bool = True
 
     @classmethod
-    def from_dict(cls, data: dict) -> SkimFilesResult:
+    def from_dict(
+        cls, data: dict, render_line_numbers: bool = True
+    ) -> SkimFilesResult:
         return cls(
             truncated=bool(data["truncated"]),
             total_files=int(data.get("total_files", len(data["files"]))),
-            files=[SkimFile.from_dict(item) for item in data["files"]],
+            files=[
+                SkimFile.from_dict(item, render_line_numbers)
+                for item in data["files"]
+            ],
+            render_line_numbers=render_line_numbers,
         )
 
     @property
@@ -338,10 +448,17 @@ class SkimFilesResult:
 class MostRelevantFilesResult:
     files: list[str]
     not_found: list[str]
+    render_line_numbers: bool = True
 
     @classmethod
-    def from_dict(cls, data: dict) -> MostRelevantFilesResult:
-        return cls(files=list(data["files"]), not_found=list(data["not_found"]))
+    def from_dict(
+        cls, data: dict, render_line_numbers: bool = True
+    ) -> MostRelevantFilesResult:
+        return cls(
+            files=list(data["files"]),
+            not_found=list(data["not_found"]),
+            render_line_numbers=render_line_numbers,
+        )
 
     @property
     def count(self) -> int:

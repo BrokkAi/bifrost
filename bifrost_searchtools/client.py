@@ -51,11 +51,13 @@ class SearchToolsClient:
         self,
         root: Path | str,
         library_path: Path | str | None = None,
+        render_line_numbers: bool = True,
     ) -> None:
         self.root = Path(root).expanduser().resolve()
         self._library_path = (
             Path(library_path).expanduser().resolve() if library_path is not None else None
         )
+        self._render_line_numbers = render_line_numbers
         self._lock = threading.Lock()
         self._native = _load_native_module(self._library_path)
         self._runtime: _RuntimeState | None = None
@@ -98,7 +100,8 @@ class SearchToolsClient:
                     "include_tests": include_tests,
                     "limit": limit,
                 },
-            )
+            ),
+            render_line_numbers=self._render_line_numbers,
         )
 
     def get_symbol_locations(
@@ -111,7 +114,8 @@ class SearchToolsClient:
             self._call_tool(
                 "get_symbol_locations",
                 {"symbols": symbols, "kind_filter": kind_filter.value},
-            )
+            ),
+            render_line_numbers=self._render_line_numbers,
         )
 
     def get_symbol_summaries(
@@ -124,7 +128,8 @@ class SearchToolsClient:
             self._call_tool(
                 "get_symbol_summaries",
                 {"symbols": symbols, "kind_filter": kind_filter.value},
-            )
+            ),
+            render_line_numbers=self._render_line_numbers,
         )
 
     def get_symbol_sources(
@@ -137,22 +142,26 @@ class SearchToolsClient:
             self._call_tool(
                 "get_symbol_sources",
                 {"symbols": symbols, "kind_filter": kind_filter.value},
-            )
+            ),
+            render_line_numbers=self._render_line_numbers,
         )
 
     def get_summaries(self, targets: list[str]) -> FileSummariesResult:
         return FileSummariesResult.from_dict(
-            self._call_tool("get_summaries", {"targets": targets})
+            self._call_tool("get_summaries", {"targets": targets}),
+            render_line_numbers=self._render_line_numbers,
         )
 
     def summarize_symbols(self, file_patterns: list[str]) -> SkimFilesResult:
         return SkimFilesResult.from_dict(
-            self._call_tool("summarize_symbols", {"file_patterns": file_patterns})
+            self._call_tool("summarize_symbols", {"file_patterns": file_patterns}),
+            render_line_numbers=self._render_line_numbers,
         )
 
     def skim_files(self, file_patterns: list[str]) -> SkimFilesResult:
         return SkimFilesResult.from_dict(
-            self._call_tool("skim_files", {"file_patterns": file_patterns})
+            self._call_tool("skim_files", {"file_patterns": file_patterns}),
+            render_line_numbers=self._render_line_numbers,
         )
 
     def most_relevant_files(
@@ -165,7 +174,8 @@ class SearchToolsClient:
             self._call_tool(
                 "most_relevant_files",
                 {"seed_files": seed_files, "limit": limit},
-            )
+            ),
+            render_line_numbers=self._render_line_numbers,
         )
 
     def _call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
