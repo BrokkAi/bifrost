@@ -1,6 +1,6 @@
 [project]
 name = "bifrost-searchtools"
-version = "0.1.0"
+version = "0.1.1"
 description = "Python searchtools client backed by a native bifrost Rust extension"
 requires-python = ">=3.12"
 dependencies = []
