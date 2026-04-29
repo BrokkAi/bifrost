@@ -191,7 +191,11 @@ fn activate_workspace_idempotent_for_same_root() {
 #[test]
 fn activate_workspace_switches_to_new_root() {
     let temp = TempDir::new().unwrap();
-    fs::write(temp.path().join("Switched.java"), "public class Switched {}\n").unwrap();
+    fs::write(
+        temp.path().join("Switched.java"),
+        "public class Switched {}\n",
+    )
+    .unwrap();
     let new_root = temp.path().canonicalize().unwrap();
 
     let mut service = SearchToolsService::new_for_python(fixture_root()).unwrap();
@@ -216,7 +220,10 @@ fn activate_workspace_switches_to_new_root() {
 
     // The new workspace should index files from the new root, not the old one.
     let summary_payload = service
-        .call_tool_json("summarize_symbols", r#"{"file_patterns":["Switched.java"]}"#)
+        .call_tool_json(
+            "summarize_symbols",
+            r#"{"file_patterns":["Switched.java"]}"#,
+        )
         .unwrap();
     let summary_value: Value = serde_json::from_str(&summary_payload).unwrap();
     assert_eq!(summary_value["files"][0]["path"], "Switched.java");
@@ -249,7 +256,10 @@ fn activate_workspace_failure_preserves_existing_workspace() {
         .unwrap();
     let active_value: Value = serde_json::from_str(&active_payload).unwrap();
     let expected = fixture_root().canonicalize().unwrap();
-    assert_eq!(active_value["workspace_path"], expected.display().to_string());
+    assert_eq!(
+        active_value["workspace_path"],
+        expected.display().to_string()
+    );
 
     let summary_payload = service
         .call_tool_json("get_summaries", r#"{"targets":["A.java"]}"#)
