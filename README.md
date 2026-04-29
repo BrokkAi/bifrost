@@ -111,6 +111,8 @@ Run it against a project root:
 This starts a stdio MCP server that publishes these tools:
 
 - `refresh`
+- `activate_workspace`
+- `get_active_workspace`
 - `search_symbols`
 - `get_symbol_locations`
 - `get_symbol_summaries`
@@ -118,6 +120,8 @@ This starts a stdio MCP server that publishes these tools:
 - `get_summaries`
 - `skim_files`
 - `most_relevant_files`
+
+`activate_workspace` lets a host swap the analyzer's root mid-session without respawning the subprocess. The path must be absolute and is normalized to the nearest enclosing git root when one exists.
 
 The intended external manual client is the official MCP Inspector.
 
