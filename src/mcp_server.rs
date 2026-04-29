@@ -136,6 +136,25 @@ fn list_tools_result() -> Value {
                 "Refresh the analyzer snapshot for the current workspace.",
                 json_schema_object(&[]),
             ),
+            mutating_tool_descriptor(
+                "activate_workspace",
+                "Set the active workspace for this MCP server. The path must be absolute and is normalized to the nearest enclosing git root when one exists.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "workspace_path": {
+                            "type": "string",
+                            "description": "Absolute path to the desired workspace directory."
+                        }
+                    },
+                    "required": ["workspace_path"]
+                }),
+            ),
+            tool_descriptor(
+                "get_active_workspace",
+                "Return the currently active workspace root.",
+                json_schema_object(&[]),
+            ),
             tool_descriptor(
                 "search_symbols",
                 "Search indexed symbols across the current workspace.",
@@ -224,6 +243,20 @@ fn tool_descriptor(name: &str, description: &str, input_schema: Value) -> Value 
         "inputSchema": input_schema,
         "annotations": {
             "readOnlyHint": true,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false,
+        }
+    })
+}
+
+fn mutating_tool_descriptor(name: &str, description: &str, input_schema: Value) -> Value {
+    json!({
+        "name": name,
+        "description": description,
+        "inputSchema": input_schema,
+        "annotations": {
+            "readOnlyHint": false,
             "destructiveHint": false,
             "idempotentHint": true,
             "openWorldHint": false,
