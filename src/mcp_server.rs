@@ -138,7 +138,7 @@ fn list_tools_result() -> Value {
             ),
             mutating_tool_descriptor(
                 "activate_workspace",
-                "Set the active workspace for this MCP server. The path must be absolute and is normalized to the nearest enclosing git root when one exists.",
+                "Set the active workspace for this MCP server. The path must be absolute. If it lives inside a git repository, the active workspace becomes the nearest enclosing repository root (discovery walks parents until a .git is found); otherwise the canonicalized path is used as-is. Pass a path you intend to be the project root.",
                 json!({
                     "type": "object",
                     "properties": {
