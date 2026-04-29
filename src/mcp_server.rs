@@ -131,9 +131,28 @@ fn initialize_result() -> Value {
 fn list_tools_result() -> Value {
     json!({
         "tools": [
-            tool_descriptor(
+            mutating_tool_descriptor(
                 "refresh",
                 "Refresh the analyzer snapshot for the current workspace.",
+                json_schema_object(&[]),
+            ),
+            mutating_tool_descriptor(
+                "activate_workspace",
+                "Set the active workspace for this MCP server. The path must be absolute. If it lives inside a git repository, the active workspace becomes the nearest enclosing repository root (discovery walks parents until a .git is found); otherwise the canonicalized path is used as-is. Pass a path you intend to be the project root.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "workspace_path": {
+                            "type": "string",
+                            "description": "Absolute path to the desired workspace directory."
+                        }
+                    },
+                    "required": ["workspace_path"]
+                }),
+            ),
+            tool_descriptor(
+                "get_active_workspace",
+                "Return the currently active workspace root.",
                 json_schema_object(&[]),
             ),
             tool_descriptor(
@@ -224,6 +243,20 @@ fn tool_descriptor(name: &str, description: &str, input_schema: Value) -> Value 
         "inputSchema": input_schema,
         "annotations": {
             "readOnlyHint": true,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false,
+        }
+    })
+}
+
+fn mutating_tool_descriptor(name: &str, description: &str, input_schema: Value) -> Value {
+    json!({
+        "name": name,
+        "description": description,
+        "inputSchema": input_schema,
+        "annotations": {
+            "readOnlyHint": false,
             "destructiveHint": false,
             "idempotentHint": true,
             "openWorldHint": false,

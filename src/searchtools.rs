@@ -17,6 +17,14 @@ const CLASS_COUNT_LIMIT: usize = 10;
 pub struct RefreshParams {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivateWorkspaceParams {
+    pub workspace_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetActiveWorkspaceParams {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchSymbolsParams {
     pub patterns: Vec<String>,
     #[serde(default)]
@@ -65,6 +73,11 @@ pub struct RefreshResult {
     pub languages: Vec<String>,
     pub analyzed_files: usize,
     pub declarations: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ActiveWorkspaceResult {
+    pub workspace_path: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
