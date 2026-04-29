@@ -141,8 +141,17 @@ impl SearchToolsService {
         }
     }
 
+    // Note: `--root` and `new_for_python` take the path as-given (canonicalized
+    // by `FilesystemProject::new`) without git-root normalization, while
+    // `activate_workspace` normalizes to the nearest enclosing git root. As a
+    // result, calling `activate_workspace` with the same path that was passed
+    // at construction may rebuild the index when the path is a subdirectory of
+    // a git repository. The construction path is intentionally precise; hosts
+    // that want git-root semantics should call `activate_workspace` after
+    // start.
     fn new_with_strategy(root: PathBuf, update_strategy: UpdateStrategy) -> Result<Self, String> {
-        let (workspace, watcher) = build_workspace_state(root, update_strategy)?;
+        let (project, workspace) = build_workspace(root)?;
+        let watcher = maybe_start_watcher(project, update_strategy);
         Ok(Self {
             workspace,
             watcher,
@@ -188,21 +197,20 @@ impl SearchToolsService {
             return active_workspace_result(&resolved);
         }
 
-        // Build the new workspace state before mutating self so a failed switch
-        // leaves the existing workspace queryable.
-        let (new_workspace, new_watcher) =
-            build_workspace_state(resolved.clone(), self.update_strategy).map_err(|err| {
-                SearchToolsServiceError::invalid_params(format!(
-                    "Failed to activate workspace {}: {err}",
-                    resolved.display()
-                ))
-            })?;
+        // Build the new project + workspace before mutating self so a failed
+        // switch leaves the existing workspace queryable.
+        let (new_project, new_workspace) = build_workspace(resolved.clone()).map_err(|err| {
+            SearchToolsServiceError::invalid_params(format!(
+                "Failed to activate workspace {}: {err}",
+                resolved.display()
+            ))
+        })?;
 
-        // Drop the old watcher first to release its OS-level handle before the
-        // new one starts watching the same tree.
+        // Drop the old watcher first so its inotify/kqueue handle is released
+        // before we start watching the same tree from the new root.
         self.watcher = None;
         self.workspace = new_workspace;
-        self.watcher = new_watcher;
+        self.watcher = maybe_start_watcher(new_project, self.update_strategy);
 
         active_workspace_result(&resolved)
     }
@@ -261,19 +269,22 @@ impl SearchToolsService {
     }
 }
 
-fn build_workspace_state(
-    root: PathBuf,
-    update_strategy: UpdateStrategy,
-) -> Result<(WorkspaceAnalyzer, Option<ProjectChangeWatcher>), String> {
+fn build_workspace(root: PathBuf) -> Result<(Arc<dyn Project>, WorkspaceAnalyzer), String> {
     let project: Arc<dyn Project> = Arc::new(
         FilesystemProject::new(root)
             .map_err(|err| format!("Failed to initialize project root: {err}"))?,
     );
     let workspace = WorkspaceAnalyzer::build(Arc::clone(&project), AnalyzerConfig::default());
-    let watcher = match update_strategy {
+    Ok((project, workspace))
+}
+
+fn maybe_start_watcher(
+    project: Arc<dyn Project>,
+    update_strategy: UpdateStrategy,
+) -> Option<ProjectChangeWatcher> {
+    match update_strategy {
         UpdateStrategy::WatchFiles => ProjectChangeWatcher::start(project).ok(),
-    };
-    Ok((workspace, watcher))
+    }
 }
 
 // Resolve an absolute path to the nearest enclosing git root, falling back to

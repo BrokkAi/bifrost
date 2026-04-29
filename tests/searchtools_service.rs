@@ -223,6 +223,42 @@ fn activate_workspace_switches_to_new_root() {
 }
 
 #[test]
+fn activate_workspace_failure_preserves_existing_workspace() {
+    // Pointing activate at a regular file (not a directory) makes
+    // FilesystemProject::new reject the path. The existing workspace must
+    // still answer queries afterwards.
+    let temp = TempDir::new().unwrap();
+    let bad_path = temp.path().join("not_a_dir.txt");
+    fs::write(&bad_path, "not a directory").unwrap();
+    let bad_path = bad_path.canonicalize().unwrap();
+
+    let mut service = SearchToolsService::new_for_python(fixture_root()).unwrap();
+
+    let arguments = format!(
+        r#"{{"workspace_path":{}}}"#,
+        serde_json::to_string(&bad_path.display().to_string()).unwrap()
+    );
+    let err = service
+        .call_tool_json("activate_workspace", &arguments)
+        .unwrap_err();
+    assert_eq!(err.code, SearchToolsServiceErrorCode::InvalidParams);
+
+    // Original workspace must remain queryable.
+    let active_payload = service
+        .call_tool_json("get_active_workspace", "{}")
+        .unwrap();
+    let active_value: Value = serde_json::from_str(&active_payload).unwrap();
+    let expected = fixture_root().canonicalize().unwrap();
+    assert_eq!(active_value["workspace_path"], expected.display().to_string());
+
+    let summary_payload = service
+        .call_tool_json("get_summaries", r#"{"targets":["A.java"]}"#)
+        .unwrap();
+    let summary_value: Value = serde_json::from_str(&summary_payload).unwrap();
+    assert_eq!(summary_value["summaries"][0]["path"], "A.java");
+}
+
+#[test]
 fn activate_workspace_normalizes_to_git_root() {
     let temp = TempDir::new().unwrap();
     fs::write(temp.path().join("Top.java"), "public class Top {}\n").unwrap();

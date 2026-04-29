@@ -131,7 +131,7 @@ fn initialize_result() -> Value {
 fn list_tools_result() -> Value {
     json!({
         "tools": [
-            tool_descriptor(
+            mutating_tool_descriptor(
                 "refresh",
                 "Refresh the analyzer snapshot for the current workspace.",
                 json_schema_object(&[]),
