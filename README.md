@@ -7,10 +7,8 @@ At the library level, this repository builds the `brokk_analyzer` crate. It prov
 At the tool level, this repository also provides:
 
 - `bifrost`, a stdio MCP server that exposes analyzer-backed search tools
-- `bifrost_searchtools`, a Python client package backed by a native Rust extension
-
-Experimental:
-- `bifrost-search`, a semantic method/function indexer and search CLI backed by rvector.
+- `bifrost_searchtools`, a Python import package backed by a native Rust extension
+- `most_relevant_files`, a CLI that ranks related project files from one or more seed files
 
 ## Status
 
@@ -27,7 +25,9 @@ The current tree includes analyzers for:
 - PHP
 - Scala
 
-For local development, test commands, and release tagging, see [CONTRIBUTING.md](/home/jonathan/Projects/bifrost/CONTRIBUTING.md).
+## Contributing
+
+For local development, test commands, repository-local Python workflow, and release tagging, see [CONTRIBUTING.md](/home/jonathan/Projects/bifrost/CONTRIBUTING.md).
 
 ## Rust Library Usage
 
@@ -95,9 +95,23 @@ This starts a stdio MCP server that publishes these tools:
 
 The intended external manual client is the official MCP Inspector.
 
+## CLI
+
+Build the CLI binaries:
+
+```bash
+cargo build --bin bifrost --bin most_relevant_files
+```
+
+Rank related files from one or more seed files:
+
+```bash
+./target/debug/most_relevant_files --root /path/to/project path/to/seed_file.py
+```
+
 ## Python Client
 
-The Python package is `bifrost_searchtools`.
+The Python distribution is `bifrost-searchtools`. Import it as `bifrost_searchtools`.
 
 Example:
 
