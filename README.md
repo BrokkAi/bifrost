@@ -27,37 +27,7 @@ The current tree includes analyzers for:
 - PHP
 - Scala
 
-## Build
-
-Rust:
-
-```bash
-cargo build --lib --bin bifrost
-```
-
-Python client build/install:
-
-```bash
-maturin develop
-```
-
-This repository has a minimal pyproject.toml so `uv run python ...` can execute the `bifrost_searchtools` client against the official Python MCP SDK dependency.
-
-## Test
-
-Rust:
-
-```bash
-cargo test
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-```
-
-Python:
-
-```bash
-uv run python -m unittest discover -s python_tests -p 'test_*.py'
-```
+For local development, test commands, and release tagging, see [CONTRIBUTING.md](/home/jonathan/Projects/bifrost/CONTRIBUTING.md).
 
 ## Rust Library Usage
 
@@ -159,9 +129,3 @@ The client talks directly to Rust through a native extension module. The Python/
 
 - source blocks use original file line numbers
 - summaries use original line ranges in `N..M: ...` form on the first line
-
-For repo-local development without installing the package, `SearchToolsClient(..., library_path=...)` can load a built debug library such as `target/debug/libbrokk_analyzer.so`.
-
-## Notes
-
-- The Tree-sitter grammar crate versions are intentionally not forced to share the same numeric version. The policy is documented in [Cargo.toml](/home/jonathan/Projects/bifrost/Cargo.toml).
