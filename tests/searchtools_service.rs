@@ -220,10 +220,7 @@ fn activate_workspace_switches_to_new_root() {
 
     // The new workspace should index files from the new root, not the old one.
     let summary_payload = service
-        .call_tool_json(
-            "list_symbols",
-            r#"{"file_patterns":["Switched.java"]}"#,
-        )
+        .call_tool_json("list_symbols", r#"{"file_patterns":["Switched.java"]}"#)
         .unwrap();
     let summary_value: Value = serde_json::from_str(&summary_payload).unwrap();
     assert_eq!(summary_value["files"][0]["path"], "Switched.java");
