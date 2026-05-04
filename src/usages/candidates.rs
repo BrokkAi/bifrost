@@ -27,11 +27,7 @@ impl Default for ImportGraphCandidateProvider {
 }
 
 impl CandidateFileProvider for ImportGraphCandidateProvider {
-    fn find_candidates(
-        &self,
-        target: &CodeUnit,
-        analyzer: &dyn IAnalyzer,
-    ) -> HashSet<ProjectFile> {
+    fn find_candidates(&self, target: &CodeUnit, analyzer: &dyn IAnalyzer) -> HashSet<ProjectFile> {
         let mut candidates: HashSet<ProjectFile> = set_with_capacity(16);
 
         // (1) Polymorphic expansion: target + descendants of its parent type.
@@ -117,11 +113,7 @@ impl Default for TextSearchCandidateProvider {
 }
 
 impl CandidateFileProvider for TextSearchCandidateProvider {
-    fn find_candidates(
-        &self,
-        target: &CodeUnit,
-        analyzer: &dyn IAnalyzer,
-    ) -> HashSet<ProjectFile> {
+    fn find_candidates(&self, target: &CodeUnit, analyzer: &dyn IAnalyzer) -> HashSet<ProjectFile> {
         let identifier = target.identifier();
         if identifier.trim().is_empty() {
             return HashSet::default();
@@ -157,10 +149,10 @@ impl CandidateFileProvider for TextSearchCandidateProvider {
             let Ok(content) = file.read_to_string() else {
                 return;
             };
-            if content.contains(identifier) {
-                if let Ok(mut sink) = matches.lock() {
-                    sink.insert(file.clone());
-                }
+            if content.contains(identifier)
+                && let Ok(mut sink) = matches.lock()
+            {
+                sink.insert(file.clone());
             }
         });
 
@@ -186,11 +178,7 @@ where
     G: CandidateFileProvider,
     T: CandidateFileProvider,
 {
-    fn find_candidates(
-        &self,
-        target: &CodeUnit,
-        analyzer: &dyn IAnalyzer,
-    ) -> HashSet<ProjectFile> {
+    fn find_candidates(&self, target: &CodeUnit, analyzer: &dyn IAnalyzer) -> HashSet<ProjectFile> {
         let candidates = self.graph.find_candidates(target, analyzer);
         if candidates.is_empty() && !analyzer.is_empty() {
             return self.text.find_candidates(target, analyzer);

@@ -193,7 +193,9 @@ fn extract_usage_hits(
         }
 
         if !local.is_empty() {
-            let mut sink = collected.lock().expect("usage hit collector mutex poisoned");
+            let mut sink = collected
+                .lock()
+                .expect("usage hit collector mutex poisoned");
             sink.extend(local);
         }
     });

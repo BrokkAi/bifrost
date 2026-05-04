@@ -70,10 +70,7 @@ impl Language {
         const DEFAULT: &[&str] = &[r"\b$ident\b"];
 
         match (self, kind) {
-            (Language::Java, CodeUnitType::Function) => &[
-                r"\b$ident\s*\(",
-                r"::\s*$ident\b",
-            ],
+            (Language::Java, CodeUnitType::Function) => &[r"\b$ident\s*\(", r"::\s*$ident\b"],
             (Language::Java, CodeUnitType::Class) => &[
                 r"\bnew\s+$ident(?:<.+?>)?\s*\(",
                 r"\bextends\s+$ident(?:<.+?>)?",
@@ -86,9 +83,7 @@ impl Language {
                 r"\bimport\s+.*\.$ident\b",
             ],
 
-            (Language::Python, CodeUnitType::Function) => {
-                &[r"\b$ident\s*\(", r"\.$ident\s*\("]
-            }
+            (Language::Python, CodeUnitType::Function) => &[r"\b$ident\s*\(", r"\.$ident\s*\("],
             (Language::Python, CodeUnitType::Class) => &[
                 r"\b$ident\s*\(",
                 r"\bclass\s+\w+\s*\([^)]*$ident[^)]*\):",
@@ -99,9 +94,7 @@ impl Language {
                 r"\bimport\s+.*\.$ident\b",
             ],
 
-            (Language::Rust, CodeUnitType::Function) => {
-                &[r"\b$ident\s*\(", r"\.$ident\s*\("]
-            }
+            (Language::Rust, CodeUnitType::Function) => &[r"\b$ident\s*\(", r"\.$ident\s*\("],
             (Language::Rust, CodeUnitType::Class) => &[
                 r"\b$ident(?:<.+?>)?\s*\{",
                 r"\b$ident(?:<.+?>)?\s*\(",
@@ -114,11 +107,9 @@ impl Language {
                 r"\buse\s+[^{\n]*::$ident\b",
             ],
 
-            (Language::Cpp, CodeUnitType::Function) => &[
-                r"\b$ident\s*\(",
-                r"\.$ident\s*\(",
-                r"::\s*$ident\s*\(",
-            ],
+            (Language::Cpp, CodeUnitType::Function) => {
+                &[r"\b$ident\s*\(", r"\.$ident\s*\(", r"::\s*$ident\s*\("]
+            }
             (Language::Cpp, CodeUnitType::Class) => &[
                 r"\bnew\s+$ident(?:<.+?>)?\s*\(",
                 r"\bclass\s+\w+\s*:\s*public\s+$ident(?:<.+?>)?",
@@ -131,9 +122,7 @@ impl Language {
                 r#"#include\s+"$ident\.h""#,
             ],
 
-            (Language::Scala, CodeUnitType::Function) => {
-                &[r"\b$ident\s*\(", r"\.$ident\s*\("]
-            }
+            (Language::Scala, CodeUnitType::Function) => &[r"\b$ident\s*\(", r"\.$ident\s*\("],
             (Language::Scala, CodeUnitType::Class) => &[
                 r"\bnew\s+$ident(?:\[.+?\])?\s*\(",
                 r"\bextends\s+$ident(?:\[.+?\])?",

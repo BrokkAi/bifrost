@@ -11,6 +11,8 @@ use crate::usages::traits::{CandidateFileProvider, UsageAnalyzer};
 type DefaultCandidateProvider =
     FallbackCandidateProvider<ImportGraphCandidateProvider, TextSearchCandidateProvider>;
 
+type FileFilter = Box<dyn Fn(&ProjectFile) -> bool + Send + Sync>;
+
 pub const DEFAULT_MAX_FILES: usize = 1000;
 pub const DEFAULT_MAX_USAGES: usize = 1000;
 
@@ -30,7 +32,7 @@ pub struct QueryResult {
 pub struct UsageFinder {
     fallback_candidate_provider: DefaultCandidateProvider,
     fallback_usage_analyzer: Box<dyn UsageAnalyzer>,
-    file_filter: Option<Box<dyn Fn(&ProjectFile) -> bool + Send + Sync>>,
+    file_filter: Option<FileFilter>,
 }
 
 impl UsageFinder {
@@ -114,7 +116,8 @@ impl UsageFinder {
         max_files: usize,
         max_usages: usize,
     ) -> FuzzyResult {
-        self.query(analyzer, overloads, max_files, max_usages).result
+        self.query(analyzer, overloads, max_files, max_usages)
+            .result
     }
 
     pub fn find_usages_default(

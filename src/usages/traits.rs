@@ -18,9 +18,5 @@ pub trait UsageAnalyzer: Send + Sync {
 /// Implementations should favor false positives over false negatives — over-reporting
 /// candidates is fine; missing real call sites is not.
 pub trait CandidateFileProvider: Send + Sync {
-    fn find_candidates(
-        &self,
-        target: &CodeUnit,
-        analyzer: &dyn IAnalyzer,
-    ) -> HashSet<ProjectFile>;
+    fn find_candidates(&self, target: &CodeUnit, analyzer: &dyn IAnalyzer) -> HashSet<ProjectFile>;
 }

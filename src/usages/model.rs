@@ -428,12 +428,7 @@ mod tests {
         let mut targets = BTreeSet::new();
         targets.insert(unit.clone());
 
-        let result = FuzzyResult::ambiguous(
-            unit,
-            "bar".to_string(),
-            targets,
-            hits,
-        );
+        let result = FuzzyResult::ambiguous(unit, "bar".to_string(), targets, hits);
         let either = result.into_either().expect("ambiguous => Ok");
         assert!(either.contains(&high));
         assert_eq!(either.len(), 1);
