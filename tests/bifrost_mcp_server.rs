@@ -274,7 +274,7 @@ fn bifrost_searchtools_server_supports_runtime_workspace_switch() {
             "id": 4,
             "method": "tools/call",
             "params": {
-                "name": "summarize_symbols",
+                "name": "list_symbols",
                 "arguments": { "file_patterns": ["Switched.java"] }
             }
         }),
