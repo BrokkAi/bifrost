@@ -10,6 +10,7 @@ pub mod searchtools;
 pub mod searchtools_service;
 pub mod summary;
 mod text_utils;
+pub mod usages;
 
 pub use analyzer::{
     AnalyzerConfig, AnalyzerDelegate, CSharpAnalyzer, CapabilityProvider, CodeBaseMetrics,
