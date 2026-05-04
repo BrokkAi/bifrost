@@ -60,6 +60,99 @@ impl Language {
         }
         Language::None
     }
+
+    /// Regex templates for usage search, parameterized by `$ident` (a placeholder for the
+    /// quoted identifier). Mirrors `Language#getSearchPatterns` in brokk.
+    ///
+    /// The default fallback is `\b$ident\b` — a word-boundary literal match — used for any
+    /// `(language, kind)` pair without a specific override.
+    pub fn search_patterns(self, kind: CodeUnitType) -> &'static [&'static str] {
+        const DEFAULT: &[&str] = &[r"\b$ident\b"];
+
+        match (self, kind) {
+            (Language::Java, CodeUnitType::Function) => &[
+                r"\b$ident\s*\(",
+                r"::\s*$ident\b",
+            ],
+            (Language::Java, CodeUnitType::Class) => &[
+                r"\bnew\s+$ident(?:<.+?>)?\s*\(",
+                r"\bextends\s+$ident(?:<.+?>)?",
+                r"\bimplements\s+$ident(?:<.+?>)?",
+                r"\b$ident\s*\.",
+                r"\b$ident(?:<.+?>)?\s+\w+\s*[;=]",
+                r"\b$ident(?:<.+?>)?\s+\w+\s*\)",
+                r"<\s*$ident\s*>",
+                r"\(\s*$ident(?:<.+?>)?\s*\)",
+                r"\bimport\s+.*\.$ident\b",
+            ],
+
+            (Language::Python, CodeUnitType::Function) => {
+                &[r"\b$ident\s*\(", r"\.$ident\s*\("]
+            }
+            (Language::Python, CodeUnitType::Class) => &[
+                r"\b$ident\s*\(",
+                r"\bclass\s+\w+\s*\([^)]*$ident[^)]*\):",
+                r"\b$ident\s*\.",
+                r":\s*$ident\b",
+                r"->\s*$ident\b",
+                r"\bfrom\s+.*\s+import\s+.*$ident",
+                r"\bimport\s+.*\.$ident\b",
+            ],
+
+            (Language::Rust, CodeUnitType::Function) => {
+                &[r"\b$ident\s*\(", r"\.$ident\s*\("]
+            }
+            (Language::Rust, CodeUnitType::Class) => &[
+                r"\b$ident(?:<.+?>)?\s*\{",
+                r"\b$ident(?:<.+?>)?\s*\(",
+                r"\bimpl\s+[^{\n]+\s+for\s+$ident(?:<.+?>)?",
+                r"\bimpl(?:<.+?>)?\s+$ident(?:<.+?>)?",
+                r"\b$ident::",
+                r":\s*$ident(?:<.+?>)?",
+                r"->\s*$ident(?:<.+?>)?",
+                r"<\s*$ident\s*>",
+                r"\buse\s+[^{\n]*::$ident\b",
+            ],
+
+            (Language::Cpp, CodeUnitType::Function) => &[
+                r"\b$ident\s*\(",
+                r"\.$ident\s*\(",
+                r"::\s*$ident\s*\(",
+            ],
+            (Language::Cpp, CodeUnitType::Class) => &[
+                r"\bnew\s+$ident(?:<.+?>)?\s*\(",
+                r"\bclass\s+\w+\s*:\s*public\s+$ident(?:<.+?>)?",
+                r"\bclass\s+\w+\s*:\s*private\s+$ident(?:<.+?>)?",
+                r"\bclass\s+\w+\s*:\s*protected\s+$ident(?:<.+?>)?",
+                r"\b$ident(?:<.+?>)?\s+\w+\s*[;=]",
+                r"\b$ident(?:<.+?>)?\s*\*",
+                r"\b$ident(?:<.+?>)?\s*&",
+                r"<\s*$ident\s*>",
+                r#"#include\s+"$ident\.h""#,
+            ],
+
+            (Language::Scala, CodeUnitType::Function) => {
+                &[r"\b$ident\s*\(", r"\.$ident\s*\("]
+            }
+            (Language::Scala, CodeUnitType::Class) => &[
+                r"\bnew\s+$ident(?:\[.+?\])?\s*\(",
+                r"\bextends\s+$ident(?:\[.+?\])?",
+                r"\bwith\s+$ident(?:\[.+?\])?",
+                r"\b$ident\s*\.",
+                r":\s*$ident(?:\[.+?\])?",
+                r"<\s*$ident\s*>",
+                r"\[\s*$ident\s*\]",
+                r"\bcase\s+class\s+\w+.*:\s*$ident(?:\[.+?\])?",
+                r"\bimport\s+.*\.$ident\b",
+            ],
+
+            (Language::Go, CodeUnitType::Function) => &[r"\b$ident\s*\("],
+
+            // JavaScript / TypeScript / PHP / C# / Module / Field / None: fall back to the
+            // generic word-boundary match. JS/TS get their richer graph strategy elsewhere.
+            _ => DEFAULT,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
