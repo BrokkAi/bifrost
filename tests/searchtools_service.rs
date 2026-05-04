@@ -221,7 +221,7 @@ fn activate_workspace_switches_to_new_root() {
     // The new workspace should index files from the new root, not the old one.
     let summary_payload = service
         .call_tool_json(
-            "summarize_symbols",
+            "list_symbols",
             r#"{"file_patterns":["Switched.java"]}"#,
         )
         .unwrap();
