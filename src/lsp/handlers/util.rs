@@ -19,21 +19,27 @@ pub fn project_file_for_uri(project_root: &Path, uri: &Uri) -> Option<ProjectFil
             return None;
         }
     };
-    let rel_path = match abs_path.strip_prefix(project_root) {
-        Ok(rel) => rel,
-        Err(_) => {
-            eprintln!(
-                "[bifrost-lsp] ignoring path outside project root: {} (root: {})",
-                abs_path.display(),
-                project_root.display()
-            );
-            return None;
-        }
+    // Canonicalize so Windows extended-length paths (`\\?\C:\…` produced by
+    // FilesystemProject's canonicalize) line up with the URI-decoded path
+    // (`C:/…`). Fall back to the as-is path when canonicalize fails — for
+    // example, didChangeWatchedFiles DELETED events reference paths that no
+    // longer exist on disk.
+    let canonical = abs_path.canonicalize().unwrap_or_else(|_| abs_path.clone());
+    let rel_path = match canonical.strip_prefix(project_root) {
+        Ok(rel) => rel.to_path_buf(),
+        Err(_) => match abs_path.strip_prefix(project_root) {
+            Ok(rel) => rel.to_path_buf(),
+            Err(_) => {
+                eprintln!(
+                    "[bifrost-lsp] ignoring path outside project root: {} (root: {})",
+                    abs_path.display(),
+                    project_root.display()
+                );
+                return None;
+            }
+        },
     };
-    Some(ProjectFile::new(
-        project_root.to_path_buf(),
-        rel_path.to_path_buf(),
-    ))
+    Some(ProjectFile::new(project_root.to_path_buf(), rel_path))
 }
 
 /// Extract the alphanumeric/underscore identifier surrounding `offset` in

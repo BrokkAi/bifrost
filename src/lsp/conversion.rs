@@ -117,7 +117,27 @@ fn has_drive_letter_prefix(s: &str) -> bool {
 pub fn path_to_uri_string(path: &Path) -> String {
     let mut encoded = String::with_capacity(path.as_os_str().len() + 8);
     encoded.push_str("file://");
-    let s = path.to_string_lossy();
+    let raw = path.to_string_lossy();
+    // Windows `Path::canonicalize` returns extended-length paths like
+    // `\\?\C:\Users\foo`. The `\\?\` prefix is a Win32 implementation detail
+    // that should never appear in a URI; strip it before further processing.
+    #[cfg(windows)]
+    let raw: std::borrow::Cow<str> = if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        std::borrow::Cow::Owned(rest.to_string())
+    } else {
+        raw
+    };
+    // RFC 8089: Windows paths use forward slashes inside the URI. Translate
+    // backslashes once up front so the per-char loop below sees a uniform
+    // separator regardless of platform conventions.
+    #[cfg(windows)]
+    let s: std::borrow::Cow<str> = if raw.contains('\\') {
+        std::borrow::Cow::Owned(raw.replace('\\', "/"))
+    } else {
+        raw
+    };
+    #[cfg(not(windows))]
+    let s = raw;
     #[cfg(windows)]
     {
         if !s.starts_with('/') {

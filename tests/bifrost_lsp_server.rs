@@ -1,8 +1,19 @@
+use brokk_analyzer::lsp::conversion::path_to_uri_string;
 use serde_json::{Value, json};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use tempfile::TempDir;
+
+/// Build an LSP-correct `file://` URI for `path`. On Windows, `Path::display()`
+/// of a canonicalized path emits the extended-length form (`\\?\C:\…`) which
+/// is NOT a valid URI; the crate's path_to_uri_string handles drive letters,
+/// percent-encoding, and the leading-slash convention correctly. Tests use
+/// this helper instead of hand-rolling `format!("file://{}", path.display())`.
+fn uri_for(path: &Path) -> String {
+    path_to_uri_string(path)
+}
 
 #[test]
 fn bifrost_lsp_server_handles_initialize_and_shutdown() {
@@ -91,8 +102,8 @@ fn bifrost_lsp_server_returns_document_symbols_for_a_java() {
     let mut reader = BufReader::new(stdout);
 
     let canonical_root = fixture_root.canonicalize().expect("canon fixture");
-    let root_uri = format!("file://{}", canonical_root.display());
-    let file_uri = format!("file://{}/A.java", canonical_root.display());
+    let root_uri = uri_for(&canonical_root);
+    let file_uri = uri_for(&canonical_root.join("A.java"));
 
     write_message(
         &mut stdin,
@@ -198,7 +209,7 @@ fn bifrost_lsp_server_workspace_symbol_finds_method() {
     let mut reader = BufReader::new(stdout);
 
     let canonical_root = fixture_root.canonicalize().expect("canon fixture");
-    let root_uri = format!("file://{}", canonical_root.display());
+    let root_uri = uri_for(&canonical_root);
 
     write_message(
         &mut stdin,
@@ -276,8 +287,8 @@ fn bifrost_lsp_server_goto_definition_finds_class_a_from_b() {
     let mut reader = BufReader::new(stdout);
 
     let canonical_root = fixture_root.canonicalize().expect("canon fixture");
-    let root_uri = format!("file://{}", canonical_root.display());
-    let b_uri = format!("file://{}/B.java", canonical_root.display());
+    let root_uri = uri_for(&canonical_root);
+    let b_uri = uri_for(&canonical_root.join("B.java"));
 
     write_message(
         &mut stdin,
@@ -363,8 +374,8 @@ fn bifrost_lsp_server_hover_returns_signature_for_class_a() {
     let mut reader = BufReader::new(stdout);
 
     let canonical_root = fixture_root.canonicalize().expect("canon fixture");
-    let root_uri = format!("file://{}", canonical_root.display());
-    let b_uri = format!("file://{}/B.java", canonical_root.display());
+    let root_uri = uri_for(&canonical_root);
+    let b_uri = uri_for(&canonical_root.join("B.java"));
 
     write_message(
         &mut stdin,
@@ -453,8 +464,8 @@ fn bifrost_lsp_server_references_finds_class_a_usages() {
     let mut reader = BufReader::new(stdout);
 
     let canonical_root = fixture_root.canonicalize().expect("canon fixture");
-    let root_uri = format!("file://{}", canonical_root.display());
-    let a_uri = format!("file://{}/A.java", canonical_root.display());
+    let root_uri = uri_for(&canonical_root);
+    let a_uri = uri_for(&canonical_root.join("A.java"));
 
     write_message(
         &mut stdin,
@@ -564,8 +575,8 @@ fn bifrost_lsp_server_diagnostics_report_parse_error() {
     let mut stderr = child.stderr.take().expect("stderr");
     let mut reader = BufReader::new(stdout);
 
-    let root_uri = format!("file://{}", temp_root.display());
-    let bad_uri = format!("file://{}/Bad.java", temp_root.display());
+    let root_uri = uri_for(&temp_root);
+    let bad_uri = uri_for(&temp_root.join("Bad.java"));
 
     write_message(
         &mut stdin,
@@ -659,7 +670,7 @@ fn bifrost_lsp_server_diagnostics_edge_cases() {
     let mut stderr = child.stderr.take().expect("stderr");
     let mut reader = BufReader::new(stdout);
 
-    let root_uri = format!("file://{}", temp_root.display());
+    let root_uri = uri_for(&temp_root);
     write_message(
         &mut stdin,
         json!({
@@ -682,7 +693,7 @@ fn bifrost_lsp_server_diagnostics_edge_cases() {
     ];
     for (idx, (label, name)) in cases.iter().enumerate() {
         let id = (idx as u64) + 2;
-        let uri = format!("file://{}/{}", temp_root.display(), name);
+        let uri = uri_for(&temp_root.join(name));
         write_message(
             &mut stdin,
             json!({
@@ -743,8 +754,8 @@ fn bifrost_lsp_server_did_save_triggers_reindex() {
     let mut stderr = child.stderr.take().expect("stderr");
     let mut reader = BufReader::new(stdout);
 
-    let root_uri = format!("file://{}", temp_root.display());
-    let watch_uri = format!("file://{}/Watch.java", temp_root.display());
+    let root_uri = uri_for(&temp_root);
+    let watch_uri = uri_for(&temp_root.join("Watch.java"));
 
     write_message(
         &mut stdin,
@@ -858,8 +869,8 @@ fn bifrost_lsp_server_hover_uses_python_language_tag_for_py_file() {
     let mut reader = BufReader::new(stdout);
 
     let canonical_root = fixture_root.canonicalize().expect("canon fixture");
-    let root_uri = format!("file://{}", canonical_root.display());
-    let py_uri = format!("file://{}/documented.py", canonical_root.display());
+    let root_uri = uri_for(&canonical_root);
+    let py_uri = uri_for(&canonical_root.join("documented.py"));
 
     write_message(
         &mut stdin,
