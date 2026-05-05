@@ -4,11 +4,15 @@ use std::sync::Arc;
 use tempfile::tempdir;
 
 fn persistent_config(cache_dir: &Path, analysis_epoch: u64) -> AnalyzerConfig {
-    let mut config = AnalyzerConfig::default();
-    config.parallelism = Some(1);
-    config.persistence.cache_dir = Some(cache_dir.to_path_buf());
-    config.persistence.analysis_epoch = analysis_epoch;
-    config
+    AnalyzerConfig {
+        parallelism: Some(1),
+        persistence: brokk_analyzer::AnalyzerPersistenceConfig {
+            cache_dir: Some(cache_dir.to_path_buf()),
+            analysis_epoch,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
 }
 
 fn rust_analyzer(root: &Path, cache_dir: &Path, analysis_epoch: u64) -> RustAnalyzer {

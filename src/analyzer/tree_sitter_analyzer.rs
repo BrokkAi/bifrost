@@ -514,10 +514,10 @@ where
             }
         }
 
-        if existing.is_none() {
-            if let Some(cache) = cache.as_ref() {
-                cache.save(&files, adapter);
-            }
+        if existing.is_none()
+            && let Some(cache) = cache.as_ref()
+        {
+            cache.save(&files, adapter);
         }
 
         {
