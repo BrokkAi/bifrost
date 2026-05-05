@@ -8,6 +8,7 @@ mod java_analyzer;
 mod javascript_analyzer;
 mod model;
 mod multi_analyzer;
+mod persistence;
 mod php_analyzer;
 mod project;
 mod python_analyzer;
@@ -23,7 +24,7 @@ pub use capabilities::{
     TypeHierarchyProvider,
 };
 pub(crate) use capabilities::{build_reverse_import_index, direct_descendants_via_ancestors};
-pub use config::AnalyzerConfig;
+pub use config::{AnalyzerConfig, AnalyzerPersistenceConfig};
 pub use cpp_analyzer::CppAnalyzer;
 pub use csharp_analyzer::CSharpAnalyzer;
 pub use go_analyzer::GoAnalyzer;

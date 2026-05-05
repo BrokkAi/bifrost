@@ -1,6 +1,6 @@
 use brokk_analyzer::{
-    AnalyzerConfig, IAnalyzer, ImportAnalysisProvider, JavaAnalyzer, Language, ProjectFile,
-    TestProject, TypeHierarchyProvider,
+    AnalyzerConfig, AnalyzerPersistenceConfig, IAnalyzer, ImportAnalysisProvider, JavaAnalyzer,
+    Language, ProjectFile, TestProject, TypeHierarchyProvider,
 };
 use std::collections::{BTreeSet, HashSet};
 use std::path::PathBuf;
@@ -14,6 +14,13 @@ fn fixture_root() -> PathBuf {
 
 fn fixture_analyzer(config: AnalyzerConfig) -> JavaAnalyzer {
     JavaAnalyzer::from_project_with_config(TestProject::new(fixture_root(), Language::Java), config)
+}
+
+fn persistence_disabled() -> AnalyzerPersistenceConfig {
+    AnalyzerPersistenceConfig {
+        enabled: false,
+        ..Default::default()
+    }
 }
 
 fn temp_analyzer(
@@ -39,10 +46,12 @@ fn parallel_build_matches_sequential_build_observables() {
     let sequential = fixture_analyzer(AnalyzerConfig {
         parallelism: Some(1),
         memo_cache_budget_bytes: Some(1024 * 1024),
+        persistence: persistence_disabled(),
     });
     let parallel = fixture_analyzer(AnalyzerConfig {
         parallelism: Some(4),
         memo_cache_budget_bytes: Some(1024 * 1024),
+        persistence: persistence_disabled(),
     });
 
     assert_eq!(
@@ -88,6 +97,7 @@ fn small_budget_memo_caches_do_not_change_update_results() {
     let config = AnalyzerConfig {
         parallelism: Some(4),
         memo_cache_budget_bytes: Some(256),
+        persistence: persistence_disabled(),
     };
     let (_temp, analyzer) = temp_analyzer(
         &[

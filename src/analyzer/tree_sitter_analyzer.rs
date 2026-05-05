@@ -1,3 +1,4 @@
+use super::persistence::AnalyzerDiskCache;
 use crate::analyzer::{
     AnalyzerConfig, CodeBaseMetrics, CodeUnit, DeclarationInfo, ImportInfo, Language, Project,
     ProjectFile, Range,
@@ -43,20 +44,20 @@ pub trait LanguageAdapter: Send + Sync + 'static {
 type BuildProgress = Arc<dyn Fn(usize, usize, &ProjectFile) + Send + Sync>;
 
 #[derive(Debug, Clone)]
-struct FileState {
-    source: String,
-    package_name: String,
-    top_level_declarations: Vec<CodeUnit>,
-    declarations: HashSet<CodeUnit>,
-    import_statements: Vec<String>,
-    imports: Vec<ImportInfo>,
-    raw_supertypes: HashMap<CodeUnit, Vec<String>>,
-    type_identifiers: HashSet<String>,
-    signatures: HashMap<CodeUnit, Vec<String>>,
-    ranges: HashMap<CodeUnit, Vec<Range>>,
-    children: HashMap<CodeUnit, Vec<CodeUnit>>,
-    type_aliases: HashSet<CodeUnit>,
-    contains_tests: bool,
+pub(crate) struct FileState {
+    pub(crate) source: String,
+    pub(crate) package_name: String,
+    pub(crate) top_level_declarations: Vec<CodeUnit>,
+    pub(crate) declarations: HashSet<CodeUnit>,
+    pub(crate) import_statements: Vec<String>,
+    pub(crate) imports: Vec<ImportInfo>,
+    pub(crate) raw_supertypes: HashMap<CodeUnit, Vec<String>>,
+    pub(crate) type_identifiers: HashSet<String>,
+    pub(crate) signatures: HashMap<CodeUnit, Vec<String>>,
+    pub(crate) ranges: HashMap<CodeUnit, Vec<Range>>,
+    pub(crate) children: HashMap<CodeUnit, Vec<CodeUnit>>,
+    pub(crate) type_aliases: HashSet<CodeUnit>,
+    pub(crate) contains_tests: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -480,10 +481,6 @@ where
             "TreeSitterAnalyzer::{:?}::build_state",
             adapter.language()
         ));
-        let mut files = existing
-            .map(|state| state.files.clone())
-            .unwrap_or_default();
-
         let analyzable_files: Vec<_> = {
             let _scope = profiling::scope(format!(
                 "TreeSitterAnalyzer::{:?}::enumerate_files",
@@ -497,13 +494,29 @@ where
         };
         let analyzable_set: HashSet<_> = analyzable_files.iter().cloned().collect();
 
-        files.retain(|file, _| analyzable_set.contains(file));
+        let cache = AnalyzerDiskCache::new(project.root(), adapter.language(), config);
+        let (mut files, files_to_analyze) = if let Some(existing) = existing {
+            let mut files = existing.files.clone();
+            files.retain(|file, _| analyzable_set.contains(file));
+            (files, analyzable_files)
+        } else if let Some(cache) = cache.as_ref() {
+            let loaded = cache.load_clean_files(&analyzable_files);
+            (loaded.files, loaded.dirty_files)
+        } else {
+            (HashMap::default(), analyzable_files)
+        };
 
-        for (file, state) in Self::analyze_files(adapter, config, analyzable_files, progress) {
+        for (file, state) in Self::analyze_files(adapter, config, files_to_analyze, progress) {
             if let Some(state) = state {
                 files.insert(file, state);
             } else {
                 files.remove(&file);
+            }
+        }
+
+        if existing.is_none() {
+            if let Some(cache) = cache.as_ref() {
+                cache.save(&files, adapter);
             }
         }
 
