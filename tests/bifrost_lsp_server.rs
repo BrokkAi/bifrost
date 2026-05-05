@@ -1,6 +1,8 @@
 use serde_json::{Value, json};
+use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
+use tempfile::TempDir;
 
 #[test]
 fn bifrost_lsp_server_handles_initialize_and_shutdown() {
@@ -503,6 +505,88 @@ fn bifrost_lsp_server_references_finds_class_a_usages() {
         uris.iter().any(|u| u.ends_with("B.java")),
         "expected at least one reference in B.java, got: {uris:?}"
     );
+
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown"}),
+    );
+    let _ = read_message(&mut reader, &mut stderr);
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "exit"}),
+    );
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
+fn bifrost_lsp_server_diagnostics_report_parse_error() {
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    fs::write(
+        temp_root.join("Bad.java"),
+        "public class Bad {\n    public void broken( {\n}\n",
+    )
+    .expect("write fixture");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(&temp_root)
+        .arg("--server")
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bifrost");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    let root_uri = format!("file://{}", temp_root.display());
+    let bad_uri = format!("file://{}/Bad.java", temp_root.display());
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"processId": null, "rootUri": root_uri, "capabilities": {}}
+        }),
+    );
+    let init = read_message(&mut reader, &mut stderr);
+    assert!(
+        init["result"]["capabilities"]["diagnosticProvider"].is_object(),
+        "diagnosticProvider should be advertised: {init}"
+    );
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "textDocument/diagnostic",
+            "params": {"textDocument": {"uri": bad_uri}}
+        }),
+    );
+    let response = read_message(&mut reader, &mut stderr);
+    let items = response["result"]["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected items array, got {response}"));
+    assert!(
+        !items.is_empty(),
+        "expected at least one parse-error diagnostic for malformed Java: {response}"
+    );
+    assert_eq!(items[0]["severity"], 1, "severity should be Error");
+    assert_eq!(items[0]["source"], "bifrost-tree-sitter");
 
     write_message(
         &mut stdin,
