@@ -1,0 +1,30 @@
+{
+  "bifrost": {
+    "command": "bifrost",
+    "args": ["--server", "lsp"],
+    "transport": "stdio",
+    "extensionToLanguage": {
+      ".java": "java",
+      ".go": "go",
+      ".c": "c",
+      ".cc": "cpp",
+      ".cpp": "cpp",
+      ".cxx": "cpp",
+      ".h": "c",
+      ".hpp": "cpp",
+      ".hh": "cpp",
+      ".hxx": "cpp",
+      ".js": "javascript",
+      ".mjs": "javascript",
+      ".cjs": "javascript",
+      ".jsx": "javascriptreact",
+      ".ts": "typescript",
+      ".tsx": "typescriptreact",
+      ".py": "python",
+      ".rs": "rust",
+      ".php": "php",
+      ".scala": "scala",
+      ".cs": "csharp"
+    }
+  }
+}
