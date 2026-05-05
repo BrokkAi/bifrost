@@ -107,6 +107,25 @@ impl PythonAnalyzer {
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
         let inner = TreeSitterAnalyzer::new_with_config(project, PythonAdapter, config);
+        Self::from_inner(inner, memo_budget)
+    }
+
+    pub fn new_with_config_and_storage(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
+    ) -> Self {
+        let memo_budget = config.memo_cache_budget_bytes();
+        let inner = TreeSitterAnalyzer::new_with_config_and_storage(
+            project,
+            PythonAdapter,
+            config,
+            storage,
+        );
+        Self::from_inner(inner, memo_budget)
+    }
+
+    fn from_inner(inner: TreeSitterAnalyzer<PythonAdapter>, memo_budget: u64) -> Self {
         Self {
             module_code_units: Arc::new(build_python_module_code_units(&inner)),
             inner,

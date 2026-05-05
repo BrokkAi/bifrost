@@ -1,3 +1,4 @@
+use crate::analyzer::persistence::{self, AnalyzerStorage};
 use crate::analyzer::{
     AnalyzerConfig, CodeBaseMetrics, CodeUnit, DeclarationInfo, ImportInfo, Language, Project,
     ProjectFile, Range,
@@ -43,20 +44,20 @@ pub trait LanguageAdapter: Send + Sync + 'static {
 type BuildProgress = Arc<dyn Fn(usize, usize, &ProjectFile) + Send + Sync>;
 
 #[derive(Debug, Clone)]
-struct FileState {
-    source: String,
-    package_name: String,
-    top_level_declarations: Vec<CodeUnit>,
-    declarations: HashSet<CodeUnit>,
-    import_statements: Vec<String>,
-    imports: Vec<ImportInfo>,
-    raw_supertypes: HashMap<CodeUnit, Vec<String>>,
-    type_identifiers: HashSet<String>,
-    signatures: HashMap<CodeUnit, Vec<String>>,
-    ranges: HashMap<CodeUnit, Vec<Range>>,
-    children: HashMap<CodeUnit, Vec<CodeUnit>>,
-    type_aliases: HashSet<CodeUnit>,
-    contains_tests: bool,
+pub(crate) struct FileState {
+    pub(crate) source: String,
+    pub(crate) package_name: String,
+    pub(crate) top_level_declarations: Vec<CodeUnit>,
+    pub(crate) declarations: HashSet<CodeUnit>,
+    pub(crate) import_statements: Vec<String>,
+    pub(crate) imports: Vec<ImportInfo>,
+    pub(crate) raw_supertypes: HashMap<CodeUnit, Vec<String>>,
+    pub(crate) type_identifiers: HashSet<String>,
+    pub(crate) signatures: HashMap<CodeUnit, Vec<String>>,
+    pub(crate) ranges: HashMap<CodeUnit, Vec<Range>>,
+    pub(crate) children: HashMap<CodeUnit, Vec<CodeUnit>>,
+    pub(crate) type_aliases: HashSet<CodeUnit>,
+    pub(crate) contains_tests: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -236,6 +237,7 @@ pub struct TreeSitterAnalyzer<A> {
     adapter: Arc<A>,
     config: AnalyzerConfig,
     state: Arc<AnalyzerState>,
+    storage: Option<Arc<AnalyzerStorage>>,
     _state: PhantomData<A>,
 }
 
@@ -246,6 +248,7 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             adapter: Arc::clone(&self.adapter),
             config: self.config.clone(),
             state: Arc::clone(&self.state),
+            storage: self.storage.as_ref().map(Arc::clone),
             _state: PhantomData,
         }
     }
@@ -311,28 +314,20 @@ where
     }
 
     pub fn new_with_config(project: Arc<dyn Project>, adapter: A, config: AnalyzerConfig) -> Self {
-        let adapter = Arc::new(adapter);
-        let state = {
-            let _scope = profiling::scope(format!(
-                "TreeSitterAnalyzer::{:?}::new_with_config",
-                adapter.language()
-            ));
-            Arc::new(Self::build_state(
-                project.as_ref(),
-                adapter.as_ref(),
-                &config,
-                None,
-                None,
-            ))
-        };
+        Self::new_internal(project, adapter, config, None, None)
+    }
 
-        Self {
-            project,
-            adapter,
-            config,
-            state,
-            _state: PhantomData,
-        }
+    /// Same as `new_with_config` but persists analyzer state to and from
+    /// `storage`. On startup the analyzer reads the persisted baseline,
+    /// reanalyzes only files whose `(mtime_ns, size)` or epoch differ, and
+    /// writes the merged result back in a single transaction.
+    pub fn new_with_config_and_storage(
+        project: Arc<dyn Project>,
+        adapter: A,
+        config: AnalyzerConfig,
+        storage: Arc<AnalyzerStorage>,
+    ) -> Self {
+        Self::new_internal(project, adapter, config, None, Some(storage))
     }
 
     pub fn new_with_progress<F>(project: Arc<dyn Project>, adapter: A, progress: F) -> Self
@@ -351,20 +346,38 @@ where
     where
         F: Fn(usize, usize, &ProjectFile) + Send + Sync + 'static,
     {
+        Self::new_internal(project, adapter, config, Some(Arc::new(progress)), None)
+    }
+
+    fn new_internal(
+        project: Arc<dyn Project>,
+        adapter: A,
+        config: AnalyzerConfig,
+        progress: Option<BuildProgress>,
+        storage: Option<Arc<AnalyzerStorage>>,
+    ) -> Self {
         let adapter = Arc::new(adapter);
-        let state = Arc::new(Self::build_state(
-            project.as_ref(),
-            adapter.as_ref(),
-            &config,
-            None,
-            Some(Arc::new(progress)),
-        ));
+        let state = {
+            let _scope = profiling::scope(format!(
+                "TreeSitterAnalyzer::{:?}::new_with_config",
+                adapter.language()
+            ));
+            Arc::new(Self::build_state(
+                project.as_ref(),
+                adapter.as_ref(),
+                &config,
+                None,
+                progress,
+                storage.as_deref(),
+            ))
+        };
 
         Self {
             project,
             adapter,
             config,
             state,
+            storage,
             _state: PhantomData,
         }
     }
@@ -382,12 +395,14 @@ where
         adapter: Arc<A>,
         config: AnalyzerConfig,
         state: AnalyzerState,
+        storage: Option<Arc<AnalyzerStorage>>,
     ) -> Self {
         Self {
             project,
             adapter,
             config,
             state: Arc::new(state),
+            storage,
             _state: PhantomData,
         }
     }
@@ -475,14 +490,12 @@ where
         config: &AnalyzerConfig,
         existing: Option<&AnalyzerState>,
         progress: Option<BuildProgress>,
+        storage: Option<&AnalyzerStorage>,
     ) -> AnalyzerState {
         let _scope = profiling::scope(format!(
             "TreeSitterAnalyzer::{:?}::build_state",
             adapter.language()
         ));
-        let mut files = existing
-            .map(|state| state.files.clone())
-            .unwrap_or_default();
 
         let analyzable_files: Vec<_> = {
             let _scope = profiling::scope(format!(
@@ -497,14 +510,79 @@ where
         };
         let analyzable_set: HashSet<_> = analyzable_files.iter().cloned().collect();
 
-        files.retain(|file, _| analyzable_set.contains(file));
+        // Decide reconcile partition.
+        let storage_epoch: Option<&'static str> = storage.map(|_| {
+            let ts_lang = adapter.parser_language();
+            persistence::epoch_for(adapter.language(), &ts_lang)
+        });
 
-        for (file, state) in Self::analyze_files(adapter, config, analyzable_files, progress) {
+        let (mut files, dirty_files, mut deletes, epoch_for_commit) = match (storage, storage_epoch)
+        {
+            (Some(storage), Some(epoch_now)) => match persistence::reconcile::plan(
+                storage,
+                adapter.language(),
+                epoch_now,
+                &analyzable_files,
+            ) {
+                Ok(plan) => (
+                    plan.clean_hydrated,
+                    plan.dirty_to_analyze,
+                    plan.deletes,
+                    Some(epoch_now),
+                ),
+                Err(_) => {
+                    // Storage failed (corrupt, locked, etc.). Fall back to a
+                    // full in-memory rebuild so the analyzer still produces
+                    // results; persistence is best-effort.
+                    (
+                        HashMap::default(),
+                        analyzable_files.clone(),
+                        Vec::new(),
+                        None,
+                    )
+                }
+            },
+            _ => {
+                let mut files = existing
+                    .map(|state| state.files.clone())
+                    .unwrap_or_default();
+                files.retain(|file, _| analyzable_set.contains(file));
+                let dirty: Vec<_> = analyzable_files.clone();
+                (files, dirty, Vec::new(), None)
+            }
+        };
+
+        let dirty_keys: HashSet<ProjectFile> = dirty_files.iter().cloned().collect();
+        let storage_active = epoch_for_commit.is_some();
+
+        for (file, state) in Self::analyze_files(adapter, config, dirty_files, progress) {
             if let Some(state) = state {
                 files.insert(file, state);
             } else {
+                // Parse failure for a workspace file: drop any in-memory
+                // entry AND tell the storage commit to delete the matching
+                // baseline row, so a stale payload from a previous epoch
+                // can't be hydrated next startup.
+                if storage_active {
+                    deletes.push(persistence::reconcile::rel_key(&file));
+                }
                 files.remove(&file);
             }
+        }
+
+        if let (Some(storage), Some(epoch)) = (storage, epoch_for_commit) {
+            let writes = persistence::reconcile::encode_writes(
+                files.iter().filter(|(file, _)| dirty_keys.contains(file)),
+            );
+            // Persistence is best-effort; a write failure should not poison
+            // the in-memory analyzer.
+            let _ = persistence::reconcile::commit(
+                storage,
+                adapter.language(),
+                epoch,
+                &writes,
+                &deletes,
+            );
         }
 
         {
@@ -842,14 +920,18 @@ where
 
         let mut files = self.state.files.clone();
         let mut to_reanalyze = Vec::new();
+        let mut deletes: Vec<String> = Vec::new();
 
         for file in changed_files {
             if !file.exists() {
                 files.remove(file);
+                deletes.push(persistence::reconcile::rel_key(file));
                 continue;
             }
             to_reanalyze.push(file.clone());
         }
+
+        let dirty_keys: HashSet<ProjectFile> = to_reanalyze.iter().cloned().collect();
 
         for (file, state) in
             Self::analyze_files(self.adapter.as_ref(), &self.config, to_reanalyze, None)
@@ -857,8 +939,24 @@ where
             if let Some(state) = state {
                 files.insert(file, state);
             } else {
+                deletes.push(persistence::reconcile::rel_key(&file));
                 files.remove(&file);
             }
+        }
+
+        if let Some(storage) = self.storage.as_ref() {
+            let ts_lang = self.adapter.parser_language();
+            let epoch = persistence::epoch_for(self.adapter.language(), &ts_lang);
+            let writes = persistence::reconcile::encode_writes(
+                files.iter().filter(|(file, _)| dirty_keys.contains(file)),
+            );
+            let _ = persistence::reconcile::commit(
+                storage.as_ref(),
+                self.adapter.language(),
+                epoch,
+                &writes,
+                &deletes,
+            );
         }
 
         let state = Self::index_state(files, self.project.as_ref(), self.adapter.as_ref());
@@ -867,6 +965,7 @@ where
             Arc::clone(&self.adapter),
             self.config.clone(),
             state,
+            self.storage.as_ref().map(Arc::clone),
         )
     }
 
@@ -877,12 +976,14 @@ where
             &self.config,
             None,
             None,
+            self.storage.as_deref(),
         );
         Self::from_state(
             Arc::clone(&self.project),
             Arc::clone(&self.adapter),
             self.config.clone(),
             state,
+            self.storage.as_ref().map(Arc::clone),
         )
     }
 

@@ -147,6 +147,27 @@ impl TypescriptAnalyzer {
         }
     }
 
+    pub fn new_with_config_and_storage(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
+    ) -> Self {
+        let memo_budget = config.memo_cache_budget_bytes();
+        Self {
+            inner: TreeSitterAnalyzer::new_with_config_and_storage(
+                project,
+                TypescriptAdapter,
+                config,
+                storage,
+            ),
+            memo_budget,
+            imported_code_units: build_weighted_cache(memo_budget / 3, weight_code_unit_set),
+            referencing_files: build_weighted_cache(memo_budget / 6, weight_project_file_set),
+            relevant_imports: build_weighted_cache(memo_budget / 6, weight_string_set),
+            reverse_import_index: Arc::new(OnceLock::new()),
+        }
+    }
+
     pub fn from_project<P>(project: P) -> Self
     where
         P: Project + 'static,

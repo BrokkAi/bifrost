@@ -145,6 +145,24 @@ impl JavascriptAnalyzer {
         }
     }
 
+    pub fn new_with_config_and_storage(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
+    ) -> Self {
+        let memo_budget = config.memo_cache_budget_bytes();
+        Self {
+            inner: TreeSitterAnalyzer::new_with_config_and_storage(
+                project,
+                JavascriptAdapter,
+                config,
+                storage,
+            ),
+            memo_budget,
+            memo_caches: Arc::new(JsMemoCaches::new(memo_budget)),
+        }
+    }
+
     pub fn from_project<P>(project: P) -> Self
     where
         P: Project + 'static,
