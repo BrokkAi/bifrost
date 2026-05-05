@@ -87,12 +87,29 @@ pub fn byte_range_to_lsp_range(
 pub fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
     let raw = uri.as_str();
     let stripped = raw.strip_prefix("file://")?;
-    // On Windows the path component starts with a leading slash before the
-    // drive letter (e.g. `file:///C:/foo`), strip it so the final path is
-    // `C:/foo` rather than `/C:/foo`.
+    // RFC 8089 §E.2: Windows file URIs put a leading `/` before the drive
+    // letter (`file:///C:/foo` → path `C:/foo`). Strip that leading slash on
+    // Windows ONLY when the next chars are a drive-letter pattern; otherwise
+    // we'd corrupt POSIX-shaped URIs like `file:///home/foo` into
+    // `home/foo`. (Most LSP clients do not send POSIX paths to Windows
+    // servers, but the round-trip property must hold either way.)
     #[cfg(windows)]
-    let stripped = stripped.strip_prefix('/').unwrap_or(stripped);
+    let stripped = if has_drive_letter_prefix(stripped) {
+        stripped.strip_prefix('/').unwrap_or(stripped)
+    } else {
+        stripped
+    };
     Some(PathBuf::from(percent_decode(stripped)))
+}
+
+#[cfg(windows)]
+fn has_drive_letter_prefix(s: &str) -> bool {
+    // Matches `/C:` or `/C:/...`.
+    let bytes = s.as_bytes();
+    bytes.len() >= 3
+        && bytes[0] == b'/'
+        && (bytes[1] as char).is_ascii_alphabetic()
+        && bytes[2] == b':'
 }
 
 /// Convert a filesystem path to a `file://` URI string. Caller is responsible
@@ -367,6 +384,22 @@ mod tests {
         let path = PathBuf::from("/home/user/Some File.rs");
         let uri_str = path_to_uri_string(&path);
         assert_eq!(uri_str, "file:///home/user/Some%20File.rs");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn has_drive_letter_prefix_distinguishes_windows_uris() {
+        // The Windows leading-`/` strip in uri_to_path must only fire for
+        // drive-prefixed URIs. POSIX-shaped URIs sent from a tooling layer
+        // that doesn't know about Windows semantics must round-trip
+        // unchanged.
+        assert!(has_drive_letter_prefix("/C:/Users/test"));
+        assert!(has_drive_letter_prefix("/d:"));
+        assert!(!has_drive_letter_prefix("/home/user"));
+        assert!(!has_drive_letter_prefix("/"));
+        assert!(!has_drive_letter_prefix(""));
+        // The drive position must be a letter, not a digit or punctuation.
+        assert!(!has_drive_letter_prefix("/9:/foo"));
     }
 
     #[test]
