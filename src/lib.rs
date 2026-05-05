@@ -1,5 +1,6 @@
 pub mod analyzer;
 pub mod hash;
+pub mod lsp;
 pub mod mcp_server;
 pub mod profiling;
 mod project_watcher;
