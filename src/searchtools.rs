@@ -2,12 +2,16 @@ use crate::analyzer::{CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, 
 use crate::profiling;
 use crate::relevance::{most_important_project_files, most_relevant_project_files};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
+use crate::usages::{
+    CONFIDENCE_THRESHOLD, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, FuzzyResult, UsageFinder, UsageHit,
+};
 use glob::Pattern;
 use rayon::prelude::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 const FILE_SEARCH_LIMIT: usize = 100;
 const FILE_SKIM_LIMIT: usize = 20;
@@ -55,6 +59,13 @@ pub struct MostRelevantFilesParams {
     pub seed_files: Vec<String>,
     #[serde(default = "default_limit")]
     pub limit: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanUsagesParams {
+    pub symbols: Vec<String>,
+    #[serde(default)]
+    pub include_tests: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -185,6 +196,57 @@ pub struct SkimFile {
     pub path: String,
     pub loc: usize,
     pub lines: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScanUsagesResult {
+    pub usages: Vec<SymbolUsages>,
+    pub not_found: Vec<String>,
+    pub ambiguous: Vec<AmbiguousUsageSymbol>,
+    pub too_many_callsites: Vec<TooManyCallsitesInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SymbolUsages {
+    pub symbol: String,
+    pub total_hits: usize,
+    /// True when the candidate file set exceeded the analyzer's per-query cap
+    /// and an arbitrary subset was scanned. Results are partial when set.
+    pub candidate_files_truncated: bool,
+    pub files: Vec<UsageFileGroup>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageFileGroup {
+    pub path: String,
+    pub hits: Vec<UsageLocation>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageLocation {
+    pub line: usize,
+    pub enclosing: String,
+    pub snippet: String,
+    pub confidence: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AmbiguousUsageSymbol {
+    pub symbol: String,
+    pub short_name: String,
+    pub candidate_targets: Vec<String>,
+    /// True when the candidate file set exceeded the analyzer's per-query cap
+    /// and an arbitrary subset was scanned. Results are partial when set.
+    pub candidate_files_truncated: bool,
+    pub files: Vec<UsageFileGroup>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TooManyCallsitesInfo {
+    pub symbol: String,
+    pub short_name: String,
+    pub total_callsites: usize,
+    pub limit: usize,
 }
 
 pub fn refresh_result(analyzer: &dyn IAnalyzer) -> RefreshResult {
@@ -635,6 +697,141 @@ pub fn most_relevant_files(
     };
 
     MostRelevantFilesResult { files, not_found }
+}
+
+pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUsagesResult {
+    let _scope = profiling::scope("searchtools::scan_usages");
+
+    let symbols: Vec<String> = strip_params(params.symbols)
+        .into_iter()
+        .filter(|symbol| !symbol.trim().is_empty())
+        .collect();
+
+    // Pre-compute the test-file set once when filtering tests so each per-symbol
+    // UsageFinder can drop test files *before* the regex scan and the
+    // DEFAULT_MAX_USAGES cap. Filtering post-hoc would let test hits eat into
+    // the cap and turn production-only queries into TooManyCallsites errors.
+    let test_files: Option<Arc<std::collections::HashSet<ProjectFile>>> = if params.include_tests {
+        None
+    } else {
+        let set: std::collections::HashSet<ProjectFile> = analyzer
+            .analyzed_files()
+            .filter(|file| analyzer.contains_tests(file))
+            .cloned()
+            .collect();
+        Some(Arc::new(set))
+    };
+
+    let mut usages = Vec::new();
+    let mut not_found = Vec::new();
+    let mut ambiguous = Vec::new();
+    let mut too_many_callsites = Vec::new();
+
+    for symbol in symbols {
+        let overloads = analyzer.get_definitions(&symbol);
+        if overloads.is_empty() {
+            not_found.push(symbol);
+            continue;
+        }
+
+        let mut finder = UsageFinder::new();
+        if let Some(test_files) = test_files.as_ref() {
+            let test_files = Arc::clone(test_files);
+            finder = finder.with_file_filter(move |file| !test_files.contains(file));
+        }
+        let query = finder.query(analyzer, &overloads, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES);
+        let truncated = query.candidate_files_truncated;
+
+        match query.result {
+            FuzzyResult::Success { hits_by_overload } => {
+                let hits: BTreeSet<UsageHit> = hits_by_overload
+                    .into_values()
+                    .flat_map(BTreeSet::into_iter)
+                    .collect();
+                // A resolved symbol with no call sites is still emitted with
+                // zero hits, so callers can distinguish "unknown symbol" (not_found)
+                // from "symbol exists but has no callers" (usages with total_hits = 0).
+                usages.push(SymbolUsages {
+                    symbol,
+                    total_hits: hits.len(),
+                    candidate_files_truncated: truncated,
+                    files: group_hits_by_file(hits),
+                });
+            }
+            FuzzyResult::Ambiguous {
+                short_name,
+                candidate_targets,
+                hits_by_overload,
+            } => {
+                let high_confidence: BTreeSet<UsageHit> = hits_by_overload
+                    .into_values()
+                    .flat_map(BTreeSet::into_iter)
+                    .filter(|hit| hit.confidence >= CONFIDENCE_THRESHOLD)
+                    .collect();
+                ambiguous.push(AmbiguousUsageSymbol {
+                    symbol,
+                    short_name,
+                    candidate_targets: candidate_targets
+                        .into_iter()
+                        .map(|code_unit| code_unit.fq_name())
+                        .collect(),
+                    candidate_files_truncated: truncated,
+                    files: group_hits_by_file(high_confidence),
+                });
+            }
+            FuzzyResult::Failure { .. } => {
+                not_found.push(symbol);
+            }
+            FuzzyResult::TooManyCallsites {
+                short_name,
+                total_callsites,
+                limit,
+            } => {
+                too_many_callsites.push(TooManyCallsitesInfo {
+                    symbol,
+                    short_name,
+                    total_callsites,
+                    limit,
+                });
+            }
+        }
+    }
+
+    ScanUsagesResult {
+        usages,
+        not_found,
+        ambiguous,
+        too_many_callsites,
+    }
+}
+
+fn group_hits_by_file(hits: BTreeSet<UsageHit>) -> Vec<UsageFileGroup> {
+    let mut grouped: BTreeMap<ProjectFile, Vec<UsageLocation>> = BTreeMap::new();
+    for hit in hits {
+        grouped
+            .entry(hit.file.clone())
+            .or_default()
+            .push(UsageLocation {
+                line: hit.line,
+                enclosing: hit.enclosing.fq_name(),
+                snippet: hit.snippet.trim_end().to_string(),
+                confidence: hit.confidence,
+            });
+    }
+    grouped
+        .into_iter()
+        .map(|(file, mut hits)| {
+            hits.sort_by(|left, right| {
+                left.line
+                    .cmp(&right.line)
+                    .then_with(|| left.enclosing.cmp(&right.enclosing))
+            });
+            UsageFileGroup {
+                path: rel_path_string(&file),
+                hits,
+            }
+        })
+        .collect()
 }
 
 fn collect_kind_names(

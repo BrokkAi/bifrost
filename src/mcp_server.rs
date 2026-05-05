@@ -227,6 +227,26 @@ fn list_tools_result() -> Value {
                     "required": ["seed_files"]
                 }),
             ),
+            tool_descriptor(
+                "scan_usages",
+                "Find call sites and references for fully qualified symbol names. Use search_symbols first when you only have a partial name. Best-effort name resolution: bifrost is tree-sitter only (no scope analysis or type checker), so output may include false positives for shadowed names.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "symbols": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Fully qualified symbol names to find usages for."
+                        },
+                        "include_tests": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Include call sites in test files."
+                        }
+                    },
+                    "required": ["symbols"]
+                }),
+            ),
         ]
     })
 }
