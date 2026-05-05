@@ -31,6 +31,7 @@ pub use go_analyzer::GoAnalyzer;
 pub use i_analyzer::IAnalyzer;
 pub use java_analyzer::JavaAnalyzer;
 pub use javascript_analyzer::JavascriptAnalyzer;
+pub(crate) use javascript_analyzer::resolve_js_ts_module_specifier;
 pub use model::{
     CodeBaseMetrics, CodeUnit, CodeUnitType, DeclarationInfo, DeclarationKind, ImportInfo,
     Language, ProjectFile, Range, metrics_from_declarations,

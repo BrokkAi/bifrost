@@ -5,7 +5,7 @@ use crate::{
         ActivateWorkspaceParams, ActiveWorkspaceResult, GetActiveWorkspaceParams,
         MostRelevantFilesParams, RefreshParams, get_summaries, get_symbol_locations,
         get_symbol_sources, get_symbol_summaries, list_symbols, most_relevant_files,
-        refresh_result, search_symbols,
+        refresh_result, scan_usages, search_symbols,
     },
 };
 use serde::Serialize;
@@ -132,6 +132,9 @@ impl SearchToolsService {
                     most_relevant_files(workspace.analyzer(), params)
                 })
             }
+            "scan_usages" => self.decode_and_run(arguments, |workspace, params| {
+                scan_usages(workspace.analyzer(), params)
+            }),
             _ => Err(SearchToolsServiceError::unknown_tool(format!(
                 "Unknown tool: {name}"
             ))),

@@ -1,0 +1,8 @@
+{
+  "name": "bifrost-lsp",
+  "description": "Tree-sitter-backed LSP server for Java, Go, C/C++, JavaScript/TypeScript, Python, Rust, PHP, Scala, and C#. Provides documentSymbol, workspace/symbol, definition, hover, references, and parse-error diagnostics.",
+  "version": "0.1.2",
+  "homepage": "https://github.com/BrokkAi/bifrost",
+  "repository": "https://github.com/BrokkAi/bifrost",
+  "license": "LGPL-3.0-or-later"
+}

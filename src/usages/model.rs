@@ -1,4 +1,4 @@
-use crate::analyzer::{CodeUnit, CodeUnitType, ProjectFile, Range};
+use crate::analyzer::{CodeUnit, ProjectFile, Range};
 use crate::hash::HashMap;
 use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
@@ -300,27 +300,10 @@ pub struct ReexportStar {
     pub module_specifier: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct HeritageEdge {
-    pub child_name: String,
-    pub parent_name: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ClassMember {
-    // Ordered tuple-style for stable Ord without manual impls.
-    pub owner_class_name: String,
-    pub member_name: String,
-    pub static_member: bool,
-    pub kind: CodeUnitType,
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct ExportIndex {
     pub exports_by_name: HashMap<String, ExportEntry>,
     pub reexport_stars: Vec<ReexportStar>,
-    pub heritage_edges: BTreeSet<HeritageEdge>,
-    pub class_members: BTreeSet<ClassMember>,
 }
 
 impl ExportIndex {

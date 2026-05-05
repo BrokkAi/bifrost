@@ -83,6 +83,34 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             .iter()
             .any(|tool| tool["name"] == "most_relevant_files")
     );
+    assert!(tools.iter().any(|tool| tool["name"] == "scan_usages"));
+
+    let scan_usages = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 100,
+            "method": "tools/call",
+            "params": {
+                "name": "scan_usages",
+                "arguments": {
+                    "symbols": ["E.iMethod"],
+                    "include_tests": true
+                }
+            }
+        }),
+    );
+    let scan = &scan_usages["result"]["structuredContent"];
+    let usages = scan["usages"].as_array().expect("usages array");
+    assert_eq!(1, usages.len(), "scan: {scan_usages}");
+    assert_eq!("E.iMethod", usages[0]["symbol"]);
+    let files = usages[0]["files"].as_array().expect("files array");
+    assert!(
+        files.iter().any(|file| file["path"] == "UseE.java"),
+        "expected UseE.java in scan_usages files: {scan_usages}"
+    );
 
     let file_summaries = round_trip(
         &mut stdin,

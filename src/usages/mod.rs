@@ -9,13 +9,14 @@
 //!
 //! - [`ImportGraphCandidateProvider`] for the candidate file set, with
 //!   [`TextSearchCandidateProvider`] as a substring-scan fallback.
-//! - [`RegexUsageAnalyzer`] for the per-file scan.
-//!
-//! The JS/TS export-graph strategy referenced in brokk is Phase 7 of the port and is not
-//! implemented here; JS/TS targets currently fall back to the regex analyzer.
+//! - [`JsTsExportUsageGraphStrategy`] for JS/TS targets. When the graph cannot infer a
+//!   seed it returns [`FuzzyResult::Failure`]; [`UsageFinder`] then routes the query to
+//!   the regex analyzer instead.
+//! - [`RegexUsageAnalyzer`] for everything else.
 
 mod candidates;
 mod finder;
+mod js_ts_graph;
 mod model;
 mod regex_analyzer;
 mod traits;
@@ -25,10 +26,11 @@ pub use candidates::{
     default_provider,
 };
 pub use finder::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, QueryResult, UsageFinder};
+pub use js_ts_graph::JsTsExportUsageGraphStrategy;
 pub use model::{
-    CONFIDENCE_THRESHOLD, ClassMember, ExportEntry, ExportIndex, FuzzyResult, HeritageEdge,
-    ImportBinder, ImportBinding, ImportKind, ReceiverTargetRef, ReexportStar, ReferenceCandidate,
-    ReferenceHit, ReferenceKind, ResolvedReceiverCandidate, UsageHit,
+    CONFIDENCE_THRESHOLD, ExportEntry, ExportIndex, FuzzyResult, ImportBinder, ImportBinding,
+    ImportKind, ReceiverTargetRef, ReexportStar, ReferenceCandidate, ReferenceHit, ReferenceKind,
+    ResolvedReceiverCandidate, UsageHit,
 };
 pub use regex_analyzer::RegexUsageAnalyzer;
 pub use traits::{CandidateFileProvider, UsageAnalyzer};

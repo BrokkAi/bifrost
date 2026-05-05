@@ -1149,10 +1149,22 @@ pub(crate) fn resolve_js_ts_import_paths(
     let Some(module_path) = extract_import_module_path(raw_import) else {
         return Vec::new();
     };
-    if !module_path.starts_with('.') {
+    resolve_js_ts_module_specifier(source_file, &module_path, language)
+}
+
+/// Resolve a relative module specifier (e.g. `"./foo"`) to project files. Bare specifiers
+/// are intentionally ignored — `package.json` `exports`/`main` resolution and tsconfig
+/// `paths`/`baseUrl` are out of scope. Shared with the JS/TS export-usage graph so both
+/// resolvers stay in lock-step.
+pub(crate) fn resolve_js_ts_module_specifier(
+    source_file: &ProjectFile,
+    module_specifier: &str,
+    language: Language,
+) -> Vec<ProjectFile> {
+    if !module_specifier.starts_with('.') {
         return Vec::new();
     }
-    let base = source_file.parent().join(module_path);
+    let base = source_file.parent().join(module_specifier);
     let mut candidates = Vec::new();
     let exts = language.extensions();
     collect_candidate_paths(source_file.root(), &base, exts, &mut candidates);

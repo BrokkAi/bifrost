@@ -1,6 +1,7 @@
 use std::env;
 use std::process::ExitCode;
 
+use brokk_analyzer::lsp::run_lsp_stdio_server;
 use brokk_analyzer::mcp_server::run_searchtools_stdio_server;
 
 fn main() -> ExitCode {
@@ -49,6 +50,7 @@ fn run() -> Result<(), String> {
 
     match server_mode.as_deref() {
         Some("searchtools") => run_searchtools_stdio_server(root),
+        Some("lsp") => run_lsp_stdio_server(root),
         Some(other) => Err(format!("Unsupported server mode: {other}")),
         None => {
             print_help();
@@ -59,5 +61,6 @@ fn run() -> Result<(), String> {
 
 fn print_help() {
     println!("Usage: bifrost --root PROJECT_ROOT --server searchtools");
+    println!("       bifrost --root PROJECT_ROOT --server lsp");
     println!("       bifrost --version");
 }

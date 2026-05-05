@@ -1,12 +1,30 @@
-use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
+use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::HashSet;
 use crate::usages::candidates::{
     FallbackCandidateProvider, ImportGraphCandidateProvider, TextSearchCandidateProvider,
     default_provider,
 };
+use crate::usages::js_ts_graph::JsTsExportUsageGraphStrategy;
 use crate::usages::model::FuzzyResult;
 use crate::usages::regex_analyzer::RegexUsageAnalyzer;
 use crate::usages::traits::{CandidateFileProvider, UsageAnalyzer};
+
+/// Languages whose targets are routed through [`JsTsExportUsageGraphStrategy`] first,
+/// with the regex analyzer as the fallback when the graph returns
+/// [`FuzzyResult::Failure`].
+fn is_graph_routed(language: Language) -> bool {
+    matches!(language, Language::JavaScript | Language::TypeScript)
+}
+
+fn target_language(target: &CodeUnit) -> Language {
+    target
+        .source()
+        .rel_path()
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(Language::from_extension)
+        .unwrap_or(Language::None)
+}
 
 type DefaultCandidateProvider =
     FallbackCandidateProvider<ImportGraphCandidateProvider, TextSearchCandidateProvider>;
@@ -23,15 +41,17 @@ pub struct QueryResult {
 }
 
 /// Facade that wires a [`CandidateFileProvider`] and a [`UsageAnalyzer`] together for a
-/// single fuzzy lookup. The strategy chosen depends on the target's language: JavaScript
-/// and TypeScript would use a graph-based analyzer when available, but for now every
-/// language falls through to [`RegexUsageAnalyzer`] (the JS/TS graph is Phase 7 — not in
-/// scope for this port).
+/// single fuzzy lookup. The strategy chosen depends on the target's language:
+///
+/// - JavaScript / TypeScript targets are routed to [`JsTsExportUsageGraphStrategy`]
+///   (Phase 7), which falls through to the regex analyzer when it cannot infer a seed.
+/// - Every other language falls through to [`RegexUsageAnalyzer`].
 ///
 /// JDT-based Java analysis is intentionally omitted; bifrost is tree-sitter only.
 pub struct UsageFinder {
     fallback_candidate_provider: DefaultCandidateProvider,
     fallback_usage_analyzer: Box<dyn UsageAnalyzer>,
+    js_ts_graph_analyzer: Box<dyn UsageAnalyzer>,
     file_filter: Option<FileFilter>,
 }
 
@@ -40,6 +60,7 @@ impl UsageFinder {
         Self {
             fallback_candidate_provider: default_provider(),
             fallback_usage_analyzer: Box::new(RegexUsageAnalyzer::new()),
+            js_ts_graph_analyzer: Box::new(JsTsExportUsageGraphStrategy::new()),
             file_filter: None,
         }
     }
@@ -98,9 +119,28 @@ impl UsageFinder {
             candidates = kept;
         }
 
-        let result =
+        let language = target_language(target);
+        let result = if is_graph_routed(language) {
+            // Try the graph strategy first; on Failure (no seed could be inferred) fall
+            // back to the regex analyzer so callers still get best-effort results.
+            match self.js_ts_graph_analyzer.find_usages(
+                analyzer,
+                overloads,
+                &candidates,
+                max_usages,
+            ) {
+                FuzzyResult::Failure { .. } => self.fallback_usage_analyzer.find_usages(
+                    analyzer,
+                    overloads,
+                    &candidates,
+                    max_usages,
+                ),
+                other => other,
+            }
+        } else {
             self.fallback_usage_analyzer
-                .find_usages(analyzer, overloads, &candidates, max_usages);
+                .find_usages(analyzer, overloads, &candidates, max_usages)
+        };
 
         QueryResult {
             candidate_files: candidates,
