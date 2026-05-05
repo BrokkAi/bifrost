@@ -2,30 +2,36 @@
 //!
 //! Mirrors brokk's `JsTsExportUsageReferenceGraph` and `JsTsExportUsageExtractor`. Where
 //! brokk's pipeline drives the JDT/LLM disambiguator, bifrost is tree-sitter only — the
-//! graph here resolves on syntax + import binders alone, and falls back to the regex
-//! analyzer when it cannot infer a seed.
+//! graph here resolves on syntax + import binders alone, and signals
+//! [`FuzzyResult::Failure`] when it cannot infer a seed so the caller can fall back to
+//! the regex analyzer.
 //!
 //! Pipeline overview:
 //! 1. Per-file [`ExportIndex`]: tree-sitter walk that captures local exports, named
-//!    re-exports, star re-exports, default exports, class members, and heritage edges.
-//! 2. Per-file [`ImportBinder`]: extracts default/named/namespace import bindings.
-//! 3. Project indices (lazy, cached on the strategy):
+//!    re-exports, star re-exports, and default exports.
+//! 2. Per-file [`ImportBinder`]: extracts default/named/namespace import bindings from
+//!    ESM `import` statements.
+//! 3. Project indices, rebuilt per query so file edits are picked up immediately:
 //!    - reverse re-export index: `(target_file, exported_name) -> {(reexporting_file, alias)}`
 //!    - reverse export-seed index: `(short_name) -> {(file, exported_name)}` for fast seed
 //!      inference from a target's identifier.
-//!    - heritage index: child class name -> resolved parent code unit.
 //! 4. Reference traversal: for the target's seed exports, walk the import-reverse index to
 //!    find files that bind a local name to the export, then AST-scan those files for
 //!    identifier / member / type / heritage references that resolve back to the target.
 //!
-//! Compared with brokk's Java implementation this port keeps the structural shape but
-//! deliberately simplifies several edge cases (alias chains across deep re-export trees,
-//! TS namespace member resolution beyond one hop, ambiguous JSX intrinsic filtering). The
-//! strategy is conservative: when it cannot confidently resolve a candidate it reports
-//! [`FuzzyResult::Failure`] so [`UsageFinder`](super::UsageFinder) falls back to the regex
-//! analyzer and the user still sees results.
+//! Scope notes:
+//! - **ESM only.** `require(...)` calls and `module.exports = …` assignments are not
+//!   walked. Mixed-ESM/CJS projects fall back to the regex analyzer for any CJS-only
+//!   edges. CJS support is tracked as future work alongside richer module resolution
+//!   (`package.json` `exports`, tsconfig `paths`).
+//! - **Per-call indices.** No cross-call cache: each query rebuilds the graph for the
+//!   target's language. This keeps results consistent after file edits at the cost of
+//!   re-parsing JS/TS files on every query. Hosts with stable file sets that need lower
+//!   latency (e.g. an LSP server) should layer their own cache around the strategy.
 
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
+use crate::analyzer::{
+    CodeUnit, IAnalyzer, Language, ProjectFile, Range, resolve_js_ts_module_specifier,
+};
 use crate::hash::{HashMap, HashSet, map_with_capacity, set_with_capacity};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use crate::usages::model::{
@@ -34,7 +40,7 @@ use crate::usages::model::{
 use crate::usages::traits::UsageAnalyzer;
 use rayon::prelude::*;
 use std::collections::{BTreeSet, VecDeque};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use tree_sitter::{Node, Parser, Tree};
 
 /// Graph-strategy hits land at the maximum confidence the regex analyzer also uses.
@@ -49,21 +55,17 @@ const SNIPPET_CONTEXT_LINES: usize = 3;
 /// JS/TS export-graph usage analyzer. Resolves usages of a JavaScript or TypeScript
 /// `CodeUnit` by walking the export/import graph rather than scanning text.
 ///
-/// Wraps an inner fallback (`fallback`) that the strategy delegates to whenever it
-/// cannot infer a seed (target language is non-JS/TS, target file isn't analyzable, no
-/// local exports match the target identifier, etc.). The fallback is typically the
-/// [`RegexUsageAnalyzer`](super::RegexUsageAnalyzer).
+/// The strategy is stateless: it rebuilds its project graph for every query. When it
+/// cannot infer a seed it returns [`FuzzyResult::Failure`] so the caller (typically
+/// [`UsageFinder`](super::UsageFinder)) can route the query to its regex analyzer.
+#[derive(Default)]
 pub struct JsTsExportUsageGraphStrategy {
-    fallback: Box<dyn UsageAnalyzer>,
-    indices: OnceLock<ProjectGraph>,
+    _private: (),
 }
 
 impl JsTsExportUsageGraphStrategy {
-    pub fn new<A: UsageAnalyzer + 'static>(fallback: A) -> Self {
-        Self {
-            fallback: Box::new(fallback),
-            indices: OnceLock::new(),
-        }
+    pub fn new() -> Self {
+        Self { _private: () }
     }
 
     /// Returns true when the target is a JavaScript or TypeScript code unit and lives in
@@ -88,27 +90,27 @@ impl UsageAnalyzer for JsTsExportUsageGraphStrategy {
         let target = &overloads[0];
         let language = target_language(target);
         if language == Language::None {
-            return self
-                .fallback
-                .find_usages(analyzer, overloads, candidate_files, max_usages);
+            return FuzzyResult::Failure {
+                fq_name: target.fq_name().to_string(),
+                reason: "JsTsExportUsageGraphStrategy: target is not JS/TS".to_string(),
+            };
         }
 
-        let graph = self
-            .indices
-            .get_or_init(|| ProjectGraph::build(analyzer, language));
+        let graph = ProjectGraph::build(analyzer, language);
 
         let seeds = graph.seeds_for_target(target);
         if seeds.is_empty() {
-            return self
-                .fallback
-                .find_usages(analyzer, overloads, candidate_files, max_usages);
+            return FuzzyResult::Failure {
+                fq_name: target.fq_name().to_string(),
+                reason: "JsTsExportUsageGraphStrategy: no export seed resolved".to_string(),
+            };
         }
 
         let importers = graph.importers_of_seeds(&seeds);
         let scan_files: HashSet<ProjectFile> =
             candidate_files.iter().cloned().chain(importers).collect();
 
-        let hits = scan_files_for_seeds(analyzer, graph, &scan_files, target, &seeds);
+        let hits = scan_files_for_seeds(analyzer, &graph, &scan_files, target, &seeds, language);
         let hits: BTreeSet<UsageHit> = hits
             .into_iter()
             .filter(|hit| &hit.enclosing != target)
@@ -141,10 +143,20 @@ fn target_language(target: &CodeUnit) -> Language {
 // Project-wide graph indices
 // ===================================================================================
 
-/// Project-wide indices computed once per [`JsTsExportUsageGraphStrategy`] invocation.
+/// Cached parse for one source file. `source` is held alongside the `Tree` so AST byte
+/// ranges remain valid for the lifetime of the graph (and so the scan phase can reuse
+/// the parse result without re-reading the file).
+struct ParsedFile {
+    source: Arc<String>,
+    tree: Tree,
+}
+
+/// Project-wide indices computed once per [`JsTsExportUsageGraphStrategy::find_usages`].
 struct ProjectGraph {
     /// Files we've actually analyzed (JS or TS depending on the target language).
     files: Vec<ProjectFile>,
+    /// Parsed source + tree per file. Reused by the scan phase to avoid double parsing.
+    parsed: HashMap<ProjectFile, ParsedFile>,
     /// Per-file export index, keyed by file.
     exports_by_file: HashMap<ProjectFile, ExportIndex>,
     /// Reverse re-export edges: for each `(target_file, exported_name)` find every
@@ -189,25 +201,35 @@ impl ProjectGraph {
             _ => return ProjectGraph::empty(),
         };
 
-        let parsed: Vec<(ProjectFile, ExportIndex, ImportBinder)> = files
+        let parsed_files: Vec<(ProjectFile, ParsedFile, ExportIndex, ImportBinder)> = files
             .par_iter()
             .filter_map(|file| {
                 let source = file.read_to_string().ok()?;
                 let mut parser = Parser::new();
                 parser.set_language(&parser_language).ok()?;
                 let tree = parser.parse(source.as_str(), None)?;
-                let exports = compute_export_index(file, &source, &tree);
+                let exports = compute_export_index(&source, &tree);
                 let binder = compute_import_binder(&source, &tree);
-                Some((file.clone(), exports, binder))
+                Some((
+                    file.clone(),
+                    ParsedFile {
+                        source: Arc::new(source),
+                        tree,
+                    },
+                    exports,
+                    binder,
+                ))
             })
             .collect();
 
+        let mut parsed: HashMap<ProjectFile, ParsedFile> = map_with_capacity(parsed_files.len());
         let mut exports_by_file: HashMap<ProjectFile, ExportIndex> =
-            map_with_capacity(parsed.len());
+            map_with_capacity(parsed_files.len());
         let mut binders_by_file: HashMap<ProjectFile, ImportBinder> =
-            map_with_capacity(parsed.len());
+            map_with_capacity(parsed_files.len());
 
-        for (file, exports, binder) in parsed.into_iter() {
+        for (file, parsed_file, exports, binder) in parsed_files.into_iter() {
+            parsed.insert(file.clone(), parsed_file);
             exports_by_file.insert(file.clone(), exports);
             binders_by_file.insert(file, binder);
         }
@@ -228,7 +250,8 @@ impl ProjectGraph {
                         module_specifier,
                         imported_name,
                     } => {
-                        let resolved = resolve_module_specifier(file, module_specifier, language);
+                        let resolved =
+                            resolve_js_ts_module_specifier(file, module_specifier, language);
                         for resolved_file in resolved {
                             reexport_edges
                                 .entry((resolved_file, imported_name.clone()))
@@ -257,7 +280,8 @@ impl ProjectGraph {
                 }
             }
             for star in &exports.reexport_stars {
-                let resolved = resolve_module_specifier(file, &star.module_specifier, language);
+                let resolved =
+                    resolve_js_ts_module_specifier(file, &star.module_specifier, language);
                 for resolved_file in resolved {
                     star_reexports
                         .entry(resolved_file)
@@ -271,6 +295,7 @@ impl ProjectGraph {
 
         Self {
             files: files_vec,
+            parsed,
             exports_by_file,
             reexport_edges,
             star_reexports,
@@ -282,6 +307,7 @@ impl ProjectGraph {
     fn empty() -> Self {
         Self {
             files: Vec::new(),
+            parsed: HashMap::default(),
             exports_by_file: HashMap::default(),
             reexport_edges: HashMap::default(),
             star_reexports: HashMap::default(),
@@ -374,17 +400,13 @@ impl ProjectGraph {
         };
         edges
             .iter()
-            .filter(|edge| edge_matches_seed(edge, seeds, self))
+            .filter(|edge| edge_matches_seed(edge, seeds))
             .cloned()
             .collect()
     }
 }
 
-fn edge_matches_seed(
-    edge: &ImportEdge,
-    seeds: &BTreeSet<(ProjectFile, String)>,
-    graph: &ProjectGraph,
-) -> bool {
+fn edge_matches_seed(edge: &ImportEdge, seeds: &BTreeSet<(ProjectFile, String)>) -> bool {
     match &edge.kind {
         ImportEdgeKind::Named(name) => seeds.contains(&(edge.target_file.clone(), name.clone())),
         ImportEdgeKind::Default => {
@@ -393,10 +415,7 @@ fn edge_matches_seed(
         ImportEdgeKind::Namespace => {
             // Namespace import binds the entire module — match if any seed lives in the
             // target file. Member-level resolution is handled by the candidate scanner.
-            seeds.iter().any(|(file, _)| file == &edge.target_file) || {
-                let _ = graph;
-                false
-            }
+            seeds.iter().any(|(file, _)| file == &edge.target_file)
         }
     }
 }
@@ -407,8 +426,6 @@ fn collect_jsts_files(analyzer: &dyn IAnalyzer, language: Language) -> Vec<Proje
         .analyzable_files(language)
         .map(|set| set.into_iter().collect())
         .unwrap_or_default();
-    // Cross-language workspaces also analyze JSX as JS and TSX as TS — extension list is
-    // already handled by `analyzable_files`, no additional widening required.
     result.sort();
     result.dedup();
     result
@@ -425,7 +442,8 @@ fn build_importer_reverse(
             continue;
         };
         for (local_name, binding) in &binder.bindings {
-            let resolved = resolve_module_specifier(file, &binding.module_specifier, language);
+            let resolved =
+                resolve_js_ts_module_specifier(file, &binding.module_specifier, language);
             for target_file in resolved {
                 let kind = match (binding.kind, binding.imported_name.as_deref()) {
                     (ImportKind::Default, _) => ImportEdgeKind::Default,
@@ -446,48 +464,6 @@ fn build_importer_reverse(
     reverse
 }
 
-/// Resolve a relative module specifier against the importing file. Mirrors
-/// `resolve_js_ts_import_paths` in `javascript_analyzer.rs` (kept private there). Only
-/// resolves `./` and `../` paths against the project root — bare specifiers (npm
-/// modules) are intentionally ignored.
-fn resolve_module_specifier(
-    source_file: &ProjectFile,
-    module_specifier: &str,
-    language: Language,
-) -> Vec<ProjectFile> {
-    if !module_specifier.starts_with('.') {
-        return Vec::new();
-    }
-    let parent = source_file.parent();
-    let base = parent.join(module_specifier);
-    let mut candidates: Vec<ProjectFile> = Vec::new();
-    let extensions = language.extensions();
-
-    if base.extension().is_some() {
-        let file = ProjectFile::new(source_file.root().to_path_buf(), base.clone());
-        if file.exists() {
-            candidates.push(file);
-        }
-    } else {
-        for ext in extensions {
-            let with_ext = base.with_extension(ext);
-            let direct = ProjectFile::new(source_file.root().to_path_buf(), with_ext);
-            if direct.exists() {
-                candidates.push(direct);
-            }
-            let index = base.join(format!("index.{ext}"));
-            let index_file = ProjectFile::new(source_file.root().to_path_buf(), index);
-            if index_file.exists() {
-                candidates.push(index_file);
-            }
-        }
-    }
-
-    candidates.sort();
-    candidates.dedup();
-    candidates
-}
-
 // ===================================================================================
 // Per-file scanning
 // ===================================================================================
@@ -498,12 +474,12 @@ fn scan_files_for_seeds(
     files: &HashSet<ProjectFile>,
     target: &CodeUnit,
     seeds: &BTreeSet<(ProjectFile, String)>,
+    language: Language,
 ) -> BTreeSet<UsageHit> {
     let collected: Mutex<BTreeSet<UsageHit>> = Mutex::new(BTreeSet::new());
     let target_short = top_level_identifier(target).to_string();
     let target_member = member_name(target);
 
-    let language = target_language(target);
     let parser_language = match language {
         Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
         Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
@@ -513,30 +489,45 @@ fn scan_files_for_seeds(
     let files_vec: Vec<&ProjectFile> = files.iter().collect();
 
     files_vec.par_iter().for_each(|file| {
-        let Ok(source) = file.read_to_string() else {
-            return;
-        };
-        if source.is_empty() {
-            return;
-        }
-        let mut parser = Parser::new();
-        if parser.set_language(&parser_language).is_err() {
-            return;
-        }
-        let Some(tree) = parser.parse(source.as_str(), None) else {
-            return;
+        // Reuse the build-phase parse when available; only fall back to a fresh parse
+        // for ad-hoc candidates that weren't part of the project graph (e.g. a text
+        // search candidate outside the analyzer's analyzable set).
+        let owned_source: Option<Arc<String>>;
+        let owned_tree: Option<Tree>;
+        let (source_str, tree_ref) = if let Some(parsed) = graph.parsed.get(*file) {
+            (parsed.source.as_str(), &parsed.tree)
+        } else {
+            let Ok(source) = file.read_to_string() else {
+                return;
+            };
+            if source.is_empty() {
+                return;
+            }
+            let mut parser = Parser::new();
+            if parser.set_language(&parser_language).is_err() {
+                return;
+            }
+            let Some(tree) = parser.parse(source.as_str(), None) else {
+                return;
+            };
+            owned_source = Some(Arc::new(source));
+            owned_tree = Some(tree);
+            (
+                owned_source.as_deref().unwrap().as_str(),
+                owned_tree.as_ref().unwrap(),
+            )
         };
 
         let edges = graph.matching_edges_for_importer(file, seeds);
 
         let mut local_hits: BTreeSet<UsageHit> = BTreeSet::new();
-        let line_starts = compute_line_starts(&source);
+        let line_starts = compute_line_starts(source_str);
 
         let target_self_file = *file == target.source();
 
         let mut scan_ctx = ScanCtx {
             file,
-            source: &source,
+            source: source_str,
             line_starts: &line_starts,
             analyzer,
             target_short: &target_short,
@@ -546,7 +537,7 @@ fn scan_files_for_seeds(
             hits: &mut local_hits,
         };
 
-        scan_node(tree.root_node(), &mut scan_ctx);
+        scan_node(tree_ref.root_node(), &mut scan_ctx);
 
         if !local_hits.is_empty() {
             let mut sink = collected
@@ -611,8 +602,6 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             handle_identifier_candidate(node, ctx);
         }
         "member_expression" => handle_member_expression(node, ctx),
-        "new_expression" => handle_new_expression(node, ctx),
-        "class_heritage" | "extends_clause" => handle_heritage(node, ctx),
         "jsx_opening_element" | "jsx_self_closing_element" => handle_jsx_element(node, ctx),
         _ => {}
     }
@@ -671,34 +660,6 @@ fn handle_member_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
-fn handle_new_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    let Some(constructor) = node.child_by_field_name("constructor") else {
-        return;
-    };
-    let text = slice(constructor, ctx.source);
-    if text.is_empty() {
-        return;
-    }
-    // `new Foo(...)` — Foo could be either a bare identifier or a member expression.
-    if constructor.kind() == "identifier" || constructor.kind() == "type_identifier" {
-        if ctx.binds_target(text) {
-            record_hit(constructor, ctx);
-        }
-    } else if constructor.kind() == "member_expression" {
-        // Already handled by handle_member_expression visit.
-    }
-}
-
-fn handle_heritage(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        let text = slice(child, ctx.source);
-        if !text.is_empty() && ctx.binds_target(text) {
-            record_hit(child, ctx);
-        }
-    }
-}
-
 fn handle_jsx_element(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let Some(name_node) = node.child_by_field_name("name") else {
         return;
@@ -707,10 +668,39 @@ fn handle_jsx_element(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if text.is_empty() {
         return;
     }
-    if let Some(last) = text.rsplit('.').next()
-        && ctx.binds_target(last)
+    // For qualified JSX names (`<Foo.Bar />`), narrow the recorded range to the
+    // rightmost identifier so LSP clients highlight just `Bar`. The descent will
+    // visit the leaf identifier directly when it isn't a member_expression child;
+    // by recording here we ensure JSX qualifications show up regardless.
+    if let Some((rightmost, leaf_text)) = rightmost_jsx_identifier(name_node, ctx.source)
+        && ctx.binds_target(leaf_text)
     {
-        record_hit(name_node, ctx);
+        record_hit(rightmost, ctx);
+    }
+}
+
+/// Walks a JSX element name (identifier or member_expression) and returns the rightmost
+/// identifier node together with its text. For `<Foo.Bar />` the leaf is `Bar`.
+fn rightmost_jsx_identifier<'a>(node: Node<'a>, source: &'a str) -> Option<(Node<'a>, &'a str)> {
+    match node.kind() {
+        "identifier" | "type_identifier" | "property_identifier" => {
+            let text = slice(node, source);
+            (!text.is_empty()).then_some((node, text))
+        }
+        // `Foo.Bar` is a `member_expression` (or `jsx_member_expression` in some
+        // grammars) — descend into the rightmost named child.
+        _ => {
+            let property = node.child_by_field_name("property");
+            if let Some(property) = property {
+                return rightmost_jsx_identifier(property, source);
+            }
+            let mut last = None;
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                last = Some(child);
+            }
+            last.and_then(|child| rightmost_jsx_identifier(child, source))
+        }
     }
 }
 
@@ -820,11 +810,18 @@ fn is_declaration_identifier(node: Node<'_>) -> bool {
             return true;
         }
     }
-    if parent_kind == "formal_parameters"
-        || parent_kind == "required_parameter"
-        || parent_kind == "optional_parameter"
-        || parent_kind == "rest_pattern"
-    {
+    if matches!(
+        parent_kind,
+        "formal_parameters"
+            | "required_parameter"
+            | "optional_parameter"
+            | "rest_pattern"
+            | "object_pattern"
+            | "array_pattern"
+            | "pair_pattern"
+            | "assignment_pattern"
+            | "shorthand_property_identifier_pattern"
+    ) {
         return true;
     }
     false
@@ -871,7 +868,7 @@ fn member_name(target: &CodeUnit) -> Option<String> {
 // ExportIndex extraction
 // ===================================================================================
 
-fn compute_export_index(_file: &ProjectFile, source: &str, tree: &Tree) -> ExportIndex {
+fn compute_export_index(source: &str, tree: &Tree) -> ExportIndex {
     let mut index = ExportIndex::empty();
     let root = tree.root_node();
 
@@ -879,12 +876,8 @@ fn compute_export_index(_file: &ProjectFile, source: &str, tree: &Tree) -> Expor
         let Some(child) = root.named_child(index_id) else {
             continue;
         };
-        match child.kind() {
-            "export_statement" => visit_export_statement(child, source, &mut index),
-            "class_declaration" | "abstract_class_declaration" | "interface_declaration" => {
-                collect_class_metadata(child, source, &mut index, false);
-            }
-            _ => {}
+        if child.kind() == "export_statement" {
+            visit_export_statement(child, source, &mut index);
         }
     }
 
@@ -990,7 +983,6 @@ fn visit_export_statement(node: Node<'_>, source: &str, index: &mut ExportIndex)
                             .insert(name.clone(), ExportEntry::Local { local_name: name });
                     }
                 }
-                collect_class_metadata(declaration, source, index, true);
             }
             "lexical_declaration" | "variable_declaration" => {
                 let mut cursor = declaration.walk();
@@ -1038,115 +1030,6 @@ fn visit_export_statement(node: Node<'_>, source: &str, index: &mut ExportIndex)
             ExportEntry::Default { local_name: None },
         );
     }
-}
-
-fn collect_class_metadata(node: Node<'_>, source: &str, index: &mut ExportIndex, _exported: bool) {
-    let Some(name_node) = node.child_by_field_name("name") else {
-        return;
-    };
-    let class_name = slice(name_node, source).to_string();
-    if class_name.is_empty() {
-        return;
-    }
-
-    // Heritage: `class Foo extends Bar {}` and `class Foo extends Bar implements Baz {}`.
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if matches!(child.kind(), "class_heritage" | "extends_clause") {
-            collect_heritage_edges(child, source, &class_name, index);
-        }
-    }
-
-    // Class members (methods + fields).
-    if let Some(body) = node.child_by_field_name("body") {
-        let mut cursor = body.walk();
-        for member in body.named_children(&mut cursor) {
-            let (kind_opt, static_member) = match member.kind() {
-                "method_definition" | "method_signature" | "abstract_method_signature" => (
-                    Some(crate::analyzer::CodeUnitType::Function),
-                    is_static_member(member, source),
-                ),
-                "field_definition"
-                | "public_field_definition"
-                | "property_signature"
-                | "index_signature" => (
-                    Some(crate::analyzer::CodeUnitType::Field),
-                    is_static_member(member, source),
-                ),
-                _ => (None, false),
-            };
-            let Some(kind) = kind_opt else { continue };
-            let Some(member_name_node) = member.child_by_field_name("name") else {
-                continue;
-            };
-            let member_name = slice(member_name_node, source)
-                .trim_matches('"')
-                .to_string();
-            if member_name.is_empty() {
-                continue;
-            }
-            index
-                .class_members
-                .insert(crate::usages::model::ClassMember {
-                    owner_class_name: class_name.clone(),
-                    member_name,
-                    static_member,
-                    kind,
-                });
-        }
-    }
-}
-
-fn collect_heritage_edges(node: Node<'_>, source: &str, child_name: &str, index: &mut ExportIndex) {
-    // class_heritage shape:
-    //   - JS:   class_heritage > <expression>            (direct identifier or member_expression)
-    //   - TS:   class_heritage > extends_clause > value:<expression>  + implements_clause > <type>
-    // Recurse into each child looking for the first identifier-shaped node. Trim to
-    // the rightmost segment so `Pkg.Base` resolves to `Base`.
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        let target = if child.kind() == "extends_clause" {
-            child.child_by_field_name("value").unwrap_or(child)
-        } else {
-            child
-        };
-        if let Some(name) = first_identifier_in(target, source) {
-            let trimmed = name.rsplit('.').next().unwrap_or(&name).to_string();
-            if !trimmed.is_empty() {
-                index
-                    .heritage_edges
-                    .insert(crate::usages::model::HeritageEdge {
-                        child_name: child_name.to_string(),
-                        parent_name: trimmed,
-                    });
-            }
-        }
-    }
-}
-
-fn first_identifier_in(node: Node<'_>, source: &str) -> Option<String> {
-    match node.kind() {
-        "identifier" | "type_identifier" => {
-            let s = slice(node, source).trim().to_string();
-            (!s.is_empty()).then_some(s)
-        }
-        "member_expression" => {
-            // Pkg.Sub.Base => grab the entire dotted path so `Pkg.Base` is preserved
-            // for the caller to trim.
-            let s = slice(node, source).trim().to_string();
-            (!s.is_empty()).then_some(s)
-        }
-        _ => {
-            let mut cursor = node.walk();
-            node.named_children(&mut cursor)
-                .find_map(|child| first_identifier_in(child, source))
-        }
-    }
-}
-
-fn is_static_member(node: Node<'_>, source: &str) -> bool {
-    let head = slice(node, source).split(['{', ';']).next().unwrap_or("");
-    head.split_whitespace().any(|token| token == "static")
 }
 
 fn unquote(text: &str) -> String {
@@ -1280,20 +1163,11 @@ mod tests {
         parser.parse(source, None).unwrap()
     }
 
-    fn parse_ts(source: &str) -> Tree {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
-            .unwrap();
-        parser.parse(source, None).unwrap()
-    }
-
     #[test]
     fn export_index_named_export() {
         let src = "export class Foo {}\nexport function bar() {}";
         let tree = parse_js(src);
-        let dummy = ProjectFile::new(std::env::temp_dir(), "x.js");
-        let idx = compute_export_index(&dummy, src, &tree);
+        let idx = compute_export_index(src, &tree);
         assert!(idx.exports_by_name.contains_key("Foo"));
         assert!(idx.exports_by_name.contains_key("bar"));
     }
@@ -1302,8 +1176,7 @@ mod tests {
     fn export_index_named_reexport() {
         let src = "export { Foo as Bar } from './other';";
         let tree = parse_js(src);
-        let dummy = ProjectFile::new(std::env::temp_dir(), "x.js");
-        let idx = compute_export_index(&dummy, src, &tree);
+        let idx = compute_export_index(src, &tree);
         match idx.exports_by_name.get("Bar") {
             Some(ExportEntry::ReexportedNamed {
                 module_specifier,
@@ -1336,24 +1209,5 @@ mod tests {
             binder.bindings.get("ns").map(|b| b.kind),
             Some(ImportKind::Namespace)
         );
-    }
-
-    #[test]
-    fn class_metadata_heritage_and_members() {
-        let src = "export class Child extends Parent { foo() {} bar = 1; static qux() {} }";
-        let tree = parse_ts(src);
-        let dummy = ProjectFile::new(std::env::temp_dir(), "x.ts");
-        let idx = compute_export_index(&dummy, src, &tree);
-        let edges: Vec<_> = idx.heritage_edges.iter().collect();
-        assert_eq!(edges.len(), 1);
-        assert_eq!(edges[0].child_name, "Child");
-        assert_eq!(edges[0].parent_name, "Parent");
-        let names: BTreeSet<_> = idx
-            .class_members
-            .iter()
-            .map(|m| (m.member_name.clone(), m.static_member))
-            .collect();
-        assert!(names.contains(&("foo".to_string(), false)));
-        assert!(names.contains(&("qux".to_string(), true)));
     }
 }

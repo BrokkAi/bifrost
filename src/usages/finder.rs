@@ -9,6 +9,23 @@ use crate::usages::model::FuzzyResult;
 use crate::usages::regex_analyzer::RegexUsageAnalyzer;
 use crate::usages::traits::{CandidateFileProvider, UsageAnalyzer};
 
+/// Languages whose targets are routed through [`JsTsExportUsageGraphStrategy`] first,
+/// with the regex analyzer as the fallback when the graph returns
+/// [`FuzzyResult::Failure`].
+fn is_graph_routed(language: Language) -> bool {
+    matches!(language, Language::JavaScript | Language::TypeScript)
+}
+
+fn target_language(target: &CodeUnit) -> Language {
+    target
+        .source()
+        .rel_path()
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(Language::from_extension)
+        .unwrap_or(Language::None)
+}
+
 type DefaultCandidateProvider =
     FallbackCandidateProvider<ImportGraphCandidateProvider, TextSearchCandidateProvider>;
 
@@ -43,9 +60,7 @@ impl UsageFinder {
         Self {
             fallback_candidate_provider: default_provider(),
             fallback_usage_analyzer: Box::new(RegexUsageAnalyzer::new()),
-            js_ts_graph_analyzer: Box::new(JsTsExportUsageGraphStrategy::new(
-                RegexUsageAnalyzer::new(),
-            )),
+            js_ts_graph_analyzer: Box::new(JsTsExportUsageGraphStrategy::new()),
             file_filter: None,
         }
     }
@@ -104,27 +119,33 @@ impl UsageFinder {
             candidates = kept;
         }
 
-        let strategy = self.choose_strategy(target);
-        let result = strategy.find_usages(analyzer, overloads, &candidates, max_usages);
+        let language = target_language(target);
+        let result = if is_graph_routed(language) {
+            // Try the graph strategy first; on Failure (no seed could be inferred) fall
+            // back to the regex analyzer so callers still get best-effort results.
+            match self.js_ts_graph_analyzer.find_usages(
+                analyzer,
+                overloads,
+                &candidates,
+                max_usages,
+            ) {
+                FuzzyResult::Failure { .. } => self.fallback_usage_analyzer.find_usages(
+                    analyzer,
+                    overloads,
+                    &candidates,
+                    max_usages,
+                ),
+                other => other,
+            }
+        } else {
+            self.fallback_usage_analyzer
+                .find_usages(analyzer, overloads, &candidates, max_usages)
+        };
 
         QueryResult {
             candidate_files: candidates,
             candidate_files_truncated,
             result,
-        }
-    }
-
-    fn choose_strategy(&self, target: &CodeUnit) -> &dyn UsageAnalyzer {
-        let language = target
-            .source()
-            .rel_path()
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .map(Language::from_extension)
-            .unwrap_or(Language::None);
-        match language {
-            Language::JavaScript | Language::TypeScript => self.js_ts_graph_analyzer.as_ref(),
-            _ => self.fallback_usage_analyzer.as_ref(),
         }
     }
 

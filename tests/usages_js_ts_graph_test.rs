@@ -1,7 +1,7 @@
 mod common;
 
 use brokk_analyzer::usages::{
-    FuzzyResult, JsTsExportUsageGraphStrategy, RegexUsageAnalyzer, UsageAnalyzer, UsageFinder,
+    FuzzyResult, JsTsExportUsageGraphStrategy, UsageAnalyzer, UsageFinder,
 };
 use brokk_analyzer::{CodeUnit, IAnalyzer, JavascriptAnalyzer, ProjectFile, TypescriptAnalyzer};
 use common::{js_fixture_project, ts_fixture_project};
@@ -36,7 +36,7 @@ fn js_graph_strategy_finds_in_file_references() {
             && cu.source().rel_path().ends_with("ClassUsagePatterns.js")
     });
 
-    let strategy = JsTsExportUsageGraphStrategy::new(RegexUsageAnalyzer::new());
+    let strategy = JsTsExportUsageGraphStrategy::new();
     let candidate_files: brokk_analyzer::hash::HashSet<ProjectFile> =
         std::iter::once(target.source().clone()).collect();
     let result = strategy.find_usages(
@@ -75,7 +75,7 @@ fn ts_graph_strategy_finds_in_file_references() {
             && cu.source().rel_path().ends_with("ClassUsagePatterns.ts")
     });
 
-    let strategy = JsTsExportUsageGraphStrategy::new(RegexUsageAnalyzer::new());
+    let strategy = JsTsExportUsageGraphStrategy::new();
     let candidate_files: brokk_analyzer::hash::HashSet<ProjectFile> =
         std::iter::once(target.source().clone()).collect();
     let result = strategy.find_usages(
