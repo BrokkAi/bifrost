@@ -7,7 +7,7 @@
 //! the `--root` path is used as a fallback.
 
 mod capabilities;
-mod conversion;
+pub mod conversion;
 mod server;
 
 pub use server::run_lsp_stdio_server;

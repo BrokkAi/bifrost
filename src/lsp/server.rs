@@ -2,10 +2,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use lsp_server::{Connection, ExtractError, IoThreads, Message, Notification, Request};
-use lsp_types::{InitializeParams, Uri};
+use lsp_types::InitializeParams;
 
 use crate::analyzer::{AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer};
 use crate::lsp::capabilities::server_capabilities;
+use crate::lsp::conversion::uri_to_path;
 
 /// Run the LSP server over stdio. `fallback_root` is used when the client does
 /// not advertise a `workspaceFolders[0]`. Returns when the client sends
@@ -141,55 +142,4 @@ fn pick_workspace_root(params: &InitializeParams, fallback: &PathBuf) -> PathBuf
     }
 
     fallback.clone()
-}
-
-fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
-    let raw = uri.as_str();
-    let stripped = raw.strip_prefix("file://")?;
-    // Strip a single leading slash on Windows (e.g. `file:///C:/foo` → `C:/foo`).
-    #[cfg(windows)]
-    let stripped = stripped.strip_prefix('/').unwrap_or(stripped);
-    let decoded = percent_decode(stripped);
-    Some(PathBuf::from(decoded))
-}
-
-fn percent_decode(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(h), Some(l)) =
-                (hex_value(bytes[i + 1]), hex_value(bytes[i + 2]))
-            {
-                out.push((h << 4) | l);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn percent_decode_handles_spaces_and_unicode() {
-        assert_eq!(percent_decode("a%20b"), "a b");
-        assert_eq!(percent_decode("%E2%9C%93"), "✓");
-        assert_eq!(percent_decode("plain/path"), "plain/path");
-    }
 }
