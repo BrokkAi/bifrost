@@ -176,6 +176,21 @@ impl JavaAnalyzer {
         }
     }
 
+    pub fn new_with_config_and_storage(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
+    ) -> Self {
+        let memo_budget = config.memo_cache_budget_bytes();
+        let inner = TreeSitterAnalyzer::new_with_config_and_storage(
+            project, JavaAdapter, config, storage,
+        );
+        Self {
+            inner,
+            memo_caches: Arc::new(JavaMemoCaches::new(memo_budget)),
+        }
+    }
+
     pub fn new_with_progress<F>(project: Arc<dyn Project>, progress: F) -> Self
     where
         F: Fn(usize, usize, &ProjectFile) + Send + Sync + 'static,

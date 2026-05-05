@@ -8,13 +8,14 @@ mod java_analyzer;
 mod javascript_analyzer;
 mod model;
 mod multi_analyzer;
+pub mod persistence;
 mod php_analyzer;
 mod project;
 mod python_analyzer;
 mod rust_analyzer;
 mod scala_analyzer;
 mod source_content;
-mod tree_sitter_analyzer;
+pub(crate) mod tree_sitter_analyzer;
 mod typescript_analyzer;
 mod workspace;
 

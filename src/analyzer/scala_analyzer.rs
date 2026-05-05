@@ -80,6 +80,18 @@ impl ScalaAnalyzer {
         }
     }
 
+    pub fn new_with_config_and_storage(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
+    ) -> Self {
+        Self {
+            inner: TreeSitterAnalyzer::new_with_config_and_storage(
+                project, ScalaAdapter, config, storage,
+            ),
+        }
+    }
+
     pub fn from_project<P>(project: P) -> Self
     where
         P: Project + 'static,

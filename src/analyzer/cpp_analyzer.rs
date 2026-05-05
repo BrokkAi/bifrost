@@ -85,6 +85,21 @@ impl CppAnalyzer {
         }
     }
 
+    pub fn new_with_config_and_storage(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
+    ) -> Self {
+        let memo_budget = config.memo_cache_budget_bytes();
+        Self {
+            inner: TreeSitterAnalyzer::new_with_config_and_storage(
+                project, CppAdapter, config, storage,
+            ),
+            imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
+            referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
+        }
+    }
+
     pub fn from_project<P>(project: P) -> Self
     where
         P: Project + 'static,
