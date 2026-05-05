@@ -4,10 +4,9 @@ use lsp_types::{
     DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, Range as LspRange, SymbolKind,
 };
 
-use crate::analyzer::{
-    CodeUnit, CodeUnitType, IAnalyzer, ProjectFile, Range as ByteRange, WorkspaceAnalyzer,
-};
-use crate::lsp::conversion::{byte_range_to_lsp_range, uri_to_path};
+use crate::analyzer::{CodeUnit, CodeUnitType, IAnalyzer, Range as ByteRange, WorkspaceAnalyzer};
+use crate::lsp::conversion::byte_range_to_lsp_range;
+use crate::lsp::handlers::util::project_file_for_uri;
 use crate::text_utils::compute_line_starts;
 
 /// Build the documentSymbol response for a request URI. Returns `None` when
@@ -18,11 +17,7 @@ pub fn handle(
     project_root: &Path,
     params: &DocumentSymbolParams,
 ) -> Option<DocumentSymbolResponse> {
-    let uri = &params.text_document.uri;
-    let abs_path = uri_to_path(uri)?;
-    let rel_path = abs_path.strip_prefix(project_root).ok()?;
-    let project_file = ProjectFile::new(project_root.to_path_buf(), rel_path.to_path_buf());
-
+    let project_file = project_file_for_uri(project_root, &params.text_document.uri)?;
     let analyzer = workspace.analyzer();
 
     // Read the file once for line-start info; rendering is fast after that.
