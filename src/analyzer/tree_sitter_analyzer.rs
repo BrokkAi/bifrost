@@ -572,9 +572,7 @@ where
 
         if let (Some(storage), Some(epoch)) = (storage, epoch_for_commit) {
             let writes = persistence::reconcile::encode_writes(
-                files
-                    .iter()
-                    .filter(|(file, _)| dirty_keys.contains(file)),
+                files.iter().filter(|(file, _)| dirty_keys.contains(file)),
             );
             // Persistence is best-effort; a write failure should not poison
             // the in-memory analyzer.
@@ -950,9 +948,7 @@ where
             let ts_lang = self.adapter.parser_language();
             let epoch = persistence::epoch_for(self.adapter.language(), &ts_lang);
             let writes = persistence::reconcile::encode_writes(
-                files
-                    .iter()
-                    .filter(|(file, _)| dirty_keys.contains(file)),
+                files.iter().filter(|(file, _)| dirty_keys.contains(file)),
             );
             let _ = persistence::reconcile::commit(
                 storage.as_ref(),

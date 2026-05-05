@@ -1,8 +1,6 @@
 //! End-to-end tests for the SQLite-backed analyzer persistence layer.
 
-use brokk_analyzer::analyzer::persistence::{
-    AnalyzerStorage, PersistenceError, default_db_path,
-};
+use brokk_analyzer::analyzer::persistence::{AnalyzerStorage, PersistenceError, default_db_path};
 use brokk_analyzer::{
     AnalyzerConfig, IAnalyzer, Language, PythonAnalyzer, TestProject, WorkspaceAnalyzer,
 };
@@ -28,21 +26,14 @@ fn fresh_python_workspace() -> (TempDir, Arc<TestProject>) {
         "alpha.py",
         "def hello():\n    return 1\n\nclass Greeter:\n    def greet(self):\n        return 'hi'\n",
     );
-    write_file(
-        tmp.path(),
-        "beta.py",
-        "def world():\n    return 2\n",
-    );
+    write_file(tmp.path(), "beta.py", "def world():\n    return 2\n");
     let canon = fs::canonicalize(tmp.path()).unwrap();
     let project = Arc::new(TestProject::new(canon, Language::Python));
     (tmp, project)
 }
 
 fn collect_fq_names<A: IAnalyzer>(analyzer: &A) -> BTreeSet<String> {
-    analyzer
-        .all_declarations()
-        .map(|cu| cu.fq_name())
-        .collect()
+    analyzer.all_declarations().map(|cu| cu.fq_name()).collect()
 }
 
 fn contains_short(names: &BTreeSet<String>, short: &str) -> bool {
@@ -72,7 +63,10 @@ fn storage_rejects_corrupt_database() {
     fs::write(&path, b"this is definitely not sqlite").unwrap();
 
     let result = AnalyzerStorage::open(&path);
-    assert!(result.is_err(), "corrupt file should not open as analyzer DB");
+    assert!(
+        result.is_err(),
+        "corrupt file should not open as analyzer DB"
+    );
     match result {
         Err(PersistenceError::Sqlite(_)) | Err(PersistenceError::IntegrityCheck(_)) => {}
         Err(other) => panic!("unexpected error variant: {other:?}"),

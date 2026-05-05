@@ -101,7 +101,11 @@ struct UnknownSchemaVersion {
 
 impl std::fmt::Display for UnknownSchemaVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "no migration registered for schema version {}", self.version)
+        write!(
+            f,
+            "no migration registered for schema version {}",
+            self.version
+        )
     }
 }
 

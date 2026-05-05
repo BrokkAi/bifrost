@@ -203,9 +203,8 @@ impl AnalyzerStorage {
         let tx = conn.transaction()?;
 
         if !deletes.is_empty() {
-            let mut delete_stmt = tx.prepare(
-                "DELETE FROM analyzed_files WHERE language = ?1 AND rel_path = ?2",
-            )?;
+            let mut delete_stmt =
+                tx.prepare("DELETE FROM analyzed_files WHERE language = ?1 AND rel_path = ?2")?;
             for path in deletes {
                 delete_stmt.execute(params![lang, path])?;
             }

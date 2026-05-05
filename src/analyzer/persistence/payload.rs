@@ -158,8 +158,7 @@ impl PersistedFileState {
             ranges.insert(unit.into_code_unit(source), file_ranges);
         }
 
-        let mut children: HashMap<CodeUnit, Vec<CodeUnit>> =
-            map_with_capacity(self.children.len());
+        let mut children: HashMap<CodeUnit, Vec<CodeUnit>> = map_with_capacity(self.children.len());
         for (parent, descendants) in self.children {
             let parent_cu = parent.into_code_unit(source);
             let descendants_cu = descendants

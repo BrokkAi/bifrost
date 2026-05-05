@@ -182,9 +182,8 @@ impl JavaAnalyzer {
         storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
     ) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
-        let inner = TreeSitterAnalyzer::new_with_config_and_storage(
-            project, JavaAdapter, config, storage,
-        );
+        let inner =
+            TreeSitterAnalyzer::new_with_config_and_storage(project, JavaAdapter, config, storage);
         Self {
             inner,
             memo_caches: Arc::new(JavaMemoCaches::new(memo_budget)),

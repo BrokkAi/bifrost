@@ -123,41 +123,119 @@ fn hash_grammar(hasher: &mut Sha256, lang: &TsLanguage) {
 /// changes the per-language epoch.
 const EMBEDDED_QUERIES: &[(&str, &str)] = &[
     // Java
-    ("treesitter/java/definitions.scm", include_str!("../../../resources/treesitter/java/definitions.scm")),
-    ("treesitter/java/imports.scm", include_str!("../../../resources/treesitter/java/imports.scm")),
-    ("treesitter/java/identifiers.scm", include_str!("../../../resources/treesitter/java/identifiers.scm")),
+    (
+        "treesitter/java/definitions.scm",
+        include_str!("../../../resources/treesitter/java/definitions.scm"),
+    ),
+    (
+        "treesitter/java/imports.scm",
+        include_str!("../../../resources/treesitter/java/imports.scm"),
+    ),
+    (
+        "treesitter/java/identifiers.scm",
+        include_str!("../../../resources/treesitter/java/identifiers.scm"),
+    ),
     // Python
-    ("treesitter/python/definitions.scm", include_str!("../../../resources/treesitter/python/definitions.scm")),
-    ("treesitter/python/imports.scm", include_str!("../../../resources/treesitter/python/imports.scm")),
-    ("treesitter/python/identifiers.scm", include_str!("../../../resources/treesitter/python/identifiers.scm")),
+    (
+        "treesitter/python/definitions.scm",
+        include_str!("../../../resources/treesitter/python/definitions.scm"),
+    ),
+    (
+        "treesitter/python/imports.scm",
+        include_str!("../../../resources/treesitter/python/imports.scm"),
+    ),
+    (
+        "treesitter/python/identifiers.scm",
+        include_str!("../../../resources/treesitter/python/identifiers.scm"),
+    ),
     // Go
-    ("treesitter/go/definitions.scm", include_str!("../../../resources/treesitter/go/definitions.scm")),
-    ("treesitter/go/imports.scm", include_str!("../../../resources/treesitter/go/imports.scm")),
-    ("treesitter/go/identifiers.scm", include_str!("../../../resources/treesitter/go/identifiers.scm")),
+    (
+        "treesitter/go/definitions.scm",
+        include_str!("../../../resources/treesitter/go/definitions.scm"),
+    ),
+    (
+        "treesitter/go/imports.scm",
+        include_str!("../../../resources/treesitter/go/imports.scm"),
+    ),
+    (
+        "treesitter/go/identifiers.scm",
+        include_str!("../../../resources/treesitter/go/identifiers.scm"),
+    ),
     // Rust
-    ("treesitter/rust/definitions.scm", include_str!("../../../resources/treesitter/rust/definitions.scm")),
-    ("treesitter/rust/imports.scm", include_str!("../../../resources/treesitter/rust/imports.scm")),
+    (
+        "treesitter/rust/definitions.scm",
+        include_str!("../../../resources/treesitter/rust/definitions.scm"),
+    ),
+    (
+        "treesitter/rust/imports.scm",
+        include_str!("../../../resources/treesitter/rust/imports.scm"),
+    ),
     // JavaScript
-    ("treesitter/javascript/definitions.scm", include_str!("../../../resources/treesitter/javascript/definitions.scm")),
-    ("treesitter/javascript/imports.scm", include_str!("../../../resources/treesitter/javascript/imports.scm")),
-    ("treesitter/javascript/identifiers.scm", include_str!("../../../resources/treesitter/javascript/identifiers.scm")),
+    (
+        "treesitter/javascript/definitions.scm",
+        include_str!("../../../resources/treesitter/javascript/definitions.scm"),
+    ),
+    (
+        "treesitter/javascript/imports.scm",
+        include_str!("../../../resources/treesitter/javascript/imports.scm"),
+    ),
+    (
+        "treesitter/javascript/identifiers.scm",
+        include_str!("../../../resources/treesitter/javascript/identifiers.scm"),
+    ),
     // TypeScript
-    ("treesitter/typescript/definitions.scm", include_str!("../../../resources/treesitter/typescript/definitions.scm")),
-    ("treesitter/typescript/imports.scm", include_str!("../../../resources/treesitter/typescript/imports.scm")),
-    ("treesitter/typescript/identifiers.scm", include_str!("../../../resources/treesitter/typescript/identifiers.scm")),
+    (
+        "treesitter/typescript/definitions.scm",
+        include_str!("../../../resources/treesitter/typescript/definitions.scm"),
+    ),
+    (
+        "treesitter/typescript/imports.scm",
+        include_str!("../../../resources/treesitter/typescript/imports.scm"),
+    ),
+    (
+        "treesitter/typescript/identifiers.scm",
+        include_str!("../../../resources/treesitter/typescript/identifiers.scm"),
+    ),
     // C++
-    ("treesitter/cpp/definitions.scm", include_str!("../../../resources/treesitter/cpp/definitions.scm")),
-    ("treesitter/cpp/imports.scm", include_str!("../../../resources/treesitter/cpp/imports.scm")),
-    ("treesitter/cpp/identifiers.scm", include_str!("../../../resources/treesitter/cpp/identifiers.scm")),
+    (
+        "treesitter/cpp/definitions.scm",
+        include_str!("../../../resources/treesitter/cpp/definitions.scm"),
+    ),
+    (
+        "treesitter/cpp/imports.scm",
+        include_str!("../../../resources/treesitter/cpp/imports.scm"),
+    ),
+    (
+        "treesitter/cpp/identifiers.scm",
+        include_str!("../../../resources/treesitter/cpp/identifiers.scm"),
+    ),
     // C#
-    ("treesitter/c_sharp/definitions.scm", include_str!("../../../resources/treesitter/c_sharp/definitions.scm")),
-    ("treesitter/c_sharp/imports.scm", include_str!("../../../resources/treesitter/c_sharp/imports.scm")),
+    (
+        "treesitter/c_sharp/definitions.scm",
+        include_str!("../../../resources/treesitter/c_sharp/definitions.scm"),
+    ),
+    (
+        "treesitter/c_sharp/imports.scm",
+        include_str!("../../../resources/treesitter/c_sharp/imports.scm"),
+    ),
     // PHP
-    ("treesitter/php/definitions.scm", include_str!("../../../resources/treesitter/php/definitions.scm")),
-    ("treesitter/php/imports.scm", include_str!("../../../resources/treesitter/php/imports.scm")),
+    (
+        "treesitter/php/definitions.scm",
+        include_str!("../../../resources/treesitter/php/definitions.scm"),
+    ),
+    (
+        "treesitter/php/imports.scm",
+        include_str!("../../../resources/treesitter/php/imports.scm"),
+    ),
     // Scala
-    ("treesitter/scala/definitions.scm", include_str!("../../../resources/treesitter/scala/definitions.scm")),
-    ("treesitter/scala/imports.scm", include_str!("../../../resources/treesitter/scala/imports.scm")),
+    (
+        "treesitter/scala/definitions.scm",
+        include_str!("../../../resources/treesitter/scala/definitions.scm"),
+    ),
+    (
+        "treesitter/scala/imports.scm",
+        include_str!("../../../resources/treesitter/scala/imports.scm"),
+    ),
 ];
 
 macro_rules! lang_epoch {

@@ -87,7 +87,10 @@ impl ScalaAnalyzer {
     ) -> Self {
         Self {
             inner: TreeSitterAnalyzer::new_with_config_and_storage(
-                project, ScalaAdapter, config, storage,
+                project,
+                ScalaAdapter,
+                config,
+                storage,
             ),
         }
     }

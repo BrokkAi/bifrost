@@ -178,7 +178,10 @@ impl RustAnalyzer {
         let memo_budget = config.memo_cache_budget_bytes();
         Self {
             inner: TreeSitterAnalyzer::new_with_config_and_storage(
-                project, RustAdapter, config, storage,
+                project,
+                RustAdapter,
+                config,
+                storage,
             ),
             memo_budget,
             imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
