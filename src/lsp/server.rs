@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use lsp_server::{Connection, ErrorCode, ExtractError, IoThreads, Message, Notification, Request, Response};
 use lsp_types::request::{
-    DocumentSymbolRequest, GotoDefinition, HoverRequest, Request as LspRequestTrait,
+    DocumentSymbolRequest, GotoDefinition, HoverRequest, References, Request as LspRequestTrait,
     WorkspaceSymbolRequest,
 };
 use lsp_types::InitializeParams;
@@ -11,7 +11,7 @@ use lsp_types::InitializeParams;
 use crate::analyzer::{AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer};
 use crate::lsp::capabilities::server_capabilities;
 use crate::lsp::conversion::uri_to_path;
-use crate::lsp::handlers::{definition, document_symbol, hover, workspace_symbol};
+use crate::lsp::handlers::{definition, document_symbol, hover, references, workspace_symbol};
 
 /// Run the LSP server over stdio. `fallback_root` is used when the client does
 /// not advertise a `workspaceFolders[0]`. Returns when the client sends
@@ -97,6 +97,13 @@ fn handle_request(
         }),
         HoverRequest::METHOD => decode_and_run::<HoverRequest, _>(req, |params| {
             Ok(hover::handle(&state.workspace, state.project.root(), &params))
+        }),
+        References::METHOD => decode_and_run::<References, _>(req, |params| {
+            Ok(references::handle(
+                &state.workspace,
+                state.project.root(),
+                &params,
+            ))
         }),
         _ => Response::new_err(
             id,
