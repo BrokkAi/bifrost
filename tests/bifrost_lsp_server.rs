@@ -263,6 +263,90 @@ fn bifrost_lsp_server_workspace_symbol_finds_method() {
 }
 
 #[test]
+fn bifrost_lsp_server_goto_definition_finds_class_a_from_b() {
+    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("testcode-java");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(&fixture_root)
+        .arg("--server")
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bifrost");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    let canonical_root = fixture_root.canonicalize().expect("canon fixture");
+    let root_uri = format!("file://{}", canonical_root.display());
+    let b_uri = format!("file://{}/B.java", canonical_root.display());
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"processId": null, "rootUri": root_uri, "capabilities": {}}
+        }),
+    );
+    let init = read_message(&mut reader, &mut stderr);
+    assert_eq!(
+        init["result"]["capabilities"]["definitionProvider"], true,
+        "definitionProvider should be advertised: {init}"
+    );
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+    );
+
+    // Line 6 (0-based), char 8: cursor is on the `A` in `A a = new A();`.
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "textDocument/definition",
+            "params": {
+                "textDocument": {"uri": b_uri},
+                "position": {"line": 6, "character": 8}
+            }
+        }),
+    );
+    let response = read_message(&mut reader, &mut stderr);
+    let locations = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected location array, got {response}"));
+    assert!(!locations.is_empty(), "no definitions found: {response}");
+    let uri = locations[0]["uri"].as_str().expect("location uri");
+    assert!(
+        uri.ends_with("A.java"),
+        "expected A.java URI, got {uri}"
+    );
+
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown"}),
+    );
+    let _ = read_message(&mut reader, &mut stderr);
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "exit"}),
+    );
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
 fn bifrost_lsp_server_unknown_request_returns_method_not_found() {
     let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
