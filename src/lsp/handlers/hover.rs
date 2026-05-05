@@ -2,9 +2,9 @@ use std::path::Path;
 
 use lsp_types::{Hover, HoverContents, HoverParams, MarkupContent, MarkupKind};
 
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, WorkspaceAnalyzer};
-use crate::lsp::conversion::position_to_byte_offset;
-use crate::lsp::handlers::util::{identifier_at_offset, project_file_for_uri};
+use crate::analyzer::{CodeUnit, IAnalyzer, Language, Range as ByteRange, WorkspaceAnalyzer};
+use crate::lsp::conversion::{byte_range_to_lsp_range, position_to_byte_offset};
+use crate::lsp::handlers::util::{identifier_span_at_offset, project_file_for_uri};
 use crate::text_utils::compute_line_starts;
 
 /// Resolve `textDocument/hover` for the symbol under the cursor. Returns the
@@ -25,7 +25,8 @@ pub fn handle(
         &line_starts,
         &params.text_document_position_params.position,
     );
-    let identifier = identifier_at_offset(&content, byte_offset)?;
+    let (start_byte, end_byte) = identifier_span_at_offset(&content, byte_offset)?;
+    let identifier = &content[start_byte..end_byte];
 
     let analyzer = workspace.analyzer();
     let candidate = pick_candidate(analyzer, identifier)?;
@@ -34,13 +35,23 @@ pub fn handle(
         .or_else(|| analyzer.get_skeleton(&candidate))?;
     let language_tag = language_for_path(candidate.source().rel_path());
 
+    let highlight_range = byte_range_to_lsp_range(
+        &content,
+        &line_starts,
+        &ByteRange {
+            start_byte,
+            end_byte,
+            start_line: 0,
+            end_line: 0,
+        },
+    );
     let value = format!("```{language_tag}\n{}\n```", skeleton.trim_end());
     Some(Hover {
         contents: HoverContents::Markup(MarkupContent {
             kind: MarkupKind::Markdown,
             value,
         }),
-        range: None,
+        range: Some(highlight_range),
     })
 }
 
@@ -49,7 +60,11 @@ fn pick_candidate(analyzer: &dyn IAnalyzer, identifier: &str) -> Option<CodeUnit
     if let Some(first) = direct.into_iter().next() {
         return Some(first);
     }
-    let pattern = format!(r"^{}$", regex::escape(identifier));
+    // See definition::resolve_candidates for the rationale: the analyzer
+    // matches the regex against the full fq_name, so an anchored pattern
+    // misses package-qualified symbols. Word-boundaries plus a
+    // short-name post-filter is the correct shape.
+    let pattern = format!(r"\b{}\b", regex::escape(identifier));
     analyzer
         .search_definitions(&pattern, false)
         .into_iter()

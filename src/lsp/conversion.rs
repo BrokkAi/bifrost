@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use lsp_types::{Position, Range as LspRange, Uri};
 
 use crate::analyzer::Range as ByteRange;
-use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
+use crate::text_utils::find_line_index_for_offset;
 
 /// Convert a byte offset within `content` to an LSP [`Position`].
 ///
@@ -94,14 +94,6 @@ pub fn byte_range_to_lsp_range(
     LspRange { start, end }
 }
 
-/// Convenience wrapper that computes line starts on the fly. Prefer the
-/// `_with_line_starts` flavors in hot paths where the same content is used
-/// for many conversions.
-pub fn byte_range_to_lsp_range_owned(content: &str, range: &ByteRange) -> LspRange {
-    let line_starts = compute_line_starts(content);
-    byte_range_to_lsp_range(content, &line_starts, range)
-}
-
 /// Convert a `file://` URI to a filesystem path. Returns `None` for
 /// non-`file` schemes or malformed URIs.
 pub fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
@@ -181,6 +173,7 @@ fn hex_value(byte: u8) -> Option<u8> {
 mod tests {
     use super::*;
     use crate::analyzer::Range as ByteRange;
+    use crate::text_utils::compute_line_starts;
 
     fn line_starts(s: &str) -> Vec<usize> {
         compute_line_starts(s)
@@ -326,5 +319,37 @@ mod tests {
         let path = PathBuf::from("/home/user/Some File.rs");
         let uri_str = path_to_uri_string(&path);
         assert_eq!(uri_str, "file:///home/user/Some%20File.rs");
+    }
+
+    #[test]
+    fn uri_path_round_trip_handles_tricky_chars() {
+        // Each path is encoded then decoded back. The original must be
+        // recovered byte-for-byte: spaces, percent literals, non-ASCII
+        // glyphs, and URI-significant punctuation (`?`, `#`, `[`, `]`).
+        let cases = [
+            "/home/user/file.rs",
+            "/home/user/Some File.rs",
+            "/home/user/100%done.txt",
+            "/home/user/résumé.pdf",
+            "/home/user/face 😀.txt",
+            "/home/user/q?x=1.txt",
+            "/home/user/anchor#frag.md",
+            "/home/user/[brackets].rs",
+            "/home/user/dir/with spaces/file.txt",
+        ];
+        for original in cases {
+            let path = PathBuf::from(original);
+            let uri_str = path_to_uri_string(&path);
+            let parsed: Uri = uri_str
+                .parse()
+                .unwrap_or_else(|err| panic!("uri parse failed for {original}: {err}"));
+            let back = uri_to_path(&parsed)
+                .unwrap_or_else(|| panic!("uri_to_path returned None for {uri_str}"));
+            assert_eq!(
+                back,
+                PathBuf::from(original),
+                "round trip failed for {original} (encoded as {uri_str})"
+            );
+        }
     }
 }

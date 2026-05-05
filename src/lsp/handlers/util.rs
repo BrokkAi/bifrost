@@ -5,10 +5,31 @@ use crate::lsp::conversion::uri_to_path;
 use lsp_types::Uri;
 
 /// Resolve an LSP `Uri` to a [`ProjectFile`] inside `project_root`. Returns
-/// `None` for non-`file:` URIs or paths outside the project.
+/// `None` for non-`file:` URIs or paths outside the project, logging a
+/// single-line stderr warning so users debugging "why is my LSP request
+/// returning empty" can see the cause.
 pub fn project_file_for_uri(project_root: &Path, uri: &Uri) -> Option<ProjectFile> {
-    let abs_path = uri_to_path(uri)?;
-    let rel_path = abs_path.strip_prefix(project_root).ok()?;
+    let abs_path = match uri_to_path(uri) {
+        Some(path) => path,
+        None => {
+            eprintln!(
+                "[bifrost-lsp] ignoring non-file URI: {} (only file:// is supported)",
+                uri.as_str()
+            );
+            return None;
+        }
+    };
+    let rel_path = match abs_path.strip_prefix(project_root) {
+        Ok(rel) => rel,
+        Err(_) => {
+            eprintln!(
+                "[bifrost-lsp] ignoring path outside project root: {} (root: {})",
+                abs_path.display(),
+                project_root.display()
+            );
+            return None;
+        }
+    };
     Some(ProjectFile::new(
         project_root.to_path_buf(),
         rel_path.to_path_buf(),
@@ -19,6 +40,14 @@ pub fn project_file_for_uri(project_root: &Path, uri: &Uri) -> Option<ProjectFil
 /// `content`. Returns `None` if neither the byte at `offset` nor the byte
 /// immediately before it is part of an identifier.
 pub fn identifier_at_offset(content: &str, offset: usize) -> Option<&str> {
+    let (start, end) = identifier_span_at_offset(content, offset)?;
+    content.get(start..end)
+}
+
+/// Like [`identifier_at_offset`] but returns the byte span `(start, end)`
+/// inside `content` instead of the slice. Useful for callers that need the
+/// range as a value (e.g. LSP hover wants to return the highlight range).
+pub fn identifier_span_at_offset(content: &str, offset: usize) -> Option<(usize, usize)> {
     let bytes = content.as_bytes();
     if bytes.is_empty() {
         return None;
@@ -47,7 +76,10 @@ pub fn identifier_at_offset(content: &str, offset: usize) -> Option<&str> {
     while end < bytes.len() && is_ident_byte(bytes[end]) {
         end += 1;
     }
-    content.get(start..end)
+    if start == end {
+        return None;
+    }
+    Some((start, end))
 }
 
 fn is_ident_byte(byte: u8) -> bool {

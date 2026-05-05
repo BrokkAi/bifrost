@@ -61,7 +61,11 @@ fn resolve_candidates(analyzer: &dyn IAnalyzer, identifier: &str) -> Vec<CodeUni
     if !direct.is_empty() {
         return direct;
     }
-    let pattern = format!(r"^{}$", regex::escape(identifier));
+    // search_definitions matches the regex against the *full* fq_name, so an
+    // anchored `^IDENT$` only finds package-less top-level symbols. Use a
+    // word-bounded substring instead, then filter by exact short-name match
+    // to keep the result tight.
+    let pattern = format!(r"\b{}\b", regex::escape(identifier));
     analyzer
         .search_definitions(&pattern, false)
         .into_iter()

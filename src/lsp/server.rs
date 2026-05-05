@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use lsp_server::{Connection, ErrorCode, ExtractError, IoThreads, Message, Notification, Request, Response};
@@ -14,11 +14,10 @@ use lsp_types::{
     DidChangeWatchedFilesParams, DidSaveTextDocumentParams, FileChangeType, InitializeParams,
 };
 
-use crate::analyzer::{
-    AnalyzerConfig, FilesystemProject, Project, ProjectFile, WorkspaceAnalyzer,
-};
+use crate::analyzer::{AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer};
 use crate::lsp::capabilities::server_capabilities;
 use crate::lsp::conversion::uri_to_path;
+use crate::lsp::handlers::util::project_file_for_uri as resolve_project_file;
 use crate::lsp::handlers::{
     definition, diagnostic, document_symbol, hover, references, workspace_symbol,
 };
@@ -45,7 +44,7 @@ pub(crate) fn run_with_connection(
     let init_params: InitializeParams = serde_json::from_value(init_params_value)
         .map_err(|err| format!("Failed to decode InitializeParams: {err}"))?;
 
-    let workspace_root = pick_workspace_root(&init_params, &fallback_root);
+    let workspace_root = pick_workspace_root(&init_params, fallback_root.as_path());
     let mut state = ServerState::new(workspace_root)?;
 
     let result = main_loop(&connection, &mut state);
@@ -180,7 +179,9 @@ fn handle_notification(state: &mut ServerState, note: Notification) -> Result<()
                 serde_json::from_value(note.params).map_err(|err| {
                     format!("Failed to decode {} params: {err}", DidSaveTextDocument::METHOD)
                 })?;
-            if let Some(file) = project_file_for_uri(state, &params.text_document.uri) {
+            if let Some(file) =
+                resolve_project_file(state.project.root(), &params.text_document.uri)
+            {
                 let mut changed = BTreeSet::new();
                 changed.insert(file);
                 state.workspace = state.workspace.update(&changed);
@@ -195,16 +196,16 @@ fn handle_notification(state: &mut ServerState, note: Notification) -> Result<()
                         DidChangeWatchedFiles::METHOD
                     )
                 })?;
+            // Treat created/changed/deleted uniformly — the analyzer's
+            // update path re-reads from disk, so it handles both new content
+            // and disappearance correctly.
             let mut changed = BTreeSet::new();
             for change in params.changes {
-                // Treat created/changed/deleted uniformly — the analyzer's
-                // update path handles both new content and disappearance.
-                let _ = change.typ;
                 if matches!(
                     change.typ,
                     FileChangeType::CREATED | FileChangeType::CHANGED | FileChangeType::DELETED
                 )
-                    && let Some(file) = project_file_for_uri(state, &change.uri)
+                    && let Some(file) = resolve_project_file(state.project.root(), &change.uri)
                 {
                     changed.insert(file);
                 }
@@ -222,16 +223,6 @@ fn handle_notification(state: &mut ServerState, note: Notification) -> Result<()
     }
 }
 
-fn project_file_for_uri(state: &ServerState, uri: &lsp_types::Uri) -> Option<ProjectFile> {
-    let abs_path = uri_to_path(uri)?;
-    let rel_path = abs_path.strip_prefix(state.project.root()).ok()?;
-    Some(ProjectFile::new(
-        state.project.root().to_path_buf(),
-        rel_path.to_path_buf(),
-    ))
-}
-
-
 pub(crate) struct ServerState {
     workspace: WorkspaceAnalyzer,
     project: Arc<dyn Project>,
@@ -248,7 +239,7 @@ impl ServerState {
     }
 }
 
-fn pick_workspace_root(params: &InitializeParams, fallback: &PathBuf) -> PathBuf {
+fn pick_workspace_root(params: &InitializeParams, fallback: &Path) -> PathBuf {
     if let Some(folders) = &params.workspace_folders
         && let Some(first) = folders.first()
         && let Some(path) = uri_to_path(&first.uri)
@@ -268,5 +259,5 @@ fn pick_workspace_root(params: &InitializeParams, fallback: &PathBuf) -> PathBuf
         return PathBuf::from(root_path);
     }
 
-    fallback.clone()
+    fallback.to_path_buf()
 }

@@ -81,7 +81,10 @@ fn resolve_overloads(analyzer: &dyn IAnalyzer, identifier: &str) -> Vec<CodeUnit
     if !out.is_empty() {
         return out;
     }
-    let pattern = format!(r"^{}$", regex::escape(identifier));
+    // Word-bounded fq_name search (the regex runs against the full fq_name
+    // including any package prefix) plus a short-name post-filter. See
+    // definition::resolve_candidates for rationale.
+    let pattern = format!(r"\b{}\b", regex::escape(identifier));
     out.extend(
         analyzer
             .search_definitions(&pattern, false)
