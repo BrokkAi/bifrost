@@ -6,9 +6,7 @@ use lsp_types::{
     WorkspaceSymbolResponse,
 };
 
-use crate::analyzer::{
-    CodeUnit, CodeUnitType, IAnalyzer, Range as ByteRange, WorkspaceAnalyzer,
-};
+use crate::analyzer::{CodeUnit, CodeUnitType, IAnalyzer, Range as ByteRange, WorkspaceAnalyzer};
 use crate::lsp::conversion::{byte_range_to_lsp_range, path_to_uri_string};
 use crate::text_utils::compute_line_starts;
 
@@ -55,28 +53,26 @@ fn build_symbol(
     cache: &mut HashMap<PathBuf, FileContent>,
 ) -> Option<WorkspaceSymbol> {
     let abs_path = code_unit.source().abs_path();
-    let entry = cache
-        .entry(abs_path.clone())
-        .or_insert_with(|| {
-            let body = code_unit
-                .source()
-                .read_to_string()
-                .unwrap_or_default();
-            let line_starts = compute_line_starts(&body);
-            FileContent { body, line_starts }
-        });
-
-    let range = analyzer.ranges(code_unit).iter().min().copied().unwrap_or(ByteRange {
-        start_byte: 0,
-        end_byte: entry.body.len(),
-        start_line: 0,
-        end_line: 0,
+    let entry = cache.entry(abs_path.clone()).or_insert_with(|| {
+        let body = code_unit.source().read_to_string().unwrap_or_default();
+        let line_starts = compute_line_starts(&body);
+        FileContent { body, line_starts }
     });
+
+    let range = analyzer
+        .ranges(code_unit)
+        .iter()
+        .min()
+        .copied()
+        .unwrap_or(ByteRange {
+            start_byte: 0,
+            end_byte: entry.body.len(),
+            start_line: 0,
+            end_line: 0,
+        });
     let lsp_range = byte_range_to_lsp_range(&entry.body, &entry.line_starts, &range);
 
-    let uri: Uri = path_to_uri_string(&abs_path)
-        .parse()
-        .ok()?;
+    let uri: Uri = path_to_uri_string(&abs_path).parse().ok()?;
 
     let location = Location {
         uri,
@@ -110,4 +106,3 @@ fn map_kind(kind: CodeUnitType) -> SymbolKind {
         CodeUnitType::Module => SymbolKind::MODULE,
     }
 }
-

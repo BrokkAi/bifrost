@@ -40,10 +40,7 @@ pub fn handle(
     ))
 }
 
-fn build_report(
-    project_root: &Path,
-    params: &DocumentDiagnosticParams,
-) -> Option<Vec<Diagnostic>> {
+fn build_report(project_root: &Path, params: &DocumentDiagnosticParams) -> Option<Vec<Diagnostic>> {
     let project_file = project_file_for_uri(project_root, &params.text_document.uri)?;
     let extension = project_file
         .rel_path()
@@ -63,12 +60,7 @@ fn build_report(
     Some(diagnostics)
 }
 
-fn walk_for_errors(
-    node: Node,
-    content: &str,
-    line_starts: &[usize],
-    out: &mut Vec<Diagnostic>,
-) {
+fn walk_for_errors(node: Node, content: &str, line_starts: &[usize], out: &mut Vec<Diagnostic>) {
     if node.is_error() || node.is_missing() {
         let byte_range = crate::analyzer::Range {
             start_byte: node.start_byte(),

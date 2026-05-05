@@ -60,10 +60,7 @@ fn bifrost_lsp_server_handles_initialize_and_shutdown() {
     assert_eq!(shutdown["id"], 2);
     assert!(shutdown["error"].is_null(), "unexpected error: {shutdown}");
 
-    write_message(
-        &mut stdin,
-        json!({"jsonrpc": "2.0", "method": "exit"}),
-    );
+    write_message(&mut stdin, json!({"jsonrpc": "2.0", "method": "exit"}));
 
     drop(stdin);
     let status = child.wait().expect("wait bifrost");
@@ -145,10 +142,7 @@ fn bifrost_lsp_server_returns_document_symbols_for_a_java() {
     let children = class_a["children"]
         .as_array()
         .unwrap_or_else(|| panic!("class A should have children: {class_a}"));
-    let child_names: Vec<&str> = children
-        .iter()
-        .filter_map(|c| c["name"].as_str())
-        .collect();
+    let child_names: Vec<&str> = children.iter().filter_map(|c| c["name"].as_str()).collect();
     for expected in ["method1", "method2", "AInner", "AInnerStatic"] {
         assert!(
             child_names.contains(&expected),
@@ -174,10 +168,7 @@ fn bifrost_lsp_server_returns_document_symbols_for_a_java() {
         json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown"}),
     );
     let _ = read_message(&mut reader, &mut stderr);
-    write_message(
-        &mut stdin,
-        json!({"jsonrpc": "2.0", "method": "exit"}),
-    );
+    write_message(&mut stdin, json!({"jsonrpc": "2.0", "method": "exit"}));
     drop(stdin);
     let status = child.wait().expect("wait bifrost");
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");
@@ -255,10 +246,7 @@ fn bifrost_lsp_server_workspace_symbol_finds_method() {
         json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown"}),
     );
     let _ = read_message(&mut reader, &mut stderr);
-    write_message(
-        &mut stdin,
-        json!({"jsonrpc": "2.0", "method": "exit"}),
-    );
+    write_message(&mut stdin, json!({"jsonrpc": "2.0", "method": "exit"}));
     drop(stdin);
     let status = child.wait().expect("wait bifrost");
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");
@@ -329,10 +317,7 @@ fn bifrost_lsp_server_goto_definition_finds_class_a_from_b() {
         .unwrap_or_else(|| panic!("expected location array, got {response}"));
     assert!(!locations.is_empty(), "no definitions found: {response}");
     let uri = locations[0]["uri"].as_str().expect("location uri");
-    assert!(
-        uri.ends_with("A.java"),
-        "expected A.java URI, got {uri}"
-    );
+    assert!(uri.ends_with("A.java"), "expected A.java URI, got {uri}");
     // class A's primary range starts on line 2 (0-based) — the `public class A {`
     // declaration in A.java. Asserts position conversion isn't off-by-one.
     let start_line = locations[0]["range"]["start"]["line"]
@@ -348,10 +333,7 @@ fn bifrost_lsp_server_goto_definition_finds_class_a_from_b() {
         json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown"}),
     );
     let _ = read_message(&mut reader, &mut stderr);
-    write_message(
-        &mut stdin,
-        json!({"jsonrpc": "2.0", "method": "exit"}),
-    );
+    write_message(&mut stdin, json!({"jsonrpc": "2.0", "method": "exit"}));
     drop(stdin);
     let status = child.wait().expect("wait bifrost");
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");
@@ -441,10 +423,7 @@ fn bifrost_lsp_server_hover_returns_signature_for_class_a() {
         json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown"}),
     );
     let _ = read_message(&mut reader, &mut stderr);
-    write_message(
-        &mut stdin,
-        json!({"jsonrpc": "2.0", "method": "exit"}),
-    );
+    write_message(&mut stdin, json!({"jsonrpc": "2.0", "method": "exit"}));
     drop(stdin);
     let status = child.wait().expect("wait bifrost");
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");
@@ -514,10 +493,7 @@ fn bifrost_lsp_server_references_finds_class_a_usages() {
     let locations = response["result"]
         .as_array()
         .unwrap_or_else(|| panic!("expected array, got {response}"));
-    let uris: Vec<&str> = locations
-        .iter()
-        .filter_map(|l| l["uri"].as_str())
-        .collect();
+    let uris: Vec<&str> = locations.iter().filter_map(|l| l["uri"].as_str()).collect();
     assert!(
         uris.iter().any(|u| u.ends_with("B.java")),
         "expected at least one reference in B.java, got: {uris:?}"
@@ -556,10 +532,7 @@ fn bifrost_lsp_server_references_finds_class_a_usages() {
         json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown"}),
     );
     let _ = read_message(&mut reader, &mut stderr);
-    write_message(
-        &mut stdin,
-        json!({"jsonrpc": "2.0", "method": "exit"}),
-    );
+    write_message(&mut stdin, json!({"jsonrpc": "2.0", "method": "exit"}));
     drop(stdin);
     let status = child.wait().expect("wait bifrost");
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");
@@ -638,10 +611,7 @@ fn bifrost_lsp_server_diagnostics_report_parse_error() {
         json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown"}),
     );
     let _ = read_message(&mut reader, &mut stderr);
-    write_message(
-        &mut stdin,
-        json!({"jsonrpc": "2.0", "method": "exit"}),
-    );
+    write_message(&mut stdin, json!({"jsonrpc": "2.0", "method": "exit"}));
     drop(stdin);
     let status = child.wait().expect("wait bifrost");
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");
@@ -741,10 +711,7 @@ fn bifrost_lsp_server_diagnostics_edge_cases() {
         json!({"jsonrpc": "2.0", "id": 99, "method": "shutdown"}),
     );
     let _ = read_message(&mut reader, &mut stderr);
-    write_message(
-        &mut stdin,
-        json!({"jsonrpc": "2.0", "method": "exit"}),
-    );
+    write_message(&mut stdin, json!({"jsonrpc": "2.0", "method": "exit"}));
     drop(stdin);
     let status = child.wait().expect("wait bifrost");
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");
@@ -861,10 +828,7 @@ fn bifrost_lsp_server_did_save_triggers_reindex() {
         json!({"jsonrpc": "2.0", "id": 4, "method": "shutdown"}),
     );
     let _ = read_message(&mut reader, &mut stderr);
-    write_message(
-        &mut stdin,
-        json!({"jsonrpc": "2.0", "method": "exit"}),
-    );
+    write_message(&mut stdin, json!({"jsonrpc": "2.0", "method": "exit"}));
     drop(stdin);
     let status = child.wait().expect("wait bifrost");
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");
@@ -945,10 +909,7 @@ fn bifrost_lsp_server_hover_uses_python_language_tag_for_py_file() {
         json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown"}),
     );
     let _ = read_message(&mut reader, &mut stderr);
-    write_message(
-        &mut stdin,
-        json!({"jsonrpc": "2.0", "method": "exit"}),
-    );
+    write_message(&mut stdin, json!({"jsonrpc": "2.0", "method": "exit"}));
     drop(stdin);
     let status = child.wait().expect("wait bifrost");
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");
@@ -1013,10 +974,7 @@ fn bifrost_lsp_server_unknown_request_returns_method_not_found() {
         json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown"}),
     );
     let _ = read_message(&mut reader, &mut stderr);
-    write_message(
-        &mut stdin,
-        json!({"jsonrpc": "2.0", "method": "exit"}),
-    );
+    write_message(&mut stdin, json!({"jsonrpc": "2.0", "method": "exit"}));
 
     drop(stdin);
     let status = child.wait().expect("wait bifrost");

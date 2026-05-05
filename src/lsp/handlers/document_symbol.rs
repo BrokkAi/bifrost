@@ -46,8 +46,8 @@ fn build_symbol(
 ) -> DocumentSymbol {
     let range = primary_range(analyzer, code_unit, content);
     let lsp_range = byte_range_to_lsp_range(content, line_starts, &range);
-    let selection_range = identifier_selection_range(code_unit, content, line_starts, &range)
-        .unwrap_or(lsp_range);
+    let selection_range =
+        identifier_selection_range(code_unit, content, line_starts, &range).unwrap_or(lsp_range);
 
     let children: Vec<DocumentSymbol> = analyzer
         .direct_children(code_unit)

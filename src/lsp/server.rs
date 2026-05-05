@@ -2,7 +2,9 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use lsp_server::{Connection, ErrorCode, ExtractError, IoThreads, Message, Notification, Request, Response};
+use lsp_server::{
+    Connection, ErrorCode, ExtractError, IoThreads, Message, Notification, Request, Response,
+};
 use lsp_types::notification::{
     DidChangeWatchedFiles, DidSaveTextDocument, Notification as LspNotificationTrait,
 };
@@ -87,16 +89,20 @@ fn handle_request(
 ) -> Result<(), String> {
     let id = req.id.clone();
     let response = match req.method.as_str() {
-        DocumentSymbolRequest::METHOD => decode_and_run::<DocumentSymbolRequest, _>(req, |params| {
-            Ok(document_symbol::handle(
-                &state.workspace,
-                state.project.root(),
-                &params,
-            ))
-        }),
-        WorkspaceSymbolRequest::METHOD => decode_and_run::<WorkspaceSymbolRequest, _>(req, |params| {
-            Ok(workspace_symbol::handle(&state.workspace, &params))
-        }),
+        DocumentSymbolRequest::METHOD => {
+            decode_and_run::<DocumentSymbolRequest, _>(req, |params| {
+                Ok(document_symbol::handle(
+                    &state.workspace,
+                    state.project.root(),
+                    &params,
+                ))
+            })
+        }
+        WorkspaceSymbolRequest::METHOD => {
+            decode_and_run::<WorkspaceSymbolRequest, _>(req, |params| {
+                Ok(workspace_symbol::handle(&state.workspace, &params))
+            })
+        }
         GotoDefinition::METHOD => decode_and_run::<GotoDefinition, _>(req, |params| {
             Ok(definition::handle(
                 &state.workspace,
@@ -105,7 +111,11 @@ fn handle_request(
             ))
         }),
         HoverRequest::METHOD => decode_and_run::<HoverRequest, _>(req, |params| {
-            Ok(hover::handle(&state.workspace, state.project.root(), &params))
+            Ok(hover::handle(
+                &state.workspace,
+                state.project.root(),
+                &params,
+            ))
         }),
         References::METHOD => decode_and_run::<References, _>(req, |params| {
             Ok(references::handle(
@@ -177,7 +187,10 @@ fn handle_notification(state: &mut ServerState, note: Notification) -> Result<()
         DidSaveTextDocument::METHOD => {
             let params: DidSaveTextDocumentParams =
                 serde_json::from_value(note.params).map_err(|err| {
-                    format!("Failed to decode {} params: {err}", DidSaveTextDocument::METHOD)
+                    format!(
+                        "Failed to decode {} params: {err}",
+                        DidSaveTextDocument::METHOD
+                    )
                 })?;
             if let Some(file) =
                 resolve_project_file(state.project.root(), &params.text_document.uri)
@@ -204,8 +217,7 @@ fn handle_notification(state: &mut ServerState, note: Notification) -> Result<()
                 if matches!(
                     change.typ,
                     FileChangeType::CREATED | FileChangeType::CHANGED | FileChangeType::DELETED
-                )
-                    && let Some(file) = resolve_project_file(state.project.root(), &change.uri)
+                ) && let Some(file) = resolve_project_file(state.project.root(), &change.uri)
                 {
                     changed.insert(file);
                 }
@@ -230,10 +242,12 @@ pub(crate) struct ServerState {
 
 impl ServerState {
     fn new(root: PathBuf) -> Result<Self, String> {
-        let project: Arc<dyn Project> = Arc::new(
-            FilesystemProject::new(&root)
-                .map_err(|err| format!("Failed to initialize project root {}: {err}", root.display()))?,
-        );
+        let project: Arc<dyn Project> = Arc::new(FilesystemProject::new(&root).map_err(|err| {
+            format!(
+                "Failed to initialize project root {}: {err}",
+                root.display()
+            )
+        })?);
         let workspace = WorkspaceAnalyzer::build(Arc::clone(&project), AnalyzerConfig::default());
         Ok(Self { workspace, project })
     }

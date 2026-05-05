@@ -10,14 +10,20 @@ fn lsp_json_parses_and_advertises_bifrost_command() {
     let parsed: Value = serde_json::from_str(&raw).expect("valid JSON");
     let bifrost = &parsed["bifrost"];
     assert_eq!(bifrost["command"], "bifrost");
-    let args = bifrost["args"]
-        .as_array()
-        .expect("args should be array");
-    assert_eq!(args, &vec![Value::String("--server".into()), Value::String("lsp".into())]);
+    let args = bifrost["args"].as_array().expect("args should be array");
+    assert_eq!(
+        args,
+        &vec![
+            Value::String("--server".into()),
+            Value::String("lsp".into())
+        ]
+    );
     let map = bifrost["extensionToLanguage"]
         .as_object()
         .expect("extensionToLanguage object");
-    for ext in [".java", ".go", ".cpp", ".js", ".ts", ".py", ".rs", ".php", ".scala", ".cs"] {
+    for ext in [
+        ".java", ".go", ".cpp", ".js", ".ts", ".py", ".rs", ".php", ".scala", ".cs",
+    ] {
         assert!(
             map.contains_key(ext),
             "{ext} should be mapped to a language: {map:?}"

@@ -2,9 +2,7 @@ use std::path::Path;
 
 use lsp_types::{GotoDefinitionParams, GotoDefinitionResponse, Location, Uri};
 
-use crate::analyzer::{
-    CodeUnit, IAnalyzer, Range as ByteRange, WorkspaceAnalyzer,
-};
+use crate::analyzer::{CodeUnit, IAnalyzer, Range as ByteRange, WorkspaceAnalyzer};
 use crate::lsp::conversion::{
     byte_range_to_lsp_range, path_to_uri_string, position_to_byte_offset,
 };
@@ -77,12 +75,17 @@ fn code_unit_location(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> Option<
     let abs_path = code_unit.source().abs_path();
     let body = std::fs::read_to_string(&abs_path).ok()?;
     let line_starts = compute_line_starts(&body);
-    let range = analyzer.ranges(code_unit).iter().min().copied().unwrap_or(ByteRange {
-        start_byte: 0,
-        end_byte: body.len(),
-        start_line: 0,
-        end_line: 0,
-    });
+    let range = analyzer
+        .ranges(code_unit)
+        .iter()
+        .min()
+        .copied()
+        .unwrap_or(ByteRange {
+            start_byte: 0,
+            end_byte: body.len(),
+            start_line: 0,
+            end_line: 0,
+        });
     let lsp_range = byte_range_to_lsp_range(&body, &line_starts, &range);
     let uri: Uri = path_to_uri_string(&abs_path).parse().ok()?;
     Some(Location {

@@ -33,10 +33,7 @@ pub fn byte_offset_to_position(
     let prefix = content
         .get(line_start..clamped)
         .unwrap_or_else(|| content.get(line_start..content.len()).unwrap_or(""));
-    let character: u32 = prefix
-        .chars()
-        .map(|ch| ch.len_utf16() as u32)
-        .sum();
+    let character: u32 = prefix.chars().map(|ch| ch.len_utf16() as u32).sum();
     Position {
         line: line as u32,
         character,
@@ -47,23 +44,14 @@ pub fn byte_offset_to_position(
 /// lines clamp to the end of file; out-of-range characters within a line
 /// clamp to the end of that line. Returns `content.len()` for any position at
 /// or past EOF.
-pub fn position_to_byte_offset(
-    content: &str,
-    line_starts: &[usize],
-    position: &Position,
-) -> usize {
+pub fn position_to_byte_offset(content: &str, line_starts: &[usize], position: &Position) -> usize {
     let line = position.line as usize;
     if line >= line_starts.len() {
         return content.len();
     }
     let line_start = line_starts[line];
-    let next_line_start = line_starts
-        .get(line + 1)
-        .copied()
-        .unwrap_or(content.len());
-    let line_slice = content
-        .get(line_start..next_line_start)
-        .unwrap_or("");
+    let next_line_start = line_starts.get(line + 1).copied().unwrap_or(content.len());
+    let line_slice = content.get(line_start..next_line_start).unwrap_or("");
 
     let target = position.character;
     let mut consumed_utf16: u32 = 0;
@@ -147,12 +135,13 @@ fn percent_decode(input: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(h), Some(l)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2])) {
-                out.push((h << 4) | l);
-                i += 3;
-                continue;
-            }
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(h), Some(l)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2]))
+        {
+            out.push((h << 4) | l);
+            i += 3;
+            continue;
         }
         out.push(bytes[i]);
         i += 1;
@@ -185,19 +174,31 @@ mod tests {
         let starts = line_starts(content);
         assert_eq!(
             byte_offset_to_position(content, &starts, 0),
-            Position { line: 0, character: 0 }
+            Position {
+                line: 0,
+                character: 0
+            }
         );
         assert_eq!(
             byte_offset_to_position(content, &starts, 2),
-            Position { line: 0, character: 2 }
+            Position {
+                line: 0,
+                character: 2
+            }
         );
         assert_eq!(
             byte_offset_to_position(content, &starts, 4),
-            Position { line: 1, character: 0 }
+            Position {
+                line: 1,
+                character: 0
+            }
         );
         assert_eq!(
             byte_offset_to_position(content, &starts, 6),
-            Position { line: 1, character: 2 }
+            Position {
+                line: 1,
+                character: 2
+            }
         );
     }
 
@@ -209,12 +210,18 @@ mod tests {
         // Before the emoji.
         assert_eq!(
             byte_offset_to_position(content, &starts, 1),
-            Position { line: 0, character: 1 }
+            Position {
+                line: 0,
+                character: 1
+            }
         );
         // After the emoji (4 bytes for emoji + 1 for 'a' = byte 5).
         assert_eq!(
             byte_offset_to_position(content, &starts, 5),
-            Position { line: 0, character: 3 }
+            Position {
+                line: 0,
+                character: 3
+            }
         );
     }
 
@@ -223,19 +230,20 @@ mod tests {
         let content = "abc";
         let starts = line_starts(content);
         let pos = byte_offset_to_position(content, &starts, 99);
-        assert_eq!(pos, Position { line: 0, character: 3 });
+        assert_eq!(
+            pos,
+            Position {
+                line: 0,
+                character: 3
+            }
+        );
     }
 
     #[test]
     fn position_to_byte_offset_handles_ascii_lines() {
         let content = "abc\ndef\nghi";
         let starts = line_starts(content);
-        let cases = [
-            ((0, 0), 0),
-            ((0, 3), 3),
-            ((1, 0), 4),
-            ((2, 2), 10),
-        ];
+        let cases = [((0, 0), 0), ((0, 3), 3), ((1, 0), 4), ((2, 2), 10)];
         for ((line, character), expected) in cases {
             let pos = Position { line, character };
             assert_eq!(
@@ -252,12 +260,26 @@ mod tests {
         let starts = line_starts(content);
         // Past end of line 0: clamps to end of line 0 (before the newline).
         assert_eq!(
-            position_to_byte_offset(content, &starts, &Position { line: 0, character: 99 }),
+            position_to_byte_offset(
+                content,
+                &starts,
+                &Position {
+                    line: 0,
+                    character: 99
+                }
+            ),
             3
         );
         // Past last line: clamps to EOF.
         assert_eq!(
-            position_to_byte_offset(content, &starts, &Position { line: 99, character: 0 }),
+            position_to_byte_offset(
+                content,
+                &starts,
+                &Position {
+                    line: 99,
+                    character: 0
+                }
+            ),
             content.len()
         );
     }
@@ -268,12 +290,26 @@ mod tests {
         let starts = line_starts(content);
         // After the first emoji (2 UTF-16 code units → 4 UTF-8 bytes).
         assert_eq!(
-            position_to_byte_offset(content, &starts, &Position { line: 0, character: 2 }),
+            position_to_byte_offset(
+                content,
+                &starts,
+                &Position {
+                    line: 0,
+                    character: 2
+                }
+            ),
             4
         );
         // After the second emoji (4 UTF-16 code units → 8 UTF-8 bytes).
         assert_eq!(
-            position_to_byte_offset(content, &starts, &Position { line: 0, character: 4 }),
+            position_to_byte_offset(
+                content,
+                &starts,
+                &Position {
+                    line: 0,
+                    character: 4
+                }
+            ),
             8
         );
     }
@@ -303,8 +339,20 @@ mod tests {
             end_line: 1,
         };
         let lsp = byte_range_to_lsp_range(content, &starts, &range);
-        assert_eq!(lsp.start, Position { line: 1, character: 0 });
-        assert_eq!(lsp.end, Position { line: 1, character: 3 });
+        assert_eq!(
+            lsp.start,
+            Position {
+                line: 1,
+                character: 0
+            }
+        );
+        assert_eq!(
+            lsp.end,
+            Position {
+                line: 1,
+                character: 3
+            }
+        );
     }
 
     #[test]

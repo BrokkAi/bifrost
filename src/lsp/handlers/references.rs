@@ -3,9 +3,7 @@ use std::path::{Path, PathBuf};
 
 use lsp_types::{Location, ReferenceParams, Uri};
 
-use crate::analyzer::{
-    CodeUnit, IAnalyzer, Range as ByteRange, WorkspaceAnalyzer,
-};
+use crate::analyzer::{CodeUnit, IAnalyzer, Range as ByteRange, WorkspaceAnalyzer};
 use crate::lsp::conversion::{
     byte_range_to_lsp_range, path_to_uri_string, position_to_byte_offset,
 };
@@ -42,12 +40,8 @@ pub fn handle(
         return None;
     }
 
-    let result = UsageFinder::new().find_usages(
-        analyzer,
-        &overloads,
-        DEFAULT_MAX_FILES,
-        DEFAULT_MAX_USAGES,
-    );
+    let result =
+        UsageFinder::new().find_usages(analyzer, &overloads, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES);
     let hits = collect_hits(result);
 
     let mut content_cache: HashMap<PathBuf, FileContent> = HashMap::new();
@@ -142,12 +136,17 @@ fn code_unit_location(
 ) -> Option<Location> {
     let abs_path = code_unit.source().abs_path();
     let entry = ensure_cached(cache, &abs_path)?;
-    let range = analyzer.ranges(code_unit).iter().min().copied().unwrap_or(ByteRange {
-        start_byte: 0,
-        end_byte: entry.body.len(),
-        start_line: 0,
-        end_line: 0,
-    });
+    let range = analyzer
+        .ranges(code_unit)
+        .iter()
+        .min()
+        .copied()
+        .unwrap_or(ByteRange {
+            start_byte: 0,
+            end_byte: entry.body.len(),
+            start_line: 0,
+            end_line: 0,
+        });
     let lsp_range = byte_range_to_lsp_range(&entry.body, &entry.line_starts, &range);
     let uri: Uri = path_to_uri_string(&abs_path).parse().ok()?;
     Some(Location {
