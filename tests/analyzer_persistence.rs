@@ -303,3 +303,61 @@ fn default_db_path_under_dot_bifrost() {
     let path = default_db_path("/tmp/some-project");
     assert!(path.ends_with(".bifrost/analyzer.db"));
 }
+
+/// Regression test: a workspace file that becomes unparseable between
+/// runs (e.g. now contains a NUL byte, or invalid UTF-8) must have its
+/// stale baseline row purged from SQLite. Otherwise on the next startup
+/// the row's mtime/size/epoch could match and we would resurrect old
+/// declarations from a file that can no longer be analyzed.
+#[test]
+fn parse_failure_at_cold_start_purges_baseline_row() {
+    let (tmp_workspace, project) = fresh_python_workspace();
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("analyzer.db");
+
+    // Cold start: analyzer parses both files, persists 2 rows.
+    {
+        let storage = Arc::new(AnalyzerStorage::open(&db_path).unwrap());
+        let analyzer = PythonAnalyzer::new_with_config_and_storage(
+            project.clone(),
+            AnalyzerConfig::default(),
+            Arc::clone(&storage),
+        );
+        assert!(contains_short(&collect_fq_names(&analyzer), "world"));
+        assert_eq!(storage.row_count(Language::Python).unwrap(), 2);
+    }
+
+    // Replace beta.py with content that `analyze_file` rejects (NUL byte =
+    // treated as binary). The file is still enumerated as a `.py`
+    // candidate, so it lands in the "dirty" partition; its parse result
+    // will be `None`.
+    let beta_path = tmp_workspace.path().join("beta.py");
+    fs::write(&beta_path, b"def world():\n    return \x00\n").unwrap();
+    let one_min_future = SystemTime::now() + Duration::from_secs(60);
+    filetime::set_file_mtime(
+        &beta_path,
+        filetime::FileTime::from_system_time(one_min_future),
+    )
+    .unwrap();
+
+    // Warm start: parse failure on beta.py must purge its baseline row.
+    let storage = Arc::new(AnalyzerStorage::open(&db_path).unwrap());
+    let analyzer = PythonAnalyzer::new_with_config_and_storage(
+        project.clone(),
+        AnalyzerConfig::default(),
+        Arc::clone(&storage),
+    );
+
+    let names = collect_fq_names(&analyzer);
+    assert!(contains_short(&names, "hello"), "alpha.py must still parse");
+    assert!(
+        !contains_short(&names, "world"),
+        "stale `world` should not be hydrated from a now-unparseable file: {:?}",
+        names
+    );
+    assert_eq!(
+        storage.row_count(Language::Python).unwrap(),
+        1,
+        "beta.py's baseline row should have been purged",
+    );
+}

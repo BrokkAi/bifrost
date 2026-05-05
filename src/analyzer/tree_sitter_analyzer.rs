@@ -511,17 +511,24 @@ where
         let analyzable_set: HashSet<_> = analyzable_files.iter().cloned().collect();
 
         // Decide reconcile partition.
-        let (mut files, dirty_files, deletes, epoch_for_commit) = match storage {
-            Some(storage) => match persistence::reconcile::plan(
+        let storage_epoch: Option<&'static str> = storage.map(|_| {
+            let ts_lang = adapter.parser_language();
+            persistence::epoch_for(adapter.language(), &ts_lang)
+        });
+
+        let (mut files, dirty_files, mut deletes, epoch_for_commit) = match (storage, storage_epoch)
+        {
+            (Some(storage), Some(epoch_now)) => match persistence::reconcile::plan(
                 storage,
                 adapter.language(),
+                epoch_now,
                 &analyzable_files,
             ) {
                 Ok(plan) => (
                     plan.clean_hydrated,
                     plan.dirty_to_analyze,
                     plan.deletes,
-                    Some(plan.epoch_now),
+                    Some(epoch_now),
                 ),
                 Err(_) => {
                     // Storage failed (corrupt, locked, etc.). Fall back to a
@@ -535,7 +542,7 @@ where
                     )
                 }
             },
-            None => {
+            _ => {
                 let mut files = existing
                     .map(|state| state.files.clone())
                     .unwrap_or_default();
@@ -546,11 +553,19 @@ where
         };
 
         let dirty_keys: HashSet<ProjectFile> = dirty_files.iter().cloned().collect();
+        let storage_active = epoch_for_commit.is_some();
 
         for (file, state) in Self::analyze_files(adapter, config, dirty_files, progress) {
             if let Some(state) = state {
                 files.insert(file, state);
             } else {
+                // Parse failure for a workspace file: drop any in-memory
+                // entry AND tell the storage commit to delete the matching
+                // baseline row, so a stale payload from a previous epoch
+                // can't be hydrated next startup.
+                if storage_active {
+                    deletes.push(persistence::reconcile::rel_key(&file));
+                }
                 files.remove(&file);
             }
         }
@@ -932,7 +947,8 @@ where
         }
 
         if let Some(storage) = self.storage.as_ref() {
-            let epoch = persistence::epoch_for(self.adapter.language());
+            let ts_lang = self.adapter.parser_language();
+            let epoch = persistence::epoch_for(self.adapter.language(), &ts_lang);
             let writes = persistence::reconcile::encode_writes(
                 files
                     .iter()

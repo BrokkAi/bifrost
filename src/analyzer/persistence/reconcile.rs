@@ -8,7 +8,7 @@
 //! (`update`) build on top of these helpers.
 
 use crate::analyzer::persistence::storage::{AnalyzerStorage, BaselineRow, WriteRow};
-use crate::analyzer::persistence::{Result, decode, encode, epoch_for};
+use crate::analyzer::persistence::{Result, decode, encode};
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::{Language, ProjectFile};
 use crate::hash::HashMap;
@@ -24,20 +24,21 @@ pub(crate) struct ReconcilePlan {
     pub dirty_to_analyze: Vec<ProjectFile>,
     /// Baseline rows whose path is no longer in the workspace.
     pub deletes: Vec<String>,
-    /// Current analysis epoch for the language. Persisted on commit.
-    pub epoch_now: &'static str,
 }
 
 /// Build a reconcile plan for `language` against `workspace_files`.
 ///
-/// Errors propagating from SQLite/IO/decode short-circuit and surface to
-/// the caller, who decides whether to fall back to a full rebuild.
+/// `epoch_now` is the current analysis epoch (computed by the caller from
+/// its language adapter so this module stays decoupled from the
+/// `LanguageAdapter` trait). Errors propagating from SQLite/IO/decode
+/// short-circuit and surface to the caller, who decides whether to fall
+/// back to a full rebuild.
 pub(crate) fn plan(
     storage: &AnalyzerStorage,
     language: Language,
+    epoch_now: &str,
     workspace_files: &[ProjectFile],
 ) -> Result<ReconcilePlan> {
-    let epoch_now = epoch_for(language);
     let baseline_epoch = storage.read_epoch(language)?;
     let epoch_matches = baseline_epoch.as_deref() == Some(epoch_now);
 
@@ -92,7 +93,6 @@ pub(crate) fn plan(
         clean_hydrated,
         dirty_to_analyze,
         deletes,
-        epoch_now,
     })
 }
 

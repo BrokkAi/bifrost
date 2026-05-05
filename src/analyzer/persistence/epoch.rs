@@ -1,48 +1,59 @@
 //! Per-language analysis epoch.
 //!
 //! The epoch is a stable fingerprint of every input that, if changed, would
-//! invalidate previously-persisted analyzer payloads. Today that means:
+//! invalidate previously-persisted analyzer payloads. It folds in:
 //!
 //! - the analyzer payload wire-format version (see `payload::PAYLOAD_VERSION`)
 //! - the analyzer crate version (`CARGO_PKG_VERSION`)
-//! - the language's tree-sitter grammar crate version
+//! - the language adapter's actual `tree_sitter::Language` fingerprint
+//!   (ABI version + every node kind name + every field name)
 //! - the contents of the language's bundled `.scm` query files
 //!
 //! When any of these change, every row written under the previous epoch is
 //! treated as logically dirty regardless of mtime/size.
+//!
+//! The grammar fingerprint is taken from the live `Language` rather than a
+//! hard-coded crate version literal: Cargo.toml uses semver ranges, so a
+//! patch update to a tree-sitter-X grammar can change parser behavior
+//! (and node tables) without changing the version literal we type here.
+//! Hashing the live `Language` makes the epoch follow the parser instead.
 
 use crate::analyzer::Language;
 use crate::analyzer::persistence::payload::PAYLOAD_VERSION;
 use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
+use tree_sitter::Language as TsLanguage;
 
 const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Returns the analysis epoch for a language as a hex string.
-pub(crate) fn epoch_for(language: Language) -> &'static str {
+///
+/// `ts_language` is the language adapter's parser; the per-language
+/// `OnceLock` caches the resulting hash, so callers must always pass the
+/// canonical parser for `language` (every `LanguageAdapter` already does).
+pub(crate) fn epoch_for(language: Language, ts_language: &TsLanguage) -> &'static str {
     match language {
-        Language::Java => epoch_cell::<Java>(),
-        Language::Go => epoch_cell::<Go>(),
-        Language::Cpp => epoch_cell::<Cpp>(),
-        Language::JavaScript => epoch_cell::<JavaScript>(),
-        Language::TypeScript => epoch_cell::<TypeScript>(),
-        Language::Python => epoch_cell::<Python>(),
-        Language::Rust => epoch_cell::<Rust>(),
-        Language::Php => epoch_cell::<Php>(),
-        Language::Scala => epoch_cell::<Scala>(),
-        Language::CSharp => epoch_cell::<CSharp>(),
+        Language::Java => epoch_cell::<Java>(ts_language),
+        Language::Go => epoch_cell::<Go>(ts_language),
+        Language::Cpp => epoch_cell::<Cpp>(ts_language),
+        Language::JavaScript => epoch_cell::<JavaScript>(ts_language),
+        Language::TypeScript => epoch_cell::<TypeScript>(ts_language),
+        Language::Python => epoch_cell::<Python>(ts_language),
+        Language::Rust => epoch_cell::<Rust>(ts_language),
+        Language::Php => epoch_cell::<Php>(ts_language),
+        Language::Scala => epoch_cell::<Scala>(ts_language),
+        Language::CSharp => epoch_cell::<CSharp>(ts_language),
         Language::None => "",
     }
 }
 
 trait LanguageEpoch {
     const NAME: &'static str;
-    const GRAMMAR_VERSION: &'static str;
     const QUERY_DIR: &'static str;
     fn cell() -> &'static OnceLock<String>;
 }
 
-fn epoch_cell<L: LanguageEpoch>() -> &'static str {
+fn epoch_cell<L: LanguageEpoch>(ts_language: &TsLanguage) -> &'static str {
     L::cell().get_or_init(|| {
         let mut hasher = Sha256::new();
         hasher.update(b"bifrost-analyzer-epoch-v1\n");
@@ -52,7 +63,7 @@ fn epoch_cell<L: LanguageEpoch>() -> &'static str {
         hasher.update(b"\n");
         hasher.update(L::NAME.as_bytes());
         hasher.update(b"\n");
-        hasher.update(L::GRAMMAR_VERSION.as_bytes());
+        hash_grammar(&mut hasher, ts_language);
         hasher.update(b"\n");
         for (path, contents) in EMBEDDED_QUERIES {
             if path.starts_with(L::QUERY_DIR) {
@@ -70,6 +81,41 @@ fn epoch_cell<L: LanguageEpoch>() -> &'static str {
         }
         hex
     })
+}
+
+/// Fingerprint a `tree_sitter::Language` so the epoch follows the
+/// resolved grammar crate version, not a hand-edited literal. Any
+/// node/field added or renamed by a grammar update changes this hash.
+fn hash_grammar(hasher: &mut Sha256, lang: &TsLanguage) {
+    hasher.update(b"abi:");
+    hasher.update((lang.abi_version() as u64).to_le_bytes());
+
+    let node_count = lang.node_kind_count();
+    hasher.update(b"\nnodes:");
+    hasher.update((node_count as u64).to_le_bytes());
+    for id in 0..node_count {
+        let id_u16 = id as u16;
+        if let Some(name) = lang.node_kind_for_id(id_u16) {
+            hasher.update(name.as_bytes());
+        }
+        hasher.update([if lang.node_kind_is_named(id_u16) {
+            1u8
+        } else {
+            0u8
+        }]);
+        hasher.update(b"\0");
+    }
+
+    let field_count = lang.field_count();
+    hasher.update(b"\nfields:");
+    hasher.update((field_count as u64).to_le_bytes());
+    // Field IDs are 1-indexed in tree-sitter; 0 is reserved for "no field".
+    for id in 1..=field_count {
+        if let Some(name) = lang.field_name_for_id(id as u16) {
+            hasher.update(name.as_bytes());
+        }
+        hasher.update(b"\0");
+    }
 }
 
 /// Compile-time embedded `.scm` query files. Each entry is `(relative_path,
@@ -115,11 +161,10 @@ const EMBEDDED_QUERIES: &[(&str, &str)] = &[
 ];
 
 macro_rules! lang_epoch {
-    ($struct:ident, $name:literal, $version:literal, $dir:literal) => {
+    ($struct:ident, $name:literal, $dir:literal) => {
         struct $struct;
         impl LanguageEpoch for $struct {
             const NAME: &'static str = $name;
-            const GRAMMAR_VERSION: &'static str = $version;
             const QUERY_DIR: &'static str = $dir;
             fn cell() -> &'static OnceLock<String> {
                 static CELL: OnceLock<String> = OnceLock::new();
@@ -129,38 +174,46 @@ macro_rules! lang_epoch {
     };
 }
 
-lang_epoch!(Java, "java", "0.23.5", "treesitter/java/");
-lang_epoch!(Go, "go", "0.25.0", "treesitter/go/");
-lang_epoch!(Cpp, "cpp", "0.23.4", "treesitter/cpp/");
-lang_epoch!(JavaScript, "javascript", "0.25.0", "treesitter/javascript/");
-lang_epoch!(TypeScript, "typescript", "0.23.2", "treesitter/typescript/");
-lang_epoch!(Python, "python", "0.25.0", "treesitter/python/");
-lang_epoch!(Rust, "rust", "0.24.0", "treesitter/rust/");
-lang_epoch!(Php, "php", "0.23.11", "treesitter/php/");
-lang_epoch!(Scala, "scala", "0.25.0", "treesitter/scala/");
-lang_epoch!(CSharp, "csharp", "0.23.1", "treesitter/c_sharp/");
+lang_epoch!(Java, "java", "treesitter/java/");
+lang_epoch!(Go, "go", "treesitter/go/");
+lang_epoch!(Cpp, "cpp", "treesitter/cpp/");
+lang_epoch!(JavaScript, "javascript", "treesitter/javascript/");
+lang_epoch!(TypeScript, "typescript", "treesitter/typescript/");
+lang_epoch!(Python, "python", "treesitter/python/");
+lang_epoch!(Rust, "rust", "treesitter/rust/");
+lang_epoch!(Php, "php", "treesitter/php/");
+lang_epoch!(Scala, "scala", "treesitter/scala/");
+lang_epoch!(CSharp, "csharp", "treesitter/c_sharp/");
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn ts_python() -> TsLanguage {
+        tree_sitter_python::LANGUAGE.into()
+    }
+
+    fn ts_go() -> TsLanguage {
+        tree_sitter_go::LANGUAGE.into()
+    }
+
     #[test]
     fn epoch_is_stable_across_calls() {
-        let a = epoch_for(Language::Python);
-        let b = epoch_for(Language::Python);
+        let a = epoch_for(Language::Python, &ts_python());
+        let b = epoch_for(Language::Python, &ts_python());
         assert_eq!(a, b);
         assert_eq!(a.len(), 64); // sha256 hex
     }
 
     #[test]
     fn epochs_differ_per_language() {
-        let py = epoch_for(Language::Python);
-        let go = epoch_for(Language::Go);
+        let py = epoch_for(Language::Python, &ts_python());
+        let go = epoch_for(Language::Go, &ts_go());
         assert_ne!(py, go);
     }
 
     #[test]
     fn no_epoch_for_language_none() {
-        assert_eq!(epoch_for(Language::None), "");
+        assert_eq!(epoch_for(Language::None, &ts_python()), "");
     }
 }
