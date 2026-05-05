@@ -18,6 +18,7 @@ pub fn server_capabilities() -> ServerCapabilities {
     ServerCapabilities {
         text_document_sync: Some(TextDocumentSyncCapability::Options(text_document_sync)),
         document_symbol_provider: Some(OneOf::Left(true)),
+        workspace_symbol_provider: Some(OneOf::Left(true)),
         // Per-feature capabilities are turned on as their handlers land.
         ..ServerCapabilities::default()
     }

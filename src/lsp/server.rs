@@ -2,13 +2,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use lsp_server::{Connection, ErrorCode, ExtractError, IoThreads, Message, Notification, Request, Response};
-use lsp_types::request::{DocumentSymbolRequest, Request as LspRequestTrait};
+use lsp_types::request::{DocumentSymbolRequest, Request as LspRequestTrait, WorkspaceSymbolRequest};
 use lsp_types::InitializeParams;
 
 use crate::analyzer::{AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer};
 use crate::lsp::capabilities::server_capabilities;
 use crate::lsp::conversion::uri_to_path;
-use crate::lsp::handlers::document_symbol;
+use crate::lsp::handlers::{document_symbol, workspace_symbol};
 
 /// Run the LSP server over stdio. `fallback_root` is used when the client does
 /// not advertise a `workspaceFolders[0]`. Returns when the client sends
@@ -81,6 +81,9 @@ fn handle_request(
                 state.project.root(),
                 &params,
             ))
+        }),
+        WorkspaceSymbolRequest::METHOD => decode_and_run::<WorkspaceSymbolRequest, _>(req, |params| {
+            Ok(workspace_symbol::handle(&state.workspace, &params))
         }),
         _ => Response::new_err(
             id,
