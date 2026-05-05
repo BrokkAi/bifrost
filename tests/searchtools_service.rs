@@ -266,6 +266,96 @@ fn activate_workspace_failure_preserves_existing_workspace() {
 }
 
 #[test]
+fn scan_usages_returns_call_sites_grouped_by_file() {
+    let mut service = SearchToolsService::new_for_python(fixture_root()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "scan_usages",
+            r#"{"symbols":["E.iMethod"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    let usages = value["usages"].as_array().unwrap();
+    assert_eq!(1, usages.len(), "payload: {value}");
+    assert_eq!("E.iMethod", usages[0]["symbol"]);
+    assert!(
+        usages[0]["total_hits"].as_u64().unwrap() >= 1,
+        "expected >=1 hit, payload: {value}"
+    );
+
+    let files = usages[0]["files"].as_array().unwrap();
+    let use_e = files
+        .iter()
+        .find(|file| file["path"] == "UseE.java")
+        .unwrap_or_else(|| panic!("expected UseE.java in files: {value}"));
+    let hits = use_e["hits"].as_array().unwrap();
+    assert!(
+        hits.iter().any(|hit| hit["snippet"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("e.iMethod()")),
+        "expected snippet to contain `e.iMethod()`: {value}"
+    );
+
+    assert_eq!(0, value["not_found"].as_array().unwrap().len());
+    assert_eq!(0, value["ambiguous"].as_array().unwrap().len());
+    assert_eq!(0, value["too_many_callsites"].as_array().unwrap().len());
+}
+
+#[test]
+fn scan_usages_reports_unknown_symbol_as_not_found() {
+    let mut service = SearchToolsService::new_for_python(fixture_root()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "scan_usages",
+            r#"{"symbols":["does.not.Exist"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert_eq!(0, value["usages"].as_array().unwrap().len());
+    let not_found = value["not_found"].as_array().unwrap();
+    assert_eq!(1, not_found.len());
+    assert_eq!("does.not.Exist", not_found[0]);
+}
+
+#[test]
+fn scan_usages_skips_blank_symbols_without_error() {
+    let mut service = SearchToolsService::new_for_python(fixture_root()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "scan_usages",
+            r#"{"symbols":["", "   "],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert_eq!(0, value["usages"].as_array().unwrap().len());
+    assert_eq!(0, value["not_found"].as_array().unwrap().len());
+}
+
+#[test]
+fn scan_usages_resolved_symbol_with_no_hits_is_emitted_with_zero_total() {
+    // method7 lives on A.AInner.AInnerInner and has no callers in the fixture.
+    let mut service = SearchToolsService::new_for_python(fixture_root()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "scan_usages",
+            r#"{"symbols":["A.AInner.AInnerInner.method7"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    let usages = value["usages"].as_array().unwrap();
+    assert_eq!(1, usages.len(), "payload: {value}");
+    assert_eq!("A.AInner.AInnerInner.method7", usages[0]["symbol"]);
+    assert_eq!(0, usages[0]["total_hits"].as_u64().unwrap());
+    assert_eq!(0, usages[0]["files"].as_array().unwrap().len());
+    assert_eq!(0, value["not_found"].as_array().unwrap().len());
+}
+
+#[test]
 fn activate_workspace_normalizes_to_git_root() {
     let temp = TempDir::new().unwrap();
     fs::write(temp.path().join("Top.java"), "public class Top {}\n").unwrap();
