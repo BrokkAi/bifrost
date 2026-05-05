@@ -283,6 +283,7 @@ fn scan_usages_returns_call_sites_grouped_by_file() {
         usages[0]["total_hits"].as_u64().unwrap() >= 1,
         "expected >=1 hit, payload: {value}"
     );
+    assert_eq!(false, usages[0]["candidate_files_truncated"]);
 
     let files = usages[0]["files"].as_array().unwrap();
     let use_e = files
@@ -333,6 +334,76 @@ fn scan_usages_skips_blank_symbols_without_error() {
 
     assert_eq!(0, value["usages"].as_array().unwrap().len());
     assert_eq!(0, value["not_found"].as_array().unwrap().len());
+}
+
+#[test]
+fn scan_usages_excludes_test_files_when_include_tests_is_false() {
+    // Two callers of `Greeter.hello`: one in production code, one in a JUnit test
+    // file. With include_tests=false, the test caller must be filtered before the
+    // regex scan so that test hits do not eat into DEFAULT_MAX_USAGES and do not
+    // appear in the result. With include_tests=true, both callers must show up.
+    let temp = TempDir::new().unwrap();
+    fs::write(
+        temp.path().join("Greeter.java"),
+        "public class Greeter {\n    public String hello() { return \"hi\"; }\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("ProdCaller.java"),
+        "public class ProdCaller {\n    public String run() { return new Greeter().hello(); }\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("GreeterTest.java"),
+        "import org.junit.Test;\npublic class GreeterTest {\n    @Test\n    public void greets() { new Greeter().hello(); }\n}\n",
+    )
+    .unwrap();
+
+    let mut service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
+
+    let production_only = service
+        .call_tool_json(
+            "scan_usages",
+            r#"{"symbols":["Greeter.hello"],"include_tests":false}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&production_only).unwrap();
+    let usages = value["usages"].as_array().unwrap();
+    assert_eq!(1, usages.len(), "payload: {value}");
+    let files = usages[0]["files"].as_array().unwrap();
+    let paths: Vec<&str> = files
+        .iter()
+        .map(|file| file["path"].as_str().unwrap())
+        .collect();
+    assert!(
+        paths.contains(&"ProdCaller.java"),
+        "ProdCaller.java should be in results: {value}"
+    );
+    assert!(
+        !paths.contains(&"GreeterTest.java"),
+        "GreeterTest.java must be filtered when include_tests=false: {value}"
+    );
+
+    let with_tests = service
+        .call_tool_json(
+            "scan_usages",
+            r#"{"symbols":["Greeter.hello"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&with_tests).unwrap();
+    let files = value["usages"][0]["files"].as_array().unwrap();
+    let paths: Vec<&str> = files
+        .iter()
+        .map(|file| file["path"].as_str().unwrap())
+        .collect();
+    assert!(
+        paths.contains(&"ProdCaller.java"),
+        "ProdCaller.java missing with include_tests=true: {value}"
+    );
+    assert!(
+        paths.contains(&"GreeterTest.java"),
+        "GreeterTest.java missing with include_tests=true: {value}"
+    );
 }
 
 #[test]
