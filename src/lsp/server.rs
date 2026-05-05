@@ -1,14 +1,22 @@
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use lsp_server::{Connection, ErrorCode, ExtractError, IoThreads, Message, Notification, Request, Response};
+use lsp_types::notification::{
+    DidChangeWatchedFiles, DidSaveTextDocument, Notification as LspNotificationTrait,
+};
 use lsp_types::request::{
     DocumentDiagnosticRequest, DocumentSymbolRequest, GotoDefinition, HoverRequest, References,
     Request as LspRequestTrait, WorkspaceSymbolRequest,
 };
-use lsp_types::InitializeParams;
+use lsp_types::{
+    DidChangeWatchedFilesParams, DidSaveTextDocumentParams, FileChangeType, InitializeParams,
+};
 
-use crate::analyzer::{AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer};
+use crate::analyzer::{
+    AnalyzerConfig, FilesystemProject, Project, ProjectFile, WorkspaceAnalyzer,
+};
 use crate::lsp::capabilities::server_capabilities;
 use crate::lsp::conversion::uri_to_path;
 use crate::lsp::handlers::{
@@ -165,30 +173,67 @@ where
     }
 }
 
-fn handle_notification(_state: &mut ServerState, note: Notification) -> Result<(), String> {
-    // Recognise `initialized` (post-handshake ack from the client) and ignore
-    // every other notification until the relevant handler ships.
-    match cast_notification::<lsp_types::notification::Initialized>(note) {
-        Ok(_params) => Ok(()),
-        Err(ExtractError::MethodMismatch(_)) => Ok(()),
-        Err(ExtractError::JsonError { method, error }) => Err(format!(
-            "Failed to decode notification {method}: {error}"
-        )),
+fn handle_notification(state: &mut ServerState, note: Notification) -> Result<(), String> {
+    match note.method.as_str() {
+        DidSaveTextDocument::METHOD => {
+            let params: DidSaveTextDocumentParams =
+                serde_json::from_value(note.params).map_err(|err| {
+                    format!("Failed to decode {} params: {err}", DidSaveTextDocument::METHOD)
+                })?;
+            if let Some(file) = project_file_for_uri(state, &params.text_document.uri) {
+                let mut changed = BTreeSet::new();
+                changed.insert(file);
+                state.workspace = state.workspace.update(&changed);
+            }
+            Ok(())
+        }
+        DidChangeWatchedFiles::METHOD => {
+            let params: DidChangeWatchedFilesParams =
+                serde_json::from_value(note.params).map_err(|err| {
+                    format!(
+                        "Failed to decode {} params: {err}",
+                        DidChangeWatchedFiles::METHOD
+                    )
+                })?;
+            let mut changed = BTreeSet::new();
+            for change in params.changes {
+                // Treat created/changed/deleted uniformly — the analyzer's
+                // update path handles both new content and disappearance.
+                let _ = change.typ;
+                if matches!(
+                    change.typ,
+                    FileChangeType::CREATED | FileChangeType::CHANGED | FileChangeType::DELETED
+                )
+                    && let Some(file) = project_file_for_uri(state, &change.uri)
+                {
+                    changed.insert(file);
+                }
+            }
+            if !changed.is_empty() {
+                state.workspace = state.workspace.update(&changed);
+            }
+            Ok(())
+        }
+        _ => {
+            // `initialized` and every unsupported notification falls through;
+            // unknown notifications are spec-required to be silently ignored.
+            Ok(())
+        }
     }
 }
 
-fn cast_notification<N>(note: Notification) -> Result<N::Params, ExtractError<Notification>>
-where
-    N: lsp_types::notification::Notification,
-    N::Params: serde::de::DeserializeOwned,
-{
-    note.extract(<N as lsp_types::notification::Notification>::METHOD)
+fn project_file_for_uri(state: &ServerState, uri: &lsp_types::Uri) -> Option<ProjectFile> {
+    let abs_path = uri_to_path(uri)?;
+    let rel_path = abs_path.strip_prefix(state.project.root()).ok()?;
+    Some(ProjectFile::new(
+        state.project.root().to_path_buf(),
+        rel_path.to_path_buf(),
+    ))
 }
 
+
 pub(crate) struct ServerState {
-    #[allow(dead_code)]
     workspace: WorkspaceAnalyzer,
-    #[allow(dead_code)]
     project: Arc<dyn Project>,
 }
 

@@ -603,6 +603,126 @@ fn bifrost_lsp_server_diagnostics_report_parse_error() {
 }
 
 #[test]
+fn bifrost_lsp_server_did_save_triggers_reindex() {
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    fs::write(
+        temp_root.join("Watch.java"),
+        "public class Watch {\n    public void initial() {}\n}\n",
+    )
+    .expect("write fixture");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(&temp_root)
+        .arg("--server")
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bifrost");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    let root_uri = format!("file://{}", temp_root.display());
+    let watch_uri = format!("file://{}/Watch.java", temp_root.display());
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"processId": null, "rootUri": root_uri, "capabilities": {}}
+        }),
+    );
+    let _ = read_message(&mut reader, &mut stderr);
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+    );
+
+    // Confirm initial workspaceSymbol query finds `initial` and not `added`.
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "workspace/symbol",
+            "params": {"query": "added"}
+        }),
+    );
+    let before = read_message(&mut reader, &mut stderr);
+    let names_before: Vec<String> = before["result"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s["name"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        !names_before.iter().any(|n| n == "added"),
+        "expected no `added` symbol pre-save, got {names_before:?}"
+    );
+
+    // Replace the file content and send didSave.
+    fs::write(
+        temp_root.join("Watch.java"),
+        "public class Watch {\n    public void added() {}\n}\n",
+    )
+    .expect("rewrite fixture");
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didSave",
+            "params": {"textDocument": {"uri": watch_uri}}
+        }),
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "workspace/symbol",
+            "params": {"query": "added"}
+        }),
+    );
+    let after = read_message(&mut reader, &mut stderr);
+    let names_after: Vec<String> = after["result"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s["name"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        names_after.iter().any(|n| n == "added"),
+        "expected `added` symbol post-save, got {names_after:?}"
+    );
+
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 4, "method": "shutdown"}),
+    );
+    let _ = read_message(&mut reader, &mut stderr);
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "exit"}),
+    );
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
 fn bifrost_lsp_server_unknown_request_returns_method_not_found() {
     let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
