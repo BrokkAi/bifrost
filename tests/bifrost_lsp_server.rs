@@ -69,6 +69,119 @@ fn bifrost_lsp_server_handles_initialize_and_shutdown() {
 }
 
 #[test]
+fn bifrost_lsp_server_returns_document_symbols_for_a_java() {
+    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("testcode-java");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(&fixture_root)
+        .arg("--server")
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bifrost");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    let canonical_root = fixture_root.canonicalize().expect("canon fixture");
+    let root_uri = format!("file://{}", canonical_root.display());
+    let file_uri = format!("file://{}/A.java", canonical_root.display());
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "processId": null,
+                "rootUri": root_uri,
+                "capabilities": {}
+            }
+        }),
+    );
+    let init = read_message(&mut reader, &mut stderr);
+    assert_eq!(init["id"], 1);
+    assert_eq!(
+        init["result"]["capabilities"]["documentSymbolProvider"], true,
+        "documentSymbolProvider should be advertised: {init}"
+    );
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "textDocument/documentSymbol",
+            "params": {"textDocument": {"uri": file_uri}}
+        }),
+    );
+    let response = read_message(&mut reader, &mut stderr);
+    assert_eq!(response["id"], 2);
+    let symbols = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected array result, got {response}"));
+
+    let class_a = symbols
+        .iter()
+        .find(|sym| sym["name"] == "A")
+        .unwrap_or_else(|| panic!("class A not present: {symbols:#?}"));
+    assert_eq!(class_a["kind"], 5, "class kind"); // SymbolKind::CLASS = 5
+
+    let children = class_a["children"]
+        .as_array()
+        .unwrap_or_else(|| panic!("class A should have children: {class_a}"));
+    let child_names: Vec<&str> = children
+        .iter()
+        .filter_map(|c| c["name"].as_str())
+        .collect();
+    for expected in ["method1", "method2", "AInner", "AInnerStatic"] {
+        assert!(
+            child_names.contains(&expected),
+            "expected {expected} in {child_names:?}"
+        );
+    }
+
+    let inner = children
+        .iter()
+        .find(|c| c["name"] == "AInner")
+        .expect("AInner");
+    let inner_children: Vec<&str> = inner["children"]
+        .as_array()
+        .map(|arr| arr.iter().filter_map(|c| c["name"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        inner_children.contains(&"AInnerInner"),
+        "AInner should contain AInnerInner: {inner_children:?}"
+    );
+
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown"}),
+    );
+    let _ = read_message(&mut reader, &mut stderr);
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "exit"}),
+    );
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
 fn bifrost_lsp_server_unknown_request_returns_method_not_found() {
     let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -111,7 +224,7 @@ fn bifrost_lsp_server_unknown_request_returns_method_not_found() {
         json!({
             "jsonrpc": "2.0",
             "id": 2,
-            "method": "textDocument/documentSymbol",
+            "method": "textDocument/foldingRange",
             "params": {"textDocument": {"uri": "file:///nope"}}
         }),
     );

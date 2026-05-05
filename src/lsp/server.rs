@@ -1,12 +1,14 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use lsp_server::{Connection, ExtractError, IoThreads, Message, Notification, Request};
+use lsp_server::{Connection, ErrorCode, ExtractError, IoThreads, Message, Notification, Request, Response};
+use lsp_types::request::{DocumentSymbolRequest, Request as LspRequestTrait};
 use lsp_types::InitializeParams;
 
 use crate::analyzer::{AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer};
 use crate::lsp::capabilities::server_capabilities;
 use crate::lsp::conversion::uri_to_path;
+use crate::lsp::handlers::document_symbol;
 
 /// Run the LSP server over stdio. `fallback_root` is used when the client does
 /// not advertise a `workspaceFolders[0]`. Returns when the client sends
@@ -68,19 +70,69 @@ fn main_loop(connection: &Connection, state: &mut ServerState) -> Result<(), Str
 
 fn handle_request(
     connection: &Connection,
-    _state: &mut ServerState,
+    state: &mut ServerState,
     req: Request,
 ) -> Result<(), String> {
-    // No request handlers are wired up yet — those land with #12 onward.
-    let response = lsp_server::Response::new_err(
-        req.id.clone(),
-        lsp_server::ErrorCode::MethodNotFound as i32,
-        format!("Method not implemented: {}", req.method),
-    );
+    let id = req.id.clone();
+    let response = match req.method.as_str() {
+        DocumentSymbolRequest::METHOD => decode_and_run::<DocumentSymbolRequest, _>(req, |params| {
+            Ok(document_symbol::handle(
+                &state.workspace,
+                state.project.root(),
+                &params,
+            ))
+        }),
+        _ => Response::new_err(
+            id,
+            ErrorCode::MethodNotFound as i32,
+            format!("Method not implemented: {}", req.method),
+        ),
+    };
     connection
         .sender
         .send(Message::Response(response))
         .map_err(|err| format!("Failed to send LSP response: {err}"))
+}
+
+/// Decode the typed params for an LSP request and run `handler`, mapping any
+/// failure into a JSON-RPC error response that preserves the original id.
+fn decode_and_run<R, F>(req: Request, handler: F) -> Response
+where
+    R: lsp_types::request::Request,
+    R::Params: serde::de::DeserializeOwned,
+    R::Result: serde::Serialize,
+    F: FnOnce(R::Params) -> Result<R::Result, String>,
+{
+    let id = req.id.clone();
+    let method = req.method.clone();
+    let params = match req.extract::<R::Params>(<R as lsp_types::request::Request>::METHOD) {
+        Ok((_, params)) => params,
+        Err(ExtractError::JsonError { error, .. }) => {
+            return Response::new_err(
+                id,
+                ErrorCode::InvalidParams as i32,
+                format!("Failed to decode params for {method}: {error}"),
+            );
+        }
+        Err(ExtractError::MethodMismatch(_)) => {
+            return Response::new_err(
+                id,
+                ErrorCode::MethodNotFound as i32,
+                format!("Method not implemented: {method}"),
+            );
+        }
+    };
+    match handler(params) {
+        Ok(result) => match serde_json::to_value(result) {
+            Ok(value) => Response::new_ok(id, value),
+            Err(err) => Response::new_err(
+                id,
+                ErrorCode::InternalError as i32,
+                format!("Failed to serialize {method} result: {err}"),
+            ),
+        },
+        Err(message) => Response::new_err(id, ErrorCode::InternalError as i32, message),
+    }
 }
 
 fn handle_notification(_state: &mut ServerState, note: Notification) -> Result<(), String> {
