@@ -7,7 +7,7 @@
 
 use rusqlite::{Connection, Result, Transaction};
 
-pub(crate) const LATEST_SCHEMA_VERSION: u32 = 1;
+pub(crate) const LATEST_SCHEMA_VERSION: u32 = 2;
 
 pub(crate) fn migrate(conn: &mut Connection) -> Result<()> {
     let current: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -32,6 +32,7 @@ pub(crate) fn migrate(conn: &mut Connection) -> Result<()> {
 fn apply_version(tx: &Transaction<'_>, version: u32) -> Result<()> {
     match version {
         1 => apply_v1(tx),
+        2 => apply_v2(tx),
         other => Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
             UnknownSchemaVersion { version: other },
         ))),
@@ -65,6 +66,74 @@ fn apply_v1(tx: &Transaction<'_>) -> Result<()> {
     tx.execute(
         "INSERT INTO schema_meta(key, value) VALUES (?1, ?2)",
         rusqlite::params!["created_at", chrono_seconds_now().to_string()],
+    )?;
+    Ok(())
+}
+
+/// v2: disk-backed symbol/FQN index for cold-start search.
+///
+/// Adds a `symbols` table populated alongside `analyzed_files`, plus two
+/// FTS5 virtual tables that index `fq_name` and `short_name`:
+///
+/// - `symbols_fts` uses the unicode61 tokenizer with `.`, `:`, and `_` as
+///   extra separators, so `foo.bar.Baz`, `Foo::Bar`, and `my_function` all
+///   tokenize into their identifier parts. Good for whole-token / FQN
+///   queries.
+/// - `symbols_fts_tri` uses the trigram tokenizer for substring/contains
+///   queries.
+///
+/// Both FTS tables are kept in sync with `symbols` via row triggers; the
+/// commit path also explicitly deletes per-file symbol rows before
+/// re-inserting them, so the FTS index never carries stale entries from a
+/// previous analysis of the same file.
+fn apply_v2(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute_batch(
+        r#"
+        CREATE TABLE symbols (
+            language     TEXT NOT NULL,
+            rel_path     TEXT NOT NULL,
+            fq_name      TEXT NOT NULL,
+            short_name   TEXT NOT NULL,
+            package_name TEXT NOT NULL,
+            kind         TEXT NOT NULL,
+            signature    TEXT,
+            synthetic    INTEGER NOT NULL,
+            start_byte   INTEGER NOT NULL,
+            end_byte     INTEGER NOT NULL,
+            start_line   INTEGER NOT NULL,
+            end_line     INTEGER NOT NULL,
+            PRIMARY KEY (language, rel_path, fq_name, kind, start_byte),
+            FOREIGN KEY (language, rel_path)
+                REFERENCES analyzed_files(language, rel_path)
+                ON DELETE CASCADE
+        );
+
+        CREATE INDEX symbols_by_file ON symbols(language, rel_path);
+
+        CREATE VIRTUAL TABLE symbols_fts USING fts5(
+            fq_name,
+            short_name,
+            tokenize = "unicode61 separators '._:'"
+        );
+
+        CREATE VIRTUAL TABLE symbols_fts_tri USING fts5(
+            fq_name,
+            short_name,
+            tokenize = "trigram"
+        );
+
+        CREATE TRIGGER symbols_ai AFTER INSERT ON symbols BEGIN
+            INSERT INTO symbols_fts(rowid, fq_name, short_name)
+                VALUES (new.rowid, new.fq_name, new.short_name);
+            INSERT INTO symbols_fts_tri(rowid, fq_name, short_name)
+                VALUES (new.rowid, new.fq_name, new.short_name);
+        END;
+
+        CREATE TRIGGER symbols_ad AFTER DELETE ON symbols BEGIN
+            DELETE FROM symbols_fts WHERE rowid = old.rowid;
+            DELETE FROM symbols_fts_tri WHERE rowid = old.rowid;
+        END;
+        "#,
     )?;
     Ok(())
 }

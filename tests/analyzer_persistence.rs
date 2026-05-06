@@ -1,6 +1,8 @@
 //! End-to-end tests for the SQLite-backed analyzer persistence layer.
 
-use brokk_analyzer::analyzer::persistence::{AnalyzerStorage, PersistenceError, default_db_path};
+use brokk_analyzer::analyzer::persistence::{
+    AnalyzerStorage, PersistenceError, SymbolQueryMode, default_db_path,
+};
 use brokk_analyzer::{
     AnalyzerConfig, IAnalyzer, Language, PythonAnalyzer, TestProject, WorkspaceAnalyzer,
 };
@@ -354,4 +356,394 @@ fn parse_failure_at_cold_start_purges_baseline_row() {
         1,
         "beta.py's baseline row should have been purged",
     );
+}
+
+// ---------- FTS5 symbol index (issue #26) ----------
+
+#[test]
+fn cold_start_populates_symbol_index() {
+    let (_tmp, project) = fresh_python_workspace();
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("analyzer.db");
+    let storage = Arc::new(AnalyzerStorage::open(&db_path).unwrap());
+    let _ = PythonAnalyzer::new_with_config_and_storage(
+        project.clone(),
+        AnalyzerConfig::default(),
+        Arc::clone(&storage),
+    );
+
+    // Three Python declarations are visible in fresh_python_workspace:
+    // alpha.py: hello, Greeter, Greeter.greet ; beta.py: world.
+    let count = storage.symbol_count(Language::Python).unwrap();
+    assert!(
+        count >= 4,
+        "expected at least 4 persisted symbols, got {count}"
+    );
+}
+
+#[test]
+fn symbol_search_substring_finds_short_name() {
+    let (_tmp, project) = fresh_python_workspace();
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("analyzer.db");
+    let storage = Arc::new(AnalyzerStorage::open(&db_path).unwrap());
+    let _ = PythonAnalyzer::new_with_config_and_storage(
+        project.clone(),
+        AnalyzerConfig::default(),
+        Arc::clone(&storage),
+    );
+
+    // Trigram substring match: "ell" should find "hello".
+    let hits = storage
+        .search_symbols(Language::Python, "ell", SymbolQueryMode::Substring)
+        .unwrap();
+    assert!(
+        hits.iter().any(|h| h.symbol.short_name == "hello"),
+        "trigram substring search for 'ell' should find 'hello': {hits:?}"
+    );
+}
+
+#[test]
+fn symbol_search_token_finds_fqn_component() {
+    let (_tmp, project) = fresh_python_workspace();
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("analyzer.db");
+    let storage = Arc::new(AnalyzerStorage::open(&db_path).unwrap());
+    let _ = PythonAnalyzer::new_with_config_and_storage(
+        project.clone(),
+        AnalyzerConfig::default(),
+        Arc::clone(&storage),
+    );
+
+    // unicode61 splits FQNs on '.', so "Greeter" should hit
+    // both "Greeter" itself and "Greeter.greet" via token match.
+    let hits = storage
+        .search_symbols(Language::Python, "Greeter", SymbolQueryMode::Token)
+        .unwrap();
+    // The Python analyzer derives a package from the file stem, so FQNs
+    // are e.g. "alpha.Greeter" and "alpha.Greeter.greet". The unicode61
+    // tokenizer with '.' as a separator should still match the
+    // "Greeter" component of both.
+    let names: BTreeSet<_> = hits.iter().map(|h| h.symbol.fq_name.clone()).collect();
+    assert!(
+        names
+            .iter()
+            .any(|n| n.split('.').any(|tok| tok == "Greeter")),
+        "token search 'Greeter' should hit FQNs containing it as a component: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n.ends_with(".Greeter.greet")),
+        "token search 'Greeter' should hit method whose FQN contains it: {names:?}"
+    );
+}
+
+#[test]
+fn search_definitions_persisted_returns_reconstructable_code_units() {
+    let (_tmp, project) = fresh_python_workspace();
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("analyzer.db");
+    let storage = Arc::new(AnalyzerStorage::open(&db_path).unwrap());
+    let analyzer = PythonAnalyzer::new_with_config_and_storage(
+        project.clone(),
+        AnalyzerConfig::default(),
+        Arc::clone(&storage),
+    );
+
+    let hits = analyzer.search_definitions_persisted("hello");
+    assert_eq!(hits.len(), 1, "exactly one 'hello' declaration: {hits:?}");
+    let cu = hits.into_iter().next().unwrap();
+    assert_eq!(cu.short_name(), "hello");
+    assert!(cu.is_function(), "hello is a Function: {cu:?}");
+    assert!(
+        cu.source().rel_path().ends_with("alpha.py"),
+        "source rebuilt with rel_path: {cu:?}"
+    );
+}
+
+#[test]
+fn search_definitions_persisted_matches_in_memory_for_substring() {
+    let (_tmp, project) = fresh_python_workspace();
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("analyzer.db");
+    let storage = Arc::new(AnalyzerStorage::open(&db_path).unwrap());
+    let analyzer = PythonAnalyzer::new_with_config_and_storage(
+        project.clone(),
+        AnalyzerConfig::default(),
+        Arc::clone(&storage),
+    );
+
+    let in_memory: BTreeSet<String> = analyzer
+        .search_definitions("greet", true)
+        .into_iter()
+        .map(|cu| cu.fq_name())
+        .collect();
+    let persisted: BTreeSet<String> = analyzer
+        .search_definitions_persisted("greet")
+        .into_iter()
+        .map(|cu| cu.fq_name())
+        .collect();
+    assert_eq!(
+        in_memory, persisted,
+        "persisted FTS5 substring search should match in-memory regex search semantics"
+    );
+}
+
+#[test]
+fn file_deletion_clears_symbol_rows() {
+    let (tmp_workspace, project) = fresh_python_workspace();
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("analyzer.db");
+
+    // Cold start.
+    {
+        let storage = Arc::new(AnalyzerStorage::open(&db_path).unwrap());
+        let _ = PythonAnalyzer::new_with_config_and_storage(
+            project.clone(),
+            AnalyzerConfig::default(),
+            storage,
+        );
+    }
+
+    // Remove beta.py.
+    fs::remove_file(tmp_workspace.path().join("beta.py")).unwrap();
+
+    // Warm start.
+    let storage = Arc::new(AnalyzerStorage::open(&db_path).unwrap());
+    let _ = PythonAnalyzer::new_with_config_and_storage(
+        project.clone(),
+        AnalyzerConfig::default(),
+        Arc::clone(&storage),
+    );
+
+    // beta.py's only symbol was `world`. After deletion, no row should
+    // remain referencing it.
+    let world_hits = storage
+        .search_symbols(Language::Python, "world", SymbolQueryMode::Substring)
+        .unwrap();
+    assert!(
+        world_hits.is_empty(),
+        "deleted file's symbols should be purged from FTS5 too: {world_hits:?}"
+    );
+
+    // alpha.py's symbols should still be there.
+    let hello_hits = storage
+        .search_symbols(Language::Python, "hello", SymbolQueryMode::Substring)
+        .unwrap();
+    assert!(
+        !hello_hits.is_empty(),
+        "untouched file's symbols should survive: {hello_hits:?}"
+    );
+}
+
+#[test]
+fn file_modification_replaces_symbol_rows() {
+    let (tmp_workspace, project) = fresh_python_workspace();
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("analyzer.db");
+
+    // Cold start.
+    {
+        let storage = Arc::new(AnalyzerStorage::open(&db_path).unwrap());
+        let _ = PythonAnalyzer::new_with_config_and_storage(
+            project.clone(),
+            AnalyzerConfig::default(),
+            storage,
+        );
+    }
+
+    // Rename alpha.py's `hello` to `goodbye` and bump mtime.
+    let alpha = tmp_workspace.path().join("alpha.py");
+    fs::write(
+        &alpha,
+        "def goodbye():\n    return 99\n\nclass Greeter:\n    def greet(self):\n        return 'hi'\n",
+    )
+    .unwrap();
+    let one_min_future = SystemTime::now() + Duration::from_secs(60);
+    filetime::set_file_mtime(&alpha, filetime::FileTime::from_system_time(one_min_future)).unwrap();
+
+    // Warm start.
+    let storage = Arc::new(AnalyzerStorage::open(&db_path).unwrap());
+    let _ = PythonAnalyzer::new_with_config_and_storage(
+        project.clone(),
+        AnalyzerConfig::default(),
+        Arc::clone(&storage),
+    );
+
+    let hello = storage
+        .search_symbols(Language::Python, "hello", SymbolQueryMode::Substring)
+        .unwrap();
+    assert!(
+        hello.is_empty(),
+        "stale symbol 'hello' should be gone: {hello:?}"
+    );
+
+    let goodbye = storage
+        .search_symbols(Language::Python, "goodbye", SymbolQueryMode::Substring)
+        .unwrap();
+    assert!(
+        goodbye.iter().any(|h| h.symbol.short_name == "goodbye"),
+        "renamed symbol 'goodbye' should be indexed: {goodbye:?}"
+    );
+
+    // Greeter survived (file content kept it).
+    let greeter = storage
+        .search_symbols(Language::Python, "Greeter", SymbolQueryMode::Token)
+        .unwrap();
+    assert!(
+        !greeter.is_empty(),
+        "untouched class on the same file should survive: {greeter:?}"
+    );
+}
+
+#[test]
+fn empty_pattern_returns_no_symbol_hits() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let storage = AnalyzerStorage::open(db_dir.path().join("analyzer.db")).unwrap();
+    let hits = storage
+        .search_symbols(Language::Python, "", SymbolQueryMode::Substring)
+        .unwrap();
+    assert!(hits.is_empty());
+}
+
+#[test]
+fn v1_to_v2_migration_preserves_analyzed_files() {
+    use rusqlite::Connection;
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("analyzer.db");
+
+    // Hand-build a v1 schema: same DDL as `apply_v1`, no symbols/FTS, set
+    // user_version=1 so the migrator only applies v2 on next open.
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE schema_meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE analyzer_epoch (
+                language TEXT PRIMARY KEY,
+                epoch    TEXT NOT NULL
+            );
+            CREATE TABLE analyzed_files (
+                language TEXT NOT NULL,
+                rel_path TEXT NOT NULL,
+                mtime_ns INTEGER NOT NULL,
+                size     INTEGER NOT NULL,
+                epoch    TEXT NOT NULL,
+                payload  BLOB NOT NULL,
+                PRIMARY KEY (language, rel_path)
+            );
+            INSERT INTO schema_meta(key, value) VALUES ('created_at', '0');
+            INSERT INTO analyzed_files(language, rel_path, mtime_ns, size, epoch, payload)
+                VALUES ('python', 'preexisting.py', 1, 1, 'old-epoch', x'00');
+            INSERT INTO analyzer_epoch(language, epoch) VALUES ('python', 'old-epoch');
+            PRAGMA user_version = 1;
+            "#,
+        )
+        .unwrap();
+    }
+
+    // Open via the real storage path: should run the v2 migration only.
+    let storage = AnalyzerStorage::open(&db_path).expect("v1 -> v2 migration must succeed");
+
+    // The pre-existing analyzed_files row must still be there.
+    assert_eq!(
+        storage.row_count(Language::Python).unwrap(),
+        1,
+        "analyzed_files row from v1 should survive v2 migration"
+    );
+
+    // The new symbols and FTS tables exist and are empty.
+    assert_eq!(storage.symbol_count(Language::Python).unwrap(), 0);
+    let hits = storage
+        .search_symbols(Language::Python, "anything", SymbolQueryMode::Substring)
+        .unwrap();
+    assert!(hits.is_empty());
+
+    // user_version must now be 2.
+    let conn = Connection::open(&db_path).unwrap();
+    let v: u32 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(v, 2, "user_version should be bumped to 2");
+}
+
+#[test]
+fn symbol_search_prefix_matches_token_starts() {
+    let (_tmp, project) = fresh_python_workspace();
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("analyzer.db");
+    let storage = Arc::new(AnalyzerStorage::open(&db_path).unwrap());
+    let _ = PythonAnalyzer::new_with_config_and_storage(
+        project.clone(),
+        AnalyzerConfig::default(),
+        Arc::clone(&storage),
+    );
+
+    // "Gree" is a partial prefix of the "Greeter" and "greet" tokens
+    // but is not itself a token. Prefix mode should match both via the
+    // FTS5 trailing `*` syntax; plain Token mode should not match
+    // because unicode61 indexes whole tokens (after case-folding).
+    let prefix_hits = storage
+        .search_symbols(Language::Python, "Gree", SymbolQueryMode::Prefix)
+        .unwrap();
+    assert!(
+        prefix_hits
+            .iter()
+            .any(|h| h.symbol.fq_name.contains("Greeter")),
+        "prefix 'Gree' should match 'Greeter': {prefix_hits:?}"
+    );
+
+    let token_hits = storage
+        .search_symbols(Language::Python, "Gree", SymbolQueryMode::Token)
+        .unwrap();
+    assert!(
+        token_hits.is_empty(),
+        "Token mode for partial token 'Gree' should not match (whole-token only): {token_hits:?}"
+    );
+}
+
+#[test]
+fn symbol_search_respects_limit() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Generate a workspace with many distinct symbols all containing
+    // "common" so a single substring query hits all of them.
+    let mut body = String::new();
+    for i in 0..50 {
+        body.push_str(&format!("def common_fn_{i}():\n    return {i}\n\n"));
+    }
+    write_file(tmp.path(), "many.py", &body);
+    let canon = fs::canonicalize(tmp.path()).unwrap();
+    let project = Arc::new(TestProject::new(canon, Language::Python));
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let storage = Arc::new(AnalyzerStorage::open(db_dir.path().join("analyzer.db")).unwrap());
+    let _ = PythonAnalyzer::new_with_config_and_storage(
+        project,
+        AnalyzerConfig::default(),
+        Arc::clone(&storage),
+    );
+
+    // Sanity: many.py contributes ≥50 matching symbols.
+    let unbounded = storage
+        .search_symbols_with_limit(Language::Python, "common", SymbolQueryMode::Substring, 1000)
+        .unwrap();
+    assert!(
+        unbounded.len() >= 50,
+        "expected ≥50 hits without a tight limit, got {}",
+        unbounded.len()
+    );
+
+    // Tight LIMIT must be respected.
+    let bounded = storage
+        .search_symbols_with_limit(Language::Python, "common", SymbolQueryMode::Substring, 5)
+        .unwrap();
+    assert_eq!(bounded.len(), 5, "LIMIT 5 must cap result count");
+
+    // limit=0 returns nothing without erroring.
+    let none = storage
+        .search_symbols_with_limit(Language::Python, "common", SymbolQueryMode::Substring, 0)
+        .unwrap();
+    assert!(none.is_empty());
 }
