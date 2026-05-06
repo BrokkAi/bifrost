@@ -1215,13 +1215,27 @@ where
         let Some(storage) = self.storage.as_ref() else {
             return self.search_definitions(pattern, true);
         };
+        // FTS5's trigram tokenizer produces no tokens for inputs shorter
+        // than three characters, so any 1- or 2-char query against the
+        // substring index returns zero rows regardless of what's
+        // indexed. The in-memory regex search has no such floor, so for
+        // short patterns we fall back to it to preserve substring
+        // semantics.
+        if pattern.chars().count() < 3 {
+            return self.search_definitions(pattern, true);
+        }
         let language = self.adapter.language();
         // The trigram index models the same substring semantics the
         // existing in-memory `search_definitions` provides, so callers
         // who switch to the persisted variant don't see a regression in
         // recall. The unicode61 token index is reserved for future
         // identifier-only / FQN-token query paths.
-        let hits = match storage.search_symbols(
+        //
+        // `search_non_synthetic_symbols` pushes the synthetic filter
+        // into SQL so it runs before `LIMIT` — otherwise a top-N cap
+        // can be entirely consumed by compiler-generated rows that the
+        // post-filter below would drop anyway.
+        let hits = match storage.search_non_synthetic_symbols(
             language,
             pattern,
             persistence::SymbolQueryMode::Substring,

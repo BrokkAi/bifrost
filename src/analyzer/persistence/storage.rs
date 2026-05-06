@@ -129,11 +129,16 @@ pub struct SymbolHit {
 ///
 /// `Substring` uses the trigram-tokenized index, which matches characters
 /// regardless of word boundaries — closest in semantics to the existing
-/// regex-based `search_definitions`. `Token` uses the unicode61 index,
-/// which splits FQNs on `.`, `:`, and `_`; useful when you want to hit
-/// whole identifier components. `Prefix` is `Token` with a trailing `*`
-/// — anchored at a token start, useful for "everything starting with
-/// `Foo`" queries.
+/// regex-based `search_definitions`. *Caveat:* FTS5's trigram tokenizer
+/// emits no tokens for inputs shorter than three characters, so 1- and
+/// 2-character `Substring` queries always return zero hits. Callers that
+/// need full substring recall on short patterns must fall back to an
+/// in-memory regex scan.
+///
+/// `Token` uses the unicode61 index, which splits FQNs on `.`, `:`, and
+/// `_`; useful when you want to hit whole identifier components.
+/// `Prefix` is `Token` with a trailing `*` — anchored at a token start,
+/// useful for "everything starting with `Foo`" queries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymbolQueryMode {
     Substring,
@@ -284,8 +289,13 @@ impl AnalyzerStorage {
                    epoch    = excluded.epoch, \
                    payload  = excluded.payload",
             )?;
+            // No `OR IGNORE`: `delete_symbols` ran for this rel_path
+            // immediately above, so any PK collision would mean
+            // `extract_symbols` emitted two rows with identical
+            // (language, rel_path, fq_name, kind, start_byte) for the
+            // same file — an analyzer bug we want to surface.
             let mut insert_symbol = tx.prepare(
-                "INSERT OR IGNORE INTO symbols \
+                "INSERT INTO symbols \
                    (language, rel_path, fq_name, short_name, package_name, \
                     kind, signature, synthetic, \
                     start_byte, end_byte, start_line, end_line) \
@@ -356,6 +366,30 @@ impl AnalyzerStorage {
         mode: SymbolQueryMode,
         limit: usize,
     ) -> Result<Vec<SymbolHit>> {
+        self.search_symbols_inner(language, pattern, mode, limit, false)
+    }
+
+    /// `search_symbols`, but synthetic rows (e.g. compiler-generated
+    /// accessors) are filtered out in SQL — that is, *before* `LIMIT`
+    /// applies, so the rank cutoff isn't burned on rows the caller
+    /// would have discarded anyway.
+    pub fn search_non_synthetic_symbols(
+        &self,
+        language: Language,
+        pattern: &str,
+        mode: SymbolQueryMode,
+    ) -> Result<Vec<SymbolHit>> {
+        self.search_symbols_inner(language, pattern, mode, DEFAULT_SYMBOL_QUERY_LIMIT, true)
+    }
+
+    fn search_symbols_inner(
+        &self,
+        language: Language,
+        pattern: &str,
+        mode: SymbolQueryMode,
+        limit: usize,
+        exclude_synthetic: bool,
+    ) -> Result<Vec<SymbolHit>> {
         if pattern.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
@@ -368,6 +402,11 @@ impl AnalyzerStorage {
             SymbolQueryMode::Token | SymbolQueryMode::Prefix => "symbols_fts",
         };
         let phrase = build_fts_phrase(pattern, mode);
+        let synthetic_clause = if exclude_synthetic {
+            " AND s.synthetic = 0"
+        } else {
+            ""
+        };
         // bm25 default weights treat all columns equally; tweak here if
         // we later want to boost short_name over fq_name.
         let sql = format!(
@@ -376,7 +415,7 @@ impl AnalyzerStorage {
                     s.start_byte, s.end_byte, s.start_line, s.end_line \
              FROM {fts_table} f \
              JOIN symbols s ON s.rowid = f.rowid \
-             WHERE f.{fts_table} MATCH ?1 AND s.language = ?2 \
+             WHERE f.{fts_table} MATCH ?1 AND s.language = ?2{synthetic_clause} \
              ORDER BY rank, s.rel_path, s.fq_name, s.start_byte \
              LIMIT ?3"
         );

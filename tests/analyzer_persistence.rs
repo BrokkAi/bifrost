@@ -372,8 +372,11 @@ fn cold_start_populates_symbol_index() {
         Arc::clone(&storage),
     );
 
-    // Three Python declarations are visible in fresh_python_workspace:
+    // Four Python declarations are visible in fresh_python_workspace:
     // alpha.py: hello, Greeter, Greeter.greet ; beta.py: world.
+    // Lower-bounded because some adapters emit additional synthetic
+    // declarations (e.g. constructors) we don't want to pin a tight
+    // count on here.
     let count = storage.symbol_count(Language::Python).unwrap();
     assert!(
         count >= 4,
@@ -667,6 +670,74 @@ fn v1_to_v2_migration_preserves_analyzed_files() {
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
     assert_eq!(v, 2, "user_version should be bumped to 2");
+}
+
+/// Catches the upgrade-path bug (PR #28 review): if `apply_v2` doesn't
+/// invalidate the v1 `analyzer_epoch` row, an upgraded repo whose
+/// computed epoch happens to match the persisted one will stay in
+/// `clean_hydrated`, never re-analyze, and leave the new `symbols`
+/// table silently empty.
+///
+/// Repro shape: cold-start a real analyzer (writes a real v2 schema +
+/// real epoch), then surgically roll the schema *backwards* to v1
+/// (drop symbols/FTS tables and their triggers, set
+/// `PRAGMA user_version = 1`) while preserving the `analyzer_epoch`
+/// row exactly. Re-open: this re-runs `apply_v2`, recreating the
+/// tables. Re-build the analyzer. Without the epoch wipe, the file
+/// would be `clean_hydrated` and symbols would stay empty; with the
+/// wipe, every file dirties and re-populates the index.
+#[test]
+fn v1_to_v2_migration_repopulates_symbols_when_epoch_matches() {
+    use rusqlite::Connection;
+    let (_tmp_workspace, project) = fresh_python_workspace();
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("analyzer.db");
+
+    // Cold start: v2 schema, populated symbols, real epoch.
+    {
+        let storage = Arc::new(AnalyzerStorage::open(&db_path).unwrap());
+        let _ = PythonAnalyzer::new_with_config_and_storage(
+            project.clone(),
+            AnalyzerConfig::default(),
+            Arc::clone(&storage),
+        );
+        assert!(
+            storage.symbol_count(Language::Python).unwrap() > 0,
+            "precondition: cold start must populate symbols"
+        );
+    }
+
+    // Surgical downgrade to v1 while preserving analyzer_epoch and
+    // analyzed_files exactly. Drop triggers first (they reference the
+    // FTS tables) before dropping the FTS/symbols tables.
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            r#"
+            DROP TRIGGER IF EXISTS symbols_ai;
+            DROP TRIGGER IF EXISTS symbols_ad;
+            DROP TABLE IF EXISTS symbols_fts_tri;
+            DROP TABLE IF EXISTS symbols_fts;
+            DROP TABLE IF EXISTS symbols;
+            PRAGMA user_version = 1;
+            "#,
+        )
+        .unwrap();
+    }
+
+    // Re-open: apply_v2 runs again. With the epoch wipe, the next
+    // analyzer build will dirty-mark every file.
+    let storage = Arc::new(AnalyzerStorage::open(&db_path).unwrap());
+    let _ = PythonAnalyzer::new_with_config_and_storage(
+        project.clone(),
+        AnalyzerConfig::default(),
+        Arc::clone(&storage),
+    );
+    assert!(
+        storage.symbol_count(Language::Python).unwrap() > 0,
+        "post v1->v2 migration with matching epoch: symbols must still populate; \
+         see migrations.rs apply_v2() epoch-wipe rationale"
+    );
 }
 
 #[test]

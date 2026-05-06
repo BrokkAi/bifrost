@@ -156,6 +156,16 @@ where
         let signature = declaration.signature().map(|s| s.to_string());
         let synthetic = declaration.is_synthetic();
         for range in ranges {
+            // No real source file ever exceeds i64 byte/line offsets;
+            // a violation here means the range got corrupted upstream
+            // (e.g. a saturating cast back to usize::MAX).
+            debug_assert!(
+                range.start_byte as u64 <= i64::MAX as u64
+                    && range.end_byte as u64 <= i64::MAX as u64
+                    && range.start_line as u64 <= i64::MAX as u64
+                    && range.end_line as u64 <= i64::MAX as u64,
+                "range offsets overflow i64: {range:?}",
+            );
             out.push(SymbolRow {
                 fq_name: fq_name.clone(),
                 short_name: short_name.clone(),

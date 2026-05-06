@@ -86,6 +86,16 @@ fn apply_v1(tx: &Transaction<'_>) -> Result<()> {
 /// commit path also explicitly deletes per-file symbol rows before
 /// re-inserting them, so the FTS index never carries stale entries from a
 /// previous analysis of the same file.
+///
+/// Why the epoch wipe at the end: `analyzed_files` rows from a v1 build
+/// are still around but their owning files have no `symbols` rows yet.
+/// The next analyzer open compares the persisted epoch to a freshly
+/// computed one. If they happen to match (same parser fingerprint, same
+/// .scm files), reconcile would land every workspace file in
+/// `clean_hydrated`, no `WriteRow`s would fire, and the new symbol index
+/// would stay silently empty. Wiping the epoch forces a one-time
+/// dirty-mark of every file on first open after migration so the symbol
+/// index gets populated.
 fn apply_v2(tx: &Transaction<'_>) -> Result<()> {
     tx.execute_batch(
         r#"
@@ -135,6 +145,9 @@ fn apply_v2(tx: &Transaction<'_>) -> Result<()> {
         END;
         "#,
     )?;
+    // See module-level rationale: this guarantees the next reconcile
+    // dirty-marks every v1 file so the new symbol index gets populated.
+    tx.execute("DELETE FROM analyzer_epoch", [])?;
     Ok(())
 }
 
