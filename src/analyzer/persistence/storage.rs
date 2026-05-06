@@ -87,14 +87,70 @@ pub struct BaselineRow {
     pub payload: Vec<u8>,
 }
 
-/// Inputs to `commit_reconcile`: a write replaces (or inserts) one row.
+/// Inputs to `commit_reconcile`: a write replaces (or inserts) one row in
+/// `analyzed_files` and replaces all of that file's `symbols` rows with the
+/// supplied list.
 #[derive(Debug)]
 pub struct WriteRow {
     pub rel_path: String,
     pub mtime_ns: i64,
     pub size: i64,
     pub payload: Vec<u8>,
+    pub symbols: Vec<SymbolRow>,
 }
+
+/// One row in the `symbols` table. The `language` column is supplied at
+/// commit time and the FK to `analyzed_files(language, rel_path)` is
+/// resolved via the parent `WriteRow`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolRow {
+    pub fq_name: String,
+    pub short_name: String,
+    pub package_name: String,
+    pub kind: String,
+    pub signature: Option<String>,
+    pub synthetic: bool,
+    pub start_byte: i64,
+    pub end_byte: i64,
+    pub start_line: i64,
+    pub end_line: i64,
+}
+
+/// One row materialized from a `symbols` FTS5 query result. Carries the
+/// `rel_path` of the owning file so the caller can rebuild a `ProjectFile`
+/// using the analyzer's project root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolHit {
+    pub rel_path: String,
+    pub symbol: SymbolRow,
+}
+
+/// Which FTS5 index to consult for a query.
+///
+/// `Substring` uses the trigram-tokenized index, which matches characters
+/// regardless of word boundaries — closest in semantics to the existing
+/// regex-based `search_definitions`. *Caveat:* FTS5's trigram tokenizer
+/// emits no tokens for inputs shorter than three characters, so 1- and
+/// 2-character `Substring` queries always return zero hits. Callers that
+/// need full substring recall on short patterns must fall back to an
+/// in-memory regex scan.
+///
+/// `Token` uses the unicode61 index, which splits FQNs on `.`, `:`, and
+/// `_`; useful when you want to hit whole identifier components.
+/// `Prefix` is `Token` with a trailing `*` — anchored at a token start,
+/// useful for "everything starting with `Foo`" queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymbolQueryMode {
+    Substring,
+    Token,
+    Prefix,
+}
+
+/// Default cap on persisted symbol search results. FTS5 ranks by bm25; a
+/// few hundred top hits is plenty for an interactive query and protects
+/// callers on large repos from accidentally pulling tens of thousands of
+/// rows.
+pub const DEFAULT_SYMBOL_QUERY_LIMIT: usize = 500;
 
 /// SQLite-backed analyzer cache. Thread-safe via an internal mutex; multiple
 /// language analyzers in the same process share one instance.
@@ -190,7 +246,14 @@ impl AnalyzerStorage {
     }
 
     /// Atomically apply one reconcile result: upsert every `WriteRow`,
+    /// replace each written file's `symbols` rows with the supplied list,
     /// delete every path in `deletes`, and bump the analyzer epoch.
+    ///
+    /// For each write we explicitly clear the file's existing symbol rows
+    /// before re-inserting; the AFTER DELETE / AFTER INSERT triggers on
+    /// `symbols` keep the FTS5 indexes in sync. We don't rely on the
+    /// `analyzed_files` FK CASCADE alone here because mixing CASCADE with
+    /// FTS5 sync triggers across SQLite versions is fragile.
     pub fn commit_reconcile(
         &self,
         language: Language,
@@ -203,15 +266,20 @@ impl AnalyzerStorage {
         let tx = conn.transaction()?;
 
         if !deletes.is_empty() {
-            let mut delete_stmt =
+            let mut delete_symbols =
+                tx.prepare("DELETE FROM symbols WHERE language = ?1 AND rel_path = ?2")?;
+            let mut delete_file =
                 tx.prepare("DELETE FROM analyzed_files WHERE language = ?1 AND rel_path = ?2")?;
             for path in deletes {
-                delete_stmt.execute(params![lang, path])?;
+                delete_symbols.execute(params![lang, path])?;
+                delete_file.execute(params![lang, path])?;
             }
         }
 
         if !writes.is_empty() {
-            let mut upsert = tx.prepare(
+            let mut delete_symbols =
+                tx.prepare("DELETE FROM symbols WHERE language = ?1 AND rel_path = ?2")?;
+            let mut upsert_file = tx.prepare(
                 "INSERT INTO analyzed_files \
                    (language, rel_path, mtime_ns, size, epoch, payload) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
@@ -221,8 +289,21 @@ impl AnalyzerStorage {
                    epoch    = excluded.epoch, \
                    payload  = excluded.payload",
             )?;
+            // No `OR IGNORE`: `delete_symbols` ran for this rel_path
+            // immediately above, so any PK collision would mean
+            // `extract_symbols` emitted two rows with identical
+            // (language, rel_path, fq_name, kind, start_byte) for the
+            // same file — an analyzer bug we want to surface.
+            let mut insert_symbol = tx.prepare(
+                "INSERT INTO symbols \
+                   (language, rel_path, fq_name, short_name, package_name, \
+                    kind, signature, synthetic, \
+                    start_byte, end_byte, start_line, end_line) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            )?;
             for write in writes {
-                upsert.execute(params![
+                delete_symbols.execute(params![lang, write.rel_path])?;
+                upsert_file.execute(params![
                     lang,
                     write.rel_path,
                     write.mtime_ns,
@@ -230,6 +311,22 @@ impl AnalyzerStorage {
                     epoch,
                     write.payload,
                 ])?;
+                for sym in &write.symbols {
+                    insert_symbol.execute(params![
+                        lang,
+                        write.rel_path,
+                        sym.fq_name,
+                        sym.short_name,
+                        sym.package_name,
+                        sym.kind,
+                        sym.signature,
+                        sym.synthetic as i64,
+                        sym.start_byte,
+                        sym.end_byte,
+                        sym.start_line,
+                        sym.end_line,
+                    ])?;
+                }
             }
         }
 
@@ -243,6 +340,124 @@ impl AnalyzerStorage {
         Ok(())
     }
 
+    /// Cold-start symbol search: query an FTS5 index on the persisted
+    /// `symbols` table without rebuilding the in-memory analyzer. Returns
+    /// at most `DEFAULT_SYMBOL_QUERY_LIMIT` matching symbol rows, ordered
+    /// by FTS5 bm25 rank (best-first), each tagged with the `rel_path` of
+    /// its owning file.
+    ///
+    /// `pattern` is treated as a literal: FTS5 special characters in the
+    /// input are escaped so a user-supplied identifier never accidentally
+    /// becomes an operator or column filter.
+    pub fn search_symbols(
+        &self,
+        language: Language,
+        pattern: &str,
+        mode: SymbolQueryMode,
+    ) -> Result<Vec<SymbolHit>> {
+        self.search_symbols_with_limit(language, pattern, mode, DEFAULT_SYMBOL_QUERY_LIMIT)
+    }
+
+    /// `search_symbols` with an explicit row cap. `0` returns no rows.
+    pub fn search_symbols_with_limit(
+        &self,
+        language: Language,
+        pattern: &str,
+        mode: SymbolQueryMode,
+        limit: usize,
+    ) -> Result<Vec<SymbolHit>> {
+        self.search_symbols_inner(language, pattern, mode, limit, false)
+    }
+
+    /// `search_symbols`, but synthetic rows (e.g. compiler-generated
+    /// accessors) are filtered out in SQL — that is, *before* `LIMIT`
+    /// applies, so the rank cutoff isn't burned on rows the caller
+    /// would have discarded anyway.
+    pub fn search_non_synthetic_symbols(
+        &self,
+        language: Language,
+        pattern: &str,
+        mode: SymbolQueryMode,
+    ) -> Result<Vec<SymbolHit>> {
+        self.search_symbols_inner(language, pattern, mode, DEFAULT_SYMBOL_QUERY_LIMIT, true)
+    }
+
+    fn search_symbols_inner(
+        &self,
+        language: Language,
+        pattern: &str,
+        mode: SymbolQueryMode,
+        limit: usize,
+        exclude_synthetic: bool,
+    ) -> Result<Vec<SymbolHit>> {
+        if pattern.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let lang = language_key(language);
+        let fts_table = match mode {
+            SymbolQueryMode::Substring => "symbols_fts_tri",
+            // Prefix uses the same unicode61 index as Token; the trailing
+            // `*` in the constructed phrase is what turns it into an
+            // FTS5 prefix query.
+            SymbolQueryMode::Token | SymbolQueryMode::Prefix => "symbols_fts",
+        };
+        let phrase = build_fts_phrase(pattern, mode);
+        let synthetic_clause = if exclude_synthetic {
+            " AND s.synthetic = 0"
+        } else {
+            ""
+        };
+        // bm25 default weights treat all columns equally; tweak here if
+        // we later want to boost short_name over fq_name.
+        let sql = format!(
+            "SELECT s.rel_path, s.fq_name, s.short_name, s.package_name, \
+                    s.kind, s.signature, s.synthetic, \
+                    s.start_byte, s.end_byte, s.start_line, s.end_line \
+             FROM {fts_table} f \
+             JOIN symbols s ON s.rowid = f.rowid \
+             WHERE f.{fts_table} MATCH ?1 AND s.language = ?2{synthetic_clause} \
+             ORDER BY rank, s.rel_path, s.fq_name, s.start_byte \
+             LIMIT ?3"
+        );
+        let conn = self.conn.lock().expect("analyzer storage mutex poisoned");
+        let mut stmt = conn.prepare(&sql)?;
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = stmt.query_map(params![phrase, lang, limit_i64], |row| {
+            let synthetic_int: i64 = row.get(6)?;
+            Ok(SymbolHit {
+                rel_path: row.get(0)?,
+                symbol: SymbolRow {
+                    fq_name: row.get(1)?,
+                    short_name: row.get(2)?,
+                    package_name: row.get(3)?,
+                    kind: row.get(4)?,
+                    signature: row.get(5)?,
+                    synthetic: synthetic_int != 0,
+                    start_byte: row.get(7)?,
+                    end_byte: row.get(8)?,
+                    start_line: row.get(9)?,
+                    end_line: row.get(10)?,
+                },
+            })
+        })?;
+        let mut out = Vec::new();
+        for hit in rows {
+            out.push(hit?);
+        }
+        Ok(out)
+    }
+
+    /// Number of persisted symbol rows for a language. Diagnostic / test helper.
+    pub fn symbol_count(&self, language: Language) -> Result<i64> {
+        let lang = language_key(language);
+        let conn = self.conn.lock().expect("analyzer storage mutex poisoned");
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM symbols WHERE language = ?1",
+            [lang],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Number of persisted file rows for a language. Useful for diagnostics
     /// and for asserting reconcile behavior in tests.
     pub fn row_count(&self, language: Language) -> Result<i64> {
@@ -253,6 +468,21 @@ impl AnalyzerStorage {
             [lang],
             |row| row.get(0),
         )?)
+    }
+}
+
+/// Build the FTS5 MATCH phrase for a user-supplied pattern.
+///
+/// The pattern is wrapped in double quotes (with inner double quotes
+/// doubled) so FTS5 special characters — `*`, `:`, `^`, `AND`, `NOT`,
+/// `OR`, column filters — never escape to operator status. For `Prefix`
+/// mode, an unquoted `*` is appended to the phrase, which FTS5
+/// interprets as a token-prefix match.
+fn build_fts_phrase(pattern: &str, mode: SymbolQueryMode) -> String {
+    let escaped = pattern.replace('"', "\"\"");
+    match mode {
+        SymbolQueryMode::Substring | SymbolQueryMode::Token => format!("\"{escaped}\""),
+        SymbolQueryMode::Prefix => format!("\"{escaped}\"*"),
     }
 }
 

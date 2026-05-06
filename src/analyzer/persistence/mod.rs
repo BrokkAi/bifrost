@@ -27,9 +27,10 @@ pub(crate) mod reconcile;
 mod storage;
 
 pub use storage::{
-    AnalyzerStorage, BaselineRow, DB_FILE_NAME, DEFAULT_CACHE_DIR, PersistenceError, Result,
-    WriteRow, default_db_path,
+    AnalyzerStorage, BaselineRow, DB_FILE_NAME, DEFAULT_CACHE_DIR, DEFAULT_SYMBOL_QUERY_LIMIT,
+    PersistenceError, Result, SymbolHit, SymbolQueryMode, SymbolRow, WriteRow, default_db_path,
 };
 
 pub(crate) use epoch::epoch_for;
 pub(crate) use payload::{decode, encode};
+pub(crate) use reconcile::parse_kind;

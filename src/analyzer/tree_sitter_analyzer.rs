@@ -573,6 +573,7 @@ where
         if let (Some(storage), Some(epoch)) = (storage, epoch_for_commit) {
             let writes = persistence::reconcile::encode_writes(
                 files.iter().filter(|(file, _)| dirty_keys.contains(file)),
+                |fq_name| adapter.normalize_full_name(fq_name),
             );
             // Persistence is best-effort; a write failure should not poison
             // the in-memory analyzer.
@@ -949,6 +950,7 @@ where
             let epoch = persistence::epoch_for(self.adapter.language(), &ts_lang);
             let writes = persistence::reconcile::encode_writes(
                 files.iter().filter(|(file, _)| dirty_keys.contains(file)),
+                |fq_name| self.adapter.normalize_full_name(fq_name),
             );
             let _ = persistence::reconcile::commit(
                 storage.as_ref(),
@@ -1204,6 +1206,64 @@ where
             })
             .flat_map(|(_, definitions)| definitions.to_vec())
             .collect()
+    }
+
+    fn search_definitions_persisted(&self, pattern: &str) -> BTreeSet<CodeUnit> {
+        if pattern.is_empty() {
+            return BTreeSet::new();
+        }
+        let Some(storage) = self.storage.as_ref() else {
+            return self.search_definitions(pattern, true);
+        };
+        // FTS5's trigram tokenizer produces no tokens for inputs shorter
+        // than three characters, so any 1- or 2-char query against the
+        // substring index returns zero rows regardless of what's
+        // indexed. The in-memory regex search has no such floor, so for
+        // short patterns we fall back to it to preserve substring
+        // semantics.
+        if pattern.chars().count() < 3 {
+            return self.search_definitions(pattern, true);
+        }
+        let language = self.adapter.language();
+        // The trigram index models the same substring semantics the
+        // existing in-memory `search_definitions` provides, so callers
+        // who switch to the persisted variant don't see a regression in
+        // recall. The unicode61 token index is reserved for future
+        // identifier-only / FQN-token query paths.
+        //
+        // `search_non_synthetic_symbols` pushes the synthetic filter
+        // into SQL so it runs before `LIMIT` — otherwise a top-N cap
+        // can be entirely consumed by compiler-generated rows that the
+        // post-filter below would drop anyway.
+        let hits = match storage.search_non_synthetic_symbols(
+            language,
+            pattern,
+            persistence::SymbolQueryMode::Substring,
+        ) {
+            Ok(hits) => hits,
+            Err(_) => return self.search_definitions(pattern, true),
+        };
+        let mut out = BTreeSet::new();
+        let project_root = self.project.root().to_path_buf();
+        for hit in hits {
+            if self.adapter.is_anonymous_structure(&hit.symbol.fq_name) {
+                continue;
+            }
+            let Some(kind) = persistence::parse_kind(&hit.symbol.kind) else {
+                continue;
+            };
+            let rel_path = std::path::PathBuf::from(&hit.rel_path);
+            let source = ProjectFile::new(project_root.clone(), rel_path);
+            out.insert(CodeUnit::with_signature(
+                source,
+                kind,
+                hit.symbol.package_name,
+                hit.symbol.short_name,
+                hit.symbol.signature,
+                hit.symbol.synthetic,
+            ));
+        }
+        out
     }
 
     fn metrics(&self) -> CodeBaseMetrics {

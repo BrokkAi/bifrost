@@ -7,10 +7,10 @@
 //! the cold-start path (`build_state`) and the warm-update path
 //! (`update`) build on top of these helpers.
 
-use crate::analyzer::persistence::storage::{AnalyzerStorage, BaselineRow, WriteRow};
+use crate::analyzer::persistence::storage::{AnalyzerStorage, BaselineRow, SymbolRow, WriteRow};
 use crate::analyzer::persistence::{Result, decode, encode};
 use crate::analyzer::tree_sitter_analyzer::FileState;
-use crate::analyzer::{Language, ProjectFile};
+use crate::analyzer::{CodeUnitType, Language, ProjectFile};
 use crate::hash::HashMap;
 use std::collections::BTreeMap;
 
@@ -96,13 +96,19 @@ pub(crate) fn plan(
     })
 }
 
-/// Encode each `(file, state)` pair as a `WriteRow` for upsert. Files
-/// that fail to stat or encode are silently skipped (they will be
+/// Encode each `(file, state)` pair as a `WriteRow` for upsert, including
+/// the symbol rows extracted from `state.declarations` and `state.ranges`.
+/// `normalize_fq_name` mirrors `LanguageAdapter::normalize_full_name`, so
+/// the persisted FQNs match the keys the in-memory `definitions` index
+/// uses.
+///
+/// Files that fail to stat or encode are silently skipped (they will be
 /// re-analyzed on the next startup); a single bad file should not abort
 /// the whole reconcile commit.
-pub(crate) fn encode_writes<'a, I>(fresh_states: I) -> Vec<WriteRow>
+pub(crate) fn encode_writes<'a, I, F>(fresh_states: I, normalize_fq_name: F) -> Vec<WriteRow>
 where
     I: IntoIterator<Item = (&'a ProjectFile, &'a FileState)>,
+    F: Fn(&str) -> String,
 {
     let iter = fresh_states.into_iter();
     let (lower, _) = iter.size_hint();
@@ -115,14 +121,89 @@ where
             Ok(bytes) => bytes,
             Err(_) => continue,
         };
+        let symbols = extract_symbols(state, &normalize_fq_name);
         writes.push(WriteRow {
             rel_path: rel_key(file),
             mtime_ns: stat.mtime_ns,
             size: stat.size,
             payload,
+            symbols,
         });
     }
     writes
+}
+
+/// Project a `FileState` onto the flat `SymbolRow` shape stored by the
+/// FTS5-backed symbol index. One row per `(declaration, range)` pair — a
+/// declaration that occurs at multiple ranges (e.g. partial classes) gets
+/// one row per range, sharing fq_name/short_name/kind.
+fn extract_symbols<F>(state: &FileState, normalize_fq_name: F) -> Vec<SymbolRow>
+where
+    F: Fn(&str) -> String,
+{
+    let mut out = Vec::new();
+    for declaration in &state.declarations {
+        let Some(ranges) = state.ranges.get(declaration) else {
+            continue;
+        };
+        if ranges.is_empty() {
+            continue;
+        }
+        let fq_name = normalize_fq_name(&declaration.fq_name());
+        let short_name = declaration.short_name().to_string();
+        let package_name = declaration.package_name().to_string();
+        let kind = code_unit_kind_str(declaration.kind()).to_string();
+        let signature = declaration.signature().map(|s| s.to_string());
+        let synthetic = declaration.is_synthetic();
+        for range in ranges {
+            // No real source file ever exceeds i64 byte/line offsets;
+            // a violation here means the range got corrupted upstream
+            // (e.g. a saturating cast back to usize::MAX).
+            debug_assert!(
+                range.start_byte as u64 <= i64::MAX as u64
+                    && range.end_byte as u64 <= i64::MAX as u64
+                    && range.start_line as u64 <= i64::MAX as u64
+                    && range.end_line as u64 <= i64::MAX as u64,
+                "range offsets overflow i64: {range:?}",
+            );
+            out.push(SymbolRow {
+                fq_name: fq_name.clone(),
+                short_name: short_name.clone(),
+                package_name: package_name.clone(),
+                kind: kind.clone(),
+                signature: signature.clone(),
+                synthetic,
+                start_byte: i64::try_from(range.start_byte).unwrap_or(i64::MAX),
+                end_byte: i64::try_from(range.end_byte).unwrap_or(i64::MAX),
+                start_line: i64::try_from(range.start_line).unwrap_or(i64::MAX),
+                end_line: i64::try_from(range.end_line).unwrap_or(i64::MAX),
+            });
+        }
+    }
+    out
+}
+
+/// Stable on-disk encoding for `CodeUnitType`. Kept intentionally trivial
+/// so a row written by an older build is still readable.
+pub(crate) fn code_unit_kind_str(kind: CodeUnitType) -> &'static str {
+    match kind {
+        CodeUnitType::Class => "Class",
+        CodeUnitType::Function => "Function",
+        CodeUnitType::Field => "Field",
+        CodeUnitType::Module => "Module",
+    }
+}
+
+/// Inverse of `code_unit_kind_str`. Unknown strings round-trip to `None`,
+/// letting callers skip rows written by a future build.
+pub(crate) fn parse_kind(s: &str) -> Option<CodeUnitType> {
+    Some(match s {
+        "Class" => CodeUnitType::Class,
+        "Function" => CodeUnitType::Function,
+        "Field" => CodeUnitType::Field,
+        "Module" => CodeUnitType::Module,
+        _ => return None,
+    })
 }
 
 /// Apply the writes + deletes + epoch update in one transaction.

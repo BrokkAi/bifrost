@@ -69,6 +69,14 @@ pub trait IAnalyzer: Send + Sync + Any {
     fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String>;
     fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String>;
     fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit>;
+    /// Cold-start substring search that runs against the persisted FTS5
+    /// symbol index, without requiring `AnalyzerState` to be fully built.
+    /// Implementations that have no persistence layer (or whose storage
+    /// open failed) should fall back to `search_definitions(pattern, true)`,
+    /// which preserves the legacy in-memory behavior.
+    fn search_definitions_persisted(&self, pattern: &str) -> BTreeSet<CodeUnit> {
+        self.search_definitions(pattern, true)
+    }
     fn signatures<'a>(&'a self, _code_unit: &CodeUnit) -> &'a [String] {
         &[]
     }
