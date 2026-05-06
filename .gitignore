@@ -1,6 +1,7 @@
 /target
 __pycache__/
 .codex
+.claude/
 .bifrost/
 bifrost_searchtools/*.so
 
