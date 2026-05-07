@@ -7,6 +7,7 @@ use lsp_server::{
 };
 use lsp_types::notification::{
     DidChangeWatchedFiles, DidSaveTextDocument, Notification as LspNotificationTrait,
+    PublishDiagnostics,
 };
 use lsp_types::request::{
     DocumentDiagnosticRequest, DocumentSymbolRequest, GotoDefinition, HoverRequest, References,
@@ -14,6 +15,7 @@ use lsp_types::request::{
 };
 use lsp_types::{
     DidChangeWatchedFilesParams, DidSaveTextDocumentParams, FileChangeType, InitializeParams,
+    PublishDiagnosticsParams, Uri,
 };
 
 use crate::analyzer::{AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer};
@@ -72,7 +74,7 @@ fn main_loop(connection: &Connection, state: &mut ServerState) -> Result<(), Str
                 }
                 handle_request(connection, state, req)?;
             }
-            Message::Notification(note) => handle_notification(state, note)?,
+            Message::Notification(note) => handle_notification(connection, state, note)?,
             Message::Response(_) => {
                 // We do not currently send server→client requests, so any
                 // inbound Response is unsolicited and safe to ignore.
@@ -182,7 +184,11 @@ where
     }
 }
 
-fn handle_notification(state: &mut ServerState, note: Notification) -> Result<(), String> {
+fn handle_notification(
+    connection: &Connection,
+    state: &mut ServerState,
+    note: Notification,
+) -> Result<(), String> {
     match note.method.as_str() {
         DidSaveTextDocument::METHOD => {
             let params: DidSaveTextDocumentParams =
@@ -199,6 +205,10 @@ fn handle_notification(state: &mut ServerState, note: Notification) -> Result<()
                 changed.insert(file);
                 state.workspace = state.workspace.update(&changed);
             }
+            // Push diagnostics for clients that don't poll the pull-model
+            // textDocument/diagnostic endpoint. Clients that DO poll just
+            // receive the same items twice, which is benign.
+            publish_diagnostics(connection, state.project.root(), &params.text_document.uri)?;
             Ok(())
         }
         DidChangeWatchedFiles::METHOD => {
@@ -233,6 +243,27 @@ fn handle_notification(state: &mut ServerState, note: Notification) -> Result<()
             Ok(())
         }
     }
+}
+
+/// Send a `textDocument/publishDiagnostics` notification with the current
+/// parse-error report for `uri`. We always send — even when the diagnostic
+/// list is empty — so clients clear stale diagnostics from a previous save.
+fn publish_diagnostics(
+    connection: &Connection,
+    project_root: &Path,
+    uri: &Uri,
+) -> Result<(), String> {
+    let diagnostics = diagnostic::collect(project_root, uri);
+    let params = PublishDiagnosticsParams {
+        uri: uri.clone(),
+        diagnostics,
+        version: None,
+    };
+    let note = Notification::new(PublishDiagnostics::METHOD.to_string(), params);
+    connection
+        .sender
+        .send(Message::Notification(note))
+        .map_err(|err| format!("Failed to send publishDiagnostics: {err}"))
 }
 
 pub(crate) struct ServerState {

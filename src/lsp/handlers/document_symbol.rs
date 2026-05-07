@@ -27,7 +27,7 @@ pub fn handle(
     let symbols: Vec<DocumentSymbol> = analyzer
         .top_level_declarations(&project_file)
         .filter(|cu| !cu.is_anonymous())
-        .map(|cu| build_symbol(analyzer, cu, &content, &line_starts))
+        .map(|cu| build_symbol(analyzer, cu, &content, &line_starts, None))
         .collect();
 
     Some(DocumentSymbolResponse::Nested(symbols))
@@ -38,23 +38,26 @@ fn build_symbol(
     code_unit: &CodeUnit,
     content: &str,
     line_starts: &[usize],
+    parent_kind: Option<SymbolKind>,
 ) -> DocumentSymbol {
     let range = primary_range(analyzer, code_unit, content);
     let lsp_range = byte_range_to_lsp_range(content, line_starts, &range);
     let selection_range =
         identifier_selection_range(code_unit, content, line_starts, &range).unwrap_or(lsp_range);
 
+    let kind = classify_symbol_kind(code_unit, parent_kind);
+
     let children: Vec<DocumentSymbol> = analyzer
         .direct_children(code_unit)
         .filter(|child| !child.is_anonymous())
-        .map(|child| build_symbol(analyzer, child, content, line_starts))
+        .map(|child| build_symbol(analyzer, child, content, line_starts, Some(kind)))
         .collect();
 
     #[allow(deprecated)] // `deprecated` field is present on lsp-types DocumentSymbol.
     DocumentSymbol {
         name: code_unit.identifier().to_string(),
         detail: code_unit.signature().map(str::to_string),
-        kind: map_kind(code_unit.kind()),
+        kind,
         tags: None,
         deprecated: None,
         range: lsp_range,
@@ -139,13 +142,110 @@ fn is_ident_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
-fn map_kind(kind: CodeUnitType) -> SymbolKind {
-    match kind {
-        CodeUnitType::Class => SymbolKind::CLASS,
-        CodeUnitType::Function => SymbolKind::FUNCTION,
-        CodeUnitType::Field => SymbolKind::FIELD,
+/// Map a code unit to its richest LSP `SymbolKind`. The analyzer only stores
+/// four coarse kinds (Class/Function/Field/Module), but tree-sitter signatures
+/// preserve the keyword that introduced the declaration (`interface`, `enum`,
+/// `struct`, `record`, `trait`) and naming conventions disambiguate
+/// constructors, constants, and enum members. `parent_kind` carries the
+/// already-classified kind of the enclosing symbol so we can promote fields
+/// of an enum to `EnumMember` and methods named after their enclosing type to
+/// `Constructor`.
+fn classify_symbol_kind(code_unit: &CodeUnit, parent_kind: Option<SymbolKind>) -> SymbolKind {
+    match code_unit.kind() {
+        CodeUnitType::Class => classify_class_like(code_unit.signature()),
+        CodeUnitType::Function => {
+            if is_constructor(code_unit, parent_kind) {
+                SymbolKind::CONSTRUCTOR
+            } else {
+                SymbolKind::FUNCTION
+            }
+        }
+        CodeUnitType::Field => {
+            if parent_kind == Some(SymbolKind::ENUM) {
+                SymbolKind::ENUM_MEMBER
+            } else if is_constant(code_unit) {
+                SymbolKind::CONSTANT
+            } else {
+                SymbolKind::VARIABLE
+            }
+        }
         CodeUnitType::Module => SymbolKind::MODULE,
     }
+}
+
+/// Inspect the leading keyword of a class-like declaration's signature to
+/// decide which LSP kind best represents it. The signature includes modifiers
+/// and the introducing keyword, e.g. `public interface Foo {`, `pub enum Bar`,
+/// `struct S {`, so a word-boundary scan picks out the right keyword without
+/// being fooled by identifiers like `enumerable` or `traits`.
+fn classify_class_like(signature: Option<&str>) -> SymbolKind {
+    let Some(sig) = signature else {
+        return SymbolKind::CLASS;
+    };
+    if find_word(sig, "interface").is_some() || find_word(sig, "trait").is_some() {
+        SymbolKind::INTERFACE
+    } else if find_word(sig, "enum").is_some() {
+        SymbolKind::ENUM
+    } else if find_word(sig, "struct").is_some() || find_word(sig, "record").is_some() {
+        SymbolKind::STRUCT
+    } else {
+        SymbolKind::CLASS
+    }
+}
+
+fn is_constructor(code_unit: &CodeUnit, parent_kind: Option<SymbolKind>) -> bool {
+    if !matches!(
+        parent_kind,
+        Some(SymbolKind::CLASS)
+            | Some(SymbolKind::STRUCT)
+            | Some(SymbolKind::ENUM)
+            | Some(SymbolKind::INTERFACE)
+    ) {
+        return false;
+    }
+    let identifier = code_unit.identifier();
+    // Language-level constructor names: TS `constructor`, Python `__init__`,
+    // PHP `__construct`. Java/C# constructors have the same name as their
+    // enclosing type, which (because short_name is built as
+    // `parent_short_name.method_name`) shows up as the last two
+    // dot-separated segments being equal.
+    matches!(identifier, "__init__" | "__construct" | "constructor")
+        || constructor_matches_owner(code_unit)
+}
+
+fn constructor_matches_owner(code_unit: &CodeUnit) -> bool {
+    let mut parts = code_unit.short_name().rsplit('.');
+    let last = parts.next();
+    let prev = parts.next();
+    matches!((prev, last), (Some(parent), Some(method)) if !parent.is_empty() && parent == method)
+}
+
+fn is_constant(code_unit: &CodeUnit) -> bool {
+    let identifier = code_unit.identifier();
+    if is_screaming_snake_case(identifier) {
+        return true;
+    }
+    let Some(sig) = code_unit.signature() else {
+        return false;
+    };
+    find_word(sig, "const").is_some()
+        || find_word(sig, "final").is_some()
+        || find_word(sig, "readonly").is_some()
+}
+
+fn is_screaming_snake_case(identifier: &str) -> bool {
+    if identifier.is_empty() {
+        return false;
+    }
+    let mut has_alpha = false;
+    for ch in identifier.chars() {
+        if ch.is_ascii_uppercase() {
+            has_alpha = true;
+        } else if !ch.is_ascii_digit() && ch != '_' {
+            return false;
+        }
+    }
+    has_alpha
 }
 
 fn line_count(content: &str) -> usize {
@@ -159,6 +259,7 @@ fn line_count(content: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::ProjectFile;
 
     #[test]
     fn find_word_skips_substring_match_inside_longer_identifier() {
@@ -184,5 +285,186 @@ mod tests {
         assert_eq!(find_word("foo", "foo"), Some(0));
         assert_eq!(find_word("a foo", "foo"), Some(2));
         assert_eq!(find_word("foo bar", "foo"), Some(0));
+    }
+
+    fn project_file() -> ProjectFile {
+        let root = if cfg!(windows) {
+            std::path::PathBuf::from("C:\\tmp")
+        } else {
+            std::path::PathBuf::from("/tmp")
+        };
+        ProjectFile::new(root, "Foo.txt")
+    }
+
+    fn function_with(short_name: &str, signature: Option<&str>) -> CodeUnit {
+        CodeUnit::with_signature(
+            project_file(),
+            CodeUnitType::Function,
+            "",
+            short_name,
+            signature.map(str::to_string),
+            false,
+        )
+    }
+
+    fn field_with(short_name: &str, signature: Option<&str>) -> CodeUnit {
+        CodeUnit::with_signature(
+            project_file(),
+            CodeUnitType::Field,
+            "",
+            short_name,
+            signature.map(str::to_string),
+            false,
+        )
+    }
+
+    #[test]
+    fn class_like_signatures_promote_to_specific_kinds() {
+        assert_eq!(
+            classify_class_like(Some("public interface Greeter {")),
+            SymbolKind::INTERFACE,
+        );
+        assert_eq!(
+            classify_class_like(Some("pub trait Drawable {")),
+            SymbolKind::INTERFACE,
+        );
+        assert_eq!(
+            classify_class_like(Some("pub enum Color { Red, Green }")),
+            SymbolKind::ENUM,
+        );
+        assert_eq!(
+            classify_class_like(Some("pub struct Point { x: f64 }")),
+            SymbolKind::STRUCT,
+        );
+        assert_eq!(
+            classify_class_like(Some("public record Pair(int a, int b) {")),
+            SymbolKind::STRUCT,
+        );
+        assert_eq!(
+            classify_class_like(Some("public class Greeter {")),
+            SymbolKind::CLASS,
+        );
+        assert_eq!(classify_class_like(None), SymbolKind::CLASS);
+    }
+
+    #[test]
+    fn class_like_keyword_match_is_word_bounded() {
+        // `enumerable` must NOT be picked up as `enum`.
+        assert_eq!(
+            classify_class_like(Some("class Enumerable {")),
+            SymbolKind::CLASS,
+        );
+    }
+
+    #[test]
+    fn java_constructor_is_detected_when_method_name_matches_owner() {
+        let constructor = function_with("Foo.Foo", Some("public Foo()"));
+        assert_eq!(
+            classify_symbol_kind(&constructor, Some(SymbolKind::CLASS)),
+            SymbolKind::CONSTRUCTOR,
+        );
+        // Same short_name without a class parent — fall back to FUNCTION.
+        assert_eq!(
+            classify_symbol_kind(&constructor, None),
+            SymbolKind::FUNCTION,
+        );
+    }
+
+    #[test]
+    fn special_constructor_names_are_detected() {
+        for name in ["__init__", "__construct", "constructor"] {
+            let func = function_with(&format!("Foo.{name}"), Some("..."));
+            assert_eq!(
+                classify_symbol_kind(&func, Some(SymbolKind::CLASS)),
+                SymbolKind::CONSTRUCTOR,
+                "{name} should classify as constructor",
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_function_stays_function() {
+        let func = function_with("Foo.bar", Some("fn bar()"));
+        assert_eq!(
+            classify_symbol_kind(&func, Some(SymbolKind::CLASS)),
+            SymbolKind::FUNCTION,
+        );
+    }
+
+    #[test]
+    fn enum_field_is_promoted_to_enum_member() {
+        let variant = field_with("Color.Red", None);
+        assert_eq!(
+            classify_symbol_kind(&variant, Some(SymbolKind::ENUM)),
+            SymbolKind::ENUM_MEMBER,
+        );
+    }
+
+    #[test]
+    fn screaming_snake_case_field_is_constant() {
+        let f = field_with("Foo.MAX_SIZE", Some("private static int MAX_SIZE = 10;"));
+        assert_eq!(
+            classify_symbol_kind(&f, Some(SymbolKind::CLASS)),
+            SymbolKind::CONSTANT,
+        );
+    }
+
+    #[test]
+    fn final_or_const_keyword_makes_field_constant() {
+        let java_final = field_with("Foo.size", Some("public static final int size = 10;"));
+        assert_eq!(
+            classify_symbol_kind(&java_final, Some(SymbolKind::CLASS)),
+            SymbolKind::CONSTANT,
+        );
+        let rust_const = field_with("Foo.SIZE", Some("pub const SIZE: usize = 10"));
+        assert_eq!(
+            classify_symbol_kind(&rust_const, Some(SymbolKind::CLASS)),
+            SymbolKind::CONSTANT,
+        );
+    }
+
+    #[test]
+    fn ordinary_field_is_variable() {
+        let f = field_with("Foo.count", Some("private int count;"));
+        assert_eq!(
+            classify_symbol_kind(&f, Some(SymbolKind::CLASS)),
+            SymbolKind::VARIABLE,
+        );
+    }
+
+    #[test]
+    fn screaming_snake_case_rejects_lowercase() {
+        assert!(is_screaming_snake_case("MAX_SIZE"));
+        assert!(is_screaming_snake_case("MAX"));
+        assert!(is_screaming_snake_case("X_1"));
+        assert!(!is_screaming_snake_case(""));
+        assert!(!is_screaming_snake_case("_"));
+        assert!(!is_screaming_snake_case("Max"));
+        assert!(!is_screaming_snake_case("max_size"));
+    }
+
+    #[test]
+    fn module_kind_passes_through() {
+        let m = CodeUnit::with_signature(
+            project_file(),
+            CodeUnitType::Module,
+            "",
+            "my_mod",
+            Some("mod my_mod {".to_string()),
+            false,
+        );
+        assert_eq!(classify_symbol_kind(&m, None), SymbolKind::MODULE);
+    }
+
+    #[test]
+    fn class_inside_class_does_not_trigger_constructor_for_field() {
+        // A field whose short_name path looks like a constructor (last two
+        // segments equal) should still classify as VARIABLE, not CONSTRUCTOR —
+        // the constructor rule only applies to functions.
+        let f = field_with("Foo.Foo", Some("private int Foo;"));
+        assert_eq!(
+            classify_symbol_kind(&f, Some(SymbolKind::CLASS)),
+            SymbolKind::VARIABLE,
+        );
     }
 }
