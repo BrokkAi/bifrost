@@ -1111,7 +1111,9 @@ fn bifrost_lsp_server_did_save_triggers_reindex() {
             "params": {"query": "added"}
         }),
     );
-    let after = read_message(&mut reader, &mut stderr);
+    // didSave now emits a publishDiagnostics notification before the
+    // workspace/symbol response — skip past it.
+    let after = read_response_for_id(&mut reader, &mut stderr, 3);
     let names_after: Vec<String> = after["result"]
         .as_array()
         .map(|arr| {
@@ -1281,6 +1283,152 @@ fn bifrost_lsp_server_unknown_request_returns_method_not_found() {
     drop(stdin);
     let status = child.wait().expect("wait bifrost");
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
+fn bifrost_lsp_server_did_save_publishes_diagnostics() {
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    // Start with a file that parses cleanly.
+    fs::write(
+        temp_root.join("Push.java"),
+        "public class Push {\n    public void ok() {}\n}\n",
+    )
+    .expect("write fixture");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(&temp_root)
+        .arg("--server")
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bifrost");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    let root_uri = uri_for(&temp_root);
+    let push_uri = uri_for(&temp_root.join("Push.java"));
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"processId": null, "rootUri": root_uri, "capabilities": {}}
+        }),
+    );
+    let _ = read_message(&mut reader, &mut stderr);
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+    );
+
+    // Replace the file with broken Java, then send didSave. The server should
+    // emit a `textDocument/publishDiagnostics` notification with at least one
+    // parse-error item.
+    fs::write(
+        temp_root.join("Push.java"),
+        "public class Push {\n    public void broken( {\n}\n",
+    )
+    .expect("rewrite fixture");
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didSave",
+            "params": {"textDocument": {"uri": push_uri}}
+        }),
+    );
+
+    let publish = read_notification(&mut reader, &mut stderr, "textDocument/publishDiagnostics");
+    assert_eq!(
+        publish["params"]["uri"].as_str(),
+        Some(push_uri.as_str()),
+        "publishDiagnostics URI should match the saved file: {publish}"
+    );
+    let items = publish["params"]["diagnostics"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected diagnostics array, got {publish}"));
+    assert!(
+        !items.is_empty(),
+        "expected at least one parse-error diagnostic for malformed Java: {publish}"
+    );
+    assert!(
+        items
+            .iter()
+            .any(|d| d["severity"] == 1 && d["source"] == "bifrost-tree-sitter"),
+        "expected an Error-severity bifrost-tree-sitter diagnostic: {publish}"
+    );
+
+    // Now save a clean version and verify the server sends an empty
+    // diagnostics array — clients use this to clear stale red squiggles.
+    fs::write(
+        temp_root.join("Push.java"),
+        "public class Push {\n    public void ok() {}\n}\n",
+    )
+    .expect("rewrite fixture");
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didSave",
+            "params": {"textDocument": {"uri": push_uri}}
+        }),
+    );
+    let cleared = read_notification(&mut reader, &mut stderr, "textDocument/publishDiagnostics");
+    let cleared_items = cleared["params"]["diagnostics"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected diagnostics array, got {cleared}"));
+    assert!(
+        cleared_items.is_empty(),
+        "expected zero diagnostics after clean save, got {cleared}"
+    );
+
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 99, "method": "shutdown"}),
+    );
+    let _ = read_message(&mut reader, &mut stderr);
+    write_message(&mut stdin, json!({"jsonrpc": "2.0", "method": "exit"}));
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+/// Read messages until a notification with `expected_method` arrives. Skips
+/// any other inbound traffic so callers don't have to know the exact ordering
+/// of unrelated server-to-client messages.
+fn read_notification(
+    reader: &mut impl BufRead,
+    stderr: &mut impl Read,
+    expected_method: &str,
+) -> Value {
+    for _ in 0..32 {
+        let msg = read_message(reader, stderr);
+        if msg["method"] == expected_method {
+            return msg;
+        }
+    }
+    panic!("did not receive {expected_method} within 32 messages");
+}
+
+/// Read messages until the response with the given id arrives, skipping
+/// notifications (e.g. publishDiagnostics) the server may interleave.
+fn read_response_for_id(reader: &mut impl BufRead, stderr: &mut impl Read, id: u64) -> Value {
+    for _ in 0..32 {
+        let msg = read_message(reader, stderr);
+        if msg["id"].as_u64() == Some(id) {
+            return msg;
+        }
+    }
+    panic!("did not receive response with id {id} within 32 messages");
 }
 
 fn write_message(stdin: &mut impl Write, payload: Value) {

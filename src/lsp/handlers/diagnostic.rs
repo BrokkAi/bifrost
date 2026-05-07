@@ -3,7 +3,7 @@ use std::path::Path;
 use lsp_types::{
     Diagnostic, DiagnosticSeverity, DocumentDiagnosticParams, DocumentDiagnosticReport,
     DocumentDiagnosticReportResult, FullDocumentDiagnosticReport,
-    RelatedFullDocumentDiagnosticReport,
+    RelatedFullDocumentDiagnosticReport, Uri,
 };
 use tree_sitter::{Language as TsLanguage, Node, Parser};
 
@@ -22,26 +22,28 @@ pub fn handle(
     project_root: &Path,
     params: &DocumentDiagnosticParams,
 ) -> DocumentDiagnosticReportResult {
-    let report = match build_report(project_root, params) {
-        Some(items) => FullDocumentDiagnosticReport {
-            result_id: None,
-            items,
-        },
-        None => FullDocumentDiagnosticReport {
-            result_id: None,
-            items: Vec::new(),
-        },
-    };
+    let items = collect(project_root, &params.text_document.uri);
     DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(
         RelatedFullDocumentDiagnosticReport {
             related_documents: None,
-            full_document_diagnostic_report: report,
+            full_document_diagnostic_report: FullDocumentDiagnosticReport {
+                result_id: None,
+                items,
+            },
         },
     ))
 }
 
-fn build_report(project_root: &Path, params: &DocumentDiagnosticParams) -> Option<Vec<Diagnostic>> {
-    let project_file = project_file_for_uri(project_root, &params.text_document.uri)?;
+/// Build the diagnostic items for a document URI. Shared between the pull-model
+/// `handle` and the push-model `publishDiagnostics` emitter so both paths
+/// surface the same parse errors. Returns an empty vec for unsupported
+/// languages, missing files, or URIs outside the project root.
+pub fn collect(project_root: &Path, uri: &Uri) -> Vec<Diagnostic> {
+    build_report(project_root, uri).unwrap_or_default()
+}
+
+fn build_report(project_root: &Path, uri: &Uri) -> Option<Vec<Diagnostic>> {
+    let project_file = project_file_for_uri(project_root, uri)?;
     let extension = project_file
         .rel_path()
         .extension()
