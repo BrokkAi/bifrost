@@ -632,15 +632,22 @@ fn bifrost_lsp_server_document_highlight_filters_to_current_file() {
     }
 
     // The two self-references in A.java live on line 26 (`System.out.println(new A())`)
-    // and line 33 (`System.out.println(new A())`). At least one of them
-    // must show up.
+    // and line 33 (`System.out.println(new A())`). Both must show up.
     let lines: Vec<u64> = highlights
         .iter()
         .filter_map(|h| h["range"]["start"]["line"].as_u64())
         .collect();
     assert!(
-        lines.iter().any(|l| *l == 26 || *l == 33),
-        "expected an in-file self-reference highlight on line 26 or 33, got lines {lines:?}"
+        lines.contains(&26) && lines.contains(&33),
+        "expected both in-file self-reference highlights on lines 26 and 33, got lines {lines:?}"
+    );
+
+    // B.java references `A` on line 6 (`A a = new A();`). The cross-file
+    // filter must drop those — if a `6` slips through, the filter regressed
+    // (B.java has no other lines that overlap with A.java's expected hits).
+    assert!(
+        !lines.contains(&6),
+        "B.java line-6 reference leaked into highlights, got lines {lines:?}"
     );
 
     write_message(
@@ -730,6 +737,96 @@ fn bifrost_lsp_server_hover_includes_doc_comment() {
     assert!(
         !value.contains("/**") && !value.contains("*/"),
         "doc-comment markers should be stripped: {value}"
+    );
+
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown"}),
+    );
+    let _ = read_message(&mut reader, &mut stderr);
+    write_message(&mut stdin, json!({"jsonrpc": "2.0", "method": "exit"}));
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
+fn bifrost_lsp_server_hover_includes_rust_triple_slash_doc_comment() {
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    fs::write(
+        temp_root.join("documented.rs"),
+        "/// Returns the answer.\n/// Always 42.\npub fn answer() -> i32 { 42 }\n",
+    )
+    .expect("write fixture");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(&temp_root)
+        .arg("--server")
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bifrost");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    let root_uri = uri_for(&temp_root);
+    let doc_uri = uri_for(&temp_root.join("documented.rs"));
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"processId": null, "rootUri": root_uri, "capabilities": {}}
+        }),
+    );
+    let _ = read_message(&mut reader, &mut stderr);
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+    );
+
+    // Line 2 (0-based) is `pub fn answer() -> i32 { 42 }`; char 7 is the `a`
+    // in `answer`.
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "textDocument/hover",
+            "params": {
+                "textDocument": {"uri": doc_uri},
+                "position": {"line": 2, "character": 7}
+            }
+        }),
+    );
+    let response = read_message(&mut reader, &mut stderr);
+    let value = response["result"]["contents"]["value"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected markdown hover, got {response}"));
+    assert!(
+        value.contains("fn answer"),
+        "hover should include the skeleton: {value}"
+    );
+    assert!(
+        value.contains("Returns the answer."),
+        "hover should include the first /// line: {value}"
+    );
+    assert!(
+        value.contains("Always 42."),
+        "hover should include the second /// line: {value}"
+    );
+    assert!(
+        !value.contains("///"),
+        "/// markers should be stripped: {value}"
     );
 
     write_message(

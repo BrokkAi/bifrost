@@ -143,16 +143,23 @@ pub fn extract_leading_doc_comment(content: &str, decl_start_byte: usize) -> Opt
 }
 
 fn is_doc_comment_line(stripped: &str) -> bool {
+    // Bare `//` is too noisy (license headers, TODOs, commented-out code), so
+    // require the explicit doc-comment prefixes `///` and `//!`.
     stripped.starts_with("///")
         || stripped.starts_with("//!")
-        || stripped.starts_with("//")
         || stripped.starts_with("/**")
         || stripped.starts_with("/*!")
         || stripped.starts_with("/*")
-        || stripped.starts_with("*/")
-        || stripped.starts_with('*')
-        // Python `#` comments. Skip `#[` so Rust attributes are not consumed.
-        || (stripped.starts_with('#') && !stripped.starts_with("#["))
+        // Javadoc continuations: bare `*`, `* ...`, or the closing `*/`.
+        // Anything else starting with `*` (e.g. `*ptr;`, `*= 2;`) is code.
+        || stripped == "*"
+        || stripped == "*/"
+        || stripped.starts_with("* ")
+        // Python `#` comments. Skip `#[` (Rust outer attribute) and `#!`
+        // (Rust inner attribute `#![...]` and Unix shebangs).
+        || (stripped.starts_with('#')
+            && !stripped.starts_with("#[")
+            && !stripped.starts_with("#!"))
 }
 
 fn clean_comment_line(line: &str) -> String {
@@ -161,20 +168,18 @@ fn clean_comment_line(line: &str) -> String {
         rest
     } else if let Some(rest) = trimmed.strip_prefix("//!") {
         rest
-    } else if let Some(rest) = trimmed.strip_prefix("//") {
-        rest
     } else if let Some(rest) = trimmed.strip_prefix("/**") {
         rest.strip_suffix("*/").unwrap_or(rest)
     } else if let Some(rest) = trimmed.strip_prefix("/*!") {
         rest.strip_suffix("*/").unwrap_or(rest)
     } else if let Some(rest) = trimmed.strip_prefix("/*") {
         rest.strip_suffix("*/").unwrap_or(rest)
-    } else if let Some(rest) = trimmed.strip_prefix("*/") {
-        rest
+    } else if trimmed == "*/" {
+        ""
     } else if let Some(rest) = trimmed.strip_prefix("* ") {
         rest
-    } else if let Some(rest) = trimmed.strip_prefix('*') {
-        rest
+    } else if trimmed == "*" {
+        ""
     } else if let Some(rest) = trimmed.strip_prefix('#') {
         rest
     } else {
@@ -244,10 +249,43 @@ mod tests {
     }
 
     #[test]
+    fn extract_doc_comment_skips_rust_inner_attributes() {
+        // `#![allow(...)]` is an inner attribute, not a doc comment.
+        let content = "#![allow(dead_code)]\nstruct S {}\n";
+        let decl_start = content.find("struct S").expect("decl");
+        assert!(extract_leading_doc_comment(content, decl_start).is_none());
+    }
+
+    #[test]
+    fn extract_doc_comment_skips_python_shebang() {
+        let content = "#!/usr/bin/env python\ndef foo():\n    pass\n";
+        let decl_start = content.find("def foo").expect("decl");
+        assert!(extract_leading_doc_comment(content, decl_start).is_none());
+    }
+
+    #[test]
+    fn extract_doc_comment_skips_bare_double_slash() {
+        // Plain `//` lines (license headers, TODOs, commented-out code) must
+        // not be lifted into hover — only `///` and `//!` are doc comments.
+        let content =
+            "// SPDX-License-Identifier: MIT\n// Copyright 2026.\npub fn first_function() {}\n";
+        let decl_start = content.find("pub fn first_function").expect("decl");
+        assert!(extract_leading_doc_comment(content, decl_start).is_none());
+    }
+
+    #[test]
+    fn extract_doc_comment_skips_pointer_deref() {
+        // A C-style `*ptr;` line must not be treated as a Javadoc continuation.
+        let content = "*ptr_value;\nint bar() { return 0; }\n";
+        let decl_start = content.find("int bar").expect("decl");
+        assert!(extract_leading_doc_comment(content, decl_start).is_none());
+    }
+
+    #[test]
     fn extract_doc_comment_stops_at_blank_line() {
         // A blank gap between the comment block and the declaration breaks
         // the association — the comment is documenting something else.
-        let content = "// Old comment.\n\nfn current() {}\n";
+        let content = "/// Old comment.\n\nfn current() {}\n";
         let decl_start = content.find("fn current").expect("decl");
         assert!(extract_leading_doc_comment(content, decl_start).is_none());
     }

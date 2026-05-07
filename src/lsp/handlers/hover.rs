@@ -68,13 +68,9 @@ pub fn handle(
 /// `None` if the file can't be read, the candidate has no recorded range, or
 /// no doc comment is present.
 fn leading_doc_comment(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> Option<String> {
-    let decl_start = analyzer
-        .ranges(candidate)
-        .iter()
-        .map(|r| r.start_byte)
-        .min()?;
+    let decl_range = analyzer.ranges(candidate).iter().min().copied()?;
     let source = candidate.source().read_to_string().ok()?;
-    extract_leading_doc_comment(&source, decl_start)
+    extract_leading_doc_comment(&source, decl_range.start_byte)
 }
 
 fn pick_candidate(analyzer: &dyn IAnalyzer, identifier: &str) -> Option<CodeUnit> {

@@ -8,9 +8,9 @@ use crate::lsp::handlers::util::{identifier_at_offset, project_file_for_uri};
 use crate::text_utils::compute_line_starts;
 use crate::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, UsageFinder, UsageHit};
 
-/// Resolve `textDocument/documentHighlight`. Same identifier-resolution path as
-/// `references`, but the resulting hits are filtered down to the current file
-/// before being mapped to LSP highlights.
+/// Resolve `textDocument/documentHighlight`. Scopes the usage scan to the
+/// current file via [`UsageFinder::with_file_filter`] — clients fire this
+/// request on every cursor movement, so a project-wide scan is too expensive.
 pub fn handle(
     workspace: &WorkspaceAnalyzer,
     project_root: &Path,
@@ -34,8 +34,10 @@ pub fn handle(
         return None;
     }
 
-    let result =
-        UsageFinder::new().find_usages(analyzer, &overloads, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES);
+    let scoped_file = project_file.clone();
+    let result = UsageFinder::new()
+        .with_file_filter(move |file| file == &scoped_file)
+        .find_usages(analyzer, &overloads, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES);
     let hits: Vec<UsageHit> = result
         .all_hits()
         .into_iter()
@@ -58,16 +60,28 @@ pub fn handle(
         }
     }
 
+    // Sort by position, then by descending kind priority so a WRITE
+    // declaration outranks a READ usage that shares the same range. dedup_by
+    // keeps the first of each consecutive run, so WRITE wins.
     highlights.sort_by(|a, b| {
         a.range
             .start
             .line
             .cmp(&b.range.start.line)
             .then_with(|| a.range.start.character.cmp(&b.range.start.character))
+            .then_with(|| kind_priority(b.kind).cmp(&kind_priority(a.kind)))
     });
     highlights.dedup_by(|a, b| a.range == b.range);
 
     Some(highlights)
+}
+
+fn kind_priority(kind: Option<DocumentHighlightKind>) -> u8 {
+    match kind {
+        Some(DocumentHighlightKind::WRITE) => 2,
+        Some(DocumentHighlightKind::READ) => 1,
+        _ => 0,
+    }
 }
 
 fn resolve_overloads(analyzer: &dyn IAnalyzer, identifier: &str) -> Vec<CodeUnit> {
@@ -114,6 +128,6 @@ fn code_unit_highlight(
     let range = analyzer.ranges(code_unit).iter().min().copied()?;
     Some(DocumentHighlight {
         range: byte_range_to_lsp_range(content, line_starts, &range),
-        kind: Some(DocumentHighlightKind::TEXT),
+        kind: Some(DocumentHighlightKind::WRITE),
     })
 }
