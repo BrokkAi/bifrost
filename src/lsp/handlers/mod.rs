@@ -1,5 +1,6 @@
 pub mod definition;
 pub mod diagnostic;
+pub mod document_highlight;
 pub mod document_symbol;
 pub mod hover;
 pub mod references;

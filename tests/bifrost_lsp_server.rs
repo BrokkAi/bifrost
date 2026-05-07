@@ -550,6 +550,297 @@ fn bifrost_lsp_server_references_finds_class_a_usages() {
 }
 
 #[test]
+fn bifrost_lsp_server_document_highlight_filters_to_current_file() {
+    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("testcode-java");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(&fixture_root)
+        .arg("--server")
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bifrost");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    let canonical_root = fixture_root.canonicalize().expect("canon fixture");
+    let root_uri = uri_for(&canonical_root);
+    let a_uri = uri_for(&canonical_root.join("A.java"));
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"processId": null, "rootUri": root_uri, "capabilities": {}}
+        }),
+    );
+    let init = read_message(&mut reader, &mut stderr);
+    assert_eq!(
+        init["result"]["capabilities"]["documentHighlightProvider"], true,
+        "documentHighlightProvider should be advertised: {init}"
+    );
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+    );
+
+    // A.java line 2 (0-based), col 13: cursor on the `A` in `public class A {`.
+    // The same `A` is referenced from A.java's own body (line 26 `new A()`,
+    // line 33 inner-class `new A()`) and from B.java. The handler must
+    // return only the A.java hits.
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "textDocument/documentHighlight",
+            "params": {
+                "textDocument": {"uri": a_uri},
+                "position": {"line": 2, "character": 13}
+            }
+        }),
+    );
+    let response = read_message(&mut reader, &mut stderr);
+    let highlights = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected array result, got {response}"));
+    assert!(
+        !highlights.is_empty(),
+        "expected at least one highlight, got: {response}"
+    );
+
+    // documentHighlight returns ranges only — no URI field, by spec. Make
+    // sure no entry accidentally smuggled one in (i.e. we didn't return
+    // `Location` shapes).
+    for h in highlights {
+        assert!(
+            h["uri"].is_null(),
+            "documentHighlight result must not include uri: {h}"
+        );
+        assert!(h["range"].is_object(), "highlight must have range: {h}");
+    }
+
+    // The two self-references in A.java live on line 26 (`System.out.println(new A())`)
+    // and line 33 (`System.out.println(new A())`). Both must show up.
+    let lines: Vec<u64> = highlights
+        .iter()
+        .filter_map(|h| h["range"]["start"]["line"].as_u64())
+        .collect();
+    assert!(
+        lines.contains(&26) && lines.contains(&33),
+        "expected both in-file self-reference highlights on lines 26 and 33, got lines {lines:?}"
+    );
+
+    // B.java references `A` on line 6 (`A a = new A();`). The cross-file
+    // filter must drop those — if a `6` slips through, the filter regressed
+    // (B.java has no other lines that overlap with A.java's expected hits).
+    assert!(
+        !lines.contains(&6),
+        "B.java line-6 reference leaked into highlights, got lines {lines:?}"
+    );
+
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown"}),
+    );
+    let _ = read_message(&mut reader, &mut stderr);
+    write_message(&mut stdin, json!({"jsonrpc": "2.0", "method": "exit"}));
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
+fn bifrost_lsp_server_hover_includes_doc_comment() {
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    fs::write(
+        temp_root.join("Documented.java"),
+        "/**\n * The documented class.\n * Multi-line.\n */\npublic class Documented {\n    public void noop() {}\n}\n",
+    )
+    .expect("write fixture");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(&temp_root)
+        .arg("--server")
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bifrost");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    let root_uri = uri_for(&temp_root);
+    let doc_uri = uri_for(&temp_root.join("Documented.java"));
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"processId": null, "rootUri": root_uri, "capabilities": {}}
+        }),
+    );
+    let _ = read_message(&mut reader, &mut stderr);
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+    );
+
+    // Line 4 (0-based) is `public class Documented {` — char 13 is the `D`.
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "textDocument/hover",
+            "params": {
+                "textDocument": {"uri": doc_uri},
+                "position": {"line": 4, "character": 13}
+            }
+        }),
+    );
+    let response = read_message(&mut reader, &mut stderr);
+    let value = response["result"]["contents"]["value"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected markdown hover, got {response}"));
+    assert!(
+        value.contains("class Documented"),
+        "hover should include the skeleton: {value}"
+    );
+    assert!(
+        value.contains("The documented class."),
+        "hover should include the doc comment first line: {value}"
+    );
+    assert!(
+        value.contains("Multi-line."),
+        "hover should include the doc comment second line: {value}"
+    );
+    assert!(
+        !value.contains("/**") && !value.contains("*/"),
+        "doc-comment markers should be stripped: {value}"
+    );
+
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown"}),
+    );
+    let _ = read_message(&mut reader, &mut stderr);
+    write_message(&mut stdin, json!({"jsonrpc": "2.0", "method": "exit"}));
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
+fn bifrost_lsp_server_hover_includes_rust_triple_slash_doc_comment() {
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    fs::write(
+        temp_root.join("documented.rs"),
+        "/// Returns the answer.\n/// Always 42.\npub fn answer() -> i32 { 42 }\n",
+    )
+    .expect("write fixture");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(&temp_root)
+        .arg("--server")
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bifrost");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    let root_uri = uri_for(&temp_root);
+    let doc_uri = uri_for(&temp_root.join("documented.rs"));
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"processId": null, "rootUri": root_uri, "capabilities": {}}
+        }),
+    );
+    let _ = read_message(&mut reader, &mut stderr);
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+    );
+
+    // Line 2 (0-based) is `pub fn answer() -> i32 { 42 }`; char 7 is the `a`
+    // in `answer`.
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "textDocument/hover",
+            "params": {
+                "textDocument": {"uri": doc_uri},
+                "position": {"line": 2, "character": 7}
+            }
+        }),
+    );
+    let response = read_message(&mut reader, &mut stderr);
+    let value = response["result"]["contents"]["value"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected markdown hover, got {response}"));
+    assert!(
+        value.contains("fn answer"),
+        "hover should include the skeleton: {value}"
+    );
+    assert!(
+        value.contains("Returns the answer."),
+        "hover should include the first /// line: {value}"
+    );
+    assert!(
+        value.contains("Always 42."),
+        "hover should include the second /// line: {value}"
+    );
+    assert!(
+        !value.contains("///"),
+        "/// markers should be stripped: {value}"
+    );
+
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown"}),
+    );
+    let _ = read_message(&mut reader, &mut stderr);
+    write_message(&mut stdin, json!({"jsonrpc": "2.0", "method": "exit"}));
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
 fn bifrost_lsp_server_diagnostics_report_parse_error() {
     let temp = TempDir::new().expect("temp dir");
     let temp_root = temp.path().canonicalize().expect("canon temp");

@@ -9,8 +9,8 @@ use lsp_types::notification::{
     DidChangeWatchedFiles, DidSaveTextDocument, Notification as LspNotificationTrait,
 };
 use lsp_types::request::{
-    DocumentDiagnosticRequest, DocumentSymbolRequest, GotoDefinition, HoverRequest, References,
-    Request as LspRequestTrait, WorkspaceSymbolRequest,
+    DocumentDiagnosticRequest, DocumentHighlightRequest, DocumentSymbolRequest, GotoDefinition,
+    HoverRequest, References, Request as LspRequestTrait, WorkspaceSymbolRequest,
 };
 use lsp_types::{
     DidChangeWatchedFilesParams, DidSaveTextDocumentParams, FileChangeType, InitializeParams,
@@ -21,7 +21,8 @@ use crate::lsp::capabilities::server_capabilities;
 use crate::lsp::conversion::uri_to_path;
 use crate::lsp::handlers::util::project_file_for_uri as resolve_project_file;
 use crate::lsp::handlers::{
-    definition, diagnostic, document_symbol, hover, references, workspace_symbol,
+    definition, diagnostic, document_highlight, document_symbol, hover, references,
+    workspace_symbol,
 };
 
 /// Run the LSP server over stdio. `fallback_root` is used when the client does
@@ -124,6 +125,15 @@ fn handle_request(
                 &params,
             ))
         }),
+        DocumentHighlightRequest::METHOD => {
+            decode_and_run::<DocumentHighlightRequest, _>(req, |params| {
+                Ok(document_highlight::handle(
+                    &state.workspace,
+                    state.project.root(),
+                    &params,
+                ))
+            })
+        }
         DocumentDiagnosticRequest::METHOD => {
             decode_and_run::<DocumentDiagnosticRequest, _>(req, |params| {
                 Ok(diagnostic::handle(state.project.root(), &params))

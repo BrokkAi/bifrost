@@ -2,6 +2,7 @@ use std::path::Path;
 
 use crate::analyzer::ProjectFile;
 use crate::lsp::conversion::uri_to_path;
+use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use lsp_types::Uri;
 
 /// Resolve an LSP `Uri` to a [`ProjectFile`] inside `project_root`. Returns
@@ -92,6 +93,101 @@ fn is_ident_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
+/// Lift the contiguous block of comment-like lines that ends immediately
+/// before the line containing `decl_start_byte`. The returned string has
+/// comment markers stripped so it can be embedded directly inside hover
+/// markdown. Returns `None` when there is no leading comment block, or the
+/// block is whitespace-only after stripping.
+///
+/// "Comment-like" covers the leading-comment shapes the issue called out:
+/// `///` and `//!` (Rust), `//` (C-family), `/** … */` (Javadoc/JSDoc/PHPDoc
+/// /Scaladoc), `/* … */`, and `#` (Python). Rust attributes (`#[…]`) are
+/// intentionally NOT consumed — they aren't doc comments, and including them
+/// would corrupt the markdown.
+pub fn extract_leading_doc_comment(content: &str, decl_start_byte: usize) -> Option<String> {
+    let line_starts = compute_line_starts(content);
+    let line_index = find_line_index_for_offset(&line_starts, decl_start_byte);
+    if line_index == 0 {
+        return None;
+    }
+
+    let mut comment_lines: Vec<&str> = Vec::new();
+    for li in (0..line_index).rev() {
+        let line_start = line_starts[li];
+        let line_end = line_starts.get(li + 1).copied().unwrap_or(content.len());
+        let raw = &content[line_start..line_end];
+        let trimmed = raw.trim_end_matches(['\n', '\r']);
+        let stripped = trimmed.trim_start();
+
+        if stripped.is_empty() || !is_doc_comment_line(stripped) {
+            break;
+        }
+        comment_lines.push(trimmed);
+    }
+
+    if comment_lines.is_empty() {
+        return None;
+    }
+    comment_lines.reverse();
+
+    let cleaned: Vec<String> = comment_lines
+        .iter()
+        .map(|line| clean_comment_line(line))
+        .collect();
+    let joined = cleaned.join("\n").trim().to_string();
+    if joined.is_empty() {
+        None
+    } else {
+        Some(joined)
+    }
+}
+
+fn is_doc_comment_line(stripped: &str) -> bool {
+    // Bare `//` is too noisy (license headers, TODOs, commented-out code), so
+    // require the explicit doc-comment prefixes `///` and `//!`.
+    stripped.starts_with("///")
+        || stripped.starts_with("//!")
+        || stripped.starts_with("/**")
+        || stripped.starts_with("/*!")
+        || stripped.starts_with("/*")
+        // Javadoc continuations: bare `*`, `* ...`, or the closing `*/`.
+        // Anything else starting with `*` (e.g. `*ptr;`, `*= 2;`) is code.
+        || stripped == "*"
+        || stripped == "*/"
+        || stripped.starts_with("* ")
+        // Python `#` comments. Skip `#[` (Rust outer attribute) and `#!`
+        // (Rust inner attribute `#![...]` and Unix shebangs).
+        || (stripped.starts_with('#')
+            && !stripped.starts_with("#[")
+            && !stripped.starts_with("#!"))
+}
+
+fn clean_comment_line(line: &str) -> String {
+    let trimmed = line.trim_start();
+    let body = if let Some(rest) = trimmed.strip_prefix("///") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("//!") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("/**") {
+        rest.strip_suffix("*/").unwrap_or(rest)
+    } else if let Some(rest) = trimmed.strip_prefix("/*!") {
+        rest.strip_suffix("*/").unwrap_or(rest)
+    } else if let Some(rest) = trimmed.strip_prefix("/*") {
+        rest.strip_suffix("*/").unwrap_or(rest)
+    } else if trimmed == "*/" {
+        ""
+    } else if let Some(rest) = trimmed.strip_prefix("* ") {
+        rest
+    } else if trimmed == "*" {
+        ""
+    } else if let Some(rest) = trimmed.strip_prefix('#') {
+        rest
+    } else {
+        trimmed
+    };
+    body.trim().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,5 +204,97 @@ mod tests {
     fn identifier_at_offset_handles_empty_or_no_word() {
         assert_eq!(identifier_at_offset("", 0), None);
         assert_eq!(identifier_at_offset("   ", 1), None);
+    }
+
+    #[test]
+    fn extract_doc_comment_handles_rust_triple_slash() {
+        let content = "/// Returns the answer.\n/// Always 42.\nfn answer() -> i32 { 42 }\n";
+        let decl_start = content.find("fn answer").expect("decl");
+        let doc = extract_leading_doc_comment(content, decl_start).expect("doc");
+        assert_eq!(doc, "Returns the answer.\nAlways 42.");
+    }
+
+    #[test]
+    fn extract_doc_comment_handles_javadoc_block() {
+        let content =
+            "    /**\n     * The class A.\n     * Important.\n     */\n    public class A {}\n";
+        let decl_start = content.find("public class A").expect("decl");
+        let doc = extract_leading_doc_comment(content, decl_start).expect("doc");
+        assert_eq!(doc, "The class A.\nImportant.");
+    }
+
+    #[test]
+    fn extract_doc_comment_handles_python_hash() {
+        let content = "# Helper module.\n# Used by tests.\ndef foo():\n    pass\n";
+        let decl_start = content.find("def foo").expect("decl");
+        let doc = extract_leading_doc_comment(content, decl_start).expect("doc");
+        assert_eq!(doc, "Helper module.\nUsed by tests.");
+    }
+
+    #[test]
+    fn extract_doc_comment_returns_none_when_no_comment() {
+        let content = "fn foo() {}\n";
+        assert!(extract_leading_doc_comment(content, 0).is_none());
+        let content2 = "let x = 1;\nfn bar() {}\n";
+        let decl = content2.find("fn bar").unwrap();
+        assert!(extract_leading_doc_comment(content2, decl).is_none());
+    }
+
+    #[test]
+    fn extract_doc_comment_skips_rust_attributes() {
+        // `#[derive(...)]` is an attribute, not a doc comment — must be ignored.
+        let content = "#[derive(Debug)]\nstruct S {}\n";
+        let decl_start = content.find("struct S").expect("decl");
+        assert!(extract_leading_doc_comment(content, decl_start).is_none());
+    }
+
+    #[test]
+    fn extract_doc_comment_skips_rust_inner_attributes() {
+        // `#![allow(...)]` is an inner attribute, not a doc comment.
+        let content = "#![allow(dead_code)]\nstruct S {}\n";
+        let decl_start = content.find("struct S").expect("decl");
+        assert!(extract_leading_doc_comment(content, decl_start).is_none());
+    }
+
+    #[test]
+    fn extract_doc_comment_skips_python_shebang() {
+        let content = "#!/usr/bin/env python\ndef foo():\n    pass\n";
+        let decl_start = content.find("def foo").expect("decl");
+        assert!(extract_leading_doc_comment(content, decl_start).is_none());
+    }
+
+    #[test]
+    fn extract_doc_comment_skips_bare_double_slash() {
+        // Plain `//` lines (license headers, TODOs, commented-out code) must
+        // not be lifted into hover — only `///` and `//!` are doc comments.
+        let content =
+            "// SPDX-License-Identifier: MIT\n// Copyright 2026.\npub fn first_function() {}\n";
+        let decl_start = content.find("pub fn first_function").expect("decl");
+        assert!(extract_leading_doc_comment(content, decl_start).is_none());
+    }
+
+    #[test]
+    fn extract_doc_comment_skips_pointer_deref() {
+        // A C-style `*ptr;` line must not be treated as a Javadoc continuation.
+        let content = "*ptr_value;\nint bar() { return 0; }\n";
+        let decl_start = content.find("int bar").expect("decl");
+        assert!(extract_leading_doc_comment(content, decl_start).is_none());
+    }
+
+    #[test]
+    fn extract_doc_comment_stops_at_blank_line() {
+        // A blank gap between the comment block and the declaration breaks
+        // the association — the comment is documenting something else.
+        let content = "/// Old comment.\n\nfn current() {}\n";
+        let decl_start = content.find("fn current").expect("decl");
+        assert!(extract_leading_doc_comment(content, decl_start).is_none());
+    }
+
+    #[test]
+    fn extract_doc_comment_handles_single_line_block() {
+        let content = "/** Single-line block doc. */\npublic void foo() {}\n";
+        let decl_start = content.find("public void foo").expect("decl");
+        let doc = extract_leading_doc_comment(content, decl_start).expect("doc");
+        assert_eq!(doc, "Single-line block doc.");
     }
 }
