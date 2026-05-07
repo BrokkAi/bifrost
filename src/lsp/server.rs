@@ -204,11 +204,15 @@ fn handle_notification(
                 let mut changed = BTreeSet::new();
                 changed.insert(file);
                 state.workspace = state.workspace.update(&changed);
+                // Push diagnostics for clients that don't poll the pull-model
+                // textDocument/diagnostic endpoint. Clients that DO poll just
+                // receive the same items twice, which is benign. Skip when
+                // the URI is outside the project — otherwise we'd publish an
+                // empty array for a URI we never published for, and a few
+                // clients (e.g. some Sublime LSP frontends) create empty
+                // diagnostic state for any URI the server publishes for.
+                publish_diagnostics(connection, state.project.root(), &params.text_document.uri)?;
             }
-            // Push diagnostics for clients that don't poll the pull-model
-            // textDocument/diagnostic endpoint. Clients that DO poll just
-            // receive the same items twice, which is benign.
-            publish_diagnostics(connection, state.project.root(), &params.text_document.uri)?;
             Ok(())
         }
         DidChangeWatchedFiles::METHOD => {

@@ -194,12 +194,13 @@ fn classify_class_like(signature: Option<&str>) -> SymbolKind {
 }
 
 fn is_constructor(code_unit: &CodeUnit, parent_kind: Option<SymbolKind>) -> bool {
+    // Only types that can actually declare constructors qualify. INTERFACE is
+    // intentionally excluded: Java/C# interfaces can't have constructors, and
+    // a TS interface member literally named `constructor` would be unusual —
+    // promoting it would just produce wrong icons.
     if !matches!(
         parent_kind,
-        Some(SymbolKind::CLASS)
-            | Some(SymbolKind::STRUCT)
-            | Some(SymbolKind::ENUM)
-            | Some(SymbolKind::INTERFACE)
+        Some(SymbolKind::CLASS) | Some(SymbolKind::STRUCT) | Some(SymbolKind::ENUM)
     ) {
         return false;
     }
@@ -228,24 +229,35 @@ fn is_constant(code_unit: &CodeUnit) -> bool {
     let Some(sig) = code_unit.signature() else {
         return false;
     };
-    find_word(sig, "const").is_some()
-        || find_word(sig, "final").is_some()
-        || find_word(sig, "readonly").is_some()
+    if find_word(sig, "const").is_some() {
+        return true;
+    }
+    // Java instance `final` (e.g. `private final List<String> names`) is just
+    // single-assignment, not a compile-time constant — `static final` together
+    // is what really means CONSTANT. TS `readonly` similarly only means
+    // "can't be reassigned post-init", so it's intentionally not handled here.
+    find_word(sig, "static").is_some() && find_word(sig, "final").is_some()
 }
 
 fn is_screaming_snake_case(identifier: &str) -> bool {
     if identifier.is_empty() {
         return false;
     }
-    let mut has_alpha = false;
+    let mut alpha_count = 0usize;
     for ch in identifier.chars() {
         if ch.is_ascii_uppercase() {
-            has_alpha = true;
+            alpha_count += 1;
         } else if !ch.is_ascii_digit() && ch != '_' {
             return false;
         }
     }
-    has_alpha
+    if alpha_count == 0 {
+        return false;
+    }
+    // Genuine SCREAMING_SNAKE_CASE either has a separator or at least two
+    // letters. Single-letter all-caps names like `X` or `T` (typical generic
+    // parameters or one-letter fields) should not be promoted to CONSTANT.
+    identifier.contains('_') || alpha_count >= 2
 }
 
 fn line_count(content: &str) -> usize {
@@ -383,6 +395,17 @@ mod tests {
     }
 
     #[test]
+    fn interface_parent_does_not_promote_to_constructor() {
+        // Interfaces can't have constructors; a TS interface member literally
+        // named `constructor` should stay FUNCTION.
+        let func = function_with("Foo.constructor", Some("constructor(): void;"));
+        assert_eq!(
+            classify_symbol_kind(&func, Some(SymbolKind::INTERFACE)),
+            SymbolKind::FUNCTION,
+        );
+    }
+
+    #[test]
     fn ordinary_function_stays_function() {
         let func = function_with("Foo.bar", Some("fn bar()"));
         assert_eq!(
@@ -424,6 +447,30 @@ mod tests {
     }
 
     #[test]
+    fn java_instance_final_field_is_not_constant() {
+        // `private final List<String> names = new ArrayList<>();` is single-
+        // assignment but not a compile-time constant — only `static final`
+        // together earns CONSTANT.
+        let f = field_with(
+            "Foo.names",
+            Some("private final List<String> names = new ArrayList<>();"),
+        );
+        assert_eq!(
+            classify_symbol_kind(&f, Some(SymbolKind::CLASS)),
+            SymbolKind::VARIABLE,
+        );
+    }
+
+    #[test]
+    fn ts_readonly_instance_field_is_not_constant() {
+        let f = field_with("Foo.name", Some("readonly name: string;"));
+        assert_eq!(
+            classify_symbol_kind(&f, Some(SymbolKind::CLASS)),
+            SymbolKind::VARIABLE,
+        );
+    }
+
+    #[test]
     fn ordinary_field_is_variable() {
         let f = field_with("Foo.count", Some("private int count;"));
         assert_eq!(
@@ -441,6 +488,14 @@ mod tests {
         assert!(!is_screaming_snake_case("_"));
         assert!(!is_screaming_snake_case("Max"));
         assert!(!is_screaming_snake_case("max_size"));
+    }
+
+    #[test]
+    fn screaming_snake_case_rejects_single_letter_names() {
+        // Single uppercase identifiers (generic params, one-letter fields)
+        // should not classify as SCREAMING_SNAKE_CASE.
+        assert!(!is_screaming_snake_case("X"));
+        assert!(!is_screaming_snake_case("T"));
     }
 
     #[test]

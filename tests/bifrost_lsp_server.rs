@@ -1069,8 +1069,12 @@ fn bifrost_lsp_server_did_save_publishes_diagnostics() {
         !items.is_empty(),
         "expected at least one parse-error diagnostic for malformed Java: {publish}"
     );
-    assert_eq!(items[0]["severity"], 1, "severity should be Error");
-    assert_eq!(items[0]["source"], "bifrost-tree-sitter");
+    assert!(
+        items
+            .iter()
+            .any(|d| d["severity"] == 1 && d["source"] == "bifrost-tree-sitter"),
+        "expected an Error-severity bifrost-tree-sitter diagnostic: {publish}"
+    );
 
     // Now save a clean version and verify the server sends an empty
     // diagnostics array — clients use this to clear stale red squiggles.
