@@ -650,6 +650,30 @@ fn bifrost_lsp_server_document_highlight_filters_to_current_file() {
         "B.java line-6 reference leaked into highlights, got lines {lines:?}"
     );
 
+    // Regression: the declaration highlight on line 2 (`public class A {`)
+    // must scope to the identifier `A` (single character), not the whole
+    // class body. A multi-line declaration highlight wipes out the editor's
+    // cursor highlight with a giant block.
+    let class_decl_highlight = highlights
+        .iter()
+        .find(|h| h["range"]["start"]["line"].as_u64() == Some(2))
+        .unwrap_or_else(|| panic!("expected declaration highlight on line 2, got {highlights:?}"));
+    assert_eq!(
+        class_decl_highlight["range"]["end"]["line"].as_u64(),
+        Some(2),
+        "class declaration highlight must stay on a single line, got {class_decl_highlight}"
+    );
+    assert_eq!(
+        class_decl_highlight["range"]["start"]["character"].as_u64(),
+        Some(13),
+        "class declaration highlight must start at the `A` identifier, got {class_decl_highlight}"
+    );
+    assert_eq!(
+        class_decl_highlight["range"]["end"]["character"].as_u64(),
+        Some(14),
+        "class declaration highlight must end after the `A` identifier, got {class_decl_highlight}"
+    );
+
     write_message(
         &mut stdin,
         json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown"}),
@@ -827,6 +851,94 @@ fn bifrost_lsp_server_hover_includes_rust_triple_slash_doc_comment() {
     assert!(
         !value.contains("///"),
         "/// markers should be stripped: {value}"
+    );
+
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown"}),
+    );
+    let _ = read_message(&mut reader, &mut stderr);
+    write_message(&mut stdin, json!({"jsonrpc": "2.0", "method": "exit"}));
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
+fn bifrost_lsp_server_hover_surfaces_rust_doc_above_outer_attribute() {
+    // Regression: a `///` doc comment separated from the declaration by an
+    // outer attribute (`#[derive(...)]`) must still be lifted into hover.
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    fs::write(
+        temp_root.join("attrs.rs"),
+        "/// Holds a single value.\n/// Cloneable for convenience.\n#[derive(Debug, Clone)]\npub struct Holder { value: i32 }\n",
+    )
+    .expect("write fixture");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(&temp_root)
+        .arg("--server")
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bifrost");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    let root_uri = uri_for(&temp_root);
+    let doc_uri = uri_for(&temp_root.join("attrs.rs"));
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"processId": null, "rootUri": root_uri, "capabilities": {}}
+        }),
+    );
+    let _ = read_message(&mut reader, &mut stderr);
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+    );
+
+    // Line 3 (0-based) is `pub struct Holder { value: i32 }`; char 11 lands
+    // on the `H` in `Holder`.
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "textDocument/hover",
+            "params": {
+                "textDocument": {"uri": doc_uri},
+                "position": {"line": 3, "character": 11}
+            }
+        }),
+    );
+    let response = read_message(&mut reader, &mut stderr);
+    let value = response["result"]["contents"]["value"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected markdown hover, got {response}"));
+    assert!(
+        value.contains("Holds a single value."),
+        "hover should surface the first /// line above the attribute: {value}"
+    );
+    assert!(
+        value.contains("Cloneable for convenience."),
+        "hover should surface the second /// line above the attribute: {value}"
+    );
+    assert!(
+        !value.contains("derive"),
+        "the #[derive(...)] attribute itself must not leak into hover markdown: {value}"
     );
 
     write_message(

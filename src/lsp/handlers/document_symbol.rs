@@ -1,12 +1,10 @@
 use std::path::Path;
 
-use lsp_types::{
-    DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, Range as LspRange, SymbolKind,
-};
+use lsp_types::{DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, SymbolKind};
 
 use crate::analyzer::{CodeUnit, CodeUnitType, IAnalyzer, Range as ByteRange, WorkspaceAnalyzer};
 use crate::lsp::conversion::byte_range_to_lsp_range;
-use crate::lsp::handlers::util::project_file_for_uri;
+use crate::lsp::handlers::util::{find_word, identifier_selection_range, project_file_for_uri};
 use crate::text_utils::compute_line_starts;
 
 /// Build the documentSymbol response for a request URI. Returns `None` when
@@ -84,62 +82,6 @@ fn primary_range(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit, content: &str) 
             start_line: 0,
             end_line: line_count(content),
         })
-}
-
-fn identifier_selection_range(
-    code_unit: &CodeUnit,
-    content: &str,
-    line_starts: &[usize],
-    fallback: &ByteRange,
-) -> Option<LspRange> {
-    // Search for the identifier within the unit's range so the editor's
-    // "select symbol" gesture lands on the name rather than the whole body.
-    // Match must be word-boundary aware — a raw `find` returns the wrong
-    // span for short identifiers (e.g. method `s` matches `class`) or
-    // identifiers that are a prefix of a longer word in the body
-    // (e.g. method `foo` matches the first three bytes of `foofoo`).
-    let slice = content.get(fallback.start_byte..fallback.end_byte)?;
-    let name = code_unit.identifier();
-    if name.is_empty() {
-        return None;
-    }
-    let offset = find_word(slice, name)?;
-    let abs_start = fallback.start_byte + offset;
-    let abs_end = abs_start + name.len();
-    let range = ByteRange {
-        start_byte: abs_start,
-        end_byte: abs_end,
-        start_line: 0,
-        end_line: 0,
-    };
-    Some(byte_range_to_lsp_range(content, line_starts, &range))
-}
-
-/// Find the first occurrence of `needle` in `haystack` that is bounded on
-/// both sides by a non-identifier byte (or buffer edge).
-fn find_word(haystack: &str, needle: &str) -> Option<usize> {
-    let needle_bytes = needle.as_bytes();
-    let bytes = haystack.as_bytes();
-    if needle_bytes.is_empty() || needle_bytes.len() > bytes.len() {
-        return None;
-    }
-    let mut start = 0;
-    while let Some(rel) = haystack[start..].find(needle) {
-        let candidate = start + rel;
-        let before_ok = candidate == 0 || !is_ident_byte(bytes[candidate - 1]);
-        let after_idx = candidate + needle_bytes.len();
-        let after_ok = after_idx >= bytes.len() || !is_ident_byte(bytes[after_idx]);
-        if before_ok && after_ok {
-            return Some(candidate);
-        }
-        // Advance past this candidate's first byte so we don't loop forever.
-        start = candidate + 1;
-    }
-    None
-}
-
-fn is_ident_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
 /// Map a code unit to its richest LSP `SymbolKind`. The analyzer only stores

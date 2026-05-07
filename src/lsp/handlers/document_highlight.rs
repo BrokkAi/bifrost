@@ -4,7 +4,9 @@ use lsp_types::{DocumentHighlight, DocumentHighlightKind, DocumentHighlightParam
 
 use crate::analyzer::{CodeUnit, IAnalyzer, Range as ByteRange, WorkspaceAnalyzer};
 use crate::lsp::conversion::{byte_range_to_lsp_range, position_to_byte_offset};
-use crate::lsp::handlers::util::{identifier_at_offset, project_file_for_uri};
+use crate::lsp::handlers::util::{
+    identifier_at_offset, identifier_selection_range, project_file_for_uri,
+};
 use crate::text_utils::compute_line_starts;
 use crate::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, UsageFinder, UsageHit};
 
@@ -126,8 +128,15 @@ fn code_unit_highlight(
     line_starts: &[usize],
 ) -> Option<DocumentHighlight> {
     let range = analyzer.ranges(code_unit).iter().min().copied()?;
+    // Scope the declaration highlight to the identifier span — the analyzer's
+    // primary range can cover the whole class/function body, which would
+    // wash out the editor with a giant highlight on cursor over the name.
+    // Fall back to the full range if the identifier can't be located word-
+    // bounded inside it (e.g. synthetic units with no recoverable name).
+    let lsp_range = identifier_selection_range(code_unit, content, line_starts, &range)
+        .unwrap_or_else(|| byte_range_to_lsp_range(content, line_starts, &range));
     Some(DocumentHighlight {
-        range: byte_range_to_lsp_range(content, line_starts, &range),
+        range: lsp_range,
         kind: Some(DocumentHighlightKind::WRITE),
     })
 }
