@@ -1913,6 +1913,13 @@ impl IAnalyzer for JavaAnalyzer {
         self.inner.search_definitions(pattern, auto_quote)
     }
 
+    fn search_definitions_persisted(&self, pattern: &str) -> BTreeSet<CodeUnit> {
+        // Forward to the inner `TreeSitterAnalyzer`; otherwise the default
+        // impl on `IAnalyzer` re-dispatches to `self.search_definitions`,
+        // skipping the FTS5 path entirely.
+        self.inner.search_definitions_persisted(pattern)
+    }
+
     fn signatures_of(&self, code_unit: &CodeUnit) -> Vec<String> {
         self.inner.signatures_of(code_unit).to_vec()
     }
