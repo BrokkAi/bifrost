@@ -4,7 +4,9 @@ use lsp_types::{Hover, HoverContents, HoverParams, MarkupContent, MarkupKind};
 
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, Range as ByteRange, WorkspaceAnalyzer};
 use crate::lsp::conversion::{byte_range_to_lsp_range, position_to_byte_offset};
-use crate::lsp::handlers::util::{identifier_span_at_offset, project_file_for_uri};
+use crate::lsp::handlers::util::{
+    extract_leading_doc_comment, identifier_span_at_offset, project_file_for_uri,
+};
 use crate::text_utils::compute_line_starts;
 
 /// Resolve `textDocument/hover` for the symbol under the cursor. Returns the
@@ -45,7 +47,13 @@ pub fn handle(
             end_line: 0,
         },
     );
-    let value = format!("```{language_tag}\n{}\n```", skeleton.trim_end());
+
+    let mut value = format!("```{language_tag}\n{}\n```", skeleton.trim_end());
+    if let Some(doc) = leading_doc_comment(analyzer, &candidate) {
+        value.push_str("\n\n---\n\n");
+        value.push_str(&doc);
+    }
+
     Some(Hover {
         contents: HoverContents::Markup(MarkupContent {
             kind: MarkupKind::Markdown,
@@ -53,6 +61,20 @@ pub fn handle(
         }),
         range: Some(highlight_range),
     })
+}
+
+/// Read the candidate's source file and lift any contiguous block of
+/// comment-like lines that immediately precedes the declaration. Returns
+/// `None` if the file can't be read, the candidate has no recorded range, or
+/// no doc comment is present.
+fn leading_doc_comment(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> Option<String> {
+    let decl_start = analyzer
+        .ranges(candidate)
+        .iter()
+        .map(|r| r.start_byte)
+        .min()?;
+    let source = candidate.source().read_to_string().ok()?;
+    extract_leading_doc_comment(&source, decl_start)
 }
 
 fn pick_candidate(analyzer: &dyn IAnalyzer, identifier: &str) -> Option<CodeUnit> {

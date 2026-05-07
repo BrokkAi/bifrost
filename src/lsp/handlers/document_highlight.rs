@@ -1,0 +1,119 @@
+use std::path::Path;
+
+use lsp_types::{DocumentHighlight, DocumentHighlightKind, DocumentHighlightParams};
+
+use crate::analyzer::{CodeUnit, IAnalyzer, Range as ByteRange, WorkspaceAnalyzer};
+use crate::lsp::conversion::{byte_range_to_lsp_range, position_to_byte_offset};
+use crate::lsp::handlers::util::{identifier_at_offset, project_file_for_uri};
+use crate::text_utils::compute_line_starts;
+use crate::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, UsageFinder, UsageHit};
+
+/// Resolve `textDocument/documentHighlight`. Same identifier-resolution path as
+/// `references`, but the resulting hits are filtered down to the current file
+/// before being mapped to LSP highlights.
+pub fn handle(
+    workspace: &WorkspaceAnalyzer,
+    project_root: &Path,
+    params: &DocumentHighlightParams,
+) -> Option<Vec<DocumentHighlight>> {
+    let uri = &params.text_document_position_params.text_document.uri;
+    let project_file = project_file_for_uri(project_root, uri)?;
+
+    let content = project_file.read_to_string().ok()?;
+    let line_starts = compute_line_starts(&content);
+    let byte_offset = position_to_byte_offset(
+        &content,
+        &line_starts,
+        &params.text_document_position_params.position,
+    );
+    let identifier = identifier_at_offset(&content, byte_offset)?;
+
+    let analyzer = workspace.analyzer();
+    let overloads = resolve_overloads(analyzer, identifier);
+    if overloads.is_empty() {
+        return None;
+    }
+
+    let result =
+        UsageFinder::new().find_usages(analyzer, &overloads, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES);
+    let hits: Vec<UsageHit> = result
+        .all_hits()
+        .into_iter()
+        .filter(|hit| hit.file == project_file)
+        .collect();
+
+    let mut highlights: Vec<DocumentHighlight> = hits
+        .into_iter()
+        .map(|hit| usage_hit_to_highlight(&hit, &content, &line_starts))
+        .collect();
+
+    // Include each overload's declaration when it lives in this file — without
+    // it, highlighting from the declaration site itself returns nothing on
+    // languages where UsageFinder does not emit a hit at the declaration.
+    for cu in &overloads {
+        if cu.source() == &project_file
+            && let Some(decl) = code_unit_highlight(analyzer, cu, &content, &line_starts)
+        {
+            highlights.push(decl);
+        }
+    }
+
+    highlights.sort_by(|a, b| {
+        a.range
+            .start
+            .line
+            .cmp(&b.range.start.line)
+            .then_with(|| a.range.start.character.cmp(&b.range.start.character))
+    });
+    highlights.dedup_by(|a, b| a.range == b.range);
+
+    Some(highlights)
+}
+
+fn resolve_overloads(analyzer: &dyn IAnalyzer, identifier: &str) -> Vec<CodeUnit> {
+    let mut out = analyzer.get_definitions(identifier);
+    if !out.is_empty() {
+        return out;
+    }
+    // Mirror the references handler: word-bounded fq_name search plus a
+    // short-name post-filter, since the analyzer matches the regex against
+    // the full fq_name (including any package prefix).
+    let pattern = format!(r"\b{}\b", regex::escape(identifier));
+    out.extend(
+        analyzer
+            .search_definitions(&pattern, false)
+            .into_iter()
+            .filter(|cu| cu.identifier() == identifier),
+    );
+    out
+}
+
+fn usage_hit_to_highlight(
+    hit: &UsageHit,
+    content: &str,
+    line_starts: &[usize],
+) -> DocumentHighlight {
+    let range = ByteRange {
+        start_byte: hit.start_offset,
+        end_byte: hit.end_offset,
+        start_line: hit.line,
+        end_line: hit.line,
+    };
+    DocumentHighlight {
+        range: byte_range_to_lsp_range(content, line_starts, &range),
+        kind: Some(DocumentHighlightKind::READ),
+    }
+}
+
+fn code_unit_highlight(
+    analyzer: &dyn IAnalyzer,
+    code_unit: &CodeUnit,
+    content: &str,
+    line_starts: &[usize],
+) -> Option<DocumentHighlight> {
+    let range = analyzer.ranges(code_unit).iter().min().copied()?;
+    Some(DocumentHighlight {
+        range: byte_range_to_lsp_range(content, line_starts, &range),
+        kind: Some(DocumentHighlightKind::TEXT),
+    })
+}
