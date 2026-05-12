@@ -448,6 +448,10 @@ impl IAnalyzer for RustAnalyzer {
         self.inner.search_definitions(pattern, auto_quote)
     }
 
+    fn search_definitions_persisted(&self, pattern: &str) -> BTreeSet<CodeUnit> {
+        self.inner.search_definitions_persisted(pattern)
+    }
+
     fn signatures_of(&self, code_unit: &CodeUnit) -> Vec<String> {
         self.inner.signatures_of(code_unit).to_vec()
     }

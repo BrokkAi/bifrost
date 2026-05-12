@@ -414,6 +414,22 @@ impl IAnalyzer for MultiAnalyzer {
             })
     }
 
+    fn search_definitions_persisted(&self, pattern: &str) -> BTreeSet<CodeUnit> {
+        // Fan out to each delegate's `search_definitions_persisted` so the
+        // FTS5 path is consulted per-language. The default impl on
+        // `IAnalyzer` would otherwise re-dispatch through our own
+        // `search_definitions` override, which only hits in-memory state.
+        self.delegates
+            .values()
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|delegate| delegate.analyzer().search_definitions_persisted(pattern))
+            .reduce(BTreeSet::new, |mut acc, definitions| {
+                acc.extend(definitions);
+                acc
+            })
+    }
+
     fn signatures<'a>(&'a self, code_unit: &CodeUnit) -> &'a [String] {
         self.delegate_for_code_unit(code_unit)
             .map(|delegate| delegate.analyzer().signatures(code_unit))
