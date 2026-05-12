@@ -1,9 +1,9 @@
 use std::path::Path;
 
-use crate::analyzer::ProjectFile;
-use crate::lsp::conversion::uri_to_path;
+use crate::analyzer::{CodeUnit, ProjectFile, Range as ByteRange};
+use crate::lsp::conversion::{byte_range_to_lsp_range, uri_to_path};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
-use lsp_types::Uri;
+use lsp_types::{Range as LspRange, Uri};
 
 /// Resolve an LSP `Uri` to a [`ProjectFile`] inside `project_root`. Returns
 /// `None` for non-`file:` URIs or paths outside the project, logging a
@@ -89,8 +89,63 @@ pub fn identifier_span_at_offset(content: &str, offset: usize) -> Option<(usize,
     Some((start, end))
 }
 
-fn is_ident_byte(byte: u8) -> bool {
+pub(super) fn is_ident_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// Find the first occurrence of `needle` in `haystack` that is bounded on
+/// both sides by a non-identifier byte (or buffer edge). Used by handlers to
+/// locate a symbol identifier inside a larger span (declaration body,
+/// signature) without matching substrings inside other identifiers.
+pub(super) fn find_word(haystack: &str, needle: &str) -> Option<usize> {
+    let needle_bytes = needle.as_bytes();
+    let bytes = haystack.as_bytes();
+    if needle_bytes.is_empty() || needle_bytes.len() > bytes.len() {
+        return None;
+    }
+    let mut start = 0;
+    while let Some(rel) = haystack[start..].find(needle) {
+        let candidate = start + rel;
+        let before_ok = candidate == 0 || !is_ident_byte(bytes[candidate - 1]);
+        let after_idx = candidate + needle_bytes.len();
+        let after_ok = after_idx >= bytes.len() || !is_ident_byte(bytes[after_idx]);
+        if before_ok && after_ok {
+            return Some(candidate);
+        }
+        // Advance past this candidate's first byte so we don't loop forever.
+        start = candidate + 1;
+    }
+    None
+}
+
+/// Locate the identifier of `code_unit` inside `fallback`'s byte span and
+/// return its position as an `LspRange`. Returns `None` when the identifier
+/// cannot be found word-bounded inside the span — callers fall back to the
+/// full span in that case. Word-boundary matching matters here: a raw `find`
+/// returns the wrong span for short identifiers (e.g. method `s` matches the
+/// `s` in `class`) or identifiers that are a prefix of a longer word in the
+/// body (e.g. method `foo` matches the first three bytes of `foofoo`).
+pub(super) fn identifier_selection_range(
+    code_unit: &CodeUnit,
+    content: &str,
+    line_starts: &[usize],
+    fallback: &ByteRange,
+) -> Option<LspRange> {
+    let slice = content.get(fallback.start_byte..fallback.end_byte)?;
+    let name = code_unit.identifier();
+    if name.is_empty() {
+        return None;
+    }
+    let offset = find_word(slice, name)?;
+    let abs_start = fallback.start_byte + offset;
+    let abs_end = abs_start + name.len();
+    let range = ByteRange {
+        start_byte: abs_start,
+        end_byte: abs_end,
+        start_line: 0,
+        end_line: 0,
+    };
+    Some(byte_range_to_lsp_range(content, line_starts, &range))
 }
 
 /// Lift the contiguous block of comment-like lines that ends immediately
@@ -119,10 +174,20 @@ pub fn extract_leading_doc_comment(content: &str, decl_start_byte: usize) -> Opt
         let trimmed = raw.trim_end_matches(['\n', '\r']);
         let stripped = trimmed.trim_start();
 
-        if stripped.is_empty() || !is_doc_comment_line(stripped) {
+        if stripped.is_empty() {
             break;
         }
-        comment_lines.push(trimmed);
+        if is_doc_comment_line(stripped) {
+            comment_lines.push(trimmed);
+            continue;
+        }
+        // A Rust outer attribute (`#[…]`) sits between the doc comment and
+        // the declaration — skip it so docs above attributes still get
+        // surfaced, but never lift the attribute itself into hover markdown.
+        if is_rust_outer_attribute_line(stripped) {
+            continue;
+        }
+        break;
     }
 
     if comment_lines.is_empty() {
@@ -140,6 +205,14 @@ pub fn extract_leading_doc_comment(content: &str, decl_start_byte: usize) -> Opt
     } else {
         Some(joined)
     }
+}
+
+/// True for a single-line Rust outer attribute (e.g. `#[derive(Debug)]`,
+/// `#[cfg(test)]`). Multi-line attributes split across lines are intentionally
+/// not handled — they're rare in practice and would require bracket-depth
+/// tracking to consume safely.
+fn is_rust_outer_attribute_line(stripped: &str) -> bool {
+    stripped.starts_with("#[") && stripped.trim_end().ends_with(']')
 }
 
 fn is_doc_comment_line(stripped: &str) -> bool {
@@ -244,6 +317,34 @@ mod tests {
     fn extract_doc_comment_skips_rust_attributes() {
         // `#[derive(...)]` is an attribute, not a doc comment — must be ignored.
         let content = "#[derive(Debug)]\nstruct S {}\n";
+        let decl_start = content.find("struct S").expect("decl");
+        assert!(extract_leading_doc_comment(content, decl_start).is_none());
+    }
+
+    #[test]
+    fn extract_doc_comment_skips_attribute_between_doc_and_decl() {
+        // Regression: `/// docs` followed by `#[derive(Debug)]` followed by
+        // `struct S` must surface "docs". Previously the scan stopped at the
+        // attribute line and dropped the doc comment entirely.
+        let content = "/// First line.\n/// Second line.\n#[derive(Debug, Clone)]\nstruct S {}\n";
+        let decl_start = content.find("struct S").expect("decl");
+        let doc = extract_leading_doc_comment(content, decl_start).expect("doc");
+        assert_eq!(doc, "First line.\nSecond line.");
+    }
+
+    #[test]
+    fn extract_doc_comment_skips_multiple_attribute_lines() {
+        let content = "/// docs\n#[derive(Debug)]\n#[allow(unused)]\nstruct S {}\n";
+        let decl_start = content.find("struct S").expect("decl");
+        let doc = extract_leading_doc_comment(content, decl_start).expect("doc");
+        assert_eq!(doc, "docs");
+    }
+
+    #[test]
+    fn extract_doc_comment_attribute_without_doc_returns_none() {
+        // Attributes alone (no preceding doc comment) must not produce hover
+        // text — the attribute itself is never lifted into markdown.
+        let content = "#[derive(Debug)]\n#[allow(unused)]\nstruct S {}\n";
         let decl_start = content.find("struct S").expect("decl");
         assert!(extract_leading_doc_comment(content, decl_start).is_none());
     }
