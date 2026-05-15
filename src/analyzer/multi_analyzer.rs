@@ -381,6 +381,12 @@ impl IAnalyzer for MultiAnalyzer {
             .unwrap_or(&[])
     }
 
+    fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
+        self.delegate_for_file(file)
+            .map(|delegate| delegate.analyzer().compute_cognitive_complexities(file))
+            .unwrap_or_default()
+    }
+
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
         self.delegate_for_code_unit(code_unit)
             .and_then(|delegate| delegate.analyzer().get_skeleton(code_unit))

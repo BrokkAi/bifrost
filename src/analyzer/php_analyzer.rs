@@ -160,6 +160,10 @@ impl IAnalyzer for PhpAnalyzer {
         self.inner.ranges(code_unit)
     }
 
+    fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
+        self.inner.compute_cognitive_complexities(file)
+    }
+
     fn signatures<'a>(&'a self, code_unit: &CodeUnit) -> &'a [String] {
         self.inner.signatures(code_unit)
     }

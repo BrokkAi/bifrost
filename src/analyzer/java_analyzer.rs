@@ -1,3 +1,4 @@
+use crate::analyzer::cognitive_complexity;
 use crate::analyzer::{
     AnalyzerConfig, CodeUnit, DeclarationInfo, DeclarationKind, IAnalyzer, ImportAnalysisProvider,
     ImportInfo, Language, LanguageAdapter, Project, ProjectFile, TestDetectionProvider,
@@ -8,8 +9,37 @@ use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
 use std::collections::BTreeSet;
 use std::mem::size_of;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
+
+/// Tree-sitter node-kind mapping used by the cognitive-complexity scorer
+/// for Java. Mirrors `ai.brokk.analyzer.java.CognitiveComplexityAnalysis`.
+static JAVA_COGNITIVE_CONFIG: LazyLock<cognitive_complexity::Config> =
+    LazyLock::new(|| cognitive_complexity::Config {
+        if_types: &["if_statement"],
+        loop_types: &[
+            "for_statement",
+            "enhanced_for_statement",
+            "while_statement",
+            "do_statement",
+        ],
+        catch_types: &["catch_clause"],
+        conditional_types: &["ternary_expression"],
+        case_types: &["switch_label", "switch_rule"],
+        binary_types: &["binary_expression"],
+        logical_operators: &["&&", "||"],
+        jump_types: &["break_statement", "continue_statement"],
+        anonymous_function_types: &["lambda_expression"],
+        default_case_predicate: Some(java_is_default_switch_label),
+        ..cognitive_complexity::Config::empty()
+    });
+
+fn java_is_default_switch_label(node: Node<'_>, source: &str) -> bool {
+    let Some(text) = source.get(node.start_byte()..node.end_byte()) else {
+        return false;
+    };
+    text.trim_start().starts_with("default")
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct JavaAdapter;
@@ -109,6 +139,10 @@ impl LanguageAdapter for JavaAdapter {
         }
 
         parsed
+    }
+
+    fn cognitive_complexity_config(&self) -> Option<&'static cognitive_complexity::Config> {
+        Some(&JAVA_COGNITIVE_CONFIG)
     }
 }
 
@@ -1716,6 +1750,10 @@ impl IAnalyzer for JavaAnalyzer {
 
     fn ranges<'a>(&'a self, code_unit: &CodeUnit) -> &'a [crate::analyzer::Range] {
         self.inner.ranges(code_unit)
+    }
+
+    fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
+        self.inner.compute_cognitive_complexities(file)
     }
 
     fn signatures<'a>(&'a self, code_unit: &CodeUnit) -> &'a [String] {

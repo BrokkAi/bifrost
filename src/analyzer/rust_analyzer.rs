@@ -1,3 +1,4 @@
+use crate::analyzer::cognitive_complexity;
 use crate::analyzer::{
     AnalyzerConfig, CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language,
     LanguageAdapter, Project, ProjectFile, TestDetectionProvider, TreeSitterAnalyzer,
@@ -8,10 +9,29 @@ use moka::sync::Cache;
 use std::collections::BTreeSet;
 use std::mem::size_of;
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
 
 use super::javascript_analyzer::build_weighted_cache;
+
+/// Tree-sitter node-kind mapping used by the cognitive-complexity scorer
+/// for Rust. Mirrors `ai.brokk.analyzer.rust.CognitiveComplexityAnalysis`
+/// in brokk-shared so the bifrost MCP output matches brokk-core byte-for-
+/// byte. Names are tree-sitter `rust` grammar node kinds.
+static RUST_COGNITIVE_CONFIG: LazyLock<cognitive_complexity::Config> =
+    LazyLock::new(|| cognitive_complexity::Config {
+        if_types: &["if_expression"],
+        loop_types: &["for_expression", "while_expression", "loop_expression"],
+        case_types: &["match_arm"],
+        binary_types: &["binary_expression"],
+        logical_operators: &["&&", "||"],
+        jump_types: &["break_expression", "continue_expression"],
+        named_function_boundary_types: &["function_item"],
+        anonymous_function_types: &["closure_expression"],
+        else_clause_types: &["else_clause"],
+        default_case_predicate: Some(cognitive_complexity::is_wildcard_case),
+        ..cognitive_complexity::Config::empty()
+    });
 
 #[derive(Debug, Clone, Default)]
 pub struct RustAdapter;
@@ -142,6 +162,10 @@ impl LanguageAdapter for RustAdapter {
         }
 
         parsed
+    }
+
+    fn cognitive_complexity_config(&self) -> Option<&'static cognitive_complexity::Config> {
+        Some(&RUST_COGNITIVE_CONFIG)
     }
 }
 
@@ -325,6 +349,10 @@ impl IAnalyzer for RustAnalyzer {
 
     fn ranges<'a>(&'a self, code_unit: &CodeUnit) -> &'a [crate::analyzer::Range] {
         self.inner.ranges(code_unit)
+    }
+
+    fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
+        self.inner.compute_cognitive_complexities(file)
     }
 
     fn signatures<'a>(&'a self, code_unit: &CodeUnit) -> &'a [String] {
