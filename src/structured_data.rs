@@ -201,9 +201,7 @@ pub fn xml_select(analyzer: &dyn IAnalyzer, params: XmlSelectParams) -> XmlSelec
         return XmlSelectResult {
             files: Vec::new(),
             truncated_files: false,
-            error: Some(
-                "attr_name is required when output is \"attribute\"".to_string(),
-            ),
+            error: Some("attr_name is required when output is \"attribute\"".to_string()),
         };
     }
 
@@ -315,8 +313,8 @@ fn run_jq_filter(
     use jaq_core::{Compiler, Ctx, Vars};
     use jaq_json::{Val, read};
 
-    let input = read::parse_single(json_text.as_bytes())
-        .map_err(|err| format!("invalid JSON: {err:?}"))?;
+    let input =
+        read::parse_single(json_text.as_bytes()).map_err(|err| format!("invalid JSON: {err:?}"))?;
 
     let program = File {
         code: filter,
@@ -398,7 +396,10 @@ fn skim_xml_string(content: &str) -> Result<Vec<XmlSkimElement>, String> {
             }
             Ok(Event::Eof) => break,
             Err(err) => {
-                return Err(format!("xml parse error at {}: {err}", reader.buffer_position()));
+                return Err(format!(
+                    "xml parse error at {}: {err}",
+                    reader.buffer_position()
+                ));
             }
             _ => {}
         }
@@ -515,9 +516,8 @@ mod tests {
                 }
                 fs::write(&abs, content).expect("write");
             }
-            let project: Arc<dyn Project> = Arc::new(
-                FilesystemProject::new(temp.path().to_path_buf()).expect("project"),
-            );
+            let project: Arc<dyn Project> =
+                Arc::new(FilesystemProject::new(temp.path().to_path_buf()).expect("project"));
             let analyzer = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
             Self {
                 _temp: temp,
@@ -528,10 +528,7 @@ mod tests {
 
     #[test]
     fn jq_runs_simple_filter() {
-        let fix = Fixture::new(&[(
-            "pkg.json",
-            "{\"name\":\"bifrost\",\"version\":\"0.2.0\"}",
-        )]);
+        let fix = Fixture::new(&[("pkg.json", "{\"name\":\"bifrost\",\"version\":\"0.2.0\"}")]);
         let result = jq(
             fix.analyzer.analyzer(),
             JqParams {
@@ -643,10 +640,7 @@ mod tests {
 
     #[test]
     fn xml_select_returns_attribute_when_requested() {
-        let fix = Fixture::new(&[(
-            "data.xml",
-            "<root><item id=\"1\"/><item id=\"2\"/></root>",
-        )]);
+        let fix = Fixture::new(&[("data.xml", "<root><item id=\"1\"/><item id=\"2\"/></root>")]);
         let result = xml_select(
             fix.analyzer.analyzer(),
             XmlSelectParams {
