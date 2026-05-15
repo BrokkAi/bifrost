@@ -655,12 +655,30 @@ fn map_service_error(code: SearchToolsServiceErrorCode, message: String) -> (i64
     (jsonrpc_code, message)
 }
 
+// Convention between this function and `SearchToolsService::decode_and_run`:
+//
+// - If a tool handler returns a serde struct (object/array), `to_value`
+//   produces a JSON object/array. We render it as pretty-printed JSON in
+//   `content[0].text` AND attach the structured value as
+//   `structuredContent` so MCP clients can choose either form.
+//
+// - If a tool handler returns a `String`, `to_value` produces
+//   `Value::String`. We treat that as the canonical text representation
+//   of the tool's output (the git-history tools take this path to mirror
+//   brokk-core's XML-style textual output) and emit it verbatim in
+//   `content[0].text`, with no `structuredContent`.
+//
+// The convention is checked here, at the wire boundary, rather than
+// expressed in the handler signature. A future tool returning a string
+// will automatically get the text-shaped envelope. If a handler returns
+// something else that happens to serialize to `Value::String` (e.g. a
+// newtype around `String`), that is also fine — it is treated as text.
+//
+// To break this convention cleanly, introduce a `ToolOutput` enum in
+// `searchtools_service` and have `decode_and_run` return it, then match
+// on the variant here. Until that refactor, the two layers must keep
+// this comment in sync.
 fn tool_success_result(structured: Value) -> Value {
-    // Tools may return a JSON-shaped result (rendered as pretty JSON in the
-    // text content with the structured value attached) or a plain string
-    // (used by the git-history tools, which match brokk-core's XML-style
-    // textual output). In the string case we pass the text through verbatim
-    // and omit `structuredContent` since there is no structured form.
     if let Value::String(text) = structured {
         return json!({
             "content": [

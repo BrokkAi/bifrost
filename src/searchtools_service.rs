@@ -293,6 +293,22 @@ impl SearchToolsService {
         self.workspace = self.workspace.update(&changed_files);
     }
 
+    // Handler return types are constrained only by `Serialize`. By
+    // convention two shapes flow through here:
+    //
+    //   1. A serde struct → serializes to a JSON object/array.
+    //      `mcp_server::tool_success_result` will pretty-print it as
+    //      text and also attach the structured value.
+    //   2. A `String` → serializes to `Value::String`. The MCP wire
+    //      treats this as the canonical text representation and emits
+    //      it verbatim with no `structuredContent`. The git-history
+    //      tools take this path to match brokk-core's XML output.
+    //
+    // The branch on `Value::String` lives in `tool_success_result`;
+    // keep both ends of the convention in sync. If a future tool needs
+    // both a text rendering AND structured content, the cleanest path
+    // is to introduce a `ToolOutput { Text(String), Structured(Value) }`
+    // enum here and match it on the wire side.
     fn decode_and_run<P, R>(
         &mut self,
         arguments: Value,
