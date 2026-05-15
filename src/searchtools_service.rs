@@ -12,6 +12,7 @@ use crate::{
         get_symbol_sources, get_symbol_summaries, list_symbols, most_relevant_files,
         refresh_result, scan_usages, search_symbols,
     },
+    structured_data::{jq, xml_select, xml_skim},
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -166,6 +167,15 @@ impl SearchToolsService {
             }),
             "get_commit_diff" => self.decode_and_run(arguments, |workspace, params| {
                 get_commit_diff(workspace.analyzer(), params)
+            }),
+            "jq" => self.decode_and_run(arguments, |workspace, params| {
+                jq(workspace.analyzer(), params)
+            }),
+            "xml_skim" => self.decode_and_run(arguments, |workspace, params| {
+                xml_skim(workspace.analyzer(), params)
+            }),
+            "xml_select" => self.decode_and_run(arguments, |workspace, params| {
+                xml_select(workspace.analyzer(), params)
             }),
             _ => Err(SearchToolsServiceError::unknown_tool(format!(
                 "Unknown tool: {name}"

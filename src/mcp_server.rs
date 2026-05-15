@@ -439,6 +439,90 @@ fn list_tools_result() -> Value {
                     "required": ["revision"]
                 }),
             ),
+            tool_descriptor(
+                "jq",
+                "Run a jq expression against one or more JSON files matched by a glob (or a literal path).",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "filepath": {
+                            "type": "string",
+                            "description": "Project-relative glob or literal path to JSON file(s)."
+                        },
+                        "filter": {
+                            "type": "string",
+                            "description": "jq filter expression."
+                        },
+                        "max_files": {
+                            "type": "integer",
+                            "default": 25,
+                            "minimum": 1,
+                            "description": "Maximum number of files to process."
+                        },
+                        "matches_per_file": {
+                            "type": "integer",
+                            "default": 100,
+                            "minimum": 1,
+                            "description": "Maximum number of filter outputs to collect per file."
+                        }
+                    },
+                    "required": ["filepath", "filter"]
+                }),
+            ),
+            tool_descriptor(
+                "xml_skim",
+                "Return an element-hierarchy outline (tag name, depth, attribute count) for one or more XML files. HTML is not supported in this revision; well-formed XML only.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "filepath": {
+                            "type": "string",
+                            "description": "Project-relative glob or literal path to XML file(s)."
+                        },
+                        "max_files": {
+                            "type": "integer",
+                            "default": 25,
+                            "minimum": 1,
+                            "description": "Maximum number of files to process."
+                        }
+                    },
+                    "required": ["filepath"]
+                }),
+            ),
+            tool_descriptor(
+                "xml_select",
+                "Run an XPath 3.1 expression against one or more XML files. Returns matched node text, attribute value, or outer XML depending on output mode. HTML is not supported in this revision.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "filepath": {
+                            "type": "string",
+                            "description": "Project-relative glob or literal path to XML file(s)."
+                        },
+                        "xpath": {
+                            "type": "string",
+                            "description": "XPath 3.1 expression."
+                        },
+                        "output": {
+                            "type": "string",
+                            "enum": ["text", "attribute", "outer-xml"],
+                            "default": "text",
+                            "description": "Output mode for matched nodes."
+                        },
+                        "attr_name": {
+                            "type": "string",
+                            "description": "Required when output is \"attribute\"."
+                        },
+                        "max_files": {
+                            "type": "integer",
+                            "default": 25,
+                            "minimum": 1,
+                            "description": "Maximum number of files to process."
+                        }
+                    },
+                    "required": ["filepath", "xpath"]
+                }),
+            ),
         ]
     })
 }

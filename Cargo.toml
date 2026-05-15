@@ -47,6 +47,12 @@ tree-sitter-php = "0.23.11"
 tree-sitter-rust = "0.24.0"
 tree-sitter-typescript = "0.23.2"
 walkdir = "2.5.0"
+quick-xml = "0.40"
+sxd-document = "0.3"
+sxd-xpath = "0.4"
+jaq-core = "3.0"
+jaq-std = "3.0"
+jaq-json = "2.0"
 
 [features]
 default = []

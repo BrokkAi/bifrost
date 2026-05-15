@@ -11,6 +11,7 @@ mod python_module;
 mod relevance;
 pub mod searchtools;
 pub mod searchtools_service;
+pub mod structured_data;
 pub mod summary;
 mod text_utils;
 pub mod usages;
