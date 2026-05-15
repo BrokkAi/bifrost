@@ -1,10 +1,9 @@
 use crate::analyzer::{IAnalyzer, ProjectFile};
-use crate::path_utils::{normalize_pattern, rel_path_string};
+use crate::path_utils::{normalize_pattern, rel_path_string, workspace_rel_path};
 use glob::{MatchOptions, Pattern};
 use rayon::prelude::*;
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 
 const STRICT_SEPARATOR: MatchOptions = MatchOptions {
     case_sensitive: true,
@@ -516,37 +515,6 @@ fn code_unit_kind_label(code_unit: &crate::analyzer::CodeUnit) -> String {
     }
 }
 
-// Convert a user-supplied path string to a workspace-relative `PathBuf`,
-// rejecting absolute paths so they cannot reach the `assert!` inside
-// `ProjectFile::new`. The downstream `normalize()` strips `..` components,
-// so traversal escapes are already contained — but absolute paths slip past
-// that and panic the server, so we reject them up front. We also reject
-// Windows drive-relative inputs (e.g. `C:foo`) which on Windows are not
-// absolute but resolve against the per-drive CWD, escaping the workspace.
-fn workspace_rel_path(input: &str) -> Option<std::path::PathBuf> {
-    let normalized = normalize_pattern(input);
-    let trimmed = normalized.trim_start_matches('/');
-    if trimmed.is_empty() {
-        return None;
-    }
-    if has_drive_letter_prefix(trimmed) {
-        return None;
-    }
-    let path = Path::new(trimmed);
-    if path.is_absolute() || path.has_root() {
-        return None;
-    }
-    Some(path.to_path_buf())
-}
-
-fn has_drive_letter_prefix(s: &str) -> bool {
-    let mut chars = s.chars();
-    matches!(
-        (chars.next(), chars.next()),
-        (Some(c1), Some(':')) if c1.is_ascii_alphabetic()
-    )
-}
-
 fn compile_regexes(patterns: &[String], case_insensitive: bool) -> (Vec<Regex>, Vec<String>) {
     let mut invalid_patterns = Vec::new();
     let regexes: Vec<Regex> = patterns
@@ -603,40 +571,7 @@ fn default_list_files_max_entries() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::{AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer};
-    use std::fs;
-    use std::path::PathBuf;
-    use std::sync::Arc;
-    use tempfile::TempDir;
-
-    struct Fixture {
-        _temp: TempDir,
-        analyzer: WorkspaceAnalyzer,
-    }
-
-    impl Fixture {
-        fn new(files: &[(&str, &str)]) -> Self {
-            let temp = TempDir::new().expect("tempdir");
-            for (rel, content) in files {
-                let abs = temp.path().join(rel);
-                if let Some(parent) = abs.parent() {
-                    fs::create_dir_all(parent).expect("mkdir");
-                }
-                fs::write(&abs, content).expect("write");
-            }
-            let project: Arc<dyn Project> =
-                Arc::new(FilesystemProject::new(temp.path().to_path_buf()).expect("project"));
-            let analyzer = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
-            Self {
-                _temp: temp,
-                analyzer,
-            }
-        }
-
-        fn project_root(&self) -> PathBuf {
-            self.analyzer.analyzer().project().root().to_path_buf()
-        }
-    }
+    use crate::test_support::AnalyzerFixture as Fixture;
 
     #[test]
     fn get_file_contents_reads_existing_files() {

@@ -527,6 +527,26 @@ fn list_tools_result() -> Value {
                     "required": ["filepath", "xpath"]
                 }),
             ),
+            tool_descriptor(
+                "compute_cyclomatic_complexity",
+                "Compute heuristic cyclomatic complexity per function/method in the given files; flag those exceeding a threshold. Heuristic counts a base of 1 plus each `if/while/for/switch/case/catch` keyword and each `&&`/`||`/`?` operator in the source.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "file_paths": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Project-relative paths of files to analyze."
+                        },
+                        "threshold": {
+                            "type": "integer",
+                            "default": 10,
+                            "description": "Flag functions whose complexity exceeds this threshold. Values <= 0 fall back to 10."
+                        }
+                    },
+                    "required": ["file_paths"]
+                }),
+            ),
         ]
     })
 }

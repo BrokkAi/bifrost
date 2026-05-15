@@ -84,6 +84,11 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             .any(|tool| tool["name"] == "most_relevant_files")
     );
     assert!(tools.iter().any(|tool| tool["name"] == "scan_usages"));
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool["name"] == "compute_cyclomatic_complexity")
+    );
 
     let scan_usages = round_trip(
         &mut stdin,
@@ -162,6 +167,33 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
         lines
             .iter()
             .any(|line| line.as_str() == Some("      - method7"))
+    );
+
+    let cyclomatic = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {
+                "name": "compute_cyclomatic_complexity",
+                "arguments": {
+                    "file_paths": ["CyclicMethods.java"],
+                    "threshold": 0
+                }
+            }
+        }),
+    );
+    let cyclomatic_report = cyclomatic["result"]["structuredContent"]["report"]
+        .as_str()
+        .expect("report string");
+    // Methods in CyclicMethods.java have no decision points (just sequential
+    // calls), so each scores 1 — well below the default threshold of 10.
+    assert_eq!(
+        cyclomatic_report,
+        "No methods exceeded the complexity threshold of 10."
     );
 
     let ping = round_trip(
