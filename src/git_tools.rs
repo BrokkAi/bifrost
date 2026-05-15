@@ -14,6 +14,12 @@ const DEFAULT_DIFF_MAX_FILES: usize = 10;
 const DEFAULT_DIFF_LINES_PER_FILE: usize = 1000;
 const MAX_DIFF_FILES: usize = 100;
 const MAX_DIFF_LINES_PER_FILE: usize = 5000;
+// Matches brokk's PerformanceConstants.MAX_DIFF_LINE_LENGTH_BYTES (50KB):
+// hunks containing any single data line longer than this are dropped from
+// the diff because they are almost always minified bundles, generated
+// fixtures, or binary blobs masquerading as text — none of which are
+// useful in the textual diff for downstream consumers.
+const MAX_DIFF_LINE_LENGTH_BYTES: usize = 50 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchGitCommitMessagesParams {
@@ -620,56 +626,233 @@ struct FormattedDiff {
     truncated: bool,
 }
 
+// Ported from brokk's CommitPrompts.preprocessUnifiedDiff so output is
+// semantically aligned across both MCP servers.
+//
+// Behavior:
+//  - Each file's hunks are inspected; any hunk containing a data line longer
+//    than MAX_DIFF_LINE_LENGTH_BYTES is dropped (minified/generated/binary
+//    text). Files whose entire patch is dropped this way are skipped.
+//  - Surviving files are ordered by (hunk-count desc, total data-line count
+//    desc) so the most-changed files surface first within max_files.
+//  - Within each emitted file, hunks are ordered by data-line count desc.
+//    Hunks are added until the cumulative file budget would exceed
+//    lines_per_file. The largest hunk is always emitted, even if it alone
+//    exceeds lines_per_file, so the file is never empty in the output.
+//  - File headers are reconstructed as `diff --git a/X b/X` / `--- a/X` /
+//    `+++ b/X`, matching brokk. Adds/deletes use `/dev/null` on the
+//    missing side.
 fn format_diff(diff: &mut Diff<'_>, max_files: usize, lines_per_file: usize) -> FormattedDiff {
     let files_total = diff.deltas().len();
-    let target = files_total.min(max_files);
-    let mut truncated_overall = files_total > max_files;
-    let mut output = String::new();
-    let mut files_included: usize = 0;
+    let mut metrics: Vec<FileMetrics> = (0..files_total)
+        .filter_map(|idx| build_file_metrics(diff, idx))
+        .collect();
 
-    for idx in 0..target {
-        let mut patch = match Patch::from_diff(diff, idx) {
-            Ok(Some(p)) => p,
-            _ => continue,
-        };
-        let buf = match patch.to_buf() {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
-        let text = std::str::from_utf8(&buf).unwrap_or("");
-        let mut file_truncated = false;
-        for (line_count, line) in text.split_inclusive('\n').enumerate() {
-            if line_count >= lines_per_file {
-                file_truncated = true;
+    metrics.sort_by(|a, b| {
+        b.hunks
+            .len()
+            .cmp(&a.hunks.len())
+            .then_with(|| b.total_data_lines.cmp(&a.total_data_lines))
+    });
+
+    let target = max_files.min(metrics.len());
+    let mut truncated = metrics.len() > target;
+    let mut output = String::new();
+    let mut files_included = 0;
+
+    for fm in metrics.iter().take(target) {
+        let _ = writeln!(output, "diff --git {} {}", fm.a_path, fm.b_path);
+        let _ = writeln!(output, "--- {}", fm.a_path);
+        let _ = writeln!(output, "+++ {}", fm.b_path);
+
+        // Hunks ordered by data-line count desc; ties broken by original
+        // file order to keep output stable.
+        let mut hunks: Vec<&FileHunk> = fm.hunks.iter().collect();
+        hunks.sort_by(|a, b| {
+            b.data_line_count
+                .cmp(&a.data_line_count)
+                .then_with(|| a.original_idx.cmp(&b.original_idx))
+        });
+
+        let mut added: usize = 0;
+        let mut included_any = false;
+        for hunk in &hunks {
+            let size = hunk.budget_size();
+            if !included_any && size > lines_per_file {
+                // Brokk semantics: always include the largest hunk to avoid
+                // emitting an empty file. Mark truncated since the budget
+                // was overshot.
+                emit_hunk(&mut output, hunk);
+                truncated = true;
                 break;
             }
-            output.push_str(line);
-        }
-        if file_truncated {
-            truncated_overall = true;
-            let _ = writeln!(
-                output,
-                "... [truncated at {lines_per_file} lines for this file]"
-            );
+            if added + size <= lines_per_file {
+                emit_hunk(&mut output, hunk);
+                added += size;
+                included_any = true;
+            } else {
+                truncated = true;
+                break;
+            }
         }
         files_included += 1;
-    }
-
-    if files_total > files_included {
-        truncated_overall = true;
-        let omitted = files_total - files_included;
-        let _ = writeln!(
-            output,
-            "... [{omitted} additional file(s) omitted; max_files={max_files}]"
-        );
     }
 
     FormattedDiff {
         text: output,
         files_total,
         files_included,
-        truncated: truncated_overall,
+        truncated,
     }
+}
+
+struct FileMetrics {
+    a_path: String,
+    b_path: String,
+    hunks: Vec<FileHunk>,
+    total_data_lines: usize,
+}
+
+struct FileHunk {
+    original_idx: usize,
+    header: String,
+    body: String,
+    data_line_count: usize,
+}
+
+impl FileHunk {
+    // Match brokk's deltaSize: 1 header line + data-line count. Context
+    // lines are not part of the budget because brokk's preprocessor strips
+    // them; bifrost keeps them in the body (since git-style context is
+    // useful to non-LLM consumers), but the budget unit is still data
+    // lines so file-budget semantics match brokk.
+    fn budget_size(&self) -> usize {
+        1 + self.data_line_count
+    }
+}
+
+fn emit_hunk(out: &mut String, hunk: &FileHunk) {
+    out.push_str(&hunk.header);
+    if !hunk.header.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&hunk.body);
+    if !hunk.body.is_empty() && !hunk.body.ends_with('\n') {
+        out.push('\n');
+    }
+}
+
+fn build_file_metrics(diff: &Diff<'_>, idx: usize) -> Option<FileMetrics> {
+    let patch = match Patch::from_diff(diff, idx) {
+        Ok(Some(p)) => p,
+        _ => return None,
+    };
+    let delta = patch.delta();
+    let (a_path, b_path) = format_ab_paths(&delta);
+    let num_hunks = patch.num_hunks();
+
+    let mut hunks: Vec<FileHunk> = Vec::new();
+    let mut total_data_lines: usize = 0;
+
+    for h in 0..num_hunks {
+        let Ok((hunk_info, _)) = patch.hunk(h) else {
+            continue;
+        };
+        let header = String::from_utf8_lossy(hunk_info.header()).into_owned();
+        let n_lines = patch.num_lines_in_hunk(h).unwrap_or(0);
+
+        let mut body = String::new();
+        let mut data_lines: usize = 0;
+        let mut has_overlong = false;
+
+        for li in 0..n_lines {
+            let Ok(line) = patch.line_in_hunk(h, li) else {
+                continue;
+            };
+            let origin = line.origin();
+            let content = String::from_utf8_lossy(line.content());
+            if content.len() > MAX_DIFF_LINE_LENGTH_BYTES {
+                has_overlong = true;
+                break;
+            }
+            // Only emit a leading origin char for the prefixes git uses on
+            // diff data lines. Other origins (file/hunk headers, binary
+            // markers) shouldn't appear here since we iterate inside a
+            // hunk; if they do, write the content verbatim so we don't
+            // corrupt the diff.
+            match origin {
+                ' ' | '+' | '-' => {
+                    body.push(origin);
+                    body.push_str(&content);
+                    if origin == '+' || origin == '-' {
+                        data_lines += 1;
+                    }
+                }
+                '<' | '>' => {
+                    // "no newline at end of file" markers; reproduce git's
+                    // literal `\ No newline at end of file` line so
+                    // round-trippers don't choke.
+                    body.push_str("\\ No newline at end of file\n");
+                }
+                _ => {
+                    body.push_str(&content);
+                }
+            }
+        }
+
+        if has_overlong {
+            continue;
+        }
+        total_data_lines += data_lines;
+        hunks.push(FileHunk {
+            original_idx: h,
+            header,
+            body,
+            data_line_count: data_lines,
+        });
+    }
+
+    if hunks.is_empty() {
+        return None;
+    }
+    Some(FileMetrics {
+        a_path,
+        b_path,
+        hunks,
+        total_data_lines,
+    })
+}
+
+fn format_ab_paths(delta: &git2::DiffDelta<'_>) -> (String, String) {
+    let old_path = delta
+        .old_file()
+        .path()
+        .and_then(|p| p.to_str())
+        .map(|s| s.to_string());
+    let new_path = delta
+        .new_file()
+        .path()
+        .and_then(|p| p.to_str())
+        .map(|s| s.to_string());
+
+    let (a_raw, b_raw) = match delta.status() {
+        Delta::Added => (None, new_path),
+        Delta::Deleted => (old_path, None),
+        // Modified, Renamed, Copied, Typechange, etc.: keep both sides.
+        _ => (old_path, new_path),
+    };
+
+    let a = match a_raw {
+        None => "/dev/null".to_string(),
+        Some(p) if p.starts_with("a/") => p,
+        Some(p) => format!("a/{p}"),
+    };
+    let b = match b_raw {
+        None => "/dev/null".to_string(),
+        Some(p) if p.starts_with("b/") => p,
+        Some(p) => format!("b/{p}"),
+    };
+    (a, b)
 }
 
 fn default_search_limit() -> usize {
@@ -856,9 +1039,9 @@ mod tests {
     #[test]
     fn get_git_log_filters_by_path() {
         let fix = GitFixture::new();
-        fix.commit("c1", &[("a.txt", "1")]);
-        fix.commit("c2 touch b", &[("b.txt", "1")]);
-        fix.commit("c3 touch a", &[("a.txt", "2")]);
+        fix.commit("create-a", &[("a.txt", "1")]);
+        fix.commit("touch-b", &[("b.txt", "1")]);
+        fix.commit("touch-a", &[("a.txt", "2")]);
 
         let out = get_git_log(
             fix.analyzer.analyzer(),
@@ -868,9 +1051,9 @@ mod tests {
             },
         );
         assert!(out.contains("<git_log path=\"b.txt\">"));
-        assert!(out.contains("c2 touch b"));
-        assert!(!out.contains("c1"));
-        assert!(!out.contains("c3 touch a"));
+        assert!(out.contains("touch-b"));
+        assert!(!out.contains("create-a"));
+        assert!(!out.contains("touch-a"));
         assert!(out.contains("</git_log>"));
     }
 
@@ -1059,7 +1242,12 @@ mod tests {
     }
 
     #[test]
-    fn get_commit_diff_truncates_per_file_lines() {
+    fn get_commit_diff_marks_truncated_when_hunk_exceeds_budget() {
+        // The new format_diff (brokk-parity) does not slice hunks at the
+        // line budget — it skips hunks that would overshoot, but always
+        // includes the largest hunk so the file is never empty. When the
+        // largest hunk alone exceeds `lines_per_file`, `truncated=true` is
+        // reported even though the hunk's content is emitted in full.
         let mut body = String::new();
         for i in 0..20 {
             body.push_str(&format!("line{i}\n"));
@@ -1074,8 +1262,109 @@ mod tests {
                 lines_per_file: 3,
             },
         );
-        assert!(out.contains("truncated=\"true\""));
-        assert!(out.contains("truncated at 3 lines for this file"));
+        assert!(out.contains("truncated=\"true\""), "got: {out}");
+        // The single hunk was emitted in full, so all 20 added lines should
+        // appear in the diff body.
+        assert!(out.contains("+line0"), "got: {out}");
+        assert!(out.contains("+line19"), "got: {out}");
+    }
+
+    #[test]
+    fn get_commit_diff_orders_files_by_change_density() {
+        // Three files. After modification, data-line counts are roughly
+        // big.txt > mid.txt > small.txt. With max_files=2 the smallest
+        // must be excluded.
+        let mut big_seed = String::new();
+        let mut big_mod = String::new();
+        for i in 0..10 {
+            let _ = writeln!(big_seed, "old{i}");
+            let _ = writeln!(big_mod, "new{i}");
+        }
+        let fix = GitFixture::new();
+        fix.commit(
+            "seed",
+            &[
+                ("big.txt", big_seed.as_str()),
+                ("mid.txt", "a\nb\nc\n"),
+                ("small.txt", "x\n"),
+            ],
+        );
+        let oid = fix.commit(
+            "many changes",
+            &[
+                ("big.txt", big_mod.as_str()),
+                ("mid.txt", "A\nB\nC\n"),
+                ("small.txt", "x\n"), // unchanged → not in diff at all
+            ],
+        );
+
+        let out = get_commit_diff(
+            fix.analyzer.analyzer(),
+            GetCommitDiffParams {
+                revision: oid.to_string(),
+                max_files: 1,
+                lines_per_file: 1000,
+            },
+        );
+        // Only big.txt and mid.txt changed, so files_total=2. With
+        // max_files=1, only the densest (big.txt) is included.
+        assert!(out.contains("files_total=\"2\""), "got: {out}");
+        assert!(out.contains("files_included=\"1\""), "got: {out}");
+        assert!(out.contains("truncated=\"true\""), "got: {out}");
+        assert!(out.contains("a/big.txt"), "got: {out}");
+        assert!(!out.contains("a/mid.txt"), "got: {out}");
+    }
+
+    #[test]
+    fn get_commit_diff_drops_files_with_overlong_lines() {
+        // A file whose sole hunk contains a >50KB single line is dropped
+        // entirely (overlong-line filter, matching brokk's hasOverlongLine).
+        // A second normal file in the same commit still surfaces.
+        let mut huge = "x".repeat(60 * 1024);
+        huge.push('\n');
+        let fix = GitFixture::new();
+        let oid = fix.commit(
+            "two files",
+            &[("normal.txt", "hello\n"), ("huge.txt", huge.as_str())],
+        );
+        let out = get_commit_diff(
+            fix.analyzer.analyzer(),
+            GetCommitDiffParams {
+                revision: oid.to_string(),
+                max_files: 10,
+                lines_per_file: 1000,
+            },
+        );
+        // files_total reflects the raw git delta count; files_included
+        // counts only the patches that survived the overlong-line filter.
+        assert!(out.contains("files_total=\"2\""), "got: {out}");
+        assert!(out.contains("files_included=\"1\""), "got: {out}");
+        assert!(out.contains("b/normal.txt"), "got: {out}");
+        assert!(!out.contains("b/huge.txt"), "got: {out}");
+    }
+
+    #[test]
+    fn get_commit_diff_always_includes_largest_hunk() {
+        // A file whose only hunk is larger than `lines_per_file` must still
+        // emit that hunk (brokk's "include the largest hunk even if it
+        // exceeds the limit" rule), so the file is never empty.
+        let mut body = String::new();
+        for i in 0..50 {
+            let _ = writeln!(body, "line{i}");
+        }
+        let fix = GitFixture::new();
+        let oid = fix.commit("dense", &[("a.txt", body.as_str())]);
+        let out = get_commit_diff(
+            fix.analyzer.analyzer(),
+            GetCommitDiffParams {
+                revision: oid.to_string(),
+                max_files: 10,
+                lines_per_file: 5,
+            },
+        );
+        assert!(out.contains("truncated=\"true\""), "got: {out}");
+        assert!(out.contains("+line0"), "got: {out}");
+        assert!(out.contains("+line49"), "got: {out}");
     }
 
     #[test]
