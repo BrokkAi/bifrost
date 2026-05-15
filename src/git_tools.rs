@@ -1,5 +1,5 @@
 use crate::analyzer::IAnalyzer;
-use git2::{Commit, Diff, DiffOptions, Patch, Repository, Sort};
+use git2::{Commit, Delta, Diff, DiffFindOptions, DiffOptions, ObjectType, Patch, Repository, Sort};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -135,6 +135,20 @@ pub fn get_git_log(analyzer: &dyn IAnalyzer, params: GetGitLogParams) -> String 
         .clone()
         .map(|rel| context.project_rel_to_repo_rel(Path::new(&rel)));
 
+    // When the filter resolves to a tracked file, walk history rename-aware so
+    // entries before a rename are still surfaced and tagged with [RENAMED].
+    // For directories or untracked paths fall back to a plain pathspec filter.
+    if let Some(repo_rel) = filter_path.as_deref()
+        && is_file_in_head(&context.repo, repo_rel)
+    {
+        return rename_aware_log(
+            &context,
+            repo_rel,
+            trimmed_path.as_deref().unwrap_or(""),
+            effective_limit,
+        );
+    }
+
     let walker = match context.revwalk_head() {
         Ok(w) => w,
         Err(err) => return format!("Cannot retrieve git log: {err}"),
@@ -171,7 +185,123 @@ pub fn get_git_log(analyzer: &dyn IAnalyzer, params: GetGitLogParams) -> String 
     out.push_str(">\n");
 
     for commit in &commits {
-        append_log_entry(&mut out, &context.repo, commit);
+        append_log_entry(&mut out, &context.repo, commit, None, None);
+    }
+
+    out.push_str("</git_log>");
+    out
+}
+
+fn is_file_in_head(repo: &Repository, rel: &Path) -> bool {
+    let Ok(head_commit) = repo.head().and_then(|h| h.peel_to_commit()) else {
+        return false;
+    };
+    let Ok(tree) = head_commit.tree() else {
+        return false;
+    };
+    tree.get_path(rel)
+        .map(|e| e.kind() == Some(ObjectType::Blob))
+        .unwrap_or(false)
+}
+
+fn rename_aware_log(
+    context: &GitContext,
+    head_rel: &Path,
+    display_path: &str,
+    effective_limit: usize,
+) -> String {
+    let walker = match context.revwalk_head() {
+        Ok(w) => w,
+        Err(err) => return format!("Cannot retrieve git log: {err}"),
+    };
+
+    // `current_target` is the path the file holds at the parent of the
+    // commit currently being inspected — i.e. the name we expect to find on
+    // the "new" side of the diff for that commit. When the commit renames
+    // the file, we follow the old name into ancestors.
+    let mut current_target: PathBuf = head_rel.to_path_buf();
+    // Collected entries in walked order (newest → oldest). Stored as
+    // (commit, currentPath, nextPath) per brokk's naming: currentPath is
+    // what the file was called before the commit, nextPath after.
+    let mut entries: Vec<(Commit<'_>, PathBuf, PathBuf)> = Vec::new();
+
+    for oid in walker.flatten() {
+        let Ok(commit) = context.repo.find_commit(oid) else {
+            continue;
+        };
+
+        let Ok(current_tree) = commit.tree() else {
+            continue;
+        };
+        let parent_tree = if commit.parent_count() == 0 {
+            None
+        } else {
+            commit.parent(0).and_then(|p| p.tree()).ok()
+        };
+
+        let mut opts = DiffOptions::new();
+        opts.include_untracked(false);
+        let Ok(mut diff) = context.repo.diff_tree_to_tree(
+            parent_tree.as_ref(),
+            Some(&current_tree),
+            Some(&mut opts),
+        ) else {
+            continue;
+        };
+
+        let mut find_opts = DiffFindOptions::new();
+        find_opts.renames(true);
+        let _ = diff.find_similar(Some(&mut find_opts));
+
+        // Locate a delta whose new-side path equals our current target.
+        let mut matched: Option<(PathBuf, PathBuf, bool)> = None;
+        for delta in diff.deltas() {
+            let Some(new_path) = delta.new_file().path() else {
+                continue;
+            };
+            if new_path == current_target {
+                let old_path = delta
+                    .old_file()
+                    .path()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| new_path.to_path_buf());
+                let is_rename =
+                    matches!(delta.status(), Delta::Renamed | Delta::Copied) && old_path != new_path;
+                matched = Some((old_path, new_path.to_path_buf(), is_rename));
+                break;
+            }
+        }
+
+        if let Some((old_path, new_path, is_rename)) = matched {
+            entries.push((commit, old_path.clone(), new_path));
+            if entries.len() >= effective_limit {
+                break;
+            }
+            if is_rename {
+                current_target = old_path;
+            }
+        }
+    }
+
+    if entries.is_empty() {
+        return format!("No history found for path: {display_path}");
+    }
+
+    let mut out = String::new();
+    out.push_str("<git_log");
+    let _ = write!(out, " path=\"{}\"", escape_xml_attr(display_path));
+    out.push_str(">\n");
+
+    for (commit, current_path, next_path) in &entries {
+        let current_display = current_path.to_string_lossy();
+        let next_display = next_path.to_string_lossy();
+        append_log_entry(
+            &mut out,
+            &context.repo,
+            commit,
+            Some(&current_display),
+            Some(&next_display),
+        );
     }
 
     out.push_str("</git_log>");
@@ -305,8 +435,14 @@ impl GitContext {
             .repo
             .revwalk()
             .map_err(|err| format!("revwalk init failed: {err}"))?;
+        // Topological + time order matches `git log`'s default: descendants
+        // always appear before their ancestors, with time as a tie-breaker.
+        // Pure time order breaks when sibling commits share a timestamp
+        // (test fixtures hit this; tight CI builds occasionally too) and
+        // would let rename-following see an ancestor before the child that
+        // performs the rename, losing the trail.
         walker
-            .set_sorting(Sort::TIME)
+            .set_sorting(Sort::TOPOLOGICAL | Sort::TIME)
             .map_err(|err| format!("revwalk sort failed: {err}"))?;
         walker
             .push_head()
@@ -322,7 +458,13 @@ impl GitContext {
     }
 }
 
-fn append_log_entry(out: &mut String, repo: &Repository, commit: &Commit<'_>) {
+fn append_log_entry(
+    out: &mut String,
+    repo: &Repository,
+    commit: &Commit<'_>,
+    current_path: Option<&str>,
+    next_path: Option<&str>,
+) {
     let full_hash = commit.id().to_string();
     let short_hash: String = full_hash.chars().take(7).collect();
     let author = commit
@@ -334,11 +476,21 @@ fn append_log_entry(out: &mut String, repo: &Repository, commit: &Commit<'_>) {
 
     let _ = write!(
         out,
-        "<entry hash=\"{}\" author=\"{}\" date=\"{}\">\n",
+        "<entry hash=\"{}\" author=\"{}\" date=\"{}\"",
         escape_xml_attr(&short_hash),
         escape_xml_attr(&author),
         escape_xml_attr(&date)
     );
+    if let Some(p) = current_path {
+        let _ = write!(out, " path=\"{}\"", escape_xml_attr(p));
+    }
+    out.push_str(">\n");
+
+    if let (Some(cur), Some(next)) = (current_path, next_path)
+        && cur != next
+    {
+        let _ = writeln!(out, "[RENAMED] {cur} -> {next}");
+    }
 
     let message = commit.message().unwrap_or("").trim_end();
     if !message.is_empty() {
@@ -736,6 +888,67 @@ mod tests {
         );
         assert!(out.starts_with("<git_log>"));
         assert_eq!(out.matches("<entry ").count(), 2);
+    }
+
+    #[test]
+    fn get_git_log_follows_renames_on_tracked_file() {
+        // Create a.txt, rename to renamed.txt, then modify renamed.txt.
+        // History for "renamed.txt" must surface all three commits with a
+        // [RENAMED] marker on the rename commit.
+        let fix = GitFixture::new();
+        fix.commit("create a", &[("a.txt", "line one\n")]);
+
+        // Rename a.txt → renamed.txt: delete the old, add the new with same
+        // contents so libgit2 rename detection picks it up via find_similar.
+        let repo = Repository::open(&fix.repo_path).expect("open repo");
+        std::fs::remove_file(fix.repo_path.join("a.txt")).expect("rm a.txt");
+        std::fs::write(fix.repo_path.join("renamed.txt"), "line one\n").expect("write renamed");
+        let mut index = repo.index().expect("index");
+        index.remove_path(Path::new("a.txt")).expect("remove a.txt");
+        index
+            .add_path(Path::new("renamed.txt"))
+            .expect("add renamed.txt");
+        index.write().expect("write index");
+        let tree_oid = index.write_tree().expect("write tree");
+        let tree = repo.find_tree(tree_oid).expect("tree");
+        let sig = git2::Signature::now("Tester", "test@example.com").expect("sig");
+        let head_commit = repo
+            .head()
+            .and_then(|h| h.peel_to_commit())
+            .expect("head commit");
+        repo.commit(
+            Some("HEAD"),
+            &sig,
+            &sig,
+            "rename a.txt to renamed.txt",
+            &tree,
+            &[&head_commit],
+        )
+        .expect("rename commit");
+
+        fix.commit("touch renamed", &[("renamed.txt", "line one\nline two\n")]);
+
+        let out = get_git_log(
+            fix.analyzer.analyzer(),
+            GetGitLogParams {
+                path: Some("renamed.txt".to_string()),
+                limit: 10,
+            },
+        );
+
+        assert!(out.contains("<git_log path=\"renamed.txt\">"), "got: {out}");
+        // Both the rename commit and the post-rename modify commit are
+        // surfaced; the original create-a.txt commit too (under its old
+        // name).
+        assert!(out.contains("touch renamed"), "got: {out}");
+        assert!(out.contains("rename a.txt to renamed.txt"), "got: {out}");
+        assert!(out.contains("create a"), "got: {out}");
+        assert!(
+            out.contains("[RENAMED] a.txt -> renamed.txt"),
+            "expected rename marker, got: {out}"
+        );
+        // Pre-rename commit's path attribute should reference the old name.
+        assert!(out.contains("path=\"a.txt\""), "got: {out}");
     }
 
     #[test]
