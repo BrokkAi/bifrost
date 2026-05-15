@@ -567,6 +567,50 @@ fn list_tools_result() -> Value {
                     "required": ["file_paths"]
                 }),
             ),
+            tool_descriptor(
+                "report_comment_density_for_code_unit",
+                "Java comment density for one symbol identified by fully qualified name. Reports header vs inline comment line counts, declaration span lines, and rolled-up totals for class-like units. Output format matches the brokk-core MCP byte-for-byte.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "fq_name": {
+                            "type": "string",
+                            "description": "Fully qualified name (e.g. com.example.MyClass or com.example.MyClass.method)."
+                        },
+                        "max_lines": {
+                            "type": "integer",
+                            "default": 120,
+                            "description": "Maximum output lines; values <= 0 default to 120."
+                        }
+                    },
+                    "required": ["fq_name"]
+                }),
+            ),
+            tool_descriptor(
+                "report_comment_density_for_files",
+                "Java comment density tables for the given source files: one section per file and one row per top-level declaration with own and rolled-up header / inline / span line counts. Non-Java files are skipped with a one-line placeholder. Output format matches the brokk-core MCP byte-for-byte.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "file_paths": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Project-relative paths of files to analyze."
+                        },
+                        "max_top_level_rows": {
+                            "type": "integer",
+                            "default": 60,
+                            "description": "Maximum declaration rows across all files; values <= 0 default to 60."
+                        },
+                        "max_files": {
+                            "type": "integer",
+                            "default": 25,
+                            "description": "Maximum files to include; values <= 0 default to 25."
+                        }
+                    },
+                    "required": ["file_paths"]
+                }),
+            ),
         ]
     })
 }

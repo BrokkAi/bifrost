@@ -1365,7 +1365,7 @@ fn node_range(node: Node<'_>) -> Range {
     }
 }
 
-fn expanded_comment_start(source: &str, start_byte: usize) -> usize {
+pub(crate) fn expanded_comment_start(source: &str, start_byte: usize) -> usize {
     let line_starts = compute_line_starts(source);
     let line_index = find_line_index_for_offset(&line_starts, start_byte);
 
