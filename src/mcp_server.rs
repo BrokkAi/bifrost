@@ -376,7 +376,7 @@ fn list_tools_result() -> Value {
             ),
             tool_descriptor(
                 "search_git_commit_messages",
-                "Regex search across the workspace's git commit messages, returning matching commits with short hash, summary, and author.",
+                "Regex search across the workspace's git commit messages. Returns matching commits as a sequence of <commit id=\"...\"> blocks, each containing <message> and <edited_files>.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -386,9 +386,10 @@ fn list_tools_result() -> Value {
                         },
                         "limit": {
                             "type": "integer",
-                            "default": 50,
+                            "default": 20,
                             "minimum": 1,
-                            "description": "Maximum number of matching commits to return."
+                            "maximum": 100,
+                            "description": "Maximum number of matching commits to return (capped at 100)."
                         }
                     },
                     "required": ["pattern"]
@@ -396,7 +397,7 @@ fn list_tools_result() -> Value {
             ),
             tool_descriptor(
                 "get_git_log",
-                "Return recent commits, optionally filtered to those that touch a given path.",
+                "Return recent commits, optionally filtered to those that touch a given path. Output is a <git_log> wrapper containing <entry> elements with hash, author, date and the commit message body.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -406,16 +407,17 @@ fn list_tools_result() -> Value {
                         },
                         "limit": {
                             "type": "integer",
-                            "default": 50,
+                            "default": 20,
                             "minimum": 1,
-                            "description": "Maximum number of commits to return."
+                            "maximum": 100,
+                            "description": "Maximum number of commits to return (capped at 100)."
                         }
                     }
                 }),
             ),
             tool_descriptor(
                 "get_commit_diff",
-                "Return the unified diff for a single commit versus its parent, truncated by file count and lines per file. Root commits are diffed against the empty tree.",
+                "Return the unified diff for a single commit versus its parent (or the empty tree for root commits), wrapped in a <commit_diff> element with revision, short_hash, files_total, files_included and truncated attributes. Truncated by file count and lines per file.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -427,13 +429,15 @@ fn list_tools_result() -> Value {
                             "type": "integer",
                             "default": 10,
                             "minimum": 1,
-                            "description": "Maximum number of files to include in the diff."
+                            "maximum": 100,
+                            "description": "Maximum number of files to include in the diff (capped at 100)."
                         },
                         "lines_per_file": {
                             "type": "integer",
                             "default": 1000,
                             "minimum": 1,
-                            "description": "Maximum number of diff lines per file."
+                            "maximum": 5000,
+                            "description": "Maximum number of diff lines per file (capped at 5000)."
                         }
                     },
                     "required": ["revision"]
@@ -651,7 +655,41 @@ fn map_service_error(code: SearchToolsServiceErrorCode, message: String) -> (i64
     (jsonrpc_code, message)
 }
 
+// Convention between this function and `SearchToolsService::decode_and_run`:
+//
+// - If a tool handler returns a serde struct (object/array), `to_value`
+//   produces a JSON object/array. We render it as pretty-printed JSON in
+//   `content[0].text` AND attach the structured value as
+//   `structuredContent` so MCP clients can choose either form.
+//
+// - If a tool handler returns a `String`, `to_value` produces
+//   `Value::String`. We treat that as the canonical text representation
+//   of the tool's output (the git-history tools take this path to mirror
+//   brokk-core's XML-style textual output) and emit it verbatim in
+//   `content[0].text`, with no `structuredContent`.
+//
+// The convention is checked here, at the wire boundary, rather than
+// expressed in the handler signature. A future tool returning a string
+// will automatically get the text-shaped envelope. If a handler returns
+// something else that happens to serialize to `Value::String` (e.g. a
+// newtype around `String`), that is also fine — it is treated as text.
+//
+// To break this convention cleanly, introduce a `ToolOutput` enum in
+// `searchtools_service` and have `decode_and_run` return it, then match
+// on the variant here. Until that refactor, the two layers must keep
+// this comment in sync.
 fn tool_success_result(structured: Value) -> Value {
+    if let Value::String(text) = structured {
+        return json!({
+            "content": [
+                {
+                    "type": "text",
+                    "text": text,
+                }
+            ],
+            "isError": false,
+        });
+    }
     let text = serde_json::to_string_pretty(&structured)
         .unwrap_or_else(|_| "Failed to pretty-print tool result".to_string());
     json!({
