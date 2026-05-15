@@ -178,11 +178,10 @@ impl SearchToolsService {
             "xml_select" => self.decode_and_run(arguments, |workspace, params| {
                 xml_select(workspace.analyzer(), params)
             }),
-            "compute_cyclomatic_complexity" => {
-                self.decode_and_run(arguments, |workspace, params| {
+            "compute_cyclomatic_complexity" => self
+                .decode_and_run(arguments, |workspace, params| {
                     compute_cyclomatic_complexity(workspace.analyzer(), params)
-                })
-            }
+                }),
             _ => Err(SearchToolsServiceError::unknown_tool(format!(
                 "Unknown tool: {name}"
             ))),
