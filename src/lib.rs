@@ -4,6 +4,7 @@ pub mod git_tools;
 pub mod hash;
 pub mod lsp;
 pub mod mcp_server;
+mod path_utils;
 pub mod profiling;
 mod project_watcher;
 #[cfg(feature = "python")]
