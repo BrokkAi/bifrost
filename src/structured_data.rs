@@ -414,95 +414,62 @@ fn run_xpath(
     output: &XmlSelectOutput,
     attr_name: Option<&str>,
 ) -> Result<Vec<String>, String> {
-    use sxd_document::parser;
-    use sxd_xpath::{Context, Factory, Value};
+    use xee_xpath::{Documents, Queries, Query};
 
-    let package = parser::parse(content).map_err(|err| format!("xml parse error: {err}"))?;
-    let document = package.as_document();
+    let mut documents = Documents::new();
+    let doc_handle = documents
+        .add_string_without_uri(content)
+        .map_err(|err| format!("xml parse error: {err:?}"))?;
 
-    let factory = Factory::new();
-    let compiled = factory
-        .build(xpath)
-        .map_err(|err| format!("xpath compile error: {err}"))?
-        .ok_or_else(|| "xpath compilation returned no expression".to_string())?;
-    let ctx = Context::new();
+    let queries = Queries::default();
+    let compiled = queries
+        .sequence(xpath)
+        .map_err(|err| format!("xpath compile error: {err:?}"))?;
 
-    let value = compiled
-        .evaluate(&ctx, document.root())
-        .map_err(|err| format!("xpath evaluation error: {err}"))?;
+    let sequence = compiled
+        .execute(&mut documents, doc_handle)
+        .map_err(|err| format!("xpath evaluation error: {err:?}"))?;
 
-    let matches = match value {
-        Value::Nodeset(nodes) => nodes
-            .document_order()
-            .into_iter()
-            .map(|node| format_node(node, output, attr_name))
-            .collect(),
-        Value::Boolean(b) => vec![b.to_string()],
-        Value::Number(n) => vec![n.to_string()],
-        Value::String(s) => vec![s],
-    };
-
+    let xot = documents.xot();
+    let mut matches = Vec::new();
+    for item in sequence.iter() {
+        matches.push(format_xee_item(&item, xot, output, attr_name));
+    }
     Ok(matches)
 }
 
-fn format_node(
-    node: sxd_xpath::nodeset::Node<'_>,
+fn format_xee_item(
+    item: &xee_xpath::Item,
+    xot: &xot::Xot,
     output: &XmlSelectOutput,
     attr_name: Option<&str>,
 ) -> String {
-    use sxd_xpath::nodeset::Node;
+    use xee_xpath::Item;
     match output {
-        XmlSelectOutput::Text => node.string_value(),
+        XmlSelectOutput::Text => item.string_value(xot).unwrap_or_default(),
         XmlSelectOutput::Attribute => {
             let Some(name) = attr_name else {
                 return String::new();
             };
-            match node {
-                Node::Element(el) => el
-                    .attribute(name)
-                    .map(|a| a.value().to_string())
+            let Item::Node(node) = item else {
+                return String::new();
+            };
+            match xot.value(*node) {
+                xot::Value::Element(_) => xot
+                    .name(name)
+                    .and_then(|name_id| xot.get_attribute(*node, name_id))
+                    .map(String::from)
                     .unwrap_or_default(),
-                Node::Attribute(a) => a.value().to_string(),
+                xot::Value::Attribute(attr) => attr.value().to_string(),
                 _ => String::new(),
             }
         }
-        XmlSelectOutput::OuterXml => match node {
-            Node::Element(el) => format_element_outer(el),
-            Node::Text(t) => t.text().to_string(),
-            Node::Attribute(a) => format!("{}=\"{}\"", a.name().local_part(), a.value()),
-            _ => String::new(),
+        XmlSelectOutput::OuterXml => match item {
+            Item::Node(node) => xot.to_string(*node).unwrap_or_default(),
+            Item::Atomic(_) => item.string_value(xot).unwrap_or_default(),
+            Item::Function(_) => String::new(),
         },
     }
-}
-
-fn format_element_outer(element: sxd_document::dom::Element<'_>) -> String {
-    let mut out = String::new();
-    let name = element.name().local_part();
-    out.push('<');
-    out.push_str(name);
-    for attr in element.attributes() {
-        out.push(' ');
-        out.push_str(attr.name().local_part());
-        out.push_str("=\"");
-        out.push_str(attr.value());
-        out.push('"');
-    }
-    out.push('>');
-    for child in element.children() {
-        match child {
-            sxd_document::dom::ChildOfElement::Element(child_el) => {
-                out.push_str(&format_element_outer(child_el));
-            }
-            sxd_document::dom::ChildOfElement::Text(t) => {
-                out.push_str(t.text());
-            }
-            _ => {}
-        }
-    }
-    out.push_str("</");
-    out.push_str(name);
-    out.push('>');
-    out
 }
 
 fn normalize_pattern(pattern: &str) -> String {
