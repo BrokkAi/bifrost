@@ -1,7 +1,8 @@
 use crate::analyzer::{IAnalyzer, ProjectFile};
+use crate::path_utils::{normalize_pattern, rel_path_string};
 use glob::{MatchOptions, Pattern};
 use rayon::prelude::*;
-use regex::RegexBuilder;
+use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -16,6 +17,10 @@ const DEFAULT_FIND_FILES_CONTAINING_LIMIT: usize = 50;
 const DEFAULT_SEARCH_FILE_CONTENTS_CONTEXT: usize = 2;
 const DEFAULT_LIST_FILES_MAX_ENTRIES: usize = 500;
 const MAX_PER_FILE_SEARCH_MATCHES: usize = 50;
+const MAX_FILE_BYTES_FOR_CONTENT_SEARCH: u64 = 5 * 1024 * 1024;
+const MAX_CONTEXT_LINES: usize = 20;
+const MAX_TOTAL_SEARCH_MATCHES: usize = 500;
+const MAX_LINES_PER_FILE_SCAN: usize = 200_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetFileContentsParams {
@@ -97,6 +102,7 @@ pub struct SearchFileContentsResult {
 pub struct FileMatchGroup {
     pub path: String,
     pub matches: Vec<LineMatch>,
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -148,7 +154,11 @@ pub fn get_file_contents(
             continue;
         }
 
-        let rel = Path::new(&normalize_pattern(trimmed)).to_path_buf();
+        let Some(rel) = workspace_rel_path(trimmed) else {
+            not_found.push(trimmed.to_string());
+            continue;
+        };
+
         match project.file_by_rel_path(&rel) {
             Some(file) => match file.read_to_string() {
                 Ok(content) => files.push(FileContent {
@@ -239,28 +249,7 @@ pub fn find_files_containing(
     let project = analyzer.project();
     let limit = params.limit.max(1);
 
-    let mut invalid_patterns = Vec::new();
-    let regexes: Vec<regex::Regex> = params
-        .patterns
-        .iter()
-        .filter_map(|raw| {
-            let pattern = raw.trim();
-            if pattern.is_empty() {
-                return None;
-            }
-            match RegexBuilder::new(pattern)
-                .case_insensitive(params.case_insensitive)
-                .build()
-            {
-                Ok(regex) => Some(regex),
-                Err(_) => {
-                    invalid_patterns.push(raw.clone());
-                    None
-                }
-            }
-        })
-        .collect();
-
+    let (regexes, invalid_patterns) = compile_regexes(&params.patterns, params.case_insensitive);
     if regexes.is_empty() {
         return FindFilesContainingResult {
             files: Vec::new(),
@@ -284,7 +273,7 @@ pub fn find_files_containing(
     let mut matched: Vec<String> = files
         .into_par_iter()
         .filter_map(|file| {
-            if file.is_binary().unwrap_or(true) {
+            if !is_searchable_text_file(&file) {
                 return None;
             }
             let contents = file.read_to_string().ok()?;
@@ -313,28 +302,7 @@ pub fn search_file_contents(
 ) -> SearchFileContentsResult {
     let project = analyzer.project();
 
-    let mut invalid_patterns = Vec::new();
-    let regexes: Vec<regex::Regex> = params
-        .patterns
-        .iter()
-        .filter_map(|raw| {
-            let pattern = raw.trim();
-            if pattern.is_empty() {
-                return None;
-            }
-            match RegexBuilder::new(pattern)
-                .case_insensitive(params.case_insensitive)
-                .build()
-            {
-                Ok(regex) => Some(regex),
-                Err(_) => {
-                    invalid_patterns.push(raw.clone());
-                    None
-                }
-            }
-        })
-        .collect();
-
+    let (regexes, invalid_patterns) = compile_regexes(&params.patterns, params.case_insensitive);
     if regexes.is_empty() {
         return SearchFileContentsResult {
             matches: Vec::new(),
@@ -363,7 +331,7 @@ pub fn search_file_contents(
         }
     };
 
-    let context = params.context_lines;
+    let context = params.context_lines.min(MAX_CONTEXT_LINES);
     let candidates: Vec<ProjectFile> = all_files
         .into_iter()
         .filter(|file| {
@@ -377,14 +345,23 @@ pub fn search_file_contents(
     let mut groups: Vec<FileMatchGroup> = candidates
         .into_par_iter()
         .filter_map(|file| {
-            if file.is_binary().unwrap_or(true) {
+            if !is_searchable_text_file(&file) {
                 return None;
             }
             let contents = file.read_to_string().ok()?;
+            // Bound the per-file line count before allocating `Vec<&str>`.
+            // A 5 MB single-byte-line file would otherwise produce ~5M slices
+            // (≈120 MB of Vec headers) across rayon workers — a memory-pressure
+            // amplifier despite the byte cap.
+            if contents.bytes().filter(|&b| b == b'\n').count() > MAX_LINES_PER_FILE_SCAN {
+                return None;
+            }
             let lines: Vec<&str> = contents.split('\n').collect();
             let mut hits = Vec::new();
+            let mut file_truncated = false;
             for (idx, line) in lines.iter().enumerate() {
                 if hits.len() >= MAX_PER_FILE_SEARCH_MATCHES {
+                    file_truncated = true;
                     break;
                 }
                 if regexes.iter().any(|regex| regex.is_match(line)) {
@@ -412,15 +389,30 @@ pub fn search_file_contents(
                 Some(FileMatchGroup {
                     path: rel_path_string(&file),
                     matches: hits,
+                    truncated: file_truncated,
                 })
             }
         })
         .collect();
 
     groups.sort_by(|left, right| left.path.cmp(&right.path));
+
+    let mut truncated = groups.iter().any(|group| group.truncated);
+    let mut total: usize = 0;
+    let mut keep = groups.len();
+    for (idx, group) in groups.iter().enumerate() {
+        total = total.saturating_add(group.matches.len());
+        if total > MAX_TOTAL_SEARCH_MATCHES {
+            keep = idx;
+            truncated = true;
+            break;
+        }
+    }
+    groups.truncate(keep);
+
     SearchFileContentsResult {
         matches: groups,
-        truncated: false,
+        truncated,
         invalid_patterns,
     }
 }
@@ -480,7 +472,11 @@ pub fn skim_files(analyzer: &dyn IAnalyzer, params: SkimFilesParams) -> SkimFile
             continue;
         }
 
-        let rel = Path::new(&normalize_pattern(trimmed)).to_path_buf();
+        let Some(rel) = workspace_rel_path(trimmed) else {
+            not_found.push(trimmed.to_string());
+            continue;
+        };
+
         let Some(file) = project.file_by_rel_path(&rel) else {
             not_found.push(trimmed.to_string());
             continue;
@@ -520,12 +516,72 @@ fn code_unit_kind_label(code_unit: &crate::analyzer::CodeUnit) -> String {
     }
 }
 
-fn normalize_pattern(pattern: &str) -> String {
-    pattern.replace('\\', "/")
+// Convert a user-supplied path string to a workspace-relative `PathBuf`,
+// rejecting absolute paths so they cannot reach the `assert!` inside
+// `ProjectFile::new`. The downstream `normalize()` strips `..` components,
+// so traversal escapes are already contained — but absolute paths slip past
+// that and panic the server, so we reject them up front. We also reject
+// Windows drive-relative inputs (e.g. `C:foo`) which on Windows are not
+// absolute but resolve against the per-drive CWD, escaping the workspace.
+fn workspace_rel_path(input: &str) -> Option<std::path::PathBuf> {
+    let normalized = normalize_pattern(input);
+    let trimmed = normalized.trim_start_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    if has_drive_letter_prefix(trimmed) {
+        return None;
+    }
+    let path = Path::new(trimmed);
+    if path.is_absolute() || path.has_root() {
+        return None;
+    }
+    Some(path.to_path_buf())
 }
 
-fn rel_path_string(file: &ProjectFile) -> String {
-    file.rel_path().to_string_lossy().replace('\\', "/")
+fn has_drive_letter_prefix(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!(
+        (chars.next(), chars.next()),
+        (Some(c1), Some(':')) if c1.is_ascii_alphabetic()
+    )
+}
+
+fn compile_regexes(patterns: &[String], case_insensitive: bool) -> (Vec<Regex>, Vec<String>) {
+    let mut invalid_patterns = Vec::new();
+    let regexes: Vec<Regex> = patterns
+        .iter()
+        .filter_map(|raw| {
+            let pattern = raw.trim();
+            if pattern.is_empty() {
+                return None;
+            }
+            match RegexBuilder::new(pattern)
+                .case_insensitive(case_insensitive)
+                .build()
+            {
+                Ok(regex) => Some(regex),
+                Err(_) => {
+                    invalid_patterns.push(raw.clone());
+                    None
+                }
+            }
+        })
+        .collect();
+    (regexes, invalid_patterns)
+}
+
+// Reject binary files and files large enough to risk OOM if read into memory.
+// `is_binary` sniffs only the first 8 KB, so the size cap protects against
+// text-prefixed but otherwise massive files (generated artifacts, blobs).
+fn is_searchable_text_file(file: &ProjectFile) -> bool {
+    if file.is_binary().unwrap_or(true) {
+        return false;
+    }
+    match std::fs::metadata(file.abs_path()) {
+        Ok(meta) => meta.len() <= MAX_FILE_BYTES_FOR_CONTENT_SEARCH,
+        Err(_) => false,
+    }
 }
 
 fn default_find_filenames_limit() -> usize {
@@ -608,6 +664,85 @@ mod tests {
         );
         assert_eq!(result.files.len(), 1);
         assert_eq!(result.files[0].path, "src/a.rs");
+    }
+
+    #[test]
+    fn get_file_contents_rejects_absolute_paths_without_panic() {
+        let fix = Fixture::new(&[("src/a.rs", "x")]);
+        let result = get_file_contents(
+            fix.analyzer.analyzer(),
+            GetFileContentsParams {
+                filenames: vec![
+                    "/etc/passwd".to_string(),
+                    "/".to_string(),
+                    "src/a.rs".to_string(),
+                ],
+            },
+        );
+        assert_eq!(result.files.len(), 1);
+        assert_eq!(result.files[0].path, "src/a.rs");
+        assert_eq!(
+            result.not_found,
+            vec!["/etc/passwd".to_string(), "/".to_string()]
+        );
+    }
+
+    #[test]
+    fn get_file_contents_rejects_windows_drive_relative_paths() {
+        let fix = Fixture::new(&[("src/a.rs", "x")]);
+        let result = get_file_contents(
+            fix.analyzer.analyzer(),
+            GetFileContentsParams {
+                filenames: vec![
+                    "C:foo".to_string(),
+                    "C:".to_string(),
+                    "d:secrets".to_string(),
+                ],
+            },
+        );
+        assert!(result.files.is_empty());
+        assert_eq!(
+            result.not_found,
+            vec![
+                "C:foo".to_string(),
+                "C:".to_string(),
+                "d:secrets".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn search_file_contents_skips_files_with_too_many_lines() {
+        // 200_001 newlines exceeds MAX_LINES_PER_FILE_SCAN; the file must be
+        // skipped rather than allocating a `Vec<&str>` for every line.
+        let body = "x\n".repeat(MAX_LINES_PER_FILE_SCAN + 1);
+        let fix = Fixture::new(&[("src/big.txt", body.as_str())]);
+        let result = search_file_contents(
+            fix.analyzer.analyzer(),
+            SearchFileContentsParams {
+                patterns: vec!["x".to_string()],
+                filepath: None,
+                context_lines: 0,
+                case_insensitive: false,
+            },
+        );
+        assert!(
+            result.matches.is_empty(),
+            "expected no matches, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn skim_files_rejects_absolute_paths_without_panic() {
+        let fix = Fixture::new(&[("a.rs", "fn a() {}\n")]);
+        let result = skim_files(
+            fix.analyzer.analyzer(),
+            SkimFilesParams {
+                file_paths: vec!["/etc/passwd".to_string()],
+            },
+        );
+        assert!(result.files.is_empty());
+        assert_eq!(result.not_found, vec!["/etc/passwd"]);
     }
 
     #[test]
@@ -698,6 +833,7 @@ mod tests {
         assert_eq!(result.matches.len(), 1);
         let group = &result.matches[0];
         assert_eq!(group.path, "src/a.rs");
+        assert!(!group.truncated);
         assert_eq!(group.matches.len(), 1);
         let hit = &group.matches[0];
         assert_eq!(hit.line, 3);
@@ -720,6 +856,46 @@ mod tests {
         );
         let paths: Vec<_> = result.matches.iter().map(|m| m.path.clone()).collect();
         assert_eq!(paths, vec!["src/a.rs"]);
+    }
+
+    #[test]
+    fn search_file_contents_marks_per_file_truncation() {
+        let mut body = String::new();
+        for _ in 0..(MAX_PER_FILE_SEARCH_MATCHES + 5) {
+            body.push_str("NEEDLE\n");
+        }
+        let fix = Fixture::new(&[("src/a.rs", body.as_str())]);
+        let result = search_file_contents(
+            fix.analyzer.analyzer(),
+            SearchFileContentsParams {
+                patterns: vec!["NEEDLE".to_string()],
+                filepath: None,
+                context_lines: 0,
+                case_insensitive: false,
+            },
+        );
+        assert_eq!(result.matches.len(), 1);
+        assert!(result.matches[0].truncated);
+        assert_eq!(result.matches[0].matches.len(), MAX_PER_FILE_SEARCH_MATCHES);
+        assert!(result.truncated);
+    }
+
+    #[test]
+    fn search_file_contents_clamps_context_lines() {
+        let fix = Fixture::new(&[("src/a.rs", "NEEDLE\n")]);
+        let result = search_file_contents(
+            fix.analyzer.analyzer(),
+            SearchFileContentsParams {
+                patterns: vec!["NEEDLE".to_string()],
+                filepath: None,
+                context_lines: usize::MAX,
+                case_insensitive: false,
+            },
+        );
+        assert_eq!(result.matches.len(), 1);
+        // No panic from oversized context_lines, and only a single line in
+        // the file means before/after stay empty regardless of the cap.
+        assert!(result.matches[0].matches[0].before.is_empty());
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use crate::analyzer::{CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, Range};
+use crate::path_utils::{normalize_pattern, rel_path_string};
 use crate::profiling;
 use crate::relevance::{most_important_project_files, most_relevant_project_files};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
@@ -1403,16 +1404,8 @@ fn likely_file_target_extension(extension: &str) -> bool {
     )
 }
 
-fn normalize_pattern(pattern: &str) -> String {
-    pattern.replace('\\', "/")
-}
-
 fn is_glob_pattern(pattern: &str) -> bool {
     pattern.contains(['*', '?', '['])
-}
-
-fn rel_path_string(file: &ProjectFile) -> String {
-    file.rel_path().to_string_lossy().replace('\\', "/")
 }
 
 fn line_count(content: &str) -> usize {

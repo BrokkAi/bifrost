@@ -8,6 +8,8 @@ const DEFAULT_LOG_LIMIT: usize = 50;
 const DEFAULT_SEARCH_LIMIT: usize = 50;
 const DEFAULT_DIFF_MAX_FILES: usize = 10;
 const DEFAULT_DIFF_LINES_PER_FILE: usize = 1000;
+const MAX_DIFF_FILES: usize = 100;
+const MAX_DIFF_LINES_PER_FILE: usize = 5000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchGitCommitMessagesParams {
@@ -64,6 +66,19 @@ pub struct GetCommitDiffResult {
     pub files_included: usize,
     pub truncated: bool,
     pub error: Option<String>,
+}
+
+impl GetCommitDiffResult {
+    fn error(revision: String, message: String) -> Self {
+        Self {
+            revision,
+            diff: String::new(),
+            files_total: 0,
+            files_included: 0,
+            truncated: false,
+            error: Some(message),
+        }
+    }
 }
 
 pub fn search_git_commit_messages(
@@ -142,12 +157,27 @@ pub fn get_git_log(analyzer: &dyn IAnalyzer, params: GetGitLogParams) -> GetGitL
     };
 
     let limit = params.limit.max(1);
-    let filter_path = params
+    let trimmed_path = params
         .path
         .as_deref()
         .map(|raw| raw.trim().replace('\\', "/"))
-        .filter(|s| !s.is_empty())
-        .map(|rel| context.project_rel_to_repo_rel(Path::new(&rel)));
+        .filter(|s| !s.is_empty());
+    // Reject pathspec magic (`:(exclude)`, `:!`, `:(glob)`, …) before it
+    // reaches libgit2. Letting the caller smuggle a leading-colon magic
+    // pathspec would let them invert or broaden the per-path filter beyond
+    // what `path` advertises.
+    if let Some(raw) = trimmed_path.as_deref()
+        && raw.starts_with(':')
+    {
+        return GetGitLogResult {
+            commits: Vec::new(),
+            truncated: false,
+            error: Some(
+                "path filter starts with ':' — pathspec magic is not supported, pass a plain workspace-relative path".to_string(),
+            ),
+        };
+    }
+    let filter_path = trimmed_path.map(|rel| context.project_rel_to_repo_rel(Path::new(&rel)));
 
     let walker = match context.revwalk_head() {
         Ok(w) => w,
@@ -191,59 +221,39 @@ pub fn get_commit_diff(
     params: GetCommitDiffParams,
 ) -> GetCommitDiffResult {
     let revision = params.revision.trim().to_string();
+    if !is_safe_revision(&revision) {
+        return GetCommitDiffResult::error(
+            revision,
+            "revision contains unsupported syntax; pass a hex hash, branch, or tag name"
+                .to_string(),
+        );
+    }
     let context = match GitContext::open(analyzer.project().root()) {
         Ok(ctx) => ctx,
-        Err(err) => {
-            return GetCommitDiffResult {
-                revision,
-                diff: String::new(),
-                files_total: 0,
-                files_included: 0,
-                truncated: false,
-                error: Some(err),
-            };
-        }
+        Err(err) => return GetCommitDiffResult::error(revision, err),
     };
 
     let object = match context.repo.revparse_single(&revision) {
         Ok(obj) => obj,
         Err(err) => {
-            return GetCommitDiffResult {
+            return GetCommitDiffResult::error(
                 revision,
-                diff: String::new(),
-                files_total: 0,
-                files_included: 0,
-                truncated: false,
-                error: Some(format!("unable to resolve revision: {err}")),
-            };
+                format!("unable to resolve revision: {err}"),
+            );
         }
     };
 
     let commit = match object.peel_to_commit() {
         Ok(c) => c,
         Err(err) => {
-            return GetCommitDiffResult {
-                revision,
-                diff: String::new(),
-                files_total: 0,
-                files_included: 0,
-                truncated: false,
-                error: Some(format!("not a commit: {err}")),
-            };
+            return GetCommitDiffResult::error(revision, format!("not a commit: {err}"));
         }
     };
 
     let current_tree = match commit.tree() {
         Ok(t) => t,
         Err(err) => {
-            return GetCommitDiffResult {
-                revision,
-                diff: String::new(),
-                files_total: 0,
-                files_included: 0,
-                truncated: false,
-                error: Some(format!("commit tree missing: {err}")),
-            };
+            return GetCommitDiffResult::error(revision, format!("commit tree missing: {err}"));
         }
     };
 
@@ -253,14 +263,7 @@ pub fn get_commit_diff(
         match commit.parent(0).and_then(|p| p.tree()) {
             Ok(t) => Some(t),
             Err(err) => {
-                return GetCommitDiffResult {
-                    revision,
-                    diff: String::new(),
-                    files_total: 0,
-                    files_included: 0,
-                    truncated: false,
-                    error: Some(format!("parent tree missing: {err}")),
-                };
+                return GetCommitDiffResult::error(revision, format!("parent tree missing: {err}"));
             }
         }
     };
@@ -274,19 +277,12 @@ pub fn get_commit_diff(
     ) {
         Ok(d) => d,
         Err(err) => {
-            return GetCommitDiffResult {
-                revision,
-                diff: String::new(),
-                files_total: 0,
-                files_included: 0,
-                truncated: false,
-                error: Some(format!("diff failed: {err}")),
-            };
+            return GetCommitDiffResult::error(revision, format!("diff failed: {err}"));
         }
     };
 
-    let max_files = params.max_files.max(1);
-    let lines_per_file = params.lines_per_file.max(1);
+    let max_files = params.max_files.clamp(1, MAX_DIFF_FILES);
+    let lines_per_file = params.lines_per_file.clamp(1, MAX_DIFF_LINES_PER_FILE);
     let formatted = format_diff(&mut diff, max_files, lines_per_file);
 
     GetCommitDiffResult {
@@ -310,8 +306,21 @@ impl GitContext {
         let canonical = project_root
             .canonicalize()
             .map_err(|err| format!("cannot canonicalize project root: {err}"))?;
-        let repo = Repository::discover(&canonical)
-            .map_err(|err| format!("not a git repository: {err}"))?;
+        // Use `Repository::open` (no upward search). `Repository::discover`
+        // would walk parents looking for a `.git`, which can quietly attach
+        // bifrost to an enclosing repository (e.g. `~/.git`) and leak commit
+        // data from outside the workspace. Callers that need git operations
+        // on a subdirectory of a repo should activate the repo root first via
+        // `activate_workspace`, which normalizes to the nearest enclosing
+        // git root.
+        let repo = Repository::open(&canonical).map_err(|err| {
+            format!(
+                "not a git repository at project root ({}): {err}. \
+                 If the workspace is a subdirectory of a repository, call \
+                 activate_workspace to normalize to the git root.",
+                canonical.display()
+            )
+        })?;
         let workdir = repo
             .workdir()
             .ok_or_else(|| "git repository has no working directory".to_string())?
@@ -390,6 +399,15 @@ fn commit_touches_path(repo: &Repository, commit: &Commit<'_>, path: &Path) -> b
     diff.deltas().len() > 0
 }
 
+// Reject revparse syntax that triggers expensive walks or non-local lookups.
+// `:/regex` walks every reachable commit's message; `@{...}` resolves reflog
+// entries or upstream tracking; leading `-` would be parsed as an option-like
+// argument by some tools. We confine input to plain hashes, refs, and the
+// peel/parent suffixes (`^`, `~`, `^{}`).
+fn is_safe_revision(s: &str) -> bool {
+    !s.is_empty() && !s.starts_with('-') && !s.contains(':') && !s.contains("@{")
+}
+
 struct FormattedDiff {
     text: String,
     files_total: usize,
@@ -399,11 +417,12 @@ struct FormattedDiff {
 
 fn format_diff(diff: &mut Diff<'_>, max_files: usize, lines_per_file: usize) -> FormattedDiff {
     let files_total = diff.deltas().len();
-    let files_included = files_total.min(max_files);
+    let target = files_total.min(max_files);
     let mut truncated_overall = files_total > max_files;
     let mut output = String::new();
+    let mut files_included: usize = 0;
 
-    for idx in 0..files_included {
+    for idx in 0..target {
         let mut patch = match Patch::from_diff(diff, idx) {
             Ok(Some(p)) => p,
             _ => continue,
@@ -427,14 +446,14 @@ fn format_diff(diff: &mut Diff<'_>, max_files: usize, lines_per_file: usize) -> 
                 "... [truncated at {lines_per_file} lines for this file]\n"
             ));
         }
+        files_included += 1;
     }
 
     if files_total > files_included {
         truncated_overall = true;
+        let omitted = files_total - files_included;
         output.push_str(&format!(
-            "... [{} additional file(s) omitted; max_files={}]\n",
-            files_total - files_included,
-            max_files
+            "... [{omitted} additional file(s) omitted; max_files={max_files}]\n"
         ));
     }
 
@@ -557,6 +576,39 @@ mod tests {
     }
 
     #[test]
+    fn search_git_commit_messages_marks_truncated_when_over_limit() {
+        let fix = GitFixture::new();
+        fix.commit("c1", &[("a.txt", "1")]);
+        fix.commit("c2", &[("a.txt", "2")]);
+        fix.commit("c3", &[("a.txt", "3")]);
+        let result = search_git_commit_messages(
+            fix.analyzer.analyzer(),
+            SearchGitCommitMessagesParams {
+                pattern: ".".to_string(),
+                limit: 2,
+            },
+        );
+        assert!(result.truncated);
+        assert_eq!(result.matches.len(), 2);
+    }
+
+    #[test]
+    fn search_git_commit_messages_not_truncated_at_exact_limit() {
+        let fix = GitFixture::new();
+        fix.commit("c1", &[("a.txt", "1")]);
+        fix.commit("c2", &[("a.txt", "2")]);
+        let result = search_git_commit_messages(
+            fix.analyzer.analyzer(),
+            SearchGitCommitMessagesParams {
+                pattern: ".".to_string(),
+                limit: 2,
+            },
+        );
+        assert!(!result.truncated);
+        assert_eq!(result.matches.len(), 2);
+    }
+
+    #[test]
     fn get_git_log_filters_by_path() {
         let fix = GitFixture::new();
         fix.commit("c1", &[("a.txt", "1")]);
@@ -605,6 +657,7 @@ mod tests {
         assert!(result.error.is_none(), "error: {:?}", result.error);
         assert!(result.diff.contains("alpha"));
         assert_eq!(result.files_total, 1);
+        assert_eq!(result.files_included, 1);
     }
 
     #[test]
@@ -628,6 +681,44 @@ mod tests {
     }
 
     #[test]
+    fn get_commit_diff_truncates_per_file_lines() {
+        let mut body = String::new();
+        for i in 0..20 {
+            body.push_str(&format!("line{i}\n"));
+        }
+        let fix = GitFixture::new();
+        let oid = fix.commit("big file", &[("a.txt", body.as_str())]);
+        let result = get_commit_diff(
+            fix.analyzer.analyzer(),
+            GetCommitDiffParams {
+                revision: oid.to_string(),
+                max_files: 10,
+                lines_per_file: 3,
+            },
+        );
+        assert!(result.error.is_none(), "error: {:?}", result.error);
+        assert!(result.truncated);
+        assert!(result.diff.contains("truncated at 3 lines for this file"));
+    }
+
+    #[test]
+    fn get_commit_diff_clamps_oversized_max_files() {
+        let fix = GitFixture::new();
+        let oid = fix.commit("one file", &[("a.txt", "a\n")]);
+        let result = get_commit_diff(
+            fix.analyzer.analyzer(),
+            GetCommitDiffParams {
+                revision: oid.to_string(),
+                max_files: usize::MAX,
+                lines_per_file: usize::MAX,
+            },
+        );
+        assert!(result.error.is_none(), "error: {:?}", result.error);
+        assert_eq!(result.files_total, 1);
+        assert_eq!(result.files_included, 1);
+    }
+
+    #[test]
     fn get_commit_diff_reports_unknown_revision() {
         let fix = GitFixture::new();
         fix.commit("c1", &[("a.txt", "1")]);
@@ -640,5 +731,75 @@ mod tests {
             },
         );
         assert!(result.error.is_some());
+    }
+
+    #[test]
+    fn get_commit_diff_rejects_unsafe_revspec_syntax() {
+        let fix = GitFixture::new();
+        fix.commit("c1", &[("a.txt", "1")]);
+        for revision in [":/.", "HEAD@{1 year ago}", "-foo"] {
+            let result = get_commit_diff(
+                fix.analyzer.analyzer(),
+                GetCommitDiffParams {
+                    revision: revision.to_string(),
+                    max_files: 10,
+                    lines_per_file: 1000,
+                },
+            );
+            assert!(
+                result.error.is_some(),
+                "expected error for revision {revision:?}, got {result:?}"
+            );
+            assert!(result.diff.is_empty());
+        }
+    }
+
+    #[test]
+    fn get_git_log_rejects_pathspec_magic() {
+        // libgit2 honors pathspec magic like ":(exclude)" / ":!" by default,
+        // letting a caller invert or broaden the per-path filter. The
+        // wrapper rejects any path beginning with ':' instead of forwarding
+        // it to libgit2.
+        let fix = GitFixture::new();
+        fix.commit("c1", &[("a.txt", "1")]);
+        fix.commit("c2", &[("b.txt", "2")]);
+        for magic in [":(exclude)a.txt", ":!a.txt", ":(glob)**"] {
+            let result = get_git_log(
+                fix.analyzer.analyzer(),
+                GetGitLogParams {
+                    path: Some(magic.to_string()),
+                    limit: 10,
+                },
+            );
+            assert!(
+                result.error.is_some(),
+                "expected error for {magic:?}, got {result:?}"
+            );
+            assert!(result.commits.is_empty());
+        }
+    }
+
+    #[test]
+    fn git_context_refuses_workspace_not_at_repo_root() {
+        // Parent dir is a git repo; project root is a subdirectory without
+        // its own `.git`. Repository::open at the project root must fail
+        // rather than silently attaching to the parent repo.
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().canonicalize().expect("canonicalize tempdir");
+        Repository::init(&repo_path).expect("git init");
+        let nested = repo_path.join("nested");
+        fs::create_dir_all(&nested).expect("mkdir nested");
+        let project: Arc<dyn Project> =
+            Arc::new(FilesystemProject::new(nested.clone()).expect("project"));
+        let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+        let result = get_git_log(
+            workspace.analyzer(),
+            GetGitLogParams {
+                path: None,
+                limit: 10,
+            },
+        );
+        assert!(result.error.is_some(), "expected error, got {result:?}");
+        assert!(result.commits.is_empty());
     }
 }
