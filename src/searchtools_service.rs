@@ -1,6 +1,11 @@
 use crate::{
     AnalyzerConfig, FilesystemProject, Project, ProjectChangeWatcher, ProjectFile,
     WorkspaceAnalyzer,
+    file_tools::{
+        find_filenames, find_files_containing, get_file_contents, list_files, search_file_contents,
+        skim_files,
+    },
+    git_tools::{get_commit_diff, get_git_log, search_git_commit_messages},
     searchtools::{
         ActivateWorkspaceParams, ActiveWorkspaceResult, GetActiveWorkspaceParams,
         MostRelevantFilesParams, RefreshParams, get_summaries, get_symbol_locations,
@@ -134,6 +139,33 @@ impl SearchToolsService {
             }
             "scan_usages" => self.decode_and_run(arguments, |workspace, params| {
                 scan_usages(workspace.analyzer(), params)
+            }),
+            "get_file_contents" => self.decode_and_run(arguments, |workspace, params| {
+                get_file_contents(workspace.analyzer(), params)
+            }),
+            "find_filenames" => self.decode_and_run(arguments, |workspace, params| {
+                find_filenames(workspace.analyzer(), params)
+            }),
+            "find_files_containing" => self.decode_and_run(arguments, |workspace, params| {
+                find_files_containing(workspace.analyzer(), params)
+            }),
+            "search_file_contents" => self.decode_and_run(arguments, |workspace, params| {
+                search_file_contents(workspace.analyzer(), params)
+            }),
+            "list_files" => self.decode_and_run(arguments, |workspace, params| {
+                list_files(workspace.analyzer(), params)
+            }),
+            "skim_files" => self.decode_and_run(arguments, |workspace, params| {
+                skim_files(workspace.analyzer(), params)
+            }),
+            "search_git_commit_messages" => self.decode_and_run(arguments, |workspace, params| {
+                search_git_commit_messages(workspace.analyzer(), params)
+            }),
+            "get_git_log" => self.decode_and_run(arguments, |workspace, params| {
+                get_git_log(workspace.analyzer(), params)
+            }),
+            "get_commit_diff" => self.decode_and_run(arguments, |workspace, params| {
+                get_commit_diff(workspace.analyzer(), params)
             }),
             _ => Err(SearchToolsServiceError::unknown_tool(format!(
                 "Unknown tool: {name}"

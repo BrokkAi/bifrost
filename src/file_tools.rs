@@ -1,0 +1,811 @@
+use crate::analyzer::{IAnalyzer, ProjectFile};
+use glob::{MatchOptions, Pattern};
+use rayon::prelude::*;
+use regex::RegexBuilder;
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+
+const STRICT_SEPARATOR: MatchOptions = MatchOptions {
+    case_sensitive: true,
+    require_literal_separator: true,
+    require_literal_leading_dot: false,
+};
+
+const DEFAULT_FIND_FILENAMES_LIMIT: usize = 100;
+const DEFAULT_FIND_FILES_CONTAINING_LIMIT: usize = 50;
+const DEFAULT_SEARCH_FILE_CONTENTS_CONTEXT: usize = 2;
+const DEFAULT_LIST_FILES_MAX_ENTRIES: usize = 500;
+const MAX_PER_FILE_SEARCH_MATCHES: usize = 50;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetFileContentsParams {
+    pub filenames: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FindFilenamesParams {
+    pub patterns: Vec<String>,
+    #[serde(default = "default_find_filenames_limit")]
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FindFilesContainingParams {
+    pub patterns: Vec<String>,
+    #[serde(default = "default_find_files_containing_limit")]
+    pub limit: usize,
+    #[serde(default)]
+    pub case_insensitive: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchFileContentsParams {
+    pub patterns: Vec<String>,
+    #[serde(default)]
+    pub filepath: Option<String>,
+    #[serde(default = "default_search_file_contents_context")]
+    pub context_lines: usize,
+    #[serde(default)]
+    pub case_insensitive: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListFilesParams {
+    pub directory_path: String,
+    #[serde(default = "default_list_files_max_entries")]
+    pub max_entries: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkimFilesParams {
+    pub file_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GetFileContentsResult {
+    pub files: Vec<FileContent>,
+    pub not_found: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FileContent {
+    pub path: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FindFilenamesResult {
+    pub files: Vec<String>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FindFilesContainingResult {
+    pub files: Vec<String>,
+    pub truncated: bool,
+    pub invalid_patterns: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchFileContentsResult {
+    pub matches: Vec<FileMatchGroup>,
+    pub truncated: bool,
+    pub invalid_patterns: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FileMatchGroup {
+    pub path: String,
+    pub matches: Vec<LineMatch>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LineMatch {
+    pub line: usize,
+    pub text: String,
+    pub before: Vec<String>,
+    pub after: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ListFilesResult {
+    pub directory: String,
+    pub files: Vec<String>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SkimFilesResult {
+    pub files: Vec<SkimFileEntry>,
+    pub not_found: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SkimFileEntry {
+    pub path: String,
+    pub declarations: Vec<SkimDeclaration>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SkimDeclaration {
+    pub symbol: String,
+    pub kind: String,
+    pub start_line: usize,
+    pub end_line: usize,
+}
+
+pub fn get_file_contents(
+    analyzer: &dyn IAnalyzer,
+    params: GetFileContentsParams,
+) -> GetFileContentsResult {
+    let project = analyzer.project();
+    let mut files = Vec::new();
+    let mut not_found = Vec::new();
+
+    for input in params.filenames {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let rel = Path::new(&normalize_pattern(trimmed)).to_path_buf();
+        match project.file_by_rel_path(&rel) {
+            Some(file) => match file.read_to_string() {
+                Ok(content) => files.push(FileContent {
+                    path: rel_path_string(&file),
+                    content,
+                }),
+                Err(_) => not_found.push(trimmed.to_string()),
+            },
+            None => not_found.push(trimmed.to_string()),
+        }
+    }
+
+    GetFileContentsResult { files, not_found }
+}
+
+pub fn find_filenames(
+    analyzer: &dyn IAnalyzer,
+    params: FindFilenamesParams,
+) -> FindFilenamesResult {
+    let project = analyzer.project();
+    let limit = params.limit.max(1);
+
+    let compiled: Vec<(Pattern, bool)> = params
+        .patterns
+        .iter()
+        .filter_map(|pattern| {
+            let normalized = normalize_pattern(pattern.trim());
+            if normalized.is_empty() {
+                return None;
+            }
+            let basename_only = !normalized.contains('/');
+            Pattern::new(&normalized)
+                .ok()
+                .map(|glob| (glob, basename_only))
+        })
+        .collect();
+
+    if compiled.is_empty() {
+        return FindFilenamesResult {
+            files: Vec::new(),
+            truncated: false,
+        };
+    }
+
+    let all_files = match project.all_files() {
+        Ok(files) => files,
+        Err(_) => {
+            return FindFilenamesResult {
+                files: Vec::new(),
+                truncated: false,
+            };
+        }
+    };
+
+    let mut matched: Vec<String> = Vec::new();
+    for file in all_files {
+        let rel = rel_path_string(&file);
+        let basename = file
+            .rel_path()
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let matches = compiled.iter().any(|(glob, basename_only)| {
+            if *basename_only {
+                glob.matches_with(&basename, STRICT_SEPARATOR)
+            } else {
+                glob.matches_with(&rel, STRICT_SEPARATOR)
+            }
+        });
+        if matches {
+            matched.push(rel);
+        }
+    }
+
+    matched.sort();
+    let truncated = matched.len() > limit;
+    matched.truncate(limit);
+    FindFilenamesResult {
+        files: matched,
+        truncated,
+    }
+}
+
+pub fn find_files_containing(
+    analyzer: &dyn IAnalyzer,
+    params: FindFilesContainingParams,
+) -> FindFilesContainingResult {
+    let project = analyzer.project();
+    let limit = params.limit.max(1);
+
+    let mut invalid_patterns = Vec::new();
+    let regexes: Vec<regex::Regex> = params
+        .patterns
+        .iter()
+        .filter_map(|raw| {
+            let pattern = raw.trim();
+            if pattern.is_empty() {
+                return None;
+            }
+            match RegexBuilder::new(pattern)
+                .case_insensitive(params.case_insensitive)
+                .build()
+            {
+                Ok(regex) => Some(regex),
+                Err(_) => {
+                    invalid_patterns.push(raw.clone());
+                    None
+                }
+            }
+        })
+        .collect();
+
+    if regexes.is_empty() {
+        return FindFilesContainingResult {
+            files: Vec::new(),
+            truncated: false,
+            invalid_patterns,
+        };
+    }
+
+    let all_files = match project.all_files() {
+        Ok(files) => files,
+        Err(_) => {
+            return FindFilesContainingResult {
+                files: Vec::new(),
+                truncated: false,
+                invalid_patterns,
+            };
+        }
+    };
+
+    let files: Vec<ProjectFile> = all_files.into_iter().collect();
+    let mut matched: Vec<String> = files
+        .into_par_iter()
+        .filter_map(|file| {
+            if file.is_binary().unwrap_or(true) {
+                return None;
+            }
+            let contents = file.read_to_string().ok()?;
+            if regexes.iter().any(|regex| regex.is_match(&contents)) {
+                Some(rel_path_string(&file))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    matched.sort();
+    matched.dedup();
+    let truncated = matched.len() > limit;
+    matched.truncate(limit);
+    FindFilesContainingResult {
+        files: matched,
+        truncated,
+        invalid_patterns,
+    }
+}
+
+pub fn search_file_contents(
+    analyzer: &dyn IAnalyzer,
+    params: SearchFileContentsParams,
+) -> SearchFileContentsResult {
+    let project = analyzer.project();
+
+    let mut invalid_patterns = Vec::new();
+    let regexes: Vec<regex::Regex> = params
+        .patterns
+        .iter()
+        .filter_map(|raw| {
+            let pattern = raw.trim();
+            if pattern.is_empty() {
+                return None;
+            }
+            match RegexBuilder::new(pattern)
+                .case_insensitive(params.case_insensitive)
+                .build()
+            {
+                Ok(regex) => Some(regex),
+                Err(_) => {
+                    invalid_patterns.push(raw.clone());
+                    None
+                }
+            }
+        })
+        .collect();
+
+    if regexes.is_empty() {
+        return SearchFileContentsResult {
+            matches: Vec::new(),
+            truncated: false,
+            invalid_patterns,
+        };
+    }
+
+    let glob = params.filepath.as_deref().and_then(|raw| {
+        let normalized = normalize_pattern(raw.trim());
+        if normalized.is_empty() {
+            None
+        } else {
+            Pattern::new(&normalized).ok()
+        }
+    });
+
+    let all_files = match project.all_files() {
+        Ok(files) => files,
+        Err(_) => {
+            return SearchFileContentsResult {
+                matches: Vec::new(),
+                truncated: false,
+                invalid_patterns,
+            };
+        }
+    };
+
+    let context = params.context_lines;
+    let candidates: Vec<ProjectFile> = all_files
+        .into_iter()
+        .filter(|file| {
+            let rel = rel_path_string(file);
+            glob.as_ref()
+                .map(|g| g.matches_with(&rel, STRICT_SEPARATOR))
+                .unwrap_or(true)
+        })
+        .collect();
+
+    let mut groups: Vec<FileMatchGroup> = candidates
+        .into_par_iter()
+        .filter_map(|file| {
+            if file.is_binary().unwrap_or(true) {
+                return None;
+            }
+            let contents = file.read_to_string().ok()?;
+            let lines: Vec<&str> = contents.split('\n').collect();
+            let mut hits = Vec::new();
+            for (idx, line) in lines.iter().enumerate() {
+                if hits.len() >= MAX_PER_FILE_SEARCH_MATCHES {
+                    break;
+                }
+                if regexes.iter().any(|regex| regex.is_match(line)) {
+                    let before_start = idx.saturating_sub(context);
+                    let before = lines[before_start..idx]
+                        .iter()
+                        .map(|l| l.to_string())
+                        .collect();
+                    let after_end = (idx + 1 + context).min(lines.len());
+                    let after = lines[idx + 1..after_end]
+                        .iter()
+                        .map(|l| l.to_string())
+                        .collect();
+                    hits.push(LineMatch {
+                        line: idx + 1,
+                        text: line.to_string(),
+                        before,
+                        after,
+                    });
+                }
+            }
+            if hits.is_empty() {
+                None
+            } else {
+                Some(FileMatchGroup {
+                    path: rel_path_string(&file),
+                    matches: hits,
+                })
+            }
+        })
+        .collect();
+
+    groups.sort_by(|left, right| left.path.cmp(&right.path));
+    SearchFileContentsResult {
+        matches: groups,
+        truncated: false,
+        invalid_patterns,
+    }
+}
+
+pub fn list_files(analyzer: &dyn IAnalyzer, params: ListFilesParams) -> ListFilesResult {
+    let project = analyzer.project();
+    let max_entries = params.max_entries.max(1);
+
+    let normalized = normalize_pattern(params.directory_path.trim());
+    let directory_rel = normalized.trim_matches('/');
+    let directory_owned = directory_rel.to_string();
+
+    let all_files = match project.all_files() {
+        Ok(files) => files,
+        Err(_) => {
+            return ListFilesResult {
+                directory: directory_owned,
+                files: Vec::new(),
+                truncated: false,
+            };
+        }
+    };
+
+    let mut matched: Vec<String> = all_files
+        .into_iter()
+        .filter_map(|file| {
+            let rel = rel_path_string(&file);
+            if directory_owned.is_empty()
+                || rel == directory_owned
+                || rel.starts_with(&format!("{directory_owned}/"))
+            {
+                Some(rel)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    matched.sort();
+    let truncated = matched.len() > max_entries;
+    matched.truncate(max_entries);
+    ListFilesResult {
+        directory: directory_owned,
+        files: matched,
+        truncated,
+    }
+}
+
+pub fn skim_files(analyzer: &dyn IAnalyzer, params: SkimFilesParams) -> SkimFilesResult {
+    let project = analyzer.project();
+    let mut files = Vec::new();
+    let mut not_found = Vec::new();
+
+    for input in params.file_paths {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let rel = Path::new(&normalize_pattern(trimmed)).to_path_buf();
+        let Some(file) = project.file_by_rel_path(&rel) else {
+            not_found.push(trimmed.to_string());
+            continue;
+        };
+
+        let declarations: Vec<SkimDeclaration> = analyzer
+            .top_level_declarations(&file)
+            .flat_map(|code_unit| {
+                analyzer.ranges_of(code_unit).into_iter().map(move |range| {
+                    SkimDeclaration {
+                        symbol: code_unit.short_name().to_string(),
+                        kind: code_unit_kind_label(code_unit),
+                        start_line: range.start_line,
+                        end_line: range.end_line,
+                    }
+                })
+            })
+            .collect();
+
+        files.push(SkimFileEntry {
+            path: rel_path_string(&file),
+            declarations,
+        });
+    }
+
+    SkimFilesResult { files, not_found }
+}
+
+fn code_unit_kind_label(code_unit: &crate::analyzer::CodeUnit) -> String {
+    use crate::analyzer::CodeUnitType;
+    match code_unit.kind() {
+        CodeUnitType::Class => "class".to_string(),
+        CodeUnitType::Function => "function".to_string(),
+        CodeUnitType::Field => "field".to_string(),
+        CodeUnitType::Module => "module".to_string(),
+    }
+}
+
+fn normalize_pattern(pattern: &str) -> String {
+    pattern.replace('\\', "/")
+}
+
+fn rel_path_string(file: &ProjectFile) -> String {
+    file.rel_path().to_string_lossy().replace('\\', "/")
+}
+
+fn default_find_filenames_limit() -> usize {
+    DEFAULT_FIND_FILENAMES_LIMIT
+}
+
+fn default_find_files_containing_limit() -> usize {
+    DEFAULT_FIND_FILES_CONTAINING_LIMIT
+}
+
+fn default_search_file_contents_context() -> usize {
+    DEFAULT_SEARCH_FILE_CONTENTS_CONTEXT
+}
+
+fn default_list_files_max_entries() -> usize {
+    DEFAULT_LIST_FILES_MAX_ENTRIES
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::{
+        AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer,
+    };
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    struct Fixture {
+        _temp: TempDir,
+        analyzer: WorkspaceAnalyzer,
+    }
+
+    impl Fixture {
+        fn new(files: &[(&str, &str)]) -> Self {
+            let temp = TempDir::new().expect("tempdir");
+            for (rel, content) in files {
+                let abs = temp.path().join(rel);
+                if let Some(parent) = abs.parent() {
+                    fs::create_dir_all(parent).expect("mkdir");
+                }
+                fs::write(&abs, content).expect("write");
+            }
+            let project: Arc<dyn Project> = Arc::new(
+                FilesystemProject::new(temp.path().to_path_buf()).expect("project"),
+            );
+            let analyzer = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+            Self {
+                _temp: temp,
+                analyzer,
+            }
+        }
+
+        fn project_root(&self) -> PathBuf {
+            self.analyzer.analyzer().project().root().to_path_buf()
+        }
+    }
+
+    #[test]
+    fn get_file_contents_reads_existing_files() {
+        let fix = Fixture::new(&[
+            ("src/a.rs", "fn a() {}\n"),
+            ("src/b.rs", "fn b() {}\n"),
+        ]);
+        let result = get_file_contents(
+            fix.analyzer.analyzer(),
+            GetFileContentsParams {
+                filenames: vec!["src/a.rs".to_string(), "missing.rs".to_string()],
+            },
+        );
+        assert_eq!(result.files.len(), 1);
+        assert_eq!(result.files[0].path, "src/a.rs");
+        assert_eq!(result.files[0].content, "fn a() {}\n");
+        assert_eq!(result.not_found, vec!["missing.rs"]);
+    }
+
+    #[test]
+    fn get_file_contents_normalizes_backslashes() {
+        let fix = Fixture::new(&[("src/a.rs", "x")]);
+        let result = get_file_contents(
+            fix.analyzer.analyzer(),
+            GetFileContentsParams {
+                filenames: vec!["src\\a.rs".to_string()],
+            },
+        );
+        assert_eq!(result.files.len(), 1);
+        assert_eq!(result.files[0].path, "src/a.rs");
+    }
+
+    #[test]
+    fn find_filenames_matches_basename_glob_without_slash() {
+        let fix = Fixture::new(&[
+            ("src/a.rs", ""),
+            ("src/nested/b.rs", ""),
+            ("README.md", ""),
+        ]);
+        let result = find_filenames(
+            fix.analyzer.analyzer(),
+            FindFilenamesParams {
+                patterns: vec!["*.rs".to_string()],
+                limit: 10,
+            },
+        );
+        assert_eq!(result.files, vec!["src/a.rs", "src/nested/b.rs"]);
+        assert!(!result.truncated);
+    }
+
+    #[test]
+    fn find_filenames_matches_full_path_with_slash() {
+        let fix = Fixture::new(&[
+            ("src/a.rs", ""),
+            ("src/nested/b.rs", ""),
+        ]);
+        let result = find_filenames(
+            fix.analyzer.analyzer(),
+            FindFilenamesParams {
+                patterns: vec!["src/*.rs".to_string()],
+                limit: 10,
+            },
+        );
+        assert_eq!(result.files, vec!["src/a.rs"]);
+    }
+
+    #[test]
+    fn find_filenames_respects_limit() {
+        let fix = Fixture::new(&[("a.rs", ""), ("b.rs", ""), ("c.rs", "")]);
+        let result = find_filenames(
+            fix.analyzer.analyzer(),
+            FindFilenamesParams {
+                patterns: vec!["*.rs".to_string()],
+                limit: 2,
+            },
+        );
+        assert_eq!(result.files.len(), 2);
+        assert!(result.truncated);
+    }
+
+    #[test]
+    fn find_files_containing_matches_regex() {
+        let fix = Fixture::new(&[
+            ("src/a.rs", "fn alpha() {}\n"),
+            ("src/b.rs", "fn beta() {}\n"),
+        ]);
+        let result = find_files_containing(
+            fix.analyzer.analyzer(),
+            FindFilesContainingParams {
+                patterns: vec!["fn al".to_string()],
+                limit: 10,
+                case_insensitive: false,
+            },
+        );
+        assert_eq!(result.files, vec!["src/a.rs"]);
+    }
+
+    #[test]
+    fn find_files_containing_records_invalid_patterns() {
+        let fix = Fixture::new(&[("a.rs", "")]);
+        let result = find_files_containing(
+            fix.analyzer.analyzer(),
+            FindFilesContainingParams {
+                patterns: vec!["[".to_string()],
+                limit: 10,
+                case_insensitive: false,
+            },
+        );
+        assert_eq!(result.invalid_patterns, vec!["[".to_string()]);
+        assert!(result.files.is_empty());
+    }
+
+    #[test]
+    fn search_file_contents_returns_context() {
+        let fix = Fixture::new(&[(
+            "src/a.rs",
+            "line1\nline2\nNEEDLE\nline4\nline5\n",
+        )]);
+        let result = search_file_contents(
+            fix.analyzer.analyzer(),
+            SearchFileContentsParams {
+                patterns: vec!["NEEDLE".to_string()],
+                filepath: None,
+                context_lines: 1,
+                case_insensitive: false,
+            },
+        );
+        assert_eq!(result.matches.len(), 1);
+        let group = &result.matches[0];
+        assert_eq!(group.path, "src/a.rs");
+        assert_eq!(group.matches.len(), 1);
+        let hit = &group.matches[0];
+        assert_eq!(hit.line, 3);
+        assert_eq!(hit.text, "NEEDLE");
+        assert_eq!(hit.before, vec!["line2".to_string()]);
+        assert_eq!(hit.after, vec!["line4".to_string()]);
+    }
+
+    #[test]
+    fn search_file_contents_respects_filepath_glob() {
+        let fix = Fixture::new(&[
+            ("src/a.rs", "NEEDLE\n"),
+            ("src/b.txt", "NEEDLE\n"),
+        ]);
+        let result = search_file_contents(
+            fix.analyzer.analyzer(),
+            SearchFileContentsParams {
+                patterns: vec!["NEEDLE".to_string()],
+                filepath: Some("**/*.rs".to_string()),
+                context_lines: 0,
+                case_insensitive: false,
+            },
+        );
+        let paths: Vec<_> = result.matches.iter().map(|m| m.path.clone()).collect();
+        assert_eq!(paths, vec!["src/a.rs"]);
+    }
+
+    #[test]
+    fn list_files_filters_by_directory_prefix() {
+        let fix = Fixture::new(&[
+            ("src/a.rs", ""),
+            ("src/nested/b.rs", ""),
+            ("README.md", ""),
+        ]);
+        let result = list_files(
+            fix.analyzer.analyzer(),
+            ListFilesParams {
+                directory_path: "src".to_string(),
+                max_entries: 100,
+            },
+        );
+        assert_eq!(
+            result.files,
+            vec!["src/a.rs".to_string(), "src/nested/b.rs".to_string()]
+        );
+        assert_eq!(result.directory, "src");
+    }
+
+    #[test]
+    fn list_files_handles_root_as_empty_path() {
+        let fix = Fixture::new(&[("a.rs", ""), ("nested/b.rs", "")]);
+        let result = list_files(
+            fix.analyzer.analyzer(),
+            ListFilesParams {
+                directory_path: "".to_string(),
+                max_entries: 100,
+            },
+        );
+        assert_eq!(
+            result.files,
+            vec!["a.rs".to_string(), "nested/b.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn list_files_respects_max_entries() {
+        let fix = Fixture::new(&[
+            ("src/a.rs", ""),
+            ("src/b.rs", ""),
+            ("src/c.rs", ""),
+        ]);
+        let result = list_files(
+            fix.analyzer.analyzer(),
+            ListFilesParams {
+                directory_path: "src".to_string(),
+                max_entries: 2,
+            },
+        );
+        assert_eq!(result.files.len(), 2);
+        assert!(result.truncated);
+    }
+
+    #[test]
+    fn skim_files_reports_unknown_paths_in_not_found() {
+        let fix = Fixture::new(&[("a.rs", "fn a() {}\n")]);
+        let result = skim_files(
+            fix.analyzer.analyzer(),
+            SkimFilesParams {
+                file_paths: vec!["missing.rs".to_string()],
+            },
+        );
+        assert!(result.files.is_empty());
+        assert_eq!(result.not_found, vec!["missing.rs"]);
+        let _ = fix.project_root();
+    }
+}

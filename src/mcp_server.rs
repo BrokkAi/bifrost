@@ -247,6 +247,198 @@ fn list_tools_result() -> Value {
                     "required": ["symbols"]
                 }),
             ),
+            tool_descriptor(
+                "get_file_contents",
+                "Return the raw text contents of one or more files in the workspace, given project-relative paths.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "filenames": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Project-relative paths of files to read."
+                        }
+                    },
+                    "required": ["filenames"]
+                }),
+            ),
+            tool_descriptor(
+                "find_filenames",
+                "Find files in the workspace whose path matches any of the given glob patterns. Patterns without '/' match against the file basename; patterns with '/' match against the full project-relative path.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "patterns": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Glob patterns to match against filenames."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "default": 100,
+                            "minimum": 1,
+                            "description": "Maximum number of matching files to return."
+                        }
+                    },
+                    "required": ["patterns"]
+                }),
+            ),
+            tool_descriptor(
+                "find_files_containing",
+                "Find files whose contents match any of the given regular expressions. Binary files and files outside the workspace's gitignore-respecting walk are skipped.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "patterns": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Regular expressions to match against file contents."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "default": 50,
+                            "minimum": 1,
+                            "description": "Maximum number of matching files to return."
+                        },
+                        "case_insensitive": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Whether to ignore case when matching."
+                        }
+                    },
+                    "required": ["patterns"]
+                }),
+            ),
+            tool_descriptor(
+                "search_file_contents",
+                "Search file contents with regular expressions, returning matching lines with surrounding context. Optionally restrict the search to files matching a glob.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "patterns": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Regular expressions to search for in file contents."
+                        },
+                        "filepath": {
+                            "type": "string",
+                            "description": "Optional glob to restrict the search to matching paths."
+                        },
+                        "context_lines": {
+                            "type": "integer",
+                            "default": 2,
+                            "minimum": 0,
+                            "description": "Number of context lines to include before and after each match."
+                        },
+                        "case_insensitive": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Whether to ignore case when matching."
+                        }
+                    },
+                    "required": ["patterns"]
+                }),
+            ),
+            tool_descriptor(
+                "list_files",
+                "Return a recursive listing of files under a workspace-relative directory. Respects .gitignore via the project's walker.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "directory_path": {
+                            "type": "string",
+                            "description": "Project-relative directory to list. Empty string lists the workspace root."
+                        },
+                        "max_entries": {
+                            "type": "integer",
+                            "default": 500,
+                            "minimum": 1,
+                            "description": "Maximum number of entries to return."
+                        }
+                    },
+                    "required": ["directory_path"]
+                }),
+            ),
+            tool_descriptor(
+                "skim_files",
+                "Return a top-level declaration outline (class/function/field/module) for each given file. Like list_symbols but constrained to top-level declarations only.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "file_paths": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Project-relative paths of files to skim."
+                        }
+                    },
+                    "required": ["file_paths"]
+                }),
+            ),
+            tool_descriptor(
+                "search_git_commit_messages",
+                "Regex search across the workspace's git commit messages, returning matching commits with short hash, summary, and author.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                            "description": "Regular expression to match against commit messages."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "default": 50,
+                            "minimum": 1,
+                            "description": "Maximum number of matching commits to return."
+                        }
+                    },
+                    "required": ["pattern"]
+                }),
+            ),
+            tool_descriptor(
+                "get_git_log",
+                "Return recent commits, optionally filtered to those that touch a given path.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Optional project-relative file or directory path to filter by."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "default": 50,
+                            "minimum": 1,
+                            "description": "Maximum number of commits to return."
+                        }
+                    }
+                }),
+            ),
+            tool_descriptor(
+                "get_commit_diff",
+                "Return the unified diff for a single commit versus its parent, truncated by file count and lines per file. Root commits are diffed against the empty tree.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "revision": {
+                            "type": "string",
+                            "description": "Commit reference (short hash, full hash, branch, tag)."
+                        },
+                        "max_files": {
+                            "type": "integer",
+                            "default": 10,
+                            "minimum": 1,
+                            "description": "Maximum number of files to include in the diff."
+                        },
+                        "lines_per_file": {
+                            "type": "integer",
+                            "default": 1000,
+                            "minimum": 1,
+                            "description": "Maximum number of diff lines per file."
+                        }
+                    },
+                    "required": ["revision"]
+                }),
+            ),
         ]
     })
 }
