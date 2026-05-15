@@ -493,6 +493,66 @@ pub struct CommentDensityStats {
     pub rolled_up_span_lines: u32,
 }
 
+/// Tunable weights for the exception-handling smell heuristic. Mirrors
+/// brokk-shared `IAnalyzer.ExceptionSmellWeights` field-for-field; callers
+/// can override individual fields by passing positive values and otherwise
+/// fall back to [`ExceptionSmellWeights::defaults`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExceptionSmellWeights {
+    pub generic_throwable_weight: i32,
+    pub generic_exception_weight: i32,
+    pub generic_runtime_exception_weight: i32,
+    pub empty_body_weight: i32,
+    pub comment_only_body_weight: i32,
+    pub small_body_weight: i32,
+    pub log_only_weight: i32,
+    pub meaningful_body_credit_per_statement: i32,
+    pub meaningful_body_statement_threshold: i32,
+    pub small_body_max_statements: i32,
+}
+
+impl ExceptionSmellWeights {
+    /// Default weights copied verbatim from brokk-shared
+    /// `IAnalyzer.ExceptionSmellWeights.defaults()` — keep these in lock-step
+    /// so identical input files produce identical scores across the two MCP
+    /// servers.
+    pub fn defaults() -> Self {
+        Self {
+            generic_throwable_weight: 5,
+            generic_exception_weight: 3,
+            generic_runtime_exception_weight: 2,
+            empty_body_weight: 5,
+            comment_only_body_weight: 4,
+            small_body_weight: 2,
+            log_only_weight: 2,
+            meaningful_body_credit_per_statement: 1,
+            meaningful_body_statement_threshold: 6,
+            small_body_max_statements: 2,
+        }
+    }
+}
+
+/// One suspicious catch handler reported by the analyzer. Mirrors
+/// brokk-shared `IAnalyzer.ExceptionHandlingSmell`. Not serde-derived —
+/// the embedded [`ProjectFile`] is only constructed inside the analyzer
+/// and the report layer rebuilds the rendered table from these in-memory
+/// values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExceptionHandlingSmell {
+    pub file: ProjectFile,
+    pub enclosing_fq_name: String,
+    pub catch_type: String,
+    pub score: i32,
+    pub body_statement_count: u32,
+    pub reasons: Vec<String>,
+    pub excerpt: String,
+    /// Source byte offset of the `catch` clause; used as the deterministic
+    /// tie-breaker when two findings share score, file, and enclosing symbol.
+    /// Not surfaced in the markdown report — kept here so callers ranking or
+    /// deduping can stay stable.
+    pub start_byte: usize,
+}
+
 impl Range {
     pub fn contains(&self, other: &Range) -> bool {
         self.start_byte <= other.start_byte && self.end_byte >= other.end_byte

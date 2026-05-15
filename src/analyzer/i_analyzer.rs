@@ -1,7 +1,8 @@
 use crate::analyzer::{
     CodeBaseMetrics, CodeUnit, CodeUnitType, CommentDensityStats, DeclarationInfo,
-    ImportAnalysisProvider, Language, Project, ProjectFile, Range, TestDetectionProvider,
-    TypeAliasProvider, TypeHierarchyProvider, metrics_from_declarations,
+    ExceptionHandlingSmell, ExceptionSmellWeights, ImportAnalysisProvider, Language, Project,
+    ProjectFile, Range, TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider,
+    metrics_from_declarations,
 };
 use crate::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, FuzzyResult, UsageFinder};
 use std::any::Any;
@@ -241,6 +242,18 @@ pub trait IAnalyzer: Send + Sync + Any {
     /// implementation. Mirrors brokk-shared
     /// `IAnalyzer.commentDensityByTopLevel(ProjectFile)`.
     fn comment_density_by_top_level(&self, _file: &ProjectFile) -> Vec<CommentDensityStats> {
+        Vec::new()
+    }
+
+    /// Detect suspicious exception-handling sites in `file` using `weights`.
+    /// Default is an empty vector so analyzers without a port of the
+    /// heuristic stay silent. Mirrors brokk-shared
+    /// `IAnalyzer.findExceptionHandlingSmells`.
+    fn find_exception_handling_smells(
+        &self,
+        _file: &ProjectFile,
+        _weights: ExceptionSmellWeights,
+    ) -> Vec<ExceptionHandlingSmell> {
         Vec::new()
     }
 

@@ -587,6 +587,71 @@ fn list_tools_result() -> Value {
                 }),
             ),
             tool_descriptor(
+                "report_exception_handling_smells",
+                "Detects suspicious exception handlers using weighted heuristics designed for high-recall triage. Scores generic catches and tiny / empty / comment-only / log-only handlers, then subtracts credit for richer handler bodies. Use min_score, max_findings, and the per-rule weights to tune precision/recall. Output format matches the brokk-core MCP byte-for-byte.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "file_paths": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Project-relative paths of files to analyze."
+                        },
+                        "min_score": {
+                            "type": "integer",
+                            "default": 4,
+                            "description": "Minimum score to include a finding; values <= 0 default to 4."
+                        },
+                        "max_findings": {
+                            "type": "integer",
+                            "default": 80,
+                            "description": "Maximum findings to emit; values <= 0 default to 80."
+                        },
+                        "generic_throwable_weight": {
+                            "type": "integer",
+                            "description": "Weight for catching Throwable; values < 0 use the brokk default (5)."
+                        },
+                        "generic_exception_weight": {
+                            "type": "integer",
+                            "description": "Weight for catching Exception; values < 0 use the brokk default (3)."
+                        },
+                        "generic_runtime_exception_weight": {
+                            "type": "integer",
+                            "description": "Weight for catching RuntimeException; values < 0 use the brokk default (2)."
+                        },
+                        "empty_body_weight": {
+                            "type": "integer",
+                            "description": "Weight for empty catch bodies; values < 0 use the brokk default (5)."
+                        },
+                        "comment_only_body_weight": {
+                            "type": "integer",
+                            "description": "Weight for comment-only catch bodies; values < 0 use the brokk default (4)."
+                        },
+                        "small_body_weight": {
+                            "type": "integer",
+                            "description": "Weight for small catch bodies; values < 0 use the brokk default (2)."
+                        },
+                        "log_only_body_weight": {
+                            "type": "integer",
+                            "description": "Weight for log-only catch bodies; values < 0 use the brokk default (2)."
+                        },
+                        "meaningful_body_credit_per_statement": {
+                            "type": "integer",
+                            "description": "Score credit subtracted per catch statement in the body; values < 0 use the brokk default (1)."
+                        },
+                        "meaningful_body_statement_threshold": {
+                            "type": "integer",
+                            "description": "Maximum statements that earn meaningful-body credit; values < 0 use the brokk default (6)."
+                        },
+                        "small_body_max_statements": {
+                            "type": "integer",
+                            "description": "Maximum statement count considered a small body; values < 0 use the brokk default (2)."
+                        }
+                    },
+                    "required": ["file_paths"]
+                }),
+            ),
+            tool_descriptor(
                 "report_comment_density_for_files",
                 "Java comment density tables for the given source files: one section per file and one row per top-level declaration with own and rolled-up header / inline / span line counts. Non-Java files are skipped with a one-line placeholder. Output format matches the brokk-core MCP byte-for-byte.",
                 json!({

@@ -1,8 +1,9 @@
 use crate::analyzer::{
-    CSharpAnalyzer, CodeUnit, CommentDensityStats, CppAnalyzer, DeclarationInfo, GoAnalyzer,
-    IAnalyzer, ImportAnalysisProvider, ImportInfo, JavaAnalyzer, JavascriptAnalyzer, Language,
-    PhpAnalyzer, Project, ProjectFile, PythonAnalyzer, Range, RustAnalyzer, ScalaAnalyzer,
-    TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider, TypescriptAnalyzer,
+    CSharpAnalyzer, CodeUnit, CommentDensityStats, CppAnalyzer, DeclarationInfo,
+    ExceptionHandlingSmell, ExceptionSmellWeights, GoAnalyzer, IAnalyzer, ImportAnalysisProvider,
+    ImportInfo, JavaAnalyzer, JavascriptAnalyzer, Language, PhpAnalyzer, Project, ProjectFile,
+    PythonAnalyzer, Range, RustAnalyzer, ScalaAnalyzer, TestDetectionProvider, TypeAliasProvider,
+    TypeHierarchyProvider, TypescriptAnalyzer,
 };
 use crate::hash::HashSet;
 use rayon::prelude::*;
@@ -395,6 +396,20 @@ impl IAnalyzer for MultiAnalyzer {
     fn comment_density_by_top_level(&self, file: &ProjectFile) -> Vec<CommentDensityStats> {
         self.delegate_for_file(file)
             .map(|delegate| delegate.analyzer().comment_density_by_top_level(file))
+            .unwrap_or_default()
+    }
+
+    fn find_exception_handling_smells(
+        &self,
+        file: &ProjectFile,
+        weights: ExceptionSmellWeights,
+    ) -> Vec<ExceptionHandlingSmell> {
+        self.delegate_for_file(file)
+            .map(|delegate| {
+                delegate
+                    .analyzer()
+                    .find_exception_handling_smells(file, weights)
+            })
             .unwrap_or_default()
     }
 

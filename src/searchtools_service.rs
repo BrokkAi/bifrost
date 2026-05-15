@@ -4,6 +4,7 @@ use crate::{
     code_quality::{
         compute_cognitive_complexity, compute_cyclomatic_complexity,
         report_comment_density_for_code_unit, report_comment_density_for_files,
+        report_exception_handling_smells,
     },
     file_tools::{
         find_filenames, find_files_containing, get_file_contents, list_files, search_file_contents,
@@ -197,6 +198,10 @@ impl SearchToolsService {
             "report_comment_density_for_files" => self
                 .decode_and_run(arguments, |workspace, params| {
                     report_comment_density_for_files(workspace.analyzer(), params)
+                }),
+            "report_exception_handling_smells" => self
+                .decode_and_run(arguments, |workspace, params| {
+                    report_exception_handling_smells(workspace.analyzer(), params)
                 }),
             _ => Err(SearchToolsServiceError::unknown_tool(format!(
                 "Unknown tool: {name}"
