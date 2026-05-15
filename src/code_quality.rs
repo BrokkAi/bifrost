@@ -1,5 +1,5 @@
 use crate::analyzer::{CodeUnit, IAnalyzer};
-use crate::path_utils::workspace_rel_path;
+use crate::path_utils::{rel_path_string, workspace_rel_path};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -111,7 +111,7 @@ pub fn compute_cyclomatic_complexity(
                     lines.push(format!(
                         "- {fq}: {complexity} (in {src})",
                         fq = cu.fq_name(),
-                        src = cu.source(),
+                        src = rel_path_string(cu.source()),
                     ));
                     found_any = true;
                 }
