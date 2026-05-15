@@ -1,4 +1,5 @@
 pub mod analyzer;
+pub mod code_quality;
 pub mod file_tools;
 pub mod git_tools;
 pub mod hash;
@@ -14,6 +15,8 @@ pub mod searchtools;
 pub mod searchtools_service;
 pub mod structured_data;
 pub mod summary;
+#[cfg(test)]
+mod test_support;
 mod text_utils;
 pub mod usages;
 

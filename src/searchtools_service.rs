@@ -1,6 +1,7 @@
 use crate::{
     AnalyzerConfig, FilesystemProject, Project, ProjectChangeWatcher, ProjectFile,
     WorkspaceAnalyzer,
+    code_quality::compute_cyclomatic_complexity,
     file_tools::{
         find_filenames, find_files_containing, get_file_contents, list_files, search_file_contents,
         skim_files,
@@ -177,6 +178,11 @@ impl SearchToolsService {
             "xml_select" => self.decode_and_run(arguments, |workspace, params| {
                 xml_select(workspace.analyzer(), params)
             }),
+            "compute_cyclomatic_complexity" => {
+                self.decode_and_run(arguments, |workspace, params| {
+                    compute_cyclomatic_complexity(workspace.analyzer(), params)
+                })
+            }
             _ => Err(SearchToolsServiceError::unknown_tool(format!(
                 "Unknown tool: {name}"
             ))),

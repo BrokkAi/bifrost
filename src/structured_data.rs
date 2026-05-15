@@ -496,35 +496,7 @@ fn default_matches_per_file() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::{AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer};
-    use std::fs;
-    use std::sync::Arc;
-    use tempfile::TempDir;
-
-    struct Fixture {
-        _temp: TempDir,
-        analyzer: WorkspaceAnalyzer,
-    }
-
-    impl Fixture {
-        fn new(files: &[(&str, &str)]) -> Self {
-            let temp = TempDir::new().expect("tempdir");
-            for (rel, content) in files {
-                let abs = temp.path().join(rel);
-                if let Some(parent) = abs.parent() {
-                    fs::create_dir_all(parent).expect("mkdir");
-                }
-                fs::write(&abs, content).expect("write");
-            }
-            let project: Arc<dyn Project> =
-                Arc::new(FilesystemProject::new(temp.path().to_path_buf()).expect("project"));
-            let analyzer = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
-            Self {
-                _temp: temp,
-                analyzer,
-            }
-        }
-    }
+    use crate::test_support::AnalyzerFixture as Fixture;
 
     #[test]
     fn jq_runs_simple_filter() {
