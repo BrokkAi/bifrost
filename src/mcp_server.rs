@@ -547,6 +547,26 @@ fn list_tools_result() -> Value {
                     "required": ["file_paths"]
                 }),
             ),
+            tool_descriptor(
+                "compute_cognitive_complexity",
+                "Compute heuristic cognitive complexity per function/method in the given files; flag those exceeding a threshold. Walks the language's tree-sitter AST, scoring control-flow breaks by SonarSource rules (each `if`/loop/`catch`/case adds 1+nesting; sequences of `&&`/`||` count per distinct adjacent operator; labeled `break`/`continue` add 1). Output format matches the brokk-core MCP byte-for-byte.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "file_paths": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Project-relative paths of files to analyze."
+                        },
+                        "threshold": {
+                            "type": "integer",
+                            "default": 15,
+                            "description": "Flag functions whose cognitive complexity exceeds this threshold. Values <= 0 fall back to 15."
+                        }
+                    },
+                    "required": ["file_paths"]
+                }),
+            ),
         ]
     })
 }

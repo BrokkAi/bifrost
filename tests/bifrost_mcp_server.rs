@@ -89,6 +89,11 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             .iter()
             .any(|tool| tool["name"] == "compute_cyclomatic_complexity")
     );
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool["name"] == "compute_cognitive_complexity")
+    );
 
     let scan_usages = round_trip(
         &mut stdin,
@@ -194,6 +199,32 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     assert_eq!(
         cyclomatic_report,
         "No methods exceeded the complexity threshold of 10."
+    );
+
+    let cognitive = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {
+                "name": "compute_cognitive_complexity",
+                "arguments": {
+                    "file_paths": ["CyclicMethods.java"],
+                    "threshold": 0
+                }
+            }
+        }),
+    );
+    let cognitive_report = cognitive["result"]["structuredContent"]["report"]
+        .as_str()
+        .expect("report string");
+    // Same fixture: no control flow ⇒ score 0 ⇒ default-message path.
+    assert_eq!(
+        cognitive_report,
+        "No methods exceeded the cognitive complexity threshold of 15."
     );
 
     let ping = round_trip(

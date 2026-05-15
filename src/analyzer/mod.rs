@@ -1,4 +1,7 @@
 mod capabilities;
+pub mod cognitive_complexity;
+#[cfg(test)]
+mod cognitive_complexity_tests;
 mod config;
 mod cpp_analyzer;
 mod csharp_analyzer;

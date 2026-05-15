@@ -210,6 +210,17 @@ pub trait IAnalyzer: Send + Sync + Any {
         false
     }
 
+    /// Compute heuristic cognitive complexity for every function-like code
+    /// unit declared in `file`, preserving source order.
+    ///
+    /// The default implementation returns an empty vector — analyzers that
+    /// expose tree-sitter ASTs override this with a per-language scorer.
+    /// Callers must treat a missing key as "not computed" rather than
+    /// "complexity is zero".
+    fn compute_cognitive_complexities(&self, _file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
+        Vec::new()
+    }
+
     fn get_skeletons(&self, file: &ProjectFile) -> BTreeMap<CodeUnit, String> {
         let mut skeletons = BTreeMap::new();
         for symbol in self.top_level_declarations(file) {

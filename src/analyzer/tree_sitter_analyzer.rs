@@ -1,3 +1,4 @@
+use crate::analyzer::cognitive_complexity;
 use crate::analyzer::persistence::{self, AnalyzerStorage};
 use crate::analyzer::{
     AnalyzerConfig, CodeBaseMetrics, CodeUnit, DeclarationInfo, ImportInfo, Language, Project,
@@ -8,7 +9,7 @@ use crate::profiling;
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use rayon::prelude::*;
 use regex::RegexBuilder;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -38,6 +39,13 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     fn parse_file(&self, file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFile;
     fn definition_priority(&self, _code_unit: &CodeUnit) -> i32 {
         0
+    }
+    /// Optional per-language cognitive-complexity configuration. Languages
+    /// without a scoring config return `None`, which makes
+    /// [`TreeSitterAnalyzer::compute_cognitive_complexities`] yield an empty
+    /// result.
+    fn cognitive_complexity_config(&self) -> Option<&'static cognitive_complexity::Config> {
+        None
     }
 }
 
@@ -1136,6 +1144,66 @@ where
             .get(code_unit)
             .map(Vec::as_slice)
             .unwrap_or(&[])
+    }
+
+    fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
+        let Some(config) = self.adapter.cognitive_complexity_config() else {
+            return Vec::new();
+        };
+        let Some(file_state) = self.file_state(file) else {
+            return Vec::new();
+        };
+
+        let source = file_state.source.as_str();
+        let mut parser = Self::build_parser(self.adapter.parser_language());
+        let Some(tree) = parser.parse(source, None) else {
+            return Vec::new();
+        };
+        let root = tree.root_node();
+
+        // Walk the declared code-unit hierarchy to enumerate every function
+        // in this file in source order (top-level + nested under classes /
+        // modules / impls). Mirrors brokk-shared's
+        // `functionCodeUnitsInFile`.
+        let mut functions: Vec<CodeUnit> = Vec::new();
+        let mut work: VecDeque<CodeUnit> =
+            file_state.top_level_declarations.iter().cloned().collect();
+        while let Some(cu) = work.pop_front() {
+            if cu.is_function() {
+                functions.push(cu.clone());
+            }
+            if let Some(children) = self.state.children.get(&cu) {
+                for child in children {
+                    work.push_back(child.clone());
+                }
+            } else if let Some(file_children) = file_state.children.get(&cu) {
+                for child in file_children {
+                    work.push_back(child.clone());
+                }
+            }
+        }
+
+        let mut result = Vec::with_capacity(functions.len());
+        for cu in functions {
+            let Some(ranges) = self.state.ranges.get(&cu) else {
+                continue;
+            };
+            let Some(primary) = ranges.first() else {
+                continue;
+            };
+            // `descendant_for_byte_range(start, end)` returns the smallest
+            // node fully containing `[start, end)`. With the analyzer's
+            // primary range for the function this lands on the
+            // function/method node itself, which is what the scorer wants
+            // as its root.
+            let Some(node) = root.descendant_for_byte_range(primary.start_byte, primary.end_byte)
+            else {
+                continue;
+            };
+            let complexity = cognitive_complexity::compute(node, source, config);
+            result.push((cu, complexity));
+        }
+        result
     }
 
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {

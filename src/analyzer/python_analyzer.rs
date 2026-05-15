@@ -1,3 +1,4 @@
+use crate::analyzer::cognitive_complexity;
 use crate::analyzer::{
     AnalyzerConfig, CodeUnit, CodeUnitType, IAnalyzer, ImportAnalysisProvider, ImportInfo,
     Language, LanguageAdapter, Project, ProjectFile, TestDetectionProvider, TreeSitterAnalyzer,
@@ -11,10 +12,37 @@ use regex::Regex;
 use std::collections::BTreeSet;
 use std::mem::size_of;
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
 
 use super::javascript_analyzer::build_weighted_cache;
+
+/// Tree-sitter node-kind mapping used by the cognitive-complexity scorer
+/// for Python. Mirrors `ai.brokk.analyzer.python.CognitiveComplexityAnalysis`.
+static PYTHON_COGNITIVE_CONFIG: LazyLock<cognitive_complexity::Config> =
+    LazyLock::new(|| cognitive_complexity::Config {
+        if_types: &["if_statement"],
+        alternate_if_types: &["elif_clause"],
+        loop_types: &["for_statement", "while_statement"],
+        catch_types: &["except_clause"],
+        conditional_types: &["conditional_expression"],
+        case_types: &["case_clause"],
+        binary_types: &["boolean_operator"],
+        logical_operators: &["and", "or"],
+        named_function_boundary_types: &["function_definition"],
+        anonymous_function_types: &["lambda"],
+        named_function_boundary_predicate: Some(python_is_decorated_function_boundary),
+        ..cognitive_complexity::Config::empty()
+    });
+
+fn python_is_decorated_function_boundary(node: Node<'_>) -> bool {
+    if node.kind() != "decorated_definition" {
+        return false;
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| child.kind() == "function_definition")
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct PythonAdapter;
@@ -84,6 +112,10 @@ impl LanguageAdapter for PythonAdapter {
         visitor.visit_container(root, &[], 0);
 
         parsed
+    }
+
+    fn cognitive_complexity_config(&self) -> Option<&'static cognitive_complexity::Config> {
+        Some(&PYTHON_COGNITIVE_CONFIG)
     }
 }
 
@@ -610,6 +642,10 @@ impl IAnalyzer for PythonAnalyzer {
 
     fn ranges<'a>(&'a self, code_unit: &CodeUnit) -> &'a [crate::analyzer::Range] {
         self.inner.ranges(code_unit)
+    }
+
+    fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
+        self.inner.compute_cognitive_complexities(file)
     }
 
     fn signatures<'a>(&'a self, code_unit: &CodeUnit) -> &'a [String] {
