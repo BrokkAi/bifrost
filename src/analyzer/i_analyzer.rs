@@ -1,7 +1,7 @@
 use crate::analyzer::{
-    CodeBaseMetrics, CodeUnit, CodeUnitType, DeclarationInfo, ImportAnalysisProvider, Language,
-    Project, ProjectFile, Range, TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider,
-    metrics_from_declarations,
+    CodeBaseMetrics, CodeUnit, CodeUnitType, CommentDensityStats, DeclarationInfo,
+    ImportAnalysisProvider, Language, Project, ProjectFile, Range, TestDetectionProvider,
+    TypeAliasProvider, TypeHierarchyProvider, metrics_from_declarations,
 };
 use crate::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, FuzzyResult, UsageFinder};
 use std::any::Any;
@@ -218,6 +218,29 @@ pub trait IAnalyzer: Send + Sync + Any {
     /// Callers must treat a missing key as "not computed" rather than
     /// "complexity is zero".
     fn compute_cognitive_complexities(&self, _file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
+        Vec::new()
+    }
+
+    /// Comment density for a single declaration. Language-specific analyzers
+    /// may override; default is unsupported. Mirrors brokk-shared
+    /// `IAnalyzer.commentDensity(CodeUnit)`.
+    fn comment_density(&self, _code_unit: &CodeUnit) -> Option<CommentDensityStats> {
+        None
+    }
+
+    /// Comment density for the first resolved declaration that supports it.
+    /// Mirrors brokk-shared `IAnalyzer.commentDensity(String)`.
+    fn comment_density_by_fq_name(&self, fq_name: &str) -> Option<CommentDensityStats> {
+        self.get_definitions(fq_name)
+            .into_iter()
+            .find_map(|cu| self.comment_density(&cu))
+    }
+
+    /// Per-top-level-declaration comment density for a file. Default is an
+    /// empty vector — non-Java analyzers stay silent until they add their own
+    /// implementation. Mirrors brokk-shared
+    /// `IAnalyzer.commentDensityByTopLevel(ProjectFile)`.
+    fn comment_density_by_top_level(&self, _file: &ProjectFile) -> Vec<CommentDensityStats> {
         Vec::new()
     }
 

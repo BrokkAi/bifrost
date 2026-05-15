@@ -1,7 +1,10 @@
 use crate::{
     AnalyzerConfig, FilesystemProject, Project, ProjectChangeWatcher, ProjectFile,
     WorkspaceAnalyzer,
-    code_quality::{compute_cognitive_complexity, compute_cyclomatic_complexity},
+    code_quality::{
+        compute_cognitive_complexity, compute_cyclomatic_complexity,
+        report_comment_density_for_code_unit, report_comment_density_for_files,
+    },
     file_tools::{
         find_filenames, find_files_containing, get_file_contents, list_files, search_file_contents,
         skim_files,
@@ -185,6 +188,15 @@ impl SearchToolsService {
             "compute_cognitive_complexity" => self
                 .decode_and_run(arguments, |workspace, params| {
                     compute_cognitive_complexity(workspace.analyzer(), params)
+                }),
+            "report_comment_density_for_code_unit" => {
+                self.decode_and_run(arguments, |workspace, params| {
+                    report_comment_density_for_code_unit(workspace.analyzer(), params)
+                })
+            }
+            "report_comment_density_for_files" => self
+                .decode_and_run(arguments, |workspace, params| {
+                    report_comment_density_for_files(workspace.analyzer(), params)
                 }),
             _ => Err(SearchToolsServiceError::unknown_tool(format!(
                 "Unknown tool: {name}"

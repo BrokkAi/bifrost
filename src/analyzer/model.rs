@@ -473,6 +473,26 @@ pub struct Range {
     pub end_line: usize,
 }
 
+/// Comment line counts and span lines for a [`CodeUnit`], with optional roll-up
+/// of nested declarations (e.g. methods inside a class). Mirrors brokk-shared
+/// `CommentDensityStats` field-for-field so report output stays byte-for-byte
+/// equivalent to brokk-core MCP.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommentDensityStats {
+    pub fq_name: String,
+    pub relative_path: String,
+    pub header_comment_lines: u32,
+    pub inline_comment_lines: u32,
+    /// Lines covered by this declaration's ranges (may sum overload ranges).
+    pub span_lines: u32,
+    /// Header lines including nested declarations (for class-like units equals own plus children).
+    pub rolled_up_header_comment_lines: u32,
+    /// Inline lines including nested declarations.
+    pub rolled_up_inline_comment_lines: u32,
+    /// Span lines including nested declarations (sum of descendant spans for roll-up).
+    pub rolled_up_span_lines: u32,
+}
+
 impl Range {
     pub fn contains(&self, other: &Range) -> bool {
         self.start_byte <= other.start_byte && self.end_byte >= other.end_byte

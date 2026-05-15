@@ -1,7 +1,7 @@
 use crate::analyzer::{
-    CSharpAnalyzer, CodeUnit, CppAnalyzer, DeclarationInfo, GoAnalyzer, IAnalyzer,
-    ImportAnalysisProvider, ImportInfo, JavaAnalyzer, JavascriptAnalyzer, Language, PhpAnalyzer,
-    Project, ProjectFile, PythonAnalyzer, Range, RustAnalyzer, ScalaAnalyzer,
+    CSharpAnalyzer, CodeUnit, CommentDensityStats, CppAnalyzer, DeclarationInfo, GoAnalyzer,
+    IAnalyzer, ImportAnalysisProvider, ImportInfo, JavaAnalyzer, JavascriptAnalyzer, Language,
+    PhpAnalyzer, Project, ProjectFile, PythonAnalyzer, Range, RustAnalyzer, ScalaAnalyzer,
     TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider, TypescriptAnalyzer,
 };
 use crate::hash::HashSet;
@@ -384,6 +384,17 @@ impl IAnalyzer for MultiAnalyzer {
     fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
         self.delegate_for_file(file)
             .map(|delegate| delegate.analyzer().compute_cognitive_complexities(file))
+            .unwrap_or_default()
+    }
+
+    fn comment_density(&self, code_unit: &CodeUnit) -> Option<CommentDensityStats> {
+        self.delegate_for_code_unit(code_unit)
+            .and_then(|delegate| delegate.analyzer().comment_density(code_unit))
+    }
+
+    fn comment_density_by_top_level(&self, file: &ProjectFile) -> Vec<CommentDensityStats> {
+        self.delegate_for_file(file)
+            .map(|delegate| delegate.analyzer().comment_density_by_top_level(file))
             .unwrap_or_default()
     }
 
