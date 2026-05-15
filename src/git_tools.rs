@@ -29,7 +29,9 @@ mod text_utils;
 
 use crate::analyzer::IAnalyzer;
 use cache::{CommitSearchKey, commit_search_cache};
-use git2::{Commit, Delta, Diff, DiffFindOptions, DiffOptions, ObjectType, Patch, Repository, Sort};
+use git2::{
+    Commit, Delta, Diff, DiffFindOptions, DiffOptions, ObjectType, Patch, Repository, Sort,
+};
 use moka::sync::Cache;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -201,7 +203,6 @@ fn search_git_commit_messages_with_cache(
     out
 }
 
-
 /// Retrieve recent commits, optionally restricted to a path. See
 /// module-level docs on [error-as-text convention](self#error-as-text-convention).
 pub fn get_git_log(analyzer: &dyn IAnalyzer, params: GetGitLogParams) -> String {
@@ -367,15 +368,13 @@ fn walk_rename_history<'repo>(
     // renames the file, we follow the old name into ancestors.
     let mut current_target: PathBuf = head_rel.to_path_buf();
     let mut entries: Vec<RenameWalkEntry<'repo>> = Vec::new();
-    let mut commits_examined: usize = 0;
     let mut hit_examination_cap = false;
 
-    for oid in walker.flatten() {
+    for (commits_examined, oid) in walker.flatten().enumerate() {
         if commits_examined >= MAX_RENAME_COMMITS_EXAMINED {
             hit_examination_cap = true;
             break;
         }
-        commits_examined += 1;
 
         let Ok(commit) = context.repo.find_commit(oid) else {
             continue;
@@ -395,8 +394,7 @@ fn walk_rename_history<'repo>(
         // missed while still being emitted with both paths equal.
         let _ = diff.find_similar(Some(&mut find_opts));
 
-        let Some((old_path, new_path, is_rename)) =
-            find_target_delta(&diff, &current_target)
+        let Some((old_path, new_path, is_rename)) = find_target_delta(&diff, &current_target)
         else {
             continue;
         };
@@ -515,7 +513,9 @@ pub fn get_commit_diff(analyzer: &dyn IAnalyzer, params: GetCommitDiffParams) ->
     let object = match context.repo.revparse_single(&revision) {
         Ok(obj) => obj,
         Err(err) => {
-            return format!("Error retrieving commit diff for {revision}: unable to resolve revision: {err}");
+            return format!(
+                "Error retrieving commit diff for {revision}: unable to resolve revision: {err}"
+            );
         }
     };
 
@@ -541,9 +541,9 @@ pub fn get_commit_diff(analyzer: &dyn IAnalyzer, params: GetCommitDiffParams) ->
     let short_hash: String = full_hash.chars().take(7).collect();
 
     let mut out = String::new();
-    let _ = write!(
+    let _ = writeln!(
         out,
-        "<commit_diff revision=\"{}\" short_hash=\"{}\" files_total=\"{}\" files_included=\"{}\" truncated=\"{}\">\n",
+        "<commit_diff revision=\"{}\" short_hash=\"{}\" files_total=\"{}\" files_included=\"{}\" truncated=\"{}\">",
         escape_xml_attr(&revision),
         escape_xml_attr(&short_hash),
         formatted.files_total,
@@ -727,7 +727,6 @@ fn is_safe_revision(s: &str) -> bool {
     !s.is_empty() && !s.starts_with('-') && !s.contains(':') && !s.contains("@{")
 }
 
-
 struct FormattedDiff {
     text: String,
     files_total: usize,
@@ -800,11 +799,7 @@ fn sort_files_by_density(metrics: &mut [FileMetrics]) {
 // Returns true iff the per-file hunk-selection had to drop at least one
 // hunk (either by overflowing the lines_per_file budget or by emitting a
 // single oversized largest-hunk).
-fn render_selected_files(
-    out: &mut String,
-    files: &[FileMetrics],
-    lines_per_file: usize,
-) -> bool {
+fn render_selected_files(out: &mut String, files: &[FileMetrics], lines_per_file: usize) -> bool {
     let mut truncated = false;
     for fm in files {
         let _ = writeln!(out, "diff --git {} {}", fm.a_path, fm.b_path);
@@ -1103,19 +1098,13 @@ mod tests {
             limit: 10,
         };
 
-        let r1 = search_git_commit_messages_with_cache(
-            fix.analyzer.analyzer(),
-            params.clone(),
-            &cache,
-        );
+        let r1 =
+            search_git_commit_messages_with_cache(fix.analyzer.analyzer(), params.clone(), &cache);
         cache.run_pending_tasks();
         assert_eq!(cache.entry_count(), 1, "first call should populate cache");
 
-        let r2 = search_git_commit_messages_with_cache(
-            fix.analyzer.analyzer(),
-            params.clone(),
-            &cache,
-        );
+        let r2 =
+            search_git_commit_messages_with_cache(fix.analyzer.analyzer(), params.clone(), &cache);
         cache.run_pending_tasks();
         assert_eq!(
             cache.entry_count(),
