@@ -465,9 +465,7 @@ fn default_diff_lines_per_file() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::{
-        AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer,
-    };
+    use crate::analyzer::{AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer};
     use git2::{Repository, Signature};
     use std::fs;
     use std::path::PathBuf;
@@ -485,9 +483,8 @@ mod tests {
             let temp = TempDir::new().expect("tempdir");
             let repo_path = temp.path().canonicalize().expect("canonicalize tempdir");
             Repository::init(&repo_path).expect("git init");
-            let project: Arc<dyn Project> = Arc::new(
-                FilesystemProject::new(repo_path.clone()).expect("project"),
-            );
+            let project: Arc<dyn Project> =
+                Arc::new(FilesystemProject::new(repo_path.clone()).expect("project"));
             let analyzer = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
             Self {
                 _temp: temp,
@@ -615,11 +612,7 @@ mod tests {
         let fix = GitFixture::new();
         let oid = fix.commit(
             "Many files",
-            &[
-                ("a.txt", "a\n"),
-                ("b.txt", "b\n"),
-                ("c.txt", "c\n"),
-            ],
+            &[("a.txt", "a\n"), ("b.txt", "b\n"), ("c.txt", "c\n")],
         );
         let result = get_commit_diff(
             fix.analyzer.analyzer(),

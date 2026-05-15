@@ -489,14 +489,15 @@ pub fn skim_files(analyzer: &dyn IAnalyzer, params: SkimFilesParams) -> SkimFile
         let declarations: Vec<SkimDeclaration> = analyzer
             .top_level_declarations(&file)
             .flat_map(|code_unit| {
-                analyzer.ranges_of(code_unit).into_iter().map(move |range| {
-                    SkimDeclaration {
+                analyzer
+                    .ranges_of(code_unit)
+                    .into_iter()
+                    .map(move |range| SkimDeclaration {
                         symbol: code_unit.short_name().to_string(),
                         kind: code_unit_kind_label(code_unit),
                         start_line: range.start_line,
                         end_line: range.end_line,
-                    }
-                })
+                    })
             })
             .collect();
 
@@ -546,9 +547,7 @@ fn default_list_files_max_entries() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::{
-        AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer,
-    };
+    use crate::analyzer::{AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -569,9 +568,8 @@ mod tests {
                 }
                 fs::write(&abs, content).expect("write");
             }
-            let project: Arc<dyn Project> = Arc::new(
-                FilesystemProject::new(temp.path().to_path_buf()).expect("project"),
-            );
+            let project: Arc<dyn Project> =
+                Arc::new(FilesystemProject::new(temp.path().to_path_buf()).expect("project"));
             let analyzer = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
             Self {
                 _temp: temp,
@@ -586,10 +584,7 @@ mod tests {
 
     #[test]
     fn get_file_contents_reads_existing_files() {
-        let fix = Fixture::new(&[
-            ("src/a.rs", "fn a() {}\n"),
-            ("src/b.rs", "fn b() {}\n"),
-        ]);
+        let fix = Fixture::new(&[("src/a.rs", "fn a() {}\n"), ("src/b.rs", "fn b() {}\n")]);
         let result = get_file_contents(
             fix.analyzer.analyzer(),
             GetFileContentsParams {
@@ -617,11 +612,7 @@ mod tests {
 
     #[test]
     fn find_filenames_matches_basename_glob_without_slash() {
-        let fix = Fixture::new(&[
-            ("src/a.rs", ""),
-            ("src/nested/b.rs", ""),
-            ("README.md", ""),
-        ]);
+        let fix = Fixture::new(&[("src/a.rs", ""), ("src/nested/b.rs", ""), ("README.md", "")]);
         let result = find_filenames(
             fix.analyzer.analyzer(),
             FindFilenamesParams {
@@ -635,10 +626,7 @@ mod tests {
 
     #[test]
     fn find_filenames_matches_full_path_with_slash() {
-        let fix = Fixture::new(&[
-            ("src/a.rs", ""),
-            ("src/nested/b.rs", ""),
-        ]);
+        let fix = Fixture::new(&[("src/a.rs", ""), ("src/nested/b.rs", "")]);
         let result = find_filenames(
             fix.analyzer.analyzer(),
             FindFilenamesParams {
@@ -697,10 +685,7 @@ mod tests {
 
     #[test]
     fn search_file_contents_returns_context() {
-        let fix = Fixture::new(&[(
-            "src/a.rs",
-            "line1\nline2\nNEEDLE\nline4\nline5\n",
-        )]);
+        let fix = Fixture::new(&[("src/a.rs", "line1\nline2\nNEEDLE\nline4\nline5\n")]);
         let result = search_file_contents(
             fix.analyzer.analyzer(),
             SearchFileContentsParams {
@@ -723,10 +708,7 @@ mod tests {
 
     #[test]
     fn search_file_contents_respects_filepath_glob() {
-        let fix = Fixture::new(&[
-            ("src/a.rs", "NEEDLE\n"),
-            ("src/b.txt", "NEEDLE\n"),
-        ]);
+        let fix = Fixture::new(&[("src/a.rs", "NEEDLE\n"), ("src/b.txt", "NEEDLE\n")]);
         let result = search_file_contents(
             fix.analyzer.analyzer(),
             SearchFileContentsParams {
@@ -742,11 +724,7 @@ mod tests {
 
     #[test]
     fn list_files_filters_by_directory_prefix() {
-        let fix = Fixture::new(&[
-            ("src/a.rs", ""),
-            ("src/nested/b.rs", ""),
-            ("README.md", ""),
-        ]);
+        let fix = Fixture::new(&[("src/a.rs", ""), ("src/nested/b.rs", ""), ("README.md", "")]);
         let result = list_files(
             fix.analyzer.analyzer(),
             ListFilesParams {
@@ -779,11 +757,7 @@ mod tests {
 
     #[test]
     fn list_files_respects_max_entries() {
-        let fix = Fixture::new(&[
-            ("src/a.rs", ""),
-            ("src/b.rs", ""),
-            ("src/c.rs", ""),
-        ]);
+        let fix = Fixture::new(&[("src/a.rs", ""), ("src/b.rs", ""), ("src/c.rs", "")]);
         let result = list_files(
             fix.analyzer.analyzer(),
             ListFilesParams {
