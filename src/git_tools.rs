@@ -1,10 +1,12 @@
 use crate::analyzer::IAnalyzer;
 use git2::{Commit, Delta, Diff, DiffFindOptions, DiffOptions, ObjectType, Patch, Repository, Sort};
+use moka::sync::Cache;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 const DEFAULT_LOG_LIMIT: usize = 20;
 const DEFAULT_SEARCH_LIMIT: usize = 20;
@@ -49,11 +51,21 @@ pub fn search_git_commit_messages(
     analyzer: &dyn IAnalyzer,
     params: SearchGitCommitMessagesParams,
 ) -> String {
-    let pattern = params.pattern.trim();
+    search_git_commit_messages_with_cache(analyzer, params, commit_search_cache())
+}
+
+fn search_git_commit_messages_with_cache(
+    analyzer: &dyn IAnalyzer,
+    params: SearchGitCommitMessagesParams,
+    cache: &Cache<CommitSearchKey, String>,
+) -> String {
+    let pattern = params.pattern.trim().to_string();
     if pattern.is_empty() {
         return "Cannot search commit messages: pattern is empty".to_string();
     }
-    let regex = match Regex::new(pattern) {
+    // Compile the regex early so we never cache results keyed on an
+    // invalid pattern, and the error message round-trips cheaply.
+    let regex = match Regex::new(&pattern) {
         Ok(re) => re,
         Err(err) => return format!("Error searching commit messages: invalid regex: {err}"),
     };
@@ -64,6 +76,22 @@ pub fn search_git_commit_messages(
     };
 
     let effective_limit = params.limit.clamp(1, MAX_SEARCH_LIMIT);
+
+    // Cache lookup is keyed on (repo root, HEAD oid, pattern, limit). HEAD
+    // changing invalidates implicitly via a new cache key; the LRU bounded
+    // capacity reclaims old entries.
+    let head_oid = context.head_oid();
+    let cache_key = head_oid.as_ref().map(|head| CommitSearchKey {
+        root: context.repo_root.clone(),
+        head: head.clone(),
+        pattern: pattern.clone(),
+        limit: effective_limit,
+    });
+    if let Some(key) = &cache_key
+        && let Some(cached) = cache.get(key)
+    {
+        return cached;
+    }
 
     let walker = match context.revwalk_head() {
         Ok(w) => w,
@@ -89,7 +117,11 @@ pub fn search_git_commit_messages(
     }
 
     if matches.is_empty() {
-        return format!("No commit messages found matching pattern: {pattern}");
+        let result = format!("No commit messages found matching pattern: {pattern}");
+        if let Some(key) = cache_key {
+            cache.insert(key, result.clone());
+        }
+        return result;
     }
 
     let mut out = String::new();
@@ -117,7 +149,27 @@ pub fn search_git_commit_messages(
         let _ = writeln!(out, "</edited_files>");
         let _ = writeln!(out, "</commit>");
     }
+
+    if let Some(key) = cache_key {
+        cache.insert(key, out.clone());
+    }
     out
+}
+
+#[derive(Clone, Hash, Eq, PartialEq)]
+struct CommitSearchKey {
+    root: PathBuf,
+    head: String,
+    pattern: String,
+    limit: usize,
+}
+
+fn commit_search_cache() -> &'static Cache<CommitSearchKey, String> {
+    static CACHE: OnceLock<Cache<CommitSearchKey, String>> = OnceLock::new();
+    // 64 entries is plenty for interactive use; LRU eviction reclaims older
+    // patterns automatically. moka's sync Cache is Arc-backed so the static
+    // reference is shared cheaply across calls.
+    CACHE.get_or_init(|| Cache::builder().max_capacity(64).build())
 }
 
 pub fn get_git_log(analyzer: &dyn IAnalyzer, params: GetGitLogParams) -> String {
@@ -461,6 +513,14 @@ impl GitContext {
             Ok(prefix) if !prefix.as_os_str().is_empty() => prefix.join(project_rel),
             _ => project_rel.to_path_buf(),
         }
+    }
+
+    fn head_oid(&self) -> Option<String> {
+        self.repo
+            .head()
+            .ok()
+            .and_then(|h| h.target())
+            .map(|oid| oid.to_string())
     }
 }
 
@@ -947,6 +1007,56 @@ mod tests {
             repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &parent_refs)
                 .expect("merge commit")
         }
+    }
+
+    #[test]
+    fn search_git_commit_messages_caches_repeat_calls_under_same_head() {
+        // Use a private cache instance to avoid races with sibling tests
+        // hitting the global cache via the public entry point.
+        let cache: Cache<CommitSearchKey, String> = Cache::builder().max_capacity(64).build();
+
+        let fix = GitFixture::new();
+        fix.commit("alpha", &[("a.txt", "1")]);
+        fix.commit("beta", &[("a.txt", "2")]);
+
+        let params = SearchGitCommitMessagesParams {
+            pattern: "alpha|beta".to_string(),
+            limit: 10,
+        };
+
+        let r1 = search_git_commit_messages_with_cache(
+            fix.analyzer.analyzer(),
+            params.clone(),
+            &cache,
+        );
+        cache.run_pending_tasks();
+        assert_eq!(cache.entry_count(), 1, "first call should populate cache");
+
+        let r2 = search_git_commit_messages_with_cache(
+            fix.analyzer.analyzer(),
+            params.clone(),
+            &cache,
+        );
+        cache.run_pending_tasks();
+        assert_eq!(
+            cache.entry_count(),
+            1,
+            "second call with same key should hit the cache, not add a new entry"
+        );
+        assert_eq!(r1, r2);
+
+        // New commit changes HEAD → new key → new entry. The result must
+        // reflect the new commit, never a stale cached value.
+        fix.commit("alpha-two", &[("a.txt", "3")]);
+        let r3 = search_git_commit_messages_with_cache(fix.analyzer.analyzer(), params, &cache);
+        cache.run_pending_tasks();
+        assert_eq!(
+            cache.entry_count(),
+            2,
+            "post-commit search should miss the cache (different HEAD)"
+        );
+        assert!(r3.contains("alpha-two"), "got: {r3}");
+        assert_ne!(r1, r3);
     }
 
     #[test]
