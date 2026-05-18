@@ -5,6 +5,9 @@ use crate::analyzer::{
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use crate::usages::graph_core::{ImportEdge, ImportEdgeKind, ProjectUsageGraph};
+use crate::usages::local_inference::{
+    LocalBindingsSnapshot, LocalInferenceConfig, LocalInferenceEngine, SymbolResolution,
+};
 use crate::usages::model::{ExportIndex, FuzzyResult, ImportBinder, UsageHit};
 use crate::usages::traits::UsageAnalyzer;
 use rayon::prelude::*;
@@ -452,12 +455,12 @@ struct ScanCtx<'a> {
     edges: &'a [ImportEdge],
     target_self_file: bool,
     local_conflicts: &'a HashSet<String>,
-    scope_facts: &'a HashMap<CodeUnit, ScopeFacts>,
+    scope_facts: &'a HashMap<CodeUnit, LocalBindingsSnapshot<String>>,
     hits: &'a mut BTreeSet<UsageHit>,
 }
 
 impl ScanCtx<'_> {
-    fn scope_facts_for_node(&self, node: Node<'_>) -> Option<&ScopeFacts> {
+    fn scope_facts_for_node(&self, node: Node<'_>) -> Option<&LocalBindingsSnapshot<String>> {
         let range = Range {
             start_byte: node.start_byte(),
             end_byte: node.end_byte(),
@@ -470,7 +473,7 @@ impl ScanCtx<'_> {
 
     fn binds_target(&self, ident: &str, node: Node<'_>) -> bool {
         if let Some(scope_facts) = self.scope_facts_for_node(node)
-            && scope_facts.local_shadows.contains(ident)
+            && scope_facts.is_shadowed(ident)
         {
             return false;
         }
@@ -491,7 +494,11 @@ impl ScanCtx<'_> {
         let Some(scope_facts) = self.scope_facts_for_node(node) else {
             return false;
         };
-        let Some(raw_type) = scope_facts.receiver_facts.get(expr) else {
+        let resolution = scope_facts.resolution_for(expr);
+        let Some(raw_type) = resolution
+            .as_precise()
+            .and_then(|targets| targets.iter().next())
+        else {
             return false;
         };
         self.receiver_type_matches_target(raw_type)
@@ -789,21 +796,16 @@ fn collect_assigned_identifiers(node: Node<'_>, source: &str, out: &mut HashSet<
     }
 }
 
-#[derive(Default, Clone)]
-struct ScopeFacts {
-    receiver_facts: HashMap<String, String>,
-    local_shadows: HashSet<String>,
-}
-
 fn collect_scope_facts(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     edges: &[ImportEdge],
     target_short: &str,
     target_self_file: bool,
-) -> HashMap<CodeUnit, ScopeFacts> {
+) -> HashMap<CodeUnit, LocalBindingsSnapshot<String>> {
     let declarations = analyzer.get_declarations(file);
-    let mut class_facts_by_name: HashMap<String, ScopeFacts> = HashMap::default();
+    let mut class_facts_by_name: HashMap<String, LocalBindingsSnapshot<String>> =
+        HashMap::default();
     for declaration in declarations
         .iter()
         .filter(|declaration| declaration.is_class())
@@ -815,14 +817,7 @@ fn collect_scope_facts(
             collect_scope_facts_from_source(&source, edges, target_short, target_self_file, true);
         class_facts_by_name.insert(
             declaration.short_name().to_string(),
-            ScopeFacts {
-                receiver_facts: facts
-                    .receiver_facts
-                    .into_iter()
-                    .filter(|(fact, _)| fact.starts_with("self."))
-                    .collect(),
-                local_shadows: HashSet::default(),
-            },
+            facts.filtered_visible_bindings(|symbol, _| symbol.starts_with("self.")),
         );
     }
 
@@ -839,9 +834,7 @@ fn collect_scope_facts(
         if let Some((owner, _)) = declaration.short_name().rsplit_once('.')
             && let Some(class_facts) = class_facts_by_name.get(owner)
         {
-            facts
-                .receiver_facts
-                .extend(class_facts.receiver_facts.clone());
+            facts = facts.merged_with_visible(class_facts);
         }
         scope_facts.insert(declaration.clone(), facts);
     }
@@ -854,7 +847,7 @@ fn collect_scope_facts_from_source(
     _target_short: &str,
     _target_self_file: bool,
     allow_self_receivers: bool,
-) -> ScopeFacts {
+) -> LocalBindingsSnapshot<String> {
     static PARAM_ANNOTATION_RE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"([A-Za-z_][A-Za-z0-9_\.]*)\s*:\s*([^=,\)\n]+)").unwrap());
     static PARAM_NAME_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -865,7 +858,7 @@ fn collect_scope_facts_from_source(
             .unwrap()
     });
 
-    let mut facts = ScopeFacts::default();
+    let mut engine = LocalInferenceEngine::new(LocalInferenceConfig::default());
     for captures in PARAM_NAME_RE.captures_iter(source) {
         let params = captures
             .name("params")
@@ -884,8 +877,8 @@ fn collect_scope_facts_from_source(
                 .next()
                 .unwrap_or(param)
                 .trim();
-            if !param_name.is_empty() {
-                facts.local_shadows.insert(param_name.to_string());
+            if !param_name.is_empty() && !engine.is_shadowed(param_name) {
+                engine.declare_shadow(param_name.to_string());
             }
         }
     }
@@ -893,6 +886,7 @@ fn collect_scope_facts_from_source(
     let mut changed = true;
     while changed {
         changed = false;
+        let mut aliases = Vec::new();
         for line in source.lines() {
             for captures in PARAM_ANNOTATION_RE.captures_iter(line) {
                 let lhs = captures.get(1).map(|m| m.as_str()).unwrap_or_default();
@@ -901,11 +895,9 @@ fn collect_scope_facts_from_source(
                     continue;
                 }
                 if let Some(receiver_type) = normalized_receiver_type(annotation)
-                    && facts
-                        .receiver_facts
-                        .insert(lhs.to_string(), receiver_type)
-                        .is_none()
+                    && engine.resolve_symbol(lhs).is_unknown()
                 {
+                    engine.seed_symbol(lhs.to_string(), receiver_type);
                     changed = true;
                 }
             }
@@ -919,38 +911,39 @@ fn collect_scope_facts_from_source(
                 continue;
             }
             let rhs_symbol = rhs.strip_suffix("()").unwrap_or(rhs).trim();
-            facts.local_shadows.insert(lhs.to_string());
+            if !engine.is_shadowed(lhs) {
+                engine.declare_shadow(lhs.to_string());
+            }
             if lhs.starts_with("self.") && !allow_self_receivers {
                 continue;
             }
 
-            if !facts.local_shadows.contains(rhs_symbol)
+            if !engine.is_shadowed(rhs_symbol)
                 && let Some(receiver_type) = normalized_receiver_type(rhs_symbol)
-                && facts
-                    .receiver_facts
-                    .insert(lhs.to_string(), receiver_type)
-                    .is_none()
+                && engine.resolve_symbol(lhs).is_unknown()
             {
+                engine.seed_symbol(lhs.to_string(), receiver_type);
                 changed = true;
                 continue;
             }
 
-            if let Some(receiver_type) = facts
-                .receiver_facts
-                .get(rhs)
-                .or_else(|| facts.receiver_facts.get(rhs_symbol))
-                .cloned()
-                && facts
-                    .receiver_facts
-                    .insert(lhs.to_string(), receiver_type)
-                    .is_none()
-            {
-                changed = true;
+            match engine.resolve_symbol(rhs_symbol) {
+                SymbolResolution::Precise(targets) if !targets.is_empty() => {
+                    aliases.push((lhs.to_string(), rhs_symbol.to_string()));
+                }
+                SymbolResolution::Unknown
+                | SymbolResolution::Ambiguous
+                | SymbolResolution::Precise(_) => {}
             }
+        }
+        let before = engine.snapshot();
+        engine.apply_aliases_until_stable(aliases);
+        if engine.snapshot() != before {
+            changed = true;
         }
     }
 
-    facts
+    engine.snapshot()
 }
 
 fn normalized_receiver_type(annotation: &str) -> Option<String> {

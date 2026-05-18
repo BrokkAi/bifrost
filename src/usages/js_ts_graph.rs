@@ -35,6 +35,7 @@ use crate::analyzer::{
 use crate::hash::{HashMap, HashSet, map_with_capacity};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use crate::usages::graph_core::{ImportEdge, ImportEdgeKind, ProjectUsageGraph};
+use crate::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::usages::model::{
     ExportEntry, ExportIndex, FuzzyResult, ImportBinder, ImportBinding, ImportKind, UsageHit,
 };
@@ -48,6 +49,7 @@ use tree_sitter::{Node, Parser, Tree};
 const GRAPH_HIT_CONFIDENCE: f64 = 1.0;
 /// Lines of context to include before/after a match in [`UsageHit::snippet`].
 const SNIPPET_CONTEXT_LINES: usize = 3;
+const TARGET_BINDING: &str = "__target__";
 
 // ===================================================================================
 // Strategy
@@ -286,6 +288,13 @@ fn scan_files_for_seeds(
         let line_starts = compute_line_starts(source_str);
 
         let target_self_file = *file == target.source();
+        let mut binding_engine = LocalInferenceEngine::new(LocalInferenceConfig::default());
+        for edge in &edges {
+            binding_engine.seed_symbol(edge.local_name.clone(), TARGET_BINDING);
+        }
+        if target_self_file {
+            binding_engine.seed_symbol(target_short.clone(), TARGET_BINDING);
+        }
 
         let mut scan_ctx = ScanCtx {
             file,
@@ -296,6 +305,7 @@ fn scan_files_for_seeds(
             target_member: target_member.as_deref(),
             edges: &edges,
             target_self_file,
+            binding_engine,
             hits: &mut local_hits,
         };
 
@@ -328,11 +338,22 @@ struct ScanCtx<'a> {
     /// True when this scan is over the target's own defining file (used to also catch
     /// in-file references that don't go through an import binding).
     target_self_file: bool,
+    binding_engine: LocalInferenceEngine<&'static str>,
     hits: &'a mut BTreeSet<UsageHit>,
 }
 
 impl ScanCtx<'_> {
     fn binds_target(&self, ident: &str) -> bool {
+        let local_resolution = self.binding_engine.resolve_symbol(ident);
+        if local_resolution
+            .as_precise()
+            .is_some_and(|targets| targets.contains(TARGET_BINDING))
+        {
+            return true;
+        }
+        if self.binding_engine.is_shadowed(ident) {
+            return false;
+        }
         if self.edges.iter().any(|edge| edge.local_name == ident) {
             return true;
         }
@@ -346,6 +367,20 @@ impl ScanCtx<'_> {
 fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let kind = node.kind();
 
+    let introduces_scope = matches!(
+        kind,
+        "statement_block"
+            | "arrow_function"
+            | "function_expression"
+            | "generator_function"
+            | "function_declaration"
+            | "method_definition"
+    );
+    if introduces_scope {
+        ctx.binding_engine.enter_scope();
+        register_function_parameters(node, ctx);
+    }
+
     // Skip import statements outright — bindings declared there are not usages.
     if matches!(
         kind,
@@ -356,7 +391,14 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             | "export_clause"
             | "export_specifier"
     ) {
+        if introduces_scope {
+            ctx.binding_engine.exit_scope();
+        }
         return;
+    }
+
+    if kind == "variable_declarator" {
+        register_local_binding(node, ctx);
     }
 
     match kind {
@@ -371,6 +413,72 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         scan_node(child, ctx);
+    }
+
+    if introduces_scope {
+        ctx.binding_engine.exit_scope();
+    }
+}
+
+fn register_local_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let Some(name_node) = node.child_by_field_name("name") else {
+        return;
+    };
+    let lhs = slice(name_node, ctx.source);
+    if lhs.is_empty() {
+        return;
+    }
+
+    ctx.binding_engine.declare_shadow(lhs.to_string());
+
+    let Some(value_node) = node.child_by_field_name("value") else {
+        return;
+    };
+    let rhs = match value_node.kind() {
+        "identifier" | "type_identifier" => slice(value_node, ctx.source),
+        _ => return,
+    };
+    if rhs.is_empty() || ctx.binding_engine.resolve_symbol(rhs).is_unknown() {
+        return;
+    }
+    ctx.binding_engine.alias_symbol(lhs.to_string(), rhs);
+}
+
+fn register_function_parameters(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let Some(parameters) = node.child_by_field_name("parameters") else {
+        return;
+    };
+    register_pattern_bindings(parameters, ctx);
+}
+
+fn register_pattern_bindings(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    match node.kind() {
+        "identifier" | "shorthand_property_identifier_pattern" => {
+            let text = slice(node, ctx.source);
+            if text.is_empty() {
+                return;
+            }
+            ctx.binding_engine.declare_shadow(text.to_string());
+        }
+        "required_parameter" | "optional_parameter" => {
+            if let Some(pattern) = node.child_by_field_name("pattern") {
+                register_pattern_bindings(pattern, ctx);
+            }
+        }
+        "rest_pattern" | "assignment_pattern" | "object_pattern" | "array_pattern"
+        | "pair_pattern" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                register_pattern_bindings(child, ctx);
+            }
+        }
+        "formal_parameters" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                register_pattern_bindings(child, ctx);
+            }
+        }
+        _ => {}
     }
 }
 

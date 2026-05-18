@@ -5,6 +5,7 @@ use crate::analyzer::{
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use crate::usages::graph_core::{ImportEdgeKind, ProjectUsageGraph};
+use crate::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::usages::model::{FuzzyResult, UsageHit};
 use crate::usages::traits::UsageAnalyzer;
 use rayon::prelude::*;
@@ -893,8 +894,23 @@ fn infer_receiver_names(
     owner_local_names: &HashSet<String>,
     self_like_constructors: &HashSet<String>,
 ) -> Vec<String> {
-    let mut receivers = BTreeSet::new();
     let owner_type_names = expanded_receiver_type_names(source, owner_local_names);
+    let bindings = collect_receiver_bindings(source, &owner_type_names, self_like_constructors);
+    let mut receivers: Vec<_> = bindings
+        .snapshot()
+        .matching_symbols(|target| owner_type_names.contains(target))
+        .into_iter()
+        .collect();
+    receivers.sort();
+    receivers
+}
+
+fn collect_receiver_bindings(
+    source: &str,
+    owner_type_names: &HashSet<String>,
+    self_like_constructors: &HashSet<String>,
+) -> LocalInferenceEngine<String> {
+    let mut engine = LocalInferenceEngine::new(LocalInferenceConfig::default());
 
     let option_field_types: HashMap<String, String> = OPTION_FIELD_RE
         .captures_iter(source)
@@ -914,7 +930,7 @@ fn infer_receiver_names(
             continue;
         };
         if owner_type_names.contains(ty.as_str()) {
-            receivers.insert(name.as_str().to_string());
+            engine.seed_symbol(name.as_str().to_string(), ty.as_str().to_string());
         }
     }
 
@@ -929,7 +945,7 @@ fn infer_receiver_names(
         let allowed_constructor =
             constructor_name.is_none_or(|name| self_like_constructors.contains(name));
         if owner_type_names.contains(ty.as_str()) && allowed_constructor {
-            receivers.insert(name.as_str().to_string());
+            engine.seed_symbol(name.as_str().to_string(), ty.as_str().to_string());
         }
     }
 
@@ -941,7 +957,7 @@ fn infer_receiver_names(
             continue;
         };
         if owner_type_names.contains(ty.as_str()) {
-            receivers.insert(name.as_str().to_string());
+            engine.seed_symbol(name.as_str().to_string(), ty.as_str().to_string());
         }
     }
 
@@ -955,28 +971,22 @@ fn infer_receiver_names(
         if option_field_types
             .get(field_name.as_str())
             .is_some_and(|ty| owner_type_names.contains(ty))
+            && let Some(ty) = option_field_types.get(field_name.as_str())
         {
-            receivers.insert(name.as_str().to_string());
+            engine.seed_symbol(name.as_str().to_string(), ty.clone());
         }
     }
 
-    loop {
-        let mut changed = false;
-        for captures in LET_ALIAS_RE.captures_iter(source) {
-            let Some(name) = captures.get(1) else {
-                continue;
-            };
-            let Some(value) = captures.get(2) else {
-                continue;
-            };
-            if receivers.contains(value.as_str()) && receivers.insert(name.as_str().to_string()) {
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
+    let aliases: Vec<_> = LET_ALIAS_RE
+        .captures_iter(source)
+        .filter_map(|captures| {
+            Some((
+                captures.get(1)?.as_str().to_string(),
+                captures.get(2)?.as_str().to_string(),
+            ))
+        })
+        .collect();
+    engine.apply_aliases_until_stable(aliases);
 
-    receivers.into_iter().collect()
+    engine
 }
