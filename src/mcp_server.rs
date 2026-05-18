@@ -632,6 +632,79 @@ fn list_tools_result() -> Value {
                 }),
             ),
             tool_descriptor(
+                "report_test_assertion_smells",
+                "Detects low-value or brittle Java test assertion smells using weighted heuristics. Uses test detection as a fast filter, then scores missing assertions, tautologies, constant-truth checks, constant-equality checks, shallow assertions, oversized literals, and anonymous test doubles. Output format matches the brokk-core MCP byte-for-byte.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "file_paths": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Project-relative paths of files to analyze."
+                        },
+                        "min_score": {
+                            "type": "integer",
+                            "default": 4,
+                            "description": "Minimum score to include a finding; values <= 0 default to 4."
+                        },
+                        "max_findings": {
+                            "type": "integer",
+                            "default": 80,
+                            "description": "Maximum findings to emit; values <= 0 default to 80."
+                        },
+                        "no_assertion_weight": {
+                            "type": "integer",
+                            "description": "Weight for tests with no assertion-equivalent calls; values < 0 use the brokk default (5)."
+                        },
+                        "tautological_assertion_weight": {
+                            "type": "integer",
+                            "description": "Weight for self-comparison or tautological assertions; values < 0 use the brokk default (6)."
+                        },
+                        "constant_truth_weight": {
+                            "type": "integer",
+                            "description": "Weight for constant-truth assertions such as assertTrue(true); values < 0 use the brokk default (4)."
+                        },
+                        "constant_equality_weight": {
+                            "type": "integer",
+                            "description": "Weight for constant-equality assertions such as assertEquals(1, 1); values < 0 use the brokk default (4)."
+                        },
+                        "nullness_only_weight": {
+                            "type": "integer",
+                            "description": "Weight for nullness-only assertions; values < 0 use the brokk default (2)."
+                        },
+                        "shallow_assertion_only_weight": {
+                            "type": "integer",
+                            "description": "Weight for tests whose assertions are all shallow; values < 0 use the brokk default (2)."
+                        },
+                        "overspecified_literal_weight": {
+                            "type": "integer",
+                            "description": "Weight for exact large literals in assertions; values < 0 use the brokk default (2)."
+                        },
+                        "anonymous_test_double_weight": {
+                            "type": "integer",
+                            "description": "Weight for inline anonymous test doubles; values < 0 use the brokk default (3)."
+                        },
+                        "repeated_anonymous_test_double_weight": {
+                            "type": "integer",
+                            "description": "Weight for repeated anonymous test-double shapes in one file; values < 0 use the brokk default (5)."
+                        },
+                        "meaningful_assertion_credit": {
+                            "type": "integer",
+                            "description": "Score credit subtracted per meaningful assertion; values < 0 use the brokk default (1)."
+                        },
+                        "meaningful_assertion_credit_cap": {
+                            "type": "integer",
+                            "description": "Maximum meaningful assertions that earn credit; values < 0 use the brokk default (4)."
+                        },
+                        "large_literal_length_threshold": {
+                            "type": "integer",
+                            "description": "Literal length considered large enough to review; values < 0 use the brokk default (120)."
+                        }
+                    },
+                    "required": ["file_paths"]
+                }),
+            ),
+            tool_descriptor(
                 "report_long_method_and_god_object_smells",
                 "Detects oversized functions, god classes, and god modules using weighted maintainability-size thresholds. Walks the declaration tree per file, rolling up function/nested-type counts and cyclomatic complexity. Tunable knobs apply when supplied; values <= 0 use brokk defaults. File-level modules (JS/TS, Python, Rust, Go, C++) get a built-in leeway multiplier. Output format matches the brokk-core MCP byte-for-byte.",
                 json!({

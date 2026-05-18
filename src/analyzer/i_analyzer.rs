@@ -1,8 +1,8 @@
 use crate::analyzer::{
     CodeBaseMetrics, CodeUnit, CodeUnitType, CommentDensityStats, DeclarationInfo,
     ExceptionHandlingSmell, ExceptionSmellWeights, ImportAnalysisProvider, Language, Project,
-    ProjectFile, Range, TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider,
-    metrics_from_declarations,
+    ProjectFile, Range, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
+    TypeAliasProvider, TypeHierarchyProvider, metrics_from_declarations,
 };
 use crate::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, FuzzyResult, UsageFinder};
 use std::any::Any;
@@ -261,6 +261,17 @@ pub trait IAnalyzer: Send + Sync + Any {
         _file: &ProjectFile,
         _weights: ExceptionSmellWeights,
     ) -> Vec<ExceptionHandlingSmell> {
+        Vec::new()
+    }
+
+    /// Detect suspicious low-value or brittle test assertions in `file`
+    /// using `weights`. Default is an empty vector so analyzers that do not
+    /// yet implement this heuristic stay silent.
+    fn find_test_assertion_smells(
+        &self,
+        _file: &ProjectFile,
+        _weights: TestAssertionWeights,
+    ) -> Vec<TestAssertionSmell> {
         Vec::new()
     }
 

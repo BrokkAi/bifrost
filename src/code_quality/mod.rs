@@ -208,6 +208,7 @@ mod comment_density;
 mod cyclomatic;
 mod exception_smells;
 mod maintainability_size;
+mod test_assertion_smells;
 
 pub use cognitive::{
     ComputeCognitiveComplexityParams, ComputeCognitiveComplexityResult,
@@ -229,4 +230,7 @@ pub use exception_smells::{
 pub use maintainability_size::{
     ReportLongMethodAndGodObjectSmellsParams, ReportLongMethodAndGodObjectSmellsResult,
     find_long_method_and_god_object_smells, report_long_method_and_god_object_smells,
+};
+pub use test_assertion_smells::{
+    ReportTestAssertionSmellsParams, ReportTestAssertionSmellsResult, report_test_assertion_smells,
 };

@@ -507,6 +507,56 @@ pub struct CommentDensityStats {
     pub rolled_up_span_lines: u32,
 }
 
+/// Tunable weights for test-assertion smell detection. Mirrors the Brokk
+/// analyzer defaults so MCP output stays behaviorally aligned when Bifrost is
+/// used as a drop-in replacement for this tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestAssertionWeights {
+    pub no_assertion_weight: i32,
+    pub tautological_assertion_weight: i32,
+    pub constant_truth_weight: i32,
+    pub constant_equality_weight: i32,
+    pub nullness_only_weight: i32,
+    pub shallow_assertion_only_weight: i32,
+    pub overspecified_literal_weight: i32,
+    pub anonymous_test_double_weight: i32,
+    pub repeated_anonymous_test_double_weight: i32,
+    pub meaningful_assertion_credit: i32,
+    pub meaningful_assertion_credit_cap: i32,
+    pub large_literal_length_threshold: i32,
+}
+
+impl TestAssertionWeights {
+    pub fn defaults() -> Self {
+        Self {
+            no_assertion_weight: 5,
+            tautological_assertion_weight: 6,
+            constant_truth_weight: 4,
+            constant_equality_weight: 4,
+            nullness_only_weight: 2,
+            shallow_assertion_only_weight: 2,
+            overspecified_literal_weight: 2,
+            anonymous_test_double_weight: 3,
+            repeated_anonymous_test_double_weight: 5,
+            meaningful_assertion_credit: 1,
+            meaningful_assertion_credit_cap: 4,
+            large_literal_length_threshold: 120,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestAssertionSmell {
+    pub file: ProjectFile,
+    pub enclosing_fq_name: String,
+    pub assertion_kind: String,
+    pub score: i32,
+    pub assertion_count: i32,
+    pub reasons: Vec<String>,
+    pub excerpt: String,
+    pub start_byte: usize,
+}
+
 /// Tunable weights for the exception-handling smell heuristic. Mirrors
 /// brokk-shared `IAnalyzer.ExceptionSmellWeights` field-for-field; callers
 /// can override individual fields by passing positive values and otherwise

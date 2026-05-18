@@ -94,6 +94,11 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             .iter()
             .any(|tool| tool["name"] == "compute_cognitive_complexity")
     );
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool["name"] == "report_test_assertion_smells")
+    );
 
     let scan_usages = round_trip(
         &mut stdin,
@@ -238,6 +243,30 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
         }),
     );
     assert_eq!(json!({}), ping["result"]);
+
+    let test_assertion_smells = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "report_test_assertion_smells",
+                "arguments": {
+                    "file_paths": ["TestAssertionSmells.java"],
+                    "min_score": 3
+                }
+            }
+        }),
+    );
+    let report = test_assertion_smells["result"]["structuredContent"]["report"]
+        .as_str()
+        .expect("report string");
+    assert!(report.starts_with("## Test assertion smells"), "{report}");
+    assert!(report.contains("self-comparison"), "{report}");
+    assert!(report.contains("anonymous-test-double"), "{report}");
 
     drop(stdin);
     let status = child.wait().expect("wait bifrost");

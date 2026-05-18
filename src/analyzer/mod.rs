@@ -38,7 +38,8 @@ pub(crate) use javascript_analyzer::resolve_js_ts_module_specifier;
 pub use model::{
     CodeBaseMetrics, CodeUnit, CodeUnitType, CommentDensityStats, DeclarationInfo, DeclarationKind,
     ExceptionHandlingSmell, ExceptionSmellWeights, ImportInfo, Language, MaintainabilitySizeSmell,
-    MaintainabilitySizeSmellWeights, ProjectFile, Range, metrics_from_declarations,
+    MaintainabilitySizeSmellWeights, ProjectFile, Range, TestAssertionSmell, TestAssertionWeights,
+    metrics_from_declarations,
 };
 pub use multi_analyzer::{AnalyzerDelegate, MultiAnalyzer};
 pub use php_analyzer::PhpAnalyzer;
