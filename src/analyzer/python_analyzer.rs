@@ -7,7 +7,9 @@ use crate::analyzer::{
 use crate::hash::{HashMap, HashSet};
 use crate::profiling;
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
-use crate::usages::{ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind};
+use crate::usages::{
+    ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind, ReexportStar,
+};
 use moka::sync::Cache;
 use regex::Regex;
 use std::collections::BTreeSet;
@@ -304,17 +306,41 @@ impl PythonAnalyzer {
                     alias,
                     wildcard,
                 } => {
+                    let resolved_module = if module.starts_with('.') {
+                        resolve_python_relative_module(file, &module)
+                    } else {
+                        Some(module.clone())
+                    };
+                    let Some(resolved_module) = resolved_module else {
+                        continue;
+                    };
+
                     if wildcard {
+                        index.reexport_stars.push(ReexportStar {
+                            module_specifier: resolved_module,
+                        });
                         continue;
                     }
+
                     let exported_name = alias.unwrap_or(name.clone());
                     if exported_name.starts_with('_') {
+                        continue;
+                    }
+                    let imported_name = format!("{resolved_module}.{name}");
+                    if self.resolve_module_code_unit(&imported_name).is_some() {
+                        index.exports_by_name.insert(
+                            exported_name,
+                            ExportEntry::ReexportedNamed {
+                                module_specifier: imported_name,
+                                imported_name: name,
+                            },
+                        );
                         continue;
                     }
                     index.exports_by_name.insert(
                         exported_name,
                         ExportEntry::ReexportedNamed {
-                            module_specifier: module,
+                            module_specifier: resolved_module,
                             imported_name: name,
                         },
                     );
@@ -356,14 +382,34 @@ impl PythonAnalyzer {
                     alias,
                     wildcard,
                 } => {
+                    let resolved_module = if module.starts_with('.') {
+                        resolve_python_relative_module(file, &module)
+                    } else {
+                        Some(module.clone())
+                    };
+                    let Some(resolved_module) = resolved_module else {
+                        continue;
+                    };
                     if wildcard {
                         continue;
                     }
                     let local_name = alias.unwrap_or_else(|| name.clone());
+                    let module_candidate = format!("{resolved_module}.{name}");
+                    if self.resolve_module_code_unit(&module_candidate).is_some() {
+                        binder.bindings.insert(
+                            local_name,
+                            ImportBinding {
+                                module_specifier: module_candidate,
+                                kind: ImportKind::Namespace,
+                                imported_name: None,
+                            },
+                        );
+                        continue;
+                    }
                     binder.bindings.insert(
                         local_name,
                         ImportBinding {
-                            module_specifier: module,
+                            module_specifier: resolved_module,
                             kind: ImportKind::Named,
                             imported_name: Some(name),
                         },

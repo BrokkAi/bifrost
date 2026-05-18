@@ -476,6 +476,12 @@ fn handle_identifier_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if ctx.target_member.is_some() {
         return;
     }
+    if node
+        .parent()
+        .is_some_and(|parent| parent.kind() == "attribute")
+    {
+        return;
+    }
     let text = slice(node, ctx.source);
     if text.is_empty() || !ctx.binds_target(text) || is_declaration_identifier(node) {
         return;
@@ -500,7 +506,9 @@ fn handle_attribute_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 
     let namespace_match = ctx.edges.iter().any(|edge| {
-        matches!(edge.kind, ImportEdgeKind::Namespace) && edge.local_name == object_text
+        matches!(edge.kind, ImportEdgeKind::Namespace)
+            && (edge.local_name == object_text
+                || object_text.ends_with(&format!(".{}", edge.local_name)))
     });
     if namespace_match && attribute_text == ctx.target_short {
         record_hit(attribute, ctx);

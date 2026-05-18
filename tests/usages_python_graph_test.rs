@@ -170,6 +170,62 @@ def run():
 }
 
 #[test]
+fn nested_package_barrel_resolves_through_init_chain() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "pkg/internal/service.py",
+            r#"
+class Service:
+    pass
+"#,
+        )
+        .file(
+            "pkg/internal/__init__.py",
+            r#"
+from .service import Service
+
+__all__ = ["Service"]
+"#,
+        )
+        .file(
+            "pkg/__init__.py",
+            r#"
+from .internal import Service
+
+__all__ = ["Service"]
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+from pkg import Service
+
+def run():
+    return Service()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "pkg.internal.service.Service");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = PythonExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("graph should resolve nested package barrel chain");
+    assert_eq!(hits.len(), 1);
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file == project.file("consumer.py"))
+    );
+}
+
+#[test]
 fn import_cycle_terminates_and_reports_proven_hits() {
     let project = InlineTestProject::with_language(Language::Python)
         .file(
@@ -218,6 +274,241 @@ def run():
         hits.iter()
             .any(|hit| hit.file == project.file("consumer.py"))
     );
+}
+
+#[test]
+fn dotted_namespace_import_resolves_export_usage() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "pkg/service.py",
+            r#"
+class Service:
+    pass
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+import pkg.service
+
+def run():
+    return pkg.service.Service()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "pkg.service.Service");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = PythonExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("graph should resolve dotted namespace import");
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn dotted_namespace_alias_resolves_export_usage() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "pkg/service.py",
+            r#"
+class Service:
+    pass
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+import pkg.service as svc
+
+def run():
+    return svc.Service()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "pkg.service.Service");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = PythonExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("graph should resolve dotted namespace alias");
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn from_package_imported_submodule_qualifier_resolves_export_usage() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "cassandra/timestamps.py",
+            r#"
+class MonotonicTimestampGenerator:
+    pass
+"#,
+        )
+        .file("cassandra/__init__.py", "")
+        .file(
+            "tests/unit/test_timestamps.py",
+            r#"
+from cassandra import timestamps
+
+def run():
+    return timestamps.MonotonicTimestampGenerator()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(
+        &analyzer,
+        "cassandra.timestamps.MonotonicTimestampGenerator",
+    );
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = PythonExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("graph should resolve package-imported submodule qualifier");
+    assert_eq!(hits.len(), 1);
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file == project.file("tests/unit/test_timestamps.py"))
+    );
+}
+
+#[test]
+fn relative_same_package_imported_submodule_qualifier_resolves_export_usage() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "pkg/service.py",
+            r#"
+class Service:
+    pass
+"#,
+        )
+        .file("pkg/__init__.py", "")
+        .file(
+            "pkg/consumer.py",
+            r#"
+from . import service
+
+def run():
+    return service.Service()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "pkg.service.Service");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = PythonExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("graph should resolve same-package imported submodule qualifier");
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn relative_parent_imported_submodule_qualifier_resolves_export_usage() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "pkg/service.py",
+            r#"
+class Service:
+    pass
+"#,
+        )
+        .file("pkg/__init__.py", "")
+        .file("pkg/tests/__init__.py", "")
+        .file(
+            "pkg/tests/consumer.py",
+            r#"
+from .. import service
+
+def run():
+    return service.Service()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "pkg.service.Service");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = PythonExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("graph should resolve parent-package imported submodule qualifier");
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn static_wildcard_barrel_resolves_through_all() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "pkg/service.py",
+            r#"
+__all__ = ["Service"]
+
+class Service:
+    pass
+"#,
+        )
+        .file(
+            "pkg/__init__.py",
+            r#"
+from .service import *
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+from pkg import Service
+
+def run():
+    return Service()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "pkg.service.Service");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = PythonExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("graph should resolve wildcard barrel re-export");
+    assert_eq!(hits.len(), 1);
 }
 
 #[test]
