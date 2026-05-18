@@ -20,6 +20,22 @@ fn analyze_pair(
     analyzer.find_structural_clone_smells_for_files(&requested, weights)
 }
 
+fn analyze_both_requested(
+    path_a: &str,
+    source_a: &str,
+    path_b: &str,
+    source_b: &str,
+    weights: CloneSmellWeights,
+) -> Vec<brokk_analyzer::CloneSmell> {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(path_a, source_a)
+        .file(path_b, source_b)
+        .build();
+    let analyzer = CSharpAnalyzer::from_project(project.project().clone());
+    let requested = vec![project.file(path_a), project.file(path_b)];
+    analyzer.find_structural_clone_smells_for_files(&requested, weights)
+}
+
 fn default_weights() -> CloneSmellWeights {
     CloneSmellWeights::defaults()
 }
@@ -134,4 +150,97 @@ fn ast_refinement_suppresses_different_csharp_control_flow() {
     );
 
     assert!(findings.is_empty(), "{findings:#?}");
+}
+
+#[test]
+fn treats_extra_logging_as_equivalent_clone_in_csharp() {
+    let alpha = r#"
+        class Alpha {
+            int Compute(int value) {
+                int total = value + 2;
+                if (total > 20) {
+                    return total * 3;
+                }
+                return total - 4;
+            }
+        }
+    "#;
+    let beta = r#"
+        using System;
+        class Beta {
+            int Calculate(int seed) {
+                Console.WriteLine(seed);
+                int amount = seed + 2;
+                if (amount > 20) {
+                    Console.WriteLine(amount);
+                    return amount * 3;
+                }
+                Console.WriteLine(amount - 4);
+                return amount - 4;
+            }
+        }
+    "#;
+
+    let findings = analyze_pair(
+        "src/A.cs",
+        alpha,
+        "src/B.cs",
+        beta,
+        CloneSmellWeights {
+            min_normalized_tokens: 12,
+            min_similarity_percent: 55,
+            shingle_size: 2,
+            min_shared_shingles: 3,
+            ast_similarity_percent: 70,
+        },
+    );
+
+    assert!(findings.iter().any(|finding| {
+        finding.enclosing_fq_name.contains("Compute")
+            && finding.peer_enclosing_fq_name.contains("Calculate")
+    }));
+}
+
+#[test]
+fn does_not_return_symmetric_pairs_when_both_csharp_files_are_requested() {
+    let alpha = r#"
+        class Alpha {
+            int Compute(int value) {
+                int total = value + 2;
+                if (total > 20) {
+                    return total * 3;
+                }
+                return total - 4;
+            }
+        }
+    "#;
+    let beta = r#"
+        class Beta {
+            int Calculate(int seed) {
+                int amount = seed + 2;
+                if (amount > 20) {
+                    return amount * 3;
+                }
+                return amount - 4;
+            }
+        }
+    "#;
+
+    let findings = analyze_both_requested("src/A.cs", alpha, "src/B.cs", beta, default_weights());
+
+    let forward = findings
+        .iter()
+        .filter(|finding| {
+            finding.enclosing_fq_name.contains("Compute")
+                && finding.peer_enclosing_fq_name.contains("Calculate")
+        })
+        .count();
+    let reverse = findings
+        .iter()
+        .filter(|finding| {
+            finding.enclosing_fq_name.contains("Calculate")
+                && finding.peer_enclosing_fq_name.contains("Compute")
+        })
+        .count();
+    assert_eq!(1, forward + reverse, "{findings:#?}");
 }

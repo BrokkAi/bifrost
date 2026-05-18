@@ -20,6 +20,22 @@ fn analyze_pair(
     analyzer.find_structural_clone_smells_for_files(&requested, weights)
 }
 
+fn analyze_both_requested(
+    path_a: &str,
+    source_a: &str,
+    path_b: &str,
+    source_b: &str,
+    weights: CloneSmellWeights,
+) -> Vec<brokk_analyzer::CloneSmell> {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(path_a, source_a)
+        .file(path_b, source_b)
+        .build();
+    let analyzer = PhpAnalyzer::from_project(project.project().clone());
+    let requested = vec![project.file(path_a), project.file(path_b)];
+    analyzer.find_structural_clone_smells_for_files(&requested, weights)
+}
+
 #[test]
 fn flags_renamed_variable_clone_in_php() {
     let alpha = r#"
@@ -137,4 +153,107 @@ fn ast_refinement_suppresses_different_php_control_flow() {
     );
 
     assert!(findings.is_empty(), "{findings:#?}");
+}
+
+#[test]
+fn treats_extra_logging_as_equivalent_clone_in_php() {
+    let alpha = r#"
+        <?php
+        function alpha($value) {
+            $total = $value + 2;
+            if ($total > 20) {
+                return $total * 3;
+            }
+            return $total - 4;
+        }
+    "#;
+    let beta = r#"
+        <?php
+        function beta($seed) {
+            error_log((string)$seed);
+            $amount = $seed + 2;
+            if ($amount > 20) {
+                error_log((string)$amount);
+                return $amount * 3;
+            }
+            error_log((string)($amount - 4));
+            return $amount - 4;
+        }
+    "#;
+
+    let findings = analyze_pair(
+        "src/a.php",
+        alpha,
+        "src/b.php",
+        beta,
+        CloneSmellWeights {
+            min_normalized_tokens: 12,
+            min_similarity_percent: 55,
+            shingle_size: 2,
+            min_shared_shingles: 3,
+            ast_similarity_percent: 70,
+        },
+    );
+
+    assert!(
+        findings.iter().any(|finding| {
+            finding.enclosing_fq_name.contains("alpha")
+                && finding.peer_enclosing_fq_name.contains("beta")
+        }),
+        "{findings:#?}"
+    );
+}
+
+#[test]
+fn does_not_return_symmetric_pairs_when_both_php_files_are_requested() {
+    let alpha = r#"
+        <?php
+        function alpha($value) {
+            $total = $value + 2;
+            if ($total > 20) {
+                return $total * 3;
+            }
+            return $total - 4;
+        }
+    "#;
+    let beta = r#"
+        <?php
+        function beta($seed) {
+            $amount = $seed + 2;
+            if ($amount > 20) {
+                return $amount * 3;
+            }
+            return $amount - 4;
+        }
+    "#;
+
+    let findings = analyze_both_requested(
+        "src/a.php",
+        alpha,
+        "src/b.php",
+        beta,
+        CloneSmellWeights {
+            min_normalized_tokens: 12,
+            min_similarity_percent: 55,
+            shingle_size: 2,
+            min_shared_shingles: 3,
+            ast_similarity_percent: 70,
+        },
+    );
+
+    let forward = findings
+        .iter()
+        .filter(|finding| {
+            finding.enclosing_fq_name.contains("alpha")
+                && finding.peer_enclosing_fq_name.contains("beta")
+        })
+        .count();
+    let reverse = findings
+        .iter()
+        .filter(|finding| {
+            finding.enclosing_fq_name.contains("beta")
+                && finding.peer_enclosing_fq_name.contains("alpha")
+        })
+        .count();
+    assert_eq!(1, forward + reverse, "{findings:#?}");
 }

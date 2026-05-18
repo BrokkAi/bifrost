@@ -619,6 +619,9 @@ fn normalized_clone_tokens_php(source: &str) -> Vec<String> {
 }
 
 fn collect_normalized_leaf_tokens_php(node: Node<'_>, source: &str, out: &mut Vec<String>) {
+    if php_is_ignorable_clone_logging_node(node, source) {
+        return;
+    }
     if node.named_child_count() == 0 {
         let token = normalize_php_clone_leaf_token(node, source);
         if !token.is_empty() {
@@ -674,6 +677,9 @@ fn build_php_clone_ast_signature(source: &str) -> String {
 }
 
 fn collect_php_clone_ast_labels(node: Node<'_>, source: &str, out: &mut Vec<String>) {
+    if php_is_ignorable_clone_logging_node(node, source) {
+        return;
+    }
     out.push(normalize_php_clone_ast_label(node, source));
     let child_count = node.child_count();
     for index in 0..child_count {
@@ -740,6 +746,21 @@ fn php_clone_parse_source(source: &str) -> String {
         source.to_string()
     } else {
         format!("<?php\n{source}")
+    }
+}
+
+fn php_is_ignorable_clone_logging_node(node: Node<'_>, source: &str) -> bool {
+    match node.kind() {
+        "expression_statement" | "echo_statement" => {
+            let text = source
+                .get(node.start_byte()..node.end_byte())
+                .unwrap_or("")
+                .trim();
+            text.starts_with("error_log(")
+                || text.starts_with("print(")
+                || text.starts_with("echo ")
+        }
+        _ => false,
     }
 }
 

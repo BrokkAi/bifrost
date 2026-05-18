@@ -772,6 +772,9 @@ fn normalized_clone_tokens_cpp(source: &str) -> Vec<String> {
 }
 
 fn collect_normalized_leaf_tokens_cpp(node: Node<'_>, source: &str, out: &mut Vec<String>) {
+    if cpp_is_ignorable_clone_logging_node(node, source) {
+        return;
+    }
     if node.named_child_count() == 0 {
         let token = normalize_cpp_clone_leaf_token(node, source);
         if !token.is_empty() {
@@ -823,6 +826,9 @@ fn build_cpp_clone_ast_signature(source: &str) -> String {
 }
 
 fn collect_cpp_clone_ast_labels(node: Node<'_>, source: &str, out: &mut Vec<String>) {
+    if cpp_is_ignorable_clone_logging_node(node, source) {
+        return;
+    }
     out.push(normalize_cpp_clone_ast_label(node, source));
     let child_count = node.child_count();
     for index in 0..child_count {
@@ -879,6 +885,20 @@ fn parse_cpp_tree(source: &str) -> Option<Tree> {
         .set_language(&tree_sitter_cpp::LANGUAGE.into())
         .expect("failed to load cpp parser");
     parser.parse(source, None)
+}
+
+fn cpp_is_ignorable_clone_logging_node(node: Node<'_>, source: &str) -> bool {
+    if node.kind() != "expression_statement" {
+        return false;
+    }
+    let text = source
+        .get(node.start_byte()..node.end_byte())
+        .unwrap_or("")
+        .trim();
+    text.contains("std::cout")
+        || text.contains("std::cerr")
+        || text.contains("std::clog")
+        || text.starts_with("printf(")
 }
 
 #[derive(Clone)]
