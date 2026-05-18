@@ -49,11 +49,11 @@ fn flags_renamed_variable_clone_in_php() {
         "src/b.php",
         beta,
         CloneSmellWeights {
-            min_normalized_tokens: 1,
-            min_similarity_percent: 45,
-            shingle_size: 1,
-            min_shared_shingles: 1,
-            ast_similarity_percent: 1,
+            min_normalized_tokens: 12,
+            min_similarity_percent: 55,
+            shingle_size: 2,
+            min_shared_shingles: 3,
+            ast_similarity_percent: 70,
         },
     );
 

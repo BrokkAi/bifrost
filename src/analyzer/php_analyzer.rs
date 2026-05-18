@@ -609,11 +609,12 @@ const PHP_CLONE_AST_STRING_TYPES: &[&str] = &["string", "encapsed_string", "stri
 const PHP_CLONE_AST_NUMBER_TYPES: &[&str] = &["integer", "float"];
 
 fn normalized_clone_tokens_php(source: &str) -> Vec<String> {
-    let Some(tree) = parse_php_tree(source) else {
+    let parse_source = php_clone_parse_source(source);
+    let Some(tree) = parse_php_tree(&parse_source) else {
         return Vec::new();
     };
     let mut out = Vec::new();
-    collect_normalized_leaf_tokens_php(tree.root_node(), source, &mut out);
+    collect_normalized_leaf_tokens_php(tree.root_node(), &parse_source, &mut out);
     out
 }
 
@@ -663,11 +664,12 @@ fn normalize_php_clone_leaf_token(node: Node<'_>, source: &str) -> String {
 }
 
 fn build_php_clone_ast_signature(source: &str) -> String {
-    let Some(tree) = parse_php_tree(source) else {
+    let parse_source = php_clone_parse_source(source);
+    let Some(tree) = parse_php_tree(&parse_source) else {
         return String::new();
     };
     let mut labels = Vec::new();
-    collect_php_clone_ast_labels(tree.root_node(), source, &mut labels);
+    collect_php_clone_ast_labels(tree.root_node(), &parse_source, &mut labels);
     labels.join("|")
 }
 
@@ -731,6 +733,14 @@ fn parse_php_tree(source: &str) -> Option<Tree> {
         .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
         .expect("failed to load php parser");
     parser.parse(source, None)
+}
+
+fn php_clone_parse_source(source: &str) -> String {
+    if source.trim_start().starts_with("<?php") {
+        source.to_string()
+    } else {
+        format!("<?php\n{source}")
+    }
 }
 
 #[derive(Clone)]
