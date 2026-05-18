@@ -8,6 +8,7 @@ use crate::usages::js_ts_graph::JsTsExportUsageGraphStrategy;
 use crate::usages::model::FuzzyResult;
 use crate::usages::python_graph::PythonExportUsageGraphStrategy;
 use crate::usages::regex_analyzer::RegexUsageAnalyzer;
+use crate::usages::rust_graph::RustExportUsageGraphStrategy;
 use crate::usages::traits::{CandidateFileProvider, UsageAnalyzer};
 
 fn target_language(target: &CodeUnit) -> Language {
@@ -63,6 +64,10 @@ impl UsageFinder {
         graph_analyzers.insert(
             Language::Python,
             Box::new(PythonExportUsageGraphStrategy::new()),
+        );
+        graph_analyzers.insert(
+            Language::Rust,
+            Box::new(RustExportUsageGraphStrategy::new()),
         );
 
         Self {

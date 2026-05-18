@@ -262,6 +262,7 @@ pub enum ImportKind {
     Default,
     Named,
     Namespace,
+    Glob,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
