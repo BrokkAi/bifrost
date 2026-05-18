@@ -954,7 +954,7 @@ fn collect_scope_facts_from_source(
 }
 
 fn normalized_receiver_type(annotation: &str) -> Option<String> {
-    let annotation = annotation.trim();
+    let annotation = unwrap_supported_receiver_wrapper(annotation.trim());
     if annotation.is_empty()
         || annotation.contains('|')
         || annotation.contains('[')
@@ -969,6 +969,21 @@ fn normalized_receiver_type(annotation: &str) -> Option<String> {
         return None;
     }
     Some(annotation.to_string())
+}
+
+fn unwrap_supported_receiver_wrapper(annotation: &str) -> &str {
+    let mut current = annotation.trim();
+    loop {
+        let next = current
+            .strip_prefix("Optional[")
+            .or_else(|| current.strip_prefix("typing.Optional["))
+            .and_then(|inner| inner.strip_suffix(']'))
+            .map(str::trim);
+        let Some(unwrapped) = next else {
+            return current;
+        };
+        current = unwrapped;
+    }
 }
 
 fn receiver_annotation_matches_target(

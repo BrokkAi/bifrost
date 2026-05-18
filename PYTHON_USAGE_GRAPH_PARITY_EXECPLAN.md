@@ -271,9 +271,9 @@ This matrix must be kept current as milestones land.
   Brokk reference: inherited members, overrides, cross-file hierarchy cases, changed-file invalidation, and export-resolution cache invalidation in `PythonExportUsageReferenceGraphTest.java`.
   Current `bifrost` proof: focused Rust tests now cover inherited base members through subclass receivers, overriding subclass members for base queries, multi-level inheritance, cross-file inheritance, changed-file analyzer invalidation, and re-export-cache invalidation after `update`.
 
-- Residual advanced receiver-flow cases: `missing`
+- Residual advanced receiver-flow cases: `done`
   Brokk reference: optional type arguments, qualified optional type arguments, multiple inheritance with one matching parent, subclass-vs-different-member negatives, unresolved superclasses, same-name sibling-module negatives, self-attribute class-isolation, local-parameter shadowing of exported class names, default-argument constructor usage, and deep attribute-expression robustness.
-  Current `bifrost` state: these cases are now recorded as ignored parity-marker tests in `tests/usages_python_graph_test.rs` (`parity_optional_type_argument_resolves_receiver_member_usage`, `parity_qualified_optional_type_argument_resolves_receiver_member_usage`, `parity_multiple_inheritance_member_counts_when_one_parent_provides_member`, `parity_subclass_receiver_does_not_count_for_different_base_member_name`, `parity_unresolved_superclass_does_not_create_member_hierarchy_hit`, `parity_same_name_from_sibling_module_does_not_match_target`, `parity_self_attribute_type_facts_do_not_leak_across_classes`, `parity_local_parameter_shadows_exported_class_attribute_candidate`, `parity_default_argument_call_counts_as_usage_instead_of_parameter_shadow`, and `parity_deep_attribute_expression_does_not_overflow`). They should be treated as the next follow-up batch if full Brokk parity is still the goal.
+  Current `bifrost` proof: focused Rust tests now cover the full Brokk follow-up batch for optional receiver annotations, qualified optional annotations, multiple inheritance, hierarchy/name-resolution negatives, class-local self-attribute isolation, local-parameter shadowing, default-argument constructor usage, and deep attribute-expression robustness.
 
 - Residual helper/cache-specific reference-graph cases: `missing`
   Brokk reference: the cached-definition helper tests and exact-member cache scoping cases in `PythonExportUsageReferenceGraphTest.java`.
@@ -298,3 +298,5 @@ Revision note: updated after Milestone 5 to record the type-aware receiver bindi
 Revision note: updated after Milestone 6 to turn the remaining Brokk-only cases into explicit `missing` and `deferred` parity-matrix entries instead of leaving them as an untracked tail.
 
 Revision note: updated again after Milestone 6 follow-up work to tie the remaining `missing` parity entries to ignored Rust parity-marker tests, so the residual Brokk gaps now live in executable form instead of prose only.
+
+Revision note: updated after the first post-Milestone-6 implementation pass to convert the 10 behavior-level Python parity markers into active passing tests, leaving only the helper-cache-specific Brokk markers ignored.

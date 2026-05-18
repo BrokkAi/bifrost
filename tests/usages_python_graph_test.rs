@@ -1548,7 +1548,6 @@ def run():
 }
 
 #[test]
-#[ignore = "Brokk parity marker: optionalTypeArgumentResolvesReceiverMemberUsage"]
 fn parity_optional_type_argument_resolves_receiver_member_usage() {
     assert_single_python_member_hit(
         r#"
@@ -1568,7 +1567,6 @@ def run():
 }
 
 #[test]
-#[ignore = "Brokk parity marker: qualifiedOptionalTypeArgumentResolvesReceiverMemberUsage"]
 fn parity_qualified_optional_type_argument_resolves_receiver_member_usage() {
     let project = InlineTestProject::with_language(Language::Python)
         .file(
@@ -1608,7 +1606,6 @@ def run():
 }
 
 #[test]
-#[ignore = "Brokk parity marker: multipleInheritanceMemberCountsWhenOneParentProvidesMember"]
 fn parity_multiple_inheritance_member_counts_when_one_parent_provides_member() {
     let project = InlineTestProject::with_language(Language::Python)
         .file(
@@ -1646,10 +1643,11 @@ def run(x: Child):
 }
 
 #[test]
-#[ignore = "Brokk parity marker: subclassReceiverDoesNotCountForDifferentBaseMemberName"]
 fn parity_subclass_receiver_does_not_count_for_different_base_member_name() {
-    assert_no_python_member_hit(
-        r#"
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
 class Base:
     def baz(self):
         pass
@@ -1657,35 +1655,62 @@ class Base:
 class Child(Base):
     pass
 "#,
-        r#"
+        )
+        .file(
+            "consumer.py",
+            r#"
 from service import Child
 
 def run(x: Child):
     x.bar()
 "#,
-    );
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.Base.baz");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should succeed for subclass negative case");
+    assert!(hits.is_empty());
 }
 
 #[test]
-#[ignore = "Brokk parity marker: unresolvedSuperclassDoesNotCreateMemberHierarchyHit"]
 fn parity_unresolved_superclass_does_not_create_member_hierarchy_hit() {
-    assert_no_python_member_hit(
-        r#"
-class Child(MissingBase):
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+class Base:
     def bar(self):
         pass
+
+class Child(UnknownBase):
+    pass
 "#,
-        r#"
+        )
+        .file(
+            "consumer.py",
+            r#"
 from service import Child
 
 def run(x: Child):
     x.bar()
 "#,
-    );
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.Base.bar");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should succeed for unresolved-superclass negative case");
+    assert!(hits.is_empty());
 }
 
 #[test]
-#[ignore = "Brokk parity marker: sameNameFromSiblingModuleDoesNotMatchTarget"]
 fn parity_same_name_from_sibling_module_does_not_match_target() {
     let project = InlineTestProject::with_language(Language::Python)
         .file(
@@ -1723,7 +1748,6 @@ def run():
 }
 
 #[test]
-#[ignore = "Brokk parity marker: selfAttributeTypeFactsDoNotLeakAcrossClasses"]
 fn parity_self_attribute_type_facts_do_not_leak_across_classes() {
     assert_no_python_member_hit(
         r#"
@@ -1746,7 +1770,6 @@ class B:
 }
 
 #[test]
-#[ignore = "Brokk parity marker: localParameterShadowsExportedClassAttributeCandidate"]
 fn parity_local_parameter_shadows_exported_class_attribute_candidate() {
     let project = InlineTestProject::with_language(Language::Python)
         .file(
@@ -1778,7 +1801,6 @@ def run(Foo):
 }
 
 #[test]
-#[ignore = "Brokk parity marker: defaultArgumentCallCountsAsUsageInsteadOfParameterShadow"]
 fn parity_default_argument_call_counts_as_usage_instead_of_parameter_shadow() {
     let project = InlineTestProject::with_language(Language::Python)
         .file(
@@ -1809,7 +1831,6 @@ def run(x=Widget()):
 }
 
 #[test]
-#[ignore = "Brokk parity marker: deepAttributeExpressionDoesNotOverflow"]
 fn parity_deep_attribute_expression_does_not_overflow() {
     let project = InlineTestProject::with_language(Language::Python)
         .file(
