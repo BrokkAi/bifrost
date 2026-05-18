@@ -57,6 +57,13 @@ where
         self.shadows.contains(symbol)
     }
 
+    pub fn from_parts(
+        shadows: HashSet<String>,
+        bindings: HashMap<String, SymbolResolution<T>>,
+    ) -> Self {
+        Self { shadows, bindings }
+    }
+
     pub fn resolution_for(&self, symbol: &str) -> SymbolResolution<T>
     where
         T: Clone,
@@ -82,6 +89,17 @@ where
                 | SymbolResolution::Precise(_) => None,
             })
             .collect()
+    }
+
+    pub fn cloned_bindings(&self) -> HashMap<String, SymbolResolution<T>>
+    where
+        T: Clone,
+    {
+        self.bindings.clone()
+    }
+
+    pub fn cloned_shadows(&self) -> HashSet<String> {
+        self.shadows.clone()
     }
 }
 
@@ -138,8 +156,7 @@ where
     {
         let symbol = symbol.into();
         let max_targets_per_symbol = self.config.max_targets_per_symbol;
-        let resolution =
-            bounded_resolution(targets.into_iter().collect(), max_targets_per_symbol);
+        let resolution = bounded_resolution(targets.into_iter().collect(), max_targets_per_symbol);
         let scope = self.current_scope_mut();
         scope.shadows.insert(symbol.clone());
         scope.bindings.insert(symbol, resolution);
@@ -163,6 +180,13 @@ where
             }
         }
         SymbolResolution::Unknown
+    }
+
+    pub fn is_shadowed(&self, symbol: &str) -> bool {
+        self.scopes
+            .iter()
+            .rev()
+            .any(|scope| scope.shadows.contains(symbol))
     }
 
     pub fn snapshot(&self) -> LocalBindingsSnapshot<T> {
@@ -209,10 +233,7 @@ where
     }
 }
 
-fn bounded_resolution<T>(
-    targets: HashSet<T>,
-    max_targets_per_symbol: usize,
-) -> SymbolResolution<T>
+fn bounded_resolution<T>(targets: HashSet<T>, max_targets_per_symbol: usize) -> SymbolResolution<T>
 where
     T: Eq + Hash,
 {

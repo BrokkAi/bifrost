@@ -16,7 +16,7 @@ This plan is the implementation program for issue `#76`, “Add reusable local r
 - [x] (2026-05-18 19:31Z) Confirmed the current baseline: Python and Rust both already implement language-specific local receiver/member inference, while JS/TS still relies mostly on direct import/member matching.
 - [x] (2026-05-18 19:31Z) Chose a dedicated repo-root plan file, `LOCAL_USAGE_INFERENCE_EXECPLAN.md`, because this work is broader than any single language parity plan and is the shared follow-on for issue `#76`.
 - [x] (2026-05-18 20:04Z) Completed Milestone 1 by adding `src/usages/local_inference.rs`, exporting the shared API from `src/usages/mod.rs`, and adding `tests/usages_local_inference_test.rs` to prove nested scopes, shadowing, seeding, alias propagation, snapshot queries, and ambiguity-cap degradation in isolation.
-- [ ] Migrate Python to the shared layer first, replacing the current ad hoc `ScopeFacts` pipeline while preserving observed behavior.
+- [x] (2026-05-18 20:23Z) Completed Milestone 2 by replacing Python’s `ScopeFacts` propagation path with `LocalInferenceEngine` snapshots in `src/usages/python_graph.rs` while keeping the focused Python suites green.
 - [ ] Migrate Rust to the shared layer for alias and receiver propagation, keeping any unavoidable Rust-specific extraction code at the strategy edge.
 - [ ] Decide how much of JS/TS should adopt the shared layer in this issue versus the follow-on JS/TS parity-hardening issue, then either wire the first slice here or record the exact seam for the next issue.
 - [ ] Add focused shared-engine tests plus per-language integration tests, then run `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and the targeted usage suites.
@@ -40,6 +40,9 @@ This plan is the implementation program for issue `#76`, “Add reusable local r
 
 - Observation: the shared engine did not need language-specific event enums to be useful in the first milestone.
   Evidence: `src/usages/local_inference.rs` is already able to model the current proven needs with a smaller contract: nested scope entry/exit, symbol shadowing, symbol seeding, alias propagation, snapshots, and ambiguity caps; the Python and Rust migrations can emit into that contract directly.
+
+- Observation: the first Python migration bug was a convergence bug, not a missing capability in the shared engine.
+  Evidence: the initial refactor re-applied `declare_shadow` on every fixed-point pass, which kept clearing bindings and caused several Python graph tests to run indefinitely; gating shadow declaration to first sight restored the monotonic behavior of the old `ScopeFacts` loop.
 
 ## Decision Log
 
@@ -67,9 +70,13 @@ This plan is the implementation program for issue `#76`, “Add reusable local r
   Rationale: the first implementation only needed a deterministic scoped symbol engine with methods for `enter_scope`, `exit_scope`, `declare_shadow`, `seed_symbol`, `seed_symbol_many`, and `alias_symbol`; introducing a larger event taxonomy before the migrations would have added complexity without increasing tested behavior.
   Date/Author: 2026-05-18 / Codex
 
+- Decision: migrate Python by preserving its existing extraction heuristics and swapping only the propagation state.
+  Rationale: the goal of Milestone 2 was to remove duplicated propagation logic without broadening Python semantics in the same step; keeping the same annotation, assignment, and alias extraction patterns made the migration easier to verify against the existing focused Python suites.
+  Date/Author: 2026-05-18 / Codex
+
 ## Outcomes & Retrospective
 
-Milestone 1 landed a reusable scoped symbol engine in `src/usages/local_inference.rs` plus a direct test suite in `tests/usages_local_inference_test.rs`. The current contract is intentionally small but already proves the core shared behaviors this issue needs: nested scopes, shadow invalidation, bounded seeding, alias propagation, and symbol queries through snapshots. The next question is whether that contract is sufficient to absorb Python’s existing `ScopeFacts` pipeline without expanding into language-specific vocabulary.
+Milestone 1 landed a reusable scoped symbol engine in `src/usages/local_inference.rs` plus a direct test suite in `tests/usages_local_inference_test.rs`. Milestone 2 then proved that the contract is already strong enough to absorb Python’s existing `ScopeFacts` propagation path without introducing Python-specific types into the shared module. The next pressure test is Rust, where the strategy still has more Rust-specific receiver-name and mismatch logic at the edge.
 
 ## Context and Orientation
 
@@ -251,3 +258,5 @@ The implementation dependencies for this plan are the existing shared graph engi
 Revision note: 2026-05-18 / Codex. Created this ExecPlan from issue `#76`, the current `bifrost` usage-graph implementation, and the existing Python/Rust parity plans so the shared receiver/member inference work can proceed as a standalone staged program.
 
 Revision note: 2026-05-18 / Codex. Updated after Milestone 1 to record the landed shared engine, its direct test proof, and the decision to keep the first shared API method-driven rather than introducing a heavier event taxonomy before the first migrations.
+
+Revision note: 2026-05-18 / Codex. Updated after Milestone 2 to record the Python migration, the fixed-point shadowing bug it exposed, and the decision to preserve Python’s existing extraction heuristics while moving only the propagation state into the shared engine.
