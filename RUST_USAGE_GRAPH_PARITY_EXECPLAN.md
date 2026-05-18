@@ -18,8 +18,8 @@ This is intentionally a long-running parity program, not only a one-issue patch 
 - [x] (2026-05-18T14:32Z) Confirmed the main analyzer gap: `RustAnalyzer` currently exposes generic import-analysis and reverse-import behavior, but not the Rust-specific graph-facing hooks that Brokk’s Rust strategy relies on.
 - [x] (2026-05-18T14:44Z) Completed Milestone 1 by adding `src/usages/rust_graph.rs`, registering `RustExportUsageGraphStrategy` in `src/usages/finder.rs`, and widening `RustAnalyzer` with first-wave helpers for export indices, import binders, and Rust module-to-file resolution.
 - [x] (2026-05-18T14:44Z) Completed Milestone 2 by adding `tests/usages_rust_graph_test.rs` and proving seeded public-export routing, `MultiAnalyzer` routing, same-file private-function support, explicit candidate restriction, broad mixed candidate filtering, `TooManyCallsites`, and same-file type-position/literal struct references.
-- [ ] (2026-05-18T14:49Z) Milestone 3 partially complete: `bifrost` now routes member targets for public Rust owners through the graph, `RustAnalyzer::exact_member` exists, and the candidate funnel keeps likely owner-importing files while dropping unrelated files; remaining work is richer receiver-fact coverage and any cache-shaped parity Brokk still proves.
-- [ ] Implement Milestone 4 so the remaining Brokk-vs-`bifrost` Rust graph gaps are either closed or recorded explicitly, including any work that truly belongs to issue `#76` rather than `#75`.
+- [x] (2026-05-18T16:41Z) Advanced Milestone 3 substantially: the focused Rust graph suite now covers 37 passing cases, including `self` imports, public re-export aliases, shadowing negatives, typed and constructed receivers, alias-propagated receivers, static associated items, `pub(crate)`/`pub(self)` visibility, same-file closure calls, barrel re-exports, chained aliased re-exports, bounded glob imports, bounded glob re-exports, simple type-alias receiver seeding, and self-like constructor-chain receiver seeding.
+- [ ] Implement the remaining Milestone 4 parity work so the Brokk-vs-`bifrost` Rust graph gaps are either closed or recorded explicitly, especially the still-open trait/associated-type/inline-module edge cases and any behavior that truly belongs to issue `#76` rather than `#75`.
 
 ## Surprises & Discoveries
 
@@ -43,6 +43,9 @@ This is intentionally a long-running parity program, not only a one-issue patch 
 
 - Observation: the first useful Rust member slice did not require a full Rust data-flow engine yet.
   Evidence: the current member tests pass with a narrower receiver heuristic built from imported owner names plus simple typed and constructed local-variable detection, which was enough to prove `Service.run`-style calls without broadening the top-level graph design.
+
+- Observation: most of the remaining high-value parity outside traits was recoverable by tightening seed and visibility semantics rather than introducing a full reference engine.
+  Evidence: `pub(self)` export handling, `crate`-root barrel resolution, grouped `pub use` flattening, bounded globs, local type aliases, and self-like constructor chains all landed as targeted graph/analyzer improvements while keeping the strategy architecture intact.
 
 ## Decision Log
 
@@ -237,5 +240,7 @@ The public behavior expected at the end of this plan is:
 Revision note: created this repo-root long-running ExecPlan after comparing the current `bifrost` Rust usage surface with the existing Brokk Rust graph strategy and tests, so the implementation path and the residual parity gap are both explicit from the start.
 
 Revision note: updated after the first implementation wave to record the new Rust graph strategy, the initial Rust-analyzer helper surface, the focused Rust graph tests that now pass, and the remaining member/receiver parity gap.
+
+Revision note: updated after the larger reference-graph parity wave to record 37 passing focused Rust graph tests, the new bounded-glob and barrel-reexport support, stricter Rust visibility semantics, and the narrowed residual gap around traits, associated types, and inline-module-specific behavior.
 
 Revision note: updated after the second implementation wave to record the first member-routing slice, the new `exact_member` and member candidate-funnel helpers, and the narrower remaining receiver/cache parity backlog.

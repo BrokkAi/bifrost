@@ -4,7 +4,7 @@ use crate::analyzer::{
 };
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
-use crate::usages::graph_core::ProjectUsageGraph;
+use crate::usages::graph_core::{ImportEdgeKind, ProjectUsageGraph};
 use crate::usages::model::{FuzzyResult, UsageHit};
 use crate::usages::traits::UsageAnalyzer;
 use rayon::prelude::*;
@@ -314,14 +314,26 @@ fn scan_files_for_target(
         };
 
         let line_starts = compute_line_starts(source);
-        let local_names: HashSet<String> = match seeds {
+        let (direct_names, namespace_names) = match seeds {
             Some(seeds) => graph
                 .usage_graph
                 .matching_edges_for_importer(file, seeds)
                 .into_iter()
-                .map(|edge| edge.local_name)
-                .collect(),
-            None => HashSet::default(),
+                .fold(
+                    (HashSet::default(), HashSet::default()),
+                    |(mut direct, mut namespaces), edge| {
+                        match edge.kind {
+                            ImportEdgeKind::Namespace => {
+                                namespaces.insert(edge.local_name);
+                            }
+                            ImportEdgeKind::Named(_) | ImportEdgeKind::Default => {
+                                direct.insert(edge.local_name);
+                            }
+                        }
+                        (direct, namespaces)
+                    },
+                ),
+            None => (HashSet::default(), HashSet::default()),
         };
         let target_self_file = file == target.source();
 
@@ -332,11 +344,20 @@ fn scan_files_for_target(
             line_starts: &line_starts,
             analyzer,
             target_short: &target_short,
-            bound_names: &local_names,
+            direct_names: &direct_names,
+            namespace_names: &namespace_names,
+            shadowed_names: detect_shadowed_names(
+                source,
+                &direct_names,
+                &namespace_names,
+                &target_short,
+                target_self_file,
+            ),
             target_self_file,
             hits: &mut local_hits,
         };
         scan_node(tree.root_node(), &mut ctx);
+        record_module_qualified_hits(&mut ctx);
 
         if !local_hits.is_empty() {
             let mut sink = hits.lock().expect("poisoned Rust graph collector");
@@ -353,14 +374,19 @@ struct ScanCtx<'a> {
     line_starts: &'a [usize],
     analyzer: &'a dyn IAnalyzer,
     target_short: &'a str,
-    bound_names: &'a HashSet<String>,
+    direct_names: &'a HashSet<String>,
+    namespace_names: &'a HashSet<String>,
+    shadowed_names: HashSet<String>,
     target_self_file: bool,
     hits: &'a mut BTreeSet<UsageHit>,
 }
 
 impl ScanCtx<'_> {
     fn matches_identifier(&self, text: &str) -> bool {
-        self.bound_names.contains(text) || (self.target_self_file && text == self.target_short)
+        (self.direct_names.contains(text) && !self.shadowed_names.contains(text))
+            || (self.target_self_file
+                && text == self.target_short
+                && !self.shadowed_names.contains(text))
     }
 }
 
@@ -373,7 +399,7 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 .ok()
                 .map(str::trim)
                 .unwrap_or_default();
-            if ctx.matches_identifier(text) {
+            if ctx.matches_identifier(text) && !is_shadowed_identifier(text, node, ctx) {
                 record_hit(node, ctx);
             }
         }
@@ -383,6 +409,99 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         scan_node(child, ctx);
+    }
+}
+
+fn is_shadowed_identifier(text: &str, node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    if ctx.shadowed_names.contains(text) {
+        return true;
+    }
+    let start = node.start_byte();
+    let end = node.end_byte();
+    ctx.analyzer
+        .find_nearest_declaration(ctx.file, start, end, text)
+        .is_some_and(|decl| {
+            decl.identifier == text
+                && (decl.range.start_byte != start || decl.range.end_byte != end)
+        })
+}
+
+fn detect_shadowed_names(
+    source: &str,
+    direct_names: &HashSet<String>,
+    namespace_names: &HashSet<String>,
+    target_short: &str,
+    target_self_file: bool,
+) -> HashSet<String> {
+    let mut names = direct_names.clone();
+    names.extend(namespace_names.iter().cloned());
+    if target_self_file {
+        names.insert(target_short.to_string());
+    }
+
+    names
+        .into_iter()
+        .filter(|name| {
+            let ident = regex::escape(name);
+            let patterns = if target_self_file && name == target_short {
+                vec![format!(r"\blet\s+{}\b", ident)]
+            } else {
+                vec![
+                    format!(r"\blet\s+{}\b", ident),
+                    format!(r"\bstruct\s+{}\b", ident),
+                    format!(r"\benum\s+{}\b", ident),
+                    format!(r"\btype\s+{}\b", ident),
+                    format!(r"\bfn\s+{}\b", ident),
+                ]
+            };
+            patterns.iter().any(|pattern| {
+                Regex::new(pattern)
+                    .ok()
+                    .is_some_and(|re| re.is_match(source))
+            })
+        })
+        .collect()
+}
+
+fn record_module_qualified_hits(ctx: &mut ScanCtx<'_>) {
+    for name in ctx.namespace_names {
+        if ctx.shadowed_names.contains(name) {
+            continue;
+        }
+        let pattern = format!(
+            r"\b{}\s*::\s*{}\b",
+            regex::escape(name),
+            regex::escape(ctx.target_short)
+        );
+        let Ok(re) = Regex::new(&pattern) else {
+            continue;
+        };
+        for matched in re.find_iter(ctx.source) {
+            let matched_text = matched.as_str();
+            let Some(local_offset) = matched_text.rfind(ctx.target_short) else {
+                continue;
+            };
+            let start = matched.start() + local_offset;
+            let end = start + ctx.target_short.len();
+            let range = Range {
+                start_byte: start,
+                end_byte: end,
+                start_line: find_line_index_for_offset(ctx.line_starts, start),
+                end_line: find_line_index_for_offset(ctx.line_starts, end),
+            };
+            let Some(enclosing) = ctx.analyzer.enclosing_code_unit(ctx.file, &range) else {
+                continue;
+            };
+            ctx.hits.insert(UsageHit::new(
+                ctx.file.clone(),
+                range.start_line + 1,
+                start,
+                end,
+                enclosing,
+                GRAPH_HIT_CONFIDENCE,
+                build_snippet(ctx.source, ctx.line_starts, start, end),
+            ));
+        }
     }
 }
 
@@ -434,12 +553,22 @@ static LET_TYPED_RE: LazyLock<Regex> = LazyLock::new(|| {
         .expect("valid typed let regex")
 });
 static LET_CONSTRUCTED_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\blet\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:\{|::)")
+    Regex::new(
+        r"\blet\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([A-Za-z_][A-Za-z0-9_]*)(?:::\s*([A-Za-z_][A-Za-z0-9_]*))?\s*(?:\{|\(|\.)",
+    )
         .expect("valid constructed let regex")
+});
+static LET_ALIAS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\blet\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*;")
+        .expect("valid alias let regex")
 });
 static PARAM_TYPED_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"([A-Za-z_][A-Za-z0-9_]*)\s*:\s*([A-Za-z_][A-Za-z0-9_]*)")
         .expect("valid typed param regex")
+});
+static TYPE_ALIAS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\btype\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*;")
+        .expect("valid type alias regex")
 });
 
 fn scan_files_for_member_target(
@@ -475,7 +604,9 @@ fn scan_files_for_member_target(
             return;
         }
 
-        let receiver_names = infer_receiver_names(&source, &owner_local_names);
+        let self_like_constructors = self_like_constructor_names(rust, &owner);
+        let receiver_names =
+            infer_receiver_names(&source, &owner_local_names, &self_like_constructors);
         if receiver_names.is_empty() {
             return;
         }
@@ -484,6 +615,12 @@ fn scan_files_for_member_target(
         let Ok(call_re) = Regex::new(&pattern) else {
             return;
         };
+        let static_owner_names: Vec<_> = owner_local_names
+            .iter()
+            .map(|name| regex::escape(name))
+            .collect();
+        let static_pattern = format!(r"\b({})::{}\b", static_owner_names.join("|"), member_name);
+        let static_re = Regex::new(&static_pattern).ok();
 
         let mut local_hits = BTreeSet::new();
         for captures in call_re.captures_iter(&source) {
@@ -511,6 +648,30 @@ fn scan_files_for_member_target(
                 build_snippet(&source, &line_starts, start, end),
             ));
         }
+        if let Some(static_re) = static_re {
+            for matched in static_re.find_iter(&source) {
+                let start = matched.end().saturating_sub(target.identifier().len());
+                let end = matched.end();
+                let range = Range {
+                    start_byte: start,
+                    end_byte: end,
+                    start_line: find_line_index_for_offset(&line_starts, start),
+                    end_line: find_line_index_for_offset(&line_starts, end),
+                };
+                let Some(enclosing) = analyzer.enclosing_code_unit(file, &range) else {
+                    continue;
+                };
+                local_hits.insert(UsageHit::new(
+                    file.clone(),
+                    range.start_line + 1,
+                    start,
+                    end,
+                    enclosing,
+                    GRAPH_HIT_CONFIDENCE,
+                    build_snippet(&source, &line_starts, start, end),
+                ));
+            }
+        }
 
         if !local_hits.is_empty() {
             let mut sink = hits.lock().expect("poisoned Rust member collector");
@@ -521,8 +682,56 @@ fn scan_files_for_member_target(
     hits.into_inner().expect("poisoned Rust member collector")
 }
 
-fn infer_receiver_names(source: &str, owner_local_names: &HashSet<String>) -> Vec<String> {
+fn self_like_constructor_names(rust: &RustAnalyzer, owner: &CodeUnit) -> HashSet<String> {
+    rust.get_all_declarations()
+        .into_iter()
+        .filter(|code_unit| code_unit.source() == owner.source())
+        .filter(|code_unit| code_unit.is_function())
+        .filter(|code_unit| {
+            rust.parent_of(code_unit)
+                .map(|parent| parent == *owner)
+                .unwrap_or(false)
+        })
+        .filter_map(|code_unit| {
+            let source = rust.get_source(&code_unit, false)?;
+            let (_, return_ty) = source.split_once("->")?;
+            let normalized: String = return_ty.chars().filter(|ch| !ch.is_whitespace()).collect();
+            (normalized.contains("Self")
+                || normalized.contains(owner.identifier())
+                || normalized.contains("Result<Self")
+                || normalized.contains(&format!("Result<{}", owner.identifier())))
+            .then(|| code_unit.identifier().to_string())
+        })
+        .collect()
+}
+
+fn infer_receiver_names(
+    source: &str,
+    owner_local_names: &HashSet<String>,
+    self_like_constructors: &HashSet<String>,
+) -> Vec<String> {
     let mut receivers = BTreeSet::new();
+    let mut owner_type_names = owner_local_names.clone();
+
+    loop {
+        let mut changed = false;
+        for captures in TYPE_ALIAS_RE.captures_iter(source) {
+            let Some(alias) = captures.get(1) else {
+                continue;
+            };
+            let Some(target) = captures.get(2) else {
+                continue;
+            };
+            if owner_type_names.contains(target.as_str())
+                && owner_type_names.insert(alias.as_str().to_string())
+            {
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
 
     for captures in LET_TYPED_RE.captures_iter(source) {
         let Some(name) = captures.get(1) else {
@@ -531,7 +740,7 @@ fn infer_receiver_names(source: &str, owner_local_names: &HashSet<String>) -> Ve
         let Some(ty) = captures.get(2) else {
             continue;
         };
-        if owner_local_names.contains(ty.as_str()) {
+        if owner_type_names.contains(ty.as_str()) {
             receivers.insert(name.as_str().to_string());
         }
     }
@@ -543,7 +752,10 @@ fn infer_receiver_names(source: &str, owner_local_names: &HashSet<String>) -> Ve
         let Some(ty) = captures.get(2) else {
             continue;
         };
-        if owner_local_names.contains(ty.as_str()) {
+        let constructor_name = captures.get(3).map(|name| name.as_str());
+        let allowed_constructor =
+            constructor_name.is_none_or(|name| self_like_constructors.contains(name));
+        if owner_type_names.contains(ty.as_str()) && allowed_constructor {
             receivers.insert(name.as_str().to_string());
         }
     }
@@ -555,8 +767,26 @@ fn infer_receiver_names(source: &str, owner_local_names: &HashSet<String>) -> Ve
         let Some(ty) = captures.get(2) else {
             continue;
         };
-        if owner_local_names.contains(ty.as_str()) {
+        if owner_type_names.contains(ty.as_str()) {
             receivers.insert(name.as_str().to_string());
+        }
+    }
+
+    loop {
+        let mut changed = false;
+        for captures in LET_ALIAS_RE.captures_iter(source) {
+            let Some(name) = captures.get(1) else {
+                continue;
+            };
+            let Some(value) = captures.get(2) else {
+                continue;
+            };
+            if receivers.contains(value.as_str()) && receivers.insert(name.as_str().to_string()) {
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
         }
     }
 

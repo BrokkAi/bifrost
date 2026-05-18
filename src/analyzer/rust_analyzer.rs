@@ -5,7 +5,9 @@ use crate::analyzer::{
     TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider, build_reverse_import_index,
 };
 use crate::hash::{HashMap, HashSet};
-use crate::usages::{ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind};
+use crate::usages::{
+    ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind, ReexportStar,
+};
 use moka::sync::Cache;
 use regex::Regex;
 use std::collections::BTreeSet;
@@ -259,6 +261,44 @@ impl RustAnalyzer {
             );
         }
 
+        for import in self.inner.import_info_of(file) {
+            let raw = import.raw_snippet.trim();
+            if !raw.starts_with("pub use ") {
+                continue;
+            }
+            if let Some(module_specifier) = raw
+                .strip_prefix("pub use ")
+                .map(str::trim)
+                .and_then(|value| value.strip_suffix("::*;"))
+                .map(str::trim)
+            {
+                index.reexport_stars.push(ReexportStar {
+                    module_specifier: module_specifier.to_string(),
+                });
+                continue;
+            }
+            let Some((module_specifier, imported_name)) =
+                split_rust_import_module_and_name(&import.raw_snippet)
+            else {
+                continue;
+            };
+            let exported_name = import
+                .alias
+                .clone()
+                .or_else(|| import.identifier.clone())
+                .unwrap_or_else(|| imported_name.clone());
+            if exported_name == "self" {
+                continue;
+            }
+            index.exports_by_name.insert(
+                exported_name,
+                ExportEntry::ReexportedNamed {
+                    module_specifier,
+                    imported_name,
+                },
+            );
+        }
+
         index
     }
 
@@ -268,6 +308,20 @@ impl RustAnalyzer {
         for import in self.inner.import_info_of(file) {
             let raw = import.raw_snippet.trim();
             if raw.ends_with("::*;") {
+                let module_specifier = raw
+                    .trim_start_matches("pub ")
+                    .trim_start_matches("use ")
+                    .trim_end_matches("::*;")
+                    .trim()
+                    .to_string();
+                binder.bindings.insert(
+                    format!("*:{module_specifier}"),
+                    ImportBinding {
+                        module_specifier,
+                        kind: ImportKind::Glob,
+                        imported_name: None,
+                    },
+                );
                 continue;
             }
             let Some((module_specifier, imported_name)) =
@@ -280,13 +334,44 @@ impl RustAnalyzer {
                 .clone()
                 .or_else(|| import.identifier.clone())
                 .unwrap_or_else(|| imported_name.clone());
+            let (local_name, kind, imported_name, module_specifier) = if imported_name == "self" {
+                let namespace_name = module_specifier
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or(module_specifier.as_str())
+                    .to_string();
+                (
+                    namespace_name,
+                    ImportKind::Namespace,
+                    None,
+                    module_specifier,
+                )
+            } else if !raw.contains('{')
+                && imported_name
+                    .chars()
+                    .all(|ch| ch.is_ascii_lowercase() || ch == '_')
+            {
+                (
+                    imported_name.clone(),
+                    ImportKind::Namespace,
+                    None,
+                    format!("{module_specifier}::{imported_name}"),
+                )
+            } else {
+                (
+                    local_name,
+                    ImportKind::Named,
+                    Some(imported_name),
+                    module_specifier,
+                )
+            };
 
             binder.bindings.insert(
                 local_name,
                 ImportBinding {
                     module_specifier,
-                    kind: ImportKind::Named,
-                    imported_name: Some(imported_name),
+                    kind,
+                    imported_name,
                 },
             );
         }
@@ -360,8 +445,9 @@ impl RustAnalyzer {
             .map(|source| {
                 let trimmed = source.trim_start();
                 trimmed.starts_with("pub ")
-                    || trimmed.starts_with("pub(")
-                    || code_unit.is_module() && trimmed.starts_with("mod ")
+                    || trimmed.starts_with("pub(crate)")
+                    || trimmed.starts_with("pub(in crate")
+                    || code_unit.is_module() && trimmed.starts_with("pub mod ")
             })
             .unwrap_or(false)
     }
@@ -1298,12 +1384,16 @@ fn collect_rust_type_identifiers(node: Node<'_>, source: &str, identifiers: &mut
 
 fn flatten_rust_use(raw: &str) -> Vec<String> {
     let trimmed = raw.trim().trim_end_matches(';').trim();
-    let Some(body) = trimmed.strip_prefix("use ") else {
+    let (prefix, body) = if let Some(body) = trimmed.strip_prefix("pub use ") {
+        ("pub use ", body)
+    } else if let Some(body) = trimmed.strip_prefix("use ") {
+        ("use ", body)
+    } else {
         return vec![format!("{trimmed};")];
     };
     expand_rust_use_body("", body)
         .into_iter()
-        .map(|path| format!("use {path};"))
+        .map(|path| format!("{prefix}{path};"))
         .collect()
 }
 
@@ -1397,6 +1487,7 @@ fn parse_rust_import_info(raw: String) -> ImportInfo {
 fn split_rust_import_module_and_name(raw_import: &str) -> Option<(String, String)> {
     let trimmed = raw_import
         .trim()
+        .trim_start_matches("pub ")
         .trim_start_matches("use ")
         .trim_end_matches(';')
         .trim();
@@ -1417,6 +1508,9 @@ fn resolve_rust_module_path(package: &str, module_specifier: &str) -> Option<Str
     let trimmed = module_specifier.trim();
     if trimmed.is_empty() {
         return None;
+    }
+    if trimmed == "crate" {
+        return Some(String::new());
     }
 
     let segments: Vec<_> = trimmed
@@ -1461,6 +1555,7 @@ fn resolve_rust_import_fq_name(
 ) -> Option<String> {
     let trimmed = raw_import
         .trim()
+        .trim_start_matches("pub ")
         .trim_start_matches("use ")
         .trim_end_matches(';')
         .trim();

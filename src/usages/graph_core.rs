@@ -66,7 +66,12 @@ impl ProjectUsageGraph {
             }
         }
 
-        let importer_reverse = build_importer_reverse(&files, binders_by_file, &mut resolve_module);
+        let importer_reverse = build_importer_reverse(
+            &files,
+            binders_by_file,
+            &exports_by_file,
+            &mut resolve_module,
+        );
 
         Self {
             files,
@@ -181,6 +186,7 @@ fn edge_matches_seed(edge: &ImportEdge, seeds: &BTreeSet<(ProjectFile, String)>)
 fn build_importer_reverse<ResolveFn>(
     files: &[ProjectFile],
     binders_by_file: &HashMap<ProjectFile, ImportBinder>,
+    exports_by_file: &HashMap<ProjectFile, ExportIndex>,
     resolve_module: &mut ResolveFn,
 ) -> HashMap<ProjectFile, Vec<ImportEdge>>
 where
@@ -193,9 +199,25 @@ where
         };
         for (local_name, binding) in &binder.bindings {
             for target_file in resolve_module(file, &binding.module_specifier) {
+                if matches!(binding.kind, ImportKind::Glob) {
+                    let Some(exports) = exports_by_file.get(&target_file) else {
+                        continue;
+                    };
+                    for export_name in exports.exports_by_name.keys() {
+                        let edge = ImportEdge {
+                            importer: file.clone(),
+                            local_name: export_name.clone(),
+                            target_file: target_file.clone(),
+                            kind: ImportEdgeKind::Named(export_name.clone()),
+                        };
+                        reverse.entry(target_file.clone()).or_default().push(edge);
+                    }
+                    continue;
+                }
                 let kind = match (binding.kind, binding.imported_name.as_deref()) {
                     (ImportKind::Default, _) => ImportEdgeKind::Default,
                     (ImportKind::Namespace, _) => ImportEdgeKind::Namespace,
+                    (ImportKind::Glob, _) => unreachable!("glob handled above"),
                     (ImportKind::Named, Some(name)) => ImportEdgeKind::Named(name.to_string()),
                     (ImportKind::Named, None) => ImportEdgeKind::Named(local_name.clone()),
                 };

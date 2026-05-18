@@ -114,6 +114,268 @@ fn run() {
 }
 
 #[test]
+fn rust_graph_strategy_finds_aliased_import_usage() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        ("src/service.rs", "pub struct Service;\n"),
+        (
+            "src/main.rs",
+            r#"
+use crate::service::Service as S;
+
+fn run() {
+    let _ = S {};
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "service.Service");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = brokk_analyzer::usages::RustExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    assert_eq!(
+        1,
+        result.into_either().expect("aliased import success").len()
+    );
+}
+
+#[test]
+fn rust_graph_strategy_finds_grouped_import_usages() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/service.rs",
+            r#"
+pub struct Service;
+pub struct Helper;
+"#,
+        ),
+        (
+            "src/main.rs",
+            r#"
+use crate::service::{Service, Helper};
+
+fn run() {
+    let _ = Service {};
+    let _ = Helper {};
+}
+"#,
+        ),
+    ]);
+
+    let service = definition(&analyzer, "service.Service");
+    let helper = definition(&analyzer, "service.Helper");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let strategy = brokk_analyzer::usages::RustExportUsageGraphStrategy::new();
+    assert_eq!(
+        1,
+        strategy
+            .find_usages(&analyzer, std::slice::from_ref(&service), &candidates, 1000)
+            .into_either()
+            .expect("grouped Service success")
+            .len()
+    );
+    assert_eq!(
+        1,
+        strategy
+            .find_usages(&analyzer, std::slice::from_ref(&helper), &candidates, 1000)
+            .into_either()
+            .expect("grouped Helper success")
+            .len()
+    );
+}
+
+#[test]
+fn rust_graph_strategy_finds_self_import_module_qualified_usage() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        ("src/service.rs", "pub fn factory() {}\n"),
+        (
+            "src/main.rs",
+            r#"
+use crate::service::{self};
+
+fn run() {
+    service::factory();
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "service.factory");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = brokk_analyzer::usages::RustExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    assert_eq!(1, result.into_either().expect("self import success").len());
+}
+
+#[test]
+fn rust_graph_strategy_finds_public_reexport_alias_usage() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        ("src/service.rs", "pub struct Service;\n"),
+        (
+            "src/index.rs",
+            "pub use crate::service::Service as PublicService;\n",
+        ),
+        (
+            "src/main.rs",
+            r#"
+use crate::index::PublicService;
+
+fn run() {
+    let _ = PublicService {};
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "service.Service");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = brokk_analyzer::usages::RustExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    assert_eq!(
+        1,
+        result.into_either().expect("reexport alias success").len()
+    );
+}
+
+#[test]
+fn rust_graph_strategy_resolves_relative_module_layouts() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        ("src/pkg/service.rs", "pub struct Service;\n"),
+        (
+            "src/pkg/nested/mod.rs",
+            r#"
+use super::service::Service;
+
+fn run() {
+    let _ = Service {};
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "pkg.service.Service");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = brokk_analyzer::usages::RustExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    assert_eq!(
+        1,
+        result
+            .into_either()
+            .expect("relative module layout success")
+            .len()
+    );
+}
+
+#[test]
+fn rust_graph_strategy_counts_function_parameter_type_usages() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        ("src/service.rs", "pub struct SearchSymbolsParams;\n"),
+        (
+            "src/searchtools.rs",
+            r#"
+use crate::service::SearchSymbolsParams;
+
+pub fn search_symbols(
+    analyzer: &dyn IAnalyzer,
+    params: SearchSymbolsParams,
+) {
+    let _ = analyzer;
+    let _ = params;
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "service.SearchSymbolsParams");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = brokk_analyzer::usages::RustExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    assert_eq!(
+        1,
+        result.into_either().expect("parameter type success").len()
+    );
+}
+
+#[test]
+fn private_rust_items_do_not_seed_graph_exports() {
+    let (project, analyzer) = rust_analyzer_with_files(&[("src/service.rs", "struct Service;\n")]);
+    let index = analyzer.export_index_of(&project.file("src/service.rs"));
+    assert!(!index.exports_by_name.contains_key("Service"));
+}
+
+#[test]
+fn local_definition_shadows_imported_rust_name() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        ("src/service.rs", "pub struct Service;\n"),
+        (
+            "src/main.rs",
+            r#"
+use crate::service::Service;
+
+struct Service;
+
+fn run() {
+    let _ = Service {};
+}
+"#,
+        ),
+    ]);
+    let target = definition(&analyzer, "service.Service");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = brokk_analyzer::usages::RustExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    assert!(result.into_either().expect("shadowed success").is_empty());
+}
+
+#[test]
+fn private_unseeded_rust_target_falls_back_to_no_graph_hits() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[("src/service.rs", "struct Service;\n")]);
+    let target = definition(&analyzer, "service.Service");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    match brokk_analyzer::usages::RustExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    ) {
+        FuzzyResult::Failure { .. } => {}
+        other => panic!("expected Failure for private unseeded target, got {other:?}"),
+    }
+}
+
+#[test]
 fn rust_graph_strategy_filters_non_rust_candidates_without_widening() {
     let (_project, analyzer) = rust_analyzer_with_files(&[
         ("src/service.rs", "pub struct Service;\n"),
@@ -234,6 +496,56 @@ fn summarize_input(input: &str) -> Result<RenderedSummary, String> {
             .into_either()
             .expect("same-file struct success")
             .len()
+    );
+}
+
+#[test]
+fn private_same_file_function_without_call_produces_no_hit() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[(
+        "src/searchtools.rs",
+        r#"
+fn summarize_symbol_targets() {}
+
+pub fn get_summaries() {}
+"#,
+    )]);
+
+    let target = definition(&analyzer, "searchtools.summarize_symbol_targets");
+    let result = brokk_analyzer::usages::RustExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &std::collections::HashSet::default(),
+        1000,
+    );
+    assert!(result.into_either().expect("no-call success").is_empty());
+}
+
+#[test]
+fn local_binding_shadows_private_same_file_function() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[(
+        "src/searchtools.rs",
+        r#"
+fn summarize_symbol_targets() {}
+
+pub fn get_summaries() {
+    let summarize_symbol_targets = 1;
+    let _ = summarize_symbol_targets;
+}
+"#,
+    )]);
+
+    let target = definition(&analyzer, "searchtools.summarize_symbol_targets");
+    let result = brokk_analyzer::usages::RustExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &std::collections::HashSet::default(),
+        1000,
+    );
+    assert!(
+        result
+            .into_either()
+            .expect("shadowed same-file success")
+            .is_empty()
     );
 }
 
@@ -385,4 +697,656 @@ fn unrelated() {
 
     assert!(candidates.contains(&project.file("src/main.rs")));
     assert!(!candidates.contains(&project.file("src/other.rs")));
+}
+
+#[test]
+fn rust_graph_strategy_resolves_typed_receiver_instance_method() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/service.rs",
+            r#"
+pub struct Foo;
+impl Foo {
+    pub fn bar(&self) {}
+}
+"#,
+        ),
+        (
+            "src/main.rs",
+            r#"
+use crate::service::Foo;
+
+fn run(x: Foo) {
+    let y: Foo = x;
+    y.bar();
+}
+"#,
+        ),
+    ]);
+
+    let target = member(&analyzer, &project.file("src/service.rs"), "Foo", "bar");
+    let hits = brokk_analyzer::usages::RustExportUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &analyzer.get_analyzed_files().into_iter().collect(),
+            1000,
+        )
+        .into_either()
+        .expect("typed receiver success");
+    assert_eq!(1, hits.len());
+}
+
+#[test]
+fn rust_graph_strategy_resolves_constructor_and_alias_receivers() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/service.rs",
+            r#"
+pub struct Foo;
+impl Foo {
+    pub fn new() -> Foo { Foo }
+    pub fn bar(&self) {}
+}
+"#,
+        ),
+        (
+            "src/main.rs",
+            r#"
+use crate::service::Foo;
+
+fn run() {
+    let a = Foo::new();
+    a.bar();
+    let b = Foo {};
+    b.bar();
+    let c = a;
+    c.bar();
+}
+"#,
+        ),
+    ]);
+
+    let target = member(&analyzer, &project.file("src/service.rs"), "Foo", "bar");
+    let hits = brokk_analyzer::usages::RustExportUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &analyzer.get_analyzed_files().into_iter().collect(),
+            1000,
+        )
+        .into_either()
+        .expect("constructor receiver success");
+    assert_eq!(3, hits.len());
+}
+
+#[test]
+fn rust_graph_strategy_resolves_associated_method_and_const_without_receiver_inference() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/service.rs",
+            r#"
+pub struct Foo;
+impl Foo {
+    pub const CONST: usize = 1;
+    pub fn make() -> Foo { Foo }
+}
+"#,
+        ),
+        (
+            "src/main.rs",
+            r#"
+use crate::service::Foo;
+
+fn run() {
+    let _ = Foo::make();
+    let _ = Foo::CONST;
+}
+"#,
+        ),
+    ]);
+
+    let make = member(&analyzer, &project.file("src/service.rs"), "Foo", "make");
+    let constant = member(&analyzer, &project.file("src/service.rs"), "Foo", "CONST");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = brokk_analyzer::usages::RustExportUsageGraphStrategy::new();
+
+    assert_eq!(
+        1,
+        strategy
+            .find_usages(&analyzer, std::slice::from_ref(&make), &candidates, 1000)
+            .into_either()
+            .expect("associated make success")
+            .len()
+    );
+    assert_eq!(
+        1,
+        strategy
+            .find_usages(
+                &analyzer,
+                std::slice::from_ref(&constant),
+                &candidates,
+                1000
+            )
+            .into_either()
+            .expect("associated const success")
+            .len()
+    );
+}
+
+#[test]
+fn rust_graph_strategy_does_not_resolve_public_member_on_private_owner() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/service.rs",
+            r#"
+struct Foo;
+impl Foo {
+    pub fn public(&self) {}
+}
+"#,
+        ),
+        (
+            "src/main.rs",
+            r#"
+use crate::service::Foo;
+
+fn run(x: Foo) {
+    x.public();
+}
+"#,
+        ),
+    ]);
+
+    let target = member(&analyzer, &project.file("src/service.rs"), "Foo", "public");
+    let hits = brokk_analyzer::usages::RustExportUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &analyzer.get_analyzed_files().into_iter().collect(),
+            1000,
+        )
+        .into_either();
+    assert!(hits.is_err() || hits.expect("private owner member").is_empty());
+}
+
+#[test]
+fn rust_graph_strategy_does_not_cross_match_duplicate_owner_names() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/service.rs",
+            r#"
+pub struct Foo;
+impl Foo {
+    pub fn bar(&self) {}
+}
+"#,
+        ),
+        (
+            "src/other.rs",
+            r#"
+pub struct Foo;
+impl Foo {
+    pub fn bar(&self) {}
+}
+"#,
+        ),
+        (
+            "src/main.rs",
+            r#"
+use crate::service::Foo;
+
+fn run() {
+    let x: Foo = Foo {};
+    x.bar();
+}
+"#,
+        ),
+    ]);
+
+    let service_target = member(&analyzer, &project.file("src/service.rs"), "Foo", "bar");
+    let other_target = member(&analyzer, &project.file("src/other.rs"), "Foo", "bar");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = brokk_analyzer::usages::RustExportUsageGraphStrategy::new();
+
+    assert_eq!(
+        1,
+        strategy
+            .find_usages(
+                &analyzer,
+                std::slice::from_ref(&service_target),
+                &candidates,
+                1000,
+            )
+            .into_either()
+            .expect("service foo member success")
+            .len()
+    );
+    assert!(
+        strategy
+            .find_usages(
+                &analyzer,
+                std::slice::from_ref(&other_target),
+                &candidates,
+                1000
+            )
+            .into_either()
+            .expect("other foo member success")
+            .is_empty()
+    );
+}
+
+#[test]
+fn rust_graph_strategy_uses_function_parameter_type_as_receiver_seed() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/service.rs",
+            r#"
+pub struct Foo;
+impl Foo {
+    pub fn bar(&self) {}
+}
+"#,
+        ),
+        (
+            "src/main.rs",
+            r#"
+use crate::service::Foo;
+
+fn run(x: Foo) {
+    x.bar();
+}
+"#,
+        ),
+    ]);
+
+    let target = member(&analyzer, &project.file("src/service.rs"), "Foo", "bar");
+    let hits = brokk_analyzer::usages::RustExportUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &analyzer.get_analyzed_files().into_iter().collect(),
+            1000,
+        )
+        .into_either()
+        .expect("parameter receiver success");
+    assert_eq!(1, hits.len());
+}
+
+#[test]
+fn rust_graph_strategy_finds_private_same_file_function_call_inside_closure() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[(
+        "src/summary.rs",
+        r#"
+pub struct RenderedSummary;
+
+pub fn summarize_inputs(inputs: &[String]) -> Result<Vec<RenderedSummary>, String> {
+    inputs
+        .iter()
+        .map(|input| summarize_input(input))
+        .collect()
+}
+
+fn summarize_input(input: &str) -> Result<RenderedSummary, String> {
+    Ok(RenderedSummary)
+}
+"#,
+    )]);
+
+    let target = definition(&analyzer, "summary.summarize_input");
+    let hits = brokk_analyzer::usages::RustExportUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &std::collections::HashSet::default(),
+            1000,
+        )
+        .into_either()
+        .expect("closure private call success");
+    assert_eq!(1, hits.len());
+}
+
+#[test]
+fn rust_graph_strategy_does_not_cross_match_same_private_function_name_in_another_module() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/a.rs",
+            r#"
+fn summarize_symbol_targets(targets: Vec<String>) -> SummaryResult {
+    SummaryResult {}
+}
+"#,
+        ),
+        (
+            "src/b.rs",
+            r#"
+fn summarize_symbol_targets(targets: Vec<String>) -> SummaryResult {
+    SummaryResult {}
+}
+
+pub fn get_summaries(params: SummariesParams) -> SummaryResult {
+    summarize_symbol_targets(params.targets)
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "a.summarize_symbol_targets");
+    let candidates = [ProjectFile::new(
+        analyzer.project().root().to_path_buf(),
+        "src/b.rs",
+    )]
+    .into_iter()
+    .collect();
+
+    let hits = brokk_analyzer::usages::RustExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("cross-module private success");
+    assert!(hits.is_empty());
+}
+
+#[test]
+fn rust_graph_strategy_does_not_seed_pub_self_exports() {
+    let (_project, analyzer) =
+        rust_analyzer_with_files(&[("src/service.rs", "pub(self) struct Hidden;\n")]);
+    let target = definition(&analyzer, "service.Hidden");
+    let hits = brokk_analyzer::usages::RustExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &analyzer.get_analyzed_files().into_iter().collect(),
+        1000,
+    );
+    assert!(matches!(hits, FuzzyResult::Failure { .. }));
+}
+
+#[test]
+fn rust_graph_strategy_keeps_pub_crate_exports_graph_visible() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        ("src/service.rs", "pub(crate) struct Local;\n"),
+        (
+            "src/main.rs",
+            r#"
+use crate::service::Local;
+
+fn run() {
+    let _ = Local {};
+}
+"#,
+        ),
+    ]);
+    let target = definition(&analyzer, "service.Local");
+    let hits = brokk_analyzer::usages::RustExportUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &analyzer.get_analyzed_files().into_iter().collect(),
+            1000,
+        )
+        .into_either()
+        .expect("pub(crate) success");
+    assert_eq!(1, hits.len());
+}
+
+#[test]
+fn rust_graph_strategy_resolves_barrel_reexport_from_private_module() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/lib.rs",
+            r#"
+mod service;
+pub use service::Foo;
+"#,
+        ),
+        ("src/service.rs", "pub struct Foo;\n"),
+        (
+            "src/main.rs",
+            r#"
+use crate::Foo;
+
+fn run() {
+    let _ = Foo {};
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "service.Foo");
+    let hits = brokk_analyzer::usages::RustExportUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &analyzer.get_analyzed_files().into_iter().collect(),
+            1000,
+        )
+        .into_either()
+        .expect("barrel reexport success");
+    assert_eq!(1, hits.len());
+}
+
+#[test]
+fn rust_graph_strategy_resolves_chained_and_aliased_barrel_reexports() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/service.rs",
+            r#"
+pub struct Foo;
+pub struct Bar;
+"#,
+        ),
+        (
+            "src/first.rs",
+            r#"
+pub use crate::service::{Foo, Bar as PublicBar};
+"#,
+        ),
+        (
+            "src/second.rs",
+            r#"
+pub use crate::first::Foo;
+pub use crate::first::PublicBar;
+"#,
+        ),
+        (
+            "src/main.rs",
+            r#"
+use crate::second::{Foo, PublicBar};
+
+fn run() {
+    let _ = Foo {};
+    let _ = PublicBar {};
+}
+"#,
+        ),
+    ]);
+
+    let foo = definition(&analyzer, "service.Foo");
+    let bar = definition(&analyzer, "service.Bar");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = brokk_analyzer::usages::RustExportUsageGraphStrategy::new();
+
+    assert_eq!(
+        1,
+        strategy
+            .find_usages(&analyzer, std::slice::from_ref(&foo), &candidates, 1000)
+            .into_either()
+            .expect("chained Foo success")
+            .len()
+    );
+    assert_eq!(
+        1,
+        strategy
+            .find_usages(&analyzer, std::slice::from_ref(&bar), &candidates, 1000)
+            .into_either()
+            .expect("chained Bar success")
+            .len()
+    );
+}
+
+#[test]
+fn rust_graph_strategy_uses_simple_type_alias_as_receiver_seed() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/service.rs",
+            r#"
+pub struct Foo;
+impl Foo {
+    pub fn bar(&self) {}
+}
+"#,
+        ),
+        (
+            "src/main.rs",
+            r#"
+use crate::service::Foo;
+
+type Alias = Foo;
+
+fn run(value: Alias) {
+    value.bar();
+}
+"#,
+        ),
+    ]);
+
+    let target = member(&analyzer, &project.file("src/service.rs"), "Foo", "bar");
+    let hits = brokk_analyzer::usages::RustExportUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &analyzer.get_analyzed_files().into_iter().collect(),
+            1000,
+        )
+        .into_either()
+        .expect("type alias receiver success");
+    assert_eq!(1, hits.len());
+}
+
+#[test]
+fn rust_graph_strategy_uses_self_like_constructor_chain_as_receiver_seed() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/service.rs",
+            r#"
+pub struct ChangeDelta;
+pub struct ProjectChangeWatcher;
+impl ProjectChangeWatcher {
+    pub fn start() -> Result<Self, String> {
+        todo!()
+    }
+    pub fn other() -> ChangeDelta {
+        todo!()
+    }
+    pub fn take_changed_files(&self) -> ChangeDelta {
+        todo!()
+    }
+}
+"#,
+        ),
+        (
+            "src/main.rs",
+            r#"
+use crate::service::ProjectChangeWatcher;
+
+fn run() {
+    let watcher = ProjectChangeWatcher::start().unwrap();
+    watcher.take_changed_files();
+}
+
+fn unrelated() {
+    let delta = ProjectChangeWatcher::other();
+    delta.take_changed_files();
+}
+"#,
+        ),
+    ]);
+
+    let target = member(
+        &analyzer,
+        &project.file("src/service.rs"),
+        "ProjectChangeWatcher",
+        "take_changed_files",
+    );
+    let hits = brokk_analyzer::usages::RustExportUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &analyzer.get_analyzed_files().into_iter().collect(),
+            1000,
+        )
+        .into_either()
+        .expect("self-like constructor success");
+    assert_eq!(1, hits.len());
+}
+
+#[test]
+fn rust_graph_strategy_resolves_bounded_glob_imports_for_public_exports_only() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/service.rs",
+            r#"
+pub struct Foo;
+struct Hidden;
+"#,
+        ),
+        (
+            "src/main.rs",
+            r#"
+use crate::service::*;
+
+fn run() {
+    let _ = Foo {};
+    let _ = Hidden {};
+}
+"#,
+        ),
+    ]);
+
+    let foo = definition(&analyzer, "service.Foo");
+    let hidden = definition(&analyzer, "service.Hidden");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = brokk_analyzer::usages::RustExportUsageGraphStrategy::new();
+
+    assert_eq!(
+        1,
+        strategy
+            .find_usages(&analyzer, std::slice::from_ref(&foo), &candidates, 1000)
+            .into_either()
+            .expect("glob Foo success")
+            .len()
+    );
+    assert!(matches!(
+        strategy.find_usages(&analyzer, std::slice::from_ref(&hidden), &candidates, 1000),
+        FuzzyResult::Failure { .. }
+    ));
+}
+
+#[test]
+fn rust_graph_strategy_resolves_bounded_glob_reexports() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        ("src/service.rs", "pub struct Foo;\n"),
+        ("src/index.rs", "pub use crate::service::*;\n"),
+        (
+            "src/main.rs",
+            r#"
+use crate::index::Foo;
+
+fn run() {
+    let _ = Foo {};
+}
+"#,
+        ),
+    ]);
+
+    let foo = definition(&analyzer, "service.Foo");
+    let hits = brokk_analyzer::usages::RustExportUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&foo),
+            &analyzer.get_analyzed_files().into_iter().collect(),
+            1000,
+        )
+        .into_either()
+        .expect("glob reexport success");
+    assert_eq!(1, hits.len());
 }
