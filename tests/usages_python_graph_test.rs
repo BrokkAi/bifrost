@@ -40,6 +40,27 @@ fn assert_single_python_member_hit(service: &str, consumer: &str) {
     );
 }
 
+fn assert_no_python_member_hit(service: &str, consumer: &str) {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("service.py", service)
+        .file("consumer.py", consumer)
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.Foo.bar");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = PythonExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("graph should return success for member query");
+    assert!(hits.is_empty(), "member query should not find proven hits");
+}
+
 #[test]
 fn absolute_import_resolves_export_usage() {
     let project = InlineTestProject::with_language(Language::Python)
@@ -956,6 +977,197 @@ def run():
         .into_either()
         .expect("graph should resolve namespace-qualified annotation receiver");
     assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn unseeded_receiver_does_not_count_as_member_usage() {
+    assert_no_python_member_hit(
+        r#"
+class Foo:
+    def bar(self):
+        pass
+"#,
+        r#"
+def run(x):
+    x.bar()
+"#,
+    );
+}
+
+#[test]
+fn unknown_constructor_does_not_count_as_member_usage() {
+    assert_no_python_member_hit(
+        r#"
+class Foo:
+    def bar(self):
+        pass
+"#,
+        r#"
+def run():
+    x = Unknown()
+    x.bar()
+"#,
+    );
+}
+
+#[test]
+fn local_class_name_shadow_blocks_imported_constructor_receiver() {
+    assert_no_python_member_hit(
+        r#"
+class Foo:
+    def bar(self):
+        pass
+"#,
+        r#"
+from service import Foo
+
+def run():
+    Foo = object
+    x = Foo()
+    x.bar()
+"#,
+    );
+}
+
+#[test]
+fn ambiguous_annotation_beyond_cap_does_not_count_as_member_usage() {
+    assert_no_python_member_hit(
+        r#"
+class Foo:
+    def bar(self):
+        pass
+class Bar:
+    def bar(self):
+        pass
+class Baz:
+    def bar(self):
+        pass
+class Qux:
+    def bar(self):
+        pass
+class Quux:
+    def bar(self):
+        pass
+"#,
+        r#"
+from service import Foo, Bar, Baz, Qux, Quux
+
+def run():
+    x: Foo | Bar | Baz | Qux | Quux
+    x.bar()
+"#,
+    );
+}
+
+#[test]
+fn receiver_type_facts_do_not_leak_across_functions() {
+    assert_no_python_member_hit(
+        r#"
+class Foo:
+    def bar(self):
+        pass
+"#,
+        r#"
+from service import Foo
+
+def typed(x: Foo):
+    pass
+
+def run(x):
+    x.bar()
+"#,
+    );
+}
+
+#[test]
+fn shadowing_in_one_function_does_not_block_sibling_receiver_inference() {
+    assert_single_python_member_hit(
+        r#"
+class Foo:
+    def bar(self):
+        pass
+"#,
+        r#"
+from service import Foo
+
+def shadow():
+    Foo = object
+
+def run(x: Foo):
+    x.bar()
+"#,
+    );
+}
+
+#[test]
+fn function_local_shadow_does_not_count_as_imported_usage() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+class Service:
+    pass
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+from service import Service
+
+def run():
+    Service = object
+    return Service()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.Service");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = PythonExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("graph should succeed for function-local shadow case");
+    assert!(
+        hits.is_empty(),
+        "function-local shadow should block imported usage"
+    );
+}
+
+#[test]
+fn python_graph_success_with_no_hits_does_not_fallback_to_regex() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+class Widget:
+    pass
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+# Widget appears only in a comment.
+note = "Widget appears only in a string"
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.Widget");
+
+    let result = UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target));
+    let hits = result
+        .into_either()
+        .expect("graph should return a successful empty result");
+    assert!(
+        hits.is_empty(),
+        "text mentions should not trigger regex fallback"
+    );
 }
 
 #[test]

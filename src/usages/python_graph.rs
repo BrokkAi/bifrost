@@ -399,8 +399,13 @@ fn scan_files_for_seeds(
         let edges = graph.usage_graph.matching_edges_for_importer(file, seeds);
         let local_conflicts = collect_top_level_conflicts(tree_ref.root_node(), source_str);
         let target_self_file = *file == target.source();
-        let receiver_facts =
-            collect_receiver_facts(source_str, &edges, target_short.as_str(), target_self_file);
+        let scope_facts = collect_scope_facts(
+            analyzer,
+            file,
+            &edges,
+            target_short.as_str(),
+            target_self_file,
+        );
 
         let mut local_hits = BTreeSet::new();
         let line_starts = compute_line_starts(source_str);
@@ -415,7 +420,7 @@ fn scan_files_for_seeds(
             edges: &edges,
             target_self_file,
             local_conflicts: &local_conflicts,
-            receiver_facts: &receiver_facts,
+            scope_facts: &scope_facts,
             hits: &mut local_hits,
         };
 
@@ -444,12 +449,28 @@ struct ScanCtx<'a> {
     edges: &'a [ImportEdge],
     target_self_file: bool,
     local_conflicts: &'a HashSet<String>,
-    receiver_facts: &'a HashSet<String>,
+    scope_facts: &'a HashMap<CodeUnit, ScopeFacts>,
     hits: &'a mut BTreeSet<UsageHit>,
 }
 
 impl ScanCtx<'_> {
-    fn binds_target(&self, ident: &str) -> bool {
+    fn scope_facts_for_node(&self, node: Node<'_>) -> Option<&ScopeFacts> {
+        let range = Range {
+            start_byte: node.start_byte(),
+            end_byte: node.end_byte(),
+            start_line: 0,
+            end_line: 0,
+        };
+        let enclosing = self.analyzer.enclosing_code_unit(self.file, &range)?;
+        self.scope_facts.get(&enclosing)
+    }
+
+    fn binds_target(&self, ident: &str, node: Node<'_>) -> bool {
+        if let Some(scope_facts) = self.scope_facts_for_node(node)
+            && scope_facts.local_shadows.contains(ident)
+        {
+            return false;
+        }
         if !self.target_self_file && self.local_conflicts.contains(ident) {
             return false;
         }
@@ -459,8 +480,11 @@ impl ScanCtx<'_> {
         self.target_self_file && ident == self.target_short
     }
 
-    fn receiver_binds_target(&self, expr: &str) -> bool {
-        self.binds_target(expr) || self.receiver_facts.contains(expr)
+    fn receiver_binds_target(&self, expr: &str, node: Node<'_>) -> bool {
+        self.binds_target(expr, node)
+            || self
+                .scope_facts_for_node(node)
+                .is_some_and(|scope_facts| scope_facts.receiver_facts.contains(expr))
     }
 }
 
@@ -492,7 +516,7 @@ fn handle_identifier_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     let text = slice(node, ctx.source);
-    if text.is_empty() || !ctx.binds_target(text) || is_declaration_identifier(node) {
+    if text.is_empty() || !ctx.binds_target(text, node) || is_declaration_identifier(node) {
         return;
     }
     record_hit(node, ctx);
@@ -508,7 +532,7 @@ fn handle_attribute_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let object_text = slice(object, ctx.source);
     let attribute_text = slice(attribute, ctx.source);
     if let Some(member) = ctx.target_member
-        && ctx.receiver_binds_target(object_text)
+        && ctx.receiver_binds_target(object_text, node)
         && attribute_text == member
     {
         record_hit(attribute, ctx);
@@ -678,21 +702,107 @@ fn collect_assigned_identifiers(node: Node<'_>, source: &str, out: &mut HashSet<
     }
 }
 
-fn collect_receiver_facts(
+#[derive(Default, Clone)]
+struct ScopeFacts {
+    receiver_facts: HashSet<String>,
+    local_shadows: HashSet<String>,
+}
+
+fn collect_scope_facts(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    edges: &[ImportEdge],
+    target_short: &str,
+    target_self_file: bool,
+) -> HashMap<CodeUnit, ScopeFacts> {
+    let declarations = analyzer.get_declarations(file);
+    let mut class_facts_by_name: HashMap<String, ScopeFacts> = HashMap::default();
+    for declaration in declarations
+        .iter()
+        .filter(|declaration| declaration.is_class())
+    {
+        let Some(source) = analyzer.get_source(declaration, false) else {
+            continue;
+        };
+        let facts =
+            collect_scope_facts_from_source(&source, edges, target_short, target_self_file, true);
+        class_facts_by_name.insert(
+            declaration.short_name().to_string(),
+            ScopeFacts {
+                receiver_facts: facts
+                    .receiver_facts
+                    .into_iter()
+                    .filter(|fact| fact.starts_with("self."))
+                    .collect(),
+                local_shadows: HashSet::default(),
+            },
+        );
+    }
+
+    let mut scope_facts = HashMap::default();
+    for declaration in declarations
+        .iter()
+        .filter(|declaration| declaration.is_function())
+    {
+        let Some(source) = analyzer.get_source(declaration, false) else {
+            continue;
+        };
+        let mut facts =
+            collect_scope_facts_from_source(&source, edges, target_short, target_self_file, false);
+        if let Some((owner, _)) = declaration.short_name().rsplit_once('.')
+            && let Some(class_facts) = class_facts_by_name.get(owner)
+        {
+            facts
+                .receiver_facts
+                .extend(class_facts.receiver_facts.iter().cloned());
+        }
+        scope_facts.insert(declaration.clone(), facts);
+    }
+    scope_facts
+}
+
+fn collect_scope_facts_from_source(
     source: &str,
     edges: &[ImportEdge],
     target_short: &str,
     target_self_file: bool,
-) -> HashSet<String> {
-    static PARAM_ANNOTATION_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"([A-Za-z_][A-Za-z0-9_\.]*)\s*:\s*([A-Za-z_][A-Za-z0-9_\.]*)").unwrap()
+    allow_self_receivers: bool,
+) -> ScopeFacts {
+    static PARAM_ANNOTATION_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"([A-Za-z_][A-Za-z0-9_\.]*)\s*:\s*([^=,\)\n]+)").unwrap());
+    static PARAM_NAME_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"def\s+[A-Za-z_][A-Za-z0-9_]*\s*\((?P<params>[^)]*)\)").unwrap()
     });
     static ASSIGNMENT_RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"^\s*([A-Za-z_][A-Za-z0-9_\.]*)\s*=\s*([A-Za-z_][A-Za-z0-9_\.()]*)\s*$")
             .unwrap()
     });
 
-    let mut facts = HashSet::default();
+    let mut facts = ScopeFacts::default();
+    for captures in PARAM_NAME_RE.captures_iter(source) {
+        let params = captures
+            .name("params")
+            .map(|m| m.as_str())
+            .unwrap_or_default();
+        for param in params.split(',') {
+            let param = param.trim();
+            if param.is_empty() || matches!(param, "self" | "cls" | "/") {
+                continue;
+            }
+            let param_name = param
+                .split(':')
+                .next()
+                .unwrap_or(param)
+                .split('=')
+                .next()
+                .unwrap_or(param)
+                .trim();
+            if !param_name.is_empty() {
+                facts.local_shadows.insert(param_name.to_string());
+            }
+        }
+    }
+
     let mut changed = true;
     while changed {
         changed = false;
@@ -700,12 +810,15 @@ fn collect_receiver_facts(
             for captures in PARAM_ANNOTATION_RE.captures_iter(line) {
                 let lhs = captures.get(1).map(|m| m.as_str()).unwrap_or_default();
                 let annotation = captures.get(2).map(|m| m.as_str()).unwrap_or_default();
+                if lhs.starts_with("self.") && !allow_self_receivers {
+                    continue;
+                }
                 if receiver_annotation_matches_target(
                     annotation,
                     edges,
                     target_short,
                     target_self_file,
-                ) && facts.insert(lhs.to_string())
+                ) && facts.receiver_facts.insert(lhs.to_string())
                 {
                     changed = true;
                 }
@@ -719,10 +832,17 @@ fn collect_receiver_facts(
             if lhs.is_empty() || rhs.is_empty() {
                 continue;
             }
+            let rhs_symbol = rhs.strip_suffix("()").unwrap_or(rhs).trim();
+            facts.local_shadows.insert(lhs.to_string());
+            if lhs.starts_with("self.") && !allow_self_receivers {
+                continue;
+            }
 
-            if (receiver_constructor_matches_target(rhs, edges, target_short, target_self_file)
-                || facts.contains(rhs))
-                && facts.insert(lhs.to_string())
+            if ((receiver_constructor_matches_target(rhs, edges, target_short, target_self_file)
+                && !facts.local_shadows.contains(rhs_symbol))
+                || facts.receiver_facts.contains(rhs)
+                || facts.receiver_facts.contains(rhs_symbol))
+                && facts.receiver_facts.insert(lhs.to_string())
             {
                 changed = true;
             }
@@ -740,6 +860,15 @@ fn receiver_annotation_matches_target(
 ) -> bool {
     let annotation = annotation.trim();
     if annotation.is_empty() {
+        return false;
+    }
+    if annotation.contains('|')
+        || annotation.contains('[')
+        || annotation.contains(']')
+        || annotation.contains(',')
+        || annotation.contains('(')
+        || annotation.contains(')')
+    {
         return false;
     }
     if annotation == target_short {
