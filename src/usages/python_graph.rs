@@ -885,10 +885,8 @@ fn collect_scope_facts_from_source(
                 .next()
                 .unwrap_or(param)
                 .trim();
-            if !param_name.is_empty() {
-                if !engine.is_shadowed(param_name) {
-                    engine.declare_shadow(param_name.to_string());
-                }
+            if !param_name.is_empty() && !engine.is_shadowed(param_name) {
+                engine.declare_shadow(param_name.to_string());
             }
         }
     }

@@ -19,7 +19,7 @@ This plan is the implementation program for issue `#76`, “Add reusable local r
 - [x] (2026-05-18 20:23Z) Completed Milestone 2 by replacing Python’s `ScopeFacts` propagation path with `LocalInferenceEngine` snapshots in `src/usages/python_graph.rs` while keeping the focused Python suites green.
 - [x] (2026-05-18 20:31Z) Completed Milestone 3 by moving Rust receiver-name and alias propagation in `src/usages/rust_graph.rs` onto `LocalInferenceEngine` while preserving the focused Rust member and receiver suite.
 - [x] (2026-05-18 20:41Z) Completed Milestone 4 by wiring `src/usages/js_ts_graph.rs` to use `LocalInferenceEngine` for local alias propagation of imported owners and proving that slice with a focused TypeScript test.
-- [ ] Add focused shared-engine tests plus per-language integration tests, then run `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and the targeted usage suites.
+- [x] (2026-05-18 20:58Z) Completed Milestone 5 by running the focused shared, Python, Rust, and JS/TS usage suites plus `cargo fmt --check` and `cargo clippy --all-targets --all-features -- -D warnings`, then fixing the last two `clippy` blockers in the migrated loops.
 
 ## Surprises & Discoveries
 
@@ -49,6 +49,9 @@ This plan is the implementation program for issue `#76`, “Add reusable local r
 
 - Observation: JS/TS also fit the shared engine without demanding a syntax-agnostic parser.
   Evidence: the first JS/TS adoption slice only needed per-file alias extraction plus shared scoped propagation, and `tests/usages_js_ts_graph_test.rs` now proves that an imported owner can be referenced through a local alias in TypeScript.
+
+- Observation: the final quality gate found only narrow cleanup items, not design regressions.
+  Evidence: `cargo clippy --all-targets --all-features -- -D warnings` failed only on two collapsible `if` patterns in the migrated Python and Rust loops; no additional correctness gaps were exposed by the final test and lint pass.
 
 ## Decision Log
 
@@ -88,9 +91,13 @@ This plan is the implementation program for issue `#76`, “Add reusable local r
   Rationale: local alias propagation for imported owners was small enough to implement and verify now, and doing so proves the shared engine works in the third strategy without dragging the broader JS/TS parity-hardening backlog into issue `#76`.
   Date/Author: 2026-05-18 / Codex
 
+- Decision: treat Milestone 5 as a full completion gate rather than a soft smoke test.
+  Rationale: after the three strategy migrations landed, the risk was no longer isolated to one file, so the right completion bar was all focused suites plus the repo formatting and lint gates, not just a subset of the previous milestone tests.
+  Date/Author: 2026-05-18 / Codex
+
 ## Outcomes & Retrospective
 
-Milestone 1 landed a reusable scoped symbol engine in `src/usages/local_inference.rs` plus a direct test suite in `tests/usages_local_inference_test.rs`. Milestone 2 then proved that the contract is already strong enough to absorb Python’s existing `ScopeFacts` propagation path without introducing Python-specific types into the shared module. Milestone 3 confirmed the same for Rust alias and receiver-local propagation, while still keeping Rust’s trait- and type-specific interpretation at the strategy edge. Milestone 4 then added a small JS/TS adoption slice for local alias propagation of imported owners. The remaining work is final validation and any last issue-boundary cleanup.
+The full plan is now complete. Milestone 1 landed a reusable scoped symbol engine in `src/usages/local_inference.rs` plus a direct test suite in `tests/usages_local_inference_test.rs`. Milestone 2 proved that the contract could absorb Python’s old `ScopeFacts` propagation path. Milestone 3 did the same for Rust alias and receiver-local propagation while leaving Rust-specific trait and type interpretation at the strategy edge. Milestone 4 added a small JS/TS adoption slice for local alias propagation of imported owners. Milestone 5 then closed the loop with focused test coverage and repo quality-gate validation. The main lesson is that the shared contract did not need to become syntax-aware to be useful; language-specific extraction and language-neutral propagation remained a stable boundary.
 
 ## Context and Orientation
 
@@ -278,3 +285,5 @@ Revision note: 2026-05-18 / Codex. Updated after Milestone 2 to record the Pytho
 Revision note: 2026-05-18 / Codex. Updated after Milestone 3 to record the Rust migration, the evidence that no broader shared API was needed for Rust receiver propagation, and the decision to keep Rust-specific type and trait interpretation at the strategy edge.
 
 Revision note: 2026-05-18 / Codex. Updated after Milestone 4 to record the landed JS/TS local-alias slice, the evidence that JS/TS could consume the shared engine without a shared parser, and the decision to land that slice now rather than only documenting it as follow-up work.
+
+Revision note: 2026-05-18 / Codex. Updated after Milestone 5 to record the final test and lint gates, the last `clippy` cleanup, and the completion of the full issue `#76` execution plan.

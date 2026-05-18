@@ -973,10 +973,9 @@ fn collect_receiver_bindings(
         if option_field_types
             .get(field_name.as_str())
             .is_some_and(|ty| owner_type_names.contains(ty))
+            && let Some(ty) = option_field_types.get(field_name.as_str())
         {
-            if let Some(ty) = option_field_types.get(field_name.as_str()) {
-                engine.seed_symbol(name.as_str().to_string(), ty.clone());
-            }
+            engine.seed_symbol(name.as_str().to_string(), ty.clone());
         }
     }
 
