@@ -19,3 +19,10 @@ the test should stay single-language.
 
 Prefer handwritten fixture directories or bespoke setup only when the test genuinely needs a larger reusable corpus or
 filesystem behavior that is awkward to express inline.
+
+# Rust CI Checks
+
+Before pushing Rust changes, run the same core checks that CI enforces locally when practical.
+
+At minimum, run `cargo fmt --check` and `cargo clippy --all-targets --all-features -- -D warnings`. If clippy or fmt
+fails, fix that locally before pushing rather than waiting for the CI matrix to report it back.
