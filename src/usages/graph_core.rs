@@ -182,14 +182,19 @@ impl ProjectUsageGraph {
         importer: &ProjectFile,
         seeds: &BTreeSet<(ProjectFile, String)>,
     ) -> Vec<ImportEdge> {
-        let Some(edges) = self.importer_reverse.get(importer) else {
-            return Vec::new();
-        };
-        edges
-            .iter()
-            .filter(|edge| edge_matches_seed(edge, seeds))
-            .cloned()
-            .collect()
+        let mut matches = Vec::new();
+        for (target_file, _) in seeds {
+            let Some(edges) = self.importer_reverse.get(target_file) else {
+                continue;
+            };
+            matches.extend(
+                edges
+                    .iter()
+                    .filter(|edge| &edge.importer == importer && edge_matches_seed(edge, seeds))
+                    .cloned(),
+            );
+        }
+        matches
     }
 }
 

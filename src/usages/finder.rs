@@ -6,6 +6,7 @@ use crate::usages::candidates::{
 };
 use crate::usages::js_ts_graph::JsTsExportUsageGraphStrategy;
 use crate::usages::model::FuzzyResult;
+use crate::usages::python_graph::PythonExportUsageGraphStrategy;
 use crate::usages::regex_analyzer::RegexUsageAnalyzer;
 use crate::usages::traits::{CandidateFileProvider, UsageAnalyzer};
 
@@ -13,7 +14,10 @@ use crate::usages::traits::{CandidateFileProvider, UsageAnalyzer};
 /// with the regex analyzer as the fallback when the graph returns
 /// [`FuzzyResult::Failure`].
 fn is_graph_routed(language: Language) -> bool {
-    matches!(language, Language::JavaScript | Language::TypeScript)
+    matches!(
+        language,
+        Language::JavaScript | Language::TypeScript | Language::Python
+    )
 }
 
 fn target_language(target: &CodeUnit) -> Language {
@@ -52,6 +56,7 @@ pub struct UsageFinder {
     fallback_candidate_provider: DefaultCandidateProvider,
     fallback_usage_analyzer: Box<dyn UsageAnalyzer>,
     js_ts_graph_analyzer: Box<dyn UsageAnalyzer>,
+    python_graph_analyzer: Box<dyn UsageAnalyzer>,
     file_filter: Option<FileFilter>,
 }
 
@@ -61,6 +66,7 @@ impl UsageFinder {
             fallback_candidate_provider: default_provider(),
             fallback_usage_analyzer: Box::new(RegexUsageAnalyzer::new()),
             js_ts_graph_analyzer: Box::new(JsTsExportUsageGraphStrategy::new()),
+            python_graph_analyzer: Box::new(PythonExportUsageGraphStrategy::new()),
             file_filter: None,
         }
     }
@@ -121,14 +127,14 @@ impl UsageFinder {
 
         let language = target_language(target);
         let result = if is_graph_routed(language) {
+            let graph_analyzer: &dyn UsageAnalyzer = match language {
+                Language::Python => self.python_graph_analyzer.as_ref(),
+                Language::JavaScript | Language::TypeScript => self.js_ts_graph_analyzer.as_ref(),
+                _ => self.fallback_usage_analyzer.as_ref(),
+            };
             // Try the graph strategy first; on Failure (no seed could be inferred) fall
             // back to the regex analyzer so callers still get best-effort results.
-            match self.js_ts_graph_analyzer.find_usages(
-                analyzer,
-                overloads,
-                &candidates,
-                max_usages,
-            ) {
+            match graph_analyzer.find_usages(analyzer, overloads, &candidates, max_usages) {
                 FuzzyResult::Failure { .. } => self.fallback_usage_analyzer.find_usages(
                     analyzer,
                     overloads,

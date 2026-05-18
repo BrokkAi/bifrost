@@ -2,8 +2,8 @@ mod common;
 
 use brokk_analyzer::usages::CandidateFileProvider as _;
 use brokk_analyzer::usages::{
-    CONFIDENCE_THRESHOLD, FuzzyResult, RegexUsageAnalyzer, TextSearchCandidateProvider,
-    UsageAnalyzer, UsageFinder,
+    CONFIDENCE_THRESHOLD, FuzzyResult, PythonExportUsageGraphStrategy, RegexUsageAnalyzer,
+    TextSearchCandidateProvider, UsageAnalyzer, UsageFinder,
 };
 use brokk_analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, PythonAnalyzer};
 use common::py_fixture_project;
@@ -85,6 +85,38 @@ fn usage_finder_default_strategy_returns_results() {
         !hits.is_empty(),
         "expected non-empty usages via UsageFinder"
     );
+}
+
+#[test]
+fn python_graph_strategy_finds_fixture_class_usages() {
+    let analyzer = fixture_analyzer();
+    let target = definition(&analyzer, "class_usage_patterns.BaseClass");
+
+    let provider = TextSearchCandidateProvider::new();
+    let candidates = provider.find_candidates(&target, &analyzer);
+
+    let strategy = PythonExportUsageGraphStrategy::new();
+    let result = strategy.find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000);
+    let hits = result.into_either().expect("graph strategy should succeed");
+    assert!(
+        !hits.is_empty(),
+        "expected graph strategy to find fixture BaseClass usages"
+    );
+}
+
+#[test]
+fn python_graph_strategy_missing_seed_returns_failure() {
+    let analyzer = fixture_analyzer();
+    let target = definition(&analyzer, "underscore_functions._private_function");
+
+    let provider = TextSearchCandidateProvider::new();
+    let candidates = provider.find_candidates(&target, &analyzer);
+
+    let strategy = PythonExportUsageGraphStrategy::new();
+    match strategy.find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000) {
+        FuzzyResult::Failure { .. } => {}
+        other => panic!("expected Failure for unresolved Python graph seed, got {other:?}"),
+    }
 }
 
 #[test]
