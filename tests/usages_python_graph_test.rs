@@ -1171,6 +1171,256 @@ note = "Widget appears only in a string"
 }
 
 #[test]
+fn inherited_base_member_counts_for_subclass_receiver() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+class Base:
+    def bar(self):
+        pass
+
+class Child(Base):
+    pass
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+from service import Child
+
+def run(x: Child):
+    x.bar()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.Base.bar");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = PythonExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("graph should count inherited base member usage");
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn overriding_subclass_member_counts_for_base_member_query() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+class Base:
+    def bar(self):
+        pass
+
+class Child(Base):
+    def bar(self):
+        pass
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+from service import Child
+
+def run(x: Child):
+    x.bar()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.Base.bar");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = PythonExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("graph should count overriding subclass member usage");
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn multi_level_inherited_member_counts_for_grandchild_receiver() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+class Base:
+    def bar(self):
+        pass
+
+class Child(Base):
+    pass
+
+class GrandChild(Child):
+    pass
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+from service import GrandChild
+
+def run(x: GrandChild):
+    x.bar()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.Base.bar");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = PythonExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("graph should count multi-level inherited member usage");
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn cross_file_inherited_member_counts_for_subclass_receiver() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "base.py",
+            r#"
+class Base:
+    def bar(self):
+        pass
+"#,
+        )
+        .file(
+            "child.py",
+            r#"
+from base import Base
+
+class Child(Base):
+    pass
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+from child import Child
+
+def run(x: Child):
+    x.bar()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "base.Base.bar");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = PythonExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("graph should count cross-file inherited member usage");
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn python_usage_graph_caches_invalidate_changed_files_on_update() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+class Service:
+    pass
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let service_file = project.file("service.py");
+
+    assert_eq!(analyzer.get_definitions("service.Service").len(), 1);
+
+    service_file
+        .write(
+            r#"
+class Renamed:
+    pass
+"#,
+        )
+        .expect("should rewrite service.py");
+    let changed = std::collections::BTreeSet::from([service_file.clone()]);
+    let updated = analyzer.update(&changed);
+
+    assert!(updated.get_definitions("service.Service").is_empty());
+    assert_eq!(updated.get_definitions("service.Renamed").len(), 1);
+}
+
+#[test]
+fn export_resolution_cache_invalidates_when_reexport_target_changes() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "pkg/service.py",
+            r#"
+class Service:
+    pass
+"#,
+        )
+        .file(
+            "pkg/__init__.py",
+            r#"
+from .service import Service
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+from pkg import Service
+
+def run():
+    return Service()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "pkg.service.Service");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let initial = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("initial graph result should succeed");
+    assert_eq!(initial.len(), 1);
+
+    let init_file = project.file("pkg/__init__.py");
+    init_file.write("").expect("should rewrite pkg/__init__.py");
+    let changed = std::collections::BTreeSet::from([init_file.clone()]);
+    let updated = analyzer.update(&changed);
+    let target = definition(&updated, "pkg.service.Service");
+    let candidates = updated.get_analyzed_files().into_iter().collect();
+    let after_update = PythonExportUsageGraphStrategy::new()
+        .find_usages(&updated, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("updated graph result should succeed");
+
+    assert!(after_update.is_empty());
+}
+
+#[test]
 fn unrelated_same_member_name_does_not_match_target_member() {
     let project = InlineTestProject::with_language(Language::Python)
         .file(

@@ -19,7 +19,7 @@ The immediate outcome is not one code patch. It is a durable implementation prog
 - [x] (2026-05-18T12:35Z) Completed Milestone 2 by porting nested `__init__.py` barrels, dotted namespace imports, dotted namespace aliases, package-imported submodule qualifiers, relative submodule qualifiers, and wildcard-barrel cases into `tests/usages_python_graph_test.rs`, then fixing Python import binding and re-export seeding so those cases route through the graph successfully.
 - [x] (2026-05-18T13:05Z) Completed Milestone 3 by porting typed local, typed parameter, typed instance attribute, constructed local, alias, and namespace-qualified annotation receiver cases into `tests/usages_python_graph_test.rs`, then adding a lightweight receiver-fact inference layer in `src/usages/python_graph.rs` so member queries can prove those receiver-based usages.
 - [x] (2026-05-18T13:45Z) Completed Milestone 4 by porting negative and ambiguity cases for unseeded receivers, unknown constructors, local constructor shadowing, function-local import shadowing, ambiguous union annotations, receiver-fact leakage across functions, sibling-scope shadow isolation, and empty-success no-fallback behavior; then tightening Python graph scope handling so receiver facts and shadows are tracked per enclosing function or method instead of file-wide.
-- [ ] Implement Milestone 5 by porting Python inheritance and cache/update cases from Brokk into focused Rust tests and then fixing any uncovered hierarchy or invalidation gaps.
+- [x] (2026-05-18T14:20Z) Completed Milestone 5 by porting inherited-member, override, multi-level inheritance, cross-file inheritance, changed-file invalidation, and re-export-cache invalidation cases into `tests/usages_python_graph_test.rs`, then making receiver bindings type-aware so member queries can match descendant receiver types against the queried owner class.
 - [ ] Complete Milestone 6 by reviewing residual Brokk Python usage tests, marking each as `done`, `missing`, `different by design`, or `deferred`, and recording the reason.
 
 ## Surprises & Discoveries
@@ -47,6 +47,9 @@ The immediate outcome is not one code patch. It is a durable implementation prog
 
 - Observation: the first receiver-fact collector was too coarse because it treated annotations and local shadows as file-global facts.
   Evidence: Milestone 4 tests initially showed false positives for function-local import shadowing, local constructor shadowing, ambiguous union annotations, and receiver facts leaking from one function into another.
+
+- Observation: inheritance parity required receiver facts to remember the receiver type itself, not just whether the receiver was already known to match the current target.
+  Evidence: the new base/child and cross-file inheritance tests only became possible once receiver facts stored raw type bindings that `PythonExportUsageGraphStrategy` could resolve through the analyzer’s type-hierarchy provider.
 
 ## Decision Log
 
@@ -82,9 +85,13 @@ The immediate outcome is not one code patch. It is a durable implementation prog
   Rationale: negative parity cases require shadowing and annotations to stay local to the function or method that produced them, while still allowing `self` attribute facts to be shared across methods on the same class.
   Date/Author: 2026-05-18 / Codex
 
+- Decision: make scope receiver facts type-aware by storing the raw bound type expression for each receiver and resolving inheritance through `TypeHierarchyProvider` at match time.
+  Rationale: descendant receiver matching is fundamentally a type relation, so the member matcher needs to know not only that `x` is a receiver, but that `x` is a `Child` when the query target is `Base.bar`.
+  Date/Author: 2026-05-18 / Codex
+
 ## Outcomes & Retrospective
 
-At the moment this plan is created, `bifrost` has already crossed the architecture threshold for Python usage graphs: the shared graph core from issue `#73` exists, Python routing is enabled, and a Python graph strategy is present. Milestone 1 converted that architecture into stronger proof by covering graph routing, fallback behavior, bounded-candidate behavior, and `MultiAnalyzer` routing with focused Rust tests. Milestone 2 then closed the first substantial functionality gaps by teaching the graph about namespace-style submodule imports and wildcard re-export stars, which in turn unlocked Brokk-style barrel and submodule-qualifier cases. Milestone 3 added the first receiver-fact inference layer, which now proves typed and constructor-seeded member usages that previously had no graph support at all. Milestone 4 then hardened that layer by making receiver facts and shadows scope-aware, which removed the main false positives around leakage, shadowing, and ambiguous annotations. What is still missing is the remaining parity tail around inheritance and cache invalidation.
+At the moment this plan is created, `bifrost` has already crossed the architecture threshold for Python usage graphs: the shared graph core from issue `#73` exists, Python routing is enabled, and a Python graph strategy is present. Milestone 1 converted that architecture into stronger proof by covering graph routing, fallback behavior, bounded-candidate behavior, and `MultiAnalyzer` routing with focused Rust tests. Milestone 2 then closed the first substantial functionality gaps by teaching the graph about namespace-style submodule imports and wildcard re-export stars, which in turn unlocked Brokk-style barrel and submodule-qualifier cases. Milestone 3 added the first receiver-fact inference layer, which now proves typed and constructor-seeded member usages that previously had no graph support at all. Milestone 4 then hardened that layer by making receiver facts and shadows scope-aware, which removed the main false positives around leakage, shadowing, and ambiguous annotations. Milestone 5 extended those bindings into type-aware receiver facts, which now let the Python graph follow subclass receivers and survive analyzer updates without stale re-export state. What remains is the explicit residual review and categorization pass.
 
 This plan turns that gap into a staged implementation program. Success is not “Python has a graph class.” Success is that a contributor can work milestone by milestone, port the representative scenarios, fix the underlying behavior where needed, and finish with a parity matrix that says exactly what has been matched and what remains intentionally different.
 
@@ -260,8 +267,9 @@ This matrix must be kept current as milestones land.
   Brokk reference: shadowing, unknown constructors, unrelated same-name receivers, ambiguity caps, and “graph success with no hits does not fallback to regex” in `PythonExportUsageReferenceGraphTest.java`.
   Current `bifrost` proof: focused Rust tests now cover unseeded receivers, unknown constructors, local constructor shadowing, unrelated same-name receivers, ambiguous union annotations, function-local import shadowing, receiver-fact leakage across functions, sibling-scope shadow isolation, and successful empty graph results that do not fall back to regex.
 
-- Inheritance and cache/update parity: `missing`
+- Inheritance and cache/update parity: `done`
   Brokk reference: inherited members, overrides, cross-file hierarchy cases, changed-file invalidation, and export-resolution cache invalidation in `PythonExportUsageReferenceGraphTest.java`.
+  Current `bifrost` proof: focused Rust tests now cover inherited base members through subclass receivers, overriding subclass members for base queries, multi-level inheritance, cross-file inheritance, changed-file analyzer invalidation, and re-export-cache invalidation after `update`.
 
 - Container-flow and out-of-scope residuals: `deferred`
   Brokk reference: the container element/value flow cases in `PythonExportUsageReferenceGraphTest.java` that Brokk itself marks as intentionally out of scope for the current Python graph. `bifrost` should record these explicitly rather than silently omitting them.
@@ -275,3 +283,5 @@ Revision note: updated after Milestone 2 to record the new import/re-export pari
 Revision note: updated after Milestone 3 to record the new receiver-inference tests and the lightweight receiver-fact collector that now feeds Python member usage matching.
 
 Revision note: updated after Milestone 4 to record the scope-aware receiver/shadow facts and the negative tests that now keep the Python graph from manufacturing false positives.
+
+Revision note: updated after Milestone 5 to record the type-aware receiver bindings and the inheritance/cache tests that now prove subclass matching and update invalidation behavior.
