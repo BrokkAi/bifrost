@@ -2813,14 +2813,16 @@ fn analyze_test_method_assertions(
         add_test_smell(
             file,
             &enclosing,
-            TEST_ASSERTION_KIND_NO_ASSERTIONS,
-            weights.no_assertion_weight,
-            0,
-            vec![TEST_ASSERTION_KIND_NO_ASSERTIONS.to_string()],
-            source
-                .get(method.start_byte()..method.end_byte())
-                .unwrap_or(""),
-            method.start_byte(),
+            PendingTestSmell {
+                assertion_kind: TEST_ASSERTION_KIND_NO_ASSERTIONS,
+                score: weights.no_assertion_weight,
+                assertion_count: 0,
+                reasons: vec![TEST_ASSERTION_KIND_NO_ASSERTIONS.to_string()],
+                excerpt_source: source
+                    .get(method.start_byte()..method.end_byte())
+                    .unwrap_or(""),
+                start_byte: method.start_byte(),
+            },
             out,
         );
         return;
@@ -2830,12 +2832,14 @@ fn analyze_test_method_assertions(
         add_test_smell(
             file,
             &enclosing,
-            &assertion.kind,
-            assertion.base_score,
-            assertion_count,
-            assertion.reasons.clone(),
-            &assertion.excerpt,
-            assertion.start_byte,
+            PendingTestSmell {
+                assertion_kind: &assertion.kind,
+                score: assertion.base_score,
+                assertion_count,
+                reasons: assertion.reasons.clone(),
+                excerpt_source: &assertion.excerpt,
+                start_byte: assertion.start_byte,
+            },
             out,
         );
     }
@@ -2846,14 +2850,16 @@ fn analyze_test_method_assertions(
         add_test_smell(
             file,
             &enclosing,
-            TEST_ASSERTION_KIND_SHALLOW_ONLY,
-            score,
-            assertion_count,
-            vec![TEST_ASSERTION_KIND_SHALLOW_ONLY.to_string()],
-            source
-                .get(method.start_byte()..method.end_byte())
-                .unwrap_or(""),
-            method.start_byte(),
+            PendingTestSmell {
+                assertion_kind: TEST_ASSERTION_KIND_SHALLOW_ONLY,
+                score,
+                assertion_count,
+                reasons: vec![TEST_ASSERTION_KIND_SHALLOW_ONLY.to_string()],
+                excerpt_source: source
+                    .get(method.start_byte()..method.end_byte())
+                    .unwrap_or(""),
+                start_byte: method.start_byte(),
+            },
             out,
         );
     }
@@ -2894,14 +2900,16 @@ fn analyze_anonymous_test_doubles(
         add_test_smell(
             file,
             &enclosing,
-            TEST_ASSERTION_KIND_ANONYMOUS_TEST_DOUBLE,
-            score,
-            0,
-            reasons,
-            source
-                .get(creation.start_byte()..creation.end_byte())
-                .unwrap_or(""),
-            creation.start_byte(),
+            PendingTestSmell {
+                assertion_kind: TEST_ASSERTION_KIND_ANONYMOUS_TEST_DOUBLE,
+                score,
+                assertion_count: 0,
+                reasons,
+                excerpt_source: source
+                    .get(creation.start_byte()..creation.end_byte())
+                    .unwrap_or(""),
+                start_byte: creation.start_byte(),
+            },
             out,
         );
     }
@@ -3100,26 +3108,21 @@ fn classify_assertj_assertion(
 fn add_test_smell(
     file: &ProjectFile,
     enclosing: &str,
-    assertion_kind: &str,
-    score: i32,
-    assertion_count: i32,
-    reasons: Vec<String>,
-    excerpt_source: &str,
-    start_byte: usize,
+    smell: PendingTestSmell<'_>,
     out: &mut Vec<TestAssertionSmell>,
 ) {
-    if score <= 0 || reasons.is_empty() {
+    if smell.score <= 0 || smell.reasons.is_empty() {
         return;
     }
     out.push(TestAssertionSmell {
         file: file.clone(),
         enclosing_fq_name: enclosing.to_string(),
-        assertion_kind: assertion_kind.to_string(),
-        score,
-        assertion_count,
-        reasons,
-        excerpt: compact_test_assertion_excerpt(excerpt_source),
-        start_byte,
+        assertion_kind: smell.assertion_kind.to_string(),
+        score: smell.score,
+        assertion_count: smell.assertion_count,
+        reasons: smell.reasons,
+        excerpt: compact_test_assertion_excerpt(smell.excerpt_source),
+        start_byte: smell.start_byte,
     });
 }
 
@@ -3294,4 +3297,13 @@ struct AssertionSignal {
     start_byte: usize,
     reasons: Vec<String>,
     excerpt: String,
+}
+
+struct PendingTestSmell<'a> {
+    assertion_kind: &'a str,
+    score: i32,
+    assertion_count: i32,
+    reasons: Vec<String>,
+    excerpt_source: &'a str,
+    start_byte: usize,
 }

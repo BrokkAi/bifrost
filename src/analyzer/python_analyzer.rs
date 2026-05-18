@@ -1586,24 +1586,23 @@ fn collect_python_test_cases(node: Node<'_>, source: &str, out: &mut Vec<PythonT
                 return;
             }
             let has_pytest_mark = py_node_text(node, source).contains("pytest.mark");
-            if has_pytest_mark {
-                if let Some(definition) = node.child_by_field_name("definition") {
-                    if definition.kind() == "function_definition" {
-                        let name = definition
-                            .child_by_field_name("name")
-                            .map(|name_node| py_node_text(name_node, source).trim().to_string())
-                            .unwrap_or_else(|| "anonymous".to_string());
-                        let body = definition
-                            .child_by_field_name("body")
-                            .map(|body| py_node_text(body, source).to_string())
-                            .unwrap_or_else(|| py_node_text(definition, source).to_string());
-                        out.push(PythonTestCase {
-                            name,
-                            body,
-                            start_byte: node.start_byte(),
-                        });
-                    }
-                }
+            if has_pytest_mark
+                && let Some(definition) = node.child_by_field_name("definition")
+                && definition.kind() == "function_definition"
+            {
+                let name = definition
+                    .child_by_field_name("name")
+                    .map(|name_node| py_node_text(name_node, source).trim().to_string())
+                    .unwrap_or_else(|| "anonymous".to_string());
+                let body = definition
+                    .child_by_field_name("body")
+                    .map(|body| py_node_text(body, source).to_string())
+                    .unwrap_or_else(|| py_node_text(definition, source).to_string());
+                out.push(PythonTestCase {
+                    name,
+                    body,
+                    start_byte: node.start_byte(),
+                });
             }
         }
         _ => {}

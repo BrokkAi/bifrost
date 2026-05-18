@@ -1460,32 +1460,33 @@ pub(crate) fn detect_js_ts_test_assertion_smells(
 }
 
 fn collect_js_ts_test_cases(node: Node<'_>, source: &str, out: &mut Vec<JsTsTestCase>) {
-    if node.kind() == "call_expression" && is_js_ts_test_invocation(node, source) {
-        if let Some(arguments) = node.child_by_field_name("arguments") {
-            let mut name: Option<String> = None;
-            let mut callback: Option<Node<'_>> = None;
-            let mut cursor = arguments.walk();
-            for child in arguments.named_children(&mut cursor) {
-                match child.kind() {
-                    "string" | "template_string" => {
-                        if name.is_none() {
-                            name = Some(trim_js_ts_string_literal(node_text(child, source)));
-                        }
+    if node.kind() == "call_expression"
+        && is_js_ts_test_invocation(node, source)
+        && let Some(arguments) = node.child_by_field_name("arguments")
+    {
+        let mut name: Option<String> = None;
+        let mut callback: Option<Node<'_>> = None;
+        let mut cursor = arguments.walk();
+        for child in arguments.named_children(&mut cursor) {
+            match child.kind() {
+                "string" | "template_string" => {
+                    if name.is_none() {
+                        name = Some(trim_js_ts_string_literal(node_text(child, source)));
                     }
-                    "arrow_function" | "function" | "generator_function" => {
-                        callback = Some(child);
-                    }
-                    _ => {}
                 }
+                "arrow_function" | "function" | "generator_function" => {
+                    callback = Some(child);
+                }
+                _ => {}
             }
-            if let Some(callback) = callback {
-                let body = callback.child_by_field_name("body").unwrap_or(callback);
-                out.push(JsTsTestCase {
-                    name: name.unwrap_or_else(|| "anonymous".to_string()),
-                    body: node_text(body, source).to_string(),
-                    start_byte: node.start_byte(),
-                });
-            }
+        }
+        if let Some(callback) = callback {
+            let body = callback.child_by_field_name("body").unwrap_or(callback);
+            out.push(JsTsTestCase {
+                name: name.unwrap_or_else(|| "anonymous".to_string()),
+                body: node_text(body, source).to_string(),
+                start_byte: node.start_byte(),
+            });
         }
     }
 
