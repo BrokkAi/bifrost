@@ -2,8 +2,6 @@
 //! materializes a `TempDir` workspace, builds a `WorkspaceAnalyzer` over
 //! it, and exposes both for assertions. Test-only.
 
-#![cfg(test)]
-
 use crate::analyzer::{AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer};
 use std::fs;
 use std::path::PathBuf;

@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use brokk_analyzer::{
     AnalyzerConfig, Language, Project, ProjectFile, TestProject, WorkspaceAnalyzer,
 };
@@ -16,7 +18,6 @@ impl InlineTestProject {
         Self::default()
     }
 
-    #[allow(dead_code)]
     pub fn with_language(language: Language) -> Self {
         Self::new().language(language)
     }
@@ -57,13 +58,11 @@ impl InlineTestProject {
     }
 }
 
-#[allow(dead_code)]
 pub struct BuiltInlineTestProject {
     temp: tempfile::TempDir,
     project: TestProject,
 }
 
-#[allow(dead_code)]
 impl BuiltInlineTestProject {
     pub fn project(&self) -> &TestProject {
         &self.project
