@@ -13,7 +13,8 @@ Bifrost now has initial `report_test_assertion_smells` support across every anal
 - [x] (2026-05-18 18:20Z) Compared Bifrost’s current assertion-smell tests against Brokk’s current language suites and confirmed that Java is close to parity while JS/TS, Python, C#, Go, Rust, Scala, and PHP are still starter-level.
 - [x] (2026-05-18 18:40Z) Closed the current JS/TS and Python parity gaps against Brokk by adding snapshot-only JS coverage, non-test TS skip coverage, Python fixture false-positive coverage, and the missing self-comparison, meaningful-clean, and constant-truth/equality direct tests.
 - [x] (2026-05-18 19:05Z) Closed the current C#, Go, and Rust parity gaps against Brokk by expanding the direct suites and adding the missing Go branch-based assertion detection plus Rust overspecified-literal/assertion-count behavior.
-- [ ] Wave 3: Scala, PHP, and the C++ decision.
+- [x] (2026-05-18 20:05Z) Closed the remaining Scala and PHP parity gaps by expanding the inline suites to match Brokk’s current cases and hardening both analyzers to distinguish constant truth/equality, nullness-only, overspecified literals, and shallow-only outcomes.
+- [x] (2026-05-18 20:25Z) Converted the C++ “decision” into a real parity wave by adding C++ test detection plus assertion-smell support for gtest, Catch2, Boost.Test, and MSTest markers, along with an inline direct suite that mirrors Brokk’s current C++ coverage.
 
 ## Surprises & Discoveries
 
@@ -29,6 +30,12 @@ Bifrost now has initial `report_test_assertion_smells` support across every anal
 - Observation: Go and Rust parity needed real analyzer behavior, not just more tests.
   Evidence: Brokk treats `t.Errorf`-style branches as assertion-like in Go and counts meaningful branches toward `assertionCount`; Rust also treats oversized string literals inside `assert_eq!` as scored smells.
 
+- Observation: Scala and PHP had feature stubs but were missing the shallow-only aggregation behavior that Brokk’s parity cases depend on.
+  Evidence: the direct parity cases for nullness-only assertions only passed once both analyzers tracked shallow assertions and emitted the derived `shallow-assertions-only` finding.
+
+- Observation: C++ support was feasible without a tree-structured smell analyzer, but not with regex-only body capture.
+  Evidence: the first C++ pass mis-associated gtest bodies around nested blocks; switching to regex-start detection plus brace matching fixed the body association case and eliminated false negatives for gtest assertions.
+
 ## Decision Log
 
 - Decision: treat Brokk’s current language-specific test classes as the parity spec.
@@ -41,4 +48,4 @@ Bifrost now has initial `report_test_assertion_smells` support across every anal
 
 ## Outcomes & Retrospective
 
-Pending. This plan is active until the non-Java parity gap is materially reduced or we decide to stop short for specific languages.
+The language waves are complete. Bifrost now has direct assertion-smell coverage for the same language set Brokk currently exercises, including C++. Remaining future work, if any, is incremental parity maintenance as Brokk evolves rather than a standing cross-language rollout gap.

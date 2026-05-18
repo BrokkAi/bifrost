@@ -336,6 +336,7 @@ static PHP_VERIFY_RE: LazyLock<Regex> =
 struct PhpAssertionSignal {
     kind: String,
     score: i32,
+    shallow: bool,
     reason: String,
     excerpt: String,
     start_byte: usize,
@@ -407,6 +408,19 @@ fn analyze_php_test_case(
             start_byte: start_byte + assertion.start_byte,
         });
     }
+
+    if assertions.iter().all(|assertion| assertion.shallow) {
+        out.push(TestAssertionSmell {
+            file: file.clone(),
+            enclosing_fq_name: symbol,
+            assertion_kind: "shallow-assertions-only".to_string(),
+            score: weights.shallow_assertion_only_weight,
+            assertion_count,
+            reasons: vec!["shallow-assertions-only".to_string()],
+            excerpt: compact_php_excerpt(body),
+            start_byte,
+        });
+    }
 }
 
 fn collect_php_assertions(body: &str, weights: &TestAssertionWeights) -> Vec<PhpAssertionSignal> {
@@ -433,6 +447,7 @@ fn collect_php_assertions(body: &str, weights: &TestAssertionWeights) -> Vec<Php
             PhpAssertionSignal {
                 kind: kind.to_string(),
                 score,
+                shallow: false,
                 reason: reason.to_string(),
                 excerpt: compact_php_excerpt(whole.as_str()),
                 start_byte: whole.start(),
@@ -441,6 +456,7 @@ fn collect_php_assertions(body: &str, weights: &TestAssertionWeights) -> Vec<Php
             PhpAssertionSignal {
                 kind: "meaningful-assertion".to_string(),
                 score: 0,
+                shallow: false,
                 reason: "meaningful-assertion".to_string(),
                 excerpt: compact_php_excerpt(whole.as_str()),
                 start_byte: whole.start(),
@@ -453,15 +469,16 @@ fn collect_php_assertions(body: &str, weights: &TestAssertionWeights) -> Vec<Php
         let whole = captures.get(0).expect("whole match");
         let matcher = captures.name("matcher").map(|m| m.as_str()).unwrap_or("");
         let arg = normalize_php_expr(captures.name("arg").map(|m| m.as_str()).unwrap_or(""));
-        let (kind, score) = match matcher {
-            "True" if arg == "true" => ("constant-truth", weights.constant_truth_weight),
-            "False" if arg == "false" => ("constant-truth", weights.constant_truth_weight),
-            "Null" | "NotNull" => ("nullness-only", weights.nullness_only_weight),
-            _ => ("meaningful-assertion", 0),
+        let (kind, score, shallow) = match matcher {
+            "True" if arg == "true" => ("constant-truth", weights.constant_truth_weight, true),
+            "False" if arg == "false" => ("constant-truth", weights.constant_truth_weight, true),
+            "Null" | "NotNull" => ("nullness-only", weights.nullness_only_weight, true),
+            _ => ("meaningful-assertion", 0, false),
         };
         assertions.push(PhpAssertionSignal {
             kind: kind.to_string(),
             score,
+            shallow,
             reason: kind.to_string(),
             excerpt: compact_php_excerpt(whole.as_str()),
             start_byte: whole.start(),
@@ -474,6 +491,7 @@ fn collect_php_assertions(body: &str, weights: &TestAssertionWeights) -> Vec<Php
             assertions.push(PhpAssertionSignal {
                 kind: "meaningful-assertion".to_string(),
                 score: 0,
+                shallow: false,
                 reason: "meaningful-assertion".to_string(),
                 excerpt: compact_php_excerpt(whole.as_str()),
                 start_byte: whole.start(),
