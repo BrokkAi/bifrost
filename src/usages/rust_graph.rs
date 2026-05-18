@@ -140,18 +140,52 @@ fn is_trait_owner(rust: &RustAnalyzer, owner: &CodeUnit) -> bool {
         .unwrap_or(false)
 }
 
+fn is_public_like_declaration(rust: &RustAnalyzer, code_unit: &CodeUnit) -> bool {
+    rust.get_source(code_unit, false)
+        .or_else(|| rust.get_skeleton_header(code_unit))
+        .map(|source| {
+            let trimmed = source.trim_start();
+            trimmed.starts_with("pub ")
+                || trimmed.starts_with("pub(")
+                || trimmed.starts_with("pub(crate)")
+                || trimmed.starts_with("pub(in ")
+        })
+        .unwrap_or(false)
+}
+
 fn infer_graph_seeds(
     analyzer: &RustAnalyzer,
     graph: &RustProjectGraph,
     target: &CodeUnit,
 ) -> BTreeSet<(ProjectFile, String)> {
     let mut seeds = BTreeSet::new();
+    let nested_module_target = analyzer
+        .parent_of(target)
+        .is_some_and(|parent| parent.is_module());
     for seed_name in infer_export_names(analyzer, target) {
-        seeds.extend(
-            graph
-                .usage_graph
-                .seeds_for_target(target.source(), &seed_name),
-        );
+        let resolved = graph
+            .usage_graph
+            .seeds_for_target(target.source(), &seed_name);
+        if resolved.is_empty() && nested_module_target {
+            seeds.insert((target.source().clone(), seed_name));
+        } else {
+            seeds.extend(resolved);
+        }
+    }
+
+    if seeds.is_empty()
+        && let Some(parent) = analyzer.parent_of(target)
+        && parent.is_module()
+        && parent.source() != target.source()
+        && is_public_like_declaration(analyzer, target)
+    {
+        let parent_index = analyzer.export_index_of(parent.source());
+        if parent_index
+            .exports_by_name
+            .contains_key(target.identifier())
+        {
+            seeds.insert((parent.source().clone(), target.identifier().to_string()));
+        }
     }
 
     seeds
@@ -168,9 +202,23 @@ fn infer_export_names(analyzer: &RustAnalyzer, target: &CodeUnit) -> BTreeSet<St
         }
     }
 
-    let export_names = infer_export_names_for_local(analyzer, target.source(), target.identifier());
+    let mut export_names =
+        infer_export_names_for_local(analyzer, target.source(), target.identifier());
     if !export_names.is_empty() {
         return export_names;
+    }
+
+    if let Some(owner) = analyzer.parent_of(target)
+        && owner.is_module()
+        && owner.source() != target.source()
+    {
+        let parent_index = analyzer.export_index_of(owner.source());
+        if parent_index
+            .exports_by_name
+            .contains_key(target.identifier())
+        {
+            export_names.insert(target.identifier().to_string());
+        }
     }
 
     if target.is_function() && analyzer.parent_of(target).is_none() {

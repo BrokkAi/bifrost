@@ -245,12 +245,12 @@ impl RustAnalyzer {
     pub fn export_index_of(&self, file: &ProjectFile) -> ExportIndex {
         let mut index = ExportIndex::empty();
 
-        for code_unit in self.inner.get_top_level_declarations(file) {
+        for code_unit in self.declarations(file) {
             let identifier = code_unit.identifier().trim();
             if identifier.is_empty() || identifier.starts_with('_') {
                 continue;
             }
-            if !self.is_public_declaration(&code_unit) {
+            if !self.is_module_export_candidate(code_unit) {
                 continue;
             }
             index.exports_by_name.insert(
@@ -394,6 +394,13 @@ impl RustAnalyzer {
             .into_iter()
             .filter(|file| rust_package_name(file) == resolved_module)
             .collect();
+        files.extend(self.get_analyzed_files().into_iter().filter(|file| {
+            self.declarations(file).any(|code_unit| {
+                code_unit.is_module()
+                    && code_unit.short_name() == resolved_module
+                    && (*file == *importing_file || self.is_visible_module_path(code_unit))
+            })
+        }));
         files.sort();
         files.dedup();
         files
@@ -476,6 +483,35 @@ impl RustAnalyzer {
                     || code_unit.is_module() && trimmed.starts_with("pub mod ")
             })
             .unwrap_or(false)
+    }
+
+    fn is_module_export_candidate(&self, code_unit: &CodeUnit) -> bool {
+        if !self.is_public_declaration(code_unit) {
+            return false;
+        }
+
+        let mut current = code_unit.clone();
+        while let Some(parent) = self.parent_of(&current) {
+            if !parent.is_module() || !self.is_public_declaration(&parent) {
+                return false;
+            }
+            current = parent;
+        }
+
+        !code_unit.is_function() || self.parent_of(code_unit).is_none()
+    }
+
+    fn is_visible_module_path(&self, code_unit: &CodeUnit) -> bool {
+        let mut current = code_unit.clone();
+        loop {
+            if !current.is_module() || !self.is_public_declaration(&current) {
+                return false;
+            }
+            let Some(parent) = self.parent_of(&current) else {
+                return true;
+            };
+            current = parent;
+        }
     }
 }
 

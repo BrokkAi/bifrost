@@ -1112,15 +1112,13 @@ fn run() {
     ]);
 
     let target = definition(&analyzer, "service.Foo");
-    let hits = brokk_analyzer::usages::RustExportUsageGraphStrategy::new()
-        .find_usages(
-            &analyzer,
-            std::slice::from_ref(&target),
-            &analyzer.get_analyzed_files().into_iter().collect(),
-            1000,
-        )
-        .into_either()
-        .expect("barrel reexport success");
+    let result = brokk_analyzer::usages::RustExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &analyzer.get_analyzed_files().into_iter().collect(),
+        1000,
+    );
+    let hits = result.into_either().expect("barrel reexport success");
     assert_eq!(1, hits.len());
 }
 
@@ -1877,4 +1875,173 @@ fn dynamic(x: &dyn Worker) {
         .into_either()
         .expect("non-concrete trait receiver success");
     assert!(hits.is_empty());
+}
+
+#[test]
+fn rust_graph_strategy_resolves_public_inline_module_exports() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/lib.rs",
+            r#"
+pub mod service;
+pub mod inline {
+    pub struct Inline;
+}
+"#,
+        ),
+        ("src/service.rs", "pub struct FileBacked;\n"),
+        (
+            "src/main.rs",
+            r#"
+use crate::service::FileBacked;
+use crate::inline::Inline;
+
+fn run() {
+    let _ = FileBacked {};
+    let _ = Inline {};
+}
+"#,
+        ),
+    ]);
+
+    let file_backed = definition(&analyzer, "service.FileBacked");
+    let inline = definition(&analyzer, "inline.Inline");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = brokk_analyzer::usages::RustExportUsageGraphStrategy::new();
+
+    assert_eq!(
+        1,
+        strategy
+            .find_usages(
+                &analyzer,
+                std::slice::from_ref(&file_backed),
+                &candidates,
+                1000
+            )
+            .into_either()
+            .expect("file-backed module success")
+            .len()
+    );
+    assert_eq!(
+        1,
+        strategy
+            .find_usages(&analyzer, std::slice::from_ref(&inline), &candidates, 1000)
+            .into_either()
+            .expect("inline module success")
+            .len()
+    );
+}
+
+#[test]
+fn rust_graph_strategy_does_not_resolve_private_inline_module_externally() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/lib.rs",
+            r#"
+mod service {
+    pub struct Foo;
+}
+"#,
+        ),
+        (
+            "src/main.rs",
+            r#"
+use crate::service::Foo;
+
+fn run() {
+    let _ = Foo {};
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "service.Foo");
+    let result = brokk_analyzer::usages::RustExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &analyzer.get_analyzed_files().into_iter().collect(),
+        1000,
+    );
+    assert!(matches!(result, FuzzyResult::Failure { .. }));
+}
+
+#[test]
+fn rust_graph_strategy_resolves_private_inline_module_when_explicitly_reexported() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/lib.rs",
+            r#"
+mod service {
+    pub struct Foo;
+}
+pub use service::Foo;
+"#,
+        ),
+        (
+            "src/main.rs",
+            r#"
+use crate::Foo;
+
+fn run() {
+    let _ = Foo {};
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "service.Foo");
+    let hits = brokk_analyzer::usages::RustExportUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &analyzer.get_analyzed_files().into_iter().collect(),
+            1000,
+        )
+        .into_either()
+        .expect("private inline reexport success");
+    assert_eq!(1, hits.len());
+}
+
+#[test]
+fn rust_graph_strategy_inline_module_exports_only_public_contents() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/lib.rs",
+            r#"
+pub mod service {
+    pub struct Foo;
+    struct Hidden;
+}
+"#,
+        ),
+        (
+            "src/main.rs",
+            r#"
+use crate::service::{Foo, Hidden};
+
+fn run() {
+    let _ = Foo {};
+    let _ = Hidden {};
+}
+"#,
+        ),
+    ]);
+
+    let foo = definition(&analyzer, "service.Foo");
+    let hidden = definition(&analyzer, "service.Hidden");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = brokk_analyzer::usages::RustExportUsageGraphStrategy::new();
+
+    assert_eq!(
+        1,
+        strategy
+            .find_usages(&analyzer, std::slice::from_ref(&foo), &candidates, 1000)
+            .into_either()
+            .expect("public inline item success")
+            .len()
+    );
+    assert!(matches!(
+        strategy.find_usages(&analyzer, std::slice::from_ref(&hidden), &candidates, 1000),
+        FuzzyResult::Failure { .. }
+    ));
 }
