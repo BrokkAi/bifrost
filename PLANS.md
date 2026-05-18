@@ -25,7 +25,8 @@ Language-specific work should stay inside each analyzer’s `find_test_assertion
 - [x] (2026-05-18 12:35Z) Reworked the Java tests to use inline projects and expanded them toward Brokk’s Java coverage.
 - [x] (2026-05-18 14:40Z) Fixed the review findings by moving the report onto the modular `src/code_quality/` layout, hardening path resolution against `..` traversal, aligning equal-score ordering with Brokk parity, and tightening the direct Java report tests.
 - [x] (2026-05-18 16:10Z) Completed Wave 1 by adding initial `report_test_assertion_smells` support for JavaScript, TypeScript, and Python, along with direct inline-project regression tests for each language and a full Java/MCP regression pass.
-- [ ] Next: implement Wave 2 for C#, Go, and Rust, then commit that wave before moving on.
+- [x] (2026-05-18 17:05Z) Completed Wave 2 by adding initial C#, Go, and Rust support plus direct inline-project regression coverage, then reran the Java and MCP suites to keep the multi-language surface stable.
+- [ ] Next: implement Wave 3 for Scala and PHP, then decide whether C++ needs a separate test-detection track before joining the rollout.
 
 ## Surprises & Discoveries
 
@@ -43,6 +44,9 @@ Language-specific work should stay inside each analyzer’s `find_test_assertion
 
 - Observation: JavaScript and TypeScript can share one assertion-smell extractor with language-specific parser selection.
   Evidence: both analyzers already share substantial import/test-detection helpers, and Wave 1 was implemented with a single `detect_js_ts_test_assertion_smells(...)` path in `src/analyzer/javascript_analyzer.rs`.
+
+- Observation: C#, Go, and Rust were cheaper than Wave 1 because their dominant assertion idioms are explicit and regex-friendly.
+  Evidence: Wave 2 landed as analyzer-local method/body scanners without needing shared AST traversal helpers beyond the existing test-file detection.
 
 ## Decision Log
 
