@@ -1933,6 +1933,141 @@ fn run() {
 }
 
 #[test]
+fn rust_graph_strategy_resolves_basic_crate_import_struct_usage() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        ("src/service.rs", "pub struct Service;\n"),
+        (
+            "src/main.rs",
+            r#"
+use crate::service::Service;
+
+fn run() {
+    let _ = Service::new();
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "service.Service");
+    let hits = brokk_analyzer::usages::RustExportUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &analyzer.get_analyzed_files().into_iter().collect(),
+            1000,
+        )
+        .into_either()
+        .expect("crate import success");
+    assert_eq!(1, hits.len());
+}
+
+#[test]
+fn rust_graph_strategy_counts_type_argument_usages() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        ("src/service.rs", "pub struct Foo;\n"),
+        (
+            "src/main.rs",
+            r#"
+use crate::service::Foo;
+use std::collections::HashMap;
+
+struct Holder {
+    a: Vec<Foo>,
+    b: Option<Foo>,
+    c: HashMap<String, Foo>,
+    d: Result<Vec<Foo>, Error>,
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "service.Foo");
+    let hits = brokk_analyzer::usages::RustExportUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &analyzer.get_analyzed_files().into_iter().collect(),
+            1000,
+        )
+        .into_either()
+        .expect("type argument success");
+    assert_eq!(4, hits.len());
+}
+
+#[test]
+fn rust_graph_strategy_does_not_resolve_private_inherent_associated_items() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/service.rs",
+            r#"
+pub struct Foo;
+impl Foo {
+    fn private(&self) {}
+    const PRIVATE: usize = 1;
+    type Private = usize;
+}
+"#,
+        ),
+        (
+            "src/main.rs",
+            r#"
+use crate::service::Foo;
+
+fn run() {
+    let x: Foo = Foo {};
+    x.private();
+    let _ = Foo::PRIVATE;
+    let _: Foo::Private;
+}
+"#,
+        ),
+    ]);
+
+    let private_method = member(&analyzer, &project.file("src/service.rs"), "Foo", "private");
+    let private_const = member(&analyzer, &project.file("src/service.rs"), "Foo", "PRIVATE");
+    let private_type = member(&analyzer, &project.file("src/service.rs"), "Foo", "Private");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = brokk_analyzer::usages::RustExportUsageGraphStrategy::new();
+
+    assert!(
+        strategy
+            .find_usages(
+                &analyzer,
+                std::slice::from_ref(&private_method),
+                &candidates,
+                1000,
+            )
+            .into_either()
+            .expect("private method success")
+            .is_empty()
+    );
+    assert!(
+        strategy
+            .find_usages(
+                &analyzer,
+                std::slice::from_ref(&private_const),
+                &candidates,
+                1000,
+            )
+            .into_either()
+            .expect("private const success")
+            .is_empty()
+    );
+    assert!(
+        strategy
+            .find_usages(
+                &analyzer,
+                std::slice::from_ref(&private_type),
+                &candidates,
+                1000,
+            )
+            .into_either()
+            .expect("private type success")
+            .is_empty()
+    );
+}
+
+#[test]
 fn rust_graph_strategy_does_not_resolve_private_inline_module_externally() {
     let (_project, analyzer) = rust_analyzer_with_files(&[
         (

@@ -76,6 +76,9 @@ impl UsageAnalyzer for RustExportUsageGraphStrategy {
                 reason: "RustExportUsageGraphStrategy: no export seed resolved".to_string(),
             };
         } else if is_member_target(rust, target) {
+            if !is_graph_visible_member_target(rust, target) {
+                return FuzzyResult::success(target.clone(), BTreeSet::new());
+            }
             let scan_files = effective_scan_files(rust, &graph, candidate_files, target, &seeds);
             scan_files_for_member_target(analyzer, &graph, rust, scan_files, target, &seeds)
         } else {
@@ -151,6 +154,28 @@ fn is_public_like_declaration(rust: &RustAnalyzer, code_unit: &CodeUnit) -> bool
                 || trimmed.starts_with("pub(in ")
         })
         .unwrap_or(false)
+}
+
+fn is_graph_visible_member_target(rust: &RustAnalyzer, target: &CodeUnit) -> bool {
+    if is_public_like_declaration(rust, target) {
+        return true;
+    }
+
+    let Some(owner) = rust.parent_of(target) else {
+        return false;
+    };
+    if !is_public_like_declaration(rust, &owner) {
+        return false;
+    }
+
+    let owner_source = rust
+        .get_source(&owner, false)
+        .or_else(|| rust.get_skeleton_header(&owner))
+        .unwrap_or_default();
+    let trimmed = owner_source.trim_start();
+
+    (trimmed.starts_with("pub trait ") && target.is_function())
+        || (trimmed.starts_with("pub enum ") && target.is_field())
 }
 
 fn infer_graph_seeds(

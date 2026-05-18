@@ -22,6 +22,7 @@ This is intentionally a long-running parity program, not only a one-issue patch 
 - [x] (2026-05-18T17:18Z) Started the follow-on milestone breakdown and completed another focused parity slice: the Rust suite now covers 43 passing cases after adding enum variants as associated fields, impl-associated types, private-item-behind-barrel negatives, `self.field.as_ref()` `let-else` receiver seeding, and destructuring-pattern receiver negatives.
 - [x] (2026-05-18T17:46Z) Completed the core trait-owner/member slice from Milestone 6: the Rust suite now covers 47 passing cases after adding explicit trait-path calls, proven impl receiver ownership, cross-file trait-owner resolution, and the negative generic/opaque/dyn trait-receiver cases.
 - [x] (2026-05-18T18:12Z) Completed most of the inline-module and module-visibility slice from Milestone 7: the Rust suite now covers 51 passing cases after adding public inline-module exports, private inline-module negatives, explicit reexport from a private inline module, public-only inline-module contents, and the file-backed private-module barrel edge.
+- [x] (2026-05-18T18:34Z) Closed the remaining practical Rust reference cases that fit the current `bifrost` result model: the focused suite now covers 54 passing cases after adding the basic crate-import proof, exact type-argument counting, and private inherent associated-item negatives. The only clearly open upstream cases are the unresolved external-frontier scenarios, which require a result shape richer than the current `FuzzyResult`.
 - [ ] Implement the remaining Milestone 4 parity work so the Brokk-vs-`bifrost` Rust graph gaps are either closed or recorded explicitly, especially the still-open trait/associated-type/inline-module edge cases and any behavior that truly belongs to issue `#76` rather than `#75`.
 
 ## Surprises & Discoveries
@@ -58,6 +59,9 @@ This is intentionally a long-running parity program, not only a one-issue patch 
 
 - Observation: inline modules and file-backed private-module barrels share the same underlying problem only up to a point.
   Evidence: both required broader module-resolution and seed recovery logic, but the final file-backed `mod service; pub use service::Foo;` case only passed after adding a parent-module-host seed fallback that still respects the target declaration’s own visibility.
+
+- Observation: the remaining upstream gap now looks model-shaped, not Rust-binding-shaped.
+  Evidence: after porting the last practical reference cases, the only uncovered upstream tests are the unresolved external public reexport and unresolved external glob reexport cases, both of which assert `externalFrontierSpecifiers()` behavior that `bifrost`’s current `FuzzyResult` cannot represent.
 
 ## Decision Log
 
@@ -284,5 +288,7 @@ Revision note: updated again after breaking the remaining backlog into Milestone
 Revision note: updated after the first trait-owner wave to record 47 passing focused Rust graph tests and to narrow the remaining parity gap mainly to unresolved-frontier and inline-module cases, plus any residual trait edge behavior not yet represented in the current focused suite.
 
 Revision note: updated after the inline-module/module-visibility wave to record 51 passing focused Rust graph tests. The remaining gap is now mainly unresolved external-frontier behavior and any residual negative/edge cases still missing from the upstream reference suite.
+
+Revision note: updated after the near-final reference-case sweep to record 54 passing focused Rust graph tests and to make explicit that the unresolved external-frontier tests are now the main remaining parity gap because they depend on Brokk’s richer result model rather than additional Rust graph binding work alone.
 
 Revision note: updated after the second implementation wave to record the first member-routing slice, the new `exact_member` and member candidate-funnel helpers, and the narrower remaining receiver/cache parity backlog.
