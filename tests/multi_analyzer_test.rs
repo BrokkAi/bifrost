@@ -1,25 +1,27 @@
+mod common;
+
 use brokk_analyzer::{
     AnalyzerDelegate, CodeUnit, CodeUnitType, IAnalyzer, JavaAnalyzer, Language, MultiAnalyzer,
-    ProjectFile, TestProject,
+    ProjectFile, WorkspaceAnalyzer,
 };
 use std::collections::BTreeMap;
-use tempfile::tempdir;
 
-fn inline_project(files: &[(&str, &str)]) -> TestProject {
-    let temp = tempdir().unwrap();
-    let root = temp.keep();
-    for (path, contents) in files {
-        ProjectFile::new(root.clone(), path)
-            .write(*contents)
-            .unwrap();
-    }
-    TestProject::new(root, Language::Java)
+use common::InlineTestProject;
+
+fn built_java_project(files: &[(&str, &str)]) -> common::BuiltInlineTestProject {
+    files
+        .iter()
+        .fold(
+            InlineTestProject::with_language(Language::Java),
+            |project, (path, contents)| project.file(*path, *contents),
+        )
+        .build()
 }
 
-fn java_multi(project: TestProject) -> MultiAnalyzer {
+fn java_multi(project: &common::BuiltInlineTestProject) -> MultiAnalyzer {
     MultiAnalyzer::new(BTreeMap::from([(
         Language::Java,
-        AnalyzerDelegate::Java(JavaAnalyzer::from_project(project)),
+        AnalyzerDelegate::Java(JavaAnalyzer::from_project(project.project().clone())),
     )]))
 }
 
@@ -41,7 +43,7 @@ fn fallback_test_file_heuristic(file: &ProjectFile, analyzer: &MultiAnalyzer) ->
 
 #[test]
 fn test_get_top_level_declarations_java_file() {
-    let multi = java_multi(inline_project(&[(
+    let project = built_java_project(&[(
         "TestClass.java",
         r#"
         public class TestClass {
@@ -50,7 +52,8 @@ fn test_get_top_level_declarations_java_file() {
             }
         }
         "#,
-    )]));
+    )]);
+    let multi = java_multi(&project);
     let java_file = ProjectFile::new(multi.project().root().to_path_buf(), "TestClass.java");
     let top_level = multi.get_top_level_declarations(&java_file);
 
@@ -61,27 +64,23 @@ fn test_get_top_level_declarations_java_file() {
 
 #[test]
 fn test_get_top_level_declarations_unsupported_language_returns_empty() {
-    let multi = java_multi(inline_project(&[(
-        "TestClass.java",
-        "public class TestClass {}",
-    )]));
+    let project = built_java_project(&[("TestClass.java", "public class TestClass {}")]);
+    let multi = java_multi(&project);
     let python_file = ProjectFile::new(multi.project().root().to_path_buf(), "test.py");
     assert!(multi.get_top_level_declarations(&python_file).is_empty());
 }
 
 #[test]
 fn test_get_top_level_declarations_non_existent_file() {
-    let multi = java_multi(inline_project(&[(
-        "TestClass.java",
-        "public class TestClass {}",
-    )]));
+    let project = built_java_project(&[("TestClass.java", "public class TestClass {}")]);
+    let multi = java_multi(&project);
     let missing = ProjectFile::new(multi.project().root().to_path_buf(), "NonExistent.java");
     assert!(multi.get_top_level_declarations(&missing).is_empty());
 }
 
 #[test]
 fn test_delegate_routing_java_file_get_skeleton() {
-    let multi = java_multi(inline_project(&[(
+    let project = built_java_project(&[(
         "TestClass.java",
         r#"
         public class TestClass {
@@ -90,7 +89,8 @@ fn test_delegate_routing_java_file_get_skeleton() {
             }
         }
         "#,
-    )]));
+    )]);
+    let multi = java_multi(&project);
     let class_unit = multi
         .get_definitions("TestClass")
         .into_iter()
@@ -104,7 +104,7 @@ fn test_delegate_routing_java_file_get_skeleton() {
 
 #[test]
 fn test_delegate_routing_java_file_get_sources() {
-    let multi = java_multi(inline_project(&[(
+    let project = built_java_project(&[(
         "TestClass.java",
         r#"
         public class TestClass {
@@ -113,7 +113,8 @@ fn test_delegate_routing_java_file_get_sources() {
             }
         }
         "#,
-    )]));
+    )]);
+    let multi = java_multi(&project);
     let method_unit = multi
         .get_definitions("TestClass.testMethod")
         .into_iter()
@@ -127,7 +128,7 @@ fn test_delegate_routing_java_file_get_sources() {
 
 #[test]
 fn test_delegate_routing_java_file_get_source() {
-    let multi = java_multi(inline_project(&[(
+    let project = built_java_project(&[(
         "TestClass.java",
         r#"
         public class TestClass {
@@ -136,7 +137,8 @@ fn test_delegate_routing_java_file_get_source() {
             }
         }
         "#,
-    )]));
+    )]);
+    let multi = java_multi(&project);
     let class_unit = multi
         .get_definitions("TestClass")
         .into_iter()
@@ -150,10 +152,8 @@ fn test_delegate_routing_java_file_get_source() {
 
 #[test]
 fn test_unknown_extension_returns_empty_get_sources() {
-    let multi = java_multi(inline_project(&[(
-        "TestClass.java",
-        "public class TestClass {}",
-    )]));
+    let project = built_java_project(&[("TestClass.java", "public class TestClass {}")]);
+    let multi = java_multi(&project);
     let unknown_file = ProjectFile::new(multi.project().root().to_path_buf(), "test.xyz");
     let unknown_unit = CodeUnit::new(
         unknown_file,
@@ -166,10 +166,8 @@ fn test_unknown_extension_returns_empty_get_sources() {
 
 #[test]
 fn test_unknown_extension_returns_empty_get_source() {
-    let multi = java_multi(inline_project(&[(
-        "TestClass.java",
-        "public class TestClass {}",
-    )]));
+    let project = built_java_project(&[("TestClass.java", "public class TestClass {}")]);
+    let multi = java_multi(&project);
     let unknown_file = ProjectFile::new(multi.project().root().to_path_buf(), "test.xyz");
     let unknown_unit = CodeUnit::new(unknown_file, CodeUnitType::Class, "", "UnknownClass");
     assert!(multi.get_source(&unknown_unit, true).is_none());
@@ -177,10 +175,8 @@ fn test_unknown_extension_returns_empty_get_source() {
 
 #[test]
 fn test_unknown_extension_returns_empty_get_skeleton() {
-    let multi = java_multi(inline_project(&[(
-        "TestClass.java",
-        "public class TestClass {}",
-    )]));
+    let project = built_java_project(&[("TestClass.java", "public class TestClass {}")]);
+    let multi = java_multi(&project);
     let unknown_file = ProjectFile::new(multi.project().root().to_path_buf(), "test.xyz");
     let unknown_unit = CodeUnit::new(unknown_file, CodeUnitType::Class, "", "UnknownClass");
     assert!(multi.get_skeleton(&unknown_unit).is_none());
@@ -188,10 +184,8 @@ fn test_unknown_extension_returns_empty_get_skeleton() {
 
 #[test]
 fn test_unknown_extension_no_exception() {
-    let multi = java_multi(inline_project(&[(
-        "TestClass.java",
-        "public class TestClass {}",
-    )]));
+    let project = built_java_project(&[("TestClass.java", "public class TestClass {}")]);
+    let multi = java_multi(&project);
     let unknown_file = ProjectFile::new(multi.project().root().to_path_buf(), "test.unknown");
     let unknown_class = CodeUnit::new(unknown_file.clone(), CodeUnitType::Class, "", "Test");
     let unknown_method = CodeUnit::new(
@@ -212,10 +206,23 @@ fn test_unknown_extension_no_exception() {
 
 #[test]
 fn test_is_test_file_falls_back_to_heuristics_when_delegate_lacks_capability() {
-    let multi = java_multi(inline_project(&[(
-        "TestClass.java",
-        "public class TestClass {}",
-    )]));
+    let project = built_java_project(&[("TestClass.java", "public class TestClass {}")]);
+    let multi = java_multi(&project);
     let python_test_file = ProjectFile::new(multi.project().root().to_path_buf(), "test_script.py");
     assert!(fallback_test_file_heuristic(&python_test_file, &multi));
+}
+
+#[test]
+fn inferred_inline_project_builds_multi_workspace_analyzer() {
+    let project = InlineTestProject::new()
+        .file("TestClass.java", "public class TestClass {}")
+        .file("helpers.py", "VALUE = 1\n")
+        .build();
+    let workspace = project.workspace_analyzer(brokk_analyzer::AnalyzerConfig::default());
+
+    assert!(matches!(workspace, WorkspaceAnalyzer::Multi(_)));
+    assert_eq!(
+        std::collections::BTreeSet::from([Language::Java, Language::Python]),
+        workspace.analyzer().languages()
+    );
 }

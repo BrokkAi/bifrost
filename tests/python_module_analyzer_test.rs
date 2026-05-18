@@ -1,16 +1,18 @@
-use brokk_analyzer::{
-    IAnalyzer, ImportAnalysisProvider, Project, ProjectFile, PythonAnalyzer, TestProject,
-};
+mod common;
+
+use brokk_analyzer::{IAnalyzer, ImportAnalysisProvider, ProjectFile, PythonAnalyzer};
 use std::collections::BTreeSet;
 
-fn inline_project(files: &[(&str, &str)]) -> TestProject {
-    let temp = tempfile::tempdir().unwrap();
-    for (path, contents) in files {
-        ProjectFile::new(temp.path().to_path_buf(), path)
-            .write(*contents)
-            .unwrap();
-    }
-    TestProject::new(temp.keep(), brokk_analyzer::Language::Python)
+use common::InlineTestProject;
+
+fn inline_project(files: &[(&str, &str)]) -> common::BuiltInlineTestProject {
+    files
+        .iter()
+        .fold(
+            InlineTestProject::with_language(brokk_analyzer::Language::Python),
+            |project, (path, contents)| project.file(*path, *contents),
+        )
+        .build()
 }
 
 #[test]
@@ -26,7 +28,7 @@ fn module_code_unit_created_with_top_level_children_only() {
         x = 1
         "#,
     )]);
-    let analyzer = PythonAnalyzer::from_project(project);
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
 
     let module = analyzer
         .get_definitions("mod")
@@ -53,7 +55,7 @@ fn module_code_unit_created_for_init_py_package_name() {
             pass
         "#,
     )]);
-    let analyzer = PythonAnalyzer::from_project(project);
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
 
     let module = analyzer
         .get_definitions("pkg")
@@ -87,7 +89,7 @@ fn module_code_units_are_per_file_in_packaged_directory() {
             "#,
         ),
     ]);
-    let analyzer = PythonAnalyzer::from_project(project);
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
 
     let mod_a = analyzer
         .get_definitions("pkg.a")
@@ -127,7 +129,7 @@ fn module_code_units_use_python_src_layout_import_root() {
             "#,
         ),
     ]);
-    let analyzer = PythonAnalyzer::from_project(project);
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
 
     let module = analyzer
         .get_definitions("pkg.mod")
@@ -161,7 +163,7 @@ fn referencing_files_resolve_python_src_layout_modules() {
         ),
     ]);
     let root = project.root().to_path_buf();
-    let analyzer = PythonAnalyzer::from_project(project);
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
     let mod_file = ProjectFile::new(root.clone(), "src/pkg/mod.py");
     let consumer_file = ProjectFile::new(root, "src/pkg/consumer.py");
 

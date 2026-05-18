@@ -25,14 +25,38 @@ pub struct TestProject {
 
 impl TestProject {
     pub fn new(root: impl Into<PathBuf>, language: Language) -> Self {
+        Self::with_languages(root, BTreeSet::from([language]))
+    }
+
+    pub fn with_languages(root: impl Into<PathBuf>, languages: BTreeSet<Language>) -> Self {
+        let root = root.into();
+        assert!(root.is_absolute(), "test project root must be absolute");
+        assert!(root.is_dir(), "test project root must exist");
+        assert!(
+            !languages.is_empty(),
+            "test project must contain at least one analyzer language"
+        );
+
+        Self { root, languages }
+    }
+
+    pub fn from_root_with_inferred_languages(root: impl Into<PathBuf>) -> io::Result<Self> {
         let root = root.into();
         assert!(root.is_absolute(), "test project root must be absolute");
         assert!(root.is_dir(), "test project root must exist");
 
-        let mut languages = BTreeSet::new();
-        languages.insert(language);
+        let languages = detect_languages(&root)?;
+        if languages.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "test project root contains no supported analyzer files: {}",
+                    root.display()
+                ),
+            ));
+        }
 
-        Self { root, languages }
+        Ok(Self { root, languages })
     }
 
     pub fn root_path(&self) -> &Path {

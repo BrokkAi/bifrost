@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use tempfile::tempdir;
 
-use common::write_file;
+use common::{InlineTestProject, write_file};
 
 fn analyzer_for(root: &Path) -> JavascriptAnalyzer {
     JavascriptAnalyzer::from_project(TestProject::new(root, Language::JavaScript))
@@ -23,12 +23,10 @@ fn imported_fq_names(analyzer: &JavascriptAnalyzer, file: &ProjectFile) -> BTree
 
 #[test]
 fn test_import() {
-    let temp = tempdir().unwrap();
-    let root = temp.path();
-    let file = write_file(
-        root,
-        "foo.js",
-        r#"
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "foo.js",
+            r#"
             import React, { useState } from 'react';
             import { Something, AnotherThing as AT } from './another-module';
             import * as AllThings from './all-the-things';
@@ -38,9 +36,11 @@ fn test_import() {
 
             function foo() {};
         "#,
-    );
+        )
+        .build();
 
-    let analyzer = analyzer_for(root);
+    let file = project.file("foo.js");
+    let analyzer = analyzer_for(project.root());
     let imports: BTreeSet<_> = analyzer.import_statements_of(&file).into_iter().collect();
     let expected = BTreeSet::from([
         "import { Something, AnotherThing as AT } from './another-module';".to_string(),
@@ -55,7 +55,7 @@ fn test_import() {
 
 #[test]
 fn test_resolve_imports_and_import_variants() {
-    let temp = tempdir().unwrap();
+    let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     write_file(
         root,
