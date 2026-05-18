@@ -1,9 +1,11 @@
 use crate::analyzer::{
     AnalyzerConfig, CodeUnit, CodeUnitType, IAnalyzer, Language, LanguageAdapter, Project,
-    ProjectFile, TestDetectionProvider, TreeSitterAnalyzer,
+    ProjectFile, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
+    TreeSitterAnalyzer,
 };
+use regex::Regex;
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tree_sitter::{Language as TsLanguage, Node, Tree};
 
 #[derive(Debug, Clone, Default)]
@@ -334,9 +336,260 @@ impl IAnalyzer for ScalaAnalyzer {
         self.inner.contains_tests(file)
     }
 
+    fn find_test_assertion_smells(
+        &self,
+        file: &ProjectFile,
+        weights: TestAssertionWeights,
+    ) -> Vec<TestAssertionSmell> {
+        if !self.contains_tests(file) || file_language(file) != Language::Scala {
+            return Vec::new();
+        }
+        let Ok(source) = file.read_to_string() else {
+            return Vec::new();
+        };
+        detect_scala_test_assertion_smells(file, &source, &weights)
+    }
+
     fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {
         Some(self)
     }
+}
+
+static SCALA_TEST_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?s)"(?P<name>[^"]+)"\s+should\s+"[^"]+"\s+in\s*\{(?P<body>.*?)\n\}"#)
+        .expect("valid regex")
+});
+static SCALA_ASSERT_EQUALITY_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"assert(?:Result)?\s*\((?P<left>[^,\n\)]+?)\s*(?:,\s*(?P<right>[^,\n\)]+))?"#)
+        .expect("valid regex")
+});
+static SCALA_SHOULDBE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?P<left>[A-Za-z0-9_\."]+)\s+should(?:Be|Equal)\s+(?P<right>[A-Za-z0-9_\."]+)"#)
+        .expect("valid regex")
+});
+static SCALA_THROWS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"assertThrows\[|thrownBy\s*\{|intercept\["#).expect("valid regex")
+});
+static SCALA_VERIFY_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"verify\s*\("#).expect("valid regex"));
+
+#[derive(Clone)]
+struct ScalaAssertionSignal {
+    kind: String,
+    score: i32,
+    reason: String,
+    excerpt: String,
+    start_byte: usize,
+}
+
+fn detect_scala_test_assertion_smells(
+    file: &ProjectFile,
+    source: &str,
+    weights: &TestAssertionWeights,
+) -> Vec<TestAssertionSmell> {
+    let mut findings = Vec::new();
+    for captures in SCALA_TEST_BLOCK_RE.captures_iter(source) {
+        let Some(name_match) = captures.name("name") else {
+            continue;
+        };
+        let Some(body_match) = captures.name("body") else {
+            continue;
+        };
+        analyze_scala_test_case(
+            file,
+            name_match.as_str(),
+            body_match.as_str(),
+            body_match.start(),
+            weights,
+            &mut findings,
+        );
+    }
+    findings
+}
+
+fn analyze_scala_test_case(
+    file: &ProjectFile,
+    name: &str,
+    body: &str,
+    start_byte: usize,
+    weights: &TestAssertionWeights,
+    out: &mut Vec<TestAssertionSmell>,
+) {
+    let assertions = collect_scala_assertions(body, weights);
+    let assertion_count = assertions.len() as i32;
+    let symbol = format!("{}::{}", file, name);
+
+    if assertion_count == 0 {
+        out.push(TestAssertionSmell {
+            file: file.clone(),
+            enclosing_fq_name: symbol,
+            assertion_kind: "no-assertions".to_string(),
+            score: weights.no_assertion_weight,
+            assertion_count: 0,
+            reasons: vec!["no-assertions".to_string()],
+            excerpt: compact_scala_excerpt(body),
+            start_byte,
+        });
+        return;
+    }
+
+    for assertion in &assertions {
+        if assertion.score <= 0 {
+            continue;
+        }
+        out.push(TestAssertionSmell {
+            file: file.clone(),
+            enclosing_fq_name: symbol.clone(),
+            assertion_kind: assertion.kind.clone(),
+            score: assertion.score,
+            assertion_count,
+            reasons: vec![assertion.reason.clone()],
+            excerpt: assertion.excerpt.clone(),
+            start_byte: start_byte + assertion.start_byte,
+        });
+    }
+}
+
+fn collect_scala_assertions(
+    body: &str,
+    weights: &TestAssertionWeights,
+) -> Vec<ScalaAssertionSignal> {
+    let mut assertions = Vec::new();
+
+    for captures in SCALA_SHOULDBE_RE.captures_iter(body) {
+        let whole = captures.get(0).expect("whole match");
+        let left = normalize_scala_expr(captures.name("left").map(|m| m.as_str()).unwrap_or(""));
+        let right = normalize_scala_expr(captures.name("right").map(|m| m.as_str()).unwrap_or(""));
+        let signal = if left == right {
+            let (kind, reason, score) = if is_scala_literal(&left) {
+                (
+                    "constant-equality",
+                    "constant-equality",
+                    weights.constant_equality_weight,
+                )
+            } else {
+                (
+                    "self-comparison",
+                    "self-comparison",
+                    weights.tautological_assertion_weight,
+                )
+            };
+            ScalaAssertionSignal {
+                kind: kind.to_string(),
+                score,
+                reason: reason.to_string(),
+                excerpt: compact_scala_excerpt(whole.as_str()),
+                start_byte: whole.start(),
+            }
+        } else {
+            ScalaAssertionSignal {
+                kind: "meaningful-assertion".to_string(),
+                score: 0,
+                reason: "meaningful-assertion".to_string(),
+                excerpt: compact_scala_excerpt(whole.as_str()),
+                start_byte: whole.start(),
+            }
+        };
+        assertions.push(signal);
+    }
+
+    for captures in SCALA_ASSERT_EQUALITY_RE.captures_iter(body) {
+        let whole = captures.get(0).expect("whole match");
+        let left = normalize_scala_expr(captures.name("left").map(|m| m.as_str()).unwrap_or(""));
+        let right = normalize_scala_expr(captures.name("right").map(|m| m.as_str()).unwrap_or(""));
+        let signal = if right.is_empty() {
+            if left == "true" {
+                ScalaAssertionSignal {
+                    kind: "constant-truth".to_string(),
+                    score: weights.constant_truth_weight,
+                    reason: "constant-truth".to_string(),
+                    excerpt: compact_scala_excerpt(whole.as_str()),
+                    start_byte: whole.start(),
+                }
+            } else {
+                ScalaAssertionSignal {
+                    kind: "meaningful-assertion".to_string(),
+                    score: 0,
+                    reason: "meaningful-assertion".to_string(),
+                    excerpt: compact_scala_excerpt(whole.as_str()),
+                    start_byte: whole.start(),
+                }
+            }
+        } else if left == right {
+            let (kind, reason, score) = if is_scala_literal(&left) {
+                (
+                    "constant-equality",
+                    "constant-equality",
+                    weights.constant_equality_weight,
+                )
+            } else {
+                (
+                    "self-comparison",
+                    "self-comparison",
+                    weights.tautological_assertion_weight,
+                )
+            };
+            ScalaAssertionSignal {
+                kind: kind.to_string(),
+                score,
+                reason: reason.to_string(),
+                excerpt: compact_scala_excerpt(whole.as_str()),
+                start_byte: whole.start(),
+            }
+        } else {
+            ScalaAssertionSignal {
+                kind: "meaningful-assertion".to_string(),
+                score: 0,
+                reason: "meaningful-assertion".to_string(),
+                excerpt: compact_scala_excerpt(whole.as_str()),
+                start_byte: whole.start(),
+            }
+        };
+        assertions.push(signal);
+    }
+
+    for regex in [&*SCALA_THROWS_RE, &*SCALA_VERIFY_RE] {
+        for captures in regex.captures_iter(body) {
+            let whole = captures.get(0).expect("whole match");
+            assertions.push(ScalaAssertionSignal {
+                kind: "meaningful-assertion".to_string(),
+                score: 0,
+                reason: "meaningful-assertion".to_string(),
+                excerpt: compact_scala_excerpt(whole.as_str()),
+                start_byte: whole.start(),
+            });
+        }
+    }
+
+    assertions
+}
+
+fn normalize_scala_expr(expr: &str) -> String {
+    expr.trim()
+        .trim_matches(|ch| matches!(ch, '(' | ')' | ' '))
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn is_scala_literal(expr: &str) -> bool {
+    let trimmed = expr.trim();
+    (trimmed.starts_with('"') && trimmed.ends_with('"'))
+        || matches!(trimmed, "true" | "false" | "null")
+        || trimmed.parse::<i64>().is_ok()
+        || trimmed.parse::<f64>().is_ok()
+}
+
+fn compact_scala_excerpt(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn file_language(file: &ProjectFile) -> Language {
+    file.rel_path()
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(Language::from_extension)
+        .unwrap_or(Language::None)
 }
 
 struct ScalaVisitor<'a> {

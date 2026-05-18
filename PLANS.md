@@ -26,7 +26,8 @@ Language-specific work should stay inside each analyzer’s `find_test_assertion
 - [x] (2026-05-18 14:40Z) Fixed the review findings by moving the report onto the modular `src/code_quality/` layout, hardening path resolution against `..` traversal, aligning equal-score ordering with Brokk parity, and tightening the direct Java report tests.
 - [x] (2026-05-18 16:10Z) Completed Wave 1 by adding initial `report_test_assertion_smells` support for JavaScript, TypeScript, and Python, along with direct inline-project regression tests for each language and a full Java/MCP regression pass.
 - [x] (2026-05-18 17:05Z) Completed Wave 2 by adding initial C#, Go, and Rust support plus direct inline-project regression coverage, then reran the Java and MCP suites to keep the multi-language surface stable.
-- [ ] Next: implement Wave 3 for Scala and PHP, then decide whether C++ needs a separate test-detection track before joining the rollout.
+- [x] (2026-05-18 17:55Z) Completed Wave 3 by adding initial Scala and PHP support, cleaning up the resulting warnings, and rerunning the Java and MCP suites alongside the new direct tests.
+- [ ] Next: decide whether C++ is worth onboarding now or whether it first needs explicit test-detection support before this feature can be made reliable there.
 
 ## Surprises & Discoveries
 
@@ -47,6 +48,9 @@ Language-specific work should stay inside each analyzer’s `find_test_assertion
 
 - Observation: C#, Go, and Rust were cheaper than Wave 1 because their dominant assertion idioms are explicit and regex-friendly.
   Evidence: Wave 2 landed as analyzer-local method/body scanners without needing shared AST traversal helpers beyond the existing test-file detection.
+
+- Observation: after Wave 3, every analyzer that already had built-in test detection now has at least an initial `find_test_assertion_smells` implementation.
+  Evidence: Java, JavaScript, TypeScript, Python, C#, Go, Rust, Scala, and PHP all participate; only C++ remains outside the rollout because it does not currently have the same test-detection foundation.
 
 ## Decision Log
 
