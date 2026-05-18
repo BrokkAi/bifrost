@@ -1,5 +1,5 @@
 use crate::analyzer::ProjectFile;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 pub(crate) fn normalize_pattern(pattern: &str) -> String {
     pattern.replace('\\', "/")
@@ -25,7 +25,18 @@ pub(crate) fn workspace_rel_path(input: &str) -> Option<PathBuf> {
     if path.is_absolute() || path.has_root() {
         return None;
     }
-    Some(path.to_path_buf())
+    let mut rel = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => rel.push(part),
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    if rel.as_os_str().is_empty() {
+        return None;
+    }
+    Some(rel)
 }
 
 pub(crate) fn has_drive_letter_prefix(s: &str) -> bool {

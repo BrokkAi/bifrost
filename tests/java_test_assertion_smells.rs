@@ -1,5 +1,6 @@
 use brokk_analyzer::code_quality::{ReportTestAssertionSmellsParams, report_test_assertion_smells};
 use brokk_analyzer::{IAnalyzer, JavaAnalyzer, Language};
+use std::fs;
 
 mod common;
 
@@ -44,6 +45,17 @@ fn assert_has_reason(report: &str, reason: &str) {
 
 fn assert_lacks_reason(report: &str, reason: &str) {
     assert!(!report.contains(reason), "{report}");
+}
+
+fn finding_rows(report: &str) -> Vec<&str> {
+    report
+        .lines()
+        .filter(|line| {
+            line.starts_with("| ")
+                && !line.starts_with("| Score |")
+                && !line.starts_with("|------:")
+        })
+        .collect()
 }
 
 #[test]
@@ -247,9 +259,18 @@ fn repeated_anonymous_test_doubles_score_higher_and_show_reusable_reason() {
     )
     .report;
 
-    assert_has_reason(&report, "anonymous-test-double");
-    assert_has_reason(&report, "reusable-test-double-candidate");
-    assert_has_reason(&report, "| 5 |");
+    let rows = finding_rows(&report);
+    assert_eq!(rows.len(), 2, "{report}");
+    assert!(
+        rows.iter()
+            .all(|row| row.contains("| 5 | `anonymous-test-double` | 0 |")),
+        "{report}"
+    );
+    assert!(
+        rows.iter()
+            .all(|row| row.contains("anonymous-test-double, reusable-test-double-candidate")),
+        "{report}"
+    );
 }
 
 #[test]
@@ -445,6 +466,33 @@ fn junit_trailing_message_does_not_hide_expected_and_actual() {
 }
 
 #[test]
+fn equal_score_findings_sort_by_assertion_kind_before_source_position() {
+    let report = java_report(
+        r#"
+        package com.example;
+        import org.junit.jupiter.api.Test;
+        import static org.junit.jupiter.api.Assertions.assertEquals;
+        import static org.junit.jupiter.api.Assertions.assertTrue;
+
+        public class SampleTest {
+            @Test
+            void orderedByKind() {
+                assertTrue(true);
+                assertEquals(1, 1);
+            }
+        }
+        "#,
+        default_params(),
+    )
+    .report;
+
+    let rows = finding_rows(&report);
+    assert_eq!(rows.len(), 2, "{report}");
+    assert!(rows[0].contains("`constant-equality`"), "{report}");
+    assert!(rows[1].contains("`constant-truth`"), "{report}");
+}
+
+#[test]
 fn assertj_chained_extraction_counts_as_assertion_equivalent() {
     let report = java_report(
         r#"
@@ -490,6 +538,63 @@ fn direct_tests_render_report_paths_realistically() {
 
     assert_has_reason(&report, "com/example/SampleTest.java");
     assert_lacks_reason(&report, "tests/fixtures/testcode-java");
+}
+
+#[test]
+fn traversal_paths_are_rejected_without_reading_outside_workspace() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "com/example/SampleTest.java",
+            r#"
+            package com.example;
+            import org.junit.jupiter.api.Test;
+            import static org.junit.jupiter.api.Assertions.assertEquals;
+
+            public class SampleTest {
+                @Test
+                void sameValue() {
+                    String value = "x";
+                    assertEquals(value, value);
+                }
+            }
+            "#,
+        )
+        .build();
+    let outside = project
+        .root()
+        .parent()
+        .expect("inline project root has parent")
+        .join("LeakTest.java");
+    fs::write(
+        &outside,
+        r#"
+        import org.junit.jupiter.api.Test;
+        import static org.junit.jupiter.api.Assertions.assertEquals;
+
+        public class LeakTest {
+            @Test
+            void leaked() {
+                assertEquals(1, 1);
+            }
+        }
+        "#,
+    )
+    .expect("write outside fixture");
+
+    let analyzer = JavaAnalyzer::from_project(project.project().clone());
+    let result = report_test_assertion_smells(
+        &analyzer as &dyn IAnalyzer,
+        ReportTestAssertionSmellsParams {
+            file_paths: vec!["../LeakTest.java".to_string()],
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(
+        "No test assertion smells met minScore 4.", result.report,
+        "{}",
+        result.report
+    );
 }
 
 #[test]
