@@ -607,46 +607,26 @@ fn list_tools_result() -> Value {
                             "default": 80,
                             "description": "Maximum findings to emit; values <= 0 default to 80."
                         },
-                        "generic_throwable_weight": {
-                            "type": "integer",
-                            "description": "Weight for catching Throwable; values < 0 use the brokk default (5)."
-                        },
-                        "generic_exception_weight": {
-                            "type": "integer",
-                            "description": "Weight for catching Exception; values < 0 use the brokk default (3)."
-                        },
-                        "generic_runtime_exception_weight": {
-                            "type": "integer",
-                            "description": "Weight for catching RuntimeException; values < 0 use the brokk default (2)."
-                        },
-                        "empty_body_weight": {
-                            "type": "integer",
-                            "description": "Weight for empty catch bodies; values < 0 use the brokk default (5)."
-                        },
-                        "comment_only_body_weight": {
-                            "type": "integer",
-                            "description": "Weight for comment-only catch bodies; values < 0 use the brokk default (4)."
-                        },
-                        "small_body_weight": {
-                            "type": "integer",
-                            "description": "Weight for small catch bodies; values < 0 use the brokk default (2)."
-                        },
-                        "log_only_body_weight": {
-                            "type": "integer",
-                            "description": "Weight for log-only catch bodies; values < 0 use the brokk default (2)."
-                        },
-                        "meaningful_body_credit_per_statement": {
-                            "type": "integer",
-                            "description": "Score credit subtracted per catch statement in the body; values < 0 use the brokk default (1)."
-                        },
-                        "meaningful_body_statement_threshold": {
-                            "type": "integer",
-                            "description": "Maximum statements that earn meaningful-body credit; values < 0 use the brokk default (6)."
-                        },
-                        "small_body_max_statements": {
-                            "type": "integer",
-                            "description": "Maximum statement count considered a small body; values < 0 use the brokk default (2)."
-                        }
+                        "generic_throwable_weight": weight_knob_descriptor(
+                            "Weight for catching Throwable", 5, WeightThreshold::Negative),
+                        "generic_exception_weight": weight_knob_descriptor(
+                            "Weight for catching Exception", 3, WeightThreshold::Negative),
+                        "generic_runtime_exception_weight": weight_knob_descriptor(
+                            "Weight for catching RuntimeException", 2, WeightThreshold::Negative),
+                        "empty_body_weight": weight_knob_descriptor(
+                            "Weight for empty catch bodies", 5, WeightThreshold::Negative),
+                        "comment_only_body_weight": weight_knob_descriptor(
+                            "Weight for comment-only catch bodies", 4, WeightThreshold::Negative),
+                        "small_body_weight": weight_knob_descriptor(
+                            "Weight for small catch bodies", 2, WeightThreshold::Negative),
+                        "log_only_body_weight": weight_knob_descriptor(
+                            "Weight for log-only catch bodies", 2, WeightThreshold::Negative),
+                        "meaningful_body_credit_per_statement": weight_knob_descriptor(
+                            "Score credit subtracted per catch statement in the body", 1, WeightThreshold::Negative),
+                        "meaningful_body_statement_threshold": weight_knob_descriptor(
+                            "Maximum statements that earn meaningful-body credit", 6, WeightThreshold::Negative),
+                        "small_body_max_statements": weight_knob_descriptor(
+                            "Maximum statement count considered a small body", 2, WeightThreshold::Negative)
                     },
                     "required": ["file_paths"]
                 }),
@@ -672,34 +652,20 @@ fn list_tools_result() -> Value {
                             "default": 25,
                             "description": "Maximum files to analyze; values <= 0 default to 25."
                         },
-                        "long_method_span_lines": {
-                            "type": "integer",
-                            "description": "Long-function span threshold; values <= 0 use the brokk default (80)."
-                        },
-                        "high_complexity_threshold": {
-                            "type": "integer",
-                            "description": "Cyclomatic complexity considered high; values <= 0 use the brokk default (10)."
-                        },
-                        "god_object_span_lines": {
-                            "type": "integer",
-                            "description": "God-object span threshold; values <= 0 use the brokk default (300)."
-                        },
-                        "god_object_direct_children": {
-                            "type": "integer",
-                            "description": "Direct member count flagged as a god object; values <= 0 use the brokk default (20)."
-                        },
-                        "god_object_functions": {
-                            "type": "integer",
-                            "description": "Function count flagged as a god object; values <= 0 use the brokk default (15)."
-                        },
-                        "helper_sprawl_functions": {
-                            "type": "integer",
-                            "description": "Function count flagged as helper sprawl; values <= 0 use the brokk default (10)."
-                        },
-                        "helper_sprawl_workflow_lines": {
-                            "type": "integer",
-                            "description": "Workflow size that triggers helper-sprawl scoring; values <= 0 use the brokk default (60)."
-                        }
+                        "long_method_span_lines": weight_knob_descriptor(
+                            "Long-function span threshold", 80, WeightThreshold::NonPositive),
+                        "high_complexity_threshold": weight_knob_descriptor(
+                            "Cyclomatic complexity considered high", 10, WeightThreshold::NonPositive),
+                        "god_object_span_lines": weight_knob_descriptor(
+                            "God-object span threshold", 300, WeightThreshold::NonPositive),
+                        "god_object_direct_children": weight_knob_descriptor(
+                            "Direct member count flagged as a god object", 20, WeightThreshold::NonPositive),
+                        "god_object_functions": weight_knob_descriptor(
+                            "Function count flagged as a god object", 15, WeightThreshold::NonPositive),
+                        "helper_sprawl_functions": weight_knob_descriptor(
+                            "Function count flagged as helper sprawl", 10, WeightThreshold::NonPositive),
+                        "helper_sprawl_workflow_lines": weight_knob_descriptor(
+                            "Workflow size that triggers helper-sprawl scoring", 60, WeightThreshold::NonPositive)
                     },
                     "required": ["file_paths"]
                 }),
@@ -745,6 +711,39 @@ fn tool_descriptor(name: &str, description: &str, input_schema: Value) -> Value 
             "openWorldHint": false,
         }
     })
+}
+
+/// JSON schema fragment for an integer "weight knob" tunable.
+/// `pick_threshold` selects the sentinel: `WeightThreshold::Negative`
+/// matches `pick_weight` semantics (only `< 0` falls back to the brokk
+/// default; `0` is an explicit override that disables the rule).
+/// `WeightThreshold::NonPositive` matches `pick_positive` (both `0` and
+/// negatives fall back; `0` is not a valid override).
+fn weight_knob_descriptor(
+    description_prefix: &str,
+    default_value: i32,
+    pick_threshold: WeightThreshold,
+) -> Value {
+    let cmp = match pick_threshold {
+        WeightThreshold::Negative => "<",
+        WeightThreshold::NonPositive => "<=",
+    };
+    json!({
+        "type": "integer",
+        "description": format!(
+            "{description_prefix}; values {cmp} 0 use the brokk default ({default_value})."
+        )
+    })
+}
+
+#[derive(Clone, Copy)]
+enum WeightThreshold {
+    /// Only `< 0` falls back to the default; `0` is honored as an
+    /// explicit override. Pairs with `code_quality::pick_weight`.
+    Negative,
+    /// Both `0` and negatives fall back to the default. Pairs with
+    /// `code_quality::pick_positive`.
+    NonPositive,
 }
 
 fn mutating_tool_descriptor(name: &str, description: &str, input_schema: Value) -> Value {
