@@ -18,6 +18,7 @@ mod candidates;
 mod finder;
 mod graph_core;
 mod js_ts_graph;
+mod local_inference;
 mod model;
 mod python_graph;
 mod regex_analyzer;
@@ -30,6 +31,9 @@ pub use candidates::{
 };
 pub use finder::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, QueryResult, UsageFinder};
 pub use js_ts_graph::JsTsExportUsageGraphStrategy;
+pub use local_inference::{
+    LocalBindingsSnapshot, LocalInferenceConfig, LocalInferenceEngine, SymbolResolution,
+};
 pub use model::{
     CONFIDENCE_THRESHOLD, ExportEntry, ExportIndex, FuzzyResult, ImportBinder, ImportBinding,
     ImportKind, ReceiverTargetRef, ReexportStar, ReferenceCandidate, ReferenceHit, ReferenceKind,
