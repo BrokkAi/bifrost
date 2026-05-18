@@ -1,9 +1,15 @@
+use crate::analyzer::clone_detection::{
+    CloneCandidateData, CloneCandidateProfile, build_clone_reason, can_reach_clone_similarity,
+    compact_clone_excerpt, compare_clone_units, compute_ast_refinement_similarity_percent,
+    compute_clone_token_similarity,
+};
 use crate::analyzer::{
     AnalyzerConfig, CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language,
     LanguageAdapter, Project, ProjectFile, TestAssertionSmell, TestAssertionWeights,
     TestDetectionProvider, TreeSitterAnalyzer, build_reverse_import_index,
 };
 use crate::hash::{HashMap, HashSet};
+use crate::{CloneSmell, CloneSmellWeights};
 use moka::sync::Cache;
 use regex::Regex;
 use std::collections::BTreeSet;
@@ -503,6 +509,140 @@ impl IAnalyzer for JavascriptAnalyzer {
             tree_sitter_javascript::LANGUAGE.into(),
             &weights,
         )
+    }
+
+    fn find_structural_clone_smells(
+        &self,
+        file: &ProjectFile,
+        weights: CloneSmellWeights,
+    ) -> Vec<CloneSmell> {
+        self.find_structural_clone_smells_for_files(std::slice::from_ref(file), weights)
+    }
+
+    fn find_structural_clone_smells_for_files(
+        &self,
+        files: &[ProjectFile],
+        weights: CloneSmellWeights,
+    ) -> Vec<CloneSmell> {
+        let requested_files: HashSet<ProjectFile> = files
+            .iter()
+            .filter(|file| file_language(file) == Language::JavaScript)
+            .cloned()
+            .collect();
+        if requested_files.is_empty() {
+            return Vec::new();
+        }
+
+        let all_candidates: Vec<CloneCandidateProfile> = self
+            .get_all_declarations()
+            .into_iter()
+            .filter(|code_unit| {
+                code_unit.is_function()
+                    && matches!(file_language(code_unit.source()), Language::JavaScript)
+            })
+            .filter_map(|code_unit| self.build_clone_candidate_data(&code_unit, weights))
+            .map(|candidate| CloneCandidateProfile::create(candidate, weights))
+            .collect();
+        if all_candidates.is_empty() {
+            return Vec::new();
+        }
+
+        let requested_candidates: Vec<&CloneCandidateProfile> = all_candidates
+            .iter()
+            .filter(|candidate| requested_files.contains(candidate.data.unit.source()))
+            .collect();
+        if requested_candidates.is_empty() {
+            return Vec::new();
+        }
+
+        let mut findings = Vec::new();
+        for left in requested_candidates {
+            for right in &all_candidates {
+                if left.data.unit == right.data.unit {
+                    continue;
+                }
+                if requested_files.contains(right.data.unit.source())
+                    && compare_clone_units(&left.data.unit, &right.data.unit).is_gt()
+                {
+                    continue;
+                }
+                if !can_reach_clone_similarity(left.shingle_count, right.shingle_count, weights) {
+                    continue;
+                }
+                let token_similarity =
+                    compute_clone_token_similarity(&left.shingles, &right.shingles, weights);
+                if token_similarity < weights.min_similarity_percent {
+                    continue;
+                }
+                let refined_similarity = refine_js_ts_clone_similarity(
+                    &left.data,
+                    &right.data,
+                    token_similarity,
+                    weights,
+                );
+                if refined_similarity < weights.min_similarity_percent {
+                    continue;
+                }
+                findings.push(CloneSmell {
+                    file: left.data.unit.source().clone(),
+                    enclosing_fq_name: left.data.unit.fq_name(),
+                    peer_file: right.data.unit.source().clone(),
+                    peer_enclosing_fq_name: right.data.unit.fq_name(),
+                    score: refined_similarity,
+                    normalized_token_count: left
+                        .data
+                        .normalized_tokens
+                        .len()
+                        .min(right.data.normalized_tokens.len())
+                        as i32,
+                    reasons: vec![build_clone_reason(token_similarity, refined_similarity)],
+                    excerpt: left.data.excerpt.clone(),
+                    peer_excerpt: right.data.excerpt.clone(),
+                });
+            }
+        }
+
+        findings.sort_by(|left, right| {
+            right
+                .score
+                .cmp(&left.score)
+                .then_with(|| left.file.to_string().cmp(&right.file.to_string()))
+                .then_with(|| left.enclosing_fq_name.cmp(&right.enclosing_fq_name))
+                .then_with(|| left.peer_file.to_string().cmp(&right.peer_file.to_string()))
+                .then_with(|| {
+                    left.peer_enclosing_fq_name
+                        .cmp(&right.peer_enclosing_fq_name)
+                })
+        });
+        findings
+    }
+}
+
+impl JavascriptAnalyzer {
+    fn build_clone_candidate_data(
+        &self,
+        code_unit: &CodeUnit,
+        weights: CloneSmellWeights,
+    ) -> Option<CloneCandidateData> {
+        self.get_source(code_unit, false)
+            .map(|source| source.trim().to_string())
+            .filter(|source| !source.is_empty())
+            .and_then(|source| {
+                let normalized_tokens =
+                    normalized_clone_tokens_js_ts(&source, tree_sitter_javascript::LANGUAGE.into());
+                if normalized_tokens.len() < weights.min_normalized_tokens.max(0) as usize {
+                    return None;
+                }
+                Some(CloneCandidateData {
+                    unit: code_unit.clone(),
+                    normalized_tokens,
+                    ast_signature: build_js_ts_clone_ast_signature(
+                        &source,
+                        tree_sitter_javascript::LANGUAGE.into(),
+                    ),
+                    excerpt: compact_clone_excerpt(&source),
+                })
+            })
     }
 }
 
@@ -1854,6 +1994,137 @@ fn file_language(file: &ProjectFile) -> Language {
         .and_then(|ext| ext.to_str())
         .map(Language::from_extension)
         .unwrap_or(Language::None)
+}
+
+const JS_TS_IDENTIFIER_TYPES: &[&str] = &["identifier", "property_identifier"];
+const JS_TS_STRING_TYPES: &[&str] = &["string", "template_string"];
+const JS_TS_NUMBER_TYPES: &[&str] = &["number"];
+const JS_TS_CLONE_AST_IGNORED_TYPES: &[&str] =
+    &["accessibility_modifier", "modifiers", "type_parameters"];
+
+pub(crate) fn normalized_clone_tokens_js_ts(
+    source: &str,
+    parser_language: TsLanguage,
+) -> Vec<String> {
+    let Some(tree) = parse_js_ts_tree(source, parser_language) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    collect_normalized_leaf_tokens_js_ts(tree.root_node(), source, &mut out);
+    out
+}
+
+fn collect_normalized_leaf_tokens_js_ts(node: Node<'_>, source: &str, out: &mut Vec<String>) {
+    if node.named_child_count() == 0 {
+        let token = normalize_js_ts_clone_leaf_token(node, source);
+        if !token.is_empty() {
+            out.push(token);
+        }
+    }
+    let child_count = node.child_count();
+    for index in 0..child_count {
+        if let Some(child) = node.child(index) {
+            collect_normalized_leaf_tokens_js_ts(child, source, out);
+        }
+    }
+}
+
+fn normalize_js_ts_clone_leaf_token(node: Node<'_>, source: &str) -> String {
+    let kind = node.kind();
+    let token = source
+        .get(node.start_byte()..node.end_byte())
+        .unwrap_or("")
+        .trim();
+    if token.is_empty() || kind == "comment" {
+        return String::new();
+    }
+    if JS_TS_IDENTIFIER_TYPES.contains(&kind) {
+        return "ID".to_string();
+    }
+    if JS_TS_STRING_TYPES.contains(&kind) {
+        return "STR".to_string();
+    }
+    if JS_TS_NUMBER_TYPES.contains(&kind) {
+        return "NUM".to_string();
+    }
+    if token == "true" || token == "false" {
+        return "BOOL".to_string();
+    }
+    if token.chars().count() == 1 && token.chars().all(|ch| !ch.is_alphanumeric()) {
+        return format!("OP:{token}");
+    }
+    format!("T:{kind}")
+}
+
+pub(crate) fn build_js_ts_clone_ast_signature(source: &str, parser_language: TsLanguage) -> String {
+    let Some(tree) = parse_js_ts_tree(source, parser_language) else {
+        return String::new();
+    };
+    let mut labels = Vec::new();
+    collect_js_ts_clone_ast_labels(tree.root_node(), source, &mut labels);
+    labels.join("|")
+}
+
+fn collect_js_ts_clone_ast_labels(node: Node<'_>, source: &str, out: &mut Vec<String>) {
+    out.push(normalize_js_ts_clone_ast_label(node, source));
+    let child_count = node.child_count();
+    for index in 0..child_count {
+        if let Some(child) = node.child(index) {
+            collect_js_ts_clone_ast_labels(child, source, out);
+        }
+    }
+}
+
+fn normalize_js_ts_clone_ast_label(node: Node<'_>, source: &str) -> String {
+    let kind = node.kind();
+    let text = source
+        .get(node.start_byte()..node.end_byte())
+        .unwrap_or("")
+        .trim();
+    if JS_TS_IDENTIFIER_TYPES.contains(&kind) {
+        return "ID".to_string();
+    }
+    if JS_TS_STRING_TYPES.contains(&kind) {
+        return "STR".to_string();
+    }
+    if JS_TS_NUMBER_TYPES.contains(&kind) {
+        return "NUM".to_string();
+    }
+    if text == "true" || text == "false" {
+        return "BOOL".to_string();
+    }
+    if JS_TS_CLONE_AST_IGNORED_TYPES.contains(&kind) {
+        return "IGN".to_string();
+    }
+    format!("N:{kind}")
+}
+
+pub(crate) fn refine_js_ts_clone_similarity(
+    left: &CloneCandidateData,
+    right: &CloneCandidateData,
+    token_similarity: i32,
+    weights: CloneSmellWeights,
+) -> i32 {
+    if left.ast_signature.is_empty() || right.ast_signature.is_empty() {
+        return token_similarity;
+    }
+    let ast_similarity =
+        compute_ast_refinement_similarity_percent(&left.ast_signature, &right.ast_signature);
+    if ast_similarity == 0 {
+        return token_similarity;
+    }
+    if ast_similarity < weights.ast_similarity_percent {
+        return 0;
+    }
+    token_similarity.min(ast_similarity)
+}
+
+fn parse_js_ts_tree(source: &str, parser_language: TsLanguage) -> Option<Tree> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&parser_language)
+        .expect("failed to set js/ts parser language");
+    parser.parse(source, None)
 }
 
 #[cfg(test)]

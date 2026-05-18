@@ -19,6 +19,8 @@ The observable outcome is that `report_structural_clone_smells` works consistent
 - [x] (2026-05-18) Audited Brokk’s current clone-smell coverage. `brokk` has dedicated tests and analyzer hooks for Java, Python, and JS/TS plus shared tree-sitter similarity tests, but not equivalent clone-smell suites for C#, C++, Scala, or PHP.
 - [x] (2026-05-18) Completed Milestone 1. Added Python structural clone detection in `src/analyzer/python_analyzer.rs`, added Brokk-style Python parity tests in `tests/python_structural_clone_smells.rs`, and proved mixed Java-plus-Python `MultiAnalyzer` routing.
 - [x] (2026-05-18) Validated the Milestone 1 checkpoint with `cargo test --test python_structural_clone_smells -- --nocapture`, `cargo test --test searchtools_service python_boundary_returns_structural_clone_report_json -- --nocapture`, `cargo test --test bifrost_mcp_server bifrost_searchtools_server_speaks_mcp_stdio -- --nocapture`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings`.
+- [x] (2026-05-18) Completed Milestone 2. Added structural clone detection for both `JavascriptAnalyzer` and `TypescriptAnalyzer`, plus parity-style JS/TS tests in `tests/js_ts_structural_clone_smells.rs` covering TypeScript parity cases, JavaScript smoke coverage, and mixed JS-plus-TS `MultiAnalyzer` routing.
+- [x] (2026-05-18) Validated the Milestone 2 checkpoint with `cargo test --test js_ts_structural_clone_smells -- --nocapture`, `cargo test --test searchtools_service python_boundary_returns_structural_clone_report_json -- --nocapture`, `cargo test --test bifrost_mcp_server bifrost_searchtools_server_speaks_mcp_stdio -- --nocapture`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings`.
 - [ ] Add this plan’s milestone tracker updates as each language slice lands.
 - [ ] Keep the `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` sections current during implementation.
 
@@ -35,6 +37,9 @@ The observable outcome is that `report_structural_clone_smells` works consistent
 
 - Observation: Python fit the shared Rust clone engine without needing a broader shared-engine refactor.
   Evidence: the milestone only required a Python-specific candidate builder plus token and AST normalization helpers in `src/analyzer/python_analyzer.rs`; the MCP wrapper and shared similarity helpers passed unchanged.
+
+- Observation: JS and TS shared enough clone semantics that a thin shared helper layer inside the existing Rust JS analyzer utilities was sufficient.
+  Evidence: both analyzers now reuse the same token normalization, AST-signature construction, and refinement helpers while keeping their own analyzer-specific file filtering and parser-language selection.
 
 ## Decision Log
 
@@ -57,6 +62,8 @@ This section is intentionally incomplete until the rollout is executed.
 The expected end state is that `bifrost` supports structural clone smells across the Brokk parity languages plus the additional tree-sitter languages targeted here, with tests proving each language’s semantics at the analyzer level and with mixed-language `MultiAnalyzer` coverage. The final retrospective should record which languages achieved near-parity with Brokk, which required Bifrost-specific semantics, and whether any shared clone-engine refactors became necessary along the way.
 
 Milestone 1 outcome: Python is now in the same category as Java for this feature. `bifrost` has Brokk-style Python clone-smell semantics for the currently covered cases, and the shared engine plus MCP/report path needed no schema or routing changes beyond the Python analyzer implementation itself.
+
+Milestone 2 outcome: JS/TS now joins Java and Python as a Brokk-backed parity slice. The Rust implementation needed only a small shared JS/TS clone-helper layer rather than a broader analyzer rewrite, which is a good sign for the upcoming shared-engine consolidation milestone.
 
 ## Context and Orientation
 
