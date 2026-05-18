@@ -32,14 +32,15 @@
 use crate::analyzer::{
     CodeUnit, IAnalyzer, Language, ProjectFile, Range, resolve_js_ts_module_specifier,
 };
-use crate::hash::{HashMap, HashSet, map_with_capacity, set_with_capacity};
+use crate::hash::{HashMap, HashSet, map_with_capacity};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
+use crate::usages::graph_core::{ImportEdge, ImportEdgeKind, ProjectUsageGraph};
 use crate::usages::model::{
     ExportEntry, ExportIndex, FuzzyResult, ImportBinder, ImportBinding, ImportKind, UsageHit,
 };
 use crate::usages::traits::UsageAnalyzer;
 use rayon::prelude::*;
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use tree_sitter::{Node, Parser, Tree};
 
@@ -96,9 +97,11 @@ impl UsageAnalyzer for JsTsExportUsageGraphStrategy {
             };
         }
 
-        let graph = ProjectGraph::build(analyzer, language);
+        let graph = build_js_ts_graph(analyzer, language);
 
-        let seeds = graph.seeds_for_target(target);
+        let seeds = graph
+            .usage_graph
+            .seeds_for_target(target.source(), top_level_identifier(target));
         if seeds.is_empty() {
             return FuzzyResult::Failure {
                 fq_name: target.fq_name().to_string(),
@@ -106,7 +109,7 @@ impl UsageAnalyzer for JsTsExportUsageGraphStrategy {
             };
         }
 
-        let importers = graph.importers_of_seeds(&seeds);
+        let importers = graph.usage_graph.importers_of_seeds(&seeds);
         let scan_files: HashSet<ProjectFile> =
             candidate_files.iter().cloned().chain(importers).collect();
 
@@ -139,10 +142,6 @@ fn target_language(target: &CodeUnit) -> Language {
         .unwrap_or(Language::None)
 }
 
-// ===================================================================================
-// Project-wide graph indices
-// ===================================================================================
-
 /// Cached parse for one source file. `source` is held alongside the `Tree` so AST byte
 /// ranges remain valid for the lifetime of the graph (and so the scan phase can reuse
 /// the parse result without re-reading the file).
@@ -151,272 +150,68 @@ struct ParsedFile {
     tree: Tree,
 }
 
-/// Project-wide indices computed once per [`JsTsExportUsageGraphStrategy::find_usages`].
-struct ProjectGraph {
-    /// Files we've actually analyzed (JS or TS depending on the target language).
-    files: Vec<ProjectFile>,
+struct JsTsProjectGraph {
     /// Parsed source + tree per file. Reused by the scan phase to avoid double parsing.
     parsed: HashMap<ProjectFile, ParsedFile>,
-    /// Per-file export index, keyed by file.
-    exports_by_file: HashMap<ProjectFile, ExportIndex>,
-    /// Reverse re-export edges: for each `(target_file, exported_name)` find every
-    /// `(reexporting_file, exposed_alias)` that re-exports it.
-    reexport_edges: HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>>,
-    /// Star re-exports: `target_file -> {reexporting_file}`.
-    star_reexports: HashMap<ProjectFile, Vec<ProjectFile>>,
-    /// Reverse seed index: `short_name -> Vec<(defining_file, exported_name)>`. Used to
-    /// pick the seed exports for an arbitrary target without scanning every export
-    /// table.
-    seed_index: HashMap<String, Vec<(ProjectFile, String)>>,
-    /// Importer reverse index: `target_file -> edges`. Each edge captures one binding
-    /// in an importing file that resolves back to `target_file`.
-    importer_reverse: HashMap<ProjectFile, Vec<ImportEdge>>,
+    usage_graph: ProjectUsageGraph,
 }
 
-#[derive(Debug, Clone)]
-struct ImportEdge {
-    /// File where the import is declared.
-    importer: ProjectFile,
-    /// Local binding name created by the import.
-    local_name: String,
-    /// Resolved target file (after path resolution).
-    target_file: ProjectFile,
-    /// What was imported: a specific exported name, the default export, or "*"/wildcard.
-    kind: ImportEdgeKind,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ImportEdgeKind {
-    Named(String),
-    Default,
-    Namespace,
-}
-
-impl ProjectGraph {
-    fn build(analyzer: &dyn IAnalyzer, language: Language) -> Self {
-        let files = collect_jsts_files(analyzer, language);
-        let parser_language = match language {
-            Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
-            Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            _ => return ProjectGraph::empty(),
-        };
-
-        let parsed_files: Vec<(ProjectFile, ParsedFile, ExportIndex, ImportBinder)> = files
-            .par_iter()
-            .filter_map(|file| {
-                let source = file.read_to_string().ok()?;
-                let mut parser = Parser::new();
-                parser.set_language(&parser_language).ok()?;
-                let tree = parser.parse(source.as_str(), None)?;
-                let exports = compute_export_index(&source, &tree);
-                let binder = compute_import_binder(&source, &tree);
-                Some((
-                    file.clone(),
-                    ParsedFile {
-                        source: Arc::new(source),
-                        tree,
-                    },
-                    exports,
-                    binder,
-                ))
-            })
-            .collect();
-
-        let mut parsed: HashMap<ProjectFile, ParsedFile> = map_with_capacity(parsed_files.len());
-        let mut exports_by_file: HashMap<ProjectFile, ExportIndex> =
-            map_with_capacity(parsed_files.len());
-        let mut binders_by_file: HashMap<ProjectFile, ImportBinder> =
-            map_with_capacity(parsed_files.len());
-
-        for (file, parsed_file, exports, binder) in parsed_files.into_iter() {
-            parsed.insert(file.clone(), parsed_file);
-            exports_by_file.insert(file.clone(), exports);
-            binders_by_file.insert(file, binder);
+fn build_js_ts_graph(analyzer: &dyn IAnalyzer, language: Language) -> JsTsProjectGraph {
+    let files = collect_jsts_files(analyzer, language);
+    let parser_language = match language {
+        Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
+        Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        _ => {
+            return JsTsProjectGraph {
+                parsed: HashMap::default(),
+                usage_graph: ProjectUsageGraph::empty(),
+            };
         }
+    };
 
-        let mut reexport_edges: HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>> =
-            HashMap::default();
-        let mut star_reexports: HashMap<ProjectFile, Vec<ProjectFile>> = HashMap::default();
-        let mut seed_index: HashMap<String, Vec<(ProjectFile, String)>> = HashMap::default();
+    let parsed_files: Vec<(ProjectFile, ParsedFile, ExportIndex, ImportBinder)> = files
+        .par_iter()
+        .filter_map(|file| {
+            let source = file.read_to_string().ok()?;
+            let mut parser = Parser::new();
+            parser.set_language(&parser_language).ok()?;
+            let tree = parser.parse(source.as_str(), None)?;
+            let exports = compute_export_index(&source, &tree);
+            let binder = compute_import_binder(&source, &tree);
+            Some((
+                file.clone(),
+                ParsedFile {
+                    source: Arc::new(source),
+                    tree,
+                },
+                exports,
+                binder,
+            ))
+        })
+        .collect();
 
-        let files_vec: Vec<ProjectFile> = files.to_vec();
+    let mut parsed: HashMap<ProjectFile, ParsedFile> = map_with_capacity(parsed_files.len());
+    let mut exports_by_file: HashMap<ProjectFile, ExportIndex> =
+        map_with_capacity(parsed_files.len());
+    let mut binders_by_file: HashMap<ProjectFile, ImportBinder> =
+        map_with_capacity(parsed_files.len());
 
-        for (file, exports) in &exports_by_file {
-            for (exported_name, entry) in &exports.exports_by_name {
-                let local = match entry {
-                    ExportEntry::Local { local_name } => Some(local_name.clone()),
-                    ExportEntry::Default { local_name } => local_name.clone(),
-                    ExportEntry::ReexportedNamed {
-                        module_specifier,
-                        imported_name,
-                    } => {
-                        let resolved =
-                            resolve_js_ts_module_specifier(file, module_specifier, language);
-                        for resolved_file in resolved {
-                            reexport_edges
-                                .entry((resolved_file, imported_name.clone()))
-                                .or_default()
-                                .push((file.clone(), exported_name.clone()));
-                        }
-                        None
-                    }
-                };
-                if let Some(local_name) = local {
-                    seed_index
-                        .entry(local_name.clone())
-                        .or_default()
-                        .push((file.clone(), exported_name.clone()));
-                    if local_name != *exported_name {
-                        seed_index
-                            .entry(exported_name.clone())
-                            .or_default()
-                            .push((file.clone(), exported_name.clone()));
-                    }
-                } else {
-                    seed_index
-                        .entry(exported_name.clone())
-                        .or_default()
-                        .push((file.clone(), exported_name.clone()));
-                }
-            }
-            for star in &exports.reexport_stars {
-                let resolved =
-                    resolve_js_ts_module_specifier(file, &star.module_specifier, language);
-                for resolved_file in resolved {
-                    star_reexports
-                        .entry(resolved_file)
-                        .or_default()
-                        .push(file.clone());
-                }
-            }
-        }
-
-        let importer_reverse = build_importer_reverse(&files_vec, &binders_by_file, language);
-
-        Self {
-            files: files_vec,
-            parsed,
-            exports_by_file,
-            reexport_edges,
-            star_reexports,
-            seed_index,
-            importer_reverse,
-        }
+    for (file, parsed_file, exports, binder) in parsed_files {
+        parsed.insert(file.clone(), parsed_file);
+        exports_by_file.insert(file.clone(), exports);
+        binders_by_file.insert(file, binder);
     }
 
-    fn empty() -> Self {
-        Self {
-            files: Vec::new(),
-            parsed: HashMap::default(),
-            exports_by_file: HashMap::default(),
-            reexport_edges: HashMap::default(),
-            star_reexports: HashMap::default(),
-            seed_index: HashMap::default(),
-            importer_reverse: HashMap::default(),
-        }
-    }
+    let usage_graph = ProjectUsageGraph::build(
+        files,
+        exports_by_file,
+        &binders_by_file,
+        |file, module_specifier| resolve_js_ts_module_specifier(file, module_specifier, language),
+    );
 
-    /// All `(file, exported_name)` seed exports that resolve to the target's identity.
-    /// Includes the direct export(s) at the target's source file plus any transitive
-    /// re-exports reachable via the re-export graph.
-    fn seeds_for_target(&self, target: &CodeUnit) -> BTreeSet<(ProjectFile, String)> {
-        let mut seeds: BTreeSet<(ProjectFile, String)> = BTreeSet::new();
-
-        let target_short = top_level_identifier(target);
-
-        // Direct seeds: every export entry in the target's defining file whose local name
-        // matches the target's short identifier.
-        if let Some(exports) = self.exports_by_file.get(target.source()) {
-            for (exported_name, entry) in &exports.exports_by_name {
-                let local = match entry {
-                    ExportEntry::Local { local_name } => Some(local_name.as_str()),
-                    ExportEntry::Default { local_name } => local_name.as_deref(),
-                    ExportEntry::ReexportedNamed { .. } => None,
-                };
-                if let Some(local_name) = local
-                    && local_name == target_short
-                {
-                    seeds.insert((target.source().clone(), exported_name.clone()));
-                }
-            }
-        }
-
-        // Augment via the seed index: any file that exports the same short name. This
-        // catches default exports of `target_short` as well as re-export aliases.
-        if let Some(matches) = self.seed_index.get(target_short) {
-            for (file, exported_name) in matches {
-                seeds.insert((file.clone(), exported_name.clone()));
-            }
-        }
-
-        // Transitive re-export expansion: BFS over reexport_edges so importers who only
-        // see the alias resolve back to the original target.
-        let mut frontier: VecDeque<(ProjectFile, String)> = seeds.iter().cloned().collect();
-        while let Some(seed) = frontier.pop_front() {
-            if let Some(reexports) = self.reexport_edges.get(&seed) {
-                for next in reexports {
-                    if seeds.insert(next.clone()) {
-                        frontier.push_back(next.clone());
-                    }
-                }
-            }
-            if let Some(star_files) = self.star_reexports.get(&seed.0) {
-                for star_file in star_files {
-                    let next = (star_file.clone(), seed.1.clone());
-                    if seeds.insert(next.clone()) {
-                        frontier.push_back(next);
-                    }
-                }
-            }
-        }
-
-        seeds
-    }
-
-    /// Files that import any of the supplied seeds (after re-export resolution).
-    fn importers_of_seeds(&self, seeds: &BTreeSet<(ProjectFile, String)>) -> HashSet<ProjectFile> {
-        let mut out: HashSet<ProjectFile> = set_with_capacity(self.files.len().min(64));
-        for (target_file, _) in seeds {
-            if let Some(edges) = self.importer_reverse.get(target_file) {
-                for edge in edges {
-                    out.insert(edge.importer.clone());
-                }
-            }
-            // Also keep the target file itself — usages within the same file count.
-            out.insert(target_file.clone());
-        }
-        out
-    }
-
-    /// Returns the import edges originating in `importer` whose resolved
-    /// `(target_file, kind)` matches one of the seeds.
-    fn matching_edges_for_importer(
-        &self,
-        importer: &ProjectFile,
-        seeds: &BTreeSet<(ProjectFile, String)>,
-    ) -> Vec<ImportEdge> {
-        let Some(edges) = self.importer_reverse.get(importer) else {
-            return Vec::new();
-        };
-        edges
-            .iter()
-            .filter(|edge| edge_matches_seed(edge, seeds))
-            .cloned()
-            .collect()
-    }
-}
-
-fn edge_matches_seed(edge: &ImportEdge, seeds: &BTreeSet<(ProjectFile, String)>) -> bool {
-    match &edge.kind {
-        ImportEdgeKind::Named(name) => seeds.contains(&(edge.target_file.clone(), name.clone())),
-        ImportEdgeKind::Default => {
-            seeds.contains(&(edge.target_file.clone(), "default".to_string()))
-        }
-        ImportEdgeKind::Namespace => {
-            // Namespace import binds the entire module — match if any seed lives in the
-            // target file. Member-level resolution is handled by the candidate scanner.
-            seeds.iter().any(|(file, _)| file == &edge.target_file)
-        }
+    JsTsProjectGraph {
+        parsed,
+        usage_graph,
     }
 }
 
@@ -431,46 +226,13 @@ fn collect_jsts_files(analyzer: &dyn IAnalyzer, language: Language) -> Vec<Proje
     result
 }
 
-fn build_importer_reverse(
-    files: &[ProjectFile],
-    binders_by_file: &HashMap<ProjectFile, ImportBinder>,
-    language: Language,
-) -> HashMap<ProjectFile, Vec<ImportEdge>> {
-    let mut reverse: HashMap<ProjectFile, Vec<ImportEdge>> = HashMap::default();
-    for file in files {
-        let Some(binder) = binders_by_file.get(file) else {
-            continue;
-        };
-        for (local_name, binding) in &binder.bindings {
-            let resolved =
-                resolve_js_ts_module_specifier(file, &binding.module_specifier, language);
-            for target_file in resolved {
-                let kind = match (binding.kind, binding.imported_name.as_deref()) {
-                    (ImportKind::Default, _) => ImportEdgeKind::Default,
-                    (ImportKind::Namespace, _) => ImportEdgeKind::Namespace,
-                    (ImportKind::Named, Some(name)) => ImportEdgeKind::Named(name.to_string()),
-                    (ImportKind::Named, None) => ImportEdgeKind::Named(local_name.clone()),
-                };
-                let edge = ImportEdge {
-                    importer: file.clone(),
-                    local_name: local_name.clone(),
-                    target_file: target_file.clone(),
-                    kind,
-                };
-                reverse.entry(target_file).or_default().push(edge);
-            }
-        }
-    }
-    reverse
-}
-
 // ===================================================================================
 // Per-file scanning
 // ===================================================================================
 
 fn scan_files_for_seeds(
     analyzer: &dyn IAnalyzer,
-    graph: &ProjectGraph,
+    graph: &JsTsProjectGraph,
     files: &HashSet<ProjectFile>,
     target: &CodeUnit,
     seeds: &BTreeSet<(ProjectFile, String)>,
@@ -518,7 +280,7 @@ fn scan_files_for_seeds(
             )
         };
 
-        let edges = graph.matching_edges_for_importer(file, seeds);
+        let edges = graph.usage_graph.matching_edges_for_importer(file, seeds);
 
         let mut local_hits: BTreeSet<UsageHit> = BTreeSet::new();
         let line_starts = compute_line_starts(source_str);

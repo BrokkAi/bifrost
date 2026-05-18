@@ -16,6 +16,7 @@
 
 mod candidates;
 mod finder;
+mod graph_core;
 mod js_ts_graph;
 mod model;
 mod regex_analyzer;
