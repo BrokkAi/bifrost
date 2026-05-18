@@ -21,6 +21,7 @@ mod js_ts_graph;
 mod model;
 mod python_graph;
 mod regex_analyzer;
+mod rust_graph;
 mod traits;
 
 pub use candidates::{
@@ -36,6 +37,7 @@ pub use model::{
 };
 pub use python_graph::PythonExportUsageGraphStrategy;
 pub use regex_analyzer::RegexUsageAnalyzer;
+pub use rust_graph::RustExportUsageGraphStrategy;
 pub use traits::{CandidateFileProvider, UsageAnalyzer};
 
 use crate::analyzer::{CodeUnit, IAnalyzer};

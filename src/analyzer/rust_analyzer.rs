@@ -5,6 +5,7 @@ use crate::analyzer::{
     TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider, build_reverse_import_index,
 };
 use crate::hash::{HashMap, HashSet};
+use crate::usages::{ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind};
 use moka::sync::Cache;
 use regex::Regex;
 use std::collections::BTreeSet;
@@ -237,6 +238,92 @@ impl RustAnalyzer {
         let mut identifiers = HashSet::default();
         collect_rust_type_identifiers(tree.root_node(), source, &mut identifiers);
         identifiers.into_iter().collect()
+    }
+
+    pub fn export_index_of(&self, file: &ProjectFile) -> ExportIndex {
+        let mut index = ExportIndex::empty();
+
+        for code_unit in self.inner.get_top_level_declarations(file) {
+            let identifier = code_unit.identifier().trim();
+            if identifier.is_empty() || identifier.starts_with('_') {
+                continue;
+            }
+            if !self.is_public_declaration(&code_unit) {
+                continue;
+            }
+            index.exports_by_name.insert(
+                identifier.to_string(),
+                ExportEntry::Local {
+                    local_name: identifier.to_string(),
+                },
+            );
+        }
+
+        index
+    }
+
+    pub fn import_binder_of(&self, file: &ProjectFile) -> ImportBinder {
+        let mut binder = ImportBinder::empty();
+
+        for import in self.inner.import_info_of(file) {
+            let raw = import.raw_snippet.trim();
+            if raw.ends_with("::*;") {
+                continue;
+            }
+            let Some((module_specifier, imported_name)) =
+                split_rust_import_module_and_name(&import.raw_snippet)
+            else {
+                continue;
+            };
+            let local_name = import
+                .alias
+                .clone()
+                .or_else(|| import.identifier.clone())
+                .unwrap_or_else(|| imported_name.clone());
+
+            binder.bindings.insert(
+                local_name,
+                ImportBinding {
+                    module_specifier,
+                    kind: ImportKind::Named,
+                    imported_name: Some(imported_name),
+                },
+            );
+        }
+
+        binder
+    }
+
+    pub fn resolve_module_files(
+        &self,
+        importing_file: &ProjectFile,
+        module_specifier: &str,
+    ) -> Vec<ProjectFile> {
+        let package = rust_package_name(importing_file);
+        let Some(resolved_module) = resolve_rust_module_path(&package, module_specifier) else {
+            return Vec::new();
+        };
+
+        let mut files: Vec<_> = self
+            .get_analyzed_files()
+            .into_iter()
+            .filter(|file| rust_package_name(file) == resolved_module)
+            .collect();
+        files.sort();
+        files.dedup();
+        files
+    }
+
+    fn is_public_declaration(&self, code_unit: &CodeUnit) -> bool {
+        self.get_source(code_unit, false)
+            .or_else(|| self.get_skeleton_header(code_unit))
+            .map(|source| {
+                let trimmed = source.trim_start();
+                trimmed.starts_with("pub ")
+                    || trimmed.starts_with("pub(")
+                    || code_unit.is_module() && trimmed.starts_with("mod ")
+            })
+            .unwrap_or(false)
     }
 }
 
@@ -1267,11 +1354,7 @@ fn parse_rust_import_info(raw: String) -> ImportInfo {
     }
 }
 
-fn resolve_rust_import_fq_name(
-    _source_file: &ProjectFile,
-    package: &str,
-    raw_import: &str,
-) -> Option<String> {
+fn split_rust_import_module_and_name(raw_import: &str) -> Option<(String, String)> {
     let trimmed = raw_import
         .trim()
         .trim_start_matches("use ")
@@ -1281,9 +1364,22 @@ fn resolve_rust_import_fq_name(
         .rsplit_once(" as ")
         .map(|(path, _)| path)
         .unwrap_or(trimmed)
-        .trim_end_matches("::*")
         .trim();
-    let segments: Vec<_> = path
+    if path.ends_with("::*") {
+        return None;
+    }
+
+    let (module_specifier, imported_name) = path.rsplit_once("::")?;
+    Some((module_specifier.to_string(), imported_name.to_string()))
+}
+
+fn resolve_rust_module_path(package: &str, module_specifier: &str) -> Option<String> {
+    let trimmed = module_specifier.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let segments: Vec<_> = trimmed
         .split("::")
         .filter(|segment| !segment.is_empty())
         .collect();
@@ -1316,6 +1412,33 @@ fn resolve_rust_import_fq_name(
     };
 
     (!resolved.is_empty()).then_some(resolved)
+}
+
+fn resolve_rust_import_fq_name(
+    _source_file: &ProjectFile,
+    package: &str,
+    raw_import: &str,
+) -> Option<String> {
+    let trimmed = raw_import
+        .trim()
+        .trim_start_matches("use ")
+        .trim_end_matches(';')
+        .trim();
+    let path = trimmed
+        .rsplit_once(" as ")
+        .map(|(path, _)| path)
+        .unwrap_or(trimmed)
+        .trim_end_matches("::*")
+        .trim();
+    let segments: Vec<_> = path
+        .split("::")
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    if segments.is_empty() {
+        return None;
+    }
+
+    resolve_rust_module_path(package, path)
 }
 
 fn extract_rust_impl_target_name(node: Node<'_>, source: &str) -> Option<String> {
