@@ -1,7 +1,7 @@
 use crate::analyzer::{
     AnalyzerConfig, CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language, Project,
-    ProjectFile, TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider,
-    build_reverse_import_index,
+    ProjectFile, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
+    TreeSitterAnalyzer, TypeAliasProvider, build_reverse_import_index,
 };
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
@@ -11,8 +11,9 @@ use std::sync::{Arc, OnceLock};
 use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
 
 use super::javascript_analyzer::{
-    build_weighted_cache, extract_js_ts_call_receiver, imported_tokens, module_code_unit,
-    node_text, parse_js_import_infos, resolve_js_ts_import_paths, trim_statement,
+    build_weighted_cache, detect_js_ts_test_assertion_smells, extract_js_ts_call_receiver,
+    imported_tokens, module_code_unit, node_text, parse_js_import_infos,
+    resolve_js_ts_import_paths, trim_statement,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -498,6 +499,33 @@ impl IAnalyzer for TypescriptAnalyzer {
     fn contains_tests(&self, file: &ProjectFile) -> bool {
         self.inner.contains_tests(file)
     }
+
+    fn find_test_assertion_smells(
+        &self,
+        file: &ProjectFile,
+        weights: TestAssertionWeights,
+    ) -> Vec<TestAssertionSmell> {
+        if !self.contains_tests(file) || file_language(file) != Language::TypeScript {
+            return Vec::new();
+        }
+        let Ok(source) = file.read_to_string() else {
+            return Vec::new();
+        };
+        detect_js_ts_test_assertion_smells(
+            file,
+            &source,
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            &weights,
+        )
+    }
+}
+
+fn file_language(file: &ProjectFile) -> Language {
+    file.rel_path()
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(Language::from_extension)
+        .unwrap_or(Language::None)
 }
 
 fn visit_ts_export(

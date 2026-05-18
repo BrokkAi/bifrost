@@ -1,4 +1,4 @@
-# Port Java test assertion smell reporting from Brokk
+# Multi-language test assertion smell parity
 
 This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
 
@@ -6,109 +6,167 @@ This document must be maintained in accordance with [.agent/PLANS.md](/Users/dav
 
 ## Purpose / Big Picture
 
-After this change, Bifrost's MCP server will expose a `report_test_assertion_smells` tool that finds low-value or brittle Java test assertions using the same weighted heuristics already implemented in `../brokk`. A caller will be able to point the tool at Java test files and get a scored markdown report showing suspicious tests, why they were flagged, and a short excerpt. The first milestone is Java only even though the design should leave room for other languages later.
+Bifrost now has a Java-capable `report_test_assertion_smells` tool with the correct modular report structure, workspace-boundary hardening, and stronger parity tests. The next milestone is to extend the same MCP tool across the other analyzers so Bifrost can reach practical parity with Brokk’s Java-level usefulness on additional languages without fragmenting the public tool surface.
+
+The tool contract stays generic and stable:
+
+- one MCP tool: `report_test_assertion_smells`
+- one shared report format
+- one shared analyzer result model: `TestAssertionSmell` and `TestAssertionWeights`
+
+Language-specific work should stay inside each analyzer’s `find_test_assertion_smells` implementation and its tests.
 
 ## Progress
 
-- [x] (2026-05-18 10:50Z) Read the Brokk implementation in `brokk-core` and `brokk-shared`, then mapped the Bifrost integration points in `src/code_quality.rs`, `src/searchtools_service.rs`, `src/mcp_server.rs`, `src/analyzer/i_analyzer.rs`, and `src/analyzer/java_analyzer.rs`.
+- [x] (2026-05-18 10:50Z) Read the Brokk implementation in `brokk-core` and `brokk-shared`, then mapped the Bifrost integration points in the analyzer, code-quality, service, and MCP layers.
 - [x] (2026-05-18 11:20Z) Added shared `TestAssertionWeights` and `TestAssertionSmell` analyzer model types plus the `IAnalyzer::find_test_assertion_smells` extension point.
 - [x] (2026-05-18 11:20Z) Ported the Java-specific heuristic into `src/analyzer/java_analyzer.rs`, covering JUnit, AssertJ, Mockito verification, missing assertions, tautologies, constant-truth/equality checks, oversized literals, and anonymous test doubles.
-- [x] (2026-05-18 11:20Z) Added `report_test_assertion_smells` to `src/code_quality.rs`, `src/searchtools_service.rs`, and `src/mcp_server.rs` with Brokk-aligned defaults and markdown formatting.
-- [x] (2026-05-18 11:20Z) Added Java fixture coverage plus end-to-end Rust tests in `tests/java_test_assertion_smells.rs` and `tests/bifrost_mcp_server.rs`, then ran `cargo fmt`, `cargo test --test java_test_assertion_smells`, and `cargo test --test bifrost_mcp_server`.
+- [x] (2026-05-18 11:20Z) Added `report_test_assertion_smells` to the report, service, and MCP layers with Brokk-aligned defaults and markdown formatting.
+- [x] (2026-05-18 12:35Z) Reworked the Java tests to use inline projects and expanded them toward Brokk’s Java coverage.
+- [x] (2026-05-18 14:40Z) Fixed the review findings by moving the report onto the modular `src/code_quality/` layout, hardening path resolution against `..` traversal, aligning equal-score ordering with Brokk parity, and tightening the direct Java report tests.
+- [x] (2026-05-18 16:10Z) Completed Wave 1 by adding initial `report_test_assertion_smells` support for JavaScript, TypeScript, and Python, along with direct inline-project regression tests for each language and a full Java/MCP regression pass.
+- [ ] Next: implement Wave 2 for C#, Go, and Rust, then commit that wave before moving on.
 
 ## Surprises & Discoveries
 
-- Observation: Bifrost already mirrors several Brokk code-quality tools and report formats, so this feature fits the existing abstraction cleanly instead of needing a new subsystem.
-  Evidence: `src/code_quality.rs` already implements cognitive complexity, comment density, exception handling smells, and long-method/god-object reports.
+- Observation: the public tool/report side is no longer the bottleneck.
+  Evidence: `src/code_quality/test_assertion_smells.rs`, `src/searchtools_service.rs`, and `src/mcp_server.rs` are already generic and dispatch via `IAnalyzer::find_test_assertion_smells`.
 
-- Observation: Brokk factors only a small shared helper for test-smell sorting and meaningful-assertion credit; most of the Java logic is local to `JavaAnalyzer`.
-  Evidence: `brokk-shared/src/main/java/ai/brokk/analyzer/TreeSitterAnalyzer.java` contains `TestSmellCandidate`, `addTestSmellCandidate`, and `testMeaningfulAssertionCredit`, while `JavaAnalyzer.java` owns the assertion classification.
+- Observation: most analyzers already have `contains_tests` support, which means Bifrost already has a language-by-language test-file detection base for this feature.
+  Evidence: `src/analyzer/{go,javascript,typescript,python,rust,csharp,scala,php}_analyzer.rs` all implement `contains_tests`, while only Java currently overrides `find_test_assertion_smells`.
 
-- Observation: The default Java anonymous-test-double score is 3, so it does not appear in the default `min_score=4` report unless the caller lowers the threshold or the anonymous shape is repeated.
-  Evidence: The first MCP test run showed the anonymous-double row only after calling `report_test_assertion_smells` with `min_score: 3`.
+- Observation: parity will not mean literal Java-rule cloning across languages.
+  Evidence: Java relies on JUnit, AssertJ, and Mockito call shapes; JS/TS, Python, Rust, Go, and C# have different assertion and mocking idioms even though the smell categories overlap.
+
+- Observation: the right reuse boundary is category-level semantics, not a single shared AST helper.
+  Evidence: the report and scoring model are reusable, but assertion extraction is heavily syntax- and framework-specific in `src/analyzer/java_analyzer.rs`.
+
+- Observation: JavaScript and TypeScript can share one assertion-smell extractor with language-specific parser selection.
+  Evidence: both analyzers already share substantial import/test-detection helpers, and Wave 1 was implemented with a single `detect_js_ts_test_assertion_smells(...)` path in `src/analyzer/javascript_analyzer.rs`.
 
 ## Decision Log
 
-- Decision: Start with the exact Java heuristic and keep the trait/report surface generic.
-  Rationale: The user explicitly wants Java first, but the existing code-quality architecture in Bifrost is shared across analyzers. Keeping the data model generic avoids repainting the API when Python, Rust, or C# are added later.
+- Decision: keep one shared MCP/report surface and add language support behind analyzer overrides.
+  Rationale: callers should not need a new tool per language, and the current Rust surface already supports per-language implementations cleanly.
   Date/Author: 2026-05-18 / Codex
 
-- Decision: Write a local ExecPlan for this port.
-  Rationale: The work spans analyzer behavior, public MCP schema, and tests. A living plan will keep the port sequence, validation commands, and design choices explicit while implementation is in progress.
+- Decision: treat Java as the reference behavior and port smell categories, not parser details.
+  Rationale: parity should mean “same classes of findings with comparable scoring semantics,” not forcing non-Java analyzers to mimic Java-specific assertion APIs.
+  Date/Author: 2026-05-18 / Codex
+
+- Decision: implement languages in rollout waves instead of trying for all analyzers in one pass.
+  Rationale: the hard part is framework-specific precision, and a staged rollout keeps false positives manageable while preserving a clean report contract.
   Date/Author: 2026-05-18 / Codex
 
 ## Outcomes & Retrospective
 
-Completed for the Java-first scope. Bifrost now exposes a Java-capable `report_test_assertion_smells` MCP tool with Brokk-aligned defaults, deterministic markdown output, and targeted regression tests that prove both the direct report function and stdio MCP path work. Remaining future work is language expansion beyond Java.
+Java is complete enough to be the template: the analyzer hook exists, the MCP tool is stable, the report layer is modular, and the test suite now catches both security and parity regressions. Remaining work is multi-language analyzer support plus language-appropriate regression suites.
 
 ## Context and Orientation
 
-Bifrost is a Rust implementation of analyzer-backed search and code-quality tools. The MCP entrypoint is `src/mcp_server.rs`, which advertises tool schemas and forwards tool calls into `src/searchtools_service.rs`. The service owns a `WorkspaceAnalyzer` and dispatches each tool into helper modules such as `src/searchtools.rs`, `src/file_tools.rs`, or `src/code_quality.rs`.
+The main entrypoints are now:
 
-Language analyzers implement the `IAnalyzer` trait in `src/analyzer/i_analyzer.rs`. Shared report logic should depend on trait methods and shared record types defined there, not on a concrete language implementation. Java analysis lives in `src/analyzer/java_analyzer.rs`, which wraps the generic tree-sitter support in `src/analyzer/tree_sitter_analyzer.rs`.
+- [src/code_quality/test_assertion_smells.rs](/Users/dave/.codex/worktrees/0df3/bifrost/src/code_quality/test_assertion_smells.rs): shared report assembly and filtering
+- [src/analyzer/i_analyzer.rs](/Users/dave/.codex/worktrees/0df3/bifrost/src/analyzer/i_analyzer.rs): `find_test_assertion_smells` trait hook
+- [src/analyzer/model.rs](/Users/dave/.codex/worktrees/0df3/bifrost/src/analyzer/model.rs): shared `TestAssertionWeights` and `TestAssertionSmell`
+- [tests/java_test_assertion_smells.rs](/Users/dave/.codex/worktrees/0df3/bifrost/tests/java_test_assertion_smells.rs): the current parity-style reference suite
 
-The feature to port already exists in the sibling Brokk repository. The report entrypoint is `brokk-core/src/main/java/ai/brokk/tools/CodeQualityToolsMcp.java`, and the Java smell detection is in `brokk-shared/src/main/java/ai/brokk/analyzer/JavaAnalyzer.java`. The important Java terms in this feature are simple:
+Non-Java analyzer candidates that already detect test files:
 
-- A "test assertion smell" is a test assertion pattern that is suspicious because it is tautological, too shallow, excessively literal, or otherwise low-value.
-- "Shallow" means a weak assertion such as nullness or type-only checks.
-- An "anonymous test double" is an inline anonymous class used as a mock or stub inside a test, which is often a sign the test setup should be extracted or reused.
+- JavaScript
+- TypeScript
+- Python
+- Go
+- Rust
+- C#
+- Scala
+- PHP
+
+C++ currently does not appear to have test detection wired, so it should be treated as a later follow-up rather than an immediate parity target.
 
 ## Plan of Work
 
-First, extend `src/analyzer/i_analyzer.rs` with Rust equivalents of Brokk's `TestAssertionWeights` and `TestAssertionSmell`, plus a default trait method `find_test_assertion_smells(&self, file, weights)` that returns an empty vector for analyzers that do not support the heuristic yet.
+Start by extracting a repeatable implementation recipe from the Java port:
 
-Next, port the Java implementation into `src/analyzer/java_analyzer.rs`. Reuse the existing tree-sitter traversal helpers in that file where possible. Keep the port narrowly focused on Java test methods, using annotations to detect tests and method invocations to classify JUnit, AssertJ, and Mockito patterns. Factor only the truly shared helpers into `src/analyzer/tree_sitter_analyzer.rs` if that avoids duplicating the same sorting or excerpt logic already present there.
+1. detect test files
+2. identify assertion-equivalent calls and no-assertion cases
+3. map assertion shapes into the shared smell categories
+4. apply the shared scoring model
+5. render through the existing report function
+6. prove behavior with inline-project tests
 
-Then add a public report function in `src/code_quality.rs` that mirrors Brokk's MCP behavior: accept a file list and optional weight overrides, filter to test-containing files, collect findings from the analyzer, sort them deterministically, and render the same markdown table plus truncation note.
+Then execute language waves in descending payoff order.
 
-Finally, expose the new tool through `src/searchtools_service.rs` and `src/mcp_server.rs`, then add regression coverage. The minimum useful coverage is one direct Java analyzer test for the heuristic and one MCP stdio test proving the tool is listed and returns the expected report against a small Java fixture.
+### Wave 1: high-leverage dynamic test ecosystems
+
+Implement JavaScript, TypeScript, and Python next.
+
+- JavaScript and TypeScript should share as much as possible around Jest/Vitest/Mocha/Chai-style assertion detection and mock/spy verification equivalents.
+- Python should target `unittest` and `pytest` idioms first, including bare `assert`, `self.assert*`, `pytest.raises`, and common mock verification patterns.
+
+These languages likely give the highest coverage payoff after Java because they already have test detection and are common in repos where assertion-style heuristics are valuable.
+
+### Wave 2: statically typed test frameworks with explicit assertion APIs
+
+Implement C#, Go, and Rust after Wave 1.
+
+- C#: xUnit/NUnit/MSTest and common mock verification patterns.
+- Go: `testing` package patterns, `require/assert` families, and shallow checks around `err`, `nil`, and boolean conditions.
+- Rust: built-in `assert!` / `assert_eq!` / `matches!`, plus common test-module patterns and panic assertions.
+
+These languages are strong candidates for good precision because their assertion forms are relatively structured, but they need bespoke AST matching.
+
+### Wave 3: lower-volume or framework-diverse follow-ups
+
+Implement Scala and PHP after the first two waves are stable.
+
+- Scala: ScalaTest / specs2 / munit style assertions and matcher chains.
+- PHP: PHPUnit assertions and common inline doubles.
+
+Only after that should we decide whether C++ is worth adding now or whether it first needs a separate test-detection foundation.
 
 ## Concrete Steps
 
-Work from `/Users/dave/.codex/worktrees/0df3/bifrost`.
+For each language rollout:
 
-During implementation, use:
-
-    cargo test --test <targeted-test-name>
-
-After the feature is wired, run:
-
-    cargo fmt
-    cargo test --test bifrost_mcp_server
-    cargo test --test java_test_assertion_smells
-
-If the new analyzer test is folded into an existing file instead of a new test target, update the second command to the real target name and keep this plan synchronized.
+1. Read the analyzer’s existing `contains_tests` implementation and AST helpers.
+2. Inspect the sibling Brokk repo for any related language heuristics or framework detection patterns.
+3. Add `find_test_assertion_smells` in that analyzer, keeping syntax-specific helpers local to the analyzer file unless both JS and TS can clearly share one helper.
+4. Add one dedicated direct Rust test file per language using `tests/common/inline_project.rs`.
+5. Build a parity-style suite around the shared smell categories:
+   - no assertions
+   - self-comparison / tautology
+   - constant truth / equality
+   - shallow assertions
+   - meaningful assertions not flagged
+   - assertion-equivalent verify / throws / raises patterns
+   - oversized literal where the language/framework supports it
+   - anonymous or inline doubles where the language idiom exists
+6. Run targeted tests for that language plus `tests/bifrost_mcp_server.rs` if the MCP surface changed.
 
 ## Validation and Acceptance
 
-Acceptance is behavioral:
+Acceptance is per language, not all-or-nothing.
 
-1. `tools/list` must advertise `report_test_assertion_smells`.
-2. Calling `report_test_assertion_smells` against a Java fixture containing intentionally weak tests must return a markdown report headed `## Test assertion smells`.
-3. The report must include scored rows with kind, assertion count, symbol, file, reasons, and excerpt, and it must suppress files that either do not exist or are not detected as tests.
-4. The Java analyzer test must prove at least one tautological or shallow assertion finding and one anonymous-test-double or no-assertion style finding so the port exercises more than one heuristic path.
+For each new language:
+
+1. `report_test_assertion_smells` must produce findings for that language without changing the tool schema.
+2. Non-test files for that language must stay silent.
+3. At least one assertion-equivalent pattern that is not a literal assertion call must be recognized where the language/framework has such a concept.
+4. The direct report test must include both positive and negative cases and must assert row-level details where parity or scoring matters.
+5. The shared Java suite must remain green to prove no regression of the reference implementation.
+
+Program-level completion means Bifrost supports the shared smell categories across every analyzer that already has reliable test detection and for which the framework conventions can be recognized with acceptable precision.
 
 ## Idempotence and Recovery
 
-All edits are additive and safe to re-run. If a partial port fails to compile, continue by fixing the type surface first in `src/analyzer/i_analyzer.rs` and then the Java analyzer, since the report layer depends on those types. If a test fixture proves awkward, create a new dedicated fixture file under `tests/fixtures/testcode-java` rather than mutating broad shared fixtures in a way that would destabilize unrelated parity tests.
+Each language rollout should be independently shippable. If one language proves noisy or framework-fragile, leave the shared tool in place and keep that analyzer returning an empty list until its heuristics are strong enough. Do not weaken Java parity or the shared report contract to accommodate a weaker language implementation.
 
-## Artifacts and Notes
-
-Important source references for the port:
-
-    ../brokk/brokk-core/src/main/java/ai/brokk/tools/CodeQualityToolsMcp.java
-    ../brokk/brokk-shared/src/main/java/ai/brokk/analyzer/IAnalyzer.java
-    ../brokk/brokk-shared/src/main/java/ai/brokk/analyzer/TreeSitterAnalyzer.java
-    ../brokk/brokk-shared/src/main/java/ai/brokk/analyzer/JavaAnalyzer.java
+If shared helpers start emerging, prefer small shared utilities for scoring, sorting, or excerpt normalization. Do not force a giant cross-language “test smell engine” abstraction unless at least two concrete analyzers demonstrably need the same code.
 
 ## Interfaces and Dependencies
 
-At the end of this work, these Rust interfaces should exist:
-
-    pub struct TestAssertionWeights { ... }
-    impl TestAssertionWeights { pub fn defaults() -> Self { ... } }
-
-    pub struct TestAssertionSmell { ... }
+The shared interface should stay unchanged:
 
     trait IAnalyzer {
         fn find_test_assertion_smells(
@@ -118,15 +176,34 @@ At the end of this work, these Rust interfaces should exist:
         ) -> Vec<TestAssertionSmell>;
     }
 
-And these report-layer entrypoints should exist:
+The intended implementation pattern is:
 
-    pub struct ReportTestAssertionSmellsParams { ... }
-    pub struct ReportTestAssertionSmellsResult { pub report: String, pub truncated: bool }
-    pub fn report_test_assertion_smells(
-        analyzer: &dyn IAnalyzer,
-        params: ReportTestAssertionSmellsParams,
-    ) -> ReportTestAssertionSmellsResult
+    shared report layer
+      -> analyzer.contains_tests(file)
+      -> analyzer.find_test_assertion_smells(file, weights)
+      -> shared markdown rendering
 
-Revision note: created this ExecPlan to guide a multi-file Java-first port of Brokk issue #81 behavior into Bifrost and to keep implementation progress observable.
+Language-specific analyzers own:
 
-Revision note: updated progress and discoveries after completing the Java-first implementation and targeted validation.
+- test assertion extraction
+- framework recognition
+- smell classification
+- assertion-equivalent credits
+- inline double detection where applicable
+
+## Artifacts and Notes
+
+Reference sources:
+
+    ../brokk/brokk-core/src/main/java/ai/brokk/tools/CodeQualityToolsMcp.java
+    ../brokk/brokk-shared/src/main/java/ai/brokk/analyzer/IAnalyzer.java
+    ../brokk/brokk-shared/src/main/java/ai/brokk/analyzer/TreeSitterAnalyzer.java
+    ../brokk/brokk-shared/src/main/java/ai/brokk/analyzer/JavaAnalyzer.java
+
+Primary local reference implementation:
+
+    src/analyzer/java_analyzer.rs
+    src/code_quality/test_assertion_smells.rs
+    tests/java_test_assertion_smells.rs
+
+Revision note: expanded the original Java-first ExecPlan into a multi-language parity program after the Java implementation and review-fix pass were completed.
