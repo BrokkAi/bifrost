@@ -662,6 +662,16 @@ fn collect_rust_assertions(body: &str, weights: &TestAssertionWeights) -> Vec<Ru
                 excerpt: compact_rust_excerpt(whole.as_str()),
                 start_byte: whole.start(),
             }
+        } else if let Some(literal) = oversized_rust_literal(&left, &right, weights) {
+            RustAssertionSignal {
+                kind: "overspecified-literal".to_string(),
+                score: weights.overspecified_literal_weight,
+                shallow: true,
+                meaningful: false,
+                reason: format!("overspecified-literal:{literal}"),
+                excerpt: compact_rust_excerpt(whole.as_str()),
+                start_byte: whole.start(),
+            }
         } else {
             RustAssertionSignal {
                 kind: "meaningful-assertion".to_string(),
@@ -758,6 +768,21 @@ fn is_rust_literal(expr: &str) -> bool {
 
 fn compact_rust_excerpt(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn oversized_rust_literal(
+    left: &str,
+    right: &str,
+    weights: &TestAssertionWeights,
+) -> Option<String> {
+    [left, right].into_iter().find_map(|expr| {
+        let trimmed = expr.trim();
+        let unquoted = trimmed
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))?;
+        (unquoted.len() >= weights.large_literal_length_threshold.max(0) as usize)
+            .then(|| trimmed.to_string())
+    })
 }
 
 fn file_language(file: &ProjectFile) -> Language {

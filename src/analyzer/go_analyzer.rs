@@ -534,6 +534,12 @@ static GO_PANICS_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?:assert|require)\.Panics\s*\("#).expect("valid regex"));
 static GO_VERIFY_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"\.\s*AssertExpectations\s*\("#).expect("valid regex"));
+static GO_TESTING_ERRORF_BRANCH_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?s)if\s+(?P<cond>.*?)\s*\{\s*[A-Za-z_][A-Za-z0-9_]*\.(?:Errorf|Fatalf|Error|Fatal)\s*\("#,
+    )
+    .expect("valid regex")
+});
 
 #[derive(Clone)]
 struct GoAssertionSignal {
@@ -712,6 +718,80 @@ fn collect_go_assertions(body: &str, weights: &TestAssertionWeights) -> Vec<GoAs
         }
     }
 
+    for captures in GO_TESTING_ERRORF_BRANCH_RE.captures_iter(body) {
+        let whole = captures.get(0).expect("whole match");
+        let cond = normalize_go_expr(captures.name("cond").map(|m| m.as_str()).unwrap_or(""));
+        let signal = if let Some((left, right)) = split_go_comparison(&cond, "==") {
+            if left == right {
+                let (kind, reason, score, shallow) = if is_go_literal(&left) {
+                    (
+                        "constant-equality",
+                        "constant-equality",
+                        weights.constant_equality_weight,
+                        false,
+                    )
+                } else {
+                    (
+                        "self-comparison",
+                        "self-comparison",
+                        weights.tautological_assertion_weight,
+                        false,
+                    )
+                };
+                GoAssertionSignal {
+                    kind: kind.to_string(),
+                    score,
+                    shallow,
+                    meaningful: false,
+                    reason: reason.to_string(),
+                    excerpt: compact_go_excerpt(whole.as_str()),
+                    start_byte: whole.start(),
+                }
+            } else if matches!(right.as_str(), "nil") || matches!(left.as_str(), "nil") {
+                GoAssertionSignal {
+                    kind: "nullness-only".to_string(),
+                    score: weights.nullness_only_weight,
+                    shallow: true,
+                    meaningful: false,
+                    reason: "nullness-only".to_string(),
+                    excerpt: compact_go_excerpt(whole.as_str()),
+                    start_byte: whole.start(),
+                }
+            } else {
+                GoAssertionSignal {
+                    kind: "meaningful-assertion".to_string(),
+                    score: 0,
+                    shallow: false,
+                    meaningful: true,
+                    reason: "meaningful-assertion".to_string(),
+                    excerpt: compact_go_excerpt(whole.as_str()),
+                    start_byte: whole.start(),
+                }
+            }
+        } else if let Some((_left, _right)) = split_go_comparison(&cond, "!=") {
+            GoAssertionSignal {
+                kind: "meaningful-assertion".to_string(),
+                score: 0,
+                shallow: false,
+                meaningful: true,
+                reason: "meaningful-assertion".to_string(),
+                excerpt: compact_go_excerpt(whole.as_str()),
+                start_byte: whole.start(),
+            }
+        } else {
+            GoAssertionSignal {
+                kind: "meaningful-assertion".to_string(),
+                score: 0,
+                shallow: false,
+                meaningful: true,
+                reason: "meaningful-assertion".to_string(),
+                excerpt: compact_go_excerpt(whole.as_str()),
+                start_byte: whole.start(),
+            }
+        };
+        assertions.push(signal);
+    }
+
     assertions
 }
 
@@ -743,6 +823,11 @@ fn is_go_literal(expr: &str) -> bool {
 
 fn compact_go_excerpt(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn split_go_comparison(expr: &str, op: &str) -> Option<(String, String)> {
+    let (left, right) = expr.split_once(op)?;
+    Some((normalize_go_expr(left), normalize_go_expr(right)))
 }
 
 fn file_language(file: &ProjectFile) -> Language {

@@ -12,7 +12,7 @@ Bifrost now has initial `report_test_assertion_smells` support across every anal
 
 - [x] (2026-05-18 18:20Z) Compared Bifrost’s current assertion-smell tests against Brokk’s current language suites and confirmed that Java is close to parity while JS/TS, Python, C#, Go, Rust, Scala, and PHP are still starter-level.
 - [x] (2026-05-18 18:40Z) Closed the current JS/TS and Python parity gaps against Brokk by adding snapshot-only JS coverage, non-test TS skip coverage, Python fixture false-positive coverage, and the missing self-comparison, meaningful-clean, and constant-truth/equality direct tests.
-- [ ] Wave 2: C#, Go, and Rust parity gaps.
+- [x] (2026-05-18 19:05Z) Closed the current C#, Go, and Rust parity gaps against Brokk by expanding the direct suites and adding the missing Go branch-based assertion detection plus Rust overspecified-literal/assertion-count behavior.
 - [ ] Wave 3: Scala, PHP, and the C++ decision.
 
 ## Surprises & Discoveries
@@ -25,6 +25,9 @@ Bifrost now has initial `report_test_assertion_smells` support across every anal
 
 - Observation: the first parity wins come mostly from tests, but a few analyzer fixes were required.
   Evidence: JS/TS needed explicit snapshot-assertion detection, and Python needed fixture-aware test-function filtering to avoid false positives for `@pytest.fixture def test_*`.
+
+- Observation: Go and Rust parity needed real analyzer behavior, not just more tests.
+  Evidence: Brokk treats `t.Errorf`-style branches as assertion-like in Go and counts meaningful branches toward `assertionCount`; Rust also treats oversized string literals inside `assert_eq!` as scored smells.
 
 ## Decision Log
 
