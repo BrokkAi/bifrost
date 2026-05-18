@@ -25,6 +25,8 @@ The observable outcome is that `report_structural_clone_smells` works consistent
 - [x] (2026-05-18) Validated the Milestone 3 checkpoint with `cargo test --lib clone_detection::tests -- --nocapture`, `cargo test --test java_structural_clone_smells -- --nocapture`, `cargo test --test python_structural_clone_smells -- --nocapture`, `cargo test --test js_ts_structural_clone_smells -- --nocapture`, `cargo test --test searchtools_service python_boundary_returns_structural_clone_report_json -- --nocapture`, `cargo test --test bifrost_mcp_server bifrost_searchtools_server_speaks_mcp_stdio -- --nocapture`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings`.
 - [x] (2026-05-18) Completed Milestone 4. Added first-pass PHP structural clone support in `src/analyzer/php_analyzer.rs` and focused PHP behavior tests in `tests/php_structural_clone_smells.rs`.
 - [x] (2026-05-18) Validated the Milestone 4 checkpoint with `cargo test --test php_structural_clone_smells -- --nocapture`, `cargo test --test searchtools_service python_boundary_returns_structural_clone_report_json -- --nocapture`, `cargo test --test bifrost_mcp_server bifrost_searchtools_server_speaks_mcp_stdio -- --nocapture`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings`.
+- [x] (2026-05-18) Completed Milestone 5. Added first-pass Scala structural clone support in `src/analyzer/scala_analyzer.rs` and focused Scala behavior tests in `tests/scala_structural_clone_smells.rs`.
+- [x] (2026-05-18) Validated the Milestone 5 checkpoint with `cargo test --test scala_structural_clone_smells -- --nocapture`, `cargo test --test searchtools_service python_boundary_returns_structural_clone_report_json -- --nocapture`, `cargo test --test bifrost_mcp_server bifrost_searchtools_server_speaks_mcp_stdio -- --nocapture`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings`.
 - [ ] Add this plan’s milestone tracker updates as each language slice lands.
 - [ ] Keep the `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` sections current during implementation.
 
@@ -50,6 +52,9 @@ The observable outcome is that `report_structural_clone_smells` works consistent
 
 - Observation: PHP clone parsing needed a wrapped `<?php` opener when operating on extracted function bodies.
   Evidence: the first PHP attempt produced clone candidates with effectively empty token streams because `get_source` returns bare function snippets, not full file text. Wrapping those snippets before tree-sitter parsing fixed the issue without changing the stored excerpts or analyzer source ranges.
+
+- Observation: Scala did not need the same parse-wrapper workaround as PHP.
+  Evidence: the extracted Scala function snippets were already parseable enough for clone-token and AST-signature generation, so the first-pass Scala port only needed the language-specific normalization hooks and test coverage.
 
 ## Decision Log
 
@@ -78,6 +83,8 @@ Milestone 2 outcome: JS/TS now joins Java and Python as a Brokk-backed parity sl
 Milestone 3 outcome: the shared clone engine is materially cleaner. The common detection loop now lives in one place, and direct unit tests cover the hashed shingle similarity and prefilter behavior independently of any one language analyzer. That reduces the risk of semantic drift as the first non-Brokk-backed languages are added next.
 
 Milestone 4 outcome: PHP now has a bounded first-pass clone feature. The semantics are covered by focused Bifrost tests rather than Brokk parity tests, and the implementation documents an important difference from the parity languages: extracted PHP snippets must be normalized into parseable PHP fragments before clone scoring works correctly.
+
+Milestone 5 outcome: Scala now has a bounded first-pass clone feature as well. Compared with PHP, the Scala port was mechanically simpler, which suggests the remaining C# and C++ work will hinge more on declaration-shape decisions and AST tuning than on the shared engine itself.
 
 ## Context and Orientation
 
