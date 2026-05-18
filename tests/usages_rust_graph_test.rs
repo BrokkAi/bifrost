@@ -273,3 +273,116 @@ fn run() {
             .all(|hit| hit.file == project.file("src/main.rs"))
     );
 }
+
+fn member(
+    analyzer: &RustAnalyzer,
+    file: &ProjectFile,
+    owner_name: &str,
+    member_name: &str,
+) -> CodeUnit {
+    analyzer
+        .exact_member(file, owner_name, member_name, true)
+        .or_else(|| analyzer.exact_member(file, owner_name, member_name, false))
+        .unwrap_or_else(|| panic!("missing member {owner_name}.{member_name}"))
+}
+
+#[test]
+fn usage_finder_routes_rust_member_targets_through_graph() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/service.rs",
+            r#"
+pub struct Service;
+impl Service {
+    pub fn run(&self) {}
+}
+"#,
+        ),
+        (
+            "src/main.rs",
+            r#"
+use crate::service::Service;
+
+fn main() {
+    let service: Service = Service {};
+    service.run();
+}
+"#,
+        ),
+    ]);
+
+    let target = member(&analyzer, &project.file("src/service.rs"), "Service", "run");
+    let hits = UsageFinder::new()
+        .find_usages_default(&analyzer, std::slice::from_ref(&target))
+        .into_either()
+        .expect("expected member graph success");
+    assert_eq!(1, hits.len());
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file == project.file("src/main.rs"))
+    );
+}
+
+#[test]
+fn rust_exact_member_lookup_is_stable_across_repeated_calls() {
+    let (project, analyzer) = rust_analyzer_with_files(&[(
+        "src/service.rs",
+        r#"
+pub struct Service;
+impl Service {
+    pub fn run(&self) {}
+}
+"#,
+    )]);
+
+    let file = project.file("src/service.rs");
+    let first = analyzer
+        .exact_member(&file, "Service", "run", true)
+        .expect("first member");
+    let second = analyzer
+        .exact_member(&file, "Service", "run", true)
+        .expect("second member");
+
+    assert_eq!(first, second);
+    assert!(!first.is_synthetic());
+}
+
+#[test]
+fn rust_member_candidate_funnel_keeps_likely_files_and_drops_unrelated_ones() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/service.rs",
+            r#"
+pub struct Service;
+impl Service {
+    pub fn run(&self) {}
+}
+"#,
+        ),
+        (
+            "src/main.rs",
+            r#"
+use crate::service::Service;
+fn main() {
+    let service: Service = Service {};
+    service.run();
+}
+"#,
+        ),
+        (
+            "src/other.rs",
+            r#"
+fn unrelated() {
+    let value = 1;
+}
+"#,
+        ),
+    ]);
+
+    let target = member(&analyzer, &project.file("src/service.rs"), "Service", "run");
+    let candidates =
+        analyzer.rust_usage_candidate_files(["Service".to_string()].into_iter().collect(), &target);
+
+    assert!(candidates.contains(&project.file("src/main.rs")));
+    assert!(!candidates.contains(&project.file("src/other.rs")));
+}

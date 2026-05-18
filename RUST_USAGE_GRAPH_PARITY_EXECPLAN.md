@@ -18,7 +18,7 @@ This is intentionally a long-running parity program, not only a one-issue patch 
 - [x] (2026-05-18T14:32Z) Confirmed the main analyzer gap: `RustAnalyzer` currently exposes generic import-analysis and reverse-import behavior, but not the Rust-specific graph-facing hooks that Brokk’s Rust strategy relies on.
 - [x] (2026-05-18T14:44Z) Completed Milestone 1 by adding `src/usages/rust_graph.rs`, registering `RustExportUsageGraphStrategy` in `src/usages/finder.rs`, and widening `RustAnalyzer` with first-wave helpers for export indices, import binders, and Rust module-to-file resolution.
 - [x] (2026-05-18T14:44Z) Completed Milestone 2 by adding `tests/usages_rust_graph_test.rs` and proving seeded public-export routing, `MultiAnalyzer` routing, same-file private-function support, explicit candidate restriction, broad mixed candidate filtering, `TooManyCallsites`, and same-file type-position/literal struct references.
-- [ ] Implement Milestone 3 so `bifrost` can answer Rust member queries through receiver facts and exact-member lookup, matching the current Brokk member-oriented strategy coverage.
+- [ ] (2026-05-18T14:49Z) Milestone 3 partially complete: `bifrost` now routes member targets for public Rust owners through the graph, `RustAnalyzer::exact_member` exists, and the candidate funnel keeps likely owner-importing files while dropping unrelated files; remaining work is richer receiver-fact coverage and any cache-shaped parity Brokk still proves.
 - [ ] Implement Milestone 4 so the remaining Brokk-vs-`bifrost` Rust graph gaps are either closed or recorded explicitly, including any work that truly belongs to issue `#76` rather than `#75`.
 
 ## Surprises & Discoveries
@@ -40,6 +40,9 @@ This is intentionally a long-running parity program, not only a one-issue patch 
 
 - Observation: the non-Rust-only candidate case was a real behavior trap even in the smaller Rust port.
   Evidence: the first implementation widened an explicit `README.md` candidate set back out to graph-derived importers, and `tests/usages_rust_graph_test.rs` caught it immediately; the fix was to preserve explicit candidate emptiness after Rust-file filtering by scanning only the target file.
+
+- Observation: the first useful Rust member slice did not require a full Rust data-flow engine yet.
+  Evidence: the current member tests pass with a narrower receiver heuristic built from imported owner names plus simple typed and constructed local-variable detection, which was enough to prove `Service.run`-style calls without broadening the top-level graph design.
 
 ## Decision Log
 
@@ -67,11 +70,15 @@ This is intentionally a long-running parity program, not only a one-issue patch 
   Rationale: Brokk’s earlier rollout proved that widening explicit filtered candidate sets is both noisy and behaviorally wrong; the focused Rust graph test now locks that rule in for `bifrost`.
   Date/Author: 2026-05-18 / Codex
 
+- Decision: implement the first member wave with a focused receiver heuristic instead of blocking on full general receiver-fact caches.
+  Rationale: the next valuable proof point was public-owner member routing and exact-member lookup, and those scenarios can be validated with simpler typed-local and constructed-local receiver inference while keeping the richer cache/fact parity explicitly open.
+  Date/Author: 2026-05-18 / Codex
+
 ## Outcomes & Retrospective
 
 At the moment this plan is created, `bifrost` has already crossed the architectural threshold for multi-language usage graphs: the shared graph engine from issue `#73` exists, and Python has already proven that a non-JS/TS language can plug into that engine successfully. The first implementation wave closed the largest Rust routing gap: Rust now has a graph strategy, `UsageFinder` now routes Rust through it, and the first focused Rust graph suite proves the top-level and same-file cases that used to fall straight to regex.
 
-What still remains is the deeper parity slice around members and receivers. Success is still not “a Rust graph class exists.” Success is that `bifrost` can demonstrate, with focused Rust tests, that it matches Brokk’s Rust graph behavior across selector routing, candidate narrowing, top-level exported-symbol lookups, same-file private-function cases, member/receiver usage resolution, and the remaining explicitly recorded residual gaps.
+What still remains is the deeper parity slice around members and receivers. The second implementation wave closed the first part of that gap by adding exact-member lookup, public-owner member routing, and a focused candidate funnel for likely owner-importing files. Success is still not “a Rust graph class exists.” Success is that `bifrost` can demonstrate, with focused Rust tests, that it matches Brokk’s Rust graph behavior across selector routing, candidate narrowing, top-level exported-symbol lookups, same-file private-function cases, member/receiver usage resolution, and the remaining explicitly recorded residual gaps.
 
 ## Context and Orientation
 
@@ -221,12 +228,14 @@ The public behavior expected at the end of this plan is:
 - Graph returns `TooManyCallsites` when hits exceed the limit: done in `bifrost` in the first wave; proved by `rust_graph_strategy_returns_too_many_callsites_when_hits_exceed_limit`.
 - Same-file struct references in return types and literals are counted as usages: done in `bifrost` in the first wave; proved by `rust_graph_strategy_finds_same_file_struct_references_in_types_and_literals`.
 - Same-file private-function calls inside closures are counted when the local seed is known: done in `bifrost` in the first wave via the same-file private function case; keep the closure-specific shape as an optional hardening follow-up if Brokk-specific coverage needs to be matched more literally.
-- Selector chooses Rust graph for members of public exports: missing in `bifrost`; likely Milestone 3 and may overlap with issue `#76`.
-- Receiver-based member usages are proven only for the correct owner type: missing in `bifrost`; likely Milestone 3 and may overlap with issue `#76`.
-- Exact-member lookup is stable across repeated lookups: missing in `bifrost`; likely Milestone 3.
-- Rust candidate funnel keeps likely member files and drops unrelated files: missing in `bifrost`; likely Milestone 3.
-- Rust usage-fact caches feed both reference and receiver lookups consistently: missing in `bifrost`; likely Milestone 3.
+- Selector chooses Rust graph for members of public exports: done in `bifrost` in the second wave; proved by `usage_finder_routes_rust_member_targets_through_graph`.
+- Receiver-based member usages are proven only for the correct owner type: partially done in `bifrost`; current proof covers typed/constructed local receiver cases for imported public owners, but broader receiver-fact parity and negative ambiguity cases remain open.
+- Exact-member lookup is stable across repeated lookups: done in `bifrost` in the second wave; proved by `rust_exact_member_lookup_is_stable_across_repeated_calls`.
+- Rust candidate funnel keeps likely member files and drops unrelated files: done in `bifrost` in the second wave; proved by `rust_member_candidate_funnel_keeps_likely_files_and_drops_unrelated_ones`.
+- Rust usage-fact caches feed both reference and receiver lookups consistently: still missing explicit parity proof in `bifrost`; keep this open for a later Milestone 3 hardening pass or issue `#76`.
 
 Revision note: created this repo-root long-running ExecPlan after comparing the current `bifrost` Rust usage surface with the existing Brokk Rust graph strategy and tests, so the implementation path and the residual parity gap are both explicit from the start.
 
 Revision note: updated after the first implementation wave to record the new Rust graph strategy, the initial Rust-analyzer helper surface, the focused Rust graph tests that now pass, and the remaining member/receiver parity gap.
+
+Revision note: updated after the second implementation wave to record the first member-routing slice, the new `exact_member` and member candidate-funnel helpers, and the narrower remaining receiver/cache parity backlog.

@@ -314,6 +314,46 @@ impl RustAnalyzer {
         files
     }
 
+    pub fn exact_member(
+        &self,
+        source_file: &ProjectFile,
+        owner_name: &str,
+        member_name: &str,
+        _instance_receiver: bool,
+    ) -> Option<CodeUnit> {
+        self.declarations(source_file)
+            .find(|code_unit| {
+                code_unit.identifier() == member_name
+                    && self
+                        .parent_of(code_unit)
+                        .map(|parent| parent.identifier() == owner_name)
+                        .unwrap_or(false)
+            })
+            .cloned()
+    }
+
+    pub fn rust_usage_candidate_files(
+        &self,
+        export_names: HashSet<String>,
+        target: &CodeUnit,
+    ) -> HashSet<ProjectFile> {
+        let owner_source = self
+            .parent_of(target)
+            .map(|owner| owner.source().clone())
+            .unwrap_or_else(|| target.source().clone());
+        let member_name = target.identifier().to_string();
+
+        self.referencing_files_of(&owner_source)
+            .into_iter()
+            .filter(|file| {
+                file.read_to_string().ok().is_some_and(|source| {
+                    export_names.iter().any(|name| source.contains(name))
+                        || source.contains(&member_name)
+                })
+            })
+            .collect()
+    }
+
     fn is_public_declaration(&self, code_unit: &CodeUnit) -> bool {
         self.get_source(code_unit, false)
             .or_else(|| self.get_skeleton_header(code_unit))

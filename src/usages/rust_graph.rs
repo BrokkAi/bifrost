@@ -8,8 +8,9 @@ use crate::usages::graph_core::ProjectUsageGraph;
 use crate::usages::model::{FuzzyResult, UsageHit};
 use crate::usages::traits::UsageAnalyzer;
 use rayon::prelude::*;
+use regex::Regex;
 use std::collections::BTreeSet;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use tree_sitter::{Node, Parser, Tree};
 
 const GRAPH_HIT_CONFIDENCE: f64 = 1.0;
@@ -74,6 +75,9 @@ impl UsageAnalyzer for RustExportUsageGraphStrategy {
                 fq_name: target.fq_name().to_string(),
                 reason: "RustExportUsageGraphStrategy: no export seed resolved".to_string(),
             };
+        } else if is_member_target(rust, target) {
+            let scan_files = effective_scan_files(rust, &graph, candidate_files, target, &seeds);
+            scan_files_for_member_target(analyzer, &graph, rust, scan_files, target, &seeds)
         } else {
             let scan_files = effective_scan_files(rust, &graph, candidate_files, target, &seeds);
             scan_files_for_target(analyzer, &graph, scan_files, target, Some(&seeds))
@@ -120,6 +124,10 @@ fn target_language(target: &CodeUnit) -> Language {
 
 fn supports_same_file_local_scan(analyzer: &RustAnalyzer, target: &CodeUnit) -> bool {
     target.is_function() && analyzer.parent_of(target).is_none()
+}
+
+fn is_member_target(analyzer: &RustAnalyzer, target: &CodeUnit) -> bool {
+    (target.is_function() || target.is_field()) && analyzer.parent_of(target).is_some()
 }
 
 fn infer_graph_seeds(
@@ -419,4 +427,138 @@ fn build_snippet(source: &str, line_starts: &[usize], start: usize, end: usize) 
         .unwrap_or(source.len());
 
     source[snippet_start..snippet_end].trim().to_string()
+}
+
+static LET_TYPED_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\blet\s+([A-Za-z_][A-Za-z0-9_]*)\s*:\s*([A-Za-z_][A-Za-z0-9_]*)")
+        .expect("valid typed let regex")
+});
+static LET_CONSTRUCTED_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\blet\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:\{|::)")
+        .expect("valid constructed let regex")
+});
+static PARAM_TYPED_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"([A-Za-z_][A-Za-z0-9_]*)\s*:\s*([A-Za-z_][A-Za-z0-9_]*)")
+        .expect("valid typed param regex")
+});
+
+fn scan_files_for_member_target(
+    analyzer: &dyn IAnalyzer,
+    graph: &RustProjectGraph,
+    rust: &RustAnalyzer,
+    files: HashSet<ProjectFile>,
+    target: &CodeUnit,
+    seeds: &BTreeSet<(ProjectFile, String)>,
+) -> BTreeSet<UsageHit> {
+    let Some(owner) = rust.parent_of(target) else {
+        return BTreeSet::new();
+    };
+    let member_name = regex::escape(target.identifier());
+    let hits = Mutex::new(BTreeSet::new());
+
+    files.par_iter().for_each(|file| {
+        let Ok(source) = file.read_to_string() else {
+            return;
+        };
+        let line_starts = compute_line_starts(&source);
+        let owner_local_names: HashSet<String> = if file == target.source() {
+            [owner.identifier().to_string()].into_iter().collect()
+        } else {
+            graph
+                .usage_graph
+                .matching_edges_for_importer(file, seeds)
+                .into_iter()
+                .map(|edge| edge.local_name)
+                .collect()
+        };
+        if owner_local_names.is_empty() {
+            return;
+        }
+
+        let receiver_names = infer_receiver_names(&source, &owner_local_names);
+        if receiver_names.is_empty() {
+            return;
+        }
+
+        let pattern = format!(r"\b({})\.{}\s*\(", receiver_names.join("|"), member_name);
+        let Ok(call_re) = Regex::new(&pattern) else {
+            return;
+        };
+
+        let mut local_hits = BTreeSet::new();
+        for captures in call_re.captures_iter(&source) {
+            let Some(matched) = captures.get(0) else {
+                continue;
+            };
+            let start = matched.end().saturating_sub(target.identifier().len() + 1);
+            let end = matched.end().saturating_sub(1);
+            let range = Range {
+                start_byte: start,
+                end_byte: end,
+                start_line: find_line_index_for_offset(&line_starts, start),
+                end_line: find_line_index_for_offset(&line_starts, end),
+            };
+            let Some(enclosing) = analyzer.enclosing_code_unit(file, &range) else {
+                continue;
+            };
+            local_hits.insert(UsageHit::new(
+                file.clone(),
+                range.start_line + 1,
+                start,
+                end,
+                enclosing,
+                GRAPH_HIT_CONFIDENCE,
+                build_snippet(&source, &line_starts, start, end),
+            ));
+        }
+
+        if !local_hits.is_empty() {
+            let mut sink = hits.lock().expect("poisoned Rust member collector");
+            sink.extend(local_hits);
+        }
+    });
+
+    hits.into_inner().expect("poisoned Rust member collector")
+}
+
+fn infer_receiver_names(source: &str, owner_local_names: &HashSet<String>) -> Vec<String> {
+    let mut receivers = BTreeSet::new();
+
+    for captures in LET_TYPED_RE.captures_iter(source) {
+        let Some(name) = captures.get(1) else {
+            continue;
+        };
+        let Some(ty) = captures.get(2) else {
+            continue;
+        };
+        if owner_local_names.contains(ty.as_str()) {
+            receivers.insert(name.as_str().to_string());
+        }
+    }
+
+    for captures in LET_CONSTRUCTED_RE.captures_iter(source) {
+        let Some(name) = captures.get(1) else {
+            continue;
+        };
+        let Some(ty) = captures.get(2) else {
+            continue;
+        };
+        if owner_local_names.contains(ty.as_str()) {
+            receivers.insert(name.as_str().to_string());
+        }
+    }
+
+    for captures in PARAM_TYPED_RE.captures_iter(source) {
+        let Some(name) = captures.get(1) else {
+            continue;
+        };
+        let Some(ty) = captures.get(2) else {
+            continue;
+        };
+        if owner_local_names.contains(ty.as_str()) {
+            receivers.insert(name.as_str().to_string());
+        }
+    }
+
+    receivers.into_iter().collect()
 }
