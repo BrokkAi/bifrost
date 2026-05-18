@@ -1,5 +1,5 @@
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
-use crate::hash::HashSet;
+use crate::hash::{HashMap, HashSet};
 use crate::usages::candidates::{
     FallbackCandidateProvider, ImportGraphCandidateProvider, TextSearchCandidateProvider,
     default_provider,
@@ -9,16 +9,6 @@ use crate::usages::model::FuzzyResult;
 use crate::usages::python_graph::PythonExportUsageGraphStrategy;
 use crate::usages::regex_analyzer::RegexUsageAnalyzer;
 use crate::usages::traits::{CandidateFileProvider, UsageAnalyzer};
-
-/// Languages whose targets are routed through [`JsTsExportUsageGraphStrategy`] first,
-/// with the regex analyzer as the fallback when the graph returns
-/// [`FuzzyResult::Failure`].
-fn is_graph_routed(language: Language) -> bool {
-    matches!(
-        language,
-        Language::JavaScript | Language::TypeScript | Language::Python
-    )
-}
 
 fn target_language(target: &CodeUnit) -> Language {
     target
@@ -55,18 +45,30 @@ pub struct QueryResult {
 pub struct UsageFinder {
     fallback_candidate_provider: DefaultCandidateProvider,
     fallback_usage_analyzer: Box<dyn UsageAnalyzer>,
-    js_ts_graph_analyzer: Box<dyn UsageAnalyzer>,
-    python_graph_analyzer: Box<dyn UsageAnalyzer>,
+    graph_analyzers: HashMap<Language, Box<dyn UsageAnalyzer>>,
     file_filter: Option<FileFilter>,
 }
 
 impl UsageFinder {
     pub fn new() -> Self {
+        let mut graph_analyzers: HashMap<Language, Box<dyn UsageAnalyzer>> = HashMap::default();
+        graph_analyzers.insert(
+            Language::JavaScript,
+            Box::new(JsTsExportUsageGraphStrategy::new()),
+        );
+        graph_analyzers.insert(
+            Language::TypeScript,
+            Box::new(JsTsExportUsageGraphStrategy::new()),
+        );
+        graph_analyzers.insert(
+            Language::Python,
+            Box::new(PythonExportUsageGraphStrategy::new()),
+        );
+
         Self {
             fallback_candidate_provider: default_provider(),
             fallback_usage_analyzer: Box::new(RegexUsageAnalyzer::new()),
-            js_ts_graph_analyzer: Box::new(JsTsExportUsageGraphStrategy::new()),
-            python_graph_analyzer: Box::new(PythonExportUsageGraphStrategy::new()),
+            graph_analyzers,
             file_filter: None,
         }
     }
@@ -126,15 +128,13 @@ impl UsageFinder {
         }
 
         let language = target_language(target);
-        let result = if is_graph_routed(language) {
-            let graph_analyzer: &dyn UsageAnalyzer = match language {
-                Language::Python => self.python_graph_analyzer.as_ref(),
-                Language::JavaScript | Language::TypeScript => self.js_ts_graph_analyzer.as_ref(),
-                _ => self.fallback_usage_analyzer.as_ref(),
-            };
+        let result = if let Some(graph_analyzer) = self.graph_analyzers.get(&language) {
             // Try the graph strategy first; on Failure (no seed could be inferred) fall
             // back to the regex analyzer so callers still get best-effort results.
-            match graph_analyzer.find_usages(analyzer, overloads, &candidates, max_usages) {
+            match graph_analyzer
+                .as_ref()
+                .find_usages(analyzer, overloads, &candidates, max_usages)
+            {
                 FuzzyResult::Failure { .. } => self.fallback_usage_analyzer.find_usages(
                     analyzer,
                     overloads,

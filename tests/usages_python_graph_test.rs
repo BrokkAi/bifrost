@@ -286,3 +286,227 @@ def run():
         .expect("UsageFinder should find Python graph usages");
     assert_eq!(hits.len(), 1);
 }
+
+#[test]
+fn same_short_name_in_other_file_does_not_collide_into_target_seeds() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+class Service:
+    pass
+"#,
+        )
+        .file(
+            "other_service.py",
+            r#"
+class Service:
+    pass
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+from other_service import Service
+
+def run():
+    return Service()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.Service");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = PythonExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("graph should resolve same-name exports without collision");
+    assert!(
+        hits.is_empty(),
+        "usages of other_service.Service must not match"
+    );
+}
+
+#[test]
+fn bare_owner_references_do_not_count_as_member_usages() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+class Service:
+    def ping(self):
+        return 1
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+from service import Service
+
+def run():
+    x: Service | None = None
+    return Service
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.Service.ping");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = PythonExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("member query should still return success");
+    assert!(hits.is_empty(), "bare owner references must not count");
+}
+
+#[test]
+fn member_query_counts_true_member_access_only() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+class Service:
+    def ping(self):
+        return 1
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+from service import Service
+
+def run():
+    return Service.ping(Service())
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.Service.ping");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = PythonExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("member access should be counted");
+    assert_eq!(hits.len(), 1);
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file == project.file("consumer.py"))
+    );
+}
+
+#[test]
+fn unrelated_same_member_name_does_not_match_target_member() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+class Service:
+    def ping(self):
+        return 1
+"#,
+        )
+        .file(
+            "other.py",
+            r#"
+class Other:
+    def ping(self):
+        return 2
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+from other import Other
+
+def run():
+    return Other.ping(Other())
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.Service.ping");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = PythonExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("graph should disambiguate unrelated owners");
+    assert!(
+        hits.is_empty(),
+        "unrelated owner member access must not match"
+    );
+}
+
+#[test]
+fn graph_strategy_respects_candidate_file_boundary() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+class Service:
+    pass
+"#,
+        )
+        .file(
+            "consumer_a.py",
+            r#"
+from service import Service
+
+def run_a():
+    return Service()
+"#,
+        )
+        .file(
+            "consumer_b.py",
+            r#"
+from service import Service
+
+def run_b():
+    return Service()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.Service");
+    let candidates = [project.file("service.py"), project.file("consumer_a.py")]
+        .into_iter()
+        .collect();
+
+    let result = PythonExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("graph should honor bounded candidate input");
+    assert_eq!(hits.len(), 1);
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file == project.file("consumer_a.py"))
+    );
+}

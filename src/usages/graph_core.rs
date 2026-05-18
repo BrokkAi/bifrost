@@ -23,7 +23,6 @@ pub struct ProjectUsageGraph {
     exports_by_file: HashMap<ProjectFile, ExportIndex>,
     reexport_edges: HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>>,
     star_reexports: HashMap<ProjectFile, Vec<ProjectFile>>,
-    seed_index: HashMap<String, Vec<(ProjectFile, String)>>,
     importer_reverse: HashMap<ProjectFile, Vec<ImportEdge>>,
 }
 
@@ -40,13 +39,10 @@ impl ProjectUsageGraph {
         let mut reexport_edges: HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>> =
             HashMap::default();
         let mut star_reexports: HashMap<ProjectFile, Vec<ProjectFile>> = HashMap::default();
-        let mut seed_index: HashMap<String, Vec<(ProjectFile, String)>> = HashMap::default();
-
         for (file, exports) in &exports_by_file {
             for (exported_name, entry) in &exports.exports_by_name {
-                let local = match entry {
-                    ExportEntry::Local { local_name } => Some(local_name.clone()),
-                    ExportEntry::Default { local_name } => local_name.clone(),
+                match entry {
+                    ExportEntry::Local { .. } | ExportEntry::Default { .. } => {}
                     ExportEntry::ReexportedNamed {
                         module_specifier,
                         imported_name,
@@ -57,25 +53,7 @@ impl ProjectUsageGraph {
                                 .or_default()
                                 .push((file.clone(), exported_name.clone()));
                         }
-                        None
                     }
-                };
-                if let Some(local_name) = local {
-                    seed_index
-                        .entry(local_name.clone())
-                        .or_default()
-                        .push((file.clone(), exported_name.clone()));
-                    if local_name != *exported_name {
-                        seed_index
-                            .entry(exported_name.clone())
-                            .or_default()
-                            .push((file.clone(), exported_name.clone()));
-                    }
-                } else {
-                    seed_index
-                        .entry(exported_name.clone())
-                        .or_default()
-                        .push((file.clone(), exported_name.clone()));
                 }
             }
             for star in &exports.reexport_stars {
@@ -95,7 +73,6 @@ impl ProjectUsageGraph {
             exports_by_file,
             reexport_edges,
             star_reexports,
-            seed_index,
             importer_reverse,
         }
     }
@@ -106,7 +83,6 @@ impl ProjectUsageGraph {
             exports_by_file: HashMap::default(),
             reexport_edges: HashMap::default(),
             star_reexports: HashMap::default(),
-            seed_index: HashMap::default(),
             importer_reverse: HashMap::default(),
         }
     }
@@ -130,12 +106,6 @@ impl ProjectUsageGraph {
                 {
                     seeds.insert((target_file.clone(), exported_name.clone()));
                 }
-            }
-        }
-
-        if let Some(matches) = self.seed_index.get(target_short) {
-            for (file, exported_name) in matches {
-                seeds.insert((file.clone(), exported_name.clone()));
             }
         }
 

@@ -1,11 +1,12 @@
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, PythonAnalyzer, Range};
-use crate::hash::{HashMap, HashSet, map_with_capacity};
+use crate::hash::{HashMap, HashSet};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use crate::usages::graph_core::{ImportEdge, ImportEdgeKind, ProjectUsageGraph};
 use crate::usages::model::{ExportIndex, FuzzyResult, ImportBinder, UsageHit};
 use crate::usages::traits::UsageAnalyzer;
 use rayon::prelude::*;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tree_sitter::{Node, Parser, Tree};
 
@@ -55,7 +56,7 @@ impl UsageAnalyzer for PythonExportUsageGraphStrategy {
             };
         };
 
-        let graph = build_python_graph(py);
+        let graph = build_python_graph(py, candidate_files, target.source());
         let seed_names = infer_export_names(py, target);
         if seed_names.is_empty() {
             return FuzzyResult::Failure {
@@ -80,9 +81,7 @@ impl UsageAnalyzer for PythonExportUsageGraphStrategy {
             };
         }
 
-        let importers = graph.usage_graph.importers_of_seeds(&seeds);
-        let scan_files: HashSet<ProjectFile> =
-            candidate_files.iter().cloned().chain(importers).collect();
+        let scan_files = graph.scan_files(candidate_files, target.source());
 
         let hits = scan_files_for_seeds(analyzer, &graph, &scan_files, target, &seeds);
         let hits: BTreeSet<UsageHit> = hits
@@ -113,19 +112,16 @@ fn target_language(target: &CodeUnit) -> Language {
 }
 
 fn infer_export_names(analyzer: &PythonAnalyzer, target: &CodeUnit) -> BTreeSet<String> {
-    let mut export_names =
-        infer_export_names_for_local(analyzer, target.source(), target.identifier());
-    if export_names.is_empty()
-        && (target.is_function() || target.is_field())
+    if (target.is_function() || target.is_field())
         && let Some(owner_name) = owner_name(target)
     {
-        export_names.extend(infer_export_names_for_local(
-            analyzer,
-            target.source(),
-            &owner_name,
-        ));
+        let owner_exports = infer_export_names_for_local(analyzer, target.source(), &owner_name);
+        if !owner_exports.is_empty() {
+            return owner_exports;
+        }
     }
-    export_names
+
+    infer_export_names_for_local(analyzer, target.source(), target.identifier())
 }
 
 fn infer_export_names_for_local(
@@ -161,52 +157,187 @@ struct ParsedFile {
 struct PythonProjectGraph {
     parsed: HashMap<ProjectFile, ParsedFile>,
     usage_graph: ProjectUsageGraph,
+    scoped_files: HashSet<ProjectFile>,
 }
 
-fn build_python_graph(analyzer: &PythonAnalyzer) -> PythonProjectGraph {
-    let files = analyzer.python_files();
-    let parser_language = tree_sitter_python::LANGUAGE.into();
+impl PythonProjectGraph {
+    fn scan_files(
+        &self,
+        candidate_files: &HashSet<ProjectFile>,
+        target_file: &ProjectFile,
+    ) -> HashSet<ProjectFile> {
+        candidate_files
+            .iter()
+            .filter(|file| self.scoped_files.contains(*file))
+            .cloned()
+            .chain(std::iter::once(target_file.clone()))
+            .collect()
+    }
+}
 
-    let parsed_files: Vec<(ProjectFile, ParsedFile, ExportIndex, ImportBinder)> = files
-        .par_iter()
-        .filter_map(|file| {
-            let source = file.read_to_string().ok()?;
+struct PythonGraphAdapter<'a> {
+    analyzer: &'a PythonAnalyzer,
+    module_index: HashMap<String, Vec<ProjectFile>>,
+}
+
+impl<'a> PythonGraphAdapter<'a> {
+    fn new(analyzer: &'a PythonAnalyzer) -> Self {
+        let python_files = collect_python_files(analyzer);
+        let mut module_index: HashMap<String, Vec<ProjectFile>> = HashMap::default();
+        for file in python_files {
+            module_index
+                .entry(python_module_name(&file))
+                .or_default()
+                .push(file);
+        }
+        for files in module_index.values_mut() {
+            files.sort();
+            files.dedup();
+        }
+
+        Self {
+            analyzer,
+            module_index,
+        }
+    }
+
+    fn build_graph(
+        &self,
+        candidate_files: &HashSet<ProjectFile>,
+        target_file: &ProjectFile,
+    ) -> PythonProjectGraph {
+        let parser_language = tree_sitter_python::LANGUAGE.into();
+        let mut scoped_files: HashSet<ProjectFile> = candidate_files.iter().cloned().collect();
+        scoped_files.insert(target_file.clone());
+
+        let mut frontier: VecDeque<ProjectFile> = scoped_files.iter().cloned().collect();
+        let mut parsed: HashMap<ProjectFile, ParsedFile> = HashMap::default();
+        let mut exports_by_file: HashMap<ProjectFile, ExportIndex> = HashMap::default();
+        let mut binders_by_file: HashMap<ProjectFile, ImportBinder> = HashMap::default();
+
+        while let Some(file) = frontier.pop_front() {
+            if parsed.contains_key(&file) {
+                continue;
+            }
+
+            let Ok(source) = file.read_to_string() else {
+                continue;
+            };
+            if source.is_empty() {
+                continue;
+            }
+
             let mut parser = Parser::new();
-            parser.set_language(&parser_language).ok()?;
-            let tree = parser.parse(source.as_str(), None)?;
-            let exports = analyzer.export_index_of(file);
-            let binder = analyzer.import_binder_of(file);
-            Some((
+            if parser.set_language(&parser_language).is_err() {
+                continue;
+            }
+            let Some(tree) = parser.parse(source.as_str(), None) else {
+                continue;
+            };
+
+            let exports = self.analyzer.export_index_of(&file);
+            let binder = self.analyzer.import_binder_of(&file);
+            self.enqueue_frontier_files(&file, &exports, &binder, &mut scoped_files, &mut frontier);
+
+            parsed.insert(
                 file.clone(),
                 ParsedFile {
                     source: Arc::new(source),
                     tree,
                 },
-                exports,
-                binder,
-            ))
-        })
-        .collect();
+            );
+            exports_by_file.insert(file.clone(), exports);
+            binders_by_file.insert(file, binder);
+        }
 
-    let mut parsed = map_with_capacity(parsed_files.len());
-    let mut exports_by_file = map_with_capacity(parsed_files.len());
-    let mut binders_by_file = map_with_capacity(parsed_files.len());
+        let files: Vec<ProjectFile> = parsed.keys().cloned().collect();
+        let usage_graph =
+            ProjectUsageGraph::build(files, exports_by_file, &binders_by_file, |file, module| {
+                self.resolve_module(file, module)
+            });
 
-    for (file, parsed_file, exports, binder) in parsed_files {
-        parsed.insert(file.clone(), parsed_file);
-        exports_by_file.insert(file.clone(), exports);
-        binders_by_file.insert(file, binder);
+        PythonProjectGraph {
+            parsed,
+            usage_graph,
+            scoped_files,
+        }
     }
 
-    let usage_graph =
-        ProjectUsageGraph::build(files, exports_by_file, &binders_by_file, |file, module| {
-            analyzer.resolve_python_module(file, module)
-        });
-
-    PythonProjectGraph {
-        parsed,
-        usage_graph,
+    fn enqueue_frontier_files(
+        &self,
+        file: &ProjectFile,
+        exports: &ExportIndex,
+        binder: &ImportBinder,
+        scoped_files: &mut HashSet<ProjectFile>,
+        frontier: &mut VecDeque<ProjectFile>,
+    ) {
+        for entry in exports.exports_by_name.values() {
+            if let crate::usages::ExportEntry::ReexportedNamed {
+                module_specifier, ..
+            } = entry
+            {
+                self.extend_scope(file, module_specifier, scoped_files, frontier);
+            }
+        }
+        for star in &exports.reexport_stars {
+            self.extend_scope(file, &star.module_specifier, scoped_files, frontier);
+        }
+        for binding in binder.bindings.values() {
+            self.extend_scope(file, &binding.module_specifier, scoped_files, frontier);
+        }
     }
+
+    fn extend_scope(
+        &self,
+        importing_file: &ProjectFile,
+        module_specifier: &str,
+        scoped_files: &mut HashSet<ProjectFile>,
+        frontier: &mut VecDeque<ProjectFile>,
+    ) {
+        for resolved in self.resolve_module(importing_file, module_specifier) {
+            if scoped_files.insert(resolved.clone()) {
+                frontier.push_back(resolved);
+            }
+        }
+    }
+
+    fn resolve_module(
+        &self,
+        importing_file: &ProjectFile,
+        module_specifier: &str,
+    ) -> Vec<ProjectFile> {
+        let resolved_module = if module_specifier.starts_with('.') {
+            resolve_python_relative_module(importing_file, module_specifier)
+        } else {
+            Some(module_specifier.to_string())
+        };
+        let Some(resolved_module) = resolved_module else {
+            return Vec::new();
+        };
+        self.module_index
+            .get(&resolved_module)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+fn build_python_graph(
+    analyzer: &PythonAnalyzer,
+    candidate_files: &HashSet<ProjectFile>,
+    target_file: &ProjectFile,
+) -> PythonProjectGraph {
+    PythonGraphAdapter::new(analyzer).build_graph(candidate_files, target_file)
+}
+
+fn collect_python_files(analyzer: &PythonAnalyzer) -> Vec<ProjectFile> {
+    let mut files: Vec<ProjectFile> = analyzer
+        .project()
+        .analyzable_files(Language::Python)
+        .map(|set| set.into_iter().collect())
+        .unwrap_or_default();
+    files.sort();
+    files.dedup();
+    files
 }
 
 fn scan_files_for_seeds(
@@ -310,20 +441,26 @@ impl ScanCtx<'_> {
 }
 
 fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    match node.kind() {
-        "import_statement" | "import_from_statement" => return,
-        "identifier" => handle_identifier_candidate(node, ctx),
-        "attribute" => handle_attribute_candidate(node, ctx),
-        _ => {}
-    }
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "import_statement" | "import_from_statement" => continue,
+            "identifier" => handle_identifier_candidate(node, ctx),
+            "attribute" => handle_attribute_candidate(node, ctx),
+            _ => {}
+        }
 
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        scan_node(child, ctx);
+        let mut cursor = node.walk();
+        let mut children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
+        children.reverse();
+        stack.extend(children);
     }
 }
 
 fn handle_identifier_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if ctx.target_member.is_some() {
+        return;
+    }
     let text = slice(node, ctx.source);
     if text.is_empty() || !ctx.binds_target(text) || is_declaration_identifier(node) {
         return;
@@ -492,18 +629,149 @@ fn collect_top_level_conflicts(root: Node<'_>, source: &str) -> HashSet<String> 
 }
 
 fn collect_assigned_identifiers(node: Node<'_>, source: &str, out: &mut HashSet<String>) {
-    match node.kind() {
-        "identifier" => {
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "identifier" {
             let text = slice(node, source).trim();
             if !text.is_empty() {
                 out.insert(text.to_string());
             }
+            continue;
         }
-        _ => {
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                collect_assigned_identifiers(child, source, out);
-            }
+
+        let mut cursor = node.walk();
+        let mut children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
+        children.reverse();
+        stack.extend(children);
+    }
+}
+
+fn python_module_name(file: &ProjectFile) -> String {
+    python_module_info(file).module_qualified_package()
+}
+
+struct PythonModuleInfo {
+    package_name: String,
+    module_name: String,
+}
+
+impl PythonModuleInfo {
+    fn module_qualified_package(&self) -> String {
+        if self.package_name.is_empty() {
+            self.module_name.clone()
+        } else {
+            format!("{}.{}", self.package_name, self.module_name)
         }
+    }
+}
+
+fn python_module_info(file: &ProjectFile) -> PythonModuleInfo {
+    let raw_package = python_package_name_for_file(file);
+    let module_name = file
+        .rel_path()
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default()
+        .to_string();
+
+    if module_name == "__init__" && !raw_package.is_empty() {
+        if let Some((package_name, last_segment)) = raw_package.rsplit_once('.') {
+            return PythonModuleInfo {
+                package_name: package_name.to_string(),
+                module_name: last_segment.to_string(),
+            };
+        }
+        return PythonModuleInfo {
+            package_name: String::new(),
+            module_name: raw_package,
+        };
+    }
+
+    PythonModuleInfo {
+        package_name: raw_package,
+        module_name,
+    }
+}
+
+fn python_package_name_for_file(file: &ProjectFile) -> String {
+    let Some(parent_rel) = file.rel_path().parent() else {
+        return String::new();
+    };
+    if parent_rel.as_os_str().is_empty() {
+        return String::new();
+    }
+
+    let mut effective_package_root_rel: Option<&Path> = None;
+    let mut current_rel = Some(parent_rel);
+    while let Some(path) = current_rel {
+        if file.root().join(path).join("__init__.py").exists() {
+            effective_package_root_rel = Some(path);
+        }
+        current_rel = path.parent();
+    }
+
+    let Some(package_root_rel) = effective_package_root_rel else {
+        return dotted_path(parent_rel);
+    };
+
+    let Some(import_root_rel) = package_root_rel.parent() else {
+        return dotted_path(parent_rel);
+    };
+
+    dotted_path(
+        import_root_rel
+            .strip_prefix("")
+            .ok()
+            .and_then(|_| parent_rel.strip_prefix(import_root_rel).ok())
+            .unwrap_or(parent_rel),
+    )
+}
+
+fn dotted_path(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy().to_string())
+        .filter(|component| !component.is_empty())
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn resolve_python_relative_module(source_file: &ProjectFile, module_expr: &str) -> Option<String> {
+    let level = module_expr.chars().take_while(|ch| *ch == '.').count();
+    let suffix = module_expr[level..].trim_matches('.');
+    let current_package = python_current_package(source_file);
+    let mut parts: Vec<_> = current_package
+        .split('.')
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect();
+    if level == 0 {
+        return Some(module_expr.to_string());
+    }
+    if level > 0 {
+        if level - 1 > parts.len() {
+            return None;
+        }
+        parts.truncate(parts.len() - (level - 1));
+    }
+    if !suffix.is_empty() {
+        parts.extend(suffix.split('.').map(str::to_string));
+    }
+    Some(parts.join("."))
+}
+
+fn python_current_package(source_file: &ProjectFile) -> String {
+    let module = python_module_name(source_file);
+    if source_file
+        .rel_path()
+        .file_name()
+        .and_then(|name| name.to_str())
+        == Some("__init__.py")
+    {
+        module
+    } else {
+        module
+            .rsplit_once('.')
+            .map(|(package, _)| package.to_string())
+            .unwrap_or_default()
     }
 }

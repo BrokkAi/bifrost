@@ -375,42 +375,6 @@ impl PythonAnalyzer {
         binder
     }
 
-    pub fn resolve_python_module(
-        &self,
-        importing_file: &ProjectFile,
-        module_specifier: &str,
-    ) -> Vec<ProjectFile> {
-        let resolved_module = if module_specifier.starts_with('.') {
-            resolve_python_relative_module(importing_file, module_specifier)
-        } else {
-            Some(module_specifier.to_string())
-        };
-        let Some(resolved_module) = resolved_module else {
-            return Vec::new();
-        };
-
-        let mut files: Vec<ProjectFile> = self
-            .inner
-            .all_files()
-            .filter(|file| python_module_name(file) == resolved_module)
-            .cloned()
-            .collect();
-        files.sort();
-        files.dedup();
-        files
-    }
-
-    pub fn python_files(&self) -> Vec<ProjectFile> {
-        let mut files: Vec<ProjectFile> = self
-            .project()
-            .analyzable_files(Language::Python)
-            .map(|set| set.into_iter().collect())
-            .unwrap_or_default();
-        files.sort();
-        files.dedup();
-        files
-    }
-
     fn build_reverse_import_index(&self) -> &HashMap<ProjectFile, Arc<HashSet<ProjectFile>>> {
         self.reverse_import_index.get_or_init(|| {
             let _scope = profiling::scope("PythonAnalyzer::build_reverse_import_index");
