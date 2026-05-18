@@ -431,7 +431,9 @@ fn orders_clone_findings_deterministically_across_files_and_peers() {
         ],
         findings
             .iter()
-            .map(|finding| format!("{}->{}", finding.file, finding.peer_file))
+            .map(|finding| {
+                format!("{}->{}", finding.file, finding.peer_file).replace('\\', "/")
+            })
             .collect::<Vec<_>>()
     );
 }
