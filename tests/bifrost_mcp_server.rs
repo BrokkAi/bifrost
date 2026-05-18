@@ -112,6 +112,11 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             .iter()
             .any(|tool| tool["name"] == "report_test_assertion_smells")
     );
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool["name"] == "report_structural_clone_smells")
+    );
 
     let ping = round_trip(
         &mut stdin,
@@ -147,6 +152,118 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     assert!(report.starts_with("## Test assertion smells"), "{report}");
     assert!(report.contains("self-comparison"), "{report}");
     assert!(report.contains("SampleTest.java"), "{report}");
+
+    fs::write(
+        fixture_root.path().join("PeerTest.java"),
+        r#"
+        public class PeerTest {
+            int sameValue(int seed) {
+                int amount = seed + 1;
+                if (amount > 10) {
+                    return amount * 2;
+                }
+                return amount - 3;
+            }
+        }
+        "#,
+    )
+    .expect("write peer java fixture");
+    fs::write(
+        fixture_root.path().join("SampleClone.java"),
+        r#"
+        public class SampleClone {
+            int sameValue(int input) {
+                int total = input + 1;
+                if (total > 10) {
+                    return total * 2;
+                }
+                return total - 3;
+            }
+        }
+        "#,
+    )
+    .expect("write clone java fixture");
+    fs::write(
+        fixture_root.path().join("SampleClone.java"),
+        r#"
+        public class SampleClone {
+            int sameValue(int input) {
+                int total = input + 1;
+                if (total > 10) {
+                    total = total * 2;
+                } else {
+                    total = total - 3;
+                }
+                return total;
+            }
+        }
+        "#,
+    )
+    .expect("rewrite clone java fixture");
+    fs::write(
+        fixture_root.path().join("PeerTest.java"),
+        r#"
+        public class PeerTest {
+            int sameValue(int seed) {
+                int amount = seed + 1;
+                if (amount > 10) {
+                    amount = amount * 2;
+                } else {
+                    amount = amount - 3;
+                }
+                return amount;
+            }
+        }
+        "#,
+    )
+    .expect("rewrite peer java fixture");
+    let refresh = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "refresh",
+                "arguments": {}
+            }
+        }),
+    );
+    assert!(refresh["result"]["structuredContent"]["analyzed_files"].is_number());
+
+    let clone_smells = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "tools/call",
+            "params": {
+                "name": "report_structural_clone_smells",
+                "arguments": {
+                    "file_paths": ["SampleClone.java", "PeerTest.java"]
+                }
+            }
+        }),
+    );
+    let clone_report = clone_smells["result"]["structuredContent"]["report"]
+        .as_str()
+        .expect("clone report string");
+    assert!(
+        clone_report.starts_with("## Structural clone smells"),
+        "{clone_report}"
+    );
+    assert!(
+        clone_report.contains("SampleClone.sameValue"),
+        "{clone_report}"
+    );
+    assert!(
+        clone_report.contains("PeerTest.sameValue"),
+        "{clone_report}"
+    );
 
     drop(stdin);
     let status = child.wait().expect("wait bifrost");

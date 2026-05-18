@@ -557,6 +557,40 @@ pub struct TestAssertionSmell {
     pub start_byte: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloneSmellWeights {
+    pub min_normalized_tokens: i32,
+    pub min_similarity_percent: i32,
+    pub shingle_size: i32,
+    pub min_shared_shingles: i32,
+    pub ast_similarity_percent: i32,
+}
+
+impl CloneSmellWeights {
+    pub fn defaults() -> Self {
+        Self {
+            min_normalized_tokens: 12,
+            min_similarity_percent: 60,
+            shingle_size: 2,
+            min_shared_shingles: 3,
+            ast_similarity_percent: 70,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloneSmell {
+    pub file: ProjectFile,
+    pub enclosing_fq_name: String,
+    pub peer_file: ProjectFile,
+    pub peer_enclosing_fq_name: String,
+    pub score: i32,
+    pub normalized_token_count: i32,
+    pub reasons: Vec<String>,
+    pub excerpt: String,
+    pub peer_excerpt: String,
+}
+
 /// Tunable weights for the exception-handling smell heuristic. Mirrors
 /// brokk-shared `IAnalyzer.ExceptionSmellWeights` field-for-field; callers
 /// can override individual fields by passing positive values and otherwise

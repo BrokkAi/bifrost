@@ -208,6 +208,7 @@ mod comment_density;
 mod cyclomatic;
 mod exception_smells;
 mod maintainability_size;
+mod structural_clone_smells;
 mod test_assertion_smells;
 
 pub use cognitive::{
@@ -230,6 +231,10 @@ pub use exception_smells::{
 pub use maintainability_size::{
     ReportLongMethodAndGodObjectSmellsParams, ReportLongMethodAndGodObjectSmellsResult,
     find_long_method_and_god_object_smells, report_long_method_and_god_object_smells,
+};
+pub use structural_clone_smells::{
+    ReportStructuralCloneSmellsParams, ReportStructuralCloneSmellsResult,
+    report_structural_clone_smells,
 };
 pub use test_assertion_smells::{
     ReportTestAssertionSmellsParams, ReportTestAssertionSmellsResult, report_test_assertion_smells,

@@ -1,9 +1,9 @@
 use crate::analyzer::{
-    CSharpAnalyzer, CodeUnit, CommentDensityStats, CppAnalyzer, DeclarationInfo,
-    ExceptionHandlingSmell, ExceptionSmellWeights, GoAnalyzer, IAnalyzer, ImportAnalysisProvider,
-    ImportInfo, JavaAnalyzer, JavascriptAnalyzer, Language, PhpAnalyzer, Project, ProjectFile,
-    PythonAnalyzer, Range, RustAnalyzer, ScalaAnalyzer, TestDetectionProvider, TypeAliasProvider,
-    TypeHierarchyProvider, TypescriptAnalyzer,
+    CSharpAnalyzer, CloneSmell, CloneSmellWeights, CodeUnit, CommentDensityStats, CppAnalyzer,
+    DeclarationInfo, ExceptionHandlingSmell, ExceptionSmellWeights, GoAnalyzer, IAnalyzer,
+    ImportAnalysisProvider, ImportInfo, JavaAnalyzer, JavascriptAnalyzer, Language, PhpAnalyzer,
+    Project, ProjectFile, PythonAnalyzer, Range, RustAnalyzer, ScalaAnalyzer,
+    TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider, TypescriptAnalyzer,
 };
 use crate::hash::HashSet;
 use rayon::prelude::*;
@@ -411,6 +411,51 @@ impl IAnalyzer for MultiAnalyzer {
                     .find_exception_handling_smells(file, weights)
             })
             .unwrap_or_default()
+    }
+
+    fn find_structural_clone_smells(
+        &self,
+        file: &ProjectFile,
+        weights: CloneSmellWeights,
+    ) -> Vec<CloneSmell> {
+        self.delegate_for_file(file)
+            .map(|delegate| {
+                delegate
+                    .analyzer()
+                    .find_structural_clone_smells(file, weights)
+            })
+            .unwrap_or_default()
+    }
+
+    fn find_structural_clone_smells_for_files(
+        &self,
+        files: &[ProjectFile],
+        weights: CloneSmellWeights,
+    ) -> Vec<CloneSmell> {
+        let mut grouped: BTreeMap<Language, Vec<ProjectFile>> = BTreeMap::new();
+        for file in files {
+            let extension = file
+                .rel_path()
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .unwrap_or_default();
+            grouped
+                .entry(Language::from_extension(extension))
+                .or_default()
+                .push(file.clone());
+        }
+
+        let mut findings = Vec::new();
+        for (language, group) in grouped {
+            if let Some(delegate) = self.delegates.get(&language) {
+                findings.extend(
+                    delegate
+                        .analyzer()
+                        .find_structural_clone_smells_for_files(&group, weights),
+                );
+            }
+        }
+        findings
     }
 
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {

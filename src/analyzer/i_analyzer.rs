@@ -1,8 +1,8 @@
 use crate::analyzer::{
-    CodeBaseMetrics, CodeUnit, CodeUnitType, CommentDensityStats, DeclarationInfo,
-    ExceptionHandlingSmell, ExceptionSmellWeights, ImportAnalysisProvider, Language, Project,
-    ProjectFile, Range, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
-    TypeAliasProvider, TypeHierarchyProvider, metrics_from_declarations,
+    CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType, CommentDensityStats,
+    DeclarationInfo, ExceptionHandlingSmell, ExceptionSmellWeights, ImportAnalysisProvider,
+    Language, Project, ProjectFile, Range, TestAssertionSmell, TestAssertionWeights,
+    TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider, metrics_from_declarations,
 };
 use crate::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, FuzzyResult, UsageFinder};
 use std::any::Any;
@@ -273,6 +273,25 @@ pub trait IAnalyzer: Send + Sync + Any {
         _weights: TestAssertionWeights,
     ) -> Vec<TestAssertionSmell> {
         Vec::new()
+    }
+
+    fn find_structural_clone_smells(
+        &self,
+        _file: &ProjectFile,
+        _weights: CloneSmellWeights,
+    ) -> Vec<CloneSmell> {
+        Vec::new()
+    }
+
+    fn find_structural_clone_smells_for_files(
+        &self,
+        files: &[ProjectFile],
+        weights: CloneSmellWeights,
+    ) -> Vec<CloneSmell> {
+        files
+            .iter()
+            .flat_map(|file| self.find_structural_clone_smells(file, weights))
+            .collect()
     }
 
     fn get_skeletons(&self, file: &ProjectFile) -> BTreeMap<CodeUnit, String> {

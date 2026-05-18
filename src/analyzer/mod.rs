@@ -1,4 +1,5 @@
 mod capabilities;
+mod clone_detection;
 pub mod cognitive_complexity;
 #[cfg(test)]
 mod cognitive_complexity_tests;
@@ -36,10 +37,10 @@ pub use java_analyzer::JavaAnalyzer;
 pub use javascript_analyzer::JavascriptAnalyzer;
 pub(crate) use javascript_analyzer::resolve_js_ts_module_specifier;
 pub use model::{
-    CodeBaseMetrics, CodeUnit, CodeUnitType, CommentDensityStats, DeclarationInfo, DeclarationKind,
-    ExceptionHandlingSmell, ExceptionSmellWeights, ImportInfo, Language, MaintainabilitySizeSmell,
-    MaintainabilitySizeSmellWeights, ProjectFile, Range, TestAssertionSmell, TestAssertionWeights,
-    metrics_from_declarations,
+    CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType, CommentDensityStats,
+    DeclarationInfo, DeclarationKind, ExceptionHandlingSmell, ExceptionSmellWeights, ImportInfo,
+    Language, MaintainabilitySizeSmell, MaintainabilitySizeSmellWeights, ProjectFile, Range,
+    TestAssertionSmell, TestAssertionWeights, metrics_from_declarations,
 };
 pub use multi_analyzer::{AnalyzerDelegate, MultiAnalyzer};
 pub use php_analyzer::PhpAnalyzer;

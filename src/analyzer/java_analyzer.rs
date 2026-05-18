@@ -1,10 +1,16 @@
+use crate::analyzer::clone_detection::{
+    CloneCandidateData, CloneCandidateProfile, build_clone_reason, can_reach_clone_similarity,
+    compact_clone_excerpt, compare_clone_units, compute_ast_refinement_similarity_percent,
+    compute_clone_token_similarity,
+};
 use crate::analyzer::cognitive_complexity;
 use crate::analyzer::tree_sitter_analyzer::expanded_comment_start;
 use crate::analyzer::{
-    AnalyzerConfig, CodeUnit, CommentDensityStats, DeclarationInfo, DeclarationKind,
-    ExceptionHandlingSmell, ExceptionSmellWeights, IAnalyzer, ImportAnalysisProvider, ImportInfo,
-    Language, LanguageAdapter, Project, ProjectFile, TestAssertionSmell, TestAssertionWeights,
-    TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider, build_reverse_import_index,
+    AnalyzerConfig, CloneSmell, CloneSmellWeights, CodeUnit, CommentDensityStats, DeclarationInfo,
+    DeclarationKind, ExceptionHandlingSmell, ExceptionSmellWeights, IAnalyzer,
+    ImportAnalysisProvider, ImportInfo, Language, LanguageAdapter, Project, ProjectFile,
+    SourceContent, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
+    TreeSitterAnalyzer, TypeHierarchyProvider, build_reverse_import_index,
     direct_descendants_via_ancestors,
 };
 use crate::hash::{HashMap, HashSet};
@@ -43,6 +49,29 @@ fn java_is_default_switch_label(node: Node<'_>, source: &str) -> bool {
     };
     text.trim_start().starts_with("default")
 }
+
+static CLONE_AST_IDENTIFIER_TYPES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
+    HashSet::from_iter([
+        "identifier",
+        "type_identifier",
+        "scoped_identifier",
+        "scoped_type_identifier",
+    ])
+});
+static CLONE_AST_STRING_TYPES: LazyLock<HashSet<&'static str>> =
+    LazyLock::new(|| HashSet::from_iter(["string_literal", "character_literal"]));
+static CLONE_AST_NUMBER_TYPES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
+    HashSet::from_iter([
+        "decimal_integer_literal",
+        "hex_integer_literal",
+        "octal_integer_literal",
+        "binary_integer_literal",
+        "decimal_floating_point_literal",
+        "hex_floating_point_literal",
+    ])
+});
+static CLONE_AST_IGNORED_TYPES: LazyLock<HashSet<&'static str>> =
+    LazyLock::new(|| HashSet::from_iter(["modifiers", "type_parameters"]));
 
 #[derive(Debug, Clone, Default)]
 pub struct JavaAdapter;
@@ -2023,6 +2052,111 @@ impl IAnalyzer for JavaAnalyzer {
         };
         detect_test_assertion_smells_java(self, file, &source, &weights)
     }
+
+    fn find_structural_clone_smells(
+        &self,
+        file: &ProjectFile,
+        weights: CloneSmellWeights,
+    ) -> Vec<CloneSmell> {
+        self.find_structural_clone_smells_for_files(std::slice::from_ref(file), weights)
+    }
+
+    fn find_structural_clone_smells_for_files(
+        &self,
+        files: &[ProjectFile],
+        weights: CloneSmellWeights,
+    ) -> Vec<CloneSmell> {
+        let requested_files: HashSet<ProjectFile> = files
+            .iter()
+            .filter(|file| file_language(file) == Language::Java)
+            .cloned()
+            .collect();
+        if requested_files.is_empty() {
+            return Vec::new();
+        }
+
+        let all_candidates: Vec<CloneCandidateProfile> = self
+            .get_all_declarations()
+            .into_iter()
+            .filter(|code_unit| {
+                code_unit.is_function() && file_language(code_unit.source()) == Language::Java
+            })
+            .filter_map(|code_unit| self.build_clone_candidate_data(&code_unit, weights))
+            .map(|candidate| CloneCandidateProfile::create(candidate, weights))
+            .collect();
+        if all_candidates.is_empty() {
+            return Vec::new();
+        }
+
+        let requested_candidates: Vec<&CloneCandidateProfile> = all_candidates
+            .iter()
+            .filter(|candidate| requested_files.contains(candidate.data.unit.source()))
+            .collect();
+        if requested_candidates.is_empty() {
+            return Vec::new();
+        }
+
+        let mut findings = Vec::new();
+        for left in requested_candidates {
+            for right in &all_candidates {
+                if left.data.unit == right.data.unit {
+                    continue;
+                }
+                if requested_files.contains(right.data.unit.source())
+                    && compare_clone_units(&left.data.unit, &right.data.unit).is_gt()
+                {
+                    continue;
+                }
+                if !can_reach_clone_similarity(left.shingle_count, right.shingle_count, weights) {
+                    continue;
+                }
+                let token_similarity =
+                    compute_clone_token_similarity(&left.shingles, &right.shingles, weights);
+                if token_similarity < weights.min_similarity_percent {
+                    continue;
+                }
+                let refined_similarity = refine_java_clone_similarity(
+                    &left.data,
+                    &right.data,
+                    token_similarity,
+                    weights,
+                );
+                if refined_similarity < weights.min_similarity_percent {
+                    continue;
+                }
+                findings.push(CloneSmell {
+                    file: left.data.unit.source().clone(),
+                    enclosing_fq_name: left.data.unit.fq_name(),
+                    peer_file: right.data.unit.source().clone(),
+                    peer_enclosing_fq_name: right.data.unit.fq_name(),
+                    score: refined_similarity,
+                    normalized_token_count: left
+                        .data
+                        .normalized_tokens
+                        .len()
+                        .min(right.data.normalized_tokens.len())
+                        as i32,
+                    reasons: vec![build_clone_reason(token_similarity, refined_similarity)],
+                    excerpt: left.data.excerpt.clone(),
+                    peer_excerpt: right.data.excerpt.clone(),
+                });
+            }
+        }
+
+        findings.sort_by(|left, right| {
+            right
+                .score
+                .cmp(&left.score)
+                .then_with(|| left.file.to_string().cmp(&right.file.to_string()))
+                .then_with(|| left.enclosing_fq_name.cmp(&right.enclosing_fq_name))
+                .then_with(|| left.peer_file.to_string().cmp(&right.peer_file.to_string()))
+                .then_with(|| {
+                    left.peer_enclosing_fq_name
+                        .cmp(&right.peer_enclosing_fq_name)
+                })
+        });
+        findings
+    }
 }
 
 fn file_language(file: &ProjectFile) -> Language {
@@ -2031,6 +2165,156 @@ fn file_language(file: &ProjectFile) -> Language {
         .and_then(|ext| ext.to_str())
         .map(Language::from_extension)
         .unwrap_or(Language::None)
+}
+
+impl JavaAnalyzer {
+    fn build_clone_candidate_data(
+        &self,
+        code_unit: &CodeUnit,
+        weights: CloneSmellWeights,
+    ) -> Option<CloneCandidateData> {
+        self.get_source(code_unit, false)
+            .map(|source| source.trim().to_string())
+            .filter(|source| !source.is_empty())
+            .and_then(|source| {
+                let normalized_tokens = normalized_clone_tokens_java(&source);
+                if normalized_tokens.len() < weights.min_normalized_tokens.max(0) as usize {
+                    return None;
+                }
+                Some(CloneCandidateData {
+                    unit: code_unit.clone(),
+                    normalized_tokens,
+                    ast_signature: build_java_clone_ast_signature(&source),
+                    excerpt: compact_clone_excerpt(&source),
+                })
+            })
+    }
+}
+
+fn normalized_clone_tokens_java(source: &str) -> Vec<String> {
+    let Some(tree) = parse_tree(source) else {
+        return Vec::new();
+    };
+    let content = SourceContent::new(source);
+    let mut out = Vec::new();
+    collect_normalized_leaf_tokens_java(tree.root_node(), &content, &mut out);
+    out
+}
+
+fn collect_normalized_leaf_tokens_java(
+    node: Node<'_>,
+    source_content: &SourceContent,
+    out: &mut Vec<String>,
+) {
+    if node.named_child_count() == 0 {
+        let token = normalize_java_clone_leaf_token(node, source_content);
+        if !token.is_empty() {
+            out.push(token);
+        }
+    }
+    let child_count = node.child_count();
+    for index in 0..child_count {
+        if let Some(child) = node.child(index) {
+            collect_normalized_leaf_tokens_java(child, source_content, out);
+        }
+    }
+}
+
+fn normalize_java_clone_leaf_token(node: Node<'_>, source_content: &SourceContent) -> String {
+    let kind = node.kind();
+    let token = source_content
+        .as_str()
+        .get(node.start_byte()..node.end_byte())
+        .unwrap_or("")
+        .trim();
+    if token.is_empty() {
+        return String::new();
+    }
+    if CLONE_AST_IDENTIFIER_TYPES.contains(kind) {
+        return "ID".to_string();
+    }
+    if CLONE_AST_STRING_TYPES.contains(kind) {
+        return "STR".to_string();
+    }
+    if CLONE_AST_NUMBER_TYPES.contains(kind) {
+        return "NUM".to_string();
+    }
+    if token == "true" || token == "false" {
+        return "BOOL".to_string();
+    }
+    if token.chars().count() == 1 && token.chars().all(|ch| !ch.is_alphanumeric()) {
+        return format!("OP:{token}");
+    }
+    format!("T:{kind}")
+}
+
+fn build_java_clone_ast_signature(source: &str) -> String {
+    let Some(tree) = parse_tree(source) else {
+        return String::new();
+    };
+    let content = SourceContent::new(source);
+    let mut labels = Vec::new();
+    collect_java_clone_ast_labels(tree.root_node(), &content, &mut labels);
+    labels.join("|")
+}
+
+fn collect_java_clone_ast_labels(
+    node: Node<'_>,
+    source_content: &SourceContent,
+    out: &mut Vec<String>,
+) {
+    out.push(normalize_java_clone_ast_label(node, source_content));
+    let child_count = node.child_count();
+    for index in 0..child_count {
+        if let Some(child) = node.child(index) {
+            collect_java_clone_ast_labels(child, source_content, out);
+        }
+    }
+}
+
+fn normalize_java_clone_ast_label(node: Node<'_>, source_content: &SourceContent) -> String {
+    let kind = node.kind();
+    let text = source_content
+        .as_str()
+        .get(node.start_byte()..node.end_byte())
+        .unwrap_or("")
+        .trim();
+    if CLONE_AST_IDENTIFIER_TYPES.contains(kind) {
+        return "ID".to_string();
+    }
+    if CLONE_AST_STRING_TYPES.contains(kind) {
+        return "STR".to_string();
+    }
+    if CLONE_AST_NUMBER_TYPES.contains(kind) {
+        return "NUM".to_string();
+    }
+    if kind == "boolean_literal" || text == "true" || text == "false" {
+        return "BOOL".to_string();
+    }
+    if CLONE_AST_IGNORED_TYPES.contains(kind) {
+        return "IGN".to_string();
+    }
+    format!("N:{kind}")
+}
+
+fn refine_java_clone_similarity(
+    left: &CloneCandidateData,
+    right: &CloneCandidateData,
+    token_similarity: i32,
+    weights: CloneSmellWeights,
+) -> i32 {
+    if left.ast_signature.is_empty() || right.ast_signature.is_empty() {
+        return token_similarity;
+    }
+    let ast_similarity =
+        compute_ast_refinement_similarity_percent(&left.ast_signature, &right.ast_signature);
+    if ast_similarity == 0 {
+        return token_similarity;
+    }
+    if ast_similarity < weights.ast_similarity_percent {
+        return 0;
+    }
+    token_similarity.min(ast_similarity)
 }
 
 /// Collect per-declaration header/inline comment line counts for a Java file.

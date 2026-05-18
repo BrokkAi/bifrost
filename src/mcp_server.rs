@@ -705,6 +705,47 @@ fn list_tools_result() -> Value {
                 }),
             ),
             tool_descriptor(
+                "report_structural_clone_smells",
+                "Detects suspicious structural clones using token shingles plus Java AST refinement. Uses analyzer-provided clone smells for high-recall triage. Output format matches the brokk-core MCP byte-for-byte.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "file_paths": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Project-relative paths of files to analyze."
+                        },
+                        "min_score": {
+                            "type": "integer",
+                            "default": 60,
+                            "description": "Minimum score to include a finding; values <= 0 default to the brokk clone threshold (60)."
+                        },
+                        "min_normalized_tokens": {
+                            "type": "integer",
+                            "description": "Minimum normalized token count for a clone candidate; values <= 0 use the brokk default (12)."
+                        },
+                        "shingle_size": {
+                            "type": "integer",
+                            "description": "Token shingle size; values <= 0 use the brokk default (2)."
+                        },
+                        "min_shared_shingles": {
+                            "type": "integer",
+                            "description": "Minimum shared shingles before similarity is considered; values <= 0 use the brokk default (3)."
+                        },
+                        "ast_similarity_percent": {
+                            "type": "integer",
+                            "description": "Minimum AST refinement similarity; values <= 0 use the brokk default (70)."
+                        },
+                        "max_findings": {
+                            "type": "integer",
+                            "default": 80,
+                            "description": "Maximum findings to emit; values <= 0 default to 80."
+                        }
+                    },
+                    "required": ["file_paths"]
+                }),
+            ),
+            tool_descriptor(
                 "report_long_method_and_god_object_smells",
                 "Detects oversized functions, god classes, and god modules using weighted maintainability-size thresholds. Walks the declaration tree per file, rolling up function/nested-type counts and cyclomatic complexity. Tunable knobs apply when supplied; values <= 0 use brokk defaults. File-level modules (JS/TS, Python, Rust, Go, C++) get a built-in leeway multiplier. Output format matches the brokk-core MCP byte-for-byte.",
                 json!({
