@@ -5,6 +5,23 @@ use crate::lsp::conversion::{byte_range_to_lsp_range, uri_to_path};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use lsp_types::{Range as LspRange, Uri};
 
+/// Resolve an LSP `Uri` to a [`ProjectFile`], read its contents, and compute
+/// the line-start index — the prologue used by every per-file handler. Returns
+/// `None` if the URI doesn't map into the project root, or the file cannot be
+/// read. Callers that need the analyzer borrow it from the workspace
+/// themselves (`workspace.analyzer()`); the analyzer capture is intentionally
+/// not bundled here because its placement (before vs. after the read) varies
+/// across handlers.
+pub fn read_document_for_uri(
+    project_root: &Path,
+    uri: &Uri,
+) -> Option<(ProjectFile, String, Vec<usize>)> {
+    let project_file = project_file_for_uri(project_root, uri)?;
+    let content = project_file.read_to_string().ok()?;
+    let line_starts = compute_line_starts(&content);
+    Some((project_file, content, line_starts))
+}
+
 /// Resolve an LSP `Uri` to a [`ProjectFile`] inside `project_root`. Returns
 /// `None` for non-`file:` URIs or paths outside the project, logging a
 /// single-line stderr warning so users debugging "why is my LSP request

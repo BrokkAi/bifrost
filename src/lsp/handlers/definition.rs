@@ -6,7 +6,7 @@ use crate::analyzer::{CodeUnit, IAnalyzer, Range as ByteRange, WorkspaceAnalyzer
 use crate::lsp::conversion::{
     byte_range_to_lsp_range, path_to_uri_string, position_to_byte_offset,
 };
-use crate::lsp::handlers::util::{identifier_at_offset, project_file_for_uri};
+use crate::lsp::handlers::util::{identifier_at_offset, read_document_for_uri};
 use crate::text_utils::compute_line_starts;
 
 /// Resolve `textDocument/definition`. Strategy:
@@ -25,10 +25,7 @@ pub fn handle(
     params: &GotoDefinitionParams,
 ) -> Option<GotoDefinitionResponse> {
     let uri = &params.text_document_position_params.text_document.uri;
-    let project_file = project_file_for_uri(project_root, uri)?;
-
-    let content = project_file.read_to_string().ok()?;
-    let line_starts = compute_line_starts(&content);
+    let (_, content, line_starts) = read_document_for_uri(project_root, uri)?;
     let byte_offset = position_to_byte_offset(
         &content,
         &line_starts,

@@ -1374,8 +1374,15 @@ fn bifrost_lsp_server_unknown_request_returns_method_not_found() {
         json!({
             "jsonrpc": "2.0",
             "id": 2,
-            "method": "textDocument/foldingRange",
-            "params": {"textDocument": {"uri": "file:///nope"}}
+            "method": "textDocument/codeAction",
+            "params": {
+                "textDocument": {"uri": "file:///nope"},
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 0}
+                },
+                "context": {"diagnostics": []}
+            }
         }),
     );
     let response = read_message(&mut reader, &mut stderr);
@@ -1506,6 +1513,109 @@ fn bifrost_lsp_server_did_save_publishes_diagnostics() {
     write_message(
         &mut stdin,
         json!({"jsonrpc": "2.0", "id": 99, "method": "shutdown"}),
+    );
+    let _ = read_message(&mut reader, &mut stderr);
+    write_message(&mut stdin, json!({"jsonrpc": "2.0", "method": "exit"}));
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
+fn bifrost_lsp_server_returns_folding_ranges_for_a_java() {
+    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("testcode-java");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(&fixture_root)
+        .arg("--server")
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bifrost");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    let canonical_root = fixture_root.canonicalize().expect("canon fixture");
+    let root_uri = uri_for(&canonical_root);
+    let file_uri = uri_for(&canonical_root.join("A.java"));
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "processId": null,
+                "rootUri": root_uri,
+                "capabilities": {}
+            }
+        }),
+    );
+    let init = read_message(&mut reader, &mut stderr);
+    assert_eq!(init["id"], 1);
+    assert_eq!(
+        init["result"]["capabilities"]["foldingRangeProvider"], true,
+        "foldingRangeProvider should be advertised: {init}"
+    );
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "textDocument/foldingRange",
+            "params": {"textDocument": {"uri": file_uri}}
+        }),
+    );
+    let response = read_message(&mut reader, &mut stderr);
+    assert_eq!(response["id"], 2);
+    let folds = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected array result, got {response}"));
+
+    assert!(
+        !folds.is_empty(),
+        "expected at least one folding range, got {folds:#?}"
+    );
+
+    // No mono-line folds, and dedup invariant: every (startLine, endLine) pair is unique.
+    let mut pairs: Vec<(u64, u64)> = Vec::with_capacity(folds.len());
+    for fold in folds {
+        let start = fold["startLine"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("startLine missing or non-numeric: {fold}"));
+        let end = fold["endLine"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("endLine missing or non-numeric: {fold}"));
+        assert!(end > start, "mono-line fold leaked through filter: {fold}");
+        pairs.push((start, end));
+    }
+    let mut sorted = pairs.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(
+        sorted.len(),
+        pairs.len(),
+        "duplicate folds returned: {pairs:?}"
+    );
+
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown"}),
     );
     let _ = read_message(&mut reader, &mut stderr);
     write_message(&mut stdin, json!({"jsonrpc": "2.0", "method": "exit"}));

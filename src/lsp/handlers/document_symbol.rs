@@ -4,7 +4,7 @@ use lsp_types::{DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, Sy
 
 use crate::analyzer::{CodeUnit, CodeUnitType, IAnalyzer, Range as ByteRange, WorkspaceAnalyzer};
 use crate::lsp::conversion::byte_range_to_lsp_range;
-use crate::lsp::handlers::util::{find_word, identifier_selection_range, project_file_for_uri};
+use crate::lsp::handlers::util::{find_word, identifier_selection_range, read_document_for_uri};
 use crate::text_utils::compute_line_starts;
 
 /// Build the documentSymbol response for a request URI. Returns `None` when
@@ -15,12 +15,9 @@ pub fn handle(
     project_root: &Path,
     params: &DocumentSymbolParams,
 ) -> Option<DocumentSymbolResponse> {
-    let project_file = project_file_for_uri(project_root, &params.text_document.uri)?;
+    let (project_file, content, line_starts) =
+        read_document_for_uri(project_root, &params.text_document.uri)?;
     let analyzer = workspace.analyzer();
-
-    // Read the file once for line-start info; rendering is fast after that.
-    let content = project_file.read_to_string().ok()?;
-    let line_starts = compute_line_starts(&content);
 
     let symbols: Vec<DocumentSymbol> = analyzer
         .top_level_declarations(&project_file)

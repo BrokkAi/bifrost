@@ -10,8 +10,9 @@ use lsp_types::notification::{
     PublishDiagnostics,
 };
 use lsp_types::request::{
-    DocumentDiagnosticRequest, DocumentHighlightRequest, DocumentSymbolRequest, GotoDefinition,
-    HoverRequest, References, Request as LspRequestTrait, WorkspaceSymbolRequest,
+    DocumentDiagnosticRequest, DocumentHighlightRequest, DocumentSymbolRequest,
+    FoldingRangeRequest, GotoDefinition, HoverRequest, References, Request as LspRequestTrait,
+    WorkspaceSymbolRequest,
 };
 use lsp_types::{
     DidChangeWatchedFilesParams, DidSaveTextDocumentParams, FileChangeType, InitializeParams,
@@ -23,7 +24,7 @@ use crate::lsp::capabilities::server_capabilities;
 use crate::lsp::conversion::uri_to_path;
 use crate::lsp::handlers::util::project_file_for_uri as resolve_project_file;
 use crate::lsp::handlers::{
-    definition, diagnostic, document_highlight, document_symbol, hover, references,
+    definition, diagnostic, document_highlight, document_symbol, folding_range, hover, references,
     workspace_symbol,
 };
 
@@ -101,6 +102,13 @@ fn handle_request(
                 ))
             })
         }
+        FoldingRangeRequest::METHOD => decode_and_run::<FoldingRangeRequest, _>(req, |params| {
+            Ok(folding_range::handle(
+                &state.workspace,
+                state.project.root(),
+                &params,
+            ))
+        }),
         WorkspaceSymbolRequest::METHOD => {
             decode_and_run::<WorkspaceSymbolRequest, _>(req, |params| {
                 Ok(workspace_symbol::handle(&state.workspace, &params))
