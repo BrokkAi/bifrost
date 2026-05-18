@@ -19,8 +19,7 @@ fn uri_for(path: &Path) -> String {
 /// line 3 is a stand-alone identifier prefix — tree-sitter still extracts the
 /// surrounding declarations even though the body doesn't parse cleanly, so
 /// the analyzer reports `greetEveryone` as a Function.
-const COMPLETOR_JAVA_FIXTURE: &str =
-    "public class Completor {\n    public void greetEveryone() {}\n    void caller() {\n        gree\n    }\n}\n";
+const COMPLETOR_JAVA_FIXTURE: &str = "public class Completor {\n    public void greetEveryone() {}\n    void caller() {\n        gree\n    }\n}\n";
 
 fn write_completor_fixture(temp_root: &Path) -> std::path::PathBuf {
     let file = temp_root.join("Completor.java");

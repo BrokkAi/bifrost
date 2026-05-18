@@ -331,7 +331,10 @@ mod tests {
         // Completion must not consume the suffix the user is overwriting.
         assert_eq!(identifier_prefix_before_offset(content, 7), Some("foo"));
         // Cursor at end of "foo_bar".
-        assert_eq!(identifier_prefix_before_offset(content, 11), Some("foo_bar"));
+        assert_eq!(
+            identifier_prefix_before_offset(content, 11),
+            Some("foo_bar")
+        );
         // Cursor sits on whitespace following an identifier.
         assert_eq!(identifier_prefix_before_offset(content, 12), None);
         // Cursor at file start.
