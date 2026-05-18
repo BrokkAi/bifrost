@@ -21,6 +21,8 @@ The observable outcome is that `report_structural_clone_smells` works consistent
 - [x] (2026-05-18) Validated the Milestone 1 checkpoint with `cargo test --test python_structural_clone_smells -- --nocapture`, `cargo test --test searchtools_service python_boundary_returns_structural_clone_report_json -- --nocapture`, `cargo test --test bifrost_mcp_server bifrost_searchtools_server_speaks_mcp_stdio -- --nocapture`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings`.
 - [x] (2026-05-18) Completed Milestone 2. Added structural clone detection for both `JavascriptAnalyzer` and `TypescriptAnalyzer`, plus parity-style JS/TS tests in `tests/js_ts_structural_clone_smells.rs` covering TypeScript parity cases, JavaScript smoke coverage, and mixed JS-plus-TS `MultiAnalyzer` routing.
 - [x] (2026-05-18) Validated the Milestone 2 checkpoint with `cargo test --test js_ts_structural_clone_smells -- --nocapture`, `cargo test --test searchtools_service python_boundary_returns_structural_clone_report_json -- --nocapture`, `cargo test --test bifrost_mcp_server bifrost_searchtools_server_speaks_mcp_stdio -- --nocapture`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings`.
+- [x] (2026-05-18) Completed Milestone 3. Extracted the shared pairwise clone-finding loop into `src/analyzer/clone_detection.rs`, rewired Java/Python/JavaScript/TypeScript analyzers to use it, and added direct shared similarity tests modeled on Brokk’s `TreeSitterCloneSimilarityTest`.
+- [x] (2026-05-18) Validated the Milestone 3 checkpoint with `cargo test --lib clone_detection::tests -- --nocapture`, `cargo test --test java_structural_clone_smells -- --nocapture`, `cargo test --test python_structural_clone_smells -- --nocapture`, `cargo test --test js_ts_structural_clone_smells -- --nocapture`, `cargo test --test searchtools_service python_boundary_returns_structural_clone_report_json -- --nocapture`, `cargo test --test bifrost_mcp_server bifrost_searchtools_server_speaks_mcp_stdio -- --nocapture`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings`.
 - [ ] Add this plan’s milestone tracker updates as each language slice lands.
 - [ ] Keep the `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` sections current during implementation.
 
@@ -40,6 +42,9 @@ The observable outcome is that `report_structural_clone_smells` works consistent
 
 - Observation: JS and TS shared enough clone semantics that a thin shared helper layer inside the existing Rust JS analyzer utilities was sufficient.
   Evidence: both analyzers now reuse the same token normalization, AST-signature construction, and refinement helpers while keeping their own analyzer-specific file filtering and parser-language selection.
+
+- Observation: after Java, Python, JS, and TS were all live, the remaining duplicated logic was concentrated almost entirely in the pairwise candidate-comparison loop rather than in candidate construction.
+  Evidence: Milestone 3 could remove the shared scan, ordering, and symmetric-pair suppression logic without disturbing the language-specific candidate builders and AST-refinement hooks.
 
 ## Decision Log
 
@@ -64,6 +69,8 @@ The expected end state is that `bifrost` supports structural clone smells across
 Milestone 1 outcome: Python is now in the same category as Java for this feature. `bifrost` has Brokk-style Python clone-smell semantics for the currently covered cases, and the shared engine plus MCP/report path needed no schema or routing changes beyond the Python analyzer implementation itself.
 
 Milestone 2 outcome: JS/TS now joins Java and Python as a Brokk-backed parity slice. The Rust implementation needed only a small shared JS/TS clone-helper layer rather than a broader analyzer rewrite, which is a good sign for the upcoming shared-engine consolidation milestone.
+
+Milestone 3 outcome: the shared clone engine is materially cleaner. The common detection loop now lives in one place, and direct unit tests cover the hashed shingle similarity and prefilter behavior independently of any one language analyzer. That reduces the risk of semantic drift as the first non-Brokk-backed languages are added next.
 
 ## Context and Orientation
 

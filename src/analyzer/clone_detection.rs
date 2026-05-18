@@ -1,4 +1,4 @@
-use crate::analyzer::{CloneSmellWeights, CodeUnit};
+use crate::analyzer::{CloneSmell, CloneSmellWeights, CodeUnit, ProjectFile};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
@@ -150,6 +150,86 @@ pub(crate) fn compare_clone_units(left: &CodeUnit, right: &CodeUnit) -> std::cmp
         .then_with(|| left.fq_name().cmp(&right.fq_name()))
 }
 
+pub(crate) fn detect_structural_clone_smells<F>(
+    requested_files: &[ProjectFile],
+    all_candidates: Vec<CloneCandidateProfile>,
+    weights: CloneSmellWeights,
+    refine_similarity: F,
+) -> Vec<CloneSmell>
+where
+    F: Fn(&CloneCandidateData, &CloneCandidateData, i32, CloneSmellWeights) -> i32,
+{
+    let requested_files: HashSet<ProjectFile> = requested_files.iter().cloned().collect();
+    if requested_files.is_empty() || all_candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let requested_candidates: Vec<&CloneCandidateProfile> = all_candidates
+        .iter()
+        .filter(|candidate| requested_files.contains(candidate.data.unit.source()))
+        .collect();
+    if requested_candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let mut findings = Vec::new();
+    for left in requested_candidates {
+        for right in &all_candidates {
+            if left.data.unit == right.data.unit {
+                continue;
+            }
+            if requested_files.contains(right.data.unit.source())
+                && compare_clone_units(&left.data.unit, &right.data.unit).is_gt()
+            {
+                continue;
+            }
+            if !can_reach_clone_similarity(left.shingle_count, right.shingle_count, weights) {
+                continue;
+            }
+            let token_similarity =
+                compute_clone_token_similarity(&left.shingles, &right.shingles, weights);
+            if token_similarity < weights.min_similarity_percent {
+                continue;
+            }
+            let refined_similarity =
+                refine_similarity(&left.data, &right.data, token_similarity, weights);
+            if refined_similarity < weights.min_similarity_percent {
+                continue;
+            }
+            findings.push(CloneSmell {
+                file: left.data.unit.source().clone(),
+                enclosing_fq_name: left.data.unit.fq_name(),
+                peer_file: right.data.unit.source().clone(),
+                peer_enclosing_fq_name: right.data.unit.fq_name(),
+                score: refined_similarity,
+                normalized_token_count: left
+                    .data
+                    .normalized_tokens
+                    .len()
+                    .min(right.data.normalized_tokens.len())
+                    as i32,
+                reasons: vec![build_clone_reason(token_similarity, refined_similarity)],
+                excerpt: left.data.excerpt.clone(),
+                peer_excerpt: right.data.excerpt.clone(),
+            });
+        }
+    }
+
+    findings.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| left.file.to_string().cmp(&right.file.to_string()))
+            .then_with(|| left.enclosing_fq_name.cmp(&right.enclosing_fq_name))
+            .then_with(|| left.peer_file.to_string().cmp(&right.peer_file.to_string()))
+            .then_with(|| {
+                left.peer_enclosing_fq_name
+                    .cmp(&right.peer_enclosing_fq_name)
+            })
+    });
+    findings
+}
+
 fn compute_ast_label_multiset_similarity_percent(left: &str, right: &str) -> i32 {
     let left_counts = ast_label_counts(left);
     let right_counts = ast_label_counts(right);
@@ -255,4 +335,206 @@ fn intersection_size(left: &LongShingles, right: &LongShingles) -> usize {
         }
     }
     count
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        LongShingles, can_reach_clone_similarity, compute_clone_token_similarity,
+        hashed_shingle_array,
+    };
+    use crate::analyzer::CloneSmellWeights;
+    use std::collections::HashSet;
+
+    #[test]
+    fn hashed_similarity_matches_string_shingle_similarity_for_identical_tokens() {
+        let tokens = vec!["ID", "OP:=", "NUM", "OP:+", "ID"];
+        let weights = weights(1, 1, 2, 1, 70);
+
+        assert_similarity_matches_string_shingles(&tokens, &tokens, weights);
+    }
+
+    #[test]
+    fn hashed_similarity_matches_string_shingle_similarity_for_partial_overlap() {
+        let left = vec!["ID", "OP:=", "NUM", "OP:+", "ID", "OP:;", "return", "ID"];
+        let right = vec!["ID", "OP:=", "NUM", "OP:-", "ID", "OP:;", "return", "NUM"];
+        let weights = weights(1, 1, 2, 1, 70);
+
+        assert_similarity_matches_string_shingles(&left, &right, weights);
+    }
+
+    #[test]
+    fn hashed_similarity_matches_string_shingle_similarity_below_min_shared_shingles() {
+        let left = vec!["ID", "OP:=", "NUM", "OP:+", "ID"];
+        let right = vec!["return", "STR", "OP:;", "throw", "ID"];
+        let weights = weights(1, 1, 2, 3, 70);
+
+        assert_similarity_matches_string_shingles(&left, &right, weights);
+    }
+
+    #[test]
+    fn hashed_similarity_matches_string_shingle_similarity_when_shorter_than_shingle_size() {
+        let left = vec!["ID", "OP:="];
+        let right = vec!["ID", "OP:="];
+        let weights = weights(1, 1, 3, 1, 70);
+
+        assert_similarity_matches_string_shingles(&left, &right, weights);
+    }
+
+    #[test]
+    fn returns_zero_when_shingle_size_skew_cannot_meet_similarity_threshold() {
+        let left = vec!["A", "B", "C"];
+        let right = vec!["A", "B", "C", "D", "E", "F", "G", "H"];
+        let weights = weights(1, 80, 1, 1, 70);
+
+        assert_eq!(
+            0,
+            compute_clone_token_similarity(
+                &hashed(left, weights.shingle_size),
+                &hashed(right, weights.shingle_size),
+                weights,
+            )
+        );
+    }
+
+    #[test]
+    fn upper_bound_uses_rounded_similarity_threshold() {
+        let left: Vec<String> = (0..699).map(|n| n.to_string()).collect();
+        let right: Vec<String> = (0..1000).map(|n| n.to_string()).collect();
+        let weights = weights(1, 70, 1, 1, 70);
+
+        assert_eq!(
+            70,
+            compute_clone_token_similarity(
+                &hashed_strings(&left, weights.shingle_size),
+                &hashed_strings(&right, weights.shingle_size),
+                weights,
+            )
+        );
+    }
+
+    #[test]
+    fn candidate_prefilter_rejects_pairs_below_min_shared_shingles() {
+        let weights = weights(1, 50, 1, 3, 70);
+
+        assert!(!can_reach_clone_similarity(2, 5, weights));
+    }
+
+    #[test]
+    fn candidate_prefilter_rejects_pairs_whose_rounded_upper_bound_misses_threshold() {
+        let weights = weights(1, 71, 1, 1, 70);
+
+        assert!(!can_reach_clone_similarity(699, 1000, weights));
+    }
+
+    #[test]
+    fn candidate_prefilter_keeps_pairs_at_rounded_upper_bound_threshold() {
+        let weights = weights(1, 70, 1, 1, 70);
+
+        assert!(can_reach_clone_similarity(699, 1000, weights));
+    }
+
+    #[test]
+    fn candidate_prefilter_stays_conservative_for_repetitive_token_streams() {
+        let left = repeated_tokens("A", "B", "C", 50);
+        let right = repeated_tokens("A", "B", "C", 100);
+        let weights = weights(1, 70, 2, 1, 70);
+        let left_shingles = hashed(left.clone(), weights.shingle_size);
+        let right_shingles = hashed(right.clone(), weights.shingle_size);
+
+        assert!(can_reach_clone_similarity(
+            left_shingles.size(),
+            right_shingles.size(),
+            weights
+        ));
+        assert_eq!(
+            100,
+            compute_clone_token_similarity(&left_shingles, &right_shingles, weights)
+        );
+    }
+
+    fn assert_similarity_matches_string_shingles(
+        left: &[&str],
+        right: &[&str],
+        weights: CloneSmellWeights,
+    ) {
+        let expected = string_shingle_similarity(left, right, weights);
+        let actual = compute_clone_token_similarity(
+            &hashed(left.to_vec(), weights.shingle_size),
+            &hashed(right.to_vec(), weights.shingle_size),
+            weights,
+        );
+        assert_eq!(expected, actual);
+    }
+
+    fn string_shingle_similarity(left: &[&str], right: &[&str], weights: CloneSmellWeights) -> i32 {
+        let left_shingles = string_shingles(left, weights.shingle_size);
+        let right_shingles = string_shingles(right, weights.shingle_size);
+        if left_shingles.len() < weights.min_shared_shingles as usize
+            || right_shingles.len() < weights.min_shared_shingles as usize
+        {
+            return 0;
+        }
+        let intersection = left_shingles.intersection(&right_shingles).count();
+        if intersection < weights.min_shared_shingles as usize {
+            return 0;
+        }
+        let union = left_shingles.union(&right_shingles).count();
+        if union == 0 {
+            return 0;
+        }
+        ((intersection as f64 * 100.0) / union as f64).round() as i32
+    }
+
+    fn string_shingles(tokens: &[&str], shingle_size: i32) -> HashSet<String> {
+        let k = shingle_size.max(1) as usize;
+        if tokens.len() < k {
+            return HashSet::new();
+        }
+        let mut shingles = HashSet::new();
+        for start in 0..=(tokens.len() - k) {
+            shingles.insert(tokens[start..start + k].join("|"));
+        }
+        shingles
+    }
+
+    fn hashed(tokens: Vec<&str>, shingle_size: i32) -> LongShingles {
+        let tokens = tokens.into_iter().map(str::to_string).collect::<Vec<_>>();
+        hashed_shingle_array(&tokens, shingle_size)
+    }
+
+    fn hashed_strings(tokens: &[String], shingle_size: i32) -> LongShingles {
+        hashed_shingle_array(tokens, shingle_size)
+    }
+
+    fn repeated_tokens<'a>(
+        first: &'a str,
+        second: &'a str,
+        third: &'a str,
+        repetitions: usize,
+    ) -> Vec<&'a str> {
+        let mut tokens = Vec::with_capacity(repetitions * 3);
+        for _ in 0..repetitions {
+            tokens.push(first);
+            tokens.push(second);
+            tokens.push(third);
+        }
+        tokens
+    }
+
+    fn weights(
+        min_normalized_tokens: i32,
+        min_similarity_percent: i32,
+        shingle_size: i32,
+        min_shared_shingles: i32,
+        ast_similarity_percent: i32,
+    ) -> CloneSmellWeights {
+        CloneSmellWeights {
+            min_normalized_tokens,
+            min_similarity_percent,
+            shingle_size,
+            min_shared_shingles,
+            ast_similarity_percent,
+        }
+    }
 }

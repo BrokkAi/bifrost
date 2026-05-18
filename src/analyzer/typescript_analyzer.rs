@@ -1,6 +1,6 @@
 use crate::analyzer::clone_detection::{
-    CloneCandidateData, CloneCandidateProfile, build_clone_reason, can_reach_clone_similarity,
-    compact_clone_excerpt, compare_clone_units, compute_clone_token_similarity,
+    CloneCandidateData, CloneCandidateProfile, compact_clone_excerpt,
+    detect_structural_clone_smells,
 };
 use crate::analyzer::{
     AnalyzerConfig, CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language, Project,
@@ -538,7 +538,7 @@ impl IAnalyzer for TypescriptAnalyzer {
         files: &[ProjectFile],
         weights: CloneSmellWeights,
     ) -> Vec<CloneSmell> {
-        let requested_files: HashSet<ProjectFile> = files
+        let requested_files: Vec<ProjectFile> = files
             .iter()
             .filter(|file| file_language(file) == Language::TypeScript)
             .cloned()
@@ -561,74 +561,12 @@ impl IAnalyzer for TypescriptAnalyzer {
             return Vec::new();
         }
 
-        let requested_candidates: Vec<&CloneCandidateProfile> = all_candidates
-            .iter()
-            .filter(|candidate| requested_files.contains(candidate.data.unit.source()))
-            .collect();
-        if requested_candidates.is_empty() {
-            return Vec::new();
-        }
-
-        let mut findings = Vec::new();
-        for left in requested_candidates {
-            for right in &all_candidates {
-                if left.data.unit == right.data.unit {
-                    continue;
-                }
-                if requested_files.contains(right.data.unit.source())
-                    && compare_clone_units(&left.data.unit, &right.data.unit).is_gt()
-                {
-                    continue;
-                }
-                if !can_reach_clone_similarity(left.shingle_count, right.shingle_count, weights) {
-                    continue;
-                }
-                let token_similarity =
-                    compute_clone_token_similarity(&left.shingles, &right.shingles, weights);
-                if token_similarity < weights.min_similarity_percent {
-                    continue;
-                }
-                let refined_similarity = refine_js_ts_clone_similarity(
-                    &left.data,
-                    &right.data,
-                    token_similarity,
-                    weights,
-                );
-                if refined_similarity < weights.min_similarity_percent {
-                    continue;
-                }
-                findings.push(CloneSmell {
-                    file: left.data.unit.source().clone(),
-                    enclosing_fq_name: left.data.unit.fq_name(),
-                    peer_file: right.data.unit.source().clone(),
-                    peer_enclosing_fq_name: right.data.unit.fq_name(),
-                    score: refined_similarity,
-                    normalized_token_count: left
-                        .data
-                        .normalized_tokens
-                        .len()
-                        .min(right.data.normalized_tokens.len())
-                        as i32,
-                    reasons: vec![build_clone_reason(token_similarity, refined_similarity)],
-                    excerpt: left.data.excerpt.clone(),
-                    peer_excerpt: right.data.excerpt.clone(),
-                });
-            }
-        }
-
-        findings.sort_by(|left, right| {
-            right
-                .score
-                .cmp(&left.score)
-                .then_with(|| left.file.to_string().cmp(&right.file.to_string()))
-                .then_with(|| left.enclosing_fq_name.cmp(&right.enclosing_fq_name))
-                .then_with(|| left.peer_file.to_string().cmp(&right.peer_file.to_string()))
-                .then_with(|| {
-                    left.peer_enclosing_fq_name
-                        .cmp(&right.peer_enclosing_fq_name)
-                })
-        });
-        findings
+        detect_structural_clone_smells(
+            &requested_files,
+            all_candidates,
+            weights,
+            refine_js_ts_clone_similarity,
+        )
     }
 }
 
