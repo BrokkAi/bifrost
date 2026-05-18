@@ -280,3 +280,117 @@ export function build() {
         "later same-scope redeclaration must block subsequent build() usage attribution"
     );
 }
+
+#[test]
+fn ts_graph_strategy_parameter_blocks_top_level_alias_match() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("base.ts", "export class BaseClass {}\n")
+        .file("other.ts", "export class Other {}\n")
+        .file(
+            "consumer.ts",
+            r#"
+import { BaseClass } from "./base";
+import { Other } from "./other";
+
+const Alias = BaseClass;
+
+export function inside(Alias: typeof Other) {
+    return new Alias();
+}
+"#,
+        )
+        .build();
+    let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
+    let units: Vec<_> = analyzer.all_declarations().cloned().collect();
+    let base_file = project.file("base.ts");
+    let target = definition_in(units.iter(), |cu| {
+        cu.is_class() && cu.identifier() == "BaseClass" && cu.source() == &base_file
+    });
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = JsTsExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("parameter shadow success");
+
+    assert!(
+        hits.iter()
+            .all(|hit| hit.enclosing.short_name() != "inside"),
+        "parameter named Alias must block top-level alias matches inside the function"
+    );
+}
+
+#[test]
+fn ts_graph_strategy_parameter_blocks_imported_owner_fallback() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("base.ts", "export class BaseClass { static build() {} }\n")
+        .file("other.ts", "export class Other { static build() {} }\n")
+        .file(
+            "consumer.ts",
+            r#"
+import { BaseClass } from "./base";
+import { Other } from "./other";
+
+export function inside(BaseClass: typeof Other) {
+    return BaseClass.build();
+}
+"#,
+        )
+        .build();
+    let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
+    let units: Vec<_> = analyzer.all_declarations().cloned().collect();
+    let base_file = project.file("base.ts");
+    let target = definition_in(units.iter(), |cu| {
+        cu.is_class() && cu.identifier() == "BaseClass" && cu.source() == &base_file
+    });
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = JsTsExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("parameter import shadow success");
+
+    assert!(
+        hits.is_empty(),
+        "parameter named BaseClass must block imported-owner fallback inside the function"
+    );
+}
+
+#[test]
+fn ts_graph_strategy_destructured_parameter_blocks_alias_match() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("base.ts", "export class BaseClass {}\n")
+        .file("other.ts", "export class Other {}\n")
+        .file(
+            "consumer.ts",
+            r#"
+import { BaseClass } from "./base";
+import { Other } from "./other";
+
+const Alias = BaseClass;
+
+export function inside({ Alias }: { Alias: typeof Other }) {
+    return new Alias();
+}
+"#,
+        )
+        .build();
+    let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
+    let units: Vec<_> = analyzer.all_declarations().cloned().collect();
+    let base_file = project.file("base.ts");
+    let target = definition_in(units.iter(), |cu| {
+        cu.is_class() && cu.identifier() == "BaseClass" && cu.source() == &base_file
+    });
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = JsTsExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("destructured parameter shadow success");
+
+    assert!(
+        hits.iter()
+            .all(|hit| hit.enclosing.short_name() != "inside"),
+        "destructured parameter binding Alias must block top-level alias matches"
+    );
+}

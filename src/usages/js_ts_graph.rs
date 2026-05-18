@@ -378,6 +378,7 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     );
     if introduces_scope {
         ctx.binding_engine.enter_scope();
+        register_function_parameters(node, ctx);
     }
 
     // Skip import statements outright — bindings declared there are not usages.
@@ -441,6 +442,44 @@ fn register_local_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     ctx.binding_engine.alias_symbol(lhs.to_string(), rhs);
+}
+
+fn register_function_parameters(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let Some(parameters) = node.child_by_field_name("parameters") else {
+        return;
+    };
+    register_pattern_bindings(parameters, ctx);
+}
+
+fn register_pattern_bindings(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    match node.kind() {
+        "identifier" | "shorthand_property_identifier_pattern" => {
+            let text = slice(node, ctx.source);
+            if text.is_empty() {
+                return;
+            }
+            ctx.binding_engine.declare_shadow(text.to_string());
+        }
+        "required_parameter" | "optional_parameter" => {
+            if let Some(pattern) = node.child_by_field_name("pattern") {
+                register_pattern_bindings(pattern, ctx);
+            }
+        }
+        "rest_pattern" | "assignment_pattern" | "object_pattern" | "array_pattern"
+        | "pair_pattern" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                register_pattern_bindings(child, ctx);
+            }
+        }
+        "formal_parameters" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                register_pattern_bindings(child, ctx);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn handle_identifier_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
