@@ -20,7 +20,7 @@ The immediate outcome is not one code patch. It is a durable implementation prog
 - [x] (2026-05-18T13:05Z) Completed Milestone 3 by porting typed local, typed parameter, typed instance attribute, constructed local, alias, and namespace-qualified annotation receiver cases into `tests/usages_python_graph_test.rs`, then adding a lightweight receiver-fact inference layer in `src/usages/python_graph.rs` so member queries can prove those receiver-based usages.
 - [x] (2026-05-18T13:45Z) Completed Milestone 4 by porting negative and ambiguity cases for unseeded receivers, unknown constructors, local constructor shadowing, function-local import shadowing, ambiguous union annotations, receiver-fact leakage across functions, sibling-scope shadow isolation, and empty-success no-fallback behavior; then tightening Python graph scope handling so receiver facts and shadows are tracked per enclosing function or method instead of file-wide.
 - [x] (2026-05-18T14:20Z) Completed Milestone 5 by porting inherited-member, override, multi-level inheritance, cross-file inheritance, changed-file invalidation, and re-export-cache invalidation cases into `tests/usages_python_graph_test.rs`, then making receiver bindings type-aware so member queries can match descendant receiver types against the queried owner class.
-- [ ] Complete Milestone 6 by reviewing residual Brokk Python usage tests, marking each as `done`, `missing`, `different by design`, or `deferred`, and recording the reason.
+- [x] (2026-05-18T14:35Z) Completed Milestone 6 by reviewing the remaining Brokk Python usage-graph tests and expanding the parity matrix so the residual cases are now explicitly marked as `done`, `missing`, or `deferred` instead of disappearing into an implicit backlog.
 
 ## Surprises & Discoveries
 
@@ -91,7 +91,7 @@ The immediate outcome is not one code patch. It is a durable implementation prog
 
 ## Outcomes & Retrospective
 
-At the moment this plan is created, `bifrost` has already crossed the architecture threshold for Python usage graphs: the shared graph core from issue `#73` exists, Python routing is enabled, and a Python graph strategy is present. Milestone 1 converted that architecture into stronger proof by covering graph routing, fallback behavior, bounded-candidate behavior, and `MultiAnalyzer` routing with focused Rust tests. Milestone 2 then closed the first substantial functionality gaps by teaching the graph about namespace-style submodule imports and wildcard re-export stars, which in turn unlocked Brokk-style barrel and submodule-qualifier cases. Milestone 3 added the first receiver-fact inference layer, which now proves typed and constructor-seeded member usages that previously had no graph support at all. Milestone 4 then hardened that layer by making receiver facts and shadows scope-aware, which removed the main false positives around leakage, shadowing, and ambiguous annotations. Milestone 5 extended those bindings into type-aware receiver facts, which now let the Python graph follow subclass receivers and survive analyzer updates without stale re-export state. What remains is the explicit residual review and categorization pass.
+At the moment this plan is created, `bifrost` has already crossed the architecture threshold for Python usage graphs: the shared graph core from issue `#73` exists, Python routing is enabled, and a Python graph strategy is present. Milestone 1 converted that architecture into stronger proof by covering graph routing, fallback behavior, bounded-candidate behavior, and `MultiAnalyzer` routing with focused Rust tests. Milestone 2 then closed the first substantial functionality gaps by teaching the graph about namespace-style submodule imports and wildcard re-export stars, which in turn unlocked Brokk-style barrel and submodule-qualifier cases. Milestone 3 added the first receiver-fact inference layer, which now proves typed and constructor-seeded member usages that previously had no graph support at all. Milestone 4 then hardened that layer by making receiver facts and shadows scope-aware, which removed the main false positives around leakage, shadowing, and ambiguous annotations. Milestone 5 extended those bindings into type-aware receiver facts, which now let the Python graph follow subclass receivers and survive analyzer updates without stale re-export state. Milestone 6 closes the planning loop by making the residual Brokk-vs-`bifrost` gaps explicit.
 
 This plan turns that gap into a staged implementation program. Success is not “Python has a graph class.” Success is that a contributor can work milestone by milestone, port the representative scenarios, fix the underlying behavior where needed, and finish with a parity matrix that says exactly what has been matched and what remains intentionally different.
 
@@ -271,8 +271,17 @@ This matrix must be kept current as milestones land.
   Brokk reference: inherited members, overrides, cross-file hierarchy cases, changed-file invalidation, and export-resolution cache invalidation in `PythonExportUsageReferenceGraphTest.java`.
   Current `bifrost` proof: focused Rust tests now cover inherited base members through subclass receivers, overriding subclass members for base queries, multi-level inheritance, cross-file inheritance, changed-file analyzer invalidation, and re-export-cache invalidation after `update`.
 
-- Container-flow and out-of-scope residuals: `deferred`
-  Brokk reference: the container element/value flow cases in `PythonExportUsageReferenceGraphTest.java` that Brokk itself marks as intentionally out of scope for the current Python graph. `bifrost` should record these explicitly rather than silently omitting them.
+- Residual advanced receiver-flow cases: `missing`
+  Brokk reference: optional type arguments, qualified optional type arguments, multiple inheritance with one matching parent, subclass-vs-different-member negatives, unresolved superclasses, same-name sibling-module negatives, self-attribute class-isolation, local-parameter shadowing of exported class names, default-argument constructor usage, and deep attribute-expression robustness.
+  Current `bifrost` state: these specific cases are not yet proven in Rust tests and should be treated as the next follow-up batch if full Brokk parity is still the goal.
+
+- Residual helper/cache-specific reference-graph cases: `missing`
+  Brokk reference: the cached-definition helper tests and exact-member cache scoping cases in `PythonExportUsageReferenceGraphTest.java`.
+  Current `bifrost` state: analyzer update invalidation is now proven, but the Brokk-specific helper-cache micro-behaviors have not been ported one-for-one into focused Rust tests yet.
+
+- Container-flow and Brokk-marked out-of-scope residuals: `deferred`
+  Brokk reference: the list/dict/iterable container element-flow cases that Brokk itself labels as intentionally out of scope for the current Python usage graph.
+  Current `bifrost` state: these remain explicitly deferred rather than silently omitted.
 
 Revision note: created this broader parity ExecPlan after issue `#73` had already landed and issue `#74` had partially landed, so the document starts from the real current Python graph baseline instead of pretending the work is still unstarted.
 
@@ -285,3 +294,5 @@ Revision note: updated after Milestone 3 to record the new receiver-inference te
 Revision note: updated after Milestone 4 to record the scope-aware receiver/shadow facts and the negative tests that now keep the Python graph from manufacturing false positives.
 
 Revision note: updated after Milestone 5 to record the type-aware receiver bindings and the inheritance/cache tests that now prove subclass matching and update invalidation behavior.
+
+Revision note: updated after Milestone 6 to turn the remaining Brokk-only cases into explicit `missing` and `deferred` parity-matrix entries instead of leaving them as an untracked tail.
