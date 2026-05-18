@@ -26,3 +26,15 @@ Before pushing Rust changes, run the same core checks that CI enforces locally w
 
 At minimum, run `cargo fmt --check` and `cargo clippy --all-targets --all-features -- -D warnings`. If clippy or fmt
 fails, fix that locally before pushing rather than waiting for the CI matrix to report it back.
+
+# Implementation details
+
+- Design APIs to avoid cloning, especially in hot loops; prefer iterators/slices where possible.
+- Avoid sorted data structures (e.g. BTreeMap) in favor of lighter-weight alternatives
+  (HashMap) unless ordering is required for semantic correctness, or when it is preferable
+  to pay the ordering cost once at insertion rather than repeatedly sorting later.
+- Avoid naive use of reference counting; prefer e.g. explicit IDs and arena allocation in
+  graph domains.
+- The above should not be interpreted as a blanket prohibition on clone or refcounting
+  when these are genuinely the best option, just be intentional rather than reaching for these
+  out of habit.
