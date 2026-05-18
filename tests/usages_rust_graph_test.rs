@@ -1350,3 +1350,300 @@ fn run() {
         .expect("glob reexport success");
     assert_eq!(1, hits.len());
 }
+
+#[test]
+fn rust_graph_strategy_resolves_enum_variants_as_associated_fields() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/service.rs",
+            r#"
+pub enum Foo {
+    Variant,
+    TupleVariant(usize),
+    StructVariant { value: usize },
+}
+"#,
+        ),
+        (
+            "src/main.rs",
+            r#"
+use crate::service::Foo;
+
+fn run() {
+    let _ = Foo::Variant;
+    let _ = Foo::TupleVariant(1);
+    let _ = Foo::StructVariant { value: 1 };
+}
+"#,
+        ),
+    ]);
+
+    let variant = member(&analyzer, &project.file("src/service.rs"), "Foo", "Variant");
+    let tuple_variant = member(
+        &analyzer,
+        &project.file("src/service.rs"),
+        "Foo",
+        "TupleVariant",
+    );
+    let struct_variant = member(
+        &analyzer,
+        &project.file("src/service.rs"),
+        "Foo",
+        "StructVariant",
+    );
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = brokk_analyzer::usages::RustExportUsageGraphStrategy::new();
+
+    assert_eq!(
+        1,
+        strategy
+            .find_usages(&analyzer, std::slice::from_ref(&variant), &candidates, 1000)
+            .into_either()
+            .expect("variant success")
+            .len()
+    );
+    assert_eq!(
+        1,
+        strategy
+            .find_usages(
+                &analyzer,
+                std::slice::from_ref(&tuple_variant),
+                &candidates,
+                1000,
+            )
+            .into_either()
+            .expect("tuple variant success")
+            .len()
+    );
+    assert_eq!(
+        1,
+        strategy
+            .find_usages(
+                &analyzer,
+                std::slice::from_ref(&struct_variant),
+                &candidates,
+                1000,
+            )
+            .into_either()
+            .expect("struct variant success")
+            .len()
+    );
+}
+
+#[test]
+fn rust_graph_strategy_resolves_associated_type_as_static_field() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/service.rs",
+            r#"
+pub struct Foo;
+impl Foo {
+    pub type AssocType = usize;
+}
+"#,
+        ),
+        (
+            "src/main.rs",
+            r#"
+use crate::service::Foo;
+
+fn run(_: Foo::AssocType) {}
+"#,
+        ),
+    ]);
+
+    let assoc_type = member(
+        &analyzer,
+        &project.file("src/service.rs"),
+        "Foo",
+        "AssocType",
+    );
+    let hits = brokk_analyzer::usages::RustExportUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&assoc_type),
+            &analyzer.get_analyzed_files().into_iter().collect(),
+            1000,
+        )
+        .into_either()
+        .expect("associated type success");
+    assert_eq!(1, hits.len());
+}
+
+#[test]
+fn rust_graph_strategy_does_not_resolve_private_item_behind_barrel_reexport() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/lib.rs",
+            r#"
+mod service;
+pub use service::Hidden;
+"#,
+        ),
+        ("src/service.rs", "struct Hidden;\n"),
+        (
+            "src/main.rs",
+            r#"
+use crate::Hidden;
+
+fn run() {
+    let _ = Hidden {};
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "service.Hidden");
+    let result = brokk_analyzer::usages::RustExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &analyzer.get_analyzed_files().into_iter().collect(),
+        1000,
+    );
+    assert!(matches!(result, FuzzyResult::Failure { .. }));
+}
+
+#[test]
+fn rust_graph_strategy_seeds_receiver_from_self_field_as_ref_let_else() {
+    let (project, analyzer) = rust_analyzer_with_files(&[(
+        "src/service.rs",
+        r#"
+pub struct ChangeDelta;
+pub struct ProjectChangeWatcher;
+impl ProjectChangeWatcher {
+    pub fn take_changed_files(&self) -> ChangeDelta {
+        todo!()
+    }
+}
+
+pub struct SearchToolsService {
+    watcher: Option<ProjectChangeWatcher>,
+}
+impl SearchToolsService {
+    pub fn apply_watcher_delta(&mut self) {
+        let Some(watcher) = self.watcher.as_ref() else {
+            return;
+        };
+        watcher.take_changed_files();
+    }
+}
+"#,
+    )]);
+
+    let target = member(
+        &analyzer,
+        &project.file("src/service.rs"),
+        "ProjectChangeWatcher",
+        "take_changed_files",
+    );
+    let hits = brokk_analyzer::usages::RustExportUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &analyzer.get_analyzed_files().into_iter().collect(),
+            1000,
+        )
+        .into_either()
+        .expect("self field let-else success");
+    assert_eq!(1, hits.len());
+}
+
+#[test]
+fn rust_graph_strategy_does_not_seed_receiver_from_wrapped_pattern_destructuring() {
+    let (project, analyzer) = rust_analyzer_with_files(&[(
+        "src/service.rs",
+        r#"
+pub struct ProjectChangeWatcher;
+impl ProjectChangeWatcher {
+    pub fn take_changed_files(&self) {}
+}
+
+pub struct Other;
+impl Other {
+    pub fn take_changed_files(&self) {}
+}
+
+pub struct SearchToolsService {
+    watcher: Option<(ProjectChangeWatcher, Other)>,
+}
+impl SearchToolsService {
+    pub fn apply_watcher_delta(&mut self) {
+        let Some((watcher, other)) = self.watcher.as_ref() else {
+            return;
+        };
+        watcher.take_changed_files();
+        other.take_changed_files();
+    }
+}
+"#,
+    )]);
+
+    let target = member(
+        &analyzer,
+        &project.file("src/service.rs"),
+        "ProjectChangeWatcher",
+        "take_changed_files",
+    );
+    let hits = brokk_analyzer::usages::RustExportUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &analyzer.get_analyzed_files().into_iter().collect(),
+            1000,
+        )
+        .into_either()
+        .expect("wrapped destructuring success");
+    assert!(hits.is_empty());
+}
+
+#[test]
+fn rust_graph_strategy_does_not_seed_receiver_from_tuple_destructuring_patterns() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/service.rs",
+            r#"
+pub struct Foo;
+impl Foo {
+    pub fn foo_method(&self) {}
+}
+
+pub struct Bar;
+impl Bar {
+    pub fn foo_method(&self) {}
+}
+"#,
+        ),
+        (
+            "src/main.rs",
+            r#"
+use crate::service::{Bar, Foo};
+
+fn tuple_parameter((foo, _bar): (Foo, Bar)) {
+    foo.foo_method();
+}
+
+fn tuple_let(pair: (Foo, Bar)) {
+    let (foo, _bar): (Foo, Bar) = pair;
+    foo.foo_method();
+}
+"#,
+        ),
+    ]);
+
+    let target = member(
+        &analyzer,
+        &project.file("src/service.rs"),
+        "Bar",
+        "foo_method",
+    );
+    let hits = brokk_analyzer::usages::RustExportUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &analyzer.get_analyzed_files().into_iter().collect(),
+            1000,
+        )
+        .into_either()
+        .expect("tuple destructuring success");
+    assert!(hits.is_empty());
+}

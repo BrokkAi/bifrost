@@ -570,6 +570,16 @@ static TYPE_ALIAS_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\btype\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*;")
         .expect("valid type alias regex")
 });
+static OPTION_FIELD_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*:\s*Option<\s*([A-Za-z_][A-Za-z0-9_]*)\s*>")
+        .expect("valid option field regex")
+});
+static SELF_FIELD_AS_REF_LET_ELSE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"\blet\s+Some\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)\s*=\s*self\.([A-Za-z_][A-Za-z0-9_]*)\.as_ref\(\)\s*else",
+    )
+    .expect("valid self field as_ref let-else regex")
+});
 
 fn scan_files_for_member_target(
     analyzer: &dyn IAnalyzer,
@@ -607,46 +617,50 @@ fn scan_files_for_member_target(
         let self_like_constructors = self_like_constructor_names(rust, &owner);
         let receiver_names =
             infer_receiver_names(&source, &owner_local_names, &self_like_constructors);
-        if receiver_names.is_empty() {
-            return;
-        }
-
-        let pattern = format!(r"\b({})\.{}\s*\(", receiver_names.join("|"), member_name);
-        let Ok(call_re) = Regex::new(&pattern) else {
-            return;
-        };
         let static_owner_names: Vec<_> = owner_local_names
             .iter()
             .map(|name| regex::escape(name))
             .collect();
+        if receiver_names.is_empty() && static_owner_names.is_empty() {
+            return;
+        }
+
+        let call_re = if receiver_names.is_empty() {
+            None
+        } else {
+            let pattern = format!(r"\b({})\.{}\s*\(", receiver_names.join("|"), member_name);
+            Regex::new(&pattern).ok()
+        };
         let static_pattern = format!(r"\b({})::{}\b", static_owner_names.join("|"), member_name);
         let static_re = Regex::new(&static_pattern).ok();
 
         let mut local_hits = BTreeSet::new();
-        for captures in call_re.captures_iter(&source) {
-            let Some(matched) = captures.get(0) else {
-                continue;
-            };
-            let start = matched.end().saturating_sub(target.identifier().len() + 1);
-            let end = matched.end().saturating_sub(1);
-            let range = Range {
-                start_byte: start,
-                end_byte: end,
-                start_line: find_line_index_for_offset(&line_starts, start),
-                end_line: find_line_index_for_offset(&line_starts, end),
-            };
-            let Some(enclosing) = analyzer.enclosing_code_unit(file, &range) else {
-                continue;
-            };
-            local_hits.insert(UsageHit::new(
-                file.clone(),
-                range.start_line + 1,
-                start,
-                end,
-                enclosing,
-                GRAPH_HIT_CONFIDENCE,
-                build_snippet(&source, &line_starts, start, end),
-            ));
+        if let Some(call_re) = call_re {
+            for captures in call_re.captures_iter(&source) {
+                let Some(matched) = captures.get(0) else {
+                    continue;
+                };
+                let start = matched.end().saturating_sub(target.identifier().len() + 1);
+                let end = matched.end().saturating_sub(1);
+                let range = Range {
+                    start_byte: start,
+                    end_byte: end,
+                    start_line: find_line_index_for_offset(&line_starts, start),
+                    end_line: find_line_index_for_offset(&line_starts, end),
+                };
+                let Some(enclosing) = analyzer.enclosing_code_unit(file, &range) else {
+                    continue;
+                };
+                local_hits.insert(UsageHit::new(
+                    file.clone(),
+                    range.start_line + 1,
+                    start,
+                    end,
+                    enclosing,
+                    GRAPH_HIT_CONFIDENCE,
+                    build_snippet(&source, &line_starts, start, end),
+                ));
+            }
         }
         if let Some(static_re) = static_re {
             for matched in static_re.find_iter(&source) {
@@ -733,6 +747,16 @@ fn infer_receiver_names(
         }
     }
 
+    let option_field_types: HashMap<String, String> = OPTION_FIELD_RE
+        .captures_iter(source)
+        .filter_map(|captures| {
+            Some((
+                captures.get(1)?.as_str().to_string(),
+                captures.get(2)?.as_str().to_string(),
+            ))
+        })
+        .collect();
+
     for captures in LET_TYPED_RE.captures_iter(source) {
         let Some(name) = captures.get(1) else {
             continue;
@@ -768,6 +792,21 @@ fn infer_receiver_names(
             continue;
         };
         if owner_type_names.contains(ty.as_str()) {
+            receivers.insert(name.as_str().to_string());
+        }
+    }
+
+    for captures in SELF_FIELD_AS_REF_LET_ELSE_RE.captures_iter(source) {
+        let Some(name) = captures.get(1) else {
+            continue;
+        };
+        let Some(field_name) = captures.get(2) else {
+            continue;
+        };
+        if option_field_types
+            .get(field_name.as_str())
+            .is_some_and(|ty| owner_type_names.contains(ty))
+        {
             receivers.insert(name.as_str().to_string());
         }
     }

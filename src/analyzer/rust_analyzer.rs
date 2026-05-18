@@ -1333,6 +1333,9 @@ fn visit_rust_impl(
             "const_item" => {
                 visit_rust_field(file, source, child, Some(&parent), package_name, parsed);
             }
+            "type_item" => {
+                visit_rust_alias(file, source, child, Some(&parent), package_name, parsed);
+            }
             _ => {}
         }
     }

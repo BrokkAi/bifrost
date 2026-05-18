@@ -19,6 +19,7 @@ This is intentionally a long-running parity program, not only a one-issue patch 
 - [x] (2026-05-18T14:44Z) Completed Milestone 1 by adding `src/usages/rust_graph.rs`, registering `RustExportUsageGraphStrategy` in `src/usages/finder.rs`, and widening `RustAnalyzer` with first-wave helpers for export indices, import binders, and Rust module-to-file resolution.
 - [x] (2026-05-18T14:44Z) Completed Milestone 2 by adding `tests/usages_rust_graph_test.rs` and proving seeded public-export routing, `MultiAnalyzer` routing, same-file private-function support, explicit candidate restriction, broad mixed candidate filtering, `TooManyCallsites`, and same-file type-position/literal struct references.
 - [x] (2026-05-18T16:41Z) Advanced Milestone 3 substantially: the focused Rust graph suite now covers 37 passing cases, including `self` imports, public re-export aliases, shadowing negatives, typed and constructed receivers, alias-propagated receivers, static associated items, `pub(crate)`/`pub(self)` visibility, same-file closure calls, barrel re-exports, chained aliased re-exports, bounded glob imports, bounded glob re-exports, simple type-alias receiver seeding, and self-like constructor-chain receiver seeding.
+- [x] (2026-05-18T17:18Z) Started the follow-on milestone breakdown and completed another focused parity slice: the Rust suite now covers 43 passing cases after adding enum variants as associated fields, impl-associated types, private-item-behind-barrel negatives, `self.field.as_ref()` `let-else` receiver seeding, and destructuring-pattern receiver negatives.
 - [ ] Implement the remaining Milestone 4 parity work so the Brokk-vs-`bifrost` Rust graph gaps are either closed or recorded explicitly, especially the still-open trait/associated-type/inline-module edge cases and any behavior that truly belongs to issue `#76` rather than `#75`.
 
 ## Surprises & Discoveries
@@ -46,6 +47,9 @@ This is intentionally a long-running parity program, not only a one-issue patch 
 
 - Observation: most of the remaining high-value parity outside traits was recoverable by tightening seed and visibility semantics rather than introducing a full reference engine.
   Evidence: `pub(self)` export handling, `crate`-root barrel resolution, grouped `pub use` flattening, bounded globs, local type aliases, and self-like constructor chains all landed as targeted graph/analyzer improvements while keeping the strategy architecture intact.
+
+- Observation: another meaningful receiver-fact slice was still available before trait work.
+  Evidence: `self.field.as_ref()` `let-else` receiver seeding and the paired destructuring negatives could be captured with narrow field-type heuristics, which raised focused parity without needing a general trait or pattern-binding engine.
 
 ## Decision Log
 
@@ -153,6 +157,30 @@ Implement this by reviewing the remaining Brokk Rust graph tests line by line an
 
 Acceptance is that no contributor needs to rescan the upstream Brokk suite just to understand the remaining Rust graph backlog.
 
+### Milestone 5: Port associated-item and visibility edge cases
+
+At the end of this milestone, `bifrost` should cover the remaining non-trait associated-item and export-visibility cases that still sit in Brokk’s reference suite. This is the best next wave because it closes a meaningful chunk of parity without requiring the full trait/reference engine.
+
+Implement this by extending the Rust analyzer and graph strategy to handle enum variants as associated fields, associated types exposed from impl blocks, private associated-item negatives, and the remaining barrel/private-item visibility checks. Add focused tests for each upstream reference case before widening behavior.
+
+Acceptance is that the focused Rust suite proves enum variant static accesses, associated-type static accesses, and the remaining negative visibility cases without regressing the current member and re-export behavior.
+
+### Milestone 6: Port trait-owner and receiver-proof semantics
+
+At the end of this milestone, `bifrost` should cover the hard Rust trait cases from Brokk: explicit trait-path calls, proven impl ownership, cross-file trait impl resolution, and negative receiver cases where generic, opaque, or dynamic receivers should not seed hits.
+
+Implement this by teaching the Rust analyzer to surface enough trait and impl ownership facts for the graph strategy to distinguish inherent methods from trait methods and to prove which owner file a method call belongs to. Keep the scope focused on the current Brokk test shapes rather than attempting general Rust trait resolution beyond the parity target.
+
+Acceptance is that the focused suite proves the upstream trait-owner/member cases and the trait-related negative receiver cases directly.
+
+### Milestone 7: Port inline-module and unresolved-frontier behavior
+
+At the end of this milestone, the remaining parity gap should be limited to explicitly intentional differences, if any. This wave covers the residual module-shape and frontier cases that are awkward but important for honest parity accounting.
+
+Implement this by adding support or explicit accounting for unresolved external re-exports/glob re-exports, public inline modules, private inline modules, explicit inline-module re-exports, and public-only inline-module contents. If a frontier case cannot be expressed through the current `bifrost` result model cleanly, record that as an intentional model gap rather than leaving it implicit.
+
+Acceptance is that the inline-module and frontier cases from Brokk are either green in `bifrost` or explicitly recorded in the parity matrix as model gaps.
+
 ## Concrete Steps
 
 From `/Users/dave/.codex/worktrees/3527/bifrost`:
@@ -242,5 +270,7 @@ Revision note: created this repo-root long-running ExecPlan after comparing the 
 Revision note: updated after the first implementation wave to record the new Rust graph strategy, the initial Rust-analyzer helper surface, the focused Rust graph tests that now pass, and the remaining member/receiver parity gap.
 
 Revision note: updated after the larger reference-graph parity wave to record 37 passing focused Rust graph tests, the new bounded-glob and barrel-reexport support, stricter Rust visibility semantics, and the narrowed residual gap around traits, associated types, and inline-module-specific behavior.
+
+Revision note: updated again after breaking the remaining backlog into Milestones 5 to 7 and landing the next associated-item/receiver slice, which brought the focused Rust graph suite to 43 passing tests and reduced the remaining gap primarily to trait semantics, unresolved-frontier behavior, and inline-module-specific cases.
 
 Revision note: updated after the second implementation wave to record the first member-routing slice, the new `exact_member` and member candidate-funnel helpers, and the narrower remaining receiver/cache parity backlog.
