@@ -1398,6 +1398,10 @@ static JS_TS_EXPECT_THROW_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"expect\s*\((?P<actual>[^)\n]+?)\)\s*(?:\.\s*(?:rejects|resolves))?\s*\.\s*toThrow(?:Error)?\s*\("#)
         .expect("valid regex")
 });
+static JS_TS_EXPECT_SNAPSHOT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"expect\s*\((?P<actual>[^)\n]+?)\)\s*\.\s*toMatch(?:Inline)?Snapshot\s*\("#)
+        .expect("valid regex")
+});
 static JS_TS_EXPECT_VERIFY_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"expect\s*\((?P<actual>[^)\n]+?)\)\s*\.\s*toHaveBeenCalled(?:Times|With)?\s*\("#)
         .expect("valid regex")
@@ -1656,6 +1660,19 @@ fn collect_js_ts_assertions(
             shallow: true,
             meaningful: false,
             reason,
+            excerpt: compact_test_assertion_excerpt(whole.as_str()),
+            start_byte: whole.start(),
+        });
+    }
+
+    for captures in JS_TS_EXPECT_SNAPSHOT_RE.captures_iter(body) {
+        let whole = captures.get(0).expect("whole match");
+        assertions.push(JsTsAssertionSignal {
+            kind: "snapshot-assertion".to_string(),
+            score: weights.overspecified_literal_weight,
+            shallow: false,
+            meaningful: false,
+            reason: "snapshot-assertion".to_string(),
             excerpt: compact_test_assertion_excerpt(whole.as_str()),
             start_byte: whole.start(),
         });

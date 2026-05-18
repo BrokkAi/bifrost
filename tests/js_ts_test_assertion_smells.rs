@@ -103,6 +103,26 @@ fn javascript_no_assertions_is_reported() {
 }
 
 #[test]
+fn javascript_self_comparison_is_reported() {
+    let report = js_or_ts_report(
+        Language::JavaScript,
+        "sample.test.js",
+        r#"
+        test("same value", () => {
+            const value = "x";
+            expect(value).toBe(value);
+        });
+        "#,
+        ReportTestAssertionSmellsParams {
+            file_paths: vec!["sample.test.js".to_string()],
+            ..Default::default()
+        },
+    );
+
+    assert!(report.contains("self-comparison"), "{report}");
+}
+
+#[test]
 fn typescript_self_comparison_is_reported() {
     let report = js_or_ts_report(
         Language::TypeScript,
@@ -142,4 +162,68 @@ fn typescript_shallow_assertions_are_reported_at_lower_threshold() {
 
     assert!(report.contains("nullness-only"), "{report}");
     assert!(report.contains("shallow-assertions-only"), "{report}");
+}
+
+#[test]
+fn javascript_meaningful_assertion_is_not_flagged() {
+    let report = js_or_ts_report(
+        Language::JavaScript,
+        "sample.test.js",
+        r#"
+        it("checks the semantic value", () => {
+            const result = { name: "expected" };
+            expect(result.name).toBe("expected");
+        });
+        "#,
+        ReportTestAssertionSmellsParams {
+            file_paths: vec!["sample.test.js".to_string()],
+            ..Default::default()
+        },
+    );
+
+    assert_eq!("No test assertion smells met minScore 4.", report);
+}
+
+#[test]
+fn javascript_snapshot_only_assertion_is_reported() {
+    let report = js_or_ts_report(
+        Language::JavaScript,
+        "sample.test.js",
+        r#"
+        test("snapshot only", () => {
+            const rendered = render();
+            expect(rendered).toMatchSnapshot();
+        });
+
+        function render() {
+            return "<div>value</div>";
+        }
+        "#,
+        ReportTestAssertionSmellsParams {
+            file_paths: vec!["sample.test.js".to_string()],
+            min_score: 2,
+            ..Default::default()
+        },
+    );
+
+    assert!(report.contains("snapshot-assertion"), "{report}");
+}
+
+#[test]
+fn non_test_typescript_file_is_skipped() {
+    let report = js_or_ts_report(
+        Language::TypeScript,
+        "src/sample.ts",
+        r#"
+        function helper() {
+            expect(true).toBe(true);
+        }
+        "#,
+        ReportTestAssertionSmellsParams {
+            file_paths: vec!["src/sample.ts".to_string()],
+            ..Default::default()
+        },
+    );
+
+    assert_eq!("No test assertion smells met minScore 4.", report);
 }

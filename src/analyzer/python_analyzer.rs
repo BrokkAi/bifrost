@@ -1563,6 +1563,9 @@ fn detect_python_test_assertion_smells(
 fn collect_python_test_cases(node: Node<'_>, source: &str, out: &mut Vec<PythonTestCase>) {
     match node.kind() {
         "function_definition" => {
+            if python_function_has_fixture_decorator(node, source) {
+                return;
+            }
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = py_node_text(name_node, source).trim().to_string();
                 if name.starts_with("test_") {
@@ -1579,6 +1582,9 @@ fn collect_python_test_cases(node: Node<'_>, source: &str, out: &mut Vec<PythonT
             }
         }
         "decorated_definition" => {
+            if python_decorated_definition_has_fixture(node, source) {
+                return;
+            }
             let has_pytest_mark = py_node_text(node, source).contains("pytest.mark");
             if has_pytest_mark {
                 if let Some(definition) = node.child_by_field_name("definition") {
@@ -1607,6 +1613,18 @@ fn collect_python_test_cases(node: Node<'_>, source: &str, out: &mut Vec<PythonT
     for child in node.named_children(&mut cursor) {
         collect_python_test_cases(child, source, out);
     }
+}
+
+fn python_function_has_fixture_decorator(function: Node<'_>, source: &str) -> bool {
+    let Some(parent) = function.parent() else {
+        return false;
+    };
+    parent.kind() == "decorated_definition"
+        && python_decorated_definition_has_fixture(parent, source)
+}
+
+fn python_decorated_definition_has_fixture(node: Node<'_>, source: &str) -> bool {
+    py_node_text(node, source).contains("@pytest.fixture")
 }
 
 fn analyze_python_test_case(
