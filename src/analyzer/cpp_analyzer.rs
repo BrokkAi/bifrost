@@ -1,16 +1,21 @@
+use crate::analyzer::clone_detection::{
+    CloneCandidateData, CloneCandidateProfile, compact_clone_excerpt,
+    compute_ast_refinement_similarity_percent, detect_structural_clone_smells,
+};
 use crate::analyzer::{
     AnalyzerConfig, CodeUnit, CodeUnitType, IAnalyzer, ImportAnalysisProvider, ImportInfo,
     Language, LanguageAdapter, Project, ProjectFile, TestAssertionSmell, TestAssertionWeights,
     TestDetectionProvider, TreeSitterAnalyzer,
 };
 use crate::hash::HashSet;
+use crate::{CloneSmell, CloneSmellWeights};
 use moka::sync::Cache;
 use regex::Regex;
 use std::collections::BTreeSet;
 use std::mem::size_of;
 use std::path::Path;
 use std::sync::{Arc, LazyLock};
-use tree_sitter::{Language as TsLanguage, Node, Tree};
+use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
 
 use super::javascript_analyzer::build_weighted_cache;
 
@@ -423,8 +428,75 @@ impl IAnalyzer for CppAnalyzer {
         detect_cpp_test_assertion_smells(file, &source, &weights)
     }
 
+    fn find_structural_clone_smells(
+        &self,
+        file: &ProjectFile,
+        weights: CloneSmellWeights,
+    ) -> Vec<CloneSmell> {
+        self.find_structural_clone_smells_for_files(std::slice::from_ref(file), weights)
+    }
+
+    fn find_structural_clone_smells_for_files(
+        &self,
+        files: &[ProjectFile],
+        weights: CloneSmellWeights,
+    ) -> Vec<CloneSmell> {
+        let requested_files: Vec<ProjectFile> = files
+            .iter()
+            .filter(|file| file_language(file) == Language::Cpp)
+            .cloned()
+            .collect();
+        if requested_files.is_empty() {
+            return Vec::new();
+        }
+
+        let all_candidates: Vec<CloneCandidateProfile> = self
+            .get_all_declarations()
+            .into_iter()
+            .filter(|code_unit| {
+                code_unit.is_function() && file_language(code_unit.source()) == Language::Cpp
+            })
+            .filter_map(|code_unit| self.build_clone_candidate_data(&code_unit, weights))
+            .map(|candidate| CloneCandidateProfile::create(candidate, weights))
+            .collect();
+        if all_candidates.is_empty() {
+            return Vec::new();
+        }
+
+        detect_structural_clone_smells(
+            &requested_files,
+            all_candidates,
+            weights,
+            refine_cpp_clone_similarity,
+        )
+    }
+
     fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {
         Some(self)
+    }
+}
+
+impl CppAnalyzer {
+    fn build_clone_candidate_data(
+        &self,
+        code_unit: &CodeUnit,
+        weights: CloneSmellWeights,
+    ) -> Option<CloneCandidateData> {
+        self.get_source(code_unit, false)
+            .map(|source| source.trim().to_string())
+            .filter(|source| !source.is_empty())
+            .and_then(|source| {
+                let normalized_tokens = normalized_clone_tokens_cpp(&source);
+                if normalized_tokens.len() < weights.min_normalized_tokens.max(0) as usize {
+                    return None;
+                }
+                Some(CloneCandidateData {
+                    unit: code_unit.clone(),
+                    normalized_tokens,
+                    ast_signature: build_cpp_clone_ast_signature(&source),
+                    excerpt: compact_clone_excerpt(&source),
+                })
+            })
     }
 }
 
@@ -679,6 +751,134 @@ fn file_language(file: &ProjectFile) -> Language {
         .and_then(|ext| ext.to_str())
         .map(Language::from_extension)
         .unwrap_or(Language::None)
+}
+
+const CPP_CLONE_AST_IDENTIFIER_TYPES: &[&str] = &[
+    "identifier",
+    "field_identifier",
+    "namespace_identifier",
+    "type_identifier",
+];
+const CPP_CLONE_AST_STRING_TYPES: &[&str] = &["string_literal", "raw_string_literal"];
+const CPP_CLONE_AST_NUMBER_TYPES: &[&str] = &["number_literal"];
+
+fn normalized_clone_tokens_cpp(source: &str) -> Vec<String> {
+    let Some(tree) = parse_cpp_tree(source) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    collect_normalized_leaf_tokens_cpp(tree.root_node(), source, &mut out);
+    out
+}
+
+fn collect_normalized_leaf_tokens_cpp(node: Node<'_>, source: &str, out: &mut Vec<String>) {
+    if node.named_child_count() == 0 {
+        let token = normalize_cpp_clone_leaf_token(node, source);
+        if !token.is_empty() {
+            out.push(token);
+        }
+    }
+    let child_count = node.child_count();
+    for index in 0..child_count {
+        if let Some(child) = node.child(index) {
+            collect_normalized_leaf_tokens_cpp(child, source, out);
+        }
+    }
+}
+
+fn normalize_cpp_clone_leaf_token(node: Node<'_>, source: &str) -> String {
+    let kind = node.kind();
+    let token = source
+        .get(node.start_byte()..node.end_byte())
+        .unwrap_or("")
+        .trim();
+    if token.is_empty() || kind == "comment" {
+        return String::new();
+    }
+    if CPP_CLONE_AST_IDENTIFIER_TYPES.contains(&kind) {
+        return "ID".to_string();
+    }
+    if CPP_CLONE_AST_STRING_TYPES.contains(&kind) {
+        return "STR".to_string();
+    }
+    if CPP_CLONE_AST_NUMBER_TYPES.contains(&kind) {
+        return "NUM".to_string();
+    }
+    if matches!(token, "true" | "false") {
+        return "BOOL".to_string();
+    }
+    if token.chars().count() == 1 && token.chars().all(|ch| !ch.is_alphanumeric()) {
+        return format!("OP:{token}");
+    }
+    format!("T:{kind}")
+}
+
+fn build_cpp_clone_ast_signature(source: &str) -> String {
+    let Some(tree) = parse_cpp_tree(source) else {
+        return String::new();
+    };
+    let mut labels = Vec::new();
+    collect_cpp_clone_ast_labels(tree.root_node(), source, &mut labels);
+    labels.join("|")
+}
+
+fn collect_cpp_clone_ast_labels(node: Node<'_>, source: &str, out: &mut Vec<String>) {
+    out.push(normalize_cpp_clone_ast_label(node, source));
+    let child_count = node.child_count();
+    for index in 0..child_count {
+        if let Some(child) = node.child(index) {
+            collect_cpp_clone_ast_labels(child, source, out);
+        }
+    }
+}
+
+fn normalize_cpp_clone_ast_label(node: Node<'_>, source: &str) -> String {
+    let kind = node.kind();
+    let text = source
+        .get(node.start_byte()..node.end_byte())
+        .unwrap_or("")
+        .trim();
+    if CPP_CLONE_AST_IDENTIFIER_TYPES.contains(&kind) {
+        return "ID".to_string();
+    }
+    if CPP_CLONE_AST_STRING_TYPES.contains(&kind) {
+        return "STR".to_string();
+    }
+    if CPP_CLONE_AST_NUMBER_TYPES.contains(&kind) {
+        return "NUM".to_string();
+    }
+    if matches!(text, "true" | "false") {
+        return "BOOL".to_string();
+    }
+    format!("N:{kind}")
+}
+
+fn refine_cpp_clone_similarity(
+    left: &CloneCandidateData,
+    right: &CloneCandidateData,
+    token_similarity: i32,
+    weights: CloneSmellWeights,
+) -> i32 {
+    if left.ast_signature.is_empty() || right.ast_signature.is_empty() {
+        return token_similarity;
+    }
+    let ast_similarity =
+        compute_ast_refinement_similarity_percent(&left.ast_signature, &right.ast_signature);
+    if ast_similarity == 0 {
+        return token_similarity;
+    }
+    if ast_similarity < weights.ast_similarity_percent {
+        return 0;
+    }
+    token_similarity.min(ast_similarity)
+}
+
+fn parse_cpp_tree(source: &str) -> Option<Tree> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_cpp::LANGUAGE.into())
+        .expect("failed to load cpp parser");
+    parser.parse(source, None)
 }
 
 #[derive(Clone)]

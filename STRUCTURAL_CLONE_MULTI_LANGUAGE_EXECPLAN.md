@@ -29,6 +29,9 @@ The observable outcome is that `report_structural_clone_smells` works consistent
 - [x] (2026-05-18) Validated the Milestone 5 checkpoint with `cargo test --test scala_structural_clone_smells -- --nocapture`, `cargo test --test searchtools_service python_boundary_returns_structural_clone_report_json -- --nocapture`, `cargo test --test bifrost_mcp_server bifrost_searchtools_server_speaks_mcp_stdio -- --nocapture`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings`.
 - [x] (2026-05-18) Completed Milestone 6. Added first-pass C# structural clone support in `src/analyzer/csharp_analyzer.rs` and focused C# behavior tests in `tests/csharp_structural_clone_smells.rs`.
 - [x] (2026-05-18) Validated the Milestone 6 checkpoint with `cargo test --test csharp_structural_clone_smells -- --nocapture`, `cargo test --test searchtools_service python_boundary_returns_structural_clone_report_json -- --nocapture`, `cargo test --test bifrost_mcp_server bifrost_searchtools_server_speaks_mcp_stdio -- --nocapture`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings`.
+- [x] (2026-05-18) Completed Milestone 7. Added first-pass C++ structural clone support in `src/analyzer/cpp_analyzer.rs` and focused C++ behavior tests in `tests/cpp_structural_clone_smells.rs`.
+- [x] (2026-05-18) Validated the Milestone 7 checkpoint with `cargo test --test cpp_structural_clone_smells -- --nocapture`, `cargo test --test searchtools_service python_boundary_returns_structural_clone_report_json -- --nocapture`, `cargo test --test bifrost_mcp_server bifrost_searchtools_server_speaks_mcp_stdio -- --nocapture`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings`.
+- [x] (2026-05-18) Completed Milestone 8. Ran the cross-language hardening sweep across Java, Python, JS/TS, PHP, Scala, C#, and C++ clone suites plus the existing MCP/report checks, with `cargo fmt --check` and `cargo clippy --all-targets --all-features -- -D warnings` clean at the end.
 - [ ] Add this plan’s milestone tracker updates as each language slice lands.
 - [ ] Keep the `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` sections current during implementation.
 
@@ -61,6 +64,9 @@ The observable outcome is that `report_structural_clone_smells` works consistent
 - Observation: C# also fit the shared clone engine without any snippet-wrapping workaround.
   Evidence: extracted method and constructor bodies from the existing C# analyzer were already parseable and produced stable results under the same first-pass thresholds used in the C# behavior suite.
 
+- Observation: C++ fit the same first-pass pattern as Scala and C# despite its richer syntax surface.
+  Evidence: the bounded first-pass scope of free functions plus class methods was enough to produce stable focused tests without requiring a deeper shared-engine change.
+
 ## Decision Log
 
 - Decision: sequence the rollout as Brokk parity languages first, then new-language support.
@@ -92,6 +98,10 @@ Milestone 4 outcome: PHP now has a bounded first-pass clone feature. The semanti
 Milestone 5 outcome: Scala now has a bounded first-pass clone feature as well. Compared with PHP, the Scala port was mechanically simpler, which suggests the remaining C# and C++ work will hinge more on declaration-shape decisions and AST tuning than on the shared engine itself.
 
 Milestone 6 outcome: C# now has a bounded first-pass clone feature too. Like Scala, it fit the shared engine cleanly, which increases confidence that the last remaining language, C++, will mostly be about candidate scoping and syntax edge cases rather than architectural gaps.
+
+Milestone 7 outcome: C++ now has a bounded first-pass clone feature as the last language milestone in this rollout. The acceptance scope remains intentionally modest, but the shared engine was sufficient for the initial pass.
+
+Milestone 8 outcome: the multi-language rollout is complete for the planned targets. The hardening sweep shows the clone suites for Java, Python, JS/TS, PHP, Scala, C#, and C++ all passing together alongside the MCP/report checks, with formatting and clippy clean at the end.
 
 ## Context and Orientation
 
