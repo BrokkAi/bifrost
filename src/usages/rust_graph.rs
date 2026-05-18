@@ -130,6 +130,16 @@ fn is_member_target(analyzer: &RustAnalyzer, target: &CodeUnit) -> bool {
     (target.is_function() || target.is_field()) && analyzer.parent_of(target).is_some()
 }
 
+fn is_trait_owner(rust: &RustAnalyzer, owner: &CodeUnit) -> bool {
+    rust.get_source(owner, false)
+        .or_else(|| rust.get_skeleton_header(owner))
+        .map(|source| {
+            let trimmed = source.trim_start();
+            trimmed.starts_with("pub trait ") || trimmed.starts_with("trait ")
+        })
+        .unwrap_or(false)
+}
+
 fn infer_graph_seeds(
     analyzer: &RustAnalyzer,
     graph: &RustProjectGraph,
@@ -610,13 +620,18 @@ fn scan_files_for_member_target(
                 .map(|edge| edge.local_name)
                 .collect()
         };
-        if owner_local_names.is_empty() {
+        let trait_owner = is_trait_owner(rust, &owner);
+        let receiver_type_names = if trait_owner {
+            rust.trait_implementer_names(&owner, file)
+        } else {
+            owner_local_names.clone()
+        };
+        if owner_local_names.is_empty() && receiver_type_names.is_empty() {
             return;
         }
-
         let self_like_constructors = self_like_constructor_names(rust, &owner);
         let receiver_names =
-            infer_receiver_names(&source, &owner_local_names, &self_like_constructors);
+            infer_receiver_names(&source, &receiver_type_names, &self_like_constructors);
         let static_owner_names: Vec<_> = owner_local_names
             .iter()
             .map(|name| regex::escape(name))
@@ -640,6 +655,9 @@ fn scan_files_for_member_target(
                 let Some(matched) = captures.get(0) else {
                     continue;
                 };
+                let Some(receiver_name) = captures.get(1).map(|receiver| receiver.as_str()) else {
+                    continue;
+                };
                 let start = matched.end().saturating_sub(target.identifier().len() + 1);
                 let end = matched.end().saturating_sub(1);
                 let range = Range {
@@ -651,6 +669,20 @@ fn scan_files_for_member_target(
                 let Some(enclosing) = analyzer.enclosing_code_unit(file, &range) else {
                     continue;
                 };
+                let receiver_mismatched = analyzer
+                    .get_source(&enclosing, false)
+                    .map(|enclosing_source| {
+                        receiver_explicitly_mismatched(
+                            &source,
+                            &enclosing_source,
+                            &receiver_type_names,
+                            receiver_name,
+                        )
+                    })
+                    .unwrap_or(false);
+                if receiver_mismatched {
+                    continue;
+                }
                 local_hits.insert(UsageHit::new(
                     file.clone(),
                     range.start_line + 1,
@@ -719,12 +751,10 @@ fn self_like_constructor_names(rust: &RustAnalyzer, owner: &CodeUnit) -> HashSet
         .collect()
 }
 
-fn infer_receiver_names(
+fn expanded_receiver_type_names(
     source: &str,
     owner_local_names: &HashSet<String>,
-    self_like_constructors: &HashSet<String>,
-) -> Vec<String> {
-    let mut receivers = BTreeSet::new();
+) -> HashSet<String> {
     let mut owner_type_names = owner_local_names.clone();
 
     loop {
@@ -746,6 +776,52 @@ fn infer_receiver_names(
             break;
         }
     }
+
+    owner_type_names
+}
+
+fn receiver_explicitly_mismatched(
+    file_source: &str,
+    enclosing_source: &str,
+    owner_local_names: &HashSet<String>,
+    receiver_name: &str,
+) -> bool {
+    let owner_type_names = expanded_receiver_type_names(file_source, owner_local_names);
+
+    for captures in PARAM_TYPED_RE.captures_iter(enclosing_source) {
+        let Some(name) = captures.get(1) else {
+            continue;
+        };
+        let Some(ty) = captures.get(2) else {
+            continue;
+        };
+        if name.as_str() == receiver_name {
+            return !owner_type_names.contains(ty.as_str());
+        }
+    }
+
+    for captures in LET_TYPED_RE.captures_iter(enclosing_source) {
+        let Some(name) = captures.get(1) else {
+            continue;
+        };
+        let Some(ty) = captures.get(2) else {
+            continue;
+        };
+        if name.as_str() == receiver_name {
+            return !owner_type_names.contains(ty.as_str());
+        }
+    }
+
+    false
+}
+
+fn infer_receiver_names(
+    source: &str,
+    owner_local_names: &HashSet<String>,
+    self_like_constructors: &HashSet<String>,
+) -> Vec<String> {
+    let mut receivers = BTreeSet::new();
+    let owner_type_names = expanded_receiver_type_names(source, owner_local_names);
 
     let option_field_types: HashMap<String, String> = OPTION_FIELD_RE
         .captures_iter(source)

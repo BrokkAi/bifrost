@@ -439,6 +439,32 @@ impl RustAnalyzer {
             .collect()
     }
 
+    pub fn trait_implementer_names(
+        &self,
+        trait_owner: &CodeUnit,
+        _importer_file: &ProjectFile,
+    ) -> HashSet<String> {
+        self.get_analyzed_files()
+            .into_iter()
+            .filter_map(|file| {
+                let source = file.read_to_string().ok()?;
+                Some((file, source))
+            })
+            .flat_map(|(file, source)| {
+                let binder = self.import_binder_of(&file);
+                TRAIT_IMPL_RE
+                    .captures_iter(&source)
+                    .filter_map(|captures| {
+                        let trait_ref = captures.get(1)?.as_str().trim();
+                        let implementer = captures.get(2)?.as_str().trim();
+                        trait_reference_matches(self, trait_owner, &file, trait_ref, &binder)
+                            .then(|| implementer.to_string())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     fn is_public_declaration(&self, code_unit: &CodeUnit) -> bool {
         self.get_source(code_unit, false)
             .or_else(|| self.get_skeleton_header(code_unit))
@@ -1507,6 +1533,37 @@ fn split_rust_import_module_and_name(raw_import: &str) -> Option<(String, String
     Some((module_specifier.to_string(), imported_name.to_string()))
 }
 
+fn trait_reference_matches(
+    analyzer: &RustAnalyzer,
+    trait_owner: &CodeUnit,
+    impl_file: &ProjectFile,
+    trait_ref: &str,
+    impl_binder: &ImportBinder,
+) -> bool {
+    if let Some((module_specifier, imported_name)) = trait_ref.rsplit_once("::") {
+        return imported_name == trait_owner.identifier()
+            && analyzer
+                .resolve_module_files(impl_file, module_specifier)
+                .into_iter()
+                .any(|file| file == *trait_owner.source());
+    }
+
+    if impl_file == trait_owner.source() && trait_ref == trait_owner.identifier() {
+        return true;
+    }
+
+    impl_binder
+        .bindings
+        .get(trait_ref)
+        .filter(|binding| binding.imported_name.as_deref() == Some(trait_owner.identifier()))
+        .is_some_and(|binding| {
+            analyzer
+                .resolve_module_files(impl_file, &binding.module_specifier)
+                .into_iter()
+                .any(|file| file == *trait_owner.source())
+        })
+}
+
 fn resolve_rust_module_path(package: &str, module_specifier: &str) -> Option<String> {
     let trimmed = module_specifier.trim();
     if trimmed.is_empty() {
@@ -1550,6 +1607,11 @@ fn resolve_rust_module_path(package: &str, module_specifier: &str) -> Option<Str
 
     (!resolved.is_empty()).then_some(resolved)
 }
+
+static TRAIT_IMPL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\bimpl\s+([A-Za-z_][A-Za-z0-9_:]*)\s+for\s+([A-Za-z_][A-Za-z0-9_]*)")
+        .expect("valid trait impl regex")
+});
 
 fn resolve_rust_import_fq_name(
     _source_file: &ProjectFile,

@@ -20,6 +20,7 @@ This is intentionally a long-running parity program, not only a one-issue patch 
 - [x] (2026-05-18T14:44Z) Completed Milestone 2 by adding `tests/usages_rust_graph_test.rs` and proving seeded public-export routing, `MultiAnalyzer` routing, same-file private-function support, explicit candidate restriction, broad mixed candidate filtering, `TooManyCallsites`, and same-file type-position/literal struct references.
 - [x] (2026-05-18T16:41Z) Advanced Milestone 3 substantially: the focused Rust graph suite now covers 37 passing cases, including `self` imports, public re-export aliases, shadowing negatives, typed and constructed receivers, alias-propagated receivers, static associated items, `pub(crate)`/`pub(self)` visibility, same-file closure calls, barrel re-exports, chained aliased re-exports, bounded glob imports, bounded glob re-exports, simple type-alias receiver seeding, and self-like constructor-chain receiver seeding.
 - [x] (2026-05-18T17:18Z) Started the follow-on milestone breakdown and completed another focused parity slice: the Rust suite now covers 43 passing cases after adding enum variants as associated fields, impl-associated types, private-item-behind-barrel negatives, `self.field.as_ref()` `let-else` receiver seeding, and destructuring-pattern receiver negatives.
+- [x] (2026-05-18T17:46Z) Completed the core trait-owner/member slice from Milestone 6: the Rust suite now covers 47 passing cases after adding explicit trait-path calls, proven impl receiver ownership, cross-file trait-owner resolution, and the negative generic/opaque/dyn trait-receiver cases.
 - [ ] Implement the remaining Milestone 4 parity work so the Brokk-vs-`bifrost` Rust graph gaps are either closed or recorded explicitly, especially the still-open trait/associated-type/inline-module edge cases and any behavior that truly belongs to issue `#76` rather than `#75`.
 
 ## Surprises & Discoveries
@@ -50,6 +51,9 @@ This is intentionally a long-running parity program, not only a one-issue patch 
 
 - Observation: another meaningful receiver-fact slice was still available before trait work.
   Evidence: `self.field.as_ref()` `let-else` receiver seeding and the paired destructuring negatives could be captured with narrow field-type heuristics, which raised focused parity without needing a general trait or pattern-binding engine.
+
+- Observation: the first trait parity slice did not require a full Rust trait solver, but it did require distinguishing “trait imported here” from “type implementing that trait anywhere in the project.”
+  Evidence: explicit `Worker::work` calls depend on imported owner names, while `x.work()` for a trait target depends on concrete implementer types and the impl file’s trait binding; the cross-file duplicate-trait test only passed once those two concerns were separated.
 
 ## Decision Log
 
@@ -272,5 +276,7 @@ Revision note: updated after the first implementation wave to record the new Rus
 Revision note: updated after the larger reference-graph parity wave to record 37 passing focused Rust graph tests, the new bounded-glob and barrel-reexport support, stricter Rust visibility semantics, and the narrowed residual gap around traits, associated types, and inline-module-specific behavior.
 
 Revision note: updated again after breaking the remaining backlog into Milestones 5 to 7 and landing the next associated-item/receiver slice, which brought the focused Rust graph suite to 43 passing tests and reduced the remaining gap primarily to trait semantics, unresolved-frontier behavior, and inline-module-specific cases.
+
+Revision note: updated after the first trait-owner wave to record 47 passing focused Rust graph tests and to narrow the remaining parity gap mainly to unresolved-frontier and inline-module cases, plus any residual trait edge behavior not yet represented in the current focused suite.
 
 Revision note: updated after the second implementation wave to record the first member-routing slice, the new `exact_member` and member candidate-funnel helpers, and the narrower remaining receiver/cache parity backlog.

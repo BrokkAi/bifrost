@@ -1647,3 +1647,234 @@ fn tuple_let(pair: (Foo, Bar)) {
         .expect("tuple destructuring success");
     assert!(hits.is_empty());
 }
+
+#[test]
+fn rust_graph_strategy_resolves_trait_method_for_explicit_trait_path_and_proven_receiver() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/service.rs",
+            r#"
+pub struct Foo;
+pub trait Worker {
+    fn work(&self);
+}
+impl Worker for Foo {
+    fn work(&self) {}
+}
+"#,
+        ),
+        (
+            "src/main.rs",
+            r#"
+use crate::service::{Foo, Worker};
+
+fn run() {
+    let x: Foo = Foo {};
+    Worker::work(&x);
+    x.work();
+}
+"#,
+        ),
+    ]);
+
+    let target = member(&analyzer, &project.file("src/service.rs"), "Worker", "work");
+    let hits = brokk_analyzer::usages::RustExportUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &analyzer.get_analyzed_files().into_iter().collect(),
+            1000,
+        )
+        .into_either()
+        .expect("trait method success");
+    assert_eq!(2, hits.len());
+}
+
+#[test]
+fn rust_graph_strategy_requires_proven_trait_impl_and_receiver_type() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/service.rs",
+            r#"
+pub struct Foo;
+pub trait Worker {
+    fn work(&self);
+}
+pub trait Other {
+    fn work(&self);
+}
+impl Worker for Foo {
+    fn work(&self) {}
+}
+"#,
+        ),
+        (
+            "src/main.rs",
+            r#"
+use crate::service::Foo;
+
+fn known() {
+    let x: Foo = Foo {};
+    x.work();
+}
+
+fn unknown(x: impl std::fmt::Debug) {
+    x.work();
+}
+"#,
+        ),
+    ]);
+
+    let worker = member(&analyzer, &project.file("src/service.rs"), "Worker", "work");
+    let other = member(&analyzer, &project.file("src/service.rs"), "Other", "work");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = brokk_analyzer::usages::RustExportUsageGraphStrategy::new();
+
+    assert_eq!(
+        1,
+        strategy
+            .find_usages(&analyzer, std::slice::from_ref(&worker), &candidates, 1000)
+            .into_either()
+            .expect("Worker trait receiver success")
+            .len()
+    );
+    assert!(
+        strategy
+            .find_usages(&analyzer, std::slice::from_ref(&other), &candidates, 1000)
+            .into_either()
+            .expect("Other trait receiver success")
+            .is_empty()
+    );
+}
+
+#[test]
+fn rust_graph_strategy_resolves_cross_file_trait_impl_to_trait_owner_file() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/traits.rs",
+            r#"
+pub trait Worker {
+    fn work(&self);
+}
+"#,
+        ),
+        (
+            "src/other.rs",
+            r#"
+pub trait Worker {
+    fn work(&self);
+}
+"#,
+        ),
+        (
+            "src/service.rs",
+            r#"
+use crate::traits::Worker;
+
+pub struct Foo;
+impl Worker for Foo {
+    fn work(&self) {}
+}
+"#,
+        ),
+        (
+            "src/main.rs",
+            r#"
+use crate::service::Foo;
+
+fn run(x: Foo) {
+    x.work();
+}
+"#,
+        ),
+    ]);
+
+    let traits_target = member(
+        &analyzer,
+        &ProjectFile::new(analyzer.project().root().to_path_buf(), "src/traits.rs"),
+        "Worker",
+        "work",
+    );
+    let other_target = member(
+        &analyzer,
+        &ProjectFile::new(analyzer.project().root().to_path_buf(), "src/other.rs"),
+        "Worker",
+        "work",
+    );
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = brokk_analyzer::usages::RustExportUsageGraphStrategy::new();
+
+    assert_eq!(
+        1,
+        strategy
+            .find_usages(
+                &analyzer,
+                std::slice::from_ref(&traits_target),
+                &candidates,
+                1000,
+            )
+            .into_either()
+            .expect("traits owner success")
+            .len()
+    );
+    assert!(
+        strategy
+            .find_usages(
+                &analyzer,
+                std::slice::from_ref(&other_target),
+                &candidates,
+                1000,
+            )
+            .into_either()
+            .expect("other owner success")
+            .is_empty()
+    );
+}
+
+#[test]
+fn rust_graph_strategy_does_not_seed_trait_receivers_from_non_concrete_parameter_types() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/service.rs",
+            r#"
+pub struct Foo;
+pub trait Worker {
+    fn work(&self);
+}
+impl Worker for Foo {
+    fn work(&self) {}
+}
+"#,
+        ),
+        (
+            "src/main.rs",
+            r#"
+use crate::service::Worker;
+
+fn generic<T: Worker>(x: T) {
+    x.work();
+}
+
+fn opaque(x: impl Worker) {
+    x.work();
+}
+
+fn dynamic(x: &dyn Worker) {
+    x.work();
+}
+"#,
+        ),
+    ]);
+
+    let target = member(&analyzer, &project.file("src/service.rs"), "Worker", "work");
+    let hits = brokk_analyzer::usages::RustExportUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &analyzer.get_analyzed_files().into_iter().collect(),
+            1000,
+        )
+        .into_either()
+        .expect("non-concrete trait receiver success");
+    assert!(hits.is_empty());
+}
