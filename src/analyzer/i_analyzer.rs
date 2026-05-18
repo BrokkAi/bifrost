@@ -257,6 +257,33 @@ pub trait IAnalyzer: Send + Sync + Any {
         Vec::new()
     }
 
+    /// True when `code_unit` represents a file-level synthetic module — the
+    /// top-level node that wraps a whole source file in module-oriented
+    /// languages (JS/TS, Python, Rust, Go, C++). Used by the
+    /// maintainability-size heuristic to apply a leeway multiplier to
+    /// file-wide modules, which are inherently broader than class-like
+    /// units. Mirrors the identical override shared by all five non-Java
+    /// brokk-shared analyzers; Java's class-based top-level naturally
+    /// returns `false` because `is_module()` is false for its top-level
+    /// declarations.
+    fn is_file_level_module(&self, code_unit: &CodeUnit, top_level: bool) -> bool {
+        if !top_level || !code_unit.is_module() || self.parent_of(code_unit).is_some() {
+            return false;
+        }
+        let Some(extension) = code_unit
+            .source()
+            .rel_path()
+            .extension()
+            .and_then(|ext| ext.to_str())
+        else {
+            return false;
+        };
+        let extension_lower = extension.to_ascii_lowercase();
+        self.languages()
+            .iter()
+            .any(|language| language.extensions().contains(&extension_lower.as_str()))
+    }
+
     fn get_skeletons(&self, file: &ProjectFile) -> BTreeMap<CodeUnit, String> {
         let mut skeletons = BTreeMap::new();
         for symbol in self.top_level_declarations(file) {

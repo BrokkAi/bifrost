@@ -557,6 +557,78 @@ impl Range {
     pub fn contains(&self, other: &Range) -> bool {
         self.start_byte <= other.start_byte && self.end_byte >= other.end_byte
     }
+
+    /// Mirrors brokk-shared `Range.isEmpty()` so the maintainability-size
+    /// heuristic skips degenerate ranges identically to the JVM analyzer.
+    pub fn is_empty(&self) -> bool {
+        self.start_line == self.end_line && self.start_byte == self.end_byte
+    }
+
+    /// Number of source lines this range spans. Matches brokk-shared
+    /// `IAnalyzer.spanLines(Range)`: empty ranges report `0`, non-empty
+    /// ranges report at least `1`.
+    pub fn span_lines(&self) -> u32 {
+        if self.is_empty() {
+            return 0;
+        }
+        let diff = self.end_line.saturating_sub(self.start_line) + 1;
+        diff.max(1) as u32
+    }
+}
+
+/// Tunable thresholds for the long-method / god-object maintainability-size
+/// heuristic. Mirrors brokk-shared `IAnalyzer.MaintainabilitySizeSmellWeights`
+/// field-for-field; the brokk-core MCP wrapper falls back to
+/// [`MaintainabilitySizeSmellWeights::defaults`] whenever a knob is `<= 0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaintainabilitySizeSmellWeights {
+    pub long_method_span_lines: i32,
+    pub high_complexity_threshold: i32,
+    pub god_object_span_lines: i32,
+    pub god_object_direct_children: i32,
+    pub god_object_functions: i32,
+    pub helper_sprawl_functions: i32,
+    pub helper_sprawl_workflow_lines: i32,
+    pub file_module_leeway_multiplier: i32,
+}
+
+impl MaintainabilitySizeSmellWeights {
+    /// Default thresholds copied verbatim from brokk-shared
+    /// `IAnalyzer.MaintainabilitySizeSmellWeights.defaults()`. Keep these in
+    /// lock-step so identical input files produce identical scores across
+    /// the two MCP servers.
+    pub fn defaults() -> Self {
+        Self {
+            long_method_span_lines: 80,
+            high_complexity_threshold: 10,
+            god_object_span_lines: 300,
+            god_object_direct_children: 20,
+            god_object_functions: 15,
+            helper_sprawl_functions: 10,
+            helper_sprawl_workflow_lines: 60,
+            file_module_leeway_multiplier: 2,
+        }
+    }
+}
+
+/// One oversized function/class/module finding reported by the
+/// maintainability-size heuristic. Mirrors brokk-shared
+/// `IAnalyzer.MaintainabilitySizeSmell`. Not serde-derived — the embedded
+/// [`CodeUnit`] only round-trips through analyzer state, and the report
+/// layer renders directly from these in-memory values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaintainabilitySizeSmell {
+    pub code_unit: CodeUnit,
+    pub range: Range,
+    pub score: i32,
+    pub own_span_lines: u32,
+    pub descendant_span_lines: u32,
+    pub direct_child_count: u32,
+    pub function_count: u32,
+    pub nested_type_count: u32,
+    pub max_function_span_lines: u32,
+    pub max_cyclomatic_complexity: u32,
+    pub reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

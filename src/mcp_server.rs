@@ -652,6 +652,59 @@ fn list_tools_result() -> Value {
                 }),
             ),
             tool_descriptor(
+                "report_long_method_and_god_object_smells",
+                "Detects oversized functions, god classes, and god modules using weighted maintainability-size thresholds. Walks the declaration tree per file, rolling up function/nested-type counts and cyclomatic complexity. Tunable knobs apply when supplied; values <= 0 use brokk defaults. File-level modules (JS/TS, Python, Rust, Go, C++) get a built-in leeway multiplier. Output format matches the brokk-core MCP byte-for-byte.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "file_paths": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Project-relative paths of files to analyze."
+                        },
+                        "max_findings": {
+                            "type": "integer",
+                            "default": 20,
+                            "description": "Maximum findings to emit; values <= 0 default to 20."
+                        },
+                        "max_files": {
+                            "type": "integer",
+                            "default": 25,
+                            "description": "Maximum files to analyze; values <= 0 default to 25."
+                        },
+                        "long_method_span_lines": {
+                            "type": "integer",
+                            "description": "Long-function span threshold; values <= 0 use the brokk default (80)."
+                        },
+                        "high_complexity_threshold": {
+                            "type": "integer",
+                            "description": "Cyclomatic complexity considered high; values <= 0 use the brokk default (10)."
+                        },
+                        "god_object_span_lines": {
+                            "type": "integer",
+                            "description": "God-object span threshold; values <= 0 use the brokk default (300)."
+                        },
+                        "god_object_direct_children": {
+                            "type": "integer",
+                            "description": "Direct member count flagged as a god object; values <= 0 use the brokk default (20)."
+                        },
+                        "god_object_functions": {
+                            "type": "integer",
+                            "description": "Function count flagged as a god object; values <= 0 use the brokk default (15)."
+                        },
+                        "helper_sprawl_functions": {
+                            "type": "integer",
+                            "description": "Function count flagged as helper sprawl; values <= 0 use the brokk default (10)."
+                        },
+                        "helper_sprawl_workflow_lines": {
+                            "type": "integer",
+                            "description": "Workflow size that triggers helper-sprawl scoring; values <= 0 use the brokk default (60)."
+                        }
+                    },
+                    "required": ["file_paths"]
+                }),
+            ),
+            tool_descriptor(
                 "report_comment_density_for_files",
                 "Java comment density tables for the given source files: one section per file and one row per top-level declaration with own and rolled-up header / inline / span line counts. Non-Java files are skipped with a one-line placeholder. Output format matches the brokk-core MCP byte-for-byte.",
                 json!({
