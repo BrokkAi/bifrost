@@ -5,8 +5,7 @@ use lsp_types::{FoldingRange, FoldingRangeParams};
 
 use crate::analyzer::{CodeUnit, IAnalyzer, WorkspaceAnalyzer};
 use crate::lsp::conversion::byte_range_to_lsp_range;
-use crate::lsp::handlers::util::project_file_for_uri;
-use crate::text_utils::compute_line_starts;
+use crate::lsp::handlers::util::read_document_for_uri;
 
 /// Build the foldingRange response for a request URI. Returns `None` when the
 /// URI does not map into the active project root, or when the file cannot be
@@ -18,11 +17,9 @@ pub fn handle(
     project_root: &Path,
     params: &FoldingRangeParams,
 ) -> Option<Vec<FoldingRange>> {
-    let project_file = project_file_for_uri(project_root, &params.text_document.uri)?;
+    let (project_file, content, line_starts) =
+        read_document_for_uri(project_root, &params.text_document.uri)?;
     let analyzer = workspace.analyzer();
-
-    let content = project_file.read_to_string().ok()?;
-    let line_starts = compute_line_starts(&content);
 
     // Dedup by (start_line, end_line) since overloads or nested scans can
     // legitimately produce duplicate spans, and BTreeSet also gives us a stable

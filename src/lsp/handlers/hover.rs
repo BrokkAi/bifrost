@@ -5,9 +5,8 @@ use lsp_types::{Hover, HoverContents, HoverParams, MarkupContent, MarkupKind};
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, Range as ByteRange, WorkspaceAnalyzer};
 use crate::lsp::conversion::{byte_range_to_lsp_range, position_to_byte_offset};
 use crate::lsp::handlers::util::{
-    extract_leading_doc_comment, identifier_span_at_offset, project_file_for_uri,
+    extract_leading_doc_comment, identifier_span_at_offset, read_document_for_uri,
 };
-use crate::text_utils::compute_line_starts;
 
 /// Resolve `textDocument/hover` for the symbol under the cursor. Returns the
 /// analyzer's skeleton header (signature plus enclosing context) wrapped in a
@@ -18,10 +17,7 @@ pub fn handle(
     params: &HoverParams,
 ) -> Option<Hover> {
     let uri = &params.text_document_position_params.text_document.uri;
-    let project_file = project_file_for_uri(project_root, uri)?;
-
-    let content = project_file.read_to_string().ok()?;
-    let line_starts = compute_line_starts(&content);
+    let (_, content, line_starts) = read_document_for_uri(project_root, uri)?;
     let byte_offset = position_to_byte_offset(
         &content,
         &line_starts,

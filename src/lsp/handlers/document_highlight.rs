@@ -5,9 +5,8 @@ use lsp_types::{DocumentHighlight, DocumentHighlightKind, DocumentHighlightParam
 use crate::analyzer::{CodeUnit, IAnalyzer, Range as ByteRange, WorkspaceAnalyzer};
 use crate::lsp::conversion::{byte_range_to_lsp_range, position_to_byte_offset};
 use crate::lsp::handlers::util::{
-    identifier_at_offset, identifier_selection_range, project_file_for_uri,
+    identifier_at_offset, identifier_selection_range, read_document_for_uri,
 };
-use crate::text_utils::compute_line_starts;
 use crate::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, UsageFinder, UsageHit};
 
 /// Resolve `textDocument/documentHighlight`. Scopes the usage scan to the
@@ -19,10 +18,7 @@ pub fn handle(
     params: &DocumentHighlightParams,
 ) -> Option<Vec<DocumentHighlight>> {
     let uri = &params.text_document_position_params.text_document.uri;
-    let project_file = project_file_for_uri(project_root, uri)?;
-
-    let content = project_file.read_to_string().ok()?;
-    let line_starts = compute_line_starts(&content);
+    let (project_file, content, line_starts) = read_document_for_uri(project_root, uri)?;
     let byte_offset = position_to_byte_offset(
         &content,
         &line_starts,
