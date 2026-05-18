@@ -112,19 +112,26 @@ pub fn identifier_span_at_offset(content: &str, offset: usize) -> Option<(usize,
 /// suffix to the right of the cursor belongs to the identifier the user is
 /// currently typing over and must not be consumed.
 ///
-/// Returns `""` when the byte immediately before `offset` is not an identifier
-/// byte (cursor after whitespace, after `(`, at file start, etc.). Callers
-/// should treat an empty prefix as "no completions" since
-/// `autocomplete_definitions` already returns an empty `Vec` for an empty
-/// query.
-pub fn identifier_prefix_before_offset(content: &str, offset: usize) -> &str {
+/// Returns `None` when there is no identifier byte immediately before `offset`
+/// (cursor after whitespace, after `(`, at file start) OR when `offset` lies
+/// past the end of `content`. The past-EOF rejection is important: callers
+/// must clamp their offsets via `position_to_byte_offset` first, and a
+/// degenerate offset must not produce a fabricated prefix from the trailing
+/// bytes of the buffer.
+pub fn identifier_prefix_before_offset(content: &str, offset: usize) -> Option<&str> {
     let bytes = content.as_bytes();
-    let end = offset.min(bytes.len());
+    if offset > bytes.len() {
+        return None;
+    }
+    let end = offset;
     let mut start = end;
     while start > 0 && is_ident_byte(bytes[start - 1]) {
         start -= 1;
     }
-    content.get(start..end).unwrap_or("")
+    if start == end {
+        return None;
+    }
+    content.get(start..end)
 }
 
 pub(super) fn is_ident_byte(byte: u8) -> bool {
@@ -322,17 +329,17 @@ mod tests {
         let content = "let foo_bar = baz123;";
         // Cursor after "foo" (inside `foo_bar`): prefix is "foo", NOT "foo_bar".
         // Completion must not consume the suffix the user is overwriting.
-        assert_eq!(identifier_prefix_before_offset(content, 7), "foo");
+        assert_eq!(identifier_prefix_before_offset(content, 7), Some("foo"));
         // Cursor at end of "foo_bar".
-        assert_eq!(identifier_prefix_before_offset(content, 11), "foo_bar");
+        assert_eq!(identifier_prefix_before_offset(content, 11), Some("foo_bar"));
         // Cursor sits on whitespace following an identifier.
-        assert_eq!(identifier_prefix_before_offset(content, 12), "");
+        assert_eq!(identifier_prefix_before_offset(content, 12), None);
         // Cursor at file start.
-        assert_eq!(identifier_prefix_before_offset(content, 0), "");
+        assert_eq!(identifier_prefix_before_offset(content, 0), None);
         // Empty content.
-        assert_eq!(identifier_prefix_before_offset("", 0), "");
-        // Offset past EOF clamps to the buffer length.
-        assert_eq!(identifier_prefix_before_offset("abc", 99), "abc");
+        assert_eq!(identifier_prefix_before_offset("", 0), None);
+        // Offset past EOF is rejected — callers must clamp first.
+        assert_eq!(identifier_prefix_before_offset("abc", 99), None);
     }
 
     #[test]

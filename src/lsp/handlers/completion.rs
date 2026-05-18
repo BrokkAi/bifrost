@@ -1,4 +1,6 @@
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
 
 use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionList, CompletionParams, CompletionResponse,
@@ -16,6 +18,52 @@ use crate::text_utils::compute_line_starts;
 /// well-behaved clients re-query as the prefix lengthens.
 const MAX_RESULTS: usize = 500;
 
+/// Minimum interval between stderr log emits for repeated read failures on
+/// the same path. Completion fires per-keystroke; without throttling, a
+/// pointed-at-unreadable-URI editor could flood the LSP host's log with
+/// hundreds of identical lines per minute.
+const READ_FAILURE_LOG_THROTTLE: Duration = Duration::from_secs(60);
+
+/// Per-handler state for `textDocument/completion`. Owned by `ServerState`
+/// (single-threaded request loop), invalidated by `didSave` /
+/// `didChangeWatchedFiles`.
+///
+/// Caching the file content + line_starts avoids paying a full-file disk
+/// read and UTF-8 line scan on every keystroke. Mtime-checked so external
+/// edits (git checkout, formatter run) don't serve stale bytes.
+///
+/// Memory bound: unbounded today. An editor with thousands of files open
+/// concurrently could grow this map without bound. Acceptable for v1 (no
+/// reasonable LSP workflow keeps that many files open at once); revisit if
+/// the cache shows up in heap profiles.
+#[derive(Default)]
+pub(crate) struct CompletionCache {
+    files: HashMap<PathBuf, FileCacheEntry>,
+    /// Last time we logged a read failure for a given path. Keyed by path
+    /// (NOT URI) to coalesce log noise even when the editor sends slightly
+    /// different URI forms for the same file.
+    last_log_failure: HashMap<PathBuf, Instant>,
+}
+
+struct FileCacheEntry {
+    mtime: SystemTime,
+    content: String,
+    line_starts: Vec<usize>,
+}
+
+impl CompletionCache {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Drop the cached entry (if any) for `path`. Called from `didSave` /
+    /// `didChangeWatchedFiles` so the next completion request re-reads the
+    /// new content.
+    pub(crate) fn invalidate(&mut self, path: &Path) {
+        self.files.remove(path);
+    }
+}
+
 /// Resolve `textDocument/completion` for the identifier prefix immediately
 /// before the cursor. Returns `None` (the LSP "no completions" shape) when:
 /// - the URI is outside the project,
@@ -26,39 +74,24 @@ const MAX_RESULTS: usize = 500;
 /// completion past `.` / `::` is intentionally out of scope; clients fall back
 /// to the editor's word-completion past those separators.
 pub fn handle(
+    cache: &mut CompletionCache,
     workspace: &WorkspaceAnalyzer,
     project_root: &Path,
     params: &CompletionParams,
 ) -> Option<CompletionResponse> {
     let uri = &params.text_document_position.text_document.uri;
     let project_file = project_file_for_uri(project_root, uri)?;
-    let content = match project_file.read_to_string() {
-        Ok(content) => content,
-        Err(err) => {
-            // Same shape as `project_file_for_uri`'s logging — surface a single
-            // line so operators chasing "why doesn't completion work" can see
-            // permission-denied / transient I/O failures instead of the
-            // silently-empty completion list the client would otherwise show.
-            eprintln!(
-                "[bifrost-lsp] completion: failed to read {}: {err}",
-                uri.as_str()
-            );
-            return None;
-        }
-    };
-    let line_starts = compute_line_starts(&content);
+    let abs_path = project_file.abs_path();
+    let entry = load_or_refresh(cache, &abs_path, uri)?;
     let byte_offset = position_to_byte_offset(
-        &content,
-        &line_starts,
+        &entry.content,
+        &entry.line_starts,
         &params.text_document_position.position,
     );
-    let prefix = identifier_prefix_before_offset(&content, byte_offset);
-    if prefix.is_empty() {
-        return None;
-    }
+    let prefix = identifier_prefix_before_offset(&entry.content, byte_offset)?;
 
     let analyzer = workspace.analyzer();
-    // Same cold-start fallback as `workspace_symbol::handle`: when the
+    // Cold-start fallback (mirrors `workspace_symbol::handle`): when the
     // in-memory analyzer state is empty (deferred build, rebuild in flight,
     // no analyzable files yet), hit the persisted FTS5 symbol index so
     // completion still responds sub-second on large repos.
@@ -66,19 +99,26 @@ pub fn handle(
     // path when no storage is wired in or the trigram tokenizer can't index
     // the prefix (< 3 chars), so editors on the legacy code path see no
     // regression.
+    //
+    // Escape asymmetry between the branches is intentional:
+    // - Hot path (`autocomplete_definitions`) interpolates `query` into a
+    //   regex internally, so we `regex::escape` the prefix. Today this is a
+    //   no-op (`is_ident_byte` constrains the prefix to ASCII alphanumeric +
+    //   `_`, none of which are regex meta), but it's defence-in-depth against
+    //   future widening (e.g. Unicode XID support).
+    // - Cold path (`search_definitions_persisted`) treats the query as an
+    //   FTS5 trigram phrase, not a regex. Escaping there would inject
+    //   backslashes into the trigrams and break matches. The same ASCII
+    //   identifier constraint guarantees no metacharacters reach this path
+    //   either.
     let raw_matches: Vec<CodeUnit> = if analyzer.is_empty() {
-        // The cold-start path doesn't filter synthetic units; filter them
-        // here to match the hot-path contract.
+        // The cold-start path doesn't filter synthetic units; we rely on the
+        // post-search filter below to match the hot-path contract.
         analyzer
             .search_definitions_persisted(prefix)
             .into_iter()
             .collect()
     } else {
-        // `autocomplete_definitions` interpolates `query` into a regex
-        // internally. Escape the prefix so regex metacharacters can never
-        // leak through — `is_ident_byte` keeps the prefix to ASCII
-        // identifier bytes today, but escaping is cheap defence-in-depth
-        // against future widening (e.g. Unicode XID support).
         let escaped = regex::escape(prefix);
         analyzer.autocomplete_definitions(&escaped)
     };
@@ -102,6 +142,90 @@ pub fn handle(
         is_incomplete,
         items,
     }))
+}
+
+/// Return a borrowed reference to the cache entry for `abs_path`, refreshing
+/// it from disk when the mtime has changed (or there's no entry yet). The
+/// fast path is mtime-only — for a hot file the cost is one `stat` call and
+/// a `HashMap` lookup instead of a full file read + `compute_line_starts`.
+///
+/// Logs a single line to stderr on a stat or read failure, **throttled to one
+/// emit per path per minute** (`READ_FAILURE_LOG_THROTTLE`). Returns `None`
+/// on any I/O failure so the caller can send the LSP "no completions" shape.
+fn load_or_refresh<'cache>(
+    cache: &'cache mut CompletionCache,
+    abs_path: &Path,
+    uri: &lsp_types::Uri,
+) -> Option<&'cache FileCacheEntry> {
+    let metadata = match std::fs::metadata(abs_path) {
+        Ok(m) => m,
+        Err(err) => {
+            maybe_log_failure(
+                &mut cache.last_log_failure,
+                abs_path,
+                uri,
+                &format_args!("stat failed: {err}").to_string(),
+            );
+            return None;
+        }
+    };
+    let mtime = metadata.modified().ok()?;
+
+    if let Some(existing) = cache.files.get(abs_path)
+        && existing.mtime == mtime
+    {
+        return cache.files.get(abs_path);
+    }
+
+    let content = match std::fs::read_to_string(abs_path) {
+        Ok(c) => c,
+        Err(err) => {
+            maybe_log_failure(
+                &mut cache.last_log_failure,
+                abs_path,
+                uri,
+                &format_args!("read failed: {err}").to_string(),
+            );
+            return None;
+        }
+    };
+    let line_starts = compute_line_starts(&content);
+    cache.files.insert(
+        abs_path.to_path_buf(),
+        FileCacheEntry {
+            mtime,
+            content,
+            line_starts,
+        },
+    );
+    cache.files.get(abs_path)
+}
+
+/// Emit a stderr line about an I/O failure on `abs_path`, but only if we
+/// haven't logged for this path in the last `READ_FAILURE_LOG_THROTTLE`.
+/// Logs the relative tail of `abs_path` rather than the full URI so that
+/// PII-bearing absolute paths (e.g. `/Users/me/secrets/.aws/credentials`)
+/// don't accumulate in LSP host logs that an editor may persist verbatim.
+fn maybe_log_failure(
+    last_log: &mut HashMap<PathBuf, Instant>,
+    abs_path: &Path,
+    uri: &lsp_types::Uri,
+    detail: &str,
+) {
+    let now = Instant::now();
+    let should_log = match last_log.get(abs_path) {
+        Some(prev) => now.duration_since(*prev) >= READ_FAILURE_LOG_THROTTLE,
+        None => true,
+    };
+    if !should_log {
+        return;
+    }
+    last_log.insert(abs_path.to_path_buf(), now);
+    let label = abs_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_else(|| uri.as_str());
+    eprintln!("[bifrost-lsp] completion: {label}: {detail}");
 }
 
 fn build_item(code_unit: &CodeUnit) -> CompletionItem {

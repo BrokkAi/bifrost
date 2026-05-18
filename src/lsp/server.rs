@@ -130,6 +130,7 @@ fn handle_request(
         }),
         Completion::METHOD => decode_and_run::<Completion, _>(req, |params| {
             Ok(completion::handle(
+                &mut state.completion_cache,
                 &state.workspace,
                 state.project.root(),
                 &params,
@@ -226,6 +227,12 @@ fn handle_notification(
             if let Some(file) =
                 resolve_project_file(state.project.root(), &params.text_document.uri)
             {
+                // Drop completion's mtime-cached content first — the save just
+                // bumped the file's mtime, but we want the next completion
+                // request to refresh from disk even if the editor's mtime is
+                // older than our cached one (which happens with editors that
+                // write atomically via rename + stat-preserving copy).
+                state.completion_cache.invalidate(&file.abs_path());
                 let mut changed = BTreeSet::new();
                 changed.insert(file);
                 state.workspace = state.workspace.update(&changed);
@@ -258,6 +265,7 @@ fn handle_notification(
                     FileChangeType::CREATED | FileChangeType::CHANGED | FileChangeType::DELETED
                 ) && let Some(file) = resolve_project_file(state.project.root(), &change.uri)
                 {
+                    state.completion_cache.invalidate(&file.abs_path());
                     changed.insert(file);
                 }
             }
@@ -298,6 +306,12 @@ fn publish_diagnostics(
 pub(crate) struct ServerState {
     workspace: WorkspaceAnalyzer,
     project: Arc<dyn Project>,
+    /// Owned by `textDocument/completion`. Lives on `ServerState` because the
+    /// handler is invoked per-keystroke and benefits from mtime-checked
+    /// caching of file content + line offsets. Other handlers (hover,
+    /// definition, references) fire far less often, so they continue to
+    /// re-read on every request without sharing this cache.
+    completion_cache: completion::CompletionCache,
 }
 
 impl ServerState {
@@ -309,7 +323,11 @@ impl ServerState {
             )
         })?);
         let workspace = WorkspaceAnalyzer::build(Arc::clone(&project), AnalyzerConfig::default());
-        Ok(Self { workspace, project })
+        Ok(Self {
+            workspace,
+            project,
+            completion_cache: completion::CompletionCache::new(),
+        })
     }
 }
 
