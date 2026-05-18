@@ -27,6 +27,8 @@ The observable outcome is that `report_structural_clone_smells` works consistent
 - [x] (2026-05-18) Validated the Milestone 4 checkpoint with `cargo test --test php_structural_clone_smells -- --nocapture`, `cargo test --test searchtools_service python_boundary_returns_structural_clone_report_json -- --nocapture`, `cargo test --test bifrost_mcp_server bifrost_searchtools_server_speaks_mcp_stdio -- --nocapture`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings`.
 - [x] (2026-05-18) Completed Milestone 5. Added first-pass Scala structural clone support in `src/analyzer/scala_analyzer.rs` and focused Scala behavior tests in `tests/scala_structural_clone_smells.rs`.
 - [x] (2026-05-18) Validated the Milestone 5 checkpoint with `cargo test --test scala_structural_clone_smells -- --nocapture`, `cargo test --test searchtools_service python_boundary_returns_structural_clone_report_json -- --nocapture`, `cargo test --test bifrost_mcp_server bifrost_searchtools_server_speaks_mcp_stdio -- --nocapture`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings`.
+- [x] (2026-05-18) Completed Milestone 6. Added first-pass C# structural clone support in `src/analyzer/csharp_analyzer.rs` and focused C# behavior tests in `tests/csharp_structural_clone_smells.rs`.
+- [x] (2026-05-18) Validated the Milestone 6 checkpoint with `cargo test --test csharp_structural_clone_smells -- --nocapture`, `cargo test --test searchtools_service python_boundary_returns_structural_clone_report_json -- --nocapture`, `cargo test --test bifrost_mcp_server bifrost_searchtools_server_speaks_mcp_stdio -- --nocapture`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings`.
 - [ ] Add this plan’s milestone tracker updates as each language slice lands.
 - [ ] Keep the `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` sections current during implementation.
 
@@ -55,6 +57,9 @@ The observable outcome is that `report_structural_clone_smells` works consistent
 
 - Observation: Scala did not need the same parse-wrapper workaround as PHP.
   Evidence: the extracted Scala function snippets were already parseable enough for clone-token and AST-signature generation, so the first-pass Scala port only needed the language-specific normalization hooks and test coverage.
+
+- Observation: C# also fit the shared clone engine without any snippet-wrapping workaround.
+  Evidence: extracted method and constructor bodies from the existing C# analyzer were already parseable and produced stable results under the same first-pass thresholds used in the C# behavior suite.
 
 ## Decision Log
 
@@ -85,6 +90,8 @@ Milestone 3 outcome: the shared clone engine is materially cleaner. The common d
 Milestone 4 outcome: PHP now has a bounded first-pass clone feature. The semantics are covered by focused Bifrost tests rather than Brokk parity tests, and the implementation documents an important difference from the parity languages: extracted PHP snippets must be normalized into parseable PHP fragments before clone scoring works correctly.
 
 Milestone 5 outcome: Scala now has a bounded first-pass clone feature as well. Compared with PHP, the Scala port was mechanically simpler, which suggests the remaining C# and C++ work will hinge more on declaration-shape decisions and AST tuning than on the shared engine itself.
+
+Milestone 6 outcome: C# now has a bounded first-pass clone feature too. Like Scala, it fit the shared engine cleanly, which increases confidence that the last remaining language, C++, will mostly be about candidate scoping and syntax edge cases rather than architectural gaps.
 
 ## Context and Orientation
 
