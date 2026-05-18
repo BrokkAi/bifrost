@@ -1469,10 +1469,8 @@ fn collect_js_ts_test_cases(node: Node<'_>, source: &str, out: &mut Vec<JsTsTest
         let mut cursor = arguments.walk();
         for child in arguments.named_children(&mut cursor) {
             match child.kind() {
-                "string" | "template_string" => {
-                    if name.is_none() {
-                        name = Some(trim_js_ts_string_literal(node_text(child, source)));
-                    }
+                "string" | "template_string" if name.is_none() => {
+                    name = Some(trim_js_ts_string_literal(node_text(child, source)));
                 }
                 "arrow_function" | "function" | "generator_function" => {
                     callback = Some(child);
