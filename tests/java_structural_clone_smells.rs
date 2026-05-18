@@ -10,6 +10,50 @@ mod common;
 
 use common::InlineTestProject;
 
+fn analyze_pair(
+    path_a: &str,
+    source_a: &str,
+    path_b: &str,
+    source_b: &str,
+    weights: CloneSmellWeights,
+) -> Vec<brokk_analyzer::CloneSmell> {
+    analyze(
+        &[(path_a, source_a), (path_b, source_b)],
+        &[path_a],
+        weights,
+    )
+}
+
+fn analyze_both_requested(
+    path_a: &str,
+    source_a: &str,
+    path_b: &str,
+    source_b: &str,
+    weights: CloneSmellWeights,
+) -> Vec<brokk_analyzer::CloneSmell> {
+    analyze(
+        &[(path_a, source_a), (path_b, source_b)],
+        &[path_a, path_b],
+        weights,
+    )
+}
+
+fn analyze_three_requested(
+    path_a: &str,
+    source_a: &str,
+    path_b: &str,
+    source_b: &str,
+    path_c: &str,
+    source_c: &str,
+    weights: CloneSmellWeights,
+) -> Vec<brokk_analyzer::CloneSmell> {
+    analyze(
+        &[(path_a, source_a), (path_b, source_b), (path_c, source_c)],
+        &[path_a, path_b, path_c],
+        weights,
+    )
+}
+
 fn analyze(
     files: &[(&str, &str)],
     requested: &[&str],
@@ -61,12 +105,11 @@ fn flags_renamed_variable_clones_across_files() {
         }
     "#;
 
-    let findings = analyze(
-        &[
-            ("com/example/Alpha.java", alpha),
-            ("com/example/Beta.java", beta),
-        ],
-        &["com/example/Alpha.java"],
+    let findings = analyze_pair(
+        "com/example/Alpha.java",
+        alpha,
+        "com/example/Beta.java",
+        beta,
         default_weights(),
     );
 
@@ -106,12 +149,11 @@ fn ast_refinement_suppresses_different_control_flow() {
         }
     "#;
 
-    let findings = analyze(
-        &[
-            ("com/example/Alpha.java", alpha),
-            ("com/example/Beta.java", beta),
-        ],
-        &["com/example/Alpha.java"],
+    let findings = analyze_pair(
+        "com/example/Alpha.java",
+        alpha,
+        "com/example/Beta.java",
+        beta,
         CloneSmellWeights {
             min_normalized_tokens: 12,
             min_similarity_percent: 50,
@@ -151,12 +193,11 @@ fn does_not_return_symmetric_pairs_when_both_files_are_requested() {
         }
     "#;
 
-    let findings = analyze(
-        &[
-            ("com/example/Alpha.java", alpha),
-            ("com/example/Beta.java", beta),
-        ],
-        &["com/example/Alpha.java", "com/example/Beta.java"],
+    let findings = analyze_both_requested(
+        "com/example/Alpha.java",
+        alpha,
+        "com/example/Beta.java",
+        beta,
         default_weights(),
     );
 
@@ -175,6 +216,224 @@ fn does_not_return_symmetric_pairs_when_both_files_are_requested() {
         })
         .count();
     assert_eq!(1, forward + reverse, "{findings:#?}");
+}
+
+#[test]
+fn treats_extra_logging_as_equivalent_clone() {
+    let alpha = r#"
+        package com.example;
+        class Alpha {
+            int compute(int input) {
+                int total = input + 1;
+                if (total > 10) {
+                    return total * 2;
+                }
+                return total - 3;
+            }
+        }
+    "#;
+    let beta = r#"
+        package com.example;
+        class Beta {
+            int calculate(int seed) {
+                log(seed);
+                int amount = seed + 1;
+                if (amount > 10) {
+                    log(amount);
+                    return amount * 2;
+                }
+                log(amount - 3);
+                return amount - 3;
+            }
+            void log(int value) {}
+        }
+    "#;
+
+    let findings = analyze_pair(
+        "com/example/Alpha.java",
+        alpha,
+        "com/example/Beta.java",
+        beta,
+        CloneSmellWeights {
+            min_normalized_tokens: 12,
+            min_similarity_percent: 55,
+            shingle_size: 2,
+            min_shared_shingles: 3,
+            ast_similarity_percent: 70,
+        },
+    );
+
+    assert!(findings.iter().any(|finding| {
+        finding.enclosing_fq_name.contains("Alpha.compute")
+            && finding.peer_enclosing_fq_name.contains("Beta.calculate")
+    }));
+}
+
+#[test]
+fn treats_try_catch_wrapped_variant_as_equivalent_clone() {
+    let alpha = r#"
+        package com.example;
+        class Alpha {
+            int compute(int input) {
+                int total = input + 1;
+                if (total > 10) {
+                    return total * 2;
+                }
+                return total - 3;
+            }
+        }
+    "#;
+    let beta = r#"
+        package com.example;
+        class Beta {
+            int calculate(int seed) {
+                try {
+                    int amount = seed + 1;
+                    if (amount > 10) {
+                        return amount * 2;
+                    }
+                    return amount - 3;
+                } catch (RuntimeException e) {
+                    throw e;
+                }
+            }
+        }
+    "#;
+
+    let findings = analyze_pair(
+        "com/example/Alpha.java",
+        alpha,
+        "com/example/Beta.java",
+        beta,
+        CloneSmellWeights {
+            min_normalized_tokens: 12,
+            min_similarity_percent: 50,
+            shingle_size: 2,
+            min_shared_shingles: 3,
+            ast_similarity_percent: 65,
+        },
+    );
+
+    assert!(findings.iter().any(|finding| {
+        finding.enclosing_fq_name.contains("Alpha.compute")
+            && finding.peer_enclosing_fq_name.contains("Beta.calculate")
+    }));
+}
+
+#[test]
+fn keeps_stable_results_with_multiple_peer_functions() {
+    let requested = r#"
+        package com.example;
+        class Alpha {
+            int compute(int input) {
+                int total = input + 1;
+                if (total > 10) {
+                    return total * 2;
+                }
+                return total - 3;
+            }
+        }
+    "#;
+    let peers = r#"
+        package com.example;
+        class Beta {
+            int calculate(int seed) {
+                int amount = seed + 1;
+                if (amount > 10) {
+                    return amount * 2;
+                }
+                return amount - 3;
+            }
+
+            int unrelated(int seed) {
+                while (seed > 0) {
+                    seed--;
+                }
+                return seed;
+            }
+        }
+    "#;
+
+    let findings = analyze_pair(
+        "com/example/Alpha.java",
+        requested,
+        "com/example/Beta.java",
+        peers,
+        default_weights(),
+    );
+    let matching = findings
+        .iter()
+        .filter(|finding| finding.enclosing_fq_name.contains("Alpha.compute"))
+        .filter(|finding| finding.peer_enclosing_fq_name.contains("Beta.calculate"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(1, matching.len(), "{findings:#?}");
+    assert!(findings.iter().all(|finding| {
+        !(finding.enclosing_fq_name.contains("Alpha.compute")
+            && finding.peer_enclosing_fq_name.contains("Beta.unrelated"))
+    }));
+}
+
+#[test]
+fn orders_clone_findings_deterministically_across_files_and_peers() {
+    let alpha = r#"
+        package com.example;
+        class Alpha {
+            int same(int input) {
+                int total = input + 1;
+                if (total > 10) {
+                    return total * 2;
+                }
+                return total - 3;
+            }
+        }
+    "#;
+    let beta = r#"
+        package com.example;
+        class Beta {
+            int same(int seed) {
+                int amount = seed + 1;
+                if (amount > 10) {
+                    return amount * 2;
+                }
+                return amount - 3;
+            }
+        }
+    "#;
+    let gamma = r#"
+        package com.example;
+        class Gamma {
+            int same(int seed) {
+                int value = seed + 1;
+                if (value > 10) {
+                    return value * 2;
+                }
+                return value - 3;
+            }
+        }
+    "#;
+
+    let findings = analyze_three_requested(
+        "com/example/Gamma.java",
+        gamma,
+        "com/example/Beta.java",
+        beta,
+        "com/example/Alpha.java",
+        alpha,
+        default_weights(),
+    );
+
+    assert_eq!(
+        vec![
+            "com/example/Alpha.java->com/example/Beta.java",
+            "com/example/Alpha.java->com/example/Gamma.java",
+            "com/example/Beta.java->com/example/Gamma.java",
+        ],
+        findings
+            .iter()
+            .map(|finding| format!("{}->{}", finding.file, finding.peer_file))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
