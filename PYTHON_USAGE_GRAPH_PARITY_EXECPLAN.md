@@ -17,7 +17,7 @@ The immediate outcome is not one code patch. It is a durable implementation prog
 - [x] (2026-05-18T11:30Z) Captured the current `bifrost` baseline: Python is already routed through `PythonExportUsageGraphStrategy`, but Rust-side coverage is still shallow compared with Brokk’s strategy and reference-graph suites.
 - [x] (2026-05-18T12:05Z) Completed Milestone 1 by expanding the focused Python graph suite for `UsageFinder` routing, `MultiAnalyzer` routing, `TooManyCallsites`, and same-file regex fallback, then fixing `PythonExportUsageGraphStrategy` so it can resolve a `PythonAnalyzer` out of `MultiAnalyzer` instead of silently dropping to regex.
 - [x] (2026-05-18T12:35Z) Completed Milestone 2 by porting nested `__init__.py` barrels, dotted namespace imports, dotted namespace aliases, package-imported submodule qualifiers, relative submodule qualifiers, and wildcard-barrel cases into `tests/usages_python_graph_test.rs`, then fixing Python import binding and re-export seeding so those cases route through the graph successfully.
-- [ ] Implement Milestone 3 by porting Python receiver/member inference cases from Brokk into focused Rust tests and then fixing any uncovered inference gaps.
+- [x] (2026-05-18T13:05Z) Completed Milestone 3 by porting typed local, typed parameter, typed instance attribute, constructed local, alias, and namespace-qualified annotation receiver cases into `tests/usages_python_graph_test.rs`, then adding a lightweight receiver-fact inference layer in `src/usages/python_graph.rs` so member queries can prove those receiver-based usages.
 - [ ] Implement Milestone 4 by porting Python negative and ambiguity cases from Brokk into focused Rust tests and then fixing any uncovered false-positive or fallback gaps.
 - [ ] Implement Milestone 5 by porting Python inheritance and cache/update cases from Brokk into focused Rust tests and then fixing any uncovered hierarchy or invalidation gaps.
 - [ ] Complete Milestone 6 by reviewing residual Brokk Python usage tests, marking each as `done`, `missing`, `different by design`, or `deferred`, and recording the reason.
@@ -41,6 +41,9 @@ The immediate outcome is not one code patch. It is a durable implementation prog
 
 - Observation: several Python import topologies were already parseable by the analyzer but were not being expressed in the usage graph with the right shape.
   Evidence: Milestone 2 tests for `from pkg import timestamps`, `from . import service`, `from .. import service`, and `from .service import *` initially failed because `import_binder_of` treated submodule imports as named symbol imports and `export_index_of` ignored wildcard re-export edges.
+
+- Observation: the Python graph had no receiver-fact layer at all before Milestone 3.
+  Evidence: member queries only succeeded when the object text directly matched the imported owner symbol, so `x.bar()` worked only for static owner references and not for typed locals, constructor-seeded locals, aliases, or `self` attributes.
 
 ## Decision Log
 
@@ -68,9 +71,13 @@ The immediate outcome is not one code patch. It is a durable implementation prog
   Rationale: `from .service import *` is an actual graph edge used by Brokk’s package-barrel tests, so skipping it prevents valid re-export seeds from ever being discovered.
   Date/Author: 2026-05-18 / Codex
 
+- Decision: implement Milestone 3 with a lightweight receiver-fact collector that infers target-bound receivers from annotations, simple constructor assignments, and direct aliases before attempting a heavier AST-wide data-flow port.
+  Rationale: the immediate parity goal for this milestone is to cover Brokk’s basic positive receiver cases, and those cases can be expressed safely with a small, targeted inference layer that keeps the implementation readable while still leaving room for later hardening in the negative/ambiguity milestone.
+  Date/Author: 2026-05-18 / Codex
+
 ## Outcomes & Retrospective
 
-At the moment this plan is created, `bifrost` has already crossed the architecture threshold for Python usage graphs: the shared graph core from issue `#73` exists, Python routing is enabled, and a Python graph strategy is present. Milestone 1 converted that architecture into stronger proof by covering graph routing, fallback behavior, bounded-candidate behavior, and `MultiAnalyzer` routing with focused Rust tests. Milestone 2 then closed the first substantial functionality gaps by teaching the graph about namespace-style submodule imports and wildcard re-export stars, which in turn unlocked Brokk-style barrel and submodule-qualifier cases. What is still missing is the larger parity tail around receiver inference, negative ambiguity control, inheritance, and cache invalidation.
+At the moment this plan is created, `bifrost` has already crossed the architecture threshold for Python usage graphs: the shared graph core from issue `#73` exists, Python routing is enabled, and a Python graph strategy is present. Milestone 1 converted that architecture into stronger proof by covering graph routing, fallback behavior, bounded-candidate behavior, and `MultiAnalyzer` routing with focused Rust tests. Milestone 2 then closed the first substantial functionality gaps by teaching the graph about namespace-style submodule imports and wildcard re-export stars, which in turn unlocked Brokk-style barrel and submodule-qualifier cases. Milestone 3 added the first receiver-fact inference layer, which now proves typed and constructor-seeded member usages that previously had no graph support at all. What is still missing is the remaining parity tail around negative ambiguity control, inheritance, and cache invalidation.
 
 This plan turns that gap into a staged implementation program. Success is not “Python has a graph class.” Success is that a contributor can work milestone by milestone, port the representative scenarios, fix the underlying behavior where needed, and finish with a parity matrix that says exactly what has been matched and what remains intentionally different.
 
@@ -238,8 +245,9 @@ This matrix must be kept current as milestones land.
   Brokk reference: absolute imports, relative imports, `__init__.py` barrels, nested barrel chains, dotted namespace imports, dotted aliases, submodule qualifiers, and cycle-safe traversal in `PythonExportUsageReferenceGraphTest.java`.
   Current `bifrost` proof: focused Rust tests now cover absolute imports, relative imports, package barrels, nested `__init__.py` chains, dotted namespace imports and aliases, package-imported submodule qualifiers, relative submodule qualifiers, wildcard barrels, and cycle-safe traversal.
 
-- Receiver/member inference parity: `missing`
+- Receiver/member inference parity: `done`
   Brokk reference: typed locals, typed parameters, typed instance attributes, constructed locals, aliases, and qualified annotations in `PythonExportUsageReferenceGraphTest.java`.
+  Current `bifrost` proof: focused Rust tests now cover typed locals, typed parameters, typed instance attributes, constructed locals, simple aliases, namespace-qualified annotations, and direct member access through the Python graph.
 
 - Negative and ambiguity parity: `missing`
   Brokk reference: shadowing, unknown constructors, unrelated same-name receivers, ambiguity caps, and “graph success with no hits does not fallback to regex” in `PythonExportUsageReferenceGraphTest.java`.
@@ -255,3 +263,5 @@ Revision note: created this broader parity ExecPlan after issue `#73` had alread
 Revision note: updated after Milestone 1 to record the added routing/fallback tests and the `MultiAnalyzer` fix in `src/usages/python_graph.rs`.
 
 Revision note: updated after Milestone 2 to record the new import/re-export parity tests plus the analyzer changes that treat imported submodules as namespace bindings and wildcard re-exports as graph edges.
+
+Revision note: updated after Milestone 3 to record the new receiver-inference tests and the lightweight receiver-fact collector that now feeds Python member usage matching.

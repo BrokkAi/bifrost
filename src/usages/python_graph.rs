@@ -8,9 +8,10 @@ use crate::usages::graph_core::{ImportEdge, ImportEdgeKind, ProjectUsageGraph};
 use crate::usages::model::{ExportIndex, FuzzyResult, ImportBinder, UsageHit};
 use crate::usages::traits::UsageAnalyzer;
 use rayon::prelude::*;
+use regex::Regex;
 use std::collections::{BTreeSet, VecDeque};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use tree_sitter::{Node, Parser, Tree};
 
 const GRAPH_HIT_CONFIDENCE: f64 = 1.0;
@@ -397,10 +398,12 @@ fn scan_files_for_seeds(
 
         let edges = graph.usage_graph.matching_edges_for_importer(file, seeds);
         let local_conflicts = collect_top_level_conflicts(tree_ref.root_node(), source_str);
+        let target_self_file = *file == target.source();
+        let receiver_facts =
+            collect_receiver_facts(source_str, &edges, target_short.as_str(), target_self_file);
 
         let mut local_hits = BTreeSet::new();
         let line_starts = compute_line_starts(source_str);
-        let target_self_file = *file == target.source();
 
         let mut scan_ctx = ScanCtx {
             file,
@@ -412,6 +415,7 @@ fn scan_files_for_seeds(
             edges: &edges,
             target_self_file,
             local_conflicts: &local_conflicts,
+            receiver_facts: &receiver_facts,
             hits: &mut local_hits,
         };
 
@@ -440,6 +444,7 @@ struct ScanCtx<'a> {
     edges: &'a [ImportEdge],
     target_self_file: bool,
     local_conflicts: &'a HashSet<String>,
+    receiver_facts: &'a HashSet<String>,
     hits: &'a mut BTreeSet<UsageHit>,
 }
 
@@ -452,6 +457,10 @@ impl ScanCtx<'_> {
             return true;
         }
         self.target_self_file && ident == self.target_short
+    }
+
+    fn receiver_binds_target(&self, expr: &str) -> bool {
+        self.binds_target(expr) || self.receiver_facts.contains(expr)
     }
 }
 
@@ -499,7 +508,7 @@ fn handle_attribute_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let object_text = slice(object, ctx.source);
     let attribute_text = slice(attribute, ctx.source);
     if let Some(member) = ctx.target_member
-        && ctx.binds_target(object_text)
+        && ctx.receiver_binds_target(object_text)
         && attribute_text == member
     {
         record_hit(attribute, ctx);
@@ -510,7 +519,7 @@ fn handle_attribute_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             && (edge.local_name == object_text
                 || object_text.ends_with(&format!(".{}", edge.local_name)))
     });
-    if namespace_match && attribute_text == ctx.target_short {
+    if ctx.target_member.is_none() && namespace_match && attribute_text == ctx.target_short {
         record_hit(attribute, ctx);
     }
 }
@@ -667,6 +676,97 @@ fn collect_assigned_identifiers(node: Node<'_>, source: &str, out: &mut HashSet<
         children.reverse();
         stack.extend(children);
     }
+}
+
+fn collect_receiver_facts(
+    source: &str,
+    edges: &[ImportEdge],
+    target_short: &str,
+    target_self_file: bool,
+) -> HashSet<String> {
+    static PARAM_ANNOTATION_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"([A-Za-z_][A-Za-z0-9_\.]*)\s*:\s*([A-Za-z_][A-Za-z0-9_\.]*)").unwrap()
+    });
+    static ASSIGNMENT_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^\s*([A-Za-z_][A-Za-z0-9_\.]*)\s*=\s*([A-Za-z_][A-Za-z0-9_\.()]*)\s*$")
+            .unwrap()
+    });
+
+    let mut facts = HashSet::default();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for line in source.lines() {
+            for captures in PARAM_ANNOTATION_RE.captures_iter(line) {
+                let lhs = captures.get(1).map(|m| m.as_str()).unwrap_or_default();
+                let annotation = captures.get(2).map(|m| m.as_str()).unwrap_or_default();
+                if receiver_annotation_matches_target(
+                    annotation,
+                    edges,
+                    target_short,
+                    target_self_file,
+                ) && facts.insert(lhs.to_string())
+                {
+                    changed = true;
+                }
+            }
+
+            let Some(captures) = ASSIGNMENT_RE.captures(line) else {
+                continue;
+            };
+            let lhs = captures.get(1).map(|m| m.as_str()).unwrap_or_default();
+            let rhs = captures.get(2).map(|m| m.as_str()).unwrap_or_default();
+            if lhs.is_empty() || rhs.is_empty() {
+                continue;
+            }
+
+            if (receiver_constructor_matches_target(rhs, edges, target_short, target_self_file)
+                || facts.contains(rhs))
+                && facts.insert(lhs.to_string())
+            {
+                changed = true;
+            }
+        }
+    }
+
+    facts
+}
+
+fn receiver_annotation_matches_target(
+    annotation: &str,
+    edges: &[ImportEdge],
+    target_short: &str,
+    target_self_file: bool,
+) -> bool {
+    let annotation = annotation.trim();
+    if annotation.is_empty() {
+        return false;
+    }
+    if annotation == target_short {
+        return target_self_file || edges.iter().any(|edge| edge.local_name == target_short);
+    }
+
+    let Some((qualifier, member)) = annotation.rsplit_once('.') else {
+        return false;
+    };
+    if member != target_short {
+        return false;
+    }
+    edges.iter().any(|edge| {
+        matches!(edge.kind, ImportEdgeKind::Namespace)
+            && (edge.local_name == qualifier
+                || qualifier.ends_with(&format!(".{}", edge.local_name)))
+    })
+}
+
+fn receiver_constructor_matches_target(
+    rhs: &str,
+    edges: &[ImportEdge],
+    target_short: &str,
+    target_self_file: bool,
+) -> bool {
+    let constructor = rhs.strip_suffix("()").unwrap_or(rhs).trim();
+    receiver_annotation_matches_target(constructor, edges, target_short, target_self_file)
 }
 
 fn python_module_name(file: &ProjectFile) -> String {

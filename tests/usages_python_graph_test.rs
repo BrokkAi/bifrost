@@ -15,6 +15,31 @@ fn definition(analyzer: &PythonAnalyzer, fq_name: &str) -> CodeUnit {
         .unwrap_or_else(|| panic!("missing definition for {fq_name}"))
 }
 
+fn assert_single_python_member_hit(service: &str, consumer: &str) {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("service.py", service)
+        .file("consumer.py", consumer)
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.Foo.bar");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = PythonExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("graph should resolve Python member usage");
+    assert_eq!(hits.len(), 1);
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file == project.file("consumer.py"))
+    );
+}
+
 #[test]
 fn absolute_import_resolves_export_usage() {
     let project = InlineTestProject::with_language(Language::Python)
@@ -794,6 +819,143 @@ def run():
         hits.iter()
             .all(|hit| hit.file == project.file("consumer.py"))
     );
+}
+
+#[test]
+fn typed_local_receiver_resolves_member_usage() {
+    assert_single_python_member_hit(
+        r#"
+class Foo:
+    def bar(self):
+        pass
+"#,
+        r#"
+from service import Foo
+
+def run():
+    x: Foo
+    x.bar()
+"#,
+    );
+}
+
+#[test]
+fn typed_parameter_receiver_resolves_member_usage() {
+    assert_single_python_member_hit(
+        r#"
+class Foo:
+    def bar(self):
+        pass
+"#,
+        r#"
+from service import Foo
+
+def run(x: Foo):
+    x.bar()
+"#,
+    );
+}
+
+#[test]
+fn typed_instance_attribute_receiver_resolves_member_usage() {
+    assert_single_python_member_hit(
+        r#"
+class Foo:
+    def bar(self):
+        pass
+"#,
+        r#"
+from service import Foo
+
+class Holder:
+    def __init__(self):
+        self.x: Foo
+
+    def run(self):
+        self.x.bar()
+"#,
+    );
+}
+
+#[test]
+fn constructed_local_receiver_resolves_member_usage() {
+    assert_single_python_member_hit(
+        r#"
+class Foo:
+    def bar(self):
+        pass
+"#,
+        r#"
+from service import Foo
+
+def run():
+    x = Foo()
+    x.bar()
+"#,
+    );
+}
+
+#[test]
+fn simple_alias_receiver_resolves_member_usage() {
+    assert_single_python_member_hit(
+        r#"
+class Foo:
+    def bar(self):
+        pass
+"#,
+        r#"
+from service import Foo
+
+def run():
+    x = Foo()
+    y = x
+    y.bar()
+"#,
+    );
+}
+
+#[test]
+fn namespace_qualified_annotation_resolves_member_usage() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "pkg/service.py",
+            r#"
+class Foo:
+    def bar(self):
+        pass
+"#,
+        )
+        .file(
+            "pkg/__init__.py",
+            r#"
+from .service import Foo
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+import pkg as p
+
+def run():
+    x: p.Foo
+    x.bar()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "pkg.service.Foo.bar");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = PythonExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("graph should resolve namespace-qualified annotation receiver");
+    assert_eq!(hits.len(), 1);
 }
 
 #[test]
