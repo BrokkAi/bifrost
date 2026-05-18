@@ -815,14 +815,9 @@ fn collect_scope_facts(
         };
         let facts =
             collect_scope_facts_from_source(&source, edges, target_short, target_self_file, true);
-        let class_bindings: HashMap<String, SymbolResolution<String>> = facts
-            .cloned_bindings()
-            .into_iter()
-            .filter(|(symbol, _)| symbol.starts_with("self."))
-            .collect();
         class_facts_by_name.insert(
             declaration.short_name().to_string(),
-            LocalBindingsSnapshot::from_parts(HashSet::default(), class_bindings),
+            facts.filtered_visible_bindings(|symbol, _| symbol.starts_with("self.")),
         );
     }
 
@@ -839,10 +834,7 @@ fn collect_scope_facts(
         if let Some((owner, _)) = declaration.short_name().rsplit_once('.')
             && let Some(class_facts) = class_facts_by_name.get(owner)
         {
-            let shadows = facts.cloned_shadows();
-            let mut merged_bindings = facts.cloned_bindings();
-            merged_bindings.extend(class_facts.cloned_bindings());
-            facts = LocalBindingsSnapshot::from_parts(shadows, merged_bindings);
+            facts = facts.merged_with_visible(class_facts);
         }
         scope_facts.insert(declaration.clone(), facts);
     }
@@ -894,6 +886,7 @@ fn collect_scope_facts_from_source(
     let mut changed = true;
     while changed {
         changed = false;
+        let mut aliases = Vec::new();
         for line in source.lines() {
             for captures in PARAM_ANNOTATION_RE.captures_iter(line) {
                 let lhs = captures.get(1).map(|m| m.as_str()).unwrap_or_default();
@@ -935,16 +928,18 @@ fn collect_scope_facts_from_source(
             }
 
             match engine.resolve_symbol(rhs_symbol) {
-                SymbolResolution::Precise(targets)
-                    if engine.resolve_symbol(lhs).is_unknown() && !targets.is_empty() =>
-                {
-                    engine.alias_symbol(lhs.to_string(), rhs_symbol);
-                    changed = true;
+                SymbolResolution::Precise(targets) if !targets.is_empty() => {
+                    aliases.push((lhs.to_string(), rhs_symbol.to_string()));
                 }
                 SymbolResolution::Unknown
                 | SymbolResolution::Ambiguous
                 | SymbolResolution::Precise(_) => {}
             }
+        }
+        let before = engine.snapshot();
+        engine.apply_aliases_until_stable(aliases);
+        if engine.snapshot() != before {
+            changed = true;
         }
     }
 

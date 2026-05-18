@@ -87,3 +87,53 @@ fn snapshot_reports_matching_symbols_and_shadows() {
     symbols.sort();
     assert_eq!(vec!["alias".to_string(), "service".to_string()], symbols);
 }
+
+#[test]
+fn snapshot_resolution_respects_shadowing() {
+    let mut engine = LocalInferenceEngine::new(LocalInferenceConfig::default());
+    engine.seed_symbol("service", "Service");
+    engine.enter_scope();
+    engine.declare_shadow("service");
+
+    let snapshot = engine.snapshot();
+    assert!(snapshot.resolution_for("service").is_unknown());
+}
+
+#[test]
+fn aliasing_unknown_symbol_stays_unknown() {
+    let mut engine: LocalInferenceEngine<&'static str> =
+        LocalInferenceEngine::new(LocalInferenceConfig::default());
+    engine.alias_symbol("alias", "missing");
+
+    assert!(engine.resolve_symbol("alias").is_unknown());
+}
+
+#[test]
+fn aliasing_ambiguous_symbol_stays_ambiguous() {
+    let mut engine = LocalInferenceEngine::new(LocalInferenceConfig {
+        max_targets_per_symbol: 2,
+    });
+    engine.seed_symbol_many("service", ["A", "B", "C"]);
+    engine.alias_symbol("alias", "service");
+
+    assert!(engine.resolve_symbol("alias").is_ambiguous());
+}
+
+#[test]
+fn inner_scope_alias_disappears_after_scope_exit() {
+    let mut engine = LocalInferenceEngine::new(LocalInferenceConfig::default());
+    engine.seed_symbol("service", "Service");
+    engine.enter_scope();
+    engine.alias_symbol("alias", "service");
+    assert_eq!(
+        vec!["Service"],
+        precise_targets(engine.resolve_symbol("alias"))
+    );
+
+    engine.exit_scope();
+    assert!(engine.resolve_symbol("alias").is_unknown());
+    assert_eq!(
+        vec!["Service"],
+        precise_targets(engine.resolve_symbol("service"))
+    );
+}

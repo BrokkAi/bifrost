@@ -5,9 +5,7 @@ use crate::analyzer::{
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use crate::usages::graph_core::{ImportEdgeKind, ProjectUsageGraph};
-use crate::usages::local_inference::{
-    LocalInferenceConfig, LocalInferenceEngine, SymbolResolution,
-};
+use crate::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::usages::model::{FuzzyResult, UsageHit};
 use crate::usages::traits::UsageAnalyzer;
 use rayon::prelude::*;
@@ -979,31 +977,16 @@ fn collect_receiver_bindings(
         }
     }
 
-    loop {
-        let mut changed = false;
-        for captures in LET_ALIAS_RE.captures_iter(source) {
-            let Some(name) = captures.get(1) else {
-                continue;
-            };
-            let Some(value) = captures.get(2) else {
-                continue;
-            };
-            match engine.resolve_symbol(value.as_str()) {
-                SymbolResolution::Precise(targets)
-                    if !targets.is_empty() && engine.resolve_symbol(name.as_str()).is_unknown() =>
-                {
-                    engine.alias_symbol(name.as_str().to_string(), value.as_str());
-                    changed = true;
-                }
-                SymbolResolution::Unknown
-                | SymbolResolution::Ambiguous
-                | SymbolResolution::Precise(_) => {}
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
+    let aliases: Vec<_> = LET_ALIAS_RE
+        .captures_iter(source)
+        .filter_map(|captures| {
+            Some((
+                captures.get(1)?.as_str().to_string(),
+                captures.get(2)?.as_str().to_string(),
+            ))
+        })
+        .collect();
+    engine.apply_aliases_until_stable(aliases);
 
     engine
 }

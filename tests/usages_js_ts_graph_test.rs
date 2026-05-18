@@ -162,3 +162,121 @@ export function build(): Alias {
         "expected local alias usage in consumer.ts"
     );
 }
+
+#[test]
+fn ts_graph_strategy_does_not_match_redeclared_import_name() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("base.ts", "export class BaseClass { static build() {} }\n")
+        .file("evil.ts", "export class Evil { static build() {} }\n")
+        .file(
+            "consumer.ts",
+            r#"
+import { BaseClass } from "./base";
+import { Evil } from "./evil";
+
+const BaseClass = Evil;
+
+export function build() {
+    return BaseClass.build();
+}
+"#,
+        )
+        .build();
+    let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
+    let units: Vec<_> = analyzer.all_declarations().cloned().collect();
+    let base_file = project.file("base.ts");
+    let target = definition_in(units.iter(), |cu| {
+        cu.is_class() && cu.identifier() == "BaseClass" && cu.source() == &base_file
+    });
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = JsTsExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("shadowed import graph success");
+
+    assert!(hits.is_empty(), "redeclared import name must not count");
+}
+
+#[test]
+fn ts_graph_strategy_keeps_function_local_alias_scoped() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("base.ts", "export class BaseClass {}\n")
+        .file(
+            "consumer.ts",
+            r#"
+import { BaseClass } from "./base";
+
+function inside(): Alias {
+    const Alias = BaseClass;
+    return new Alias();
+}
+
+const Alias = Other;
+
+export class Other {}
+
+export function outside() {
+    return new Alias();
+}
+"#,
+        )
+        .build();
+    let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
+    let units: Vec<_> = analyzer.all_declarations().cloned().collect();
+    let base_file = project.file("base.ts");
+    let target = definition_in(units.iter(), |cu| {
+        cu.is_class() && cu.identifier() == "BaseClass" && cu.source() == &base_file
+    });
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = JsTsExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("function-local alias success");
+
+    assert!(
+        hits.iter()
+            .all(|hit| hit.enclosing.short_name() == "inside"),
+        "only the inner scoped alias should match BaseClass"
+    );
+}
+
+#[test]
+fn ts_graph_strategy_prefers_later_same_scope_redeclaration() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("base.ts", "export class BaseClass {}\n")
+        .file("other.ts", "export class Other {}\n")
+        .file(
+            "consumer.ts",
+            r#"
+import { BaseClass } from "./base";
+import { Other } from "./other";
+
+var Alias = BaseClass;
+var Alias = Other;
+
+export function build() {
+    return new Alias();
+}
+"#,
+        )
+        .build();
+    let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
+    let units: Vec<_> = analyzer.all_declarations().cloned().collect();
+    let base_file = project.file("base.ts");
+    let target = definition_in(units.iter(), |cu| {
+        cu.is_class() && cu.identifier() == "BaseClass" && cu.source() == &base_file
+    });
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = JsTsExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("same-scope redeclaration success");
+
+    assert!(
+        hits.iter().all(|hit| hit.enclosing.short_name() != "build"),
+        "later same-scope redeclaration must block subsequent build() usage attribution"
+    );
+}

@@ -35,17 +35,14 @@ use crate::analyzer::{
 use crate::hash::{HashMap, HashSet, map_with_capacity};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use crate::usages::graph_core::{ImportEdge, ImportEdgeKind, ProjectUsageGraph};
-use crate::usages::local_inference::{
-    LocalBindingsSnapshot, LocalInferenceConfig, LocalInferenceEngine,
-};
+use crate::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::usages::model::{
     ExportEntry, ExportIndex, FuzzyResult, ImportBinder, ImportBinding, ImportKind, UsageHit,
 };
 use crate::usages::traits::UsageAnalyzer;
 use rayon::prelude::*;
-use regex::Regex;
 use std::collections::BTreeSet;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 use tree_sitter::{Node, Parser, Tree};
 
 /// Graph-strategy hits land at the maximum confidence the regex analyzer also uses.
@@ -291,8 +288,13 @@ fn scan_files_for_seeds(
         let line_starts = compute_line_starts(source_str);
 
         let target_self_file = *file == target.source();
-        let local_bindings =
-            collect_local_bindings(source_str, &edges, &target_short, target_self_file);
+        let mut binding_engine = LocalInferenceEngine::new(LocalInferenceConfig::default());
+        for edge in &edges {
+            binding_engine.seed_symbol(edge.local_name.clone(), TARGET_BINDING);
+        }
+        if target_self_file {
+            binding_engine.seed_symbol(target_short.clone(), TARGET_BINDING);
+        }
 
         let mut scan_ctx = ScanCtx {
             file,
@@ -303,7 +305,7 @@ fn scan_files_for_seeds(
             target_member: target_member.as_deref(),
             edges: &edges,
             target_self_file,
-            local_bindings: &local_bindings,
+            binding_engine,
             hits: &mut local_hits,
         };
 
@@ -336,18 +338,21 @@ struct ScanCtx<'a> {
     /// True when this scan is over the target's own defining file (used to also catch
     /// in-file references that don't go through an import binding).
     target_self_file: bool,
-    local_bindings: &'a LocalBindingsSnapshot<&'static str>,
+    binding_engine: LocalInferenceEngine<&'static str>,
     hits: &'a mut BTreeSet<UsageHit>,
 }
 
 impl ScanCtx<'_> {
     fn binds_target(&self, ident: &str) -> bool {
-        if self
-            .local_bindings
-            .matching_symbols(|target| *target == TARGET_BINDING)
-            .contains(ident)
+        let local_resolution = self.binding_engine.resolve_symbol(ident);
+        if local_resolution
+            .as_precise()
+            .is_some_and(|targets| targets.contains(TARGET_BINDING))
         {
             return true;
+        }
+        if self.binding_engine.is_shadowed(ident) {
+            return false;
         }
         if self.edges.iter().any(|edge| edge.local_name == ident) {
             return true;
@@ -359,54 +364,21 @@ impl ScanCtx<'_> {
     }
 }
 
-static JS_TS_ALIAS_DECL_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"\b(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*;",
-    )
-    .expect("valid JS/TS alias declaration regex")
-});
-
-fn collect_local_bindings(
-    source: &str,
-    edges: &[ImportEdge],
-    target_short: &str,
-    target_self_file: bool,
-) -> LocalBindingsSnapshot<&'static str> {
-    let mut engine = LocalInferenceEngine::new(LocalInferenceConfig::default());
-    for edge in edges {
-        engine.seed_symbol(edge.local_name.clone(), TARGET_BINDING);
-    }
-    if target_self_file {
-        engine.seed_symbol(target_short.to_string(), TARGET_BINDING);
-    }
-
-    loop {
-        let mut changed = false;
-        for captures in JS_TS_ALIAS_DECL_RE.captures_iter(source) {
-            let Some(lhs) = captures.get(1).map(|m| m.as_str()) else {
-                continue;
-            };
-            let Some(rhs) = captures.get(2).map(|m| m.as_str()) else {
-                continue;
-            };
-            if !engine.is_shadowed(lhs) {
-                engine.declare_shadow(lhs.to_string());
-            }
-            if engine.resolve_symbol(lhs).is_unknown() && !engine.resolve_symbol(rhs).is_unknown() {
-                engine.alias_symbol(lhs.to_string(), rhs);
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-
-    engine.snapshot()
-}
-
 fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let kind = node.kind();
+
+    let introduces_scope = matches!(
+        kind,
+        "statement_block"
+            | "arrow_function"
+            | "function_expression"
+            | "generator_function"
+            | "function_declaration"
+            | "method_definition"
+    );
+    if introduces_scope {
+        ctx.binding_engine.enter_scope();
+    }
 
     // Skip import statements outright — bindings declared there are not usages.
     if matches!(
@@ -418,7 +390,14 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             | "export_clause"
             | "export_specifier"
     ) {
+        if introduces_scope {
+            ctx.binding_engine.exit_scope();
+        }
         return;
+    }
+
+    if kind == "variable_declarator" {
+        register_local_binding(node, ctx);
     }
 
     match kind {
@@ -434,6 +413,34 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     for child in node.named_children(&mut cursor) {
         scan_node(child, ctx);
     }
+
+    if introduces_scope {
+        ctx.binding_engine.exit_scope();
+    }
+}
+
+fn register_local_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let Some(name_node) = node.child_by_field_name("name") else {
+        return;
+    };
+    let lhs = slice(name_node, ctx.source);
+    if lhs.is_empty() {
+        return;
+    }
+
+    ctx.binding_engine.declare_shadow(lhs.to_string());
+
+    let Some(value_node) = node.child_by_field_name("value") else {
+        return;
+    };
+    let rhs = match value_node.kind() {
+        "identifier" | "type_identifier" => slice(value_node, ctx.source),
+        _ => return,
+    };
+    if rhs.is_empty() || ctx.binding_engine.resolve_symbol(rhs).is_unknown() {
+        return;
+    }
+    ctx.binding_engine.alias_symbol(lhs.to_string(), rhs);
 }
 
 fn handle_identifier_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {

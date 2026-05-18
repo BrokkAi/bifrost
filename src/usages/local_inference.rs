@@ -45,7 +45,7 @@ where
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalBindingsSnapshot<T: Eq + Hash> {
-    shadows: HashSet<String>,
+    declared: HashSet<String>,
     bindings: HashMap<String, SymbolResolution<T>>,
 }
 
@@ -53,25 +53,12 @@ impl<T> LocalBindingsSnapshot<T>
 where
     T: Eq + Hash,
 {
+    fn visible_binding(&self, symbol: &str) -> Option<&SymbolResolution<T>> {
+        self.bindings.get(symbol)
+    }
+
     pub fn is_shadowed(&self, symbol: &str) -> bool {
-        self.shadows.contains(symbol)
-    }
-
-    pub fn from_parts(
-        shadows: HashSet<String>,
-        bindings: HashMap<String, SymbolResolution<T>>,
-    ) -> Self {
-        Self { shadows, bindings }
-    }
-
-    pub fn resolution_for(&self, symbol: &str) -> SymbolResolution<T>
-    where
-        T: Clone,
-    {
-        self.bindings
-            .get(symbol)
-            .cloned()
-            .unwrap_or(SymbolResolution::Unknown)
+        self.declared.contains(symbol)
     }
 
     pub fn matching_symbols<F>(&self, mut predicate: F) -> HashSet<String>
@@ -91,15 +78,49 @@ where
             .collect()
     }
 
-    pub fn cloned_bindings(&self) -> HashMap<String, SymbolResolution<T>>
+    pub fn filtered_visible_bindings<F>(&self, mut predicate: F) -> Self
+    where
+        T: Clone,
+        F: FnMut(&str, &SymbolResolution<T>) -> bool,
+    {
+        let bindings: HashMap<String, SymbolResolution<T>> = self
+            .bindings
+            .iter()
+            .filter(|(symbol, resolution)| predicate(symbol.as_str(), resolution))
+            .map(|(symbol, resolution)| (symbol.clone(), resolution.clone()))
+            .collect();
+        Self {
+            declared: bindings.keys().cloned().collect(),
+            bindings,
+        }
+    }
+
+    pub fn merged_with_visible(&self, other: &Self) -> Self
     where
         T: Clone,
     {
-        self.bindings.clone()
+        let mut bindings = self.bindings.clone();
+        for (symbol, resolution) in &other.bindings {
+            bindings.insert(symbol.clone(), resolution.clone());
+        }
+        Self {
+            declared: self
+                .declared
+                .iter()
+                .cloned()
+                .chain(other.declared.iter().cloned())
+                .collect(),
+            bindings,
+        }
     }
 
-    pub fn cloned_shadows(&self) -> HashSet<String> {
-        self.shadows.clone()
+    pub fn resolution_for(&self, symbol: &str) -> SymbolResolution<T>
+    where
+        T: Clone,
+    {
+        self.visible_binding(symbol)
+            .cloned()
+            .unwrap_or(SymbolResolution::Unknown)
     }
 }
 
@@ -170,6 +191,25 @@ where
         scope.bindings.insert(symbol, source_resolution);
     }
 
+    pub fn apply_aliases_until_stable<I>(&mut self, aliases: I)
+    where
+        I: IntoIterator<Item = (String, String)>,
+    {
+        let aliases: Vec<_> = aliases.into_iter().collect();
+        loop {
+            let mut changed = false;
+            for (lhs, rhs) in &aliases {
+                if self.resolve_symbol(lhs).is_unknown() && !self.resolve_symbol(rhs).is_unknown() {
+                    self.alias_symbol(lhs.clone(), rhs);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
     pub fn resolve_symbol(&self, symbol: &str) -> SymbolResolution<T> {
         for scope in self.scopes.iter().rev() {
             if let Some(resolution) = scope.bindings.get(symbol) {
@@ -190,17 +230,19 @@ where
     }
 
     pub fn snapshot(&self) -> LocalBindingsSnapshot<T> {
-        let mut shadows = HashSet::default();
+        let mut declared = HashSet::default();
         let mut bindings = HashMap::default();
-        for scope in &self.scopes {
+        for scope in self.scopes.iter().rev() {
             for symbol in &scope.shadows {
-                shadows.insert(symbol.clone());
-            }
-            for (symbol, resolution) in &scope.bindings {
-                bindings.insert(symbol.clone(), resolution.clone());
+                if !declared.insert(symbol.clone()) {
+                    continue;
+                }
+                if let Some(resolution) = scope.bindings.get(symbol) {
+                    bindings.insert(symbol.clone(), resolution.clone());
+                }
             }
         }
-        LocalBindingsSnapshot { shadows, bindings }
+        LocalBindingsSnapshot { declared, bindings }
     }
 }
 
