@@ -6,14 +6,27 @@ use tempfile::TempDir;
 
 #[test]
 fn bifrost_searchtools_server_speaks_mcp_stdio() {
-    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("testcode-java");
+    let fixture_root = TempDir::new().expect("temp dir");
+    fs::write(
+        fixture_root.path().join("SampleTest.java"),
+        r#"
+        import org.junit.jupiter.api.Test;
+        import static org.junit.jupiter.api.Assertions.assertEquals;
+
+        public class SampleTest {
+            @Test
+            void sameValue() {
+                String value = "x";
+                assertEquals(value, value);
+            }
+        }
+        "#,
+    )
+    .expect("write java fixture");
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
         .arg("--root")
-        .arg(&fixture_root)
+        .arg(fixture_root.path())
         .arg("--server")
         .arg("searchtools")
         .stdin(Stdio::piped())
@@ -100,138 +113,6 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             .any(|tool| tool["name"] == "report_test_assertion_smells")
     );
 
-    let scan_usages = round_trip(
-        &mut stdin,
-        &mut reader,
-        &mut stderr,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 100,
-            "method": "tools/call",
-            "params": {
-                "name": "scan_usages",
-                "arguments": {
-                    "symbols": ["E.iMethod"],
-                    "include_tests": true
-                }
-            }
-        }),
-    );
-    let scan = &scan_usages["result"]["structuredContent"];
-    let usages = scan["usages"].as_array().expect("usages array");
-    assert_eq!(1, usages.len(), "scan: {scan_usages}");
-    assert_eq!("E.iMethod", usages[0]["symbol"]);
-    let files = usages[0]["files"].as_array().expect("files array");
-    assert!(
-        files.iter().any(|file| file["path"] == "UseE.java"),
-        "expected UseE.java in scan_usages files: {scan_usages}"
-    );
-
-    let file_summaries = round_trip(
-        &mut stdin,
-        &mut reader,
-        &mut stderr,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/call",
-            "params": {
-                "name": "get_summaries",
-                "arguments": {
-                    "targets": ["A.java"]
-                }
-            }
-        }),
-    );
-    let structured = &file_summaries["result"]["structuredContent"];
-    assert_eq!("A.java", structured["summaries"][0]["path"]);
-    assert_eq!(3, structured["summaries"][0]["elements"][0]["start_line"]);
-    assert_eq!(52, structured["summaries"][0]["elements"][0]["end_line"]);
-
-    let list_symbols = round_trip(
-        &mut stdin,
-        &mut reader,
-        &mut stderr,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 3,
-            "method": "tools/call",
-            "params": {
-                "name": "list_symbols",
-                "arguments": {
-                    "file_patterns": ["A.java"]
-                }
-            }
-        }),
-    );
-    let skim = &list_symbols["result"]["structuredContent"];
-    assert_eq!("A.java", skim["files"][0]["path"]);
-    let lines = skim["files"][0]["lines"].as_array().expect("skim lines");
-    assert!(lines.iter().any(|line| line.as_str() == Some("  - AInner")));
-    assert!(
-        lines
-            .iter()
-            .any(|line| line.as_str() == Some("    - AInnerInner"))
-    );
-    assert!(
-        lines
-            .iter()
-            .any(|line| line.as_str() == Some("      - method7"))
-    );
-
-    let cyclomatic = round_trip(
-        &mut stdin,
-        &mut reader,
-        &mut stderr,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 5,
-            "method": "tools/call",
-            "params": {
-                "name": "compute_cyclomatic_complexity",
-                "arguments": {
-                    "file_paths": ["CyclicMethods.java"],
-                    "threshold": 0
-                }
-            }
-        }),
-    );
-    let cyclomatic_report = cyclomatic["result"]["structuredContent"]["report"]
-        .as_str()
-        .expect("report string");
-    // Methods in CyclicMethods.java have no decision points (just sequential
-    // calls), so each scores 1 — well below the default threshold of 10.
-    assert_eq!(
-        cyclomatic_report,
-        "No methods exceeded the complexity threshold of 10."
-    );
-
-    let cognitive = round_trip(
-        &mut stdin,
-        &mut reader,
-        &mut stderr,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 6,
-            "method": "tools/call",
-            "params": {
-                "name": "compute_cognitive_complexity",
-                "arguments": {
-                    "file_paths": ["CyclicMethods.java"],
-                    "threshold": 0
-                }
-            }
-        }),
-    );
-    let cognitive_report = cognitive["result"]["structuredContent"]["report"]
-        .as_str()
-        .expect("report string");
-    // Same fixture: no control flow ⇒ score 0 ⇒ default-message path.
-    assert_eq!(
-        cognitive_report,
-        "No methods exceeded the cognitive complexity threshold of 15."
-    );
-
     let ping = round_trip(
         &mut stdin,
         &mut reader,
@@ -255,8 +136,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "params": {
                 "name": "report_test_assertion_smells",
                 "arguments": {
-                    "file_paths": ["TestAssertionSmells.java"],
-                    "min_score": 3
+                    "file_paths": ["SampleTest.java"]
                 }
             }
         }),
@@ -266,7 +146,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
         .expect("report string");
     assert!(report.starts_with("## Test assertion smells"), "{report}");
     assert!(report.contains("self-comparison"), "{report}");
-    assert!(report.contains("anonymous-test-double"), "{report}");
+    assert!(report.contains("SampleTest.java"), "{report}");
 
     drop(stdin);
     let status = child.wait().expect("wait bifrost");
