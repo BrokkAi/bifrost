@@ -1546,3 +1546,313 @@ def run():
             .all(|hit| hit.file == project.file("service.py"))
     );
 }
+
+#[test]
+#[ignore = "Brokk parity marker: optionalTypeArgumentResolvesReceiverMemberUsage"]
+fn parity_optional_type_argument_resolves_receiver_member_usage() {
+    assert_single_python_member_hit(
+        r#"
+class Foo:
+    def bar(self):
+        pass
+"#,
+        r#"
+from typing import Optional
+from service import Foo
+
+def run():
+    x: Optional[Foo]
+    x.bar()
+"#,
+    );
+}
+
+#[test]
+#[ignore = "Brokk parity marker: qualifiedOptionalTypeArgumentResolvesReceiverMemberUsage"]
+fn parity_qualified_optional_type_argument_resolves_receiver_member_usage() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "pkg/service.py",
+            r#"
+class Foo:
+    def bar(self):
+        pass
+"#,
+        )
+        .file(
+            "pkg/__init__.py",
+            r#"
+from .service import Foo
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+from typing import Optional
+import pkg as p
+
+def run():
+    x: Optional[p.Foo]
+    x.bar()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "pkg.service.Foo.bar");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should resolve qualified optional receiver usage");
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+#[ignore = "Brokk parity marker: multipleInheritanceMemberCountsWhenOneParentProvidesMember"]
+fn parity_multiple_inheritance_member_counts_when_one_parent_provides_member() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+class Left:
+    pass
+
+class Right:
+    def bar(self):
+        pass
+
+class Child(Left, Right):
+    pass
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+from service import Child
+
+def run(x: Child):
+    x.bar()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.Right.bar");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should count inherited member from one matching parent");
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+#[ignore = "Brokk parity marker: subclassReceiverDoesNotCountForDifferentBaseMemberName"]
+fn parity_subclass_receiver_does_not_count_for_different_base_member_name() {
+    assert_no_python_member_hit(
+        r#"
+class Base:
+    def baz(self):
+        pass
+
+class Child(Base):
+    pass
+"#,
+        r#"
+from service import Child
+
+def run(x: Child):
+    x.bar()
+"#,
+    );
+}
+
+#[test]
+#[ignore = "Brokk parity marker: unresolvedSuperclassDoesNotCreateMemberHierarchyHit"]
+fn parity_unresolved_superclass_does_not_create_member_hierarchy_hit() {
+    assert_no_python_member_hit(
+        r#"
+class Child(MissingBase):
+    def bar(self):
+        pass
+"#,
+        r#"
+from service import Child
+
+def run(x: Child):
+    x.bar()
+"#,
+    );
+}
+
+#[test]
+#[ignore = "Brokk parity marker: sameNameFromSiblingModuleDoesNotMatchTarget"]
+fn parity_same_name_from_sibling_module_does_not_match_target() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "target_mod.py",
+            r#"
+class Foo:
+    pass
+"#,
+        )
+        .file(
+            "sibling.py",
+            r#"
+class Foo:
+    pass
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+from sibling import Foo
+
+def run():
+    return Foo()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "target_mod.Foo");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should succeed for sibling-module same-name case");
+    assert!(hits.is_empty());
+}
+
+#[test]
+#[ignore = "Brokk parity marker: selfAttributeTypeFactsDoNotLeakAcrossClasses"]
+fn parity_self_attribute_type_facts_do_not_leak_across_classes() {
+    assert_no_python_member_hit(
+        r#"
+class Foo:
+    def bar(self):
+        pass
+"#,
+        r#"
+from service import Foo
+
+class A:
+    def __init__(self):
+        self.x: Foo = Foo()
+
+class B:
+    def run(self):
+        self.x.bar()
+"#,
+    );
+}
+
+#[test]
+#[ignore = "Brokk parity marker: localParameterShadowsExportedClassAttributeCandidate"]
+fn parity_local_parameter_shadows_exported_class_attribute_candidate() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+class Foo:
+    def bar(self):
+        pass
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+from service import Foo
+
+def run(Foo):
+    Foo.bar()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.Foo.bar");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should succeed for parameter-shadow case");
+    assert!(hits.is_empty());
+}
+
+#[test]
+#[ignore = "Brokk parity marker: defaultArgumentCallCountsAsUsageInsteadOfParameterShadow"]
+fn parity_default_argument_call_counts_as_usage_instead_of_parameter_shadow() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+class Widget:
+    pass
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+from service import Widget
+
+def run(x=Widget()):
+    pass
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.Widget");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should count default-argument constructor usage");
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+#[ignore = "Brokk parity marker: deepAttributeExpressionDoesNotOverflow"]
+fn parity_deep_attribute_expression_does_not_overflow() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+class Foo:
+    def bar(self):
+        pass
+"#,
+        )
+        .file(
+            "consumer.py",
+            format!(
+                "\nfrom service import Foo\n\ndef run(root):\n    return root.{}.bar()\n",
+                vec!["child"; 300].join(".")
+            ),
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.Foo.bar");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let _ = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should not overflow on deep attribute expressions");
+}
+
+#[test]
+#[ignore = "Brokk parity marker: cachedDefinitionsByIdentifierFindsBareTopLevelFunction"]
+fn parity_cached_definitions_by_identifier_finds_bare_top_level_function() {
+    // No direct bifrost helper yet; keep as a parity marker until a Rust-side helper
+    // equivalent exists or this assertion is folded into another public-facing surface.
+    panic!("parity marker only");
+}
+
+#[test]
+#[ignore = "Brokk parity marker: cachedDefinitionsByIdentifierFindsMemberIdentifierFallback"]
+fn parity_cached_definitions_by_identifier_finds_member_identifier_fallback() {
+    panic!("parity marker only");
+}
+
+#[test]
+#[ignore = "Brokk parity marker: cachedExactMemberResolvesOnlyWithinSourceFile"]
+fn parity_cached_exact_member_resolves_only_within_source_file() {
+    panic!("parity marker only");
+}

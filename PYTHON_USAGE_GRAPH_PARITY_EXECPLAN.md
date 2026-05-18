@@ -273,11 +273,11 @@ This matrix must be kept current as milestones land.
 
 - Residual advanced receiver-flow cases: `missing`
   Brokk reference: optional type arguments, qualified optional type arguments, multiple inheritance with one matching parent, subclass-vs-different-member negatives, unresolved superclasses, same-name sibling-module negatives, self-attribute class-isolation, local-parameter shadowing of exported class names, default-argument constructor usage, and deep attribute-expression robustness.
-  Current `bifrost` state: these specific cases are not yet proven in Rust tests and should be treated as the next follow-up batch if full Brokk parity is still the goal.
+  Current `bifrost` state: these cases are now recorded as ignored parity-marker tests in `tests/usages_python_graph_test.rs` (`parity_optional_type_argument_resolves_receiver_member_usage`, `parity_qualified_optional_type_argument_resolves_receiver_member_usage`, `parity_multiple_inheritance_member_counts_when_one_parent_provides_member`, `parity_subclass_receiver_does_not_count_for_different_base_member_name`, `parity_unresolved_superclass_does_not_create_member_hierarchy_hit`, `parity_same_name_from_sibling_module_does_not_match_target`, `parity_self_attribute_type_facts_do_not_leak_across_classes`, `parity_local_parameter_shadows_exported_class_attribute_candidate`, `parity_default_argument_call_counts_as_usage_instead_of_parameter_shadow`, and `parity_deep_attribute_expression_does_not_overflow`). They should be treated as the next follow-up batch if full Brokk parity is still the goal.
 
 - Residual helper/cache-specific reference-graph cases: `missing`
   Brokk reference: the cached-definition helper tests and exact-member cache scoping cases in `PythonExportUsageReferenceGraphTest.java`.
-  Current `bifrost` state: analyzer update invalidation is now proven, but the Brokk-specific helper-cache micro-behaviors have not been ported one-for-one into focused Rust tests yet.
+  Current `bifrost` state: analyzer update invalidation is now proven, and the remaining Brokk-specific helper-cache micro-behaviors are recorded as ignored parity-marker tests in `tests/usages_python_graph_test.rs` (`parity_cached_definitions_by_identifier_finds_bare_top_level_function`, `parity_cached_definitions_by_identifier_finds_member_identifier_fallback`, and `parity_cached_exact_member_resolves_only_within_source_file`).
 
 - Container-flow and Brokk-marked out-of-scope residuals: `deferred`
   Brokk reference: the list/dict/iterable container element-flow cases that Brokk itself labels as intentionally out of scope for the current Python usage graph.
@@ -296,3 +296,5 @@ Revision note: updated after Milestone 4 to record the scope-aware receiver/shad
 Revision note: updated after Milestone 5 to record the type-aware receiver bindings and the inheritance/cache tests that now prove subclass matching and update invalidation behavior.
 
 Revision note: updated after Milestone 6 to turn the remaining Brokk-only cases into explicit `missing` and `deferred` parity-matrix entries instead of leaving them as an untracked tail.
+
+Revision note: updated again after Milestone 6 follow-up work to tie the remaining `missing` parity entries to ignored Rust parity-marker tests, so the residual Brokk gaps now live in executable form instead of prose only.
