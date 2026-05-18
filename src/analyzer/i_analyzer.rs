@@ -141,7 +141,14 @@ pub trait IAnalyzer: Send + Sync + Any {
 
         let base_results = self.search_definitions(&format!(".*?{query}.*?"), false);
 
-        let fuzzy_results = if query.len() < 5 {
+        // Short prefixes additionally run a fuzzy `c.*?h.*?a.*?r` pass to
+        // surface camelCase matches the strict substring wouldn't catch. Skip
+        // that pass when the strict pass already saturated downstream caps:
+        // every reasonable caller truncates somewhere ≤ AUTOCOMPLETE_SATURATION,
+        // so the fuzzy pass can only contribute items that will be discarded.
+        // This is the dominant cost on per-keystroke completion paths.
+        const AUTOCOMPLETE_SATURATION: usize = 1000;
+        let fuzzy_results = if query.len() < 5 && base_results.len() < AUTOCOMPLETE_SATURATION {
             let mut pattern = String::from(".*?");
             for ch in query.chars() {
                 pattern.push_str(&regex::escape(&ch.to_string()));

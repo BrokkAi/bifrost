@@ -15,6 +15,18 @@ fn uri_for(path: &Path) -> String {
     path_to_uri_string(path)
 }
 
+/// Java fixture used by the completion-handler integration tests. `gree` on
+/// line 3 is a stand-alone identifier prefix — tree-sitter still extracts the
+/// surrounding declarations even though the body doesn't parse cleanly, so
+/// the analyzer reports `greetEveryone` as a Function.
+const COMPLETOR_JAVA_FIXTURE: &str = "public class Completor {\n    public void greetEveryone() {}\n    void caller() {\n        gree\n    }\n}\n";
+
+fn write_completor_fixture(temp_root: &Path) -> std::path::PathBuf {
+    let file = temp_root.join("Completor.java");
+    fs::write(&file, COMPLETOR_JAVA_FIXTURE).expect("write Completor.java fixture");
+    file
+}
+
 #[test]
 fn bifrost_lsp_server_handles_initialize_and_shutdown() {
     let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -251,6 +263,271 @@ fn bifrost_lsp_server_workspace_symbol_finds_method() {
     let location = &method2["location"];
     let uri = location["uri"].as_str().expect("location uri");
     assert!(uri.ends_with("A.java"), "expected A.java URI, got {uri}");
+
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown"}),
+    );
+    let _ = read_message(&mut reader, &mut stderr);
+    write_message(&mut stdin, json!({"jsonrpc": "2.0", "method": "exit"}));
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
+fn bifrost_lsp_server_completion_finds_symbol_by_prefix() {
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    let completor_path = write_completor_fixture(&temp_root);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(&temp_root)
+        .arg("--server")
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bifrost");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    let root_uri = uri_for(&temp_root);
+    let file_uri = uri_for(&completor_path);
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"processId": null, "rootUri": root_uri, "capabilities": {}}
+        }),
+    );
+    let init = read_message(&mut reader, &mut stderr);
+    assert!(
+        init["result"]["capabilities"]["completionProvider"].is_object(),
+        "completionProvider should be advertised: {init}"
+    );
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+    );
+
+    // Line 3 (0-based) is `        gree`. The cursor sits at the end of
+    // `gree`, character 12 (8 spaces + 4 prefix bytes).
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "textDocument/completion",
+            "params": {
+                "textDocument": {"uri": file_uri},
+                "position": {"line": 3, "character": 12}
+            }
+        }),
+    );
+    let response = read_message(&mut reader, &mut stderr);
+    let result = &response["result"];
+    assert_eq!(
+        result["isIncomplete"], false,
+        "small fixture should not trigger truncation: {response}"
+    );
+    let items = result["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected items array, got {response}"));
+    let item = items
+        .iter()
+        .find(|i| i["label"] == "greetEveryone")
+        .unwrap_or_else(|| panic!("greetEveryone not present in {items:#?}"));
+    // CompletionItemKind::FUNCTION == 3.
+    assert_eq!(item["kind"], 3, "Java method should map to FUNCTION kind");
+
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown"}),
+    );
+    let _ = read_message(&mut reader, &mut stderr);
+    write_message(&mut stdin, json!({"jsonrpc": "2.0", "method": "exit"}));
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
+fn bifrost_lsp_server_completion_truncates_at_max_results_and_sets_is_incomplete() {
+    // Generate a fixture with 501 method declarations that all match the
+    // prefix `matchme_`. The handler must cap items at MAX_RESULTS=500 and
+    // set isIncomplete=true. Builds confidence in both the truncation logic
+    // and the regex-escape path (`autocomplete_definitions` interpolates the
+    // query into a regex internally).
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    let mut source = String::from("public class FloodMatch {\n");
+    for i in 0..501 {
+        use std::fmt::Write;
+        writeln!(source, "    public void matchme_{i:03}() {{}}").expect("fmt");
+    }
+    source.push_str("    void caller() {\n        matchme_\n    }\n}\n");
+    let flood_path = temp_root.join("FloodMatch.java");
+    fs::write(&flood_path, &source).expect("write FloodMatch.java");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(&temp_root)
+        .arg("--server")
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bifrost");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    let root_uri = uri_for(&temp_root);
+    let file_uri = uri_for(&flood_path);
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"processId": null, "rootUri": root_uri, "capabilities": {}}
+        }),
+    );
+    let _ = read_message(&mut reader, &mut stderr);
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+    );
+
+    // The `caller()` body sits on the line right after the 501 method
+    // declarations: lines 0..=501 are the class header + methods, line 502 is
+    // `    void caller() {`, line 503 is `        matchme_`. The cursor goes
+    // at the end of `matchme_` = char position 16 (8 spaces + 8 chars).
+    let cursor_line = 503;
+    let cursor_char = 16;
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "textDocument/completion",
+            "params": {
+                "textDocument": {"uri": file_uri},
+                "position": {"line": cursor_line, "character": cursor_char}
+            }
+        }),
+    );
+    let response = read_message(&mut reader, &mut stderr);
+    let result = &response["result"];
+    assert_eq!(
+        result["isIncomplete"], true,
+        "501 matches should set isIncomplete=true: {response}"
+    );
+    let items = result["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected items array, got {response}"));
+    assert_eq!(
+        items.len(),
+        500,
+        "items should be capped at MAX_RESULTS=500: got {}",
+        items.len()
+    );
+    // Spot-check a few specific labels survived truncation. Sort order is
+    // analyzer-controlled (Function rank + fq_name alphabetic), so we don't
+    // assert which 500 — just that they're well-formed.
+    for item in items {
+        let label = item["label"].as_str().expect("label string");
+        assert!(
+            label.starts_with("matchme_"),
+            "unexpected label outside the matchme_ namespace: {label}"
+        );
+        assert_eq!(item["kind"], 3, "all should map to FUNCTION kind");
+    }
+
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown"}),
+    );
+    let _ = read_message(&mut reader, &mut stderr);
+    write_message(&mut stdin, json!({"jsonrpc": "2.0", "method": "exit"}));
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
+fn bifrost_lsp_server_completion_empty_prefix_returns_null() {
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    let completor_path = write_completor_fixture(&temp_root);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(&temp_root)
+        .arg("--server")
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bifrost");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    let root_uri = uri_for(&temp_root);
+    let file_uri = uri_for(&completor_path);
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"processId": null, "rootUri": root_uri, "capabilities": {}}
+        }),
+    );
+    let _ = read_message(&mut reader, &mut stderr);
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+    );
+
+    // Line 4 (0-based) is `    }` — character 0 sits on whitespace with no
+    // preceding identifier bytes on the same line. The handler must return
+    // null (no completions) rather than dumping the whole symbol index.
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "textDocument/completion",
+            "params": {
+                "textDocument": {"uri": file_uri},
+                "position": {"line": 4, "character": 0}
+            }
+        }),
+    );
+    let response = read_message(&mut reader, &mut stderr);
+    assert!(
+        response["result"].is_null(),
+        "empty prefix should produce a null result, got {response}"
+    );
 
     write_message(
         &mut stdin,

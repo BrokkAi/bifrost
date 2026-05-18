@@ -1,8 +1,8 @@
 use lsp_types::{
-    DiagnosticOptions, DiagnosticServerCapabilities, FoldingRangeProviderCapability,
-    HoverProviderCapability, OneOf, ServerCapabilities, TextDocumentSyncCapability,
-    TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions,
-    WorkDoneProgressOptions,
+    CompletionOptions, DiagnosticOptions, DiagnosticServerCapabilities,
+    FoldingRangeProviderCapability, HoverProviderCapability, OneOf, ServerCapabilities,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+    TextDocumentSyncSaveOptions, WorkDoneProgressOptions,
 };
 
 pub fn server_capabilities() -> ServerCapabilities {
@@ -19,6 +19,14 @@ pub fn server_capabilities() -> ServerCapabilities {
 
     ServerCapabilities {
         text_document_sync: Some(TextDocumentSyncCapability::Options(text_document_sync)),
+        completion_provider: Some(CompletionOptions {
+            // v1: client must invoke completion explicitly. We don't expose
+            // trigger characters because identifier-prefix-only completion
+            // isn't meaningful on `.` or `::` (we don't resolve qualified
+            // names yet).
+            resolve_provider: Some(false),
+            ..CompletionOptions::default()
+        }),
         definition_provider: Some(OneOf::Left(true)),
         document_highlight_provider: Some(OneOf::Left(true)),
         document_symbol_provider: Some(OneOf::Left(true)),
