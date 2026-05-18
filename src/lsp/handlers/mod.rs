@@ -1,3 +1,4 @@
+pub mod completion;
 pub mod definition;
 pub mod diagnostic;
 pub mod document_highlight;

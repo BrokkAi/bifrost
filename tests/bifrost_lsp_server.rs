@@ -264,6 +264,170 @@ fn bifrost_lsp_server_workspace_symbol_finds_method() {
 }
 
 #[test]
+fn bifrost_lsp_server_completion_finds_symbol_by_prefix() {
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    // `gree` on line 3 is a stand-alone identifier prefix. Tree-sitter still
+    // extracts the surrounding declarations even though the body doesn't
+    // parse cleanly — the analyzer reports `greetEveryone` as a Function.
+    let source =
+        "public class Completor {\n    public void greetEveryone() {}\n    void caller() {\n        gree\n    }\n}\n";
+    fs::write(temp_root.join("Completor.java"), source).expect("write fixture");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(&temp_root)
+        .arg("--server")
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bifrost");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    let root_uri = uri_for(&temp_root);
+    let file_uri = uri_for(&temp_root.join("Completor.java"));
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"processId": null, "rootUri": root_uri, "capabilities": {}}
+        }),
+    );
+    let init = read_message(&mut reader, &mut stderr);
+    assert!(
+        init["result"]["capabilities"]["completionProvider"].is_object(),
+        "completionProvider should be advertised: {init}"
+    );
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+    );
+
+    // Line 3 (0-based) is `        gree`. The cursor sits at the end of
+    // `gree`, character 12 (8 spaces + 4 prefix bytes).
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "textDocument/completion",
+            "params": {
+                "textDocument": {"uri": file_uri},
+                "position": {"line": 3, "character": 12}
+            }
+        }),
+    );
+    let response = read_message(&mut reader, &mut stderr);
+    let result = &response["result"];
+    assert_eq!(
+        result["isIncomplete"], false,
+        "small fixture should not trigger truncation: {response}"
+    );
+    let items = result["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected items array, got {response}"));
+    let item = items
+        .iter()
+        .find(|i| i["label"] == "greetEveryone")
+        .unwrap_or_else(|| panic!("greetEveryone not present in {items:#?}"));
+    // CompletionItemKind::FUNCTION == 3.
+    assert_eq!(item["kind"], 3, "Java method should map to FUNCTION kind");
+
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown"}),
+    );
+    let _ = read_message(&mut reader, &mut stderr);
+    write_message(&mut stdin, json!({"jsonrpc": "2.0", "method": "exit"}));
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
+fn bifrost_lsp_server_completion_empty_prefix_returns_null() {
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    let source =
+        "public class Completor {\n    public void greetEveryone() {}\n    void caller() {\n        gree\n    }\n}\n";
+    fs::write(temp_root.join("Completor.java"), source).expect("write fixture");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(&temp_root)
+        .arg("--server")
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bifrost");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    let root_uri = uri_for(&temp_root);
+    let file_uri = uri_for(&temp_root.join("Completor.java"));
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"processId": null, "rootUri": root_uri, "capabilities": {}}
+        }),
+    );
+    let _ = read_message(&mut reader, &mut stderr);
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+    );
+
+    // Line 4 (0-based) is `    }` — character 0 sits on whitespace with no
+    // preceding identifier bytes on the same line. The handler must return
+    // null (no completions) rather than dumping the whole symbol index.
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "textDocument/completion",
+            "params": {
+                "textDocument": {"uri": file_uri},
+                "position": {"line": 4, "character": 0}
+            }
+        }),
+    );
+    let response = read_message(&mut reader, &mut stderr);
+    assert!(
+        response["result"].is_null(),
+        "empty prefix should produce a null result, got {response}"
+    );
+
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown"}),
+    );
+    let _ = read_message(&mut reader, &mut stderr);
+    write_message(&mut stdin, json!({"jsonrpc": "2.0", "method": "exit"}));
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
 fn bifrost_lsp_server_goto_definition_finds_class_a_from_b() {
     let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")

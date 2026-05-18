@@ -10,7 +10,7 @@ use lsp_types::notification::{
     PublishDiagnostics,
 };
 use lsp_types::request::{
-    DocumentDiagnosticRequest, DocumentHighlightRequest, DocumentSymbolRequest,
+    Completion, DocumentDiagnosticRequest, DocumentHighlightRequest, DocumentSymbolRequest,
     FoldingRangeRequest, GotoDefinition, HoverRequest, References, Request as LspRequestTrait,
     WorkspaceSymbolRequest,
 };
@@ -24,8 +24,8 @@ use crate::lsp::capabilities::server_capabilities;
 use crate::lsp::conversion::uri_to_path;
 use crate::lsp::handlers::util::project_file_for_uri as resolve_project_file;
 use crate::lsp::handlers::{
-    definition, diagnostic, document_highlight, document_symbol, folding_range, hover, references,
-    workspace_symbol,
+    completion, definition, diagnostic, document_highlight, document_symbol, folding_range, hover,
+    references, workspace_symbol,
 };
 
 /// Run the LSP server over stdio. `fallback_root` is used when the client does
@@ -123,6 +123,13 @@ fn handle_request(
         }),
         HoverRequest::METHOD => decode_and_run::<HoverRequest, _>(req, |params| {
             Ok(hover::handle(
+                &state.workspace,
+                state.project.root(),
+                &params,
+            ))
+        }),
+        Completion::METHOD => decode_and_run::<Completion, _>(req, |params| {
+            Ok(completion::handle(
                 &state.workspace,
                 state.project.root(),
                 &params,
