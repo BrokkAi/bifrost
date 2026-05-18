@@ -153,6 +153,20 @@ pub enum CodeUnitType {
     Module,
 }
 
+impl CodeUnitType {
+    /// Lowercase English label suitable for inline use in human-facing
+    /// report sentences (e.g. "large class spans 423 lines"). Distinct from
+    /// the on-disk persistence label so the two evolve independently.
+    pub fn display_lowercase(&self) -> &'static str {
+        match self {
+            CodeUnitType::Class => "class",
+            CodeUnitType::Function => "function",
+            CodeUnitType::Field => "field",
+            CodeUnitType::Module => "module",
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct ProjectFileInner {
     root: PathBuf,
@@ -567,6 +581,11 @@ impl Range {
     /// Number of source lines this range spans. Matches brokk-shared
     /// `IAnalyzer.spanLines(Range)`: empty ranges report `0`, non-empty
     /// ranges report at least `1`.
+    ///
+    /// API note: brokk-shared puts this on `IAnalyzer` (static helper);
+    /// bifrost places it on `Range` because the computation depends only
+    /// on the range's own fields. Do not "re-align" by adding a trait
+    /// method — the current placement is intentional.
     pub fn span_lines(&self) -> u32 {
         if self.is_empty() {
             return 0;

@@ -5,8 +5,8 @@ use crate::analyzer::{
 use crate::path_utils::{rel_path_string, workspace_rel_path};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
-use std::collections::VecDeque;
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::LazyLock;
 
 const DEFAULT_CYCLOMATIC_THRESHOLD: i32 = 10;
@@ -18,6 +18,11 @@ const DEFAULT_EXCEPTION_MIN_SCORE: i32 = 4;
 const DEFAULT_EXCEPTION_MAX_FINDINGS: i32 = 80;
 const DEFAULT_LONG_METHOD_MAX_FINDINGS: i32 = 20;
 const DEFAULT_LONG_METHOD_MAX_FILES: i32 = 25;
+/// Per-file declaration ceiling for the maintainability-size walk. Bounds
+/// the worst-case work on a single pathologically large generated file
+/// (e.g. multi-megabyte UI bindings, generated protobuf). Equal to roughly
+/// 50k declarations — well above any real Java source we expect.
+const MAX_DECLARATIONS_PER_FILE: usize = 50_000;
 
 /// Sentinel returned by brokk-core MCP when comment density isn't available
 /// for the requested symbol or file. Bifrost mirrors the wording exactly so
@@ -642,6 +647,11 @@ pub fn report_exception_handling_smells(
     }
 }
 
+/// Pick `candidate` when non-negative, otherwise fall back to `fallback`.
+/// `0` is treated as a valid explicit override (semantically: "disable this
+/// rule"). Use this for the exception-handling-smells weight knobs. For
+/// knobs where `0` is meaningless and should map to the brokk default,
+/// use [`pick_positive`] instead.
 fn pick_weight(candidate: i32, fallback: i32) -> i32 {
     if candidate >= 0 { candidate } else { fallback }
 }
@@ -663,47 +673,80 @@ fn format_exception_weights(w: &ExceptionSmellWeights) -> String {
 }
 
 /// Ports brokk-shared `IAnalyzer.findLongMethodAndGodObjectSmells` to bifrost.
-/// Walks the analyzer's declaration tree for `file`, scoring each function /
-/// class / module against the long-method and god-object thresholds in
-/// `weights`, and returns the findings sorted by
-/// [`maintainability_size_smell_sort_key`] (score desc, then file path, then
-/// fqName) — matching brokk-shared's `maintainabilitySizeSmellComparator`.
+/// Walks the analyzer's declaration tree for `file` iteratively (post-order
+/// DFS, like [`cyclomatic_complexity_for`]'s sibling handler) and scores
+/// each function / class / module against the long-method and god-object
+/// thresholds in `weights`.
 ///
 /// The algorithm is intentionally generic: any analyzer that implements the
 /// trait primitives (`get_top_level_declarations`, `get_direct_children`,
-/// `ranges_of`, `is_file_level_module`) participates. In bifrost the
-/// per-function cyclomatic complexity is computed via
-/// [`cyclomatic_complexity_for`] (shared with `compute_cyclomatic_complexity`).
+/// `ranges_of`) participates. Per-function cyclomatic complexity is computed
+/// via [`cyclomatic_complexity_for`] (shared with
+/// `compute_cyclomatic_complexity`).
+///
+/// **Sort note:** findings are returned in declaration-walk order, *not* the
+/// final report order. Callers that merge findings across files (e.g.
+/// [`report_long_method_and_god_object_smells`]) must apply
+/// [`maintainability_size_smell_cmp`] before rendering.
+///
+/// **Recursion bound:** the walk aborts after
+/// [`MAX_DECLARATIONS_PER_FILE`] declarations have been visited, returning
+/// the partial findings collected so far. Pathological generated files
+/// cannot cause unbounded work.
 pub fn find_long_method_and_god_object_smells(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     weights: MaintainabilitySizeSmellWeights,
 ) -> Vec<MaintainabilitySizeSmell> {
     let mut findings: Vec<MaintainabilitySizeSmell> = Vec::new();
+    // `visited` guards against cycles or shared sub-trees: if a CodeUnit is
+    // reached via two paths, the second visit short-circuits and contributes
+    // default metrics to its parent — mirroring brokk-shared
+    // `IAnalyzer.collectMaintainabilitySizeSmells`'s `visited.add(cu)` guard.
     let mut visited: HashSet<CodeUnit> = HashSet::new();
-    for cu in analyzer.get_top_level_declarations(file) {
-        collect_maintainability_size_smells(
-            analyzer,
-            &cu,
-            weights,
-            true,
-            &mut visited,
-            &mut findings,
-        );
+    let mut metrics: HashMap<CodeUnit, MaintainabilitySizeMetrics> = HashMap::new();
+
+    enum Frame {
+        Enter(CodeUnit, bool),
+        Exit(CodeUnit, bool),
     }
-    findings.sort_by(|a, b| {
-        b.score.cmp(&a.score).then_with(|| {
-            rel_path_string(a.code_unit.source())
-                .to_lowercase()
-                .cmp(&rel_path_string(b.code_unit.source()).to_lowercase())
-                .then_with(|| {
-                    a.code_unit
-                        .fq_name()
-                        .to_lowercase()
-                        .cmp(&b.code_unit.fq_name().to_lowercase())
-                })
-        })
-    });
+
+    let top_levels = analyzer.get_top_level_declarations(file);
+    let mut stack: Vec<Frame> = Vec::with_capacity(top_levels.len() * 2);
+    for cu in top_levels.into_iter().rev() {
+        stack.push(Frame::Enter(cu, true));
+    }
+
+    while let Some(frame) = stack.pop() {
+        match frame {
+            Frame::Enter(cu, top_level) => {
+                if !visited.insert(cu.clone()) {
+                    continue;
+                }
+                if visited.len() > MAX_DECLARATIONS_PER_FILE {
+                    // Stop expanding; already-queued Exit frames will still
+                    // run and produce findings for the partial subtree.
+                    continue;
+                }
+                let children = analyzer.get_direct_children(&cu);
+                stack.push(Frame::Exit(cu, top_level));
+                for child in children.into_iter().rev() {
+                    stack.push(Frame::Enter(child, false));
+                }
+            }
+            Frame::Exit(cu, top_level) => {
+                let cu_metrics = score_maintainability_size_unit(
+                    analyzer,
+                    &cu,
+                    weights,
+                    top_level,
+                    &metrics,
+                    &mut findings,
+                );
+                metrics.insert(cu, cu_metrics);
+            }
+        }
+    }
     findings
 }
 
@@ -716,19 +759,18 @@ struct MaintainabilitySizeMetrics {
     max_cyclomatic_complexity: u32,
 }
 
-fn collect_maintainability_size_smells(
+/// Compute scoring + metrics for a single CodeUnit using already-computed
+/// child metrics from `child_metrics`. Returns the aggregate metrics that
+/// the caller stores so the parent's Exit frame can roll them up.
+fn score_maintainability_size_unit(
     analyzer: &dyn IAnalyzer,
     cu: &CodeUnit,
     weights: MaintainabilitySizeSmellWeights,
     top_level: bool,
-    visited: &mut HashSet<CodeUnit>,
+    child_metrics: &HashMap<CodeUnit, MaintainabilitySizeMetrics>,
     findings: &mut Vec<MaintainabilitySizeSmell>,
 ) -> MaintainabilitySizeMetrics {
-    if !visited.insert(cu.clone()) {
-        return MaintainabilitySizeMetrics::default();
-    }
-
-    let range = primary_range_of(analyzer, cu);
+    let range = widest_non_empty_range_of(analyzer, cu);
     let synthetic = cu.is_synthetic();
     let own_span_lines = if synthetic { 0 } else { range.span_lines() };
     let mut max_function_span_lines = if !synthetic && cu.is_function() {
@@ -757,16 +799,13 @@ fn collect_maintainability_size_smells(
         .collect();
 
     for child in &children {
-        let child_metrics =
-            collect_maintainability_size_smells(analyzer, child, weights, false, visited, findings);
-        function_count = function_count.saturating_add(child_metrics.function_count);
-        nested_type_count = nested_type_count.saturating_add(child_metrics.nested_type_count);
-        descendant_span_lines =
-            descendant_span_lines.saturating_add(child_metrics.descendant_span_lines);
-        max_function_span_lines =
-            max_function_span_lines.max(child_metrics.max_function_span_lines);
-        max_cyclomatic_complexity =
-            max_cyclomatic_complexity.max(child_metrics.max_cyclomatic_complexity);
+        if let Some(m) = child_metrics.get(child) {
+            function_count = function_count.saturating_add(m.function_count);
+            nested_type_count = nested_type_count.saturating_add(m.nested_type_count);
+            descendant_span_lines = descendant_span_lines.saturating_add(m.descendant_span_lines);
+            max_function_span_lines = max_function_span_lines.max(m.max_function_span_lines);
+            max_cyclomatic_complexity = max_cyclomatic_complexity.max(m.max_cyclomatic_complexity);
+        }
     }
 
     if !synthetic && !range.is_empty() {
@@ -774,43 +813,67 @@ fn collect_maintainability_size_smells(
         let mut score: i32 = 0;
         if cu.is_function() {
             if (own_span_lines as i32) >= weights.long_method_span_lines {
-                score += own_span_lines as i32 - weights.long_method_span_lines + 25;
+                score = score.saturating_add(
+                    (own_span_lines as i32).saturating_sub(weights.long_method_span_lines) + 25,
+                );
                 reasons.push(format!("long function spans {own_span_lines} lines"));
             }
             if (max_cyclomatic_complexity as i32) > weights.high_complexity_threshold {
-                score += (max_cyclomatic_complexity as i32 - weights.high_complexity_threshold) * 5;
+                score = score.saturating_add(
+                    (max_cyclomatic_complexity as i32)
+                        .saturating_sub(weights.high_complexity_threshold)
+                        .saturating_mul(5),
+                );
                 reasons.push(format!(
                     "high cyclomatic complexity {max_cyclomatic_complexity}"
                 ));
             }
         } else if cu.is_class() || cu.is_module() {
-            let module_leeway_multiplier = if analyzer.is_file_level_module(cu, top_level) {
+            let module_leeway_multiplier = if is_file_level_module(analyzer, cu, top_level) {
                 weights.file_module_leeway_multiplier
             } else {
                 1
             };
-            let god_object_span_lines = weights.god_object_span_lines * module_leeway_multiplier;
-            let god_object_direct_children =
-                weights.god_object_direct_children * module_leeway_multiplier;
-            let god_object_functions = weights.god_object_functions * module_leeway_multiplier;
-            let helper_sprawl_functions =
-                weights.helper_sprawl_functions * module_leeway_multiplier;
+            let god_object_span_lines = weights
+                .god_object_span_lines
+                .saturating_mul(module_leeway_multiplier);
+            let god_object_direct_children = weights
+                .god_object_direct_children
+                .saturating_mul(module_leeway_multiplier);
+            let god_object_functions = weights
+                .god_object_functions
+                .saturating_mul(module_leeway_multiplier);
+            let helper_sprawl_functions = weights
+                .helper_sprawl_functions
+                .saturating_mul(module_leeway_multiplier);
             let responsibility_cluster = cu.is_class() || non_synthetic_children.len() > 1;
             let child_count = non_synthetic_children.len() as i32;
 
             if (own_span_lines as i32) >= god_object_span_lines {
-                score += (own_span_lines as i32 - god_object_span_lines) / 4 + 20;
+                score = score.saturating_add(
+                    ((own_span_lines as i32).saturating_sub(god_object_span_lines)) / 4 + 20,
+                );
                 reasons.push(format!(
                     "large {kind} spans {own_span_lines} lines",
-                    kind = code_unit_kind_word(cu),
+                    kind = cu.kind().display_lowercase(),
                 ));
             }
             if responsibility_cluster && child_count >= god_object_direct_children {
-                score += (child_count - god_object_direct_children) * 2 + 15;
+                score = score.saturating_add(
+                    child_count
+                        .saturating_sub(god_object_direct_children)
+                        .saturating_mul(2)
+                        + 15,
+                );
                 reasons.push(format!("many direct members ({child_count})"));
             }
             if responsibility_cluster && (function_count as i32) >= god_object_functions {
-                score += (function_count as i32 - god_object_functions) * 2 + 15;
+                score = score.saturating_add(
+                    (function_count as i32)
+                        .saturating_sub(god_object_functions)
+                        .saturating_mul(2)
+                        + 15,
+                );
                 reasons.push(format!(
                     "many functions in one responsibility cluster ({function_count})"
                 ));
@@ -819,13 +882,19 @@ fn collect_maintainability_size_smells(
                 && (function_count as i32) >= helper_sprawl_functions
                 && (max_function_span_lines as i32) >= weights.helper_sprawl_workflow_lines
             {
-                score += function_count as i32 + max_function_span_lines as i32 / 4;
+                score = score.saturating_add(
+                    (function_count as i32).saturating_add(max_function_span_lines as i32 / 4),
+                );
                 reasons.push(format!(
                     "helper sprawl around a {max_function_span_lines}-line workflow"
                 ));
             }
             if (max_cyclomatic_complexity as i32) > weights.high_complexity_threshold {
-                score += (max_cyclomatic_complexity as i32 - weights.high_complexity_threshold) * 3;
+                score = score.saturating_add(
+                    (max_cyclomatic_complexity as i32)
+                        .saturating_sub(weights.high_complexity_threshold)
+                        .saturating_mul(3),
+                );
                 reasons.push(format!(
                     "contains high-complexity workflow (CC {max_cyclomatic_complexity})"
                 ));
@@ -861,7 +930,32 @@ fn collect_maintainability_size_smells(
     }
 }
 
-fn primary_range_of(analyzer: &dyn IAnalyzer, cu: &CodeUnit) -> Range {
+/// Stable comparator for [`MaintainabilitySizeSmell`] matching brokk-shared
+/// `IAnalyzer.maintainabilitySizeSmellComparator`: highest score first,
+/// then case-insensitive source path, then case-insensitive fqName.
+fn maintainability_size_smell_cmp(
+    a: &MaintainabilitySizeSmell,
+    b: &MaintainabilitySizeSmell,
+) -> Ordering {
+    b.score.cmp(&a.score).then_with(|| {
+        rel_path_string(a.code_unit.source())
+            .to_lowercase()
+            .cmp(&rel_path_string(b.code_unit.source()).to_lowercase())
+            .then_with(|| {
+                a.code_unit
+                    .fq_name()
+                    .to_lowercase()
+                    .cmp(&b.code_unit.fq_name().to_lowercase())
+            })
+    })
+}
+
+/// Widest non-empty range for `cu`, or a zero-range fallback when the
+/// analyzer reports no usable ranges. Mirrors brokk-shared
+/// `IAnalyzer.primaryRangeOf`. Named explicitly to distinguish from the
+/// LSP-side `primary_range` helper, which selects the *first* range by
+/// position rather than the widest.
+fn widest_non_empty_range_of(analyzer: &dyn IAnalyzer, cu: &CodeUnit) -> Range {
     analyzer
         .ranges_of(cu)
         .into_iter()
@@ -875,20 +969,46 @@ fn primary_range_of(analyzer: &dyn IAnalyzer, cu: &CodeUnit) -> Range {
         })
 }
 
-fn code_unit_kind_word(cu: &CodeUnit) -> &'static str {
-    if cu.is_class() {
-        "class"
-    } else if cu.is_module() {
-        "module"
-    } else if cu.is_function() {
-        "function"
-    } else if cu.is_field() {
-        "field"
-    } else {
-        "code unit"
+/// True when `code_unit` is the synthetic top-level module that wraps a
+/// whole source file in module-oriented languages (JS/TS, Python, Rust,
+/// Go, C++ and friends). Used by the maintainability-size heuristic to
+/// apply a leeway multiplier to file-wide modules.
+///
+/// Java is explicitly excluded: bifrost's JavaAnalyzer emits a synthetic
+/// `Module` CodeUnit for each package, but those are not "file-level
+/// modules" in the brokk sense — they don't span source lines and they
+/// should keep the class-style scoring thresholds. brokk-shared's
+/// JavaAnalyzer doesn't override `isFileLevelModule` (default = false);
+/// mirroring that here keeps the heuristic byte-for-byte equivalent.
+fn is_file_level_module(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit, top_level: bool) -> bool {
+    if !top_level || !code_unit.is_module() || analyzer.parent_of(code_unit).is_some() {
+        return false;
     }
+    let Some(extension) = code_unit
+        .source()
+        .rel_path()
+        .extension()
+        .and_then(|ext| ext.to_str())
+    else {
+        return false;
+    };
+    let extension_lower = extension.to_ascii_lowercase();
+    if Language::from_extension(&extension_lower) == Language::Java {
+        return false;
+    }
+    analyzer
+        .languages()
+        .iter()
+        .any(|language| language.extensions().contains(&extension_lower.as_str()))
 }
 
+/// Params for [`report_long_method_and_god_object_smells`].
+///
+/// Note: [`MaintainabilitySizeSmellWeights::file_module_leeway_multiplier`]
+/// is deliberately NOT exposed as a tool argument. brokk-core MCP keeps
+/// the leeway multiplier internal too; expanding this struct would break
+/// byte-for-byte schema parity. Don't add the field without first
+/// changing the brokk-core wrapper as well.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReportLongMethodAndGodObjectSmellsParams {
     pub file_paths: Vec<String>,
@@ -984,12 +1104,17 @@ pub fn report_long_method_and_god_object_smells(
 
     let project = analyzer.project();
     let mut input_truncated = params.file_paths.len() > MAX_FILE_PATHS;
+    let input_count = params.file_paths.len().min(MAX_FILE_PATHS);
 
     // Resolve project files first so we can both gate findings to the
     // selected set (matching brokk-core's `selectedFiles` filter) and apply
-    // `max_files` before computing findings.
+    // `max_files` before computing findings. Track how many inputs were
+    // dropped here (empty / unresolvable / missing) so the report can
+    // surface a footer when something was silently skipped — brokk-core's
+    // wrapper does the same.
     let mut selected_files: Vec<ProjectFile> = Vec::new();
     let mut seen_files: HashSet<ProjectFile> = HashSet::new();
+    let mut accepted_count: usize = 0;
     for input in params.file_paths.into_iter().take(MAX_FILE_PATHS) {
         let trimmed = input.trim();
         if trimmed.is_empty() {
@@ -1004,6 +1129,7 @@ pub fn report_long_method_and_god_object_smells(
         if !file.exists() {
             continue;
         }
+        accepted_count += 1;
         if seen_files.insert(file.clone()) {
             selected_files.push(file);
         }
@@ -1012,6 +1138,7 @@ pub fn report_long_method_and_god_object_smells(
             break;
         }
     }
+    let skipped_inputs = input_count.saturating_sub(accepted_count);
 
     let mut findings: Vec<MaintainabilitySizeSmell> = Vec::new();
     for file in &selected_files {
@@ -1021,19 +1148,7 @@ pub fn report_long_method_and_god_object_smells(
     }
     let selected_set: HashSet<ProjectFile> = selected_files.iter().cloned().collect();
     findings.retain(|smell| selected_set.contains(smell.code_unit.source()));
-    findings.sort_by(|a, b| {
-        b.score.cmp(&a.score).then_with(|| {
-            rel_path_string(a.code_unit.source())
-                .to_lowercase()
-                .cmp(&rel_path_string(b.code_unit.source()).to_lowercase())
-                .then_with(|| {
-                    a.code_unit
-                        .fq_name()
-                        .to_lowercase()
-                        .cmp(&b.code_unit.fq_name().to_lowercase())
-                })
-        })
-    });
+    findings.sort_by(maintainability_size_smell_cmp);
 
     let total = findings.len();
     let shown = findings_cap.min(total);
@@ -1041,7 +1156,7 @@ pub fn report_long_method_and_god_object_smells(
         input_truncated = true;
     }
 
-    let mut lines: Vec<String> = Vec::with_capacity(shown * 3 + 4);
+    let mut lines: Vec<String> = Vec::with_capacity(shown * 3 + 5);
     lines.push(format!(
         "Long method and god object smells (max findings: {findings_cap}):"
     ));
@@ -1051,6 +1166,11 @@ pub fn report_long_method_and_god_object_smells(
     if findings.is_empty() {
         lines.push(String::new());
         lines.push("No long method or god object smells found.".to_string());
+        if skipped_inputs > 0 {
+            lines.push(format!(
+                "- Note: skipped {skipped_inputs} input(s) (empty, unresolvable, or missing)."
+            ));
+        }
         return ReportLongMethodAndGodObjectSmellsResult {
             report: lines.join("\n"),
             truncated: input_truncated,
@@ -1077,6 +1197,11 @@ pub fn report_long_method_and_god_object_smells(
         ));
         lines.push(format!("  - Rationale: {}", smell.reasons.join("; ")));
     }
+    if skipped_inputs > 0 {
+        lines.push(format!(
+            "- Note: skipped {skipped_inputs} input(s) (empty, unresolvable, or missing)."
+        ));
+    }
 
     ReportLongMethodAndGodObjectSmellsResult {
         report: lines.join("\n"),
@@ -1084,6 +1209,12 @@ pub fn report_long_method_and_god_object_smells(
     }
 }
 
+/// Pick `candidate` when strictly positive, otherwise fall back to
+/// `fallback`. Use this for the maintainability-size weight knobs (and any
+/// other knob where `0` is meaningless and should fall back to the brokk
+/// default). For knobs where `0` is a valid explicit override (e.g.
+/// exception-handling-smells weights — `0` correctly disables the rule),
+/// use [`pick_weight`] instead.
 fn pick_positive(candidate: i32, fallback: i32) -> i32 {
     if candidate > 0 { candidate } else { fallback }
 }
@@ -2119,6 +2250,157 @@ mod tests {
                 .report
                 .contains("No long method or god object smells found.")
         );
+        // The skipped-inputs footer must surface the silent drop.
+        assert!(
+            result
+                .report
+                .contains("- Note: skipped 1 input(s) (empty, unresolvable, or missing)."),
+            "report: {}",
+            result.report
+        );
         assert!(!result.truncated);
+    }
+
+    #[test]
+    fn long_method_max_files_caps_analyzed_set() {
+        // Two files each contain a god-object class. Cap at 1 file; only the
+        // first (alphabetical-input-order) one should be analyzed.
+        let java_a = format!(
+            "package com.example;\npublic class AlphaController {{\n    public void run() {{\n{body}\n    }}\n{helpers}\n}}\n",
+            body = java_statements(65),
+            helpers = java_helpers(16),
+        );
+        let java_b = format!(
+            "package com.example;\npublic class BetaController {{\n    public void run() {{\n{body}\n    }}\n{helpers}\n}}\n",
+            body = java_statements(65),
+            helpers = java_helpers(16),
+        );
+        let fix = AnalyzerFixture::new(&[
+            ("com/example/AlphaController.java", java_a.as_str()),
+            ("com/example/BetaController.java", java_b.as_str()),
+        ]);
+        let result = report_long_method_and_god_object_smells(
+            fix.analyzer.analyzer(),
+            ReportLongMethodAndGodObjectSmellsParams {
+                file_paths: vec![
+                    "com/example/AlphaController.java".to_string(),
+                    "com/example/BetaController.java".to_string(),
+                ],
+                max_files: 1,
+                ..Default::default()
+            },
+        );
+        assert!(
+            result.report.contains("`com.example.AlphaController`"),
+            "report: {}",
+            result.report
+        );
+        assert!(
+            !result.report.contains("`com.example.BetaController`"),
+            "Beta should have been excluded by max_files=1; report: {}",
+            result.report
+        );
+    }
+
+    #[test]
+    fn is_file_level_module_excludes_java_package_modules() {
+        // Java package modules are NOT file-level in the brokk sense; they
+        // must keep class-style scoring thresholds. This test guards the
+        // explicit Language::Java exclusion in is_file_level_module.
+        let java = "package com.example;\npublic class Foo {}\n";
+        let fix = AnalyzerFixture::new(&[("com/example/Foo.java", java)]);
+        let analyzer = fix.analyzer.analyzer();
+        // Hunt for the Module CU that the JavaAnalyzer emits for the
+        // `com.example` package. If the analyzer evolves to stop emitting
+        // it, this test still validates the negative case via the
+        // pass-through (no Module → nothing to flag, predicate stays
+        // correct for any future Java Module emission).
+        let package_modules: Vec<_> = analyzer
+            .get_top_level_declarations(
+                &analyzer
+                    .project()
+                    .file_by_rel_path(std::path::Path::new("com/example/Foo.java"))
+                    .unwrap(),
+            )
+            .into_iter()
+            .filter(|cu| cu.is_module())
+            .collect();
+        for module_cu in &package_modules {
+            assert!(
+                !is_file_level_module(analyzer, module_cu, true),
+                "Java package module should not be treated as file-level: {:?}",
+                module_cu
+            );
+        }
+    }
+
+    #[test]
+    fn is_file_level_module_rejects_non_module_and_non_top_level() {
+        let java = "package com.example;\npublic class Foo { public void m() {} }\n";
+        let fix = AnalyzerFixture::new(&[("com/example/Foo.java", java)]);
+        let analyzer = fix.analyzer.analyzer();
+        let file = analyzer
+            .project()
+            .file_by_rel_path(std::path::Path::new("com/example/Foo.java"))
+            .unwrap();
+        // Find a non-Module CU (the class itself); predicate must return false.
+        let class_cu = analyzer
+            .get_top_level_declarations(&file)
+            .into_iter()
+            .find(|cu| cu.is_class())
+            .expect("expected the Foo class");
+        assert!(
+            !is_file_level_module(analyzer, &class_cu, true),
+            "non-module CU must never be flagged file-level"
+        );
+        // Also: even a module CU is rejected when top_level=false.
+        for cu in analyzer.get_top_level_declarations(&file) {
+            if cu.is_module() {
+                assert!(
+                    !is_file_level_module(analyzer, &cu, false),
+                    "top_level=false must always reject"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn long_method_synthetic_constructor_does_not_inflate_god_object() {
+        // brokk-shared's `ignoresSyntheticConstructorAtThresholdBoundary`
+        // checks that a Java class's synthetic constructor doesn't push the
+        // class over the god-object thresholds. Weights are configured so
+        // the only way to trip is via the implicit constructor counting as
+        // a direct child/function; if synthetic-skipping works, the result
+        // is empty.
+        let java = format!(
+            "package com.example;\npublic class Boundary {{\n{helpers}\n}}\n",
+            helpers = java_helpers(14),
+        );
+        let fix = AnalyzerFixture::new(&[("com/example/Boundary.java", java.as_str())]);
+        let result = report_long_method_and_god_object_smells(
+            fix.analyzer.analyzer(),
+            ReportLongMethodAndGodObjectSmellsParams {
+                file_paths: vec!["com/example/Boundary.java".to_string()],
+                // Disable the dimensions we don't care about by setting
+                // them very high; force the trip-point to be exactly 15
+                // direct members / functions. The 14 helpers + synthetic
+                // constructor = 15 total raw, but only 14 non-synthetic.
+                long_method_span_lines: 999,
+                high_complexity_threshold: 999,
+                god_object_span_lines: 999,
+                god_object_direct_children: 15,
+                god_object_functions: 15,
+                helper_sprawl_functions: 999,
+                helper_sprawl_workflow_lines: 999,
+                ..Default::default()
+            },
+        );
+        assert!(
+            result
+                .report
+                .contains("No long method or god object smells found."),
+            "synthetic constructor must not count toward direct-children / functions; report: {}",
+            result.report
+        );
     }
 }
