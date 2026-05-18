@@ -1,8 +1,11 @@
 mod common;
 
 use brokk_analyzer::usages::{PythonExportUsageGraphStrategy, UsageAnalyzer, UsageFinder};
-use brokk_analyzer::{CodeUnit, IAnalyzer, Language, PythonAnalyzer};
+use brokk_analyzer::{
+    AnalyzerDelegate, CodeUnit, IAnalyzer, Language, MultiAnalyzer, PythonAnalyzer,
+};
 use common::InlineTestProject;
+use std::collections::BTreeMap;
 
 fn definition(analyzer: &PythonAnalyzer, fq_name: &str) -> CodeUnit {
     analyzer
@@ -10,6 +13,52 @@ fn definition(analyzer: &PythonAnalyzer, fq_name: &str) -> CodeUnit {
         .into_iter()
         .next()
         .unwrap_or_else(|| panic!("missing definition for {fq_name}"))
+}
+
+fn assert_single_python_member_hit(service: &str, consumer: &str) {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("service.py", service)
+        .file("consumer.py", consumer)
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.Foo.bar");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = PythonExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("graph should resolve Python member usage");
+    assert_eq!(hits.len(), 1);
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file == project.file("consumer.py"))
+    );
+}
+
+fn assert_no_python_member_hit(service: &str, consumer: &str) {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("service.py", service)
+        .file("consumer.py", consumer)
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.Foo.bar");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = PythonExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("graph should return success for member query");
+    assert!(hits.is_empty(), "member query should not find proven hits");
 }
 
 #[test]
@@ -167,6 +216,62 @@ def run():
 }
 
 #[test]
+fn nested_package_barrel_resolves_through_init_chain() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "pkg/internal/service.py",
+            r#"
+class Service:
+    pass
+"#,
+        )
+        .file(
+            "pkg/internal/__init__.py",
+            r#"
+from .service import Service
+
+__all__ = ["Service"]
+"#,
+        )
+        .file(
+            "pkg/__init__.py",
+            r#"
+from .internal import Service
+
+__all__ = ["Service"]
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+from pkg import Service
+
+def run():
+    return Service()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "pkg.internal.service.Service");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = PythonExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("graph should resolve nested package barrel chain");
+    assert_eq!(hits.len(), 1);
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file == project.file("consumer.py"))
+    );
+}
+
+#[test]
 fn import_cycle_terminates_and_reports_proven_hits() {
     let project = InlineTestProject::with_language(Language::Python)
         .file(
@@ -215,6 +320,241 @@ def run():
         hits.iter()
             .any(|hit| hit.file == project.file("consumer.py"))
     );
+}
+
+#[test]
+fn dotted_namespace_import_resolves_export_usage() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "pkg/service.py",
+            r#"
+class Service:
+    pass
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+import pkg.service
+
+def run():
+    return pkg.service.Service()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "pkg.service.Service");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = PythonExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("graph should resolve dotted namespace import");
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn dotted_namespace_alias_resolves_export_usage() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "pkg/service.py",
+            r#"
+class Service:
+    pass
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+import pkg.service as svc
+
+def run():
+    return svc.Service()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "pkg.service.Service");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = PythonExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("graph should resolve dotted namespace alias");
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn from_package_imported_submodule_qualifier_resolves_export_usage() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "cassandra/timestamps.py",
+            r#"
+class MonotonicTimestampGenerator:
+    pass
+"#,
+        )
+        .file("cassandra/__init__.py", "")
+        .file(
+            "tests/unit/test_timestamps.py",
+            r#"
+from cassandra import timestamps
+
+def run():
+    return timestamps.MonotonicTimestampGenerator()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(
+        &analyzer,
+        "cassandra.timestamps.MonotonicTimestampGenerator",
+    );
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = PythonExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("graph should resolve package-imported submodule qualifier");
+    assert_eq!(hits.len(), 1);
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file == project.file("tests/unit/test_timestamps.py"))
+    );
+}
+
+#[test]
+fn relative_same_package_imported_submodule_qualifier_resolves_export_usage() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "pkg/service.py",
+            r#"
+class Service:
+    pass
+"#,
+        )
+        .file("pkg/__init__.py", "")
+        .file(
+            "pkg/consumer.py",
+            r#"
+from . import service
+
+def run():
+    return service.Service()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "pkg.service.Service");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = PythonExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("graph should resolve same-package imported submodule qualifier");
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn relative_parent_imported_submodule_qualifier_resolves_export_usage() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "pkg/service.py",
+            r#"
+class Service:
+    pass
+"#,
+        )
+        .file("pkg/__init__.py", "")
+        .file("pkg/tests/__init__.py", "")
+        .file(
+            "pkg/tests/consumer.py",
+            r#"
+from .. import service
+
+def run():
+    return service.Service()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "pkg.service.Service");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = PythonExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("graph should resolve parent-package imported submodule qualifier");
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn static_wildcard_barrel_resolves_through_all() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "pkg/service.py",
+            r#"
+__all__ = ["Service"]
+
+class Service:
+    pass
+"#,
+        )
+        .file(
+            "pkg/__init__.py",
+            r#"
+from .service import *
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+from pkg import Service
+
+def run():
+    return Service()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "pkg.service.Service");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = PythonExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("graph should resolve wildcard barrel re-export");
+    assert_eq!(hits.len(), 1);
 }
 
 #[test]
@@ -285,6 +625,96 @@ def run():
         .into_either()
         .expect("UsageFinder should find Python graph usages");
     assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn usage_finder_routes_python_through_graph_strategy_with_multi_analyzer() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+class Service:
+    pass
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+from service import Service
+
+def run():
+    return Service()
+"#,
+        )
+        .build();
+    let python = PythonAnalyzer::from_project(project.project().clone());
+    let multi = MultiAnalyzer::new(BTreeMap::from([(
+        Language::Python,
+        AnalyzerDelegate::Python(python.clone()),
+    )]));
+    let target = definition(&python, "service.Service");
+
+    let result = UsageFinder::new().find_usages_default(&multi, std::slice::from_ref(&target));
+    let hits = result
+        .into_either()
+        .expect("UsageFinder should find Python graph usages through MultiAnalyzer");
+    assert_eq!(hits.len(), 1);
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file == project.file("consumer.py"))
+    );
+}
+
+#[test]
+fn graph_strategy_returns_too_many_callsites_when_limit_is_exceeded() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+class Service:
+    pass
+"#,
+        )
+        .file(
+            "first.py",
+            r#"
+from service import Service
+
+def first():
+    return Service()
+"#,
+        )
+        .file(
+            "second.py",
+            r#"
+from service import Service
+
+def second():
+    return Service()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.Service");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = PythonExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1,
+    );
+    match result {
+        brokk_analyzer::usages::FuzzyResult::TooManyCallsites {
+            total_callsites,
+            limit,
+            ..
+        } => {
+            assert_eq!(limit, 1);
+            assert!(total_callsites > limit);
+        }
+        other => panic!("expected TooManyCallsites, got {other:?}"),
+    }
 }
 
 #[test]
@@ -413,6 +843,584 @@ def run():
 }
 
 #[test]
+fn typed_local_receiver_resolves_member_usage() {
+    assert_single_python_member_hit(
+        r#"
+class Foo:
+    def bar(self):
+        pass
+"#,
+        r#"
+from service import Foo
+
+def run():
+    x: Foo
+    x.bar()
+"#,
+    );
+}
+
+#[test]
+fn typed_parameter_receiver_resolves_member_usage() {
+    assert_single_python_member_hit(
+        r#"
+class Foo:
+    def bar(self):
+        pass
+"#,
+        r#"
+from service import Foo
+
+def run(x: Foo):
+    x.bar()
+"#,
+    );
+}
+
+#[test]
+fn typed_instance_attribute_receiver_resolves_member_usage() {
+    assert_single_python_member_hit(
+        r#"
+class Foo:
+    def bar(self):
+        pass
+"#,
+        r#"
+from service import Foo
+
+class Holder:
+    def __init__(self):
+        self.x: Foo
+
+    def run(self):
+        self.x.bar()
+"#,
+    );
+}
+
+#[test]
+fn constructed_local_receiver_resolves_member_usage() {
+    assert_single_python_member_hit(
+        r#"
+class Foo:
+    def bar(self):
+        pass
+"#,
+        r#"
+from service import Foo
+
+def run():
+    x = Foo()
+    x.bar()
+"#,
+    );
+}
+
+#[test]
+fn simple_alias_receiver_resolves_member_usage() {
+    assert_single_python_member_hit(
+        r#"
+class Foo:
+    def bar(self):
+        pass
+"#,
+        r#"
+from service import Foo
+
+def run():
+    x = Foo()
+    y = x
+    y.bar()
+"#,
+    );
+}
+
+#[test]
+fn namespace_qualified_annotation_resolves_member_usage() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "pkg/service.py",
+            r#"
+class Foo:
+    def bar(self):
+        pass
+"#,
+        )
+        .file(
+            "pkg/__init__.py",
+            r#"
+from .service import Foo
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+import pkg as p
+
+def run():
+    x: p.Foo
+    x.bar()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "pkg.service.Foo.bar");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = PythonExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("graph should resolve namespace-qualified annotation receiver");
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn unseeded_receiver_does_not_count_as_member_usage() {
+    assert_no_python_member_hit(
+        r#"
+class Foo:
+    def bar(self):
+        pass
+"#,
+        r#"
+def run(x):
+    x.bar()
+"#,
+    );
+}
+
+#[test]
+fn unknown_constructor_does_not_count_as_member_usage() {
+    assert_no_python_member_hit(
+        r#"
+class Foo:
+    def bar(self):
+        pass
+"#,
+        r#"
+def run():
+    x = Unknown()
+    x.bar()
+"#,
+    );
+}
+
+#[test]
+fn local_class_name_shadow_blocks_imported_constructor_receiver() {
+    assert_no_python_member_hit(
+        r#"
+class Foo:
+    def bar(self):
+        pass
+"#,
+        r#"
+from service import Foo
+
+def run():
+    Foo = object
+    x = Foo()
+    x.bar()
+"#,
+    );
+}
+
+#[test]
+fn ambiguous_annotation_beyond_cap_does_not_count_as_member_usage() {
+    assert_no_python_member_hit(
+        r#"
+class Foo:
+    def bar(self):
+        pass
+class Bar:
+    def bar(self):
+        pass
+class Baz:
+    def bar(self):
+        pass
+class Qux:
+    def bar(self):
+        pass
+class Quux:
+    def bar(self):
+        pass
+"#,
+        r#"
+from service import Foo, Bar, Baz, Qux, Quux
+
+def run():
+    x: Foo | Bar | Baz | Qux | Quux
+    x.bar()
+"#,
+    );
+}
+
+#[test]
+fn receiver_type_facts_do_not_leak_across_functions() {
+    assert_no_python_member_hit(
+        r#"
+class Foo:
+    def bar(self):
+        pass
+"#,
+        r#"
+from service import Foo
+
+def typed(x: Foo):
+    pass
+
+def run(x):
+    x.bar()
+"#,
+    );
+}
+
+#[test]
+fn shadowing_in_one_function_does_not_block_sibling_receiver_inference() {
+    assert_single_python_member_hit(
+        r#"
+class Foo:
+    def bar(self):
+        pass
+"#,
+        r#"
+from service import Foo
+
+def shadow():
+    Foo = object
+
+def run(x: Foo):
+    x.bar()
+"#,
+    );
+}
+
+#[test]
+fn function_local_shadow_does_not_count_as_imported_usage() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+class Service:
+    pass
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+from service import Service
+
+def run():
+    Service = object
+    return Service()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.Service");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = PythonExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("graph should succeed for function-local shadow case");
+    assert!(
+        hits.is_empty(),
+        "function-local shadow should block imported usage"
+    );
+}
+
+#[test]
+fn python_graph_success_with_no_hits_does_not_fallback_to_regex() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+class Widget:
+    pass
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+# Widget appears only in a comment.
+note = "Widget appears only in a string"
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.Widget");
+
+    let result = UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target));
+    let hits = result
+        .into_either()
+        .expect("graph should return a successful empty result");
+    assert!(
+        hits.is_empty(),
+        "text mentions should not trigger regex fallback"
+    );
+}
+
+#[test]
+fn inherited_base_member_counts_for_subclass_receiver() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+class Base:
+    def bar(self):
+        pass
+
+class Child(Base):
+    pass
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+from service import Child
+
+def run(x: Child):
+    x.bar()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.Base.bar");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = PythonExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("graph should count inherited base member usage");
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn overriding_subclass_member_counts_for_base_member_query() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+class Base:
+    def bar(self):
+        pass
+
+class Child(Base):
+    def bar(self):
+        pass
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+from service import Child
+
+def run(x: Child):
+    x.bar()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.Base.bar");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = PythonExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("graph should count overriding subclass member usage");
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn multi_level_inherited_member_counts_for_grandchild_receiver() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+class Base:
+    def bar(self):
+        pass
+
+class Child(Base):
+    pass
+
+class GrandChild(Child):
+    pass
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+from service import GrandChild
+
+def run(x: GrandChild):
+    x.bar()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.Base.bar");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = PythonExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("graph should count multi-level inherited member usage");
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn cross_file_inherited_member_counts_for_subclass_receiver() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "base.py",
+            r#"
+class Base:
+    def bar(self):
+        pass
+"#,
+        )
+        .file(
+            "child.py",
+            r#"
+from base import Base
+
+class Child(Base):
+    pass
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+from child import Child
+
+def run(x: Child):
+    x.bar()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "base.Base.bar");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = PythonExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("graph should count cross-file inherited member usage");
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn python_usage_graph_caches_invalidate_changed_files_on_update() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+class Service:
+    pass
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let service_file = project.file("service.py");
+
+    assert_eq!(analyzer.get_definitions("service.Service").len(), 1);
+
+    service_file
+        .write(
+            r#"
+class Renamed:
+    pass
+"#,
+        )
+        .expect("should rewrite service.py");
+    let changed = std::collections::BTreeSet::from([service_file.clone()]);
+    let updated = analyzer.update(&changed);
+
+    assert!(updated.get_definitions("service.Service").is_empty());
+    assert_eq!(updated.get_definitions("service.Renamed").len(), 1);
+}
+
+#[test]
+fn export_resolution_cache_invalidates_when_reexport_target_changes() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "pkg/service.py",
+            r#"
+class Service:
+    pass
+"#,
+        )
+        .file(
+            "pkg/__init__.py",
+            r#"
+from .service import Service
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+from pkg import Service
+
+def run():
+    return Service()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "pkg.service.Service");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let initial = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("initial graph result should succeed");
+    assert_eq!(initial.len(), 1);
+
+    let init_file = project.file("pkg/__init__.py");
+    init_file.write("").expect("should rewrite pkg/__init__.py");
+    let changed = std::collections::BTreeSet::from([init_file.clone()]);
+    let updated = analyzer.update(&changed);
+    let target = definition(&updated, "pkg.service.Service");
+    let candidates = updated.get_analyzed_files().into_iter().collect();
+    let after_update = PythonExportUsageGraphStrategy::new()
+        .find_usages(&updated, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("updated graph result should succeed");
+
+    assert!(after_update.is_empty());
+}
+
+#[test]
 fn unrelated_same_member_name_does_not_match_target_member() {
     let project = InlineTestProject::with_language(Language::Python)
         .file(
@@ -509,4 +1517,363 @@ def run_b():
         hits.iter()
             .all(|hit| hit.file == project.file("consumer_a.py"))
     );
+}
+
+#[test]
+fn usage_finder_falls_back_to_regex_for_same_file_unseeded_function() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+def helper():
+    return 1
+
+def run():
+    return helper()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.helper");
+
+    let result = UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target));
+    let hits = result
+        .into_either()
+        .expect("UsageFinder should fall back to regex for unseeded same-file functions");
+    assert_eq!(hits.len(), 1);
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file == project.file("service.py"))
+    );
+}
+
+#[test]
+fn parity_optional_type_argument_resolves_receiver_member_usage() {
+    assert_single_python_member_hit(
+        r#"
+class Foo:
+    def bar(self):
+        pass
+"#,
+        r#"
+from typing import Optional
+from service import Foo
+
+def run():
+    x: Optional[Foo]
+    x.bar()
+"#,
+    );
+}
+
+#[test]
+fn parity_qualified_optional_type_argument_resolves_receiver_member_usage() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "pkg/service.py",
+            r#"
+class Foo:
+    def bar(self):
+        pass
+"#,
+        )
+        .file(
+            "pkg/__init__.py",
+            r#"
+from .service import Foo
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+from typing import Optional
+import pkg as p
+
+def run():
+    x: Optional[p.Foo]
+    x.bar()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "pkg.service.Foo.bar");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should resolve qualified optional receiver usage");
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn parity_multiple_inheritance_member_counts_when_one_parent_provides_member() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+class Left:
+    pass
+
+class Right:
+    def bar(self):
+        pass
+
+class Child(Left, Right):
+    pass
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+from service import Child
+
+def run(x: Child):
+    x.bar()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.Right.bar");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should count inherited member from one matching parent");
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn parity_subclass_receiver_does_not_count_for_different_base_member_name() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+class Base:
+    def baz(self):
+        pass
+
+class Child(Base):
+    pass
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+from service import Child
+
+def run(x: Child):
+    x.bar()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.Base.baz");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should succeed for subclass negative case");
+    assert!(hits.is_empty());
+}
+
+#[test]
+fn parity_unresolved_superclass_does_not_create_member_hierarchy_hit() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+class Base:
+    def bar(self):
+        pass
+
+class Child(UnknownBase):
+    pass
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+from service import Child
+
+def run(x: Child):
+    x.bar()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.Base.bar");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should succeed for unresolved-superclass negative case");
+    assert!(hits.is_empty());
+}
+
+#[test]
+fn parity_same_name_from_sibling_module_does_not_match_target() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "target_mod.py",
+            r#"
+class Foo:
+    pass
+"#,
+        )
+        .file(
+            "sibling.py",
+            r#"
+class Foo:
+    pass
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+from sibling import Foo
+
+def run():
+    return Foo()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "target_mod.Foo");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should succeed for sibling-module same-name case");
+    assert!(hits.is_empty());
+}
+
+#[test]
+fn parity_self_attribute_type_facts_do_not_leak_across_classes() {
+    assert_no_python_member_hit(
+        r#"
+class Foo:
+    def bar(self):
+        pass
+"#,
+        r#"
+from service import Foo
+
+class A:
+    def __init__(self):
+        self.x: Foo = Foo()
+
+class B:
+    def run(self):
+        self.x.bar()
+"#,
+    );
+}
+
+#[test]
+fn parity_local_parameter_shadows_exported_class_attribute_candidate() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+class Foo:
+    def bar(self):
+        pass
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+from service import Foo
+
+def run(Foo):
+    Foo.bar()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.Foo.bar");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should succeed for parameter-shadow case");
+    assert!(hits.is_empty());
+}
+
+#[test]
+fn parity_default_argument_call_counts_as_usage_instead_of_parameter_shadow() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+class Widget:
+    pass
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+from service import Widget
+
+def run(x=Widget()):
+    pass
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.Widget");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should count default-argument constructor usage");
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn parity_deep_attribute_expression_does_not_overflow() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+class Foo:
+    def bar(self):
+        pass
+"#,
+        )
+        .file(
+            "consumer.py",
+            format!(
+                "\nfrom service import Foo\n\ndef run(root):\n    return root.{}.bar()\n",
+                vec!["child"; 300].join(".")
+            ),
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.Foo.bar");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let _ = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should not overflow on deep attribute expressions");
+}
+
+#[test]
+#[ignore = "Brokk parity marker: cachedDefinitionsByIdentifierFindsBareTopLevelFunction"]
+fn parity_cached_definitions_by_identifier_finds_bare_top_level_function() {
+    // No direct bifrost helper yet; keep as a parity marker until a Rust-side helper
+    // equivalent exists or this assertion is folded into another public-facing surface.
+    panic!("parity marker only");
+}
+
+#[test]
+#[ignore = "Brokk parity marker: cachedDefinitionsByIdentifierFindsMemberIdentifierFallback"]
+fn parity_cached_definitions_by_identifier_finds_member_identifier_fallback() {
+    panic!("parity marker only");
+}
+
+#[test]
+#[ignore = "Brokk parity marker: cachedExactMemberResolvesOnlyWithinSourceFile"]
+fn parity_cached_exact_member_resolves_only_within_source_file() {
+    panic!("parity marker only");
 }

@@ -1,13 +1,17 @@
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, PythonAnalyzer, Range};
+use crate::analyzer::{
+    AnalyzerDelegate, CodeUnit, IAnalyzer, Language, MultiAnalyzer, ProjectFile, PythonAnalyzer,
+    Range,
+};
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use crate::usages::graph_core::{ImportEdge, ImportEdgeKind, ProjectUsageGraph};
 use crate::usages::model::{ExportIndex, FuzzyResult, ImportBinder, UsageHit};
 use crate::usages::traits::UsageAnalyzer;
 use rayon::prelude::*;
+use regex::Regex;
 use std::collections::{BTreeSet, VecDeque};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use tree_sitter::{Node, Parser, Tree};
 
 const GRAPH_HIT_CONFIDENCE: f64 = 1.0;
@@ -48,10 +52,10 @@ impl UsageAnalyzer for PythonExportUsageGraphStrategy {
             };
         }
 
-        let Some(py) = (analyzer as &dyn std::any::Any).downcast_ref::<PythonAnalyzer>() else {
+        let Some(py) = resolve_python_analyzer(analyzer) else {
             return FuzzyResult::Failure {
                 fq_name: target.fq_name().to_string(),
-                reason: "PythonExportUsageGraphStrategy: analyzer is not PythonAnalyzer"
+                reason: "PythonExportUsageGraphStrategy: analyzer does not expose PythonAnalyzer"
                     .to_string(),
             };
         };
@@ -98,6 +102,18 @@ impl UsageAnalyzer for PythonExportUsageGraphStrategy {
         }
 
         FuzzyResult::success(target.clone(), hits)
+    }
+}
+
+fn resolve_python_analyzer(analyzer: &dyn IAnalyzer) -> Option<&PythonAnalyzer> {
+    if let Some(py) = (analyzer as &dyn std::any::Any).downcast_ref::<PythonAnalyzer>() {
+        return Some(py);
+    }
+
+    let multi = (analyzer as &dyn std::any::Any).downcast_ref::<MultiAnalyzer>()?;
+    match multi.delegates().get(&Language::Python) {
+        Some(AnalyzerDelegate::Python(py)) => Some(py),
+        _ => None,
     }
 }
 
@@ -350,6 +366,7 @@ fn scan_files_for_seeds(
     let collected: Mutex<BTreeSet<UsageHit>> = Mutex::new(BTreeSet::new());
     let target_short = top_level_identifier(target).to_string();
     let target_member = member_name(target);
+    let target_owner = target_owner_code_unit(analyzer, target);
     let files_vec: Vec<&ProjectFile> = files.iter().collect();
     let parser_language = tree_sitter_python::LANGUAGE.into();
 
@@ -382,10 +399,17 @@ fn scan_files_for_seeds(
 
         let edges = graph.usage_graph.matching_edges_for_importer(file, seeds);
         let local_conflicts = collect_top_level_conflicts(tree_ref.root_node(), source_str);
+        let target_self_file = *file == target.source();
+        let scope_facts = collect_scope_facts(
+            analyzer,
+            file,
+            &edges,
+            target_short.as_str(),
+            target_self_file,
+        );
 
         let mut local_hits = BTreeSet::new();
         let line_starts = compute_line_starts(source_str);
-        let target_self_file = *file == target.source();
 
         let mut scan_ctx = ScanCtx {
             file,
@@ -394,9 +418,11 @@ fn scan_files_for_seeds(
             analyzer,
             target_short: &target_short,
             target_member: target_member.as_deref(),
+            target_owner: target_owner.clone(),
             edges: &edges,
             target_self_file,
             local_conflicts: &local_conflicts,
+            scope_facts: &scope_facts,
             hits: &mut local_hits,
         };
 
@@ -422,14 +448,32 @@ struct ScanCtx<'a> {
     analyzer: &'a dyn IAnalyzer,
     target_short: &'a str,
     target_member: Option<&'a str>,
+    target_owner: Option<CodeUnit>,
     edges: &'a [ImportEdge],
     target_self_file: bool,
     local_conflicts: &'a HashSet<String>,
+    scope_facts: &'a HashMap<CodeUnit, ScopeFacts>,
     hits: &'a mut BTreeSet<UsageHit>,
 }
 
 impl ScanCtx<'_> {
-    fn binds_target(&self, ident: &str) -> bool {
+    fn scope_facts_for_node(&self, node: Node<'_>) -> Option<&ScopeFacts> {
+        let range = Range {
+            start_byte: node.start_byte(),
+            end_byte: node.end_byte(),
+            start_line: 0,
+            end_line: 0,
+        };
+        let enclosing = self.analyzer.enclosing_code_unit(self.file, &range)?;
+        self.scope_facts.get(&enclosing)
+    }
+
+    fn binds_target(&self, ident: &str, node: Node<'_>) -> bool {
+        if let Some(scope_facts) = self.scope_facts_for_node(node)
+            && scope_facts.local_shadows.contains(ident)
+        {
+            return false;
+        }
         if !self.target_self_file && self.local_conflicts.contains(ident) {
             return false;
         }
@@ -437,6 +481,49 @@ impl ScanCtx<'_> {
             return true;
         }
         self.target_self_file && ident == self.target_short
+    }
+
+    fn receiver_binds_target(&self, expr: &str, node: Node<'_>) -> bool {
+        if self.binds_target(expr, node) {
+            return true;
+        }
+
+        let Some(scope_facts) = self.scope_facts_for_node(node) else {
+            return false;
+        };
+        let Some(raw_type) = scope_facts.receiver_facts.get(expr) else {
+            return false;
+        };
+        self.receiver_type_matches_target(raw_type)
+    }
+
+    fn receiver_type_matches_target(&self, raw_type: &str) -> bool {
+        if receiver_annotation_matches_target(
+            raw_type,
+            self.edges,
+            self.target_short,
+            self.target_self_file,
+        ) {
+            return true;
+        }
+
+        let Some(target_owner) = self.target_owner.as_ref() else {
+            return false;
+        };
+        let Some(receiver_type) =
+            resolve_receiver_type(self.analyzer, self.file, raw_type, self.target_self_file)
+        else {
+            return false;
+        };
+        if &receiver_type == target_owner {
+            return true;
+        }
+        self.analyzer
+            .type_hierarchy_provider()
+            .map(|provider| provider.get_ancestors(&receiver_type))
+            .unwrap_or_default()
+            .into_iter()
+            .any(|ancestor| ancestor == *target_owner)
     }
 }
 
@@ -461,8 +548,14 @@ fn handle_identifier_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if ctx.target_member.is_some() {
         return;
     }
+    if node
+        .parent()
+        .is_some_and(|parent| parent.kind() == "attribute")
+    {
+        return;
+    }
     let text = slice(node, ctx.source);
-    if text.is_empty() || !ctx.binds_target(text) || is_declaration_identifier(node) {
+    if text.is_empty() || !ctx.binds_target(text, node) || is_declaration_identifier(node) {
         return;
     }
     record_hit(node, ctx);
@@ -478,16 +571,18 @@ fn handle_attribute_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let object_text = slice(object, ctx.source);
     let attribute_text = slice(attribute, ctx.source);
     if let Some(member) = ctx.target_member
-        && ctx.binds_target(object_text)
+        && ctx.receiver_binds_target(object_text, node)
         && attribute_text == member
     {
         record_hit(attribute, ctx);
     }
 
     let namespace_match = ctx.edges.iter().any(|edge| {
-        matches!(edge.kind, ImportEdgeKind::Namespace) && edge.local_name == object_text
+        matches!(edge.kind, ImportEdgeKind::Namespace)
+            && (edge.local_name == object_text
+                || object_text.ends_with(&format!(".{}", edge.local_name)))
     });
-    if namespace_match && attribute_text == ctx.target_short {
+    if ctx.target_member.is_none() && namespace_match && attribute_text == ctx.target_short {
         record_hit(attribute, ctx);
     }
 }
@@ -569,6 +664,54 @@ fn member_name(target: &CodeUnit) -> Option<String> {
     (parts.len() > 1).then(|| parts.last().unwrap().to_string())
 }
 
+fn target_owner_code_unit(analyzer: &dyn IAnalyzer, target: &CodeUnit) -> Option<CodeUnit> {
+    let owner_name = top_level_identifier(target);
+    let owner_fq = if target.package_name().is_empty() {
+        owner_name.to_string()
+    } else {
+        format!("{}.{}", target.package_name(), owner_name)
+    };
+    analyzer
+        .get_definitions(&owner_fq)
+        .into_iter()
+        .find(|code_unit| code_unit.source() == target.source() && code_unit.is_class())
+}
+
+fn resolve_receiver_type(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    raw_type: &str,
+    target_self_file: bool,
+) -> Option<CodeUnit> {
+    let raw_type = raw_type.trim();
+    if raw_type.is_empty() || raw_type.contains('.') || raw_type.contains('|') {
+        return None;
+    }
+
+    if let Some(provider) = analyzer.import_analysis_provider()
+        && let Some(imported) = provider
+            .imported_code_units_of(file)
+            .into_iter()
+            .find(|code_unit| code_unit.identifier() == raw_type && code_unit.is_class())
+    {
+        return Some(imported);
+    }
+
+    analyzer
+        .get_declarations(file)
+        .into_iter()
+        .find(|code_unit| code_unit.identifier() == raw_type && code_unit.is_class())
+        .or_else(|| {
+            if !target_self_file {
+                return None;
+            }
+            analyzer
+                .get_all_declarations()
+                .into_iter()
+                .find(|code_unit| code_unit.identifier() == raw_type && code_unit.is_class())
+        })
+}
+
 fn is_declaration_identifier(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
@@ -644,6 +787,239 @@ fn collect_assigned_identifiers(node: Node<'_>, source: &str, out: &mut HashSet<
         children.reverse();
         stack.extend(children);
     }
+}
+
+#[derive(Default, Clone)]
+struct ScopeFacts {
+    receiver_facts: HashMap<String, String>,
+    local_shadows: HashSet<String>,
+}
+
+fn collect_scope_facts(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    edges: &[ImportEdge],
+    target_short: &str,
+    target_self_file: bool,
+) -> HashMap<CodeUnit, ScopeFacts> {
+    let declarations = analyzer.get_declarations(file);
+    let mut class_facts_by_name: HashMap<String, ScopeFacts> = HashMap::default();
+    for declaration in declarations
+        .iter()
+        .filter(|declaration| declaration.is_class())
+    {
+        let Some(source) = analyzer.get_source(declaration, false) else {
+            continue;
+        };
+        let facts =
+            collect_scope_facts_from_source(&source, edges, target_short, target_self_file, true);
+        class_facts_by_name.insert(
+            declaration.short_name().to_string(),
+            ScopeFacts {
+                receiver_facts: facts
+                    .receiver_facts
+                    .into_iter()
+                    .filter(|(fact, _)| fact.starts_with("self."))
+                    .collect(),
+                local_shadows: HashSet::default(),
+            },
+        );
+    }
+
+    let mut scope_facts = HashMap::default();
+    for declaration in declarations
+        .iter()
+        .filter(|declaration| declaration.is_function())
+    {
+        let Some(source) = analyzer.get_source(declaration, false) else {
+            continue;
+        };
+        let mut facts =
+            collect_scope_facts_from_source(&source, edges, target_short, target_self_file, false);
+        if let Some((owner, _)) = declaration.short_name().rsplit_once('.')
+            && let Some(class_facts) = class_facts_by_name.get(owner)
+        {
+            facts
+                .receiver_facts
+                .extend(class_facts.receiver_facts.clone());
+        }
+        scope_facts.insert(declaration.clone(), facts);
+    }
+    scope_facts
+}
+
+fn collect_scope_facts_from_source(
+    source: &str,
+    _edges: &[ImportEdge],
+    _target_short: &str,
+    _target_self_file: bool,
+    allow_self_receivers: bool,
+) -> ScopeFacts {
+    static PARAM_ANNOTATION_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"([A-Za-z_][A-Za-z0-9_\.]*)\s*:\s*([^=,\)\n]+)").unwrap());
+    static PARAM_NAME_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"def\s+[A-Za-z_][A-Za-z0-9_]*\s*\((?P<params>[^)]*)\)").unwrap()
+    });
+    static ASSIGNMENT_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^\s*([A-Za-z_][A-Za-z0-9_\.]*)\s*=\s*([A-Za-z_][A-Za-z0-9_\.()]*)\s*$")
+            .unwrap()
+    });
+
+    let mut facts = ScopeFacts::default();
+    for captures in PARAM_NAME_RE.captures_iter(source) {
+        let params = captures
+            .name("params")
+            .map(|m| m.as_str())
+            .unwrap_or_default();
+        for param in params.split(',') {
+            let param = param.trim();
+            if param.is_empty() || matches!(param, "self" | "cls" | "/") {
+                continue;
+            }
+            let param_name = param
+                .split(':')
+                .next()
+                .unwrap_or(param)
+                .split('=')
+                .next()
+                .unwrap_or(param)
+                .trim();
+            if !param_name.is_empty() {
+                facts.local_shadows.insert(param_name.to_string());
+            }
+        }
+    }
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for line in source.lines() {
+            for captures in PARAM_ANNOTATION_RE.captures_iter(line) {
+                let lhs = captures.get(1).map(|m| m.as_str()).unwrap_or_default();
+                let annotation = captures.get(2).map(|m| m.as_str()).unwrap_or_default();
+                if lhs.starts_with("self.") && !allow_self_receivers {
+                    continue;
+                }
+                if let Some(receiver_type) = normalized_receiver_type(annotation)
+                    && facts
+                        .receiver_facts
+                        .insert(lhs.to_string(), receiver_type)
+                        .is_none()
+                {
+                    changed = true;
+                }
+            }
+
+            let Some(captures) = ASSIGNMENT_RE.captures(line) else {
+                continue;
+            };
+            let lhs = captures.get(1).map(|m| m.as_str()).unwrap_or_default();
+            let rhs = captures.get(2).map(|m| m.as_str()).unwrap_or_default();
+            if lhs.is_empty() || rhs.is_empty() {
+                continue;
+            }
+            let rhs_symbol = rhs.strip_suffix("()").unwrap_or(rhs).trim();
+            facts.local_shadows.insert(lhs.to_string());
+            if lhs.starts_with("self.") && !allow_self_receivers {
+                continue;
+            }
+
+            if !facts.local_shadows.contains(rhs_symbol)
+                && let Some(receiver_type) = normalized_receiver_type(rhs_symbol)
+                && facts
+                    .receiver_facts
+                    .insert(lhs.to_string(), receiver_type)
+                    .is_none()
+            {
+                changed = true;
+                continue;
+            }
+
+            if let Some(receiver_type) = facts
+                .receiver_facts
+                .get(rhs)
+                .or_else(|| facts.receiver_facts.get(rhs_symbol))
+                .cloned()
+                && facts
+                    .receiver_facts
+                    .insert(lhs.to_string(), receiver_type)
+                    .is_none()
+            {
+                changed = true;
+            }
+        }
+    }
+
+    facts
+}
+
+fn normalized_receiver_type(annotation: &str) -> Option<String> {
+    let annotation = unwrap_supported_receiver_wrapper(annotation.trim());
+    if annotation.is_empty()
+        || annotation.contains('|')
+        || annotation.contains('[')
+        || annotation.contains(']')
+        || annotation.contains(',')
+        || annotation.contains('(')
+        || annotation.contains(')')
+        || annotation.contains('{')
+        || annotation.contains('}')
+        || annotation.contains(':')
+    {
+        return None;
+    }
+    Some(annotation.to_string())
+}
+
+fn unwrap_supported_receiver_wrapper(annotation: &str) -> &str {
+    let mut current = annotation.trim();
+    loop {
+        let next = current
+            .strip_prefix("Optional[")
+            .or_else(|| current.strip_prefix("typing.Optional["))
+            .and_then(|inner| inner.strip_suffix(']'))
+            .map(str::trim);
+        let Some(unwrapped) = next else {
+            return current;
+        };
+        current = unwrapped;
+    }
+}
+
+fn receiver_annotation_matches_target(
+    annotation: &str,
+    edges: &[ImportEdge],
+    target_short: &str,
+    target_self_file: bool,
+) -> bool {
+    let annotation = annotation.trim();
+    if annotation.is_empty() {
+        return false;
+    }
+    if annotation.contains('|')
+        || annotation.contains('[')
+        || annotation.contains(']')
+        || annotation.contains(',')
+        || annotation.contains('(')
+        || annotation.contains(')')
+    {
+        return false;
+    }
+    if annotation == target_short {
+        return target_self_file || edges.iter().any(|edge| edge.local_name == target_short);
+    }
+
+    let Some((qualifier, member)) = annotation.rsplit_once('.') else {
+        return false;
+    };
+    if member != target_short {
+        return false;
+    }
+    edges.iter().any(|edge| {
+        matches!(edge.kind, ImportEdgeKind::Namespace)
+            && (edge.local_name == qualifier
+                || qualifier.ends_with(&format!(".{}", edge.local_name)))
+    })
 }
 
 fn python_module_name(file: &ProjectFile) -> String {
