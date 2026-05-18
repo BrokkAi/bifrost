@@ -1,6 +1,11 @@
+mod inline_project;
+
 use brokk_analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, TestProject};
 use pretty_assertions::assert_eq;
 use std::path::Path;
+
+#[allow(unused_imports)]
+pub use inline_project::{BuiltInlineTestProject, InlineTestProject};
 
 #[allow(dead_code)]
 pub fn js_fixture_project() -> TestProject {

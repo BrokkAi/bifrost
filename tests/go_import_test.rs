@@ -1,16 +1,17 @@
-use brokk_analyzer::{
-    GoAnalyzer, IAnalyzer, ImportAnalysisProvider, Language, Project, ProjectFile, TestProject,
-};
-use tempfile::tempdir;
+use brokk_analyzer::{GoAnalyzer, IAnalyzer, ImportAnalysisProvider, ProjectFile};
 
-fn inline_project(files: &[(&str, &str)]) -> TestProject {
-    let temp = tempdir().unwrap();
-    for (path, contents) in files {
-        ProjectFile::new(temp.path().to_path_buf(), path)
-            .write(*contents)
-            .unwrap();
-    }
-    TestProject::new(temp.keep(), Language::Go)
+mod common;
+
+use common::InlineTestProject;
+
+fn inline_project(files: &[(&str, &str)]) -> common::BuiltInlineTestProject {
+    files
+        .iter()
+        .fold(
+            InlineTestProject::with_language(brokk_analyzer::Language::Go),
+            |project, (path, contents)| project.file(*path, *contents),
+        )
+        .build()
 }
 
 #[test]
@@ -30,7 +31,7 @@ fn test_go_import_resolution_variants() {
             "#,
         ),
     ]);
-    let analyzer = GoAnalyzer::from_project(project.clone());
+    let analyzer = GoAnalyzer::from_project(project.project().clone());
     let main_file = ProjectFile::new(project.root().to_path_buf(), "main.go");
     let resolved = analyzer.imported_code_units_of(&main_file);
     assert!(resolved.iter().any(|cu| cu.package_name() == "fmt"));
@@ -70,7 +71,7 @@ fn test_go_import_alias_dot_blank_comments_and_versioned_paths() {
             "#,
         ),
     ]);
-    let analyzer = GoAnalyzer::from_project(project.clone());
+    let analyzer = GoAnalyzer::from_project(project.project().clone());
     let main_file = ProjectFile::new(project.root().to_path_buf(), "main.go");
     let yaml_file = ProjectFile::new(project.root().to_path_buf(), "yaml_main.go");
 
@@ -116,7 +117,7 @@ fn test_go_relevant_imports_and_could_import_file() {
             "#,
         ),
     ]);
-    let analyzer = GoAnalyzer::from_project(project.clone());
+    let analyzer = GoAnalyzer::from_project(project.project().clone());
     let main_file = ProjectFile::new(project.root().to_path_buf(), "main.go");
     let main_fn = analyzer
         .get_declarations(&main_file)
@@ -146,7 +147,7 @@ fn test_go_referencing_files_uses_resolved_import_targets() {
             "#,
         ),
     ]);
-    let analyzer = GoAnalyzer::from_project(project.clone());
+    let analyzer = GoAnalyzer::from_project(project.project().clone());
     let target = ProjectFile::new(project.root().to_path_buf(), "pkg/utils/helper.go");
     let consumer = ProjectFile::new(project.root().to_path_buf(), "main.go");
 
