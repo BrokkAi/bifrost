@@ -3,8 +3,10 @@ mod common;
 use brokk_analyzer::usages::{
     FuzzyResult, JsTsExportUsageGraphStrategy, UsageAnalyzer, UsageFinder,
 };
-use brokk_analyzer::{CodeUnit, IAnalyzer, JavascriptAnalyzer, ProjectFile, TypescriptAnalyzer};
-use common::{js_fixture_project, ts_fixture_project};
+use brokk_analyzer::{
+    CodeUnit, IAnalyzer, JavascriptAnalyzer, Language, ProjectFile, TypescriptAnalyzer,
+};
+use common::{InlineTestProject, js_fixture_project, ts_fixture_project};
 use std::collections::BTreeSet;
 
 fn js_analyzer() -> JavascriptAnalyzer {
@@ -116,5 +118,47 @@ fn usage_finder_routes_jsts_targets_to_graph_strategy() {
     assert!(
         !hits.is_empty(),
         "UsageFinder should resolve at least one reference for BaseClass via the graph strategy"
+    );
+}
+
+#[test]
+fn ts_graph_strategy_resolves_local_alias_of_imported_owner() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "base.ts",
+            r#"
+export class BaseClass {}
+"#,
+        )
+        .file(
+            "consumer.ts",
+            r#"
+import { BaseClass } from "./base";
+
+const Alias = BaseClass;
+
+export function build(): Alias {
+    return new Alias();
+}
+"#,
+        )
+        .build();
+    let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
+    let units: Vec<_> = analyzer.all_declarations().cloned().collect();
+    let base_file = project.file("base.ts");
+    let target = definition_in(units.iter(), |cu| {
+        cu.is_class() && cu.identifier() == "BaseClass" && cu.source() == &base_file
+    });
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = JsTsExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("local alias graph success");
+
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == project.file("consumer.ts")),
+        "expected local alias usage in consumer.ts"
     );
 }
