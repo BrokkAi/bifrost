@@ -5,6 +5,9 @@ use crate::analyzer::{
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use crate::usages::graph_core::{ImportEdgeKind, ProjectUsageGraph};
+use crate::usages::local_inference::{
+    LocalInferenceConfig, LocalInferenceEngine, SymbolResolution,
+};
 use crate::usages::model::{FuzzyResult, UsageHit};
 use crate::usages::traits::UsageAnalyzer;
 use rayon::prelude::*;
@@ -893,8 +896,23 @@ fn infer_receiver_names(
     owner_local_names: &HashSet<String>,
     self_like_constructors: &HashSet<String>,
 ) -> Vec<String> {
-    let mut receivers = BTreeSet::new();
     let owner_type_names = expanded_receiver_type_names(source, owner_local_names);
+    let bindings = collect_receiver_bindings(source, &owner_type_names, self_like_constructors);
+    let mut receivers: Vec<_> = bindings
+        .snapshot()
+        .matching_symbols(|target| owner_type_names.contains(target))
+        .into_iter()
+        .collect();
+    receivers.sort();
+    receivers
+}
+
+fn collect_receiver_bindings(
+    source: &str,
+    owner_type_names: &HashSet<String>,
+    self_like_constructors: &HashSet<String>,
+) -> LocalInferenceEngine<String> {
+    let mut engine = LocalInferenceEngine::new(LocalInferenceConfig::default());
 
     let option_field_types: HashMap<String, String> = OPTION_FIELD_RE
         .captures_iter(source)
@@ -914,7 +932,7 @@ fn infer_receiver_names(
             continue;
         };
         if owner_type_names.contains(ty.as_str()) {
-            receivers.insert(name.as_str().to_string());
+            engine.seed_symbol(name.as_str().to_string(), ty.as_str().to_string());
         }
     }
 
@@ -929,7 +947,7 @@ fn infer_receiver_names(
         let allowed_constructor =
             constructor_name.is_none_or(|name| self_like_constructors.contains(name));
         if owner_type_names.contains(ty.as_str()) && allowed_constructor {
-            receivers.insert(name.as_str().to_string());
+            engine.seed_symbol(name.as_str().to_string(), ty.as_str().to_string());
         }
     }
 
@@ -941,7 +959,7 @@ fn infer_receiver_names(
             continue;
         };
         if owner_type_names.contains(ty.as_str()) {
-            receivers.insert(name.as_str().to_string());
+            engine.seed_symbol(name.as_str().to_string(), ty.as_str().to_string());
         }
     }
 
@@ -956,7 +974,9 @@ fn infer_receiver_names(
             .get(field_name.as_str())
             .is_some_and(|ty| owner_type_names.contains(ty))
         {
-            receivers.insert(name.as_str().to_string());
+            if let Some(ty) = option_field_types.get(field_name.as_str()) {
+                engine.seed_symbol(name.as_str().to_string(), ty.clone());
+            }
         }
     }
 
@@ -969,8 +989,16 @@ fn infer_receiver_names(
             let Some(value) = captures.get(2) else {
                 continue;
             };
-            if receivers.contains(value.as_str()) && receivers.insert(name.as_str().to_string()) {
-                changed = true;
+            match engine.resolve_symbol(value.as_str()) {
+                SymbolResolution::Precise(targets)
+                    if !targets.is_empty() && engine.resolve_symbol(name.as_str()).is_unknown() =>
+                {
+                    engine.alias_symbol(name.as_str().to_string(), value.as_str());
+                    changed = true;
+                }
+                SymbolResolution::Unknown
+                | SymbolResolution::Ambiguous
+                | SymbolResolution::Precise(_) => {}
             }
         }
         if !changed {
@@ -978,5 +1006,5 @@ fn infer_receiver_names(
         }
     }
 
-    receivers.into_iter().collect()
+    engine
 }
