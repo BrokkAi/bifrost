@@ -1,4 +1,7 @@
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, PythonAnalyzer, Range};
+use crate::analyzer::{
+    AnalyzerDelegate, CodeUnit, IAnalyzer, Language, MultiAnalyzer, ProjectFile, PythonAnalyzer,
+    Range,
+};
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use crate::usages::graph_core::{ImportEdge, ImportEdgeKind, ProjectUsageGraph};
@@ -48,10 +51,10 @@ impl UsageAnalyzer for PythonExportUsageGraphStrategy {
             };
         }
 
-        let Some(py) = (analyzer as &dyn std::any::Any).downcast_ref::<PythonAnalyzer>() else {
+        let Some(py) = resolve_python_analyzer(analyzer) else {
             return FuzzyResult::Failure {
                 fq_name: target.fq_name().to_string(),
-                reason: "PythonExportUsageGraphStrategy: analyzer is not PythonAnalyzer"
+                reason: "PythonExportUsageGraphStrategy: analyzer does not expose PythonAnalyzer"
                     .to_string(),
             };
         };
@@ -98,6 +101,18 @@ impl UsageAnalyzer for PythonExportUsageGraphStrategy {
         }
 
         FuzzyResult::success(target.clone(), hits)
+    }
+}
+
+fn resolve_python_analyzer(analyzer: &dyn IAnalyzer) -> Option<&PythonAnalyzer> {
+    if let Some(py) = (analyzer as &dyn std::any::Any).downcast_ref::<PythonAnalyzer>() {
+        return Some(py);
+    }
+
+    let multi = (analyzer as &dyn std::any::Any).downcast_ref::<MultiAnalyzer>()?;
+    match multi.delegates().get(&Language::Python) {
+        Some(AnalyzerDelegate::Python(py)) => Some(py),
+        _ => None,
     }
 }
 

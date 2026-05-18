@@ -15,7 +15,7 @@ The immediate outcome is not one code patch. It is a durable implementation prog
 - [x] (2026-05-18T11:30Z) Read `.agent/PLANS.md`, `src/usages/graph_core.rs`, `src/usages/python_graph.rs`, `src/usages/finder.rs`, `tests/usages_python_test.rs`, `tests/common/inline_project.rs`, and Brokk’s Python usage-graph strategy/reference-graph tests.
 - [x] (2026-05-18T11:30Z) Chose a new repo-root plan name, `PYTHON_USAGE_GRAPH_PARITY_EXECPLAN.md`, because this document is intentionally broader than issue `#74`.
 - [x] (2026-05-18T11:30Z) Captured the current `bifrost` baseline: Python is already routed through `PythonExportUsageGraphStrategy`, but Rust-side coverage is still shallow compared with Brokk’s strategy and reference-graph suites.
-- [ ] Implement Milestone 1 by expanding `bifrost`’s Python usage tests to cover the remaining issue `#74` routing and fallback behaviors that Brokk already exercises.
+- [x] (2026-05-18T12:05Z) Completed Milestone 1 by expanding the focused Python graph suite for `UsageFinder` routing, `MultiAnalyzer` routing, `TooManyCallsites`, and same-file regex fallback, then fixing `PythonExportUsageGraphStrategy` so it can resolve a `PythonAnalyzer` out of `MultiAnalyzer` instead of silently dropping to regex.
 - [ ] Implement Milestone 2 by porting Python import and re-export graph cases from Brokk into focused Rust tests and then fixing any uncovered graph traversal gaps.
 - [ ] Implement Milestone 3 by porting Python receiver/member inference cases from Brokk into focused Rust tests and then fixing any uncovered inference gaps.
 - [ ] Implement Milestone 4 by porting Python negative and ambiguity cases from Brokk into focused Rust tests and then fixing any uncovered false-positive or fallback gaps.
@@ -36,6 +36,9 @@ The immediate outcome is not one code patch. It is a durable implementation prog
 - Observation: the shared inline harness in `tests/common/inline_project.rs` is already the right default for this plan.
   Evidence: it builds ad hoc temporary test projects with inferred or explicit language selection and removes the need for hand-managed tempdirs in most small Python graph cases.
 
+- Observation: `PythonExportUsageGraphStrategy` originally only worked when the caller passed a concrete `PythonAnalyzer`.
+  Evidence: a new focused `MultiAnalyzer` routing test initially returned two regex hits instead of one graph-proven hit, because `src/usages/python_graph.rs` downcast directly to `PythonAnalyzer` and therefore forced `UsageFinder` to fall back on `Failure`.
+
 ## Decision Log
 
 - Decision: make this a broader parity program document instead of `ISSUE_74_EXECPLAN.md`.
@@ -50,9 +53,13 @@ The immediate outcome is not one code patch. It is a durable implementation prog
   Rationale: the inline harness keeps tests small, local, and easy to read while matching the repo guidance in `AGENTS.md`.
   Date/Author: 2026-05-18 / Codex
 
+- Decision: treat typed-parameter receiver inference as Milestone 3 work even though it was uncovered while expanding Milestone 1 coverage.
+  Rationale: the failure required receiver-type reasoning rather than strategy-selection logic, so keeping it in the later milestone preserves the milestone boundaries and keeps the first checkpoint narrowly about routing and fallback behavior.
+  Date/Author: 2026-05-18 / Codex
+
 ## Outcomes & Retrospective
 
-At the moment this plan is created, `bifrost` has already crossed the architecture threshold for Python usage graphs: the shared graph core from issue `#73` exists, Python routing is enabled, and a Python graph strategy is present. What is missing is the long tail of parity proof and follow-through. Brokk already demonstrates that those behaviors matter, because its Python usage suite covers selector behavior, re-export traversal, receiver inference, shadowing, inheritance, and update invalidation.
+At the moment this plan is created, `bifrost` has already crossed the architecture threshold for Python usage graphs: the shared graph core from issue `#73` exists, Python routing is enabled, and a Python graph strategy is present. Milestone 1 has now converted that architecture into stronger proof by covering graph routing, fallback behavior, bounded-candidate behavior, and `MultiAnalyzer` routing with focused Rust tests. What is still missing is the larger parity tail around import topologies, receiver inference, negative ambiguity control, inheritance, and cache invalidation. Brokk already demonstrates that those behaviors matter, because its Python usage suite covers selector behavior, re-export traversal, receiver inference, shadowing, inheritance, and update invalidation.
 
 This plan turns that gap into a staged implementation program. Success is not “Python has a graph class.” Success is that a contributor can work milestone by milestone, port the representative scenarios, fix the underlying behavior where needed, and finish with a parity matrix that says exactly what has been matched and what remains intentionally different.
 
@@ -211,9 +218,9 @@ The implementation dependencies for parity work are the shared usage-graph IR in
 
 This matrix must be kept current as milestones land.
 
-- Strategy and routing parity: `missing`
+- Strategy and routing parity: `done`
   Brokk reference: `PythonExportUsageGraphStrategyTest.java`.
-  Required `bifrost` end state: focused Rust tests prove seeded export routing, member-owner fallback, multi-analyzer compatibility where applicable, and correct regex fallback boundaries.
+  Current `bifrost` proof: focused Rust tests now cover seeded export routing, multi-analyzer compatibility, `TooManyCallsites`, and same-file regex fallback boundaries through `tests/usages_python_graph_test.rs` and `tests/usages_python_test.rs`.
 
 - Import and re-export resolution parity: `missing`
   Brokk reference: absolute imports, relative imports, `__init__.py` barrels, nested barrel chains, dotted namespace imports, dotted aliases, submodule qualifiers, and cycle-safe traversal in `PythonExportUsageReferenceGraphTest.java`.
@@ -231,3 +238,5 @@ This matrix must be kept current as milestones land.
   Brokk reference: the container element/value flow cases in `PythonExportUsageReferenceGraphTest.java` that Brokk itself marks as intentionally out of scope for the current Python graph. `bifrost` should record these explicitly rather than silently omitting them.
 
 Revision note: created this broader parity ExecPlan after issue `#73` had already landed and issue `#74` had partially landed, so the document starts from the real current Python graph baseline instead of pretending the work is still unstarted.
+
+Revision note: updated after Milestone 1 to record the added routing/fallback tests and the `MultiAnalyzer` fix in `src/usages/python_graph.rs`.

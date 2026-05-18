@@ -1,8 +1,11 @@
 mod common;
 
 use brokk_analyzer::usages::{PythonExportUsageGraphStrategy, UsageAnalyzer, UsageFinder};
-use brokk_analyzer::{CodeUnit, IAnalyzer, Language, PythonAnalyzer};
+use brokk_analyzer::{
+    AnalyzerDelegate, CodeUnit, IAnalyzer, Language, MultiAnalyzer, PythonAnalyzer,
+};
 use common::InlineTestProject;
+use std::collections::BTreeMap;
 
 fn definition(analyzer: &PythonAnalyzer, fq_name: &str) -> CodeUnit {
     analyzer
@@ -288,6 +291,96 @@ def run():
 }
 
 #[test]
+fn usage_finder_routes_python_through_graph_strategy_with_multi_analyzer() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+class Service:
+    pass
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+from service import Service
+
+def run():
+    return Service()
+"#,
+        )
+        .build();
+    let python = PythonAnalyzer::from_project(project.project().clone());
+    let multi = MultiAnalyzer::new(BTreeMap::from([(
+        Language::Python,
+        AnalyzerDelegate::Python(python.clone()),
+    )]));
+    let target = definition(&python, "service.Service");
+
+    let result = UsageFinder::new().find_usages_default(&multi, std::slice::from_ref(&target));
+    let hits = result
+        .into_either()
+        .expect("UsageFinder should find Python graph usages through MultiAnalyzer");
+    assert_eq!(hits.len(), 1);
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file == project.file("consumer.py"))
+    );
+}
+
+#[test]
+fn graph_strategy_returns_too_many_callsites_when_limit_is_exceeded() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+class Service:
+    pass
+"#,
+        )
+        .file(
+            "first.py",
+            r#"
+from service import Service
+
+def first():
+    return Service()
+"#,
+        )
+        .file(
+            "second.py",
+            r#"
+from service import Service
+
+def second():
+    return Service()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.Service");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = PythonExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1,
+    );
+    match result {
+        brokk_analyzer::usages::FuzzyResult::TooManyCallsites {
+            total_callsites,
+            limit,
+            ..
+        } => {
+            assert_eq!(limit, 1);
+            assert!(total_callsites > limit);
+        }
+        other => panic!("expected TooManyCallsites, got {other:?}"),
+    }
+}
+
+#[test]
 fn same_short_name_in_other_file_does_not_collide_into_target_seeds() {
     let project = InlineTestProject::with_language(Language::Python)
         .file(
@@ -508,5 +601,33 @@ def run_b():
     assert!(
         hits.iter()
             .all(|hit| hit.file == project.file("consumer_a.py"))
+    );
+}
+
+#[test]
+fn usage_finder_falls_back_to_regex_for_same_file_unseeded_function() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+def helper():
+    return 1
+
+def run():
+    return helper()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.helper");
+
+    let result = UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target));
+    let hits = result
+        .into_either()
+        .expect("UsageFinder should fall back to regex for unseeded same-file functions");
+    assert_eq!(hits.len(), 1);
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file == project.file("service.py"))
     );
 }
