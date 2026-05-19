@@ -277,16 +277,15 @@ fn process_commit(
     let name = author.name().unwrap_or_default().to_string();
     let commit_secs = author.when().seconds();
 
-    let diff = diff_commit_to_parent(repo, commit).map_err(|err| err.message().to_string())?;
-    let diff = apply_rename_detection_with_fallback(repo, commit, diff)?;
+    let changed_files = changed_project_files_for_commit(
+        repo,
+        project_root,
+        repo_root,
+        commit,
+        apply_rename_detection_with_fallback,
+    )?;
 
-    for delta in diff.deltas() {
-        let Some(path) = delta_path(&delta) else {
-            continue;
-        };
-        let Some(project_file) = repo_rel_to_project_file(project_root, repo_root, path) else {
-            continue;
-        };
+    for project_file in changed_files {
         let stats = stats_by_file.entry(project_file).or_default();
         stats.churn += 1;
         *stats.author_counts.entry(email.clone()).or_insert(0) += 1;
@@ -302,6 +301,35 @@ fn process_commit(
         }
     }
     Ok(())
+}
+
+fn changed_project_files_for_commit<'repo, F>(
+    repo: &'repo Repository,
+    project_root: &Path,
+    repo_root: &Path,
+    commit: &Commit<'repo>,
+    finalize_diff: F,
+) -> Result<Vec<ProjectFile>, String>
+where
+    F: FnOnce(
+        &'repo Repository,
+        &Commit<'repo>,
+        git2::Diff<'repo>,
+    ) -> Result<git2::Diff<'repo>, String>,
+{
+    let diff = diff_commit_to_parent(repo, commit).map_err(|err| err.message().to_string())?;
+    let diff = finalize_diff(repo, commit, diff)?;
+    let mut files = Vec::new();
+    for delta in diff.deltas() {
+        let Some(path) = delta_path(&delta) else {
+            continue;
+        };
+        let Some(project_file) = repo_rel_to_project_file(project_root, repo_root, path) else {
+            continue;
+        };
+        files.push(project_file);
+    }
+    Ok(files)
 }
 
 fn diff_commit_to_parent<'repo>(
@@ -322,15 +350,36 @@ fn diff_commit_to_parent<'repo>(
 fn apply_rename_detection_with_fallback<'repo>(
     repo: &'repo Repository,
     commit: &Commit<'_>,
-    mut diff: git2::Diff<'repo>,
+    diff: git2::Diff<'repo>,
 ) -> Result<git2::Diff<'repo>, String> {
-    let mut find_opts = DiffFindOptions::new();
-    find_opts.renames(true);
-    find_opts.rename_limit(RENAME_DETECTION_LIMIT);
-    match diff.find_similar(Some(&mut find_opts)) {
-        Ok(()) => Ok(diff),
-        Err(_) => diff_commit_to_parent(repo, commit)
-            .map_err(|err| format!("diff retry without rename detection failed: {err}")),
+    let mut original_diff = Some(diff);
+    with_rename_detection_fallback(|detect_renames| {
+        let mut diff = if detect_renames {
+            original_diff
+                .take()
+                .ok_or_else(|| "rename-detection retry exhausted original diff".to_string())?
+        } else {
+            diff_commit_to_parent(repo, commit)
+                .map_err(|err| format!("diff retry without rename detection failed: {err}"))?
+        };
+        if detect_renames {
+            let mut find_opts = DiffFindOptions::new();
+            find_opts.renames(true);
+            find_opts.rename_limit(RENAME_DETECTION_LIMIT);
+            diff.find_similar(Some(&mut find_opts))
+                .map_err(|err| err.message().to_string())?;
+        }
+        Ok(diff)
+    })
+}
+
+fn with_rename_detection_fallback<T, F>(mut attempt: F) -> Result<T, String>
+where
+    F: FnMut(bool) -> Result<T, String>,
+{
+    match attempt(true) {
+        Ok(value) => Ok(value),
+        Err(_) => attempt(false),
     }
 }
 
@@ -782,5 +831,160 @@ mod tests {
             "{}",
             result.report
         );
+    }
+
+    #[test]
+    fn fallback_retry_disables_rename_detection_and_keeps_changed_file() {
+        let fixture = AnalyzerFixture::new(&[(
+            "src/FallbackService.java",
+            "public class FallbackService { void fallback() { if (true) {} } }\n",
+        )]);
+        let repo = init_repo(&fixture.project_root());
+        commit_paths(
+            &repo,
+            "initial fallback",
+            "dev0",
+            "dev0@example.com",
+            "2020-06-01T00:00:00Z",
+            &["src/FallbackService.java"],
+        );
+
+        let commit = repo
+            .find_commit(repo.head().expect("head").target().expect("head target"))
+            .expect("head commit");
+        let mut attempts = Vec::new();
+        let changed_files = changed_project_files_for_commit(
+            &repo,
+            fixture.project_root().as_path(),
+            fixture.project_root().as_path(),
+            &commit,
+            |repo, commit, diff| {
+                let mut original_diff = Some(diff);
+                with_rename_detection_fallback(|detect_renames| {
+                    attempts.push(detect_renames);
+                    if detect_renames {
+                        Err("simulated rename detection failure".to_string())
+                    } else {
+                        original_diff.take();
+                        diff_commit_to_parent(repo, commit)
+                            .map_err(|err| format!("fallback diff rebuild failed: {err}"))
+                    }
+                })
+            },
+        )
+        .expect("fallback succeeds");
+
+        assert_eq!(attempts, vec![true, false]);
+        assert_eq!(
+            changed_files,
+            vec![ProjectFile::new(
+                fixture.project_root(),
+                Path::new("src/FallbackService.java")
+            )]
+        );
+    }
+
+    #[test]
+    fn fallback_retry_preserves_report_churn_output() {
+        let fixture = AnalyzerFixture::new(&[(
+            "src/FallbackService.java",
+            "public class FallbackService { void fallback() { if (true) {} } }\n",
+        )]);
+        let repo = init_repo(&fixture.project_root());
+        commit_paths(
+            &repo,
+            "initial fallback",
+            "dev0",
+            "dev0@example.com",
+            "2020-06-01T00:00:00Z",
+            &["src/FallbackService.java"],
+        );
+        fs::write(
+            fixture
+                .project_root()
+                .join("src")
+                .join("FallbackService.java"),
+            "public class FallbackService { void fallback() { int marker = 1; if (true) {} } }\n",
+        )
+        .expect("rewrite fallback");
+        commit_paths(
+            &repo,
+            "update fallback",
+            "dev0",
+            "dev0@example.com",
+            "2020-06-02T00:00:00Z",
+            &["src/FallbackService.java"],
+        );
+
+        let commit = repo
+            .find_commit(repo.head().expect("head").target().expect("head target"))
+            .expect("head commit");
+        let mut attempts = Vec::new();
+        let changed_files = changed_project_files_for_commit(
+            &repo,
+            fixture.project_root().as_path(),
+            fixture.project_root().as_path(),
+            &commit,
+            |repo, commit, diff| {
+                let mut original_diff = Some(diff);
+                with_rename_detection_fallback(|detect_renames| {
+                    attempts.push(detect_renames);
+                    if detect_renames {
+                        Err("simulated rename detection failure".to_string())
+                    } else {
+                        original_diff.take();
+                        diff_commit_to_parent(repo, commit)
+                            .map_err(|err| format!("fallback diff rebuild failed: {err}"))
+                    }
+                })
+            },
+        )
+        .expect("fallback succeeds");
+
+        let mut stats_by_file = StdHashMap::new();
+        let author = commit.author();
+        let email = author.email().unwrap_or_default().to_string();
+        let name = author.name().unwrap_or_default().to_string();
+        for project_file in changed_files {
+            let stats = stats_by_file
+                .entry(project_file)
+                .or_insert_with(FileStats::default);
+            stats.churn += 1;
+            *stats.author_counts.entry(email.clone()).or_insert(0) += 1;
+            stats
+                .author_names
+                .entry(email.clone())
+                .or_insert_with(|| name.clone());
+        }
+
+        let file = ProjectFile::new(
+            fixture.project_root(),
+            Path::new("src/FallbackService.java"),
+        );
+        let info = create_file_info(
+            fixture.analyzer.analyzer(),
+            file.clone(),
+            stats_by_file
+                .remove(&file)
+                .expect("stats for fallback file"),
+        )
+        .expect("file info");
+
+        assert_eq!(attempts, vec![true, false]);
+        assert_eq!(info.churn, 1);
+        assert_eq!(info.category, HotspotCategory::Stable);
+        assert_eq!(
+            info.top_authors,
+            vec![AuthorInfo {
+                name: "dev0".to_string(),
+                commits: 1,
+            }]
+        );
+    }
+
+    #[test]
+    #[ignore = "Brokk parity marker: add a cross-repo golden hotspot report harness if a lightweight Brokk-side CLI entrypoint becomes available"]
+    fn parity_marker_cross_repo_hotspot_markdown_match() {
+        panic!("parity marker only");
     }
 }
