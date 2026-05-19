@@ -549,7 +549,7 @@ fn list_tools_result() -> Value {
                         "max_commits": {
                             "type": "integer",
                             "default": 500,
-                            "description": "Maximum commits to walk; values <= 0 default to 500."
+                            "description": "Maximum commits to walk; values <= 0 default to 500; hard cap 5000."
                         },
                         "max_files": {
                             "type": "integer",
