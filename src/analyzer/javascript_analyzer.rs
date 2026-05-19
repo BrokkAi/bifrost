@@ -13,7 +13,7 @@ use moka::sync::Cache;
 use regex::Regex;
 use std::collections::BTreeSet;
 use std::mem::size_of;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, OnceLock};
 use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
 
@@ -1303,7 +1303,11 @@ fn collect_candidate_paths(
     extensions: &[&str],
     out: &mut Vec<ProjectFile>,
 ) {
-    if module_path.extension().is_some() {
+    if module_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| extensions.contains(&ext))
+    {
         let file = ProjectFile::new(root.to_path_buf(), module_path.to_path_buf());
         if file.exists() {
             out.push(file);
@@ -1311,7 +1315,7 @@ fn collect_candidate_paths(
         return;
     }
     for extension in extensions {
-        let with_ext = module_path.with_extension(extension);
+        let with_ext = PathBuf::from(format!("{}.{}", module_path.to_string_lossy(), extension));
         let direct = ProjectFile::new(root.to_path_buf(), with_ext);
         if direct.exists() {
             out.push(direct);

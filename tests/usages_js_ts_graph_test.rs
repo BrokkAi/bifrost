@@ -394,3 +394,374 @@ export function inside({ Alias }: { Alias: typeof Other }) {
         "destructured parameter binding Alias must block top-level alias matches"
     );
 }
+
+fn ts_inline_analyzer(
+    build: impl FnOnce(InlineTestProject) -> common::BuiltInlineTestProject,
+) -> (common::BuiltInlineTestProject, TypescriptAnalyzer) {
+    let project = build(InlineTestProject::with_language(
+        brokk_analyzer::Language::TypeScript,
+    ));
+    let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
+    (project, analyzer)
+}
+
+fn find_ts_target(
+    analyzer: &TypescriptAnalyzer,
+    source_file: &ProjectFile,
+    predicate: impl Fn(&CodeUnit) -> bool,
+) -> CodeUnit {
+    analyzer
+        .all_declarations()
+        .find(|cu| cu.source() == source_file && predicate(cu))
+        .cloned()
+        .expect("target definition not found")
+}
+
+fn flatten_hits(result: FuzzyResult) -> BTreeSet<brokk_analyzer::usages::UsageHit> {
+    match result {
+        FuzzyResult::Success { hits_by_overload } => hits_by_overload
+            .into_values()
+            .flat_map(BTreeSet::into_iter)
+            .collect(),
+        other => panic!("expected Success, got {other:?}"),
+    }
+}
+
+#[test]
+fn ts_named_import_alias_resolves_to_exported_symbol() {
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file("a.ts", "export function foo() {}\n")
+            .file(
+                "b.ts",
+                "import { foo as bar } from './a';\nexport function run() { bar(); }\n",
+            )
+            .build()
+    });
+
+    let target = find_ts_target(&analyzer, &project.file("a.ts"), |cu| {
+        cu.identifier() == "foo" && cu.is_function()
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert_eq!(1, hits.len());
+    assert!(hits.iter().all(|hit| hit.file == project.file("b.ts")));
+}
+
+#[test]
+fn ts_namespace_import_resolves_member_reference() {
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file("a.ts", "export function foo() {}\n")
+            .file(
+                "b.ts",
+                "import * as NS from './a';\nexport function run() { NS.foo(); }\n",
+            )
+            .build()
+    });
+
+    let target = find_ts_target(&analyzer, &project.file("a.ts"), |cu| {
+        cu.identifier() == "foo" && cu.is_function()
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert_eq!(1, hits.len());
+}
+
+#[test]
+fn ts_local_barrel_reexport_is_followed() {
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file("layout.service.ts", "export class LayoutService {}\n")
+            .file(
+                "index.ts",
+                "import { LayoutService } from './layout.service';\nexport { LayoutService };\n",
+            )
+            .file(
+                "consumer.ts",
+                "import { LayoutService } from './index';\nexport function run() { new LayoutService(); }\n",
+            )
+            .build()
+    });
+
+    let target = find_ts_target(&analyzer, &project.file("layout.service.ts"), |cu| {
+        cu.identifier() == "LayoutService" && cu.is_class()
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert_eq!(1, hits.len());
+}
+
+#[test]
+fn ts_chained_local_barrel_reexport_is_followed() {
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file("layout.service.ts", "export class LayoutService {}\n")
+            .file(
+                "index.ts",
+                "import { LayoutService } from './layout.service';\nexport { LayoutService };\n",
+            )
+            .file(
+                "feature/index.ts",
+                "export { LayoutService } from '../index';\n",
+            )
+            .file(
+                "consumer.ts",
+                "import { LayoutService } from './feature/index';\nexport function run() { new LayoutService(); }\n",
+            )
+            .build()
+    });
+
+    let target = find_ts_target(&analyzer, &project.file("layout.service.ts"), |cu| {
+        cu.identifier() == "LayoutService" && cu.is_class()
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert_eq!(1, hits.len());
+}
+
+#[test]
+fn ts_local_shadowing_does_not_count_as_usage() {
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file("a.ts", "export function foo() {}\n").file(
+            "b.ts",
+            "import { foo as bar } from './a';\nexport function run() {\n  function f() {\n    const bar = 1;\n    bar;\n  }\n  bar();\n}\n",
+        )
+        .build()
+    });
+
+    let target = find_ts_target(&analyzer, &project.file("a.ts"), |cu| {
+        cu.identifier() == "foo" && cu.is_function()
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert_eq!(1, hits.len());
+}
+
+#[test]
+fn ts_type_annotation_and_return_type_count_as_usages() {
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file("a.ts", "export class Foo {}\n")
+            .file(
+                "b.ts",
+                "import { Foo } from './a';\nconst value: Foo | null = null;\nfunction load(): Foo { return null as Foo; }\n",
+            )
+            .build()
+    });
+
+    let target = find_ts_target(&analyzer, &project.file("a.ts"), |cu| {
+        cu.identifier() == "Foo" && cu.is_class()
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert_eq!(3, hits.len());
+}
+
+#[test]
+fn ts_generic_type_argument_counts_as_usage() {
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file(
+            "a.ts",
+            "export class Foo {}\nexport type Box<T> = { value: T };\n",
+        )
+        .file(
+            "b.ts",
+            "import { Foo, Box } from './a';\nconst value: Box<Foo> = { value: null as Foo };\n",
+        )
+        .build()
+    });
+
+    let target = find_ts_target(&analyzer, &project.file("a.ts"), |cu| {
+        cu.identifier() == "Foo" && cu.is_class()
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert_eq!(2, hits.len());
+}
+
+#[test]
+fn ts_class_inheritance_counts_as_usage() {
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file(
+            "a.ts",
+            "export class Base {}\nexport class Child extends Base {}\n",
+        )
+        .file(
+            "b.ts",
+            "import { Child } from './a';\nexport function run() { new Child(); }\n",
+        )
+        .build()
+    });
+
+    let target = find_ts_target(&analyzer, &project.file("a.ts"), |cu| {
+        cu.identifier() == "Base" && cu.is_class()
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert_eq!(1, hits.len());
+}
+
+#[test]
+fn ts_duplicate_owner_names_do_not_cross_match_members() {
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file("a.ts", "export class Foo { bar() {} }\n")
+            .file("other.ts", "export class Foo { bar() {} }\n")
+            .file(
+                "b.ts",
+                "import { Foo } from './a';\nexport function run() { const value = new Foo(); value.bar(); }\n",
+            )
+            .build()
+    });
+
+    let target_a = find_ts_target(&analyzer, &project.file("a.ts"), |cu| {
+        cu.identifier().starts_with("bar") && cu.is_function()
+    });
+    let target_other = find_ts_target(&analyzer, &project.file("other.ts"), |cu| {
+        cu.identifier().starts_with("bar") && cu.is_function()
+    });
+
+    let strategy = JsTsExportUsageGraphStrategy::new();
+    let candidate_files: brokk_analyzer::hash::HashSet<ProjectFile> = [
+        project.file("a.ts"),
+        project.file("other.ts"),
+        project.file("b.ts"),
+    ]
+    .into_iter()
+    .collect();
+
+    let hits_a = flatten_hits(strategy.find_usages(
+        &analyzer,
+        std::slice::from_ref(&target_a),
+        &candidate_files,
+        1000,
+    ));
+    let hits_other = flatten_hits(strategy.find_usages(
+        &analyzer,
+        std::slice::from_ref(&target_other),
+        &candidate_files,
+        1000,
+    ));
+
+    assert_eq!(1, hits_a.len());
+    assert!(hits_other.is_empty());
+}
+
+#[test]
+fn ts_member_receiver_inference_handles_direct_and_aliased_receivers() {
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file("a.ts", "export class Foo { bar() {} }\n")
+            .file(
+                "b.ts",
+                "import { Foo } from './a';\nexport function run() {\n  new Foo().bar();\n  const x = new Foo();\n  const y = x;\n  y.bar();\n}\n",
+            )
+            .build()
+    });
+
+    let target = find_ts_target(&analyzer, &project.file("a.ts"), |cu| {
+        cu.identifier().starts_with("bar") && cu.is_function()
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert_eq!(2, hits.len());
+}
+
+#[test]
+fn ts_receiver_shadowing_and_unknown_sources_do_not_count() {
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file("a.ts", "export class Foo { bar() {} }\n")
+            .file(
+                "b.ts",
+                "import { Foo } from './a';\nexport function run() {\n  const x = new Foo();\n  {\n    const x = { bar() {} };\n    x.bar();\n  }\n  const y = missing;\n  y.bar();\n}\n",
+            )
+            .build()
+    });
+
+    let target = find_ts_target(&analyzer, &project.file("a.ts"), |cu| {
+        cu.identifier().starts_with("bar") && cu.is_function()
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert!(hits.is_empty());
+}
+
+#[test]
+fn ts_typed_receivers_count_as_member_usages() {
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file("a.ts", "export class Foo { bar() {} }\n")
+            .file(
+                "b.ts",
+                "import { Foo } from './a';\ndeclare const seed: Foo;\nconst x: Foo = seed;\nexport function run(value: Foo) { value.bar(); x.bar(); }\n",
+            )
+            .build()
+    });
+
+    let target = find_ts_target(&analyzer, &project.file("a.ts"), |cu| {
+        cu.identifier().starts_with("bar") && cu.is_function()
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert_eq!(2, hits.len());
+}
+
+#[test]
+fn ts_static_member_on_namespace_import_resolves_member_usage() {
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file("a.ts", "export class Foo { static make() {} }\n")
+            .file(
+                "b.ts",
+                "import * as NS from './a';\nexport function run() { NS.Foo.make(); }\n",
+            )
+            .build()
+    });
+
+    let target = find_ts_target(&analyzer, &project.file("a.ts"), |cu| {
+        cu.identifier().starts_with("make") && cu.is_function()
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert_eq!(1, hits.len());
+}
+
+#[test]
+#[ignore = "Brokk parity marker: tsconfig paths and baseUrl resolution stay out of scope for issue #78"]
+fn parity_tsconfig_paths_alias_resolution_is_follow_up_work() {}
+
+#[test]
+#[ignore = "Brokk parity marker: external frontier reporting needs a richer result model than bifrost v1"]
+fn parity_external_frontier_reporting_is_follow_up_work() {}
+
+#[test]
+#[ignore = "Brokk parity marker: cross-query caches and thread-safety hardening are follow-up work"]
+fn parity_jsts_cache_and_thread_safety_hardening_is_follow_up_work() {}
