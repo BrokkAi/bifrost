@@ -117,6 +117,11 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             .iter()
             .any(|tool| tool["name"] == "report_structural_clone_smells")
     );
+    assert!(
+        tools
+            .iter()
+            .any(|tool| { tool["name"] == "report_dead_code_and_unused_abstraction_smells" })
+    );
 
     let ping = round_trip(
         &mut stdin,
@@ -168,6 +173,40 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
         "#,
     )
     .expect("write peer java fixture");
+    fs::write(fixture_root.path().join("helpers.rs"), "fn helper() {}\n")
+        .expect("write rust fixture");
+    fs::write(fixture_root.path().join("main.rs"), "fn main() {}\n")
+        .expect("write rust main fixture");
+
+    let dead_code_smells = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "tools/call",
+            "params": {
+                "name": "report_dead_code_and_unused_abstraction_smells",
+                "arguments": {
+                    "file_paths": ["helpers.rs", "main.rs"],
+                    "fq_names": ["helpers.helper"]
+                }
+            }
+        }),
+    );
+    let dead_code_report = dead_code_smells["result"]["structuredContent"]["report"]
+        .as_str()
+        .expect("dead code report string");
+    assert!(
+        dead_code_report.starts_with("## Dead code and unused abstraction smells"),
+        "{dead_code_report}"
+    );
+    assert!(
+        dead_code_report.contains("helpers.helper"),
+        "{dead_code_report}"
+    );
+
     fs::write(
         fixture_root.path().join("SampleClone.java"),
         r#"

@@ -785,6 +785,56 @@ fn list_tools_result() -> Value {
                 }),
             ),
             tool_descriptor(
+                "report_dead_code_and_unused_abstraction_smells",
+                "Detects likely dead Rust declarations and one-call abstractions using tree-sitter-backed usage queries. The handler is intentionally conservative: ambiguous results, candidate truncation, and usage-cap guardrails are surfaced as skipped evidence instead of findings.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "file_paths": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Project-relative paths of files to analyze."
+                        },
+                        "fq_names": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Optional fully qualified Rust symbols to analyze; when omitted the tool discovers candidates from file_paths."
+                        },
+                        "min_score": {
+                            "type": "integer",
+                            "default": 8,
+                            "description": "Minimum score to include a finding; values <= 0 default to 8."
+                        },
+                        "max_findings": {
+                            "type": "integer",
+                            "default": 40,
+                            "description": "Maximum findings to emit; values <= 0 default to 40."
+                        },
+                        "max_input_files": {
+                            "type": "integer",
+                            "default": 25,
+                            "description": "Maximum existing files to scan for candidate declarations; values <= 0 default to 25."
+                        },
+                        "max_candidate_symbols": {
+                            "type": "integer",
+                            "default": 200,
+                            "description": "Maximum candidate symbols to analyze; values <= 0 default to 200."
+                        },
+                        "max_usage_candidate_files": {
+                            "type": "integer",
+                            "default": 1000,
+                            "description": "Maximum candidate files per symbol usage query; values <= 0 default to 1000."
+                        },
+                        "max_usages_per_symbol": {
+                            "type": "integer",
+                            "default": 100,
+                            "description": "Maximum usage hits per symbol before the guardrail returns an inconclusive skip; values <= 0 default to 100."
+                        }
+                    },
+                    "required": ["file_paths"]
+                }),
+            ),
+            tool_descriptor(
                 "report_comment_density_for_files",
                 "Java comment density tables for the given source files: one section per file and one row per top-level declaration with own and rolled-up header / inline / span line counts. Non-Java files are skipped with a one-line placeholder. Output format matches the brokk-core MCP byte-for-byte.",
                 json!({

@@ -206,6 +206,7 @@ pub(crate) fn sanitize_table_cell(value: &str) -> String {
 mod cognitive;
 mod comment_density;
 mod cyclomatic;
+mod dead_code_smells;
 mod exception_smells;
 mod maintainability_size;
 mod structural_clone_smells;
@@ -223,6 +224,10 @@ pub use comment_density::{
 pub use cyclomatic::{
     ComputeCyclomaticComplexityParams, ComputeCyclomaticComplexityResult,
     compute_cyclomatic_complexity,
+};
+pub use dead_code_smells::{
+    ReportDeadCodeAndUnusedAbstractionSmellsParams, ReportDeadCodeAndUnusedAbstractionSmellsResult,
+    report_dead_code_and_unused_abstraction_smells,
 };
 pub use exception_smells::{
     ReportExceptionHandlingSmellsParams, ReportExceptionHandlingSmellsResult,

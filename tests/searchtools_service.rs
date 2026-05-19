@@ -57,6 +57,29 @@ fn python_boundary_returns_structural_clone_report_json() {
 }
 
 #[test]
+fn python_boundary_returns_dead_code_smell_report_json() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("helpers.rs"), "fn helper() {}\n").unwrap();
+    fs::write(temp.path().join("main.rs"), "fn main() {}\n").unwrap();
+
+    let mut service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "report_dead_code_and_unused_abstraction_smells",
+            r#"{"file_paths":["helpers.rs","main.rs"],"fq_names":["helpers.helper"]}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    let report = value["report"].as_str().expect("report string");
+    assert!(
+        report.starts_with("## Dead code and unused abstraction smells"),
+        "payload: {value}"
+    );
+    assert!(report.contains("helpers.helper"), "payload: {value}");
+}
+
+#[test]
 fn python_boundary_returns_list_symbols_json() {
     let mut service = SearchToolsService::new_for_python(fixture_root()).unwrap();
     let payload = service
