@@ -528,6 +528,38 @@ fn list_tools_result() -> Value {
                 }),
             ),
             tool_descriptor(
+                "analyze_git_hotspots",
+                "Git churn and complexity hotspots: correlates recent commit activity with cyclomatic complexity per file. Bounded to control context size: use max_files and max_commits, and an optional time window (since_days or ISO instants). Returns a compact markdown summary.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "since_days": {
+                            "type": "integer",
+                            "default": 7,
+                            "description": "Days back from now for the window start when since_iso is empty; values <= 0 default to 7."
+                        },
+                        "since_iso": {
+                            "type": "string",
+                            "description": "Optional ISO-8601 start instant; when non-blank, overrides since_days."
+                        },
+                        "until_iso": {
+                            "type": "string",
+                            "description": "Optional ISO-8601 exclusive end instant; empty means no upper bound."
+                        },
+                        "max_commits": {
+                            "type": "integer",
+                            "default": 500,
+                            "description": "Maximum commits to walk; values <= 0 default to 500; hard cap 5000."
+                        },
+                        "max_files": {
+                            "type": "integer",
+                            "default": 75,
+                            "description": "Maximum files to return (top by churn); values <= 0 default to 75; hard cap 500."
+                        }
+                    }
+                }),
+            ),
+            tool_descriptor(
                 "compute_cyclomatic_complexity",
                 "Compute heuristic cyclomatic complexity per function/method in the given files; flag those exceeding a threshold. Heuristic counts a base of 1 plus each `if/while/for/switch/case/catch` keyword and each `&&`/`||`/`?` operator in the source.",
                 json!({

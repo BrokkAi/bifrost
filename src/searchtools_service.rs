@@ -2,7 +2,7 @@ use crate::{
     AnalyzerConfig, FilesystemProject, Project, ProjectChangeWatcher, ProjectFile,
     WorkspaceAnalyzer,
     code_quality::{
-        compute_cognitive_complexity, compute_cyclomatic_complexity,
+        analyze_git_hotspots, compute_cognitive_complexity, compute_cyclomatic_complexity,
         report_comment_density_for_code_unit, report_comment_density_for_files,
         report_dead_code_and_unused_abstraction_smells, report_exception_handling_smells,
         report_long_method_and_god_object_smells, report_secret_like_code,
@@ -225,6 +225,9 @@ impl SearchToolsService {
             }
             "report_secret_like_code" => self.decode_and_run(arguments, |workspace, params| {
                 report_secret_like_code(workspace.analyzer(), params)
+            }),
+            "analyze_git_hotspots" => self.decode_and_run(arguments, |workspace, params| {
+                analyze_git_hotspots(workspace.analyzer(), params)
             }),
             _ => Err(SearchToolsServiceError::unknown_tool(format!(
                 "Unknown tool: {name}"
