@@ -169,7 +169,8 @@ fn analyze_report(
             &repo_root,
             &commit,
             &mut stats_by_file,
-        );
+        )
+        .map_err(|err| format!("Git hotspot analysis failed while diffing commit {oid}: {err}"))?;
     }
 
     let mut files = stats_by_file
@@ -270,19 +271,14 @@ fn process_commit(
     repo_root: &Path,
     commit: &Commit<'_>,
     stats_by_file: &mut StdHashMap<ProjectFile, FileStats>,
-) {
+) -> Result<(), String> {
     let author = commit.author();
     let email = author.email().unwrap_or_default().to_string();
     let name = author.name().unwrap_or_default().to_string();
     let commit_secs = author.when().seconds();
 
-    let Ok(mut diff) = diff_commit_to_parent(repo, commit) else {
-        return;
-    };
-    let mut find_opts = DiffFindOptions::new();
-    find_opts.renames(true);
-    find_opts.rename_limit(RENAME_DETECTION_LIMIT);
-    let _ = diff.find_similar(Some(&mut find_opts));
+    let diff = diff_commit_to_parent(repo, commit).map_err(|err| err.message().to_string())?;
+    let diff = apply_rename_detection_with_fallback(repo, commit, diff)?;
 
     for delta in diff.deltas() {
         let Some(path) = delta_path(&delta) else {
@@ -305,6 +301,7 @@ fn process_commit(
             stats.last_modified_epoch_secs = Some(commit_secs);
         }
     }
+    Ok(())
 }
 
 fn diff_commit_to_parent<'repo>(
@@ -320,6 +317,21 @@ fn diff_commit_to_parent<'repo>(
     let mut opts = DiffOptions::new();
     opts.include_untracked(false);
     repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&current_tree), Some(&mut opts))
+}
+
+fn apply_rename_detection_with_fallback<'repo>(
+    repo: &'repo Repository,
+    commit: &Commit<'_>,
+    mut diff: git2::Diff<'repo>,
+) -> Result<git2::Diff<'repo>, String> {
+    let mut find_opts = DiffFindOptions::new();
+    find_opts.renames(true);
+    find_opts.rename_limit(RENAME_DETECTION_LIMIT);
+    match diff.find_similar(Some(&mut find_opts)) {
+        Ok(()) => Ok(diff),
+        Err(_) => diff_commit_to_parent(repo, commit)
+            .map_err(|err| format!("diff retry without rename detection failed: {err}")),
+    }
 }
 
 fn delta_path<'a>(delta: &'a git2::DiffDelta<'a>) -> Option<&'a Path> {
