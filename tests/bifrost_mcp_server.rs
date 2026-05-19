@@ -23,6 +23,24 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
         "#,
     )
     .expect("write java fixture");
+    let repo = git2::Repository::init(fixture_root.path()).expect("init fixture repo");
+    let mut index = repo.index().expect("repo index");
+    index
+        .add_path(std::path::Path::new("SampleTest.java"))
+        .expect("add sample file");
+    index.write().expect("write index");
+    let tree_id = index.write_tree().expect("write tree");
+    let tree = repo.find_tree(tree_id).expect("find tree");
+    let sig = git2::Signature::now("Test User", "test@example.com").expect("signature");
+    repo.commit(Some("HEAD"), &sig, &sig, "initial", &tree, &[])
+        .expect("initial commit");
+    repo.reference_symbolic(
+        "refs/remotes/origin/HEAD",
+        "refs/heads/master",
+        true,
+        "set remote default",
+    )
+    .expect("set remote default");
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
         .arg("--root")
@@ -120,7 +138,12 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     assert!(
         tools
             .iter()
-            .any(|tool| { tool["name"] == "report_dead_code_and_unused_abstraction_smells" })
+            .any(|tool| tool["name"] == "report_dead_code_and_unused_abstraction_smells")
+    );
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool["name"] == "report_secret_like_code")
     );
 
     let ping = round_trip(
@@ -302,6 +325,89 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     assert!(
         clone_report.contains("PeerTest.sameValue"),
         "{clone_report}"
+    );
+
+    let secret_file = fixture_root.path().join("config.properties");
+    fs::write(
+        &secret_file,
+        "aws_access_key_id=AKIAIOSFODNN7EXAMPLE\naws_secret_access_key=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n",
+    )
+    .expect("write secret fixture");
+    let repo = git2::Repository::open(fixture_root.path()).expect("open fixture repo");
+    let mut index = repo.index().expect("repo index");
+    index
+        .add_path(std::path::Path::new("config.properties"))
+        .expect("add secret file");
+    index.write().expect("write index");
+    let tree_id = index.write_tree().expect("write tree");
+    let tree = repo.find_tree(tree_id).expect("find tree");
+    let head_commit = repo
+        .head()
+        .expect("repo head")
+        .target()
+        .and_then(|oid| repo.find_commit(oid).ok())
+        .expect("head commit");
+    let sig = git2::Signature::now("Test User", "test@example.com").expect("signature");
+    repo.commit(
+        Some("HEAD"),
+        &sig,
+        &sig,
+        "add secret",
+        &tree,
+        &[&head_commit],
+    )
+    .expect("commit secret");
+    let refresh_after_secret = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "tools/call",
+            "params": {
+                "name": "refresh",
+                "arguments": {}
+            }
+        }),
+    );
+    assert!(refresh_after_secret["result"]["structuredContent"]["analyzed_files"].is_number());
+
+    let secret_scan = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tools/call",
+            "params": {
+                "name": "report_secret_like_code",
+                "arguments": {
+                    "max_findings": 10,
+                    "max_commits": 10
+                }
+            }
+        }),
+    );
+    let secret_report = secret_scan["result"]["structuredContent"]["report"]
+        .as_str()
+        .expect("secret report string");
+    assert!(
+        secret_report.starts_with("## brokk-secret-scan"),
+        "{secret_report}"
+    );
+    assert!(
+        secret_report.contains("config.properties"),
+        "{secret_report}"
+    );
+    assert!(
+        !secret_report.contains("AKIAIOSFODNN7EXAMPLE"),
+        "{secret_report}"
+    );
+    assert!(
+        !secret_report.contains("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
+        "{secret_report}"
     );
 
     drop(stdin);

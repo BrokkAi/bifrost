@@ -835,6 +835,35 @@ fn list_tools_result() -> Value {
                 }),
             ),
             tool_descriptor(
+                "report_secret_like_code",
+                "Scans non-test text files for secret-looking strings, including current/default-branch files and git history. Findings are heuristic and redacted for downstream LLM triage. Use maxFindings/maxCommits to bound output and work.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "max_findings": {
+                            "type": "integer",
+                            "default": 100,
+                            "description": "Maximum findings to emit; values <= 0 default to 100."
+                        },
+                        "max_commits": {
+                            "type": "integer",
+                            "default": 2000,
+                            "description": "Maximum commits to walk from HEAD; values <= 0 default to 2000."
+                        },
+                        "include_history_only": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Include findings that only appear in history and are not present in the current/default branch."
+                        },
+                        "include_low_confidence": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Include lower-confidence short credential-like assignments."
+                        }
+                    }
+                }),
+            ),
+            tool_descriptor(
                 "report_comment_density_for_files",
                 "Java comment density tables for the given source files: one section per file and one row per top-level declaration with own and rolled-up header / inline / span line counts. Non-Java files are skipped with a one-line placeholder. Output format matches the brokk-core MCP byte-for-byte.",
                 json!({
