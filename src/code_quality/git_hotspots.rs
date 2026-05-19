@@ -464,6 +464,7 @@ mod tests {
     use git2::{Repository, Signature};
     use std::fs;
     use std::path::Path;
+    use std::path::{MAIN_SEPARATOR, MAIN_SEPARATOR_STR};
 
     fn init_repo(root: &Path) -> Repository {
         Repository::init(root).expect("init repo")
@@ -556,6 +557,10 @@ mod tests {
         fixture
     }
 
+    fn rel(rel: &str) -> String {
+        rel.replace('/', MAIN_SEPARATOR_STR)
+    }
+
     #[test]
     fn hotspot_report_matches_expected_categories_and_authors() {
         let fixture = fixture_with_repo();
@@ -576,25 +581,24 @@ mod tests {
         );
         assert!(result.report.contains("- Analyzed commits: 15"));
         assert!(
-            result
-                .report
-                .contains("| `src/ComplexService.java` | 15 | 16 | HOTSPOT |"),
+            result.report.contains(&format!(
+                "| `{}` | 15 | 16 | HOTSPOT |",
+                rel("src/ComplexService.java")
+            )),
             "{}",
             result.report
         );
         for expected in ["dev0(5)", "dev1(5)", "dev2(5)"] {
             assert!(result.report.contains(expected), "{}", result.report);
         }
-        assert!(
-            result
-                .report
-                .contains("| `src/StableService.java` | 1 | 1 | STABLE | dev0(1) |")
-        );
-        assert!(
-            result
-                .report
-                .contains("| `src/UnusedService.java` | 1 | 16 | ABANDONWARE | dev0(1) |")
-        );
+        assert!(result.report.contains(&format!(
+            "| `{}` | 1 | 1 | STABLE | dev0(1) |",
+            rel("src/StableService.java")
+        )));
+        assert!(result.report.contains(&format!(
+            "| `{}` | 1 | 16 | ABANDONWARE | dev0(1) |",
+            rel("src/UnusedService.java")
+        )));
     }
 
     #[test]
@@ -613,7 +617,10 @@ mod tests {
         assert!(result.report.contains("- Unique files (before cap): 3"));
         assert!(result.report.contains("- Truncated: true"));
         assert_eq!(
-            result.report.matches("| `src/").count(),
+            result
+                .report
+                .matches(&format!("| `{}{}", "src", MAIN_SEPARATOR))
+                .count(),
             2,
             "{}",
             result.report
@@ -639,9 +646,10 @@ mod tests {
             result.report
         );
         assert!(
-            result
-                .report
-                .contains("| `src/ComplexService.java` | 2 | 16 | ABANDONWARE |"),
+            result.report.contains(&format!(
+                "| `{}` | 2 | 16 | ABANDONWARE |",
+                rel("src/ComplexService.java")
+            )),
             "{}",
             result.report
         );
@@ -770,7 +778,7 @@ mod tests {
             result.report
         );
         assert!(
-            result.report.contains("src/RebasedService.java"),
+            result.report.contains(&rel("src/RebasedService.java")),
             "{}",
             result.report
         );
