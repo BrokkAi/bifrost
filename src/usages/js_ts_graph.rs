@@ -243,7 +243,9 @@ fn scan_files_for_seeds(
     let collected: Mutex<BTreeSet<UsageHit>> = Mutex::new(BTreeSet::new());
     let target_short = top_level_identifier(target).to_string();
     let target_member = member_name(target);
-    let target_owner_source = analyzer.parent_of(target).map(|owner| owner.source().clone());
+    let target_owner_source = analyzer
+        .parent_of(target)
+        .map(|owner| owner.source().clone());
 
     let parser_language = match language {
         Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
@@ -541,11 +543,7 @@ fn register_declaration(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     collect_pattern_identifiers(name_node, ctx, binding);
 }
 
-fn collect_pattern_identifiers(
-    node: Node<'_>,
-    ctx: &mut ScanCtx<'_>,
-    binding: LocalBinding,
-) {
+fn collect_pattern_identifiers(node: Node<'_>, ctx: &mut ScanCtx<'_>, binding: LocalBinding) {
     let Some(scope) = ctx.scope_stack.last_mut() else {
         return;
     };
@@ -756,9 +754,10 @@ fn type_annotation_mentions_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
             if ctx.target_self_file {
                 return text == ctx.target_short;
             }
-            return ctx.edges.iter().any(|edge| {
-                edge.local_name == text && edge.target_file == *owner_source
-            });
+            return ctx
+                .edges
+                .iter()
+                .any(|edge| edge.local_name == text && edge.target_file == *owner_source);
         }
         return true;
     }
