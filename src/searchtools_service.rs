@@ -5,8 +5,8 @@ use crate::{
         compute_cognitive_complexity, compute_cyclomatic_complexity,
         report_comment_density_for_code_unit, report_comment_density_for_files,
         report_dead_code_and_unused_abstraction_smells, report_exception_handling_smells,
-        report_exception_handling_smells, report_long_method_and_god_object_smells,
-        report_secret_like_code, report_structural_clone_smells, report_test_assertion_smells,
+        report_long_method_and_god_object_smells, report_secret_like_code,
+        report_structural_clone_smells, report_test_assertion_smells,
     },
     file_tools::{
         find_filenames, find_files_containing, get_file_contents, list_files, search_file_contents,
