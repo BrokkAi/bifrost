@@ -128,6 +128,11 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     assert!(
         tools
             .iter()
+            .any(|tool| tool["name"] == "analyze_git_hotspots")
+    );
+    assert!(
+        tools
+            .iter()
             .any(|tool| tool["name"] == "report_test_assertion_smells")
     );
     assert!(

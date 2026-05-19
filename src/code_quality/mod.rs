@@ -208,6 +208,7 @@ mod comment_density;
 mod cyclomatic;
 mod dead_code_smells;
 mod exception_smells;
+mod git_hotspots;
 mod maintainability_size;
 mod secret_like_code;
 mod structural_clone_smells;
@@ -234,6 +235,7 @@ pub use exception_smells::{
     ReportExceptionHandlingSmellsParams, ReportExceptionHandlingSmellsResult,
     report_exception_handling_smells,
 };
+pub use git_hotspots::{AnalyzeGitHotspotsParams, AnalyzeGitHotspotsResult, analyze_git_hotspots};
 pub use maintainability_size::{
     ReportLongMethodAndGodObjectSmellsParams, ReportLongMethodAndGodObjectSmellsResult,
     find_long_method_and_god_object_smells, report_long_method_and_god_object_smells,

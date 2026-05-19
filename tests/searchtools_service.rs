@@ -132,6 +132,44 @@ fn python_boundary_returns_secret_scan_report_json() {
 }
 
 #[test]
+fn python_boundary_returns_git_hotspot_report_json() {
+    let temp = TempDir::new().unwrap();
+    fs::create_dir_all(temp.path().join("src")).unwrap();
+    fs::write(
+        temp.path().join("src").join("ComplexService.java"),
+        "public class ComplexService { void hotspot(int x) { if (x > 0) {} if (x > 1) {} if (x > 2) {} if (x > 3) {} if (x > 4) {} if (x > 5) {} if (x > 6) {} if (x > 7) {} if (x > 8) {} if (x > 9) {} if (x > 10) {} if (x > 11) {} if (x > 12) {} if (x > 13) {} if (x > 14) {} } }\n",
+    )
+    .unwrap();
+    let repo = Repository::init(temp.path()).unwrap();
+    commit_paths(&repo, &["src/ComplexService.java"], "initial");
+    for i in 0..11 {
+        fs::write(
+            temp.path().join("src").join("ComplexService.java"),
+            format!("public class ComplexService {{ void hotspot(int x) {{ int marker = {i}; if (x > 0) {{}} if (x > 1) {{}} if (x > 2) {{}} if (x > 3) {{}} if (x > 4) {{}} if (x > 5) {{}} if (x > 6) {{}} if (x > 7) {{}} if (x > 8) {{}} if (x > 9) {{}} if (x > 10) {{}} if (x > 11) {{}} if (x > 12) {{}} if (x > 13) {{}} if (x > 14) {{}} }} }}\n"),
+        )
+        .unwrap();
+        commit_paths(&repo, &["src/ComplexService.java"], &format!("update {i}"));
+    }
+
+    let mut service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "analyze_git_hotspots",
+            r#"{"since_iso":"2020-01-01T00:00:00Z","max_commits":500,"max_files":75}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let report = value["report"].as_str().expect("report string");
+    assert_eq!(
+        report,
+        format!(
+            "## Git hotspots\n\n- Repository: `{}`\n- Timeframe: since 2020-01-01T00:00:00Z\n- Analyzed commits: 12\n- Unique files (before cap): 1\n- Truncated: false\n\n| Path | Churn | Complexity | Category | Authors |\n|------|-------|------------|----------|---------|\n| `src/ComplexService.java` | 12 | 16 | HOTSPOT | Test User(12) |",
+            temp.path().canonicalize().unwrap().display()
+        )
+    );
+}
+
+#[test]
 fn python_boundary_returns_list_symbols_json() {
     let mut service = SearchToolsService::new_for_python(fixture_root()).unwrap();
     let payload = service
