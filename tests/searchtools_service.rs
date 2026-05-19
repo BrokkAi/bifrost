@@ -80,6 +80,58 @@ fn python_boundary_returns_dead_code_smell_report_json() {
 }
 
 #[test]
+fn python_boundary_returns_secret_scan_report_json() {
+    let temp = TempDir::new().unwrap();
+    fs::write(
+        temp.path().join("config.properties"),
+        "aws_access_key_id=AKIAIOSFODNN7EXAMPLE\n",
+    )
+    .unwrap();
+    let repo = Repository::init(temp.path()).unwrap();
+    let mut index = repo.index().unwrap();
+    index
+        .add_path(std::path::Path::new("config.properties"))
+        .unwrap();
+    index.write().unwrap();
+    let tree_id = index.write_tree().unwrap();
+    let tree = repo.find_tree(tree_id).unwrap();
+    let signature = Signature::now("Test User", "test@example.com").unwrap();
+    repo.commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+        .unwrap();
+    repo.reference_symbolic(
+        "refs/remotes/origin/HEAD",
+        "refs/heads/master",
+        true,
+        "set remote default",
+    )
+    .unwrap();
+
+    let mut service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "report_secret_like_code",
+            r#"{"max_findings":10,"max_commits":10}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert!(
+        value["report"]
+            .as_str()
+            .expect("report string")
+            .starts_with("## brokk-secret-scan"),
+        "payload: {value}"
+    );
+    assert!(
+        !value["report"]
+            .as_str()
+            .unwrap()
+            .contains("AKIAIOSFODNN7EXAMPLE"),
+        "payload: {value}"
+    );
+}
+
+#[test]
 fn python_boundary_returns_list_symbols_json() {
     let mut service = SearchToolsService::new_for_python(fixture_root()).unwrap();
     let payload = service

@@ -209,6 +209,7 @@ mod cyclomatic;
 mod dead_code_smells;
 mod exception_smells;
 mod maintainability_size;
+mod secret_like_code;
 mod structural_clone_smells;
 mod test_assertion_smells;
 
@@ -236,6 +237,9 @@ pub use exception_smells::{
 pub use maintainability_size::{
     ReportLongMethodAndGodObjectSmellsParams, ReportLongMethodAndGodObjectSmellsResult,
     find_long_method_and_god_object_smells, report_long_method_and_god_object_smells,
+};
+pub use secret_like_code::{
+    ReportSecretLikeCodeParams, ReportSecretLikeCodeResult, report_secret_like_code,
 };
 pub use structural_clone_smells::{
     ReportStructuralCloneSmellsParams, ReportStructuralCloneSmellsResult,
