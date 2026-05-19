@@ -2,7 +2,7 @@ use brokk_analyzer::{SearchToolsService, SearchToolsServiceErrorCode};
 use git2::{Repository, Signature};
 use serde_json::Value;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{MAIN_SEPARATOR, PathBuf};
 use tempfile::TempDir;
 
 fn fixture_root() -> PathBuf {
@@ -163,8 +163,9 @@ fn python_boundary_returns_git_hotspot_report_json() {
     assert_eq!(
         report,
         format!(
-            "## Git hotspots\n\n- Repository: `{}`\n- Timeframe: since 2020-01-01T00:00:00Z\n- Analyzed commits: 12\n- Unique files (before cap): 1\n- Truncated: false\n\n| Path | Churn | Complexity | Category | Authors |\n|------|-------|------------|----------|---------|\n| `src/ComplexService.java` | 12 | 16 | HOTSPOT | Test User(12) |",
-            temp.path().canonicalize().unwrap().display()
+            "## Git hotspots\n\n- Repository: `{}`\n- Timeframe: since 2020-01-01T00:00:00Z\n- Analyzed commits: 12\n- Unique files (before cap): 1\n- Truncated: false\n\n| Path | Churn | Complexity | Category | Authors |\n|------|-------|------------|----------|---------|\n| `src{sep}ComplexService.java` | 12 | 16 | HOTSPOT | Test User(12) |",
+            temp.path().canonicalize().unwrap().display(),
+            sep = MAIN_SEPARATOR
         )
     );
 }
