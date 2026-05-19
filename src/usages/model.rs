@@ -137,6 +137,12 @@ pub struct ResolvedReceiverCandidate {
     pub confidence: u32,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReferenceGraphResult {
+    pub hits: BTreeSet<UsageHit>,
+    pub external_frontier_specifiers: BTreeSet<String>,
+}
+
 /// Outcome of [`super::UsageAnalyzer::find_usages`].
 ///
 /// Modelled after the brokk Java sealed interface `FuzzyResult`. The raw enum keeps the

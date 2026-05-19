@@ -2068,6 +2068,54 @@ fn run() {
 }
 
 #[test]
+fn rust_graph_strategy_records_external_frontier_for_unresolved_public_reexport() {
+    let (project, analyzer) =
+        rust_analyzer_with_files(&[("src/index.rs", "pub use external_crate::Foo;\n")]);
+
+    let index_file = project.file("src/index.rs");
+    let candidates = [index_file.clone()].into_iter().collect();
+    let result = brokk_analyzer::usages::RustExportUsageGraphStrategy::find_export_usages(
+        &analyzer,
+        &index_file,
+        "Foo",
+        None,
+        &candidates,
+        1000,
+    );
+
+    assert!(result.hits.is_empty());
+    assert!(
+        result
+            .external_frontier_specifiers
+            .contains("external_crate")
+    );
+}
+
+#[test]
+fn rust_graph_strategy_records_external_frontier_for_unresolved_glob_reexport() {
+    let (project, analyzer) =
+        rust_analyzer_with_files(&[("src/index.rs", "pub use external_crate::*;\n")]);
+
+    let index_file = project.file("src/index.rs");
+    let candidates = [index_file.clone()].into_iter().collect();
+    let result = brokk_analyzer::usages::RustExportUsageGraphStrategy::find_export_usages(
+        &analyzer,
+        &index_file,
+        "Foo",
+        None,
+        &candidates,
+        1000,
+    );
+
+    assert!(result.hits.is_empty());
+    assert!(
+        result
+            .external_frontier_specifiers
+            .contains("external_crate")
+    );
+}
+
+#[test]
 fn rust_graph_strategy_does_not_resolve_private_inline_module_externally() {
     let (_project, analyzer) = rust_analyzer_with_files(&[
         (

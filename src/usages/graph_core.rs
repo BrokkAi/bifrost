@@ -42,7 +42,24 @@ impl ProjectUsageGraph {
         for (file, exports) in &exports_by_file {
             for (exported_name, entry) in &exports.exports_by_name {
                 match entry {
-                    ExportEntry::Local { .. } | ExportEntry::Default { .. } => {}
+                    ExportEntry::Local { local_name } => {
+                        let Some(binder) = binders_by_file.get(file) else {
+                            continue;
+                        };
+                        let Some(binding) = binder.bindings.get(local_name) else {
+                            continue;
+                        };
+                        let Some(imported_name) = binding.imported_name.as_ref() else {
+                            continue;
+                        };
+                        for resolved_file in resolve_module(file, &binding.module_specifier) {
+                            reexport_edges
+                                .entry((resolved_file, imported_name.clone()))
+                                .or_default()
+                                .push((file.clone(), exported_name.clone()));
+                        }
+                    }
+                    ExportEntry::Default { .. } => {}
                     ExportEntry::ReexportedNamed {
                         module_specifier,
                         imported_name,

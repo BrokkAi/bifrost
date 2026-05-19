@@ -243,6 +243,9 @@ fn scan_files_for_seeds(
     let collected: Mutex<BTreeSet<UsageHit>> = Mutex::new(BTreeSet::new());
     let target_short = top_level_identifier(target).to_string();
     let target_member = member_name(target);
+    let target_owner_source = analyzer
+        .parent_of(target)
+        .map(|owner| owner.source().clone());
 
     let parser_language = match language {
         Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
@@ -305,6 +308,9 @@ fn scan_files_for_seeds(
             target_member: target_member.as_deref(),
             edges: &edges,
             target_self_file,
+            target_is_static_member: is_static_member(target),
+            target_owner_source: target_owner_source.as_ref(),
+            scope_stack: vec![HashMap::default()],
             binding_engine,
             hits: &mut local_hits,
         };
@@ -338,8 +344,17 @@ struct ScanCtx<'a> {
     /// True when this scan is over the target's own defining file (used to also catch
     /// in-file references that don't go through an import binding).
     target_self_file: bool,
+    target_is_static_member: bool,
+    target_owner_source: Option<&'a ProjectFile>,
+    scope_stack: Vec<HashMap<String, LocalBinding>>,
     binding_engine: LocalInferenceEngine<&'static str>,
     hits: &'a mut BTreeSet<UsageHit>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LocalBinding {
+    Other,
+    TargetReceiver,
 }
 
 impl ScanCtx<'_> {
@@ -379,6 +394,8 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if introduces_scope {
         ctx.binding_engine.enter_scope();
         register_function_parameters(node, ctx);
+        ctx.scope_stack.push(HashMap::default());
+        register_scope_parameters(node, ctx);
     }
 
     // Skip import statements outright — bindings declared there are not usages.
@@ -392,6 +409,7 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             | "export_specifier"
     ) {
         if introduces_scope {
+            ctx.scope_stack.pop();
             ctx.binding_engine.exit_scope();
         }
         return;
@@ -399,6 +417,7 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 
     if kind == "variable_declarator" {
         register_local_binding(node, ctx);
+        register_declaration(node, ctx);
     }
 
     match kind {
@@ -416,6 +435,7 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 
     if introduces_scope {
+        ctx.scope_stack.pop();
         ctx.binding_engine.exit_scope();
     }
 }
@@ -451,6 +471,39 @@ fn register_function_parameters(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     register_pattern_bindings(parameters, ctx);
 }
 
+fn register_scope_parameters(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let Some(parameters) = node.child_by_field_name("parameters") else {
+        return;
+    };
+    let mut cursor = parameters.walk();
+    for child in parameters.named_children(&mut cursor) {
+        register_parameter_binding(child, ctx);
+    }
+}
+
+fn register_parameter_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    match node.kind() {
+        "required_parameter" | "optional_parameter" => {
+            if let Some(pattern) = node.child_by_field_name("pattern") {
+                let binding = if has_target_type_annotation(node, ctx) {
+                    LocalBinding::TargetReceiver
+                } else {
+                    LocalBinding::Other
+                };
+                collect_pattern_identifiers(pattern, ctx, binding);
+            }
+        }
+        "rest_pattern" | "assignment_pattern" | "object_pattern" | "array_pattern"
+        | "pair_pattern" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                register_parameter_binding(child, ctx);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn register_pattern_bindings(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     match node.kind() {
         "identifier" | "shorthand_property_identifier_pattern" => {
@@ -482,7 +535,49 @@ fn register_pattern_bindings(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
+fn register_declaration(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let Some(name_node) = node.child_by_field_name("name") else {
+        return;
+    };
+    let binding = infer_receiver_binding(node, ctx).unwrap_or(LocalBinding::Other);
+    collect_pattern_identifiers(name_node, ctx, binding);
+}
+
+fn collect_pattern_identifiers(node: Node<'_>, ctx: &mut ScanCtx<'_>, binding: LocalBinding) {
+    let Some(scope) = ctx.scope_stack.last_mut() else {
+        return;
+    };
+    collect_pattern_identifiers_into(node, ctx.source, binding, scope);
+}
+
+fn collect_pattern_identifiers_into(
+    node: Node<'_>,
+    source: &str,
+    binding: LocalBinding,
+    out: &mut HashMap<String, LocalBinding>,
+) {
+    match node.kind() {
+        "identifier" | "shorthand_property_identifier_pattern" => {
+            let name = slice(node, source);
+            if !name.is_empty() {
+                out.insert(name.to_string(), binding);
+            }
+        }
+        "object_pattern" | "array_pattern" | "assignment_pattern" | "rest_pattern"
+        | "pair_pattern" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect_pattern_identifiers_into(child, source, binding, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn handle_identifier_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if ctx.target_member.is_some() {
+        return;
+    }
     let text = slice(node, ctx.source);
     if text.is_empty() {
         return;
@@ -494,6 +589,9 @@ fn handle_identifier_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     if is_property_key_in_member(node) {
+        return;
+    }
+    if is_object_in_member_expression(node) {
         return;
     }
     record_hit(node, ctx);
@@ -523,8 +621,8 @@ fn handle_member_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     // `BaseClass.staticMethod()` style — object binds to the target's parent class, the
     // property is the requested member.
     if let Some(member) = ctx.target_member
-        && ctx.binds_target(object_text)
         && property_text == member
+        && member_object_matches_target(object, object_text, ctx)
     {
         record_hit(property, ctx);
     }
@@ -572,6 +670,111 @@ fn rightmost_jsx_identifier<'a>(node: Node<'a>, source: &'a str) -> Option<(Node
             last.and_then(|child| rightmost_jsx_identifier(child, source))
         }
     }
+}
+
+fn member_object_matches_target(node: Node<'_>, object_text: &str, ctx: &ScanCtx<'_>) -> bool {
+    if ctx.target_is_static_member {
+        return ctx.binds_target(object_text);
+    }
+
+    if expression_is_target_constructor(node, ctx) {
+        return true;
+    }
+
+    if let Some(binding) = simple_identifier_text(node, ctx.source).and_then(|name| {
+        ctx.scope_stack
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name))
+            .copied()
+    }) {
+        return binding == LocalBinding::TargetReceiver;
+    }
+
+    false
+}
+
+fn simple_identifier_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
+    match node.kind() {
+        "identifier" | "type_identifier" => {
+            let text = slice(node, source);
+            (!text.is_empty()).then_some(text)
+        }
+        _ => None,
+    }
+}
+
+fn infer_receiver_binding(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<LocalBinding> {
+    let value = node.child_by_field_name("value")?;
+    if expression_is_target_constructor(value, ctx) || has_target_type_annotation(node, ctx) {
+        return Some(LocalBinding::TargetReceiver);
+    }
+
+    simple_identifier_text(value, ctx.source).map(|ident| {
+        ctx.scope_stack
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(ident))
+            .copied()
+            .unwrap_or(LocalBinding::Other)
+    })
+}
+
+fn expression_is_target_constructor(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    match node.kind() {
+        "new_expression" => node
+            .child_by_field_name("constructor")
+            .and_then(|constructor| simple_identifier_text(constructor, ctx.source))
+            .is_some_and(|name| ctx.binds_target(name)),
+        "identifier" | "type_identifier" => {
+            let text = slice(node, ctx.source);
+            ctx.binds_target(text)
+        }
+        _ => false,
+    }
+}
+
+fn has_target_type_annotation(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    node.child_by_field_name("type")
+        .or_else(|| node.child_by_field_name("return_type"))
+        .is_some_and(|type_node| type_annotation_mentions_target(type_node, ctx))
+        || node
+            .child_by_field_name("name")
+            .is_some_and(|name| name_subtree_mentions_target_type(name, ctx))
+        || node
+            .child_by_field_name("pattern")
+            .is_some_and(|pattern| name_subtree_mentions_target_type(pattern, ctx))
+}
+
+fn type_annotation_mentions_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    if let Some(text) = simple_identifier_text(node, ctx.source)
+        && ctx.binds_target(text)
+    {
+        if let Some(owner_source) = ctx.target_owner_source {
+            if ctx.target_self_file {
+                return text == ctx.target_short;
+            }
+            return ctx
+                .edges
+                .iter()
+                .any(|edge| edge.local_name == text && edge.target_file == *owner_source);
+        }
+        return true;
+    }
+
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| type_annotation_mentions_target(child, ctx))
+}
+
+fn name_subtree_mentions_target_type(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    if node.kind() == "type_annotation" {
+        return type_annotation_mentions_target(node, ctx);
+    }
+
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| name_subtree_mentions_target_type(child, ctx))
 }
 
 fn record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -714,6 +917,19 @@ fn is_property_key_in_member(node: Node<'_>) -> bool {
         .unwrap_or(false)
 }
 
+fn is_object_in_member_expression(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if parent.kind() != "member_expression" {
+        return false;
+    }
+    parent
+        .child_by_field_name("object")
+        .map(|object| object.id() == node.id())
+        .unwrap_or(false)
+}
+
 fn top_level_identifier(target: &CodeUnit) -> &str {
     // For nested members like `BaseClass.foo`, the top-level identifier is `BaseClass`.
     target
@@ -732,6 +948,10 @@ fn member_name(target: &CodeUnit) -> Option<String> {
     }
     let last = parts.last().copied()?;
     Some(last.trim_end_matches("$static").to_string())
+}
+
+fn is_static_member(target: &CodeUnit) -> bool {
+    target.short_name().ends_with("$static")
 }
 
 // ===================================================================================
