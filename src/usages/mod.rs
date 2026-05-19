@@ -36,8 +36,8 @@ pub use local_inference::{
 };
 pub use model::{
     CONFIDENCE_THRESHOLD, ExportEntry, ExportIndex, FuzzyResult, ImportBinder, ImportBinding,
-    ImportKind, ReceiverTargetRef, ReexportStar, ReferenceCandidate, ReferenceHit, ReferenceKind,
-    ResolvedReceiverCandidate, UsageHit,
+    ImportKind, ReceiverTargetRef, ReexportStar, ReferenceCandidate, ReferenceGraphResult,
+    ReferenceHit, ReferenceKind, ResolvedReceiverCandidate, UsageHit,
 };
 pub use python_graph::PythonExportUsageGraphStrategy;
 pub use regex_analyzer::RegexUsageAnalyzer;

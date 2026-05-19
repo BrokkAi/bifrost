@@ -6,7 +6,7 @@ use crate::hash::{HashMap, HashSet};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use crate::usages::graph_core::{ImportEdgeKind, ProjectUsageGraph};
 use crate::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::usages::model::{FuzzyResult, UsageHit};
+use crate::usages::model::{FuzzyResult, ReferenceGraphResult, UsageHit};
 use crate::usages::traits::UsageAnalyzer;
 use rayon::prelude::*;
 use regex::Regex;
@@ -29,6 +29,35 @@ impl RustExportUsageGraphStrategy {
 
     pub fn can_handle(target: &CodeUnit) -> bool {
         target_language(target) == Language::Rust
+    }
+
+    pub fn find_export_usages(
+        analyzer: &RustAnalyzer,
+        defining_file: &ProjectFile,
+        export_name: &str,
+        query_target: Option<&CodeUnit>,
+        candidate_files: &HashSet<ProjectFile>,
+        max_usages: usize,
+    ) -> ReferenceGraphResult {
+        let external_frontier_specifiers =
+            unresolved_external_frontier_specifiers(analyzer, defining_file, export_name);
+        let hits = query_target
+            .map(|target| {
+                Self::new()
+                    .find_usages(
+                        analyzer,
+                        std::slice::from_ref(target),
+                        candidate_files,
+                        max_usages,
+                    )
+                    .all_hits()
+            })
+            .unwrap_or_default();
+
+        ReferenceGraphResult {
+            hits,
+            external_frontier_specifiers,
+        }
     }
 }
 
@@ -271,6 +300,46 @@ fn infer_export_names_for_local(
         }
     }
     export_names
+}
+
+fn unresolved_external_frontier_specifiers(
+    analyzer: &RustAnalyzer,
+    defining_file: &ProjectFile,
+    export_name: &str,
+) -> BTreeSet<String> {
+    let mut frontier = BTreeSet::new();
+    let index = analyzer.export_index_of(defining_file);
+
+    if let Some(crate::usages::ExportEntry::ReexportedNamed {
+        module_specifier, ..
+    }) = index.exports_by_name.get(export_name)
+        && analyzer
+            .resolve_module_files(defining_file, module_specifier)
+            .is_empty()
+        && let Some(external) = external_frontier_specifier(module_specifier)
+    {
+        frontier.insert(external);
+    }
+
+    for star in &index.reexport_stars {
+        if analyzer
+            .resolve_module_files(defining_file, &star.module_specifier)
+            .is_empty()
+            && let Some(external) = external_frontier_specifier(&star.module_specifier)
+        {
+            frontier.insert(external);
+        }
+    }
+
+    frontier
+}
+
+fn external_frontier_specifier(module_specifier: &str) -> Option<String> {
+    let root = module_specifier
+        .split("::")
+        .find(|segment| !segment.is_empty())?
+        .trim();
+    (!matches!(root, "crate" | "self" | "super") && !root.is_empty()).then(|| root.to_string())
 }
 
 struct ParsedFile {
