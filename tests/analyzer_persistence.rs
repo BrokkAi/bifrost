@@ -4,7 +4,8 @@ use brokk_analyzer::analyzer::persistence::{
     AnalyzerStorage, PersistenceError, SymbolQueryMode, default_db_path,
 };
 use brokk_analyzer::{
-    AnalyzerConfig, IAnalyzer, Language, PythonAnalyzer, TestProject, WorkspaceAnalyzer,
+    AnalyzerConfig, IAnalyzer, Language, OverlayProject, Project, ProjectFile, PythonAnalyzer,
+    TestProject, WorkspaceAnalyzer,
 };
 use std::collections::BTreeSet;
 use std::fs;
@@ -817,4 +818,120 @@ fn symbol_search_respects_limit() {
         .search_symbols_with_limit(Language::Python, "common", SymbolQueryMode::Substring, 0)
         .unwrap();
     assert!(none.is_empty());
+}
+
+#[test]
+fn update_with_overlay_does_not_overwrite_baseline_payload() {
+    // Regression guard for the overlay path in TreeSitterAnalyzer::update +
+    // build_state. When an OverlayProject reports `has_overlay(file) = true`,
+    // analyzer reparse must NOT commit a baseline row for that file —
+    // otherwise the next session would hydrate overlay-derived symbols
+    // against an unchanged disk mtime, silently poisoning the cross-session
+    // index.
+    let (_tmp_workspace, project) = fresh_python_workspace();
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("analyzer.db");
+    let storage = Arc::new(AnalyzerStorage::open(&db_path).unwrap());
+
+    // Cold-start through the OverlayProject wrapper with no overlay set: the
+    // analyzer reparses the workspace from disk and writes baseline rows for
+    // every file. Going through OverlayProject here (rather than the plain
+    // FilesystemProject) means the subsequent update is the *same* analyzer
+    // instance whose project is overlay-aware — required for the persistence
+    // guard to consult `has_overlay` at write time.
+    let overlay = Arc::new(OverlayProject::new(project.clone() as Arc<dyn Project>));
+    let analyzer = PythonAnalyzer::new_with_config_and_storage(
+        Arc::clone(&overlay) as Arc<dyn Project>,
+        AnalyzerConfig::default(),
+        Arc::clone(&storage),
+    );
+    let names_before = collect_fq_names(&analyzer);
+    assert!(
+        contains_short(&names_before, "hello"),
+        "cold start should index on-disk symbols: {names_before:?}"
+    );
+
+    // Snapshot the baseline row for alpha.py — that's the file the overlay
+    // will shadow. The payload encodes the parsed declarations; if the guard
+    // works the payload must be byte-identical after the overlay reparse.
+    let baseline_before = storage.read_baseline(Language::Python).unwrap();
+    let alpha_before = baseline_before
+        .get("alpha.py")
+        .expect("alpha.py should have a baseline row after cold start")
+        .clone();
+
+    // Install an overlay that introduces a brand-new symbol the disk never
+    // saw.
+    let alpha_file = ProjectFile::new(
+        project.root_path().to_path_buf(),
+        std::path::PathBuf::from("alpha.py"),
+    );
+    overlay.set(
+        alpha_file.abs_path(),
+        "def overlay_only_symbol():\n    return 999\n".to_string(),
+    );
+
+    // Trigger a reparse against the overlaid file.
+    let mut changed = BTreeSet::new();
+    changed.insert(alpha_file.clone());
+    let updated = analyzer.update(&changed);
+
+    // In-memory state must reflect the overlay: the analyzer sees the new
+    // symbol AND has dropped the symbols the disk content used to define.
+    let names_after = collect_fq_names(&updated);
+    assert!(
+        contains_short(&names_after, "overlay_only_symbol"),
+        "in-memory analyzer should reflect overlay content: {names_after:?}"
+    );
+    assert!(
+        !contains_short(&names_after, "hello"),
+        "in-memory analyzer should have dropped on-disk symbols after overlay reparse: {names_after:?}"
+    );
+
+    // Persistence guard: the baseline row for alpha.py must NOT have been
+    // overwritten. The payload bytes encode the on-disk declarations from
+    // before the overlay, so they must match the snapshot. mtime/size also
+    // unchanged because the disk file was never touched.
+    let baseline_after = storage.read_baseline(Language::Python).unwrap();
+    let alpha_after = baseline_after
+        .get("alpha.py")
+        .expect("alpha.py baseline row must still exist after overlay update");
+    assert_eq!(
+        alpha_after.payload, alpha_before.payload,
+        "overlay reparse must not overwrite baseline payload"
+    );
+    assert_eq!(
+        alpha_after.mtime_ns, alpha_before.mtime_ns,
+        "overlay reparse must not bump baseline mtime"
+    );
+    assert_eq!(
+        alpha_after.size, alpha_before.size,
+        "overlay reparse must not bump baseline size"
+    );
+
+    // beta.py (no overlay) is untouched by this update, but it MUST still
+    // have its row — guard against accidental purging.
+    assert!(
+        baseline_after.contains_key("beta.py"),
+        "unrelated baseline rows must survive overlay-driven update"
+    );
+
+    // Final guarantee: a fresh analyzer hydrated from the same storage with
+    // no overlay must report the original on-disk symbols, proving the
+    // baseline survived intact and a future restart won't see overlay
+    // residue.
+    let rehydrated = PythonAnalyzer::new_with_config_and_storage(
+        project.clone() as Arc<dyn Project>,
+        AnalyzerConfig::default(),
+        Arc::clone(&storage),
+    );
+    let rehydrated_names = collect_fq_names(&rehydrated);
+    assert!(
+        contains_short(&rehydrated_names, "hello"),
+        "rehydrated analyzer should still see on-disk symbols: {rehydrated_names:?}"
+    );
+    assert!(
+        !contains_short(&rehydrated_names, "overlay_only_symbol"),
+        "rehydrated analyzer must NOT carry overlay residue: {rehydrated_names:?}"
+    );
 }
