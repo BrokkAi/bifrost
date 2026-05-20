@@ -1,6 +1,7 @@
 //! Regression tests for the analyzer-side parse-error cache that backs the
 //! LSP diagnostic handler. See issue #102 + PR #101 review.
 
+use brokk_analyzer::analyzer::persistence::AnalyzerStorage;
 use brokk_analyzer::{
     AnalyzerConfig, IAnalyzer, Language, ParseErrorKind, ProjectFile, PythonAnalyzer, TestProject,
 };
@@ -128,6 +129,58 @@ fn parse_error_kind_distinguishes_error_vs_missing() {
             }
         }
     }
+}
+
+#[test]
+fn hydrated_baseline_returns_none_so_diagnostic_falls_back() {
+    // Persistence does NOT carry parse_errors across sessions — the
+    // diagnostic handler's `Some(empty) = clean` / `None = unknown`
+    // distinction is what keeps a hydrated session from silently reporting
+    // "no errors" on every file. If someone later persists parse_errors
+    // thinking it's a free win, they invalidate the fallback contract and
+    // hydrated files would mis-report cleanly. This test pins the contract.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(tmp.path()).unwrap();
+    write_file(&root, "broken.py", "def x():\n    return 1)\n");
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("analyzer.db");
+
+    // Cold start: writes a baseline row that captures everything except
+    // parse_errors.
+    {
+        let storage = Arc::new(AnalyzerStorage::open(&db_path).unwrap());
+        let project = Arc::new(TestProject::new(root.clone(), Language::Python));
+        let analyzer = PythonAnalyzer::new_with_config_and_storage(
+            project as Arc<dyn brokk_analyzer::Project>,
+            AnalyzerConfig::default(),
+            storage,
+        );
+        let file = project_file(&root, "broken.py");
+        // Sanity: the cold-start analyzer DID populate parse_errors.
+        let errors = analyzer
+            .parse_errors(&file)
+            .expect("cold-start analyzer should hold parse_errors");
+        assert!(
+            !errors.is_empty(),
+            "cold-start parse_errors should reflect the broken file"
+        );
+    }
+
+    // Warm start: a fresh analyzer reusing the same DB hydrates from the
+    // baseline without re-parsing. `parse_errors` must return None so the
+    // diagnostic handler knows to fall back to a fresh parse.
+    let storage = Arc::new(AnalyzerStorage::open(&db_path).unwrap());
+    let project = Arc::new(TestProject::new(root.clone(), Language::Python));
+    let analyzer = PythonAnalyzer::new_with_config_and_storage(
+        project as Arc<dyn brokk_analyzer::Project>,
+        AnalyzerConfig::default(),
+        storage,
+    );
+    let file = project_file(&root, "broken.py");
+    assert!(
+        analyzer.parse_errors(&file).is_none(),
+        "hydrated baseline must return None so diagnostic falls back to fresh parse"
+    );
 }
 
 #[test]

@@ -1449,10 +1449,12 @@ fn first_comment_offset(line: &str) -> Option<usize> {
 
 /// Walk `node` and append every `ERROR` / `MISSING` span into `out`. Does NOT
 /// recurse into `ERROR` nodes: every descendant would also report as errored
-/// and the diagnostic list would explode. Matches the walk previously open-
-/// coded in `src/lsp/handlers/diagnostic.rs`, hoisted here so the analyzer can
-/// pre-compute and cache the result during `analyze_file`.
-fn collect_parse_errors(node: Node, out: &mut Vec<crate::analyzer::ParseError>) {
+/// and the diagnostic list would explode. Used both by `analyze_file` (to
+/// populate the per-file cache) and by `lsp::handlers::diagnostic` (for the
+/// fallback path when the analyzer has no cached state), so the two paths
+/// share one source of truth for the walk semantics and the
+/// `end_byte.max(start_byte)` clamp.
+pub(crate) fn collect_parse_errors(node: Node, out: &mut Vec<crate::analyzer::ParseError>) {
     if node.is_error() || node.is_missing() {
         let range = Range {
             start_byte: node.start_byte(),

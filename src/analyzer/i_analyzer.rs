@@ -46,8 +46,16 @@ pub trait IAnalyzer: Send + Sync + Any {
     /// Return the tree-sitter parse errors recorded for `file` during the
     /// most recent `analyze_file` pass. Returns `None` when the analyzer
     /// holds no state for this file (file outside the analyzer's language,
-    /// or analysis failed); callers fall back to a fresh parse in that case.
-    /// An empty `Some(...)` means the file parsed cleanly.
+    /// `FileState` hydrated from the persisted baseline this session and
+    /// not yet re-parsed, or analysis failed); callers fall back to a fresh
+    /// parse in that case. An empty `Some(...)` means the file parsed
+    /// cleanly. Today's `TreeSitterAnalyzer` impl clones the cached `Vec`
+    /// per call — fine on clean files (the vec is empty), but a buffer
+    /// mid-edit with many errors does one alloc per request. Acceptable
+    /// while the second-parse cost still dominates; revisit by switching
+    /// the return type to `Option<&[ParseError]>` (needs a lifetime on the
+    /// trait method) or wrapping in `Arc<[ParseError]>` if it shows up in
+    /// profiles.
     fn parse_errors(&self, _file: &ProjectFile) -> Option<Vec<ParseError>> {
         None
     }

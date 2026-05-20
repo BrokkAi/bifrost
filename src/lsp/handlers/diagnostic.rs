@@ -3,8 +3,9 @@ use lsp_types::{
     DocumentDiagnosticReportResult, FullDocumentDiagnosticReport,
     RelatedFullDocumentDiagnosticReport, Uri,
 };
-use tree_sitter::{Language as TsLanguage, Node, Parser};
+use tree_sitter::{Language as TsLanguage, Parser};
 
+use crate::analyzer::tree_sitter_analyzer::collect_parse_errors;
 use crate::analyzer::{Language, ParseError, ParseErrorKind, Project, WorkspaceAnalyzer};
 use crate::lsp::conversion::byte_range_to_lsp_range;
 use crate::lsp::handlers::util::project_file_for_uri;
@@ -56,29 +57,43 @@ fn build_report(
     let language = Language::from_extension(extension);
     let ts_language = ts_language_for(language)?;
 
+    // The cached byte offsets and `content` come from independent reads, but
+    // they describe the same snapshot: `server.rs` always calls
+    // `workspace.update(&{file})` immediately before `publish_diagnostics`,
+    // and LSP request handling is single-threaded, so no concurrent edit can
+    // race between the two reads.
     let content = project.read_source(&project_file).ok()?;
     let line_starts = compute_line_starts(&content);
 
-    if let Some(errors) = workspace.analyzer().parse_errors(&project_file) {
-        return Some(
+    let errors: Vec<ParseError> = match workspace.analyzer().parse_errors(&project_file) {
+        Some(cached) => cached,
+        None => {
+            // Analyzer has no cached errors for this file (hydrated baseline,
+            // or file outside the loaded language set). Parse fresh and walk
+            // for errors using the SAME helper the analyzer uses, so the two
+            // paths can't drift on recursion / clamp semantics.
+            let mut parser = Parser::new();
+            parser.set_language(&ts_language).ok()?;
+            let tree = parser.parse(&content, None)?;
+            let mut errors = Vec::new();
+            collect_parse_errors(tree.root_node(), &mut errors);
             errors
-                .into_iter()
-                .map(|err| parse_error_to_diagnostic(err, &content, &line_starts))
-                .collect(),
-        );
-    }
+        }
+    };
 
-    // Analyzer has no cached errors for this file (hydrated baseline, or file
-    // outside the loaded language set). Parse fresh.
-    let mut parser = Parser::new();
-    parser.set_language(&ts_language).ok()?;
-    let tree = parser.parse(&content, None)?;
-
-    let mut diagnostics = Vec::new();
-    walk_for_errors(tree.root_node(), &content, &line_starts, &mut diagnostics);
-    Some(diagnostics)
+    Some(
+        errors
+            .into_iter()
+            .map(|err| parse_error_to_diagnostic(err, &content, &line_starts))
+            .collect(),
+    )
 }
 
+/// Render a cached [`ParseError`] into the LSP `Diagnostic` shape. Both the
+/// cached path and the fallback path funnel through this function so the
+/// message text and severity stay in lockstep — see the contract on
+/// [`crate::analyzer::IAnalyzer::parse_errors`] for the `Some` / `None`
+/// semantics that decide which path is taken.
 fn parse_error_to_diagnostic(
     error: ParseError,
     content: &str,
@@ -99,44 +114,6 @@ fn parse_error_to_diagnostic(
         related_information: None,
         tags: None,
         data: None,
-    }
-}
-
-fn walk_for_errors(node: Node, content: &str, line_starts: &[usize], out: &mut Vec<Diagnostic>) {
-    if node.is_error() || node.is_missing() {
-        let byte_range = crate::analyzer::Range {
-            start_byte: node.start_byte(),
-            end_byte: node.end_byte().max(node.start_byte()),
-            start_line: node.start_position().row,
-            end_line: node.end_position().row,
-        };
-        let lsp_range = byte_range_to_lsp_range(content, line_starts, &byte_range);
-        let message = if node.is_missing() {
-            format!("missing {}", node.kind())
-        } else {
-            "syntax error".to_string()
-        };
-        out.push(Diagnostic {
-            range: lsp_range,
-            severity: Some(DiagnosticSeverity::ERROR),
-            code: None,
-            code_description: None,
-            source: Some(DIAGNOSTIC_SOURCE.to_string()),
-            message,
-            related_information: None,
-            tags: None,
-            data: None,
-        });
-        // Don't recurse into ERROR nodes — every descendant would also be
-        // marked as an error and explode the diagnostic list.
-        if node.is_error() {
-            return;
-        }
-    }
-
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        walk_for_errors(child, content, line_starts, out);
     }
 }
 
