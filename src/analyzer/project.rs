@@ -3,8 +3,24 @@ use ignore::WalkBuilder;
 use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 use walkdir::WalkDir;
+
+/// Default upper bound (8 MiB) on the size of a single in-memory overlay.
+/// Picked to cover all hand-written source comfortably while bounding the
+/// blast radius of an editor that opens a multi-MB minified bundle or vendor
+/// blob — tree-sitter still parses such files, but holding many of them in
+/// memory simultaneously across an LSP session quickly becomes expensive.
+/// `OverlayProject::set` rejects content above this cap (and logs once per
+/// path per [`OVERLAY_REJECTION_LOG_THROTTLE`]); reads fall through to disk
+/// instead.
+pub const DEFAULT_MAX_OVERLAY_BYTES: usize = 8 * 1024 * 1024;
+
+/// Minimum interval between stderr lines reporting an oversized overlay for
+/// the same path. didChange fires per-keystroke, so an editor parked on a
+/// >8 MB file would otherwise spam thousands of identical log lines.
+const OVERLAY_REJECTION_LOG_THROTTLE: Duration = Duration::from_secs(60);
 
 pub trait Project: Send + Sync {
     fn root(&self) -> &Path;
@@ -248,22 +264,50 @@ fn collect_project_files(root: &Path) -> io::Result<BTreeSet<ProjectFile>> {
 pub struct OverlayProject {
     delegate: Arc<dyn Project>,
     overlays: Arc<RwLock<HashMap<PathBuf, String>>>,
+    max_overlay_bytes: usize,
+    /// Last instant we emitted a rejection log for a given path. Kept on a
+    /// separate `Mutex` so the per-keystroke read path doesn't contend with
+    /// the rejection-logging code on the main overlay lock.
+    last_rejection_log: Mutex<HashMap<PathBuf, Instant>>,
 }
 
 impl OverlayProject {
     pub fn new(delegate: Arc<dyn Project>) -> Self {
+        Self::with_max_bytes(delegate, DEFAULT_MAX_OVERLAY_BYTES)
+    }
+
+    /// Construct with a custom per-overlay size cap. Reserved for tests and
+    /// future tuning; production LSP wiring uses [`Self::new`].
+    pub fn with_max_bytes(delegate: Arc<dyn Project>, max_overlay_bytes: usize) -> Self {
         Self {
             delegate,
             overlays: Arc::new(RwLock::new(HashMap::new())),
+            max_overlay_bytes,
+            last_rejection_log: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Replace (or insert) the overlay for `abs_path`.
-    pub fn set(&self, abs_path: PathBuf, content: String) {
+    /// Replace (or insert) the overlay for `abs_path`. Returns `true` when
+    /// the overlay was stored and `false` when it was rejected because
+    /// `content` exceeded the configured per-overlay byte cap; in the reject
+    /// case any prior overlay for the path is cleared so subsequent reads
+    /// fall through to disk rather than serving stale content.
+    pub fn set(&self, abs_path: PathBuf, content: String) -> bool {
+        if content.len() > self.max_overlay_bytes {
+            self.log_rejection(&abs_path, content.len());
+            // Drop any stale overlay so reads return disk content rather than
+            // a now-misleading older version of the buffer.
+            self.overlays
+                .write()
+                .expect("overlay lock poisoned")
+                .remove(&abs_path);
+            return false;
+        }
         self.overlays
             .write()
             .expect("overlay lock poisoned")
             .insert(abs_path, content);
+        true
     }
 
     /// Remove an overlay, if present. Returns `true` when an overlay was
@@ -283,6 +327,35 @@ impl OverlayProject {
             .write()
             .expect("overlay lock poisoned")
             .clear();
+    }
+
+    /// Emit a single stderr line reporting that `abs_path` was rejected, but
+    /// only when we haven't logged for the same path within
+    /// [`OVERLAY_REJECTION_LOG_THROTTLE`]. Logs are intentionally one-line
+    /// and absolute-path-free below the project root would require extra
+    /// state the overlay layer doesn't carry, so we accept the full path
+    /// here — operators routing LSP stderr to a log aggregator can scrub if
+    /// needed.
+    fn log_rejection(&self, abs_path: &Path, content_len: usize) {
+        let mut log = self
+            .last_rejection_log
+            .lock()
+            .expect("overlay rejection log poisoned");
+        let now = Instant::now();
+        let should_log = log
+            .get(abs_path)
+            .map(|last| now.duration_since(*last) >= OVERLAY_REJECTION_LOG_THROTTLE)
+            .unwrap_or(true);
+        if !should_log {
+            return;
+        }
+        log.insert(abs_path.to_path_buf(), now);
+        eprintln!(
+            "[bifrost-lsp] dropping overlay for {}: {} bytes exceeds cap of {} bytes",
+            abs_path.display(),
+            content_len,
+            self.max_overlay_bytes,
+        );
     }
 }
 
@@ -381,7 +454,7 @@ mod tests {
         assert!(!overlay.has_overlay(&file));
 
         // Set overlay: served from memory regardless of disk.
-        overlay.set(file.abs_path(), "fn new() {}\n".to_string());
+        assert!(overlay.set(file.abs_path(), "fn new() {}\n".to_string()));
         assert_eq!(overlay.read_source(&file).unwrap(), "fn new() {}\n");
         assert!(overlay.has_overlay(&file));
 
@@ -412,5 +485,106 @@ mod tests {
         assert_eq!(overlay.root(), delegate.root());
         assert_eq!(overlay.analyzer_languages(), delegate.analyzer_languages());
         assert_eq!(overlay.all_files().unwrap(), delegate.all_files().unwrap());
+    }
+
+    #[test]
+    fn overlay_project_rejects_oversized_set_and_falls_back_to_disk() {
+        // A tiny cap (16 bytes) makes the oversized case trivial to construct.
+        // Verifies the contract: set returns false, has_overlay stays false,
+        // read_source returns disk content.
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let file = write_file(&root, "lib.rs", "fn disk() {}\n");
+        let delegate: Arc<dyn Project> = Arc::new(FilesystemProject::new(&root).unwrap());
+        let overlay = OverlayProject::with_max_bytes(delegate, 16);
+
+        let oversized = "x".repeat(64);
+        assert!(
+            !overlay.set(file.abs_path(), oversized),
+            "set must reject content larger than the cap"
+        );
+        assert!(
+            !overlay.has_overlay(&file),
+            "rejected set must not leave an overlay record"
+        );
+        assert_eq!(
+            overlay.read_source(&file).unwrap(),
+            "fn disk() {}\n",
+            "read must fall through to disk when overlay was rejected"
+        );
+    }
+
+    #[test]
+    fn overlay_project_oversized_set_clears_prior_overlay() {
+        // Sequence: small overlay accepted, then huge overlay rejected. The
+        // existing overlay must be cleared so the next read returns disk
+        // content (not the now-misleading older buffer).
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let file = write_file(&root, "lib.rs", "fn disk() {}\n");
+        let delegate: Arc<dyn Project> = Arc::new(FilesystemProject::new(&root).unwrap());
+        let overlay = OverlayProject::with_max_bytes(delegate, 16);
+
+        assert!(overlay.set(file.abs_path(), "fn small() {}\n".to_string()));
+        assert!(overlay.has_overlay(&file));
+        assert_eq!(overlay.read_source(&file).unwrap(), "fn small() {}\n");
+
+        // Now exceed the cap; the small overlay must be evicted.
+        assert!(!overlay.set(file.abs_path(), "x".repeat(64)));
+        assert!(
+            !overlay.has_overlay(&file),
+            "oversized set must evict the prior overlay"
+        );
+        assert_eq!(
+            overlay.read_source(&file).unwrap(),
+            "fn disk() {}\n",
+            "after rejection, read must fall through to disk"
+        );
+    }
+
+    #[test]
+    fn overlay_project_accepts_set_exactly_at_cap() {
+        // Boundary case: content_len == cap is accepted (the rejection rule
+        // uses `>`, not `>=`).
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let file = write_file(&root, "lib.rs", "fn disk() {}\n");
+        let delegate: Arc<dyn Project> = Arc::new(FilesystemProject::new(&root).unwrap());
+        let overlay = OverlayProject::with_max_bytes(delegate, 16);
+
+        let exactly_at_cap = "x".repeat(16);
+        assert!(
+            overlay.set(file.abs_path(), exactly_at_cap.clone()),
+            "set at exactly the cap must succeed"
+        );
+        assert_eq!(overlay.read_source(&file).unwrap(), exactly_at_cap);
+    }
+
+    #[test]
+    fn overlay_project_default_cap_constant_is_eight_mib() {
+        // Sanity check on the constant — bumping the default is a deliberate
+        // memory-budget decision and should not happen by accident.
+        assert_eq!(DEFAULT_MAX_OVERLAY_BYTES, 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn overlay_project_repeated_rejections_are_idempotent() {
+        // didChange fires per-keystroke. An editor parked on a buffer that's
+        // permanently over the cap will hammer set() repeatedly. The
+        // visible-state contract — has_overlay false, reads return disk —
+        // must hold for every call, and the throttled log path must not
+        // panic on the second-onwards calls (they take the "skip log"
+        // branch).
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let file = write_file(&root, "lib.rs", "fn disk() {}\n");
+        let delegate: Arc<dyn Project> = Arc::new(FilesystemProject::new(&root).unwrap());
+        let overlay = OverlayProject::with_max_bytes(delegate, 16);
+
+        for _ in 0..5 {
+            assert!(!overlay.set(file.abs_path(), "x".repeat(64)));
+            assert!(!overlay.has_overlay(&file));
+            assert_eq!(overlay.read_source(&file).unwrap(), "fn disk() {}\n");
+        }
     }
 }
