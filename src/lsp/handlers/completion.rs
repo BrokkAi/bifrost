@@ -6,7 +6,7 @@ use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionList, CompletionParams, CompletionResponse,
 };
 
-use crate::analyzer::{CodeUnit, CodeUnitType, WorkspaceAnalyzer};
+use crate::analyzer::{CodeUnit, CodeUnitType, Project, WorkspaceAnalyzer};
 use crate::lsp::conversion::position_to_byte_offset;
 use crate::lsp::handlers::util::{identifier_prefix_before_offset, project_file_for_uri};
 use crate::text_utils::compute_line_starts;
@@ -76,19 +76,36 @@ impl CompletionCache {
 pub fn handle(
     cache: &mut CompletionCache,
     workspace: &WorkspaceAnalyzer,
-    project_root: &Path,
+    project: &dyn Project,
     params: &CompletionParams,
 ) -> Option<CompletionResponse> {
     let uri = &params.text_document_position.text_document.uri;
-    let project_file = project_file_for_uri(project_root, uri)?;
+    let project_file = project_file_for_uri(project.root(), uri)?;
     let abs_path = project_file.abs_path();
-    let entry = load_or_refresh(cache, &abs_path, uri)?;
-    let byte_offset = position_to_byte_offset(
-        &entry.content,
-        &entry.line_starts,
-        &params.text_document_position.position,
-    );
-    let prefix = identifier_prefix_before_offset(&entry.content, byte_offset)?;
+
+    // Overlay short-circuit: the mtime cache is keyed on disk mtime, which the
+    // editor's in-flight buffer doesn't bump. Read straight through and skip
+    // the cache for any file that has an active didOpen/didChange overlay.
+    let prefix_owned: String;
+    let prefix: &str = if project.has_overlay(&project_file) {
+        let content = project.read_source(&project_file).ok()?;
+        let line_starts = compute_line_starts(&content);
+        let byte_offset = position_to_byte_offset(
+            &content,
+            &line_starts,
+            &params.text_document_position.position,
+        );
+        prefix_owned = identifier_prefix_before_offset(&content, byte_offset)?.to_string();
+        &prefix_owned
+    } else {
+        let entry = load_or_refresh(cache, &abs_path, uri)?;
+        let byte_offset = position_to_byte_offset(
+            &entry.content,
+            &entry.line_starts,
+            &params.text_document_position.position,
+        );
+        identifier_prefix_before_offset(&entry.content, byte_offset)?
+    };
 
     let analyzer = workspace.analyzer();
     // Cold-start fallback (mirrors `workspace_symbol::handle`): when the

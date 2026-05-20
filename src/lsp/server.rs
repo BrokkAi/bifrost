@@ -6,8 +6,8 @@ use lsp_server::{
     Connection, ErrorCode, ExtractError, IoThreads, Message, Notification, Request, Response,
 };
 use lsp_types::notification::{
-    DidChangeWatchedFiles, DidSaveTextDocument, Notification as LspNotificationTrait,
-    PublishDiagnostics,
+    DidChangeTextDocument, DidChangeWatchedFiles, DidCloseTextDocument, DidOpenTextDocument,
+    DidSaveTextDocument, Notification as LspNotificationTrait, PublishDiagnostics,
 };
 use lsp_types::request::{
     Completion, DocumentDiagnosticRequest, DocumentHighlightRequest, DocumentSymbolRequest,
@@ -15,11 +15,14 @@ use lsp_types::request::{
     WorkspaceSymbolRequest,
 };
 use lsp_types::{
-    DidChangeWatchedFilesParams, DidSaveTextDocumentParams, FileChangeType, InitializeParams,
+    DidChangeTextDocumentParams, DidChangeWatchedFilesParams, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, FileChangeType, InitializeParams,
     PublishDiagnosticsParams, Uri,
 };
 
-use crate::analyzer::{AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer};
+use crate::analyzer::{
+    AnalyzerConfig, FilesystemProject, OverlayProject, Project, WorkspaceAnalyzer,
+};
 use crate::lsp::capabilities::server_capabilities;
 use crate::lsp::conversion::uri_to_path;
 use crate::lsp::handlers::util::project_file_for_uri as resolve_project_file;
@@ -97,7 +100,7 @@ fn handle_request(
             decode_and_run::<DocumentSymbolRequest, _>(req, |params| {
                 Ok(document_symbol::handle(
                     &state.workspace,
-                    state.project.root(),
+                    state.project(),
                     &params,
                 ))
             })
@@ -105,7 +108,7 @@ fn handle_request(
         FoldingRangeRequest::METHOD => decode_and_run::<FoldingRangeRequest, _>(req, |params| {
             Ok(folding_range::handle(
                 &state.workspace,
-                state.project.root(),
+                state.project(),
                 &params,
             ))
         }),
@@ -117,29 +120,27 @@ fn handle_request(
         GotoDefinition::METHOD => decode_and_run::<GotoDefinition, _>(req, |params| {
             Ok(definition::handle(
                 &state.workspace,
-                state.project.root(),
+                state.project(),
                 &params,
             ))
         }),
         HoverRequest::METHOD => decode_and_run::<HoverRequest, _>(req, |params| {
-            Ok(hover::handle(
-                &state.workspace,
-                state.project.root(),
-                &params,
-            ))
+            Ok(hover::handle(&state.workspace, state.project(), &params))
         }),
         Completion::METHOD => decode_and_run::<Completion, _>(req, |params| {
+            // Borrow the overlay field directly (not via `state.project()`) so
+            // it disjoint-borrows from `&mut state.completion_cache`.
             Ok(completion::handle(
                 &mut state.completion_cache,
                 &state.workspace,
-                state.project.root(),
+                state.overlay.as_ref(),
                 &params,
             ))
         }),
         References::METHOD => decode_and_run::<References, _>(req, |params| {
             Ok(references::handle(
                 &state.workspace,
-                state.project.root(),
+                state.project(),
                 &params,
             ))
         }),
@@ -147,14 +148,14 @@ fn handle_request(
             decode_and_run::<DocumentHighlightRequest, _>(req, |params| {
                 Ok(document_highlight::handle(
                     &state.workspace,
-                    state.project.root(),
+                    state.project(),
                     &params,
                 ))
             })
         }
         DocumentDiagnosticRequest::METHOD => {
             decode_and_run::<DocumentDiagnosticRequest, _>(req, |params| {
-                Ok(diagnostic::handle(state.project.root(), &params))
+                Ok(diagnostic::handle(state.project(), &params))
             })
         }
         _ => Response::new_err(
@@ -216,6 +217,85 @@ fn handle_notification(
     note: Notification,
 ) -> Result<(), String> {
     match note.method.as_str() {
+        DidOpenTextDocument::METHOD => {
+            let params: DidOpenTextDocumentParams =
+                serde_json::from_value(note.params).map_err(|err| {
+                    format!(
+                        "Failed to decode {} params: {err}",
+                        DidOpenTextDocument::METHOD
+                    )
+                })?;
+            if let Some(file) =
+                resolve_project_file(state.project().root(), &params.text_document.uri)
+            {
+                state
+                    .overlay
+                    .set(file.abs_path(), params.text_document.text);
+                state.completion_cache.invalidate(&file.abs_path());
+                let mut changed = BTreeSet::new();
+                changed.insert(file);
+                state.workspace = state.workspace.update(&changed);
+                publish_diagnostics(connection, state.project(), &params.text_document.uri)?;
+            }
+            Ok(())
+        }
+        DidChangeTextDocument::METHOD => {
+            let params: DidChangeTextDocumentParams =
+                serde_json::from_value(note.params).map_err(|err| {
+                    format!(
+                        "Failed to decode {} params: {err}",
+                        DidChangeTextDocument::METHOD
+                    )
+                })?;
+            if let Some(file) =
+                resolve_project_file(state.project().root(), &params.text_document.uri)
+            {
+                // With TextDocumentSyncKind::FULL each event has `range = None`
+                // and `text` = full document. We capability-advertise FULL, but
+                // tolerate non-conforming clients by taking the *last* event
+                // that looks full-document — anything else, drop the
+                // notification rather than apply a malformed partial edit.
+                if let Some(text) = params
+                    .content_changes
+                    .into_iter()
+                    .rev()
+                    .find(|change| change.range.is_none())
+                    .map(|change| change.text)
+                {
+                    state.overlay.set(file.abs_path(), text);
+                    state.completion_cache.invalidate(&file.abs_path());
+                    let mut changed = BTreeSet::new();
+                    changed.insert(file);
+                    state.workspace = state.workspace.update(&changed);
+                    publish_diagnostics(connection, state.project(), &params.text_document.uri)?;
+                }
+            }
+            Ok(())
+        }
+        DidCloseTextDocument::METHOD => {
+            let params: DidCloseTextDocumentParams =
+                serde_json::from_value(note.params).map_err(|err| {
+                    format!(
+                        "Failed to decode {} params: {err}",
+                        DidCloseTextDocument::METHOD
+                    )
+                })?;
+            if let Some(file) =
+                resolve_project_file(state.project().root(), &params.text_document.uri)
+            {
+                // Only reparse if we actually had an overlay — close without a
+                // prior open is a spec-permitted nop (e.g. some clients send it
+                // for files the server never opened).
+                if state.overlay.clear(&file.abs_path()) {
+                    state.completion_cache.invalidate(&file.abs_path());
+                    let mut changed = BTreeSet::new();
+                    changed.insert(file);
+                    state.workspace = state.workspace.update(&changed);
+                    publish_diagnostics(connection, state.project(), &params.text_document.uri)?;
+                }
+            }
+            Ok(())
+        }
         DidSaveTextDocument::METHOD => {
             let params: DidSaveTextDocumentParams =
                 serde_json::from_value(note.params).map_err(|err| {
@@ -225,7 +305,7 @@ fn handle_notification(
                     )
                 })?;
             if let Some(file) =
-                resolve_project_file(state.project.root(), &params.text_document.uri)
+                resolve_project_file(state.project().root(), &params.text_document.uri)
             {
                 // Drop completion's mtime-cached content first — the save just
                 // bumped the file's mtime, but we want the next completion
@@ -243,7 +323,7 @@ fn handle_notification(
                 // empty array for a URI we never published for, and a few
                 // clients (e.g. some Sublime LSP frontends) create empty
                 // diagnostic state for any URI the server publishes for.
-                publish_diagnostics(connection, state.project.root(), &params.text_document.uri)?;
+                publish_diagnostics(connection, state.project(), &params.text_document.uri)?;
             }
             Ok(())
         }
@@ -263,7 +343,7 @@ fn handle_notification(
                 if matches!(
                     change.typ,
                     FileChangeType::CREATED | FileChangeType::CHANGED | FileChangeType::DELETED
-                ) && let Some(file) = resolve_project_file(state.project.root(), &change.uri)
+                ) && let Some(file) = resolve_project_file(state.project().root(), &change.uri)
                 {
                     state.completion_cache.invalidate(&file.abs_path());
                     changed.insert(file);
@@ -287,10 +367,10 @@ fn handle_notification(
 /// list is empty — so clients clear stale diagnostics from a previous save.
 fn publish_diagnostics(
     connection: &Connection,
-    project_root: &Path,
+    project: &dyn Project,
     uri: &Uri,
 ) -> Result<(), String> {
-    let diagnostics = diagnostic::collect(project_root, uri);
+    let diagnostics = diagnostic::collect(project, uri);
     let params = PublishDiagnosticsParams {
         uri: uri.clone(),
         diagnostics,
@@ -305,7 +385,12 @@ fn publish_diagnostics(
 
 pub(crate) struct ServerState {
     workspace: WorkspaceAnalyzer,
-    project: Arc<dyn Project>,
+    /// The `OverlayProject` is shared with the analyzer (via `Arc<dyn Project>`
+    /// inside `WorkspaceAnalyzer`) and with request-time read paths in
+    /// `handlers::util::read_document_for_uri`. did{Open,Change,Close}
+    /// notifications mutate the overlay store in-place; analyzer reparses and
+    /// LSP reads observe the new content on the next call.
+    overlay: Arc<OverlayProject>,
     /// Owned by `textDocument/completion`. Lives on `ServerState` because the
     /// handler is invoked per-keystroke and benefits from mtime-checked
     /// caching of file content + line offsets. Other handlers (hover,
@@ -316,18 +401,27 @@ pub(crate) struct ServerState {
 
 impl ServerState {
     fn new(root: PathBuf) -> Result<Self, String> {
-        let project: Arc<dyn Project> = Arc::new(FilesystemProject::new(&root).map_err(|err| {
-            format!(
-                "Failed to initialize project root {}: {err}",
-                root.display()
-            )
-        })?);
-        let workspace = WorkspaceAnalyzer::build(Arc::clone(&project), AnalyzerConfig::default());
+        let filesystem: Arc<dyn Project> =
+            Arc::new(FilesystemProject::new(&root).map_err(|err| {
+                format!(
+                    "Failed to initialize project root {}: {err}",
+                    root.display()
+                )
+            })?);
+        let overlay = Arc::new(OverlayProject::new(filesystem));
+        let workspace = WorkspaceAnalyzer::build(
+            Arc::clone(&overlay) as Arc<dyn Project>,
+            AnalyzerConfig::default(),
+        );
         Ok(Self {
             workspace,
-            project,
+            overlay,
             completion_cache: completion::CompletionCache::new(),
         })
+    }
+
+    pub(crate) fn project(&self) -> &dyn Project {
+        self.overlay.as_ref()
     }
 }
 

@@ -1901,6 +1901,351 @@ fn bifrost_lsp_server_returns_folding_ranges_for_a_java() {
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");
 }
 
+/// Spin up a bifrost LSP server rooted at `root`, do the initialize handshake,
+/// and return (child, stdin, reader, stderr). Used by the didOpen/didChange/
+/// didClose tests so each test isn't 50 lines of boilerplate before the
+/// scenario starts.
+fn start_lsp_server(
+    root: &Path,
+) -> (
+    std::process::Child,
+    std::process::ChildStdin,
+    BufReader<std::process::ChildStdout>,
+    std::process::ChildStderr,
+) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(root)
+        .arg("--server")
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bifrost");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    let root_uri = uri_for(root);
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"processId": null, "rootUri": root_uri, "capabilities": {}}
+        }),
+    );
+    let _ = read_message(&mut reader, &mut stderr);
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+    );
+    (child, stdin, reader, stderr)
+}
+
+#[test]
+fn bifrost_lsp_server_did_open_overlay_drives_hover_identifier() {
+    // Disk content vs. opened buffer differ in the identifier at (line 0, char 5).
+    // Verifies that did{Open,Change,Close} drive both the analyzer reparse and
+    // the request-time identifier extraction.
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("lib.rs");
+    fs::write(&file_path, "fn original() {}\n").expect("write disk");
+
+    let (mut child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+
+    // didOpen with overlay content — different function name than disk.
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": file_uri,
+                    "languageId": "rust",
+                    "version": 1,
+                    "text": "fn overlay_only() {}\n"
+                }
+            }
+        }),
+    );
+    // didOpen emits a publishDiagnostics — drain it before the request.
+    let _ = read_notification(&mut reader, &mut stderr, "textDocument/publishDiagnostics");
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "textDocument/hover",
+            "params": {
+                "textDocument": {"uri": file_uri},
+                "position": {"line": 0, "character": 5}
+            }
+        }),
+    );
+    let hover_open = read_response_for_id(&mut reader, &mut stderr, 10);
+    let hover_text_open = hover_open["result"]["contents"]["value"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        hover_text_open.contains("overlay_only"),
+        "hover should reflect didOpen overlay, got {hover_text_open}"
+    );
+    assert!(
+        !hover_text_open.contains("original"),
+        "hover should NOT show on-disk identifier while overlay is active, got {hover_text_open}"
+    );
+
+    // didChange replaces the buffer.
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didChange",
+            "params": {
+                "textDocument": {"uri": file_uri, "version": 2},
+                "contentChanges": [{"text": "fn changed() {}\n"}]
+            }
+        }),
+    );
+    let _ = read_notification(&mut reader, &mut stderr, "textDocument/publishDiagnostics");
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "textDocument/hover",
+            "params": {
+                "textDocument": {"uri": file_uri},
+                "position": {"line": 0, "character": 5}
+            }
+        }),
+    );
+    let hover_changed = read_response_for_id(&mut reader, &mut stderr, 11);
+    let hover_text_changed = hover_changed["result"]["contents"]["value"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        hover_text_changed.contains("changed"),
+        "hover should reflect didChange overlay, got {hover_text_changed}"
+    );
+    assert!(
+        !hover_text_changed.contains("overlay_only"),
+        "hover should NOT show pre-change overlay after didChange, got {hover_text_changed}"
+    );
+
+    // didClose drops the overlay; disk content reasserts.
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didClose",
+            "params": {"textDocument": {"uri": file_uri}}
+        }),
+    );
+    let _ = read_notification(&mut reader, &mut stderr, "textDocument/publishDiagnostics");
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 12,
+            "method": "textDocument/hover",
+            "params": {
+                "textDocument": {"uri": file_uri},
+                "position": {"line": 0, "character": 5}
+            }
+        }),
+    );
+    let hover_closed = read_response_for_id(&mut reader, &mut stderr, 12);
+    let hover_text_closed = hover_closed["result"]["contents"]["value"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        hover_text_closed.contains("original"),
+        "after didClose, hover should reflect disk content, got {hover_text_closed}"
+    );
+
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 99, "method": "shutdown"}),
+    );
+    let _ = read_response_for_id(&mut reader, &mut stderr, 99);
+    write_message(&mut stdin, json!({"jsonrpc": "2.0", "method": "exit"}));
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
+fn bifrost_lsp_server_did_change_completion_finds_overlay_only_symbol() {
+    // A Rust file on disk has nothing matching `mark`. didOpen + didChange
+    // introduce `mark_overlay_42`. Completion at prefix `mark` must surface it
+    // — proving the analyzer reparsed against overlay content AND that
+    // completion's mtime cache was bypassed for the overlaid file.
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("lib.rs");
+    fs::write(&file_path, "fn placeholder() {}\n").expect("write disk");
+
+    let (mut child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": file_uri,
+                    "languageId": "rust",
+                    "version": 1,
+                    "text": "fn placeholder() {}\n"
+                }
+            }
+        }),
+    );
+    let _ = read_notification(&mut reader, &mut stderr, "textDocument/publishDiagnostics");
+
+    // The overlay introduces `mark_overlay_42` followed by a partial call at
+    // position (2, 4) so the completion prefix on the cursor is `mark`.
+    let overlay_text = "fn mark_overlay_42() {}\nfn caller() {\n    mark\n}\n";
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didChange",
+            "params": {
+                "textDocument": {"uri": file_uri, "version": 2},
+                "contentChanges": [{"text": overlay_text}]
+            }
+        }),
+    );
+    let _ = read_notification(&mut reader, &mut stderr, "textDocument/publishDiagnostics");
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 20,
+            "method": "textDocument/completion",
+            "params": {
+                "textDocument": {"uri": file_uri},
+                "position": {"line": 2, "character": 8}
+            }
+        }),
+    );
+    let completion = read_response_for_id(&mut reader, &mut stderr, 20);
+    let items = completion["result"]["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected completion items array, got {completion}"));
+    let labels: Vec<String> = items
+        .iter()
+        .filter_map(|item| item["label"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        labels.iter().any(|label| label == "mark_overlay_42"),
+        "expected `mark_overlay_42` in completion results, got {labels:?}"
+    );
+
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 99, "method": "shutdown"}),
+    );
+    let _ = read_response_for_id(&mut reader, &mut stderr, 99);
+    write_message(&mut stdin, json!({"jsonrpc": "2.0", "method": "exit"}));
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
+fn bifrost_lsp_server_did_close_reverts_completion_to_disk() {
+    // After didOpen + didClose, the overlay symbol vanishes from completion
+    // results. Guards against state leakage of the overlay across close.
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("lib.rs");
+    fs::write(&file_path, "fn disk_placeholder() {}\n").expect("write disk");
+
+    let (mut child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": file_uri,
+                    "languageId": "rust",
+                    "version": 1,
+                    "text": "fn unique_overlay_token() {}\nfn caller() {\n    uniqu\n}\n"
+                }
+            }
+        }),
+    );
+    let _ = read_notification(&mut reader, &mut stderr, "textDocument/publishDiagnostics");
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didClose",
+            "params": {"textDocument": {"uri": file_uri}}
+        }),
+    );
+    let _ = read_notification(&mut reader, &mut stderr, "textDocument/publishDiagnostics");
+
+    // Disk content has no `unique` symbol; completion (across the workspace)
+    // for prefix `unique` must return nothing matching the overlay symbol.
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 30,
+            "method": "workspace/symbol",
+            "params": {"query": "unique_overlay_token"}
+        }),
+    );
+    let symbols = read_response_for_id(&mut reader, &mut stderr, 30);
+    let names: Vec<String> = symbols["result"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s["name"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        !names.iter().any(|n| n == "unique_overlay_token"),
+        "overlay symbol should be gone after didClose, got {names:?}"
+    );
+
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 99, "method": "shutdown"}),
+    );
+    let _ = read_response_for_id(&mut reader, &mut stderr, 99);
+    write_message(&mut stdin, json!({"jsonrpc": "2.0", "method": "exit"}));
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
 /// Read messages until a notification with `expected_method` arrives. Skips
 /// any other inbound traffic so callers don't have to know the exact ordering
 /// of unrelated server-to-client messages.

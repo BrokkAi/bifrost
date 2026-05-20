@@ -1876,7 +1876,7 @@ impl IAnalyzer for JavaAnalyzer {
     }
 
     fn is_access_expression(&self, file: &ProjectFile, start_byte: usize, end_byte: usize) -> bool {
-        let Ok(source) = file.read_to_string() else {
+        let Ok(source) = self.inner.project().read_source(file) else {
             return true;
         };
         let Some(tree) = parse_tree(&source) else {
@@ -1949,7 +1949,7 @@ impl IAnalyzer for JavaAnalyzer {
         end_byte: usize,
         ident: &str,
     ) -> Option<crate::analyzer::DeclarationInfo> {
-        let Ok(source) = file.read_to_string() else {
+        let Ok(source) = self.inner.project().read_source(file) else {
             return None;
         };
         let tree = parse_tree(&source)?;
@@ -2001,7 +2001,7 @@ impl IAnalyzer for JavaAnalyzer {
         if file_language(code_unit.source()) != Language::Java {
             return None;
         }
-        let source = code_unit.source().read_to_string().ok()?;
+        let source = self.inner.project().read_source(code_unit.source()).ok()?;
         let aggs = collect_java_comment_aggregates(self, code_unit.source(), &source);
         Some(build_java_roll_up_stats(self, code_unit, &aggs))
     }
@@ -2010,7 +2010,7 @@ impl IAnalyzer for JavaAnalyzer {
         if file_language(file) != Language::Java {
             return Vec::new();
         }
-        let Ok(source) = file.read_to_string() else {
+        let Ok(source) = self.inner.project().read_source(file) else {
             return Vec::new();
         };
         let aggs = collect_java_comment_aggregates(self, file, &source);
@@ -2032,7 +2032,7 @@ impl IAnalyzer for JavaAnalyzer {
         if file_language(file) != Language::Java {
             return Vec::new();
         }
-        let Ok(source) = file.read_to_string() else {
+        let Ok(source) = self.inner.project().read_source(file) else {
             return Vec::new();
         };
         detect_exception_handling_smells_java(self, file, &source, &weights)
@@ -2046,7 +2046,7 @@ impl IAnalyzer for JavaAnalyzer {
         if file_language(file) != Language::Java || !self.contains_tests(file) {
             return Vec::new();
         }
-        let Ok(source) = file.read_to_string() else {
+        let Ok(source) = self.inner.project().read_source(file) else {
             return Vec::new();
         };
         detect_test_assertion_smells_java(self, file, &source, &weights)

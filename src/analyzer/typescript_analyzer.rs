@@ -514,7 +514,7 @@ impl IAnalyzer for TypescriptAnalyzer {
         if !self.contains_tests(file) || file_language(file) != Language::TypeScript {
             return Vec::new();
         }
-        let Ok(source) = file.read_to_string() else {
+        let Ok(source) = self.inner.project().read_source(file) else {
             return Vec::new();
         };
         detect_js_ts_test_assertion_smells(

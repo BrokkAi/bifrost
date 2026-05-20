@@ -422,7 +422,7 @@ impl IAnalyzer for CppAnalyzer {
         if !self.contains_tests(file) || file_language(file) != Language::Cpp {
             return Vec::new();
         }
-        let Ok(source) = file.read_to_string() else {
+        let Ok(source) = self.inner.project().read_source(file) else {
             return Vec::new();
         };
         detect_cpp_test_assertion_smells(file, &source, &weights)

@@ -956,7 +956,7 @@ impl IAnalyzer for PythonAnalyzer {
             self.inner.ranges(code_unit).to_vec()
         };
 
-        let Ok(source) = code_unit.source().read_to_string() else {
+        let Ok(source) = self.inner.project().read_source(code_unit.source()) else {
             return BTreeSet::new();
         };
 
@@ -1006,7 +1006,7 @@ impl IAnalyzer for PythonAnalyzer {
         if !self.contains_tests(file) || file_language(file) != Language::Python {
             return Vec::new();
         }
-        let Ok(source) = file.read_to_string() else {
+        let Ok(source) = self.inner.project().read_source(file) else {
             return Vec::new();
         };
         detect_python_test_assertion_smells(file, &source, &weights)

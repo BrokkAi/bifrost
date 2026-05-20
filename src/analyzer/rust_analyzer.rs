@@ -435,10 +435,11 @@ impl RustAnalyzer {
             .unwrap_or_else(|| target.source().clone());
         let member_name = target.identifier().to_string();
 
+        let project = self.inner.project();
         self.referencing_files_of(&owner_source)
             .into_iter()
             .filter(|file| {
-                file.read_to_string().ok().is_some_and(|source| {
+                project.read_source(file).ok().is_some_and(|source| {
                     export_names.iter().any(|name| source.contains(name))
                         || source.contains(&member_name)
                 })
@@ -451,10 +452,11 @@ impl RustAnalyzer {
         trait_owner: &CodeUnit,
         _importer_file: &ProjectFile,
     ) -> HashSet<String> {
+        let project = self.inner.project();
         self.get_analyzed_files()
             .into_iter()
             .filter_map(|file| {
-                let source = file.read_to_string().ok()?;
+                let source = project.read_source(&file).ok()?;
                 Some((file, source))
             })
             .flat_map(|(file, source)| {
@@ -784,7 +786,7 @@ impl IAnalyzer for RustAnalyzer {
         if !self.contains_tests(file) || file_language(file) != Language::Rust {
             return Vec::new();
         }
-        let Ok(source) = file.read_to_string() else {
+        let Ok(source) = self.inner.project().read_source(file) else {
             return Vec::new();
         };
         detect_rust_test_assertion_smells(file, &source, &weights)

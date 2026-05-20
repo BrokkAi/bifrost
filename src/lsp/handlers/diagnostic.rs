@@ -1,5 +1,3 @@
-use std::path::Path;
-
 use lsp_types::{
     Diagnostic, DiagnosticSeverity, DocumentDiagnosticParams, DocumentDiagnosticReport,
     DocumentDiagnosticReportResult, FullDocumentDiagnosticReport,
@@ -7,7 +5,7 @@ use lsp_types::{
 };
 use tree_sitter::{Language as TsLanguage, Node, Parser};
 
-use crate::analyzer::Language;
+use crate::analyzer::{Language, Project};
 use crate::lsp::conversion::byte_range_to_lsp_range;
 use crate::lsp::handlers::util::project_file_for_uri;
 use crate::text_utils::compute_line_starts;
@@ -19,10 +17,10 @@ const DIAGNOSTIC_SOURCE: &str = "bifrost-tree-sitter";
 /// Diagnostic. Returns an empty report for unsupported languages so editors
 /// don't see a stale "method not found" or stale diagnostics.
 pub fn handle(
-    project_root: &Path,
+    project: &dyn Project,
     params: &DocumentDiagnosticParams,
 ) -> DocumentDiagnosticReportResult {
-    let items = collect(project_root, &params.text_document.uri);
+    let items = collect(project, &params.text_document.uri);
     DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(
         RelatedFullDocumentDiagnosticReport {
             related_documents: None,
@@ -38,12 +36,12 @@ pub fn handle(
 /// `handle` and the push-model `publishDiagnostics` emitter so both paths
 /// surface the same parse errors. Returns an empty vec for unsupported
 /// languages, missing files, or URIs outside the project root.
-pub fn collect(project_root: &Path, uri: &Uri) -> Vec<Diagnostic> {
-    build_report(project_root, uri).unwrap_or_default()
+pub fn collect(project: &dyn Project, uri: &Uri) -> Vec<Diagnostic> {
+    build_report(project, uri).unwrap_or_default()
 }
 
-fn build_report(project_root: &Path, uri: &Uri) -> Option<Vec<Diagnostic>> {
-    let project_file = project_file_for_uri(project_root, uri)?;
+fn build_report(project: &dyn Project, uri: &Uri) -> Option<Vec<Diagnostic>> {
+    let project_file = project_file_for_uri(project.root(), uri)?;
     let extension = project_file
         .rel_path()
         .extension()
@@ -51,7 +49,7 @@ fn build_report(project_root: &Path, uri: &Uri) -> Option<Vec<Diagnostic>> {
     let language = Language::from_extension(extension);
     let ts_language = ts_language_for(language)?;
 
-    let content = project_file.read_to_string().ok()?;
+    let content = project.read_source(&project_file).ok()?;
     let mut parser = Parser::new();
     parser.set_language(&ts_language).ok()?;
     let tree = parser.parse(&content, None)?;

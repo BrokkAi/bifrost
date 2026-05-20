@@ -2,7 +2,9 @@ use std::path::Path;
 
 use lsp_types::{Hover, HoverContents, HoverParams, MarkupContent, MarkupKind};
 
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, Range as ByteRange, WorkspaceAnalyzer};
+use crate::analyzer::{
+    CodeUnit, IAnalyzer, Language, Project, Range as ByteRange, WorkspaceAnalyzer,
+};
 use crate::lsp::conversion::{byte_range_to_lsp_range, position_to_byte_offset};
 use crate::lsp::handlers::util::{
     extract_leading_doc_comment, identifier_span_at_offset, read_document_for_uri,
@@ -13,11 +15,11 @@ use crate::lsp::handlers::util::{
 /// fenced code block; `None` if the cursor isn't on a known symbol.
 pub fn handle(
     workspace: &WorkspaceAnalyzer,
-    project_root: &Path,
+    project: &dyn Project,
     params: &HoverParams,
 ) -> Option<Hover> {
     let uri = &params.text_document_position_params.text_document.uri;
-    let (_, content, line_starts) = read_document_for_uri(project_root, uri)?;
+    let (_, content, line_starts) = read_document_for_uri(project, uri)?;
     let byte_offset = position_to_byte_offset(
         &content,
         &line_starts,
