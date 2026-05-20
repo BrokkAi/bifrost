@@ -155,7 +155,11 @@ fn handle_request(
         }
         DocumentDiagnosticRequest::METHOD => {
             decode_and_run::<DocumentDiagnosticRequest, _>(req, |params| {
-                Ok(diagnostic::handle(state.project(), &params))
+                Ok(diagnostic::handle(
+                    &state.workspace,
+                    state.project(),
+                    &params,
+                ))
             })
         }
         _ => Response::new_err(
@@ -235,7 +239,12 @@ fn handle_notification(
                 let mut changed = BTreeSet::new();
                 changed.insert(file);
                 state.workspace = state.workspace.update(&changed);
-                publish_diagnostics(connection, state.project(), &params.text_document.uri)?;
+                publish_diagnostics(
+                    connection,
+                    &state.workspace,
+                    state.project(),
+                    &params.text_document.uri,
+                )?;
             }
             Ok(())
         }
@@ -267,7 +276,12 @@ fn handle_notification(
                     let mut changed = BTreeSet::new();
                     changed.insert(file);
                     state.workspace = state.workspace.update(&changed);
-                    publish_diagnostics(connection, state.project(), &params.text_document.uri)?;
+                    publish_diagnostics(
+                        connection,
+                        &state.workspace,
+                        state.project(),
+                        &params.text_document.uri,
+                    )?;
                 }
             }
             Ok(())
@@ -291,7 +305,12 @@ fn handle_notification(
                     let mut changed = BTreeSet::new();
                     changed.insert(file);
                     state.workspace = state.workspace.update(&changed);
-                    publish_diagnostics(connection, state.project(), &params.text_document.uri)?;
+                    publish_diagnostics(
+                        connection,
+                        &state.workspace,
+                        state.project(),
+                        &params.text_document.uri,
+                    )?;
                 }
             }
             Ok(())
@@ -323,7 +342,12 @@ fn handle_notification(
                 // empty array for a URI we never published for, and a few
                 // clients (e.g. some Sublime LSP frontends) create empty
                 // diagnostic state for any URI the server publishes for.
-                publish_diagnostics(connection, state.project(), &params.text_document.uri)?;
+                publish_diagnostics(
+                    connection,
+                    &state.workspace,
+                    state.project(),
+                    &params.text_document.uri,
+                )?;
             }
             Ok(())
         }
@@ -367,10 +391,11 @@ fn handle_notification(
 /// list is empty — so clients clear stale diagnostics from a previous save.
 fn publish_diagnostics(
     connection: &Connection,
+    workspace: &WorkspaceAnalyzer,
     project: &dyn Project,
     uri: &Uri,
 ) -> Result<(), String> {
-    let diagnostics = diagnostic::collect(project, uri);
+    let diagnostics = diagnostic::collect(workspace, project, uri);
     let params = PublishDiagnosticsParams {
         uri: uri.clone(),
         diagnostics,

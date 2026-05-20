@@ -322,6 +322,11 @@ impl IAnalyzer for MultiAnalyzer {
         }
     }
 
+    fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
+        self.delegate_for_file(file)
+            .and_then(|delegate| delegate.analyzer().parse_errors(file))
+    }
+
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {
         self.delegates
             .values()

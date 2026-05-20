@@ -487,6 +487,27 @@ pub struct Range {
     pub end_line: usize,
 }
 
+/// A tree-sitter parse-error span captured during analysis so the LSP
+/// diagnostic handler can skip re-parsing on every request. `kind` records
+/// whether tree-sitter flagged the span as an `ERROR` node or a `MISSING`
+/// child; for missing nodes we also keep the grammar's expected-node name so
+/// the diagnostic message reads "missing foo".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseError {
+    pub range: Range,
+    pub kind: ParseErrorKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParseErrorKind {
+    /// A tree-sitter `ERROR` node — unexpected/unparseable input.
+    Error,
+    /// A `MISSING` node — the parser inserted a placeholder for a token the
+    /// grammar required. The wrapped string is the node kind that was
+    /// expected (e.g. `"}"`, `";"`).
+    Missing(String),
+}
+
 /// Comment line counts and span lines for a [`CodeUnit`], with optional roll-up
 /// of nested declarations (e.g. methods inside a class). Mirrors brokk-shared
 /// `CommentDensityStats` field-for-field so report output stays byte-for-byte

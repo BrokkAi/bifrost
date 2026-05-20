@@ -260,6 +260,10 @@ impl IAnalyzer for ScalaAnalyzer {
             .collect()
     }
 
+    fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
+        self.inner.parse_errors(file)
+    }
+
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {
         self.inner.extract_call_receiver(reference)
     }

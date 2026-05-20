@@ -206,6 +206,10 @@ impl IAnalyzer for CSharpAnalyzer {
         self.inner.get_direct_children(code_unit)
     }
 
+    fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
+        self.inner.parse_errors(file)
+    }
+
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {
         self.inner.extract_call_receiver(reference)
     }
