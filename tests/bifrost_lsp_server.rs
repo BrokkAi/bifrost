@@ -2246,6 +2246,113 @@ fn bifrost_lsp_server_did_close_reverts_completion_to_disk() {
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");
 }
 
+#[test]
+fn bifrost_lsp_server_malformed_didchange_drops_silently_to_client() {
+    // A non-conforming client that sends `didChange` events with `range`
+    // populated (INCREMENTAL semantics) despite our advertising
+    // `TextDocumentSyncKind::FULL` must NOT trigger a parse or a
+    // publishDiagnostics — we have no way to apply the partial edits and
+    // applying any one of them as a full document would silently truncate
+    // the buffer.
+    //
+    // The visible contract this test pins is the absence of side effects:
+    // a hover request issued immediately after the malformed didChange
+    // must receive its response without an interleaved publishDiagnostics
+    // notification. (Stderr does carry a throttled warning; capturing
+    // child stderr deterministically is too flaky to assert on here.)
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("lib.rs");
+    fs::write(&file_path, "fn original() {}\n").expect("write disk");
+
+    let (mut child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+
+    // didOpen establishes an overlay and produces one publishDiagnostics.
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": file_uri,
+                    "languageId": "rust",
+                    "version": 1,
+                    "text": "fn original() {}\n"
+                }
+            }
+        }),
+    );
+    let _ = read_notification(&mut reader, &mut stderr, "textDocument/publishDiagnostics");
+
+    // Malformed didChange: a single content_change with a populated range.
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didChange",
+            "params": {
+                "textDocument": {"uri": file_uri, "version": 2},
+                "contentChanges": [{
+                    "range": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 0}
+                    },
+                    "text": "this would be an incremental edit"
+                }]
+            }
+        }),
+    );
+
+    // The server should drop the notification with no publishDiagnostics.
+    // We can't assert "no message" without a timeout, but we can prove the
+    // next message off the wire is the hover response (not a diagnostics
+    // notification interleaved before it), since LSP messages are processed
+    // serially.
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 40,
+            "method": "textDocument/hover",
+            "params": {
+                "textDocument": {"uri": file_uri},
+                "position": {"line": 0, "character": 5}
+            }
+        }),
+    );
+
+    // Read the very next inbound message. If the malformed didChange had
+    // emitted publishDiagnostics, the notification would arrive first.
+    let next = read_message(&mut reader, &mut stderr);
+    assert_eq!(
+        next["id"].as_u64(),
+        Some(40),
+        "expected hover response (id 40) as the next message; \
+         malformed didChange must not emit publishDiagnostics: {next}"
+    );
+
+    // Overlay must still reflect the pre-malformed-didChange state.
+    let hover_text = next["result"]["contents"]["value"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        hover_text.contains("original"),
+        "hover should still see the didOpen overlay content, got {hover_text}"
+    );
+
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 99, "method": "shutdown"}),
+    );
+    let _ = read_response_for_id(&mut reader, &mut stderr, 99);
+    write_message(&mut stdin, json!({"jsonrpc": "2.0", "method": "exit"}));
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
 /// Read messages until a notification with `expected_method` arrives. Skips
 /// any other inbound traffic so callers don't have to know the exact ordering
 /// of unrelated server-to-client messages.

@@ -1,6 +1,7 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use lsp_server::{
     Connection, ErrorCode, ExtractError, IoThreads, Message, Notification, Request, Response,
@@ -256,32 +257,41 @@ fn handle_notification(
                         DidChangeTextDocument::METHOD
                     )
                 })?;
-            if let Some(file) =
-                resolve_project_file(state.project().root(), &params.text_document.uri)
-            {
-                // With TextDocumentSyncKind::FULL each event has `range = None`
-                // and `text` = full document. We capability-advertise FULL, but
-                // tolerate non-conforming clients by taking the *last* event
-                // that looks full-document — anything else, drop the
-                // notification rather than apply a malformed partial edit.
-                if let Some(text) = params
-                    .content_changes
-                    .into_iter()
-                    .rev()
-                    .find(|change| change.range.is_none())
-                    .map(|change| change.text)
-                {
-                    state.overlay.set(file.abs_path(), text);
-                    state.completion_cache.invalidate(&file.abs_path());
-                    let mut changed = BTreeSet::new();
-                    changed.insert(file);
-                    state.workspace = state.workspace.update(&changed);
-                    publish_diagnostics(
-                        connection,
-                        &state.workspace,
-                        state.project(),
-                        &params.text_document.uri,
-                    )?;
+            // With TextDocumentSyncKind::FULL each event has `range = None`
+            // and `text` = full document. We capability-advertise FULL, but
+            // tolerate non-conforming clients by taking the *last* event
+            // that looks full-document — anything else, drop the
+            // notification rather than apply a malformed partial edit.
+            let uri = params.text_document.uri;
+            let n_changes = params.content_changes.len();
+            let full_text = params
+                .content_changes
+                .into_iter()
+                .rev()
+                .find(|change| change.range.is_none())
+                .map(|change| change.text);
+            if let Some(file) = resolve_project_file(state.project().root(), &uri) {
+                match full_text {
+                    Some(text) => {
+                        state.overlay.set(file.abs_path(), text);
+                        state.completion_cache.invalidate(&file.abs_path());
+                        let mut changed = BTreeSet::new();
+                        changed.insert(file);
+                        state.workspace = state.workspace.update(&changed);
+                        publish_diagnostics(connection, &state.workspace, state.project(), &uri)?;
+                    }
+                    None if n_changes > 0 => {
+                        // Non-conforming client: it sent events but none was
+                        // full-document. Drop the notification (we have no
+                        // way to apply incremental ranges) but warn so the
+                        // user can debug "edits aren't reflected" instead of
+                        // silently diverging from the buffer.
+                        state.maybe_log_malformed_didchange(&uri, n_changes);
+                    }
+                    None => {
+                        // Empty content_changes — spec-permitted no-op. Stay
+                        // silent.
+                    }
                 }
             }
             Ok(())
@@ -422,7 +432,22 @@ pub(crate) struct ServerState {
     /// definition, references) fire far less often, so they continue to
     /// re-read on every request without sharing this cache.
     completion_cache: completion::CompletionCache,
+    /// Last instant we logged a malformed `didChange` for a given URI. Used
+    /// to throttle the warning to one line per URI per
+    /// [`MALFORMED_DIDCHANGE_LOG_THROTTLE`] — a misbehaving client sending
+    /// incremental events per keystroke would otherwise flood stderr.
+    malformed_didchange_log: Mutex<HashMap<String, Instant>>,
 }
+
+/// Minimum interval between stderr lines reporting a malformed `didChange`
+/// for the same URI. Mirrors the cadence of `OVERLAY_REJECTION_LOG_THROTTLE`
+/// in the analyzer layer.
+const MALFORMED_DIDCHANGE_LOG_THROTTLE: Duration = Duration::from_secs(60);
+
+/// Soft cap on the malformed-didChange throttle map. Same rationale as
+/// `OVERLAY_REJECTION_LOG_MAX_ENTRIES`: a sloppy or hostile client could
+/// otherwise send a stream of distinct URIs and grow the map without bound.
+const MALFORMED_DIDCHANGE_LOG_MAX_ENTRIES: usize = 256;
 
 impl ServerState {
     fn new(root: PathBuf) -> Result<Self, String> {
@@ -442,11 +467,51 @@ impl ServerState {
             workspace,
             overlay,
             completion_cache: completion::CompletionCache::new(),
+            malformed_didchange_log: Mutex::new(HashMap::new()),
         })
     }
 
     pub(crate) fn project(&self) -> &dyn Project {
         self.overlay.as_ref()
+    }
+
+    /// Emit a single stderr warning for `uri` if we haven't logged one
+    /// within [`MALFORMED_DIDCHANGE_LOG_THROTTLE`]. The throttle map is
+    /// bounded; entries older than the throttle window are pruned when it
+    /// fills.
+    fn maybe_log_malformed_didchange(&self, uri: &Uri, n_changes: usize) {
+        let now = Instant::now();
+        let should_log = {
+            let mut log = self
+                .malformed_didchange_log
+                .lock()
+                .expect("malformed didChange log poisoned");
+            let key = uri.as_str();
+            let recent = log
+                .get(key)
+                .map(|last| now.duration_since(*last) < MALFORMED_DIDCHANGE_LOG_THROTTLE)
+                .unwrap_or(false);
+            if recent {
+                false
+            } else {
+                if log.len() >= MALFORMED_DIDCHANGE_LOG_MAX_ENTRIES {
+                    log.retain(|_, last| {
+                        now.duration_since(*last) < MALFORMED_DIDCHANGE_LOG_THROTTLE
+                    });
+                    if log.len() >= MALFORMED_DIDCHANGE_LOG_MAX_ENTRIES {
+                        log.clear();
+                    }
+                }
+                log.insert(key.to_string(), now);
+                true
+            }
+        };
+        if should_log {
+            eprintln!(
+                "[bifrost-lsp] dropping didChange for {}: {n_changes} content_change events but none was a full-document replacement (server advertises TextDocumentSyncKind::FULL)",
+                uri.as_str(),
+            );
+        }
     }
 }
 

@@ -10,6 +10,11 @@ pub fn server_capabilities() -> ServerCapabilities {
     // store in `OverlayProject` so request-time reads and the analyzer's
     // reparse both see the unsaved content. INCREMENTAL would require applying
     // range edits locally and is left as a follow-up.
+    //
+    // Non-conforming clients that ignore the advertised FULL kind and send
+    // INCREMENTAL events anyway are detected by `server.rs::handle_notification`
+    // (the `DidChangeTextDocument` arm) and warned about via a throttled
+    // stderr line — see `maybe_log_malformed_didchange` for the contract.
     let text_document_sync = TextDocumentSyncOptions {
         open_close: Some(true),
         change: Some(TextDocumentSyncKind::FULL),
