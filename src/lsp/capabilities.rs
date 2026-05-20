@@ -6,12 +6,13 @@ use lsp_types::{
 };
 
 pub fn server_capabilities() -> ServerCapabilities {
-    // Text sync: open/close + full-document save. Live didChange overlays are
-    // intentionally out of scope for v1 — the analyzer re-reads from disk via
-    // WorkspaceAnalyzer::update on save.
+    // Full-document sync: each `didChange` carries the entire buffer, which we
+    // store in `OverlayProject` so request-time reads and the analyzer's
+    // reparse both see the unsaved content. INCREMENTAL would require applying
+    // range edits locally and is left as a follow-up.
     let text_document_sync = TextDocumentSyncOptions {
         open_close: Some(true),
-        change: Some(TextDocumentSyncKind::NONE),
+        change: Some(TextDocumentSyncKind::FULL),
         will_save: None,
         will_save_wait_until: None,
         save: Some(TextDocumentSyncSaveOptions::Supported(true)),

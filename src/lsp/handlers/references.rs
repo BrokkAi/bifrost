@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use lsp_types::{Location, ReferenceParams, Uri};
 
-use crate::analyzer::{CodeUnit, IAnalyzer, Range as ByteRange, WorkspaceAnalyzer};
+use crate::analyzer::{CodeUnit, IAnalyzer, Project, Range as ByteRange, WorkspaceAnalyzer};
 use crate::lsp::conversion::{
     byte_range_to_lsp_range, path_to_uri_string, position_to_byte_offset,
 };
@@ -19,11 +19,11 @@ use crate::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, FuzzyResult, UsageFin
 ///    `params.context.include_declaration` is true.
 pub fn handle(
     workspace: &WorkspaceAnalyzer,
-    project_root: &Path,
+    project: &dyn Project,
     params: &ReferenceParams,
 ) -> Option<Vec<Location>> {
     let uri = &params.text_document_position.text_document.uri;
-    let (_, content, line_starts) = read_document_for_uri(project_root, uri)?;
+    let (_, content, line_starts) = read_document_for_uri(project, uri)?;
     let byte_offset = position_to_byte_offset(
         &content,
         &line_starts,

@@ -1,8 +1,6 @@
-use std::path::Path;
-
 use lsp_types::{DocumentHighlight, DocumentHighlightKind, DocumentHighlightParams};
 
-use crate::analyzer::{CodeUnit, IAnalyzer, Range as ByteRange, WorkspaceAnalyzer};
+use crate::analyzer::{CodeUnit, IAnalyzer, Project, Range as ByteRange, WorkspaceAnalyzer};
 use crate::lsp::conversion::{byte_range_to_lsp_range, position_to_byte_offset};
 use crate::lsp::handlers::util::{
     identifier_at_offset, identifier_selection_range, read_document_for_uri,
@@ -14,11 +12,11 @@ use crate::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, UsageFinder, UsageHit
 /// request on every cursor movement, so a project-wide scan is too expensive.
 pub fn handle(
     workspace: &WorkspaceAnalyzer,
-    project_root: &Path,
+    project: &dyn Project,
     params: &DocumentHighlightParams,
 ) -> Option<Vec<DocumentHighlight>> {
     let uri = &params.text_document_position_params.text_document.uri;
-    let (project_file, content, line_starts) = read_document_for_uri(project_root, uri)?;
+    let (project_file, content, line_starts) = read_document_for_uri(project, uri)?;
     let byte_offset = position_to_byte_offset(
         &content,
         &line_starts,

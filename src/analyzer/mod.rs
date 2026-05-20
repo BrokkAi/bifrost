@@ -44,7 +44,7 @@ pub use model::{
 };
 pub use multi_analyzer::{AnalyzerDelegate, MultiAnalyzer};
 pub use php_analyzer::PhpAnalyzer;
-pub use project::{FilesystemProject, Project, TestProject};
+pub use project::{FilesystemProject, OverlayProject, Project, TestProject};
 pub use python_analyzer::PythonAnalyzer;
 pub use rust_analyzer::RustAnalyzer;
 pub use scala_analyzer::ScalaAnalyzer;

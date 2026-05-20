@@ -499,7 +499,7 @@ impl IAnalyzer for JavascriptAnalyzer {
         if !self.contains_tests(file) || file_language(file) != Language::JavaScript {
             return Vec::new();
         }
-        let Ok(source) = file.read_to_string() else {
+        let Ok(source) = self.inner.project().read_source(file) else {
             return Vec::new();
         };
         detect_js_ts_test_assertion_smells(

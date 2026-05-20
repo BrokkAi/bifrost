@@ -1,9 +1,8 @@
 use std::collections::BTreeSet;
-use std::path::Path;
 
 use lsp_types::{FoldingRange, FoldingRangeParams};
 
-use crate::analyzer::{CodeUnit, IAnalyzer, WorkspaceAnalyzer};
+use crate::analyzer::{CodeUnit, IAnalyzer, Project, WorkspaceAnalyzer};
 use crate::lsp::conversion::byte_range_to_lsp_range;
 use crate::lsp::handlers::util::read_document_for_uri;
 
@@ -14,11 +13,11 @@ use crate::lsp::handlers::util::read_document_for_uri;
 /// "no result" instead of "empty result" when the URI is unknown).
 pub fn handle(
     workspace: &WorkspaceAnalyzer,
-    project_root: &Path,
+    project: &dyn Project,
     params: &FoldingRangeParams,
 ) -> Option<Vec<FoldingRange>> {
     let (project_file, content, line_starts) =
-        read_document_for_uri(project_root, &params.text_document.uri)?;
+        read_document_for_uri(project, &params.text_document.uri)?;
     let analyzer = workspace.analyzer();
 
     // Dedup by (start_line, end_line) since overloads or nested scans can

@@ -291,7 +291,7 @@ impl IAnalyzer for CSharpAnalyzer {
         if !self.contains_tests(file) || file_language(file) != Language::CSharp {
             return Vec::new();
         }
-        let Ok(source) = file.read_to_string() else {
+        let Ok(source) = self.inner.project().read_source(file) else {
             return Vec::new();
         };
         detect_csharp_test_assertion_smells(file, &source, &weights)

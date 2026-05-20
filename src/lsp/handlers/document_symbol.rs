@@ -1,8 +1,8 @@
-use std::path::Path;
-
 use lsp_types::{DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, SymbolKind};
 
-use crate::analyzer::{CodeUnit, CodeUnitType, IAnalyzer, Range as ByteRange, WorkspaceAnalyzer};
+use crate::analyzer::{
+    CodeUnit, CodeUnitType, IAnalyzer, Project, Range as ByteRange, WorkspaceAnalyzer,
+};
 use crate::lsp::conversion::byte_range_to_lsp_range;
 use crate::lsp::handlers::util::{find_word, identifier_selection_range, read_document_for_uri};
 use crate::text_utils::compute_line_starts;
@@ -12,11 +12,11 @@ use crate::text_utils::compute_line_starts;
 /// not analyzed by any of the workspace's per-language analyzers.
 pub fn handle(
     workspace: &WorkspaceAnalyzer,
-    project_root: &Path,
+    project: &dyn Project,
     params: &DocumentSymbolParams,
 ) -> Option<DocumentSymbolResponse> {
     let (project_file, content, line_starts) =
-        read_document_for_uri(project_root, &params.text_document.uri)?;
+        read_document_for_uri(project, &params.text_document.uri)?;
     let analyzer = workspace.analyzer();
 
     let symbols: Vec<DocumentSymbol> = analyzer

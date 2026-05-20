@@ -423,13 +423,16 @@ where
         parser
     }
 
-    fn analyze_file(parser: &mut Parser, adapter: &A, file: &ProjectFile) -> Option<FileState> {
-        let bytes = std::fs::read(file.abs_path()).ok()?;
-        if bytes.contains(&0) {
+    fn analyze_file(
+        parser: &mut Parser,
+        adapter: &A,
+        project: &dyn Project,
+        file: &ProjectFile,
+    ) -> Option<FileState> {
+        let source = project.read_source(file).ok()?;
+        if source.as_bytes().contains(&0) {
             return None;
         }
-
-        let source = String::from_utf8(bytes).ok()?;
         let tree = parser.parse(source.as_str(), None)?;
         let parsed = adapter.parse_file(file, &source, &tree);
         let contains_tests = adapter.contains_tests(file, &source, &tree, &parsed);
@@ -453,6 +456,7 @@ where
 
     fn analyze_files(
         adapter: &A,
+        project: &dyn Project,
         config: &AnalyzerConfig,
         files: Vec<ProjectFile>,
         progress: Option<BuildProgress>,
@@ -480,7 +484,7 @@ where
                 .map_init(
                     || Self::build_parser(language.clone()),
                     |parser, file| {
-                        let state = Self::analyze_file(parser, adapter, &file);
+                        let state = Self::analyze_file(parser, adapter, project, &file);
                         if let Some(progress) = progress.as_ref() {
                             let current = completed.fetch_add(1, Ordering::Relaxed) + 1;
                             progress(current, total, &file);
@@ -563,7 +567,7 @@ where
         let dirty_keys: HashSet<ProjectFile> = dirty_files.iter().cloned().collect();
         let storage_active = epoch_for_commit.is_some();
 
-        for (file, state) in Self::analyze_files(adapter, config, dirty_files, progress) {
+        for (file, state) in Self::analyze_files(adapter, project, config, dirty_files, progress) {
             if let Some(state) = state {
                 files.insert(file, state);
             } else {
@@ -579,8 +583,14 @@ where
         }
 
         if let (Some(storage), Some(epoch)) = (storage, epoch_for_commit) {
+            // Skip baseline writes for files whose parsed state was computed
+            // against an in-memory overlay — the on-disk mtime did not change,
+            // so a baseline row would mis-hydrate the next session.
             let writes = persistence::reconcile::encode_writes(
-                files.iter().filter(|(file, _)| dirty_keys.contains(file)),
+                files
+                    .iter()
+                    .filter(|(file, _)| dirty_keys.contains(file))
+                    .filter(|(file, _)| !project.has_overlay(file)),
                 |fq_name| adapter.normalize_full_name(fq_name),
             );
             // Persistence is best-effort; a write failure should not poison
@@ -942,9 +952,13 @@ where
 
         let dirty_keys: HashSet<ProjectFile> = to_reanalyze.iter().cloned().collect();
 
-        for (file, state) in
-            Self::analyze_files(self.adapter.as_ref(), &self.config, to_reanalyze, None)
-        {
+        for (file, state) in Self::analyze_files(
+            self.adapter.as_ref(),
+            self.project.as_ref(),
+            &self.config,
+            to_reanalyze,
+            None,
+        ) {
             if let Some(state) = state {
                 files.insert(file, state);
             } else {
@@ -956,8 +970,13 @@ where
         if let Some(storage) = self.storage.as_ref() {
             let ts_lang = self.adapter.parser_language();
             let epoch = persistence::epoch_for(self.adapter.language(), &ts_lang);
+            let project = self.project.as_ref();
+            // Skip baseline writes for overlaid files; see build_state.
             let writes = persistence::reconcile::encode_writes(
-                files.iter().filter(|(file, _)| dirty_keys.contains(file)),
+                files
+                    .iter()
+                    .filter(|(file, _)| dirty_keys.contains(file))
+                    .filter(|(file, _)| !project.has_overlay(file)),
                 |fq_name| self.adapter.normalize_full_name(fq_name),
             );
             let _ = persistence::reconcile::commit(
