@@ -66,6 +66,13 @@ pub(crate) struct FileState {
     pub(crate) children: HashMap<CodeUnit, Vec<CodeUnit>>,
     pub(crate) type_aliases: HashSet<CodeUnit>,
     pub(crate) contains_tests: bool,
+    /// Tree-sitter parse errors captured during `analyze_file`. The LSP
+    /// diagnostic handler reads this instead of re-parsing on every keystroke
+    /// — see issue #102. `None` when the `FileState` was hydrated from the
+    /// persisted baseline (which does not carry parse_errors); the diagnostic
+    /// handler falls back to a fresh parse in that case until the next
+    /// `update` re-populates the field.
+    pub(crate) parse_errors: Option<Vec<crate::analyzer::ParseError>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -436,6 +443,8 @@ where
         let tree = parser.parse(source.as_str(), None)?;
         let parsed = adapter.parse_file(file, &source, &tree);
         let contains_tests = adapter.contains_tests(file, &source, &tree, &parsed);
+        let mut parse_errors = Vec::new();
+        collect_parse_errors(tree.root_node(), &mut parse_errors);
 
         Some(FileState {
             source,
@@ -451,6 +460,7 @@ where
             children: parsed.children,
             type_aliases: parsed.type_aliases,
             contains_tests,
+            parse_errors: Some(parse_errors),
         })
     }
 
@@ -1081,6 +1091,11 @@ where
         }
     }
 
+    fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
+        self.file_state(file)
+            .and_then(|state| state.parse_errors.clone())
+    }
+
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {
         self.adapter.extract_call_receiver(reference)
     }
@@ -1430,4 +1445,35 @@ fn first_comment_offset(line: &str) -> Option<usize> {
         .into_iter()
         .filter_map(|marker| line.find(marker))
         .min()
+}
+
+/// Walk `node` and append every `ERROR` / `MISSING` span into `out`. Does NOT
+/// recurse into `ERROR` nodes: every descendant would also report as errored
+/// and the diagnostic list would explode. Used both by `analyze_file` (to
+/// populate the per-file cache) and by `lsp::handlers::diagnostic` (for the
+/// fallback path when the analyzer has no cached state), so the two paths
+/// share one source of truth for the walk semantics and the
+/// `end_byte.max(start_byte)` clamp.
+pub(crate) fn collect_parse_errors(node: Node, out: &mut Vec<crate::analyzer::ParseError>) {
+    if node.is_error() || node.is_missing() {
+        let range = Range {
+            start_byte: node.start_byte(),
+            end_byte: node.end_byte().max(node.start_byte()),
+            start_line: node.start_position().row,
+            end_line: node.end_position().row,
+        };
+        let kind = if node.is_missing() {
+            crate::analyzer::ParseErrorKind::Missing(node.kind().to_string())
+        } else {
+            crate::analyzer::ParseErrorKind::Error
+        };
+        out.push(crate::analyzer::ParseError { range, kind });
+        if node.is_error() {
+            return;
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_parse_errors(child, out);
+    }
 }

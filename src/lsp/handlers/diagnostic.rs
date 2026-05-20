@@ -3,24 +3,28 @@ use lsp_types::{
     DocumentDiagnosticReportResult, FullDocumentDiagnosticReport,
     RelatedFullDocumentDiagnosticReport, Uri,
 };
-use tree_sitter::{Language as TsLanguage, Node, Parser};
+use tree_sitter::{Language as TsLanguage, Parser};
 
-use crate::analyzer::{Language, Project};
+use crate::analyzer::tree_sitter_analyzer::collect_parse_errors;
+use crate::analyzer::{Language, ParseError, ParseErrorKind, Project, WorkspaceAnalyzer};
 use crate::lsp::conversion::byte_range_to_lsp_range;
 use crate::lsp::handlers::util::project_file_for_uri;
 use crate::text_utils::compute_line_starts;
 
 const DIAGNOSTIC_SOURCE: &str = "bifrost-tree-sitter";
 
-/// Pull-model diagnostic provider. Reparse the file with the appropriate
-/// tree-sitter grammar and surface every `ERROR` / `MISSING` node as an LSP
-/// Diagnostic. Returns an empty report for unsupported languages so editors
-/// don't see a stale "method not found" or stale diagnostics.
+/// Pull-model diagnostic provider. Surfaces tree-sitter `ERROR` / `MISSING`
+/// nodes as LSP Diagnostics. Tries the analyzer's cached parse-error list
+/// first (populated during `analyze_file`); falls back to a fresh parse only
+/// when the analyzer has no state for the file — e.g. when `FileState` was
+/// hydrated from the persisted baseline this session and not yet re-parsed,
+/// or when the file's language isn't loaded into the workspace.
 pub fn handle(
+    workspace: &WorkspaceAnalyzer,
     project: &dyn Project,
     params: &DocumentDiagnosticParams,
 ) -> DocumentDiagnosticReportResult {
-    let items = collect(project, &params.text_document.uri);
+    let items = collect(workspace, project, &params.text_document.uri);
     DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(
         RelatedFullDocumentDiagnosticReport {
             related_documents: None,
@@ -36,11 +40,15 @@ pub fn handle(
 /// `handle` and the push-model `publishDiagnostics` emitter so both paths
 /// surface the same parse errors. Returns an empty vec for unsupported
 /// languages, missing files, or URIs outside the project root.
-pub fn collect(project: &dyn Project, uri: &Uri) -> Vec<Diagnostic> {
-    build_report(project, uri).unwrap_or_default()
+pub fn collect(workspace: &WorkspaceAnalyzer, project: &dyn Project, uri: &Uri) -> Vec<Diagnostic> {
+    build_report(workspace, project, uri).unwrap_or_default()
 }
 
-fn build_report(project: &dyn Project, uri: &Uri) -> Option<Vec<Diagnostic>> {
+fn build_report(
+    workspace: &WorkspaceAnalyzer,
+    project: &dyn Project,
+    uri: &Uri,
+) -> Option<Vec<Diagnostic>> {
     let project_file = project_file_for_uri(project.root(), uri)?;
     let extension = project_file
         .rel_path()
@@ -49,52 +57,63 @@ fn build_report(project: &dyn Project, uri: &Uri) -> Option<Vec<Diagnostic>> {
     let language = Language::from_extension(extension);
     let ts_language = ts_language_for(language)?;
 
+    // The cached byte offsets and `content` come from independent reads, but
+    // they describe the same snapshot: `server.rs` always calls
+    // `workspace.update(&{file})` immediately before `publish_diagnostics`,
+    // and LSP request handling is single-threaded, so no concurrent edit can
+    // race between the two reads.
     let content = project.read_source(&project_file).ok()?;
-    let mut parser = Parser::new();
-    parser.set_language(&ts_language).ok()?;
-    let tree = parser.parse(&content, None)?;
-
     let line_starts = compute_line_starts(&content);
-    let mut diagnostics = Vec::new();
-    walk_for_errors(tree.root_node(), &content, &line_starts, &mut diagnostics);
-    Some(diagnostics)
+
+    let errors: Vec<ParseError> = match workspace.analyzer().parse_errors(&project_file) {
+        Some(cached) => cached,
+        None => {
+            // Analyzer has no cached errors for this file (hydrated baseline,
+            // or file outside the loaded language set). Parse fresh and walk
+            // for errors using the SAME helper the analyzer uses, so the two
+            // paths can't drift on recursion / clamp semantics.
+            let mut parser = Parser::new();
+            parser.set_language(&ts_language).ok()?;
+            let tree = parser.parse(&content, None)?;
+            let mut errors = Vec::new();
+            collect_parse_errors(tree.root_node(), &mut errors);
+            errors
+        }
+    };
+
+    Some(
+        errors
+            .into_iter()
+            .map(|err| parse_error_to_diagnostic(err, &content, &line_starts))
+            .collect(),
+    )
 }
 
-fn walk_for_errors(node: Node, content: &str, line_starts: &[usize], out: &mut Vec<Diagnostic>) {
-    if node.is_error() || node.is_missing() {
-        let byte_range = crate::analyzer::Range {
-            start_byte: node.start_byte(),
-            end_byte: node.end_byte().max(node.start_byte()),
-            start_line: node.start_position().row,
-            end_line: node.end_position().row,
-        };
-        let lsp_range = byte_range_to_lsp_range(content, line_starts, &byte_range);
-        let message = if node.is_missing() {
-            format!("missing {}", node.kind())
-        } else {
-            "syntax error".to_string()
-        };
-        out.push(Diagnostic {
-            range: lsp_range,
-            severity: Some(DiagnosticSeverity::ERROR),
-            code: None,
-            code_description: None,
-            source: Some(DIAGNOSTIC_SOURCE.to_string()),
-            message,
-            related_information: None,
-            tags: None,
-            data: None,
-        });
-        // Don't recurse into ERROR nodes — every descendant would also be
-        // marked as an error and explode the diagnostic list.
-        if node.is_error() {
-            return;
-        }
-    }
-
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        walk_for_errors(child, content, line_starts, out);
+/// Render a cached [`ParseError`] into the LSP `Diagnostic` shape. Both the
+/// cached path and the fallback path funnel through this function so the
+/// message text and severity stay in lockstep — see the contract on
+/// [`crate::analyzer::IAnalyzer::parse_errors`] for the `Some` / `None`
+/// semantics that decide which path is taken.
+fn parse_error_to_diagnostic(
+    error: ParseError,
+    content: &str,
+    line_starts: &[usize],
+) -> Diagnostic {
+    let lsp_range = byte_range_to_lsp_range(content, line_starts, &error.range);
+    let message = match &error.kind {
+        ParseErrorKind::Error => "syntax error".to_string(),
+        ParseErrorKind::Missing(kind) => format!("missing {kind}"),
+    };
+    Diagnostic {
+        range: lsp_range,
+        severity: Some(DiagnosticSeverity::ERROR),
+        code: None,
+        code_description: None,
+        source: Some(DIAGNOSTIC_SOURCE.to_string()),
+        message,
+        related_information: None,
+        tags: None,
+        data: None,
     }
 }
 

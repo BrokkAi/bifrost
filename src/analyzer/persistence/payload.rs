@@ -187,6 +187,10 @@ impl PersistedFileState {
             children,
             type_aliases,
             contains_tests: self.contains_tests,
+            // `parse_errors` is not part of the persisted payload — the
+            // diagnostic handler falls back to a fresh parse on first request
+            // for any hydrated file and re-populates on the next `update`.
+            parse_errors: None,
         }
     }
 }

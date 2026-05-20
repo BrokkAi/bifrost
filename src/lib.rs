@@ -25,10 +25,10 @@ pub use analyzer::{
     CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType, CppAnalyzer, DeclarationInfo,
     DeclarationKind, EmptyAnalyzer, FilesystemProject, GoAnalyzer, IAnalyzer,
     ImportAnalysisProvider, ImportInfo, JavaAnalyzer, JavascriptAnalyzer, Language, MultiAnalyzer,
-    OverlayProject, PhpAnalyzer, Project, ProjectFile, PythonAnalyzer, Range, RustAnalyzer,
-    ScalaAnalyzer, SourceContent, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
-    TestProject, TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider, TypescriptAnalyzer,
-    WorkspaceAnalyzer,
+    OverlayProject, ParseError, ParseErrorKind, PhpAnalyzer, Project, ProjectFile, PythonAnalyzer,
+    Range, RustAnalyzer, ScalaAnalyzer, SourceContent, TestAssertionSmell, TestAssertionWeights,
+    TestDetectionProvider, TestProject, TreeSitterAnalyzer, TypeAliasProvider,
+    TypeHierarchyProvider, TypescriptAnalyzer, WorkspaceAnalyzer,
 };
 pub use project_watcher::{ChangeDelta, ProjectChangeWatcher};
 pub use searchtools_service::{
