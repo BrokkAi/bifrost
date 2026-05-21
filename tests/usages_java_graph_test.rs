@@ -1,5 +1,6 @@
 mod common;
 
+use brokk_analyzer::usages::FuzzyResult;
 use brokk_analyzer::usages::{JavaUsageGraphStrategy, UsageAnalyzer, UsageFinder};
 use brokk_analyzer::{CodeUnit, IAnalyzer, JavaAnalyzer, Language};
 use common::InlineTestProject;
@@ -660,6 +661,77 @@ public class Consumer {
 }
 
 #[test]
+fn java_graph_strategy_keeps_overloaded_constructor_usage_narrow() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "com/example/Target.java",
+            r#"
+package com.example;
+
+public class Target {
+    public Target() {}
+    public Target(String arg) {}
+}
+"#,
+        ),
+        (
+            "com/example/Consumer.java",
+            r#"
+package com.example;
+
+public class Consumer {
+    Target buildEmpty() {
+        return new Target();
+    }
+
+    Target buildNamed() {
+        return new Target("x");
+    }
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let zero_arg_target = analyzer
+        .get_definitions("com.example.Target.Target")
+        .into_iter()
+        .find(|cu| cu.signature() == Some("()"))
+        .expect("missing zero-arg constructor");
+    let one_arg_target = analyzer
+        .get_definitions("com.example.Target.Target")
+        .into_iter()
+        .find(|cu| cu.signature() == Some("(String)"))
+        .expect("missing one-arg constructor");
+
+    let zero_hits = JavaUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&zero_arg_target),
+            &candidates,
+            1000,
+        )
+        .into_either()
+        .expect("zero-arg constructor success");
+    let one_hits = JavaUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&one_arg_target),
+            &candidates,
+            1000,
+        )
+        .into_either()
+        .expect("one-arg constructor success");
+
+    assert_eq!(
+        1,
+        zero_hits.len(),
+        "zero-arg constructor should stay narrow"
+    );
+    assert_eq!(1, one_hits.len(), "one-arg constructor should stay narrow");
+}
+
+#[test]
 fn java_graph_strategy_counts_same_package_implicit_type_and_method_references() {
     let (_project, analyzer) = java_analyzer_with_files(&[
         (
@@ -755,4 +827,50 @@ public class Consumer {
         hits.len(),
         "expected this.run() inside anon class and base.run()"
     );
+}
+
+#[test]
+fn java_graph_strategy_reports_too_many_callsites_for_high_fanout_symbol() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "com/example/Target.java",
+            "package com.example; public class Target { public void run() {} }\n",
+        ),
+        (
+            "com/example/Consumer.java",
+            r#"
+package com.example;
+
+public class Consumer {
+    void call(Target target) {
+        target.run();
+        target.run();
+        target.run();
+    }
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let method_target = definition(&analyzer, "com.example.Target.run");
+    let result = JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&method_target),
+        &candidates,
+        1,
+    );
+
+    match result {
+        FuzzyResult::TooManyCallsites {
+            short_name,
+            total_callsites,
+            limit,
+        } => {
+            assert_eq!("Target.run", short_name);
+            assert_eq!(1, limit);
+            assert!(total_callsites > limit);
+        }
+        other => panic!("expected TooManyCallsites, got {other:?}"),
+    }
 }

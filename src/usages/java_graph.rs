@@ -2,7 +2,7 @@ use crate::analyzer::{
     AnalyzerDelegate, CodeUnit, IAnalyzer, JavaAnalyzer, Language, MultiAnalyzer, ProjectFile,
     Range,
 };
-use crate::hash::HashSet;
+use crate::hash::{HashMap, HashSet};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use crate::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::usages::model::{FuzzyResult, UsageHit};
@@ -72,22 +72,20 @@ impl UsageAnalyzer for JavaUsageGraphStrategy {
         let mut hits = BTreeSet::new();
         let mut saw_unproven_match = false;
         let mut raw_match_count = 0usize;
+        let mut limit_exceeded = false;
+        let mut state = ScanState {
+            max_usages,
+            hits: &mut hits,
+            saw_unproven_match: &mut saw_unproven_match,
+            raw_match_count: &mut raw_match_count,
+            limit_exceeded: &mut limit_exceeded,
+        };
         for file in files {
-            scan_file(
-                java,
-                analyzer,
-                &file,
-                &spec,
-                &mut hits,
-                &mut saw_unproven_match,
-                &mut raw_match_count,
-            );
+            scan_file(java, analyzer, &file, &spec, &mut state);
+            if *state.limit_exceeded {
+                break;
+            }
         }
-
-        let hits: BTreeSet<_> = hits
-            .into_iter()
-            .filter(|hit| &hit.enclosing != target)
-            .collect();
 
         if hits.is_empty() && saw_unproven_match {
             return FuzzyResult::Failure {
@@ -104,7 +102,7 @@ impl UsageAnalyzer for JavaUsageGraphStrategy {
             return FuzzyResult::success(target.clone(), BTreeSet::new());
         }
 
-        if hits.len() > max_usages {
+        if limit_exceeded || hits.len() > max_usages {
             return FuzzyResult::TooManyCallsites {
                 short_name: target.short_name().to_string(),
                 total_callsites: hits.len(),
@@ -125,6 +123,7 @@ enum TargetKind {
 }
 
 struct TargetSpec {
+    target: CodeUnit,
     kind: TargetKind,
     owner: CodeUnit,
     accepted_owner_fq_names: HashSet<String>,
@@ -137,6 +136,7 @@ impl TargetSpec {
         if target.is_class() {
             let fq_name = target.fq_name();
             return Some(Self {
+                target: target.clone(),
                 kind: TargetKind::Type,
                 owner: target.clone(),
                 accepted_owner_fq_names: [fq_name].into_iter().collect(),
@@ -155,6 +155,7 @@ impl TargetSpec {
         };
 
         Some(Self {
+            target: target.clone(),
             kind,
             accepted_owner_fq_names: [owner.fq_name()].into_iter().collect(),
             member_name: target.identifier().to_string(),
@@ -207,10 +208,11 @@ fn scan_file(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     spec: &TargetSpec,
-    hits: &mut BTreeSet<UsageHit>,
-    saw_unproven_match: &mut bool,
-    raw_match_count: &mut usize,
+    state: &mut ScanState<'_>,
 ) {
+    if *state.limit_exceeded {
+        return;
+    }
     let Ok(source) = file.read_to_string() else {
         return;
     };
@@ -241,9 +243,12 @@ fn scan_file(
         line_starts: &line_starts,
         spec,
         bindings: &mut bindings,
-        hits,
-        saw_unproven_match,
-        raw_match_count,
+        hits: state.hits,
+        saw_unproven_match: state.saw_unproven_match,
+        raw_match_count: state.raw_match_count,
+        max_usages: state.max_usages,
+        limit_exceeded: state.limit_exceeded,
+        enclosing_cache: HashMap::default(),
     };
     scan_node(tree.root_node(), &mut ctx);
 }
@@ -263,6 +268,14 @@ fn seed_class_binding(
     }
 }
 
+struct ScanState<'a> {
+    max_usages: usize,
+    hits: &'a mut BTreeSet<UsageHit>,
+    saw_unproven_match: &'a mut bool,
+    raw_match_count: &'a mut usize,
+    limit_exceeded: &'a mut bool,
+}
+
 struct ScanCtx<'a> {
     java: &'a JavaAnalyzer,
     analyzer: &'a dyn IAnalyzer,
@@ -274,9 +287,21 @@ struct ScanCtx<'a> {
     hits: &'a mut BTreeSet<UsageHit>,
     saw_unproven_match: &'a mut bool,
     raw_match_count: &'a mut usize,
+    max_usages: usize,
+    limit_exceeded: &'a mut bool,
+    enclosing_cache: HashMap<(usize, usize), EnclosingContext>,
+}
+
+#[derive(Clone, Default)]
+struct EnclosingContext {
+    enclosing: Option<CodeUnit>,
+    owner: Option<CodeUnit>,
 }
 
 fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if *ctx.limit_exceeded {
+        return;
+    }
     let enters_scope = matches!(
         node.kind(),
         "method_declaration"
@@ -300,6 +325,9 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         scan_node(child, ctx);
+        if *ctx.limit_exceeded {
+            break;
+        }
     }
 
     if enters_scope {
@@ -444,6 +472,11 @@ fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if resolved != ctx.spec.owner {
         return;
     }
+    if let Some(expected_arity) = ctx.spec.method_arity
+        && argument_list_arity(node) != expected_arity
+    {
+        return;
+    }
     push_hit(node, ctx);
 }
 
@@ -546,40 +579,24 @@ fn is_static_import_of_target_method(ctx: &ScanCtx<'_>) -> bool {
         })
 }
 
-fn same_owner_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
-    let range = Range {
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_line: find_line_index_for_offset(ctx.line_starts, node.start_byte()),
-        end_line: find_line_index_for_offset(ctx.line_starts, node.end_byte()),
-    };
-    let Some(enclosing) = ctx.analyzer.enclosing_code_unit(ctx.file, &range) else {
-        return false;
-    };
-    ctx.analyzer
-        .parent_of(&enclosing)
-        .is_some_and(|owner| owner == ctx.spec.owner)
+fn same_owner_context(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> bool {
+    enclosing_context(node, ctx)
+        .owner
+        .as_ref()
+        .is_some_and(|owner| owner == &ctx.spec.owner)
 }
 
-fn owner_matches_target_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
-    let range = Range {
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_line: find_line_index_for_offset(ctx.line_starts, node.start_byte()),
-        end_line: find_line_index_for_offset(ctx.line_starts, node.end_byte()),
-    };
-    let Some(enclosing) = ctx.analyzer.enclosing_code_unit(ctx.file, &range) else {
+fn owner_matches_target_context(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> bool {
+    let context = enclosing_context(node, ctx);
+    let Some(owner) = context.owner.as_ref() else {
         return false;
     };
-    let Some(owner) = ctx.analyzer.parent_of(&enclosing) else {
-        return false;
-    };
-    if owner == ctx.spec.owner {
+    if owner == &ctx.spec.owner {
         return true;
     }
     ctx.analyzer
         .type_hierarchy_provider()
-        .is_some_and(|provider| provider.get_ancestors(&owner).contains(&ctx.spec.owner))
+        .is_some_and(|provider| provider.get_ancestors(owner).contains(&ctx.spec.owner))
 }
 
 fn anonymous_creation_context_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
@@ -598,6 +615,10 @@ fn anonymous_creation_context_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) 
 }
 
 fn invocation_arity(node: Node<'_>) -> usize {
+    argument_list_arity(node)
+}
+
+fn argument_list_arity(node: Node<'_>) -> usize {
     let Some(arguments) = node.child_by_field_name("arguments") else {
         return 0;
     };
@@ -656,18 +677,18 @@ fn is_declaration_name(node: Node<'_>) -> bool {
 
 fn push_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     *ctx.raw_match_count += 1;
+    if *ctx.limit_exceeded {
+        return;
+    }
     let start = node.start_byte();
-    let end = node.end_byte();
     let line_idx = find_line_index_for_offset(ctx.line_starts, start);
-    let range = Range {
-        start_byte: start,
-        end_byte: end,
-        start_line: line_idx,
-        end_line: find_line_index_for_offset(ctx.line_starts, end),
-    };
-    let Some(enclosing) = ctx.analyzer.enclosing_code_unit(ctx.file, &range) else {
+    let Some(enclosing) = enclosing_context(node, ctx).enclosing.clone() else {
         return;
     };
+    if enclosing == ctx.spec.target {
+        return;
+    }
+    let end = node.end_byte();
     ctx.hits.insert(UsageHit::new(
         ctx.file.clone(),
         line_idx + 1,
@@ -677,6 +698,30 @@ fn push_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         GRAPH_HIT_CONFIDENCE,
         build_snippet(ctx.source, ctx.line_starts, line_idx),
     ));
+    if ctx.hits.len() > ctx.max_usages {
+        *ctx.limit_exceeded = true;
+    }
+}
+
+fn enclosing_context(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> EnclosingContext {
+    let key = (node.start_byte(), node.end_byte());
+    if let Some(cached) = ctx.enclosing_cache.get(&key) {
+        return cached.clone();
+    }
+
+    let range = Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: find_line_index_for_offset(ctx.line_starts, node.start_byte()),
+        end_line: find_line_index_for_offset(ctx.line_starts, node.end_byte()),
+    };
+    let enclosing = ctx.analyzer.enclosing_code_unit(ctx.file, &range);
+    let owner = enclosing
+        .as_ref()
+        .and_then(|enclosing| ctx.analyzer.parent_of(enclosing));
+    let resolved = EnclosingContext { enclosing, owner };
+    ctx.enclosing_cache.insert(key, resolved.clone());
+    resolved
 }
 
 fn build_snippet(source: &str, line_starts: &[usize], line_idx: usize) -> String {
