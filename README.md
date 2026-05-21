@@ -118,14 +118,20 @@ The Python distribution is `bifrost-searchtools`. Import it as `bifrost_searchto
 Example:
 
 ```bash
-maturin develop
-python - <<'PY'
+uv run --python 3.12 --with maturin maturin develop
+uv run --python 3.12 python - <<'PY'
 from bifrost_searchtools import SearchToolsClient
 
 with SearchToolsClient("tests/fixtures/testcode-java") as client:
     print(client.get_summaries(["A.java"]).render_text())
     print(client.most_relevant_files(["A.java"]).render_text())
 PY
+```
+
+Run the Python test suite with:
+
+```bash
+scripts/test_python.sh
 ```
 
 Pass `render_line_numbers=False` to `SearchToolsClient(...)` to omit line numbers from rendered text while keeping the structured line metadata in the result objects.

@@ -107,7 +107,7 @@ impl ToolOutput {
                 structured,
                 rendered_text,
             })
-            .unwrap_or_else(|_| Value::Null),
+            .unwrap_or(Value::Null),
         }
     }
 }

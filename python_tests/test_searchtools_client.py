@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -11,36 +12,27 @@ sys.path.insert(0, str(ROOT))
 
 from bifrost_searchtools import SearchToolsClient, SearchToolsError, SymbolKindFilter
 
-
-def native_library_path() -> Path:
-    if sys.platform == "darwin":
-        name = "libbrokk_analyzer.dylib"
-    elif sys.platform == "win32":
-        name = "brokk_analyzer.dll"
-    else:
-        name = "libbrokk_analyzer.so"
-    return ROOT / "target" / "debug" / name
-
-
 class SearchToolsClientTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
+        maturin = shutil.which("maturin")
+        if maturin is None:
+            raise RuntimeError(
+                "maturin is required for python_tests. Run scripts/test_python.sh "
+                "or `uv run --python 3.12 --with maturin python -m unittest ...`."
+            )
         subprocess.run(
-            ["cargo", "build", "--lib", "--features", "python"], cwd=ROOT, check=True
+            [maturin, "develop"], cwd=ROOT, check=True
         )
-        cls.library_path = native_library_path()
         cls.fixture_root = ROOT / "tests" / "fixtures" / "testcode-java"
 
     def test_file_summary_uses_fixture_line_ranges(self) -> None:
-        with SearchToolsClient(
-            root=self.fixture_root, library_path=self.library_path
-        ) as client:
+        with SearchToolsClient(root=self.fixture_root) as client:
             summaries = client.get_summaries(["A.java"])
             text = summaries.render_text()
 
         with SearchToolsClient(
             root=self.fixture_root,
-            library_path=self.library_path,
             render_line_numbers=False,
         ) as client:
             summaries_without_lines = client.get_summaries(["A.java"])
@@ -61,9 +53,7 @@ class SearchToolsClientTest(unittest.TestCase):
         self.assertNotIn("41..43:", text_without_lines)
 
     def test_symbol_sources_use_original_file_line_numbers(self) -> None:
-        with SearchToolsClient(
-            root=self.fixture_root, library_path=self.library_path
-        ) as client:
+        with SearchToolsClient(root=self.fixture_root) as client:
             sources = client.get_symbol_sources(
                 ["A.method2"], kind_filter=SymbolKindFilter.FUNCTION
             )
@@ -71,7 +61,6 @@ class SearchToolsClientTest(unittest.TestCase):
 
         with SearchToolsClient(
             root=self.fixture_root,
-            library_path=self.library_path,
             render_line_numbers=False,
         ) as client:
             sources_without_lines = client.get_symbol_sources(
@@ -91,9 +80,7 @@ class SearchToolsClientTest(unittest.TestCase):
         self.assertNotIn("12: ", text_without_lines)
 
     def test_list_symbols_matches_recursive_brokk_style_output(self) -> None:
-        with SearchToolsClient(
-            root=self.fixture_root, library_path=self.library_path
-        ) as client:
+        with SearchToolsClient(root=self.fixture_root) as client:
             summaries = client.list_symbols(["A.java"])
             text = summaries.render_text()
 
@@ -103,9 +90,7 @@ class SearchToolsClientTest(unittest.TestCase):
         self.assertIn("      - method7", text)
 
     def test_native_errors_are_raised_as_searchtools_error(self) -> None:
-        with SearchToolsClient(
-            root=self.fixture_root, library_path=self.library_path
-        ) as client:
+        with SearchToolsClient(root=self.fixture_root) as client:
             with self.assertRaisesRegex(SearchToolsError, "Unknown tool: nope"):
                 client._call_tool("nope", {})
 
@@ -131,9 +116,7 @@ class SearchToolsClientTest(unittest.TestCase):
                 check=True,
             )
 
-            with SearchToolsClient(
-                root=root, library_path=self.library_path
-            ) as client:
+            with SearchToolsClient(root=root) as client:
                 result = client.most_relevant_files(["A.java"], limit=5)
                 text = result.render_text()
 

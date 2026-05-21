@@ -29,8 +29,10 @@ cargo clippy --all-targets --all-features -- -D warnings
 Python:
 
 ```bash
-uv run python -m unittest discover -s python_tests -p 'test_*.py'
+scripts/test_python.sh
 ```
+
+That wrapper provisions a uv-managed Python 3.12 environment, makes `maturin` available, installs the editable native extension, and then runs the unittest suite.
 
 ## Python Development
 
