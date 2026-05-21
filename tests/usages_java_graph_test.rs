@@ -274,6 +274,68 @@ public class Derived extends Base {
 }
 
 #[test]
+fn java_graph_strategy_handles_interface_references_and_receivers() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "com/example/Service.java",
+            "package com.example; public interface Service { void run(); }\n",
+        ),
+        (
+            "com/example/ServiceImpl.java",
+            r#"
+package com.example;
+
+public class ServiceImpl implements Service {
+    @Override
+    public void run() {}
+}
+"#,
+        ),
+        (
+            "com/example/Consumer.java",
+            r#"
+package com.example;
+
+public class Consumer {
+    void call(Service service) {
+        service.run();
+    }
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let interface_target = definition(&analyzer, "com.example.Service");
+    let method_target = definition(&analyzer, "com.example.Service.run");
+
+    let interface_hits = JavaUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&interface_target),
+            &candidates,
+            1000,
+        )
+        .into_either()
+        .expect("interface type success");
+    assert!(
+        interface_hits.len() >= 2,
+        "expected implements and parameter type references"
+    );
+
+    let method_hits = JavaUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&method_target),
+            &candidates,
+            1000,
+        )
+        .into_either()
+        .expect("interface receiver success");
+    assert_eq!(1, method_hits.len());
+}
+
+#[test]
 fn java_graph_strategy_respects_candidate_files() {
     let (project, analyzer) = java_analyzer_with_files(&[
         (
@@ -351,6 +413,84 @@ public class Consumer {
     assert!(
         result.into_either().is_err(),
         "unproven shadowed call should fall back"
+    );
+}
+
+#[test]
+fn java_graph_strategy_counts_enum_type_references() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "com/example/Mode.java",
+            "package com.example; public enum Mode { ON, OFF }\n",
+        ),
+        (
+            "com/example/Consumer.java",
+            r#"
+package com.example;
+
+public class Consumer {
+    private Mode mode = Mode.ON;
+
+    Mode current() {
+        return mode;
+    }
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let enum_target = definition(&analyzer, "com.example.Mode");
+    let hits = JavaUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&enum_target),
+            &candidates,
+            1000,
+        )
+        .into_either()
+        .expect("enum type success");
+    assert!(
+        hits.len() >= 2,
+        "expected enum declaration-site type references in field and return"
+    );
+}
+
+#[test]
+fn java_graph_strategy_counts_record_type_references() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "com/example/Payload.java",
+            "package com.example; public record Payload(int value) {}\n",
+        ),
+        (
+            "com/example/Consumer.java",
+            r#"
+package com.example;
+
+public class Consumer {
+    Payload build() {
+        return new Payload(1);
+    }
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let record_target = definition(&analyzer, "com.example.Payload");
+    let hits = JavaUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&record_target),
+            &candidates,
+            1000,
+        )
+        .into_either()
+        .expect("record type success");
+    assert!(
+        !hits.is_empty(),
+        "expected record return or constructor type reference"
     );
 }
 
@@ -521,6 +661,88 @@ public class Target {
 }
 
 #[test]
+fn java_graph_strategy_counts_static_field_usages() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "com/example/Target.java",
+            "package com.example; public class Target { public static final int VALUE = 1; }\n",
+        ),
+        (
+            "com/example/Consumer.java",
+            r#"
+package com.example;
+
+import static com.example.Target.VALUE;
+
+public class Consumer {
+    int readQualified() {
+        return Target.VALUE;
+    }
+
+    int readImported() {
+        return VALUE;
+    }
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let field_target = definition(&analyzer, "com.example.Target.VALUE");
+    let hits = JavaUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&field_target),
+            &candidates,
+            1000,
+        )
+        .into_either()
+        .expect("static field success");
+    assert_eq!(
+        2,
+        hits.len(),
+        "expected qualified and imported static field reads"
+    );
+}
+
+#[test]
+fn java_graph_strategy_counts_static_wildcard_imported_field_usage() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "com/example/Target.java",
+            "package com.example; public class Target { public static final int VALUE = 1; }\n",
+        ),
+        (
+            "com/example/Consumer.java",
+            r#"
+package com.example;
+
+import static com.example.Target.*;
+
+public class Consumer {
+    int readImported() {
+        return VALUE;
+    }
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let field_target = definition(&analyzer, "com.example.Target.VALUE");
+    let hits = JavaUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&field_target),
+            &candidates,
+            1000,
+        )
+        .into_either()
+        .expect("static wildcard field success");
+    assert_eq!(1, hits.len());
+}
+
+#[test]
 fn java_graph_strategy_counts_static_imported_method_usage() {
     let (_project, analyzer) = java_analyzer_with_files(&[
         (
@@ -555,6 +777,48 @@ public class Consumer {
         .into_either()
         .expect("static import success");
     assert_eq!(1, hits.len());
+}
+
+#[test]
+fn java_graph_strategy_falls_back_on_ambiguous_static_imported_method_usage() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "com/example/Alpha.java",
+            "package com.example; public class Alpha { public static void run() {} }\n",
+        ),
+        (
+            "com/example/Beta.java",
+            "package com.example; public class Beta { public static void run() {} }\n",
+        ),
+        (
+            "com/example/Consumer.java",
+            r#"
+package com.example;
+
+import static com.example.Alpha.run;
+import static com.example.Beta.run;
+
+public class Consumer {
+    void call() {
+        run();
+    }
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let method_target = definition(&analyzer, "com.example.Alpha.run");
+    let result = JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&method_target),
+        &candidates,
+        1000,
+    );
+    assert!(
+        result.into_either().is_err(),
+        "ambiguous static import should fall back instead of proving a hit"
+    );
 }
 
 #[test]

@@ -499,7 +499,7 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let receiver_matches = if let Some(object) = node.child_by_field_name("object") {
         receiver_matches_target(object, ctx)
     } else {
-        same_owner_context(node, ctx) || is_static_import_of_target_method(ctx)
+        same_owner_context(node, ctx) || has_proven_static_import(ctx)
     };
 
     if receiver_matches {
@@ -530,7 +530,9 @@ fn maybe_record_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if node.kind() != "identifier" || node_text(node, ctx.source) != ctx.spec.member_name {
         return;
     }
-    if same_owner_context(node, ctx) && !is_declaration_name(node) {
+    if !is_declaration_name(node)
+        && (same_owner_context(node, ctx) || has_proven_static_import(ctx))
+    {
         push_hit(node, ctx);
     }
 }
@@ -559,24 +561,44 @@ fn receiver_matches_target(receiver: Node<'_>, ctx: &mut ScanCtx<'_>) -> bool {
     }
 }
 
-fn is_static_import_of_target_method(ctx: &ScanCtx<'_>) -> bool {
+fn has_proven_static_import(ctx: &ScanCtx<'_>) -> bool {
     let target_fq_name = ctx.spec.owner.fq_name();
-    ctx.analyzer
-        .import_statements(ctx.file)
-        .iter()
-        .any(|import| {
-            let trimmed = import.trim();
-            if !trimmed.starts_with("import static ") {
+    let mut target_visible = false;
+
+    for import in ctx.analyzer.import_statements(ctx.file) {
+        let trimmed = import.trim();
+        if !trimmed.starts_with("import static ") {
+            continue;
+        }
+        let path = trimmed
+            .strip_prefix("import static ")
+            .unwrap_or(trimmed)
+            .trim_end_matches(';')
+            .trim();
+
+        if let Some(owner) = path.strip_suffix(".*") {
+            if owner == target_fq_name {
+                target_visible = true;
+            } else {
                 return false;
             }
-            let path = trimmed
-                .strip_prefix("import static ")
-                .unwrap_or(trimmed)
-                .trim_end_matches(';')
-                .trim();
-            path == format!("{}.{}", target_fq_name, ctx.spec.member_name)
-                || path == format!("{target_fq_name}.*")
-        })
+            continue;
+        }
+
+        let Some((owner, member)) = path.rsplit_once('.') else {
+            continue;
+        };
+        if member != ctx.spec.member_name {
+            continue;
+        }
+        if owner == target_fq_name {
+            target_visible = true;
+        } else {
+            return false;
+        }
+    }
+
+    target_visible
 }
 
 fn same_owner_context(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> bool {
