@@ -1,6 +1,4 @@
-use brokk_bifrost::{
-    DeclarationKind, IAnalyzer, JavaAnalyzer, Language, ProjectFile, TestProject,
-};
+use brokk_bifrost::{DeclarationKind, IAnalyzer, JavaAnalyzer, Language, ProjectFile, TestProject};
 use std::collections::BTreeSet;
 
 fn analyzer_for(

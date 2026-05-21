@@ -1,6 +1,4 @@
-use brokk_bifrost::{
-    ImportAnalysisProvider, ImportInfo, ProjectFile, PythonAnalyzer, TestProject,
-};
+use brokk_bifrost::{ImportAnalysisProvider, ImportInfo, ProjectFile, PythonAnalyzer, TestProject};
 
 fn analyzer_for_temp_root(root: &std::path::Path) -> PythonAnalyzer {
     PythonAnalyzer::from_project(TestProject::new(root, brokk_bifrost::Language::Python))
