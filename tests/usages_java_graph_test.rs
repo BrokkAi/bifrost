@@ -352,3 +352,407 @@ public class Consumer {
         "unproven shadowed call should fall back"
     );
 }
+
+#[test]
+fn java_graph_strategy_counts_generic_type_arguments_as_type_usages() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "com/example/Target.java",
+            "package com.example; public class Target {}\n",
+        ),
+        (
+            "com/example/Consumer.java",
+            r#"
+package com.example;
+
+import java.util.List;
+
+public class Consumer {
+    private List<Target> targets;
+
+    List<Target> get() {
+        return targets;
+    }
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let class_target = definition(&analyzer, "com.example.Target");
+    let hits = JavaUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&class_target),
+            &candidates,
+            1000,
+        )
+        .into_either()
+        .expect("generic type argument success");
+    assert!(
+        hits.len() >= 2,
+        "expected field and return generic type references"
+    );
+}
+
+#[test]
+fn java_graph_strategy_counts_lambda_body_method_usage() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "com/example/Target.java",
+            "package com.example; public class Target { public void run() {} }\n",
+        ),
+        (
+            "com/example/Consumer.java",
+            r#"
+package com.example;
+
+public class Consumer {
+    Runnable build(Target target) {
+        return () -> target.run();
+    }
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let method_target = definition(&analyzer, "com.example.Target.run");
+    let hits = JavaUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&method_target),
+            &candidates,
+            1000,
+        )
+        .into_either()
+        .expect("lambda body success");
+    assert_eq!(1, hits.len());
+}
+
+#[test]
+fn java_graph_strategy_counts_anonymous_class_and_super_method_usages() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "com/example/Base.java",
+            "package com.example; public class Base { public void run() {} }\n",
+        ),
+        (
+            "com/example/Consumer.java",
+            r#"
+package com.example;
+
+public class Consumer {
+    void execute() {
+        Base base = new Base() {
+            @Override
+            public void run() {
+                super.run();
+            }
+        };
+        base.run();
+    }
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let method_target = definition(&analyzer, "com.example.Base.run");
+    let hits = JavaUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&method_target),
+            &candidates,
+            1000,
+        )
+        .into_either()
+        .expect("anonymous class success");
+    assert_eq!(2, hits.len(), "expected super.run() and base.run()");
+}
+
+#[test]
+fn java_graph_strategy_counts_this_field_and_method_usages() {
+    let (_project, analyzer) = java_analyzer_with_files(&[(
+        "com/example/Target.java",
+        r#"
+package com.example;
+
+public class Target {
+    public int field;
+
+    public void run() {
+        this.field = 1;
+        this.run();
+    }
+}
+"#,
+    )]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let field_target = definition(&analyzer, "com.example.Target.field");
+    let method_target = definition(&analyzer, "com.example.Target.run");
+
+    let field_hits = JavaUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&field_target),
+            &candidates,
+            1000,
+        )
+        .into_either()
+        .expect("this field success");
+    assert_eq!(1, field_hits.len());
+
+    let method_hits = JavaUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&method_target),
+            &candidates,
+            1000,
+        )
+        .into_either()
+        .expect("this method success");
+    assert!(
+        method_hits.is_empty(),
+        "self-recursive this.run should still be filtered"
+    );
+}
+
+#[test]
+fn java_graph_strategy_counts_static_imported_method_usage() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "com/example/Target.java",
+            "package com.example; public class Target { public static void run() {} }\n",
+        ),
+        (
+            "com/example/Consumer.java",
+            r#"
+package com.example;
+
+import static com.example.Target.run;
+
+public class Consumer {
+    void call() {
+        run();
+    }
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let method_target = definition(&analyzer, "com.example.Target.run");
+    let hits = JavaUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&method_target),
+            &candidates,
+            1000,
+        )
+        .into_either()
+        .expect("static import success");
+    assert_eq!(1, hits.len());
+}
+
+#[test]
+fn java_graph_strategy_counts_static_wildcard_imported_method_usage() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "com/example/Target.java",
+            "package com.example; public class Target { public static void run() {} }\n",
+        ),
+        (
+            "com/example/Consumer.java",
+            r#"
+package com.example;
+
+import static com.example.Target.*;
+
+public class Consumer {
+    void call() {
+        run();
+    }
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let method_target = definition(&analyzer, "com.example.Target.run");
+    let hits = JavaUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&method_target),
+            &candidates,
+            1000,
+        )
+        .into_either()
+        .expect("static wildcard import success");
+    assert_eq!(1, hits.len());
+}
+
+#[test]
+fn java_graph_strategy_keeps_overloaded_static_import_method_usage_narrow() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "com/example/Target.java",
+            r#"
+package com.example;
+
+public class Target {
+    public static void run() {}
+    public static void run(String arg) {}
+}
+"#,
+        ),
+        (
+            "com/example/Consumer.java",
+            r#"
+package com.example;
+
+import static com.example.Target.run;
+
+public class Consumer {
+    void call() {
+        run();
+        run("x");
+    }
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let zero_arg_target = analyzer
+        .get_definitions("com.example.Target.run")
+        .into_iter()
+        .find(|cu| cu.signature() == Some("()"))
+        .expect("missing zero-arg overload");
+    let one_arg_target = analyzer
+        .get_definitions("com.example.Target.run")
+        .into_iter()
+        .find(|cu| cu.signature() == Some("(String)"))
+        .expect("missing one-arg overload");
+
+    let zero_hits = JavaUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&zero_arg_target),
+            &candidates,
+            1000,
+        )
+        .into_either()
+        .expect("zero-arg overload success");
+    let one_hits = JavaUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&one_arg_target),
+            &candidates,
+            1000,
+        )
+        .into_either()
+        .expect("one-arg overload success");
+
+    assert_eq!(1, zero_hits.len(), "zero-arg overload should stay narrow");
+    assert_eq!(1, one_hits.len(), "one-arg overload should stay narrow");
+}
+
+#[test]
+fn java_graph_strategy_counts_same_package_implicit_type_and_method_references() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "com/example/Target.java",
+            "package com.example; public class Target { public void run() {} }\n",
+        ),
+        (
+            "com/example/Consumer.java",
+            r#"
+package com.example;
+
+public class Consumer {
+    private Target target;
+
+    void call(Target value) {
+        target = new Target();
+        value.run();
+    }
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let class_target = definition(&analyzer, "com.example.Target");
+    let method_target = definition(&analyzer, "com.example.Target.run");
+
+    let class_hits = JavaUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&class_target),
+            &candidates,
+            1000,
+        )
+        .into_either()
+        .expect("same-package type success");
+    assert!(
+        class_hits.len() >= 3,
+        "expected declaration, param, and constructor type references"
+    );
+
+    let method_hits = JavaUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&method_target),
+            &candidates,
+            1000,
+        )
+        .into_either()
+        .expect("same-package method success");
+    assert_eq!(1, method_hits.len());
+}
+
+#[test]
+fn java_graph_strategy_counts_anonymous_class_typed_receiver_usage() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "com/example/Base.java",
+            "package com.example; public class Base { public void run() {} }\n",
+        ),
+        (
+            "com/example/Consumer.java",
+            r#"
+package com.example;
+
+public class Consumer {
+    void execute() {
+        Base base = new Base() {
+            void helper() {
+                this.run();
+            }
+        };
+        base.run();
+    }
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let method_target = definition(&analyzer, "com.example.Base.run");
+    let hits = JavaUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&method_target),
+            &candidates,
+            1000,
+        )
+        .into_either()
+        .expect("anonymous typed receiver success");
+    assert_eq!(
+        2,
+        hits.len(),
+        "expected this.run() inside anon class and base.run()"
+    );
+}

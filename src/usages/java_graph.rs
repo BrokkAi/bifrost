@@ -129,6 +129,7 @@ struct TargetSpec {
     owner: CodeUnit,
     accepted_owner_fq_names: HashSet<String>,
     member_name: String,
+    method_arity: Option<usize>,
 }
 
 impl TargetSpec {
@@ -140,6 +141,7 @@ impl TargetSpec {
                 owner: target.clone(),
                 accepted_owner_fq_names: [fq_name].into_iter().collect(),
                 member_name: target.identifier().to_string(),
+                method_arity: None,
             });
         }
 
@@ -156,9 +158,26 @@ impl TargetSpec {
             kind,
             accepted_owner_fq_names: [owner.fq_name()].into_iter().collect(),
             member_name: target.identifier().to_string(),
+            method_arity: (kind == TargetKind::Method || kind == TargetKind::Constructor)
+                .then(|| signature_arity(target.signature())),
             owner,
         })
     }
+}
+
+fn signature_arity(signature: Option<&str>) -> usize {
+    let Some(signature) = signature else {
+        return 0;
+    };
+    let inner = signature
+        .strip_prefix('(')
+        .and_then(|rest| rest.strip_suffix(')'))
+        .unwrap_or(signature)
+        .trim();
+    if inner.is_empty() {
+        return 0;
+    }
+    inner.split(',').count()
 }
 
 fn resolve_java_analyzer(analyzer: &dyn IAnalyzer) -> Option<&JavaAnalyzer> {
@@ -438,11 +457,16 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if node_text(name_node, ctx.source) != ctx.spec.member_name {
         return;
     }
+    if let Some(expected_arity) = ctx.spec.method_arity
+        && invocation_arity(node) != expected_arity
+    {
+        return;
+    }
 
     let receiver_matches = if let Some(object) = node.child_by_field_name("object") {
         receiver_matches_target(object, ctx)
     } else {
-        same_owner_context(node, ctx)
+        same_owner_context(node, ctx) || is_static_import_of_target_method(ctx)
     };
 
     if receiver_matches {
@@ -490,9 +514,36 @@ fn receiver_matches_target(receiver: Node<'_>, ctx: &mut ScanCtx<'_>) -> bool {
         "type_identifier" | "scoped_type_identifier" | "generic_type" => {
             resolve_type_from_node(receiver, ctx).is_some_and(|resolved| resolved == ctx.spec.owner)
         }
-        "this" | "super" => same_owner_context(receiver, ctx),
+        "this" => {
+            owner_matches_target_context(receiver, ctx)
+                || anonymous_creation_context_matches_target(receiver, ctx)
+        }
+        "super" => {
+            owner_matches_target_context(receiver, ctx)
+                || anonymous_creation_context_matches_target(receiver, ctx)
+        }
         _ => false,
     }
+}
+
+fn is_static_import_of_target_method(ctx: &ScanCtx<'_>) -> bool {
+    let target_fq_name = ctx.spec.owner.fq_name();
+    ctx.analyzer
+        .import_statements(ctx.file)
+        .iter()
+        .any(|import| {
+            let trimmed = import.trim();
+            if !trimmed.starts_with("import static ") {
+                return false;
+            }
+            let path = trimmed
+                .strip_prefix("import static ")
+                .unwrap_or(trimmed)
+                .trim_end_matches(';')
+                .trim();
+            path == format!("{}.{}", target_fq_name, ctx.spec.member_name)
+                || path == format!("{target_fq_name}.*")
+        })
 }
 
 fn same_owner_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
@@ -508,6 +559,50 @@ fn same_owner_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     ctx.analyzer
         .parent_of(&enclosing)
         .is_some_and(|owner| owner == ctx.spec.owner)
+}
+
+fn owner_matches_target_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    let range = Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: find_line_index_for_offset(ctx.line_starts, node.start_byte()),
+        end_line: find_line_index_for_offset(ctx.line_starts, node.end_byte()),
+    };
+    let Some(enclosing) = ctx.analyzer.enclosing_code_unit(ctx.file, &range) else {
+        return false;
+    };
+    let Some(owner) = ctx.analyzer.parent_of(&enclosing) else {
+        return false;
+    };
+    if owner == ctx.spec.owner {
+        return true;
+    }
+    ctx.analyzer
+        .type_hierarchy_provider()
+        .is_some_and(|provider| provider.get_ancestors(&owner).contains(&ctx.spec.owner))
+}
+
+fn anonymous_creation_context_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "object_creation_expression"
+            && let Some(type_node) = parent.child_by_field_name("type")
+            && resolve_type_from_node(type_node, ctx)
+                .is_some_and(|resolved| resolved == ctx.spec.owner)
+        {
+            return true;
+        }
+        current = parent.parent();
+    }
+    false
+}
+
+fn invocation_arity(node: Node<'_>) -> usize {
+    let Some(arguments) = node.child_by_field_name("arguments") else {
+        return 0;
+    };
+    let mut cursor = arguments.walk();
+    arguments.named_children(&mut cursor).count()
 }
 
 fn resolve_type_from_node(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {
