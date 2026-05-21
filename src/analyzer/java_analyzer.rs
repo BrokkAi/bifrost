@@ -337,6 +337,18 @@ impl JavaAnalyzer {
         collect_type_identifiers(tree.root_node(), source, &mut identifiers);
         identifiers.into_iter().collect()
     }
+
+    pub fn resolve_type_name_in_file(
+        &self,
+        file: &ProjectFile,
+        raw_name: &str,
+    ) -> Option<CodeUnit> {
+        self.resolve_type_name(file, raw_name)
+    }
+
+    pub fn package_name_of(&self, file: &ProjectFile) -> Option<&str> {
+        self.inner.package_name_of(file)
+    }
 }
 
 impl ImportAnalysisProvider for JavaAnalyzer {
