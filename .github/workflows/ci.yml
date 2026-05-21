@@ -120,4 +120,4 @@ jobs:
           python-version: '3.12'
 
       - name: Run python tests
-        run: uv run python -m unittest discover -s python_tests -p 'test_*.py'
+        run: bash scripts/test_python.sh
