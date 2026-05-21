@@ -1,4 +1,7 @@
-use crate::{SearchToolsService, SearchToolsServiceError, SearchToolsServiceErrorCode};
+use crate::{
+    SearchToolsService, SearchToolsServiceError, SearchToolsServiceErrorCode,
+    searchtools_render::RenderOptions,
+};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use std::path::PathBuf;
@@ -36,6 +39,41 @@ impl SearchToolsNativeSession {
             let service = inner.as_mut().ok_or(CallToolError::Closed)?;
             service
                 .call_tool_json(&name, &arguments_json)
+                .map_err(CallToolError::Service)
+        });
+
+        match result {
+            Ok(payload) => Ok(payload),
+            Err(CallToolError::Closed) => Err(PyRuntimeError::new_err(
+                "SearchToolsNativeSession is closed",
+            )),
+            Err(CallToolError::LockPoisoned) => Err(PyRuntimeError::new_err(
+                "SearchToolsNativeSession lock poisoned",
+            )),
+            Err(CallToolError::Service(err)) => Err(service_error_to_py(err)),
+        }
+    }
+
+    fn call_tool_payload_json(
+        &self,
+        py: Python<'_>,
+        name: &str,
+        arguments_json: &str,
+        render_line_numbers: bool,
+    ) -> PyResult<String> {
+        let name = name.to_owned();
+        let arguments_json = arguments_json.to_owned();
+        let result = py.allow_threads(|| {
+            let mut inner = self.inner.lock().map_err(|_| CallToolError::LockPoisoned)?;
+            let service = inner.as_mut().ok_or(CallToolError::Closed)?;
+            service
+                .call_tool_payload_json(
+                    &name,
+                    &arguments_json,
+                    RenderOptions {
+                        render_line_numbers,
+                    },
+                )
                 .map_err(CallToolError::Service)
         });
 

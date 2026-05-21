@@ -19,6 +19,7 @@ use crate::{
         get_symbol_sources, get_symbol_summaries, list_symbols, most_relevant_files,
         refresh_result, scan_usages, search_symbols,
     },
+    searchtools_render::{RenderOptions, RenderText},
     structured_data::{jq, xml_select, xml_skim},
 };
 use serde::Serialize;
@@ -72,6 +73,45 @@ impl fmt::Display for SearchToolsServiceError {
 
 impl std::error::Error for SearchToolsServiceError {}
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum ToolOutput {
+    Text(String),
+    Structured {
+        structured: Value,
+        rendered_text: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PythonToolPayload {
+    structured: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rendered_text: Option<String>,
+}
+
+impl ToolOutput {
+    pub fn into_value(self) -> Value {
+        match self {
+            Self::Text(text) => Value::String(text),
+            Self::Structured { structured, .. } => structured,
+        }
+    }
+
+    pub fn into_python_payload(self) -> Value {
+        match self {
+            Self::Text(text) => Value::String(text),
+            Self::Structured {
+                structured,
+                rendered_text,
+            } => serde_json::to_value(PythonToolPayload {
+                structured,
+                rendered_text,
+            })
+            .unwrap_or_else(|_| Value::Null),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UpdateStrategy {
     WatchFiles,
@@ -100,9 +140,26 @@ impl SearchToolsService {
         let arguments = serde_json::from_str::<Value>(arguments_json).map_err(|err| {
             SearchToolsServiceError::invalid_params(format!("Invalid JSON arguments: {err}"))
         })?;
-        let result = self.call_tool_value(name, arguments)?;
+        let result = self
+            .call_tool_output(name, arguments, RenderOptions::default())?
+            .into_value();
         serde_json::to_string(&result).map_err(|err| {
             SearchToolsServiceError::internal(format!("Failed to serialize tool result: {err}"))
+        })
+    }
+
+    pub fn call_tool_payload_json(
+        &mut self,
+        name: &str,
+        arguments_json: &str,
+        render_options: RenderOptions,
+    ) -> Result<String, SearchToolsServiceError> {
+        let arguments = serde_json::from_str::<Value>(arguments_json).map_err(|err| {
+            SearchToolsServiceError::invalid_params(format!("Invalid JSON arguments: {err}"))
+        })?;
+        let result = self.call_tool_output(name, arguments, render_options)?;
+        serde_json::to_string(&result.into_python_payload()).map_err(|err| {
+            SearchToolsServiceError::internal(format!("Failed to serialize tool payload: {err}"))
         })
     }
 
@@ -111,6 +168,17 @@ impl SearchToolsService {
         name: &str,
         arguments: Value,
     ) -> Result<Value, SearchToolsServiceError> {
+        Ok(self
+            .call_tool_output(name, arguments, RenderOptions::default())?
+            .into_value())
+    }
+
+    pub fn call_tool_output(
+        &mut self,
+        name: &str,
+        arguments: Value,
+        render_options: RenderOptions,
+    ) -> Result<ToolOutput, SearchToolsServiceError> {
         // Lifecycle tools bypass watcher delta application: refresh rebuilds
         // explicitly, activate replaces the whole workspace, and get is cheap.
         match name {
@@ -122,29 +190,43 @@ impl SearchToolsService {
 
         self.prepare_for_call();
         match name {
-            "search_symbols" => self.decode_and_run(arguments, |workspace, params| {
-                search_symbols(workspace.analyzer(), params)
-            }),
-            "get_symbol_locations" => self.decode_and_run(arguments, |workspace, params| {
-                get_symbol_locations(workspace.analyzer(), params)
-            }),
-            "get_symbol_summaries" => self.decode_and_run(arguments, |workspace, params| {
-                get_symbol_summaries(workspace.analyzer(), params)
-            }),
-            "get_symbol_sources" => self.decode_and_run(arguments, |workspace, params| {
-                get_symbol_sources(workspace.analyzer(), params)
-            }),
-            "get_summaries" => self.decode_and_run(arguments, |workspace, params| {
-                get_summaries(workspace.analyzer(), params)
-            }),
-            "list_symbols" => self.decode_and_run(arguments, |workspace, params| {
-                list_symbols(workspace.analyzer(), params)
-            }),
-            "most_relevant_files" => {
-                self.decode_and_run(arguments, |workspace, params: MostRelevantFilesParams| {
-                    most_relevant_files(workspace.analyzer(), params)
+            "search_symbols" => {
+                self.decode_render_and_run(arguments, render_options, |workspace, params| {
+                    search_symbols(workspace.analyzer(), params)
                 })
             }
+            "get_symbol_locations" => {
+                self.decode_render_and_run(arguments, render_options, |workspace, params| {
+                    get_symbol_locations(workspace.analyzer(), params)
+                })
+            }
+            "get_symbol_summaries" => {
+                self.decode_render_and_run(arguments, render_options, |workspace, params| {
+                    get_symbol_summaries(workspace.analyzer(), params)
+                })
+            }
+            "get_symbol_sources" => {
+                self.decode_render_and_run(arguments, render_options, |workspace, params| {
+                    get_symbol_sources(workspace.analyzer(), params)
+                })
+            }
+            "get_summaries" => {
+                self.decode_render_and_run(arguments, render_options, |workspace, params| {
+                    get_summaries(workspace.analyzer(), params)
+                })
+            }
+            "list_symbols" => {
+                self.decode_render_and_run(arguments, render_options, |workspace, params| {
+                    list_symbols(workspace.analyzer(), params)
+                })
+            }
+            "most_relevant_files" => self.decode_render_and_run(
+                arguments,
+                render_options,
+                |workspace, params: MostRelevantFilesParams| {
+                    most_relevant_files(workspace.analyzer(), params)
+                },
+            ),
             "scan_usages" => self.decode_and_run(arguments, |workspace, params| {
                 scan_usages(workspace.analyzer(), params)
             }),
@@ -253,20 +335,18 @@ impl SearchToolsService {
         })
     }
 
-    fn handle_refresh(&mut self, arguments: Value) -> Result<Value, SearchToolsServiceError> {
+    fn handle_refresh(&mut self, arguments: Value) -> Result<ToolOutput, SearchToolsServiceError> {
         let _params = serde_json::from_value::<RefreshParams>(arguments).map_err(|err| {
             SearchToolsServiceError::invalid_params(format!("Invalid tool arguments: {err}"))
         })?;
         self.workspace = self.workspace.update_all();
-        serde_json::to_value(refresh_result(self.workspace.analyzer())).map_err(|err| {
-            SearchToolsServiceError::internal(format!("Failed to serialize tool result: {err}"))
-        })
+        self.structured_only(refresh_result(self.workspace.analyzer()))
     }
 
     fn handle_activate_workspace(
         &mut self,
         arguments: Value,
-    ) -> Result<Value, SearchToolsServiceError> {
+    ) -> Result<ToolOutput, SearchToolsServiceError> {
         let params =
             serde_json::from_value::<ActivateWorkspaceParams>(arguments).map_err(|err| {
                 SearchToolsServiceError::invalid_params(format!("Invalid tool arguments: {err}"))
@@ -312,7 +392,7 @@ impl SearchToolsService {
     fn handle_get_active_workspace(
         &mut self,
         arguments: Value,
-    ) -> Result<Value, SearchToolsServiceError> {
+    ) -> Result<ToolOutput, SearchToolsServiceError> {
         let _params =
             serde_json::from_value::<GetActiveWorkspaceParams>(arguments).map_err(|err| {
                 SearchToolsServiceError::invalid_params(format!("Invalid tool arguments: {err}"))
@@ -345,27 +425,11 @@ impl SearchToolsService {
         self.workspace = self.workspace.update(&changed_files);
     }
 
-    // Handler return types are constrained only by `Serialize`. By
-    // convention two shapes flow through here:
-    //
-    //   1. A serde struct → serializes to a JSON object/array.
-    //      `mcp_server::tool_success_result` will pretty-print it as
-    //      text and also attach the structured value.
-    //   2. A `String` → serializes to `Value::String`. The MCP wire
-    //      treats this as the canonical text representation and emits
-    //      it verbatim with no `structuredContent`. The git-history
-    //      tools take this path to match brokk-core's XML output.
-    //
-    // The branch on `Value::String` lives in `tool_success_result`;
-    // keep both ends of the convention in sync. If a future tool needs
-    // both a text rendering AND structured content, the cleanest path
-    // is to introduce a `ToolOutput { Text(String), Structured(Value) }`
-    // enum here and match it on the wire side.
     fn decode_and_run<P, R>(
         &mut self,
         arguments: Value,
         handler: impl FnOnce(&WorkspaceAnalyzer, P) -> R,
-    ) -> Result<Value, SearchToolsServiceError>
+    ) -> Result<ToolOutput, SearchToolsServiceError>
     where
         P: serde::de::DeserializeOwned,
         R: Serialize,
@@ -373,8 +437,52 @@ impl SearchToolsService {
         let params = serde_json::from_value::<P>(arguments).map_err(|err| {
             SearchToolsServiceError::invalid_params(format!("Invalid tool arguments: {err}"))
         })?;
-        serde_json::to_value(handler(&self.workspace, params)).map_err(|err| {
+        let result = handler(&self.workspace, params);
+        match serde_json::to_value(result).map_err(|err| {
             SearchToolsServiceError::internal(format!("Failed to serialize tool result: {err}"))
+        })? {
+            Value::String(text) => Ok(ToolOutput::Text(text)),
+            structured => Ok(ToolOutput::Structured {
+                structured,
+                rendered_text: None,
+            }),
+        }
+    }
+
+    fn decode_render_and_run<P, R>(
+        &mut self,
+        arguments: Value,
+        render_options: RenderOptions,
+        handler: impl FnOnce(&WorkspaceAnalyzer, P) -> R,
+    ) -> Result<ToolOutput, SearchToolsServiceError>
+    where
+        P: serde::de::DeserializeOwned,
+        R: Serialize + RenderText,
+    {
+        let params = serde_json::from_value::<P>(arguments).map_err(|err| {
+            SearchToolsServiceError::invalid_params(format!("Invalid tool arguments: {err}"))
+        })?;
+        let result = handler(&self.workspace, params);
+        let rendered_text = result.render_text(render_options);
+        let structured = serde_json::to_value(result).map_err(|err| {
+            SearchToolsServiceError::internal(format!("Failed to serialize tool result: {err}"))
+        })?;
+        Ok(ToolOutput::Structured {
+            structured,
+            rendered_text: Some(rendered_text),
+        })
+    }
+
+    fn structured_only<R: Serialize>(
+        &self,
+        result: R,
+    ) -> Result<ToolOutput, SearchToolsServiceError> {
+        let structured = serde_json::to_value(result).map_err(|err| {
+            SearchToolsServiceError::internal(format!("Failed to serialize tool result: {err}"))
+        })?;
+        Ok(ToolOutput::Structured {
+            structured,
+            rendered_text: None,
         })
     }
 }
@@ -418,11 +526,15 @@ fn resolve_workspace_root(path: &Path) -> Result<PathBuf, String> {
     Ok(canonical)
 }
 
-fn active_workspace_result(root: &Path) -> Result<Value, SearchToolsServiceError> {
-    serde_json::to_value(ActiveWorkspaceResult {
+fn active_workspace_result(root: &Path) -> Result<ToolOutput, SearchToolsServiceError> {
+    let structured = serde_json::to_value(ActiveWorkspaceResult {
         workspace_path: root.display().to_string(),
     })
     .map_err(|err| {
         SearchToolsServiceError::internal(format!("Failed to serialize tool result: {err}"))
+    })?;
+    Ok(ToolOutput::Structured {
+        structured,
+        rendered_text: None,
     })
 }

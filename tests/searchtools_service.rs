@@ -1,4 +1,6 @@
-use brokk_analyzer::{SearchToolsService, SearchToolsServiceErrorCode};
+use brokk_analyzer::{
+    SearchToolsService, SearchToolsServiceErrorCode, searchtools_render::RenderOptions,
+};
 use git2::{Repository, Signature};
 use serde_json::Value;
 use std::fs;
@@ -22,6 +24,27 @@ fn python_boundary_returns_structured_json() {
 
     assert_eq!(value["summaries"][0]["path"], "A.java");
     assert_eq!(value["summaries"][0]["elements"][0]["start_line"], 3);
+}
+
+#[test]
+fn python_boundary_returns_canonical_rendered_text_payload() {
+    let mut service = SearchToolsService::new_for_python(fixture_root()).unwrap();
+    let payload = service
+        .call_tool_payload_json(
+            "get_symbol_sources",
+            r#"{"symbols":["A.method2"],"kind_filter":"function"}"#,
+            RenderOptions::default(),
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert_eq!(value["structured"]["sources"][0]["start_line"], 8);
+    let rendered = value["rendered_text"].as_str().expect("rendered text");
+    assert!(rendered.contains("A.method2 (A.java:8..10)"), "{rendered}");
+    assert!(
+        rendered.contains("8: public String method2(String input)"),
+        "{rendered}"
+    );
 }
 
 #[test]

@@ -12,6 +12,7 @@ mod project_watcher;
 mod python_module;
 mod relevance;
 pub mod searchtools;
+pub mod searchtools_render;
 pub mod searchtools_service;
 pub mod structured_data;
 pub mod summary;
@@ -32,6 +33,6 @@ pub use analyzer::{
 };
 pub use project_watcher::{ChangeDelta, ProjectChangeWatcher};
 pub use searchtools_service::{
-    SearchToolsService, SearchToolsServiceError, SearchToolsServiceErrorCode,
+    SearchToolsService, SearchToolsServiceError, SearchToolsServiceErrorCode, ToolOutput,
 };
 pub use summary::{RenderedSummary, SummaryInput, summarize_inputs};

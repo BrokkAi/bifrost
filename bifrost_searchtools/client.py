@@ -46,6 +46,12 @@ class _RuntimeState:
     native: Any
 
 
+@dataclass(frozen=True)
+class _ToolPayload:
+    structured: dict[str, Any]
+    rendered_text: str | None
+
+
 class SearchToolsClient:
     def __init__(
         self,
@@ -92,16 +98,18 @@ class SearchToolsClient:
         include_tests: bool = False,
         limit: int = 20,
     ) -> SearchSymbolsResult:
+        payload = self._call_tool_payload(
+            "search_symbols",
+            {
+                "patterns": patterns,
+                "include_tests": include_tests,
+                "limit": limit,
+            },
+        )
         return SearchSymbolsResult.from_dict(
-            self._call_tool(
-                "search_symbols",
-                {
-                    "patterns": patterns,
-                    "include_tests": include_tests,
-                    "limit": limit,
-                },
-            ),
+            payload.structured,
             render_line_numbers=self._render_line_numbers,
+            rendered_text=payload.rendered_text,
         )
 
     def get_symbol_locations(
@@ -110,12 +118,14 @@ class SearchToolsClient:
         *,
         kind_filter: SymbolKindFilter = SymbolKindFilter.ANY,
     ) -> SymbolLocationsResult:
+        payload = self._call_tool_payload(
+            "get_symbol_locations",
+            {"symbols": symbols, "kind_filter": kind_filter.value},
+        )
         return SymbolLocationsResult.from_dict(
-            self._call_tool(
-                "get_symbol_locations",
-                {"symbols": symbols, "kind_filter": kind_filter.value},
-            ),
+            payload.structured,
             render_line_numbers=self._render_line_numbers,
+            rendered_text=payload.rendered_text,
         )
 
     def get_symbol_summaries(
@@ -124,12 +134,14 @@ class SearchToolsClient:
         *,
         kind_filter: SymbolKindFilter = SymbolKindFilter.ANY,
     ) -> SymbolSummariesResult:
+        payload = self._call_tool_payload(
+            "get_symbol_summaries",
+            {"symbols": symbols, "kind_filter": kind_filter.value},
+        )
         return SymbolSummariesResult.from_dict(
-            self._call_tool(
-                "get_symbol_summaries",
-                {"symbols": symbols, "kind_filter": kind_filter.value},
-            ),
+            payload.structured,
             render_line_numbers=self._render_line_numbers,
+            rendered_text=payload.rendered_text,
         )
 
     def get_symbol_sources(
@@ -138,24 +150,32 @@ class SearchToolsClient:
         *,
         kind_filter: SymbolKindFilter = SymbolKindFilter.ANY,
     ) -> SymbolSourcesResult:
+        payload = self._call_tool_payload(
+            "get_symbol_sources",
+            {"symbols": symbols, "kind_filter": kind_filter.value},
+        )
         return SymbolSourcesResult.from_dict(
-            self._call_tool(
-                "get_symbol_sources",
-                {"symbols": symbols, "kind_filter": kind_filter.value},
-            ),
+            payload.structured,
             render_line_numbers=self._render_line_numbers,
+            rendered_text=payload.rendered_text,
         )
 
     def get_summaries(self, targets: list[str]) -> FileSummariesResult:
+        payload = self._call_tool_payload("get_summaries", {"targets": targets})
         return FileSummariesResult.from_dict(
-            self._call_tool("get_summaries", {"targets": targets}),
+            payload.structured,
             render_line_numbers=self._render_line_numbers,
+            rendered_text=payload.rendered_text,
         )
 
     def list_symbols(self, file_patterns: list[str]) -> SkimFilesResult:
+        payload = self._call_tool_payload(
+            "list_symbols", {"file_patterns": file_patterns}
+        )
         return SkimFilesResult.from_dict(
-            self._call_tool("list_symbols", {"file_patterns": file_patterns}),
+            payload.structured,
             render_line_numbers=self._render_line_numbers,
+            rendered_text=payload.rendered_text,
         )
 
     def most_relevant_files(
@@ -164,12 +184,14 @@ class SearchToolsClient:
         *,
         limit: int = 20,
     ) -> MostRelevantFilesResult:
+        payload = self._call_tool_payload(
+            "most_relevant_files",
+            {"seed_files": seed_files, "limit": limit},
+        )
         return MostRelevantFilesResult.from_dict(
-            self._call_tool(
-                "most_relevant_files",
-                {"seed_files": seed_files, "limit": limit},
-            ),
+            payload.structured,
             render_line_numbers=self._render_line_numbers,
+            rendered_text=payload.rendered_text,
         )
 
     def _call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -189,6 +211,40 @@ class SearchToolsClient:
         if not isinstance(structured, dict):
             raise SearchToolsError("Native searchtools call did not return a JSON object")
         return structured
+
+    def _call_tool_payload(self, name: str, arguments: dict[str, Any]) -> _ToolPayload:
+        with self._lock:
+            runtime = self._ensure_started()
+            try:
+                payload = runtime.native.call_tool_payload_json(
+                    name,
+                    json.dumps(arguments),
+                    self._render_line_numbers,
+                )
+            except Exception as exc:
+                raise SearchToolsError(str(exc)) from exc
+
+        try:
+            decoded = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise SearchToolsError(
+                f"Native searchtools call returned invalid JSON: {exc}"
+            ) from exc
+        if not isinstance(decoded, dict):
+            raise SearchToolsError(
+                "Native searchtools call did not return a JSON object payload"
+            )
+        structured = decoded.get("structured")
+        if not isinstance(structured, dict):
+            raise SearchToolsError(
+                "Native searchtools payload did not include a structured JSON object"
+            )
+        rendered_text = decoded.get("rendered_text")
+        if rendered_text is not None and not isinstance(rendered_text, str):
+            raise SearchToolsError(
+                "Native searchtools payload returned a non-string rendered_text"
+            )
+        return _ToolPayload(structured=structured, rendered_text=rendered_text)
 
     def _ensure_started(self) -> _RuntimeState:
         if self._runtime is not None:

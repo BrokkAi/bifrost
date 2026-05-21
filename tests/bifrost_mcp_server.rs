@@ -186,6 +186,39 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     assert!(report.contains("self-comparison"), "{report}");
     assert!(report.contains("SampleTest.java"), "{report}");
 
+    let symbol_sources = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 7_1,
+            "method": "tools/call",
+            "params": {
+                "name": "get_symbol_sources",
+                "arguments": {
+                    "symbols": ["SampleTest.sameValue"],
+                    "kind_filter": "function"
+                }
+            }
+        }),
+    );
+    let source_preview = symbol_sources["result"]["content"][0]["text"]
+        .as_str()
+        .expect("source preview text");
+    assert!(
+        source_preview.starts_with("SampleTest.sameValue (SampleTest.java:"),
+        "{source_preview}"
+    );
+    assert!(
+        !source_preview.trim_start().starts_with('{'),
+        "{source_preview}"
+    );
+    let source_text = symbol_sources["result"]["structuredContent"]["sources"][0]["text"]
+        .as_str()
+        .expect("source block text");
+    assert!(!source_text.starts_with("6: "), "{source_text}");
+
     fs::write(
         fixture_root.path().join("PeerTest.java"),
         r#"
@@ -435,16 +468,7 @@ fn bifrost_searchtools_server_supports_runtime_workspace_switch() {
     .expect("write fixture");
     let switched_root = switched.path().canonicalize().expect("canonicalize");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
-        .arg("--root")
-        .arg(&initial_root)
-        .arg("--server")
-        .arg("searchtools")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn bifrost");
+    let mut child = spawn_searchtools_server(&initial_root, &[]);
 
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
@@ -570,6 +594,90 @@ fn bifrost_searchtools_server_supports_runtime_workspace_switch() {
     drop(stdin);
     let status = child.wait().expect("wait bifrost");
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
+fn bifrost_searchtools_server_can_hide_line_numbers_in_text_preview() {
+    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("testcode-java");
+
+    let mut child = spawn_searchtools_server(&fixture_root, &["--no-line-numbers"]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": { "name": "test-client", "version": "0.1.0" }
+            }
+        }),
+    );
+    write_line(
+        &mut stdin,
+        json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+    );
+
+    let summaries = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "get_summaries",
+                "arguments": {
+                    "targets": ["A.java"]
+                }
+            }
+        }),
+    );
+    let preview = summaries["result"]["content"][0]["text"]
+        .as_str()
+        .expect("preview text");
+    assert!(preview.contains("public class A"), "{preview}");
+    assert!(!preview.contains("\"summaries\""), "{preview}");
+    assert!(!preview.contains("3..52:"), "{preview}");
+    assert!(!preview.contains("8..10:"), "{preview}");
+    assert!(
+        summaries["result"]["structuredContent"]["summaries"][0]["elements"][0]["start_line"]
+            .is_number()
+    );
+
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+fn spawn_searchtools_server(root: &std::path::Path, extra_args: &[&str]) -> std::process::Child {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_bifrost"));
+    command
+        .arg("--root")
+        .arg(root)
+        .arg("--server")
+        .arg("searchtools");
+    for arg in extra_args {
+        command.arg(arg);
+    }
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bifrost")
 }
 
 fn round_trip(

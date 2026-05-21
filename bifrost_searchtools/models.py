@@ -113,10 +113,11 @@ class SearchSymbolsResult:
     total_files: int
     files: list[SearchSymbolsFile]
     render_line_numbers: bool = True
+    rendered_text: str | None = None
 
     @classmethod
     def from_dict(
-        cls, data: dict, render_line_numbers: bool = True
+        cls, data: dict, render_line_numbers: bool = True, rendered_text: str | None = None
     ) -> SearchSymbolsResult:
         return cls(
             patterns=list(data["patterns"]),
@@ -127,6 +128,7 @@ class SearchSymbolsResult:
                 for item in data["files"]
             ],
             render_line_numbers=render_line_numbers,
+            rendered_text=rendered_text,
         )
 
     @property
@@ -134,6 +136,8 @@ class SearchSymbolsResult:
         return len(self.files)
 
     def render_text(self) -> str:
+        if self.rendered_text is not None:
+            return self.rendered_text
         blocks = [file.render_text() for file in self.files]
         if not blocks:
             return "No matching symbols found."
@@ -177,10 +181,11 @@ class SymbolLocationsResult:
     locations: list[SymbolLocation]
     not_found: list[str]
     render_line_numbers: bool = True
+    rendered_text: str | None = None
 
     @classmethod
     def from_dict(
-        cls, data: dict, render_line_numbers: bool = True
+        cls, data: dict, render_line_numbers: bool = True, rendered_text: str | None = None
     ) -> SymbolLocationsResult:
         return cls(
             locations=[
@@ -189,6 +194,7 @@ class SymbolLocationsResult:
             ],
             not_found=list(data["not_found"]),
             render_line_numbers=render_line_numbers,
+            rendered_text=rendered_text,
         )
 
     @property
@@ -196,6 +202,8 @@ class SymbolLocationsResult:
         return len(self.locations)
 
     def render_text(self) -> str:
+        if self.rendered_text is not None:
+            return self.rendered_text
         lines = [location.render_text() for location in self.locations]
         if self.not_found:
             lines.append(f"Not found: {', '.join(self.not_found)}")
@@ -288,10 +296,11 @@ class SymbolSummariesResult:
     not_found: list[str]
     ambiguous: list[AmbiguousSymbol]
     render_line_numbers: bool = True
+    rendered_text: str | None = None
 
     @classmethod
     def from_dict(
-        cls, data: dict, render_line_numbers: bool = True
+        cls, data: dict, render_line_numbers: bool = True, rendered_text: str | None = None
     ) -> SymbolSummariesResult:
         return cls(
             summaries=[
@@ -303,6 +312,7 @@ class SymbolSummariesResult:
                 AmbiguousSymbol.from_dict(item) for item in data.get("ambiguous", [])
             ],
             render_line_numbers=render_line_numbers,
+            rendered_text=rendered_text,
         )
 
     @property
@@ -310,6 +320,8 @@ class SymbolSummariesResult:
         return len(self.summaries)
 
     def render_text(self) -> str:
+        if self.rendered_text is not None:
+            return self.rendered_text
         blocks = [summary.render_text() for summary in self.summaries]
         if self.not_found:
             blocks.append(f"Not found: {', '.join(self.not_found)}")
@@ -357,10 +369,11 @@ class SymbolSourcesResult:
     not_found: list[str]
     ambiguous: list[AmbiguousSymbol]
     render_line_numbers: bool = True
+    rendered_text: str | None = None
 
     @classmethod
     def from_dict(
-        cls, data: dict, render_line_numbers: bool = True
+        cls, data: dict, render_line_numbers: bool = True, rendered_text: str | None = None
     ) -> SymbolSourcesResult:
         return cls(
             sources=[
@@ -372,6 +385,7 @@ class SymbolSourcesResult:
                 AmbiguousSymbol.from_dict(item) for item in data.get("ambiguous", [])
             ],
             render_line_numbers=render_line_numbers,
+            rendered_text=rendered_text,
         )
 
     @property
@@ -379,6 +393,8 @@ class SymbolSourcesResult:
         return len(self.sources)
 
     def render_text(self) -> str:
+        if self.rendered_text is not None:
+            return self.rendered_text
         blocks = [source.render_text() for source in self.sources]
         if self.not_found:
             blocks.append(f"Not found: {', '.join(self.not_found)}")
@@ -412,10 +428,11 @@ class SkimFilesResult:
     total_files: int
     files: list[SkimFile]
     render_line_numbers: bool = True
+    rendered_text: str | None = None
 
     @classmethod
     def from_dict(
-        cls, data: dict, render_line_numbers: bool = True
+        cls, data: dict, render_line_numbers: bool = True, rendered_text: str | None = None
     ) -> SkimFilesResult:
         return cls(
             truncated=bool(data["truncated"]),
@@ -425,6 +442,7 @@ class SkimFilesResult:
                 for item in data["files"]
             ],
             render_line_numbers=render_line_numbers,
+            rendered_text=rendered_text,
         )
 
     @property
@@ -432,6 +450,8 @@ class SkimFilesResult:
         return len(self.files)
 
     def render_text(self) -> str:
+        if self.rendered_text is not None:
+            return self.rendered_text
         blocks = [file.render_text() for file in self.files]
         if not blocks:
             return "No matching files found."
@@ -449,15 +469,17 @@ class MostRelevantFilesResult:
     files: list[str]
     not_found: list[str]
     render_line_numbers: bool = True
+    rendered_text: str | None = None
 
     @classmethod
     def from_dict(
-        cls, data: dict, render_line_numbers: bool = True
+        cls, data: dict, render_line_numbers: bool = True, rendered_text: str | None = None
     ) -> MostRelevantFilesResult:
         return cls(
             files=list(data["files"]),
             not_found=list(data["not_found"]),
             render_line_numbers=render_line_numbers,
+            rendered_text=rendered_text,
         )
 
     @property
@@ -465,6 +487,8 @@ class MostRelevantFilesResult:
         return len(self.files)
 
     def render_text(self) -> str:
+        if self.rendered_text is not None:
+            return self.rendered_text
         if not self.files and not self.not_found:
             return "No related files found."
 

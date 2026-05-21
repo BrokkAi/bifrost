@@ -1,4 +1,6 @@
-use crate::{SearchToolsService, SearchToolsServiceErrorCode};
+use crate::{
+    SearchToolsService, SearchToolsServiceErrorCode, ToolOutput, searchtools_render::RenderOptions,
+};
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
@@ -11,7 +13,23 @@ const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 const INTERNAL_ERROR: i64 = -32603;
 
-pub fn run_searchtools_stdio_server(root: PathBuf) -> Result<(), String> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct McpRenderOptions {
+    pub render_line_numbers: bool,
+}
+
+impl Default for McpRenderOptions {
+    fn default() -> Self {
+        Self {
+            render_line_numbers: true,
+        }
+    }
+}
+
+pub fn run_searchtools_stdio_server(
+    root: PathBuf,
+    render_options: McpRenderOptions,
+) -> Result<(), String> {
     let mut service = SearchToolsService::new(root)?;
 
     let stdin = io::stdin();
@@ -27,7 +45,7 @@ pub fn run_searchtools_stdio_server(root: PathBuf) -> Result<(), String> {
         }
 
         let response = match serde_json::from_str::<Value>(&line) {
-            Ok(message) => dispatch_message(&mut service, message),
+            Ok(message) => dispatch_message(&mut service, message, render_options),
             Err(err) => Some(error_response(
                 Value::Null,
                 PARSE_ERROR,
@@ -47,7 +65,11 @@ pub fn run_searchtools_stdio_server(root: PathBuf) -> Result<(), String> {
     Ok(())
 }
 
-fn dispatch_message(service: &mut SearchToolsService, message: Value) -> Option<Value> {
+fn dispatch_message(
+    service: &mut SearchToolsService,
+    message: Value,
+    render_options: McpRenderOptions,
+) -> Option<Value> {
     let Some(object) = message.as_object() else {
         return Some(error_response(
             Value::Null,
@@ -82,7 +104,13 @@ fn dispatch_message(service: &mut SearchToolsService, message: Value) -> Option<
     let id = object.get("id").cloned();
 
     match id {
-        Some(id) => Some(dispatch_request(service, id, method, params)),
+        Some(id) => Some(dispatch_request(
+            service,
+            id,
+            method,
+            params,
+            render_options,
+        )),
         None => {
             handle_notification(method, params);
             None
@@ -95,12 +123,13 @@ fn dispatch_request(
     id: Value,
     method: &str,
     params: Value,
+    render_options: McpRenderOptions,
 ) -> Value {
     let response = match method {
         "initialize" => Ok(initialize_result()),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(list_tools_result()),
-        "tools/call" => handle_tool_call(service, params),
+        "tools/call" => handle_tool_call(service, params, render_options),
         _ => Err((METHOD_NOT_FOUND, format!("Unknown method: {method}"))),
     };
 
@@ -1044,6 +1073,7 @@ fn summaries_schema() -> Value {
 fn handle_tool_call(
     service: &mut SearchToolsService,
     params: Value,
+    render_options: McpRenderOptions,
 ) -> Result<Value, (i64, String)> {
     let Some(object) = params.as_object() else {
         return Err((
@@ -1061,8 +1091,14 @@ fn handle_tool_call(
         .cloned()
         .unwrap_or_else(|| json!({}));
 
-    match service.call_tool_value(name, arguments) {
-        Ok(structured) => Ok(tool_success_result(structured)),
+    match service.call_tool_output(
+        name,
+        arguments,
+        RenderOptions {
+            render_line_numbers: render_options.render_line_numbers,
+        },
+    ) {
+        Ok(output) => Ok(tool_success_result(output)),
         Err(err) => {
             if err.code == SearchToolsServiceErrorCode::UnknownTool {
                 return Ok(tool_error_result(err.message));
@@ -1081,32 +1117,9 @@ fn map_service_error(code: SearchToolsServiceErrorCode, message: String) -> (i64
     (jsonrpc_code, message)
 }
 
-// Convention between this function and `SearchToolsService::decode_and_run`:
-//
-// - If a tool handler returns a serde struct (object/array), `to_value`
-//   produces a JSON object/array. We render it as pretty-printed JSON in
-//   `content[0].text` AND attach the structured value as
-//   `structuredContent` so MCP clients can choose either form.
-//
-// - If a tool handler returns a `String`, `to_value` produces
-//   `Value::String`. We treat that as the canonical text representation
-//   of the tool's output (the git-history tools take this path to mirror
-//   brokk-core's XML-style textual output) and emit it verbatim in
-//   `content[0].text`, with no `structuredContent`.
-//
-// The convention is checked here, at the wire boundary, rather than
-// expressed in the handler signature. A future tool returning a string
-// will automatically get the text-shaped envelope. If a handler returns
-// something else that happens to serialize to `Value::String` (e.g. a
-// newtype around `String`), that is also fine — it is treated as text.
-//
-// To break this convention cleanly, introduce a `ToolOutput` enum in
-// `searchtools_service` and have `decode_and_run` return it, then match
-// on the variant here. Until that refactor, the two layers must keep
-// this comment in sync.
-fn tool_success_result(structured: Value) -> Value {
-    if let Value::String(text) = structured {
-        return json!({
+fn tool_success_result(output: ToolOutput) -> Value {
+    match output {
+        ToolOutput::Text(text) => json!({
             "content": [
                 {
                     "type": "text",
@@ -1114,20 +1127,27 @@ fn tool_success_result(structured: Value) -> Value {
                 }
             ],
             "isError": false,
-        });
+        }),
+        ToolOutput::Structured {
+            structured,
+            rendered_text,
+        } => {
+            let text = rendered_text.unwrap_or_else(|| {
+                serde_json::to_string_pretty(&structured)
+                    .unwrap_or_else(|_| "Failed to pretty-print tool result".to_string())
+            });
+            json!({
+                "content": [
+                    {
+                        "type": "text",
+                        "text": text,
+                    }
+                ],
+                "structuredContent": structured,
+                "isError": false,
+            })
+        }
     }
-    let text = serde_json::to_string_pretty(&structured)
-        .unwrap_or_else(|_| "Failed to pretty-print tool result".to_string());
-    json!({
-        "content": [
-            {
-                "type": "text",
-                "text": text,
-            }
-        ],
-        "structuredContent": structured,
-        "isError": false,
-    })
 }
 
 fn tool_error_result(message: String) -> Value {

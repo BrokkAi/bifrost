@@ -2,7 +2,7 @@ use std::env;
 use std::process::ExitCode;
 
 use brokk_analyzer::lsp::run_lsp_stdio_server;
-use brokk_analyzer::mcp_server::run_searchtools_stdio_server;
+use brokk_analyzer::mcp_server::{McpRenderOptions, run_searchtools_stdio_server};
 
 fn main() -> ExitCode {
     match run() {
@@ -19,6 +19,7 @@ fn run() -> Result<(), String> {
     let mut root =
         env::current_dir().map_err(|err| format!("Failed to get current directory: {err}"))?;
     let mut server_mode = None;
+    let mut render_options = McpRenderOptions::default();
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -33,6 +34,9 @@ fn run() -> Result<(), String> {
                     .next()
                     .ok_or_else(|| "--server requires a mode".to_string())?;
                 server_mode = Some(value);
+            }
+            "--no-line-numbers" => {
+                render_options.render_line_numbers = false;
             }
             "--help" | "-h" => {
                 print_help();
@@ -49,7 +53,7 @@ fn run() -> Result<(), String> {
     }
 
     match server_mode.as_deref() {
-        Some("searchtools") => run_searchtools_stdio_server(root),
+        Some("searchtools") => run_searchtools_stdio_server(root, render_options),
         Some("lsp") => run_lsp_stdio_server(root),
         Some(other) => Err(format!("Unsupported server mode: {other}")),
         None => {
@@ -61,6 +65,7 @@ fn run() -> Result<(), String> {
 
 fn print_help() {
     println!("Usage: bifrost --root PROJECT_ROOT --server searchtools");
+    println!("       bifrost --root PROJECT_ROOT --server searchtools --no-line-numbers");
     println!("       bifrost --root PROJECT_ROOT --server lsp");
     println!("       bifrost --version");
 }

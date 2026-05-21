@@ -78,6 +78,8 @@ Run it against a project root:
 ./target/debug/bifrost --root /path/to/project --server searchtools
 ```
 
+Pass `--no-line-numbers` to remove rendered line and line-range prefixes from the MCP text preview for the searchtools outputs while keeping `structuredContent` unchanged.
+
 This starts a stdio MCP server that publishes these tools:
 
 - `refresh`
@@ -139,7 +141,7 @@ The client exposes:
 - `list_symbols(...)`
 - `most_relevant_files(...)`
 
-The client talks directly to Rust through a native extension module. The Python/Rust boundary stays JSON-shaped: Python sends tool names plus JSON arguments and Rust returns JSON result objects. Rendering still lives in the Python package:
+The client talks directly to Rust through a native extension module. The Python/Rust boundary stays JSON-shaped: Python sends tool names plus JSON arguments and Rust returns structured JSON plus canonical rendered text. The line-number policy now lives in the shared Rust renderer used by both the MCP server and the Python client:
 
 - source blocks use original file line numbers
 - summaries use original line ranges in `N..M: ...` form on the first line
