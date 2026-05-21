@@ -1,4 +1,4 @@
-use brokk_analyzer::{
+use brokk_bifrost::{
     AnalyzerConfig, FilesystemProject, Language, WorkspaceAnalyzer,
     searchtools::{MostRelevantFilesParams, most_relevant_files},
 };
@@ -20,7 +20,7 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), String> {
-    let _run_scope = brokk_analyzer::profiling::scope("cli.most_relevant_files");
+    let _run_scope = brokk_bifrost::profiling::scope("cli.most_relevant_files");
     let mut args = env::args().skip(1);
     let mut root =
         env::current_dir().map_err(|err| format!("Failed to get current directory: {err}"))?;
@@ -48,14 +48,14 @@ fn run() -> Result<(), String> {
     }
 
     let project = {
-        let _scope = brokk_analyzer::profiling::scope("cli.open_project");
+        let _scope = brokk_bifrost::profiling::scope("cli.open_project");
         Arc::new(
             FilesystemProject::new(root)
                 .map_err(|err| format!("Failed to open project root: {err}"))?,
         )
     };
     let workspace = {
-        let _scope = brokk_analyzer::profiling::scope("cli.workspace_build");
+        let _scope = brokk_bifrost::profiling::scope("cli.workspace_build");
         let seed_languages: std::collections::BTreeSet<_> = seed_files
             .iter()
             .filter_map(|seed| {
@@ -77,7 +77,7 @@ fn run() -> Result<(), String> {
         }
     };
     let result = {
-        let _scope = brokk_analyzer::profiling::scope("cli.rank");
+        let _scope = brokk_bifrost::profiling::scope("cli.rank");
         most_relevant_files(
             workspace.analyzer(),
             MostRelevantFilesParams {

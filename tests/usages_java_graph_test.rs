@@ -1,8 +1,8 @@
 mod common;
 
-use brokk_analyzer::usages::FuzzyResult;
-use brokk_analyzer::usages::{JavaUsageGraphStrategy, UsageAnalyzer, UsageFinder};
-use brokk_analyzer::{CodeUnit, IAnalyzer, JavaAnalyzer, Language};
+use brokk_bifrost::usages::FuzzyResult;
+use brokk_bifrost::usages::{JavaUsageGraphStrategy, UsageAnalyzer, UsageFinder};
+use brokk_bifrost::{CodeUnit, IAnalyzer, JavaAnalyzer, Language};
 use common::InlineTestProject;
 
 fn definition(analyzer: &JavaAnalyzer, fq_name: &str) -> CodeUnit {

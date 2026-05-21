@@ -1,9 +1,9 @@
 mod common;
 
-use brokk_analyzer::code_quality::{
+use brokk_bifrost::code_quality::{
     ReportDeadCodeAndUnusedAbstractionSmellsParams, report_dead_code_and_unused_abstraction_smells,
 };
-use brokk_analyzer::{
+use brokk_bifrost::{
     CodeUnit, IAnalyzer, JavascriptAnalyzer, Language, PythonAnalyzer, TypescriptAnalyzer,
 };
 use common::InlineTestProject;

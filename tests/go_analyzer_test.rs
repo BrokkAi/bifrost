@@ -1,6 +1,6 @@
 mod common;
 
-use brokk_analyzer::{
+use brokk_bifrost::{
     CodeUnit, CodeUnitType, GoAnalyzer, IAnalyzer, Language, ProjectFile, TestProject,
     TypeAliasProvider,
 };

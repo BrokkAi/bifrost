@@ -1,11 +1,11 @@
-use brokk_analyzer::{IAnalyzer, ProjectFile, PythonAnalyzer, TestProject};
+use brokk_bifrost::{IAnalyzer, ProjectFile, PythonAnalyzer, TestProject};
 
 fn single_file_project(path: &str, contents: &str) -> (TestProject, ProjectFile) {
     let temp = tempfile::tempdir().unwrap();
     let file = ProjectFile::new(temp.path().to_path_buf(), path);
     file.write(contents).unwrap();
     (
-        TestProject::new(temp.keep(), brokk_analyzer::Language::Python),
+        TestProject::new(temp.keep(), brokk_bifrost::Language::Python),
         file,
     )
 }

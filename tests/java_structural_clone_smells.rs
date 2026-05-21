@@ -1,7 +1,7 @@
-use brokk_analyzer::code_quality::{
+use brokk_bifrost::code_quality::{
     ReportStructuralCloneSmellsParams, report_structural_clone_smells,
 };
-use brokk_analyzer::{
+use brokk_bifrost::{
     AnalyzerDelegate, CloneSmellWeights, IAnalyzer, JavaAnalyzer, Language, MultiAnalyzer,
 };
 use std::collections::BTreeMap;
@@ -16,7 +16,7 @@ fn analyze_pair(
     path_b: &str,
     source_b: &str,
     weights: CloneSmellWeights,
-) -> Vec<brokk_analyzer::CloneSmell> {
+) -> Vec<brokk_bifrost::CloneSmell> {
     analyze(
         &[(path_a, source_a), (path_b, source_b)],
         &[path_a],
@@ -30,7 +30,7 @@ fn analyze_both_requested(
     path_b: &str,
     source_b: &str,
     weights: CloneSmellWeights,
-) -> Vec<brokk_analyzer::CloneSmell> {
+) -> Vec<brokk_bifrost::CloneSmell> {
     analyze(
         &[(path_a, source_a), (path_b, source_b)],
         &[path_a, path_b],
@@ -46,7 +46,7 @@ fn analyze_three_requested(
     path_c: &str,
     source_c: &str,
     weights: CloneSmellWeights,
-) -> Vec<brokk_analyzer::CloneSmell> {
+) -> Vec<brokk_bifrost::CloneSmell> {
     analyze(
         &[(path_a, source_a), (path_b, source_b), (path_c, source_c)],
         &[path_a, path_b, path_c],
@@ -58,7 +58,7 @@ fn analyze(
     files: &[(&str, &str)],
     requested: &[&str],
     weights: CloneSmellWeights,
-) -> Vec<brokk_analyzer::CloneSmell> {
+) -> Vec<brokk_bifrost::CloneSmell> {
     let project = files
         .iter()
         .fold(

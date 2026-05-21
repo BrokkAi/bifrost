@@ -1,5 +1,5 @@
-use brokk_analyzer::code_quality::{ReportTestAssertionSmellsParams, report_test_assertion_smells};
-use brokk_analyzer::{IAnalyzer, JavaAnalyzer, Language};
+use brokk_bifrost::code_quality::{ReportTestAssertionSmellsParams, report_test_assertion_smells};
+use brokk_bifrost::{IAnalyzer, JavaAnalyzer, Language};
 use std::fs;
 
 mod common;
@@ -9,7 +9,7 @@ use common::InlineTestProject;
 fn java_report(
     source: &str,
     params: ReportTestAssertionSmellsParams,
-) -> brokk_analyzer::code_quality::ReportTestAssertionSmellsResult {
+) -> brokk_bifrost::code_quality::ReportTestAssertionSmellsResult {
     let project = InlineTestProject::with_language(Language::Java)
         .file("com/example/SampleTest.java", source)
         .build();
@@ -20,7 +20,7 @@ fn java_report(
 fn java_report_for_files(
     files: &[(&str, &str)],
     params: ReportTestAssertionSmellsParams,
-) -> brokk_analyzer::code_quality::ReportTestAssertionSmellsResult {
+) -> brokk_bifrost::code_quality::ReportTestAssertionSmellsResult {
     let project = files
         .iter()
         .fold(

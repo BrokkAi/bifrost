@@ -1,4 +1,4 @@
-use brokk_analyzer::{IAnalyzer, JavaAnalyzer, Language, ProjectFile, TestProject};
+use brokk_bifrost::{IAnalyzer, JavaAnalyzer, Language, ProjectFile, TestProject};
 
 fn fixture_analyzer() -> JavaAnalyzer {
     let root = std::env::current_dir()

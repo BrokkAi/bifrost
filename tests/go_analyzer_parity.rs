@@ -1,4 +1,4 @@
-use brokk_analyzer::{
+use brokk_bifrost::{
     AnalyzerDelegate, GoAnalyzer, IAnalyzer, ImportAnalysisProvider, Language, MultiAnalyzer,
     Project, ProjectFile, TestProject, TypeAliasProvider,
 };

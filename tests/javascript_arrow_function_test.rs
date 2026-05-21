@@ -1,6 +1,6 @@
 mod common;
 
-use brokk_analyzer::{IAnalyzer, JavascriptAnalyzer, Language, TestProject};
+use brokk_bifrost::{IAnalyzer, JavascriptAnalyzer, Language, TestProject};
 use tempfile::tempdir;
 
 use common::write_file;

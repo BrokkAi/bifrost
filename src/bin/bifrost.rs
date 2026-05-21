@@ -1,8 +1,8 @@
 use std::env;
 use std::process::ExitCode;
 
-use brokk_analyzer::lsp::run_lsp_stdio_server;
-use brokk_analyzer::mcp_server::{McpRenderOptions, run_searchtools_stdio_server};
+use brokk_bifrost::lsp::run_lsp_stdio_server;
+use brokk_bifrost::mcp_server::{McpRenderOptions, run_searchtools_stdio_server};
 
 fn main() -> ExitCode {
     match run() {

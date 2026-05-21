@@ -36,7 +36,7 @@ That wrapper provisions a uv-managed Python 3.12 environment, makes `maturin` av
 
 ## Python Development
 
-For repo-local development without installing the package, `SearchToolsClient(..., library_path=...)` can load a built debug library such as `target/debug/libbrokk_analyzer.so`.
+For repo-local development without installing the package, `SearchToolsClient(..., library_path=...)` can load a built debug library such as `target/debug/libbrokk_bifrost.so`.
 
 ## Release Process
 

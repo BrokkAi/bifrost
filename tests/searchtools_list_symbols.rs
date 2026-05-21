@@ -1,4 +1,4 @@
-use brokk_analyzer::{
+use brokk_bifrost::{
     JavaAnalyzer, Language, TestProject,
     searchtools::{FilePatternsParams, list_symbols},
 };

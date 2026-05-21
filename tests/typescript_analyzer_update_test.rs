@@ -1,6 +1,6 @@
 mod common;
 
-use brokk_analyzer::{IAnalyzer, Language, TestProject, TypescriptAnalyzer};
+use brokk_bifrost::{IAnalyzer, Language, TestProject, TypescriptAnalyzer};
 use std::collections::BTreeSet;
 use tempfile::tempdir;
 

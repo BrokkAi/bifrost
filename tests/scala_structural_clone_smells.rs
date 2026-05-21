@@ -1,4 +1,4 @@
-use brokk_analyzer::{CloneSmellWeights, IAnalyzer, Language, ScalaAnalyzer};
+use brokk_bifrost::{CloneSmellWeights, IAnalyzer, Language, ScalaAnalyzer};
 
 mod common;
 
@@ -10,7 +10,7 @@ fn analyze_pair(
     path_b: &str,
     source_b: &str,
     weights: CloneSmellWeights,
-) -> Vec<brokk_analyzer::CloneSmell> {
+) -> Vec<brokk_bifrost::CloneSmell> {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(path_a, source_a)
         .file(path_b, source_b)
@@ -26,7 +26,7 @@ fn analyze_both_requested(
     path_b: &str,
     source_b: &str,
     weights: CloneSmellWeights,
-) -> Vec<brokk_analyzer::CloneSmell> {
+) -> Vec<brokk_bifrost::CloneSmell> {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(path_a, source_a)
         .file(path_b, source_b)

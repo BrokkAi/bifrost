@@ -1,6 +1,6 @@
 mod common;
 
-use brokk_analyzer::{
+use brokk_bifrost::{
     CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, TestProject, TypescriptAnalyzer,
 };
 use pretty_assertions::assert_eq;

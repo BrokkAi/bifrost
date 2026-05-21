@@ -1,4 +1,4 @@
-use brokk_analyzer::{
+use brokk_bifrost::{
     AnalyzerConfig, IAnalyzer, ImportAnalysisProvider, JavaAnalyzer, Language, ProjectFile,
     TestProject, TypeHierarchyProvider,
 };

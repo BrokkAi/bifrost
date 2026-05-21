@@ -1,11 +1,11 @@
 mod common;
 
-use brokk_analyzer::usages::CandidateFileProvider as _;
-use brokk_analyzer::usages::{
+use brokk_bifrost::usages::CandidateFileProvider as _;
+use brokk_bifrost::usages::{
     CONFIDENCE_THRESHOLD, FuzzyResult, PythonExportUsageGraphStrategy, RegexUsageAnalyzer,
     TextSearchCandidateProvider, UsageAnalyzer, UsageFinder,
 };
-use brokk_analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, PythonAnalyzer};
+use brokk_bifrost::{CodeUnit, IAnalyzer, Language, ProjectFile, PythonAnalyzer};
 use common::py_fixture_project;
 use std::collections::BTreeSet;
 
@@ -135,7 +135,7 @@ fn empty_overloads_yields_empty_success() {
 
 #[test]
 fn search_patterns_table_is_populated_for_known_languages() {
-    use brokk_analyzer::CodeUnitType;
+    use brokk_bifrost::CodeUnitType;
 
     // Function patterns we explicitly ported.
     for lang in [

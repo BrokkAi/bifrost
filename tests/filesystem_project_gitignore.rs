@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 
-use brokk_analyzer::{FilesystemProject, Language, Project, ProjectFile};
+use brokk_bifrost::{FilesystemProject, Language, Project, ProjectFile};
 
 fn rel_path_forward_slash(file: &ProjectFile) -> String {
     file.rel_path()

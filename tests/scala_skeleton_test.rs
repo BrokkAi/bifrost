@@ -1,6 +1,6 @@
 mod common;
 
-use brokk_analyzer::{IAnalyzer, Language, ProjectFile, ScalaAnalyzer, TestProject};
+use brokk_bifrost::{IAnalyzer, Language, ProjectFile, ScalaAnalyzer, TestProject};
 use common::assert_code_eq;
 use tempfile::tempdir;
 

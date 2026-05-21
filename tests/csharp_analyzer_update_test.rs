@@ -1,4 +1,4 @@
-use brokk_analyzer::{CSharpAnalyzer, IAnalyzer, Language, ProjectFile, TestProject};
+use brokk_bifrost::{CSharpAnalyzer, IAnalyzer, Language, ProjectFile, TestProject};
 use std::collections::BTreeSet;
 use tempfile::tempdir;
 

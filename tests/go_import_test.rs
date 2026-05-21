@@ -1,4 +1,4 @@
-use brokk_analyzer::{GoAnalyzer, IAnalyzer, ImportAnalysisProvider, ProjectFile};
+use brokk_bifrost::{GoAnalyzer, IAnalyzer, ImportAnalysisProvider, ProjectFile};
 
 mod common;
 
@@ -8,7 +8,7 @@ fn inline_project(files: &[(&str, &str)]) -> common::BuiltInlineTestProject {
     files
         .iter()
         .fold(
-            InlineTestProject::with_language(brokk_analyzer::Language::Go),
+            InlineTestProject::with_language(brokk_bifrost::Language::Go),
             |project, (path, contents)| project.file(*path, *contents),
         )
         .build()

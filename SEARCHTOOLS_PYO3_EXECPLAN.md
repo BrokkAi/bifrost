@@ -101,7 +101,7 @@ Build the Rust library and binary from `/home/jonathan/Projects/bifrost`:
 
 Acceptance for the standalone path is that `./target/debug/bifrost --root tests/fixtures/testcode-java --server searchtools` still starts and answers valid MCP requests with the same tool list and structured results.
 
-Acceptance for the Python path is that after installing with `maturin develop`, or when passing `library_path=target/debug/libbrokk_analyzer.so` from a checkout, this script:
+Acceptance for the Python path is that after installing with `maturin develop`, or when passing `library_path=target/debug/libbrokk_bifrost.so` from a checkout, this script:
 
     python - <<'PY'
     from bifrost_searchtools import SearchToolsClient

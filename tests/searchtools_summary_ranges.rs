@@ -1,4 +1,4 @@
-use brokk_analyzer::{
+use brokk_bifrost::{
     GoAnalyzer, JavaAnalyzer, Language, TestProject,
     searchtools::{SummariesParams, SummaryElement, get_summaries},
 };

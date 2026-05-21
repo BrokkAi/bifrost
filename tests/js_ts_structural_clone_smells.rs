@@ -1,4 +1,4 @@
-use brokk_analyzer::{
+use brokk_bifrost::{
     AnalyzerDelegate, CloneSmellWeights, IAnalyzer, JavascriptAnalyzer, Language, MultiAnalyzer,
     TypescriptAnalyzer,
 };
@@ -14,7 +14,7 @@ fn analyze_pair(
     path_b: &str,
     source_b: &str,
     weights: CloneSmellWeights,
-) -> Vec<brokk_analyzer::CloneSmell> {
+) -> Vec<brokk_bifrost::CloneSmell> {
     analyze(
         &[(path_a, source_a), (path_b, source_b)],
         &[path_a],
@@ -26,7 +26,7 @@ fn analyze(
     files: &[(&str, &str)],
     requested: &[&str],
     weights: CloneSmellWeights,
-) -> Vec<brokk_analyzer::CloneSmell> {
+) -> Vec<brokk_bifrost::CloneSmell> {
     let project = files
         .iter()
         .fold(

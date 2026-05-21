@@ -1,9 +1,9 @@
 mod common;
 
-use brokk_analyzer::code_quality::{
+use brokk_bifrost::code_quality::{
     ReportDeadCodeAndUnusedAbstractionSmellsParams, report_dead_code_and_unused_abstraction_smells,
 };
-use brokk_analyzer::{IAnalyzer, Language, RustAnalyzer};
+use brokk_bifrost::{IAnalyzer, Language, RustAnalyzer};
 use common::InlineTestProject;
 
 fn rust_analyzer_with_files(

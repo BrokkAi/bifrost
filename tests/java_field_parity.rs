@@ -1,4 +1,4 @@
-use brokk_analyzer::{
+use brokk_bifrost::{
     DeclarationKind, IAnalyzer, JavaAnalyzer, Language, ProjectFile, TestProject,
 };
 use std::collections::BTreeSet;

@@ -1,4 +1,4 @@
-use brokk_analyzer::{CodeUnitType, IAnalyzer, JavaAnalyzer, Language, ProjectFile, TestProject};
+use brokk_bifrost::{CodeUnitType, IAnalyzer, JavaAnalyzer, Language, ProjectFile, TestProject};
 
 fn analyzer_for(files: &[(&str, &str)]) -> JavaAnalyzer {
     let temp = tempfile::tempdir().unwrap();

@@ -1,4 +1,4 @@
-use brokk_analyzer::{IAnalyzer, JavascriptAnalyzer, Language, ProjectFile, TestProject};
+use brokk_bifrost::{IAnalyzer, JavascriptAnalyzer, Language, ProjectFile, TestProject};
 
 #[test]
 fn analyzer_skips_binary_file_with_supported_extension() {

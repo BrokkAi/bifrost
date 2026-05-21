@@ -1,4 +1,4 @@
-use brokk_analyzer::usages::{LocalInferenceConfig, LocalInferenceEngine, SymbolResolution};
+use brokk_bifrost::usages::{LocalInferenceConfig, LocalInferenceEngine, SymbolResolution};
 
 fn precise_targets(resolution: SymbolResolution<&'static str>) -> Vec<&'static str> {
     let mut values: Vec<_> = resolution

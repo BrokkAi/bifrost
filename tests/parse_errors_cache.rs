@@ -1,8 +1,8 @@
 //! Regression tests for the analyzer-side parse-error cache that backs the
 //! LSP diagnostic handler. See issue #102 + PR #101 review.
 
-use brokk_analyzer::analyzer::persistence::AnalyzerStorage;
-use brokk_analyzer::{
+use brokk_bifrost::analyzer::persistence::AnalyzerStorage;
+use brokk_bifrost::{
     AnalyzerConfig, IAnalyzer, Language, ParseErrorKind, ProjectFile, PythonAnalyzer, TestProject,
 };
 use std::collections::BTreeSet;
@@ -33,7 +33,7 @@ fn analyzer_caches_parse_errors_during_analyze_file() {
     let project = Arc::new(TestProject::new(root.clone(), Language::Python));
 
     let analyzer = PythonAnalyzer::new_with_config(
-        project as Arc<dyn brokk_analyzer::Project>,
+        project as Arc<dyn brokk_bifrost::Project>,
         AnalyzerConfig::default(),
     );
     let file = project_file(&root, "broken.py");
@@ -58,7 +58,7 @@ fn analyzer_returns_empty_vec_for_cleanly_parsed_file() {
     let project = Arc::new(TestProject::new(root.clone(), Language::Python));
 
     let analyzer = PythonAnalyzer::new_with_config(
-        project as Arc<dyn brokk_analyzer::Project>,
+        project as Arc<dyn brokk_bifrost::Project>,
         AnalyzerConfig::default(),
     );
     let file = project_file(&root, "clean.py");
@@ -81,7 +81,7 @@ fn analyzer_returns_none_for_unanalyzed_file() {
     let project = Arc::new(TestProject::new(root.clone(), Language::Python));
 
     let analyzer = PythonAnalyzer::new_with_config(
-        project as Arc<dyn brokk_analyzer::Project>,
+        project as Arc<dyn brokk_bifrost::Project>,
         AnalyzerConfig::default(),
     );
     // A path the analyzer never indexed.
@@ -105,7 +105,7 @@ fn parse_error_kind_distinguishes_error_vs_missing() {
     let project = Arc::new(TestProject::new(root.clone(), Language::Python));
 
     let analyzer = PythonAnalyzer::new_with_config(
-        project as Arc<dyn brokk_analyzer::Project>,
+        project as Arc<dyn brokk_bifrost::Project>,
         AnalyzerConfig::default(),
     );
     let file = project_file(&root, "missing.py");
@@ -151,7 +151,7 @@ fn hydrated_baseline_returns_none_so_diagnostic_falls_back() {
         let storage = Arc::new(AnalyzerStorage::open(&db_path).unwrap());
         let project = Arc::new(TestProject::new(root.clone(), Language::Python));
         let analyzer = PythonAnalyzer::new_with_config_and_storage(
-            project as Arc<dyn brokk_analyzer::Project>,
+            project as Arc<dyn brokk_bifrost::Project>,
             AnalyzerConfig::default(),
             storage,
         );
@@ -172,7 +172,7 @@ fn hydrated_baseline_returns_none_so_diagnostic_falls_back() {
     let storage = Arc::new(AnalyzerStorage::open(&db_path).unwrap());
     let project = Arc::new(TestProject::new(root.clone(), Language::Python));
     let analyzer = PythonAnalyzer::new_with_config_and_storage(
-        project as Arc<dyn brokk_analyzer::Project>,
+        project as Arc<dyn brokk_bifrost::Project>,
         AnalyzerConfig::default(),
         storage,
     );
@@ -195,7 +195,7 @@ fn parse_errors_refresh_on_update() {
     let project = Arc::new(TestProject::new(root.clone(), Language::Python));
 
     let analyzer = PythonAnalyzer::new_with_config(
-        project as Arc<dyn brokk_analyzer::Project>,
+        project as Arc<dyn brokk_bifrost::Project>,
         AnalyzerConfig::default(),
     );
     let file = project_file(&root, rel);

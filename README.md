@@ -2,7 +2,7 @@
 
 `bifrost` is a Rust port of Brokk's Tree-sitter-backed analyzer suite.
 
-At the library level, this repository builds the `brokk_analyzer` crate. It provides single-language analyzers, a `MultiAnalyzer`, snapshot-style updates, import analysis, type hierarchy queries, test-file detection, and source/skeleton extraction.
+At the library level, this repository builds the `brokk_bifrost` crate. It provides single-language analyzers, a `MultiAnalyzer`, snapshot-style updates, import analysis, type hierarchy queries, test-file detection, and source/skeleton extraction.
 
 At the tool level, this repository also provides:
 
@@ -31,14 +31,14 @@ For local development, test commands, repository-local Python workflow, and rele
 
 ## Rust Library Usage
 
-The crate name is `brokk_analyzer`.
+The crate name is `brokk_bifrost`.
 
 Example:
 
 ```rust
 use std::sync::Arc;
 
-use brokk_analyzer::{AnalyzerConfig, FilesystemProject, WorkspaceAnalyzer};
+use brokk_bifrost::{AnalyzerConfig, FilesystemProject, WorkspaceAnalyzer};
 
 fn main() -> Result<(), String> {
     let project = Arc::new(FilesystemProject::new(".")?);

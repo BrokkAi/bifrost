@@ -1,6 +1,6 @@
 mod common;
 
-use brokk_analyzer::{AnalyzerConfig, FilesystemProject, Language, Project, WorkspaceAnalyzer};
+use brokk_bifrost::{AnalyzerConfig, FilesystemProject, Language, Project, WorkspaceAnalyzer};
 use common::InlineTestProject;
 use std::collections::BTreeSet;
 use std::sync::Arc;

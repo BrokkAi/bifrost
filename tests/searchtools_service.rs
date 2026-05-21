@@ -1,4 +1,4 @@
-use brokk_analyzer::{
+use brokk_bifrost::{
     SearchToolsService, SearchToolsServiceErrorCode, searchtools_render::RenderOptions,
 };
 use git2::{Repository, Signature};

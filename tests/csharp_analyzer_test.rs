@@ -1,6 +1,6 @@
 mod common;
 
-use brokk_analyzer::{
+use brokk_bifrost::{
     CSharpAnalyzer, CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, TestProject,
 };
 use common::{assert_code_eq, csharp_fixture_project};

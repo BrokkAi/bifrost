@@ -1,4 +1,4 @@
-use brokk_analyzer::{IAnalyzer, Language, Project, ProjectFile, RustAnalyzer, TestProject};
+use brokk_bifrost::{IAnalyzer, Language, Project, ProjectFile, RustAnalyzer, TestProject};
 use tempfile::tempdir;
 
 fn rust_project(files: &[(&str, &str)]) -> TestProject {

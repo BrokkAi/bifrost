@@ -1,4 +1,4 @@
-use brokk_analyzer::{
+use brokk_bifrost::{
     CodeUnit, CodeUnitType, ImportAnalysisProvider, JavaAnalyzer, Language, ProjectFile,
     TestProject,
 };

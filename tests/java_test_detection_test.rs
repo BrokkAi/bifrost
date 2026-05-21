@@ -1,4 +1,4 @@
-use brokk_analyzer::{IAnalyzer, JavaAnalyzer, Language, Project, ProjectFile, TestProject};
+use brokk_bifrost::{IAnalyzer, JavaAnalyzer, Language, Project, ProjectFile, TestProject};
 use tempfile::tempdir;
 
 fn java_project(files: &[(&str, &str)]) -> TestProject {

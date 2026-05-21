@@ -1,6 +1,6 @@
 mod common;
 
-use brokk_analyzer::{
+use brokk_bifrost::{
     CodeUnit, CodeUnitType, CppAnalyzer, IAnalyzer, ImportAnalysisProvider, Language, Project,
     ProjectFile, TestProject,
 };

@@ -1,6 +1,6 @@
 mod common;
 
-use brokk_analyzer::{
+use brokk_bifrost::{
     AnalyzerDelegate, CodeUnit, CodeUnitType, IAnalyzer, JavaAnalyzer, Language, MultiAnalyzer,
     ProjectFile, WorkspaceAnalyzer,
 };
@@ -218,7 +218,7 @@ fn inferred_inline_project_builds_multi_workspace_analyzer() {
         .file("TestClass.java", "public class TestClass {}")
         .file("helpers.py", "VALUE = 1\n")
         .build();
-    let workspace = project.workspace_analyzer(brokk_analyzer::AnalyzerConfig::default());
+    let workspace = project.workspace_analyzer(brokk_bifrost::AnalyzerConfig::default());
 
     assert!(matches!(workspace, WorkspaceAnalyzer::Multi(_)));
     assert_eq!(

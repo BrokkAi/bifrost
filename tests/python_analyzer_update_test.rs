@@ -1,4 +1,4 @@
-use brokk_analyzer::{IAnalyzer, ProjectFile, PythonAnalyzer, TestProject};
+use brokk_bifrost::{IAnalyzer, ProjectFile, PythonAnalyzer, TestProject};
 use std::collections::BTreeSet;
 
 #[test]
@@ -14,7 +14,7 @@ fn explicit_update() {
     )
     .unwrap();
     let analyzer =
-        PythonAnalyzer::from_project(TestProject::new(root, brokk_analyzer::Language::Python));
+        PythonAnalyzer::from_project(TestProject::new(root, brokk_bifrost::Language::Python));
 
     assert!(!analyzer.get_definitions("mod.foo").is_empty());
     assert!(analyzer.get_definitions("mod.bar").is_empty());
@@ -46,7 +46,7 @@ fn auto_detect_changes_and_deletes() {
     )
     .unwrap();
     let analyzer =
-        PythonAnalyzer::from_project(TestProject::new(root, brokk_analyzer::Language::Python));
+        PythonAnalyzer::from_project(TestProject::new(root, brokk_bifrost::Language::Python));
 
     file.write(
         r#"

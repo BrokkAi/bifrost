@@ -1,5 +1,5 @@
-use brokk_analyzer::code_quality::{ReportTestAssertionSmellsParams, report_test_assertion_smells};
-use brokk_analyzer::{CppAnalyzer, IAnalyzer, Language};
+use brokk_bifrost::code_quality::{ReportTestAssertionSmellsParams, report_test_assertion_smells};
+use brokk_bifrost::{CppAnalyzer, IAnalyzer, Language};
 
 mod common;
 

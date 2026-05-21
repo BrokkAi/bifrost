@@ -1,6 +1,6 @@
 mod common;
 
-use brokk_analyzer::{
+use brokk_bifrost::{
     CodeUnit, CodeUnitType, IAnalyzer, Language, Project, ProjectFile, ScalaAnalyzer, TestProject,
 };
 use common::assert_code_eq;

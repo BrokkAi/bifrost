@@ -1,4 +1,4 @@
-use brokk_analyzer::{IAnalyzer, Language, PhpAnalyzer, Project, ProjectFile, TestProject};
+use brokk_bifrost::{IAnalyzer, Language, PhpAnalyzer, Project, ProjectFile, TestProject};
 use tempfile::tempdir;
 
 fn inline_project(files: &[(&str, &str)]) -> TestProject {

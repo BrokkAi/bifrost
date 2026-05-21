@@ -1,9 +1,9 @@
 mod common;
 
-use brokk_analyzer::usages::{
+use brokk_bifrost::usages::{
     FuzzyResult, JsTsExportUsageGraphStrategy, UsageAnalyzer, UsageFinder,
 };
-use brokk_analyzer::{
+use brokk_bifrost::{
     CodeUnit, IAnalyzer, JavascriptAnalyzer, Language, ProjectFile, TypescriptAnalyzer,
 };
 use common::{InlineTestProject, js_fixture_project, ts_fixture_project};
@@ -39,7 +39,7 @@ fn js_graph_strategy_finds_in_file_references() {
     });
 
     let strategy = JsTsExportUsageGraphStrategy::new();
-    let candidate_files: brokk_analyzer::hash::HashSet<ProjectFile> =
+    let candidate_files: brokk_bifrost::hash::HashSet<ProjectFile> =
         std::iter::once(target.source().clone()).collect();
     let result = strategy.find_usages(
         &analyzer,
@@ -78,7 +78,7 @@ fn ts_graph_strategy_finds_in_file_references() {
     });
 
     let strategy = JsTsExportUsageGraphStrategy::new();
-    let candidate_files: brokk_analyzer::hash::HashSet<ProjectFile> =
+    let candidate_files: brokk_bifrost::hash::HashSet<ProjectFile> =
         std::iter::once(target.source().clone()).collect();
     let result = strategy.find_usages(
         &analyzer,
@@ -399,7 +399,7 @@ fn ts_inline_analyzer(
     build: impl FnOnce(InlineTestProject) -> common::BuiltInlineTestProject,
 ) -> (common::BuiltInlineTestProject, TypescriptAnalyzer) {
     let project = build(InlineTestProject::with_language(
-        brokk_analyzer::Language::TypeScript,
+        brokk_bifrost::Language::TypeScript,
     ));
     let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
     (project, analyzer)
@@ -417,7 +417,7 @@ fn find_ts_target(
         .expect("target definition not found")
 }
 
-fn flatten_hits(result: FuzzyResult) -> BTreeSet<brokk_analyzer::usages::UsageHit> {
+fn flatten_hits(result: FuzzyResult) -> BTreeSet<brokk_bifrost::usages::UsageHit> {
     match result {
         FuzzyResult::Success { hits_by_overload } => hits_by_overload
             .into_values()
@@ -641,7 +641,7 @@ fn ts_duplicate_owner_names_do_not_cross_match_members() {
     });
 
     let strategy = JsTsExportUsageGraphStrategy::new();
-    let candidate_files: brokk_analyzer::hash::HashSet<ProjectFile> = [
+    let candidate_files: brokk_bifrost::hash::HashSet<ProjectFile> = [
         project.file("a.ts"),
         project.file("other.ts"),
         project.file("b.ts"),

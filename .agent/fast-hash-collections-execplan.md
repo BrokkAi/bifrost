@@ -24,7 +24,7 @@ The analyzer builds large internal maps and sets keyed by repository paths, file
   Evidence: `cargo check` reported constructor errors for the custom-hasher map/set types.
 
 - Observation: One integration test constructed a standard `HashSet` for comparison with a public watcher delta set.
-  Evidence: `cargo test --tests --no-run` failed in `tests/project_change_watcher_test.rs` until the test used `brokk_analyzer::hash::HashSet`.
+  Evidence: `cargo test --tests --no-run` failed in `tests/project_change_watcher_test.rs` until the test used `brokk_bifrost::hash::HashSet`.
 
 ## Decision Log
 

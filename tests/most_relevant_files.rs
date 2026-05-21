@@ -1,4 +1,4 @@
-use brokk_analyzer::{
+use brokk_bifrost::{
     AnalyzerConfig, FilesystemProject, GoAnalyzer, ImportAnalysisProvider, JavaAnalyzer, Language,
     Project, ProjectFile, TestProject, WorkspaceAnalyzer,
     searchtools::{MostRelevantFilesParams, most_relevant_files},

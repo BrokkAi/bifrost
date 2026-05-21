@@ -1,0 +1,65 @@
+name: Publish crate
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish (e.g. v0.4.0). Must already exist.'
+        required: true
+        type: string
+      dry_run:
+        description: 'Run cargo publish --dry-run only'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    name: cargo publish
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify Cargo.toml version matches tag
+        shell: bash
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          tag_version="${tag#v}"
+          crate_version=$(grep -m1 '^version' Cargo.toml | sed -E 's/version *= *"([^"]+)"/\1/')
+          if [ "$tag_version" != "$crate_version" ]; then
+            echo "Tag $tag_version != Cargo.toml $crate_version" >&2
+            exit 1
+          fi
+
+      - name: Authenticate to crates.io (trusted publishing)
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish (dry run)
+        if: ${{ inputs.dry_run }}
+        run: cargo publish --dry-run
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+      - name: Publish
+        if: ${{ !inputs.dry_run }}
+        run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

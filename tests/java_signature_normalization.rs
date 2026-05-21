@@ -1,4 +1,4 @@
-use brokk_analyzer::{IAnalyzer, JavaAnalyzer, Language, ProjectFile, TestProject};
+use brokk_bifrost::{IAnalyzer, JavaAnalyzer, Language, ProjectFile, TestProject};
 
 #[test]
 fn normalizes_callable_signatures_to_parameter_types() {

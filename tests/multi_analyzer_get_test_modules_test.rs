@@ -1,4 +1,4 @@
-use brokk_analyzer::{
+use brokk_bifrost::{
     AnalyzerDelegate, GoAnalyzer, IAnalyzer, Language, MultiAnalyzer, ProjectFile, PythonAnalyzer,
     TestProject,
 };

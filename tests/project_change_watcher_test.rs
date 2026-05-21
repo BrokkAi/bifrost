@@ -1,5 +1,5 @@
-use brokk_analyzer::hash::HashSet;
-use brokk_analyzer::{FilesystemProject, ProjectChangeWatcher, ProjectFile};
+use brokk_bifrost::hash::HashSet;
+use brokk_bifrost::{FilesystemProject, ProjectChangeWatcher, ProjectFile};
 use std::fs;
 use std::sync::Arc;
 use std::time::Duration;

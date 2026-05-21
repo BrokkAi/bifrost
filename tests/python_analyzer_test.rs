@@ -1,6 +1,6 @@
 mod common;
 
-use brokk_analyzer::{
+use brokk_bifrost::{
     CodeUnit, IAnalyzer, ImportAnalysisProvider, ProjectFile, PythonAnalyzer, TypeHierarchyProvider,
 };
 use common::{assert_code_eq, normalize_nonempty_lines, py_fixture_project};
@@ -25,7 +25,7 @@ fn test_python_initialization_and_skeletons() {
 
     let class_a = CodeUnit::new(
         file_a.clone(),
-        brokk_analyzer::CodeUnitType::Class,
+        brokk_bifrost::CodeUnitType::Class,
         "a.A",
         "A",
     );
@@ -70,13 +70,13 @@ fn test_python_top_level_variables() {
     let vars_py = ProjectFile::new(analyzer.project().root().to_path_buf(), "vars.py");
     let top_value = CodeUnit::new(
         vars_py.clone(),
-        brokk_analyzer::CodeUnitType::Field,
+        brokk_bifrost::CodeUnitType::Field,
         "vars",
         "TOP_VALUE",
     );
     let export_like = CodeUnit::new(
         vars_py.clone(),
-        brokk_analyzer::CodeUnitType::Field,
+        brokk_bifrost::CodeUnitType::Field,
         "vars",
         "export_like",
     );

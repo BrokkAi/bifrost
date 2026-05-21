@@ -1,4 +1,4 @@
-use brokk_analyzer::lsp::conversion::path_to_uri_string;
+use brokk_bifrost::lsp::conversion::path_to_uri_string;
 use serde_json::{Value, json};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};

@@ -279,7 +279,7 @@ Work from `/home/jonathan/Projects/bifrost`.
 
 The scaffold and vendoring steps have already been run:
 
-    cargo init --lib --name brokk_analyzer .
+    cargo init --lib --name brokk_bifrost .
     mkdir -p resources tests/fixtures
     cp -R ../brokk/app/src/main/resources/treesitter resources/
     cp -R ../brokk/app/src/test/resources/testcode-* tests/fixtures/

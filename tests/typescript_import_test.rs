@@ -1,6 +1,6 @@
 mod common;
 
-use brokk_analyzer::{
+use brokk_bifrost::{
     IAnalyzer, ImportAnalysisProvider, Language, ProjectFile, TestProject, TypescriptAnalyzer,
 };
 use std::collections::BTreeSet;

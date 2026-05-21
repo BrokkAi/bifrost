@@ -1,4 +1,4 @@
-use brokk_analyzer::{IAnalyzer, Language, Project, ProjectFile, ScalaAnalyzer, TestProject};
+use brokk_bifrost::{IAnalyzer, Language, Project, ProjectFile, ScalaAnalyzer, TestProject};
 use std::collections::BTreeSet;
 use tempfile::tempdir;
 

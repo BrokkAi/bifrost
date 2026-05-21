@@ -1,4 +1,4 @@
-use brokk_analyzer::{
+use brokk_bifrost::{
     AnalyzerDelegate, CSharpAnalyzer, CppAnalyzer, GoAnalyzer, IAnalyzer, JavaAnalyzer,
     JavascriptAnalyzer, Language, MultiAnalyzer, PhpAnalyzer, PythonAnalyzer, RustAnalyzer,
     ScalaAnalyzer, TestProject, TypescriptAnalyzer,

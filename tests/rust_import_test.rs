@@ -1,4 +1,4 @@
-use brokk_analyzer::{
+use brokk_bifrost::{
     IAnalyzer, ImportAnalysisProvider, Language, ProjectFile, RustAnalyzer, TestProject,
 };
 use tempfile::tempdir;

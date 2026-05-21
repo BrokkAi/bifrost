@@ -1,6 +1,6 @@
 mod common;
 
-use brokk_analyzer::{IAnalyzer, ImportAnalysisProvider, ProjectFile, PythonAnalyzer};
+use brokk_bifrost::{IAnalyzer, ImportAnalysisProvider, ProjectFile, PythonAnalyzer};
 use std::collections::BTreeSet;
 
 use common::InlineTestProject;
@@ -9,7 +9,7 @@ fn inline_project(files: &[(&str, &str)]) -> common::BuiltInlineTestProject {
     files
         .iter()
         .fold(
-            InlineTestProject::with_language(brokk_analyzer::Language::Python),
+            InlineTestProject::with_language(brokk_bifrost::Language::Python),
             |project, (path, contents)| project.file(*path, *contents),
         )
         .build()

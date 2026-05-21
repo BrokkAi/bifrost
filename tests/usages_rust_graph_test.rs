@@ -1,7 +1,7 @@
 mod common;
 
-use brokk_analyzer::usages::{FuzzyResult, UsageAnalyzer, UsageFinder};
-use brokk_analyzer::{
+use brokk_bifrost::usages::{FuzzyResult, UsageAnalyzer, UsageFinder};
+use brokk_bifrost::{
     AnalyzerDelegate, CodeUnit, IAnalyzer, Language, MultiAnalyzer, ProjectFile, RustAnalyzer,
 };
 use common::InlineTestProject;
@@ -71,7 +71,7 @@ pub fn get_summaries() {
     let target = definition(&analyzer, "searchtools.summarize_symbol_targets");
     let candidates = BTreeSet::new();
 
-    let result = brokk_analyzer::usages::RustExportUsageGraphStrategy::new().find_usages(
+    let result = brokk_bifrost::usages::RustExportUsageGraphStrategy::new().find_usages(
         &analyzer,
         std::slice::from_ref(&target),
         &candidates.into_iter().collect(),
@@ -103,7 +103,7 @@ fn run() {
     let target = definition(&analyzer, "service.Service");
     let candidates = [project.file("src/other.rs")].into_iter().collect();
 
-    let result = brokk_analyzer::usages::RustExportUsageGraphStrategy::new().find_usages(
+    let result = brokk_bifrost::usages::RustExportUsageGraphStrategy::new().find_usages(
         &analyzer,
         std::slice::from_ref(&target),
         &candidates,
@@ -132,7 +132,7 @@ fn run() {
     let target = definition(&analyzer, "service.Service");
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
 
-    let result = brokk_analyzer::usages::RustExportUsageGraphStrategy::new().find_usages(
+    let result = brokk_bifrost::usages::RustExportUsageGraphStrategy::new().find_usages(
         &analyzer,
         std::slice::from_ref(&target),
         &candidates,
@@ -171,7 +171,7 @@ fn run() {
     let helper = definition(&analyzer, "service.Helper");
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
 
-    let strategy = brokk_analyzer::usages::RustExportUsageGraphStrategy::new();
+    let strategy = brokk_bifrost::usages::RustExportUsageGraphStrategy::new();
     assert_eq!(
         1,
         strategy
@@ -209,7 +209,7 @@ fn run() {
     let target = definition(&analyzer, "service.factory");
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
 
-    let result = brokk_analyzer::usages::RustExportUsageGraphStrategy::new().find_usages(
+    let result = brokk_bifrost::usages::RustExportUsageGraphStrategy::new().find_usages(
         &analyzer,
         std::slice::from_ref(&target),
         &candidates,
@@ -241,7 +241,7 @@ fn run() {
     let target = definition(&analyzer, "service.Service");
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
 
-    let result = brokk_analyzer::usages::RustExportUsageGraphStrategy::new().find_usages(
+    let result = brokk_bifrost::usages::RustExportUsageGraphStrategy::new().find_usages(
         &analyzer,
         std::slice::from_ref(&target),
         &candidates,
@@ -272,7 +272,7 @@ fn run() {
     let target = definition(&analyzer, "pkg.service.Service");
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
 
-    let result = brokk_analyzer::usages::RustExportUsageGraphStrategy::new().find_usages(
+    let result = brokk_bifrost::usages::RustExportUsageGraphStrategy::new().find_usages(
         &analyzer,
         std::slice::from_ref(&target),
         &candidates,
@@ -310,7 +310,7 @@ pub fn search_symbols(
     let target = definition(&analyzer, "service.SearchSymbolsParams");
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
 
-    let result = brokk_analyzer::usages::RustExportUsageGraphStrategy::new().find_usages(
+    let result = brokk_bifrost::usages::RustExportUsageGraphStrategy::new().find_usages(
         &analyzer,
         std::slice::from_ref(&target),
         &candidates,
@@ -349,7 +349,7 @@ fn run() {
     let target = definition(&analyzer, "service.Service");
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
 
-    let result = brokk_analyzer::usages::RustExportUsageGraphStrategy::new().find_usages(
+    let result = brokk_bifrost::usages::RustExportUsageGraphStrategy::new().find_usages(
         &analyzer,
         std::slice::from_ref(&target),
         &candidates,
@@ -364,7 +364,7 @@ fn private_unseeded_rust_target_falls_back_to_no_graph_hits() {
     let target = definition(&analyzer, "service.Service");
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
 
-    match brokk_analyzer::usages::RustExportUsageGraphStrategy::new().find_usages(
+    match brokk_bifrost::usages::RustExportUsageGraphStrategy::new().find_usages(
         &analyzer,
         std::slice::from_ref(&target),
         &candidates,
@@ -402,13 +402,13 @@ fn run() {
     .into_iter()
     .collect();
 
-    let broad = brokk_analyzer::usages::RustExportUsageGraphStrategy::new().find_usages(
+    let broad = brokk_bifrost::usages::RustExportUsageGraphStrategy::new().find_usages(
         &analyzer,
         std::slice::from_ref(&target),
         &broad_candidates,
         1000,
     );
-    let narrowed = brokk_analyzer::usages::RustExportUsageGraphStrategy::new().find_usages(
+    let narrowed = brokk_bifrost::usages::RustExportUsageGraphStrategy::new().find_usages(
         &analyzer,
         std::slice::from_ref(&target),
         &non_rust_only,
@@ -442,7 +442,7 @@ fn second() { let _ = Service {}; }
     let target = definition(&analyzer, "service.Service");
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
 
-    let result = brokk_analyzer::usages::RustExportUsageGraphStrategy::new().find_usages(
+    let result = brokk_bifrost::usages::RustExportUsageGraphStrategy::new().find_usages(
         &analyzer,
         std::slice::from_ref(&target),
         &candidates,
@@ -484,7 +484,7 @@ fn summarize_input(input: &str) -> Result<RenderedSummary, String> {
     let target = definition(&analyzer, "summary.RenderedSummary");
     let candidates = std::collections::HashSet::default();
 
-    let result = brokk_analyzer::usages::RustExportUsageGraphStrategy::new().find_usages(
+    let result = brokk_bifrost::usages::RustExportUsageGraphStrategy::new().find_usages(
         &analyzer,
         std::slice::from_ref(&target),
         &candidates,
@@ -511,7 +511,7 @@ pub fn get_summaries() {}
     )]);
 
     let target = definition(&analyzer, "searchtools.summarize_symbol_targets");
-    let result = brokk_analyzer::usages::RustExportUsageGraphStrategy::new().find_usages(
+    let result = brokk_bifrost::usages::RustExportUsageGraphStrategy::new().find_usages(
         &analyzer,
         std::slice::from_ref(&target),
         &std::collections::HashSet::default(),
@@ -535,7 +535,7 @@ pub fn get_summaries() {
     )]);
 
     let target = definition(&analyzer, "searchtools.summarize_symbol_targets");
-    let result = brokk_analyzer::usages::RustExportUsageGraphStrategy::new().find_usages(
+    let result = brokk_bifrost::usages::RustExportUsageGraphStrategy::new().find_usages(
         &analyzer,
         std::slice::from_ref(&target),
         &std::collections::HashSet::default(),
@@ -725,7 +725,7 @@ fn run(x: Foo) {
     ]);
 
     let target = member(&analyzer, &project.file("src/service.rs"), "Foo", "bar");
-    let hits = brokk_analyzer::usages::RustExportUsageGraphStrategy::new()
+    let hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
         .find_usages(
             &analyzer,
             std::slice::from_ref(&target),
@@ -768,7 +768,7 @@ fn run() {
     ]);
 
     let target = member(&analyzer, &project.file("src/service.rs"), "Foo", "bar");
-    let hits = brokk_analyzer::usages::RustExportUsageGraphStrategy::new()
+    let hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
         .find_usages(
             &analyzer,
             std::slice::from_ref(&target),
@@ -809,7 +809,7 @@ fn run() {
     let make = member(&analyzer, &project.file("src/service.rs"), "Foo", "make");
     let constant = member(&analyzer, &project.file("src/service.rs"), "Foo", "CONST");
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
-    let strategy = brokk_analyzer::usages::RustExportUsageGraphStrategy::new();
+    let strategy = brokk_bifrost::usages::RustExportUsageGraphStrategy::new();
 
     assert_eq!(
         1,
@@ -859,7 +859,7 @@ fn run(x: Foo) {
     ]);
 
     let target = member(&analyzer, &project.file("src/service.rs"), "Foo", "public");
-    let hits = brokk_analyzer::usages::RustExportUsageGraphStrategy::new()
+    let hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
         .find_usages(
             &analyzer,
             std::slice::from_ref(&target),
@@ -907,7 +907,7 @@ fn run() {
     let service_target = member(&analyzer, &project.file("src/service.rs"), "Foo", "bar");
     let other_target = member(&analyzer, &project.file("src/other.rs"), "Foo", "bar");
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
-    let strategy = brokk_analyzer::usages::RustExportUsageGraphStrategy::new();
+    let strategy = brokk_bifrost::usages::RustExportUsageGraphStrategy::new();
 
     assert_eq!(
         1,
@@ -961,7 +961,7 @@ fn run(x: Foo) {
     ]);
 
     let target = member(&analyzer, &project.file("src/service.rs"), "Foo", "bar");
-    let hits = brokk_analyzer::usages::RustExportUsageGraphStrategy::new()
+    let hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
         .find_usages(
             &analyzer,
             std::slice::from_ref(&target),
@@ -994,7 +994,7 @@ fn summarize_input(input: &str) -> Result<RenderedSummary, String> {
     )]);
 
     let target = definition(&analyzer, "summary.summarize_input");
-    let hits = brokk_analyzer::usages::RustExportUsageGraphStrategy::new()
+    let hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
         .find_usages(
             &analyzer,
             std::slice::from_ref(&target),
@@ -1039,7 +1039,7 @@ pub fn get_summaries(params: SummariesParams) -> SummaryResult {
     .into_iter()
     .collect();
 
-    let hits = brokk_analyzer::usages::RustExportUsageGraphStrategy::new()
+    let hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
         .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
         .into_either()
         .expect("cross-module private success");
@@ -1051,7 +1051,7 @@ fn rust_graph_strategy_does_not_seed_pub_self_exports() {
     let (_project, analyzer) =
         rust_analyzer_with_files(&[("src/service.rs", "pub(self) struct Hidden;\n")]);
     let target = definition(&analyzer, "service.Hidden");
-    let hits = brokk_analyzer::usages::RustExportUsageGraphStrategy::new().find_usages(
+    let hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new().find_usages(
         &analyzer,
         std::slice::from_ref(&target),
         &analyzer.get_analyzed_files().into_iter().collect(),
@@ -1076,7 +1076,7 @@ fn run() {
         ),
     ]);
     let target = definition(&analyzer, "service.Local");
-    let hits = brokk_analyzer::usages::RustExportUsageGraphStrategy::new()
+    let hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
         .find_usages(
             &analyzer,
             std::slice::from_ref(&target),
@@ -1112,7 +1112,7 @@ fn run() {
     ]);
 
     let target = definition(&analyzer, "service.Foo");
-    let result = brokk_analyzer::usages::RustExportUsageGraphStrategy::new().find_usages(
+    let result = brokk_bifrost::usages::RustExportUsageGraphStrategy::new().find_usages(
         &analyzer,
         std::slice::from_ref(&target),
         &analyzer.get_analyzed_files().into_iter().collect(),
@@ -1161,7 +1161,7 @@ fn run() {
     let foo = definition(&analyzer, "service.Foo");
     let bar = definition(&analyzer, "service.Bar");
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
-    let strategy = brokk_analyzer::usages::RustExportUsageGraphStrategy::new();
+    let strategy = brokk_bifrost::usages::RustExportUsageGraphStrategy::new();
 
     assert_eq!(
         1,
@@ -1208,7 +1208,7 @@ fn run(value: Alias) {
     ]);
 
     let target = member(&analyzer, &project.file("src/service.rs"), "Foo", "bar");
-    let hits = brokk_analyzer::usages::RustExportUsageGraphStrategy::new()
+    let hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
         .find_usages(
             &analyzer,
             std::slice::from_ref(&target),
@@ -1265,7 +1265,7 @@ fn unrelated() {
         "ProjectChangeWatcher",
         "take_changed_files",
     );
-    let hits = brokk_analyzer::usages::RustExportUsageGraphStrategy::new()
+    let hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
         .find_usages(
             &analyzer,
             std::slice::from_ref(&target),
@@ -1303,7 +1303,7 @@ fn run() {
     let foo = definition(&analyzer, "service.Foo");
     let hidden = definition(&analyzer, "service.Hidden");
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
-    let strategy = brokk_analyzer::usages::RustExportUsageGraphStrategy::new();
+    let strategy = brokk_bifrost::usages::RustExportUsageGraphStrategy::new();
 
     assert_eq!(
         1,
@@ -1337,7 +1337,7 @@ fn run() {
     ]);
 
     let foo = definition(&analyzer, "service.Foo");
-    let hits = brokk_analyzer::usages::RustExportUsageGraphStrategy::new()
+    let hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
         .find_usages(
             &analyzer,
             std::slice::from_ref(&foo),
@@ -1390,7 +1390,7 @@ fn run() {
         "StructVariant",
     );
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
-    let strategy = brokk_analyzer::usages::RustExportUsageGraphStrategy::new();
+    let strategy = brokk_bifrost::usages::RustExportUsageGraphStrategy::new();
 
     assert_eq!(
         1,
@@ -1456,7 +1456,7 @@ fn run(_: Foo::AssocType) {}
         "Foo",
         "AssocType",
     );
-    let hits = brokk_analyzer::usages::RustExportUsageGraphStrategy::new()
+    let hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
         .find_usages(
             &analyzer,
             std::slice::from_ref(&assoc_type),
@@ -1492,7 +1492,7 @@ fn run() {
     ]);
 
     let target = definition(&analyzer, "service.Hidden");
-    let result = brokk_analyzer::usages::RustExportUsageGraphStrategy::new().find_usages(
+    let result = brokk_bifrost::usages::RustExportUsageGraphStrategy::new().find_usages(
         &analyzer,
         std::slice::from_ref(&target),
         &analyzer.get_analyzed_files().into_iter().collect(),
@@ -1534,7 +1534,7 @@ impl SearchToolsService {
         "ProjectChangeWatcher",
         "take_changed_files",
     );
-    let hits = brokk_analyzer::usages::RustExportUsageGraphStrategy::new()
+    let hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
         .find_usages(
             &analyzer,
             std::slice::from_ref(&target),
@@ -1582,7 +1582,7 @@ impl SearchToolsService {
         "ProjectChangeWatcher",
         "take_changed_files",
     );
-    let hits = brokk_analyzer::usages::RustExportUsageGraphStrategy::new()
+    let hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
         .find_usages(
             &analyzer,
             std::slice::from_ref(&target),
@@ -1634,7 +1634,7 @@ fn tuple_let(pair: (Foo, Bar)) {
         "Bar",
         "foo_method",
     );
-    let hits = brokk_analyzer::usages::RustExportUsageGraphStrategy::new()
+    let hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
         .find_usages(
             &analyzer,
             std::slice::from_ref(&target),
@@ -1676,7 +1676,7 @@ fn run() {
     ]);
 
     let target = member(&analyzer, &project.file("src/service.rs"), "Worker", "work");
-    let hits = brokk_analyzer::usages::RustExportUsageGraphStrategy::new()
+    let hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
         .find_usages(
             &analyzer,
             std::slice::from_ref(&target),
@@ -1726,7 +1726,7 @@ fn unknown(x: impl std::fmt::Debug) {
     let worker = member(&analyzer, &project.file("src/service.rs"), "Worker", "work");
     let other = member(&analyzer, &project.file("src/service.rs"), "Other", "work");
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
-    let strategy = brokk_analyzer::usages::RustExportUsageGraphStrategy::new();
+    let strategy = brokk_bifrost::usages::RustExportUsageGraphStrategy::new();
 
     assert_eq!(
         1,
@@ -1800,7 +1800,7 @@ fn run(x: Foo) {
         "work",
     );
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
-    let strategy = brokk_analyzer::usages::RustExportUsageGraphStrategy::new();
+    let strategy = brokk_bifrost::usages::RustExportUsageGraphStrategy::new();
 
     assert_eq!(
         1,
@@ -1865,7 +1865,7 @@ fn dynamic(x: &dyn Worker) {
     ]);
 
     let target = member(&analyzer, &project.file("src/service.rs"), "Worker", "work");
-    let hits = brokk_analyzer::usages::RustExportUsageGraphStrategy::new()
+    let hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
         .find_usages(
             &analyzer,
             std::slice::from_ref(&target),
@@ -1907,7 +1907,7 @@ fn run() {
     let file_backed = definition(&analyzer, "service.FileBacked");
     let inline = definition(&analyzer, "inline.Inline");
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
-    let strategy = brokk_analyzer::usages::RustExportUsageGraphStrategy::new();
+    let strategy = brokk_bifrost::usages::RustExportUsageGraphStrategy::new();
 
     assert_eq!(
         1,
@@ -1949,7 +1949,7 @@ fn run() {
     ]);
 
     let target = definition(&analyzer, "service.Service");
-    let hits = brokk_analyzer::usages::RustExportUsageGraphStrategy::new()
+    let hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
         .find_usages(
             &analyzer,
             std::slice::from_ref(&target),
@@ -1982,7 +1982,7 @@ struct Holder {
     ]);
 
     let target = definition(&analyzer, "service.Foo");
-    let hits = brokk_analyzer::usages::RustExportUsageGraphStrategy::new()
+    let hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
         .find_usages(
             &analyzer,
             std::slice::from_ref(&target),
@@ -2027,7 +2027,7 @@ fn run() {
     let private_const = member(&analyzer, &project.file("src/service.rs"), "Foo", "PRIVATE");
     let private_type = member(&analyzer, &project.file("src/service.rs"), "Foo", "Private");
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
-    let strategy = brokk_analyzer::usages::RustExportUsageGraphStrategy::new();
+    let strategy = brokk_bifrost::usages::RustExportUsageGraphStrategy::new();
 
     assert!(
         strategy
@@ -2074,7 +2074,7 @@ fn rust_graph_strategy_records_external_frontier_for_unresolved_public_reexport(
 
     let index_file = project.file("src/index.rs");
     let candidates = [index_file.clone()].into_iter().collect();
-    let result = brokk_analyzer::usages::RustExportUsageGraphStrategy::find_export_usages(
+    let result = brokk_bifrost::usages::RustExportUsageGraphStrategy::find_export_usages(
         &analyzer,
         &index_file,
         "Foo",
@@ -2098,7 +2098,7 @@ fn rust_graph_strategy_records_external_frontier_for_unresolved_glob_reexport() 
 
     let index_file = project.file("src/index.rs");
     let candidates = [index_file.clone()].into_iter().collect();
-    let result = brokk_analyzer::usages::RustExportUsageGraphStrategy::find_export_usages(
+    let result = brokk_bifrost::usages::RustExportUsageGraphStrategy::find_export_usages(
         &analyzer,
         &index_file,
         "Foo",
@@ -2139,7 +2139,7 @@ fn run() {
     ]);
 
     let target = definition(&analyzer, "service.Foo");
-    let result = brokk_analyzer::usages::RustExportUsageGraphStrategy::new().find_usages(
+    let result = brokk_bifrost::usages::RustExportUsageGraphStrategy::new().find_usages(
         &analyzer,
         std::slice::from_ref(&target),
         &analyzer.get_analyzed_files().into_iter().collect(),
@@ -2173,7 +2173,7 @@ fn run() {
     ]);
 
     let target = definition(&analyzer, "service.Foo");
-    let hits = brokk_analyzer::usages::RustExportUsageGraphStrategy::new()
+    let hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
         .find_usages(
             &analyzer,
             std::slice::from_ref(&target),
@@ -2213,7 +2213,7 @@ fn run() {
     let foo = definition(&analyzer, "service.Foo");
     let hidden = definition(&analyzer, "service.Hidden");
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
-    let strategy = brokk_analyzer::usages::RustExportUsageGraphStrategy::new();
+    let strategy = brokk_bifrost::usages::RustExportUsageGraphStrategy::new();
 
     assert_eq!(
         1,

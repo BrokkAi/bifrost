@@ -1,6 +1,6 @@
 mod common;
 
-use brokk_analyzer::{CodeUnit, IAnalyzer, PhpAnalyzer, ProjectFile};
+use brokk_bifrost::{CodeUnit, IAnalyzer, PhpAnalyzer, ProjectFile};
 use common::{assert_code_eq, definition, normalize_nonempty_lines, php_fixture_project};
 
 fn fixture_analyzer() -> PhpAnalyzer {
@@ -233,9 +233,9 @@ fn test_php_complex_field_initializer_is_omitted() {
     )
     .unwrap();
 
-    let analyzer = PhpAnalyzer::from_project(brokk_analyzer::TestProject::new(
+    let analyzer = PhpAnalyzer::from_project(brokk_bifrost::TestProject::new(
         root,
-        brokk_analyzer::Language::Php,
+        brokk_bifrost::Language::Php,
     ));
 
     assert_code_eq(

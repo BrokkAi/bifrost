@@ -1,7 +1,7 @@
 mod common;
 
-use brokk_analyzer::usages::{PythonExportUsageGraphStrategy, UsageAnalyzer, UsageFinder};
-use brokk_analyzer::{
+use brokk_bifrost::usages::{PythonExportUsageGraphStrategy, UsageAnalyzer, UsageFinder};
+use brokk_bifrost::{
     AnalyzerDelegate, CodeUnit, IAnalyzer, Language, MultiAnalyzer, PythonAnalyzer,
 };
 use common::InlineTestProject;
@@ -705,7 +705,7 @@ def second():
         1,
     );
     match result {
-        brokk_analyzer::usages::FuzzyResult::TooManyCallsites {
+        brokk_bifrost::usages::FuzzyResult::TooManyCallsites {
             total_callsites,
             limit,
             ..

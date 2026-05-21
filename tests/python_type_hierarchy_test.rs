@@ -1,4 +1,4 @@
-use brokk_analyzer::{
+use brokk_bifrost::{
     IAnalyzer, ImportAnalysisProvider, ProjectFile, PythonAnalyzer, TestProject,
     TypeHierarchyProvider,
 };
@@ -6,7 +6,7 @@ use brokk_analyzer::{
 fn fixture_project() -> TestProject {
     TestProject::new(
         std::fs::canonicalize("tests/fixtures/testcode-py").unwrap(),
-        brokk_analyzer::Language::Python,
+        brokk_bifrost::Language::Python,
     )
 }
 
@@ -99,7 +99,7 @@ fn test_relative_import_and_inheritance_cases() {
         .unwrap();
 
     let analyzer =
-        PythonAnalyzer::from_project(TestProject::new(root, brokk_analyzer::Language::Python));
+        PythonAnalyzer::from_project(TestProject::new(root, brokk_bifrost::Language::Python));
     let child_file = ProjectFile::new(root.to_path_buf(), "mypackage/subdir/child.py");
     let imports = analyzer.imported_code_units_of(&child_file);
     assert!(
@@ -198,7 +198,7 @@ class TypeScriptLanguageServer:
         .unwrap();
 
     let analyzer =
-        PythonAnalyzer::from_project(TestProject::new(root, brokk_analyzer::Language::Python));
+        PythonAnalyzer::from_project(TestProject::new(root, brokk_bifrost::Language::Python));
     let language_server = ProjectFile::new(root.to_path_buf(), "pkg/language_server.py");
     let imports = analyzer.imported_code_units_of(&language_server);
 

@@ -1,9 +1,9 @@
 //! End-to-end tests for the SQLite-backed analyzer persistence layer.
 
-use brokk_analyzer::analyzer::persistence::{
+use brokk_bifrost::analyzer::persistence::{
     AnalyzerStorage, PersistenceError, SymbolQueryMode, default_db_path,
 };
-use brokk_analyzer::{
+use brokk_bifrost::{
     AnalyzerConfig, IAnalyzer, Language, OverlayProject, Project, ProjectFile, PythonAnalyzer,
     TestProject, WorkspaceAnalyzer,
 };
@@ -269,7 +269,7 @@ fn workspace_analyzer_with_storage_round_trips() {
     let storage = Arc::new(AnalyzerStorage::open(db_dir.path().join("analyzer.db")).unwrap());
 
     let analyzer = WorkspaceAnalyzer::build_with_storage(
-        project.clone() as Arc<dyn brokk_analyzer::Project>,
+        project.clone() as Arc<dyn brokk_bifrost::Project>,
         AnalyzerConfig::default(),
         Arc::clone(&storage),
     );
@@ -283,7 +283,7 @@ fn workspace_analyzer_with_storage_round_trips() {
 
     // Re-open with the same storage; should hydrate identically.
     let warm = WorkspaceAnalyzer::build_with_storage(
-        project as Arc<dyn brokk_analyzer::Project>,
+        project as Arc<dyn brokk_bifrost::Project>,
         AnalyzerConfig::default(),
         storage,
     );
