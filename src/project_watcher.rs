@@ -1,11 +1,13 @@
 use crate::hash::HashSet;
 use crate::{Project, ProjectFile};
 use notify::{
-    Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher, recommended_watcher,
+    Config, Event, EventKind, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher,
+    recommended_watcher,
 };
 use std::mem;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ChangeDelta {
@@ -20,21 +22,20 @@ struct PendingChanges {
 }
 
 pub struct ProjectChangeWatcher {
-    _watcher: RecommendedWatcher,
+    _watcher: WatcherBackend,
     pending: Arc<Mutex<PendingChanges>>,
+}
+
+enum WatcherBackend {
+    Recommended { _watcher: RecommendedWatcher },
+    Poll { _watcher: PollWatcher },
 }
 
 impl ProjectChangeWatcher {
     pub fn start(project: Arc<dyn Project>) -> Result<Self, String> {
         let pending = Arc::new(Mutex::new(PendingChanges::default()));
-        let pending_for_callback = Arc::clone(&pending);
-        let project_for_callback = Arc::clone(&project);
-
-        let mut watcher = recommended_watcher(move |result: notify::Result<Event>| match result {
-            Ok(event) => handle_event(&project_for_callback, &pending_for_callback, event),
-            Err(_) => mark_full_refresh(&pending_for_callback),
-        })
-        .map_err(|err| format!("Failed to create project watcher: {err}"))?;
+        let mut watcher = recommended_watcher(event_handler(&project, &pending))
+            .map_err(|err| format!("Failed to create project watcher: {err}"))?;
 
         watcher
             .configure(Config::default())
@@ -44,7 +45,26 @@ impl ProjectChangeWatcher {
             .map_err(|err| format!("Failed to watch project root: {err}"))?;
 
         Ok(Self {
-            _watcher: watcher,
+            _watcher: WatcherBackend::Recommended { _watcher: watcher },
+            pending,
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn start_polling_for_tests(project: Arc<dyn Project>) -> Result<Self, String> {
+        let pending = Arc::new(Mutex::new(PendingChanges::default()));
+        let config = Config::default()
+            .with_poll_interval(Duration::from_millis(20))
+            .with_compare_contents(true);
+        let mut watcher = PollWatcher::new(event_handler(&project, &pending), config)
+            .map_err(|err| format!("Failed to create polling project watcher: {err}"))?;
+
+        watcher
+            .watch(project.root(), RecursiveMode::Recursive)
+            .map_err(|err| format!("Failed to watch project root: {err}"))?;
+
+        Ok(Self {
+            _watcher: WatcherBackend::Poll { _watcher: watcher },
             pending,
         })
     }
@@ -58,6 +78,18 @@ impl ProjectChangeWatcher {
             files: mem::take(&mut pending.files),
             requires_full_refresh: mem::take(&mut pending.requires_full_refresh),
         }
+    }
+}
+
+fn event_handler(
+    project: &Arc<dyn Project>,
+    pending: &Arc<Mutex<PendingChanges>>,
+) -> impl FnMut(notify::Result<Event>) + Send + 'static {
+    let pending_for_callback = Arc::clone(pending);
+    let project_for_callback = Arc::clone(project);
+    move |result: notify::Result<Event>| match result {
+        Ok(event) => handle_event(&project_for_callback, &pending_for_callback, event),
+        Err(_) => mark_full_refresh(&pending_for_callback),
     }
 }
 

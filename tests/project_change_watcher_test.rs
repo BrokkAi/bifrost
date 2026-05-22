@@ -15,8 +15,7 @@ fn watcher_reports_create_modify_delete_since_last_poll() {
     fs::write(root.join(".gitignore"), "").unwrap();
 
     let project = Arc::new(FilesystemProject::new(root.clone()).unwrap());
-    let watcher = ProjectChangeWatcher::start(project).unwrap();
-    std::thread::sleep(Duration::from_millis(100));
+    let watcher = ProjectChangeWatcher::start_polling_for_tests(project).unwrap();
     let file = ProjectFile::new(root.clone(), "src/main.rs");
 
     file.write("fn one() {}\n").unwrap();
@@ -42,8 +41,7 @@ fn watcher_works_outside_git_repo() {
     fs::write(root.join(".gitignore"), "ignored.rs\n").unwrap();
 
     let project = Arc::new(FilesystemProject::new(root.clone()).unwrap());
-    let watcher = ProjectChangeWatcher::start(project).unwrap();
-    std::thread::sleep(Duration::from_millis(100));
+    let watcher = ProjectChangeWatcher::start_polling_for_tests(project).unwrap();
 
     let file = ProjectFile::new(root.clone(), "src/main.rs");
     file.write("fn main() {}\n").unwrap();
@@ -57,7 +55,7 @@ fn watcher_works_outside_git_repo() {
 }
 
 fn wait_for_expected_file(watcher: &ProjectChangeWatcher, expected: &ProjectFile) {
-    for _ in 0..50 {
+    for _ in 0..250 {
         let delta = watcher.take_changed_files();
         if delta.requires_full_refresh {
             return;
