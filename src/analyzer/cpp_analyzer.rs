@@ -1090,12 +1090,24 @@ impl<'a> CppVisitor<'a> {
         }
         if node.kind() == "enum_specifier" {
             self.visit_enum_enumerators(node, scope, &code_unit);
+            self.visit_enum_enumerators_from_text(node, scope, &code_unit);
         }
     }
 
     fn visit_enum_enumerators(&mut self, node: Node<'_>, scope: &ScopeInfo, parent: &CodeUnit) {
+        if node.kind() == "enumerator_list" {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                self.visit_enum_enumerators(child, scope, parent);
+            }
+            return;
+        }
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
+            if child.kind() == "enumerator_list" {
+                self.visit_enum_enumerators(child, scope, parent);
+                continue;
+            }
             if child.kind() != "enumerator" {
                 continue;
             }
@@ -1121,6 +1133,47 @@ impl<'a> CppVisitor<'a> {
                 code_unit.clone(),
                 normalize_cpp_whitespace(node_text(child, self.source)),
             );
+            self.parsed.add_child(parent.clone(), code_unit);
+        }
+    }
+
+    fn visit_enum_enumerators_from_text(
+        &mut self,
+        node: Node<'_>,
+        scope: &ScopeInfo,
+        parent: &CodeUnit,
+    ) {
+        let text = node_text(node, self.source);
+        let Some((_, body)) = text.split_once('{') else {
+            return;
+        };
+        let Some((body, _)) = body.rsplit_once('}') else {
+            return;
+        };
+        for entry in body.split(',') {
+            let name = entry
+                .split('=')
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .next()
+                .unwrap_or("");
+            if name.is_empty() {
+                continue;
+            }
+            let code_unit = CodeUnit::new(
+                self.file.clone(),
+                CodeUnitType::Field,
+                scope.package_name.clone(),
+                format!("{}.{}", parent.short_name(), name),
+            );
+            if self.parsed.declarations.contains(&code_unit) {
+                continue;
+            }
+            self.parsed
+                .add_code_unit(code_unit.clone(), node, self.source, None, None);
+            self.parsed
+                .add_signature(code_unit.clone(), name.to_string());
             self.parsed.add_child(parent.clone(), code_unit);
         }
     }
@@ -1770,7 +1823,7 @@ fn normalize_cpp_qualifier_suffix(suffix: &str) -> String {
     )
 }
 
-fn normalize_cpp_whitespace(value: &str) -> String {
+pub(crate) fn normalize_cpp_whitespace(value: &str) -> String {
     collapse_cpp_whitespace(value)
 }
 
@@ -1799,7 +1852,7 @@ fn collapse_cpp_whitespace(value: &str) -> String {
     result.trim().to_string()
 }
 
-fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+pub(crate) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     source.get(node.start_byte()..node.end_byte()).unwrap_or("")
 }
 
@@ -1831,14 +1884,14 @@ fn cpp_body_node(node: Node<'_>) -> Option<Node<'_>> {
     })
 }
 
-fn parse_quoted_include(line: &str) -> Option<String> {
+pub(crate) fn parse_quoted_include(line: &str) -> Option<String> {
     let trimmed = line.trim();
     let quote_start = trimmed.find('"')?;
     let quote_end = trimmed[quote_start + 1..].find('"')?;
     Some(trimmed[quote_start + 1..quote_start + 1 + quote_end].to_string())
 }
 
-fn resolve_include_targets(
+pub(crate) fn resolve_include_targets(
     _project: &dyn Project,
     source_file: &ProjectFile,
     include: &str,
