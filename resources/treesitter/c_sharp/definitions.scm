@@ -10,7 +10,12 @@
 (struct_declaration
   name: (identifier) @class.name) @class.definition
 
-; Record types (record_declaration, record_struct_declaration) if captured, should also use @class.name / @class.definition.
+; Record types: Capture node and its name field. Uses class.* captures for consistency.
+(record_declaration
+  name: (identifier) @class.name) @class.definition
+
+(record_struct_declaration
+  name: (identifier) @class.name) @class.definition
 
 ; Function (Method): Capture node and its name field
 (method_declaration

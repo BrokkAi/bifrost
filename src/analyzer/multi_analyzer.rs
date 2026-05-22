@@ -42,7 +42,7 @@ impl AnalyzerDelegate {
     fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {
         match self {
             Self::Java(analyzer) => Some(analyzer),
-            Self::CSharp(analyzer) => analyzer.import_analysis_provider(),
+            Self::CSharp(analyzer) => Some(analyzer),
             Self::Cpp(analyzer) => Some(analyzer),
             Self::Go(analyzer) => Some(analyzer),
             Self::JavaScript(analyzer) => Some(analyzer),
