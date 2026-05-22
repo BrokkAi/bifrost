@@ -1090,8 +1090,20 @@ impl<'a> CppVisitor<'a> {
         }
         if node.kind() == "enum_specifier" {
             self.visit_enum_enumerators(node, scope, &code_unit);
-            self.visit_enum_enumerators_from_text(node, scope, &code_unit);
+            if !self.has_enum_enumerator_units(&code_unit) {
+                self.visit_enum_enumerators_from_text(node, scope, &code_unit);
+            }
         }
+    }
+
+    fn has_enum_enumerator_units(&self, parent: &CodeUnit) -> bool {
+        let prefix = format!("{}.", parent.short_name());
+        self.parsed.declarations.iter().any(|unit| {
+            unit.kind() == CodeUnitType::Field
+                && unit.source() == parent.source()
+                && unit.package_name() == parent.package_name()
+                && unit.short_name().starts_with(&prefix)
+        })
     }
 
     fn visit_enum_enumerators(&mut self, node: Node<'_>, scope: &ScopeInfo, parent: &CodeUnit) {
@@ -1151,7 +1163,8 @@ impl<'a> CppVisitor<'a> {
             return;
         };
         for entry in body.split(',') {
-            let name = entry
+            let trimmed = entry.trim();
+            let name = trimmed
                 .split('=')
                 .next()
                 .unwrap_or("")
@@ -1173,7 +1186,7 @@ impl<'a> CppVisitor<'a> {
             self.parsed
                 .add_code_unit(code_unit.clone(), node, self.source, None, None);
             self.parsed
-                .add_signature(code_unit.clone(), name.to_string());
+                .add_signature(code_unit.clone(), trimmed.to_string());
             self.parsed.add_child(parent.clone(), code_unit);
         }
     }

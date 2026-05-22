@@ -63,13 +63,13 @@ impl UsageAnalyzer for CppUsageGraphStrategy {
             };
         };
 
-        let visibility = VisibilityIndex::build(cpp, analyzer);
         let files: HashSet<ProjectFile> = candidate_files
             .iter()
             .filter(|file| file_language(file) == Language::Cpp)
             .cloned()
             .chain(std::iter::once(target.source().clone()))
             .collect();
+        let visibility = VisibilityIndex::build(cpp, analyzer, &files);
 
         let mut hits = BTreeSet::new();
         let mut saw_unproven_match = false;
@@ -90,7 +90,7 @@ impl UsageAnalyzer for CppUsageGraphStrategy {
             }
         }
 
-        if hits.is_empty() && saw_unproven_match {
+        if saw_unproven_match {
             return FuzzyResult::Failure {
                 fq_name: target.fq_name(),
                 reason: "CppUsageGraphStrategy: no proven structured hits".to_string(),
@@ -207,29 +207,28 @@ struct VisibilityIndex {
 }
 
 impl VisibilityIndex {
-    fn build(cpp: &CppAnalyzer, analyzer: &dyn IAnalyzer) -> Self {
-        let files: Vec<ProjectFile> = analyzer
-            .project()
-            .analyzable_files(Language::Cpp)
-            .map(|files| files.into_iter().collect())
-            .unwrap_or_default();
+    fn build(cpp: &CppAnalyzer, analyzer: &dyn IAnalyzer, roots: &HashSet<ProjectFile>) -> Self {
+        let mut files = HashSet::default();
+        for file in roots {
+            collect_include_closure(cpp, analyzer, file, &mut files);
+        }
         let declarations_by_file: HashMap<ProjectFile, BTreeSet<CodeUnit>> = files
             .iter()
             .map(|file| (file.clone(), analyzer.get_declarations(file)))
             .collect();
         let mut visible_by_file = HashMap::default();
-        for file in files {
+        for file in roots {
             let mut visited = HashSet::default();
             let mut visible = HashSet::default();
             collect_visible_declarations(
                 cpp,
                 analyzer,
                 &declarations_by_file,
-                &file,
+                file,
                 &mut visited,
                 &mut visible,
             );
-            visible_by_file.insert(file, visible);
+            visible_by_file.insert(file.clone(), visible);
         }
         Self { visible_by_file }
     }
@@ -239,7 +238,7 @@ impl VisibilityIndex {
             || self
                 .visible_by_file
                 .get(file)
-                .is_some_and(|visible| visible.iter().any(|unit| same_symbol(unit, target)))
+                .is_some_and(|visible| visible.iter().any(|unit| same_visible_symbol(unit, target)))
     }
 
     fn resolve_type(&self, file: &ProjectFile, raw_name: &str) -> Option<CodeUnit> {
@@ -257,9 +256,10 @@ impl VisibilityIndex {
             return self.text_alias_resolves_to_type(file, raw_name, target);
         };
         same_symbol(&resolved, target)
+            || same_visible_symbol(&resolved, target)
             || self
                 .alias_target(&resolved)
-                .is_some_and(|alias_target| same_symbol(&alias_target, target))
+                .is_some_and(|alias_target| same_visible_symbol(&alias_target, target))
             || self.text_alias_resolves_to_type(file, raw_name, target)
     }
 
@@ -343,9 +343,28 @@ impl VisibilityIndex {
             visible.iter().any(|unit| {
                 matches_kind_for_lookup(unit, kind)
                     && reference_matches_unit(&normalized, unit)
-                    && same_symbol(unit, target)
+                    && same_visible_symbol(unit, target)
             })
         })
+    }
+}
+
+fn collect_include_closure(
+    cpp: &CppAnalyzer,
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    out: &mut HashSet<ProjectFile>,
+) {
+    if !out.insert(file.clone()) {
+        return;
+    }
+    for line in analyzer.import_statements(file) {
+        let Some(include) = parse_quoted_include(line) else {
+            continue;
+        };
+        for target in resolve_include_targets(cpp.project(), file, &include) {
+            collect_include_closure(cpp, analyzer, &target, out);
+        }
     }
 }
 
@@ -393,6 +412,7 @@ struct ScanCtx<'a> {
     visibility: &'a VisibilityIndex,
     file: &'a ProjectFile,
     source: &'a str,
+    root: Node<'a>,
     line_starts: &'a [usize],
     spec: &'a TargetSpec,
     bindings: LocalInferenceEngine<CodeUnit>,
@@ -442,6 +462,7 @@ fn scan_file(
         visibility,
         file,
         source: &source,
+        root: tree.root_node(),
         line_starts: &line_starts,
         spec,
         bindings: LocalInferenceEngine::new(LocalInferenceConfig::default()),
@@ -511,6 +532,7 @@ fn seed_declarations(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 fn seed_variable_declaration(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let type_text = node
         .child_by_field_name("type")
+        .or_else(|| first_type_child(node))
         .map(|node| normalize_type_text(node_text(node, ctx.source)));
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
@@ -544,6 +566,7 @@ fn seed_typed_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     };
     let type_text = node
         .child_by_field_name("type")
+        .or_else(|| first_type_child(node))
         .map(|node| normalize_type_text(node_text(node, ctx.source)));
     seed_binding_from_type_or_value(&name, type_text.as_deref(), None, ctx);
 }
@@ -562,15 +585,7 @@ fn seed_binding_from_type_or_value(
         .and_then(|text| ctx.visibility.resolve_type(ctx.file, text))
         .or_else(|| value.and_then(|value| infer_type_from_value(value, ctx)));
 
-    if let Some(resolved) = resolved
-        && ctx.spec.owner.as_ref().is_some_and(|owner| {
-            same_symbol(&resolved, owner)
-                || ctx
-                    .visibility
-                    .alias_target(&resolved)
-                    .is_some_and(|alias_target| same_symbol(&alias_target, owner))
-        })
-    {
+    if let Some(resolved) = resolved {
         ctx.bindings.seed_symbol(name.to_string(), resolved);
     } else if let Some(value) = value
         && value.kind() == "identifier"
@@ -747,7 +762,9 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
     if receiver_matches_target(function, ctx) || same_owner_context(function, ctx) {
         push_hit(function_terminal_node(function), ctx);
-    } else {
+    } else if !receiver_has_known_non_target(function, ctx)
+        && !known_non_target_owner_context(function, ctx)
+    {
         *ctx.saw_unproven_match = true;
     }
 }
@@ -758,6 +775,8 @@ fn maybe_record_global_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         "identifier" | "field_identifier" | "qualified_identifier"
     ) || !name_matches_terminal(node_text(node, ctx.source), &ctx.spec.member_name)
         || is_declaration_name(node)
+        || is_member_field_declaration_context(node, ctx)
+        || has_ancestor_kind(node, "field_expression")
     {
         return;
     }
@@ -769,7 +788,7 @@ fn maybe_record_global_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             node_text(node, ctx.source),
             TargetKind::GlobalField,
         )
-        .is_some_and(|resolved| same_symbol(&resolved, &ctx.spec.target))
+        .is_some_and(|resolved| same_visible_symbol(&resolved, &ctx.spec.target))
     {
         push_hit(node, ctx);
     } else {
@@ -788,7 +807,7 @@ fn maybe_record_member_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         *ctx.raw_match_count += 1;
         if receiver_matches_target(node, ctx) {
             push_hit(field, ctx);
-        } else {
+        } else if !receiver_has_known_non_target(node, ctx) {
             *ctx.saw_unproven_match = true;
         }
         return;
@@ -799,23 +818,22 @@ fn maybe_record_member_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         "identifier" | "field_identifier" | "qualified_identifier"
     ) || !name_matches_terminal(node_text(node, ctx.source), &ctx.spec.member_name)
         || is_declaration_name(node)
+        || is_member_field_declaration_context(node, ctx)
+        || has_ancestor_kind(node, "field_expression")
     {
         return;
     }
     *ctx.raw_match_count += 1;
-    if ctx
-        .visibility
-        .resolve_named(
-            ctx.file,
-            node_text(node, ctx.source),
-            TargetKind::MemberField,
-        )
-        .is_some_and(|resolved| same_symbol(&resolved, &ctx.spec.target))
-        || qualified_owner_matches(node_text(node, ctx.source), ctx)
-        || same_owner_context(node, ctx)
-    {
+    let text = node_text(node, ctx.source);
+    let qualified_match = text.contains("::")
+        && (ctx
+            .visibility
+            .resolve_named(ctx.file, text, TargetKind::MemberField)
+            .is_some_and(|resolved| same_visible_symbol(&resolved, &ctx.spec.target))
+            || qualified_owner_matches(text, ctx));
+    if qualified_match || same_owner_context(node, ctx) {
         push_hit(node, ctx);
-    } else {
+    } else if !known_non_target_owner_context(node, ctx) {
         *ctx.saw_unproven_match = true;
     }
 }
@@ -845,6 +863,9 @@ fn scan_text_symbol_hits(ctx: &mut ScanCtx<'_>) {
 
 fn push_text_hit(start: usize, end: usize, ctx: &mut ScanCtx<'_>) {
     if *ctx.limit_exceeded || ctx.file == ctx.spec.target.source() {
+        return;
+    }
+    if !is_code_text_range(ctx, start, end) {
         return;
     }
     let line_idx = find_line_index_for_offset(ctx.line_starts, start);
@@ -894,6 +915,31 @@ fn is_identifier_char(ch: char) -> bool {
     ch == '_' || ch.is_ascii_alphanumeric()
 }
 
+fn is_code_text_range(ctx: &ScanCtx<'_>, start: usize, end: usize) -> bool {
+    let Some(node) = ctx.root.descendant_for_byte_range(start, end) else {
+        return false;
+    };
+    let mut current = Some(node);
+    while let Some(node) = current {
+        if matches!(
+            node.kind(),
+            "comment"
+                | "raw_string_literal"
+                | "string_literal"
+                | "char_literal"
+                | "preproc_call"
+                | "preproc_def"
+                | "preproc_function_def"
+                | "preproc_arg"
+        ) || node.kind().starts_with("preproc_")
+        {
+            return false;
+        }
+        current = node.parent();
+    }
+    true
+}
+
 fn is_out_of_line_member_definition_line(ctx: &ScanCtx<'_>, line_idx: usize, start: usize) -> bool {
     if !matches!(ctx.spec.kind, TargetKind::MemberField | TargetKind::Method) {
         return false;
@@ -933,10 +979,29 @@ fn field_text_qualifier_matches(source: &str, start: usize, ctx: &ScanCtx<'_>) -
             .unwrap_or("");
         return qualifier == owner_cpp_name || qualifier == owner.identifier();
     }
+    if let Some(prefix) = prefix.strip_suffix('.') {
+        return text_receiver_matches_target(prefix, ctx);
+    }
+    if let Some(prefix) = prefix.strip_suffix("->") {
+        return text_receiver_matches_target(prefix, ctx);
+    }
     if owner_is_class_like(owner, ctx) {
         return false;
     }
     !owner_is_scoped_enum(owner, ctx)
+}
+
+fn text_receiver_matches_target(prefix: &str, ctx: &ScanCtx<'_>) -> bool {
+    let receiver = receiver_token_before(prefix, prefix.len());
+    if receiver == Some("this") {
+        return textual_owner_context_at(prefix)
+            .zip(ctx.spec.owner_cpp_name.as_deref())
+            .is_some_and(|(owner, target)| owner == target)
+            || textual_owner_context_at(prefix)
+                .zip(ctx.spec.owner.as_ref())
+                .is_some_and(|(owner_text, owner)| owner_text == owner.identifier());
+    }
+    receiver.is_some_and(|receiver| text_receiver_has_target_type(ctx.source, receiver, ctx))
 }
 
 fn owner_is_class_like(owner: &CodeUnit, ctx: &ScanCtx<'_>) -> bool {
@@ -1073,12 +1138,15 @@ fn text_constructor_arity(source: &str, start: usize, pattern: &str) -> usize {
     if inner.is_empty() {
         0
     } else {
-        inner.split(',').count()
+        split_top_level_commas(inner).count()
     }
 }
 
 fn push_text_constructor_hit(start: usize, end: usize, ctx: &mut ScanCtx<'_>) {
     if *ctx.limit_exceeded || ctx.file == ctx.spec.target.source() {
+        return;
+    }
+    if !is_code_text_range(ctx, start, end) {
         return;
     }
     let line_idx = find_line_index_for_offset(ctx.line_starts, start);
@@ -1189,6 +1257,10 @@ fn receiver_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
         "call_expression" => node
             .child_by_field_name("function")
             .is_some_and(|function| receiver_matches_target(function, ctx)),
+        "pointer_expression" | "parenthesized_expression" => node
+            .child_by_field_name("argument")
+            .or_else(|| node.named_child(0))
+            .is_some_and(|child| receiver_matches_target(child, ctx)),
         "identifier" => ctx
             .bindings
             .resolve_symbol(node_text(node, ctx.source))
@@ -1202,6 +1274,41 @@ fn receiver_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
             let text = node_text(node, ctx.source);
             qualified_owner_matches(text, ctx)
         }
+    }
+}
+
+fn receiver_has_known_non_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    let Some(owner) = ctx.spec.owner.as_ref() else {
+        return false;
+    };
+    match node.kind() {
+        "field_expression" => node
+            .child_by_field_name("argument")
+            .or_else(|| node.child_by_field_name("object"))
+            .is_some_and(|receiver| receiver_has_known_non_target(receiver, ctx)),
+        "call_expression" => node
+            .child_by_field_name("function")
+            .is_some_and(|function| receiver_has_known_non_target(function, ctx)),
+        "pointer_expression" | "parenthesized_expression" => node
+            .child_by_field_name("argument")
+            .or_else(|| node.named_child(0))
+            .is_some_and(|child| receiver_has_known_non_target(child, ctx)),
+        "identifier" => ctx
+            .bindings
+            .resolve_symbol(node_text(node, ctx.source))
+            .as_precise()
+            .is_some_and(|targets| {
+                !targets.is_empty()
+                    && targets
+                        .iter()
+                        .all(|target| !same_visible_symbol(target, owner))
+            }),
+        "this" => known_non_target_owner_context(node, ctx),
+        "qualified_identifier" | "scoped_identifier" | "field_identifier" => {
+            let text = node_text(node, ctx.source);
+            !qualified_owner_matches(text, ctx) && text.contains("::")
+        }
+        _ => false,
     }
 }
 
@@ -1241,8 +1348,29 @@ fn same_owner_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
         .is_some_and(|target_owner| target_owner == &owner.fq_name())
 }
 
+fn known_non_target_owner_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    let Some(owner_text) = textual_owner_context(node, ctx) else {
+        return false;
+    };
+    ctx.spec
+        .owner_cpp_name
+        .as_deref()
+        .is_some_and(|target_owner| {
+            owner_text != target_owner
+                && ctx
+                    .spec
+                    .owner
+                    .as_ref()
+                    .is_none_or(|owner| owner_text != owner.identifier())
+        })
+}
+
 fn textual_owner_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {
     let before = &ctx.source[..node.start_byte()];
+    textual_owner_context_at(before)
+}
+
+fn textual_owner_context_at(before: &str) -> Option<String> {
     let brace = before.rfind('{')?;
     let header_start = before[..brace]
         .rfind(['\n', ';', '}'])
@@ -1395,7 +1523,7 @@ fn signature_arity(signature: Option<&str>) -> usize {
     if inner.is_empty() {
         return 0;
     }
-    inner.split(',').count()
+    split_top_level_commas(inner).count()
 }
 
 fn call_arity(node: Node<'_>) -> usize {
@@ -1470,8 +1598,65 @@ fn declaration_constructor_arity(node: Node<'_>, ctx: &ScanCtx<'_>) -> usize {
     if inner.is_empty() {
         0
     } else {
-        inner.split(',').count()
+        split_top_level_commas(inner).count()
     }
+}
+
+fn split_top_level_commas(value: &str) -> impl Iterator<Item = &str> {
+    struct TopLevelCommaSplit<'a> {
+        value: &'a str,
+        start: usize,
+        angle: usize,
+        paren: usize,
+        brace: usize,
+        bracket: usize,
+    }
+
+    impl<'a> Iterator for TopLevelCommaSplit<'a> {
+        type Item = &'a str;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.start > self.value.len() {
+                return None;
+            }
+            for (offset, ch) in self.value[self.start..].char_indices() {
+                let absolute = self.start + offset;
+                match ch {
+                    '<' => self.angle += 1,
+                    '>' => self.angle = self.angle.saturating_sub(1),
+                    '(' => self.paren += 1,
+                    ')' => self.paren = self.paren.saturating_sub(1),
+                    '{' => self.brace += 1,
+                    '}' => self.brace = self.brace.saturating_sub(1),
+                    '[' => self.bracket += 1,
+                    ']' => self.bracket = self.bracket.saturating_sub(1),
+                    ',' if self.angle == 0
+                        && self.paren == 0
+                        && self.brace == 0
+                        && self.bracket == 0 =>
+                    {
+                        let item = self.value[self.start..absolute].trim();
+                        self.start = absolute + ch.len_utf8();
+                        return Some(item);
+                    }
+                    _ => {}
+                }
+            }
+            let item = self.value[self.start..].trim();
+            self.start = self.value.len() + 1;
+            Some(item)
+        }
+    }
+
+    TopLevelCommaSplit {
+        value,
+        start: 0,
+        angle: 0,
+        paren: 0,
+        brace: 0,
+        bracket: 0,
+    }
+    .filter(|item| !item.is_empty())
 }
 
 fn extract_variable_name(node: Node<'_>, source: &str) -> Option<String> {
@@ -1501,6 +1686,19 @@ fn is_declarator_node(node: Node<'_>) -> bool {
     )
 }
 
+fn first_type_child(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).find(|child| {
+        matches!(
+            child.kind(),
+            "type_identifier"
+                | "primitive_type"
+                | "qualified_identifier"
+                | "scoped_type_identifier"
+        )
+    })
+}
+
 fn is_declaration_name(node: Node<'_>) -> bool {
     node.parent()
         .and_then(|parent| parent.child_by_field_name("name"))
@@ -1509,6 +1707,17 @@ fn is_declaration_name(node: Node<'_>) -> bool {
             node.parent().map(|parent| parent.kind()),
             Some("function_declarator" | "init_declarator")
         )
+}
+
+fn has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == kind {
+            return true;
+        }
+        current = parent.parent();
+    }
+    false
 }
 
 fn function_terminal_node(node: Node<'_>) -> Node<'_> {
@@ -1679,6 +1888,10 @@ fn same_symbol(left: &CodeUnit, right: &CodeUnit) -> bool {
         && left.fq_name() == right.fq_name()
         && left.signature() == right.signature()
         && left.source() == right.source()
+}
+
+fn same_visible_symbol(left: &CodeUnit, right: &CodeUnit) -> bool {
+    same_symbol(left, right) || same_logical_symbol(left, right)
 }
 
 fn same_logical_symbol(left: &CodeUnit, right: &CodeUnit) -> bool {
