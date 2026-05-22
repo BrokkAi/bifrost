@@ -50,10 +50,37 @@ fn member_function_with_arity(
     name: &str,
     arity: usize,
 ) -> CodeUnit {
+    member_function_matching_signature(analyzer, owner, name, |actual| {
+        if arity == 0 {
+            actual == Some("()")
+        } else {
+            actual.is_some_and(|actual| count_signature_parameters(actual) == arity)
+        }
+    })
+}
+
+fn member_function_with_signature(
+    analyzer: &CSharpAnalyzer,
+    owner: &str,
+    name: &str,
+    signature: &str,
+) -> CodeUnit {
+    member_function_matching_signature(analyzer, owner, name, |actual| actual == Some(signature))
+}
+
+fn member_function_matching_signature<F>(
+    analyzer: &CSharpAnalyzer,
+    owner: &str,
+    name: &str,
+    signature_matches: F,
+) -> CodeUnit
+where
+    F: Fn(Option<&str>) -> bool,
+{
     definition_by(analyzer, |unit| {
         unit.kind() == CodeUnitType::Function
             && unit.identifier() == name
-            && signature_arity(unit.signature()) == arity
+            && signature_matches(unit.signature())
             && analyzer
                 .parent_of(unit)
                 .is_some_and(|parent| parent.fq_name() == owner)
@@ -70,51 +97,16 @@ fn member_field(analyzer: &CSharpAnalyzer, owner: &str, name: &str) -> CodeUnit 
     })
 }
 
-fn signature_arity(signature: Option<&str>) -> usize {
-    let Some(signature) = signature else {
-        return 0;
-    };
+fn count_signature_parameters(signature: &str) -> usize {
     let inner = signature
         .strip_prefix('(')
         .and_then(|rest| rest.strip_suffix(')'))
         .unwrap_or(signature)
         .trim();
     if inner.is_empty() {
-        0
-    } else {
-        count_top_level_comma_separated(inner)
+        return 0;
     }
-}
-
-fn count_top_level_comma_separated(text: &str) -> usize {
-    let mut count = 1;
-    let mut angle_depth: usize = 0;
-    let mut paren_depth: usize = 0;
-    let mut bracket_depth: usize = 0;
-    let mut brace_depth: usize = 0;
-
-    for ch in text.chars() {
-        match ch {
-            '<' => angle_depth = angle_depth.saturating_add(1),
-            '>' if angle_depth > 0 => angle_depth -= 1,
-            '(' => paren_depth = paren_depth.saturating_add(1),
-            ')' if paren_depth > 0 => paren_depth -= 1,
-            '[' => bracket_depth = bracket_depth.saturating_add(1),
-            ']' if bracket_depth > 0 => bracket_depth -= 1,
-            '{' => brace_depth = brace_depth.saturating_add(1),
-            '}' if brace_depth > 0 => brace_depth -= 1,
-            ',' if angle_depth == 0
-                && paren_depth == 0
-                && bracket_depth == 0
-                && brace_depth == 0 =>
-            {
-                count += 1;
-            }
-            _ => {}
-        }
-    }
-
-    count
+    inner.split(", ").count()
 }
 
 fn graph_hits(
@@ -265,8 +257,125 @@ namespace Other {
             .any(|hit| hit.file == project.file("Other/Consumer.cs"))
     );
     assert!(
-        hits.len() >= 5,
+        hits.len() >= 3,
         "expected several structured type hits: {hits:#?}"
+    );
+}
+
+#[test]
+fn usage_finder_csharp_routes_fully_qualified_type_references_without_using() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Shared/Target.cs",
+            "namespace Shared { public class Target { } }\n",
+        ),
+        (
+            "App/FqnConsumer.cs",
+            r#"
+namespace App {
+    public class FqnConsumer {
+        private Shared.Target field;
+    }
+}
+"#,
+        ),
+    ]);
+
+    let target = type_definition(&analyzer, "Shared.Target");
+    let query = UsageFinder::new().query(&analyzer, std::slice::from_ref(&target), 1000, 1000);
+
+    assert!(
+        query
+            .candidate_files
+            .contains(&project.file("App/FqnConsumer.cs")),
+        "fully-qualified references should be routed without a using directive"
+    );
+    let hits = query.result.into_either().expect("csharp graph success");
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == project.file("App/FqnConsumer.cs"))
+    );
+}
+
+#[test]
+fn usage_finder_csharp_routes_global_using_references() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Shared/Target.cs",
+            "namespace Shared { public class Target { } }\n",
+        ),
+        ("GlobalUsings.cs", "global using Shared;\n"),
+        (
+            "App/GlobalConsumer.cs",
+            r#"
+namespace App {
+    public class GlobalConsumer {
+        private Target field;
+    }
+}
+"#,
+        ),
+    ]);
+
+    let target = type_definition(&analyzer, "Shared.Target");
+    let query = UsageFinder::new().query(&analyzer, std::slice::from_ref(&target), 1000, 1000);
+
+    assert!(
+        query
+            .candidate_files
+            .contains(&project.file("App/GlobalConsumer.cs")),
+        "global using directives should apply project-wide during routing"
+    );
+    let hits = query.result.into_either().expect("csharp graph success");
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == project.file("App/GlobalConsumer.cs"))
+    );
+}
+
+#[test]
+fn csharp_analyzer_caches_using_import_info_from_tree_sitter() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[(
+        "App/Consumer.cs",
+        r#"
+global using Shared;
+using System.Collections.Generic;
+using Alias = Other.Target;
+using static Shared.Target;
+
+namespace App {
+    public class Consumer {}
+}
+"#,
+    )]);
+
+    let file = project.file("App/Consumer.cs");
+    let statements = analyzer.import_statements_of(&file);
+    assert_eq!(
+        vec![
+            "global using Shared;",
+            "using System.Collections.Generic;",
+            "using Alias = Other.Target;",
+            "using static Shared.Target;",
+        ],
+        statements
+    );
+
+    let provider = analyzer
+        .import_analysis_provider()
+        .expect("C# import provider");
+    let imports: Vec<_> = provider
+        .import_info_of(&file)
+        .iter()
+        .map(|info| info.raw_snippet.as_str())
+        .collect();
+    assert_eq!(
+        vec!["global using Shared;", "using System.Collections.Generic;"],
+        imports
+    );
+    assert_eq!(
+        vec!["Shared", "System.Collections.Generic"],
+        analyzer.using_namespaces_of(&file)
     );
 }
 
@@ -358,8 +467,18 @@ namespace App {
         ),
     ]);
 
-    let run_one = member_function_with_arity(&analyzer, "Domain.Target", "Run", 1);
-    let run_two = member_function_with_arity(&analyzer, "Domain.Target", "Run", 2);
+    let run_one = member_function_with_signature(
+        &analyzer,
+        "Domain.Target",
+        "Run",
+        "(Dictionary<string, int>)",
+    );
+    let run_two = member_function_with_signature(
+        &analyzer,
+        "Domain.Target",
+        "Run",
+        "(Dictionary<string, int>, int)",
+    );
 
     assert_eq!(1, graph_hits(&analyzer, &run_one).len());
     assert_eq!(1, graph_hits(&analyzer, &run_two).len());
@@ -557,6 +676,76 @@ namespace App {
     assert!(
         matches!(result, FuzzyResult::Failure { .. }),
         "an inner unresolved declaration should shadow the typed receiver conservatively"
+    );
+}
+
+#[test]
+fn csharp_graph_does_not_use_forward_local_declarations() {
+    let (_project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Domain/Target.cs",
+            "namespace Domain { public class Target { public void Run() {} } }\n",
+        ),
+        (
+            "App/Consumer.cs",
+            r#"
+using Domain;
+
+namespace App {
+    public class Consumer {
+        public void Execute() {
+            local.Run();
+            Target local = new Target();
+        }
+    }
+}
+"#,
+        ),
+    ]);
+
+    let run = member_function(&analyzer, "Domain.Target", "Run");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let result = CSharpUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&run),
+        &candidates,
+        1000,
+    );
+
+    assert!(
+        matches!(result, FuzzyResult::Failure { .. }),
+        "locals declared after a member access must not prove receiver type"
+    );
+}
+
+#[test]
+fn csharp_graph_fails_on_unqualified_member_calls_for_fallback() {
+    let (_project, analyzer) = csharp_analyzer_with_files(&[(
+        "Domain/Target.cs",
+        r#"
+namespace Domain {
+    public class Target {
+        public void Run() {}
+        public void Execute() {
+            Run();
+        }
+    }
+}
+"#,
+    )]);
+
+    let run = member_function(&analyzer, "Domain.Target", "Run");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let result = CSharpUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&run),
+        &candidates,
+        1000,
+    );
+
+    assert!(
+        matches!(result, FuzzyResult::Failure { .. }),
+        "unqualified member calls are unsupported in v1 and should fall back"
     );
 }
 
@@ -803,6 +992,41 @@ namespace App {
     assert!(
         matches!(result, FuzzyResult::Failure { .. }),
         "using static and alias using member forms are deferred and should fall back"
+    );
+}
+
+#[test]
+fn csharp_graph_does_not_count_expression_identifiers_as_type_refs() {
+    let (_project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Domain/Target.cs",
+            "namespace Domain { public class Target { } }\n",
+        ),
+        (
+            "App/Consumer.cs",
+            r#"
+using Domain;
+
+namespace App {
+    public class Consumer {
+        private int Target;
+
+        public void Execute(dynamic other) {
+            System.Console.WriteLine(Target);
+            other.Target = 1;
+        }
+    }
+}
+"#,
+        ),
+    ]);
+
+    let target = type_definition(&analyzer, "Domain.Target");
+    let hits = graph_hits(&analyzer, &target);
+
+    assert!(
+        hits.is_empty(),
+        "expression identifiers named like a visible type must not count as type references: {hits:#?}"
     );
 }
 

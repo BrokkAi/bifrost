@@ -3,16 +3,20 @@ use crate::analyzer::clone_detection::{
     compute_ast_refinement_similarity_percent, detect_structural_clone_smells,
 };
 use crate::analyzer::{
-    AnalyzerConfig, CodeUnit, CodeUnitType, IAnalyzer, ImportAnalysisProvider, Language,
-    LanguageAdapter, Project, ProjectFile, TestAssertionSmell, TestAssertionWeights,
-    TestDetectionProvider, TreeSitterAnalyzer,
+    AnalyzerConfig, CodeUnit, CodeUnitType, IAnalyzer, ImportAnalysisProvider, ImportInfo,
+    Language, LanguageAdapter, Project, ProjectFile, TestAssertionSmell, TestAssertionWeights,
+    TestDetectionProvider, TreeSitterAnalyzer, build_reverse_import_index,
 };
-use crate::hash::HashSet;
+use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
+use moka::sync::Cache;
 use regex::Regex;
 use std::collections::BTreeSet;
-use std::sync::{Arc, LazyLock};
+use std::mem::size_of;
+use std::sync::{Arc, LazyLock, OnceLock};
 use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
+
+use super::javascript_analyzer::build_weighted_cache;
 
 #[derive(Debug, Clone, Default)]
 pub struct CSharpAdapter;
@@ -62,6 +66,7 @@ impl LanguageAdapter for CSharpAdapter {
         tree: &Tree,
     ) -> crate::analyzer::tree_sitter_analyzer::ParsedFile {
         let mut parsed = crate::analyzer::tree_sitter_analyzer::ParsedFile::new(String::new());
+        collect_csharp_type_identifiers(tree.root_node(), source, &mut parsed.type_identifiers);
         let mut visitor = CSharpVisitor {
             file,
             source,
@@ -75,6 +80,34 @@ impl LanguageAdapter for CSharpAdapter {
 #[derive(Clone)]
 pub struct CSharpAnalyzer {
     inner: TreeSitterAnalyzer<CSharpAdapter>,
+    memo_caches: Arc<CSharpMemoCaches>,
+}
+
+#[derive(Clone)]
+struct CSharpMemoCaches {
+    budget_bytes: u64,
+    using_namespaces: Cache<ProjectFile, Arc<Vec<String>>>,
+    imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
+    referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
+    reverse_import_index: OnceLock<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
+    global_using_namespaces: OnceLock<HashSet<String>>,
+}
+
+impl CSharpMemoCaches {
+    fn new(budget_bytes: u64) -> Self {
+        Self {
+            budget_bytes,
+            using_namespaces: build_weighted_cache(budget_bytes / 8, weight_string_vec),
+            imported_code_units: build_weighted_cache(budget_bytes / 4, weight_code_unit_set),
+            referencing_files: build_weighted_cache(budget_bytes / 8, weight_project_file_set),
+            reverse_import_index: OnceLock::new(),
+            global_using_namespaces: OnceLock::new(),
+        }
+    }
+
+    fn budget_bytes(&self) -> u64 {
+        self.budget_bytes
+    }
 }
 
 impl CSharpAnalyzer {
@@ -83,8 +116,10 @@ impl CSharpAnalyzer {
     }
 
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
+        let memo_budget = config.memo_cache_budget_bytes();
         Self {
             inner: TreeSitterAnalyzer::new_with_config(project, CSharpAdapter, config),
+            memo_caches: Arc::new(CSharpMemoCaches::new(memo_budget)),
         }
     }
 
@@ -93,6 +128,7 @@ impl CSharpAnalyzer {
         config: AnalyzerConfig,
         storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
     ) -> Self {
+        let memo_budget = config.memo_cache_budget_bytes();
         Self {
             inner: TreeSitterAnalyzer::new_with_config_and_storage(
                 project,
@@ -100,6 +136,7 @@ impl CSharpAnalyzer {
                 config,
                 storage,
             ),
+            memo_caches: Arc::new(CSharpMemoCaches::new(memo_budget)),
         }
     }
 
@@ -123,10 +160,36 @@ impl CSharpAnalyzer {
     }
 
     pub fn using_namespaces_of(&self, file: &ProjectFile) -> Vec<String> {
-        file.read_to_string()
-            .ok()
-            .map(|source| source.lines().filter_map(csharp_using_namespace).collect())
-            .unwrap_or_default()
+        if let Some(cached) = self.memo_caches.using_namespaces.get(file) {
+            return (*cached).clone();
+        }
+
+        let mut namespaces: Vec<String> = self
+            .inner
+            .import_info_of(file)
+            .iter()
+            .filter_map(|import| csharp_using_namespace(&import.raw_snippet))
+            .collect();
+        for namespace in self.global_using_namespaces() {
+            if !namespaces.contains(namespace) {
+                namespaces.push(namespace.clone());
+            }
+        }
+        self.memo_caches
+            .using_namespaces
+            .insert(file.clone(), Arc::new(namespaces.clone()));
+        namespaces
+    }
+
+    fn global_using_namespaces(&self) -> &HashSet<String> {
+        self.memo_caches.global_using_namespaces.get_or_init(|| {
+            self.inner
+                .all_files()
+                .flat_map(|file| self.inner.import_info_of(file).iter())
+                .filter(|import| import.raw_snippet.trim_start().starts_with("global using "))
+                .filter_map(|import| csharp_using_namespace(&import.raw_snippet))
+                .collect()
+        })
     }
 
     pub fn visible_type_candidates(&self, file: &ProjectFile, name: &str) -> Vec<CodeUnit> {
@@ -160,11 +223,15 @@ impl TestDetectionProvider for CSharpAnalyzer {}
 
 impl ImportAnalysisProvider for CSharpAnalyzer {
     fn imported_code_units_of(&self, file: &ProjectFile) -> HashSet<CodeUnit> {
+        if let Some(cached) = self.memo_caches.imported_code_units.get(file) {
+            return (*cached).clone();
+        }
         let namespaces = self.using_namespaces_of(file);
         if namespaces.is_empty() {
             return HashSet::default();
         }
-        self.get_all_declarations()
+        let imported: HashSet<CodeUnit> = self
+            .get_all_declarations()
             .into_iter()
             .filter(|unit| unit.kind() == CodeUnitType::Class)
             .filter(|unit| {
@@ -172,10 +239,17 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
                     .iter()
                     .any(|namespace| unit.package_name() == namespace)
             })
-            .collect()
+            .collect();
+        self.memo_caches
+            .imported_code_units
+            .insert(file.clone(), Arc::new(imported.clone()));
+        imported
     }
 
     fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
+        if let Some(cached) = self.memo_caches.referencing_files.get(file) {
+            return (*cached).clone();
+        }
         let target_namespaces: HashSet<String> = self
             .get_declarations(file)
             .into_iter()
@@ -185,21 +259,59 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
         if target_namespaces.is_empty() {
             return HashSet::default();
         }
-
-        self.get_analyzed_files()
+        let target_identifiers: HashSet<String> = self
+            .get_declarations(file)
             .into_iter()
-            .filter(|candidate| candidate != file)
-            .filter(|candidate| {
-                let candidate_namespace = self.namespace_of_file(candidate);
-                target_namespaces
+            .filter(|unit| unit.kind() == CodeUnitType::Class)
+            .map(|unit| unit.identifier().to_string())
+            .collect();
+        let target_fq_names: HashSet<String> = self
+            .get_declarations(file)
+            .into_iter()
+            .filter(|unit| unit.kind() == CodeUnitType::Class)
+            .flat_map(|unit| [unit.fq_name(), unit.fq_name().replace('$', ".")])
+            .collect();
+
+        let reverse_index = self.memo_caches.reverse_import_index.get_or_init(|| {
+            let files: Vec<_> = self.inner.all_files().cloned().collect();
+            build_reverse_import_index(&files, |candidate| self.imported_code_units_of(candidate))
+        });
+        let mut result = reverse_index
+            .get(file)
+            .map(|files| (**files).clone())
+            .unwrap_or_default();
+
+        for candidate in self.inner.all_files() {
+            if candidate == file || result.contains(candidate) {
+                continue;
+            }
+            let Some(identifiers) = self.inner.type_identifiers_of(candidate) else {
+                continue;
+            };
+            let candidate_namespace = self.namespace_of_file(candidate);
+            let same_namespace = target_namespaces
+                .iter()
+                .any(|namespace| namespace == &candidate_namespace);
+            if same_namespace
+                && identifiers
                     .iter()
-                    .any(|namespace| namespace == &candidate_namespace)
-                    || self
-                        .using_namespaces_of(candidate)
-                        .iter()
-                        .any(|namespace| target_namespaces.contains(namespace))
-            })
-            .collect()
+                    .any(|name| target_identifiers.contains(name))
+            {
+                result.insert(candidate.clone());
+                continue;
+            }
+            if identifiers
+                .iter()
+                .any(|name| target_fq_names.contains(name))
+            {
+                result.insert(candidate.clone());
+            }
+        }
+
+        self.memo_caches
+            .referencing_files
+            .insert(file.clone(), Arc::new(result.clone()));
+        result
     }
 
     fn import_info_of<'a>(&'a self, file: &ProjectFile) -> &'a [crate::analyzer::ImportInfo] {
@@ -295,12 +407,14 @@ impl IAnalyzer for CSharpAnalyzer {
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
         Self {
             inner: self.inner.update(changed_files),
+            memo_caches: Arc::new(CSharpMemoCaches::new(self.memo_caches.budget_bytes())),
         }
     }
 
     fn update_all(&self) -> Self {
         Self {
             inner: self.inner.update_all(),
+            memo_caches: Arc::new(CSharpMemoCaches::new(self.memo_caches.budget_bytes())),
         }
     }
 
@@ -538,7 +652,19 @@ impl<'a> CSharpVisitor<'a> {
             "constructor_declaration" => self.visit_constructor(node, scope),
             "property_declaration" => self.visit_property(node, scope),
             "field_declaration" => self.visit_field_declaration(node, scope),
+            "using_directive" => self.visit_using_directive(node),
             _ => {}
+        }
+    }
+
+    fn visit_using_directive(&mut self, node: Node<'_>) {
+        let raw = cs_node_text(node, self.source).trim().to_string();
+        if raw.is_empty() {
+            return;
+        }
+        self.parsed.import_statements.push(raw.clone());
+        if csharp_using_namespace(&raw).is_some() {
+            self.parsed.imports.push(csharp_import_info(raw));
         }
     }
 
@@ -992,12 +1118,24 @@ fn csharp_using_namespace(raw: &str) -> Option<String> {
     Some(rest.to_string())
 }
 
+fn csharp_import_info(raw: String) -> ImportInfo {
+    let identifier = csharp_using_namespace(&raw)
+        .and_then(|namespace| namespace.rsplit('.').next().map(str::to_string));
+    ImportInfo {
+        raw_snippet: raw,
+        is_wildcard: true,
+        identifier,
+        alias: None,
+    }
+}
+
 fn csharp_type_name_matches(unit: &CodeUnit, raw_name: &str) -> bool {
     let normalized = normalize_csharp_type_name(raw_name);
     if normalized.is_empty() {
         return false;
     }
     normalized == unit.fq_name()
+        || normalized == unit.fq_name().replace('$', ".")
         || (normalized.contains('$') && normalized == unit.short_name())
         || (normalized.contains('.')
             && unit
@@ -1018,6 +1156,85 @@ fn normalize_csharp_type_name(raw_name: &str) -> String {
         .unwrap_or(without_arrays)
         .trim()
         .to_string()
+}
+
+fn collect_csharp_type_identifiers(
+    node: Node<'_>,
+    source: &str,
+    identifiers: &mut HashSet<String>,
+) {
+    if is_csharp_type_position_node(node)
+        && matches!(
+            node.kind(),
+            "identifier"
+                | "qualified_name"
+                | "generic_name"
+                | "nullable_type"
+                | "array_type"
+                | "type"
+        )
+    {
+        let text = normalize_csharp_type_name(cs_node_text(node, source));
+        if !text.is_empty() {
+            identifiers.insert(text);
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_csharp_type_identifiers(child, source, identifiers);
+    }
+}
+
+fn is_csharp_type_position_node(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        if parent
+            .child_by_field_name("type")
+            .is_some_and(|type_node| same_cs_node(type_node, node))
+            || parent
+                .child_by_field_name("return_type")
+                .is_some_and(|type_node| same_cs_node(type_node, node))
+        {
+            return true;
+        }
+        if parent.kind() == "type" {
+            return true;
+        }
+        if parent.kind() == "object_creation_expression" {
+            return true;
+        }
+        if matches!(
+            parent.kind(),
+            "class_declaration"
+                | "interface_declaration"
+                | "struct_declaration"
+                | "record_declaration"
+                | "record_struct_declaration"
+        ) && !parent
+            .child_by_field_name("name")
+            .is_some_and(|name| same_cs_node(name, node))
+        {
+            return true;
+        }
+        if matches!(
+            parent.kind(),
+            "qualified_name"
+                | "generic_name"
+                | "nullable_type"
+                | "array_type"
+                | "type_argument_list"
+                | "base_list"
+        ) {
+            node = parent;
+            continue;
+        }
+        return false;
+    }
+    false
+}
+
+fn same_cs_node(left: Node<'_>, right: Node<'_>) -> bool {
+    left.start_byte() == right.start_byte() && left.end_byte() == right.end_byte()
 }
 
 const CSHARP_CLONE_AST_IDENTIFIER_TYPES: &[&str] = &["identifier"];
@@ -1309,4 +1526,46 @@ fn csharp_contains_tests(source: &str) -> bool {
         .expect("valid csharp test regex")
     });
     regex.is_match(source)
+}
+
+fn weight_string_vec(_key: &ProjectFile, value: &Arc<Vec<String>>) -> u32 {
+    weight_bytes(
+        size_of::<Vec<String>>() as u64 + value.iter().map(|item| item.len() as u64).sum::<u64>(),
+    )
+}
+
+fn weight_code_unit_set(_key: &ProjectFile, value: &Arc<HashSet<CodeUnit>>) -> u32 {
+    weight_bytes(estimate_code_unit_set(value.as_ref()))
+}
+
+fn weight_project_file_set(_key: &ProjectFile, value: &Arc<HashSet<ProjectFile>>) -> u32 {
+    weight_bytes(estimate_project_file_set(value.as_ref()))
+}
+
+fn weight_bytes(bytes: u64) -> u32 {
+    bytes.clamp(1, u32::MAX as u64) as u32
+}
+
+fn estimate_project_file(file: &ProjectFile) -> u64 {
+    size_of::<ProjectFile>() as u64
+        + file.root().as_os_str().to_string_lossy().len() as u64
+        + file.rel_path().as_os_str().to_string_lossy().len() as u64
+}
+
+fn estimate_code_unit(code_unit: &CodeUnit) -> u64 {
+    size_of::<CodeUnit>() as u64
+        + estimate_project_file(code_unit.source())
+        + code_unit.package_name().len() as u64
+        + code_unit.short_name().len() as u64
+        + code_unit
+            .signature()
+            .map_or(0, |signature| signature.len() as u64)
+}
+
+fn estimate_code_unit_set(values: &HashSet<CodeUnit>) -> u64 {
+    size_of::<HashSet<CodeUnit>>() as u64 + values.iter().map(estimate_code_unit).sum::<u64>()
+}
+
+fn estimate_project_file_set(files: &HashSet<ProjectFile>) -> u64 {
+    size_of::<HashSet<ProjectFile>>() as u64 + files.iter().map(estimate_project_file).sum::<u64>()
 }

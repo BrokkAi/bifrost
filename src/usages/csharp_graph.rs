@@ -272,7 +272,10 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     match ctx.spec.kind {
         TargetKind::Type => scan_type_reference(node, ctx),
         TargetKind::Constructor => scan_constructor_reference(node, ctx),
-        TargetKind::Method | TargetKind::Field => scan_member_reference(node, ctx),
+        TargetKind::Method | TargetKind::Field => {
+            scan_member_reference(node, ctx);
+            scan_unqualified_member_reference(node, ctx);
+        }
     }
 
     let mut cursor = node.walk();
@@ -285,10 +288,13 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn scan_type_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if node.kind() != "identifier" || is_declaration_name(node) {
+    if !matches!(node.kind(), "identifier" | "type")
+        || is_declaration_name(node)
+        || !is_type_reference_node(node)
+    {
         return;
     }
-    if node_text(node, ctx.source) != ctx.spec.member_name {
+    if normalize_type_text(node_text(node, ctx.source)) != ctx.spec.member_name {
         return;
     }
     let reference = reference_type_text(node, ctx.source);
@@ -361,8 +367,9 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 
     let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
-    seed_bindings(
+    seed_bindings_before(
         binding_scope_node(node),
+        node.start_byte(),
         ctx.csharp,
         ctx.file,
         ctx.source,
@@ -386,6 +393,34 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
+fn scan_unqualified_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if node.kind() != "identifier" || is_declaration_name(node) {
+        return;
+    }
+    if node_text(node, ctx.source) != ctx.spec.member_name {
+        return;
+    }
+    if node
+        .parent()
+        .is_some_and(|parent| parent.kind() == "member_access_expression")
+    {
+        return;
+    }
+    match ctx.spec.kind {
+        TargetKind::Method
+            if node
+                .parent()
+                .is_some_and(|parent| parent.kind() == "invocation_expression") =>
+        {
+            *ctx.saw_unproven_match = true;
+        }
+        TargetKind::Field if !is_type_reference_node(node) => {
+            *ctx.saw_unproven_match = true;
+        }
+        _ => {}
+    }
+}
+
 fn binding_scope_node(mut node: Node<'_>) -> Node<'_> {
     while let Some(parent) = node.parent() {
         if matches!(
@@ -403,13 +438,29 @@ fn binding_scope_node(mut node: Node<'_>) -> Node<'_> {
     node
 }
 
-fn seed_bindings(
+fn seed_bindings_before(
     node: Node<'_>,
+    cutoff_start: usize,
     csharp: &CSharpAnalyzer,
     file: &ProjectFile,
     source: &str,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
+    seed_bindings_before_inner(node, cutoff_start, csharp, file, source, bindings);
+}
+
+fn seed_bindings_before_inner(
+    node: Node<'_>,
+    cutoff_start: usize,
+    csharp: &CSharpAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    bindings: &mut LocalInferenceEngine<String>,
+) {
+    if node.start_byte() >= cutoff_start {
+        return;
+    }
+
     match node.kind() {
         "parameter" => seed_parameter(node, csharp, file, source, bindings),
         "variable_declaration" => seed_variable_declaration(node, csharp, file, source, bindings),
@@ -418,7 +469,10 @@ fn seed_bindings(
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        seed_bindings(child, csharp, file, source, bindings);
+        if child.start_byte() >= cutoff_start {
+            break;
+        }
+        seed_bindings_before_inner(child, cutoff_start, csharp, file, source, bindings);
     }
 }
 
@@ -563,6 +617,53 @@ fn reference_type_text(node: Node<'_>, source: &str) -> String {
     normalize_type_text(node_text(current, source))
 }
 
+fn is_type_reference_node(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        if parent
+            .child_by_field_name("type")
+            .is_some_and(|type_node| same_node(type_node, node))
+            || parent
+                .child_by_field_name("return_type")
+                .is_some_and(|type_node| same_node(type_node, node))
+        {
+            return true;
+        }
+        if parent.kind() == "type" {
+            return true;
+        }
+        if parent.kind() == "object_creation_expression" {
+            return true;
+        }
+        if matches!(
+            parent.kind(),
+            "class_declaration"
+                | "interface_declaration"
+                | "struct_declaration"
+                | "record_declaration"
+                | "record_struct_declaration"
+        ) && !parent
+            .child_by_field_name("name")
+            .is_some_and(|name| same_node(name, node))
+        {
+            return true;
+        }
+        if matches!(
+            parent.kind(),
+            "qualified_name"
+                | "generic_name"
+                | "nullable_type"
+                | "array_type"
+                | "type_argument_list"
+                | "base_list"
+        ) {
+            node = parent;
+            continue;
+        }
+        return false;
+    }
+    false
+}
+
 fn is_declaration_name(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
@@ -616,7 +717,12 @@ fn first_type_child(node: Node<'_>) -> Option<Node<'_>> {
     node.named_children(&mut cursor).find(|child| {
         matches!(
             child.kind(),
-            "identifier" | "qualified_name" | "generic_name" | "nullable_type" | "array_type"
+            "identifier"
+                | "qualified_name"
+                | "generic_name"
+                | "nullable_type"
+                | "array_type"
+                | "type"
         )
     })
 }
