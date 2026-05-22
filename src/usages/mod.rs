@@ -28,6 +28,7 @@ mod php_graph;
 mod python_graph;
 mod regex_analyzer;
 mod rust_graph;
+mod scala_graph;
 mod traits;
 
 pub use candidates::{
@@ -52,6 +53,7 @@ pub use php_graph::PhpUsageGraphStrategy;
 pub use python_graph::PythonExportUsageGraphStrategy;
 pub use regex_analyzer::RegexUsageAnalyzer;
 pub use rust_graph::RustExportUsageGraphStrategy;
+pub use scala_graph::ScalaUsageGraphStrategy;
 pub use traits::{CandidateFileProvider, UsageAnalyzer};
 
 use crate::analyzer::{CodeUnit, IAnalyzer};

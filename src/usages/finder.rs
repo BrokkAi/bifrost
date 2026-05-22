@@ -14,6 +14,7 @@ use crate::usages::php_graph::PhpUsageGraphStrategy;
 use crate::usages::python_graph::PythonExportUsageGraphStrategy;
 use crate::usages::regex_analyzer::RegexUsageAnalyzer;
 use crate::usages::rust_graph::RustExportUsageGraphStrategy;
+use crate::usages::scala_graph::ScalaUsageGraphStrategy;
 use crate::usages::traits::{CandidateFileProvider, UsageAnalyzer};
 
 fn target_language(target: &CodeUnit) -> Language {
@@ -79,6 +80,7 @@ impl UsageFinder {
         graph_analyzers.insert(Language::CSharp, Box::new(CSharpUsageGraphStrategy::new()));
         graph_analyzers.insert(Language::Cpp, Box::new(CppUsageGraphStrategy::new()));
         graph_analyzers.insert(Language::Go, Box::new(GoUsageGraphStrategy::new()));
+        graph_analyzers.insert(Language::Scala, Box::new(ScalaUsageGraphStrategy::new()));
 
         Self {
             fallback_candidate_provider: default_provider(),
