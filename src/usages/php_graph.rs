@@ -1,6 +1,6 @@
 use crate::analyzer::{
     AnalyzerDelegate, CodeUnit, IAnalyzer, Language, MultiAnalyzer, PhpAnalyzer, PhpUseAliases,
-    ProjectFile, Range, php_namespace_to_fq,
+    ProjectFile, Range, parse_php_use_aliases_from_source, php_namespace_to_fq,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
@@ -207,31 +207,34 @@ fn scan_file(
 
     let ctx = FileContext {
         namespace: php.namespace_of_file(file),
-        aliases: php.use_aliases_by_kind_of(file),
+        aliases: parse_php_use_aliases_from_source(&source),
     };
 
     let line_starts = compute_line_starts(&source);
-    scan_node(
-        tree.root_node(),
-        analyzer,
-        file,
-        &source,
-        &line_starts,
-        &ctx,
-        spec,
-        hits,
-    );
-    scan_member_patterns(
-        tree.root_node(),
-        analyzer,
-        file,
-        &source,
-        &line_starts,
-        &ctx,
-        hierarchy,
-        spec,
-        hits,
-    );
+    if matches!(spec.kind, TargetKind::Method | TargetKind::Field) {
+        scan_member_patterns(
+            tree.root_node(),
+            analyzer,
+            file,
+            &source,
+            &line_starts,
+            &ctx,
+            hierarchy,
+            spec,
+            hits,
+        );
+    } else {
+        scan_node(
+            tree.root_node(),
+            analyzer,
+            file,
+            &source,
+            &line_starts,
+            &ctx,
+            spec,
+            hits,
+        );
+    }
 }
 
 static PARAMETER_VARIABLE_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -244,6 +247,18 @@ static PARAMETER_VARIABLE_RE: LazyLock<Regex> = LazyLock::new(|| {
 static ASSIGNMENT_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\$(?P<lhs>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<rhs>[^;]+);")
         .expect("valid PHP assignment regex")
+});
+
+static INSTANCE_MEMBER_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\$(?P<var>[A-Za-z_][A-Za-z0-9_]*)\s*->\s*(?P<member>[A-Za-z_][A-Za-z0-9_]*)\b")
+        .expect("valid PHP instance member regex")
+});
+
+static STATIC_MEMBER_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?P<recv>\\?[A-Za-z_][A-Za-z0-9_\\]*)\s*::\s*\$?(?P<member>[A-Za-z_][A-Za-z0-9_]*)\b",
+    )
+    .expect("valid PHP static member regex")
 });
 
 #[allow(clippy::too_many_arguments)]
@@ -479,11 +494,6 @@ fn scan_member_patterns(
     let Some(owner) = spec.owner_fq_name.as_deref() else {
         return;
     };
-    let escaped_member = regex::escape(&spec.member_name);
-    let instance = Regex::new(&format!(
-        r"\$(?P<var>[A-Za-z_][A-Za-z0-9_]*)\s*->\s*(?P<member>{escaped_member})\b"
-    ))
-    .expect("valid PHP instance member regex");
     for (scope_start, scope_end) in member_scope_ranges(root) {
         let Some(scope_source) = source.get(scope_start..scope_end) else {
             continue;
@@ -491,7 +501,6 @@ fn scan_member_patterns(
         scan_instance_members_in_order(
             scope_start,
             scope_source,
-            &instance,
             analyzer,
             file,
             source,
@@ -504,15 +513,14 @@ fn scan_member_patterns(
         );
     }
 
-    let static_member = Regex::new(&format!(
-        r"(?P<recv>\\?[A-Za-z_][A-Za-z0-9_\\]*)\s*::\s*\$?(?P<member>{escaped_member})\b"
-    ))
-    .expect("valid PHP static member regex");
-    for captures in static_member.captures_iter(source) {
+    for captures in STATIC_MEMBER_RE.captures_iter(source) {
         let Some(receiver) = captures.name("recv") else {
             continue;
         };
         let member = captures.name("member").expect("member capture");
+        if member.as_str() != spec.member_name {
+            continue;
+        }
         if !static_receiver_matches(
             analyzer,
             file,
@@ -543,7 +551,6 @@ fn scan_member_patterns(
 fn scan_instance_members_in_order(
     scope_start: usize,
     scope_source: &str,
-    instance: &Regex,
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     full_source: &str,
@@ -566,13 +573,21 @@ fn scan_instance_members_in_order(
         let Some(whole) = captures.get(0) else {
             continue;
         };
+        let Some(lhs) = captures.name("lhs") else {
+            continue;
+        };
+        let Some(rhs) = captures.name("rhs") else {
+            continue;
+        };
         events.push(MemberScanEvent::Assignment {
             start: whole.start(),
-            lhs: captures.name("lhs").map(|m| m.as_str().to_string()),
-            rhs: captures.name("rhs").map(|m| m.as_str().trim().to_string()),
+            lhs_start: lhs.start(),
+            lhs_end: lhs.end(),
+            rhs_start: rhs.start(),
+            rhs_end: rhs.end(),
         });
     }
-    for captures in instance.captures_iter(scope_source) {
+    for captures in INSTANCE_MEMBER_RE.captures_iter(scope_source) {
         let Some(whole) = captures.get(0) else {
             continue;
         };
@@ -582,9 +597,13 @@ fn scan_instance_members_in_order(
         let Some(member) = captures.name("member") else {
             continue;
         };
+        if member.as_str() != spec.member_name {
+            continue;
+        }
         events.push(MemberScanEvent::InstanceMember {
             start: whole.start(),
-            receiver: var.as_str().to_string(),
+            receiver_start: var.start(),
+            receiver_end: var.end(),
             member_start: member.start(),
             member_end: member.end(),
         });
@@ -593,20 +612,33 @@ fn scan_instance_members_in_order(
 
     for event in events {
         match event {
-            MemberScanEvent::Assignment { lhs, rhs, .. } => {
-                let (Some(lhs), Some(rhs)) = (lhs, rhs) else {
+            MemberScanEvent::Assignment {
+                lhs_start,
+                lhs_end,
+                rhs_start,
+                rhs_end,
+                ..
+            } => {
+                let Some(lhs) = scope_source.get(lhs_start..lhs_end) else {
                     continue;
                 };
-                apply_receiver_assignment(&lhs, &rhs, ctx, &mut engine);
+                let Some(rhs) = scope_source.get(rhs_start..rhs_end) else {
+                    continue;
+                };
+                apply_receiver_assignment(lhs, rhs.trim(), ctx, &mut engine);
             }
             MemberScanEvent::InstanceMember {
-                receiver,
+                receiver_start,
+                receiver_end,
                 member_start,
                 member_end,
                 ..
             } => {
                 let absolute_start = scope_start + member_start;
                 let absolute_end = scope_start + member_end;
+                let Some(receiver) = scope_source.get(receiver_start..receiver_end) else {
+                    continue;
+                };
                 let receiver_matches = if receiver == "this" {
                     receiver_is_enclosing_subtype(
                         analyzer,
@@ -618,7 +650,7 @@ fn scan_instance_members_in_order(
                         hierarchy,
                     )
                 } else {
-                    precise_receiver_type(&engine, &receiver)
+                    precise_receiver_type(&engine, receiver)
                         .is_some_and(|fq| receiver_type_matches(&fq, owner, hierarchy))
                 };
                 if receiver_matches {
@@ -641,12 +673,15 @@ fn scan_instance_members_in_order(
 enum MemberScanEvent {
     Assignment {
         start: usize,
-        lhs: Option<String>,
-        rhs: Option<String>,
+        lhs_start: usize,
+        lhs_end: usize,
+        rhs_start: usize,
+        rhs_end: usize,
     },
     InstanceMember {
         start: usize,
-        receiver: String,
+        receiver_start: usize,
+        receiver_end: usize,
         member_start: usize,
         member_end: usize,
     },
@@ -779,7 +814,7 @@ impl PhpHierarchyIndex {
             };
             let ctx = FileContext {
                 namespace: php.namespace_of_file(file),
-                aliases: php.use_aliases_by_kind_of(file),
+                aliases: parse_php_use_aliases_from_source(&source),
             };
             hierarchy.extend_file(&source, &ctx);
         }
@@ -816,12 +851,12 @@ impl PhpHierarchyIndex {
             .get(receiver_fq_name)
             .map(|ancestors| ancestors.iter().map(String::as_str).collect())
             .unwrap_or_default();
-        let mut visited = HashSet::default();
+        let mut visited: HashSet<&str> = HashSet::default();
         while let Some(candidate) = stack.pop() {
             if candidate == owner {
                 return true;
             }
-            if !visited.insert(candidate.to_string()) {
+            if !visited.insert(candidate) {
                 continue;
             }
             if let Some(ancestors) = self.ancestors.get(candidate) {

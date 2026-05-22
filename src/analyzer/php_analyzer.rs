@@ -174,7 +174,7 @@ enum PhpUseKind {
 static PHP_USE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?m)^use\s+[^;]+;").expect("valid PHP use regex"));
 
-fn parse_php_use_aliases_from_source(source: &str) -> PhpUseAliases {
+pub fn parse_php_use_aliases_from_source(source: &str) -> PhpUseAliases {
     let mut aliases = PhpUseAliases::default();
     for matched in PHP_USE_RE.find_iter(source) {
         aliases.extend(parse_php_use_aliases_by_kind(matched.as_str()));
