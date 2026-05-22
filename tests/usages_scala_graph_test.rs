@@ -50,6 +50,47 @@ fn assert_hit_contains(hits: &[UsageHit], needle: &str) {
     );
 }
 
+fn assert_hit_line(hits: &[UsageHit], line: usize) {
+    assert!(
+        hits.iter().any(|hit| hit.line == line),
+        "expected hit on line {line}, got {hits:#?}"
+    );
+}
+
+fn assert_no_hit_line(hits: &[UsageHit], line: usize) {
+    assert!(
+        hits.iter().all(|hit| hit.line != line),
+        "expected no hit on line {line}, got {hits:#?}"
+    );
+}
+
+fn assert_no_hit_in_enclosing(hits: &[UsageHit], enclosing_fq_name: &str) {
+    assert!(
+        hits.iter()
+            .all(|hit| hit.enclosing.fq_name() != enclosing_fq_name),
+        "expected no hit in {enclosing_fq_name}, got {hits:#?}"
+    );
+}
+
+fn assert_hit_count_by_snippet(hits: &[UsageHit], needle: &str, expected: usize) {
+    let actual = hits
+        .iter()
+        .filter(|hit| hit.snippet.contains(needle))
+        .count();
+    assert_eq!(
+        expected, actual,
+        "expected {expected} hits containing {needle:?}, got {hits:#?}"
+    );
+}
+
+fn line_of(source: &str, needle: &str) -> usize {
+    source
+        .lines()
+        .position(|line| line.contains(needle))
+        .map(|line| line + 1)
+        .unwrap_or_else(|| panic!("missing line containing {needle:?}"))
+}
+
 #[test]
 fn usage_finder_routes_scala_targets_through_graph_strategy() {
     let (_project, analyzer) = scala_analyzer_with_files(&[
@@ -87,6 +128,27 @@ class Consumer {
 
 #[test]
 fn scala_graph_finds_imported_types_constructors_and_members() {
+    let consumer_source = r#"
+package app
+
+import pkg.{Target as AliasTarget, Contract}
+import pkg.Utility
+
+class Consumer extends Contract {
+  val target: AliasTarget = new AliasTarget(1)
+
+  def call(): Int = {
+    if (Utility.flag) {
+      target.field = 2
+      Utility.help() + target.run()
+      val copy = target.field
+      copy
+    } else {
+      0
+    }
+  }
+}
+"#;
     let (_project, analyzer) = scala_analyzer_with_files(&[
         (
             "pkg/Target.scala",
@@ -118,28 +180,7 @@ object Utility {
 }
 "#,
         ),
-        (
-            "app/Consumer.scala",
-            r#"
-package app
-
-import pkg.{Target as AliasTarget, Contract}
-import pkg.Utility
-
-class Consumer extends Contract {
-  val target: AliasTarget = new AliasTarget(1)
-
-  def call(): Int = {
-    if (Utility.flag) {
-      target.field = 2
-      Utility.help() + target.run() + target.field
-    } else {
-      0
-    }
-  }
-}
-"#,
-        ),
+        ("app/Consumer.scala", consumer_source),
     ]);
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let strategy = ScalaUsageGraphStrategy::new();
@@ -191,7 +232,11 @@ class Consumer extends Contract {
             .iter()
             .any(|hit| hit.contains("target.field = 2"))
     );
-    assert!(field_hits.iter().any(|hit| hit.contains("target.field")));
+    assert!(
+        field_hits
+            .iter()
+            .any(|hit| hit.contains("val copy = target.field"))
+    );
 
     let help = definition(&analyzer, "pkg.Utility$.help");
     let help_hits = hit_snippets(strategy.find_usages(
@@ -319,10 +364,7 @@ class Impl extends Base with Contract {
     let ready_hits =
         hits(strategy.find_usages(&analyzer, std::slice::from_ref(&ready), &candidates, 1000));
     assert_hit_contains(&ready_hits, "Mode.Ready");
-    assert!(
-        ready_hits.iter().all(|hit| hit.line != 9),
-        "OtherMode.Ready should not be reported: {ready_hits:#?}"
-    );
+    assert_no_hit_in_enclosing(&ready_hits, "app.Consumer.unrelated");
 }
 
 #[test]
@@ -382,26 +424,332 @@ class ImportedConsumer {
         hits(strategy.find_usages(&analyzer, std::slice::from_ref(&helper), &candidates, 1000));
     assert_hit_contains(&helper_hits, "helper() + answer");
     assert_hit_contains(&helper_hits, "helper() + pkg.helper()");
-    assert!(
-        helper_hits.iter().all(|hit| hit.line != 11),
-        "other.helper() should not be reported: {helper_hits:#?}"
-    );
+    assert_no_hit_in_enclosing(&helper_hits, "app.ImportedConsumer.unrelated");
 
     let answer = definition(&analyzer, "pkg.answer");
     let answer_hits =
         hits(strategy.find_usages(&analyzer, std::slice::from_ref(&answer), &candidates, 1000));
     assert_hit_contains(&answer_hits, "helper() + answer");
     assert_hit_contains(&answer_hits, "answer + counter");
-    assert!(
-        answer_hits.iter().all(|hit| hit.line != 11),
-        "other.answer should not be reported: {answer_hits:#?}"
-    );
+    assert_no_hit_in_enclosing(&answer_hits, "app.ImportedConsumer.unrelated");
 
     let counter = definition(&analyzer, "pkg.counter");
     let counter_hits =
         hits(strategy.find_usages(&analyzer, std::slice::from_ref(&counter), &candidates, 1000));
     assert_hit_contains(&counter_hits, "counter = counter + 1");
     assert_hit_contains(&counter_hits, "answer + counter");
+}
+
+#[test]
+fn scala_graph_distinguishes_field_reads_and_writes() {
+    let consumer_source = r#"
+package app
+
+import pkg.Target
+
+class Consumer {
+  val target = new Target(1)
+
+  def call(): Int = {
+    target.field = 2
+    val copy = target.field
+    copy
+  }
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "pkg/Target.scala",
+            r#"
+package pkg
+
+class Target(initial: Int) {
+  var field: Int = initial
+}
+"#,
+        ),
+        ("app/Consumer.scala", consumer_source),
+    ]);
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let field = definition(&analyzer, "pkg.Target.field");
+    let field_hits = hits(ScalaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&field),
+        &candidates,
+        1000,
+    ));
+
+    assert_hit_line(&field_hits, line_of(consumer_source, "target.field = 2"));
+    assert_hit_line(
+        &field_hits,
+        line_of(consumer_source, "val copy = target.field"),
+    );
+    assert_hit_count_by_snippet(&field_hits, "target.field", 2);
+}
+
+#[test]
+fn scala_graph_resolves_this_members_only_in_owner_context() {
+    let target_source = r#"
+package pkg
+
+class Target {
+  var field: Int = 1
+  def run(): Int = field
+  def call(): Int = {
+    this.field = 2
+    this.run()
+    field + run()
+  }
+}
+
+class Other {
+  var field: Int = 3
+  def run(): Int = field
+  def call(): Int = {
+    this.field = 4
+    this.run()
+    field + run()
+  }
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[("pkg/Target.scala", target_source)]);
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = ScalaUsageGraphStrategy::new();
+
+    let field = definition(&analyzer, "pkg.Target.field");
+    let field_hits =
+        hits(strategy.find_usages(&analyzer, std::slice::from_ref(&field), &candidates, 1000));
+    assert_hit_line(&field_hits, line_of(target_source, "this.field = 2"));
+    assert_hit_line(&field_hits, line_of(target_source, "field + run()"));
+    assert_no_hit_line(&field_hits, line_of(target_source, "this.field = 4"));
+    assert_no_hit_in_enclosing(&field_hits, "pkg.Other.call");
+
+    let run = definition(&analyzer, "pkg.Target.run");
+    let run_hits =
+        hits(strategy.find_usages(&analyzer, std::slice::from_ref(&run), &candidates, 1000));
+    assert_hit_line(&run_hits, line_of(target_source, "this.run()"));
+    assert_hit_line(&run_hits, line_of(target_source, "field + run()"));
+    assert_no_hit_in_enclosing(&run_hits, "pkg.Other.call");
+}
+
+#[test]
+fn scala_graph_resolves_constructor_inferred_receivers() {
+    let consumer_source = r#"
+package app
+
+import pkg.{Other, Target}
+
+class Consumer {
+  def call(): Int = {
+    val target = new Target(1)
+    target.run() + target.field
+  }
+  def unrelated(): Int = {
+    val other = new Other()
+    other.run()
+  }
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "pkg/Target.scala",
+            r#"
+package pkg
+
+class Target(initial: Int) {
+  val field: Int = initial
+  def run(): Int = field
+}
+"#,
+        ),
+        (
+            "pkg/Other.scala",
+            r#"
+package pkg
+
+class Other {
+  def run(): Int = 0
+}
+"#,
+        ),
+        ("app/Consumer.scala", consumer_source),
+    ]);
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = ScalaUsageGraphStrategy::new();
+
+    let run = definition(&analyzer, "pkg.Target.run");
+    let run_hits =
+        hits(strategy.find_usages(&analyzer, std::slice::from_ref(&run), &candidates, 1000));
+    assert_hit_line(&run_hits, line_of(consumer_source, "target.run()"));
+    assert_no_hit_in_enclosing(&run_hits, "app.Consumer.unrelated");
+
+    let field = definition(&analyzer, "pkg.Target.field");
+    let field_hits =
+        hits(strategy.find_usages(&analyzer, std::slice::from_ref(&field), &candidates, 1000));
+    assert_hit_line(
+        &field_hits,
+        line_of(consumer_source, "target.run() + target.field"),
+    );
+    assert_no_hit_in_enclosing(&field_hits, "app.Consumer.unrelated");
+}
+
+#[test]
+fn scala_graph_respects_local_shadowing() {
+    let consumer_source = r#"
+package app
+
+import pkg.{Utility, answer, helper}
+
+class Consumer {
+  def helperShadow(helper: Int): Int = helper + 1
+
+  def answerShadow(): Int = {
+    val answer = 0
+    answer
+  }
+
+  def receiverShadow(): Int = {
+    val target = new other.Other()
+    target.run()
+  }
+
+  def utilityShadow(Utility: other.Utility.type): Int = Utility.help()
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "pkg/Api.scala",
+            r#"
+package pkg
+
+def helper(): Int = 1
+val answer: Int = 42
+
+object Utility {
+  def help(): Int = 1
+}
+
+class Target {
+  def run(): Int = 1
+}
+"#,
+        ),
+        (
+            "other/Api.scala",
+            r#"
+package other
+
+object Utility {
+  def help(): Int = 2
+}
+
+class Other {
+  def run(): Int = 2
+}
+"#,
+        ),
+        ("app/Consumer.scala", consumer_source),
+    ]);
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = ScalaUsageGraphStrategy::new();
+
+    let helper = definition(&analyzer, "pkg.helper");
+    let helper_hits =
+        hits(strategy.find_usages(&analyzer, std::slice::from_ref(&helper), &candidates, 1000));
+    assert_no_hit_in_enclosing(&helper_hits, "app.Consumer.helperShadow");
+
+    let answer = definition(&analyzer, "pkg.answer");
+    let answer_hits =
+        hits(strategy.find_usages(&analyzer, std::slice::from_ref(&answer), &candidates, 1000));
+    assert_no_hit_in_enclosing(&answer_hits, "app.Consumer.answerShadow");
+
+    let run = definition(&analyzer, "pkg.Target.run");
+    let run_hits =
+        hits(strategy.find_usages(&analyzer, std::slice::from_ref(&run), &candidates, 1000));
+    assert_no_hit_in_enclosing(&run_hits, "app.Consumer.receiverShadow");
+
+    let help = definition(&analyzer, "pkg.Utility$.help");
+    let help_hits =
+        hits(strategy.find_usages(&analyzer, std::slice::from_ref(&help), &candidates, 1000));
+    assert_no_hit_in_enclosing(&help_hits, "app.Consumer.utilityShadow");
+}
+
+#[test]
+fn scala_graph_handles_alias_and_wildcard_import_edges() {
+    let alias_source = r#"
+package app
+
+import pkg.{Utility as U}
+import pkg.{helper as h}
+
+class AliasConsumer {
+  def call(): Int = U.help() + h()
+}
+"#;
+    let wildcard_source = r#"
+package app
+
+import pkg.*
+
+class WildcardConsumer {
+  def call(): Int = helper() + answer
+}
+"#;
+    let ambiguous_source = r#"
+package app
+
+import pkg.*
+import other.*
+
+class AmbiguousConsumer {
+  def call(): Int = helper()
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "pkg/Api.scala",
+            r#"
+package pkg
+
+def helper(): Int = 1
+val answer: Int = 42
+
+object Utility {
+  def help(): Int = 1
+}
+"#,
+        ),
+        (
+            "other/Api.scala",
+            r#"
+package other
+
+def helper(): Int = 2
+"#,
+        ),
+        ("app/AliasConsumer.scala", alias_source),
+        ("app/WildcardConsumer.scala", wildcard_source),
+        ("app/AmbiguousConsumer.scala", ambiguous_source),
+    ]);
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = ScalaUsageGraphStrategy::new();
+
+    let help = definition(&analyzer, "pkg.Utility$.help");
+    let help_hits =
+        hits(strategy.find_usages(&analyzer, std::slice::from_ref(&help), &candidates, 1000));
+    assert_hit_line(&help_hits, line_of(alias_source, "U.help()"));
+
+    let helper = definition(&analyzer, "pkg.helper");
+    let helper_hits =
+        hits(strategy.find_usages(&analyzer, std::slice::from_ref(&helper), &candidates, 1000));
+    assert_hit_line(&helper_hits, line_of(alias_source, "h()"));
+    assert_hit_line(&helper_hits, line_of(wildcard_source, "helper() + answer"));
+    assert_no_hit_in_enclosing(&helper_hits, "app.AmbiguousConsumer.call");
+
+    let answer = definition(&analyzer, "pkg.answer");
+    let answer_hits =
+        hits(strategy.find_usages(&analyzer, std::slice::from_ref(&answer), &candidates, 1000));
+    assert_hit_line(&answer_hits, line_of(wildcard_source, "helper() + answer"));
 }
 
 #[test]

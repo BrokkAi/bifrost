@@ -16,6 +16,7 @@ Scala files are already parsed by Bifrost, but usage lookup for Scala symbols st
 - [x] (2026-05-22 12:50Z) Added focused usage graph tests for package/import/type/object/member behavior; `cargo test --test usages_scala_graph_test -- --nocapture` passes.
 - [x] (2026-05-22 12:52Z) Ran the full planned validation set: targeted tests, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings` all pass.
 - [x] (2026-05-22 13:01Z) Hardened coverage for enum cases, `with` inheritance, field writes, top-level functions, and top-level vals/vars; reran targeted tests, formatting, and clippy successfully.
+- [x] (2026-05-22 13:12Z) Completed round-three hardening for exact `UsageHit` assertions, `this` member references, constructor-inferred receivers, local shadowing, aliased imports, wildcard top-level imports, and ambiguous wildcard imports; reran targeted tests, formatting, and clippy successfully.
 
 ## Surprises & Discoveries
 
@@ -30,6 +31,12 @@ Scala files are already parsed by Bifrost, but usage lookup for Scala symbols st
 
 - Observation: top-level Scala functions and vals/vars have no owning class-like declaration.
   Evidence: package-level `def helper`, `val answer`, and `var counter` initially had unsupported target shapes until `ScalaUsageGraphStrategy` treated ownerless function/field targets as package-level symbols.
+
+- Observation: proving qualified object-member calls must still account for local symbols that shadow the qualifier.
+  Evidence: `Utility.help()` was initially reported for an imported `pkg.Utility` target even when a method parameter named `Utility` referred to `other.Utility.type`; the graph now checks qualifier shadowing before trusting imported owner names.
+
+- Observation: grouped alias imports for top-level declarations need to match the alias token, not only the target member's declared name.
+  Evidence: `import pkg.{helper as h}; h()` was not proven until direct member visibility accepted imported local names independently from `spec.member_name`.
 
 ## Decision Log
 
@@ -49,9 +56,15 @@ Scala files are already parsed by Bifrost, but usage lookup for Scala symbols st
   Rationale: Scala 3 allows top-level declarations, and they must resolve through package-local visibility, explicit imports, wildcard package imports, or package-qualified references without making unqualified class/object methods visible across a package.
   Date/Author: 2026-05-22 / Codex
 
+- Decision: treat wildcard import collisions as ambiguous for unqualified package-level member references.
+  Rationale: when multiple wildcard imports can expose the same top-level function or value name, the flow-insensitive graph cannot prove which declaration an unqualified identifier denotes without compiler-grade resolution.
+  Date/Author: 2026-05-22 / Codex
+
 ## Outcomes & Retrospective
 
 Issue 114 is implemented. Scala imports now have structured metadata, `UsageFinder` routes Scala targets through `ScalaUsageGraphStrategy`, and the graph proves package/import/type/object/member references without claiming compiler-grade Scala resolution. The focused tests cover routing, grouped and aliased imports, wildcard object-member imports, inheritance/type references including `with`, enum cases, top-level functions, top-level vals/vars, field reads/writes, local receiver inference, unrelated same-name negatives, and `max_usages`.
+
+Round-three hardening added exact line/enclosing-symbol assertions over `UsageHit` fields, distinct read/write field checks, owner-context `this` member resolution, constructor-only receiver inference, local shadowing protections for unqualified and qualified imported symbols, alias import edges for object and top-level symbols, wildcard package imports for top-level functions/values, and conservative behavior for ambiguous wildcard imports.
 
 The remaining limitations are intentional and match the issue scope: no implicit conversions or givens, no extension-method resolution, no overload resolution, no path-dependent type support, no macro-generated code, and no interprocedural data-flow.
 

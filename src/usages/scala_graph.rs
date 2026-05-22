@@ -232,6 +232,7 @@ struct Visibility {
     type_names: HashSet<String>,
     owner_names: HashSet<String>,
     direct_member_names: HashSet<String>,
+    ambiguous_direct_member_names: HashSet<String>,
 }
 
 impl Visibility {
@@ -240,6 +241,7 @@ impl Visibility {
             type_names: HashSet::default(),
             owner_names: HashSet::default(),
             direct_member_names: HashSet::default(),
+            ambiguous_direct_member_names: ambiguous_wildcard_members(scala, file, spec),
         };
 
         let file_package = package_name_of(scala, file);
@@ -371,12 +373,16 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> bool {
-    if text != ctx.spec.member_name {
-        return false;
+    if ctx.visibility.direct_member_names.contains(text)
+        && !ctx.visibility.ambiguous_direct_member_names.contains(text)
+        && !has_dot_qualifier(node, ctx.source)
+        && !is_shadowed_unqualified(node, text, ctx)
+    {
+        return true;
     }
 
-    if ctx.visibility.direct_member_names.contains(text) && !has_dot_qualifier(node, ctx.source) {
-        return true;
+    if text != ctx.spec.member_name {
+        return false;
     }
 
     if ctx.spec.owner.is_none() {
@@ -385,14 +391,160 @@ fn member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> 
     }
 
     let Some(qualifier) = dot_qualifier_before(node, ctx.source) else {
-        return false;
+        return !is_shadowed_unqualified(node, text, ctx) && enclosing_matches_owner(node, ctx);
     };
-    if ctx.visibility.owner_names.contains(&qualifier) {
+    if qualifier == "this" {
+        return enclosing_matches_owner(node, ctx);
+    }
+    if ctx.visibility.owner_names.contains(&qualifier)
+        && !is_qualifier_shadowed(node, &qualifier, ctx)
+    {
         return true;
     }
     ctx.receiver_bindings
         .get(&qualifier)
         .is_some_and(|owner_fq| Some(owner_fq) == ctx.spec.owner_fq_name.as_ref())
+}
+
+fn ambiguous_wildcard_members(
+    scala: &ScalaAnalyzer,
+    file: &ProjectFile,
+    spec: &TargetSpec,
+) -> HashSet<String> {
+    if spec.kind == TargetKind::Type {
+        return HashSet::default();
+    }
+
+    let mut exposing_wildcards = HashSet::default();
+    for import in scala.import_info_of(file) {
+        if !import.is_wildcard {
+            continue;
+        }
+        let Some(path) = scala_import_path(import) else {
+            continue;
+        };
+        if wildcard_path_could_expose(scala, &path, spec) {
+            exposing_wildcards.insert(path);
+        }
+    }
+
+    let mut ambiguous = HashSet::default();
+    if exposing_wildcards.len() > 1 {
+        ambiguous.insert(spec.member_name.clone());
+    }
+    ambiguous
+}
+
+fn wildcard_path_could_expose(scala: &ScalaAnalyzer, path: &str, spec: &TargetSpec) -> bool {
+    if spec.owner.is_none() {
+        return scala
+            .definitions(&format!("{path}.{}", spec.member_name))
+            .any(|unit| {
+                matches!(spec.kind, TargetKind::Method) && unit.is_function()
+                    || matches!(spec.kind, TargetKind::Field) && unit.is_field()
+            });
+    }
+
+    spec.owner_fq_name
+        .as_ref()
+        .is_some_and(|owner_fq| path == owner_fq)
+}
+
+fn enclosing_matches_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    let Some(owner) = ctx.spec.owner.as_ref() else {
+        return false;
+    };
+    let range = Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: node.start_position().row,
+        end_line: node.end_position().row,
+    };
+    let Some(enclosing) = ctx.analyzer.enclosing_code_unit(ctx.file, &range) else {
+        return false;
+    };
+    if enclosing == *owner {
+        return true;
+    }
+    enclosing.source() == owner.source()
+        && enclosing.package_name() == owner.package_name()
+        && enclosing
+            .short_name()
+            .strip_prefix(owner.short_name())
+            .is_some_and(|rest| rest.starts_with('.'))
+}
+
+fn is_shadowed_unqualified(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> bool {
+    if has_dot_qualifier(node, ctx.source) {
+        return false;
+    }
+    if is_declaration_identifier(node) {
+        return true;
+    }
+
+    let scope_start = lexical_scope_start(node, ctx);
+    let prefix = &ctx.source[scope_start..node.start_byte()];
+    shadows_name(prefix, text)
+}
+
+fn is_qualifier_shadowed(node: Node<'_>, qualifier: &str, ctx: &ScanCtx<'_>) -> bool {
+    let scope_start = lexical_scope_start(node, ctx);
+    let prefix = &ctx.source[scope_start..node.start_byte()];
+    shadows_name(prefix, qualifier)
+}
+
+fn is_declaration_identifier(node: Node<'_>) -> bool {
+    if has_ancestor_kind(node, "parameter") || has_ancestor_kind(node, "parameters") {
+        return true;
+    }
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    matches!(
+        parent.kind(),
+        "function_definition"
+            | "val_definition"
+            | "var_definition"
+            | "class_definition"
+            | "object_definition"
+            | "trait_definition"
+            | "enum_definition"
+            | "case_clause"
+    )
+}
+
+fn lexical_scope_start(node: Node<'_>, ctx: &ScanCtx<'_>) -> usize {
+    let range = Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: node.start_position().row,
+        end_line: node.end_position().row,
+    };
+    ctx.analyzer
+        .enclosing_code_unit(ctx.file, &range)
+        .and_then(|unit| {
+            ctx.analyzer
+                .ranges(&unit)
+                .first()
+                .map(|range| range.start_byte)
+        })
+        .unwrap_or(0)
+}
+
+fn shadows_name(prefix: &str, text: &str) -> bool {
+    let escaped = regex::escape(text);
+    let declaration = Regex::new(&format!(r#"\b(?:val|var|def)\s+{escaped}\b"#))
+        .expect("valid shadow declaration regex");
+    if declaration.is_match(prefix) {
+        return true;
+    }
+    let parameter =
+        Regex::new(&format!(r#"[\(\,]\s*{escaped}\s*:"#)).expect("valid shadow parameter regex");
+    if parameter.is_match(prefix) {
+        return true;
+    }
+    let pattern = Regex::new(&format!(r#"\bcase\s+{escaped}\b"#)).expect("valid pattern regex");
+    pattern.is_match(prefix)
 }
 
 fn add_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
