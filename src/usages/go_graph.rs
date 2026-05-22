@@ -127,28 +127,14 @@ impl GoProjectGraph {
     fn scan_files(
         &self,
         candidate_files: &HashSet<ProjectFile>,
-        target: &CodeUnit,
-        spec: &TargetSpec,
+        _target: &CodeUnit,
+        _spec: &TargetSpec,
     ) -> HashSet<ProjectFile> {
-        let mut files: HashSet<ProjectFile> = candidate_files
+        let files: HashSet<ProjectFile> = candidate_files
             .iter()
             .filter(|file| self.parsed.contains_key(*file))
             .cloned()
             .collect();
-        files.insert(target.source().clone());
-
-        if let Some(seeds) = &spec.top_level_seeds {
-            files.extend(self.usage_graph.importers_of_seeds(seeds));
-        }
-        if let Some(seeds) = &spec.owner_seeds {
-            files.extend(self.usage_graph.importers_of_seeds(seeds));
-        }
-
-        files.retain(|file| {
-            file == target.source()
-                || candidate_files.contains(file)
-                || same_go_package(self, file, target.source())
-        });
         files
     }
 }
@@ -156,13 +142,15 @@ impl GoProjectGraph {
 fn build_go_graph(analyzer: &GoAnalyzer) -> GoProjectGraph {
     let parser_language = tree_sitter_go::LANGUAGE.into();
     let mut parsed = HashMap::default();
-    let mut exports_by_file = HashMap::default();
-    let mut binders_by_file = HashMap::default();
     let mut files = Vec::new();
+    let mut module_path = None;
 
     for file in analyzer.get_analyzed_files() {
         if target_language_file(&file) != Language::Go {
             continue;
+        }
+        if module_path.is_none() {
+            module_path = read_go_module_path(file.root());
         }
         let Ok(source) = file.read_to_string() else {
             continue;
@@ -176,8 +164,6 @@ fn build_go_graph(analyzer: &GoAnalyzer) -> GoProjectGraph {
         };
 
         let package_name = package_name(tree.root_node(), &source);
-        exports_by_file.insert(file.clone(), export_index_of(analyzer, &file));
-        binders_by_file.insert(file.clone(), import_binder_of(analyzer, &file));
         files.push(file.clone());
         parsed.insert(
             file,
@@ -189,11 +175,21 @@ fn build_go_graph(analyzer: &GoAnalyzer) -> GoProjectGraph {
         );
     }
 
+    let mut exports_by_file = HashMap::default();
+    let mut binders_by_file = HashMap::default();
+    for file in &files {
+        exports_by_file.insert(file.clone(), export_index_of(analyzer, file));
+        binders_by_file.insert(
+            file.clone(),
+            import_binder_of(analyzer, file, &parsed, module_path.as_deref()),
+        );
+    }
+
     let usage_graph = ProjectUsageGraph::build(
         files,
         exports_by_file,
         &binders_by_file,
-        |importer, module| resolve_go_module(importer, module, &parsed),
+        |importer, module| resolve_go_module(importer, module, &parsed, module_path.as_deref()),
     );
 
     GoProjectGraph {
@@ -226,7 +222,12 @@ fn export_index_of(analyzer: &GoAnalyzer, file: &ProjectFile) -> ExportIndex {
     index
 }
 
-fn import_binder_of(analyzer: &GoAnalyzer, file: &ProjectFile) -> ImportBinder {
+fn import_binder_of(
+    analyzer: &GoAnalyzer,
+    file: &ProjectFile,
+    parsed: &HashMap<ProjectFile, ParsedFile>,
+    module_path: Option<&str>,
+) -> ImportBinder {
     let mut binder = ImportBinder::empty();
     for import in analyzer.import_info_of(file) {
         if import.alias.as_deref() == Some("_") {
@@ -247,20 +248,36 @@ fn import_binder_of(analyzer: &GoAnalyzer, file: &ProjectFile) -> ImportBinder {
                 );
             }
             _ => {
-                let local = import
-                    .alias
-                    .clone()
-                    .or_else(|| import.identifier.clone())
-                    .map(|identifier| default_go_import_local_name(&identifier))
-                    .unwrap_or_else(|| default_go_import_local_name(&path));
-                binder.bindings.insert(
-                    local,
-                    ImportBinding {
-                        module_specifier: path,
-                        kind: ImportKind::Namespace,
-                        imported_name: None,
-                    },
-                );
+                let locals = match import.alias.clone() {
+                    Some(alias) => vec![default_go_import_local_name(&alias)],
+                    None => {
+                        let resolved = resolve_go_module(file, &path, parsed, module_path);
+                        let mut names: Vec<_> = resolved
+                            .iter()
+                            .filter_map(|target| parsed.get(target))
+                            .map(|target| target.package_name.clone())
+                            .filter(|name| !name.is_empty())
+                            .collect();
+                        names.sort();
+                        names.dedup();
+                        if names.is_empty() && is_local_like_go_import(&path, module_path) {
+                            names.push(default_go_import_local_name(
+                                import.identifier.as_deref().unwrap_or(path.as_str()),
+                            ));
+                        }
+                        names
+                    }
+                };
+                for local in locals {
+                    binder.bindings.insert(
+                        local,
+                        ImportBinding {
+                            module_specifier: path.clone(),
+                            kind: ImportKind::Namespace,
+                            imported_name: None,
+                        },
+                    );
+                }
             }
         }
     }
@@ -271,20 +288,59 @@ fn resolve_go_module(
     _importer: &ProjectFile,
     module: &str,
     parsed: &HashMap<ProjectFile, ParsedFile>,
+    module_path: Option<&str>,
 ) -> Vec<ProjectFile> {
+    let local_rel = local_go_import_rel_path(module, module_path);
+    let vendor_rel = format!("vendor/{}", module.trim_matches('/'));
     let mut resolved: Vec<_> = parsed
         .keys()
         .filter(|candidate| {
             let parent = candidate.parent().to_string_lossy().replace('\\', "/");
-            parent == module
-                || module.ends_with(&format!("/{parent}"))
-                || parent.ends_with(&format!("/{module}"))
+            parent == vendor_rel
+                || local_rel
+                    .as_ref()
+                    .is_some_and(|rel| parent == *rel || (rel.is_empty() && parent.is_empty()))
         })
         .cloned()
         .collect();
     resolved.sort();
     resolved.dedup();
     resolved
+}
+
+fn read_go_module_path(root: &std::path::Path) -> Option<String> {
+    let contents = std::fs::read_to_string(root.join("go.mod")).ok()?;
+    contents.lines().find_map(|line| {
+        let trimmed = line.trim();
+        trimmed
+            .strip_prefix("module ")
+            .map(str::trim)
+            .filter(|module| !module.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn local_go_import_rel_path(import_path: &str, module_path: Option<&str>) -> Option<String> {
+    let import_path = import_path.trim().trim_matches('/');
+    if let Some(relative) = import_path.strip_prefix("./") {
+        return Some(relative.trim_matches('/').to_string());
+    }
+    if import_path == "." {
+        return Some(String::new());
+    }
+    let module_path = module_path?.trim_matches('/');
+    if import_path == module_path {
+        return Some(String::new());
+    }
+    import_path
+        .strip_prefix(&format!("{module_path}/"))
+        .map(|suffix| suffix.trim_matches('/').to_string())
+}
+
+fn is_local_like_go_import(import_path: &str, module_path: Option<&str>) -> bool {
+    local_go_import_rel_path(import_path, module_path).is_some()
+        || import_path.starts_with("./")
+        || import_path == "."
 }
 
 fn package_name(root: Node<'_>, source: &str) -> String {
@@ -597,69 +653,200 @@ fn seed_local_bindings(
     ctx: &ScanCtx<'_>,
     locals: &mut LocalInferenceEngine<String>,
 ) {
+    match node.kind() {
+        "var_declaration" => {
+            seed_typed_var_lines(node, ctx, locals);
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if child.kind() == "var_spec" {
+                    seed_var_spec(child, ctx, locals);
+                }
+            }
+        }
+        "var_spec" => seed_var_spec(node, ctx, locals),
+        "short_var_declaration" | "assignment_statement" => seed_assignment_like(node, ctx, locals),
+        _ => {}
+    }
+}
+
+fn seed_typed_var_lines(
+    node: Node<'_>,
+    ctx: &ScanCtx<'_>,
+    locals: &mut LocalInferenceEngine<String>,
+) {
     let text = node_text(node, ctx.source);
-    for caps in VAR_TYPED_RE.captures_iter(text) {
-        if type_ref_from_captures(&caps, "qualifier", "name")
-            .is_some_and(|ty| ctx.bindings.matches_owner_type(&ty))
-            && let Some(var) = caps.name("var")
-        {
-            locals.seed_symbol(var.as_str().to_string(), OWNER_TOKEN.to_string());
+    for caps in VAR_TYPED_LIST_RE.captures_iter(text) {
+        let ty = TypeRef {
+            qualifier: caps.name("qualifier").map(|m| m.as_str().to_string()),
+            name: caps.name("name").map(|m| m.as_str().to_string()),
+        };
+        if !ctx.bindings.matches_owner_type(&ty) {
+            continue;
         }
-    }
-    for caps in CONSTRUCTED_RE.captures_iter(text) {
-        if type_ref_from_captures(&caps, "qualifier", "name")
-            .is_some_and(|ty| ctx.bindings.matches_owner_type(&ty))
-            && let Some(var) = caps.name("var")
-        {
-            locals.seed_symbol(var.as_str().to_string(), OWNER_TOKEN.to_string());
-        }
-    }
-    for caps in ALIAS_RE.captures_iter(text) {
-        let Some(lhs) = caps.name("lhs") else {
+        let Some(vars) = caps.name("vars") else {
             continue;
         };
-        let Some(rhs) = caps.name("rhs") else {
-            continue;
-        };
-        locals.alias_symbol(lhs.as_str().to_string(), rhs.as_str());
-    }
-    if owner_type_appears_in_node(node, ctx) {
-        for name in declared_names(node, ctx.source) {
-            locals.seed_symbol(name, OWNER_TOKEN.to_string());
+        for name in vars
+            .as_str()
+            .split(',')
+            .map(str::trim)
+            .filter(|name| *name != "_" && IDENT_RE.is_match(name))
+        {
+            locals.seed_symbol(name.to_string(), OWNER_TOKEN.to_string());
         }
     }
 }
 
 fn declared_names(node: Node<'_>, source: &str) -> Vec<String> {
-    let text = node_text(node, source);
-    let mut out = Vec::new();
-    for caps in VAR_DECL_NAMES_RE.captures_iter(text) {
-        if let Some(name) = caps.name("var") {
-            out.push(name.as_str().to_string());
+    match node.kind() {
+        "var_declaration" => {
+            let mut out = Vec::new();
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if child.kind() == "var_spec" {
+                    out.extend(declared_names(child, source));
+                }
+            }
+            out
+        }
+        "var_spec" => var_spec_names(node, source),
+        "short_var_declaration" => lhs_identifiers(node, source),
+        _ => Vec::new(),
+    }
+}
+
+fn seed_var_spec(node: Node<'_>, ctx: &ScanCtx<'_>, locals: &mut LocalInferenceEngine<String>) {
+    let names = var_spec_names(node, ctx.source);
+    if names.is_empty() {
+        return;
+    }
+
+    if node
+        .child_by_field_name("type")
+        .and_then(|type_node| type_ref_from_node(type_node, ctx.source))
+        .is_some_and(|ty| ctx.bindings.matches_owner_type(&ty))
+    {
+        for name in names {
+            locals.seed_symbol(name, OWNER_TOKEN.to_string());
+        }
+        return;
+    }
+
+    seed_names_from_values(names, rhs_expressions(node), ctx, locals);
+}
+
+fn seed_assignment_like(
+    node: Node<'_>,
+    ctx: &ScanCtx<'_>,
+    locals: &mut LocalInferenceEngine<String>,
+) {
+    seed_names_from_values(
+        lhs_identifiers(node, ctx.source),
+        rhs_expressions(node),
+        ctx,
+        locals,
+    );
+}
+
+fn seed_names_from_values(
+    names: Vec<String>,
+    values: Vec<Node<'_>>,
+    ctx: &ScanCtx<'_>,
+    locals: &mut LocalInferenceEngine<String>,
+) {
+    if names.is_empty() || values.is_empty() {
+        return;
+    }
+
+    for (name, value) in names.iter().zip(values.iter()) {
+        if expression_matches_owner_type(*value, ctx) {
+            locals.seed_symbol(name.clone(), OWNER_TOKEN.to_string());
+        } else if is_identifier_node(*value) {
+            locals.alias_symbol(name.clone(), node_text(*value, ctx.source));
         }
     }
-    for caps in SHORT_DECL_NAMES_RE.captures_iter(text) {
-        let Some(vars) = caps.name("vars") else {
+}
+
+fn var_spec_names(node: Node<'_>, source: &str) -> Vec<String> {
+    let boundary = node
+        .child_by_field_name("type")
+        .or_else(|| node.child_by_field_name("value"))
+        .map(|child| child.start_byte())
+        .unwrap_or(node.end_byte());
+    let mut out = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.start_byte() >= boundary {
             continue;
-        };
-        out.extend(
-            vars.as_str()
-                .split(',')
-                .map(str::trim)
-                .filter(|name| *name != "_" && IDENT_RE.is_match(name))
-                .map(str::to_string),
-        );
+        }
+        if is_identifier_node(child) {
+            let name = node_text(child, source);
+            if name != "_" {
+                out.push(name.to_string());
+            }
+        }
     }
     out
 }
 
-fn owner_type_appears_in_node(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+fn lhs_identifiers(node: Node<'_>, source: &str) -> Vec<String> {
+    let Some(left) = node
+        .child_by_field_name("left")
+        .or_else(|| first_named_child(node))
+    else {
+        return Vec::new();
+    };
+    identifiers_in_node(left, source)
+        .into_iter()
+        .filter(|name| name != "_")
+        .collect()
+}
+
+fn rhs_expressions(node: Node<'_>) -> Vec<Node<'_>> {
+    let Some(right) = node
+        .child_by_field_name("right")
+        .or_else(|| last_named_child(node))
+    else {
+        return Vec::new();
+    };
+    if right.kind() == "expression_list" {
+        let mut cursor = right.walk();
+        let children: Vec<_> = right.named_children(&mut cursor).collect();
+        if !children.is_empty() {
+            return children;
+        }
+    }
+    vec![right]
+}
+
+fn identifiers_in_node(node: Node<'_>, source: &str) -> Vec<String> {
+    if is_identifier_node(node) {
+        return vec![node_text(node, source).to_string()];
+    }
+    let mut out = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if is_identifier_node(child) {
+            out.push(node_text(child, source).to_string());
+        }
+    }
+    out
+}
+
+fn expression_matches_owner_type(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     if type_ref_from_node(node, ctx.source).is_some_and(|ty| ctx.bindings.matches_owner_type(&ty)) {
         return true;
     }
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
-        .any(|child| owner_type_appears_in_node(child, ctx))
+        .any(|child| expression_matches_owner_type(child, ctx))
+}
+
+fn is_identifier_node(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "identifier" | "field_identifier" | "type_identifier" | "package_identifier"
+    )
 }
 
 fn scan_selector_like(
@@ -760,17 +947,6 @@ fn type_ref_from_node(node: Node<'_>, source: &str) -> Option<TypeRef> {
         }
         _ => None,
     }
-}
-
-fn type_ref_from_captures(
-    caps: &regex::Captures<'_>,
-    qualifier: &str,
-    name: &str,
-) -> Option<TypeRef> {
-    Some(TypeRef {
-        qualifier: caps.name(qualifier).map(|m| m.as_str().to_string()),
-        name: caps.name(name).map(|m| m.as_str().to_string()),
-    })
 }
 
 fn record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -934,29 +1110,11 @@ fn default_go_import_local_name(import_path_or_identifier: &str) -> String {
     VERSION_SUFFIX_RE.replace(tail, "").to_string()
 }
 
-static VAR_TYPED_RE: LazyLock<Regex> = LazyLock::new(|| {
+static VAR_TYPED_LIST_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"\bvar\s+(?P<var>[A-Za-z_][A-Za-z0-9_]*)\s+\*?(?:(?P<qualifier>[A-Za-z_][A-Za-z0-9_]*)\.)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)\b",
+        r"(?m)^\s*(?:var\s+)?(?P<vars>[A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*)\s+\*?(?:(?P<qualifier>[A-Za-z_][A-Za-z0-9_]*)\.)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)\b",
     )
-    .expect("valid Go typed var regex")
-});
-static CONSTRUCTED_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"\b(?P<var>[A-Za-z_][A-Za-z0-9_]*)\s*(?::=|=)\s*&?\s*(?:(?P<qualifier>[A-Za-z_][A-Za-z0-9_]*)\.)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*(?:\{|\(|\b)",
-    )
-    .expect("valid Go constructed value regex")
-});
-static ALIAS_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b(?P<lhs>[A-Za-z_][A-Za-z0-9_]*)\s*:=\s*(?P<rhs>[A-Za-z_][A-Za-z0-9_]*)\b")
-        .expect("valid Go alias regex")
-});
-static VAR_DECL_NAMES_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\bvar\s+(?P<var>[A-Za-z_][A-Za-z0-9_]*)\b")
-        .expect("valid Go var declaration-name regex")
-});
-static SHORT_DECL_NAMES_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?P<vars>[A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*)\s*:=")
-        .expect("valid Go short declaration-name regex")
+    .expect("valid Go typed var-list regex")
 });
 static IDENT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$").expect("valid Go identifier regex"));

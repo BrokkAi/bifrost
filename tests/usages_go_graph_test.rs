@@ -6,6 +6,9 @@ use common::InlineTestProject;
 
 fn go_analyzer_with_files(files: &[(&str, &str)]) -> (common::BuiltInlineTestProject, GoAnalyzer) {
     let mut builder = InlineTestProject::with_language(Language::Go);
+    if !files.iter().any(|(path, _)| *path == "go.mod") {
+        builder = builder.file("go.mod", "module example.com/app\n\ngo 1.22\n");
+    }
     for (path, contents) in files {
         builder = builder.file(path, *contents);
     }
@@ -237,6 +240,107 @@ func run() {
 }
 
 #[test]
+fn go_graph_strategy_does_not_resolve_external_same_tail_imports_to_local_packages() {
+    let (_project, analyzer) = go_analyzer_with_files(&[
+        ("model/model.go", "package model\nfunc Helper() {}\n"),
+        (
+            "main.go",
+            r#"
+package main
+
+import "github.com/other/model"
+
+func run() {
+    model.Helper()
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "model.Helper");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = GoUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("external same-tail import query should succeed");
+
+    assert!(
+        hits.is_empty(),
+        "external same-tail imports must not resolve to local packages: {hits:?}"
+    );
+}
+
+#[test]
+fn go_graph_strategy_resolves_go_mod_module_imports() {
+    let (_project, analyzer) = go_analyzer_with_files(&[
+        ("model/model.go", "package model\nfunc Helper() {}\n"),
+        (
+            "main.go",
+            r#"
+package main
+
+import "example.com/app/model"
+
+func run() {
+    model.Helper()
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "model.Helper");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = GoUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("module import should resolve");
+
+    assert_eq!(1, hits.len(), "module import hits: {hits:?}");
+}
+
+#[test]
+fn go_graph_strategy_uses_resolved_package_clause_for_unaliased_imports() {
+    let (_project, analyzer) = go_analyzer_with_files(&[
+        (
+            "vendor/github.com/go-chi/chi/v5/router.go",
+            "package chi\nfunc NewRouter() {}\n",
+        ),
+        ("internal/foo/foo.go", "package bar\nfunc Helper() {}\n"),
+        (
+            "main.go",
+            r#"
+package main
+
+import "github.com/go-chi/chi/v5"
+import "example.com/app/internal/foo"
+
+func run() {
+    chi.NewRouter()
+    bar.Helper()
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = GoUsageGraphStrategy::new();
+
+    let router = definition(&analyzer, "chi.NewRouter");
+    let router_hits = strategy
+        .find_usages(&analyzer, std::slice::from_ref(&router), &candidates, 1000)
+        .into_either()
+        .expect("semantic import version package clause should resolve");
+    assert_eq!(1, router_hits.len(), "router hits: {router_hits:?}");
+
+    let helper = definition(&analyzer, "bar.Helper");
+    let helper_hits = strategy
+        .find_usages(&analyzer, std::slice::from_ref(&helper), &candidates, 1000)
+        .into_either()
+        .expect("directory/package name mismatch should resolve");
+    assert_eq!(1, helper_hits.len(), "helper hits: {helper_hits:?}");
+}
+
+#[test]
 fn go_graph_strategy_respects_explicit_candidate_file_boundaries() {
     let (project, analyzer) = go_analyzer_with_files(&[
         ("util/util.go", "package util\nfunc Helper() {}\n"),
@@ -275,6 +379,47 @@ func b() {
 
     assert_eq!(1, hits.len());
     assert!(hits.iter().all(|hit| hit.file == project.file("a.go")));
+}
+
+#[test]
+fn usage_finder_go_graph_respects_file_filters_as_result_scope() {
+    let (project, analyzer) = go_analyzer_with_files(&[
+        ("helper.go", "package main\nfunc helper() {}\n"),
+        (
+            "allowed.go",
+            r#"
+package main
+
+func allowed() {
+    helper()
+}
+"#,
+        ),
+        (
+            "blocked.go",
+            r#"
+package main
+
+func blocked() {
+    helper()
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "main.helper");
+    let allowed = project.file("allowed.go");
+    let hits = UsageFinder::new()
+        .with_file_filter(move |file| file == &allowed)
+        .find_usages_default(&analyzer, std::slice::from_ref(&target))
+        .into_either()
+        .expect("filtered go graph query should succeed");
+
+    assert_eq!(1, hits.len(), "filtered hits: {hits:?}");
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file == project.file("allowed.go"))
+    );
 }
 
 #[test]
@@ -475,6 +620,100 @@ func FromConstructors() string {
         .expect("receiver seed forms should resolve");
 
     assert_eq!(5, hits.len(), "receiver seed hits: {hits:?}");
+}
+
+#[test]
+fn go_graph_strategy_keeps_mixed_multi_assignment_receiver_proofs_positional() {
+    let (_project, analyzer) = go_analyzer_with_files(&[
+        (
+            "model/album.go",
+            r#"
+package model
+
+type Album struct{}
+
+func (a Album) Title() string { return "" }
+"#,
+        ),
+        (
+            "other/album.go",
+            r#"
+package other
+
+type Album struct{}
+
+func (a Album) Title() string { return "" }
+"#,
+        ),
+        (
+            "core/reader.go",
+            r#"
+package core
+
+import "example.com/app/model"
+import "example.com/app/other"
+
+func Read() string {
+    album, otherAlbum := model.Album{}, other.Album{}
+    return album.Title() + otherAlbum.Title()
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "model.Album.Title");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = GoUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("mixed multi-assignment receiver query should succeed");
+
+    assert_eq!(
+        1,
+        hits.len(),
+        "only the positionally matched model receiver should count: {hits:?}"
+    );
+}
+
+#[test]
+fn go_graph_strategy_seeds_members_from_grouped_and_multi_name_var_declarations() {
+    let (_project, analyzer) = go_analyzer_with_files(&[
+        (
+            "model/album.go",
+            r#"
+package model
+
+type Album struct{}
+
+func (a Album) Title() string { return "" }
+"#,
+        ),
+        (
+            "core/reader.go",
+            r#"
+package core
+
+import "example.com/app/model"
+
+func Read() string {
+    var (
+        album model.Album
+    )
+    var first, second model.Album
+    return album.Title() + first.Title() + second.Title()
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "model.Album.Title");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = GoUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("grouped and multi-name var receivers should resolve");
+
+    assert_eq!(3, hits.len(), "var receiver hits: {hits:?}");
 }
 
 #[test]
