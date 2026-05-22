@@ -51,7 +51,7 @@ fn direct_analyzers_match_brokk_capability_matrix() {
     assert!(typescript.import_analysis_provider().is_some());
     assert!(rust.import_analysis_provider().is_some());
     assert!(cpp.import_analysis_provider().is_some());
-    assert!(csharp.import_analysis_provider().is_none());
+    assert!(csharp.import_analysis_provider().is_some());
     assert!(php.import_analysis_provider().is_none());
     assert!(scala.import_analysis_provider().is_none());
 
