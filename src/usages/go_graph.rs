@@ -62,7 +62,7 @@ impl UsageAnalyzer for GoUsageGraphStrategy {
             };
         };
 
-        let graph = build_go_graph(go);
+        let graph = build_go_graph(go, candidate_files, target.source());
         let target_spec = TargetSpec::new(go, &graph, target);
         if !target_spec.has_scan_seed() {
             return FuzzyResult::Failure {
@@ -139,13 +139,23 @@ impl GoProjectGraph {
     }
 }
 
-fn build_go_graph(analyzer: &GoAnalyzer) -> GoProjectGraph {
+fn build_go_graph(
+    analyzer: &GoAnalyzer,
+    candidate_files: &HashSet<ProjectFile>,
+    target_file: &ProjectFile,
+) -> GoProjectGraph {
     let parser_language = tree_sitter_go::LANGUAGE.into();
     let mut parsed = HashMap::default();
     let mut files = Vec::new();
     let mut module_path = None;
+    let scoped_files: BTreeSet<ProjectFile> = candidate_files
+        .iter()
+        .filter(|file| target_language_file(file) == Language::Go)
+        .cloned()
+        .chain(std::iter::once(target_file.clone()))
+        .collect();
 
-    for file in analyzer.get_analyzed_files() {
+    for file in scoped_files {
         if target_language_file(&file) != Language::Go {
             continue;
         }

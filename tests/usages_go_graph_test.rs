@@ -382,6 +382,42 @@ func b() {
 }
 
 #[test]
+fn go_graph_strategy_builds_from_target_and_candidates_not_unrelated_project_files() {
+    let mut files = vec![
+        ("util/util.go", "package util\nfunc Helper() {}\n"),
+        (
+            "main.go",
+            r#"
+package main
+
+import "example.com/app/util"
+
+func run() {
+    util.Helper()
+}
+"#,
+        ),
+    ];
+    for index in 0..40 {
+        let path = Box::leak(format!("unrelated/pkg{index}/noise.go").into_boxed_str());
+        let contents =
+            Box::leak(format!("package pkg{index}\nfunc Noise{index}() {{}}\n").into_boxed_str());
+        files.push((path, contents));
+    }
+    let (project, analyzer) = go_analyzer_with_files(&files);
+
+    let target = definition(&analyzer, "util.Helper");
+    let candidates = [project.file("main.go")].into_iter().collect();
+    let hits = GoUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("candidate-bounded go graph query should succeed");
+
+    assert_eq!(1, hits.len(), "bounded graph hits: {hits:?}");
+    assert!(hits.iter().all(|hit| hit.file == project.file("main.go")));
+}
+
+#[test]
 fn usage_finder_go_graph_respects_file_filters_as_result_scope() {
     let (project, analyzer) = go_analyzer_with_files(&[
         ("helper.go", "package main\nfunc helper() {}\n"),
