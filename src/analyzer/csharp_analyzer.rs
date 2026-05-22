@@ -3,10 +3,11 @@ use crate::analyzer::clone_detection::{
     compute_ast_refinement_similarity_percent, detect_structural_clone_smells,
 };
 use crate::analyzer::{
-    AnalyzerConfig, CodeUnit, CodeUnitType, IAnalyzer, Language, LanguageAdapter, Project,
-    ProjectFile, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
-    TreeSitterAnalyzer,
+    AnalyzerConfig, CodeUnit, CodeUnitType, IAnalyzer, ImportAnalysisProvider, Language,
+    LanguageAdapter, Project, ProjectFile, TestAssertionSmell, TestAssertionWeights,
+    TestDetectionProvider, TreeSitterAnalyzer,
 };
+use crate::hash::HashSet;
 use crate::{CloneSmell, CloneSmellWeights};
 use regex::Regex;
 use std::collections::BTreeSet;
@@ -108,9 +109,126 @@ impl CSharpAnalyzer {
     {
         Self::new(Arc::new(project))
     }
+
+    pub fn namespace_of_file(&self, file: &ProjectFile) -> String {
+        let package = self.inner.package_name_of(file).unwrap_or("");
+        if !package.is_empty() {
+            return package.to_string();
+        }
+        self.get_declarations(file)
+            .into_iter()
+            .map(|unit| unit.package_name().to_string())
+            .find(|package| !package.is_empty())
+            .unwrap_or_default()
+    }
+
+    pub fn using_namespaces_of(&self, file: &ProjectFile) -> Vec<String> {
+        file.read_to_string()
+            .ok()
+            .map(|source| source.lines().filter_map(csharp_using_namespace).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn visible_type_candidates(&self, file: &ProjectFile, name: &str) -> Vec<CodeUnit> {
+        let mut namespaces = self.using_namespaces_of(file);
+        let file_namespace = self.namespace_of_file(file);
+        if !file_namespace.is_empty() {
+            namespaces.push(file_namespace);
+        }
+
+        self.get_all_declarations()
+            .into_iter()
+            .filter(|unit| unit.kind() == CodeUnitType::Class)
+            .filter(|unit| {
+                csharp_type_name_matches(unit, name)
+                    || namespaces.iter().any(|namespace| {
+                        unit.package_name() == namespace && unit.identifier() == name
+                    })
+            })
+            .collect()
+    }
+
+    pub fn resolve_visible_type(&self, file: &ProjectFile, name: &str) -> Option<CodeUnit> {
+        let mut candidates = self.visible_type_candidates(file, name);
+        candidates.sort_by_key(CodeUnit::fq_name);
+        candidates.dedup();
+        (candidates.len() == 1).then(|| candidates.remove(0))
+    }
 }
 
 impl TestDetectionProvider for CSharpAnalyzer {}
+
+impl ImportAnalysisProvider for CSharpAnalyzer {
+    fn imported_code_units_of(&self, file: &ProjectFile) -> HashSet<CodeUnit> {
+        let namespaces = self.using_namespaces_of(file);
+        if namespaces.is_empty() {
+            return HashSet::default();
+        }
+        self.get_all_declarations()
+            .into_iter()
+            .filter(|unit| unit.kind() == CodeUnitType::Class)
+            .filter(|unit| {
+                namespaces
+                    .iter()
+                    .any(|namespace| unit.package_name() == namespace)
+            })
+            .collect()
+    }
+
+    fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
+        let target_namespaces: HashSet<String> = self
+            .get_declarations(file)
+            .into_iter()
+            .filter(|unit| unit.kind() == CodeUnitType::Class)
+            .map(|unit| unit.package_name().to_string())
+            .collect();
+        if target_namespaces.is_empty() {
+            return HashSet::default();
+        }
+
+        self.get_analyzed_files()
+            .into_iter()
+            .filter(|candidate| candidate != file)
+            .filter(|candidate| {
+                let candidate_namespace = self.namespace_of_file(candidate);
+                target_namespaces
+                    .iter()
+                    .any(|namespace| namespace == &candidate_namespace)
+                    || self
+                        .using_namespaces_of(candidate)
+                        .iter()
+                        .any(|namespace| target_namespaces.contains(namespace))
+            })
+            .collect()
+    }
+
+    fn import_info_of<'a>(&'a self, file: &ProjectFile) -> &'a [crate::analyzer::ImportInfo] {
+        self.inner.import_info_of(file)
+    }
+
+    fn could_import_file(
+        &self,
+        source_file: &ProjectFile,
+        imports: &[crate::analyzer::ImportInfo],
+        target: &ProjectFile,
+    ) -> bool {
+        if self.namespace_of_file(source_file) == self.namespace_of_file(target) {
+            return true;
+        }
+        let target_namespaces: HashSet<String> = self
+            .get_declarations(target)
+            .into_iter()
+            .filter(|unit| unit.kind() == CodeUnitType::Class)
+            .map(|unit| unit.package_name().to_string())
+            .collect();
+        let source_imports = self.using_namespaces_of(source_file);
+        imports
+            .iter()
+            .filter_map(|import| csharp_using_namespace(&import.raw_snippet))
+            .chain(source_imports)
+            .any(|namespace| target_namespaces.contains(&namespace))
+    }
+}
 
 impl IAnalyzer for CSharpAnalyzer {
     fn top_level_declarations<'a>(
@@ -347,6 +465,10 @@ impl IAnalyzer for CSharpAnalyzer {
     fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {
         Some(self)
     }
+
+    fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {
+        Some(self)
+    }
 }
 
 impl CSharpAnalyzer {
@@ -407,9 +529,11 @@ impl<'a> CSharpVisitor<'a> {
             "namespace_declaration" | "file_scoped_namespace_declaration" => {
                 self.visit_namespace(node, scope)
             }
-            "class_declaration" | "interface_declaration" | "struct_declaration" => {
-                self.visit_type_declaration(node, scope)
-            }
+            "class_declaration"
+            | "interface_declaration"
+            | "struct_declaration"
+            | "record_declaration"
+            | "record_struct_declaration" => self.visit_type_declaration(node, scope),
             "method_declaration" => self.visit_method(node, scope),
             "constructor_declaration" => self.visit_constructor(node, scope),
             "property_declaration" => self.visit_property(node, scope),
@@ -853,6 +977,47 @@ fn file_language(file: &ProjectFile) -> Language {
         .and_then(|ext| ext.to_str())
         .map(Language::from_extension)
         .unwrap_or(Language::None)
+}
+
+fn csharp_using_namespace(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_end_matches(';').trim();
+    let rest = trimmed
+        .strip_prefix("global ")
+        .unwrap_or(trimmed)
+        .strip_prefix("using ")?
+        .trim();
+    if rest.starts_with("static ") || rest.contains('=') || rest.is_empty() {
+        return None;
+    }
+    Some(rest.to_string())
+}
+
+fn csharp_type_name_matches(unit: &CodeUnit, raw_name: &str) -> bool {
+    let normalized = normalize_csharp_type_name(raw_name);
+    if normalized.is_empty() {
+        return false;
+    }
+    normalized == unit.fq_name()
+        || (normalized.contains('$') && normalized == unit.short_name())
+        || (normalized.contains('.')
+            && unit
+                .fq_name()
+                .strip_suffix(unit.identifier())
+                .is_some_and(|prefix| normalized == format!("{prefix}{}", unit.identifier())))
+}
+
+fn normalize_csharp_type_name(raw_name: &str) -> String {
+    let without_nullable = raw_name.trim().trim_end_matches('?').trim();
+    let without_arrays = without_nullable
+        .trim_end_matches("[]")
+        .trim_end_matches('?')
+        .trim();
+    without_arrays
+        .split('<')
+        .next()
+        .unwrap_or(without_arrays)
+        .trim()
+        .to_string()
 }
 
 const CSHARP_CLONE_AST_IDENTIFIER_TYPES: &[&str] = &["identifier"];
