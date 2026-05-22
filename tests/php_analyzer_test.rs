@@ -1,5 +1,6 @@
 mod common;
 
+use brokk_bifrost::analyzer::parse_php_use_aliases;
 use brokk_bifrost::{CodeUnit, IAnalyzer, PhpAnalyzer, ProjectFile};
 use common::{assert_code_eq, definition, normalize_nonempty_lines, php_fixture_project};
 
@@ -274,4 +275,18 @@ fn test_php_complex_field_initializer_is_omitted() {
             .get_skeleton(&definition(&analyzer, "ComplexFields.multiB"))
             .unwrap(),
     );
+}
+
+#[test]
+fn test_php_use_alias_helper_handles_grouped_function_and_const_imports() {
+    let grouped = parse_php_use_aliases("use Vendor\\Package\\{Target, Helper as Tool};");
+    assert_eq!("Vendor.Package.Target", grouped["Target"]);
+    assert_eq!("Vendor.Package.Helper", grouped["Tool"]);
+
+    let function_import =
+        parse_php_use_aliases("use function Vendor\\Package\\helper as run_helper;");
+    assert_eq!("Vendor.Package.helper", function_import["run_helper"]);
+
+    let const_import = parse_php_use_aliases("use const Vendor\\Package\\LIMIT;");
+    assert_eq!("Vendor.Package.LIMIT", const_import["LIMIT"]);
 }

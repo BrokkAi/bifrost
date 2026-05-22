@@ -24,6 +24,18 @@ fn php_analyzer_with_files(
     (project, analyzer)
 }
 
+fn graph_hits(
+    analyzer: &PhpAnalyzer,
+    fq_name: &str,
+) -> std::collections::BTreeSet<brokk_bifrost::usages::UsageHit> {
+    let target = definition(analyzer, fq_name);
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    PhpUsageGraphStrategy::new()
+        .find_usages(analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .unwrap_or_else(|err| panic!("usage query failed for {fq_name}: {err}"))
+}
+
 #[test]
 fn usage_finder_routes_php_targets_through_graph_strategy() {
     let (_project, analyzer) = php_analyzer_with_files(&[
@@ -315,4 +327,383 @@ function consume(Target $a, Target $b): void {
         1,
     );
     assert!(matches!(result, FuzzyResult::TooManyCallsites { .. }));
+}
+
+#[test]
+fn php_graph_resolves_grouped_unaliased_function_and_const_imports() {
+    let (project, analyzer) = php_analyzer_with_files(&[
+        (
+            "Lib.php",
+            r#"<?php
+namespace Vendor\Package;
+class Target {}
+function helper(): void {}
+const LIMIT = 10;
+"#,
+        ),
+        (
+            "Consumer.php",
+            r#"<?php
+namespace App;
+use Vendor\Package\{Target, helper as run_helper, LIMIT};
+function consume(): void {
+    new Target();
+    run_helper();
+    echo LIMIT;
+}
+"#,
+        ),
+    ]);
+
+    let type_hits = graph_hits(&analyzer, "Vendor.Package.Target");
+    assert!(
+        type_hits
+            .iter()
+            .any(|hit| hit.file == project.file("Consumer.php"))
+    );
+
+    let function_hits = graph_hits(&analyzer, "Vendor.Package.helper");
+    assert_eq!(1, function_hits.len());
+
+    let const_hits = graph_hits(&analyzer, "Vendor.Package._module_.LIMIT");
+    assert_eq!(1, const_hits.len());
+}
+
+#[test]
+fn php_graph_resolves_imported_namespace_alias_suffixes() {
+    let (project, analyzer) = php_analyzer_with_files(&[
+        (
+            "Target.php",
+            r#"<?php
+namespace Vendor\Package;
+class Target {}
+"#,
+        ),
+        (
+            "Consumer.php",
+            r#"<?php
+namespace App;
+use Vendor\Package as Pkg;
+function consume(): void {
+    new Pkg\Target();
+}
+"#,
+        ),
+    ]);
+
+    let hits = graph_hits(&analyzer, "Vendor.Package.Target");
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == project.file("Consumer.php"))
+    );
+}
+
+#[test]
+fn php_graph_counts_inheritance_trait_and_rich_type_references() {
+    let (project, analyzer) = php_analyzer_with_files(&[
+        (
+            "Types.php",
+            r#"<?php
+namespace App\Contracts;
+interface Service {}
+trait SharedTrait {}
+class Base {}
+class Target {}
+"#,
+        ),
+        (
+            "Consumer.php",
+            r#"<?php
+namespace App\Feature;
+use App\Contracts\Base;
+use App\Contracts\Service;
+use App\Contracts\SharedTrait;
+use App\Contracts\Target;
+
+class Child extends Base implements Service {
+    use SharedTrait;
+    private ?Target $nullable;
+    public Target|Base $union;
+    public Target&Service $intersection;
+
+    public function consume(Target $target): ?Target {
+        return $target;
+    }
+}
+"#,
+        ),
+    ]);
+
+    let base_hits = graph_hits(&analyzer, "App.Contracts.Base");
+    assert!(
+        base_hits
+            .iter()
+            .any(|hit| hit.file == project.file("Consumer.php"))
+    );
+
+    let interface_hits = graph_hits(&analyzer, "App.Contracts.Service");
+    assert!(
+        interface_hits
+            .iter()
+            .any(|hit| hit.file == project.file("Consumer.php"))
+    );
+
+    let trait_hits = graph_hits(&analyzer, "App.Contracts.SharedTrait");
+    assert!(
+        trait_hits
+            .iter()
+            .any(|hit| hit.file == project.file("Consumer.php"))
+    );
+
+    let target_hits = graph_hits(&analyzer, "App.Contracts.Target");
+    assert!(
+        target_hits
+            .iter()
+            .filter(|hit| hit.file == project.file("Consumer.php"))
+            .count()
+            >= 4,
+        "expected nullable/property/parameter/return Target references, got {target_hits:?}"
+    );
+}
+
+#[test]
+fn php_graph_does_not_treat_class_trait_use_as_namespace_import() {
+    let (_project, analyzer) = php_analyzer_with_files(&[
+        (
+            "Target.php",
+            r#"<?php
+namespace App\Real;
+class SharedTrait {
+    public function run(): void {}
+}
+"#,
+        ),
+        (
+            "Consumer.php",
+            r#"<?php
+namespace App\Feature;
+class Consumer {
+    use SharedTrait;
+
+    public function call(SharedTrait $trait): void {
+        $trait->run();
+    }
+}
+"#,
+        ),
+    ]);
+
+    let hits = graph_hits(&analyzer, "App.Real.SharedTrait.run");
+    assert!(
+        hits.is_empty(),
+        "class trait-use should not import App.Real.SharedTrait"
+    );
+}
+
+#[test]
+fn php_graph_resolves_this_self_static_and_parent_member_references() {
+    let (_project, analyzer) = php_analyzer_with_files(&[(
+        "Target.php",
+        r#"<?php
+namespace App;
+class Base {
+    public static function inherited(): void {}
+}
+class Target extends Base {
+    public static string $label;
+    public const VALUE = 1;
+    public function run(): void {}
+
+    public function callThis(): void {
+        $this->run();
+        $this->label = 'x';
+    }
+
+    public static function callStatic(): void {
+        self::VALUE;
+        static::$label;
+        parent::inherited();
+    }
+}
+"#,
+    )]);
+
+    assert_eq!(1, graph_hits(&analyzer, "App.Target.run").len());
+    assert_eq!(2, graph_hits(&analyzer, "App.Target.label").len());
+    assert_eq!(1, graph_hits(&analyzer, "App.Target.VALUE").len());
+    assert_eq!(1, graph_hits(&analyzer, "App.Base.inherited").len());
+}
+
+#[test]
+fn php_graph_keeps_unproven_interface_and_inherited_receivers_empty() {
+    let (_project, analyzer) = php_analyzer_with_files(&[
+        (
+            "Service.php",
+            r#"<?php
+namespace App;
+interface Service {
+    public function run(): void;
+}
+class Target implements Service {
+    public function run(): void {}
+}
+class Child extends Target {}
+"#,
+        ),
+        (
+            "Consumer.php",
+            r#"<?php
+namespace App;
+function byInterface(Service $service): void {
+    $service->run();
+}
+function byChild(Child $child): void {
+    $child->run();
+}
+"#,
+        ),
+    ]);
+
+    assert!(graph_hits(&analyzer, "App.Target.run").is_empty());
+}
+
+#[test]
+fn php_graph_blocks_shadowed_reassigned_unknown_and_sibling_receivers() {
+    let (_project, analyzer) = php_analyzer_with_files(&[
+        (
+            "Target.php",
+            r#"<?php
+namespace App;
+class Target {
+    public function run(): void {}
+}
+class Other {
+    public function run(): void {}
+}
+"#,
+        ),
+        (
+            "Consumer.php",
+            r#"<?php
+namespace App;
+function shadow(Target $target): void {
+    $target = new Other();
+    $target->run();
+}
+function unknown($target): void {
+    $target->run();
+}
+function sibling(Target $target): void {}
+function otherSibling($target): void {
+    $target->run();
+}
+"#,
+        ),
+    ]);
+
+    assert!(graph_hits(&analyzer, "App.Target.run").is_empty());
+}
+
+#[test]
+fn php_graph_resolves_simple_local_receiver_aliases() {
+    let (_project, analyzer) = php_analyzer_with_files(&[
+        (
+            "Target.php",
+            r#"<?php
+namespace App;
+class Target {
+    public function run(): void {}
+}
+"#,
+        ),
+        (
+            "Consumer.php",
+            r#"<?php
+namespace App;
+function consume(Target $target): void {
+    $alias = $target;
+    $alias->run();
+}
+"#,
+        ),
+    ]);
+
+    assert_eq!(1, graph_hits(&analyzer, "App.Target.run").len());
+}
+
+#[test]
+fn php_graph_ignores_dynamic_class_function_and_member_forms() {
+    let (_project, analyzer) = php_analyzer_with_files(&[
+        (
+            "Target.php",
+            r#"<?php
+namespace App;
+class Target {
+    public function run(): void {}
+    public string $name;
+}
+function helper(): void {}
+"#,
+        ),
+        (
+            "Consumer.php",
+            r#"<?php
+namespace App;
+function dynamic(): void {
+    $class = Target::class;
+    new $class();
+    $method = 'run';
+    $property = 'name';
+    $target = new Target();
+    $target->$method();
+    echo $target->$property;
+    $fn = 'helper';
+    $fn();
+    include 'Target.php';
+}
+"#,
+        ),
+    ]);
+
+    assert!(graph_hits(&analyzer, "App.Target.run").is_empty());
+    assert!(graph_hits(&analyzer, "App.Target.name").is_empty());
+    assert!(graph_hits(&analyzer, "App.helper").is_empty());
+}
+
+#[test]
+fn php_graph_ignores_magic_methods_and_properties_as_dynamic_dispatch() {
+    let (_project, analyzer) = php_analyzer_with_files(&[
+        (
+            "Target.php",
+            r#"<?php
+namespace App;
+class Target {
+    public function run(): void {}
+    public string $name;
+}
+"#,
+        ),
+        (
+            "MagicProxy.php",
+            r#"<?php
+namespace App;
+class MagicProxy {
+    public function __call(string $name, array $args): mixed {
+        return null;
+    }
+
+    public function __get(string $name): mixed {
+        return null;
+    }
+}
+function consume(MagicProxy $proxy): void {
+    $proxy->run();
+    echo $proxy->name;
+}
+"#,
+        ),
+    ]);
+
+    assert!(graph_hits(&analyzer, "App.Target.run").is_empty());
+    assert!(graph_hits(&analyzer, "App.Target.name").is_empty());
 }

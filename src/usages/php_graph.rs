@@ -92,6 +92,7 @@ enum TargetKind {
     Constructor,
     Method,
     Field,
+    Constant,
     Function,
 }
 
@@ -125,7 +126,11 @@ impl TargetSpec {
                 TargetKind::Function
             }
         } else if target.is_field() {
-            TargetKind::Field
+            if parent.is_some() {
+                TargetKind::Field
+            } else {
+                TargetKind::Constant
+            }
         } else {
             return None;
         };
@@ -254,6 +259,18 @@ fn seed_variable_types(source: &str, ctx: &mut FileContext) {
             ctx.variables.insert(var_match.as_str().to_string(), fq);
         }
     }
+
+    for captures in VARIABLE_ALIAS_RE.captures_iter(source) {
+        let Some(lhs_match) = captures.name("lhs") else {
+            continue;
+        };
+        let Some(rhs_match) = captures.name("rhs") else {
+            continue;
+        };
+        if let Some(fq) = ctx.variables.get(rhs_match.as_str()).cloned() {
+            ctx.variables.insert(lhs_match.as_str().to_string(), fq);
+        }
+    }
 }
 
 static TYPED_VARIABLE_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -275,6 +292,11 @@ static PARAMETER_VARIABLE_RE: LazyLock<Regex> = LazyLock::new(|| {
         r"[(,]\s*(?P<type>\\?[A-Za-z_][A-Za-z0-9_\\]*(?:\|\\?[A-Za-z_][A-Za-z0-9_\\]*)?)\s+\$(?P<var>[A-Za-z_][A-Za-z0-9_]*)",
     )
     .expect("valid PHP parameter-variable regex")
+});
+
+static VARIABLE_ALIAS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\$(?P<lhs>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*\$(?P<rhs>[A-Za-z_][A-Za-z0-9_]*)\s*;")
+        .expect("valid PHP variable-alias regex")
 });
 
 static PHP_USE_RE: LazyLock<Regex> =
@@ -340,6 +362,7 @@ fn handle_candidate(
                 push_hit(node, analyzer, file, source, line_starts, spec, hits);
             }
         }
+        TargetKind::Constant => {}
         TargetKind::Function => {
             if node.kind() != "namespace_name" && is_function_reference(node, source, ctx, spec) {
                 push_hit(node, analyzer, file, source, line_starts, spec, hits);
@@ -524,14 +547,23 @@ fn scan_member_patterns(
         let Some(var_match) = captures.name("var") else {
             continue;
         };
-        if ctx
-            .variables
-            .get(var_match.as_str())
-            .is_none_or(|fq| fq != owner)
-        {
+        let receiver = var_match.as_str();
+        let member = captures.name("member").expect("member capture");
+        let receiver_matches = if receiver == "this" {
+            receiver_is_enclosing_owner(
+                analyzer,
+                file,
+                member.start(),
+                member.end(),
+                line_starts,
+                owner,
+            )
+        } else {
+            ctx.variables.get(receiver).is_some_and(|fq| fq == owner)
+        };
+        if !receiver_matches {
             continue;
         }
-        let member = captures.name("member").expect("member capture");
         push_hit_range(
             member.start(),
             member.end(),
@@ -630,6 +662,32 @@ fn scan_resolved_text_patterns(
                 }
             }
         }
+        TargetKind::Constant => {
+            for alias in target_aliases(ctx, &spec.target_fq_name) {
+                let pattern = Regex::new(&format!(
+                    r"(^|[^A-Za-z0-9_\\$>:])({})([^A-Za-z0-9_\\]|$)",
+                    regex::escape(&alias)
+                ))
+                .expect("valid PHP constant regex");
+                for captures in pattern.captures_iter(source) {
+                    let matched = captures.get(2).expect("constant alias capture");
+                    if is_import_or_declaration_context(matched.start(), source, &["const", "use"])
+                    {
+                        continue;
+                    }
+                    push_hit_range(
+                        matched.start(),
+                        matched.end(),
+                        analyzer,
+                        file,
+                        source,
+                        line_starts,
+                        spec,
+                        hits,
+                    );
+                }
+            }
+        }
         TargetKind::Function => {
             for alias in target_aliases(ctx, &spec.target_fq_name) {
                 let pattern = Regex::new(&format!(
@@ -665,23 +723,53 @@ fn scan_resolved_text_patterns(
 
 fn target_aliases(ctx: &FileContext, target_fq_name: &str) -> BTreeSet<String> {
     let mut aliases = BTreeSet::new();
-    let php_path = target_fq_name.replace('.', "\\");
+    let lookup_fq_name = public_php_fq_name(target_fq_name);
+    let php_path = lookup_fq_name.replace('.', "\\");
     aliases.insert(format!("\\{php_path}"));
 
-    let short = target_fq_name
+    let short = lookup_fq_name
         .rsplit('.')
         .next()
-        .unwrap_or(target_fq_name)
+        .unwrap_or(lookup_fq_name.as_str())
         .to_string();
-    if namespace_of_fq(target_fq_name) == ctx.namespace {
+    if namespace_of_fq(&lookup_fq_name) == ctx.namespace {
         aliases.insert(short);
     }
     for (alias, imported) in &ctx.aliases {
-        if imported == target_fq_name {
+        if imported == &lookup_fq_name || imported == target_fq_name {
             aliases.insert(alias.clone());
+        } else if let Some(suffix) = lookup_fq_name
+            .strip_prefix(imported)
+            .and_then(|suffix| suffix.strip_prefix('.'))
+        {
+            aliases.insert(format!("{alias}\\{}", suffix.replace('.', "\\")));
         }
     }
     aliases
+}
+
+fn public_php_fq_name(fq_name: &str) -> String {
+    fq_name.replace("._module_.", ".")
+}
+
+fn receiver_is_enclosing_owner(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    start: usize,
+    end: usize,
+    line_starts: &[usize],
+    owner: &str,
+) -> bool {
+    let range = Range {
+        start_byte: start,
+        end_byte: end,
+        start_line: find_line_index_for_offset(line_starts, start),
+        end_line: find_line_index_for_offset(line_starts, end),
+    };
+    analyzer
+        .enclosing_code_unit(file, &range)
+        .and_then(|enclosing| analyzer.parent_of(&enclosing).or(Some(enclosing)))
+        .is_some_and(|enclosing_owner| enclosing_owner.fq_name() == owner)
 }
 
 fn namespace_of_fq(fq_name: &str) -> String {
