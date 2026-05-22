@@ -251,9 +251,8 @@ fn import_binder_of(analyzer: &GoAnalyzer, file: &ProjectFile) -> ImportBinder {
                     .alias
                     .clone()
                     .or_else(|| import.identifier.clone())
-                    .unwrap_or_else(|| {
-                        path.rsplit('/').next().unwrap_or(path.as_str()).to_string()
-                    });
+                    .map(|identifier| default_go_import_local_name(&identifier))
+                    .unwrap_or_else(|| default_go_import_local_name(&path));
                 binder.bindings.insert(
                     local,
                     ImportBinding {
@@ -507,14 +506,18 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>, locals: &mut LocalInferenceE
         "parameter_declaration" => {
             seed_parameter_declaration(node, ctx, locals);
         }
-        "var_declaration" | "short_var_declaration" | "assignment_statement" => {
+        "var_declaration" | "short_var_declaration" => {
+            declare_local_names(node, ctx, locals);
+            seed_local_bindings(node, ctx, locals);
+        }
+        "assignment_statement" => {
             seed_local_bindings(node, ctx, locals);
         }
         "selector_expression" | "qualified_type" => {
             scan_selector_like(node, ctx, locals);
         }
         "identifier" | "type_identifier" => {
-            scan_direct_identifier(node, ctx);
+            scan_direct_identifier(node, ctx, locals);
         }
         _ => {}
     }
@@ -548,22 +551,44 @@ fn seed_parameter_declaration(
     ctx: &ScanCtx<'_>,
     locals: &mut LocalInferenceEngine<String>,
 ) {
+    let parameter_names = parameter_names(node, ctx.source);
     let Some(type_node) = node.child_by_field_name("type") else {
+        for name in parameter_names {
+            locals.declare_shadow(name);
+        }
         return;
     };
     if !type_ref_from_node(type_node, ctx.source)
         .is_some_and(|ty| ctx.bindings.matches_owner_type(&ty))
     {
+        for name in parameter_names {
+            locals.declare_shadow(name);
+        }
         return;
     }
+    for name in parameter_names {
+        locals.seed_symbol(name, OWNER_TOKEN.to_string());
+    }
+}
+
+fn parameter_names(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut out = Vec::new();
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         if child.kind() == "identifier" {
-            locals.seed_symbol(
-                node_text(child, ctx.source).to_string(),
-                OWNER_TOKEN.to_string(),
-            );
+            out.push(node_text(child, source).to_string());
         }
+    }
+    out
+}
+
+fn declare_local_names(
+    node: Node<'_>,
+    ctx: &ScanCtx<'_>,
+    locals: &mut LocalInferenceEngine<String>,
+) {
+    for name in declared_names(node, ctx.source) {
+        locals.declare_shadow(name);
     }
 }
 
@@ -598,6 +623,43 @@ fn seed_local_bindings(
         };
         locals.alias_symbol(lhs.as_str().to_string(), rhs.as_str());
     }
+    if owner_type_appears_in_node(node, ctx) {
+        for name in declared_names(node, ctx.source) {
+            locals.seed_symbol(name, OWNER_TOKEN.to_string());
+        }
+    }
+}
+
+fn declared_names(node: Node<'_>, source: &str) -> Vec<String> {
+    let text = node_text(node, source);
+    let mut out = Vec::new();
+    for caps in VAR_DECL_NAMES_RE.captures_iter(text) {
+        if let Some(name) = caps.name("var") {
+            out.push(name.as_str().to_string());
+        }
+    }
+    for caps in SHORT_DECL_NAMES_RE.captures_iter(text) {
+        let Some(vars) = caps.name("vars") else {
+            continue;
+        };
+        out.extend(
+            vars.as_str()
+                .split(',')
+                .map(str::trim)
+                .filter(|name| *name != "_" && IDENT_RE.is_match(name))
+                .map(str::to_string),
+        );
+    }
+    out
+}
+
+fn owner_type_appears_in_node(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    if type_ref_from_node(node, ctx.source).is_some_and(|ty| ctx.bindings.matches_owner_type(&ty)) {
+        return true;
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| owner_type_appears_in_node(child, ctx))
 }
 
 fn scan_selector_like(
@@ -605,7 +667,7 @@ fn scan_selector_like(
     ctx: &mut ScanCtx<'_>,
     locals: &LocalInferenceEngine<String>,
 ) {
-    let Some((qualifier, field_node)) = selector_parts(node, ctx.source) else {
+    let Some((qualifier, qualifier_node, field_node)) = selector_parts(node, ctx.source) else {
         return;
     };
     let field = node_text(field_node, ctx.source);
@@ -624,22 +686,29 @@ fn scan_selector_like(
         return;
     }
 
-    if ctx.bindings.namespace_names.contains(&qualifier) {
+    if ctx.bindings.namespace_names.contains(&qualifier)
+        && !locals.is_shadowed(&qualifier)
+        && !is_definition_identifier(qualifier_node)
+    {
         record_hit(field_node, ctx);
     }
 }
 
-fn scan_direct_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+fn scan_direct_identifier(
+    node: Node<'_>,
+    ctx: &mut ScanCtx<'_>,
+    locals: &LocalInferenceEngine<String>,
+) {
     if ctx.spec.is_member() || is_definition_identifier(node) {
         return;
     }
     let text = node_text(node, ctx.source);
-    if ctx.bindings.matches_direct_target(text) {
+    if ctx.bindings.matches_direct_target(text) && !locals.is_shadowed(text) {
         record_hit(node, ctx);
     }
 }
 
-fn selector_parts<'a>(node: Node<'a>, source: &str) -> Option<(String, Node<'a>)> {
+fn selector_parts<'a>(node: Node<'a>, source: &str) -> Option<(String, Node<'a>, Node<'a>)> {
     let qualifier_node = node
         .child_by_field_name("operand")
         .or_else(|| node.child_by_field_name("package"))
@@ -648,7 +717,11 @@ fn selector_parts<'a>(node: Node<'a>, source: &str) -> Option<(String, Node<'a>)
         .child_by_field_name("field")
         .or_else(|| node.child_by_field_name("name"))
         .or_else(|| last_named_child(node))?;
-    Some((node_text(qualifier_node, source).to_string(), field_node))
+    Some((
+        node_text(qualifier_node, source).to_string(),
+        qualifier_node,
+        field_node,
+    ))
 }
 
 #[derive(Default)]
@@ -664,7 +737,7 @@ fn type_ref_from_node(node: Node<'_>, source: &str) -> Option<TypeRef> {
             name: Some(node_text(node, source).to_string()),
         }),
         "qualified_type" | "selector_expression" => {
-            let (qualifier, field) = selector_parts(node, source)?;
+            let (qualifier, _qualifier_node, field) = selector_parts(node, source)?;
             Some(TypeRef {
                 qualifier: Some(qualifier),
                 name: Some(node_text(field, source).to_string()),
@@ -801,6 +874,14 @@ fn extract_go_import_path(raw_import: &str) -> Option<String> {
         .filter(|path| !path.is_empty())
 }
 
+fn default_go_import_local_name(import_path_or_identifier: &str) -> String {
+    let tail = import_path_or_identifier
+        .rsplit('/')
+        .next()
+        .unwrap_or(import_path_or_identifier);
+    VERSION_SUFFIX_RE.replace(tail, "").to_string()
+}
+
 static VAR_TYPED_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"\bvar\s+(?P<var>[A-Za-z_][A-Za-z0-9_]*)\s+\*?(?:(?P<qualifier>[A-Za-z_][A-Za-z0-9_]*)\.)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)\b",
@@ -809,7 +890,7 @@ static VAR_TYPED_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 static CONSTRUCTED_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"\b(?P<var>[A-Za-z_][A-Za-z0-9_]*)\s*(?::=|=)\s*&?\s*(?:(?P<qualifier>[A-Za-z_][A-Za-z0-9_]*)\.)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*(?:\{|\()",
+        r"\b(?P<var>[A-Za-z_][A-Za-z0-9_]*)\s*(?::=|=)\s*&?\s*(?:(?P<qualifier>[A-Za-z_][A-Za-z0-9_]*)\.)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*(?:\{|\(|\b)",
     )
     .expect("valid Go constructed value regex")
 });
@@ -817,3 +898,15 @@ static ALIAS_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\b(?P<lhs>[A-Za-z_][A-Za-z0-9_]*)\s*:=\s*(?P<rhs>[A-Za-z_][A-Za-z0-9_]*)\b")
         .expect("valid Go alias regex")
 });
+static VAR_DECL_NAMES_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\bvar\s+(?P<var>[A-Za-z_][A-Za-z0-9_]*)\b")
+        .expect("valid Go var declaration-name regex")
+});
+static SHORT_DECL_NAMES_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?P<vars>[A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*)\s*:=")
+        .expect("valid Go short declaration-name regex")
+});
+static IDENT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$").expect("valid Go identifier regex"));
+static VERSION_SUFFIX_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\.v\d+$").expect("valid Go module version suffix regex"));

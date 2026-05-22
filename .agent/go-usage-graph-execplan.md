@@ -17,6 +17,7 @@ The behavior is observable through `cargo test --test usages_go_graph_test`: tho
 - [x] (2026-05-22T08:35Z) Added and wired `src/usages/go_graph.rs`.
 - [x] (2026-05-22T08:35Z) Added focused inline Go usage graph tests.
 - [x] (2026-05-22T08:35Z) Ran targeted tests, formatting, and clippy; all requested checks passed.
+- [x] (2026-05-22T09:01Z) Hardened Go usage graph coverage from 7 to 14 tests across dot imports, blank imports, versioned module paths, candidate boundaries, richer type positions, receiver seed forms, local shadowing, and conservative negative cases.
 
 ## Surprises & Discoveries
 
@@ -25,6 +26,12 @@ The behavior is observable through `cargo test --test usages_go_graph_test`: tho
 
 - Observation: Brokk's main checkout has Go analyzer behavior and at least one Go field usage test, but no direct Go static usage graph strategy to port wholesale.
   Evidence: searches in `/Users/dave/Workspace/BrokkAi/brokk` found Rust/Python/JS-TS graph strategies and Go analyzer tests, not a Go graph strategy.
+
+- Observation: Default Go import identifiers can differ from the import path tail when module paths carry semantic-import suffixes.
+  Evidence: `import "gopkg.in/yaml.v3"` is used as `yaml.Marshal`, while the raw path tail is `yaml.v3`.
+
+- Observation: The initial receiver inference handled pointer constructors but missed plain composite literals and alias chains in one constructor-heavy scenario.
+  Evidence: the hardening test for `album := model.Album{}`, `copy := album`, and `next := copy` initially returned 3 hits instead of the expected 5.
 
 ## Decision Log
 
@@ -36,9 +43,15 @@ The behavior is observable through `cargo test --test usages_go_graph_test`: tho
   Rationale: Issue #111 explicitly excludes a full `go/types` implementation, dynamic dispatch, embedded promotion, module replacement, and interprocedural data flow.
   Date/Author: 2026-05-22 / Codex
 
+- Decision: Treat local shadows of import aliases and dot-imported names as blockers for graph proofs.
+  Rationale: Once a local parameter, variable, or short declaration owns the same token, the graph cannot safely treat that token as a package namespace or dot-imported symbol.
+  Date/Author: 2026-05-22 / Codex
+
 ## Outcomes & Retrospective
 
-The implementation is complete for issue #111's flow-insensitive scope. Go targets now route through `GoUsageGraphStrategy` before regex fallback. The strategy proves same-package references, package-qualified imports, aliased imports, common type-position references, locally inferred receiver method calls, struct field reads/writes, and `max_usages` limits.
+The implementation is complete for issue #111's flow-insensitive scope. Go targets now route through `GoUsageGraphStrategy` before regex fallback. The strategy proves same-package references, package-qualified imports, aliased imports, dot imports, versioned module path imports, common type-position references, locally inferred receiver method calls, struct field reads/writes, and `max_usages` limits.
+
+The hardening wave expanded the Go usage graph suite to parity-style coverage for the current scope. It also fixed two in-scope bugs: semantic import suffixes such as `.v3` are stripped from default import-local names, and receiver inference now uses AST type references plus local shadow tracking to support plain composite literals and alias chains without over-counting local shadows.
 
 The intentional limits remain: this does not implement full `go/types`, dynamic interface dispatch, embedded method or field promotion, build tags, vendoring/module replacement semantics, reflection, or interprocedural receiver inference.
 
@@ -87,7 +100,7 @@ The changes are additive except for module wiring. Tests can be rerun safely. If
 Verification completed from `/Users/dave/.codex/worktrees/d23e/bifrost`:
 
     cargo test --test usages_go_graph_test
-    test result: ok. 7 passed; 0 failed; 0 ignored
+    test result: ok. 14 passed; 0 failed; 0 ignored
 
     cargo test --test go_import_test --test go_analyzer_test
     tests/go_analyzer_test.rs: 13 passed
@@ -117,3 +130,5 @@ Verification completed from `/Users/dave/.codex/worktrees/d23e/bifrost`:
 Revision note, 2026-05-22: Created the initial plan from issue #111 and local code inspection so the implementation can be resumed from this file alone.
 
 Revision note, 2026-05-22: Updated the plan after implementation and verification so it records the completed behavior, known limits, and exact checks run.
+
+Revision note, 2026-05-22: Updated after the Go coverage hardening wave to record expanded tests, the versioned-import and receiver-alias fixes, and the new verification result.
