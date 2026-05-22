@@ -1,0 +1,1669 @@
+mod common;
+
+use brokk_bifrost::usages::{CppUsageGraphStrategy, FuzzyResult, UsageAnalyzer, UsageFinder};
+use brokk_bifrost::{CodeUnit, CodeUnitType, CppAnalyzer, IAnalyzer, Language, ProjectFile};
+use common::InlineTestProject;
+
+fn cpp_analyzer_with_files(
+    files: &[(&str, &str)],
+) -> (common::BuiltInlineTestProject, CppAnalyzer) {
+    let mut builder = InlineTestProject::with_language(Language::Cpp);
+    for (path, contents) in files {
+        builder = builder.file(path, *contents);
+    }
+    let project = builder.build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    (project, analyzer)
+}
+
+fn definition_by<F>(analyzer: &CppAnalyzer, mut predicate: F) -> CodeUnit
+where
+    F: FnMut(&CodeUnit) -> bool,
+{
+    let declarations = analyzer.get_all_declarations();
+    declarations
+        .iter()
+        .find(|unit| predicate(unit))
+        .cloned()
+        .unwrap_or_else(|| panic!("missing matching C++ declaration in {declarations:#?}"))
+}
+
+fn class_definition(analyzer: &CppAnalyzer, name: &str) -> CodeUnit {
+    definition_by(analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class && unit.identifier() == name
+    })
+}
+
+fn function_definition(analyzer: &CppAnalyzer, name: &str) -> CodeUnit {
+    definition_by(analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function && unit.identifier() == name
+    })
+}
+
+fn function_definition_in_package_with_arity(
+    analyzer: &CppAnalyzer,
+    package_name: &str,
+    name: &str,
+    arity: usize,
+) -> CodeUnit {
+    definition_by(analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.package_name() == package_name
+            && unit.identifier() == name
+            && signature_arity(unit.signature()) == arity
+    })
+}
+
+fn function_definition_with_short_name_and_arity(
+    analyzer: &CppAnalyzer,
+    short_name: &str,
+    arity: usize,
+) -> CodeUnit {
+    definition_by(analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.short_name() == short_name
+            && signature_arity(unit.signature()) == arity
+    })
+}
+
+fn function_definition_with_signature(
+    analyzer: &CppAnalyzer,
+    short_name: &str,
+    signature: &str,
+) -> CodeUnit {
+    definition_by(analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.short_name() == short_name
+            && unit.signature() == Some(signature)
+    })
+}
+
+fn field_definition(analyzer: &CppAnalyzer, name: &str) -> CodeUnit {
+    definition_by(analyzer, |unit| {
+        unit.kind() == CodeUnitType::Field && unit.identifier() == name
+    })
+}
+
+fn field_definition_with_owner(analyzer: &CppAnalyzer, owner: &str, name: &str) -> CodeUnit {
+    definition_by(analyzer, |unit| {
+        unit.kind() == CodeUnitType::Field
+            && unit.identifier() == name
+            && analyzer
+                .parent_of(unit)
+                .is_some_and(|parent| parent.identifier() == owner)
+    })
+}
+
+fn member_function_definition(analyzer: &CppAnalyzer, owner: &str, name: &str) -> CodeUnit {
+    definition_by(analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.identifier() == name
+            && analyzer
+                .parent_of(unit)
+                .is_some_and(|parent| parent.identifier() == owner)
+    })
+}
+
+fn member_function_definition_in_source(
+    analyzer: &CppAnalyzer,
+    owner: &str,
+    name: &str,
+    source: &str,
+) -> CodeUnit {
+    definition_by(analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.identifier() == name
+            && slash_path(unit.source()) == source
+            && analyzer
+                .parent_of(unit)
+                .is_some_and(|parent| parent.identifier() == owner)
+    })
+}
+
+fn constructor_definition(analyzer: &CppAnalyzer, owner: &str) -> CodeUnit {
+    definition_by(analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.identifier() == owner
+            && analyzer
+                .parent_of(unit)
+                .is_some_and(|parent| parent.identifier() == owner)
+    })
+}
+
+fn constructor_definition_with_arity(
+    analyzer: &CppAnalyzer,
+    owner: &str,
+    arity: usize,
+) -> CodeUnit {
+    definition_by(analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.identifier() == owner
+            && signature_arity(unit.signature()) == arity
+            && analyzer
+                .parent_of(unit)
+                .is_some_and(|parent| parent.identifier() == owner)
+    })
+}
+
+fn signature_arity(signature: Option<&str>) -> usize {
+    let Some(signature) = signature else {
+        return 0;
+    };
+    let inner = signature
+        .find('(')
+        .and_then(|open| {
+            signature[open + 1..]
+                .find(')')
+                .map(|close| &signature[open + 1..open + 1 + close])
+        })
+        .unwrap_or(signature)
+        .trim();
+    if inner.is_empty() {
+        0
+    } else {
+        split_top_level_commas(inner).count()
+    }
+}
+
+fn split_top_level_commas(value: &str) -> impl Iterator<Item = &str> {
+    struct TopLevelCommaSplit<'a> {
+        value: &'a str,
+        start: usize,
+        angle: usize,
+        paren: usize,
+        brace: usize,
+        bracket: usize,
+    }
+
+    impl<'a> Iterator for TopLevelCommaSplit<'a> {
+        type Item = &'a str;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.start > self.value.len() {
+                return None;
+            }
+            for (offset, ch) in self.value[self.start..].char_indices() {
+                let absolute = self.start + offset;
+                match ch {
+                    '<' => self.angle += 1,
+                    '>' => self.angle = self.angle.saturating_sub(1),
+                    '(' => self.paren += 1,
+                    ')' => self.paren = self.paren.saturating_sub(1),
+                    '{' => self.brace += 1,
+                    '}' => self.brace = self.brace.saturating_sub(1),
+                    '[' => self.bracket += 1,
+                    ']' => self.bracket = self.bracket.saturating_sub(1),
+                    ',' if self.angle == 0
+                        && self.paren == 0
+                        && self.brace == 0
+                        && self.bracket == 0 =>
+                    {
+                        let item = self.value[self.start..absolute].trim();
+                        self.start = absolute + ch.len_utf8();
+                        return Some(item);
+                    }
+                    _ => {}
+                }
+            }
+            let item = self.value[self.start..].trim();
+            self.start = self.value.len() + 1;
+            Some(item)
+        }
+    }
+
+    TopLevelCommaSplit {
+        value,
+        start: 0,
+        angle: 0,
+        paren: 0,
+        brace: 0,
+        bracket: 0,
+    }
+    .filter(|item| !item.is_empty())
+}
+
+#[derive(Debug)]
+struct HitSummary {
+    file: String,
+    line: String,
+}
+
+fn usage_hits(analyzer: &CppAnalyzer, target: &CodeUnit) -> Vec<HitSummary> {
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    CppUsageGraphStrategy::new()
+        .find_usages(analyzer, std::slice::from_ref(target), &candidates, 1000)
+        .into_either()
+        .expect("cpp graph success")
+        .into_iter()
+        .map(|hit| {
+            let line = hit
+                .file
+                .read_to_string()
+                .ok()
+                .and_then(|source| {
+                    source
+                        .lines()
+                        .nth(hit.line.saturating_sub(1))
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
+            HitSummary {
+                file: slash_path(&hit.file),
+                line,
+            }
+        })
+        .collect()
+}
+
+fn slash_path(file: &ProjectFile) -> String {
+    file.rel_path()
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn assert_hit_contains(hits: &[HitSummary], file: &str, snippet: &str) {
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == file && hit.line.contains(snippet)),
+        "missing hit in {file} containing {snippet:?}; hits were {hits:#?}"
+    );
+}
+
+fn assert_no_hit_contains(hits: &[HitSummary], snippet: &str) {
+    assert!(
+        hits.iter().all(|hit| !hit.line.contains(snippet)),
+        "unexpected hit containing {snippet:?}; hits were {hits:#?}"
+    );
+}
+
+#[test]
+fn usage_finder_routes_cpp_targets_through_graph_strategy() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "target.h",
+            r#"
+class Target {
+public:
+    void run();
+};
+
+class Other {
+public:
+    void run();
+};
+"#,
+        ),
+        (
+            "consumer.cpp",
+            r#"
+#include "target.h"
+
+void call(Target& target, Other& other) {
+    target.run();
+    other.run();
+}
+"#,
+        ),
+    ]);
+
+    let target = member_function_definition(&analyzer, "Target", "run");
+    let hits = UsageFinder::new()
+        .find_usages_default(&analyzer, std::slice::from_ref(&target))
+        .into_either()
+        .expect("cpp graph success");
+
+    assert_eq!(1, hits.len());
+    let hit = hits.iter().next().expect("one hit");
+    assert_eq!(project.file("consumer.cpp"), hit.file);
+    assert!(hit.snippet.contains("target.run()"));
+}
+
+#[test]
+fn cpp_graph_finds_include_aware_namespaced_type_and_free_function_usages() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "api/target.h",
+            r#"
+namespace ns {
+struct Target {};
+void run(Target target);
+}
+"#,
+        ),
+        (
+            "consumer.cpp",
+            r#"
+#include "api/target.h"
+
+void call() {
+    ns::Target target;
+    ns::run(target);
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = CppUsageGraphStrategy::new();
+    let class_target = class_definition(&analyzer, "Target");
+    let function_target = function_definition(&analyzer, "run");
+
+    let type_hits = strategy
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&class_target),
+            &candidates,
+            1000,
+        )
+        .into_either()
+        .expect("type success");
+    assert!(
+        type_hits
+            .iter()
+            .any(|hit| hit.file == project.file("consumer.cpp")
+                && hit.snippet.contains("ns::Target"))
+    );
+
+    let function_hits = strategy
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&function_target),
+            &candidates,
+            1000,
+        )
+        .into_either()
+        .expect("free function success");
+    assert_eq!(1, function_hits.len());
+    assert!(
+        function_hits
+            .iter()
+            .any(|hit| hit.file == project.file("consumer.cpp") && hit.snippet.contains("ns::run"))
+    );
+}
+
+#[test]
+fn cpp_graph_finds_constructors_methods_and_field_accesses_for_typed_receivers() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "target.h",
+            r#"
+struct Target {
+    Target();
+    void run();
+    int value;
+};
+"#,
+        ),
+        (
+            "consumer.cpp",
+            r#"
+#include "target.h"
+
+void call(Target* ptr) {
+    Target stack;
+    Target braced{};
+    auto heap = new Target();
+    stack.run();
+    ptr->run();
+    stack.value = 1;
+    int copy = ptr->value;
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = CppUsageGraphStrategy::new();
+    let constructor = constructor_definition(&analyzer, "Target");
+    let method = member_function_definition(&analyzer, "Target", "run");
+    let field = field_definition(&analyzer, "value");
+
+    let constructor_hits = strategy
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&constructor),
+            &candidates,
+            1000,
+        )
+        .into_either()
+        .expect("constructor success");
+    assert!(
+        constructor_hits.len() >= 3,
+        "expected stack, braced, and heap construction hits, got {constructor_hits:?}"
+    );
+
+    let method_hits = strategy
+        .find_usages(&analyzer, std::slice::from_ref(&method), &candidates, 1000)
+        .into_either()
+        .expect("method success");
+    assert_eq!(2, method_hits.len());
+
+    let field_hits = strategy
+        .find_usages(&analyzer, std::slice::from_ref(&field), &candidates, 1000)
+        .into_either()
+        .expect("field success");
+    assert_eq!(2, field_hits.len());
+}
+
+#[test]
+fn cpp_graph_finds_globals_enum_values_and_alias_references() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "target.h",
+            r#"
+struct Target {};
+using Alias = Target;
+extern int global_value;
+enum Mode { Ready, Done };
+"#,
+        ),
+        (
+            "consumer.cpp",
+            r#"
+#include "target.h"
+
+void call() {
+    using LocalAlias = Target;
+    Alias alias;
+    Target target;
+    int copy = global_value;
+    Mode mode = Ready;
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = CppUsageGraphStrategy::new();
+    let target_type = class_definition(&analyzer, "Target");
+    let global = field_definition(&analyzer, "global_value");
+    let enum_value = field_definition(&analyzer, "Ready");
+
+    let type_hits = strategy
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&target_type),
+            &candidates,
+            1000,
+        )
+        .into_either()
+        .expect("type success");
+    assert!(
+        type_hits
+            .iter()
+            .any(|hit| hit.file == project.file("consumer.cpp")
+                && hit.snippet.contains("using LocalAlias = Target"))
+    );
+    assert!(type_hits.iter().any(
+        |hit| hit.file == project.file("consumer.cpp") && hit.snippet.contains("Target target")
+    ));
+
+    let global_hits = strategy
+        .find_usages(&analyzer, std::slice::from_ref(&global), &candidates, 1000)
+        .into_either()
+        .expect("global success");
+    assert_eq!(1, global_hits.len());
+
+    let enum_hits = strategy
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&enum_value),
+            &candidates,
+            1000,
+        )
+        .into_either()
+        .expect("enum value success");
+    assert_eq!(1, enum_hits.len());
+}
+
+#[test]
+fn cpp_graph_rejects_unrelated_same_name_without_include_visibility() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[
+        ("target.h", "struct Target { void run(); };\n"),
+        (
+            "consumer.cpp",
+            r#"
+struct Target { void run(); };
+
+void call(Target& target) {
+    target.run();
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.identifier() == "run"
+            && unit.source().rel_path().to_string_lossy() == "target.h"
+    });
+    let result = CppUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    assert!(
+        result.into_either().is_err(),
+        "unproven same-name receiver should force fallback"
+    );
+}
+
+#[test]
+fn cpp_graph_respects_candidate_files_and_max_usages() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        ("target.h", "struct Target { void run(); };\n"),
+        (
+            "one.cpp",
+            r#"
+#include "target.h"
+void one(Target& target) { target.run(); }
+"#,
+        ),
+        (
+            "two.cpp",
+            r#"
+#include "target.h"
+void two(Target& target) { target.run(); }
+"#,
+        ),
+    ]);
+
+    let target = member_function_definition(&analyzer, "Target", "run");
+    let restricted_candidates = [project.file("one.cpp")].into_iter().collect();
+    let strategy = CppUsageGraphStrategy::new();
+    let hits = strategy
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &restricted_candidates,
+            1000,
+        )
+        .into_either()
+        .expect("restricted success");
+    assert_eq!(1, hits.len());
+    assert_eq!(project.file("one.cpp"), hits.iter().next().unwrap().file);
+
+    let all_candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let result = strategy.find_usages(&analyzer, std::slice::from_ref(&target), &all_candidates, 1);
+    assert!(matches!(
+        result,
+        FuzzyResult::TooManyCallsites {
+            total_callsites: 2,
+            limit: 1,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn cpp_graph_v2_handles_transitive_cycles_relative_and_angle_includes() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[
+        ("target.h", "struct Target { void run(); };\n"),
+        (
+            "cycle_a.h",
+            "#include \"cycle_b.h\"\n#include \"target.h\"\n",
+        ),
+        ("cycle_b.h", "#include \"cycle_a.h\"\n"),
+        (
+            "src/consumer.cpp",
+            r#"
+#include "../cycle_a.h"
+#include <vector>
+
+void call(Target& target) {
+    target.run();
+}
+"#,
+        ),
+    ]);
+
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.identifier() == "run"
+            && unit.source().rel_path().to_string_lossy() == "target.h"
+    });
+    let hits = usage_hits(&analyzer, &target);
+    assert_eq!(1, hits.len(), "expected only the quoted include-chain call");
+    assert_hit_contains(&hits, "src/consumer.cpp", "target.run()");
+}
+
+#[test]
+fn cpp_graph_v2_keeps_namespace_and_nested_owner_identity_narrow() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "ns1.h",
+            r#"
+namespace ns1 {
+struct Target { void run(); };
+}
+"#,
+        ),
+        (
+            "ns2.h",
+            r#"
+namespace ns2 {
+struct Target { void run(); };
+}
+"#,
+        ),
+        (
+            "widgets_a.h",
+            r#"
+namespace ui::widgets {
+struct Widget { void render(); };
+}
+"#,
+        ),
+        (
+            "widgets_b.h",
+            r#"
+namespace ui::widgets {
+void paint(Widget& widget);
+}
+"#,
+        ),
+        (
+            "nested.h",
+            r#"
+struct Outer {
+    struct Inner { void run(); };
+    struct Sibling { void run(); };
+    void run();
+};
+"#,
+        ),
+        (
+            "consumer.cpp",
+            r#"
+#include "ns1.h"
+#include "ns2.h"
+#include "widgets_a.h"
+#include "widgets_b.h"
+#include "nested.h"
+
+void call(ns1::Target& one, ns2::Target& two, ui::widgets::Widget& widget, Outer& outer, Outer::Inner& inner, Outer::Sibling& sibling) {
+    one.run();
+    two.run();
+    ui::widgets::paint(widget);
+    outer.run();
+    inner.run();
+    sibling.run();
+}
+"#,
+        ),
+    ]);
+
+    let ns1_run = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.identifier() == "run"
+            && unit.package_name() == "ns1"
+    });
+    let ns1_hits = usage_hits(&analyzer, &ns1_run);
+    assert_eq!(1, ns1_hits.len());
+    assert_hit_contains(&ns1_hits, "consumer.cpp", "one.run()");
+    assert_no_hit_contains(&ns1_hits, "two.run()");
+
+    let paint = function_definition(&analyzer, "paint");
+    let paint_hits = usage_hits(&analyzer, &paint);
+    assert_eq!(1, paint_hits.len());
+    assert_hit_contains(&paint_hits, "consumer.cpp", "ui::widgets::paint(widget)");
+
+    let inner_run = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.identifier() == "run"
+            && analyzer
+                .parent_of(unit)
+                .is_some_and(|parent| parent.short_name().ends_with("Inner"))
+    });
+    let inner_hits = usage_hits(&analyzer, &inner_run);
+    assert_eq!(1, inner_hits.len());
+    assert_hit_contains(&inner_hits, "consumer.cpp", "inner.run()");
+    assert_no_hit_contains(&inner_hits, "outer.run()");
+    assert_no_hit_contains(&inner_hits, "sibling.run()");
+}
+
+#[test]
+fn cpp_graph_v2_counts_broad_type_reference_forms() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "target.h",
+            r#"
+namespace ns {
+struct Target {};
+}
+"#,
+        ),
+        (
+            "consumer.cpp",
+            r#"
+#include "target.h"
+#include <vector>
+
+ns::Target make();
+void take(ns::Target value, const ns::Target* ptr, ns::Target& ref) {
+    ns::Target local;
+    const ns::Target* local_ptr = ptr;
+    std::vector<ns::Target> values;
+    auto casted = static_cast<ns::Target*>(ptr);
+}
+"#,
+        ),
+    ]);
+
+    let target = class_definition(&analyzer, "Target");
+    let hits = usage_hits(&analyzer, &target);
+    assert_hit_contains(&hits, "consumer.cpp", "ns::Target make()");
+    assert_hit_contains(&hits, "consumer.cpp", "void take(ns::Target value");
+    assert_hit_contains(&hits, "consumer.cpp", "const ns::Target* ptr");
+    assert_hit_contains(&hits, "consumer.cpp", "ns::Target& ref");
+    assert_hit_contains(&hits, "consumer.cpp", "ns::Target local");
+    assert_hit_contains(&hits, "consumer.cpp", "std::vector<ns::Target>");
+    assert_hit_contains(&hits, "consumer.cpp", "static_cast<ns::Target*>");
+    assert_no_hit_contains(&hits, "struct Target {}");
+}
+
+#[test]
+fn cpp_graph_v2_keeps_free_function_overloads_and_headers_narrow() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "target.h",
+            r#"
+namespace ns {
+void run();
+void run(int value);
+}
+"#,
+        ),
+        (
+            "other.h",
+            r#"
+namespace other {
+void run();
+}
+"#,
+        ),
+        (
+            "consumer.cpp",
+            r#"
+#include "target.h"
+#include "other.h"
+
+void call() {
+    ns::run();
+    ns::run(1);
+    other::run();
+}
+"#,
+        ),
+    ]);
+
+    let zero_arg = function_definition_in_package_with_arity(&analyzer, "ns", "run", 0);
+    let one_arg = function_definition_in_package_with_arity(&analyzer, "ns", "run", 1);
+
+    let zero_hits = usage_hits(&analyzer, &zero_arg);
+    assert_eq!(1, zero_hits.len());
+    assert_hit_contains(&zero_hits, "consumer.cpp", "ns::run();");
+    assert_no_hit_contains(&zero_hits, "ns::run(1)");
+    assert_no_hit_contains(&zero_hits, "other::run()");
+
+    let one_hits = usage_hits(&analyzer, &one_arg);
+    assert_eq!(1, one_hits.len());
+    assert_hit_contains(&one_hits, "consumer.cpp", "ns::run(1)");
+    assert_no_hit_contains(&one_hits, "ns::run();");
+    assert_no_hit_contains(&one_hits, "other::run()");
+}
+
+#[test]
+fn cpp_graph_v2_covers_constructor_forms_and_arity() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "target.h",
+            r#"
+struct Target {
+    Target();
+    Target(int value);
+};
+"#,
+        ),
+        (
+            "consumer.cpp",
+            r#"
+#include "target.h"
+
+void call() {
+    Target stack;
+    Target braced{};
+    Target paren(1);
+    auto direct = Target{1};
+    auto heap0 = new Target;
+    auto heap1 = new Target(1);
+}
+"#,
+        ),
+    ]);
+
+    let zero_arg = constructor_definition_with_arity(&analyzer, "Target", 0);
+    let one_arg = constructor_definition_with_arity(&analyzer, "Target", 1);
+
+    let zero_hits = usage_hits(&analyzer, &zero_arg);
+    assert_hit_contains(&zero_hits, "consumer.cpp", "Target stack");
+    assert_hit_contains(&zero_hits, "consumer.cpp", "Target braced{}");
+    assert_hit_contains(&zero_hits, "consumer.cpp", "new Target");
+    assert_no_hit_contains(&zero_hits, "Target paren(1)");
+    assert_no_hit_contains(&zero_hits, "Target{1}");
+    assert_no_hit_contains(&zero_hits, "new Target(1)");
+
+    let one_hits = usage_hits(&analyzer, &one_arg);
+    assert_hit_contains(&one_hits, "consumer.cpp", "Target paren(1)");
+    assert_hit_contains(&one_hits, "consumer.cpp", "Target{1}");
+    assert_hit_contains(&one_hits, "consumer.cpp", "new Target(1)");
+    assert_no_hit_contains(&one_hits, "Target stack");
+    assert_no_hit_contains(&one_hits, "Target braced{}");
+}
+
+#[test]
+fn cpp_graph_v2_handles_static_methods_aliases_and_receiver_shadowing() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "target.h",
+            r#"
+namespace ns {
+struct Target {
+    static void stat();
+    void run();
+};
+struct Other {
+    void run();
+};
+}
+"#,
+        ),
+        (
+            "consumer.cpp",
+            r#"
+#include "target.h"
+
+void call(ns::Target& obj, ns::Target* ptr, ns::Other& other) {
+    ns::Target& ref = obj;
+    auto alias = obj;
+    obj.run();
+    ptr->run();
+    ref.run();
+    alias.run();
+    ns::Target::stat();
+    ns::Other target;
+    target.run();
+    other.run();
+}
+"#,
+        ),
+    ]);
+
+    let run = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.package_name() == "ns"
+            && unit.short_name() == "Target.run"
+    });
+    let run_hits = usage_hits(&analyzer, &run);
+    assert_eq!(4, run_hits.len());
+    assert_hit_contains(&run_hits, "consumer.cpp", "obj.run()");
+    assert_hit_contains(&run_hits, "consumer.cpp", "ptr->run()");
+    assert_hit_contains(&run_hits, "consumer.cpp", "ref.run()");
+    assert_hit_contains(&run_hits, "consumer.cpp", "alias.run()");
+    assert_no_hit_contains(&run_hits, "target.run()");
+    assert_no_hit_contains(&run_hits, "other.run()");
+
+    let stat = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.package_name() == "ns"
+            && unit.short_name() == "Target.stat"
+    });
+    let stat_hits = usage_hits(&analyzer, &stat);
+    assert_eq!(1, stat_hits.len());
+    assert_hit_contains(&stat_hits, "consumer.cpp", "ns::Target::stat()");
+}
+
+#[test]
+fn cpp_graph_v2_handles_static_fields_globals_and_scoped_enums() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "target.h",
+            r#"
+struct Target {
+    static int value;
+    int member;
+};
+extern int global_value;
+enum Mode { Ready, Done };
+enum class ScopedMode { Ready, Done };
+"#,
+        ),
+        (
+            "consumer.cpp",
+            r#"
+#include "target.h"
+
+void call(Target& target) {
+    target.member = 1;
+    int copy = target.member;
+    Target::value = 2;
+    int static_copy = Target::value;
+    global_value = static_copy;
+    int global_copy = global_value;
+    Mode mode = Ready;
+    auto scoped = ScopedMode::Ready;
+}
+"#,
+        ),
+    ]);
+
+    let member = field_definition_with_owner(&analyzer, "Target", "member");
+    let member_hits = usage_hits(&analyzer, &member);
+    assert_eq!(2, member_hits.len());
+    assert_hit_contains(&member_hits, "consumer.cpp", "target.member = 1");
+    assert_hit_contains(&member_hits, "consumer.cpp", "target.member");
+
+    let static_value = field_definition_with_owner(&analyzer, "Target", "value");
+    let static_hits = usage_hits(&analyzer, &static_value);
+    assert_eq!(2, static_hits.len());
+    assert_hit_contains(&static_hits, "consumer.cpp", "Target::value = 2");
+    assert_hit_contains(&static_hits, "consumer.cpp", "Target::value");
+
+    let global = field_definition(&analyzer, "global_value");
+    let global_hits = usage_hits(&analyzer, &global);
+    assert_eq!(2, global_hits.len());
+
+    let ready = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Field && unit.short_name() == "Mode.Ready"
+    });
+    let ready_hits = usage_hits(&analyzer, &ready);
+    assert_eq!(1, ready_hits.len());
+    assert_hit_contains(&ready_hits, "consumer.cpp", "Mode mode = Ready");
+
+    let scoped_ready = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Field && unit.short_name() == "ScopedMode.Ready"
+    });
+    let scoped_hits = usage_hits(&analyzer, &scoped_ready);
+    assert_eq!(1, scoped_hits.len());
+    assert_hit_contains(&scoped_hits, "consumer.cpp", "ScopedMode::Ready");
+}
+
+#[test]
+fn cpp_graph_v2_guardrails_cover_limits_fallback_zero_hits_and_extensions() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "target.hpp",
+            "struct Target { void run(); };\nvoid free_fn(Target& target);\n",
+        ),
+        (
+            "a.cc",
+            "#include \"target.hpp\"\nvoid a(Target& target) { target.run(); }\n",
+        ),
+        (
+            "b.cxx",
+            "#include \"target.hpp\"\nvoid b(Target& target) { target.run(); }\n",
+        ),
+        (
+            "c.hxx",
+            "#include \"target.hpp\"\nvoid c(Target& target) { target.run(); }\n",
+        ),
+        (
+            "d.c",
+            "#include \"target.hpp\"\nvoid d(Target* target) { free_fn(*target); }\n",
+        ),
+        ("zero.cpp", "#include \"target.hpp\"\nvoid zero() {}\n"),
+        (
+            "fallback.cpp",
+            "auto make_unknown();\nvoid fallback() { auto target = make_unknown(); target.run(); }\n",
+        ),
+    ]);
+
+    let run = member_function_definition_in_source(&analyzer, "Target", "run", "target.hpp");
+    let candidates = [
+        project.file("target.hpp"),
+        project.file("a.cc"),
+        project.file("b.cxx"),
+        project.file("c.hxx"),
+        project.file("d.c"),
+    ]
+    .into_iter()
+    .collect();
+    let too_many = CppUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&run),
+        &candidates,
+        2,
+    );
+    assert!(
+        matches!(
+            too_many,
+            FuzzyResult::TooManyCallsites {
+                total_callsites: 3,
+                limit: 2,
+                ..
+            }
+        ),
+        "expected TooManyCallsites for extension hits, got {too_many:#?}"
+    );
+
+    let restricted = [project.file("a.cc")].into_iter().collect();
+    let restricted_hits = CppUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&run), &restricted, 1000)
+        .into_either()
+        .expect("restricted success");
+    assert_eq!(1, restricted_hits.len());
+    assert_eq!(
+        project.file("a.cc"),
+        restricted_hits.iter().next().unwrap().file
+    );
+
+    let free_fn = function_definition(&analyzer, "free_fn");
+    let free_hits = usage_hits(&analyzer, &free_fn);
+    assert_eq!(1, free_hits.len());
+    assert_hit_contains(&free_hits, "d.c", "free_fn(*target)");
+
+    let zero_candidates = [project.file("zero.cpp")].into_iter().collect();
+    let zero_result = CppUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&run),
+        &zero_candidates,
+        1000,
+    );
+    assert!(
+        zero_result
+            .into_either()
+            .expect("zero-hit graph success")
+            .is_empty(),
+        "graph success with zero hits should remain zero hits"
+    );
+
+    let fallback_hits = UsageFinder::new()
+        .with_file_filter(|file| file.rel_path().to_string_lossy() == "fallback.cpp")
+        .find_usages_default(&analyzer, std::slice::from_ref(&run))
+        .into_either()
+        .expect("usage finder fallback success");
+    assert!(
+        fallback_hits
+            .iter()
+            .any(|hit| hit.file == project.file("fallback.cpp")),
+        "UsageFinder should use regex fallback for graph failure cases"
+    );
+}
+
+#[test]
+fn cpp_graph_v3_covers_templates_and_alias_type_references() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "target.h",
+            r#"
+struct Target {};
+template <typename T> struct Box {};
+template <typename K, typename V> struct Map {};
+template <typename T> void templated(T value);
+using Alias = Target;
+typedef Target LegacyAlias;
+void overloaded();
+template <typename T> void overloaded(T value);
+"#,
+        ),
+        (
+            "consumer.cpp",
+            r#"
+#include "target.h"
+
+void call(Target target) {
+    Box<Target> boxed;
+    Map<int, Target> mapped;
+    Box<Map<int, Target>> nested;
+    templated<Target>(target);
+    Alias alias;
+    LegacyAlias legacy;
+    overloaded();
+    overloaded<Target>(target);
+}
+"#,
+        ),
+    ]);
+
+    let target = class_definition(&analyzer, "Target");
+    let type_hits = usage_hits(&analyzer, &target);
+    assert_hit_contains(&type_hits, "consumer.cpp", "Box<Target> boxed");
+    assert_hit_contains(&type_hits, "consumer.cpp", "Map<int, Target> mapped");
+    assert_hit_contains(&type_hits, "consumer.cpp", "Box<Map<int, Target>> nested");
+    assert_hit_contains(&type_hits, "consumer.cpp", "templated<Target>(target)");
+    assert_hit_contains(&type_hits, "consumer.cpp", "Alias alias");
+    assert_hit_contains(&type_hits, "consumer.cpp", "LegacyAlias legacy");
+    assert_no_hit_contains(&type_hits, "struct Target {}");
+
+    let zero_arg = function_definition_with_short_name_and_arity(&analyzer, "overloaded", 0);
+    let one_arg = function_definition_with_short_name_and_arity(&analyzer, "overloaded", 1);
+
+    let zero_hits = usage_hits(&analyzer, &zero_arg);
+    assert_eq!(1, zero_hits.len());
+    assert_hit_contains(&zero_hits, "consumer.cpp", "overloaded();");
+    assert_no_hit_contains(&zero_hits, "overloaded<Target>(target)");
+
+    let one_hits = usage_hits(&analyzer, &one_arg);
+    assert_eq!(1, one_hits.len());
+    assert_hit_contains(&one_hits, "consumer.cpp", "overloaded<Target>(target)");
+    assert_no_hit_contains(&one_hits, "overloaded();");
+}
+
+#[test]
+fn cpp_graph_v3_handles_out_of_line_members_this_and_owner_context() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "target.h",
+            r#"
+struct Target {
+    static int value;
+    void run();
+    void inside();
+};
+struct Other {
+    int value;
+    void run();
+    void inside();
+};
+"#,
+        ),
+        (
+            "target.cpp",
+            r#"
+#include "target.h"
+
+int Target::value = 0;
+void Target::run() {}
+void Target::inside() {
+    run();
+    this->run();
+    value = 1;
+    this->value = 2;
+}
+void Other::run() {}
+void Other::inside() {
+    run();
+    this->run();
+    value = 3;
+    this->value = 4;
+}
+void outside(Target& target, Other& other) {
+    target.run();
+    other.run();
+    Target::value = 5;
+}
+"#,
+        ),
+    ]);
+
+    let run = function_definition_with_short_name_and_arity(&analyzer, "Target.run", 0);
+    let run_hits = usage_hits(&analyzer, &run);
+    assert_eq!(3, run_hits.len(), "run hits were {run_hits:#?}");
+    assert_hit_contains(&run_hits, "target.cpp", "run();");
+    assert_hit_contains(&run_hits, "target.cpp", "this->run();");
+    assert_hit_contains(&run_hits, "target.cpp", "target.run();");
+    assert_no_hit_contains(&run_hits, "Other::run");
+    assert_no_hit_contains(&run_hits, "other.run()");
+
+    let value = field_definition_with_owner(&analyzer, "Target", "value");
+    let value_hits = usage_hits(&analyzer, &value);
+    assert_hit_contains(&value_hits, "target.cpp", "value = 1");
+    assert_hit_contains(&value_hits, "target.cpp", "this->value = 2");
+    assert_hit_contains(&value_hits, "target.cpp", "Target::value = 5");
+    assert_no_hit_contains(&value_hits, "int Target::value = 0");
+    assert_no_hit_contains(&value_hits, "value = 3");
+    assert_no_hit_contains(&value_hits, "this->value = 4");
+}
+
+#[test]
+fn cpp_graph_v3_keeps_method_overloads_const_refs_and_operators_conservative() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "target.h",
+            r#"
+struct Target {
+    void run();
+    void run(int value);
+    void run(int left, int right);
+    void inspect() const;
+    void mutate();
+    void operator()();
+};
+bool operator==(const Target& left, const Target& right);
+"#,
+        ),
+        (
+            "consumer.cpp",
+            r#"
+#include "target.h"
+
+void call(Target& target, const Target& frozen) {
+    target.run();
+    target.run(1);
+    target.run(1, 2);
+    frozen.inspect();
+    target.mutate();
+    target.operator()();
+    target();
+    bool same = target == target;
+}
+"#,
+        ),
+    ]);
+
+    let run0 = function_definition_with_short_name_and_arity(&analyzer, "Target.run", 0);
+    let run1 = function_definition_with_short_name_and_arity(&analyzer, "Target.run", 1);
+    let run2 = function_definition_with_short_name_and_arity(&analyzer, "Target.run", 2);
+
+    let run0_hits = usage_hits(&analyzer, &run0);
+    assert_eq!(1, run0_hits.len());
+    assert_hit_contains(&run0_hits, "consumer.cpp", "target.run();");
+
+    let run1_hits = usage_hits(&analyzer, &run1);
+    assert_eq!(1, run1_hits.len());
+    assert_hit_contains(&run1_hits, "consumer.cpp", "target.run(1)");
+
+    let run2_hits = usage_hits(&analyzer, &run2);
+    assert_eq!(1, run2_hits.len());
+    assert_hit_contains(&run2_hits, "consumer.cpp", "target.run(1, 2)");
+
+    let inspect = function_definition_with_signature(&analyzer, "Target.inspect", "() const");
+    let inspect_hits = usage_hits(&analyzer, &inspect);
+    assert_eq!(1, inspect_hits.len());
+    assert_hit_contains(&inspect_hits, "consumer.cpp", "frozen.inspect()");
+
+    let call_operator =
+        function_definition_with_short_name_and_arity(&analyzer, "Target.operator()", 0);
+    let operator_hits = usage_hits(&analyzer, &call_operator);
+    assert_hit_contains(&operator_hits, "consumer.cpp", "target.operator()()");
+
+    let equality = function_definition_with_short_name_and_arity(&analyzer, "operator==", 2);
+    let equality_hits = CppUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&equality),
+            &analyzer.get_analyzed_files().into_iter().collect(),
+            1000,
+        )
+        .into_either()
+        .expect("operator syntax without a call_expression name should be proven zero-hit");
+    assert!(
+        equality_hits.is_empty(),
+        "operator syntax without a call_expression name should not invent graph hits"
+    );
+}
+
+#[test]
+fn cpp_graph_v3_hardens_constructors_and_initializer_forms() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "target.h",
+            r#"
+namespace std { template <typename T> T&& move(T& value); }
+struct Target {
+    int field;
+    Target();
+    Target(int value);
+    Target(const Target& other);
+};
+struct Owner {
+    Target target;
+    Owner();
+    Owner(int value);
+};
+"#,
+        ),
+        (
+            "consumer.cpp",
+            r#"
+#include "target.h"
+
+Owner::Owner() : target() {}
+Owner::Owner(int value) : target(value) {}
+
+void call(Target original) {
+    Target copy = original;
+    Target direct_copy(original);
+    Target moved(std::move(original));
+    Target aggregate{.field = 1};
+}
+"#,
+        ),
+    ]);
+
+    let zero_arg = constructor_definition_with_arity(&analyzer, "Target", 0);
+    let one_arg = constructor_definition_with_arity(&analyzer, "Target", 1);
+
+    let zero_hits = usage_hits(&analyzer, &zero_arg);
+    assert_hit_contains(&zero_hits, "consumer.cpp", "target() {}");
+    assert_no_hit_contains(&zero_hits, "target(value)");
+    assert_no_hit_contains(&zero_hits, "Target copy = original");
+
+    let one_hits = usage_hits(&analyzer, &one_arg);
+    assert_hit_contains(&one_hits, "consumer.cpp", "Target copy = original");
+    assert_hit_contains(&one_hits, "consumer.cpp", "target(value)");
+    assert_hit_contains(&one_hits, "consumer.cpp", "Target direct_copy(original)");
+    assert_hit_contains(
+        &one_hits,
+        "consumer.cpp",
+        "Target moved(std::move(original))",
+    );
+    assert_hit_contains(&one_hits, "consumer.cpp", "Target aggregate{.field = 1}");
+    assert_no_hit_contains(&one_hits, "Target();");
+}
+
+#[test]
+fn cpp_graph_v3_resolves_include_path_ambiguity_precisely() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        ("a/target.h", "struct Target { void run(); };\n"),
+        ("b/target.h", "struct Target { void run(); };\n"),
+        ("a/wrapper.h", "#include \"target.h\"\n"),
+        (
+            "use_a.cpp",
+            "#include \"a/wrapper.h\"\nvoid use_a(Target& target) { target.run(); }\n",
+        ),
+        (
+            "use_b.cpp",
+            "#include \"b/target.h\"\nvoid use_b(Target& target) { target.run(); }\n",
+        ),
+        (
+            "missing.cpp",
+            "struct Target { void run(); };\nvoid missing(Target& target) { target.run(); }\n",
+        ),
+        (
+            "angle.cpp",
+            "#include <target.h>\nvoid angle(Target& target) { target.run(); }\n",
+        ),
+    ]);
+
+    let a_run = member_function_definition_in_source(&analyzer, "Target", "run", "a/target.h");
+    let a_candidates = [project.file("use_a.cpp")].into_iter().collect();
+    let a_hits = CppUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&a_run), &a_candidates, 1000)
+        .into_either()
+        .expect("a include success")
+        .into_iter()
+        .map(|hit| HitSummary {
+            file: slash_path(&hit.file),
+            line: hit
+                .file
+                .read_to_string()
+                .ok()
+                .and_then(|source| {
+                    source
+                        .lines()
+                        .nth(hit.line.saturating_sub(1))
+                        .map(str::to_string)
+                })
+                .unwrap_or_default(),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(1, a_hits.len());
+    assert_hit_contains(&a_hits, "use_a.cpp", "target.run()");
+    assert_no_hit_contains(&a_hits, "use_b");
+    assert_no_hit_contains(&a_hits, "missing");
+    assert_no_hit_contains(&a_hits, "angle");
+
+    let b_run = member_function_definition_in_source(&analyzer, "Target", "run", "b/target.h");
+    let b_candidates = [project.file("use_b.cpp")].into_iter().collect();
+    let b_hits = CppUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&b_run), &b_candidates, 1000)
+        .into_either()
+        .expect("b include success")
+        .into_iter()
+        .map(|hit| HitSummary {
+            file: slash_path(&hit.file),
+            line: hit
+                .file
+                .read_to_string()
+                .ok()
+                .and_then(|source| {
+                    source
+                        .lines()
+                        .nth(hit.line.saturating_sub(1))
+                        .map(str::to_string)
+                })
+                .unwrap_or_default(),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(1, b_hits.len());
+    assert_hit_contains(&b_hits, "use_b.cpp", "target.run()");
+    assert_no_hit_contains(&b_hits, "use_a");
+}
+
+#[test]
+fn cpp_graph_v3_preserves_declaration_filtering_and_fallback_boundaries() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "target.h",
+            r#"
+struct Target {
+    void run();
+};
+"#,
+        ),
+        (
+            "target.cpp",
+            "#include \"target.h\"\nvoid Target::run() {}\n",
+        ),
+        (
+            "hit.cpp",
+            "#include \"target.h\"\nvoid hit(Target& target) { target.run(); }\n",
+        ),
+        (
+            "ambiguous.cpp",
+            r#"
+struct Target { void run(); };
+struct Other { void run(); };
+void ambiguous(Target& target, Other& other) {
+    target.run();
+    other.run();
+}
+"#,
+        ),
+        ("zero.cpp", "#include \"target.h\"\nvoid zero() {}\n"),
+    ]);
+
+    let run = member_function_definition_in_source(&analyzer, "Target", "run", "target.h");
+    let restricted = [project.file("hit.cpp")].into_iter().collect();
+    let hits = CppUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&run), &restricted, 1000)
+        .into_either()
+        .expect("restricted success")
+        .into_iter()
+        .map(|hit| HitSummary {
+            file: slash_path(&hit.file),
+            line: hit
+                .file
+                .read_to_string()
+                .ok()
+                .and_then(|source| {
+                    source
+                        .lines()
+                        .nth(hit.line.saturating_sub(1))
+                        .map(str::to_string)
+                })
+                .unwrap_or_default(),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(1, hits.len());
+    assert_hit_contains(&hits, "hit.cpp", "target.run()");
+    assert_no_hit_contains(&hits, "void Target::run() {}");
+
+    let restricted_hits = CppUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&run), &restricted, 1000)
+        .into_either()
+        .expect("restricted success");
+    assert_eq!(1, restricted_hits.len());
+
+    let zero_candidates = [project.file("zero.cpp")].into_iter().collect();
+    let zero_hits = CppUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&run),
+            &zero_candidates,
+            1000,
+        )
+        .into_either()
+        .expect("zero-hit graph success");
+    assert!(zero_hits.is_empty());
+
+    let ambiguous_candidates = [project.file("ambiguous.cpp")].into_iter().collect();
+    let ambiguous_result = CppUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&run),
+        &ambiguous_candidates,
+        1000,
+    );
+    assert!(
+        ambiguous_result.into_either().is_err(),
+        "ambiguous local same-name declarations should force regex fallback"
+    );
+}
+
+#[test]
+fn cpp_graph_review_resolves_visible_header_declaration_from_source_definition() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[
+        ("api.h", "void run();\n"),
+        ("api.cpp", "#include \"api.h\"\nvoid run() {}\n"),
+        (
+            "consumer.cpp",
+            "#include \"api.h\"\nvoid call() { run(); }\n",
+        ),
+        ("unseen.h", "void run();\n"),
+    ]);
+
+    let definition = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.identifier() == "run"
+            && unit.source().rel_path().to_string_lossy() == "api.cpp"
+    });
+    let hits = usage_hits(&analyzer, &definition);
+    assert_eq!(1, hits.len());
+    assert_hit_contains(&hits, "consumer.cpp", "run();");
+    assert_no_hit_contains(&hits, "unseen");
+}
+
+#[test]
+fn cpp_graph_review_rejects_text_only_comments_strings_and_preprocessor_hits() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "target.h",
+            r#"
+struct Target { Target(); };
+extern int global_value;
+"#,
+        ),
+        (
+            "consumer.cpp",
+            r#"
+#include "target.h"
+#define MENTION Target(
+
+void call() {
+    const char* text = "Target(";
+    // global_value
+    /* Target( */
+}
+"#,
+        ),
+    ]);
+
+    let constructor = constructor_definition(&analyzer, "Target");
+    let constructor_hits = usage_hits(&analyzer, &constructor);
+    assert!(
+        constructor_hits.is_empty(),
+        "hits were {constructor_hits:#?}"
+    );
+
+    let global = field_definition(&analyzer, "global_value");
+    let global_hits = usage_hits(&analyzer, &global);
+    assert!(global_hits.is_empty(), "hits were {global_hits:#?}");
+}
+
+#[test]
+fn cpp_graph_review_fails_on_mixed_proven_and_unproven_member_matches() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[
+        ("target.h", "struct Target { void run(); };\n"),
+        (
+            "consumer.cpp",
+            r#"
+#include "target.h"
+
+Target make_target();
+auto make_unknown();
+void call(Target& target) {
+    target.run();
+    auto unknown = make_unknown();
+    unknown.run();
+}
+"#,
+        ),
+    ]);
+
+    let target = member_function_definition(&analyzer, "Target", "run");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let result = CppUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    assert!(
+        result.into_either().is_err(),
+        "mixed proven and unproven receiver matches should fall back"
+    );
+}
+
+#[test]
+fn cpp_graph_review_counts_arity_with_nested_commas() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "target.h",
+            r#"
+namespace std { template <typename A, typename B> struct pair {}; }
+struct Target {
+    void run(std::pair<int, int> value);
+    Target(std::pair<int, int> value);
+};
+"#,
+        ),
+        (
+            "consumer.cpp",
+            r#"
+#include "target.h"
+
+void call(Target& target, std::pair<int, int> pair) {
+    target.run(pair);
+    Target copy(pair);
+}
+"#,
+        ),
+    ]);
+
+    let run = function_definition_with_short_name_and_arity(&analyzer, "Target.run", 1);
+    let run_hits = usage_hits(&analyzer, &run);
+    assert_eq!(1, run_hits.len());
+    assert_hit_contains(&run_hits, "consumer.cpp", "target.run(pair)");
+
+    let constructor = constructor_definition_with_arity(&analyzer, "Target", 1);
+    let constructor_hits = usage_hits(&analyzer, &constructor);
+    assert_hit_contains(&constructor_hits, "consumer.cpp", "Target copy(pair)");
+}
+
+#[test]
+fn cpp_graph_review_keeps_enum_enumerators_single_sourced() {
+    let (_project, analyzer) =
+        cpp_analyzer_with_files(&[("target.h", "enum Mode { Ready = 1, Done = 2 };\n")]);
+
+    let ready: Vec<_> = analyzer
+        .get_all_declarations()
+        .into_iter()
+        .filter(|unit| unit.kind() == CodeUnitType::Field && unit.short_name() == "Mode.Ready")
+        .collect();
+    assert_eq!(1, ready.len(), "Ready declarations were {ready:#?}");
+}

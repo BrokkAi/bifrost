@@ -30,6 +30,10 @@ pub use capabilities::{
 pub(crate) use capabilities::{build_reverse_import_index, direct_descendants_via_ancestors};
 pub use config::AnalyzerConfig;
 pub use cpp_analyzer::CppAnalyzer;
+pub(crate) use cpp_analyzer::{
+    node_text as cpp_node_text, normalize_cpp_whitespace, parse_quoted_include,
+    resolve_include_targets,
+};
 pub use csharp_analyzer::CSharpAnalyzer;
 pub use go_analyzer::GoAnalyzer;
 pub use i_analyzer::IAnalyzer;
