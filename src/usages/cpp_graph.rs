@@ -142,7 +142,7 @@ impl TargetSpec {
         }
 
         if target.is_field() {
-            let owner = analyzer.parent_of(target);
+            let owner = precise_parent_of(analyzer, target);
             let kind = if owner.is_some() {
                 TargetKind::MemberField
             } else {
@@ -158,7 +158,7 @@ impl TargetSpec {
         }
 
         if target.is_function() {
-            let owner = analyzer.parent_of(target);
+            let owner = precise_parent_of(analyzer, target);
             let kind = if owner
                 .as_ref()
                 .is_some_and(|owner| target.identifier() == owner.identifier())
@@ -252,6 +252,67 @@ impl VisibilityIndex {
             .cloned()
     }
 
+    fn resolves_to_type(&self, file: &ProjectFile, raw_name: &str, target: &CodeUnit) -> bool {
+        let Some(resolved) = self.resolve_type(file, raw_name) else {
+            return self.text_alias_resolves_to_type(file, raw_name, target);
+        };
+        same_symbol(&resolved, target)
+            || self
+                .alias_target(&resolved)
+                .is_some_and(|alias_target| same_symbol(&alias_target, target))
+            || self.text_alias_resolves_to_type(file, raw_name, target)
+    }
+
+    fn alias_target(&self, alias: &CodeUnit) -> Option<CodeUnit> {
+        let signature = alias.signature()?;
+        let raw_target = signature
+            .strip_prefix("using ")
+            .and_then(|rest| rest.split_once('=').map(|(_, rhs)| rhs))
+            .or_else(|| {
+                signature
+                    .strip_prefix("typedef ")
+                    .and_then(|rest| rest.rsplit_once(' ').map(|(lhs, _)| lhs))
+            })?
+            .trim()
+            .trim_end_matches(';')
+            .trim();
+        self.visible_by_file
+            .get(alias.source())?
+            .iter()
+            .filter(|unit| unit.kind() == CodeUnitType::Class)
+            .find(|unit| reference_matches_unit(raw_target, unit))
+            .cloned()
+    }
+
+    fn text_alias_resolves_to_type(
+        &self,
+        file: &ProjectFile,
+        raw_name: &str,
+        target: &CodeUnit,
+    ) -> bool {
+        let Some(alias_name) = normalize_reference_name(raw_name) else {
+            return false;
+        };
+        self.visible_source_files(file)
+            .into_iter()
+            .any(|source_file| {
+                source_file.read_to_string().is_ok_and(|source| {
+                    source.split(';').any(|statement| {
+                        alias_statement_matches_target(statement, &alias_name, target)
+                    })
+                })
+            })
+    }
+
+    fn visible_source_files(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
+        let mut files = HashSet::default();
+        files.insert(file.clone());
+        if let Some(visible) = self.visible_by_file.get(file) {
+            files.extend(visible.iter().map(|unit| unit.source().clone()));
+        }
+        files
+    }
+
     fn resolve_named(
         &self,
         file: &ProjectFile,
@@ -266,6 +327,25 @@ impl VisibilityIndex {
                 matches_kind_for_lookup(unit, kind) && reference_matches_unit(&normalized, unit)
             })
             .cloned()
+    }
+
+    fn contains_named_symbol(
+        &self,
+        file: &ProjectFile,
+        raw_name: &str,
+        kind: TargetKind,
+        target: &CodeUnit,
+    ) -> bool {
+        let Some(normalized) = normalize_reference_name(raw_name) else {
+            return false;
+        };
+        self.visible_by_file.get(file).is_some_and(|visible| {
+            visible.iter().any(|unit| {
+                matches_kind_for_lookup(unit, kind)
+                    && reference_matches_unit(&normalized, unit)
+                    && same_symbol(unit, target)
+            })
+        })
     }
 }
 
@@ -376,6 +456,9 @@ fn scan_file(
     if matches!(ctx.spec.kind, TargetKind::Constructor) {
         scan_text_constructor_hits(&mut ctx);
     }
+    if matches!(ctx.spec.kind, TargetKind::Method) && ctx.spec.member_name.starts_with("operator") {
+        scan_text_operator_method_hits(&mut ctx);
+    }
     if matches!(
         ctx.spec.kind,
         TargetKind::GlobalField | TargetKind::MemberField
@@ -480,11 +563,13 @@ fn seed_binding_from_type_or_value(
         .or_else(|| value.and_then(|value| infer_type_from_value(value, ctx)));
 
     if let Some(resolved) = resolved
-        && ctx
-            .spec
-            .owner
-            .as_ref()
-            .is_some_and(|owner| same_symbol(&resolved, owner))
+        && ctx.spec.owner.as_ref().is_some_and(|owner| {
+            same_symbol(&resolved, owner)
+                || ctx
+                    .visibility
+                    .alias_target(&resolved)
+                    .is_some_and(|alias_target| same_symbol(&alias_target, owner))
+        })
     {
         ctx.bindings.seed_symbol(name.to_string(), resolved);
     } else if let Some(value) = value
@@ -544,14 +629,17 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     let text = node_text(node, ctx.source);
-    if !name_mentions(text, &ctx.spec.member_name) {
+    if !name_mentions(text, &ctx.spec.member_name)
+        && !ctx
+            .visibility
+            .resolves_to_type(ctx.file, text, &ctx.spec.target)
+    {
         return;
     }
     *ctx.raw_match_count += 1;
     if ctx
         .visibility
-        .resolve_type(ctx.file, text)
-        .is_some_and(|resolved| same_symbol(&resolved, &ctx.spec.target))
+        .resolves_to_type(ctx.file, text, &ctx.spec.target)
     {
         push_hit(node, ctx);
     } else if !ctx.visibility.is_visible(ctx.file, &ctx.spec.target) {
@@ -562,13 +650,24 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if !matches!(
         node.kind(),
-        "call_expression" | "new_expression" | "declaration"
+        "call_expression" | "new_expression" | "declaration" | "field_initializer"
     ) {
         return;
     }
     let Some(owner) = ctx.spec.owner.as_ref() else {
         return;
     };
+    if node.kind() == "field_initializer" {
+        if field_initializer_constructs_target(node, ctx, owner)
+            && ctx
+                .spec
+                .method_arity
+                .is_none_or(|expected| call_arity(node) == expected)
+        {
+            push_hit(node, ctx);
+        }
+        return;
+    }
     if node.kind() == "declaration" {
         if declaration_mentions_type(node, ctx, owner)
             && ctx
@@ -593,11 +692,7 @@ fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     {
         return;
     }
-    if ctx
-        .visibility
-        .resolve_type(ctx.file, text)
-        .is_some_and(|resolved| same_symbol(&resolved, owner))
-    {
+    if ctx.visibility.resolves_to_type(ctx.file, text, owner) {
         push_hit(type_node, ctx);
     } else {
         *ctx.saw_unproven_match = true;
@@ -612,7 +707,7 @@ fn maybe_record_free_function_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     };
     let text = node_text(function, ctx.source);
-    if !name_matches_terminal(text, &ctx.spec.member_name) {
+    if !name_matches_callable(text, &ctx.spec.member_name) {
         return;
     }
     *ctx.raw_match_count += 1;
@@ -621,11 +716,12 @@ fn maybe_record_free_function_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     {
         return;
     }
-    if ctx
-        .visibility
-        .resolve_named(ctx.file, text, TargetKind::FreeFunction)
-        .is_some_and(|resolved| same_symbol(&resolved, &ctx.spec.target))
-    {
+    if ctx.visibility.contains_named_symbol(
+        ctx.file,
+        text,
+        TargetKind::FreeFunction,
+        &ctx.spec.target,
+    ) {
         push_hit(function, ctx);
     } else {
         *ctx.saw_unproven_match = true;
@@ -640,7 +736,7 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     };
     let text = node_text(function, ctx.source);
-    if !name_matches_terminal(text, &ctx.spec.member_name) {
+    if !name_matches_callable(text, &ctx.spec.member_name) {
         return;
     }
     *ctx.raw_match_count += 1;
@@ -752,6 +848,9 @@ fn push_text_hit(start: usize, end: usize, ctx: &mut ScanCtx<'_>) {
         return;
     }
     let line_idx = find_line_index_for_offset(ctx.line_starts, start);
+    if is_out_of_line_member_definition_line(ctx, line_idx, start) {
+        return;
+    }
     if ctx
         .hits
         .iter()
@@ -768,7 +867,7 @@ fn push_text_hit(start: usize, end: usize, ctx: &mut ScanCtx<'_>) {
     let Some(enclosing) = ctx.analyzer.enclosing_code_unit(ctx.file, &range) else {
         return;
     };
-    if enclosing == ctx.spec.target {
+    if enclosing == ctx.spec.target || same_logical_symbol(&enclosing, &ctx.spec.target) {
         return;
     }
     ctx.hits.insert(UsageHit::new(
@@ -795,6 +894,27 @@ fn is_identifier_char(ch: char) -> bool {
     ch == '_' || ch.is_ascii_alphanumeric()
 }
 
+fn is_out_of_line_member_definition_line(ctx: &ScanCtx<'_>, line_idx: usize, start: usize) -> bool {
+    if !matches!(ctx.spec.kind, TargetKind::MemberField | TargetKind::Method) {
+        return false;
+    }
+    let Some(owner_name) = ctx.spec.owner_cpp_name.as_deref() else {
+        return false;
+    };
+    let line_start = ctx.line_starts[line_idx];
+    let line_end = ctx
+        .line_starts
+        .get(line_idx + 1)
+        .copied()
+        .unwrap_or(ctx.source.len());
+    let line = ctx.source[line_start..line_end].trim();
+    let qualified = format!("{owner_name}::{}", ctx.spec.member_name);
+    let Some(prefix) = line.split_once(&qualified).map(|(prefix, _)| prefix) else {
+        return false;
+    };
+    !line.starts_with(&qualified) && !prefix.contains('=') && start >= line_start
+}
+
 fn field_text_qualifier_matches(source: &str, start: usize, ctx: &ScanCtx<'_>) -> bool {
     if !matches!(ctx.spec.kind, TargetKind::MemberField) {
         return true;
@@ -813,7 +933,23 @@ fn field_text_qualifier_matches(source: &str, start: usize, ctx: &ScanCtx<'_>) -
             .unwrap_or("");
         return qualifier == owner_cpp_name || qualifier == owner.identifier();
     }
+    if owner_is_class_like(owner, ctx) {
+        return false;
+    }
     !owner_is_scoped_enum(owner, ctx)
+}
+
+fn owner_is_class_like(owner: &CodeUnit, ctx: &ScanCtx<'_>) -> bool {
+    owner.signature().is_some_and(|signature| {
+        signature.starts_with("class ")
+            || signature.starts_with("struct ")
+            || signature.starts_with("union ")
+    }) || ctx.analyzer.get_source(owner, false).is_some_and(|source| {
+        let trimmed = source.trim_start();
+        trimmed.starts_with("class ")
+            || trimmed.starts_with("struct ")
+            || trimmed.starts_with("union ")
+    })
 }
 
 fn owner_is_scoped_enum(owner: &CodeUnit, ctx: &ScanCtx<'_>) -> bool {
@@ -860,6 +996,62 @@ fn scan_text_constructor_hits(ctx: &mut ScanCtx<'_>) {
             }
         }
     }
+    for field_name in constructor_member_names(ctx, owner) {
+        for pattern in [format!(": {field_name}("), format!(", {field_name}(")] {
+            let mut start = 0usize;
+            while let Some(relative) = ctx.source[start..].find(&pattern) {
+                let absolute = start + relative + 2;
+                let end = absolute + field_name.len();
+                start = absolute + pattern.len();
+                if text_constructor_arity(ctx.source, absolute, &format!("{field_name}("))
+                    != expected_arity
+                {
+                    continue;
+                }
+                push_text_constructor_hit(absolute, end, ctx);
+                if *ctx.limit_exceeded {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn constructor_member_names(ctx: &ScanCtx<'_>, owner: &CodeUnit) -> Vec<String> {
+    let mut names: Vec<String> = ctx
+        .visibility
+        .visible_by_file
+        .get(ctx.file)
+        .into_iter()
+        .flatten()
+        .filter(|unit| unit.is_field())
+        .filter_map(|unit| {
+            unit.signature()
+                .filter(|signature| field_signature_type_matches(signature, owner, ctx))
+                .map(|_| unit.identifier().to_string())
+        })
+        .collect();
+    let fallback = lower_initial(owner.identifier());
+    if !names.iter().any(|name| name == &fallback) {
+        names.push(fallback);
+    }
+    names
+}
+
+fn field_signature_type_matches(signature: &str, owner: &CodeUnit, ctx: &ScanCtx<'_>) -> bool {
+    ctx.visibility.resolves_to_type(ctx.file, signature, owner)
+        || signature
+            .split_whitespace()
+            .next()
+            .is_some_and(|type_text| ctx.visibility.resolves_to_type(ctx.file, type_text, owner))
+}
+
+fn lower_initial(value: &str) -> String {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    first.to_ascii_lowercase().to_string() + chars.as_str()
 }
 
 fn text_constructor_arity(source: &str, start: usize, pattern: &str) -> usize {
@@ -906,7 +1098,7 @@ fn push_text_constructor_hit(start: usize, end: usize, ctx: &mut ScanCtx<'_>) {
     let Some(enclosing) = ctx.analyzer.enclosing_code_unit(ctx.file, &range) else {
         return;
     };
-    if enclosing == ctx.spec.target {
+    if enclosing == ctx.spec.target || same_logical_symbol(&enclosing, &ctx.spec.target) {
         return;
     }
     ctx.hits.insert(UsageHit::new(
@@ -921,6 +1113,68 @@ fn push_text_constructor_hit(start: usize, end: usize, ctx: &mut ScanCtx<'_>) {
     if ctx.hits.len() > ctx.max_usages {
         *ctx.limit_exceeded = true;
     }
+}
+
+fn scan_text_operator_method_hits(ctx: &mut ScanCtx<'_>) {
+    let Some(operator_suffix) = ctx.spec.member_name.strip_prefix("operator") else {
+        return;
+    };
+    if operator_suffix.is_empty() {
+        return;
+    }
+    let pattern = format!(".operator{operator_suffix}(");
+    let mut start = 0usize;
+    while let Some(relative) = ctx.source[start..].find(&pattern) {
+        let dot = start + relative;
+        let operator_start = dot + 1;
+        let end = operator_start + ctx.spec.member_name.len();
+        start = end;
+        let Some(receiver) = receiver_token_before(ctx.source, dot) else {
+            continue;
+        };
+        if ctx
+            .bindings
+            .resolve_symbol(receiver)
+            .as_precise()
+            .is_some_and(|targets| {
+                ctx.spec
+                    .owner
+                    .as_ref()
+                    .is_some_and(|owner| targets.iter().any(|target| same_symbol(target, owner)))
+            })
+            || text_receiver_has_target_type(ctx.source, receiver, ctx)
+        {
+            push_text_constructor_hit(operator_start, end, ctx);
+        }
+        if *ctx.limit_exceeded {
+            return;
+        }
+    }
+}
+
+fn text_receiver_has_target_type(source: &str, receiver: &str, ctx: &ScanCtx<'_>) -> bool {
+    let Some(owner_name) = ctx.spec.owner_cpp_name.as_deref() else {
+        return false;
+    };
+    [
+        format!("{owner_name}& {receiver}"),
+        format!("{owner_name} &{receiver}"),
+        format!("{owner_name}* {receiver}"),
+        format!("{owner_name} *{receiver}"),
+        format!("{owner_name} {receiver}"),
+    ]
+    .iter()
+    .any(|pattern| source.contains(pattern))
+}
+
+fn receiver_token_before(source: &str, end: usize) -> Option<&str> {
+    let prefix = source[..end].trim_end();
+    let start = prefix
+        .rfind(|ch: char| !(ch == '_' || ch.is_ascii_alphanumeric()))
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let token = prefix[start..].trim();
+    (!token.is_empty()).then_some(token)
 }
 
 fn receiver_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
@@ -940,6 +1194,7 @@ fn receiver_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
             .resolve_symbol(node_text(node, ctx.source))
             .as_precise()
             .is_some_and(|targets| targets.iter().any(|target| same_symbol(target, owner))),
+        "this" => same_owner_context(node, ctx),
         "qualified_identifier" | "scoped_identifier" | "field_identifier" => {
             qualified_owner_matches(node_text(node, ctx.source), ctx)
         }
@@ -962,6 +1217,20 @@ fn qualified_owner_matches(text: &str, ctx: &ScanCtx<'_>) -> bool {
 }
 
 fn same_owner_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    if let Some(owner_text) = textual_owner_context(node, ctx) {
+        return ctx
+            .spec
+            .owner_cpp_name
+            .as_deref()
+            .is_some_and(|target_owner| {
+                owner_text == target_owner
+                    || ctx
+                        .spec
+                        .owner
+                        .as_ref()
+                        .is_some_and(|owner| owner_text == owner.identifier())
+            });
+    }
     let context = enclosing_context(node, ctx);
     let Some(owner) = context.owner.as_ref() else {
         return false;
@@ -972,20 +1241,38 @@ fn same_owner_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
         .is_some_and(|target_owner| target_owner == &owner.fq_name())
 }
 
+fn textual_owner_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {
+    let before = &ctx.source[..node.start_byte()];
+    let brace = before.rfind('{')?;
+    let header_start = before[..brace]
+        .rfind(['\n', ';', '}'])
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let header = before[header_start..brace].trim();
+    let qualifier_end = header.rfind("::")?;
+    let qualifier_prefix = header[..qualifier_end].trim_end();
+    let qualifier_start = qualifier_prefix
+        .rfind(|ch: char| !(ch == '_' || ch == ':' || ch.is_ascii_alphanumeric()))
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let qualifier = qualifier_prefix[qualifier_start..].trim();
+    (!qualifier.is_empty()).then(|| normalize_cpp_reference_text(qualifier))
+}
+
 fn push_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if *ctx.limit_exceeded {
         return;
     }
     let start = node.start_byte();
     let end = node.end_byte();
-    if is_inside_target_declaration(node, ctx) {
+    if is_inside_target_declaration(node, ctx) || is_member_field_declaration_context(node, ctx) {
         return;
     }
     let line_idx = find_line_index_for_offset(ctx.line_starts, start);
     let Some(enclosing) = enclosing_context(node, ctx).enclosing.clone() else {
         return;
     };
-    if enclosing == ctx.spec.target {
+    if enclosing == ctx.spec.target || same_logical_symbol(&enclosing, &ctx.spec.target) {
         return;
     }
     ctx.hits.insert(UsageHit::new(
@@ -1016,7 +1303,12 @@ fn enclosing_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> EnclosingContext {
     let enclosing = ctx.analyzer.enclosing_code_unit(ctx.file, &range);
     let owner = enclosing
         .as_ref()
-        .and_then(|enclosing| ctx.analyzer.parent_of(enclosing));
+        .and_then(|enclosing| precise_parent_of(ctx.analyzer, enclosing))
+        .or_else(|| {
+            enclosing
+                .as_ref()
+                .and_then(|enclosing| visible_owner_from_member_name(ctx, enclosing))
+        });
     EnclosingContext { enclosing, owner }
 }
 
@@ -1028,6 +1320,23 @@ fn is_inside_target_declaration(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
         .ranges(&ctx.spec.target)
         .iter()
         .any(|range| node.start_byte() >= range.start_byte && node.end_byte() <= range.end_byte)
+}
+
+fn is_member_field_declaration_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    if !matches!(ctx.spec.kind, TargetKind::MemberField) {
+        return false;
+    }
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "field_declaration" {
+            return true;
+        }
+        if matches!(parent.kind(), "compound_statement" | "function_definition") {
+            return false;
+        }
+        current = parent.parent();
+    }
+    false
 }
 
 fn build_snippet(source: &str, line_starts: &[usize], line_idx: usize) -> String {
@@ -1075,8 +1384,12 @@ fn signature_arity(signature: Option<&str>) -> usize {
         return 0;
     };
     let inner = signature
-        .strip_prefix('(')
-        .and_then(|rest| rest.strip_suffix(')'))
+        .find('(')
+        .and_then(|open| {
+            signature[open + 1..]
+                .find(')')
+                .map(|close| &signature[open + 1..open + 1 + close])
+        })
         .unwrap_or(signature)
         .trim();
     if inner.is_empty() {
@@ -1087,6 +1400,7 @@ fn signature_arity(signature: Option<&str>) -> usize {
 
 fn call_arity(node: Node<'_>) -> usize {
     node.child_by_field_name("arguments")
+        .or_else(|| node.child_by_field_name("parameters"))
         .map(|args| args.named_child_count())
         .unwrap_or(0)
 }
@@ -1101,13 +1415,34 @@ fn constructor_type_node(node: Node<'_>) -> Option<Node<'_>> {
     }
 }
 
+fn field_initializer_constructs_target(
+    node: Node<'_>,
+    ctx: &ScanCtx<'_>,
+    owner: &CodeUnit,
+) -> bool {
+    let Some(name) = node.child_by_field_name("name") else {
+        return false;
+    };
+    let field_name = node_text(name, ctx.source);
+    ctx.visibility
+        .visible_by_file
+        .get(ctx.file)
+        .into_iter()
+        .flatten()
+        .filter(|unit| unit.is_field() && unit.identifier() == field_name)
+        .any(|unit| {
+            unit.signature().is_some_and(|signature| {
+                ctx.visibility.resolves_to_type(ctx.file, signature, owner)
+            })
+        })
+}
+
 fn declaration_mentions_type(node: Node<'_>, ctx: &ScanCtx<'_>, owner: &CodeUnit) -> bool {
     let Some(type_node) = node.child_by_field_name("type") else {
         return false;
     };
     ctx.visibility
-        .resolve_type(ctx.file, node_text(type_node, ctx.source))
-        .is_some_and(|resolved| same_symbol(&resolved, owner))
+        .resolves_to_type(ctx.file, node_text(type_node, ctx.source), owner)
 }
 
 fn declaration_constructor_arity(node: Node<'_>, ctx: &ScanCtx<'_>) -> usize {
@@ -1120,6 +1455,9 @@ fn declaration_constructor_arity(node: Node<'_>, ctx: &ScanCtx<'_>) -> usize {
         return 0;
     };
     let after_type = after_type.trim();
+    if after_type.contains('=') {
+        return 1;
+    }
     let Some(open_index) = after_type.find(['(', '{']) else {
         return 0;
     };
@@ -1236,6 +1574,12 @@ fn name_matches_terminal(value: &str, expected: &str) -> bool {
     terminal_name(&normalize_cpp_reference_text(value)) == expected
 }
 
+fn name_matches_callable(value: &str, expected: &str) -> bool {
+    name_matches_terminal(value, expected)
+        || expected.starts_with("operator")
+            && terminal_name(&normalize_cpp_reference_text(value)) == "operator"
+}
+
 fn name_mentions(value: &str, expected: &str) -> bool {
     normalize_cpp_reference_text(value)
         .split("::")
@@ -1267,9 +1611,78 @@ fn is_type_alias(unit: &CodeUnit) -> bool {
         })
 }
 
+fn alias_statement_matches_target(statement: &str, alias_name: &str, target: &CodeUnit) -> bool {
+    let normalized = normalize_cpp_whitespace(statement).trim().to_string();
+    if let Some(rest) = normalized.strip_prefix("using ")
+        && let Some((alias, rhs)) = rest.split_once('=')
+    {
+        return alias.trim() == alias_name && type_text_matches_target(rhs, target);
+    }
+    if let Some(rest) = normalized.strip_prefix("typedef ")
+        && let Some((lhs, alias)) = rest.rsplit_once(' ')
+    {
+        return alias.trim() == alias_name && type_text_matches_target(lhs, target);
+    }
+    false
+}
+
+fn type_text_matches_target(type_text: &str, target: &CodeUnit) -> bool {
+    let normalized = normalize_cpp_reference_text(type_text.trim().trim_end_matches(';'));
+    normalized == cpp_name_for(target) || normalized == target.identifier()
+}
+
+fn precise_parent_of(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> Option<CodeUnit> {
+    let fallback = analyzer.parent_of(code_unit);
+    let Some(owner_name) = code_unit
+        .short_name()
+        .rsplit_once('.')
+        .map(|(owner, _)| owner)
+    else {
+        return fallback;
+    };
+    analyzer
+        .get_all_declarations()
+        .into_iter()
+        .find(|candidate| {
+            candidate.is_class()
+                && candidate.source() == code_unit.source()
+                && candidate.short_name() == owner_name
+                && candidate.package_name() == code_unit.package_name()
+        })
+        .or_else(|| {
+            fallback.filter(|parent| {
+                parent.short_name() == owner_name
+                    && parent.package_name() == code_unit.package_name()
+            })
+        })
+}
+
+fn visible_owner_from_member_name(ctx: &ScanCtx<'_>, code_unit: &CodeUnit) -> Option<CodeUnit> {
+    let owner_name = code_unit
+        .short_name()
+        .rsplit_once('.')
+        .map(|(owner, _)| owner)?;
+    ctx.visibility
+        .visible_by_file
+        .get(ctx.file)?
+        .iter()
+        .find(|candidate| {
+            candidate.is_class()
+                && candidate.short_name() == owner_name
+                && candidate.package_name() == code_unit.package_name()
+        })
+        .cloned()
+}
+
 fn same_symbol(left: &CodeUnit, right: &CodeUnit) -> bool {
     left.kind() == right.kind()
         && left.fq_name() == right.fq_name()
         && left.signature() == right.signature()
         && left.source() == right.source()
+}
+
+fn same_logical_symbol(left: &CodeUnit, right: &CodeUnit) -> bool {
+    left.kind() == right.kind()
+        && left.fq_name() == right.fq_name()
+        && left.signature() == right.signature()
 }
