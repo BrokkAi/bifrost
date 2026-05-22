@@ -602,6 +602,460 @@ func shadowDotImport() {
 }
 
 #[test]
+fn go_graph_strategy_finds_function_usage_forms_across_call_contexts() {
+    let (_project, analyzer) = go_analyzer_with_files(&[
+        ("util/util.go", "package util\nfunc Helper() {}\n"),
+        (
+            "local.go",
+            r#"
+package main
+
+func helper() {}
+
+func samePackage() {
+    helper()
+    f := helper
+    f()
+}
+"#,
+        ),
+        (
+            "main.go",
+            r#"
+package main
+
+import "example.com/app/util"
+import . "example.com/app/util"
+
+func callForms() {
+    util.Helper()
+    Helper()
+    deferred := func() {
+        util.Helper()
+    }
+    deferred()
+    defer util.Helper()
+    go util.Helper()
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = GoUsageGraphStrategy::new();
+
+    let imported = definition(&analyzer, "util.Helper");
+    let imported_hits = strategy
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&imported),
+            &candidates,
+            1000,
+        )
+        .into_either()
+        .expect("imported function forms should resolve");
+    assert_eq!(5, imported_hits.len(), "imported hits: {imported_hits:?}");
+
+    let local = definition(&analyzer, "main.helper");
+    let local_hits = strategy
+        .find_usages(&analyzer, std::slice::from_ref(&local), &candidates, 1000)
+        .into_either()
+        .expect("same-package function values should resolve");
+    assert_eq!(2, local_hits.len(), "local function hits: {local_hits:?}");
+}
+
+#[test]
+fn go_graph_strategy_keeps_function_usage_shadowing_conservative() {
+    let (_project, analyzer) = go_analyzer_with_files(&[
+        ("util/util.go", "package util\nfunc Helper() {}\n"),
+        (
+            "main.go",
+            r#"
+package main
+
+import util "example.com/app/util"
+import . "example.com/app/util"
+
+func shadowPackageAlias() {
+    util := struct{ Helper func() }{Helper: func() {}}
+    util.Helper()
+}
+
+func shadowDotImport() {
+    Helper := func() {}
+    Helper()
+}
+
+func shadowParameter(Helper func()) {
+    Helper()
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "util.Helper");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = GoUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("shadowed function query should succeed");
+
+    assert!(
+        hits.is_empty(),
+        "local shadows should block imported function proofs: {hits:?}"
+    );
+}
+
+#[test]
+fn go_graph_strategy_keeps_same_package_top_level_shadowing_conservative() {
+    let (_project, analyzer) = go_analyzer_with_files(&[
+        (
+            "defs.go",
+            r#"
+package main
+
+const Flag = "global"
+
+func helper() {}
+"#,
+        ),
+        (
+            "consumer.go",
+            r#"
+package main
+
+func localShadows() {
+    helper := func() {}
+    helper()
+    Flag := "local"
+    _ = Flag
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = GoUsageGraphStrategy::new();
+
+    let helper = definition(&analyzer, "main.helper");
+    let helper_hits = strategy
+        .find_usages(&analyzer, std::slice::from_ref(&helper), &candidates, 1000)
+        .into_either()
+        .expect("same-package function shadowing query should succeed");
+    assert!(
+        helper_hits.is_empty(),
+        "same-package function shadows should not count: {helper_hits:?}"
+    );
+
+    let flag = definition(&analyzer, "main._module_.Flag");
+    let flag_hits = strategy
+        .find_usages(&analyzer, std::slice::from_ref(&flag), &candidates, 1000)
+        .into_either()
+        .expect("same-package const shadowing query should succeed");
+    assert!(
+        flag_hits.is_empty(),
+        "same-package const shadows should not count: {flag_hits:?}"
+    );
+}
+
+#[test]
+fn go_graph_strategy_finds_top_level_var_and_const_usage_forms() {
+    let (project, analyzer) = go_analyzer_with_files(&[
+        (
+            "config/config.go",
+            r#"
+package config
+
+const Flag = "on"
+var Count = 1
+"#,
+        ),
+        (
+            "config/internal.go",
+            r#"
+package config
+
+func samePackage() {
+    _ = Flag
+    Count += 1
+}
+"#,
+        ),
+        (
+            "other/config.go",
+            r#"
+package other
+
+const Flag = "other"
+var Count = 99
+"#,
+        ),
+        (
+            "main.go",
+            r#"
+package main
+
+import cfg "example.com/app/config"
+import other "example.com/app/other"
+
+func external() {
+    _ = cfg.Flag
+    cfg.Count = cfg.Count + 1
+    _ = &cfg.Count
+    _ = other.Flag
+    other.Count += 1
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = GoUsageGraphStrategy::new();
+
+    let flag = definition(&analyzer, "config._module_.Flag");
+    let flag_hits = strategy
+        .find_usages(&analyzer, std::slice::from_ref(&flag), &candidates, 1000)
+        .into_either()
+        .expect("const usages should resolve");
+    assert_eq!(2, flag_hits.len(), "flag hits: {flag_hits:?}");
+    assert!(
+        flag_hits
+            .iter()
+            .all(|hit| hit.file == project.file("config/internal.go")
+                || hit.file == project.file("main.go"))
+    );
+
+    let count = definition(&analyzer, "config._module_.Count");
+    let count_hits = strategy
+        .find_usages(&analyzer, std::slice::from_ref(&count), &candidates, 1000)
+        .into_either()
+        .expect("var usages should resolve");
+    assert_eq!(4, count_hits.len(), "count hits: {count_hits:?}");
+    assert!(
+        count_hits
+            .iter()
+            .all(|hit| hit.file == project.file("config/internal.go")
+                || hit.file == project.file("main.go"))
+    );
+}
+
+#[test]
+fn go_graph_strategy_finds_type_references_in_advanced_type_positions() {
+    let (project, analyzer) = go_analyzer_with_files(&[
+        (
+            "model/album.go",
+            r#"
+package model
+
+type Album struct{}
+type Box[T any] struct{ Item T }
+"#,
+        ),
+        (
+            "core/types.go",
+            r#"
+package core
+
+import "example.com/app/model"
+
+type Alias = model.Album
+type Constraint interface {
+    ~[]model.Album
+    Accept(model.Album) *model.Album
+}
+type Handler func(model.Album) model.Album
+type Uses struct {
+    Fixed [2]model.Album
+    Boxed model.Box[model.Album]
+}
+
+func Check(v any) {
+    _ = v.(model.Album)
+    switch v.(type) {
+    case model.Album:
+    }
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "model.Album");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = GoUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("advanced type positions should resolve");
+
+    assert!(
+        hits.len() >= 9,
+        "expected alias, constraint, function, array, generic, assertion, and switch hits: {hits:?}"
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file == project.file("core/types.go"))
+    );
+}
+
+#[test]
+fn go_graph_strategy_finds_member_usages_in_nested_receiver_contexts() {
+    let (_project, analyzer) = go_analyzer_with_files(&[
+        (
+            "model/album.go",
+            r#"
+package model
+
+type Album struct {
+    ImageFiles string
+}
+
+func (a Album) Title() string { return "" }
+"#,
+        ),
+        (
+            "core/reader.go",
+            r#"
+package core
+
+import "example.com/app/model"
+
+func NamedReturn() (album model.Album) {
+    _ = album.Title()
+    album.ImageFiles = "cover.jpg"
+    return
+}
+
+func Nested(album model.Album) {
+    func() {
+        alias := album
+        _ = alias.Title()
+        _ = alias.ImageFiles
+    }()
+    {
+        next := album
+        _ = next.Title()
+        next.ImageFiles = "back.jpg"
+    }
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = GoUsageGraphStrategy::new();
+
+    let method = definition(&analyzer, "model.Album.Title");
+    let method_hits = strategy
+        .find_usages(&analyzer, std::slice::from_ref(&method), &candidates, 1000)
+        .into_either()
+        .expect("nested method receiver usages should resolve");
+    assert_eq!(3, method_hits.len(), "method hits: {method_hits:?}");
+
+    let field = definition(&analyzer, "model.Album.ImageFiles");
+    let field_hits = strategy
+        .find_usages(&analyzer, std::slice::from_ref(&field), &candidates, 1000)
+        .into_either()
+        .expect("nested field receiver usages should resolve");
+    assert_eq!(3, field_hits.len(), "field hits: {field_hits:?}");
+}
+
+#[test]
+fn go_graph_strategy_finds_member_usages_through_pointer_dereference_receivers() {
+    let (_project, analyzer) = go_analyzer_with_files(&[
+        (
+            "model/album.go",
+            r#"
+package model
+
+type Album struct {
+    ImageFiles string
+}
+
+func (a *Album) Title() string { return "" }
+"#,
+        ),
+        (
+            "core/reader.go",
+            r#"
+package core
+
+import "example.com/app/model"
+
+func Read(album *model.Album) string {
+    _ = (*album).Title()
+    (*album).ImageFiles = "cover.jpg"
+    return album.Title()
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = GoUsageGraphStrategy::new();
+
+    let method = definition(&analyzer, "model.Album.Title");
+    let method_hits = strategy
+        .find_usages(&analyzer, std::slice::from_ref(&method), &candidates, 1000)
+        .into_either()
+        .expect("dereferenced method receiver usages should resolve");
+    assert_eq!(2, method_hits.len(), "method hits: {method_hits:?}");
+
+    let field = definition(&analyzer, "model.Album.ImageFiles");
+    let field_hits = strategy
+        .find_usages(&analyzer, std::slice::from_ref(&field), &candidates, 1000)
+        .into_either()
+        .expect("dereferenced field receiver usages should resolve");
+    assert_eq!(1, field_hits.len(), "field hits: {field_hits:?}");
+}
+
+#[test]
+fn go_graph_strategy_keeps_interprocedural_member_assignment_out_of_scope() {
+    let (_project, analyzer) = go_analyzer_with_files(&[
+        (
+            "model/album.go",
+            r#"
+package model
+
+type Album struct {
+    ImageFiles string
+}
+
+func (a Album) Title() string { return "" }
+"#,
+        ),
+        (
+            "core/reader.go",
+            r#"
+package core
+
+import "example.com/app/model"
+
+var saved any
+
+func Save(album model.Album) {
+    saved = album
+}
+
+func Later() string {
+    return saved.Title()
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "model.Album.Title");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = GoUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("interprocedural negative query should succeed");
+
+    assert!(
+        hits.is_empty(),
+        "interprocedural data-flow should remain out of scope: {hits:?}"
+    );
+}
+
+#[test]
 fn go_graph_strategy_enforces_max_usages_limit() {
     let (_project, analyzer) = go_analyzer_with_files(&[
         ("helper.go", "package main\nfunc helper() {}\n"),

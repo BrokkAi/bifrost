@@ -676,8 +676,9 @@ fn scan_selector_like(
     }
 
     if ctx.spec.is_member() {
+        let receiver = receiver_symbol_from_qualifier(&qualifier);
         if locals
-            .resolve_symbol(&qualifier)
+            .resolve_symbol(receiver)
             .as_precise()
             .is_some_and(|targets| targets.contains(OWNER_TOKEN))
         {
@@ -688,7 +689,7 @@ fn scan_selector_like(
 
     if ctx.bindings.namespace_names.contains(&qualifier)
         && !locals.is_shadowed(&qualifier)
-        && !is_definition_identifier(qualifier_node)
+        && !is_definition_identifier(qualifier_node, ctx.source)
     {
         record_hit(field_node, ctx);
     }
@@ -699,7 +700,7 @@ fn scan_direct_identifier(
     ctx: &mut ScanCtx<'_>,
     locals: &LocalInferenceEngine<String>,
 ) {
-    if ctx.spec.is_member() || is_definition_identifier(node) {
+    if ctx.spec.is_member() || is_definition_identifier(node, ctx.source) {
         return;
     }
     let text = node_text(node, ctx.source);
@@ -722,6 +723,15 @@ fn selector_parts<'a>(node: Node<'a>, source: &str) -> Option<(String, Node<'a>,
         qualifier_node,
         field_node,
     ))
+}
+
+fn receiver_symbol_from_qualifier(qualifier: &str) -> &str {
+    qualifier
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .trim_start_matches(['*', '&'])
+        .trim()
 }
 
 #[derive(Default)]
@@ -821,10 +831,30 @@ fn last_named_child(node: Node<'_>) -> Option<Node<'_>> {
     node.named_children(&mut cursor).last()
 }
 
-fn is_definition_identifier(node: Node<'_>) -> bool {
+fn is_definition_identifier(node: Node<'_>, source: &str) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
+    if has_ancestor_kind(node, "literal_value") && next_non_whitespace_is_colon(node, source) {
+        return true;
+    }
+    if parent.kind() == "keyed_element"
+        && parent
+            .child_by_field_name("key")
+            .is_some_and(|key| same_node(key, node))
+    {
+        return true;
+    }
+    if parent.kind() == "field_declaration"
+        && parent.child_by_field_name("type").is_some_and(|ty| {
+            node.start_byte() < ty.start_byte()
+                && parent
+                    .child_by_field_name("name")
+                    .is_none_or(|name| same_node(name, node) || node.end_byte() <= ty.start_byte())
+        })
+    {
+        return true;
+    }
     matches!(
         parent.kind(),
         "package_clause"
@@ -845,6 +875,28 @@ fn is_definition_identifier(node: Node<'_>) -> bool {
         .is_some_and(|name| {
             name.start_byte() == node.start_byte() && name.end_byte() == node.end_byte()
         })
+}
+
+fn same_node(left: Node<'_>, right: Node<'_>) -> bool {
+    left.start_byte() == right.start_byte() && left.end_byte() == right.end_byte()
+}
+
+fn has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == kind {
+            return true;
+        }
+        current = parent.parent();
+    }
+    false
+}
+
+fn next_non_whitespace_is_colon(node: Node<'_>, source: &str) -> bool {
+    source
+        .get(node.end_byte()..)
+        .and_then(|rest| rest.chars().find(|ch| !ch.is_whitespace()))
+        == Some(':')
 }
 
 fn same_go_package(graph: &GoProjectGraph, left: &ProjectFile, right: &ProjectFile) -> bool {
