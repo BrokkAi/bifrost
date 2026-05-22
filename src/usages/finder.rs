@@ -4,6 +4,7 @@ use crate::usages::candidates::{
     FallbackCandidateProvider, ImportGraphCandidateProvider, TextSearchCandidateProvider,
     default_provider,
 };
+use crate::usages::go_graph::GoUsageGraphStrategy;
 use crate::usages::java_graph::JavaUsageGraphStrategy;
 use crate::usages::js_ts_graph::JsTsExportUsageGraphStrategy;
 use crate::usages::model::FuzzyResult;
@@ -71,6 +72,7 @@ impl UsageFinder {
             Box::new(RustExportUsageGraphStrategy::new()),
         );
         graph_analyzers.insert(Language::Java, Box::new(JavaUsageGraphStrategy::new()));
+        graph_analyzers.insert(Language::Go, Box::new(GoUsageGraphStrategy::new()));
 
         Self {
             fallback_candidate_provider: default_provider(),

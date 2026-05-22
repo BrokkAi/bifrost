@@ -16,6 +16,7 @@
 
 mod candidates;
 mod finder;
+mod go_graph;
 mod graph_core;
 mod java_graph;
 mod js_ts_graph;
@@ -31,6 +32,7 @@ pub use candidates::{
     default_provider,
 };
 pub use finder::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, QueryResult, UsageFinder};
+pub use go_graph::GoUsageGraphStrategy;
 pub use java_graph::JavaUsageGraphStrategy;
 pub use js_ts_graph::JsTsExportUsageGraphStrategy;
 pub use local_inference::{
