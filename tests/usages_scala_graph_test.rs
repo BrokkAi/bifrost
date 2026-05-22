@@ -98,12 +98,16 @@ fn line_of(source: &str, needle: &str) -> usize {
         .unwrap_or_else(|| panic!("missing line containing {needle:?}"))
 }
 
+fn rel_path_string(file: &brokk_bifrost::ProjectFile) -> String {
+    file.rel_path().to_string_lossy().replace('\\', "/")
+}
+
 fn scala_hits(analyzer: &ScalaAnalyzer, target: &CodeUnit, candidates: &[&str]) -> Vec<UsageHit> {
     let candidate_files = analyzer
         .get_analyzed_files()
         .into_iter()
         .filter(|file| {
-            let rel_path = file.rel_path().to_string_lossy();
+            let rel_path = rel_path_string(file);
             candidates.iter().any(|candidate| rel_path == *candidate)
         })
         .collect();
@@ -828,7 +832,7 @@ class Target {
     let run = definition(&analyzer, "pkg.Target.run");
     let zero_hits = hits(
         UsageFinder::new()
-            .with_file_filter(|file| file.rel_path().to_string_lossy() == "app/ZeroFallback.scala")
+            .with_file_filter(|file| rel_path_string(file) == "app/ZeroFallback.scala")
             .find_usages_default(&analyzer, std::slice::from_ref(&run)),
     );
     assert!(
@@ -844,7 +848,7 @@ class Target {
         analyzer
             .get_analyzed_files()
             .into_iter()
-            .find(|file| file.rel_path().to_string_lossy() == "app/FallbackConsumer.scala")
+            .find(|file| rel_path_string(file) == "app/FallbackConsumer.scala")
             .expect("fallback source file"),
         CodeUnitType::Function,
         "pkg",
