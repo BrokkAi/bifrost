@@ -131,12 +131,88 @@ impl PhpAnalyzer {
     }
 
     pub fn use_aliases_of(&self, file: &ProjectFile) -> HashMap<String, String> {
-        let mut aliases = HashMap::default();
-        for import in self.inner.import_info_of(file) {
-            aliases.extend(parse_php_use_aliases(&import.raw_snippet));
-        }
+        self.use_aliases_by_kind_of(file).type_aliases
+    }
+
+    pub fn use_aliases_by_kind_of(&self, file: &ProjectFile) -> PhpUseAliases {
+        let Ok(source) = file.read_to_string() else {
+            return PhpUseAliases::default();
+        };
+        parse_php_use_aliases_from_source(&source)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PhpUseAliases {
+    pub type_aliases: HashMap<String, String>,
+    pub function_aliases: HashMap<String, String>,
+    pub const_aliases: HashMap<String, String>,
+}
+
+impl PhpUseAliases {
+    fn extend(&mut self, other: Self) {
+        self.type_aliases.extend(other.type_aliases);
+        self.function_aliases.extend(other.function_aliases);
+        self.const_aliases.extend(other.const_aliases);
+    }
+
+    pub fn merged(&self) -> HashMap<String, String> {
+        let mut aliases = self.type_aliases.clone();
+        aliases.extend(self.function_aliases.clone());
+        aliases.extend(self.const_aliases.clone());
         aliases
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PhpUseKind {
+    Type,
+    Function,
+    Const,
+}
+
+static PHP_USE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^use\s+[^;]+;").expect("valid PHP use regex"));
+
+fn parse_php_use_aliases_from_source(source: &str) -> PhpUseAliases {
+    let mut aliases = PhpUseAliases::default();
+    for matched in PHP_USE_RE.find_iter(source) {
+        aliases.extend(parse_php_use_aliases_by_kind(matched.as_str()));
+    }
+    aliases
+}
+
+pub fn parse_php_use_aliases_by_kind(raw: &str) -> PhpUseAliases {
+    let mut text = raw.trim().trim_end_matches(';').trim();
+    let Some(rest) = text.strip_prefix("use ") else {
+        return PhpUseAliases::default();
+    };
+    text = rest.trim();
+
+    let (default_kind, text) = if let Some(rest) = text.strip_prefix("function ") {
+        (PhpUseKind::Function, rest.trim())
+    } else if let Some(rest) = text.strip_prefix("const ") {
+        (PhpUseKind::Const, rest.trim())
+    } else {
+        (PhpUseKind::Type, text)
+    };
+
+    let mut aliases = PhpUseAliases::default();
+    if text.is_empty() {
+        return aliases;
+    }
+
+    if let Some((prefix, group)) = text.split_once('{') {
+        let prefix = prefix.trim().trim_end_matches('\\');
+        let group = group.trim_end_matches('}').trim();
+        for part in group.split(',') {
+            add_php_use_alias(prefix, part.trim(), default_kind, &mut aliases);
+        }
+        return aliases;
+    }
+
+    add_php_use_alias("", text, default_kind, &mut aliases);
+    aliases
 }
 
 impl TestDetectionProvider for PhpAnalyzer {}
@@ -626,35 +702,25 @@ fn file_language(file: &ProjectFile) -> Language {
 }
 
 pub fn parse_php_use_aliases(raw: &str) -> HashMap<String, String> {
-    let text = raw
-        .trim()
-        .trim_start_matches("use ")
-        .trim_start_matches("function ")
-        .trim_start_matches("const ")
-        .trim_end_matches(';')
-        .trim();
-    let mut aliases = HashMap::default();
-    if text.is_empty() {
-        return aliases;
-    }
-
-    if let Some((prefix, group)) = text.split_once('{') {
-        let prefix = prefix.trim().trim_end_matches('\\');
-        let group = group.trim_end_matches('}').trim();
-        for part in group.split(',') {
-            add_php_use_alias(prefix, part.trim(), &mut aliases);
-        }
-        return aliases;
-    }
-
-    add_php_use_alias("", text, &mut aliases);
-    aliases
+    parse_php_use_aliases_by_kind(raw).merged()
 }
 
-fn add_php_use_alias(prefix: &str, raw_part: &str, aliases: &mut HashMap<String, String>) {
+fn add_php_use_alias(
+    prefix: &str,
+    raw_part: &str,
+    default_kind: PhpUseKind,
+    aliases: &mut PhpUseAliases,
+) {
     if raw_part.is_empty() {
         return;
     }
+    let (kind, raw_part) = if let Some(rest) = raw_part.strip_prefix("function ") {
+        (PhpUseKind::Function, rest.trim())
+    } else if let Some(rest) = raw_part.strip_prefix("const ") {
+        (PhpUseKind::Const, rest.trim())
+    } else {
+        (default_kind, raw_part)
+    };
     let (path, alias) = split_php_use_alias(raw_part);
     let full_path = if prefix.is_empty() {
         path
@@ -666,7 +732,11 @@ fn add_php_use_alias(prefix: &str, raw_part: &str, aliases: &mut HashMap<String,
         return;
     }
     let local = alias.unwrap_or_else(|| fq.rsplit('.').next().unwrap_or(fq.as_str()).to_string());
-    aliases.insert(local, fq);
+    match kind {
+        PhpUseKind::Type => aliases.type_aliases.insert(local, fq),
+        PhpUseKind::Function => aliases.function_aliases.insert(local, fq),
+        PhpUseKind::Const => aliases.const_aliases.insert(local, fq),
+    };
 }
 
 fn split_php_use_alias(raw_part: &str) -> (String, Option<String>) {

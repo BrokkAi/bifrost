@@ -1,9 +1,10 @@
 use crate::analyzer::{
-    AnalyzerDelegate, CodeUnit, IAnalyzer, Language, MultiAnalyzer, PhpAnalyzer, ProjectFile,
-    Range, parse_php_use_aliases, php_namespace_to_fq,
+    AnalyzerDelegate, CodeUnit, IAnalyzer, Language, MultiAnalyzer, PhpAnalyzer, PhpUseAliases,
+    ProjectFile, Range, php_namespace_to_fq,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
+use crate::usages::local_inference::{LocalInferenceEngine, SymbolResolution};
 use crate::usages::model::{FuzzyResult, UsageHit};
 use crate::usages::traits::UsageAnalyzer;
 use regex::Regex;
@@ -70,10 +71,13 @@ impl UsageAnalyzer for PhpUsageGraphStrategy {
             .chain(std::iter::once(target.source().clone()))
             .collect();
 
+        let hierarchy = matches!(spec.kind, TargetKind::Method | TargetKind::Field)
+            .then(|| PhpHierarchyIndex::build(php, &files));
+        let empty_hierarchy = PhpHierarchyIndex::default();
+        let hierarchy = hierarchy.as_ref().unwrap_or(&empty_hierarchy);
         let mut hits = BTreeSet::new();
-        let hierarchy = PhpHierarchyIndex::build(php);
         for file in files {
-            scan_file(php, analyzer, &file, &spec, &hierarchy, &mut hits);
+            scan_file(php, analyzer, &file, &spec, hierarchy, &mut hits);
             if hits.len() > max_usages {
                 return FuzzyResult::TooManyCallsites {
                     short_name: target.short_name().to_string(),
@@ -172,7 +176,7 @@ fn target_language_for_file(file: &ProjectFile) -> Language {
 
 struct FileContext {
     namespace: String,
-    aliases: HashMap<String, String>,
+    aliases: PhpUseAliases,
 }
 
 fn scan_file(
@@ -201,11 +205,10 @@ fn scan_file(
         return;
     };
 
-    let mut ctx = FileContext {
+    let ctx = FileContext {
         namespace: php.namespace_of_file(file),
-        aliases: php.use_aliases_of(file),
+        aliases: php.use_aliases_by_kind_of(file),
     };
-    ctx.aliases.extend(source_use_aliases(&source));
 
     let line_starts = compute_line_starts(&source);
     scan_node(
@@ -229,71 +232,7 @@ fn scan_file(
         spec,
         hits,
     );
-    scan_resolved_text_patterns(analyzer, file, &source, &line_starts, &ctx, spec, hits);
 }
-
-fn scoped_variable_types(source: &str, ctx: &FileContext) -> HashMap<String, String> {
-    let mut variables = HashMap::default();
-
-    for captures in TYPED_VARIABLE_RE.captures_iter(source) {
-        let Some(type_match) = captures.name("type") else {
-            continue;
-        };
-        let Some(var_match) = captures.name("var") else {
-            continue;
-        };
-        if let Some(fq) = resolve_php_type(type_match.as_str(), ctx) {
-            variables.insert(var_match.as_str().to_string(), fq);
-        }
-    }
-
-    for captures in PARAMETER_VARIABLE_RE.captures_iter(source) {
-        let Some(type_match) = captures.name("type") else {
-            continue;
-        };
-        let Some(var_match) = captures.name("var") else {
-            continue;
-        };
-        if let Some(fq) = resolve_php_type(type_match.as_str(), ctx) {
-            variables.insert(var_match.as_str().to_string(), fq);
-        }
-    }
-
-    for captures in ASSIGNMENT_RE.captures_iter(source) {
-        let Some(lhs_match) = captures.name("lhs") else {
-            continue;
-        };
-        let Some(rhs_match) = captures.name("rhs") else {
-            continue;
-        };
-        let lhs = lhs_match.as_str().to_string();
-        let rhs = rhs_match.as_str().trim();
-        if let Some(type_name) = rhs.strip_prefix("new ").and_then(read_leading_type_name) {
-            if let Some(fq) = resolve_php_type(type_name, ctx) {
-                variables.insert(lhs, fq);
-            } else {
-                variables.remove(&lhs);
-            }
-        } else if let Some(rhs_var) = rhs.strip_prefix('$').and_then(read_leading_variable_name) {
-            if let Some(fq) = variables.get(rhs_var).cloned() {
-                variables.insert(lhs, fq);
-            } else {
-                variables.remove(&lhs);
-            }
-        } else {
-            variables.remove(&lhs);
-        }
-    }
-
-    variables
-}
-
-static TYPED_VARIABLE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?P<type>\\?[A-Za-z_][A-Za-z0-9_\\]*(?:\|\\?[A-Za-z_][A-Za-z0-9_\\]*)?)\s+\$(?P<var>[A-Za-z_][A-Za-z0-9_]*)",
-    )
-    .expect("valid PHP typed-variable regex")
-});
 
 static PARAMETER_VARIABLE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
@@ -306,17 +245,6 @@ static ASSIGNMENT_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\$(?P<lhs>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<rhs>[^;]+);")
         .expect("valid PHP assignment regex")
 });
-
-static PHP_USE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?m)^use\s+[^;]+;").expect("valid PHP use regex"));
-
-fn source_use_aliases(source: &str) -> HashMap<String, String> {
-    let mut aliases = HashMap::default();
-    for matched in PHP_USE_RE.find_iter(source) {
-        aliases.extend(parse_php_use_aliases(matched.as_str()));
-    }
-    aliases
-}
 
 #[allow(clippy::too_many_arguments)]
 fn scan_node(
@@ -333,7 +261,12 @@ fn scan_node(
         return;
     }
 
-    if matches!(node.kind(), "name" | "namespace_name" | "variable_name") {
+    if matches!(node.kind(), "namespace_name" | "qualified_name") {
+        handle_candidate(node, analyzer, file, source, line_starts, ctx, spec, hits);
+        return;
+    }
+
+    if matches!(node.kind(), "name" | "variable_name") {
         handle_candidate(node, analyzer, file, source, line_starts, ctx, spec, hits);
     }
 
@@ -366,7 +299,11 @@ fn handle_candidate(
             }
         }
         TargetKind::Method | TargetKind::Field => {}
-        TargetKind::Constant => {}
+        TargetKind::Constant => {
+            if node.kind() != "namespace_name" && is_constant_reference(node, source, ctx, spec) {
+                push_hit(node, analyzer, file, source, line_starts, spec, hits);
+            }
+        }
         TargetKind::Function => {
             if node.kind() != "namespace_name" && is_function_reference(node, source, ctx, spec) {
                 push_hit(node, analyzer, file, source, line_starts, spec, hits);
@@ -397,11 +334,34 @@ fn is_constructor_reference(
     let Some(owner) = spec.owner_fq_name.as_deref() else {
         return false;
     };
+    if !is_reference_context(node) {
+        return false;
+    }
     if !has_token_before(node.start_byte(), source, "new") {
         return false;
     }
     let raw = qualified_candidate_text(node, source);
     resolve_php_type(&raw, ctx).is_some_and(|fq| fq == owner)
+}
+
+fn is_constant_reference(
+    node: Node<'_>,
+    source: &str,
+    ctx: &FileContext,
+    spec: &TargetSpec,
+) -> bool {
+    if !is_reference_context(node) {
+        return false;
+    }
+    let raw = qualified_candidate_text(node, source);
+    if has_open_paren_after(node.end_byte(), source)
+        || has_operator_before(node.start_byte(), source, "->")
+        || has_operator_before(node.start_byte(), source, "::")
+        || has_token_before(node.start_byte(), source, "const")
+    {
+        return false;
+    }
+    resolve_php_constant(&raw, ctx).is_some_and(|fq| fq == spec.target_fq_name)
 }
 
 fn is_function_reference(
@@ -410,6 +370,9 @@ fn is_function_reference(
     ctx: &FileContext,
     spec: &TargetSpec,
 ) -> bool {
+    if !is_reference_context(node) {
+        return false;
+    }
     let raw = qualified_candidate_text(node, source);
     if !has_open_paren_after(node.end_byte(), source) {
         return false;
@@ -426,7 +389,16 @@ fn is_function_reference(
 fn is_reference_context(node: Node<'_>) -> bool {
     let mut parent = node.parent();
     while let Some(current) = parent {
-        if current.kind() == "namespace_use_declaration" {
+        if matches!(
+            current.kind(),
+            "namespace_use_declaration"
+                | "comment"
+                | "string"
+                | "encapsed_string"
+                | "string_value"
+                | "heredoc"
+                | "nowdoc"
+        ) {
             return false;
         }
         parent = current.parent();
@@ -443,28 +415,16 @@ fn push_hit(
     spec: &TargetSpec,
     hits: &mut BTreeSet<UsageHit>,
 ) {
-    let range = Range {
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_line: find_line_index_for_offset(line_starts, node.start_byte()),
-        end_line: find_line_index_for_offset(line_starts, node.end_byte()),
-    };
-    let Some(enclosing) = analyzer.enclosing_code_unit(file, &range) else {
-        return;
-    };
-    if enclosing == spec.target {
-        return;
-    }
-    let line_idx = range.start_line;
-    hits.insert(UsageHit::new(
-        file.clone(),
-        line_idx + 1,
+    push_hit_range(
         node.start_byte(),
         node.end_byte(),
-        enclosing,
-        GRAPH_HIT_CONFIDENCE,
-        build_snippet(source, line_starts, line_idx),
-    ));
+        analyzer,
+        file,
+        source,
+        line_starts,
+        spec,
+        hits,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -528,44 +488,20 @@ fn scan_member_patterns(
         let Some(scope_source) = source.get(scope_start..scope_end) else {
             continue;
         };
-        let variables = scoped_variable_types(scope_source, ctx);
-        for captures in instance.captures_iter(scope_source) {
-            let Some(var_match) = captures.name("var") else {
-                continue;
-            };
-            let receiver = var_match.as_str();
-            let member = captures.name("member").expect("member capture");
-            let member_start = scope_start + member.start();
-            let member_end = scope_start + member.end();
-            let receiver_matches = if receiver == "this" {
-                receiver_is_enclosing_subtype(
-                    analyzer,
-                    file,
-                    member_start,
-                    member_end,
-                    line_starts,
-                    owner,
-                    hierarchy,
-                )
-            } else {
-                variables
-                    .get(receiver)
-                    .is_some_and(|fq| receiver_type_matches(fq, owner, hierarchy))
-            };
-            if !receiver_matches {
-                continue;
-            }
-            push_hit_range(
-                member_start,
-                member_end,
-                analyzer,
-                file,
-                source,
-                line_starts,
-                spec,
-                hits,
-            );
-        }
+        scan_instance_members_in_order(
+            scope_start,
+            scope_source,
+            &instance,
+            analyzer,
+            file,
+            source,
+            line_starts,
+            ctx,
+            hierarchy,
+            owner,
+            spec,
+            hits,
+        );
     }
 
     let static_member = Regex::new(&format!(
@@ -600,6 +536,173 @@ fn scan_member_patterns(
             spec,
             hits,
         );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_instance_members_in_order(
+    scope_start: usize,
+    scope_source: &str,
+    instance: &Regex,
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    full_source: &str,
+    line_starts: &[usize],
+    ctx: &FileContext,
+    hierarchy: &PhpHierarchyIndex,
+    owner: &str,
+    spec: &TargetSpec,
+    hits: &mut BTreeSet<UsageHit>,
+) {
+    let mut engine = LocalInferenceEngine::default();
+    let header = scope_source
+        .split_once('{')
+        .map(|(header, _)| header)
+        .unwrap_or(scope_source);
+    seed_parameter_receivers(header, ctx, &mut engine);
+
+    let mut events = Vec::new();
+    for captures in ASSIGNMENT_RE.captures_iter(scope_source) {
+        let Some(whole) = captures.get(0) else {
+            continue;
+        };
+        events.push(MemberScanEvent::Assignment {
+            start: whole.start(),
+            lhs: captures.name("lhs").map(|m| m.as_str().to_string()),
+            rhs: captures.name("rhs").map(|m| m.as_str().trim().to_string()),
+        });
+    }
+    for captures in instance.captures_iter(scope_source) {
+        let Some(whole) = captures.get(0) else {
+            continue;
+        };
+        let Some(var) = captures.name("var") else {
+            continue;
+        };
+        let Some(member) = captures.name("member") else {
+            continue;
+        };
+        events.push(MemberScanEvent::InstanceMember {
+            start: whole.start(),
+            receiver: var.as_str().to_string(),
+            member_start: member.start(),
+            member_end: member.end(),
+        });
+    }
+    events.sort_by_key(MemberScanEvent::start);
+
+    for event in events {
+        match event {
+            MemberScanEvent::Assignment { lhs, rhs, .. } => {
+                let (Some(lhs), Some(rhs)) = (lhs, rhs) else {
+                    continue;
+                };
+                apply_receiver_assignment(&lhs, &rhs, ctx, &mut engine);
+            }
+            MemberScanEvent::InstanceMember {
+                receiver,
+                member_start,
+                member_end,
+                ..
+            } => {
+                let absolute_start = scope_start + member_start;
+                let absolute_end = scope_start + member_end;
+                let receiver_matches = if receiver == "this" {
+                    receiver_is_enclosing_subtype(
+                        analyzer,
+                        file,
+                        absolute_start,
+                        absolute_end,
+                        line_starts,
+                        owner,
+                        hierarchy,
+                    )
+                } else {
+                    precise_receiver_type(&engine, &receiver)
+                        .is_some_and(|fq| receiver_type_matches(&fq, owner, hierarchy))
+                };
+                if receiver_matches {
+                    push_hit_range(
+                        absolute_start,
+                        absolute_end,
+                        analyzer,
+                        file,
+                        full_source,
+                        line_starts,
+                        spec,
+                        hits,
+                    );
+                }
+            }
+        }
+    }
+}
+
+enum MemberScanEvent {
+    Assignment {
+        start: usize,
+        lhs: Option<String>,
+        rhs: Option<String>,
+    },
+    InstanceMember {
+        start: usize,
+        receiver: String,
+        member_start: usize,
+        member_end: usize,
+    },
+}
+
+impl MemberScanEvent {
+    fn start(&self) -> usize {
+        match self {
+            Self::Assignment { start, .. } | Self::InstanceMember { start, .. } => *start,
+        }
+    }
+}
+
+fn seed_parameter_receivers(
+    header: &str,
+    ctx: &FileContext,
+    engine: &mut LocalInferenceEngine<String>,
+) {
+    for captures in PARAMETER_VARIABLE_RE.captures_iter(header) {
+        let Some(type_match) = captures.name("type") else {
+            continue;
+        };
+        let Some(var_match) = captures.name("var") else {
+            continue;
+        };
+        if let Some(fq) = resolve_php_type(type_match.as_str(), ctx) {
+            engine.seed_symbol(var_match.as_str(), fq);
+        }
+    }
+}
+
+fn apply_receiver_assignment(
+    lhs: &str,
+    rhs: &str,
+    ctx: &FileContext,
+    engine: &mut LocalInferenceEngine<String>,
+) {
+    if let Some(type_name) = rhs.strip_prefix("new ").and_then(read_leading_type_name)
+        && let Some(fq) = resolve_php_type(type_name, ctx)
+    {
+        engine.seed_symbol(lhs, fq);
+        return;
+    }
+    if let Some(rhs_var) = rhs.strip_prefix('$').and_then(read_leading_variable_name) {
+        engine.alias_symbol(lhs, rhs_var);
+        return;
+    }
+    engine.declare_shadow(lhs);
+}
+
+fn precise_receiver_type(engine: &LocalInferenceEngine<String>, receiver: &str) -> Option<String> {
+    match engine.resolve_symbol(receiver) {
+        SymbolResolution::Precise(targets) if targets.len() == 1 => targets.into_iter().next(),
+        SymbolResolution::Unknown | SymbolResolution::Ambiguous | SymbolResolution::Precise(_) => {
+            None
+        }
     }
 }
 
@@ -665,23 +768,21 @@ struct PhpHierarchyIndex {
 }
 
 impl PhpHierarchyIndex {
-    fn build(php: &PhpAnalyzer) -> Self {
+    fn build(php: &PhpAnalyzer, files: &HashSet<ProjectFile>) -> Self {
         let mut hierarchy = Self::default();
-        for file in php.analyzed_files() {
+        for file in files {
             if target_language_for_file(file) != Language::Php {
                 continue;
             }
             let Ok(source) = file.read_to_string() else {
                 continue;
             };
-            let mut ctx = FileContext {
+            let ctx = FileContext {
                 namespace: php.namespace_of_file(file),
-                aliases: php.use_aliases_of(file),
+                aliases: php.use_aliases_by_kind_of(file),
             };
-            ctx.aliases.extend(source_use_aliases(&source));
             hierarchy.extend_file(&source, &ctx);
         }
-        hierarchy.close_transitively();
         hierarchy
     }
 
@@ -709,24 +810,25 @@ impl PhpHierarchyIndex {
         }
     }
 
-    fn close_transitively(&mut self) {
-        loop {
-            let snapshot = self.ancestors.clone();
-            let mut changed = false;
-            for parents in self.ancestors.values_mut() {
-                let current: Vec<String> = parents.iter().cloned().collect();
-                for parent in current {
-                    if let Some(grandparents) = snapshot.get(&parent) {
-                        for grandparent in grandparents {
-                            changed |= parents.insert(grandparent.clone());
-                        }
-                    }
-                }
+    fn is_subtype(&self, receiver_fq_name: &str, owner: &str) -> bool {
+        let mut stack: Vec<&str> = self
+            .ancestors
+            .get(receiver_fq_name)
+            .map(|ancestors| ancestors.iter().map(String::as_str).collect())
+            .unwrap_or_default();
+        let mut visited = HashSet::default();
+        while let Some(candidate) = stack.pop() {
+            if candidate == owner {
+                return true;
             }
-            if !changed {
-                break;
+            if !visited.insert(candidate.to_string()) {
+                continue;
+            }
+            if let Some(ancestors) = self.ancestors.get(candidate) {
+                stack.extend(ancestors.iter().map(String::as_str));
             }
         }
+        false
     }
 }
 
@@ -751,10 +853,7 @@ fn receiver_type_matches(
     if receiver_fq_name == owner {
         return !hierarchy.interfaces.contains(owner);
     }
-    hierarchy
-        .ancestors
-        .get(receiver_fq_name)
-        .is_some_and(|ancestors| ancestors.contains(owner))
+    hierarchy.is_subtype(receiver_fq_name, owner)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -773,164 +872,11 @@ fn static_receiver_matches(
         "self" | "static" => {
             receiver_is_enclosing_subtype(analyzer, file, start, end, line_starts, owner, hierarchy)
         }
-        "parent" => enclosing_owner_at(analyzer, file, start, end, line_starts).is_some_and(
-            |enclosing_owner| {
-                hierarchy
-                    .ancestors
-                    .get(&enclosing_owner)
-                    .is_some_and(|ancestors| ancestors.contains(owner))
-            },
-        ),
+        "parent" => enclosing_owner_at(analyzer, file, start, end, line_starts)
+            .is_some_and(|enclosing_owner| hierarchy.is_subtype(&enclosing_owner, owner)),
         _ => resolve_php_type(receiver, ctx)
             .is_some_and(|fq| receiver_type_matches(&fq, owner, hierarchy)),
     }
-}
-
-fn scan_resolved_text_patterns(
-    analyzer: &dyn IAnalyzer,
-    file: &ProjectFile,
-    source: &str,
-    line_starts: &[usize],
-    ctx: &FileContext,
-    spec: &TargetSpec,
-    hits: &mut BTreeSet<UsageHit>,
-) {
-    match spec.kind {
-        TargetKind::Type => {
-            for alias in target_aliases(ctx, &spec.target_fq_name) {
-                let pattern = Regex::new(&format!(
-                    r"(^|[^A-Za-z0-9_\\$])({})([^A-Za-z0-9_\\]|$)",
-                    regex::escape(&alias)
-                ))
-                .expect("valid PHP type alias regex");
-                for captures in pattern.captures_iter(source) {
-                    let matched = captures.get(2).expect("type alias capture");
-                    if is_import_or_declaration_context(
-                        matched.start(),
-                        source,
-                        &["use", "class", "interface", "trait"],
-                    ) {
-                        continue;
-                    }
-                    push_hit_range(
-                        matched.start(),
-                        matched.end(),
-                        analyzer,
-                        file,
-                        source,
-                        line_starts,
-                        spec,
-                        hits,
-                    );
-                }
-            }
-        }
-        TargetKind::Constructor => {
-            let Some(owner) = spec.owner_fq_name.as_deref() else {
-                return;
-            };
-            for alias in target_aliases(ctx, owner) {
-                let pattern = Regex::new(&format!(r"\bnew\s+({})\b", regex::escape(&alias)))
-                    .expect("valid PHP constructor regex");
-                for captures in pattern.captures_iter(source) {
-                    let matched = captures.get(1).expect("constructor target capture");
-                    push_hit_range(
-                        matched.start(),
-                        matched.end(),
-                        analyzer,
-                        file,
-                        source,
-                        line_starts,
-                        spec,
-                        hits,
-                    );
-                }
-            }
-        }
-        TargetKind::Constant => {
-            for alias in target_aliases(ctx, &spec.target_fq_name) {
-                let pattern = Regex::new(&format!(
-                    r"(^|[^A-Za-z0-9_\\$>:])({})([^A-Za-z0-9_\\]|$)",
-                    regex::escape(&alias)
-                ))
-                .expect("valid PHP constant regex");
-                for captures in pattern.captures_iter(source) {
-                    let matched = captures.get(2).expect("constant alias capture");
-                    if is_import_or_declaration_context(matched.start(), source, &["const", "use"])
-                    {
-                        continue;
-                    }
-                    push_hit_range(
-                        matched.start(),
-                        matched.end(),
-                        analyzer,
-                        file,
-                        source,
-                        line_starts,
-                        spec,
-                        hits,
-                    );
-                }
-            }
-        }
-        TargetKind::Function => {
-            for alias in target_aliases(ctx, &spec.target_fq_name) {
-                let pattern = Regex::new(&format!(
-                    r"(^|[^A-Za-z0-9_\\$>:])({})\s*\(",
-                    regex::escape(&alias)
-                ))
-                .expect("valid PHP function regex");
-                for captures in pattern.captures_iter(source) {
-                    let matched = captures.get(2).expect("function alias capture");
-                    if is_import_or_declaration_context(
-                        matched.start(),
-                        source,
-                        &["function", "use"],
-                    ) {
-                        continue;
-                    }
-                    push_hit_range(
-                        matched.start(),
-                        matched.end(),
-                        analyzer,
-                        file,
-                        source,
-                        line_starts,
-                        spec,
-                        hits,
-                    );
-                }
-            }
-        }
-        TargetKind::Method | TargetKind::Field => {}
-    }
-}
-
-fn target_aliases(ctx: &FileContext, target_fq_name: &str) -> BTreeSet<String> {
-    let mut aliases = BTreeSet::new();
-    let lookup_fq_name = public_php_fq_name(target_fq_name);
-    let php_path = lookup_fq_name.replace('.', "\\");
-    aliases.insert(format!("\\{php_path}"));
-
-    let short = lookup_fq_name
-        .rsplit('.')
-        .next()
-        .unwrap_or(lookup_fq_name.as_str())
-        .to_string();
-    if namespace_of_fq(&lookup_fq_name) == ctx.namespace {
-        aliases.insert(short);
-    }
-    for (alias, imported) in &ctx.aliases {
-        if imported == &lookup_fq_name || imported == target_fq_name {
-            aliases.insert(alias.clone());
-        } else if let Some(suffix) = lookup_fq_name
-            .strip_prefix(imported)
-            .and_then(|suffix| suffix.strip_prefix('.'))
-        {
-            aliases.insert(format!("{alias}\\{}", suffix.replace('.', "\\")));
-        }
-    }
-    aliases
 }
 
 fn public_php_fq_name(fq_name: &str) -> String {
@@ -969,37 +915,32 @@ fn enclosing_owner_at(
         .map(|enclosing_owner| enclosing_owner.fq_name())
 }
 
-fn namespace_of_fq(fq_name: &str) -> String {
-    fq_name
-        .rsplit_once('.')
-        .map(|(namespace, _)| namespace.to_string())
-        .unwrap_or_default()
-}
-
-fn is_import_or_declaration_context(start: usize, source: &str, keywords: &[&str]) -> bool {
-    let line_start = source[..start].rfind('\n').map(|idx| idx + 1).unwrap_or(0);
-    let before = source[line_start..start].trim_start();
-    keywords
-        .iter()
-        .any(|keyword| before.starts_with(keyword) || before.ends_with(keyword))
-}
-
 fn qualified_candidate_text(node: Node<'_>, source: &str) -> String {
-    let (start, text) = if node.kind() == "namespace_name" {
-        (node.start_byte(), node_text(node, source).to_string())
-    } else if let Some(parent) = node.parent()
-        && parent.kind() == "namespace_name"
-        && node.end_byte() == parent.end_byte()
-    {
-        (parent.start_byte(), node_text(parent, source).to_string())
-    } else {
-        (node.start_byte(), node_text(node, source).to_string())
-    };
+    let mut candidate = node;
+    let mut parent = node.parent();
+    while let Some(ancestor) = parent {
+        let text = node_text(ancestor, source).trim();
+        if is_php_qualified_name_text(text) {
+            candidate = ancestor;
+            parent = ancestor.parent();
+        } else {
+            break;
+        }
+    }
+    let start = candidate.start_byte();
+    let text = node_text(candidate, source).trim().to_string();
     if source.get(..start).unwrap_or_default().ends_with('\\') {
         format!("\\{text}")
     } else {
         text
     }
+}
+
+fn is_php_qualified_name_text(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '\\'))
 }
 
 fn resolve_php_type(raw: &str, ctx: &FileContext) -> Option<String> {
@@ -1012,7 +953,7 @@ fn resolve_php_type(raw: &str, ctx: &FileContext) -> Option<String> {
     }
     let normalized = php_namespace_to_fq(first);
     let local = normalized.split('.').next().unwrap_or(normalized.as_str());
-    if let Some(imported) = ctx.aliases.get(local) {
+    if let Some(imported) = ctx.aliases.type_aliases.get(local) {
         if normalized == local {
             return Some(imported.clone());
         }
@@ -1034,7 +975,36 @@ fn resolve_php_function(raw: &str, ctx: &FileContext) -> Option<String> {
         return Some(php_namespace_to_fq(raw));
     }
     let normalized = php_namespace_to_fq(raw);
+    if let Some(imported) = ctx.aliases.function_aliases.get(&normalized) {
+        return Some(imported.clone());
+    }
     Some(join_namespace(&ctx.namespace, &normalized))
+}
+
+fn resolve_php_constant(raw: &str, ctx: &FileContext) -> Option<String> {
+    if raw.starts_with('\\') {
+        return Some(module_constant_fq(&php_namespace_to_fq(raw)));
+    }
+    let normalized = php_namespace_to_fq(raw);
+    if let Some(imported) = ctx.aliases.const_aliases.get(&normalized) {
+        return Some(module_constant_fq(imported));
+    }
+    Some(join_namespace(
+        &ctx.namespace,
+        &format!("_module_.{normalized}"),
+    ))
+}
+
+fn module_constant_fq(fq_name: &str) -> String {
+    if fq_name.contains("._module_.") {
+        return fq_name.to_string();
+    }
+    let public = public_php_fq_name(fq_name);
+    if let Some((namespace, name)) = public.rsplit_once('.') {
+        format!("{namespace}._module_.{name}")
+    } else {
+        format!("_module_.{public}")
+    }
 }
 
 fn join_namespace(namespace: &str, name: &str) -> String {

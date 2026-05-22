@@ -1,6 +1,6 @@
 mod common;
 
-use brokk_bifrost::analyzer::parse_php_use_aliases;
+use brokk_bifrost::analyzer::{parse_php_use_aliases, parse_php_use_aliases_by_kind};
 use brokk_bifrost::{CodeUnit, IAnalyzer, PhpAnalyzer, ProjectFile};
 use common::{assert_code_eq, definition, normalize_nonempty_lines, php_fixture_project};
 
@@ -289,4 +289,16 @@ fn test_php_use_alias_helper_handles_grouped_function_and_const_imports() {
 
     let const_import = parse_php_use_aliases("use const Vendor\\Package\\LIMIT;");
     assert_eq!("Vendor.Package.LIMIT", const_import["LIMIT"]);
+
+    let typed = parse_php_use_aliases_by_kind(
+        "use Vendor\\Package\\{Target, function helper as run_helper, const LIMIT};",
+    );
+    assert_eq!("Vendor.Package.Target", typed.type_aliases["Target"]);
+    assert_eq!(
+        "Vendor.Package.helper",
+        typed.function_aliases["run_helper"]
+    );
+    assert_eq!("Vendor.Package.LIMIT", typed.const_aliases["LIMIT"]);
+    assert!(!typed.function_aliases.contains_key("Target"));
+    assert!(!typed.const_aliases.contains_key("Target"));
 }

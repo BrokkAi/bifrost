@@ -355,7 +355,7 @@ const LIMIT = 10;
             "Consumer.php",
             r#"<?php
 namespace App;
-use Vendor\Package\{Target, helper as run_helper, LIMIT};
+use Vendor\Package\{Target, function helper as run_helper, const LIMIT};
 function consume(): void {
     new Target();
     run_helper();
@@ -727,6 +727,45 @@ function consume(Target $target, mixed $other): void {
 }
 
 #[test]
+fn php_graph_respects_receiver_assignment_order() {
+    let (_project, analyzer) = php_analyzer_with_files(&[
+        (
+            "Target.php",
+            r#"<?php
+namespace App;
+class Target {
+    public function run(): void {}
+}
+class Other {
+    public function run(): void {}
+}
+"#,
+        ),
+        (
+            "Consumer.php",
+            r#"<?php
+namespace App;
+function beforeAssignment($x): void {
+    $x->run();
+    $x = new Target();
+}
+function beforeReassignment(Target $target): void {
+    $target->run();
+    $target = new Other();
+}
+function mixed(Target $target): void {
+    $target->run();
+    $target = new Other();
+    $target->run();
+}
+"#,
+        ),
+    ]);
+
+    assert_eq!(2, graph_hits(&analyzer, "App.Target.run").len());
+}
+
+#[test]
 fn php_graph_resolves_simple_local_receiver_aliases() {
     let (_project, analyzer) = php_analyzer_with_files(&[
         (
@@ -751,6 +790,100 @@ function consume(Target $target): void {
     ]);
 
     assert_eq!(1, graph_hits(&analyzer, "App.Target.run").len());
+}
+
+#[test]
+fn php_graph_ignores_reference_names_inside_comments_and_strings() {
+    let (_project, analyzer) = php_analyzer_with_files(&[
+        (
+            "Symbols.php",
+            r#"<?php
+namespace App;
+class Target {
+    public function __construct() {}
+}
+function helper(): void {}
+const LIMIT = 1;
+"#,
+        ),
+        (
+            "Consumer.php",
+            r#"<?php
+namespace App;
+function consume(): void {
+    // new Target();
+    /* helper(); LIMIT Target */
+    $text = "Target helper( LIMIT new Target()";
+}
+"#,
+        ),
+    ]);
+
+    assert!(graph_hits(&analyzer, "App.Target").is_empty());
+    assert!(graph_hits(&analyzer, "App.Target.__construct").is_empty());
+    assert!(graph_hits(&analyzer, "App.helper").is_empty());
+    assert!(graph_hits(&analyzer, "App._module_.LIMIT").is_empty());
+}
+
+#[test]
+fn php_graph_keeps_import_kinds_separate() {
+    let (_project, analyzer) = php_analyzer_with_files(&[
+        (
+            "Lib.php",
+            r#"<?php
+namespace Vendor\Package;
+function helper(): void {}
+const LIMIT = 10;
+"#,
+        ),
+        (
+            "Consumer.php",
+            r#"<?php
+namespace App;
+use Vendor\Package\helper;
+use Vendor\Package\LIMIT;
+function consume(): void {
+    helper();
+    echo LIMIT;
+}
+"#,
+        ),
+    ]);
+
+    assert!(graph_hits(&analyzer, "Vendor.Package.helper").is_empty());
+    assert!(graph_hits(&analyzer, "Vendor.Package._module_.LIMIT").is_empty());
+}
+
+#[test]
+fn php_graph_resolves_function_and_const_import_kinds() {
+    let (_project, analyzer) = php_analyzer_with_files(&[
+        (
+            "Lib.php",
+            r#"<?php
+namespace Vendor\Package;
+function helper(): void {}
+const LIMIT = 10;
+"#,
+        ),
+        (
+            "Consumer.php",
+            r#"<?php
+namespace App;
+use function Vendor\Package\helper as run_helper;
+use const Vendor\Package\LIMIT as MAX_LIMIT;
+function consume(): void {
+    run_helper();
+    echo MAX_LIMIT;
+}
+"#,
+        ),
+    ]);
+
+    assert_eq!(1, graph_hits(&analyzer, "Vendor.Package.helper").len());
+    assert_eq!(
+        1,
+        graph_hits(&analyzer, "Vendor.Package._module_.LIMIT").len()
+    );
 }
 
 #[test]
