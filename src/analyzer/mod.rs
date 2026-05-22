@@ -48,7 +48,7 @@ pub use model::{
     metrics_from_declarations,
 };
 pub use multi_analyzer::{AnalyzerDelegate, MultiAnalyzer};
-pub use php_analyzer::PhpAnalyzer;
+pub use php_analyzer::{PhpAnalyzer, parse_php_use_aliases, php_namespace_to_fq};
 pub use project::{
     DEFAULT_MAX_OVERLAY_BYTES, FilesystemProject, OverlayProject, Project, TestProject,
 };

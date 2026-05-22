@@ -7,6 +7,7 @@ use crate::analyzer::{
     ProjectFile, Range, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
     TreeSitterAnalyzer,
 };
+use crate::hash::HashMap;
 use crate::{CloneSmell, CloneSmellWeights};
 use regex::Regex;
 use std::collections::BTreeSet;
@@ -119,6 +120,22 @@ impl PhpAnalyzer {
             && class_unit.is_class()
             && method.identifier() == "__construct"
             && method.fq_name() == format!("{}.__construct", class_unit.fq_name())
+    }
+
+    pub fn namespace_of_file(&self, file: &ProjectFile) -> String {
+        self.inner
+            .top_level_declarations(file)
+            .next()
+            .map(|unit| unit.package_name().to_string())
+            .unwrap_or_default()
+    }
+
+    pub fn use_aliases_of(&self, file: &ProjectFile) -> HashMap<String, String> {
+        let mut aliases = HashMap::default();
+        for import in self.inner.import_info_of(file) {
+            aliases.extend(parse_php_use_aliases(&import.raw_snippet));
+        }
+        aliases
     }
 }
 
@@ -606,6 +623,70 @@ fn file_language(file: &ProjectFile) -> Language {
         .and_then(|ext| ext.to_str())
         .map(Language::from_extension)
         .unwrap_or(Language::None)
+}
+
+pub fn parse_php_use_aliases(raw: &str) -> HashMap<String, String> {
+    let text = raw
+        .trim()
+        .trim_start_matches("use ")
+        .trim_start_matches("function ")
+        .trim_start_matches("const ")
+        .trim_end_matches(';')
+        .trim();
+    let mut aliases = HashMap::default();
+    if text.is_empty() {
+        return aliases;
+    }
+
+    if let Some((prefix, group)) = text.split_once('{') {
+        let prefix = prefix.trim().trim_end_matches('\\');
+        let group = group.trim_end_matches('}').trim();
+        for part in group.split(',') {
+            add_php_use_alias(prefix, part.trim(), &mut aliases);
+        }
+        return aliases;
+    }
+
+    add_php_use_alias("", text, &mut aliases);
+    aliases
+}
+
+fn add_php_use_alias(prefix: &str, raw_part: &str, aliases: &mut HashMap<String, String>) {
+    if raw_part.is_empty() {
+        return;
+    }
+    let (path, alias) = split_php_use_alias(raw_part);
+    let full_path = if prefix.is_empty() {
+        path
+    } else {
+        format!("{prefix}\\{path}")
+    };
+    let fq = php_namespace_to_fq(&full_path);
+    if fq.is_empty() {
+        return;
+    }
+    let local = alias.unwrap_or_else(|| fq.rsplit('.').next().unwrap_or(fq.as_str()).to_string());
+    aliases.insert(local, fq);
+}
+
+fn split_php_use_alias(raw_part: &str) -> (String, Option<String>) {
+    let normalized = raw_part.trim();
+    let lower = normalized.to_ascii_lowercase();
+    if let Some(index) = lower.rfind(" as ") {
+        let path = normalized[..index].trim().to_string();
+        let alias = normalized[index + 4..].trim().to_string();
+        return (path, (!alias.is_empty()).then_some(alias));
+    }
+    (normalized.to_string(), None)
+}
+
+pub fn php_namespace_to_fq(name: &str) -> String {
+    name.trim()
+        .trim_start_matches('\\')
+        .split('\\')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 const PHP_CLONE_AST_IDENTIFIER_TYPES: &[&str] = &["name", "variable_name"];

@@ -9,6 +9,7 @@ use crate::usages::go_graph::GoUsageGraphStrategy;
 use crate::usages::java_graph::JavaUsageGraphStrategy;
 use crate::usages::js_ts_graph::JsTsExportUsageGraphStrategy;
 use crate::usages::model::FuzzyResult;
+use crate::usages::php_graph::PhpUsageGraphStrategy;
 use crate::usages::python_graph::PythonExportUsageGraphStrategy;
 use crate::usages::regex_analyzer::RegexUsageAnalyzer;
 use crate::usages::rust_graph::RustExportUsageGraphStrategy;
@@ -68,6 +69,7 @@ impl UsageFinder {
             Language::Python,
             Box::new(PythonExportUsageGraphStrategy::new()),
         );
+        graph_analyzers.insert(Language::Php, Box::new(PhpUsageGraphStrategy::new()));
         graph_analyzers.insert(
             Language::Rust,
             Box::new(RustExportUsageGraphStrategy::new()),
