@@ -71,8 +71,9 @@ impl UsageAnalyzer for PhpUsageGraphStrategy {
             .collect();
 
         let mut hits = BTreeSet::new();
+        let hierarchy = PhpHierarchyIndex::build(php);
         for file in files {
-            scan_file(php, analyzer, &file, &spec, &mut hits);
+            scan_file(php, analyzer, &file, &spec, &hierarchy, &mut hits);
             if hits.len() > max_usages {
                 return FuzzyResult::TooManyCallsites {
                     short_name: target.short_name().to_string(),
@@ -172,7 +173,6 @@ fn target_language_for_file(file: &ProjectFile) -> Language {
 struct FileContext {
     namespace: String,
     aliases: HashMap<String, String>,
-    variables: HashMap<String, String>,
 }
 
 fn scan_file(
@@ -180,6 +180,7 @@ fn scan_file(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     spec: &TargetSpec,
+    hierarchy: &PhpHierarchyIndex,
     hits: &mut BTreeSet<UsageHit>,
 ) {
     let Ok(source) = file.read_to_string() else {
@@ -203,10 +204,8 @@ fn scan_file(
     let mut ctx = FileContext {
         namespace: php.namespace_of_file(file),
         aliases: php.use_aliases_of(file),
-        variables: HashMap::default(),
     };
     ctx.aliases.extend(source_use_aliases(&source));
-    seed_variable_types(&source, &mut ctx);
 
     let line_starts = compute_line_starts(&source);
     scan_node(
@@ -219,11 +218,23 @@ fn scan_file(
         spec,
         hits,
     );
-    scan_member_patterns(analyzer, file, &source, &line_starts, &ctx, spec, hits);
+    scan_member_patterns(
+        tree.root_node(),
+        analyzer,
+        file,
+        &source,
+        &line_starts,
+        &ctx,
+        hierarchy,
+        spec,
+        hits,
+    );
     scan_resolved_text_patterns(analyzer, file, &source, &line_starts, &ctx, spec, hits);
 }
 
-fn seed_variable_types(source: &str, ctx: &mut FileContext) {
+fn scoped_variable_types(source: &str, ctx: &FileContext) -> HashMap<String, String> {
+    let mut variables = HashMap::default();
+
     for captures in TYPED_VARIABLE_RE.captures_iter(source) {
         let Some(type_match) = captures.name("type") else {
             continue;
@@ -232,7 +243,7 @@ fn seed_variable_types(source: &str, ctx: &mut FileContext) {
             continue;
         };
         if let Some(fq) = resolve_php_type(type_match.as_str(), ctx) {
-            ctx.variables.insert(var_match.as_str().to_string(), fq);
+            variables.insert(var_match.as_str().to_string(), fq);
         }
     }
 
@@ -244,33 +255,37 @@ fn seed_variable_types(source: &str, ctx: &mut FileContext) {
             continue;
         };
         if let Some(fq) = resolve_php_type(type_match.as_str(), ctx) {
-            ctx.variables.insert(var_match.as_str().to_string(), fq);
+            variables.insert(var_match.as_str().to_string(), fq);
         }
     }
 
-    for captures in NEW_ASSIGNMENT_RE.captures_iter(source) {
-        let Some(var_match) = captures.name("var") else {
-            continue;
-        };
-        let Some(type_match) = captures.name("type") else {
-            continue;
-        };
-        if let Some(fq) = resolve_php_type(type_match.as_str(), ctx) {
-            ctx.variables.insert(var_match.as_str().to_string(), fq);
-        }
-    }
-
-    for captures in VARIABLE_ALIAS_RE.captures_iter(source) {
+    for captures in ASSIGNMENT_RE.captures_iter(source) {
         let Some(lhs_match) = captures.name("lhs") else {
             continue;
         };
         let Some(rhs_match) = captures.name("rhs") else {
             continue;
         };
-        if let Some(fq) = ctx.variables.get(rhs_match.as_str()).cloned() {
-            ctx.variables.insert(lhs_match.as_str().to_string(), fq);
+        let lhs = lhs_match.as_str().to_string();
+        let rhs = rhs_match.as_str().trim();
+        if let Some(type_name) = rhs.strip_prefix("new ").and_then(read_leading_type_name) {
+            if let Some(fq) = resolve_php_type(type_name, ctx) {
+                variables.insert(lhs, fq);
+            } else {
+                variables.remove(&lhs);
+            }
+        } else if let Some(rhs_var) = rhs.strip_prefix('$').and_then(read_leading_variable_name) {
+            if let Some(fq) = variables.get(rhs_var).cloned() {
+                variables.insert(lhs, fq);
+            } else {
+                variables.remove(&lhs);
+            }
+        } else {
+            variables.remove(&lhs);
         }
     }
+
+    variables
 }
 
 static TYPED_VARIABLE_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -280,13 +295,6 @@ static TYPED_VARIABLE_RE: LazyLock<Regex> = LazyLock::new(|| {
     .expect("valid PHP typed-variable regex")
 });
 
-static NEW_ASSIGNMENT_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"\$(?P<var>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*new\s+(?P<type>\\?[A-Za-z_][A-Za-z0-9_\\]*)",
-    )
-    .expect("valid PHP new-assignment regex")
-});
-
 static PARAMETER_VARIABLE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"[(,]\s*(?P<type>\\?[A-Za-z_][A-Za-z0-9_\\]*(?:\|\\?[A-Za-z_][A-Za-z0-9_\\]*)?)\s+\$(?P<var>[A-Za-z_][A-Za-z0-9_]*)",
@@ -294,9 +302,9 @@ static PARAMETER_VARIABLE_RE: LazyLock<Regex> = LazyLock::new(|| {
     .expect("valid PHP parameter-variable regex")
 });
 
-static VARIABLE_ALIAS_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\$(?P<lhs>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*\$(?P<rhs>[A-Za-z_][A-Za-z0-9_]*)\s*;")
-        .expect("valid PHP variable-alias regex")
+static ASSIGNMENT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\$(?P<lhs>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<rhs>[^;]+);")
+        .expect("valid PHP assignment regex")
 });
 
 static PHP_USE_RE: LazyLock<Regex> =
@@ -357,11 +365,7 @@ fn handle_candidate(
                 push_hit(node, analyzer, file, source, line_starts, spec, hits);
             }
         }
-        TargetKind::Method | TargetKind::Field => {
-            if node.kind() != "namespace_name" && is_member_reference(node, source, ctx, spec) {
-                push_hit(node, analyzer, file, source, line_starts, spec, hits);
-            }
-        }
+        TargetKind::Method | TargetKind::Field => {}
         TargetKind::Constant => {}
         TargetKind::Function => {
             if node.kind() != "namespace_name" && is_function_reference(node, source, ctx, spec) {
@@ -398,32 +402,6 @@ fn is_constructor_reference(
     }
     let raw = qualified_candidate_text(node, source);
     resolve_php_type(&raw, ctx).is_some_and(|fq| fq == owner)
-}
-
-fn is_member_reference(node: Node<'_>, source: &str, ctx: &FileContext, spec: &TargetSpec) -> bool {
-    let text = node_text(node, source).trim_start_matches('$');
-    if text != spec.member_name {
-        return false;
-    }
-    let Some(owner) = spec.owner_fq_name.as_deref() else {
-        return false;
-    };
-
-    if let Some(receiver) = static_receiver_before(node.start_byte(), source) {
-        if matches!(receiver.as_str(), "self" | "static" | "parent") {
-            return true;
-        }
-        return resolve_php_type(&receiver, ctx).is_some_and(|fq| fq == owner);
-    }
-
-    if let Some(receiver) = instance_receiver_before(node.start_byte(), source) {
-        return ctx
-            .variables
-            .get(receiver.trim_start_matches('$'))
-            .is_some_and(|fq| fq == owner);
-    }
-
-    false
 }
 
 fn is_function_reference(
@@ -523,12 +501,15 @@ fn push_hit_range(
     ));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scan_member_patterns(
+    root: Node<'_>,
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     source: &str,
     line_starts: &[usize],
     ctx: &FileContext,
+    hierarchy: &PhpHierarchyIndex,
     spec: &TargetSpec,
     hits: &mut BTreeSet<UsageHit>,
 ) {
@@ -543,25 +524,70 @@ fn scan_member_patterns(
         r"\$(?P<var>[A-Za-z_][A-Za-z0-9_]*)\s*->\s*(?P<member>{escaped_member})\b"
     ))
     .expect("valid PHP instance member regex");
-    for captures in instance.captures_iter(source) {
-        let Some(var_match) = captures.name("var") else {
+    for (scope_start, scope_end) in member_scope_ranges(root) {
+        let Some(scope_source) = source.get(scope_start..scope_end) else {
             continue;
         };
-        let receiver = var_match.as_str();
-        let member = captures.name("member").expect("member capture");
-        let receiver_matches = if receiver == "this" {
-            receiver_is_enclosing_owner(
+        let variables = scoped_variable_types(scope_source, ctx);
+        for captures in instance.captures_iter(scope_source) {
+            let Some(var_match) = captures.name("var") else {
+                continue;
+            };
+            let receiver = var_match.as_str();
+            let member = captures.name("member").expect("member capture");
+            let member_start = scope_start + member.start();
+            let member_end = scope_start + member.end();
+            let receiver_matches = if receiver == "this" {
+                receiver_is_enclosing_subtype(
+                    analyzer,
+                    file,
+                    member_start,
+                    member_end,
+                    line_starts,
+                    owner,
+                    hierarchy,
+                )
+            } else {
+                variables
+                    .get(receiver)
+                    .is_some_and(|fq| receiver_type_matches(fq, owner, hierarchy))
+            };
+            if !receiver_matches {
+                continue;
+            }
+            push_hit_range(
+                member_start,
+                member_end,
                 analyzer,
                 file,
-                member.start(),
-                member.end(),
+                source,
                 line_starts,
-                owner,
-            )
-        } else {
-            ctx.variables.get(receiver).is_some_and(|fq| fq == owner)
+                spec,
+                hits,
+            );
+        }
+    }
+
+    let static_member = Regex::new(&format!(
+        r"(?P<recv>\\?[A-Za-z_][A-Za-z0-9_\\]*)\s*::\s*\$?(?P<member>{escaped_member})\b"
+    ))
+    .expect("valid PHP static member regex");
+    for captures in static_member.captures_iter(source) {
+        let Some(receiver) = captures.name("recv") else {
+            continue;
         };
-        if !receiver_matches {
+        let member = captures.name("member").expect("member capture");
+        if !static_receiver_matches(
+            analyzer,
+            file,
+            member.start(),
+            member.end(),
+            line_starts,
+            receiver.as_str(),
+            owner,
+            ctx,
+            hierarchy,
+        ) {
             continue;
         }
         push_hit_range(
@@ -575,29 +601,188 @@ fn scan_member_patterns(
             hits,
         );
     }
+}
 
-    let static_member = Regex::new(&format!(
-        r"(?P<recv>\\?[A-Za-z_][A-Za-z0-9_\\]*)\s*::\s*(?P<member>{escaped_member})\b"
-    ))
-    .expect("valid PHP static member regex");
-    for captures in static_member.captures_iter(source) {
-        let Some(receiver) = captures.name("recv") else {
-            continue;
-        };
-        if resolve_php_type(receiver.as_str(), ctx).is_none_or(|fq| fq != owner) {
-            continue;
+fn member_scope_ranges(root: Node<'_>) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    collect_member_scope_ranges(root, &mut ranges);
+    ranges.sort_unstable();
+
+    let mut scoped = Vec::new();
+    let mut cursor = 0;
+    for (start, end) in ranges {
+        if cursor < start {
+            scoped.push((cursor, start));
         }
-        let member = captures.name("member").expect("member capture");
-        push_hit_range(
-            member.start(),
-            member.end(),
-            analyzer,
-            file,
-            source,
-            line_starts,
-            spec,
-            hits,
-        );
+        scoped.push((start, end));
+        cursor = cursor.max(end);
+    }
+    if cursor < root.end_byte() {
+        scoped.push((cursor, root.end_byte()));
+    }
+    scoped
+}
+
+fn collect_member_scope_ranges(node: Node<'_>, ranges: &mut Vec<(usize, usize)>) {
+    match node.kind() {
+        "function_definition" | "method_declaration" | "anonymous_function_creation" => {
+            ranges.push((node.start_byte(), node.end_byte()));
+            return;
+        }
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_member_scope_ranges(child, ranges);
+    }
+}
+
+fn read_leading_type_name(value: &str) -> Option<&str> {
+    let end = value
+        .char_indices()
+        .take_while(|(_, ch)| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '\\'))
+        .map(|(idx, ch)| idx + ch.len_utf8())
+        .last()
+        .unwrap_or(0);
+    (end > 0).then(|| &value[..end])
+}
+
+fn read_leading_variable_name(value: &str) -> Option<&str> {
+    let end = value
+        .char_indices()
+        .take_while(|(_, ch)| ch.is_ascii_alphanumeric() || *ch == '_')
+        .map(|(idx, ch)| idx + ch.len_utf8())
+        .last()
+        .unwrap_or(0);
+    (end > 0).then(|| &value[..end])
+}
+
+#[derive(Default)]
+struct PhpHierarchyIndex {
+    ancestors: HashMap<String, HashSet<String>>,
+    interfaces: HashSet<String>,
+}
+
+impl PhpHierarchyIndex {
+    fn build(php: &PhpAnalyzer) -> Self {
+        let mut hierarchy = Self::default();
+        for file in php.analyzed_files() {
+            if target_language_for_file(file) != Language::Php {
+                continue;
+            }
+            let Ok(source) = file.read_to_string() else {
+                continue;
+            };
+            let mut ctx = FileContext {
+                namespace: php.namespace_of_file(file),
+                aliases: php.use_aliases_of(file),
+            };
+            ctx.aliases.extend(source_use_aliases(&source));
+            hierarchy.extend_file(&source, &ctx);
+        }
+        hierarchy.close_transitively();
+        hierarchy
+    }
+
+    fn extend_file(&mut self, source: &str, ctx: &FileContext) {
+        for captures in TYPE_DECLARATION_RE.captures_iter(source) {
+            let Some(kind) = captures.name("kind") else {
+                continue;
+            };
+            let Some(name) = captures.name("name") else {
+                continue;
+            };
+            let Some(type_name) = resolve_php_type(name.as_str(), ctx) else {
+                continue;
+            };
+            if kind.as_str() == "interface" {
+                self.interfaces.insert(type_name.clone());
+            }
+            let parents = self.ancestors.entry(type_name).or_default();
+            if let Some(extends) = captures.name("extends") {
+                parents.extend(resolve_type_list(extends.as_str(), ctx));
+            }
+            if let Some(implements) = captures.name("implements") {
+                parents.extend(resolve_type_list(implements.as_str(), ctx));
+            }
+        }
+    }
+
+    fn close_transitively(&mut self) {
+        loop {
+            let snapshot = self.ancestors.clone();
+            let mut changed = false;
+            for parents in self.ancestors.values_mut() {
+                let current: Vec<String> = parents.iter().cloned().collect();
+                for parent in current {
+                    if let Some(grandparents) = snapshot.get(&parent) {
+                        for grandparent in grandparents {
+                            changed |= parents.insert(grandparent.clone());
+                        }
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+}
+
+static TYPE_DECLARATION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"\b(?P<kind>class|interface|trait)\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?:\s+extends\s+(?P<extends>[^ {]+(?:\s*,\s*[^ {]+)*))?(?:\s+implements\s+(?P<implements>[^ {]+(?:\s*,\s*[^ {]+)*))?",
+    )
+    .expect("valid PHP type declaration regex")
+});
+
+fn resolve_type_list(raw: &str, ctx: &FileContext) -> Vec<String> {
+    raw.split(',')
+        .filter_map(|name| resolve_php_type(name.trim(), ctx))
+        .collect()
+}
+
+fn receiver_type_matches(
+    receiver_fq_name: &str,
+    owner: &str,
+    hierarchy: &PhpHierarchyIndex,
+) -> bool {
+    if receiver_fq_name == owner {
+        return !hierarchy.interfaces.contains(owner);
+    }
+    hierarchy
+        .ancestors
+        .get(receiver_fq_name)
+        .is_some_and(|ancestors| ancestors.contains(owner))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn static_receiver_matches(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    start: usize,
+    end: usize,
+    line_starts: &[usize],
+    receiver: &str,
+    owner: &str,
+    ctx: &FileContext,
+    hierarchy: &PhpHierarchyIndex,
+) -> bool {
+    match receiver {
+        "self" | "static" => {
+            receiver_is_enclosing_subtype(analyzer, file, start, end, line_starts, owner, hierarchy)
+        }
+        "parent" => enclosing_owner_at(analyzer, file, start, end, line_starts).is_some_and(
+            |enclosing_owner| {
+                hierarchy
+                    .ancestors
+                    .get(&enclosing_owner)
+                    .is_some_and(|ancestors| ancestors.contains(owner))
+            },
+        ),
+        _ => resolve_php_type(receiver, ctx)
+            .is_some_and(|fq| receiver_type_matches(&fq, owner, hierarchy)),
     }
 }
 
@@ -752,14 +937,26 @@ fn public_php_fq_name(fq_name: &str) -> String {
     fq_name.replace("._module_.", ".")
 }
 
-fn receiver_is_enclosing_owner(
+fn receiver_is_enclosing_subtype(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     start: usize,
     end: usize,
     line_starts: &[usize],
     owner: &str,
+    hierarchy: &PhpHierarchyIndex,
 ) -> bool {
+    enclosing_owner_at(analyzer, file, start, end, line_starts)
+        .is_some_and(|receiver| receiver_type_matches(&receiver, owner, hierarchy))
+}
+
+fn enclosing_owner_at(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    start: usize,
+    end: usize,
+    line_starts: &[usize],
+) -> Option<String> {
     let range = Range {
         start_byte: start,
         end_byte: end,
@@ -769,7 +966,7 @@ fn receiver_is_enclosing_owner(
     analyzer
         .enclosing_code_unit(file, &range)
         .and_then(|enclosing| analyzer.parent_of(&enclosing).or(Some(enclosing)))
-        .is_some_and(|enclosing_owner| enclosing_owner.fq_name() == owner)
+        .map(|enclosing_owner| enclosing_owner.fq_name())
 }
 
 fn namespace_of_fq(fq_name: &str) -> String {
@@ -848,32 +1045,6 @@ fn join_namespace(namespace: &str, name: &str) -> String {
     } else {
         format!("{namespace}.{name}")
     }
-}
-
-fn static_receiver_before(start: usize, source: &str) -> Option<String> {
-    let prefix = source.get(..start)?;
-    let before = prefix.trim_end();
-    let before = before.strip_suffix("::")?.trim_end();
-    read_identifier_backwards(before)
-}
-
-fn instance_receiver_before(start: usize, source: &str) -> Option<String> {
-    let prefix = source.get(..start)?;
-    let before = prefix.trim_end();
-    let before = before.strip_suffix("->")?.trim_end();
-    read_identifier_backwards(before)
-}
-
-fn read_identifier_backwards(value: &str) -> Option<String> {
-    let mut start = value.len();
-    for (idx, ch) in value.char_indices().rev() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '\\' | '$') {
-            start = idx;
-        } else {
-            break;
-        }
-    }
-    (start < value.len()).then(|| value[start..].to_string())
 }
 
 fn has_token_before(start: usize, source: &str, token: &str) -> bool {

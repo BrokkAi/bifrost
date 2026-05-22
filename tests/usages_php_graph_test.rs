@@ -220,6 +220,16 @@ function consume(Target $target): void {
         .into_either()
         .expect("instance method success");
     assert_eq!(2, method_hits.len());
+    assert!(
+        method_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("$target->run();"))
+    );
+    assert!(
+        method_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("$local->run();"))
+    );
 
     let property = definition(&analyzer, "App.Target.name");
     let property_hits = PhpUsageGraphStrategy::new()
@@ -535,7 +545,7 @@ class Target extends Base {
 }
 
 #[test]
-fn php_graph_keeps_unproven_interface_and_inherited_receivers_empty() {
+fn php_graph_counts_inherited_and_concrete_interface_receivers() {
     let (_project, analyzer) = php_analyzer_with_files(&[
         (
             "Service.php",
@@ -564,7 +574,64 @@ function byChild(Child $child): void {
         ),
     ]);
 
-    assert!(graph_hits(&analyzer, "App.Target.run").is_empty());
+    assert_eq!(1, graph_hits(&analyzer, "App.Target.run").len());
+    assert_eq!(1, graph_hits(&analyzer, "App.Service.run").len());
+}
+
+#[test]
+fn php_graph_counts_interface_member_when_concrete_receiver_is_proven() {
+    let (_project, analyzer) = php_analyzer_with_files(&[
+        (
+            "Service.php",
+            r#"<?php
+namespace App;
+interface Service {
+    public function run(): void;
+}
+class Target implements Service {
+    public function run(): void {}
+}
+"#,
+        ),
+        (
+            "Consumer.php",
+            r#"<?php
+namespace App;
+function consume(): void {
+    $target = new Target();
+    $target->run();
+}
+"#,
+        ),
+    ]);
+
+    assert_eq!(1, graph_hits(&analyzer, "App.Service.run").len());
+}
+
+#[test]
+fn php_graph_keeps_interface_typed_receiver_unproven() {
+    let (_project, analyzer) = php_analyzer_with_files(&[
+        (
+            "Service.php",
+            r#"<?php
+namespace App;
+interface Service {
+    public function run(): void;
+}
+"#,
+        ),
+        (
+            "Consumer.php",
+            r#"<?php
+namespace App;
+function consume(Service $service): void {
+    $service->run();
+}
+"#,
+        ),
+    ]);
+
+    assert!(graph_hits(&analyzer, "App.Service.run").is_empty());
 }
 
 #[test]
@@ -595,6 +662,61 @@ function unknown($target): void {
 }
 function sibling(Target $target): void {}
 function otherSibling($target): void {
+    $target->run();
+}
+"#,
+        ),
+    ]);
+
+    assert!(graph_hits(&analyzer, "App.Target.run").is_empty());
+}
+
+#[test]
+fn php_graph_scopes_receiver_facts_to_enclosing_functions() {
+    let (_project, analyzer) = php_analyzer_with_files(&[
+        (
+            "Target.php",
+            r#"<?php
+namespace App;
+class Target {
+    public function run(): void {}
+}
+"#,
+        ),
+        (
+            "Consumer.php",
+            r#"<?php
+namespace App;
+function first(Target $target): void {
+}
+function second($target): void {
+    $target->run();
+}
+"#,
+        ),
+    ]);
+
+    assert!(graph_hits(&analyzer, "App.Target.run").is_empty());
+}
+
+#[test]
+fn php_graph_invalidates_receiver_after_unknown_reassignment() {
+    let (_project, analyzer) = php_analyzer_with_files(&[
+        (
+            "Target.php",
+            r#"<?php
+namespace App;
+class Target {
+    public function run(): void {}
+}
+"#,
+        ),
+        (
+            "Consumer.php",
+            r#"<?php
+namespace App;
+function consume(Target $target, mixed $other): void {
+    $target = $other;
     $target->run();
 }
 "#,
