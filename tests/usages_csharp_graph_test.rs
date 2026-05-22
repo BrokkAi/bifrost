@@ -82,8 +82,39 @@ fn signature_arity(signature: Option<&str>) -> usize {
     if inner.is_empty() {
         0
     } else {
-        inner.split(',').count()
+        count_top_level_comma_separated(inner)
     }
+}
+
+fn count_top_level_comma_separated(text: &str) -> usize {
+    let mut count = 1;
+    let mut angle_depth: usize = 0;
+    let mut paren_depth: usize = 0;
+    let mut bracket_depth: usize = 0;
+    let mut brace_depth: usize = 0;
+
+    for ch in text.chars() {
+        match ch {
+            '<' => angle_depth = angle_depth.saturating_add(1),
+            '>' if angle_depth > 0 => angle_depth -= 1,
+            '(' => paren_depth = paren_depth.saturating_add(1),
+            ')' if paren_depth > 0 => paren_depth -= 1,
+            '[' => bracket_depth = bracket_depth.saturating_add(1),
+            ']' if bracket_depth > 0 => bracket_depth -= 1,
+            '{' => brace_depth = brace_depth.saturating_add(1),
+            '}' if brace_depth > 0 => brace_depth -= 1,
+            ',' if angle_depth == 0
+                && paren_depth == 0
+                && bracket_depth == 0
+                && brace_depth == 0 =>
+            {
+                count += 1;
+            }
+            _ => {}
+        }
+    }
+
+    count
 }
 
 fn graph_hits(
@@ -294,6 +325,47 @@ namespace App {
 }
 
 #[test]
+fn csharp_graph_counts_nested_argument_lists_for_overload_arity() {
+    let (_project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Domain/Target.cs",
+            r#"
+using System.Collections.Generic;
+
+namespace Domain {
+    public class Target {
+        public void Run(Dictionary<string, int> values) {}
+        public void Run(Dictionary<string, int> values, int count) {}
+    }
+}
+"#,
+        ),
+        (
+            "App/Consumer.cs",
+            r#"
+using System.Collections.Generic;
+using Domain;
+
+namespace App {
+    public class Consumer {
+        public void Execute(Target target) {
+            target.Run(new Dictionary<string, int>());
+            target.Run(new Dictionary<string, int>(), 1);
+        }
+    }
+}
+"#,
+        ),
+    ]);
+
+    let run_one = member_function_with_arity(&analyzer, "Domain.Target", "Run", 1);
+    let run_two = member_function_with_arity(&analyzer, "Domain.Target", "Run", 2);
+
+    assert_eq!(1, graph_hits(&analyzer, &run_one).len());
+    assert_eq!(1, graph_hits(&analyzer, &run_two).len());
+}
+
+#[test]
 fn csharp_graph_finds_constructors_inheritance_and_generic_type_arguments() {
     let (_project, analyzer) = csharp_analyzer_with_files(&[
         (
@@ -406,6 +478,48 @@ namespace App {
 }
 
 #[test]
+fn csharp_graph_keeps_receiver_bindings_method_scoped() {
+    let (_project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Domain/Target.cs",
+            "namespace Domain { public class Target { public void Run() {} } }\n",
+        ),
+        (
+            "App/Consumer.cs",
+            r#"
+using Domain;
+
+namespace App {
+    public class Consumer {
+        public void First() {
+            Target local = new Target();
+        }
+
+        public void Second() {
+            local.Run();
+        }
+    }
+}
+"#,
+        ),
+    ]);
+
+    let run = member_function(&analyzer, "Domain.Target", "Run");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let result = CSharpUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&run),
+        &candidates,
+        1000,
+    );
+
+    assert!(
+        matches!(result, FuzzyResult::Failure { .. }),
+        "a receiver declared in another method must not prove this member hit"
+    );
+}
+
+#[test]
 fn csharp_graph_finds_static_and_instance_member_references() {
     let (_project, analyzer) = csharp_analyzer_with_files(&[
         (
@@ -512,6 +626,119 @@ namespace App {
     assert_eq!(1, graph_hits(&analyzer, &name).len());
     assert_eq!(2, graph_hits(&analyzer, &value).len());
     assert_eq!(2, graph_hits(&analyzer, &size).len());
+}
+
+#[test]
+fn csharp_graph_resolves_fully_qualified_static_member_references() {
+    let (_project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Domain/Target.cs",
+            r#"
+namespace Domain {
+    public class Target {
+        public static int Count;
+        public static string Name { get; set; }
+        public static void Configure() {}
+    }
+}
+"#,
+        ),
+        (
+            "App/Consumer.cs",
+            r#"
+namespace App {
+    public class Consumer {
+        public void Execute() {
+            Domain.Target.Configure();
+            Domain.Target.Count = Domain.Target.Count + 1;
+            var name = Domain.Target.Name;
+        }
+    }
+}
+"#,
+        ),
+    ]);
+
+    let configure = member_function(&analyzer, "Domain.Target", "Configure");
+    let count = member_field(&analyzer, "Domain.Target", "Count");
+    let name = member_field(&analyzer, "Domain.Target", "Name");
+
+    assert_eq!(1, graph_hits(&analyzer, &configure).len());
+    assert_eq!(2, graph_hits(&analyzer, &count).len());
+    assert_eq!(1, graph_hits(&analyzer, &name).len());
+}
+
+#[test]
+fn usage_finder_csharp_candidate_routing_covers_using_and_same_namespace() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Shared/Target.cs",
+            "namespace Shared { public class Target { } }\n",
+        ),
+        (
+            "Shared/SameNamespace.cs",
+            r#"
+namespace Shared {
+    public class SameNamespace {
+        private Target same;
+    }
+}
+"#,
+        ),
+        (
+            "App/UsingConsumer.cs",
+            r#"
+using Shared;
+
+namespace App {
+    public class UsingConsumer {
+        private Target imported;
+    }
+}
+"#,
+        ),
+        (
+            "Other/Unrelated.cs",
+            "namespace Other { public class Unrelated { } }\n",
+        ),
+    ]);
+
+    let target = type_definition(&analyzer, "Shared.Target");
+    let query = UsageFinder::new().query(&analyzer, std::slice::from_ref(&target), 1000, 1000);
+
+    assert!(
+        query
+            .candidate_files
+            .contains(&project.file("Shared/Target.cs"))
+    );
+    assert!(
+        query
+            .candidate_files
+            .contains(&project.file("Shared/SameNamespace.cs")),
+        "same-namespace files should be routed to the C# graph"
+    );
+    assert!(
+        query
+            .candidate_files
+            .contains(&project.file("App/UsingConsumer.cs")),
+        "using-importing files should be routed to the C# graph"
+    );
+    assert!(
+        !query
+            .candidate_files
+            .contains(&project.file("Other/Unrelated.cs")),
+        "unrelated files should not be candidate files for this target"
+    );
+
+    let hits = query.result.into_either().expect("csharp graph success");
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == project.file("Shared/SameNamespace.cs"))
+    );
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == project.file("App/UsingConsumer.cs"))
+    );
 }
 
 #[test]

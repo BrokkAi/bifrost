@@ -198,7 +198,7 @@ fn signature_arity(signature: Option<&str>) -> usize {
     if inner.is_empty() {
         return 0;
     }
-    inner.split(',').count()
+    count_top_level_comma_separated(inner)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -233,8 +233,6 @@ fn scan_file(
         return;
     };
     let line_starts = compute_line_starts(&source);
-    let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
-    seed_bindings(tree.root_node(), csharp, file, &source, &mut bindings);
 
     let mut ctx = ScanCtx {
         csharp,
@@ -243,7 +241,6 @@ fn scan_file(
         source: &source,
         line_starts: &line_starts,
         spec,
-        bindings,
         hits,
         saw_unproven_match,
         max_usages,
@@ -260,7 +257,6 @@ struct ScanCtx<'a> {
     source: &'a str,
     line_starts: &'a [usize],
     spec: &'a TargetSpec,
-    bindings: LocalInferenceEngine<String>,
     hits: &'a mut BTreeSet<UsageHit>,
     saw_unproven_match: &'a mut bool,
     max_usages: usize,
@@ -364,7 +360,15 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
 
-    match ctx.bindings.resolve_symbol(receiver) {
+    let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
+    seed_bindings(
+        binding_scope_node(node),
+        ctx.csharp,
+        ctx.file,
+        ctx.source,
+        &mut bindings,
+    );
+    match bindings.resolve_symbol(receiver) {
         crate::usages::local_inference::SymbolResolution::Precise(targets)
             if targets
                 .iter()
@@ -380,6 +384,23 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             *ctx.saw_unproven_match = true;
         }
     }
+}
+
+fn binding_scope_node(mut node: Node<'_>) -> Node<'_> {
+    while let Some(parent) = node.parent() {
+        if matches!(
+            parent.kind(),
+            "method_declaration"
+                | "constructor_declaration"
+                | "property_declaration"
+                | "accessor_declaration"
+                | "local_function_statement"
+        ) {
+            return parent;
+        }
+        node = parent;
+    }
+    node
 }
 
 fn seed_bindings(
@@ -582,13 +603,61 @@ fn argument_count(node: Node<'_>, source: &str) -> usize {
     else {
         return 0;
     };
-    node_text(arguments, source)
+    let inner = node_text(arguments, source)
         .trim()
         .trim_start_matches('(')
         .trim_end_matches(')')
-        .split(',')
-        .filter(|part| !part.trim().is_empty())
-        .count()
+        .trim();
+    count_top_level_comma_separated(inner)
+}
+
+fn count_top_level_comma_separated(text: &str) -> usize {
+    if text.trim().is_empty() {
+        return 0;
+    }
+
+    let mut count = 1;
+    let mut angle_depth: usize = 0;
+    let mut paren_depth: usize = 0;
+    let mut bracket_depth: usize = 0;
+    let mut brace_depth: usize = 0;
+    let mut string_quote: Option<char> = None;
+    let mut escaped = false;
+
+    for ch in text.chars() {
+        if let Some(quote) = string_quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == quote {
+                string_quote = None;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' | '\'' => string_quote = Some(ch),
+            '<' => angle_depth = angle_depth.saturating_add(1),
+            '>' if angle_depth > 0 => angle_depth -= 1,
+            '(' => paren_depth = paren_depth.saturating_add(1),
+            ')' if paren_depth > 0 => paren_depth -= 1,
+            '[' => bracket_depth = bracket_depth.saturating_add(1),
+            ']' if bracket_depth > 0 => bracket_depth -= 1,
+            '{' => brace_depth = brace_depth.saturating_add(1),
+            '}' if brace_depth > 0 => brace_depth -= 1,
+            ',' if angle_depth == 0
+                && paren_depth == 0
+                && bracket_depth == 0
+                && brace_depth == 0 =>
+            {
+                count += 1;
+            }
+            _ => {}
+        }
+    }
+
+    count
 }
 
 fn first_named_child_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
