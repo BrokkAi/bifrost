@@ -23,6 +23,7 @@ mod java_graph;
 mod js_ts_graph;
 mod local_inference;
 mod model;
+mod php_graph;
 mod python_graph;
 mod regex_analyzer;
 mod rust_graph;
@@ -45,6 +46,7 @@ pub use model::{
     ImportKind, ReceiverTargetRef, ReexportStar, ReferenceCandidate, ReferenceGraphResult,
     ReferenceHit, ReferenceKind, ResolvedReceiverCandidate, UsageHit,
 };
+pub use php_graph::PhpUsageGraphStrategy;
 pub use python_graph::PythonExportUsageGraphStrategy;
 pub use regex_analyzer::RegexUsageAnalyzer;
 pub use rust_graph::RustExportUsageGraphStrategy;
