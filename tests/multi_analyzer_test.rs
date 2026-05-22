@@ -1,8 +1,8 @@
 mod common;
 
 use brokk_bifrost::{
-    AnalyzerDelegate, CodeUnit, CodeUnitType, IAnalyzer, JavaAnalyzer, Language, MultiAnalyzer,
-    ProjectFile, WorkspaceAnalyzer,
+    AnalyzerDelegate, CodeUnit, CodeUnitType, IAnalyzer, ImportAnalysisProvider, JavaAnalyzer,
+    Language, MultiAnalyzer, ProjectFile, ScalaAnalyzer, WorkspaceAnalyzer,
 };
 use std::collections::BTreeMap;
 
@@ -224,5 +224,29 @@ fn inferred_inline_project_builds_multi_workspace_analyzer() {
     assert_eq!(
         std::collections::BTreeSet::from([Language::Java, Language::Python]),
         workspace.analyzer().languages()
+    );
+}
+
+#[test]
+fn scala_import_analysis_does_not_pollute_non_scala_candidates() {
+    let project = InlineTestProject::new()
+        .file("A.java", "class A {}")
+        .file("Default.scala", "class Default\n")
+        .build();
+    let multi = MultiAnalyzer::new(BTreeMap::from([
+        (
+            Language::Java,
+            AnalyzerDelegate::Java(JavaAnalyzer::from_project(project.project().clone())),
+        ),
+        (
+            Language::Scala,
+            AnalyzerDelegate::Scala(ScalaAnalyzer::from_project(project.project().clone())),
+        ),
+    ]));
+    let java_file = ProjectFile::new(project.root().to_path_buf(), "A.java");
+
+    assert!(
+        multi.referencing_files_of(&java_file).is_empty(),
+        "Scala import analysis should ignore non-Scala target files"
     );
 }

@@ -4,11 +4,10 @@ use crate::analyzer::{
 };
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
+use crate::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::usages::model::{FuzzyResult, UsageHit};
 use crate::usages::traits::UsageAnalyzer;
-use regex::Regex;
 use std::collections::BTreeSet;
-use std::sync::LazyLock;
 use tree_sitter::{Node, Parser};
 
 const GRAPH_HIT_CONFIDENCE: f64 = 1.0;
@@ -72,14 +71,26 @@ impl UsageAnalyzer for ScalaUsageGraphStrategy {
             .collect();
 
         let mut hits = BTreeSet::new();
+        let mut limit_exceeded = false;
         for file in files {
-            scan_file(scala, analyzer, &file, &spec, &mut hits);
+            scan_file(
+                scala,
+                analyzer,
+                &file,
+                &spec,
+                &mut hits,
+                max_usages,
+                &mut limit_exceeded,
+            );
             if hits.len() > max_usages {
                 return FuzzyResult::TooManyCallsites {
                     short_name: target.short_name().to_string(),
                     total_callsites: hits.len(),
                     limit: max_usages,
                 };
+            }
+            if limit_exceeded {
+                break;
             }
         }
 
@@ -202,7 +213,12 @@ fn scan_file(
     file: &ProjectFile,
     spec: &TargetSpec,
     hits: &mut BTreeSet<UsageHit>,
+    max_usages: usize,
+    limit_exceeded: &mut bool,
 ) {
+    if *limit_exceeded {
+        return;
+    }
     let Ok(source) = file.read_to_string() else {
         return;
     };
@@ -221,8 +237,7 @@ fn scan_file(
     };
     let line_starts = compute_line_starts(&source);
     let visibility = Visibility::for_file(scala, file, spec);
-    let receiver_bindings =
-        infer_receivers(&source, analyzer, file, &line_starts, &visibility, spec);
+    let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
     let mut ctx = ScanCtx {
         scala,
         analyzer,
@@ -231,8 +246,10 @@ fn scan_file(
         line_starts: &line_starts,
         spec,
         visibility,
-        receiver_bindings,
+        bindings: &mut bindings,
         hits,
+        max_usages,
+        limit_exceeded,
         enclosing_cache: HashMap::default(),
     };
     scan_node(tree.root_node(), &mut ctx);
@@ -328,6 +345,9 @@ impl Visibility {
             .is_some_and(|owner_fq| normalized == *owner_fq)
         {
             self.owner_names.insert(local_name.clone());
+            if spec.kind == TargetKind::Constructor {
+                self.type_names.insert(local_name.clone());
+            }
         }
         if normalized == spec.target_fq_name && spec.kind != TargetKind::Type {
             self.direct_member_names.insert(local_name);
@@ -343,18 +363,307 @@ struct ScanCtx<'a> {
     line_starts: &'a [usize],
     spec: &'a TargetSpec,
     visibility: Visibility,
-    receiver_bindings: Vec<ReceiverBinding>,
+    bindings: &'a mut LocalInferenceEngine<String>,
     hits: &'a mut BTreeSet<UsageHit>,
+    max_usages: usize,
+    limit_exceeded: &'a mut bool,
     enclosing_cache: HashMap<(usize, usize), Option<CodeUnit>>,
 }
 
 fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if *ctx.limit_exceeded {
+        return;
+    }
+    seed_parent_scope_declarations(node, ctx);
+    let enters_scope = enters_local_scope(node);
+    if enters_scope {
+        ctx.bindings.enter_scope();
+        seed_scope_declarations(node, ctx);
+    } else {
+        seed_inline_declarations(node, ctx);
+    }
+
+    if node.kind() == "call_expression" {
+        scan_call_expression(node, ctx);
+    }
     if is_identifier_node(node) {
         scan_identifier(node, ctx);
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         scan_node(child, ctx);
+        if *ctx.limit_exceeded {
+            break;
+        }
+    }
+
+    if enters_scope {
+        ctx.bindings.exit_scope();
+    }
+}
+
+fn scan_call_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if !matches!(ctx.spec.kind, TargetKind::Method) {
+        return;
+    }
+    let Some(function) = node.child_by_field_name("function") else {
+        return;
+    };
+    let text = node_text(function, ctx.source).trim();
+    if text != ctx.spec.member_name || has_dot_qualifier(function, ctx.source) {
+        return;
+    }
+    if !is_locally_shadowed(ctx, text)
+        && enclosing_matches_owner(function, ctx)
+        && member_call_arity_matches(function, ctx)
+    {
+        add_hit(function, ctx);
+    }
+}
+
+fn seed_parent_scope_declarations(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if node.kind() != "function_definition" || !has_ancestor_kind(node, "function_definition") {
+        return;
+    }
+    if let Some(name) = node.child_by_field_name("name") {
+        let name = node_text(name, ctx.source).trim();
+        if !name.is_empty() {
+            ctx.bindings.declare_shadow(name.to_string());
+        }
+    }
+}
+
+fn enters_local_scope(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "class_definition"
+            | "object_definition"
+            | "trait_definition"
+            | "enum_definition"
+            | "function_definition"
+            | "block"
+            | "block_expression"
+            | "case_clause"
+            | "lambda_expression"
+            | "anonymous_function"
+    )
+}
+
+fn seed_scope_declarations(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    match node.kind() {
+        "class_definition" | "object_definition" | "trait_definition" | "enum_definition" => {
+            seed_owner_field_bindings(node, ctx);
+        }
+        "function_definition" => {
+            if let Some(name) = node.child_by_field_name("name") {
+                let name = node_text(name, ctx.source).trim();
+                if !name.is_empty() {
+                    ctx.bindings.declare_shadow(name.to_string());
+                }
+            }
+            seed_parameter_bindings(node, ctx);
+        }
+        "case_clause" => seed_case_pattern_shadow(node, ctx),
+        _ => {}
+    }
+}
+
+fn seed_inline_declarations(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    match node.kind() {
+        "val_definition" | "var_definition" => seed_value_definition(node, ctx),
+        "function_definition" => {
+            if let Some(name) = node.child_by_field_name("name") {
+                let name = node_text(name, ctx.source).trim();
+                if !name.is_empty() {
+                    ctx.bindings.declare_shadow(name.to_string());
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn seed_owner_field_bindings(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if ctx.spec.owner.is_none() {
+        return;
+    }
+    if !enclosing_type_matches_owner(node, ctx) {
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if matches!(child.kind(), "template_body" | "enum_body") {
+            seed_direct_field_bindings(child, ctx);
+        }
+    }
+}
+
+fn seed_direct_field_bindings(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "val_definition" | "var_definition" => seed_value_definition(child, ctx),
+            "function_definition"
+            | "class_definition"
+            | "object_definition"
+            | "trait_definition"
+            | "enum_definition" => {}
+            _ => seed_direct_field_bindings(child, ctx),
+        }
+    }
+}
+
+fn enclosing_type_matches_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    let Some(owner_name) = ctx.spec.owner_name.as_deref() else {
+        return false;
+    };
+    node.child_by_field_name("name")
+        .map(|name| node_text(name, ctx.source).trim().trim_end_matches('$') == owner_name)
+        .unwrap_or(false)
+}
+
+fn seed_parameter_bindings(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() != "parameters" {
+            continue;
+        }
+        for (name, type_name) in typed_parameter_pairs(node_text(child, ctx.source)) {
+            seed_or_shadow_typed_symbol(name, Some(type_name), None, ctx);
+        }
+    }
+}
+
+fn typed_parameter_pairs(parameters: &str) -> Vec<(&str, &str)> {
+    let inner = parameters
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')');
+    split_top_level_commas(inner)
+        .filter_map(|part| {
+            let (name, type_text) = part.split_once(':')?;
+            let name = name.trim();
+            let type_name = simple_type_name(type_text.trim())?;
+            (!name.is_empty()).then_some((name, type_name))
+        })
+        .collect()
+}
+
+fn seed_value_definition(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let Some(pattern) = node.child_by_field_name("pattern") else {
+        seed_value_definition_from_text(node_text(node, ctx.source), ctx);
+        return;
+    };
+    let type_name = node
+        .child_by_field_name("type")
+        .and_then(|type_node| simple_type_name(node_text(type_node, ctx.source).trim()));
+    let value_name = node
+        .child_by_field_name("value")
+        .and_then(|value_node| constructor_type_name(node_text(value_node, ctx.source)));
+    if type_name.is_none() && value_name.is_none() {
+        seed_value_definition_from_text(node_text(node, ctx.source), ctx);
+        return;
+    }
+    for name in pattern_names(pattern, ctx.source) {
+        seed_or_shadow_typed_symbol(name, type_name, value_name, ctx);
+    }
+}
+
+fn seed_value_definition_from_text(text: &str, ctx: &mut ScanCtx<'_>) {
+    let trimmed = text.trim_start();
+    let Some(after_keyword) = trimmed
+        .strip_prefix("val ")
+        .or_else(|| trimmed.strip_prefix("var "))
+    else {
+        return;
+    };
+    let name_end = after_keyword
+        .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .unwrap_or(after_keyword.len());
+    if name_end == 0 {
+        return;
+    }
+    let name = &after_keyword[..name_end];
+    let rest = after_keyword[name_end..].trim_start();
+    let type_name = rest
+        .strip_prefix(':')
+        .and_then(|after_colon| simple_type_name(after_colon.trim_start()));
+    let value_name = rest
+        .split_once('=')
+        .and_then(|(_, value)| constructor_type_name(value));
+    seed_or_shadow_typed_symbol(name, type_name, value_name, ctx);
+}
+
+fn seed_or_shadow_typed_symbol(
+    name: &str,
+    type_name: Option<&str>,
+    value_name: Option<&str>,
+    ctx: &mut ScanCtx<'_>,
+) {
+    let visible_type = type_name
+        .or(value_name)
+        .filter(|name| ctx.visibility.owner_names.contains(*name));
+    if let Some(_type_name) = visible_type
+        && let Some(owner_fq_name) = ctx.spec.owner_fq_name.as_ref()
+    {
+        ctx.bindings
+            .seed_symbol(name.to_string(), owner_fq_name.clone());
+        return;
+    }
+    ctx.bindings.declare_shadow(name.to_string());
+}
+
+fn simple_type_name(type_text: &str) -> Option<&str> {
+    type_text
+        .split(['[', '(', '{', '.', ' '])
+        .next()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+}
+
+fn constructor_type_name(value_text: &str) -> Option<&str> {
+    let trimmed = value_text.trim_start();
+    let trimmed = trimmed.strip_prefix("new ").unwrap_or(trimmed).trim_start();
+    let end = trimmed
+        .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .unwrap_or(trimmed.len());
+    (end > 0).then_some(&trimmed[..end])
+}
+
+fn pattern_names<'a>(node: Node<'_>, source: &'a str) -> Vec<&'a str> {
+    match node.kind() {
+        "identifier" | "operator_identifier" => {
+            let name = node_text(node, source).trim();
+            if name.is_empty() {
+                Vec::new()
+            } else {
+                vec![name]
+            }
+        }
+        "identifiers" | "tuple_pattern" | "pattern" => {
+            let mut names = Vec::new();
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                names.extend(pattern_names(child, source));
+            }
+            names
+        }
+        _ => {
+            let mut names = Vec::new();
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                names.extend(pattern_names(child, source));
+            }
+            names
+        }
+    }
+}
+
+fn seed_case_pattern_shadow(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if let Some(pattern) = node.child_by_field_name("pattern") {
+        for name in pattern_names(pattern, ctx.source) {
+            ctx.bindings.declare_shadow(name.to_string());
+        }
     }
 }
 
@@ -364,6 +673,9 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
     let text = node_text(node, ctx.source).trim();
     if text.is_empty() {
+        return;
+    }
+    if seed_value_binding_identifier(node, text, ctx) {
         return;
     }
 
@@ -380,13 +692,46 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if proven {
         add_hit(node, ctx);
     }
+    if is_simple_assignment_lhs(node, ctx.source) && !ctx.bindings.resolve_symbol(text).is_unknown()
+    {
+        ctx.bindings.declare_shadow(text.to_string());
+    }
+}
+
+fn seed_value_binding_identifier(node: Node<'_>, text: &str, ctx: &mut ScanCtx<'_>) -> bool {
+    let before = ctx.source[..node.start_byte()].trim_end();
+    let Some(keyword) = previous_word(before) else {
+        return false;
+    };
+    if !matches!(keyword, "val" | "var") {
+        return false;
+    }
+    let line_end = ctx.source[node.end_byte()..]
+        .find(['\n', '\r', ';'])
+        .map(|offset| node.end_byte() + offset)
+        .unwrap_or(ctx.source.len());
+    let rest = ctx.source[node.end_byte()..line_end].trim_start();
+    let type_name = rest
+        .strip_prefix(':')
+        .and_then(|after_colon| simple_type_name(after_colon.trim_start()));
+    let value_name = rest
+        .split_once('=')
+        .and_then(|(_, value)| constructor_type_name(value));
+    seed_or_shadow_typed_symbol(text, type_name, value_name, ctx);
+    true
+}
+
+fn previous_word(value: &str) -> Option<&str> {
+    value
+        .rsplit(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .find(|part| !part.is_empty())
 }
 
 fn member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> bool {
     if ctx.visibility.direct_member_names.contains(text)
         && !ctx.visibility.ambiguous_direct_member_names.contains(text)
         && !has_dot_qualifier(node, ctx.source)
-        && !is_shadowed_unqualified(node, text, ctx)
+        && !is_locally_shadowed(ctx, text)
         && member_call_arity_matches(node, ctx)
     {
         return true;
@@ -402,7 +747,7 @@ fn member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> 
     }
 
     let Some(qualifier) = dot_qualifier_before(node, ctx.source) else {
-        return !is_shadowed_unqualified(node, text, ctx)
+        return !is_locally_shadowed(ctx, text)
             && enclosing_matches_owner(node, ctx)
             && member_call_arity_matches(node, ctx);
     };
@@ -410,7 +755,7 @@ fn member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> 
         return enclosing_matches_owner(node, ctx) && member_call_arity_matches(node, ctx);
     }
     if ctx.visibility.owner_names.contains(&qualifier)
-        && !is_qualifier_shadowed(node, &qualifier, ctx)
+        && !is_locally_shadowed(ctx, &qualifier)
         && member_call_arity_matches(node, ctx)
     {
         return true;
@@ -418,72 +763,21 @@ fn member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> 
     receiver_binding_matches(node, &qualifier, ctx)
 }
 
-struct ReceiverBinding {
-    name: String,
-    owner_fq_name: String,
-    start_byte: usize,
-    end_byte: usize,
-    enclosing: Option<CodeUnit>,
+fn is_locally_shadowed(ctx: &ScanCtx<'_>, name: &str) -> bool {
+    ctx.bindings.is_shadowed(name) && ctx.bindings.resolve_symbol(name).is_unknown()
 }
 
 fn receiver_binding_matches(node: Node<'_>, qualifier: &str, ctx: &ScanCtx<'_>) -> bool {
     let Some(target_owner_fq) = ctx.spec.owner_fq_name.as_ref() else {
         return false;
     };
-    let usage_enclosing = enclosing_for_node(node, ctx);
-    ctx.receiver_bindings.iter().any(|binding| {
-        binding.name == qualifier
-            && binding.owner_fq_name == *target_owner_fq
-            && binding.start_byte <= node.start_byte()
-            && binding_scope_matches(binding.enclosing.as_ref(), usage_enclosing.as_ref())
-            && !receiver_shadowed_after_binding(binding, node, ctx.source)
-            && member_call_arity_matches(node, ctx)
-    })
-}
-
-fn binding_scope_matches(binding: Option<&CodeUnit>, usage: Option<&CodeUnit>) -> bool {
-    let Some(binding) = binding else {
-        return false;
-    };
-    let Some(usage) = usage else {
-        return false;
-    };
-    if binding == usage {
-        return true;
-    }
-    if binding.is_field() && declaration_owner_contains(binding, usage) {
-        return true;
-    }
-    binding.source() == usage.source()
-        && binding.package_name() == usage.package_name()
-        && usage
-            .short_name()
-            .strip_prefix(binding.short_name())
-            .is_some_and(|rest| rest.starts_with('.'))
-}
-
-fn declaration_owner_contains(binding: &CodeUnit, usage: &CodeUnit) -> bool {
-    let Some((owner_short, _)) = binding.short_name().rsplit_once('.') else {
-        return false;
-    };
-    binding.source() == usage.source()
-        && binding.package_name() == usage.package_name()
-        && usage
-            .short_name()
-            .strip_prefix(owner_short)
-            .is_some_and(|rest| rest.starts_with('.'))
-}
-
-fn receiver_shadowed_after_binding(
-    binding: &ReceiverBinding,
-    node: Node<'_>,
-    source: &str,
-) -> bool {
-    if binding.end_byte >= node.start_byte() {
+    if !member_call_arity_matches(node, ctx) {
         return false;
     }
-    let prefix = &source[binding.end_byte..node.start_byte()];
-    shadows_name(prefix, &binding.name)
+    ctx.bindings
+        .resolve_symbol(qualifier)
+        .as_precise()
+        .is_some_and(|targets| targets.contains(target_owner_fq))
 }
 
 fn ambiguous_wildcard_members(
@@ -554,123 +848,10 @@ fn enclosing_matches_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
             .is_some_and(|rest| rest.starts_with('.'))
 }
 
-fn is_shadowed_unqualified(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> bool {
-    if has_dot_qualifier(node, ctx.source) {
-        return false;
-    }
-    if is_declaration_identifier(node) {
-        return true;
-    }
-
-    let scope_start = lexical_scope_start(node, ctx);
-    let prefix = &ctx.source[scope_start..node.start_byte()];
-    shadows_name(prefix, text)
-}
-
-fn is_qualifier_shadowed(node: Node<'_>, qualifier: &str, ctx: &ScanCtx<'_>) -> bool {
-    let scope_start = lexical_scope_start(node, ctx);
-    let prefix = &ctx.source[scope_start..node.start_byte()];
-    shadows_name(prefix, qualifier)
-}
-
-fn is_declaration_identifier(node: Node<'_>) -> bool {
-    if has_ancestor_kind(node, "parameter") || has_ancestor_kind(node, "parameters") {
-        return true;
-    }
-    let Some(parent) = node.parent() else {
-        return false;
-    };
-    matches!(
-        parent.kind(),
-        "function_definition"
-            | "val_definition"
-            | "var_definition"
-            | "class_definition"
-            | "object_definition"
-            | "trait_definition"
-            | "enum_definition"
-            | "case_clause"
-    )
-}
-
-fn lexical_scope_start(node: Node<'_>, ctx: &ScanCtx<'_>) -> usize {
-    enclosing_for_node(node, ctx)
-        .and_then(|unit| {
-            ctx.analyzer
-                .ranges(&unit)
-                .first()
-                .map(|range| range.start_byte)
-        })
-        .unwrap_or(0)
-}
-
-fn enclosing_for_node(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {
-    let range = Range {
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_line: node.start_position().row,
-        end_line: node.end_position().row,
-    };
-    ctx.analyzer.enclosing_code_unit(ctx.file, &range)
-}
-
-fn shadows_name(prefix: &str, text: &str) -> bool {
-    let cleaned = without_closed_brace_blocks(prefix);
-    let prefix = cleaned.as_str();
-    let escaped = regex::escape(text);
-    let declaration = Regex::new(&format!(r#"\b(?:val|var|def)\s+{escaped}\b"#))
-        .expect("valid shadow declaration regex");
-    if declaration.is_match(prefix) {
-        return true;
-    }
-    let parameter =
-        Regex::new(&format!(r#"[\(\,]\s*{escaped}\s*:"#)).expect("valid shadow parameter regex");
-    if parameter.is_match(prefix) {
-        return true;
-    }
-    let assignment = Regex::new(&format!(r#"(?m)(?:^|[;\n\r\{{]\s*){escaped}\s="#))
-        .expect("valid shadow assignment regex");
-    if assignment.is_match(prefix) {
-        return true;
-    }
-    let pattern = Regex::new(&format!(r#"\bcase\s+{escaped}\b"#)).expect("valid pattern regex");
-    pattern.is_match(prefix)
-}
-
-fn without_closed_brace_blocks(prefix: &str) -> String {
-    let mut stack = Vec::new();
-    let mut ranges = Vec::new();
-    for (idx, ch) in prefix.char_indices() {
-        match ch {
-            '{' => stack.push(idx),
-            '}' => {
-                if let Some(start) = stack.pop() {
-                    ranges.push(start..idx + ch.len_utf8());
-                }
-            }
-            _ => {}
-        }
-    }
-    if ranges.is_empty() {
-        return prefix.to_string();
-    }
-
-    ranges.sort_by_key(|range| range.start);
-    let mut cleaned = String::with_capacity(prefix.len());
-    let mut cursor = 0;
-    for range in ranges {
-        if cursor < range.start {
-            cleaned.push_str(&prefix[cursor..range.start]);
-        }
-        cursor = cursor.max(range.end);
-    }
-    if cursor < prefix.len() {
-        cleaned.push_str(&prefix[cursor..]);
-    }
-    cleaned
-}
-
 fn add_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if *ctx.limit_exceeded {
+        return;
+    }
     let range = Range {
         start_byte: node.start_byte(),
         end_byte: node.end_byte(),
@@ -691,7 +872,9 @@ fn add_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let Some(enclosing) = enclosing else {
         return;
     };
-    if enclosing == ctx.spec.target {
+    if enclosing == ctx.spec.target
+        && range_within_any(ctx.analyzer.ranges(&ctx.spec.target), &range)
+    {
         return;
     }
     let line = find_line_index_for_offset(ctx.line_starts, range.start_byte) + 1;
@@ -704,6 +887,15 @@ fn add_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         GRAPH_HIT_CONFIDENCE,
         snippet_around(ctx.source, ctx.line_starts, line),
     ));
+    if ctx.hits.len() > ctx.max_usages {
+        *ctx.limit_exceeded = true;
+    }
+}
+
+fn range_within_any(ranges: &[Range], needle: &Range) -> bool {
+    ranges
+        .iter()
+        .any(|range| range.start_byte <= needle.start_byte && needle.end_byte <= range.end_byte)
 }
 
 fn nearest_declaration(scala: &ScalaAnalyzer, file: &ProjectFile) -> Option<CodeUnit> {
@@ -711,7 +903,10 @@ fn nearest_declaration(scala: &ScalaAnalyzer, file: &ProjectFile) -> Option<Code
 }
 
 fn is_identifier_node(node: Node<'_>) -> bool {
-    matches!(node.kind(), "identifier" | "type_identifier")
+    matches!(
+        node.kind(),
+        "identifier" | "type_identifier" | "operator_identifier"
+    )
 }
 
 fn is_type_like_reference(node: Node<'_>, source: &str) -> bool {
@@ -822,6 +1017,14 @@ fn has_dot_qualifier(node: Node<'_>, source: &str) -> bool {
     dot_qualifier_before(node, source).is_some()
 }
 
+fn is_simple_assignment_lhs(node: Node<'_>, source: &str) -> bool {
+    if has_dot_qualifier(node, source) {
+        return false;
+    }
+    let after = source[node.end_byte()..].trim_start();
+    after.starts_with('=') && !after.starts_with("=>") && !after.starts_with("==")
+}
+
 fn dot_qualifier_before(node: Node<'_>, source: &str) -> Option<String> {
     let before = &source[..node.start_byte()];
     let before = before.trim_end();
@@ -849,137 +1052,6 @@ fn dotted_qualifier_before(node: Node<'_>, source: &str) -> Option<String> {
         .rev()
         .collect();
     (!qualifier.is_empty()).then_some(qualifier.trim_end_matches('$').to_string())
-}
-
-fn infer_receivers(
-    source: &str,
-    analyzer: &dyn IAnalyzer,
-    file: &ProjectFile,
-    line_starts: &[usize],
-    visibility: &Visibility,
-    spec: &TargetSpec,
-) -> Vec<ReceiverBinding> {
-    static TYPED_BINDING_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"\b(?:val|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*:\s*([A-Za-z_][A-Za-z0-9_]*)"#)
-            .expect("valid regex")
-    });
-    static CONSTRUCTOR_BINDING_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(
-            r#"\b(?:val|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:new\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*[\(\{]"#,
-        )
-        .expect("valid regex")
-    });
-    static PARAM_BINDING_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"\(([A-Za-z_][A-Za-z0-9_]*)\s*:\s*([A-Za-z_][A-Za-z0-9_]*)"#)
-            .expect("valid regex")
-    });
-
-    let mut bindings = Vec::new();
-    for captures in TYPED_BINDING_RE.captures_iter(source) {
-        let Some(match_range) = captures.get(0) else {
-            continue;
-        };
-        let Some(name) = captures.get(1).map(|m| m.as_str()) else {
-            continue;
-        };
-        let Some(type_name) = captures.get(2).map(|m| m.as_str()) else {
-            continue;
-        };
-        if visibility.owner_names.contains(type_name)
-            && let Some(owner_fq_name) = spec.owner_fq_name.as_ref()
-        {
-            bindings.push(ReceiverBinding {
-                name: name.to_string(),
-                owner_fq_name: owner_fq_name.clone(),
-                start_byte: match_range.start(),
-                end_byte: match_range.end(),
-                enclosing: enclosing_for_range(
-                    analyzer,
-                    file,
-                    line_starts,
-                    match_range.start(),
-                    match_range.end(),
-                ),
-            });
-        }
-    }
-    for captures in CONSTRUCTOR_BINDING_RE.captures_iter(source) {
-        let Some(match_range) = captures.get(0) else {
-            continue;
-        };
-        let Some(name) = captures.get(1).map(|m| m.as_str()) else {
-            continue;
-        };
-        let Some(type_name) = captures.get(2).map(|m| m.as_str()) else {
-            continue;
-        };
-        if visibility.owner_names.contains(type_name)
-            && let Some(owner_fq_name) = spec.owner_fq_name.as_ref()
-        {
-            bindings.push(ReceiverBinding {
-                name: name.to_string(),
-                owner_fq_name: owner_fq_name.clone(),
-                start_byte: match_range.start(),
-                end_byte: match_range.end(),
-                enclosing: enclosing_for_range(
-                    analyzer,
-                    file,
-                    line_starts,
-                    match_range.start(),
-                    match_range.end(),
-                ),
-            });
-        }
-    }
-    for captures in PARAM_BINDING_RE.captures_iter(source) {
-        let Some(match_range) = captures.get(0) else {
-            continue;
-        };
-        let Some(name) = captures.get(1).map(|m| m.as_str()) else {
-            continue;
-        };
-        let Some(type_name) = captures.get(2).map(|m| m.as_str()) else {
-            continue;
-        };
-        if visibility.owner_names.contains(type_name)
-            && let Some(owner_fq_name) = spec.owner_fq_name.as_ref()
-        {
-            bindings.push(ReceiverBinding {
-                name: name.to_string(),
-                owner_fq_name: owner_fq_name.clone(),
-                start_byte: match_range.start(),
-                end_byte: match_range.end(),
-                enclosing: enclosing_for_range(
-                    analyzer,
-                    file,
-                    line_starts,
-                    match_range.start(),
-                    match_range.end(),
-                ),
-            });
-        }
-    }
-    bindings
-}
-
-fn enclosing_for_range(
-    analyzer: &dyn IAnalyzer,
-    file: &ProjectFile,
-    line_starts: &[usize],
-    start_byte: usize,
-    end_byte: usize,
-) -> Option<CodeUnit> {
-    let start_line = find_line_index_for_offset(line_starts, start_byte);
-    let end_line = find_line_index_for_offset(line_starts, end_byte);
-    analyzer.enclosing_code_unit(
-        file,
-        &Range {
-            start_byte,
-            end_byte,
-            start_line,
-            end_line,
-        },
-    )
 }
 
 fn package_name_of(scala: &ScalaAnalyzer, file: &ProjectFile) -> Option<String> {

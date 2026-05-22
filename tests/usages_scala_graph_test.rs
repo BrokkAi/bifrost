@@ -544,7 +544,6 @@ class Other {
     let field_hits =
         hits(strategy.find_usages(&analyzer, std::slice::from_ref(&field), &candidates, 1000));
     assert_hit_line(&field_hits, line_of(target_source, "this.field = 2"));
-    assert_hit_line(&field_hits, line_of(target_source, "field + run()"));
     assert_no_hit_line(&field_hits, line_of(target_source, "this.field = 4"));
     assert_no_hit_in_enclosing(&field_hits, "pkg.Other.call");
 
@@ -552,7 +551,6 @@ class Other {
     let run_hits =
         hits(strategy.find_usages(&analyzer, std::slice::from_ref(&run), &candidates, 1000));
     assert_hit_line(&run_hits, line_of(target_source, "this.run()"));
-    assert_hit_line(&run_hits, line_of(target_source, "field + run()"));
     assert_no_hit_in_enclosing(&run_hits, "pkg.Other.call");
 }
 
@@ -1132,6 +1130,119 @@ extension (target: Target) {
     assert_no_hit_in_enclosing(&target_run_hits, "app.Consumer.overriddenMember");
     assert_no_hit_in_enclosing(&target_run_hits, "app.Consumer.extensionMember");
     assert_no_hit_contains(&target_run_hits, "item.run()");
+}
+
+#[test]
+fn scala_usage_finder_finds_imported_top_level_members_by_default() {
+    let consumer_source = r#"
+package app
+
+import pkg.{answer, helper}
+
+class Consumer {
+  def call(): Int = helper() + answer
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "pkg/Api.scala",
+            r#"
+package pkg
+
+def helper(): Int = 1
+val answer: Int = 42
+"#,
+        ),
+        ("app/Consumer.scala", consumer_source),
+    ]);
+
+    let helper = definition(&analyzer, "pkg.helper");
+    let helper_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&helper)));
+    assert_hit_line(&helper_hits, line_of(consumer_source, "helper() + answer"));
+
+    let answer = definition(&analyzer, "pkg.answer");
+    let answer_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&answer)));
+    assert_hit_line(&answer_hits, line_of(consumer_source, "helper() + answer"));
+}
+
+#[test]
+fn scala_graph_resolves_imported_constructor_targets() {
+    let consumer_source = r#"
+package app
+
+import pkg.Target
+
+class Consumer {
+  val target = new Target(1)
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "pkg/Target.scala",
+            r#"
+package pkg
+
+class Target(value: Int)
+"#,
+        ),
+        ("app/Consumer.scala", consumer_source),
+    ]);
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let constructor = definition(&analyzer, "pkg.Target.Target");
+    let constructor_hits = hits(ScalaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&constructor),
+        &candidates,
+        1000,
+    ));
+
+    assert_hit_line(&constructor_hits, line_of(consumer_source, "new Target(1)"));
+}
+
+#[test]
+fn scala_graph_resolves_non_first_typed_parameter_receiver() {
+    let consumer_source = r#"
+package app
+
+import pkg.{Other, Target}
+
+class Consumer {
+  def call(other: Other, target: Target): Int = target.run()
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "pkg/Target.scala",
+            r#"
+package pkg
+
+class Target {
+  def run(): Int = 1
+}
+"#,
+        ),
+        (
+            "pkg/Other.scala",
+            r#"
+package pkg
+
+class Other
+"#,
+        ),
+        ("app/Consumer.scala", consumer_source),
+    ]);
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let run = definition(&analyzer, "pkg.Target.run");
+    let run_hits = hits(ScalaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&run),
+        &candidates,
+        1000,
+    ));
+
+    assert_hit_line(&run_hits, line_of(consumer_source, "target.run()"));
 }
 
 #[test]

@@ -161,13 +161,14 @@ impl ScalaAnalyzer {
             return Vec::new();
         };
         if info.is_wildcard {
-            return self.inner.class_declarations_in_package(&path).to_vec();
+            return self
+                .inner
+                .all_declarations()
+                .filter(|unit| unit.package_name() == path && is_scala_importable_top_level(unit))
+                .cloned()
+                .collect();
         }
-        self.inner
-            .definitions(&path)
-            .filter(|unit| unit.is_class())
-            .cloned()
-            .collect()
+        self.inner.definitions(&path).cloned().collect()
     }
 }
 
@@ -186,11 +187,16 @@ impl ImportAnalysisProvider for ScalaAnalyzer {
 
     fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
         let mut result = HashSet::default();
-        let target_package = self.inner.package_name_of(file).unwrap_or("");
+        if file_language(file) != Language::Scala {
+            return result;
+        }
+        let Some(target_package) = self.inner.package_name_of(file) else {
+            return result;
+        };
         let target_names: HashSet<String> = self
             .inner
             .top_level_declarations(file)
-            .filter(|unit| unit.is_class())
+            .filter(|unit| is_scala_importable_top_level(unit))
             .map(scala_importable_name)
             .collect();
 
@@ -231,9 +237,17 @@ impl ImportAnalysisProvider for ScalaAnalyzer {
         if source_file == target {
             return false;
         }
+        if file_language(source_file) != Language::Scala || file_language(target) != Language::Scala
+        {
+            return false;
+        }
 
-        let source_package = self.inner.package_name_of(source_file).unwrap_or("");
-        let target_package = self.inner.package_name_of(target).unwrap_or("");
+        let Some(source_package) = self.inner.package_name_of(source_file) else {
+            return false;
+        };
+        let Some(target_package) = self.inner.package_name_of(target) else {
+            return false;
+        };
         if source_package == target_package {
             return true;
         }
@@ -241,7 +255,7 @@ impl ImportAnalysisProvider for ScalaAnalyzer {
         let target_names: HashSet<String> = self
             .inner
             .top_level_declarations(target)
-            .filter(|unit| unit.is_class())
+            .filter(|unit| is_scala_importable_top_level(unit))
             .map(scala_importable_name)
             .collect();
         imports.iter().any(|info| {
@@ -1315,7 +1329,7 @@ fn parse_scala_import_infos(raw: &str) -> Vec<ImportInfo> {
                 if imported.is_empty() {
                     return None;
                 }
-                let is_wildcard = imported == "*";
+                let is_wildcard = matches!(imported.as_str(), "*" | "_");
                 Some(ImportInfo {
                     raw_snippet: if let Some(alias) = &alias {
                         format!("import {prefix}.{imported} as {alias}")
@@ -1333,8 +1347,8 @@ fn parse_scala_import_infos(raw: &str) -> Vec<ImportInfo> {
             .collect();
     }
 
-    let is_wildcard = trimmed.ends_with(".*");
-    let path = trimmed.trim_end_matches(".*").trim();
+    let is_wildcard = trimmed.ends_with(".*") || trimmed.ends_with("._");
+    let path = trimmed.trim_end_matches(".*").trim_end_matches("._").trim();
     let (path, alias) = split_scala_alias(path);
     let identifier = if is_wildcard {
         None
@@ -1400,6 +1414,13 @@ fn scala_importable_name(unit: &CodeUnit) -> String {
     last_segment(unit.short_name())
         .trim_end_matches('$')
         .to_string()
+}
+
+fn is_scala_importable_top_level(unit: &CodeUnit) -> bool {
+    if unit.short_name().contains('.') {
+        return false;
+    }
+    unit.is_class() || unit.is_function() || unit.is_field()
 }
 
 fn scala_package_name(node: Node<'_>, source: &str) -> String {

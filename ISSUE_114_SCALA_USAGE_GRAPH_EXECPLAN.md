@@ -18,6 +18,7 @@ Scala files are already parsed by Bifrost, but usage lookup for Scala symbols st
 - [x] (2026-05-22 13:01Z) Hardened coverage for enum cases, `with` inheritance, field writes, top-level functions, and top-level vals/vars; reran targeted tests, formatting, and clippy successfully.
 - [x] (2026-05-22 13:12Z) Completed round-three hardening for exact `UsageHit` assertions, `this` member references, constructor-inferred receivers, local shadowing, aliased imports, wildcard top-level imports, and ambiguous wildcard imports; reran targeted tests, formatting, and clippy successfully.
 - [x] (2026-05-22 13:22Z) Completed depth-testing hardening for fallback semantics, candidate boundaries, lexical shadowing, scoped receiver inference, conservative receiver limits, and intentional inheritance/member limits; reran targeted tests, formatting, and clippy successfully.
+- [x] (2026-05-22 13:44Z) Fixed guided-review findings for Scala import candidate discovery, Scala 2 wildcard import parsing, cross-language import boundaries, imported constructor visibility, scoped receiver seeding, and max-usages scan short-circuiting; reran targeted import, analyzer, usage graph, capability parity, and multi-analyzer tests successfully.
 
 ## Surprises & Discoveries
 
@@ -45,6 +46,15 @@ Scala files are already parsed by Bifrost, but usage lookup for Scala symbols st
 - Observation: local shadow detection needs to ignore completed inner blocks while still respecting active nested blocks.
   Evidence: `val helper = ...` inside a completed block should not block a later sibling `helper()` call, but it must block references inside the block.
 
+- Observation: direct analyzer import relevance needs to understand top-level Scala declarations, not only class-like declarations.
+  Evidence: `ImportAnalysisProvider::referencing_files_of` and `imported_code_units_of` now prove imports for top-level `def`, `val`, and `var`, and `UsageFinder::new().find_usages_default` finds imported package-level `helper()` and `answer` across package directories.
+
+- Observation: `MultiAnalyzer` can ask a language-specific import provider about targets from another language.
+  Evidence: Scala import relevance now rejects non-Scala or unknown-language source/target files before comparing packages, and the multi-analyzer regression proves a default-package Scala file is not reported as an importer for a non-Scala target.
+
+- Observation: constructor targets need owner visibility, not constructor-name visibility.
+  Evidence: `import pkg.Target; new Target()` now resolves when searching for the synthetic constructor target because the imported owner class name is visible as the constructor type name.
+
 ## Decision Log
 
 - Decision: implement Scala import metadata in `ScalaAnalyzer` before the graph strategy.
@@ -71,6 +81,14 @@ Scala files are already parsed by Bifrost, but usage lookup for Scala symbols st
   Rationale: this blocks obvious overload false positives such as matching `run(1)` while searching for `run()`, without attempting compiler-grade overload resolution.
   Date/Author: 2026-05-22 / Codex
 
+- Decision: replace file-wide receiver/shadow regex checks with scoped `LocalInferenceEngine` bindings.
+  Rationale: receiver facts and local shadows must follow lexical scope boundaries, handle non-first typed parameters, and avoid repeated per-identifier regex work while remaining flow-insensitive.
+  Date/Author: 2026-05-22 / Codex
+
+- Decision: short-circuit Scala graph scanning after proven hits exceed `max_usages`.
+  Rationale: callers only need `TooManyCallsites` once the limit is exceeded, so continuing to scan the remaining tree and files is unnecessary work.
+  Date/Author: 2026-05-22 / Codex
+
 ## Outcomes & Retrospective
 
 Issue 114 is implemented. Scala imports now have structured metadata, `UsageFinder` routes Scala targets through `ScalaUsageGraphStrategy`, and the graph proves package/import/type/object/member references without claiming compiler-grade Scala resolution. The focused tests cover routing, grouped and aliased imports, wildcard object-member imports, inheritance/type references including `with`, enum cases, top-level functions, top-level vals/vars, field reads/writes, local receiver inference, unrelated same-name negatives, and `max_usages`.
@@ -78,6 +96,8 @@ Issue 114 is implemented. Scala imports now have structured metadata, `UsageFind
 Round-three hardening added exact line/enclosing-symbol assertions over `UsageHit` fields, distinct read/write field checks, owner-context `this` member resolution, constructor-only receiver inference, local shadowing protections for unqualified and qualified imported symbols, alias import edges for object and top-level symbols, wildcard package imports for top-level functions/values, and conservative behavior for ambiguous wildcard imports.
 
 Depth-testing hardening added explicit coverage for graph `Failure` fallback, successful zero-hit graph results that must not fall back to regex, candidate-file boundaries, block/method-local shadowing, scoped receiver facts, receiver reassignment and alias-chain limits, and non-goals around inherited/overloaded/extension/path-dependent member references. The maturity checklist is now:
+
+Guided-review hardening expanded Scala import analysis so top-level `def`, `val`, and `var` declarations participate in candidate discovery, normalized Scala 2 `_` wildcards to the same structured wildcard form as `*`, added cross-language guards for import relevance, made imported owner class names visible for constructor targets, moved receiver/shadow proof into scoped local inference, and stops graph scanning as soon as `max_usages` is exceeded.
 
 - Covered: type/class/trait/object/enum references, constructors, enum cases, object/static-like members, instance methods, field reads/writes, top-level functions, top-level vals/vars, imports, aliases, wildcard imports, `extends`/`with`, `this`, simple typed/constructor receivers, candidate limits, and max-usages.
 - Intentional non-goals: implicits/givens, extension methods, compiler overload resolution, path-dependent types, macro-generated symbols, interprocedural flow, alias-chain receiver propagation, and broad pattern/destructuring receiver inference.

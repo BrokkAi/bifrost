@@ -53,7 +53,7 @@ fn direct_analyzers_match_brokk_capability_matrix() {
     assert!(cpp.import_analysis_provider().is_some());
     assert!(csharp.import_analysis_provider().is_some());
     assert!(php.import_analysis_provider().is_none());
-    assert!(scala.import_analysis_provider().is_none());
+    assert!(scala.import_analysis_provider().is_some());
 
     assert!(java.type_hierarchy_provider().is_some());
     assert!(python.type_hierarchy_provider().is_some());
