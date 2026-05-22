@@ -461,9 +461,11 @@ fn seed_variable_declaration(
         if type_text == "var" {
             if let Some(initializer_type) = object_created_type(child)
                 && let Some(target) =
-                    csharp.resolve_visible_type(file, node_text(initializer_type, source))
+                    resolve_type_fq_name(csharp, file, node_text(initializer_type, source))
             {
-                bindings.seed_symbol(node_text(name_node, source), target.fq_name());
+                bindings.seed_symbol(node_text(name_node, source), target);
+            } else {
+                bindings.declare_shadow(node_text(name_node, source));
             }
         } else {
             seed_symbol_for_type(name_node, type_node, csharp, file, source, bindings);
@@ -479,8 +481,10 @@ fn seed_symbol_for_type(
     source: &str,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
-    if let Some(target) = csharp.resolve_visible_type(file, node_text(type_node, source)) {
-        bindings.seed_symbol(node_text(name_node, source), target.fq_name());
+    if let Some(target) = resolve_type_fq_name(csharp, file, node_text(type_node, source)) {
+        bindings.seed_symbol(node_text(name_node, source), target);
+    } else {
+        bindings.declare_shadow(node_text(name_node, source));
     }
 }
 
@@ -505,10 +509,31 @@ fn resolves_to_target(
     reference: &str,
     target: &CodeUnit,
 ) -> bool {
+    let normalized = normalize_type_text(reference);
     csharp
-        .resolve_visible_type(file, &normalize_type_text(reference))
+        .resolve_visible_type(file, &normalized)
         .is_some_and(|resolved| resolved == *target)
-        || normalize_type_text(reference) == target.fq_name()
+        || reference_matches_target_fq_name(&normalized, target)
+}
+
+fn resolve_type_fq_name(
+    csharp: &CSharpAnalyzer,
+    file: &ProjectFile,
+    reference: &str,
+) -> Option<String> {
+    let normalized = normalize_type_text(reference);
+    if let Some(target) = csharp.resolve_visible_type(file, &normalized) {
+        return Some(target.fq_name());
+    }
+    csharp
+        .get_all_declarations()
+        .into_iter()
+        .find(|unit| unit.is_class() && reference_matches_target_fq_name(&normalized, unit))
+        .map(|unit| unit.fq_name())
+}
+
+fn reference_matches_target_fq_name(reference: &str, target: &CodeUnit) -> bool {
+    reference == target.fq_name() || reference == target.fq_name().replace('$', ".")
 }
 
 fn normalize_type_text(reference: &str) -> String {

@@ -520,6 +520,47 @@ namespace App {
 }
 
 #[test]
+fn csharp_graph_fails_when_inner_block_shadows_typed_receiver() {
+    let (_project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Domain/Target.cs",
+            "namespace Domain { public class Target { public void Run() {} } }\n",
+        ),
+        (
+            "App/Consumer.cs",
+            r#"
+using Domain;
+
+namespace App {
+    public class Consumer {
+        public void Execute(Target local) {
+            if (local != null) {
+                object local = new object();
+                local.Run();
+            }
+        }
+    }
+}
+"#,
+        ),
+    ]);
+
+    let run = member_function(&analyzer, "Domain.Target", "Run");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let result = CSharpUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&run),
+        &candidates,
+        1000,
+    );
+
+    assert!(
+        matches!(result, FuzzyResult::Failure { .. }),
+        "an inner unresolved declaration should shadow the typed receiver conservatively"
+    );
+}
+
+#[test]
 fn csharp_graph_finds_static_and_instance_member_references() {
     let (_project, analyzer) = csharp_analyzer_with_files(&[
         (
@@ -666,6 +707,103 @@ namespace App {
     assert_eq!(1, graph_hits(&analyzer, &configure).len());
     assert_eq!(2, graph_hits(&analyzer, &count).len());
     assert_eq!(1, graph_hits(&analyzer, &name).len());
+}
+
+#[test]
+fn csharp_graph_resolves_nested_fully_qualified_member_owners() {
+    let (_project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Domain/Outer.cs",
+            r#"
+namespace Domain {
+    public class Outer {
+        public class Inner {
+            public static int Count;
+            public void Run() {}
+        }
+    }
+}
+"#,
+        ),
+        (
+            "App/Consumer.cs",
+            r#"
+namespace App {
+    public class Consumer {
+        public void Execute() {
+            Domain.Outer.Inner.Count = Domain.Outer.Inner.Count + 1;
+            var local = new Domain.Outer.Inner();
+            local.Run();
+        }
+    }
+}
+"#,
+        ),
+    ]);
+
+    let count = member_field(&analyzer, "Domain.Outer$Inner", "Count");
+    let run = member_function(&analyzer, "Domain.Outer$Inner", "Run");
+
+    assert_eq!(2, graph_hits(&analyzer, &count).len());
+    assert_eq!(1, graph_hits(&analyzer, &run).len());
+}
+
+#[test]
+fn csharp_graph_fails_closed_for_deferred_using_member_forms() {
+    let (_project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Domain/Target.cs",
+            r#"
+namespace Domain {
+    public class Target {
+        public static void Configure() {}
+    }
+}
+"#,
+        ),
+        (
+            "App/UsingStaticConsumer.cs",
+            r#"
+using static Domain.Target;
+
+namespace App {
+    public class UsingStaticConsumer {
+        public void Execute() {
+            Configure();
+        }
+    }
+}
+"#,
+        ),
+        (
+            "App/AliasConsumer.cs",
+            r#"
+using Alias = Domain.Target;
+
+namespace App {
+    public class AliasConsumer {
+        public void Execute() {
+            Alias.Configure();
+        }
+    }
+}
+"#,
+        ),
+    ]);
+
+    let configure = member_function(&analyzer, "Domain.Target", "Configure");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let result = CSharpUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&configure),
+        &candidates,
+        1000,
+    );
+
+    assert!(
+        matches!(result, FuzzyResult::Failure { .. }),
+        "using static and alias using member forms are deferred and should fall back"
+    );
 }
 
 #[test]
