@@ -15,6 +15,7 @@ Scala files are already parsed by Bifrost, but usage lookup for Scala symbols st
 - [x] (2026-05-22 12:50Z) Implemented `ScalaUsageGraphStrategy`, exported it, and routed `Language::Scala` through `UsageFinder`.
 - [x] (2026-05-22 12:50Z) Added focused usage graph tests for package/import/type/object/member behavior; `cargo test --test usages_scala_graph_test -- --nocapture` passes.
 - [x] (2026-05-22 12:52Z) Ran the full planned validation set: targeted tests, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings` all pass.
+- [x] (2026-05-22 13:01Z) Hardened coverage for enum cases, `with` inheritance, field writes, top-level functions, and top-level vals/vars; reran targeted tests, formatting, and clippy successfully.
 
 ## Surprises & Discoveries
 
@@ -26,6 +27,9 @@ Scala files are already parsed by Bifrost, but usage lookup for Scala symbols st
 
 - Observation: snippet context can include nearby unrelated same-name calls even when the graph hit itself is correct.
   Evidence: the usage graph routing test and wildcard-member negative test assert hit line/offset behavior instead of using snippet exclusion as proof.
+
+- Observation: top-level Scala functions and vals/vars have no owning class-like declaration.
+  Evidence: package-level `def helper`, `val answer`, and `var counter` initially had unsupported target shapes until `ScalaUsageGraphStrategy` treated ownerless function/field targets as package-level symbols.
 
 ## Decision Log
 
@@ -41,9 +45,13 @@ Scala files are already parsed by Bifrost, but usage lookup for Scala symbols st
   Rationale: Scala source imports and qualifiers use `Utility`, while Bifrost declarations represent objects as `Utility$`; the graph needs these to compare equal without changing declaration identity.
   Date/Author: 2026-05-22 / Codex
 
+- Decision: ownerless Scala functions and fields are package-level graph targets, not class/object members.
+  Rationale: Scala 3 allows top-level declarations, and they must resolve through package-local visibility, explicit imports, wildcard package imports, or package-qualified references without making unqualified class/object methods visible across a package.
+  Date/Author: 2026-05-22 / Codex
+
 ## Outcomes & Retrospective
 
-Issue 114 is implemented. Scala imports now have structured metadata, `UsageFinder` routes Scala targets through `ScalaUsageGraphStrategy`, and the graph proves package/import/type/object/member references without claiming compiler-grade Scala resolution. The focused tests cover routing, grouped and aliased imports, wildcard object-member imports, inheritance/type references, local receiver inference, unrelated same-name negatives, and `max_usages`.
+Issue 114 is implemented. Scala imports now have structured metadata, `UsageFinder` routes Scala targets through `ScalaUsageGraphStrategy`, and the graph proves package/import/type/object/member references without claiming compiler-grade Scala resolution. The focused tests cover routing, grouped and aliased imports, wildcard object-member imports, inheritance/type references including `with`, enum cases, top-level functions, top-level vals/vars, field reads/writes, local receiver inference, unrelated same-name negatives, and `max_usages`.
 
 The remaining limitations are intentional and match the issue scope: no implicit conversions or givens, no extension-method resolution, no overload resolution, no path-dependent type support, no macro-generated code, and no interprocedural data-flow.
 

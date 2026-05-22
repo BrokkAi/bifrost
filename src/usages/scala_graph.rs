@@ -98,11 +98,11 @@ enum TargetKind {
 struct TargetSpec {
     target: CodeUnit,
     kind: TargetKind,
-    owner: CodeUnit,
-    owner_name: String,
+    owner: Option<CodeUnit>,
+    owner_name: Option<String>,
     member_name: String,
     target_fq_name: String,
-    owner_fq_name: String,
+    owner_fq_name: Option<String>,
 }
 
 impl TargetSpec {
@@ -112,35 +112,37 @@ impl TargetSpec {
             return Some(Self {
                 target: target.clone(),
                 kind: TargetKind::Type,
-                owner: target.clone(),
+                owner: Some(target.clone()),
                 member_name: owner_name.clone(),
                 target_fq_name: scala_normalized_fq_name(&target.fq_name()),
-                owner_fq_name: scala_normalized_fq_name(&target.fq_name()),
-                owner_name,
+                owner_fq_name: Some(scala_normalized_fq_name(&target.fq_name())),
+                owner_name: Some(owner_name),
             });
         }
 
-        let owner = owner_of(scala, target)?;
-        let owner_name = scala_display_name(&owner);
+        let owner = owner_of(scala, target);
+        let owner_name = owner.as_ref().map(scala_display_name);
         let kind = if target.is_field() {
             TargetKind::Field
-        } else if target.is_synthetic() || target.identifier() == owner_name {
+        } else if target.is_synthetic() || owner_name.as_deref() == Some(target.identifier()) {
             TargetKind::Constructor
         } else {
             TargetKind::Method
         };
         let member_name = if kind == TargetKind::Constructor {
-            owner_name.clone()
+            owner_name.clone()?
         } else {
             target.identifier().to_string()
         };
         Some(Self {
             target: target.clone(),
-            kind,
-            owner_fq_name: scala_normalized_fq_name(&owner.fq_name()),
             target_fq_name: scala_normalized_fq_name(&target.fq_name()),
+            owner_fq_name: owner
+                .as_ref()
+                .map(|owner| scala_normalized_fq_name(&owner.fq_name())),
             owner,
             owner_name,
+            kind,
             member_name,
         })
     }
@@ -243,10 +245,24 @@ impl Visibility {
         let file_package = package_name_of(scala, file);
         if file == spec.target.source()
             || file_package.as_deref() == Some(spec.target.package_name())
-            || file_package.as_deref() == Some(spec.owner.package_name())
         {
             visibility.type_names.insert(spec.member_name.clone());
-            visibility.owner_names.insert(spec.owner_name.clone());
+            if spec.owner.is_none() {
+                visibility
+                    .direct_member_names
+                    .insert(spec.member_name.clone());
+            }
+            if let Some(owner_name) = spec.owner_name.as_ref() {
+                visibility.owner_names.insert(owner_name.clone());
+            }
+        }
+        if spec
+            .owner
+            .as_ref()
+            .is_some_and(|owner| file_package.as_deref() == Some(owner.package_name()))
+            && let Some(owner_name) = spec.owner_name.as_ref()
+        {
+            visibility.owner_names.insert(owner_name.clone());
         }
 
         for import in scala.import_info_of(file) {
@@ -268,11 +284,23 @@ impl Visibility {
         if import.is_wildcard {
             if path == spec.target.package_name() {
                 self.type_names.insert(spec.member_name.clone());
+                if spec.owner.is_none() {
+                    self.direct_member_names.insert(spec.member_name.clone());
+                }
             }
-            if path == spec.owner.package_name() {
-                self.owner_names.insert(spec.owner_name.clone());
+            if spec
+                .owner
+                .as_ref()
+                .is_some_and(|owner| path == owner.package_name())
+                && let Some(owner_name) = spec.owner_name.as_ref()
+            {
+                self.owner_names.insert(owner_name.clone());
             }
-            if path == spec.owner_fq_name {
+            if spec
+                .owner_fq_name
+                .as_ref()
+                .is_some_and(|owner_fq| path == *owner_fq)
+            {
                 self.direct_member_names.insert(spec.member_name.clone());
             }
             return;
@@ -282,7 +310,11 @@ impl Visibility {
         if normalized == spec.target_fq_name {
             self.type_names.insert(local_name.clone());
         }
-        if normalized == spec.owner_fq_name {
+        if spec
+            .owner_fq_name
+            .as_ref()
+            .is_some_and(|owner_fq| normalized == *owner_fq)
+        {
             self.owner_names.insert(local_name.clone());
         }
         if normalized == spec.target_fq_name && spec.kind != TargetKind::Type {
@@ -315,6 +347,9 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if has_ancestor_kind(node, "import_declaration") {
+        return;
+    }
     let text = node_text(node, ctx.source).trim();
     if text.is_empty() {
         return;
@@ -344,6 +379,11 @@ fn member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> 
         return true;
     }
 
+    if ctx.spec.owner.is_none() {
+        return dotted_qualifier_before(node, ctx.source)
+            .is_some_and(|qualifier| qualifier == ctx.spec.target.package_name());
+    }
+
     let Some(qualifier) = dot_qualifier_before(node, ctx.source) else {
         return false;
     };
@@ -352,7 +392,7 @@ fn member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> 
     }
     ctx.receiver_bindings
         .get(&qualifier)
-        .is_some_and(|owner_fq| owner_fq == &ctx.spec.owner_fq_name)
+        .is_some_and(|owner_fq| Some(owner_fq) == ctx.spec.owner_fq_name.as_ref())
 }
 
 fn add_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -420,6 +460,17 @@ fn parent_kind(node: Node<'_>) -> Option<&str> {
     node.parent().map(|parent| parent.kind())
 }
 
+fn has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == kind {
+            return true;
+        }
+        current = parent.parent();
+    }
+    false
+}
+
 fn has_dot_qualifier(node: Node<'_>, source: &str) -> bool {
     dot_qualifier_before(node, source).is_some()
 }
@@ -432,6 +483,20 @@ fn dot_qualifier_before(node: Node<'_>, source: &str) -> Option<String> {
         .chars()
         .rev()
         .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$'))
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    (!qualifier.is_empty()).then_some(qualifier.trim_end_matches('$').to_string())
+}
+
+fn dotted_qualifier_before(node: Node<'_>, source: &str) -> Option<String> {
+    let before = source[..node.start_byte()].trim_end();
+    let without_dot = before.strip_suffix('.')?;
+    let qualifier: String = without_dot
+        .chars()
+        .rev()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$' | '.'))
         .collect::<String>()
         .chars()
         .rev()
@@ -467,8 +532,10 @@ fn infer_receivers(
         let Some(type_name) = captures.get(2).map(|m| m.as_str()) else {
             continue;
         };
-        if visibility.owner_names.contains(type_name) {
-            bindings.insert(name.to_string(), spec.owner_fq_name.clone());
+        if visibility.owner_names.contains(type_name)
+            && let Some(owner_fq_name) = spec.owner_fq_name.as_ref()
+        {
+            bindings.insert(name.to_string(), owner_fq_name.clone());
         }
     }
     for captures in CONSTRUCTOR_BINDING_RE.captures_iter(source) {
@@ -478,8 +545,10 @@ fn infer_receivers(
         let Some(type_name) = captures.get(2).map(|m| m.as_str()) else {
             continue;
         };
-        if visibility.owner_names.contains(type_name) {
-            bindings.insert(name.to_string(), spec.owner_fq_name.clone());
+        if visibility.owner_names.contains(type_name)
+            && let Some(owner_fq_name) = spec.owner_fq_name.as_ref()
+        {
+            bindings.insert(name.to_string(), owner_fq_name.clone());
         }
     }
     for captures in PARAM_BINDING_RE.captures_iter(source) {
@@ -489,8 +558,10 @@ fn infer_receivers(
         let Some(type_name) = captures.get(2).map(|m| m.as_str()) else {
             continue;
         };
-        if visibility.owner_names.contains(type_name) {
-            bindings.insert(name.to_string(), spec.owner_fq_name.clone());
+        if visibility.owner_names.contains(type_name)
+            && let Some(owner_fq_name) = spec.owner_fq_name.as_ref()
+        {
+            bindings.insert(name.to_string(), owner_fq_name.clone());
         }
     }
     bindings
