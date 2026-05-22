@@ -89,7 +89,7 @@ impl UsageAnalyzer for CSharpUsageGraphStrategy {
             }
         }
 
-        if hits.is_empty() && saw_unproven_match {
+        if saw_unproven_match && spec.kind != TargetKind::Type {
             return FuzzyResult::Failure {
                 fq_name: target.fq_name(),
                 reason: "CSharpUsageGraphStrategy: no proven structured hits".to_string(),
@@ -339,6 +339,15 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if node_text(name_node, ctx.source) != ctx.spec.member_name {
         return;
     }
+    if ctx.spec.kind == TargetKind::Method
+        && let Some(invocation) = enclosing_invocation(node)
+        && ctx
+            .spec
+            .method_arity
+            .is_some_and(|arity| argument_count(invocation, ctx.source) != arity)
+    {
+        return;
+    }
 
     let Some(receiver_node) = member_access_receiver(node) else {
         *ctx.saw_unproven_match = true;
@@ -429,9 +438,7 @@ fn seed_variable_declaration(
             continue;
         };
         if type_text == "var" {
-            if let Some(initializer_type) = child
-                .child_by_field_name("value")
-                .and_then(|value| object_created_type(value))
+            if let Some(initializer_type) = object_created_type(child)
                 && let Some(target) =
                     csharp.resolve_visible_type(file, node_text(initializer_type, source))
             {
@@ -551,6 +558,11 @@ fn member_access_name(node: Node<'_>) -> Option<Node<'_>> {
         }
         last
     })
+}
+
+fn enclosing_invocation(node: Node<'_>) -> Option<Node<'_>> {
+    let parent = node.parent()?;
+    (parent.kind() == "invocation_expression").then_some(parent)
 }
 
 fn first_type_child(node: Node<'_>) -> Option<Node<'_>> {

@@ -44,6 +44,22 @@ fn member_function(analyzer: &CSharpAnalyzer, owner: &str, name: &str) -> CodeUn
     })
 }
 
+fn member_function_with_arity(
+    analyzer: &CSharpAnalyzer,
+    owner: &str,
+    name: &str,
+    arity: usize,
+) -> CodeUnit {
+    definition_by(analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.identifier() == name
+            && signature_arity(unit.signature()) == arity
+            && analyzer
+                .parent_of(unit)
+                .is_some_and(|parent| parent.fq_name() == owner)
+    })
+}
+
 fn member_field(analyzer: &CSharpAnalyzer, owner: &str, name: &str) -> CodeUnit {
     definition_by(analyzer, |unit| {
         unit.kind() == CodeUnitType::Field
@@ -52,6 +68,33 @@ fn member_field(analyzer: &CSharpAnalyzer, owner: &str, name: &str) -> CodeUnit 
                 .parent_of(unit)
                 .is_some_and(|parent| parent.fq_name() == owner)
     })
+}
+
+fn signature_arity(signature: Option<&str>) -> usize {
+    let Some(signature) = signature else {
+        return 0;
+    };
+    let inner = signature
+        .strip_prefix('(')
+        .and_then(|rest| rest.strip_suffix(')'))
+        .unwrap_or(signature)
+        .trim();
+    if inner.is_empty() {
+        0
+    } else {
+        inner.split(',').count()
+    }
+}
+
+fn graph_hits(
+    analyzer: &CSharpAnalyzer,
+    target: &CodeUnit,
+) -> std::collections::BTreeSet<brokk_bifrost::usages::UsageHit> {
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    CSharpUsageGraphStrategy::new()
+        .find_usages(analyzer, std::slice::from_ref(target), &candidates, 1000)
+        .into_either()
+        .unwrap_or_else(|err| panic!("{} should resolve: {err}", target.fq_name()))
 }
 
 #[test]
@@ -87,6 +130,59 @@ namespace Consumers {
     assert!(
         hits.iter()
             .all(|hit| hit.file == project.file("Consumers/Consumer.cs"))
+    );
+}
+
+#[test]
+fn csharp_graph_covers_non_class_type_targets() {
+    let (_project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Domain/Types.cs",
+            r#"
+namespace Domain {
+    public interface IService {}
+    public struct Coordinate {}
+    public record Marker();
+    public class Service : IService {
+        private Coordinate current;
+        public void Accept(IService service, Coordinate coordinate, Marker marker) {}
+    }
+}
+"#,
+        ),
+        (
+            "App/Consumer.cs",
+            r#"
+using System.Collections.Generic;
+using Domain;
+
+namespace App {
+    public class Consumer {
+        public List<Coordinate> Build(IService service, Marker marker) {
+            Coordinate coordinate = new Coordinate();
+            return new List<Coordinate> { coordinate };
+        }
+    }
+}
+"#,
+        ),
+    ]);
+
+    let interface_target = type_definition(&analyzer, "Domain.IService");
+    let struct_target = type_definition(&analyzer, "Domain.Coordinate");
+    let record_target = type_definition(&analyzer, "Domain.Marker");
+
+    assert!(
+        graph_hits(&analyzer, &interface_target).len() >= 3,
+        "interface target should be covered in inheritance and parameter positions"
+    );
+    assert!(
+        graph_hits(&analyzer, &struct_target).len() >= 4,
+        "struct target should be covered in field, parameter, generic, and construction positions"
+    );
+    assert!(
+        graph_hits(&analyzer, &record_target).len() >= 2,
+        "record target should be covered in parameter positions"
     );
 }
 
@@ -141,6 +237,60 @@ namespace Other {
         hits.len() >= 5,
         "expected several structured type hits: {hits:#?}"
     );
+}
+
+#[test]
+fn csharp_graph_keeps_constructor_and_method_overloads_narrow() {
+    let (_project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Domain/Target.cs",
+            r#"
+namespace Domain {
+    public class Target {
+        public Target() {}
+        public Target(string name) {}
+        public static Target Create() { return null; }
+        public static Target Create(string name) { return null; }
+        public void Run() {}
+        public void Run(int count) {}
+    }
+}
+"#,
+        ),
+        (
+            "App/Consumer.cs",
+            r#"
+using Domain;
+
+namespace App {
+    public class Consumer {
+        public void Execute(Target target) {
+            var first = new Target();
+            var second = new Target("named");
+            Target.Create();
+            Target.Create("named");
+            target.Run();
+            target.Run(1);
+        }
+    }
+}
+"#,
+        ),
+    ]);
+
+    let ctor_zero = member_function_with_arity(&analyzer, "Domain.Target", "Target", 0);
+    let ctor_one = member_function_with_arity(&analyzer, "Domain.Target", "Target", 1);
+    let create_zero = member_function_with_arity(&analyzer, "Domain.Target", "Create", 0);
+    let create_one = member_function_with_arity(&analyzer, "Domain.Target", "Create", 1);
+    let run_zero = member_function_with_arity(&analyzer, "Domain.Target", "Run", 0);
+    let run_one = member_function_with_arity(&analyzer, "Domain.Target", "Run", 1);
+
+    assert_eq!(1, graph_hits(&analyzer, &ctor_zero).len());
+    assert_eq!(1, graph_hits(&analyzer, &ctor_one).len());
+    assert_eq!(1, graph_hits(&analyzer, &create_zero).len());
+    assert_eq!(1, graph_hits(&analyzer, &create_one).len());
+    assert_eq!(1, graph_hits(&analyzer, &run_zero).len());
+    assert_eq!(1, graph_hits(&analyzer, &run_one).len());
 }
 
 #[test]
@@ -221,6 +371,41 @@ namespace App {
 }
 
 #[test]
+fn csharp_graph_covers_var_receiver_inference() {
+    let (_project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Domain/Target.cs",
+            r#"
+namespace Domain {
+    public class Target {
+        public Target() {}
+        public void Run() {}
+    }
+}
+"#,
+        ),
+        (
+            "App/Consumer.cs",
+            r#"
+using Domain;
+
+namespace App {
+    public class Consumer {
+        public void Execute() {
+            var local = new Target();
+            local.Run();
+        }
+    }
+}
+"#,
+        ),
+    ]);
+
+    let run = member_function(&analyzer, "Domain.Target", "Run");
+    assert_eq!(1, graph_hits(&analyzer, &run).len());
+}
+
+#[test]
 fn csharp_graph_finds_static_and_instance_member_references() {
     let (_project, analyzer) = csharp_analyzer_with_files(&[
         (
@@ -283,6 +468,53 @@ namespace App {
 }
 
 #[test]
+fn csharp_graph_counts_field_and_property_references_precisely() {
+    let (_project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Domain/Target.cs",
+            r#"
+namespace Domain {
+    public class Target {
+        public static int Count;
+        public static string Name { get; set; }
+        public int Value;
+        public int Size { get; set; }
+    }
+}
+"#,
+        ),
+        (
+            "App/Consumer.cs",
+            r#"
+using Domain;
+
+namespace App {
+    public class Consumer {
+        public void Execute(Target parameter) {
+            Target.Count = Target.Count + 1;
+            var name = Target.Name;
+            Target local = new Target();
+            local.Value = local.Value + 1;
+            parameter.Size = parameter.Size + 1;
+        }
+    }
+}
+"#,
+        ),
+    ]);
+
+    let count = member_field(&analyzer, "Domain.Target", "Count");
+    let name = member_field(&analyzer, "Domain.Target", "Name");
+    let value = member_field(&analyzer, "Domain.Target", "Value");
+    let size = member_field(&analyzer, "Domain.Target", "Size");
+
+    assert_eq!(2, graph_hits(&analyzer, &count).len());
+    assert_eq!(1, graph_hits(&analyzer, &name).len());
+    assert_eq!(2, graph_hits(&analyzer, &value).len());
+    assert_eq!(2, graph_hits(&analyzer, &size).len());
+}
+
+#[test]
 fn csharp_graph_avoids_unrelated_same_name_symbols_and_fails_on_unsupported_receivers() {
     let (_project, analyzer) = csharp_analyzer_with_files(&[
         (
@@ -338,6 +570,94 @@ namespace App {
     assert!(
         matches!(alpha_run_result, FuzzyResult::Failure { .. }),
         "unsupported same-name member receiver should fail so UsageFinder can fall back"
+    );
+}
+
+#[test]
+fn csharp_graph_fails_on_ambiguous_visible_type_names() {
+    let (_project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Alpha/Target.cs",
+            "namespace Alpha { public class Target {} }\n",
+        ),
+        (
+            "Beta/Target.cs",
+            "namespace Beta { public class Target {} }\n",
+        ),
+        (
+            "App/Consumer.cs",
+            r#"
+using Alpha;
+using Beta;
+
+namespace App {
+    public class Consumer {
+        public void Execute() {
+            Target target = null;
+        }
+    }
+}
+"#,
+        ),
+    ]);
+
+    let alpha = type_definition(&analyzer, "Alpha.Target");
+    let beta = type_definition(&analyzer, "Beta.Target");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = CSharpUsageGraphStrategy::new();
+
+    let alpha_hits = strategy
+        .find_usages(&analyzer, std::slice::from_ref(&alpha), &candidates, 1000)
+        .into_either()
+        .expect("ambiguous alpha type query should succeed empty");
+    let beta_hits = strategy
+        .find_usages(&analyzer, std::slice::from_ref(&beta), &candidates, 1000)
+        .into_either()
+        .expect("ambiguous beta type query should succeed empty");
+
+    assert!(alpha_hits.is_empty());
+    assert!(beta_hits.is_empty());
+}
+
+#[test]
+fn csharp_graph_fails_unknown_receiver_but_accepts_typed_receiver() {
+    let (_project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Domain/Target.cs",
+            "namespace Domain { public class Target { public void Run() {} } }\n",
+        ),
+        (
+            "App/Consumer.cs",
+            r#"
+using Domain;
+
+namespace App {
+    public class Consumer {
+        public void Known(Target known) {
+            known.Run();
+        }
+
+        public void Unknown(object unknown) {
+            unknown.Run();
+        }
+    }
+}
+"#,
+        ),
+    ]);
+
+    let run = member_function(&analyzer, "Domain.Target", "Run");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let result = CSharpUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&run),
+        &candidates,
+        1000,
+    );
+
+    assert!(
+        matches!(result, FuzzyResult::Failure { .. }),
+        "mixed typed and unknown receivers should fall back instead of returning partial proof"
     );
 }
 
