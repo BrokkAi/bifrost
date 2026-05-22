@@ -113,7 +113,7 @@ fn member_function_definition_in_source(
     definition_by(analyzer, |unit| {
         unit.kind() == CodeUnitType::Function
             && unit.identifier() == name
-            && unit.source().rel_path().to_string_lossy() == source
+            && slash_path(unit.source()) == source
             && analyzer
                 .parent_of(unit)
                 .is_some_and(|parent| parent.identifier() == owner)
