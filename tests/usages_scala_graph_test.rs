@@ -3,7 +3,7 @@ mod common;
 use brokk_bifrost::usages::{
     FuzzyResult, ScalaUsageGraphStrategy, UsageAnalyzer, UsageFinder, UsageHit,
 };
-use brokk_bifrost::{CodeUnit, IAnalyzer, Language, ScalaAnalyzer};
+use brokk_bifrost::{CodeUnit, CodeUnitType, IAnalyzer, Language, ScalaAnalyzer};
 use common::InlineTestProject;
 
 fn scala_analyzer_with_files(
@@ -83,12 +83,36 @@ fn assert_hit_count_by_snippet(hits: &[UsageHit], needle: &str, expected: usize)
     );
 }
 
+fn assert_no_hit_contains(hits: &[UsageHit], needle: &str) {
+    assert!(
+        hits.iter().all(|hit| !hit.snippet.contains(needle)),
+        "expected no hit containing {needle:?}, got {hits:#?}"
+    );
+}
+
 fn line_of(source: &str, needle: &str) -> usize {
     source
         .lines()
         .position(|line| line.contains(needle))
         .map(|line| line + 1)
         .unwrap_or_else(|| panic!("missing line containing {needle:?}"))
+}
+
+fn scala_hits(analyzer: &ScalaAnalyzer, target: &CodeUnit, candidates: &[&str]) -> Vec<UsageHit> {
+    let candidate_files = analyzer
+        .get_analyzed_files()
+        .into_iter()
+        .filter(|file| {
+            let rel_path = file.rel_path().to_string_lossy();
+            candidates.iter().any(|candidate| rel_path == *candidate)
+        })
+        .collect();
+    hits(ScalaUsageGraphStrategy::new().find_usages(
+        analyzer,
+        std::slice::from_ref(target),
+        &candidate_files,
+        1000,
+    ))
 }
 
 #[test]
@@ -750,6 +774,364 @@ def helper(): Int = 2
     let answer_hits =
         hits(strategy.find_usages(&analyzer, std::slice::from_ref(&answer), &candidates, 1000));
     assert_hit_line(&answer_hits, line_of(wildcard_source, "helper() + answer"));
+}
+
+#[test]
+fn scala_graph_guardrails_cover_failure_fallback_zero_hits_and_candidate_boundaries() {
+    let zero_fallback_source = r#"
+package app
+
+class ZeroFallback {
+  def call(): Int = run()
+}
+"#;
+    let included_source = r#"
+package app
+
+import pkg.Target
+
+class Included {
+  def call(target: Target): Int = target.run()
+}
+"#;
+    let excluded_source = r#"
+package app
+
+import pkg.Target
+
+class Excluded {
+  def call(target: Target): Int = target.run()
+}
+"#;
+    let fallback_source = r#"
+package app
+
+class FallbackConsumer {
+  def call(): Unit = Ghost()
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "pkg/Target.scala",
+            r#"
+package pkg
+
+class Target {
+  def run(): Int = 1
+}
+"#,
+        ),
+        ("app/ZeroFallback.scala", zero_fallback_source),
+        ("app/Included.scala", included_source),
+        ("app/Excluded.scala", excluded_source),
+        ("app/FallbackConsumer.scala", fallback_source),
+    ]);
+
+    let run = definition(&analyzer, "pkg.Target.run");
+    let zero_hits = hits(
+        UsageFinder::new()
+            .with_file_filter(|file| file.rel_path().to_string_lossy() == "app/ZeroFallback.scala")
+            .find_usages_default(&analyzer, std::slice::from_ref(&run)),
+    );
+    assert!(
+        zero_hits.is_empty(),
+        "successful zero-hit graph result should not fall back to regex: {zero_hits:#?}"
+    );
+
+    let boundary_hits = scala_hits(&analyzer, &run, &["app/Included.scala"]);
+    assert_hit_line(&boundary_hits, line_of(included_source, "target.run()"));
+    assert_no_hit_in_enclosing(&boundary_hits, "app.Excluded.call");
+
+    let fallback_target = CodeUnit::with_signature(
+        analyzer
+            .get_analyzed_files()
+            .into_iter()
+            .find(|file| file.rel_path().to_string_lossy() == "app/FallbackConsumer.scala")
+            .expect("fallback source file"),
+        CodeUnitType::Function,
+        "pkg",
+        "Ghost",
+        None,
+        true,
+    );
+    let direct = ScalaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&fallback_target),
+        &analyzer.get_analyzed_files().into_iter().collect(),
+        1000,
+    );
+    assert!(
+        matches!(direct, FuzzyResult::Failure { .. }),
+        "unsupported synthetic constructor shape should fail graph seeding, got {direct:?}"
+    );
+    let fallback_hits = hits(UsageFinder::new().find_usages_default(&analyzer, &[fallback_target]));
+    assert_hit_contains(&fallback_hits, "Ghost()");
+}
+
+#[test]
+fn scala_graph_keeps_shadowing_lexical_and_method_local() {
+    let consumer_source = r#"
+package app
+
+import pkg.{Utility, helper}
+
+class Consumer {
+  def nestedBlock(): Int = {
+    val before = helper()
+    {
+      val helper = 0
+      helper
+    }
+    val after = helper()
+    before + after
+  }
+
+  def localFunctionShadow(): Int = {
+    def helper(): Int = 0
+    helper()
+  }
+
+  def patternShadow(value: Int): Int = value match {
+    case helper => helper
+  }
+
+  def sibling(): Int = helper()
+
+  def localQualifierShadow(): Int = {
+    val Utility = other.Utility
+    Utility.help()
+  }
+
+  def parameterQualifierShadow(Utility: other.Utility.type): Int = Utility.help()
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "pkg/Api.scala",
+            r#"
+package pkg
+
+def helper(): Int = 1
+
+object Utility {
+  def help(): Int = 1
+}
+"#,
+        ),
+        (
+            "other/Utility.scala",
+            r#"
+package other
+
+object Utility {
+  def help(): Int = 2
+}
+"#,
+        ),
+        ("app/Consumer.scala", consumer_source),
+    ]);
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = ScalaUsageGraphStrategy::new();
+
+    let helper = definition(&analyzer, "pkg.helper");
+    let helper_hits =
+        hits(strategy.find_usages(&analyzer, std::slice::from_ref(&helper), &candidates, 1000));
+    assert_hit_line(
+        &helper_hits,
+        line_of(consumer_source, "val before = helper()"),
+    );
+    assert_hit_line(
+        &helper_hits,
+        line_of(consumer_source, "val after = helper()"),
+    );
+    assert_hit_line(
+        &helper_hits,
+        line_of(consumer_source, "def sibling(): Int = helper()"),
+    );
+    assert_no_hit_in_enclosing(&helper_hits, "app.Consumer.localFunctionShadow");
+    assert_no_hit_in_enclosing(&helper_hits, "app.Consumer.patternShadow");
+
+    let help = definition(&analyzer, "pkg.Utility$.help");
+    let help_hits =
+        hits(strategy.find_usages(&analyzer, std::slice::from_ref(&help), &candidates, 1000));
+    assert_no_hit_in_enclosing(&help_hits, "app.Consumer.localQualifierShadow");
+    assert_no_hit_in_enclosing(&help_hits, "app.Consumer.parameterQualifierShadow");
+}
+
+#[test]
+fn scala_graph_keeps_receiver_inference_scoped_and_conservative() {
+    let consumer_source = r#"
+package app
+
+import pkg.{Other, Target}
+
+class Consumer {
+  def typedParam(target: Target): Int = target.run()
+
+  def typedLocal(): Int = {
+    val target: Target = new Target()
+    target.run()
+  }
+
+  def constructorLocal(): Int = {
+    val target = new Target()
+    target.run()
+  }
+
+  def reassigned(): Int = {
+    var target: Target = new Target()
+    target = new Other()
+    target.run()
+  }
+
+  def tupleDestructuring(pair: (Target, Int)): Int = {
+    val (target, _) = pair
+    target.run()
+  }
+
+  def aliasChain(): Int = {
+    val target = new Target()
+    val alias = target
+    alias.run()
+  }
+
+  def leakedName(): Int = target.run()
+}
+
+class OtherConsumer {
+  def leakedClass(): Int = target.run()
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "pkg/Target.scala",
+            r#"
+package pkg
+
+class Target {
+  def run(): Int = 1
+}
+"#,
+        ),
+        (
+            "pkg/Other.scala",
+            r#"
+package pkg
+
+class Other {
+  def run(): Int = 2
+}
+"#,
+        ),
+        ("app/Consumer.scala", consumer_source),
+    ]);
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let run = definition(&analyzer, "pkg.Target.run");
+    let run_hits = hits(ScalaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&run),
+        &candidates,
+        1000,
+    ));
+
+    assert_hit_line(&run_hits, line_of(consumer_source, "def typedParam"));
+    assert_hit_line(&run_hits, line_of(consumer_source, "target.run()"));
+    assert_no_hit_in_enclosing(&run_hits, "app.Consumer.reassigned");
+    assert_no_hit_in_enclosing(&run_hits, "app.Consumer.tupleDestructuring");
+    assert_no_hit_in_enclosing(&run_hits, "app.Consumer.aliasChain");
+    assert_no_hit_in_enclosing(&run_hits, "app.Consumer.leakedName");
+    assert_no_hit_in_enclosing(&run_hits, "app.OtherConsumer.leakedClass");
+}
+
+#[test]
+fn scala_graph_documents_inheritance_member_limits() {
+    let consumer_source = r#"
+package app
+
+import pkg.{Base, Contract, Impl, Target}
+
+class Concrete extends Base with Contract
+
+class Consumer {
+  def typeRefs(): Unit = {
+    val concrete: Contract = new Concrete()
+  }
+
+  def inheritedMember(impl: Impl): Int = impl.run()
+
+  def overriddenMember(target: Target): Int = target.run(1)
+
+  def extensionMember(target: Target): Int = target.extra()
+
+  def pathDependent(box: Box): Int = {
+    val item: box.Item = box.item
+    item.run()
+  }
+}
+
+class Box {
+  class Item {
+    def run(): Int = 1
+  }
+  val item: Item = new Item()
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "pkg/Types.scala",
+            r#"
+package pkg
+
+trait Base
+trait Contract
+
+class Impl extends Contract {
+  def run(): Int = 1
+}
+
+class Target {
+  def run(): Int = 1
+  def run(value: Int): Int = value
+}
+
+extension (target: Target) {
+  def extra(): Int = 1
+}
+"#,
+        ),
+        ("app/Consumer.scala", consumer_source),
+    ]);
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = ScalaUsageGraphStrategy::new();
+
+    let contract = definition(&analyzer, "pkg.Contract");
+    let contract_hits = hits(strategy.find_usages(
+        &analyzer,
+        std::slice::from_ref(&contract),
+        &candidates,
+        1000,
+    ));
+    assert_hit_line(&contract_hits, line_of(consumer_source, "with Contract"));
+    assert_hit_line(
+        &contract_hits,
+        line_of(consumer_source, "val concrete: Contract"),
+    );
+
+    let run = definition(&analyzer, "pkg.Impl.run");
+    let run_hits =
+        hits(strategy.find_usages(&analyzer, std::slice::from_ref(&run), &candidates, 1000));
+    assert_hit_line(&run_hits, line_of(consumer_source, "impl.run()"));
+
+    let target_run = definition(&analyzer, "pkg.Target.run");
+    let target_run_hits = hits(strategy.find_usages(
+        &analyzer,
+        std::slice::from_ref(&target_run),
+        &candidates,
+        1000,
+    ));
+    assert_no_hit_in_enclosing(&target_run_hits, "app.Consumer.overriddenMember");
+    assert_no_hit_in_enclosing(&target_run_hits, "app.Consumer.extensionMember");
+    assert_no_hit_contains(&target_run_hits, "item.run()");
 }
 
 #[test]

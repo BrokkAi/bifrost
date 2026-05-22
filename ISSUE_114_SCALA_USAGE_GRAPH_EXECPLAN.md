@@ -17,6 +17,7 @@ Scala files are already parsed by Bifrost, but usage lookup for Scala symbols st
 - [x] (2026-05-22 12:52Z) Ran the full planned validation set: targeted tests, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings` all pass.
 - [x] (2026-05-22 13:01Z) Hardened coverage for enum cases, `with` inheritance, field writes, top-level functions, and top-level vals/vars; reran targeted tests, formatting, and clippy successfully.
 - [x] (2026-05-22 13:12Z) Completed round-three hardening for exact `UsageHit` assertions, `this` member references, constructor-inferred receivers, local shadowing, aliased imports, wildcard top-level imports, and ambiguous wildcard imports; reran targeted tests, formatting, and clippy successfully.
+- [x] (2026-05-22 13:22Z) Completed depth-testing hardening for fallback semantics, candidate boundaries, lexical shadowing, scoped receiver inference, conservative receiver limits, and intentional inheritance/member limits; reran targeted tests, formatting, and clippy successfully.
 
 ## Surprises & Discoveries
 
@@ -37,6 +38,12 @@ Scala files are already parsed by Bifrost, but usage lookup for Scala symbols st
 
 - Observation: grouped alias imports for top-level declarations need to match the alias token, not only the target member's declared name.
   Evidence: `import pkg.{helper as h}; h()` was not proven until direct member visibility accepted imported local names independently from `spec.member_name`.
+
+- Observation: receiver facts cannot be file-wide without producing false positives.
+  Evidence: a `Target` receiver declared in one method or class could otherwise prove `target.run()` in unrelated methods/classes; receiver bindings are now scoped to their enclosing declaration and child declarations.
+
+- Observation: local shadow detection needs to ignore completed inner blocks while still respecting active nested blocks.
+  Evidence: `val helper = ...` inside a completed block should not block a later sibling `helper()` call, but it must block references inside the block.
 
 ## Decision Log
 
@@ -60,11 +67,21 @@ Scala files are already parsed by Bifrost, but usage lookup for Scala symbols st
   Rationale: when multiple wildcard imports can expose the same top-level function or value name, the flow-insensitive graph cannot prove which declaration an unqualified identifier denotes without compiler-grade resolution.
   Date/Author: 2026-05-22 / Codex
 
+- Decision: add only simple call-arity filtering for Scala methods.
+  Rationale: this blocks obvious overload false positives such as matching `run(1)` while searching for `run()`, without attempting compiler-grade overload resolution.
+  Date/Author: 2026-05-22 / Codex
+
 ## Outcomes & Retrospective
 
 Issue 114 is implemented. Scala imports now have structured metadata, `UsageFinder` routes Scala targets through `ScalaUsageGraphStrategy`, and the graph proves package/import/type/object/member references without claiming compiler-grade Scala resolution. The focused tests cover routing, grouped and aliased imports, wildcard object-member imports, inheritance/type references including `with`, enum cases, top-level functions, top-level vals/vars, field reads/writes, local receiver inference, unrelated same-name negatives, and `max_usages`.
 
 Round-three hardening added exact line/enclosing-symbol assertions over `UsageHit` fields, distinct read/write field checks, owner-context `this` member resolution, constructor-only receiver inference, local shadowing protections for unqualified and qualified imported symbols, alias import edges for object and top-level symbols, wildcard package imports for top-level functions/values, and conservative behavior for ambiguous wildcard imports.
+
+Depth-testing hardening added explicit coverage for graph `Failure` fallback, successful zero-hit graph results that must not fall back to regex, candidate-file boundaries, block/method-local shadowing, scoped receiver facts, receiver reassignment and alias-chain limits, and non-goals around inherited/overloaded/extension/path-dependent member references. The maturity checklist is now:
+
+- Covered: type/class/trait/object/enum references, constructors, enum cases, object/static-like members, instance methods, field reads/writes, top-level functions, top-level vals/vars, imports, aliases, wildcard imports, `extends`/`with`, `this`, simple typed/constructor receivers, candidate limits, and max-usages.
+- Intentional non-goals: implicits/givens, extension methods, compiler overload resolution, path-dependent types, macro-generated symbols, interprocedural flow, alias-chain receiver propagation, and broad pattern/destructuring receiver inference.
+- Remaining parity gaps versus Rust/Python/Go: no update/cache invalidation tests for Scala usage graph state, no large fixture corpus, and fewer deep language-specific edge cases around inheritance and visibility.
 
 The remaining limitations are intentional and match the issue scope: no implicit conversions or givens, no extension-method resolution, no overload resolution, no path-dependent type support, no macro-generated code, and no interprocedural data-flow.
 
