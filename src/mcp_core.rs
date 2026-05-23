@@ -1,0 +1,212 @@
+use crate::mcp_common::{
+    McpRenderOptions, McpServerSpec, SEARCHTOOLS_INSTRUCTIONS, file_patterns_schema,
+    json_schema_object, mutating_tool_descriptor, run_stdio_server, summaries_schema,
+    symbol_names_schema, tool_descriptor,
+};
+use serde_json::{Value, json};
+use std::path::PathBuf;
+
+pub const CORE_TOOL_NAMES: &[&str] = &[
+    "refresh",
+    "activate_workspace",
+    "get_active_workspace",
+    "search_symbols",
+    "get_symbol_locations",
+    "get_symbol_summaries",
+    "get_symbol_sources",
+    "get_summaries",
+    "list_symbols",
+    "most_relevant_files",
+    "scan_usages",
+];
+
+pub const SEARCHTOOLS_TOOL_NAMES: &[&str] = &[
+    "refresh",
+    "activate_workspace",
+    "get_active_workspace",
+    "search_symbols",
+    "get_symbol_locations",
+    "get_symbol_summaries",
+    "get_symbol_sources",
+    "get_summaries",
+    "list_symbols",
+    "most_relevant_files",
+    "scan_usages",
+    "get_file_contents",
+    "find_filenames",
+    "find_files_containing",
+    "search_file_contents",
+    "list_files",
+    "skim_files",
+    "search_git_commit_messages",
+    "get_git_log",
+    "get_commit_diff",
+    "jq",
+    "xml_skim",
+    "xml_select",
+    "compute_cyclomatic_complexity",
+    "compute_cognitive_complexity",
+    "report_comment_density_for_code_unit",
+    "report_exception_handling_smells",
+    "report_comment_density_for_files",
+    "analyze_git_hotspots",
+    "report_test_assertion_smells",
+    "report_structural_clone_smells",
+    "report_long_method_and_god_object_smells",
+    "report_dead_code_and_unused_abstraction_smells",
+    "report_secret_like_code",
+];
+
+const CORE_SPEC: McpServerSpec = McpServerSpec {
+    instructions: SEARCHTOOLS_INSTRUCTIONS,
+    tool_names: CORE_TOOL_NAMES,
+    tool_descriptors: core_tool_descriptors,
+};
+
+const SEARCHTOOLS_SPEC: McpServerSpec = McpServerSpec {
+    instructions: SEARCHTOOLS_INSTRUCTIONS,
+    tool_names: SEARCHTOOLS_TOOL_NAMES,
+    tool_descriptors: searchtools_tool_descriptors,
+};
+
+pub fn run_core_stdio_server(
+    root: PathBuf,
+    render_options: McpRenderOptions,
+) -> Result<(), String> {
+    run_stdio_server(root, render_options, &CORE_SPEC)
+}
+
+pub fn run_searchtools_stdio_server(
+    root: PathBuf,
+    render_options: McpRenderOptions,
+) -> Result<(), String> {
+    run_stdio_server(root, render_options, &SEARCHTOOLS_SPEC)
+}
+
+pub(crate) fn core_tool_descriptors() -> Vec<Value> {
+    vec![
+        mutating_tool_descriptor(
+            "refresh",
+            "Refresh the analyzer snapshot for the current workspace.",
+            json_schema_object(&[]),
+        ),
+        mutating_tool_descriptor(
+            "activate_workspace",
+            "Set the active workspace for this MCP server. The path must be absolute. If it lives inside a git repository, the active workspace becomes the nearest enclosing repository root (discovery walks parents until a .git is found); otherwise the canonicalized path is used as-is. Pass a path you intend to be the project root.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "workspace_path": {
+                        "type": "string",
+                        "description": "Absolute path to the desired workspace directory."
+                    }
+                },
+                "required": ["workspace_path"]
+            }),
+        ),
+        tool_descriptor(
+            "get_active_workspace",
+            "Return the currently active workspace root.",
+            json_schema_object(&[]),
+        ),
+        tool_descriptor(
+            "search_symbols",
+            "Search indexed symbols across the current workspace.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "patterns": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Search patterns to match against indexed symbol names."
+                    },
+                    "include_tests": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Whether to include symbols from detected test files."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "default": 20,
+                        "minimum": 1,
+                        "description": "Maximum number of files to return."
+                    }
+                },
+                "required": ["patterns"]
+            }),
+        ),
+        tool_descriptor(
+            "get_symbol_locations",
+            "Return file locations for indexed symbols.",
+            symbol_names_schema(),
+        ),
+        tool_descriptor(
+            "get_symbol_summaries",
+            "Return ranged summaries for indexed symbols.",
+            symbol_names_schema(),
+        ),
+        tool_descriptor(
+            "get_symbol_sources",
+            "Return source blocks for indexed symbols.",
+            symbol_names_schema(),
+        ),
+        tool_descriptor(
+            "get_summaries",
+            "Return ranged summaries for matching files, globs, or class targets.",
+            summaries_schema(),
+        ),
+        tool_descriptor(
+            "list_symbols",
+            "Return compact recursive symbol outlines for matching files.",
+            file_patterns_schema(),
+        ),
+        tool_descriptor(
+            "most_relevant_files",
+            "Return related project files ranked by Git history and imports.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "seed_files": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Project-relative seed files used to rank related files."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "default": 20,
+                        "minimum": 0,
+                        "description": "Maximum number of related files to return."
+                    }
+                },
+                "required": ["seed_files"]
+            }),
+        ),
+        tool_descriptor(
+            "scan_usages",
+            "Find call sites and references for fully qualified symbol names. Use search_symbols first when you only have a partial name. Best-effort name resolution: bifrost is tree-sitter only (no scope analysis or type checker), so output may include false positives for shadowed names.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "symbols": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Fully qualified symbol names to find usages for."
+                    },
+                    "include_tests": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Include call sites in test files."
+                    }
+                },
+                "required": ["symbols"]
+            }),
+        ),
+    ]
+}
+
+fn searchtools_tool_descriptors() -> Vec<Value> {
+    let mut tools = core_tool_descriptors();
+    tools.extend(crate::mcp_extended::extended_tool_descriptors());
+    tools.extend(crate::mcp_slopcop::slopcop_tool_descriptors());
+    tools
+}

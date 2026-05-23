@@ -454,6 +454,74 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
 }
 
 #[test]
+fn bifrost_split_servers_publish_expected_tool_sets() {
+    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("testcode-java");
+
+    assert_server_tools(
+        &fixture_root,
+        "core",
+        &[
+            "refresh",
+            "activate_workspace",
+            "get_summaries",
+            "scan_usages",
+        ],
+        &["get_file_contents", "report_secret_like_code"],
+    );
+    assert_server_tools(
+        &fixture_root,
+        "extended",
+        &[
+            "get_file_contents",
+            "find_filenames",
+            "compute_cyclomatic_complexity",
+            "report_comment_density_for_files",
+        ],
+        &["refresh", "get_summaries", "report_secret_like_code"],
+    );
+    assert_server_tools(
+        &fixture_root,
+        "slopcop",
+        &[
+            "analyze_git_hotspots",
+            "report_test_assertion_smells",
+            "report_secret_like_code",
+        ],
+        &["refresh", "get_file_contents", "get_summaries"],
+    );
+}
+
+#[test]
+fn bifrost_split_servers_reject_tools_outside_their_registry() {
+    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("testcode-java");
+
+    assert_unknown_tool(
+        &fixture_root,
+        "core",
+        "get_file_contents",
+        json!({ "filenames": ["A.java"] }),
+    );
+    assert_unknown_tool(
+        &fixture_root,
+        "extended",
+        "get_summaries",
+        json!({ "targets": ["A.java"] }),
+    );
+    assert_unknown_tool(
+        &fixture_root,
+        "slopcop",
+        "get_file_contents",
+        json!({ "filenames": ["A.java"] }),
+    );
+}
+
+#[test]
 fn bifrost_searchtools_server_supports_runtime_workspace_switch() {
     let initial_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -468,7 +536,7 @@ fn bifrost_searchtools_server_supports_runtime_workspace_switch() {
     .expect("write fixture");
     let switched_root = switched.path().canonicalize().expect("canonicalize");
 
-    let mut child = spawn_searchtools_server(&initial_root, &[]);
+    let mut child = spawn_server(&initial_root, "searchtools", &[]);
 
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
@@ -603,31 +671,13 @@ fn bifrost_searchtools_server_can_hide_line_numbers_in_text_preview() {
         .join("fixtures")
         .join("testcode-java");
 
-    let mut child = spawn_searchtools_server(&fixture_root, &["--no-line-numbers"]);
+    let mut child = spawn_server(&fixture_root, "searchtools", &["--no-line-numbers"]);
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
     let mut stderr = child.stderr.take().expect("stderr");
     let mut reader = BufReader::new(stdout);
 
-    round_trip(
-        &mut stdin,
-        &mut reader,
-        &mut stderr,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 0,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2025-11-25",
-                "capabilities": {},
-                "clientInfo": { "name": "test-client", "version": "0.1.0" }
-            }
-        }),
-    );
-    write_line(
-        &mut stdin,
-        json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
-    );
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
 
     let summaries = round_trip(
         &mut stdin,
@@ -662,13 +712,149 @@ fn bifrost_searchtools_server_can_hide_line_numbers_in_text_preview() {
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");
 }
 
-fn spawn_searchtools_server(root: &std::path::Path, extra_args: &[&str]) -> std::process::Child {
+#[test]
+fn bifrost_core_server_can_hide_line_numbers_in_text_preview() {
+    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("testcode-java");
+
+    let mut child = spawn_server(&fixture_root, "core", &["--no-line-numbers"]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+
+    let summaries = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "get_summaries",
+                "arguments": {
+                    "targets": ["A.java"]
+                }
+            }
+        }),
+    );
+    let preview = summaries["result"]["content"][0]["text"]
+        .as_str()
+        .expect("preview text");
+    assert!(preview.contains("public class A"), "{preview}");
+    assert!(!preview.contains("\"summaries\""), "{preview}");
+    assert!(!preview.contains("3..52:"), "{preview}");
+    assert!(!preview.contains("8..10:"), "{preview}");
+    assert!(
+        summaries["result"]["structuredContent"]["summaries"][0]["elements"][0]["start_line"]
+            .is_number()
+    );
+
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+fn assert_server_tools(root: &std::path::Path, mode: &str, expected: &[&str], unexpected: &[&str]) {
+    let mut child = spawn_server(root, mode, &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+
+    let list_tools = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+    );
+    let tools = list_tools["result"]["tools"]
+        .as_array()
+        .expect("tools array");
+    for name in expected {
+        assert!(
+            tools.iter().any(|tool| tool["name"] == *name),
+            "mode {mode} missing tool {name}: {list_tools}"
+        );
+    }
+    for name in unexpected {
+        assert!(
+            !tools.iter().any(|tool| tool["name"] == *name),
+            "mode {mode} unexpectedly exposed tool {name}: {list_tools}"
+        );
+    }
+
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+fn assert_unknown_tool(root: &std::path::Path, mode: &str, tool_name: &str, arguments: Value) {
+    let mut child = spawn_server(root, mode, &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+
+    let response = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": tool_name,
+                "arguments": arguments
+            }
+        }),
+    );
+    assert_eq!(response["result"]["isError"], true, "{response}");
+    assert_eq!(
+        response["result"]["content"][0]["text"],
+        format!("Unknown tool: {tool_name}")
+    );
+
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+fn initialize_session(stdin: &mut impl Write, reader: &mut impl BufRead, stderr: &mut impl Read) {
+    round_trip(
+        stdin,
+        reader,
+        stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": { "name": "test-client", "version": "0.1.0" }
+            }
+        }),
+    );
+    write_line(
+        stdin,
+        json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+    );
+}
+
+fn spawn_server(root: &std::path::Path, mode: &str, extra_args: &[&str]) -> std::process::Child {
     let mut command = Command::new(env!("CARGO_BIN_EXE_bifrost"));
-    command
-        .arg("--root")
-        .arg(root)
-        .arg("--server")
-        .arg("searchtools");
+    command.arg("--root").arg(root).arg("--server").arg(mode);
     for arg in extra_args {
         command.arg(arg);
     }

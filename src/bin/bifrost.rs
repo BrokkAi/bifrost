@@ -2,7 +2,10 @@ use std::env;
 use std::process::ExitCode;
 
 use brokk_bifrost::lsp::run_lsp_stdio_server;
-use brokk_bifrost::mcp_server::{McpRenderOptions, run_searchtools_stdio_server};
+use brokk_bifrost::mcp_common::McpRenderOptions;
+use brokk_bifrost::mcp_core::{run_core_stdio_server, run_searchtools_stdio_server};
+use brokk_bifrost::mcp_extended::run_extended_stdio_server;
+use brokk_bifrost::mcp_slopcop::run_slopcop_stdio_server;
 
 fn main() -> ExitCode {
     match run() {
@@ -54,6 +57,9 @@ fn run() -> Result<(), String> {
 
     match server_mode.as_deref() {
         Some("searchtools") => run_searchtools_stdio_server(root, render_options),
+        Some("core") => run_core_stdio_server(root, render_options),
+        Some("extended") => run_extended_stdio_server(root, render_options),
+        Some("slopcop") => run_slopcop_stdio_server(root, render_options),
         Some("lsp") => run_lsp_stdio_server(root),
         Some(other) => Err(format!("Unsupported server mode: {other}")),
         None => {
@@ -66,6 +72,9 @@ fn run() -> Result<(), String> {
 fn print_help() {
     println!("Usage: bifrost --root PROJECT_ROOT --server searchtools");
     println!("       bifrost --root PROJECT_ROOT --server searchtools --no-line-numbers");
+    println!("       bifrost --root PROJECT_ROOT --server core");
+    println!("       bifrost --root PROJECT_ROOT --server extended");
+    println!("       bifrost --root PROJECT_ROOT --server slopcop");
     println!("       bifrost --root PROJECT_ROOT --server lsp");
     println!("       bifrost --version");
 }

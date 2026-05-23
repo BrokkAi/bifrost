@@ -78,7 +78,15 @@ Run it against a project root:
 ./target/debug/bifrost --root /path/to/project --server searchtools
 ```
 
-Pass `--no-line-numbers` to remove rendered line and line-range prefixes from the MCP text preview for the searchtools outputs while keeping `structuredContent` unchanged.
+Additional MCP modes expose subsets of the tool surface:
+
+```bash
+./target/debug/bifrost --root /path/to/project --server core
+./target/debug/bifrost --root /path/to/project --server extended
+./target/debug/bifrost --root /path/to/project --server slopcop
+```
+
+`searchtools` remains the compatibility mode and exposes the full current union of MCP tools. Pass `--no-line-numbers` to remove rendered line and line-range prefixes from the MCP text preview while keeping `structuredContent` unchanged.
 
 This starts a stdio MCP server that publishes these tools:
 
@@ -92,6 +100,12 @@ This starts a stdio MCP server that publishes these tools:
 - `get_summaries`
 - `list_symbols`
 - `most_relevant_files`
+
+The subset servers publish:
+
+- `core`: the original analyzer/search navigation tools
+- `extended`: file, grep-like, git, jq/XML, and comment/complexity tools added on `2026-05-15`
+- `slopcop`: hotspot and smell-detection tools added after `2026-05-15`
 
 `activate_workspace` lets a host swap the analyzer's root mid-session without respawning the subprocess. The path must be absolute and is normalized to the nearest enclosing git root when one exists.
 
