@@ -92,7 +92,7 @@ pub(crate) fn core_tool_descriptors() -> Vec<Value> {
         ),
         mutating_tool_descriptor(
             "activate_workspace",
-            "Switch the indexed workspace root for subsequent tools; use when moving to a different checkout, task repository, or worktree. The path must be absolute. If it lives inside a git repository, the active workspace becomes the nearest enclosing repository root.",
+            "Switch the indexed workspace root for later tools; use when moving to a different checkout, task repo, or worktree.",
             json!({
                 "type": "object",
                 "properties": {
