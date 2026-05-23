@@ -87,12 +87,12 @@ pub(crate) fn core_tool_descriptors() -> Vec<Value> {
     vec![
         mutating_tool_descriptor(
             "refresh",
-            "Refresh the analyzer snapshot for the current workspace.",
+            "Update the code index after files change so symbol, usage, and workspace search results reflect the current checkout.",
             json_schema_object(&[]),
         ),
         mutating_tool_descriptor(
             "activate_workspace",
-            "Set the active workspace for this MCP server. The path must be absolute. If it lives inside a git repository, the active workspace becomes the nearest enclosing repository root (discovery walks parents until a .git is found); otherwise the canonicalized path is used as-is. Pass a path you intend to be the project root.",
+            "Switch the indexed workspace root for subsequent tools; use when moving to a different checkout, task repository, or worktree. The path must be absolute. If it lives inside a git repository, the active workspace becomes the nearest enclosing repository root.",
             json!({
                 "type": "object",
                 "properties": {
@@ -106,12 +106,12 @@ pub(crate) fn core_tool_descriptors() -> Vec<Value> {
         ),
         tool_descriptor(
             "get_active_workspace",
-            "Return the currently active workspace root.",
+            "Return the currently indexed workspace root; use to verify which repository the search and analysis tools will inspect.",
             json_schema_object(&[]),
         ),
         tool_descriptor(
             "search_symbols",
-            "Search indexed symbols across the current workspace.",
+            "Find classes, functions, methods, fields, modules, and other indexed declarations by name; prefer over grep when looking for code symbols.",
             json!({
                 "type": "object",
                 "properties": {
@@ -129,7 +129,7 @@ pub(crate) fn core_tool_descriptors() -> Vec<Value> {
                         "type": "integer",
                         "default": 20,
                         "minimum": 1,
-                        "description": "Maximum number of files to return."
+                        "description": "Maximum number of matching symbol results to return."
                     }
                 },
                 "required": ["patterns"]
@@ -137,32 +137,32 @@ pub(crate) fn core_tool_descriptors() -> Vec<Value> {
         ),
         tool_descriptor(
             "get_symbol_locations",
-            "Return file locations for indexed symbols.",
+            "Get project-relative file paths and line ranges for known symbols after search_symbols; use before opening exact definitions.",
             symbol_names_schema(),
         ),
         tool_descriptor(
             "get_symbol_summaries",
-            "Return ranged summaries for indexed symbols.",
+            "Preview compact line-ranged summaries for known symbols after search_symbols; cheaper than reading whole files.",
             symbol_names_schema(),
         ),
         tool_descriptor(
             "get_symbol_sources",
-            "Return source blocks for indexed symbols.",
+            "Read exact source blocks for known symbols after search_symbols; prefer over cat when inspecting definitions.",
             symbol_names_schema(),
         ),
         tool_descriptor(
             "get_summaries",
-            "Return ranged summaries for matching files, globs, or class targets.",
+            "Summarize matching source files, globs, or classes with line ranges; use to orient in code before reading full files.",
             summaries_schema(),
         ),
         tool_descriptor(
             "list_symbols",
-            "Return compact recursive symbol outlines for matching files.",
+            "Outline declarations recursively for source files; use to understand code structure without reading entire files.",
             file_patterns_schema(),
         ),
         tool_descriptor(
             "most_relevant_files",
-            "Return related project files ranked by Git history and imports.",
+            "Given seed source files, rank related code by imports and git history; use after finding one relevant file to expand context.",
             json!({
                 "type": "object",
                 "properties": {
@@ -183,7 +183,7 @@ pub(crate) fn core_tool_descriptors() -> Vec<Value> {
         ),
         tool_descriptor(
             "scan_usages",
-            "Find call sites and references for fully qualified symbol names. Use search_symbols first when you only have a partial name. Best-effort name resolution: bifrost is tree-sitter only (no scope analysis or type checker), so output may include false positives for shadowed names.",
+            "Find references and call sites for known fully qualified symbols; use search_symbols first for partial names. Static analysis may include false positives.",
             json!({
                 "type": "object",
                 "properties": {
