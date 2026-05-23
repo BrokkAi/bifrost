@@ -92,7 +92,7 @@ pub(crate) fn core_tool_descriptors() -> Vec<Value> {
         ),
         mutating_tool_descriptor(
             "activate_workspace",
-            "Switch the indexed workspace root for later tools; use when moving to a different checkout, task repo, or worktree.",
+            "Switch the active workspace root for later tools; a workspace is already active at startup, so use this only to move to a different repo, checkout, or worktree.",
             json!({
                 "type": "object",
                 "properties": {
@@ -106,7 +106,7 @@ pub(crate) fn core_tool_descriptors() -> Vec<Value> {
         ),
         tool_descriptor(
             "get_active_workspace",
-            "Return the currently indexed workspace root; use to verify which repository the search and analysis tools will inspect.",
+            "Return the current active workspace root, including after any prior workspace switch; use this to confirm which repository later tools will inspect.",
             json_schema_object(&[]),
         ),
         tool_descriptor(
