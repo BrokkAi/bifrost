@@ -207,9 +207,10 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
         .as_str()
         .expect("source preview text");
     assert!(
-        source_preview.starts_with("SampleTest.sameValue (SampleTest.java:"),
+        source_preview.starts_with("## SampleTest.sameValue\n\n- Location: SampleTest.java:"),
         "{source_preview}"
     );
+    assert!(source_preview.contains("```text\n"), "{source_preview}");
     assert!(
         !source_preview.trim_start().starts_with('{'),
         "{source_preview}"
