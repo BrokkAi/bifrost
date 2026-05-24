@@ -479,19 +479,24 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
     assert_server_tools(
         &fixture_root,
         "extended",
+        &["get_file_contents", "find_filenames", "most_relevant_files"],
         &[
-            "get_file_contents",
-            "find_filenames",
-            "most_relevant_files",
+            "refresh",
+            "get_summaries",
             "compute_cyclomatic_complexity",
             "report_comment_density_for_files",
+            "report_secret_like_code",
         ],
-        &["refresh", "get_summaries", "report_secret_like_code"],
     );
     assert_server_tools(
         &fixture_root,
         "slopcop",
         &[
+            "compute_cyclomatic_complexity",
+            "compute_cognitive_complexity",
+            "report_comment_density_for_code_unit",
+            "report_exception_handling_smells",
+            "report_comment_density_for_files",
             "analyze_git_hotspots",
             "report_test_assertion_smells",
             "report_secret_like_code",
@@ -831,7 +836,11 @@ fn bifrost_mcp_normalizes_absolute_paths_inside_workspace() {
         "src/A.java"
     );
 
-    let absolute_glob = format!("{}/src/**/*.java", fixture_root.path().display());
+    let absolute_glob_root = fixture_root
+        .path()
+        .canonicalize()
+        .expect("canonicalize fixture root");
+    let absolute_glob = format!("{}/src/**/*.java", absolute_glob_root.display());
     let search = round_trip(
         &mut stdin,
         &mut reader,

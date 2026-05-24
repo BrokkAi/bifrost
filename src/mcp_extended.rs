@@ -1,6 +1,5 @@
 use crate::mcp_common::{
-    McpRenderOptions, McpServerSpec, SEARCHTOOLS_INSTRUCTIONS, WeightThreshold, run_stdio_server,
-    tool_descriptor, weight_knob_descriptor,
+    McpRenderOptions, McpServerSpec, SEARCHTOOLS_INSTRUCTIONS, run_stdio_server, tool_descriptor,
 };
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -19,11 +18,6 @@ pub const EXTENDED_TOOL_NAMES: &[&str] = &[
     "jq",
     "xml_skim",
     "xml_select",
-    "compute_cyclomatic_complexity",
-    "compute_cognitive_complexity",
-    "report_comment_density_for_code_unit",
-    "report_exception_handling_smells",
-    "report_comment_density_for_files",
 ];
 
 const EXTENDED_SPEC: McpServerSpec = McpServerSpec {
@@ -340,135 +334,6 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                     }
                 },
                 "required": ["filepath", "xpath"]
-            }),
-        ),
-        tool_descriptor(
-            "compute_cyclomatic_complexity",
-            "Compute heuristic cyclomatic complexity per function/method in the given files; flag those exceeding a threshold. Heuristic counts a base of 1 plus each `if/while/for/switch/case/catch` keyword and each `&&`/`||`/`?` operator in the source.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "file_paths": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Project-relative paths of files to analyze, or absolute paths inside the active workspace."
-                    },
-                    "threshold": {
-                        "type": "integer",
-                        "default": 10,
-                        "description": "Flag functions whose complexity exceeds this threshold. Values <= 0 fall back to 10."
-                    }
-                },
-                "required": ["file_paths"]
-            }),
-        ),
-        tool_descriptor(
-            "compute_cognitive_complexity",
-            "Compute heuristic cognitive complexity per function/method in the given files; flag those exceeding a threshold. Walks the language's tree-sitter AST, scoring control-flow breaks by SonarSource rules (each `if`/loop/`catch`/case adds 1+nesting; sequences of `&&`/`||` count per distinct adjacent operator; labeled `break`/`continue` add 1). Output format matches the brokk-core MCP byte-for-byte.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "file_paths": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Project-relative paths of files to analyze, or absolute paths inside the active workspace."
-                    },
-                    "threshold": {
-                        "type": "integer",
-                        "default": 15,
-                        "description": "Flag functions whose cognitive complexity exceeds this threshold. Values <= 0 fall back to 15."
-                    }
-                },
-                "required": ["file_paths"]
-            }),
-        ),
-        tool_descriptor(
-            "report_comment_density_for_code_unit",
-            "Java comment density for one symbol identified by fully qualified name. Reports header vs inline comment line counts, declaration span lines, and rolled-up totals for class-like units. Output format matches the brokk-core MCP byte-for-byte.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "fq_name": {
-                        "type": "string",
-                        "description": "Fully qualified name (e.g. com.example.MyClass or com.example.MyClass.method)."
-                    },
-                    "max_lines": {
-                        "type": "integer",
-                        "default": 120,
-                        "description": "Maximum output lines; values <= 0 default to 120."
-                    }
-                },
-                "required": ["fq_name"]
-            }),
-        ),
-        tool_descriptor(
-            "report_exception_handling_smells",
-            "Detects suspicious exception handlers using weighted heuristics designed for high-recall triage. Scores generic catches and tiny / empty / comment-only / log-only handlers, then subtracts credit for richer handler bodies. Use min_score, max_findings, and the per-rule weights to tune precision/recall. Output format matches the brokk-core MCP byte-for-byte.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "file_paths": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Project-relative paths of files to analyze, or absolute paths inside the active workspace."
-                    },
-                    "min_score": {
-                        "type": "integer",
-                        "default": 4,
-                        "description": "Minimum score to include a finding; values <= 0 default to 4."
-                    },
-                    "max_findings": {
-                        "type": "integer",
-                        "default": 80,
-                        "description": "Maximum findings to emit; values <= 0 default to 80."
-                    },
-                    "generic_throwable_weight": weight_knob_descriptor(
-                        "Weight for catching Throwable", 5, WeightThreshold::Negative),
-                    "generic_exception_weight": weight_knob_descriptor(
-                        "Weight for catching Exception", 3, WeightThreshold::Negative),
-                    "generic_runtime_exception_weight": weight_knob_descriptor(
-                        "Weight for catching RuntimeException", 2, WeightThreshold::Negative),
-                    "empty_body_weight": weight_knob_descriptor(
-                        "Weight for empty catch bodies", 5, WeightThreshold::Negative),
-                    "comment_only_body_weight": weight_knob_descriptor(
-                        "Weight for comment-only catch bodies", 4, WeightThreshold::Negative),
-                    "small_body_weight": weight_knob_descriptor(
-                        "Weight for small catch bodies", 2, WeightThreshold::Negative),
-                    "log_only_body_weight": weight_knob_descriptor(
-                        "Weight for log-only catch bodies", 2, WeightThreshold::Negative),
-                    "meaningful_body_credit_per_statement": weight_knob_descriptor(
-                        "Score credit subtracted per catch statement in the body", 1, WeightThreshold::Negative),
-                    "meaningful_body_statement_threshold": weight_knob_descriptor(
-                        "Maximum statements that earn meaningful-body credit", 6, WeightThreshold::Negative),
-                    "small_body_max_statements": weight_knob_descriptor(
-                        "Maximum statement count considered a small body", 2, WeightThreshold::Negative)
-                },
-                "required": ["file_paths"]
-            }),
-        ),
-        tool_descriptor(
-            "report_comment_density_for_files",
-            "Java comment density tables for the given source files: one section per file and one row per top-level declaration with own and rolled-up header / inline / span line counts. Non-Java files are skipped with a one-line placeholder. Output format matches the brokk-core MCP byte-for-byte.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "file_paths": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Project-relative paths of files to analyze, or absolute paths inside the active workspace."
-                    },
-                    "max_top_level_rows": {
-                        "type": "integer",
-                        "default": 60,
-                        "description": "Maximum declaration rows across all files; values <= 0 default to 60."
-                    },
-                    "max_files": {
-                        "type": "integer",
-                        "default": 25,
-                        "description": "Maximum files to include; values <= 0 default to 25."
-                    }
-                },
-                "required": ["file_paths"]
             }),
         ),
     ]
