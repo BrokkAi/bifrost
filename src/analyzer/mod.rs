@@ -19,6 +19,7 @@ mod python_analyzer;
 mod rust_analyzer;
 mod scala_analyzer;
 mod source_content;
+pub(crate) mod symbol_lookup;
 pub(crate) mod tree_sitter_analyzer;
 mod typescript_analyzer;
 mod workspace;
