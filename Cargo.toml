@@ -1,6 +1,6 @@
 [package]
 name = "brokk-bifrost"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 description = "Tree-sitter-backed multi-language code analyzer with bundled LSP and MCP search-tool servers. Powers Brokk's `bifrost` binary."
 license = "LGPL-3.0-or-later"
