@@ -9,10 +9,10 @@
 //!
 //! - [`ImportGraphCandidateProvider`] for the candidate file set, with
 //!   [`TextSearchCandidateProvider`] as a substring-scan fallback.
-//! - [`JsTsExportUsageGraphStrategy`] for JS/TS targets. When the graph cannot infer a
-//!   seed it returns [`FuzzyResult::Failure`]; [`UsageFinder`] then routes the query to
-//!   the regex analyzer instead.
-//! - [`RegexUsageAnalyzer`] for everything else.
+//! - Language-specific graph strategies for JavaScript / TypeScript, Python, PHP, Rust,
+//!   Java, C#, C++, Go, and Scala targets.
+//! - [`RegexUsageAnalyzer`] for unsupported languages and as a best-effort fallback when
+//!   a graph strategy returns [`FuzzyResult::Failure`].
 
 mod candidates;
 mod cpp_graph;
