@@ -1,11 +1,11 @@
 use lsp_types::{DocumentHighlight, DocumentHighlightKind, DocumentHighlightParams};
 
+use crate::analyzer::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, UsageFinder, UsageHit};
 use crate::analyzer::{CodeUnit, IAnalyzer, Project, Range as ByteRange, WorkspaceAnalyzer};
 use crate::lsp::conversion::{byte_range_to_lsp_range, position_to_byte_offset};
 use crate::lsp::handlers::util::{
     identifier_at_offset, identifier_selection_range, read_document_for_uri,
 };
-use crate::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, UsageFinder, UsageHit};
 
 /// Resolve `textDocument/documentHighlight`. Scopes the usage scan to the
 /// current file via [`UsageFinder::with_file_filter`] — clients fire this

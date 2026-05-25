@@ -22,7 +22,7 @@ pub mod summary;
 #[cfg(test)]
 mod test_support;
 mod text_utils;
-pub mod usages;
+pub use analyzer::usages;
 
 pub use analyzer::{
     AnalyzerConfig, AnalyzerDelegate, CSharpAnalyzer, CapabilityProvider, CloneSmell,

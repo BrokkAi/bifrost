@@ -22,6 +22,7 @@ mod source_content;
 pub(crate) mod symbol_lookup;
 pub(crate) mod tree_sitter_analyzer;
 mod typescript_analyzer;
+pub mod usages;
 mod workspace;
 
 pub use capabilities::{

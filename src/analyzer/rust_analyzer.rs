@@ -1,13 +1,13 @@
 use crate::analyzer::cognitive_complexity;
+use crate::analyzer::usages::{
+    ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind, ReexportStar,
+};
 use crate::analyzer::{
     AnalyzerConfig, CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language,
     LanguageAdapter, Project, ProjectFile, TestAssertionSmell, TestAssertionWeights,
     TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider, build_reverse_import_index,
 };
 use crate::hash::{HashMap, HashSet};
-use crate::usages::{
-    ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind, ReexportStar,
-};
 use moka::sync::Cache;
 use regex::Regex;
 use std::collections::BTreeSet;

@@ -10,3 +10,5 @@ bifrost_searchtools/*.so
 !AGENTS.md
 !**/.brokk/style.md
 !**/.brokk/project.properties
+
+.idea

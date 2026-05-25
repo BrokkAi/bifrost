@@ -1,10 +1,10 @@
+use crate::analyzer::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, FuzzyResult, UsageFinder};
 use crate::analyzer::{
     CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType, CommentDensityStats,
     DeclarationInfo, ExceptionHandlingSmell, ExceptionSmellWeights, ImportAnalysisProvider,
     Language, ParseError, Project, ProjectFile, Range, TestAssertionSmell, TestAssertionWeights,
     TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider, metrics_from_declarations,
 };
-use crate::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, FuzzyResult, UsageFinder};
 use std::any::Any;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -201,7 +201,7 @@ pub trait IAnalyzer: Send + Sync + Any {
     }
 
     /// Find call sites and references to the given overloads using the default
-    /// [`UsageFinder`] strategy. The free function [`crate::usages::find_usages`] is the
+    /// [`UsageFinder`] strategy. The free function [`crate::analyzer::usages::find_usages`] is the
     /// equivalent for callers that hold a `&dyn IAnalyzer`.
     fn find_usages(&self, overloads: &[CodeUnit]) -> FuzzyResult
     where
@@ -216,7 +216,7 @@ pub trait IAnalyzer: Send + Sync + Any {
         overloads: &[CodeUnit],
         max_files: usize,
         max_usages: usize,
-    ) -> crate::usages::QueryResult
+    ) -> crate::analyzer::usages::QueryResult
     where
         Self: Sized,
     {

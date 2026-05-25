@@ -1,15 +1,15 @@
+use crate::analyzer::usages::graph_core::{ImportEdgeKind, ProjectUsageGraph};
+use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
+use crate::analyzer::usages::model::{
+    ExportEntry, ExportIndex, FuzzyResult, ImportBinder, ImportBinding, ImportKind, UsageHit,
+};
+use crate::analyzer::usages::traits::UsageAnalyzer;
 use crate::analyzer::{
     AnalyzerDelegate, CodeUnit, GoAnalyzer, IAnalyzer, ImportAnalysisProvider, Language,
     MultiAnalyzer, ProjectFile, Range,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
-use crate::usages::graph_core::{ImportEdgeKind, ProjectUsageGraph};
-use crate::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::usages::model::{
-    ExportEntry, ExportIndex, FuzzyResult, ImportBinder, ImportBinding, ImportKind, UsageHit,
-};
-use crate::usages::traits::UsageAnalyzer;
 use rayon::prelude::*;
 use regex::Regex;
 use std::collections::BTreeSet;

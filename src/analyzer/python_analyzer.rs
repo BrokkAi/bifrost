@@ -1,4 +1,7 @@
 use crate::analyzer::cognitive_complexity;
+use crate::analyzer::usages::{
+    ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind, ReexportStar,
+};
 use crate::analyzer::{
     AnalyzerConfig, CodeUnit, CodeUnitType, IAnalyzer, ImportAnalysisProvider, ImportInfo,
     Language, LanguageAdapter, Project, ProjectFile, TestAssertionSmell, TestAssertionWeights,
@@ -8,9 +11,6 @@ use crate::analyzer::{
 use crate::hash::{HashMap, HashSet};
 use crate::profiling;
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
-use crate::usages::{
-    ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind, ReexportStar,
-};
 use crate::{
     analyzer::clone_detection::{
         CloneCandidateData, CloneCandidateProfile, compact_clone_excerpt,

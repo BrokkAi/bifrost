@@ -1,15 +1,15 @@
+use crate::analyzer::usages::graph_core::{ImportEdge, ImportEdgeKind, ProjectUsageGraph};
+use crate::analyzer::usages::local_inference::{
+    LocalBindingsSnapshot, LocalInferenceConfig, LocalInferenceEngine, SymbolResolution,
+};
+use crate::analyzer::usages::model::{ExportIndex, FuzzyResult, ImportBinder, UsageHit};
+use crate::analyzer::usages::traits::UsageAnalyzer;
 use crate::analyzer::{
     AnalyzerDelegate, CodeUnit, IAnalyzer, Language, MultiAnalyzer, ProjectFile, PythonAnalyzer,
     Range,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
-use crate::usages::graph_core::{ImportEdge, ImportEdgeKind, ProjectUsageGraph};
-use crate::usages::local_inference::{
-    LocalBindingsSnapshot, LocalInferenceConfig, LocalInferenceEngine, SymbolResolution,
-};
-use crate::usages::model::{ExportIndex, FuzzyResult, ImportBinder, UsageHit};
-use crate::usages::traits::UsageAnalyzer;
 use rayon::prelude::*;
 use regex::Regex;
 use std::collections::{BTreeSet, VecDeque};
@@ -154,7 +154,7 @@ fn infer_export_names_for_local(
         export_names.insert(local_name.to_string());
     }
     for (export_name, entry) in index.exports_by_name {
-        if matches!(entry, crate::usages::ExportEntry::Local { local_name: ref name } if name == local_name)
+        if matches!(entry, crate::analyzer::usages::ExportEntry::Local { local_name: ref name } if name == local_name)
         {
             export_names.insert(export_name);
         }
@@ -291,7 +291,7 @@ impl<'a> PythonGraphAdapter<'a> {
         frontier: &mut VecDeque<ProjectFile>,
     ) {
         for entry in exports.exports_by_name.values() {
-            if let crate::usages::ExportEntry::ReexportedNamed {
+            if let crate::analyzer::usages::ExportEntry::ReexportedNamed {
                 module_specifier, ..
             } = entry
             {

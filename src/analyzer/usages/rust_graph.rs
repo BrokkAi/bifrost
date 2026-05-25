@@ -1,13 +1,13 @@
+use crate::analyzer::usages::graph_core::{ImportEdgeKind, ProjectUsageGraph};
+use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
+use crate::analyzer::usages::model::{FuzzyResult, ReferenceGraphResult, UsageHit};
+use crate::analyzer::usages::traits::UsageAnalyzer;
 use crate::analyzer::{
     AnalyzerDelegate, CodeUnit, IAnalyzer, Language, MultiAnalyzer, ProjectFile, Range,
     RustAnalyzer,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
-use crate::usages::graph_core::{ImportEdgeKind, ProjectUsageGraph};
-use crate::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::usages::model::{FuzzyResult, ReferenceGraphResult, UsageHit};
-use crate::usages::traits::UsageAnalyzer;
 use rayon::prelude::*;
 use regex::Regex;
 use std::collections::BTreeSet;
@@ -294,7 +294,7 @@ fn infer_export_names_for_local(
         export_names.insert(local_name.to_string());
     }
     for (export_name, entry) in index.exports_by_name {
-        if matches!(entry, crate::usages::ExportEntry::Local { local_name: ref name } if name == local_name)
+        if matches!(entry, crate::analyzer::usages::ExportEntry::Local { local_name: ref name } if name == local_name)
         {
             export_names.insert(export_name);
         }
@@ -310,7 +310,7 @@ fn unresolved_external_frontier_specifiers(
     let mut frontier = BTreeSet::new();
     let index = analyzer.export_index_of(defining_file);
 
-    if let Some(crate::usages::ExportEntry::ReexportedNamed {
+    if let Some(crate::analyzer::usages::ExportEntry::ReexportedNamed {
         module_specifier, ..
     }) = index.exports_by_name.get(export_name)
         && analyzer

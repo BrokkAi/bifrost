@@ -1,12 +1,12 @@
+use crate::analyzer::usages::local_inference::{LocalInferenceEngine, SymbolResolution};
+use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
+use crate::analyzer::usages::traits::UsageAnalyzer;
 use crate::analyzer::{
     AnalyzerDelegate, CodeUnit, IAnalyzer, Language, MultiAnalyzer, PhpAnalyzer, PhpUseAliases,
     ProjectFile, Range, parse_php_use_aliases_from_source, php_namespace_to_fq,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
-use crate::usages::local_inference::{LocalInferenceEngine, SymbolResolution};
-use crate::usages::model::{FuzzyResult, UsageHit};
-use crate::usages::traits::UsageAnalyzer;
 use regex::Regex;
 use std::collections::BTreeSet;
 use std::sync::LazyLock;
