@@ -29,17 +29,17 @@
 //!   re-parsing JS/TS files on every query. Hosts with stable file sets that need lower
 //!   latency (e.g. an LSP server) should layer their own cache around the strategy.
 
+use crate::analyzer::usages::graph_core::{ImportEdge, ImportEdgeKind, ProjectUsageGraph};
+use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
+use crate::analyzer::usages::model::{
+    ExportEntry, ExportIndex, FuzzyResult, ImportBinder, ImportBinding, ImportKind, UsageHit,
+};
+use crate::analyzer::usages::traits::UsageAnalyzer;
 use crate::analyzer::{
     CodeUnit, IAnalyzer, Language, ProjectFile, Range, resolve_js_ts_module_specifier,
 };
 use crate::hash::{HashMap, HashSet, map_with_capacity};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
-use crate::usages::graph_core::{ImportEdge, ImportEdgeKind, ProjectUsageGraph};
-use crate::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::usages::model::{
-    ExportEntry, ExportIndex, FuzzyResult, ImportBinder, ImportBinding, ImportKind, UsageHit,
-};
-use crate::usages::traits::UsageAnalyzer;
 use rayon::prelude::*;
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -1015,7 +1015,7 @@ fn visit_export_statement(node: Node<'_>, source: &str, index: &mut ExportIndex)
             // No clause => `export * from "..."`.
             index
                 .reexport_stars
-                .push(crate::usages::model::ReexportStar { module_specifier });
+                .push(crate::analyzer::usages::model::ReexportStar { module_specifier });
         }
         return;
     }

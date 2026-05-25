@@ -1,14 +1,14 @@
 use crate::analyzer::symbol_lookup::{
     CodeUnitKindFilter, CodeUnitResolution, resolve_codeunit_fuzzy, strip_trailing_call_suffix,
 };
+use crate::analyzer::usages::{
+    CONFIDENCE_THRESHOLD, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, FuzzyResult, UsageFinder, UsageHit,
+};
 use crate::analyzer::{CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, Range};
 use crate::path_utils::{normalize_pattern, rel_path_string};
 use crate::profiling;
 use crate::relevance::{most_important_project_files, most_relevant_project_files};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
-use crate::usages::{
-    CONFIDENCE_THRESHOLD, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, FuzzyResult, UsageFinder, UsageHit,
-};
 use glob::Pattern;
 use rayon::prelude::*;
 use regex::Regex;

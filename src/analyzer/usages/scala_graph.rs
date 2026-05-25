@@ -1,12 +1,12 @@
+use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
+use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
+use crate::analyzer::usages::traits::UsageAnalyzer;
 use crate::analyzer::{
     AnalyzerDelegate, CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language,
     MultiAnalyzer, ProjectFile, Range, ScalaAnalyzer,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
-use crate::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::usages::model::{FuzzyResult, UsageHit};
-use crate::usages::traits::UsageAnalyzer;
 use std::collections::BTreeSet;
 use tree_sitter::{Node, Parser};
 

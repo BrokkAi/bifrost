@@ -1,8 +1,8 @@
+use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
+use crate::analyzer::usages::traits::UsageAnalyzer;
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
 use crate::hash::HashSet;
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
-use crate::usages::model::{FuzzyResult, UsageHit};
-use crate::usages::traits::UsageAnalyzer;
 use rayon::prelude::*;
 use regex::Regex;
 use std::collections::BTreeSet;

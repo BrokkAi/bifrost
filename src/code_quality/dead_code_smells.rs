@@ -4,14 +4,14 @@
 //! cases.
 
 use super::{ReportLines, resolve_project_files, sanitize_table_cell};
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
-use crate::path_utils::rel_path_string;
-use crate::usages::ImportGraphCandidateProvider;
-use crate::usages::{
+use crate::analyzer::usages::ImportGraphCandidateProvider;
+use crate::analyzer::usages::{
     CandidateFileProvider, FallbackCandidateProvider, FuzzyResult, JsTsExportUsageGraphStrategy,
     PythonExportUsageGraphStrategy, RustExportUsageGraphStrategy, TextSearchCandidateProvider,
     UsageAnalyzer, UsageHit,
 };
+use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
+use crate::path_utils::rel_path_string;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
@@ -450,7 +450,7 @@ fn query_graph_usages(
     let provider: FallbackCandidateProvider<
         ImportGraphCandidateProvider,
         TextSearchCandidateProvider,
-    > = crate::usages::default_provider();
+    > = crate::analyzer::usages::default_provider();
     let mut candidates = provider.find_candidates(candidate, analyzer);
     let candidate_files_truncated = candidates.len() > usage_candidate_file_cap;
     if candidate_files_truncated {

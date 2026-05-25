@@ -1,6 +1,6 @@
+use crate::analyzer::usages::traits::CandidateFileProvider;
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::{HashSet, set_with_capacity};
-use crate::usages::traits::CandidateFileProvider;
 use rayon::prelude::*;
 use std::collections::BTreeSet;
 use std::path::PathBuf;

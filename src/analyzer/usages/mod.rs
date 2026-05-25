@@ -1,8 +1,8 @@
 //! Find call sites and references for a [`crate::analyzer::CodeUnit`].
 //!
-//! The subsystem is a Rust port of brokk's `ai.brokk.analyzer.usages` package. JDT-driven
-//! Java analysis and the LLM-based disambiguator are intentionally omitted — bifrost is a
-//! tree-sitter-only codebase and the LLM layer belongs to the embedding host.
+//! This analyzer-owned subsystem resolves usage queries from tree-sitter analyzer state.
+//! JDT-driven Java analysis and the LLM-based disambiguator from Brokk are intentionally
+//! omitted because Bifrost is tree-sitter-only and the LLM layer belongs to the embedding host.
 //!
 //! Public entry point is [`UsageFinder`], which wires a [`CandidateFileProvider`] together
 //! with a [`UsageAnalyzer`] strategy. The default fallback chain is:

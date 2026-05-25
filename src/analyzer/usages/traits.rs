@@ -1,6 +1,6 @@
+use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
 use crate::hash::HashSet;
-use crate::usages::model::FuzzyResult;
 
 /// Strategy for resolving usages of one or more overloads within a candidate file set.
 pub trait UsageAnalyzer: Send + Sync {

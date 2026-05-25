@@ -1,6 +1,6 @@
 use crate::analyzer::ProjectFile;
+use crate::analyzer::usages::model::{ExportEntry, ExportIndex, ImportBinder, ImportKind};
 use crate::hash::{HashMap, HashSet, set_with_capacity};
-use crate::usages::model::{ExportEntry, ExportIndex, ImportBinder, ImportKind};
 use std::collections::{BTreeSet, VecDeque};
 
 #[derive(Debug, Clone)]

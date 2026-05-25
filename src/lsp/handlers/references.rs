@@ -3,13 +3,15 @@ use std::path::{Path, PathBuf};
 
 use lsp_types::{Location, ReferenceParams, Uri};
 
+use crate::analyzer::usages::{
+    DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, FuzzyResult, UsageFinder, UsageHit,
+};
 use crate::analyzer::{CodeUnit, IAnalyzer, Project, Range as ByteRange, WorkspaceAnalyzer};
 use crate::lsp::conversion::{
     byte_range_to_lsp_range, path_to_uri_string, position_to_byte_offset,
 };
 use crate::lsp::handlers::util::{identifier_at_offset, read_document_for_uri};
 use crate::text_utils::compute_line_starts;
-use crate::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, FuzzyResult, UsageFinder, UsageHit};
 
 /// Resolve `textDocument/references`. Strategy:
 /// 1. Identifier under cursor -> resolve all matching CodeUnits (overloads).

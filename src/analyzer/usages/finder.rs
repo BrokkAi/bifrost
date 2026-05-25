@@ -1,21 +1,21 @@
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
-use crate::hash::{HashMap, HashSet};
-use crate::usages::candidates::{
+use crate::analyzer::usages::candidates::{
     FallbackCandidateProvider, ImportGraphCandidateProvider, TextSearchCandidateProvider,
     default_provider,
 };
-use crate::usages::cpp_graph::CppUsageGraphStrategy;
-use crate::usages::csharp_graph::CSharpUsageGraphStrategy;
-use crate::usages::go_graph::GoUsageGraphStrategy;
-use crate::usages::java_graph::JavaUsageGraphStrategy;
-use crate::usages::js_ts_graph::JsTsExportUsageGraphStrategy;
-use crate::usages::model::FuzzyResult;
-use crate::usages::php_graph::PhpUsageGraphStrategy;
-use crate::usages::python_graph::PythonExportUsageGraphStrategy;
-use crate::usages::regex_analyzer::RegexUsageAnalyzer;
-use crate::usages::rust_graph::RustExportUsageGraphStrategy;
-use crate::usages::scala_graph::ScalaUsageGraphStrategy;
-use crate::usages::traits::{CandidateFileProvider, UsageAnalyzer};
+use crate::analyzer::usages::cpp_graph::CppUsageGraphStrategy;
+use crate::analyzer::usages::csharp_graph::CSharpUsageGraphStrategy;
+use crate::analyzer::usages::go_graph::GoUsageGraphStrategy;
+use crate::analyzer::usages::java_graph::JavaUsageGraphStrategy;
+use crate::analyzer::usages::js_ts_graph::JsTsExportUsageGraphStrategy;
+use crate::analyzer::usages::model::FuzzyResult;
+use crate::analyzer::usages::php_graph::PhpUsageGraphStrategy;
+use crate::analyzer::usages::python_graph::PythonExportUsageGraphStrategy;
+use crate::analyzer::usages::regex_analyzer::RegexUsageAnalyzer;
+use crate::analyzer::usages::rust_graph::RustExportUsageGraphStrategy;
+use crate::analyzer::usages::scala_graph::ScalaUsageGraphStrategy;
+use crate::analyzer::usages::traits::{CandidateFileProvider, UsageAnalyzer};
+use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
+use crate::hash::{HashMap, HashSet};
 
 fn target_language(target: &CodeUnit) -> Language {
     target

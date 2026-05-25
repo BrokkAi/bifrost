@@ -1,12 +1,12 @@
+use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
+use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
+use crate::analyzer::usages::traits::UsageAnalyzer;
 use crate::analyzer::{
     AnalyzerDelegate, CSharpAnalyzer, CodeUnit, IAnalyzer, Language, MultiAnalyzer, ProjectFile,
     Range,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
-use crate::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::usages::model::{FuzzyResult, UsageHit};
-use crate::usages::traits::UsageAnalyzer;
 use std::collections::BTreeSet;
 use tree_sitter::{Node, Parser};
 
@@ -376,18 +376,18 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         &mut bindings,
     );
     match bindings.resolve_symbol(receiver) {
-        crate::usages::local_inference::SymbolResolution::Precise(targets)
+        crate::analyzer::usages::local_inference::SymbolResolution::Precise(targets)
             if targets
                 .iter()
                 .any(|target| target == &ctx.spec.owner.fq_name()) =>
         {
             push_hit(name_node, ctx);
         }
-        crate::usages::local_inference::SymbolResolution::Ambiguous => {
+        crate::analyzer::usages::local_inference::SymbolResolution::Ambiguous => {
             *ctx.saw_unproven_match = true;
         }
-        crate::usages::local_inference::SymbolResolution::Unknown
-        | crate::usages::local_inference::SymbolResolution::Precise(_) => {
+        crate::analyzer::usages::local_inference::SymbolResolution::Unknown
+        | crate::analyzer::usages::local_inference::SymbolResolution::Precise(_) => {
             *ctx.saw_unproven_match = true;
         }
     }
