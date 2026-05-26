@@ -3,6 +3,7 @@ use crate::analyzer::usages::common::{SNIPPET_CONTEXT_LINES, usage_hit};
 use crate::analyzer::usages::graph_core::{ImportEdgeKind, ProjectUsageGraph};
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::{FuzzyResult, ReferenceGraphResult, UsageHit};
+use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::UsageAnalyzer;
 use crate::analyzer::{
     AnalyzerDelegate, CodeUnit, IAnalyzer, Language, MultiAnalyzer, ProjectFile, Range,
@@ -60,34 +61,35 @@ impl RustExportUsageGraphStrategy {
             external_frontier_specifiers,
         }
     }
-}
 
-impl UsageAnalyzer for RustExportUsageGraphStrategy {
-    fn find_usages(
+    pub(crate) fn find_graph_usages(
         &self,
         analyzer: &dyn IAnalyzer,
         overloads: &[CodeUnit],
         candidate_files: &HashSet<ProjectFile>,
         max_usages: usize,
-    ) -> FuzzyResult {
+    ) -> GraphUsageOutcome {
         if overloads.is_empty() {
-            return FuzzyResult::empty_success();
+            return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
         }
 
         let target = &overloads[0];
         if language_for_target(target) != Language::Rust {
-            return FuzzyResult::Failure {
-                fq_name: target.fq_name().to_string(),
-                reason: "RustExportUsageGraphStrategy: target is not Rust".to_string(),
-            };
+            return GraphUsageOutcome::fallback_safe(
+                target.fq_name(),
+                GraphFailureReason::UnsupportedTargetLanguage("target is not Rust"),
+                "RustExportUsageGraphStrategy",
+            );
         }
 
         let Some(rust) = resolve_rust_analyzer(analyzer) else {
-            return FuzzyResult::Failure {
-                fq_name: target.fq_name().to_string(),
-                reason: "RustExportUsageGraphStrategy: analyzer does not expose RustAnalyzer"
-                    .to_string(),
-            };
+            return GraphUsageOutcome::fallback_safe(
+                target.fq_name(),
+                GraphFailureReason::MissingAnalyzerCapability(
+                    "analyzer does not expose RustAnalyzer",
+                ),
+                "RustExportUsageGraphStrategy",
+            );
         };
 
         let graph = build_rust_graph(rust);
@@ -102,13 +104,17 @@ impl UsageAnalyzer for RustExportUsageGraphStrategy {
                 None,
             )
         } else if seeds.is_empty() {
-            return FuzzyResult::Failure {
-                fq_name: target.fq_name().to_string(),
-                reason: "RustExportUsageGraphStrategy: no export seed resolved".to_string(),
-            };
+            return GraphUsageOutcome::fallback_safe(
+                target.fq_name(),
+                GraphFailureReason::NoGraphSeed("no export seed resolved"),
+                "RustExportUsageGraphStrategy",
+            );
         } else if is_member_target(rust, target) {
             if !is_graph_visible_member_target(rust, target) {
-                return FuzzyResult::success(target.clone(), BTreeSet::new());
+                return GraphUsageOutcome::Resolved(FuzzyResult::success(
+                    target.clone(),
+                    BTreeSet::new(),
+                ));
             }
             let scan_files = effective_scan_files(rust, &graph, candidate_files, target, &seeds);
             scan_files_for_member_target(analyzer, &graph, rust, scan_files, target, &seeds)
@@ -123,14 +129,27 @@ impl UsageAnalyzer for RustExportUsageGraphStrategy {
             .collect();
 
         if hits.len() > max_usages {
-            return FuzzyResult::TooManyCallsites {
+            return GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites {
                 short_name: target.short_name().to_string(),
                 total_callsites: hits.len(),
                 limit: max_usages,
-            };
+            });
         }
 
-        FuzzyResult::success(target.clone(), hits)
+        GraphUsageOutcome::Resolved(FuzzyResult::success(target.clone(), hits))
+    }
+}
+
+impl UsageAnalyzer for RustExportUsageGraphStrategy {
+    fn find_usages(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        overloads: &[CodeUnit],
+        candidate_files: &HashSet<ProjectFile>,
+        max_usages: usize,
+    ) -> FuzzyResult {
+        self.find_graph_usages(analyzer, overloads, candidate_files, max_usages)
+            .into_fuzzy_result()
     }
 }
 

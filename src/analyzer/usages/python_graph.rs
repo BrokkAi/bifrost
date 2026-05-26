@@ -5,6 +5,7 @@ use crate::analyzer::usages::local_inference::{
     LocalBindingsSnapshot, LocalInferenceConfig, LocalInferenceEngine, SymbolResolution,
 };
 use crate::analyzer::usages::model::{ExportIndex, FuzzyResult, ImportBinder, UsageHit};
+use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::UsageAnalyzer;
 use crate::analyzer::{
     AnalyzerDelegate, CodeUnit, IAnalyzer, Language, MultiAnalyzer, ProjectFile, PythonAnalyzer,
@@ -34,43 +35,45 @@ impl PythonExportUsageGraphStrategy {
     pub fn can_handle(target: &CodeUnit) -> bool {
         language_for_target(target) == Language::Python
     }
-}
 
-impl UsageAnalyzer for PythonExportUsageGraphStrategy {
-    fn find_usages(
+    pub(crate) fn find_graph_usages(
         &self,
         analyzer: &dyn IAnalyzer,
         overloads: &[CodeUnit],
         candidate_files: &HashSet<ProjectFile>,
         max_usages: usize,
-    ) -> FuzzyResult {
+    ) -> GraphUsageOutcome {
         if overloads.is_empty() {
-            return FuzzyResult::empty_success();
+            return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
         }
 
         let target = &overloads[0];
         if language_for_target(target) != Language::Python {
-            return FuzzyResult::Failure {
-                fq_name: target.fq_name().to_string(),
-                reason: "PythonExportUsageGraphStrategy: target is not Python".to_string(),
-            };
+            return GraphUsageOutcome::fallback_safe(
+                target.fq_name(),
+                GraphFailureReason::UnsupportedTargetLanguage("target is not Python"),
+                "PythonExportUsageGraphStrategy",
+            );
         }
 
         let Some(py) = resolve_python_analyzer(analyzer) else {
-            return FuzzyResult::Failure {
-                fq_name: target.fq_name().to_string(),
-                reason: "PythonExportUsageGraphStrategy: analyzer does not expose PythonAnalyzer"
-                    .to_string(),
-            };
+            return GraphUsageOutcome::fallback_safe(
+                target.fq_name(),
+                GraphFailureReason::MissingAnalyzerCapability(
+                    "analyzer does not expose PythonAnalyzer",
+                ),
+                "PythonExportUsageGraphStrategy",
+            );
         };
 
         let graph = build_python_graph(py, candidate_files, target.source());
         let seed_names = infer_export_names(py, target);
         if seed_names.is_empty() {
-            return FuzzyResult::Failure {
-                fq_name: target.fq_name().to_string(),
-                reason: "PythonExportUsageGraphStrategy: no export seed resolved".to_string(),
-            };
+            return GraphUsageOutcome::fallback_safe(
+                target.fq_name(),
+                GraphFailureReason::NoGraphSeed("no export seed resolved"),
+                "PythonExportUsageGraphStrategy",
+            );
         }
 
         let mut seeds = BTreeSet::new();
@@ -82,11 +85,11 @@ impl UsageAnalyzer for PythonExportUsageGraphStrategy {
             );
         }
         if seeds.is_empty() {
-            return FuzzyResult::Failure {
-                fq_name: target.fq_name().to_string(),
-                reason: "PythonExportUsageGraphStrategy: export graph produced no seeds"
-                    .to_string(),
-            };
+            return GraphUsageOutcome::fallback_safe(
+                target.fq_name(),
+                GraphFailureReason::NoGraphSeed("export graph produced no seeds"),
+                "PythonExportUsageGraphStrategy",
+            );
         }
 
         let scan_files = graph.scan_files(candidate_files, target.source());
@@ -98,14 +101,27 @@ impl UsageAnalyzer for PythonExportUsageGraphStrategy {
             .collect();
 
         if hits.len() > max_usages {
-            return FuzzyResult::TooManyCallsites {
+            return GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites {
                 short_name: target.short_name().to_string(),
                 total_callsites: hits.len(),
                 limit: max_usages,
-            };
+            });
         }
 
-        FuzzyResult::success(target.clone(), hits)
+        GraphUsageOutcome::Resolved(FuzzyResult::success(target.clone(), hits))
+    }
+}
+
+impl UsageAnalyzer for PythonExportUsageGraphStrategy {
+    fn find_usages(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        overloads: &[CodeUnit],
+        candidate_files: &HashSet<ProjectFile>,
+        max_usages: usize,
+    ) -> FuzzyResult {
+        self.find_graph_usages(analyzer, overloads, candidate_files, max_usages)
+            .into_fuzzy_result()
     }
 }
 

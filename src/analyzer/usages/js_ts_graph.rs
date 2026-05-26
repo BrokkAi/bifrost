@@ -2,8 +2,8 @@
 //!
 //! Mirrors brokk's `JsTsExportUsageReferenceGraph` and `JsTsExportUsageExtractor`. Where
 //! brokk's pipeline drives the JDT/LLM disambiguator, bifrost is tree-sitter only — the
-//! graph here resolves on syntax + import binders alone, and signals
-//! [`FuzzyResult::Failure`] when it cannot infer a seed so the caller can fall back to
+//! graph here resolves on syntax + import binders alone, and reports an internal
+//! fallback-safe outcome when it cannot infer a seed so the caller can fall back to
 //! the regex analyzer.
 //!
 //! Pipeline overview:
@@ -36,6 +36,7 @@ use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInfere
 use crate::analyzer::usages::model::{
     ExportEntry, ExportIndex, FuzzyResult, ImportBinder, ImportBinding, ImportKind, UsageHit,
 };
+use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::UsageAnalyzer;
 use crate::analyzer::{
     CodeUnit, IAnalyzer, Language, ProjectFile, Range, resolve_js_ts_module_specifier,
@@ -59,8 +60,8 @@ const TARGET_BINDING: &str = "__target__";
 /// `CodeUnit` by walking the export/import graph rather than scanning text.
 ///
 /// The strategy is stateless: it rebuilds its project graph for every query. When it
-/// cannot infer a seed it returns [`FuzzyResult::Failure`] so the caller (typically
-/// [`UsageFinder`](super::UsageFinder)) can route the query to its regex analyzer.
+/// cannot infer a seed it returns an internal fallback-safe outcome so the caller
+/// (typically [`UsageFinder`](super::UsageFinder)) can route the query to its regex analyzer.
 #[derive(Default)]
 pub struct JsTsExportUsageGraphStrategy {
     _private: (),
@@ -76,27 +77,26 @@ impl JsTsExportUsageGraphStrategy {
     pub fn can_handle(target: &CodeUnit) -> bool {
         target_language(target) != Language::None
     }
-}
 
-impl UsageAnalyzer for JsTsExportUsageGraphStrategy {
-    fn find_usages(
+    pub(crate) fn find_graph_usages(
         &self,
         analyzer: &dyn IAnalyzer,
         overloads: &[CodeUnit],
         candidate_files: &HashSet<ProjectFile>,
         max_usages: usize,
-    ) -> FuzzyResult {
+    ) -> GraphUsageOutcome {
         if overloads.is_empty() {
-            return FuzzyResult::empty_success();
+            return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
         }
 
         let target = &overloads[0];
         let language = target_language(target);
         if language == Language::None {
-            return FuzzyResult::Failure {
-                fq_name: target.fq_name().to_string(),
-                reason: "JsTsExportUsageGraphStrategy: target is not JS/TS".to_string(),
-            };
+            return GraphUsageOutcome::fallback_safe(
+                target.fq_name(),
+                GraphFailureReason::UnsupportedTargetLanguage("target is not JS/TS"),
+                "JsTsExportUsageGraphStrategy",
+            );
         }
 
         let graph = build_js_ts_graph(analyzer, language);
@@ -105,10 +105,11 @@ impl UsageAnalyzer for JsTsExportUsageGraphStrategy {
             .usage_graph
             .seeds_for_target(target.source(), top_level_identifier(target));
         if seeds.is_empty() {
-            return FuzzyResult::Failure {
-                fq_name: target.fq_name().to_string(),
-                reason: "JsTsExportUsageGraphStrategy: no export seed resolved".to_string(),
-            };
+            return GraphUsageOutcome::fallback_safe(
+                target.fq_name(),
+                GraphFailureReason::NoGraphSeed("no export seed resolved"),
+                "JsTsExportUsageGraphStrategy",
+            );
         }
 
         let importers = graph.usage_graph.importers_of_seeds(&seeds);
@@ -122,14 +123,27 @@ impl UsageAnalyzer for JsTsExportUsageGraphStrategy {
             .collect();
 
         if hits.len() > max_usages {
-            return FuzzyResult::TooManyCallsites {
+            return GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites {
                 short_name: target.short_name().to_string(),
                 total_callsites: hits.len(),
                 limit: max_usages,
-            };
+            });
         }
 
-        FuzzyResult::success(target.clone(), hits)
+        GraphUsageOutcome::Resolved(FuzzyResult::success(target.clone(), hits))
+    }
+}
+
+impl UsageAnalyzer for JsTsExportUsageGraphStrategy {
+    fn find_usages(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        overloads: &[CodeUnit],
+        candidate_files: &HashSet<ProjectFile>,
+        max_usages: usize,
+    ) -> FuzzyResult {
+        self.find_graph_usages(analyzer, overloads, candidate_files, max_usages)
+            .into_fuzzy_result()
     }
 }
 

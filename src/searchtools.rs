@@ -206,6 +206,8 @@ pub struct SkimFile {
 pub struct ScanUsagesResult {
     pub usages: Vec<SymbolUsages>,
     pub not_found: Vec<String>,
+    pub fallbacks: Vec<UsageFallbackInfo>,
+    pub failures: Vec<UsageFailureInfo>,
     pub ambiguous: Vec<AmbiguousUsageSymbol>,
     pub too_many_callsites: Vec<TooManyCallsitesInfo>,
 }
@@ -243,6 +245,40 @@ pub struct AmbiguousUsageSymbol {
     /// and an arbitrary subset was scanned. Results are partial when set.
     pub candidate_files_truncated: bool,
     pub files: Vec<UsageFileGroup>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageFailureInfo {
+    /// Symbol requested by the caller.
+    pub symbol: String,
+    /// Fully qualified symbol reported by the analyzer failure, when available.
+    pub fq_name: String,
+    /// Graph strategy that produced the failure, when available.
+    pub strategy: String,
+    /// Stable machine-readable failure category, when available.
+    pub reason_kind: String,
+    /// Analyzer-provided reason. This is separate from `not_found` because the symbol
+    /// resolved, but usage analysis could not produce a trustworthy answer.
+    pub reason: String,
+    /// True when the candidate file set exceeded the analyzer's per-query cap
+    /// and an arbitrary subset was scanned before the failure was produced.
+    pub candidate_files_truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageFallbackInfo {
+    /// Symbol requested by the caller.
+    pub symbol: String,
+    /// Fully qualified symbol reported by the graph strategy.
+    pub fq_name: String,
+    /// Graph strategy that requested fallback.
+    pub strategy: String,
+    /// Stable machine-readable fallback category.
+    pub reason_kind: String,
+    /// Human-readable fallback reason.
+    pub reason: String,
+    /// Fallback policy used by `UsageFinder`.
+    pub fallback_policy: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -764,6 +800,8 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
 
     let mut usages = Vec::new();
     let mut not_found = Vec::new();
+    let mut fallbacks = Vec::new();
+    let mut failures = Vec::new();
     let mut ambiguous = Vec::new();
     let mut too_many_callsites = Vec::new();
 
@@ -793,6 +831,16 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
         }
         let query = finder.query(analyzer, &overloads, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES);
         let truncated = query.candidate_files_truncated;
+        if let Some(diagnostic) = query.graph_fallback.as_ref() {
+            fallbacks.push(UsageFallbackInfo {
+                symbol: symbol.clone(),
+                fq_name: diagnostic.fq_name.clone(),
+                strategy: diagnostic.strategy.clone(),
+                reason_kind: diagnostic.reason_kind.clone(),
+                reason: diagnostic.reason.clone(),
+                fallback_policy: "regex".to_string(),
+            });
+        }
 
         match query.result {
             FuzzyResult::Success { hits_by_overload } => {
@@ -831,8 +879,20 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
                     files: group_hits_by_file(high_confidence),
                 });
             }
-            FuzzyResult::Failure { .. } => {
-                not_found.push(symbol);
+            FuzzyResult::Failure { fq_name, reason } => {
+                let diagnostic = query.graph_failure.as_ref();
+                failures.push(UsageFailureInfo {
+                    symbol,
+                    fq_name,
+                    strategy: diagnostic
+                        .map(|diagnostic| diagnostic.strategy.clone())
+                        .unwrap_or_default(),
+                    reason_kind: diagnostic
+                        .map(|diagnostic| diagnostic.reason_kind.clone())
+                        .unwrap_or_default(),
+                    reason,
+                    candidate_files_truncated: truncated,
+                });
             }
             FuzzyResult::TooManyCallsites {
                 short_name,
@@ -852,6 +912,8 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
     ScanUsagesResult {
         usages,
         not_found,
+        fallbacks,
+        failures,
         ambiguous,
         too_many_callsites,
     }

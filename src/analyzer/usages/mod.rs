@@ -12,7 +12,7 @@
 //! - Language-specific graph strategies for JavaScript / TypeScript, Python, PHP, Rust,
 //!   Java, C#, C++, Go, and Scala targets.
 //! - [`RegexUsageAnalyzer`] for unsupported languages and as a best-effort fallback when
-//!   a graph strategy returns [`FuzzyResult::Failure`].
+//!   an internal graph-strategy outcome is explicitly marked fallback-safe.
 
 mod candidates;
 mod common;
@@ -25,6 +25,7 @@ mod java_graph;
 mod js_ts_graph;
 mod local_inference;
 mod model;
+mod outcome;
 mod php_graph;
 mod python_graph;
 mod regex_analyzer;
@@ -48,7 +49,7 @@ pub use local_inference::{
 pub use model::{
     CONFIDENCE_THRESHOLD, ExportEntry, ExportIndex, FuzzyResult, ImportBinder, ImportBinding,
     ImportKind, ReceiverTargetRef, ReexportStar, ReferenceCandidate, ReferenceGraphResult,
-    ReferenceHit, ReferenceKind, ResolvedReceiverCandidate, UsageHit,
+    ReferenceHit, ReferenceKind, ResolvedReceiverCandidate, UsageAnalysisDiagnostic, UsageHit,
 };
 pub use php_graph::PhpUsageGraphStrategy;
 pub use python_graph::PythonExportUsageGraphStrategy;
