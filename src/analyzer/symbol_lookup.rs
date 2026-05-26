@@ -1,3 +1,4 @@
+use crate::analyzer::common::language_for_target as code_unit_language;
 use crate::analyzer::{CodeUnit, CodeUnitType, IAnalyzer, Language};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -344,14 +345,4 @@ fn matches_kind_filter(code_unit: &CodeUnit, filter: CodeUnitKindFilter) -> bool
         CodeUnitKindFilter::Field => code_unit.kind() == CodeUnitType::Field,
         CodeUnitKindFilter::Module => code_unit.kind() == CodeUnitType::Module,
     }
-}
-
-fn code_unit_language(code_unit: &CodeUnit) -> Language {
-    code_unit
-        .source()
-        .rel_path()
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(Language::from_extension)
-        .unwrap_or(Language::None)
 }

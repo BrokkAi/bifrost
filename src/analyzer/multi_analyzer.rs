@@ -1,3 +1,4 @@
+use crate::analyzer::common::language_for_file;
 use crate::analyzer::{
     CSharpAnalyzer, CloneSmell, CloneSmellWeights, CodeUnit, CommentDensityStats, CppAnalyzer,
     DeclarationInfo, ExceptionHandlingSmell, ExceptionSmellWeights, GoAnalyzer, IAnalyzer,
@@ -152,9 +153,7 @@ impl MultiAnalyzer {
     }
 
     fn delegate_for_file(&self, file: &ProjectFile) -> Option<&AnalyzerDelegate> {
-        let extension = file.rel_path().extension().and_then(|ext| ext.to_str())?;
-        let language = Language::from_extension(extension);
-        self.delegates.get(&language)
+        self.delegates.get(&language_for_file(file))
     }
 
     fn delegate_for_code_unit(&self, code_unit: &CodeUnit) -> Option<&AnalyzerDelegate> {
@@ -439,13 +438,8 @@ impl IAnalyzer for MultiAnalyzer {
     ) -> Vec<CloneSmell> {
         let mut grouped: BTreeMap<Language, Vec<ProjectFile>> = BTreeMap::new();
         for file in files {
-            let extension = file
-                .rel_path()
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .unwrap_or_default();
             grouped
-                .entry(Language::from_extension(extension))
+                .entry(language_for_file(file))
                 .or_default()
                 .push(file.clone());
         }
@@ -555,13 +549,8 @@ impl IAnalyzer for MultiAnalyzer {
     fn get_test_modules(&self, files: &[ProjectFile]) -> Vec<String> {
         let mut grouped: BTreeMap<Language, Vec<ProjectFile>> = BTreeMap::new();
         for file in files {
-            let extension = file
-                .rel_path()
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .unwrap_or_default();
             grouped
-                .entry(Language::from_extension(extension))
+                .entry(language_for_file(file))
                 .or_default()
                 .push(file.clone());
         }
@@ -582,13 +571,8 @@ impl IAnalyzer for MultiAnalyzer {
     fn test_files_to_code_units(&self, files: &[ProjectFile]) -> BTreeSet<CodeUnit> {
         let mut grouped: BTreeMap<Language, Vec<ProjectFile>> = BTreeMap::new();
         for file in files {
-            let extension = file
-                .rel_path()
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .unwrap_or_default();
             grouped
-                .entry(Language::from_extension(extension))
+                .entry(language_for_file(file))
                 .or_default()
                 .push(file.clone());
         }

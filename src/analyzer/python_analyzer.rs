@@ -1,4 +1,5 @@
 use crate::analyzer::cognitive_complexity;
+use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::usages::{
     ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind, ReexportStar,
 };
@@ -2033,14 +2034,6 @@ fn oversized_python_literal(
 
 fn compact_python_excerpt(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn file_language(file: &ProjectFile) -> Language {
-    file.rel_path()
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(Language::from_extension)
-        .unwrap_or(Language::None)
 }
 
 const PYTHON_CLONE_AST_IDENTIFIER_TYPES: &[&str] = &["identifier", "keyword_identifier"];

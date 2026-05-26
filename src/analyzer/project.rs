@@ -1,3 +1,4 @@
+use crate::analyzer::common::language_for_file;
 use crate::analyzer::{Language, ProjectFile};
 use ignore::WalkBuilder;
 use std::collections::{BTreeSet, HashMap};
@@ -440,11 +441,9 @@ impl Project for OverlayProject {
 fn detect_languages(root: &Path) -> io::Result<BTreeSet<Language>> {
     let mut languages = BTreeSet::new();
     for file in collect_project_files(root)? {
-        if let Some(extension) = file.rel_path().extension().and_then(|ext| ext.to_str()) {
-            let language = Language::from_extension(extension);
-            if language != Language::None {
-                languages.insert(language);
-            }
+        let language = language_for_file(&file);
+        if language != Language::None {
+            languages.insert(language);
         }
     }
     Ok(languages)

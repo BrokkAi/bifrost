@@ -1,3 +1,4 @@
+use crate::analyzer::common::{language_for_file, language_for_target};
 use crate::analyzer::usages::traits::CandidateFileProvider;
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::{HashSet, set_with_capacity};
@@ -55,12 +56,7 @@ impl CandidateFileProvider for ImportGraphCandidateProvider {
                 .parent()
                 .map(|p| p.to_path_buf())
                 .unwrap_or_default();
-            let language = source_file
-                .rel_path()
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .map(Language::from_extension)
-                .unwrap_or(Language::None);
+            let language = language_for_file(source_file);
 
             if language == Language::None {
                 continue;
@@ -119,13 +115,7 @@ impl CandidateFileProvider for TextSearchCandidateProvider {
             return HashSet::default();
         }
 
-        let language = target
-            .source()
-            .rel_path()
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .map(Language::from_extension)
-            .unwrap_or(Language::None);
+        let language = language_for_target(target);
 
         if language == Language::None {
             return HashSet::default();

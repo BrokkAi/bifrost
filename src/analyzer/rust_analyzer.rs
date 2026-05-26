@@ -1,4 +1,5 @@
 use crate::analyzer::cognitive_complexity;
+use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::usages::{
     ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind, ReexportStar,
 };
@@ -1064,14 +1065,6 @@ fn oversized_rust_literal(
         (unquoted.len() >= weights.large_literal_length_threshold.max(0) as usize)
             .then(|| trimmed.to_string())
     })
-}
-
-fn file_language(file: &ProjectFile) -> Language {
-    file.rel_path()
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(Language::from_extension)
-        .unwrap_or(Language::None)
 }
 
 fn rust_package_name(file: &ProjectFile) -> String {

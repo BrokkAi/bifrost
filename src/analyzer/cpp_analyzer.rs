@@ -2,6 +2,7 @@ use crate::analyzer::clone_detection::{
     CloneCandidateData, CloneCandidateProfile, compact_clone_excerpt,
     compute_ast_refinement_similarity_percent, detect_structural_clone_smells,
 };
+use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::{
     AnalyzerConfig, CodeUnit, CodeUnitType, IAnalyzer, ImportAnalysisProvider, ImportInfo,
     Language, LanguageAdapter, Project, ProjectFile, TestAssertionSmell, TestAssertionWeights,
@@ -747,14 +748,6 @@ fn extract_braced_body(source: &str, open_brace_index: usize) -> Option<(&str, u
         }
     }
     None
-}
-
-fn file_language(file: &ProjectFile) -> Language {
-    file.rel_path()
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(Language::from_extension)
-        .unwrap_or(Language::None)
 }
 
 const CPP_CLONE_AST_IDENTIFIER_TYPES: &[&str] = &[

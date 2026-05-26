@@ -3,6 +3,7 @@ use crate::analyzer::clone_detection::{
     compute_ast_refinement_similarity_percent, detect_structural_clone_smells,
 };
 use crate::analyzer::cognitive_complexity;
+use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::tree_sitter_analyzer::expanded_comment_start;
 use crate::analyzer::{
     AnalyzerConfig, CloneSmell, CloneSmellWeights, CodeUnit, CommentDensityStats, DeclarationInfo,
@@ -2110,14 +2111,6 @@ impl IAnalyzer for JavaAnalyzer {
             refine_java_clone_similarity,
         )
     }
-}
-
-fn file_language(file: &ProjectFile) -> Language {
-    file.rel_path()
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(Language::from_extension)
-        .unwrap_or(Language::None)
 }
 
 impl JavaAnalyzer {

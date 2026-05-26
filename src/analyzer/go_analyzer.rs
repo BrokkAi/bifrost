@@ -1,3 +1,4 @@
+use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::{
     AnalyzerConfig, CodeUnit, CodeUnitType, IAnalyzer, ImportAnalysisProvider, ImportInfo,
     Language, LanguageAdapter, Project, ProjectFile, TestAssertionSmell, TestAssertionWeights,
@@ -832,14 +833,6 @@ fn compact_go_excerpt(text: &str) -> String {
 fn split_go_comparison(expr: &str, op: &str) -> Option<(String, String)> {
     let (left, right) = expr.split_once(op)?;
     Some((normalize_go_expr(left), normalize_go_expr(right)))
-}
-
-fn file_language(file: &ProjectFile) -> Language {
-    file.rel_path()
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(Language::from_extension)
-        .unwrap_or(Language::None)
 }
 
 fn determine_go_package_name(root: Node<'_>, source: &str) -> String {

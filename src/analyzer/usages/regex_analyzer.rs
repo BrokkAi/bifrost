@@ -1,6 +1,7 @@
+use crate::analyzer::common::language_for_target;
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::traits::UsageAnalyzer;
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
+use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range};
 use crate::hash::HashSet;
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use rayon::prelude::*;
@@ -52,13 +53,7 @@ impl UsageAnalyzer for RegexUsageAnalyzer {
             return FuzzyResult::empty_success();
         }
 
-        let lang = target
-            .source()
-            .rel_path()
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .map(Language::from_extension)
-            .unwrap_or(Language::None);
+        let lang = language_for_target(target);
 
         let templates = lang.search_patterns(target.kind());
         let quoted = regex::escape(&identifier);
