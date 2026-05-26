@@ -5,6 +5,7 @@ use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInfere
 use crate::analyzer::usages::model::{
     ExportEntry, ExportIndex, FuzzyResult, ImportBinder, ImportBinding, ImportKind, UsageHit,
 };
+use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::UsageAnalyzer;
 use crate::analyzer::{
     AnalyzerDelegate, CodeUnit, GoAnalyzer, IAnalyzer, ImportAnalysisProvider, Language,
@@ -35,42 +36,45 @@ impl GoUsageGraphStrategy {
     pub fn can_handle(target: &CodeUnit) -> bool {
         language_for_target(target) == Language::Go
     }
-}
 
-impl UsageAnalyzer for GoUsageGraphStrategy {
-    fn find_usages(
+    pub(crate) fn find_graph_usages(
         &self,
         analyzer: &dyn IAnalyzer,
         overloads: &[CodeUnit],
         candidate_files: &HashSet<ProjectFile>,
         max_usages: usize,
-    ) -> FuzzyResult {
+    ) -> GraphUsageOutcome {
         if overloads.is_empty() {
-            return FuzzyResult::empty_success();
+            return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
         }
 
         let target = &overloads[0];
         if language_for_target(target) != Language::Go {
-            return FuzzyResult::Failure {
-                fq_name: target.fq_name(),
-                reason: "GoUsageGraphStrategy: target is not Go".to_string(),
-            };
+            return GraphUsageOutcome::fallback_safe(
+                target.fq_name(),
+                GraphFailureReason::UnsupportedTargetLanguage("target is not Go"),
+                "GoUsageGraphStrategy",
+            );
         }
 
         let Some(go) = resolve_go_analyzer(analyzer) else {
-            return FuzzyResult::Failure {
-                fq_name: target.fq_name(),
-                reason: "GoUsageGraphStrategy: analyzer does not expose GoAnalyzer".to_string(),
-            };
+            return GraphUsageOutcome::fallback_safe(
+                target.fq_name(),
+                GraphFailureReason::MissingAnalyzerCapability(
+                    "analyzer does not expose GoAnalyzer",
+                ),
+                "GoUsageGraphStrategy",
+            );
         };
 
         let graph = build_go_graph(go, candidate_files, target.source());
         let target_spec = TargetSpec::new(go, &graph, target);
         if !target_spec.has_scan_seed() {
-            return FuzzyResult::Failure {
-                fq_name: target.fq_name(),
-                reason: "GoUsageGraphStrategy: no graph seed resolved".to_string(),
-            };
+            return GraphUsageOutcome::fallback_safe(
+                target.fq_name(),
+                GraphFailureReason::NoGraphSeed("no graph seed resolved"),
+                "GoUsageGraphStrategy",
+            );
         }
 
         let scan_files = graph.scan_files(candidate_files, target, &target_spec);
@@ -81,14 +85,27 @@ impl UsageAnalyzer for GoUsageGraphStrategy {
             .collect();
 
         if hits.len() > max_usages {
-            return FuzzyResult::TooManyCallsites {
+            return GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites {
                 short_name: target.short_name().to_string(),
                 total_callsites: hits.len(),
                 limit: max_usages,
-            };
+            });
         }
 
-        FuzzyResult::success(target.clone(), hits)
+        GraphUsageOutcome::Resolved(FuzzyResult::success(target.clone(), hits))
+    }
+}
+
+impl UsageAnalyzer for GoUsageGraphStrategy {
+    fn find_usages(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        overloads: &[CodeUnit],
+        candidate_files: &HashSet<ProjectFile>,
+        max_usages: usize,
+    ) -> FuzzyResult {
+        self.find_graph_usages(analyzer, overloads, candidate_files, max_usages)
+            .into_fuzzy_result()
     }
 }
 

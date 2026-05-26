@@ -2,6 +2,7 @@ use crate::analyzer::common::language_for_target;
 use crate::analyzer::usages::common::{SNIPPET_CONTEXT_LINES, usage_hit};
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
+use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::UsageAnalyzer;
 use crate::analyzer::{
     AnalyzerDelegate, CodeUnit, IAnalyzer, JavaAnalyzer, Language, MultiAnalyzer, ProjectFile,
@@ -25,40 +26,43 @@ impl JavaUsageGraphStrategy {
     pub fn can_handle(target: &CodeUnit) -> bool {
         language_for_target(target) == Language::Java
     }
-}
 
-impl UsageAnalyzer for JavaUsageGraphStrategy {
-    fn find_usages(
+    pub(crate) fn find_graph_usages(
         &self,
         analyzer: &dyn IAnalyzer,
         overloads: &[CodeUnit],
         candidate_files: &HashSet<ProjectFile>,
         max_usages: usize,
-    ) -> FuzzyResult {
+    ) -> GraphUsageOutcome {
         if overloads.is_empty() {
-            return FuzzyResult::empty_success();
+            return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
         }
 
         let target = &overloads[0];
         if language_for_target(target) != Language::Java {
-            return FuzzyResult::Failure {
-                fq_name: target.fq_name(),
-                reason: "JavaUsageGraphStrategy: target is not Java".to_string(),
-            };
+            return GraphUsageOutcome::fallback_safe(
+                target.fq_name(),
+                GraphFailureReason::UnsupportedTargetLanguage("target is not Java"),
+                "JavaUsageGraphStrategy",
+            );
         }
 
         let Some(java) = resolve_java_analyzer(analyzer) else {
-            return FuzzyResult::Failure {
-                fq_name: target.fq_name(),
-                reason: "JavaUsageGraphStrategy: analyzer does not expose JavaAnalyzer".to_string(),
-            };
+            return GraphUsageOutcome::fallback_safe(
+                target.fq_name(),
+                GraphFailureReason::MissingAnalyzerCapability(
+                    "analyzer does not expose JavaAnalyzer",
+                ),
+                "JavaUsageGraphStrategy",
+            );
         };
 
         let Some(spec) = TargetSpec::from_target(java, target) else {
-            return FuzzyResult::Failure {
-                fq_name: target.fq_name(),
-                reason: "JavaUsageGraphStrategy: target shape is unsupported".to_string(),
-            };
+            return GraphUsageOutcome::fallback_safe(
+                target.fq_name(),
+                GraphFailureReason::UnsupportedTargetShape("target shape is unsupported"),
+                "JavaUsageGraphStrategy",
+            );
         };
 
         let files: HashSet<ProjectFile> = candidate_files
@@ -87,29 +91,49 @@ impl UsageAnalyzer for JavaUsageGraphStrategy {
         }
 
         if hits.is_empty() && saw_unproven_match {
-            return FuzzyResult::Failure {
-                fq_name: target.fq_name(),
-                reason: "JavaUsageGraphStrategy: no proven structured hits".to_string(),
-            };
+            return GraphUsageOutcome::fallback_safe(
+                target.fq_name(),
+                GraphFailureReason::UnsafeInference("no proven structured hits"),
+                "JavaUsageGraphStrategy",
+            );
         }
 
         if hits.is_empty() && raw_match_count > 0 {
-            return FuzzyResult::success(target.clone(), BTreeSet::new());
+            return GraphUsageOutcome::Resolved(FuzzyResult::success(
+                target.clone(),
+                BTreeSet::new(),
+            ));
         }
 
         if hits.is_empty() {
-            return FuzzyResult::success(target.clone(), BTreeSet::new());
+            return GraphUsageOutcome::Resolved(FuzzyResult::success(
+                target.clone(),
+                BTreeSet::new(),
+            ));
         }
 
         if limit_exceeded || hits.len() > max_usages {
-            return FuzzyResult::TooManyCallsites {
+            return GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites {
                 short_name: target.short_name().to_string(),
                 total_callsites: hits.len(),
                 limit: max_usages,
-            };
+            });
         }
 
-        FuzzyResult::success(target.clone(), hits)
+        GraphUsageOutcome::Resolved(FuzzyResult::success(target.clone(), hits))
+    }
+}
+
+impl UsageAnalyzer for JavaUsageGraphStrategy {
+    fn find_usages(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        overloads: &[CodeUnit],
+        candidate_files: &HashSet<ProjectFile>,
+        max_usages: usize,
+    ) -> FuzzyResult {
+        self.find_graph_usages(analyzer, overloads, candidate_files, max_usages)
+            .into_fuzzy_result()
     }
 }
 

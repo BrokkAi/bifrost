@@ -2,6 +2,7 @@ use crate::analyzer::common::{language_for_file, language_for_target};
 use crate::analyzer::usages::common::{SNIPPET_CONTEXT_LINES, usage_hit};
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
+use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::UsageAnalyzer;
 use crate::analyzer::{
     AnalyzerDelegate, CSharpAnalyzer, CodeUnit, IAnalyzer, Language, MultiAnalyzer, ProjectFile,
@@ -25,41 +26,43 @@ impl CSharpUsageGraphStrategy {
     pub fn can_handle(target: &CodeUnit) -> bool {
         language_for_target(target) == Language::CSharp
     }
-}
 
-impl UsageAnalyzer for CSharpUsageGraphStrategy {
-    fn find_usages(
+    pub(crate) fn find_graph_usages(
         &self,
         analyzer: &dyn IAnalyzer,
         overloads: &[CodeUnit],
         candidate_files: &HashSet<ProjectFile>,
         max_usages: usize,
-    ) -> FuzzyResult {
+    ) -> GraphUsageOutcome {
         if overloads.is_empty() {
-            return FuzzyResult::empty_success();
+            return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
         }
 
         let target = &overloads[0];
         if language_for_target(target) != Language::CSharp {
-            return FuzzyResult::Failure {
-                fq_name: target.fq_name(),
-                reason: "CSharpUsageGraphStrategy: target is not C#".to_string(),
-            };
+            return GraphUsageOutcome::fallback_safe(
+                target.fq_name(),
+                GraphFailureReason::UnsupportedTargetLanguage("target is not C#"),
+                "CSharpUsageGraphStrategy",
+            );
         }
 
         let Some(csharp) = resolve_csharp_analyzer(analyzer) else {
-            return FuzzyResult::Failure {
-                fq_name: target.fq_name(),
-                reason: "CSharpUsageGraphStrategy: analyzer does not expose CSharpAnalyzer"
-                    .to_string(),
-            };
+            return GraphUsageOutcome::fallback_safe(
+                target.fq_name(),
+                GraphFailureReason::MissingAnalyzerCapability(
+                    "analyzer does not expose CSharpAnalyzer",
+                ),
+                "CSharpUsageGraphStrategy",
+            );
         };
 
         let Some(spec) = TargetSpec::from_target(analyzer, target) else {
-            return FuzzyResult::Failure {
-                fq_name: target.fq_name(),
-                reason: "CSharpUsageGraphStrategy: target shape is unsupported".to_string(),
-            };
+            return GraphUsageOutcome::fallback_safe(
+                target.fq_name(),
+                GraphFailureReason::UnsupportedTargetShape("target shape is unsupported"),
+                "CSharpUsageGraphStrategy",
+            );
         };
 
         let files: HashSet<ProjectFile> = candidate_files
@@ -89,21 +92,35 @@ impl UsageAnalyzer for CSharpUsageGraphStrategy {
         }
 
         if saw_unproven_match && spec.kind != TargetKind::Type {
-            return FuzzyResult::Failure {
-                fq_name: target.fq_name(),
-                reason: "CSharpUsageGraphStrategy: no proven structured hits".to_string(),
-            };
+            return GraphUsageOutcome::fallback_safe(
+                target.fq_name(),
+                GraphFailureReason::UnsafeInference("no proven structured hits"),
+                "CSharpUsageGraphStrategy",
+            );
         }
 
         if limit_exceeded || hits.len() > max_usages {
-            return FuzzyResult::TooManyCallsites {
+            return GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites {
                 short_name: target.short_name().to_string(),
                 total_callsites: hits.len(),
                 limit: max_usages,
-            };
+            });
         }
 
-        FuzzyResult::success(target.clone(), hits)
+        GraphUsageOutcome::Resolved(FuzzyResult::success(target.clone(), hits))
+    }
+}
+
+impl UsageAnalyzer for CSharpUsageGraphStrategy {
+    fn find_usages(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        overloads: &[CodeUnit],
+        candidate_files: &HashSet<ProjectFile>,
+        max_usages: usize,
+    ) -> FuzzyResult {
+        self.find_graph_usages(analyzer, overloads, candidate_files, max_usages)
+            .into_fuzzy_result()
     }
 }
 

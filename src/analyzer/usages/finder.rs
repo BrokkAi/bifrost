@@ -9,6 +9,7 @@ use crate::analyzer::usages::go_graph::GoUsageGraphStrategy;
 use crate::analyzer::usages::java_graph::JavaUsageGraphStrategy;
 use crate::analyzer::usages::js_ts_graph::JsTsExportUsageGraphStrategy;
 use crate::analyzer::usages::model::FuzzyResult;
+use crate::analyzer::usages::outcome::GraphUsageOutcome;
 use crate::analyzer::usages::php_graph::PhpUsageGraphStrategy;
 use crate::analyzer::usages::python_graph::PythonExportUsageGraphStrategy;
 use crate::analyzer::usages::regex_analyzer::RegexUsageAnalyzer;
@@ -37,8 +38,8 @@ pub struct QueryResult {
 ///
 /// - JavaScript / TypeScript, Python, PHP, Rust, Java, C#, C++, Go, and Scala targets
 ///   are routed to their graph strategy first.
-/// - Graph strategy failures fall through to [`RegexUsageAnalyzer`] so callers still get
-///   best-effort results.
+/// - Graph strategies can explicitly mark an internal outcome as fallback-safe, which
+///   falls through to [`RegexUsageAnalyzer`] so callers still get best-effort results.
 /// - Languages without a graph strategy go directly to [`RegexUsageAnalyzer`].
 ///
 /// JDT-based Java analysis is intentionally omitted; bifrost is tree-sitter only.
@@ -116,12 +117,13 @@ impl UsageFinder {
             &candidates,
             max_usages,
         ) {
-            // Try the graph strategy first; on Failure (no seed could be inferred) fall
-            // back to the regex analyzer so callers still get best-effort results.
-            Some(FuzzyResult::Failure { .. }) | None => {
+            Some(GraphUsageOutcome::Resolved(result)) => result,
+            Some(GraphUsageOutcome::FallbackSafe { .. }) | None => {
                 regex_find_usages(analyzer, overloads, &candidates, max_usages)
             }
-            Some(other) => other,
+            Some(GraphUsageOutcome::TerminalFailure { fq_name, reason }) => {
+                FuzzyResult::Failure { fq_name, reason }
+            }
         };
 
         QueryResult {
@@ -163,38 +165,43 @@ fn graph_find_usages(
     overloads: &[CodeUnit],
     candidates: &HashSet<ProjectFile>,
     max_usages: usize,
-) -> Option<FuzzyResult> {
+) -> Option<GraphUsageOutcome> {
     match language {
         Language::JavaScript | Language::TypeScript => Some(
             JsTsExportUsageGraphStrategy::new()
-                .find_usages(analyzer, overloads, candidates, max_usages),
+                .find_graph_usages(analyzer, overloads, candidates, max_usages),
         ),
         Language::Python => Some(
             PythonExportUsageGraphStrategy::new()
-                .find_usages(analyzer, overloads, candidates, max_usages),
+                .find_graph_usages(analyzer, overloads, candidates, max_usages),
         ),
         Language::Php => Some(
-            PhpUsageGraphStrategy::new().find_usages(analyzer, overloads, candidates, max_usages),
+            PhpUsageGraphStrategy::new()
+                .find_graph_usages(analyzer, overloads, candidates, max_usages),
         ),
         Language::Rust => Some(
             RustExportUsageGraphStrategy::new()
-                .find_usages(analyzer, overloads, candidates, max_usages),
+                .find_graph_usages(analyzer, overloads, candidates, max_usages),
         ),
         Language::Java => Some(
-            JavaUsageGraphStrategy::new().find_usages(analyzer, overloads, candidates, max_usages),
+            JavaUsageGraphStrategy::new()
+                .find_graph_usages(analyzer, overloads, candidates, max_usages),
         ),
         Language::CSharp => Some(
             CSharpUsageGraphStrategy::new()
-                .find_usages(analyzer, overloads, candidates, max_usages),
+                .find_graph_usages(analyzer, overloads, candidates, max_usages),
         ),
         Language::Cpp => Some(
-            CppUsageGraphStrategy::new().find_usages(analyzer, overloads, candidates, max_usages),
+            CppUsageGraphStrategy::new()
+                .find_graph_usages(analyzer, overloads, candidates, max_usages),
         ),
         Language::Go => Some(
-            GoUsageGraphStrategy::new().find_usages(analyzer, overloads, candidates, max_usages),
+            GoUsageGraphStrategy::new()
+                .find_graph_usages(analyzer, overloads, candidates, max_usages),
         ),
         Language::Scala => Some(
-            ScalaUsageGraphStrategy::new().find_usages(analyzer, overloads, candidates, max_usages),
+            ScalaUsageGraphStrategy::new()
+                .find_graph_usages(analyzer, overloads, candidates, max_usages),
         ),
         _ => None,
     }
