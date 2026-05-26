@@ -1,6 +1,5 @@
-use crate::analyzer::usages::common::{
-    language_for_file, language_for_target, snippet_around_line, usage_hit,
-};
+use crate::analyzer::common::{language_for_file, language_for_target};
+use crate::analyzer::usages::common::{SNIPPET_CONTEXT_LINES, usage_hit};
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::traits::UsageAnalyzer;
@@ -9,7 +8,7 @@ use crate::analyzer::{
     Range,
 };
 use crate::hash::{HashMap, HashSet};
-use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
+use crate::text_utils::{compute_line_starts, find_line_index_for_offset, snippet_around_line};
 use std::collections::BTreeSet;
 use tree_sitter::{Node, Parser};
 
@@ -798,7 +797,7 @@ fn push_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         start,
         end,
         enclosing,
-        snippet_around_line(ctx.source, ctx.line_starts, line_idx),
+        snippet_around_line(ctx.source, ctx.line_starts, line_idx, SNIPPET_CONTEXT_LINES),
     ));
     if ctx.hits.len() > ctx.max_usages {
         *ctx.limit_exceeded = true;

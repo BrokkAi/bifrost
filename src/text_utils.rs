@@ -34,6 +34,80 @@ pub(crate) fn find_line_index_for_offset(line_starts: &[usize], offset: usize) -
     }
 }
 
+pub(crate) fn snippet_around_line(
+    source: &str,
+    line_starts: &[usize],
+    line_idx: usize,
+    context_lines: usize,
+) -> String {
+    if line_starts.is_empty() {
+        return String::new();
+    }
+    let snippet_start = line_idx.saturating_sub(context_lines);
+    let snippet_end = line_idx
+        .saturating_add(context_lines)
+        .min(line_starts.len().saturating_sub(1));
+
+    let mut snippet = String::new();
+    for idx in snippet_start..=snippet_end {
+        let start = line_starts[idx];
+        let end = line_starts.get(idx + 1).copied().unwrap_or(source.len());
+        snippet.push_str(source.get(start..end).unwrap_or_default());
+    }
+    snippet
+}
+
+pub(crate) fn trimmed_snippet_around_line(
+    source: &str,
+    line_starts: &[usize],
+    line_idx: usize,
+    context_lines: usize,
+) -> String {
+    if line_starts.is_empty() {
+        return String::new();
+    }
+    let line_count = line_starts.len();
+    let snippet_start = line_idx.saturating_sub(context_lines);
+    let snippet_end = line_idx
+        .saturating_add(context_lines)
+        .min(line_count.saturating_sub(1));
+
+    let mut buf = String::new();
+    for idx in snippet_start..=snippet_end {
+        let start = line_starts[idx];
+        let end = line_starts.get(idx + 1).copied().unwrap_or(source.len());
+        let line = source[start..end]
+            .trim_end_matches('\n')
+            .trim_end_matches('\r');
+        if !buf.is_empty() {
+            buf.push('\n');
+        }
+        buf.push_str(line);
+    }
+    buf
+}
+
+pub(crate) fn trimmed_snippet_around_range(
+    source: &str,
+    line_starts: &[usize],
+    start: usize,
+    end: usize,
+    context_lines: usize,
+) -> String {
+    let start_line = find_line_index_for_offset(line_starts, start);
+    let end_line = find_line_index_for_offset(line_starts, end);
+    let snippet_start_line = start_line.saturating_sub(context_lines);
+    let snippet_end_line = end_line + context_lines + 1;
+
+    let snippet_start = *line_starts.get(snippet_start_line).unwrap_or(&0);
+    let snippet_end = line_starts
+        .get(snippet_end_line)
+        .copied()
+        .unwrap_or(source.len());
+
+    source[snippet_start..snippet_end].trim().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{compute_line_starts, find_line_index_for_offset};

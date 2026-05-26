@@ -1,6 +1,5 @@
-use crate::analyzer::usages::common::{
-    language_for_target, trimmed_snippet_around_range, usage_hit,
-};
+use crate::analyzer::common::language_for_target;
+use crate::analyzer::usages::common::{SNIPPET_CONTEXT_LINES, usage_hit};
 use crate::analyzer::usages::graph_core::{ImportEdgeKind, ProjectUsageGraph};
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::{FuzzyResult, ReferenceGraphResult, UsageHit};
@@ -10,7 +9,9 @@ use crate::analyzer::{
     RustAnalyzer,
 };
 use crate::hash::{HashMap, HashSet};
-use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
+use crate::text_utils::{
+    compute_line_starts, find_line_index_for_offset, trimmed_snippet_around_range,
+};
 use rayon::prelude::*;
 use regex::Regex;
 use std::collections::BTreeSet;
@@ -641,7 +642,13 @@ fn record_module_qualified_hits(ctx: &mut ScanCtx<'_>) {
                 start,
                 end,
                 enclosing,
-                trimmed_snippet_around_range(ctx.source, ctx.line_starts, start, end),
+                trimmed_snippet_around_range(
+                    ctx.source,
+                    ctx.line_starts,
+                    start,
+                    end,
+                    SNIPPET_CONTEXT_LINES,
+                ),
             ));
         }
     }
@@ -670,6 +677,7 @@ fn record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             ctx.line_starts,
             node.start_byte(),
             node.end_byte(),
+            SNIPPET_CONTEXT_LINES,
         ),
     ));
 }
@@ -805,7 +813,13 @@ fn scan_files_for_member_target(
                     start,
                     end,
                     enclosing,
-                    trimmed_snippet_around_range(&source, &line_starts, start, end),
+                    trimmed_snippet_around_range(
+                        &source,
+                        &line_starts,
+                        start,
+                        end,
+                        SNIPPET_CONTEXT_LINES,
+                    ),
                 ));
             }
         }
@@ -828,7 +842,13 @@ fn scan_files_for_member_target(
                     start,
                     end,
                     enclosing,
-                    trimmed_snippet_around_range(&source, &line_starts, start, end),
+                    trimmed_snippet_around_range(
+                        &source,
+                        &line_starts,
+                        start,
+                        end,
+                        SNIPPET_CONTEXT_LINES,
+                    ),
                 ));
             }
         }

@@ -1,8 +1,8 @@
+use crate::analyzer::common::language_for_target;
 use crate::analyzer::usages::candidates::{
     FallbackCandidateProvider, ImportGraphCandidateProvider, TextSearchCandidateProvider,
     default_provider,
 };
-use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::cpp_graph::CppUsageGraphStrategy;
 use crate::analyzer::usages::csharp_graph::CSharpUsageGraphStrategy;
 use crate::analyzer::usages::go_graph::GoUsageGraphStrategy;

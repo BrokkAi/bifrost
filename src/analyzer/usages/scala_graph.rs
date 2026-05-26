@@ -1,4 +1,5 @@
-use crate::analyzer::usages::common::{language_for_file, language_for_target, usage_hit};
+use crate::analyzer::common::{language_for_file, language_for_target};
+use crate::analyzer::usages::common::usage_hit;
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::traits::UsageAnalyzer;

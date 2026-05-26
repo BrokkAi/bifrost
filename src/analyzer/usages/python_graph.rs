@@ -1,6 +1,5 @@
-use crate::analyzer::usages::common::{
-    language_for_target, trimmed_snippet_around_line, usage_hit,
-};
+use crate::analyzer::common::language_for_target;
+use crate::analyzer::usages::common::{SNIPPET_CONTEXT_LINES, usage_hit};
 use crate::analyzer::usages::graph_core::{ImportEdge, ImportEdgeKind, ProjectUsageGraph};
 use crate::analyzer::usages::local_inference::{
     LocalBindingsSnapshot, LocalInferenceConfig, LocalInferenceEngine, SymbolResolution,
@@ -12,7 +11,9 @@ use crate::analyzer::{
     Range,
 };
 use crate::hash::{HashMap, HashSet};
-use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
+use crate::text_utils::{
+    compute_line_starts, find_line_index_for_offset, trimmed_snippet_around_line,
+};
 use rayon::prelude::*;
 use regex::Regex;
 use std::collections::{BTreeSet, VecDeque};
@@ -592,7 +593,8 @@ fn record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 
     let line_idx = find_line_index_for_offset(ctx.line_starts, start_byte);
-    let snippet = trimmed_snippet_around_line(ctx.source, ctx.line_starts, line_idx);
+    let snippet =
+        trimmed_snippet_around_line(ctx.source, ctx.line_starts, line_idx, SNIPPET_CONTEXT_LINES);
     let range = Range {
         start_byte,
         end_byte,

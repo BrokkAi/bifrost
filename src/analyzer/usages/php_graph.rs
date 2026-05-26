@@ -1,6 +1,5 @@
-use crate::analyzer::usages::common::{
-    language_for_file, language_for_target, snippet_around_line, usage_hit,
-};
+use crate::analyzer::common::{language_for_file, language_for_target};
+use crate::analyzer::usages::common::{SNIPPET_CONTEXT_LINES, usage_hit};
 use crate::analyzer::usages::local_inference::{LocalInferenceEngine, SymbolResolution};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::traits::UsageAnalyzer;
@@ -9,7 +8,7 @@ use crate::analyzer::{
     ProjectFile, Range, parse_php_use_aliases_from_source, php_namespace_to_fq,
 };
 use crate::hash::{HashMap, HashSet};
-use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
+use crate::text_utils::{compute_line_starts, find_line_index_for_offset, snippet_around_line};
 use regex::Regex;
 use std::collections::BTreeSet;
 use std::sync::LazyLock;
@@ -459,7 +458,7 @@ fn push_hit_range(
         start,
         end,
         enclosing,
-        snippet_around_line(source, line_starts, range.start_line),
+        snippet_around_line(source, line_starts, range.start_line, SNIPPET_CONTEXT_LINES),
     ));
 }
 

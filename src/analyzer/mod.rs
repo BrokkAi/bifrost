@@ -3,6 +3,7 @@ mod clone_detection;
 pub mod cognitive_complexity;
 #[cfg(test)]
 mod cognitive_complexity_tests;
+pub(crate) mod common;
 mod config;
 mod cpp_analyzer;
 mod csharp_analyzer;
