@@ -1,4 +1,5 @@
 use crate::analyzer::usages::model::FuzzyResult;
+use crate::analyzer::usages::outcome::GraphUsageOutcome;
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
 use crate::hash::HashSet;
 
@@ -11,6 +12,17 @@ pub trait UsageAnalyzer: Send + Sync {
         candidate_files: &HashSet<ProjectFile>,
         max_usages: usize,
     ) -> FuzzyResult;
+}
+
+/// Graph-backed usage strategy that can distinguish fallback-safe gaps from terminal failures.
+pub(crate) trait GraphUsageAnalyzer: UsageAnalyzer {
+    fn find_graph_usages(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        overloads: &[CodeUnit],
+        candidate_files: &HashSet<ProjectFile>,
+        max_usages: usize,
+    ) -> GraphUsageOutcome;
 }
 
 /// Strategy for narrowing the file set fed into a [`UsageAnalyzer`].

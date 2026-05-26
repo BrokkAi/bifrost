@@ -143,6 +143,14 @@ pub struct ReferenceGraphResult {
     pub external_frontier_specifiers: BTreeSet<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageAnalysisDiagnostic {
+    pub fq_name: String,
+    pub strategy: String,
+    pub reason_kind: String,
+    pub reason: String,
+}
+
 /// Outcome of [`super::UsageAnalyzer::find_usages`].
 ///
 /// Modelled after the brokk Java sealed interface `FuzzyResult`. The raw enum keeps the

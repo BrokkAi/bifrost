@@ -471,6 +471,7 @@ fn scan_usages_returns_call_sites_grouped_by_file() {
 
     assert_eq!(0, value["not_found"].as_array().unwrap().len());
     assert_eq!(0, value["ambiguous"].as_array().unwrap().len());
+    assert_eq!(0, value["fallbacks"].as_array().unwrap().len());
     assert_eq!(0, value["failures"].as_array().unwrap().len());
     assert_eq!(0, value["too_many_callsites"].as_array().unwrap().len());
 }
@@ -490,6 +491,49 @@ fn scan_usages_reports_unknown_symbol_as_not_found() {
     let not_found = value["not_found"].as_array().unwrap();
     assert_eq!(1, not_found.len());
     assert_eq!("does.not.Exist", not_found[0]);
+    assert_eq!(0, value["fallbacks"].as_array().unwrap().len());
+    assert_eq!(0, value["failures"].as_array().unwrap().len());
+}
+
+#[test]
+fn scan_usages_reports_graph_fallback_reason() {
+    let temp = TempDir::new().unwrap();
+    fs::create_dir_all(temp.path().join("Domain")).unwrap();
+    fs::write(
+        temp.path().join("Domain").join("Target.cs"),
+        r#"
+namespace Domain {
+    public class Target {
+        public void Run() {}
+        public void Execute() {
+            Run();
+        }
+    }
+}
+"#,
+    )
+    .unwrap();
+    let mut service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "scan_usages",
+            r#"{"symbols":["Domain.Target.Run"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert_eq!(
+        1,
+        value["usages"].as_array().unwrap().len(),
+        "payload: {value}"
+    );
+    let fallbacks = value["fallbacks"].as_array().unwrap();
+    assert_eq!(1, fallbacks.len(), "payload: {value}");
+    assert_eq!("Domain.Target.Run", fallbacks[0]["symbol"]);
+    assert_eq!("CSharpUsageGraphStrategy", fallbacks[0]["strategy"]);
+    assert_eq!("unsafe_inference", fallbacks[0]["reason_kind"]);
+    assert_eq!("regex", fallbacks[0]["fallback_policy"]);
+    assert_eq!(0, value["not_found"].as_array().unwrap().len());
     assert_eq!(0, value["failures"].as_array().unwrap().len());
 }
 
@@ -506,6 +550,7 @@ fn scan_usages_skips_blank_symbols_without_error() {
 
     assert_eq!(0, value["usages"].as_array().unwrap().len());
     assert_eq!(0, value["not_found"].as_array().unwrap().len());
+    assert_eq!(0, value["fallbacks"].as_array().unwrap().len());
     assert_eq!(0, value["failures"].as_array().unwrap().len());
 }
 
@@ -597,6 +642,7 @@ fn scan_usages_resolved_symbol_with_no_hits_is_emitted_with_zero_total() {
     assert_eq!(0, usages[0]["total_hits"].as_u64().unwrap());
     assert_eq!(0, usages[0]["files"].as_array().unwrap().len());
     assert_eq!(0, value["not_found"].as_array().unwrap().len());
+    assert_eq!(0, value["fallbacks"].as_array().unwrap().len());
     assert_eq!(0, value["failures"].as_array().unwrap().len());
 }
 

@@ -1,17 +1,11 @@
-use crate::analyzer::usages::model::FuzzyResult;
+use crate::analyzer::usages::model::{FuzzyResult, UsageAnalysisDiagnostic};
 
 #[derive(Debug, Clone)]
 pub(crate) enum GraphUsageOutcome {
     Resolved(FuzzyResult),
-    FallbackSafe {
-        fq_name: String,
-        reason: String,
-    },
+    FallbackSafe(UsageAnalysisDiagnostic),
     #[allow(dead_code)]
-    TerminalFailure {
-        fq_name: String,
-        reason: String,
-    },
+    TerminalFailure(UsageAnalysisDiagnostic),
 }
 
 impl GraphUsageOutcome {
@@ -20,10 +14,7 @@ impl GraphUsageOutcome {
         reason: GraphFailureReason,
         strategy: &'static str,
     ) -> Self {
-        Self::FallbackSafe {
-            fq_name: fq_name.into(),
-            reason: reason.message(strategy),
-        }
+        Self::FallbackSafe(usage_diagnostic(fq_name, reason, strategy))
     }
 
     #[allow(dead_code)]
@@ -32,20 +23,31 @@ impl GraphUsageOutcome {
         reason: GraphFailureReason,
         strategy: &'static str,
     ) -> Self {
-        Self::TerminalFailure {
-            fq_name: fq_name.into(),
-            reason: reason.message(strategy),
-        }
+        Self::TerminalFailure(usage_diagnostic(fq_name, reason, strategy))
     }
 
     pub(crate) fn into_fuzzy_result(self) -> FuzzyResult {
         match self {
             GraphUsageOutcome::Resolved(result) => result,
-            GraphUsageOutcome::FallbackSafe { fq_name, reason }
-            | GraphUsageOutcome::TerminalFailure { fq_name, reason } => {
-                FuzzyResult::Failure { fq_name, reason }
-            }
+            GraphUsageOutcome::FallbackSafe(diagnostic)
+            | GraphUsageOutcome::TerminalFailure(diagnostic) => FuzzyResult::Failure {
+                fq_name: diagnostic.fq_name,
+                reason: diagnostic.reason,
+            },
         }
+    }
+}
+
+fn usage_diagnostic(
+    fq_name: impl Into<String>,
+    reason: GraphFailureReason,
+    strategy: &'static str,
+) -> UsageAnalysisDiagnostic {
+    UsageAnalysisDiagnostic {
+        fq_name: fq_name.into(),
+        strategy: strategy.to_string(),
+        reason_kind: reason.kind().to_string(),
+        reason: reason.message(strategy),
     }
 }
 
@@ -59,6 +61,16 @@ pub(crate) enum GraphFailureReason {
 }
 
 impl GraphFailureReason {
+    fn kind(self) -> &'static str {
+        match self {
+            GraphFailureReason::UnsupportedTargetLanguage(_) => "unsupported_target_language",
+            GraphFailureReason::MissingAnalyzerCapability(_) => "missing_analyzer_capability",
+            GraphFailureReason::UnsupportedTargetShape(_) => "unsupported_target_shape",
+            GraphFailureReason::NoGraphSeed(_) => "no_graph_seed",
+            GraphFailureReason::UnsafeInference(_) => "unsafe_inference",
+        }
+    }
+
     fn message(self, strategy: &'static str) -> String {
         let detail = match self {
             GraphFailureReason::UnsupportedTargetLanguage(message)

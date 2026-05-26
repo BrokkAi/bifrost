@@ -3,7 +3,7 @@ mod common;
 use brokk_bifrost::hash::HashSet;
 use brokk_bifrost::usages::{CandidateFileProvider, FuzzyResult, UsageFinder};
 use brokk_bifrost::{
-    CodeUnit, CodeUnitType, IAnalyzer, JavascriptAnalyzer, Language, ProjectFile, PythonAnalyzer,
+    CSharpAnalyzer, CodeUnit, CodeUnitType, IAnalyzer, JavascriptAnalyzer, Language, ProjectFile,
     TypescriptAnalyzer,
 };
 use common::InlineTestProject;
@@ -65,30 +65,41 @@ export function build(): BaseClass {
 
 #[test]
 fn usage_finder_uses_regex_for_fallback_safe_graph_failure() {
-    let project = InlineTestProject::with_language(Language::Python)
+    let project = InlineTestProject::with_language(Language::CSharp)
         .file(
-            "service.py",
+            "Domain/Target.cs",
             r#"
-def helper():
-    return 1
-
-def run():
-    return helper()
+namespace Domain {
+    public class Target {
+        public void Run() {}
+        public void Execute() {
+            Run();
+        }
+    }
+}
 "#,
         )
         .build();
-    let analyzer = PythonAnalyzer::from_project(project.project().clone());
-    let target = definition(&analyzer, |unit| unit.fq_name() == "service.helper");
+    let analyzer = CSharpAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, |unit| unit.fq_name() == "Domain.Target.Run");
 
-    let hits = UsageFinder::new()
-        .find_usages_default(&analyzer, std::slice::from_ref(&target))
+    let query = UsageFinder::new().query(&analyzer, std::slice::from_ref(&target), 1000, 1000);
+    let diagnostic = query
+        .graph_fallback
+        .as_ref()
+        .expect("graph fallback diagnostic");
+    assert_eq!("CSharpUsageGraphStrategy", diagnostic.strategy);
+    assert_eq!("unsafe_inference", diagnostic.reason_kind);
+
+    let hits = query
+        .result
         .into_either()
         .expect("fallback-safe graph failure should use regex");
 
     assert_eq!(1, hits.len());
     assert!(
         hits.iter()
-            .all(|hit| hit.file == project.file("service.py"))
+            .all(|hit| hit.file == project.file("Domain/Target.cs"))
     );
 }
 
