@@ -161,7 +161,7 @@ pub(crate) fn core_tool_descriptors() -> Vec<Value> {
         ),
         tool_descriptor(
             "scan_usages",
-            "Find references and call sites for known fully qualified symbols; use search_symbols first for partial names. Static analysis may include false positives.",
+            "Find references and call sites for known fully qualified symbols; use search_symbols first for partial names. Static analysis may include false positives. Resolved symbols whose usage analysis cannot produce a trustworthy answer are returned with structured failure reasons.",
             json!({
                 "type": "object",
                 "properties": {

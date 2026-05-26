@@ -206,6 +206,7 @@ pub struct SkimFile {
 pub struct ScanUsagesResult {
     pub usages: Vec<SymbolUsages>,
     pub not_found: Vec<String>,
+    pub failures: Vec<UsageFailureInfo>,
     pub ambiguous: Vec<AmbiguousUsageSymbol>,
     pub too_many_callsites: Vec<TooManyCallsitesInfo>,
 }
@@ -243,6 +244,20 @@ pub struct AmbiguousUsageSymbol {
     /// and an arbitrary subset was scanned. Results are partial when set.
     pub candidate_files_truncated: bool,
     pub files: Vec<UsageFileGroup>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageFailureInfo {
+    /// Symbol requested by the caller.
+    pub symbol: String,
+    /// Fully qualified symbol reported by the analyzer failure, when available.
+    pub fq_name: String,
+    /// Analyzer-provided reason. This is separate from `not_found` because the symbol
+    /// resolved, but usage analysis could not produce a trustworthy answer.
+    pub reason: String,
+    /// True when the candidate file set exceeded the analyzer's per-query cap
+    /// and an arbitrary subset was scanned before the failure was produced.
+    pub candidate_files_truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -764,6 +779,7 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
 
     let mut usages = Vec::new();
     let mut not_found = Vec::new();
+    let mut failures = Vec::new();
     let mut ambiguous = Vec::new();
     let mut too_many_callsites = Vec::new();
 
@@ -831,8 +847,13 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
                     files: group_hits_by_file(high_confidence),
                 });
             }
-            FuzzyResult::Failure { .. } => {
-                not_found.push(symbol);
+            FuzzyResult::Failure { fq_name, reason } => {
+                failures.push(UsageFailureInfo {
+                    symbol,
+                    fq_name,
+                    reason,
+                    candidate_files_truncated: truncated,
+                });
             }
             FuzzyResult::TooManyCallsites {
                 short_name,
@@ -852,6 +873,7 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
     ScanUsagesResult {
         usages,
         not_found,
+        failures,
         ambiguous,
         too_many_callsites,
     }

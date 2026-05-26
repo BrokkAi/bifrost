@@ -471,6 +471,7 @@ fn scan_usages_returns_call_sites_grouped_by_file() {
 
     assert_eq!(0, value["not_found"].as_array().unwrap().len());
     assert_eq!(0, value["ambiguous"].as_array().unwrap().len());
+    assert_eq!(0, value["failures"].as_array().unwrap().len());
     assert_eq!(0, value["too_many_callsites"].as_array().unwrap().len());
 }
 
@@ -489,6 +490,7 @@ fn scan_usages_reports_unknown_symbol_as_not_found() {
     let not_found = value["not_found"].as_array().unwrap();
     assert_eq!(1, not_found.len());
     assert_eq!("does.not.Exist", not_found[0]);
+    assert_eq!(0, value["failures"].as_array().unwrap().len());
 }
 
 #[test]
@@ -504,6 +506,7 @@ fn scan_usages_skips_blank_symbols_without_error() {
 
     assert_eq!(0, value["usages"].as_array().unwrap().len());
     assert_eq!(0, value["not_found"].as_array().unwrap().len());
+    assert_eq!(0, value["failures"].as_array().unwrap().len());
 }
 
 #[test]
@@ -594,6 +597,7 @@ fn scan_usages_resolved_symbol_with_no_hits_is_emitted_with_zero_total() {
     assert_eq!(0, usages[0]["total_hits"].as_u64().unwrap());
     assert_eq!(0, usages[0]["files"].as_array().unwrap().len());
     assert_eq!(0, value["not_found"].as_array().unwrap().len());
+    assert_eq!(0, value["failures"].as_array().unwrap().len());
 }
 
 #[test]
