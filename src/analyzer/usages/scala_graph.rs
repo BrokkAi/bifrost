@@ -1,6 +1,7 @@
 mod extractor;
 mod hits;
 mod resolver;
+mod syntax;
 
 use crate::analyzer::common::{language_for_file, language_for_target};
 use crate::analyzer::usages::model::FuzzyResult;

@@ -2,6 +2,7 @@ use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInfere
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::usages::scala_graph::hits::add_hit;
 use crate::analyzer::usages::scala_graph::resolver::{TargetKind, TargetSpec, Visibility};
+use crate::analyzer::usages::scala_graph::syntax::{parenthesized_arity, split_top_level_commas};
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range, ScalaAnalyzer};
 use crate::hash::HashMap;
 use crate::text_utils::compute_line_starts;
@@ -544,52 +545,7 @@ fn member_call_arity_matches(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
 
 fn call_arity_after(node: Node<'_>, source: &str) -> Option<usize> {
     let after = source[node.end_byte()..].trim_start();
-    let inner = balanced_parenthesized_prefix(after)?;
-    if inner.trim().is_empty() {
-        return Some(0);
-    }
-    Some(split_top_level_commas(inner).count())
-}
-
-fn balanced_parenthesized_prefix(source: &str) -> Option<&str> {
-    let mut chars = source.char_indices();
-    let (_, first) = chars.next()?;
-    if first != '(' {
-        return None;
-    }
-    let mut depth = 1usize;
-    for (idx, ch) in chars {
-        match ch {
-            '(' => depth += 1,
-            ')' => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    return Some(&source[1..idx]);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-fn split_top_level_commas(value: &str) -> impl Iterator<Item = &str> {
-    let mut depth = 0usize;
-    let mut start = 0usize;
-    let mut parts = Vec::new();
-    for (idx, ch) in value.char_indices() {
-        match ch {
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => {
-                parts.push(value[start..idx].trim());
-                start = idx + ch.len_utf8();
-            }
-            _ => {}
-        }
-    }
-    parts.push(value[start..].trim());
-    parts.into_iter().filter(|part| !part.is_empty())
+    parenthesized_arity(after)
 }
 
 fn parent_kind(node: Node<'_>) -> Option<&str> {
