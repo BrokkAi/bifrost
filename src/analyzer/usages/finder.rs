@@ -2,6 +2,7 @@ use crate::analyzer::usages::candidates::{
     FallbackCandidateProvider, ImportGraphCandidateProvider, TextSearchCandidateProvider,
     default_provider,
 };
+use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::cpp_graph::CppUsageGraphStrategy;
 use crate::analyzer::usages::csharp_graph::CSharpUsageGraphStrategy;
 use crate::analyzer::usages::go_graph::GoUsageGraphStrategy;
@@ -16,16 +17,6 @@ use crate::analyzer::usages::scala_graph::ScalaUsageGraphStrategy;
 use crate::analyzer::usages::traits::{CandidateFileProvider, UsageAnalyzer};
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::HashSet;
-
-fn target_language(target: &CodeUnit) -> Language {
-    target
-        .source()
-        .rel_path()
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(Language::from_extension)
-        .unwrap_or(Language::None)
-}
 
 type DefaultCandidateProvider =
     FallbackCandidateProvider<ImportGraphCandidateProvider, TextSearchCandidateProvider>;
@@ -119,7 +110,7 @@ impl UsageFinder {
         }
 
         let result = match graph_find_usages(
-            target_language(target),
+            language_for_target(target),
             analyzer,
             overloads,
             &candidates,

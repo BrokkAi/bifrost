@@ -1,3 +1,6 @@
+use crate::analyzer::usages::common::{
+    language_for_file, language_for_target, snippet_around_line, usage_hit,
+};
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::traits::UsageAnalyzer;
@@ -11,9 +14,6 @@ use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use std::collections::BTreeSet;
 use tree_sitter::{Node, Parser};
 
-const GRAPH_HIT_CONFIDENCE: f64 = 1.0;
-const SNIPPET_CONTEXT_LINES: usize = 3;
-
 #[derive(Default)]
 pub struct CppUsageGraphStrategy {
     _private: (),
@@ -25,7 +25,7 @@ impl CppUsageGraphStrategy {
     }
 
     pub fn can_handle(target: &CodeUnit) -> bool {
-        target_language(target) == Language::Cpp
+        language_for_target(target) == Language::Cpp
     }
 }
 
@@ -42,7 +42,7 @@ impl UsageAnalyzer for CppUsageGraphStrategy {
         }
 
         let target = &overloads[0];
-        if target_language(target) != Language::Cpp {
+        if language_for_target(target) != Language::Cpp {
             return FuzzyResult::Failure {
                 fq_name: target.fq_name(),
                 reason: "CppUsageGraphStrategy: target is not C/C++".to_string(),
@@ -65,7 +65,7 @@ impl UsageAnalyzer for CppUsageGraphStrategy {
 
         let files: HashSet<ProjectFile> = candidate_files
             .iter()
-            .filter(|file| file_language(file) == Language::Cpp)
+            .filter(|file| language_for_file(file) == Language::Cpp)
             .cloned()
             .chain(std::iter::once(target.source().clone()))
             .collect();
@@ -437,7 +437,7 @@ fn scan_file(
     spec: &TargetSpec,
     state: &mut ScanState<'_>,
 ) {
-    if *state.limit_exceeded || file_language(file) != Language::Cpp {
+    if *state.limit_exceeded || language_for_file(file) != Language::Cpp {
         return;
     }
     let Ok(source) = file.read_to_string() else {
@@ -891,14 +891,13 @@ fn push_text_hit(start: usize, end: usize, ctx: &mut ScanCtx<'_>) {
     if enclosing == ctx.spec.target || same_logical_symbol(&enclosing, &ctx.spec.target) {
         return;
     }
-    ctx.hits.insert(UsageHit::new(
-        ctx.file.clone(),
-        line_idx + 1,
+    ctx.hits.insert(usage_hit(
+        ctx.file,
+        line_idx,
         start,
         end,
         enclosing,
-        GRAPH_HIT_CONFIDENCE,
-        build_snippet(ctx.source, ctx.line_starts, line_idx),
+        snippet_around_line(ctx.source, ctx.line_starts, line_idx),
     ));
     if ctx.hits.len() > ctx.max_usages {
         *ctx.limit_exceeded = true;
@@ -1169,14 +1168,13 @@ fn push_text_constructor_hit(start: usize, end: usize, ctx: &mut ScanCtx<'_>) {
     if enclosing == ctx.spec.target || same_logical_symbol(&enclosing, &ctx.spec.target) {
         return;
     }
-    ctx.hits.insert(UsageHit::new(
-        ctx.file.clone(),
-        line_idx + 1,
+    ctx.hits.insert(usage_hit(
+        ctx.file,
+        line_idx,
         start,
         end,
         enclosing,
-        GRAPH_HIT_CONFIDENCE,
-        build_snippet(ctx.source, ctx.line_starts, line_idx),
+        snippet_around_line(ctx.source, ctx.line_starts, line_idx),
     ));
     if ctx.hits.len() > ctx.max_usages {
         *ctx.limit_exceeded = true;
@@ -1403,14 +1401,13 @@ fn push_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if enclosing == ctx.spec.target || same_logical_symbol(&enclosing, &ctx.spec.target) {
         return;
     }
-    ctx.hits.insert(UsageHit::new(
-        ctx.file.clone(),
-        line_idx + 1,
+    ctx.hits.insert(usage_hit(
+        ctx.file,
+        line_idx,
         start,
         end,
         enclosing,
-        GRAPH_HIT_CONFIDENCE,
-        build_snippet(ctx.source, ctx.line_starts, line_idx),
+        snippet_around_line(ctx.source, ctx.line_starts, line_idx),
     ));
     if ctx.hits.len() > ctx.max_usages {
         *ctx.limit_exceeded = true;
@@ -1467,23 +1464,6 @@ fn is_member_field_declaration_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> boo
     false
 }
 
-fn build_snippet(source: &str, line_starts: &[usize], line_idx: usize) -> String {
-    if line_starts.is_empty() {
-        return String::new();
-    }
-    let snippet_start = line_idx.saturating_sub(SNIPPET_CONTEXT_LINES);
-    let snippet_end = line_idx
-        .saturating_add(SNIPPET_CONTEXT_LINES)
-        .min(line_starts.len().saturating_sub(1));
-    let mut snippet = String::new();
-    for idx in snippet_start..=snippet_end {
-        let start = line_starts[idx];
-        let end = line_starts.get(idx + 1).copied().unwrap_or(source.len());
-        snippet.push_str(source.get(start..end).unwrap_or_default());
-    }
-    snippet
-}
-
 fn resolve_cpp_analyzer(analyzer: &dyn IAnalyzer) -> Option<&CppAnalyzer> {
     if let Some(cpp) = (analyzer as &dyn std::any::Any).downcast_ref::<CppAnalyzer>() {
         return Some(cpp);
@@ -1493,18 +1473,6 @@ fn resolve_cpp_analyzer(analyzer: &dyn IAnalyzer) -> Option<&CppAnalyzer> {
         Some(AnalyzerDelegate::Cpp(cpp)) => Some(cpp),
         _ => None,
     }
-}
-
-fn target_language(target: &CodeUnit) -> Language {
-    file_language(target.source())
-}
-
-fn file_language(file: &ProjectFile) -> Language {
-    file.rel_path()
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(Language::from_extension)
-        .unwrap_or(Language::None)
 }
 
 fn signature_arity(signature: Option<&str>) -> usize {

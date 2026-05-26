@@ -1,3 +1,6 @@
+use crate::analyzer::usages::common::{
+    language_for_file, language_for_target, trimmed_snippet_around_range, usage_hit,
+};
 use crate::analyzer::usages::graph_core::{ImportEdgeKind, ProjectUsageGraph};
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::{
@@ -16,8 +19,6 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, LazyLock, Mutex};
 use tree_sitter::{Node, Parser, Tree};
 
-const GRAPH_HIT_CONFIDENCE: f64 = 1.0;
-const SNIPPET_CONTEXT_LINES: usize = 3;
 const OWNER_TOKEN: &str = "__go_target_owner__";
 
 #[derive(Default)]
@@ -31,7 +32,7 @@ impl GoUsageGraphStrategy {
     }
 
     pub fn can_handle(target: &CodeUnit) -> bool {
-        target_language(target) == Language::Go
+        language_for_target(target) == Language::Go
     }
 }
 
@@ -48,7 +49,7 @@ impl UsageAnalyzer for GoUsageGraphStrategy {
         }
 
         let target = &overloads[0];
-        if target_language(target) != Language::Go {
+        if language_for_target(target) != Language::Go {
             return FuzzyResult::Failure {
                 fq_name: target.fq_name(),
                 reason: "GoUsageGraphStrategy: target is not Go".to_string(),
@@ -102,16 +103,6 @@ fn resolve_go_analyzer(analyzer: &dyn IAnalyzer) -> Option<&GoAnalyzer> {
     }
 }
 
-fn target_language(target: &CodeUnit) -> Language {
-    target
-        .source()
-        .rel_path()
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(Language::from_extension)
-        .unwrap_or(Language::None)
-}
-
 struct ParsedFile {
     source: Arc<String>,
     tree: Tree,
@@ -150,13 +141,13 @@ fn build_go_graph(
     let mut module_path = None;
     let scoped_files: BTreeSet<ProjectFile> = candidate_files
         .iter()
-        .filter(|file| target_language_file(file) == Language::Go)
+        .filter(|file| language_for_file(file) == Language::Go)
         .cloned()
         .chain(std::iter::once(target_file.clone()))
         .collect();
 
     for file in scoped_files {
-        if target_language_file(&file) != Language::Go {
+        if language_for_file(&file) != Language::Go {
             continue;
         }
         if module_path.is_none() {
@@ -206,14 +197,6 @@ fn build_go_graph(
         parsed,
         usage_graph,
     }
-}
-
-fn target_language_file(file: &ProjectFile) -> Language {
-    file.rel_path()
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(Language::from_extension)
-        .unwrap_or(Language::None)
 }
 
 fn export_index_of(analyzer: &GoAnalyzer, file: &ProjectFile) -> ExportIndex {
@@ -974,30 +957,14 @@ fn record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if enclosing == ctx.spec.target {
         return;
     }
-    ctx.hits.insert(UsageHit::new(
-        ctx.file.clone(),
-        range.start_line + 1,
+    ctx.hits.insert(usage_hit(
+        ctx.file,
+        range.start_line,
         start,
         end,
         enclosing,
-        GRAPH_HIT_CONFIDENCE,
-        build_snippet(ctx.source, ctx.line_starts, start, end),
+        trimmed_snippet_around_range(ctx.source, ctx.line_starts, start, end),
     ));
-}
-
-fn build_snippet(source: &str, line_starts: &[usize], start: usize, end: usize) -> String {
-    let start_line = find_line_index_for_offset(line_starts, start);
-    let end_line = find_line_index_for_offset(line_starts, end);
-    let snippet_start_line = start_line.saturating_sub(SNIPPET_CONTEXT_LINES);
-    let snippet_end_line = end_line + SNIPPET_CONTEXT_LINES + 1;
-
-    let snippet_start = *line_starts.get(snippet_start_line).unwrap_or(&0);
-    let snippet_end = line_starts
-        .get(snippet_end_line)
-        .copied()
-        .unwrap_or(source.len());
-
-    source[snippet_start..snippet_end].trim().to_string()
 }
 
 fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {

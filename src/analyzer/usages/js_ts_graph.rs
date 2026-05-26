@@ -29,6 +29,9 @@
 //!   re-parsing JS/TS files on every query. Hosts with stable file sets that need lower
 //!   latency (e.g. an LSP server) should layer their own cache around the strategy.
 
+use crate::analyzer::usages::common::{
+    language_for_target_filtered, trimmed_snippet_around_line, usage_hit,
+};
 use crate::analyzer::usages::graph_core::{ImportEdge, ImportEdgeKind, ProjectUsageGraph};
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::{
@@ -45,10 +48,6 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use tree_sitter::{Node, Parser, Tree};
 
-/// Graph-strategy hits land at the maximum confidence the regex analyzer also uses.
-const GRAPH_HIT_CONFIDENCE: f64 = 1.0;
-/// Lines of context to include before/after a match in [`UsageHit::snippet`].
-const SNIPPET_CONTEXT_LINES: usize = 3;
 const TARGET_BINDING: &str = "__target__";
 
 // ===================================================================================
@@ -134,14 +133,9 @@ impl UsageAnalyzer for JsTsExportUsageGraphStrategy {
 }
 
 fn target_language(target: &CodeUnit) -> Language {
-    target
-        .source()
-        .rel_path()
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(Language::from_extension)
-        .filter(|lang| matches!(lang, Language::JavaScript | Language::TypeScript))
-        .unwrap_or(Language::None)
+    language_for_target_filtered(target, |lang| {
+        matches!(lang, Language::JavaScript | Language::TypeScript)
+    })
 }
 
 /// Cached parse for one source file. `source` is held alongside the `Tree` so AST byte
@@ -785,7 +779,7 @@ fn record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 
     let line_idx = find_line_index_for_offset(ctx.line_starts, start_byte);
-    let snippet = build_snippet(ctx.source, ctx.line_starts, line_idx);
+    let snippet = trimmed_snippet_around_line(ctx.source, ctx.line_starts, line_idx);
     let range = Range {
         start_byte,
         end_byte,
@@ -797,44 +791,9 @@ fn record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     };
 
-    ctx.hits.insert(UsageHit::new(
-        ctx.file.clone(),
-        line_idx + 1,
-        start_byte,
-        end_byte,
-        enclosing,
-        GRAPH_HIT_CONFIDENCE,
-        snippet,
+    ctx.hits.insert(usage_hit(
+        ctx.file, line_idx, start_byte, end_byte, enclosing, snippet,
     ));
-}
-
-fn build_snippet(source: &str, line_starts: &[usize], line_idx: usize) -> String {
-    if line_starts.is_empty() {
-        return String::new();
-    }
-    let line_count = line_starts.len();
-    let snippet_start = line_idx.saturating_sub(SNIPPET_CONTEXT_LINES);
-    let snippet_end = line_idx
-        .saturating_add(SNIPPET_CONTEXT_LINES)
-        .min(line_count.saturating_sub(1));
-
-    let mut buf = String::new();
-    for idx in snippet_start..=snippet_end {
-        let start = line_starts[idx];
-        let end = if idx + 1 < line_count {
-            line_starts[idx + 1]
-        } else {
-            source.len()
-        };
-        let line = source[start..end]
-            .trim_end_matches('\n')
-            .trim_end_matches('\r');
-        if !buf.is_empty() {
-            buf.push('\n');
-        }
-        buf.push_str(line);
-    }
-    buf
 }
 
 fn slice<'a>(node: Node<'_>, source: &'a str) -> &'a str {

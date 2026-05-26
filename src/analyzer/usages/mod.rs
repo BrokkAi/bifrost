@@ -15,6 +15,7 @@
 //!   a graph strategy returns [`FuzzyResult::Failure`].
 
 mod candidates;
+mod common;
 mod cpp_graph;
 mod csharp_graph;
 mod finder;

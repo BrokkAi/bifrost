@@ -1,3 +1,4 @@
+use crate::analyzer::usages::common::{language_for_file, language_for_target, usage_hit};
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::traits::UsageAnalyzer;
@@ -10,7 +11,6 @@ use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use std::collections::BTreeSet;
 use tree_sitter::{Node, Parser};
 
-const GRAPH_HIT_CONFIDENCE: f64 = 1.0;
 const SNIPPET_CONTEXT_LINES: usize = 3;
 
 #[derive(Default)]
@@ -24,7 +24,7 @@ impl ScalaUsageGraphStrategy {
     }
 
     pub fn can_handle(target: &CodeUnit) -> bool {
-        target_language(target) == Language::Scala
+        language_for_target(target) == Language::Scala
     }
 }
 
@@ -41,7 +41,7 @@ impl UsageAnalyzer for ScalaUsageGraphStrategy {
         }
 
         let target = &overloads[0];
-        if target_language(target) != Language::Scala {
+        if language_for_target(target) != Language::Scala {
             return FuzzyResult::Failure {
                 fq_name: target.fq_name(),
                 reason: "ScalaUsageGraphStrategy: target is not Scala".to_string(),
@@ -65,7 +65,7 @@ impl UsageAnalyzer for ScalaUsageGraphStrategy {
 
         let files: HashSet<ProjectFile> = candidate_files
             .iter()
-            .filter(|file| target_language_file(file) == Language::Scala)
+            .filter(|file| language_for_file(file) == Language::Scala)
             .cloned()
             .chain(std::iter::once(target.source().clone()))
             .collect();
@@ -878,13 +878,12 @@ fn add_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     let line = find_line_index_for_offset(ctx.line_starts, range.start_byte) + 1;
-    ctx.hits.insert(UsageHit::new(
-        ctx.file.clone(),
-        line,
+    ctx.hits.insert(usage_hit(
+        ctx.file,
+        line - 1,
         range.start_byte,
         range.end_byte,
         enclosing,
-        GRAPH_HIT_CONFIDENCE,
         snippet_around(ctx.source, ctx.line_starts, line),
     ));
     if ctx.hits.len() > ctx.max_usages {
@@ -1095,18 +1094,6 @@ fn scala_display_name(unit: &CodeUnit) -> String {
         .unwrap_or(unit.short_name())
         .trim_end_matches('$')
         .to_string()
-}
-
-fn target_language(target: &CodeUnit) -> Language {
-    target_language_file(target.source())
-}
-
-fn target_language_file(file: &ProjectFile) -> Language {
-    file.rel_path()
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(Language::from_extension)
-        .unwrap_or(Language::None)
 }
 
 fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {

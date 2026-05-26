@@ -1,3 +1,6 @@
+use crate::analyzer::usages::common::{
+    language_for_target, trimmed_snippet_around_range, usage_hit,
+};
 use crate::analyzer::usages::graph_core::{ImportEdgeKind, ProjectUsageGraph};
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::{FuzzyResult, ReferenceGraphResult, UsageHit};
@@ -14,9 +17,6 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, LazyLock, Mutex};
 use tree_sitter::{Node, Parser, Tree};
 
-const GRAPH_HIT_CONFIDENCE: f64 = 1.0;
-const SNIPPET_CONTEXT_LINES: usize = 3;
-
 #[derive(Default)]
 pub struct RustExportUsageGraphStrategy {
     _private: (),
@@ -28,7 +28,7 @@ impl RustExportUsageGraphStrategy {
     }
 
     pub fn can_handle(target: &CodeUnit) -> bool {
-        target_language(target) == Language::Rust
+        language_for_target(target) == Language::Rust
     }
 
     pub fn find_export_usages(
@@ -74,7 +74,7 @@ impl UsageAnalyzer for RustExportUsageGraphStrategy {
         }
 
         let target = &overloads[0];
-        if target_language(target) != Language::Rust {
+        if language_for_target(target) != Language::Rust {
             return FuzzyResult::Failure {
                 fq_name: target.fq_name().to_string(),
                 reason: "RustExportUsageGraphStrategy: target is not Rust".to_string(),
@@ -143,16 +143,6 @@ fn resolve_rust_analyzer(analyzer: &dyn IAnalyzer) -> Option<&RustAnalyzer> {
         Some(AnalyzerDelegate::Rust(rust)) => Some(rust),
         _ => None,
     }
-}
-
-fn target_language(target: &CodeUnit) -> Language {
-    target
-        .source()
-        .rel_path()
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(Language::from_extension)
-        .unwrap_or(Language::None)
 }
 
 fn supports_same_file_local_scan(analyzer: &RustAnalyzer, target: &CodeUnit) -> bool {
@@ -645,14 +635,13 @@ fn record_module_qualified_hits(ctx: &mut ScanCtx<'_>) {
             let Some(enclosing) = ctx.analyzer.enclosing_code_unit(ctx.file, &range) else {
                 continue;
             };
-            ctx.hits.insert(UsageHit::new(
-                ctx.file.clone(),
-                range.start_line + 1,
+            ctx.hits.insert(usage_hit(
+                ctx.file,
+                range.start_line,
                 start,
                 end,
                 enclosing,
-                GRAPH_HIT_CONFIDENCE,
-                build_snippet(ctx.source, ctx.line_starts, start, end),
+                trimmed_snippet_around_range(ctx.source, ctx.line_starts, start, end),
             ));
         }
     }
@@ -670,35 +659,19 @@ fn record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let Some(enclosing) = ctx.analyzer.enclosing_code_unit(ctx.file, &range) else {
         return;
     };
-    ctx.hits.insert(UsageHit::new(
-        ctx.file.clone(),
-        start_line + 1,
+    ctx.hits.insert(usage_hit(
+        ctx.file,
+        start_line,
         node.start_byte(),
         node.end_byte(),
         enclosing,
-        GRAPH_HIT_CONFIDENCE,
-        build_snippet(
+        trimmed_snippet_around_range(
             ctx.source,
             ctx.line_starts,
             node.start_byte(),
             node.end_byte(),
         ),
     ));
-}
-
-fn build_snippet(source: &str, line_starts: &[usize], start: usize, end: usize) -> String {
-    let start_line = find_line_index_for_offset(line_starts, start);
-    let end_line = find_line_index_for_offset(line_starts, end);
-    let snippet_start_line = start_line.saturating_sub(SNIPPET_CONTEXT_LINES);
-    let snippet_end_line = end_line + SNIPPET_CONTEXT_LINES + 1;
-
-    let snippet_start = *line_starts.get(snippet_start_line).unwrap_or(&0);
-    let snippet_end = line_starts
-        .get(snippet_end_line)
-        .copied()
-        .unwrap_or(source.len());
-
-    source[snippet_start..snippet_end].trim().to_string()
 }
 
 static LET_TYPED_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -826,14 +799,13 @@ fn scan_files_for_member_target(
                 if receiver_mismatched {
                     continue;
                 }
-                local_hits.insert(UsageHit::new(
-                    file.clone(),
-                    range.start_line + 1,
+                local_hits.insert(usage_hit(
+                    file,
+                    range.start_line,
                     start,
                     end,
                     enclosing,
-                    GRAPH_HIT_CONFIDENCE,
-                    build_snippet(&source, &line_starts, start, end),
+                    trimmed_snippet_around_range(&source, &line_starts, start, end),
                 ));
             }
         }
@@ -850,14 +822,13 @@ fn scan_files_for_member_target(
                 let Some(enclosing) = analyzer.enclosing_code_unit(file, &range) else {
                     continue;
                 };
-                local_hits.insert(UsageHit::new(
-                    file.clone(),
-                    range.start_line + 1,
+                local_hits.insert(usage_hit(
+                    file,
+                    range.start_line,
                     start,
                     end,
                     enclosing,
-                    GRAPH_HIT_CONFIDENCE,
-                    build_snippet(&source, &line_starts, start, end),
+                    trimmed_snippet_around_range(&source, &line_starts, start, end),
                 ));
             }
         }

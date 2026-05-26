@@ -1,3 +1,6 @@
+use crate::analyzer::usages::common::{
+    language_for_target, trimmed_snippet_around_line, usage_hit,
+};
 use crate::analyzer::usages::graph_core::{ImportEdge, ImportEdgeKind, ProjectUsageGraph};
 use crate::analyzer::usages::local_inference::{
     LocalBindingsSnapshot, LocalInferenceConfig, LocalInferenceEngine, SymbolResolution,
@@ -17,9 +20,6 @@ use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex};
 use tree_sitter::{Node, Parser, Tree};
 
-const GRAPH_HIT_CONFIDENCE: f64 = 1.0;
-const SNIPPET_CONTEXT_LINES: usize = 3;
-
 #[derive(Default)]
 pub struct PythonExportUsageGraphStrategy {
     _private: (),
@@ -31,7 +31,7 @@ impl PythonExportUsageGraphStrategy {
     }
 
     pub fn can_handle(target: &CodeUnit) -> bool {
-        target_language(target) == Language::Python
+        language_for_target(target) == Language::Python
     }
 }
 
@@ -48,7 +48,7 @@ impl UsageAnalyzer for PythonExportUsageGraphStrategy {
         }
 
         let target = &overloads[0];
-        if target_language(target) != Language::Python {
+        if language_for_target(target) != Language::Python {
             return FuzzyResult::Failure {
                 fq_name: target.fq_name().to_string(),
                 reason: "PythonExportUsageGraphStrategy: target is not Python".to_string(),
@@ -118,16 +118,6 @@ fn resolve_python_analyzer(analyzer: &dyn IAnalyzer) -> Option<&PythonAnalyzer> 
         Some(AnalyzerDelegate::Python(py)) => Some(py),
         _ => None,
     }
-}
-
-fn target_language(target: &CodeUnit) -> Language {
-    target
-        .source()
-        .rel_path()
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(Language::from_extension)
-        .unwrap_or(Language::None)
 }
 
 fn infer_export_names(analyzer: &PythonAnalyzer, target: &CodeUnit) -> BTreeSet<String> {
@@ -602,7 +592,7 @@ fn record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 
     let line_idx = find_line_index_for_offset(ctx.line_starts, start_byte);
-    let snippet = build_snippet(ctx.source, ctx.line_starts, line_idx);
+    let snippet = trimmed_snippet_around_line(ctx.source, ctx.line_starts, line_idx);
     let range = Range {
         start_byte,
         end_byte,
@@ -614,44 +604,9 @@ fn record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     };
 
-    ctx.hits.insert(UsageHit::new(
-        ctx.file.clone(),
-        line_idx + 1,
-        start_byte,
-        end_byte,
-        enclosing,
-        GRAPH_HIT_CONFIDENCE,
-        snippet,
+    ctx.hits.insert(usage_hit(
+        ctx.file, line_idx, start_byte, end_byte, enclosing, snippet,
     ));
-}
-
-fn build_snippet(source: &str, line_starts: &[usize], line_idx: usize) -> String {
-    if line_starts.is_empty() {
-        return String::new();
-    }
-    let line_count = line_starts.len();
-    let snippet_start = line_idx.saturating_sub(SNIPPET_CONTEXT_LINES);
-    let snippet_end = line_idx
-        .saturating_add(SNIPPET_CONTEXT_LINES)
-        .min(line_count.saturating_sub(1));
-
-    let mut buf = String::new();
-    for idx in snippet_start..=snippet_end {
-        let start = line_starts[idx];
-        let end = if idx + 1 < line_count {
-            line_starts[idx + 1]
-        } else {
-            source.len()
-        };
-        let line = source[start..end]
-            .trim_end_matches('\n')
-            .trim_end_matches('\r');
-        if !buf.is_empty() {
-            buf.push('\n');
-        }
-        buf.push_str(line);
-    }
-    buf
 }
 
 fn slice<'a>(node: Node<'_>, source: &'a str) -> &'a str {

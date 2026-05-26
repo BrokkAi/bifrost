@@ -1,3 +1,6 @@
+use crate::analyzer::usages::common::{
+    language_for_file, language_for_target, snippet_around_line, usage_hit,
+};
 use crate::analyzer::usages::local_inference::{LocalInferenceEngine, SymbolResolution};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::traits::UsageAnalyzer;
@@ -12,9 +15,6 @@ use std::collections::BTreeSet;
 use std::sync::LazyLock;
 use tree_sitter::{Node, Parser};
 
-const GRAPH_HIT_CONFIDENCE: f64 = 1.0;
-const SNIPPET_CONTEXT_LINES: usize = 3;
-
 #[derive(Default)]
 pub struct PhpUsageGraphStrategy {
     _private: (),
@@ -26,7 +26,7 @@ impl PhpUsageGraphStrategy {
     }
 
     pub fn can_handle(target: &CodeUnit) -> bool {
-        target_language(target) == Language::Php
+        language_for_target(target) == Language::Php
     }
 }
 
@@ -43,7 +43,7 @@ impl UsageAnalyzer for PhpUsageGraphStrategy {
         }
 
         let target = &overloads[0];
-        if target_language(target) != Language::Php {
+        if language_for_target(target) != Language::Php {
             return FuzzyResult::Failure {
                 fq_name: target.fq_name(),
                 reason: "PhpUsageGraphStrategy: target is not PHP".to_string(),
@@ -66,7 +66,7 @@ impl UsageAnalyzer for PhpUsageGraphStrategy {
 
         let files: HashSet<ProjectFile> = candidate_files
             .iter()
-            .filter(|file| target_language_for_file(file) == Language::Php)
+            .filter(|file| language_for_file(file) == Language::Php)
             .cloned()
             .chain(std::iter::once(target.source().clone()))
             .collect();
@@ -160,18 +160,6 @@ fn resolve_php_analyzer(analyzer: &dyn IAnalyzer) -> Option<&PhpAnalyzer> {
         Some(AnalyzerDelegate::Php(php)) => Some(php),
         _ => None,
     }
-}
-
-fn target_language(target: &CodeUnit) -> Language {
-    target_language_for_file(target.source())
-}
-
-fn target_language_for_file(file: &ProjectFile) -> Language {
-    file.rel_path()
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(Language::from_extension)
-        .unwrap_or(Language::None)
 }
 
 struct FileContext {
@@ -465,14 +453,13 @@ fn push_hit_range(
     if enclosing == spec.target {
         return;
     }
-    hits.insert(UsageHit::new(
-        file.clone(),
-        range.start_line + 1,
+    hits.insert(usage_hit(
+        file,
+        range.start_line,
         start,
         end,
         enclosing,
-        GRAPH_HIT_CONFIDENCE,
-        build_snippet(source, line_starts, range.start_line),
+        snippet_around_line(source, line_starts, range.start_line),
     ));
 }
 
@@ -806,7 +793,7 @@ impl PhpHierarchyIndex {
     fn build(php: &PhpAnalyzer, files: &HashSet<ProjectFile>) -> Self {
         let mut hierarchy = Self::default();
         for file in files {
-            if target_language_for_file(file) != Language::Php {
+            if language_for_file(file) != Language::Php {
                 continue;
             }
             let Ok(source) = file.read_to_string() else {
@@ -1078,22 +1065,4 @@ fn has_open_paren_after(end: usize, source: &str) -> bool {
 
 fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     source.get(node.start_byte()..node.end_byte()).unwrap_or("")
-}
-
-fn build_snippet(source: &str, line_starts: &[usize], line_idx: usize) -> String {
-    if line_starts.is_empty() {
-        return String::new();
-    }
-    let snippet_start = line_idx.saturating_sub(SNIPPET_CONTEXT_LINES);
-    let snippet_end = line_idx
-        .saturating_add(SNIPPET_CONTEXT_LINES)
-        .min(line_starts.len().saturating_sub(1));
-
-    let mut snippet = String::new();
-    for idx in snippet_start..=snippet_end {
-        let start = line_starts[idx];
-        let end = line_starts.get(idx + 1).copied().unwrap_or(source.len());
-        snippet.push_str(source.get(start..end).unwrap_or_default());
-    }
-    snippet
 }

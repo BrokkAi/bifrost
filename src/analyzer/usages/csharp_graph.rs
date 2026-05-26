@@ -1,3 +1,6 @@
+use crate::analyzer::usages::common::{
+    language_for_file, language_for_target, snippet_around_line, usage_hit,
+};
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::traits::UsageAnalyzer;
@@ -10,9 +13,6 @@ use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use std::collections::BTreeSet;
 use tree_sitter::{Node, Parser};
 
-const GRAPH_HIT_CONFIDENCE: f64 = 1.0;
-const SNIPPET_CONTEXT_LINES: usize = 3;
-
 #[derive(Default)]
 pub struct CSharpUsageGraphStrategy {
     _private: (),
@@ -24,7 +24,7 @@ impl CSharpUsageGraphStrategy {
     }
 
     pub fn can_handle(target: &CodeUnit) -> bool {
-        target_language(target) == Language::CSharp
+        language_for_target(target) == Language::CSharp
     }
 }
 
@@ -41,7 +41,7 @@ impl UsageAnalyzer for CSharpUsageGraphStrategy {
         }
 
         let target = &overloads[0];
-        if target_language(target) != Language::CSharp {
+        if language_for_target(target) != Language::CSharp {
             return FuzzyResult::Failure {
                 fq_name: target.fq_name(),
                 reason: "CSharpUsageGraphStrategy: target is not C#".to_string(),
@@ -65,7 +65,7 @@ impl UsageAnalyzer for CSharpUsageGraphStrategy {
 
         let files: HashSet<ProjectFile> = candidate_files
             .iter()
-            .filter(|file| file_language(file) == Language::CSharp)
+            .filter(|file| language_for_file(file) == Language::CSharp)
             .cloned()
             .chain(std::iter::once(target.source().clone()))
             .collect();
@@ -166,24 +166,6 @@ fn resolve_csharp_analyzer(analyzer: &dyn IAnalyzer) -> Option<&CSharpAnalyzer> 
         Some(AnalyzerDelegate::CSharp(csharp)) => Some(csharp),
         _ => None,
     }
-}
-
-fn target_language(target: &CodeUnit) -> Language {
-    target
-        .source()
-        .rel_path()
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(Language::from_extension)
-        .unwrap_or(Language::None)
-}
-
-fn file_language(file: &ProjectFile) -> Language {
-    file.rel_path()
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(Language::from_extension)
-        .unwrap_or(Language::None)
 }
 
 fn signature_arity(signature: Option<&str>) -> usize {
@@ -810,14 +792,13 @@ fn push_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if enclosing == ctx.spec.target {
         return;
     }
-    ctx.hits.insert(UsageHit::new(
-        ctx.file.clone(),
-        line_idx + 1,
+    ctx.hits.insert(usage_hit(
+        ctx.file,
+        line_idx,
         start,
         end,
         enclosing,
-        GRAPH_HIT_CONFIDENCE,
-        build_snippet(ctx.source, ctx.line_starts, line_idx),
+        snippet_around_line(ctx.source, ctx.line_starts, line_idx),
     ));
     if ctx.hits.len() > ctx.max_usages {
         *ctx.limit_exceeded = true;
@@ -838,24 +819,6 @@ fn enclosing_code_unit(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> Option<CodeUnit
     let enclosing = ctx.analyzer.enclosing_code_unit(ctx.file, &range);
     ctx.enclosing_cache.insert(key, enclosing.clone());
     enclosing
-}
-
-fn build_snippet(source: &str, line_starts: &[usize], line_idx: usize) -> String {
-    if line_starts.is_empty() {
-        return String::new();
-    }
-    let snippet_start = line_idx.saturating_sub(SNIPPET_CONTEXT_LINES);
-    let snippet_end = line_idx
-        .saturating_add(SNIPPET_CONTEXT_LINES)
-        .min(line_starts.len().saturating_sub(1));
-
-    let mut snippet = String::new();
-    for idx in snippet_start..=snippet_end {
-        let start = line_starts[idx];
-        let end = line_starts.get(idx + 1).copied().unwrap_or(source.len());
-        snippet.push_str(source.get(start..end).unwrap_or_default());
-    }
-    snippet
 }
 
 fn same_node(left: Node<'_>, right: Node<'_>) -> bool {
