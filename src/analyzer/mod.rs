@@ -16,7 +16,7 @@ mod multi_analyzer;
 pub mod persistence;
 mod php_analyzer;
 mod project;
-mod python_analyzer;
+mod python;
 mod rust_analyzer;
 mod scala_analyzer;
 mod source_content;
@@ -58,7 +58,7 @@ pub use php_analyzer::{
 pub use project::{
     DEFAULT_MAX_OVERLAY_BYTES, FilesystemProject, OverlayProject, Project, TestProject,
 };
-pub use python_analyzer::PythonAnalyzer;
+pub use python::PythonAnalyzer;
 pub use rust_analyzer::RustAnalyzer;
 pub use scala_analyzer::ScalaAnalyzer;
 pub use source_content::SourceContent;
