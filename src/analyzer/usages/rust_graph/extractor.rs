@@ -1,13 +1,13 @@
 use crate::analyzer::usages::graph_core::{ImportEdgeKind, ProjectUsageGraph};
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::UsageHit;
-use crate::analyzer::usages::rust_graph::hits::{SNIPPET_CONTEXT_LINES, usage_hit};
-use crate::analyzer::usages::rust_graph::resolver::is_trait_owner;
-use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range, RustAnalyzer};
-use crate::hash::{HashMap, HashSet};
-use crate::text_utils::{
-    compute_line_starts, find_line_index_for_offset, trimmed_snippet_around_range,
+use crate::analyzer::usages::rust_graph::hits::{
+    member_hit_enclosing, push_member_hit, record_hit, record_module_qualified_hits,
 };
+use crate::analyzer::usages::rust_graph::resolver::is_trait_owner;
+use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, RustAnalyzer};
+use crate::hash::{HashMap, HashSet};
+use crate::text_utils::compute_line_starts;
 use rayon::prelude::*;
 use regex::Regex;
 use std::collections::BTreeSet;
@@ -193,17 +193,17 @@ pub(super) fn scan_files_for_target(
     hits.into_inner().expect("poisoned Rust graph collector")
 }
 
-struct ScanCtx<'a> {
-    file: &'a ProjectFile,
-    source: &'a str,
-    line_starts: &'a [usize],
-    analyzer: &'a dyn IAnalyzer,
-    target_short: &'a str,
+pub(super) struct ScanCtx<'a> {
+    pub(super) file: &'a ProjectFile,
+    pub(super) source: &'a str,
+    pub(super) line_starts: &'a [usize],
+    pub(super) analyzer: &'a dyn IAnalyzer,
+    pub(super) target_short: &'a str,
     direct_names: &'a HashSet<String>,
-    namespace_names: &'a HashSet<String>,
-    shadowed_names: HashSet<String>,
+    pub(super) namespace_names: &'a HashSet<String>,
+    pub(super) shadowed_names: HashSet<String>,
     target_self_file: bool,
-    hits: &'a mut BTreeSet<UsageHit>,
+    pub(super) hits: &'a mut BTreeSet<UsageHit>,
 }
 
 impl ScanCtx<'_> {
@@ -286,81 +286,6 @@ fn detect_shadowed_names(
             })
         })
         .collect()
-}
-
-fn record_module_qualified_hits(ctx: &mut ScanCtx<'_>) {
-    for name in ctx.namespace_names {
-        if ctx.shadowed_names.contains(name) {
-            continue;
-        }
-        let pattern = format!(
-            r"\b{}\s*::\s*{}\b",
-            regex::escape(name),
-            regex::escape(ctx.target_short)
-        );
-        let Ok(re) = Regex::new(&pattern) else {
-            continue;
-        };
-        for matched in re.find_iter(ctx.source) {
-            let matched_text = matched.as_str();
-            let Some(local_offset) = matched_text.rfind(ctx.target_short) else {
-                continue;
-            };
-            let start = matched.start() + local_offset;
-            let end = start + ctx.target_short.len();
-            let range = Range {
-                start_byte: start,
-                end_byte: end,
-                start_line: find_line_index_for_offset(ctx.line_starts, start),
-                end_line: find_line_index_for_offset(ctx.line_starts, end),
-            };
-            let Some(enclosing) = ctx.analyzer.enclosing_code_unit(ctx.file, &range) else {
-                continue;
-            };
-            ctx.hits.insert(usage_hit(
-                ctx.file,
-                range.start_line,
-                start,
-                end,
-                enclosing,
-                trimmed_snippet_around_range(
-                    ctx.source,
-                    ctx.line_starts,
-                    start,
-                    end,
-                    SNIPPET_CONTEXT_LINES,
-                ),
-            ));
-        }
-    }
-}
-
-fn record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    let start_line = find_line_index_for_offset(ctx.line_starts, node.start_byte());
-    let end_line = find_line_index_for_offset(ctx.line_starts, node.end_byte());
-    let range = Range {
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_line,
-        end_line,
-    };
-    let Some(enclosing) = ctx.analyzer.enclosing_code_unit(ctx.file, &range) else {
-        return;
-    };
-    ctx.hits.insert(usage_hit(
-        ctx.file,
-        start_line,
-        node.start_byte(),
-        node.end_byte(),
-        enclosing,
-        trimmed_snippet_around_range(
-            ctx.source,
-            ctx.line_starts,
-            node.start_byte(),
-            node.end_byte(),
-            SNIPPET_CONTEXT_LINES,
-        ),
-    ));
 }
 
 static LET_TYPED_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -465,13 +390,9 @@ pub(super) fn scan_files_for_member_target(
                 };
                 let start = matched.end().saturating_sub(target.identifier().len() + 1);
                 let end = matched.end().saturating_sub(1);
-                let range = Range {
-                    start_byte: start,
-                    end_byte: end,
-                    start_line: find_line_index_for_offset(&line_starts, start),
-                    end_line: find_line_index_for_offset(&line_starts, end),
-                };
-                let Some(enclosing) = analyzer.enclosing_code_unit(file, &range) else {
+                let Some(enclosing) =
+                    member_hit_enclosing(analyzer, file, &line_starts, start, end)
+                else {
                     continue;
                 };
                 let receiver_mismatched = analyzer
@@ -488,49 +409,35 @@ pub(super) fn scan_files_for_member_target(
                 if receiver_mismatched {
                     continue;
                 }
-                local_hits.insert(usage_hit(
+                push_member_hit(
                     file,
-                    range.start_line,
+                    &source,
+                    &line_starts,
                     start,
                     end,
                     enclosing,
-                    trimmed_snippet_around_range(
-                        &source,
-                        &line_starts,
-                        start,
-                        end,
-                        SNIPPET_CONTEXT_LINES,
-                    ),
-                ));
+                    &mut local_hits,
+                );
             }
         }
         if let Some(static_re) = static_re {
             for matched in static_re.find_iter(&source) {
                 let start = matched.end().saturating_sub(target.identifier().len());
                 let end = matched.end();
-                let range = Range {
-                    start_byte: start,
-                    end_byte: end,
-                    start_line: find_line_index_for_offset(&line_starts, start),
-                    end_line: find_line_index_for_offset(&line_starts, end),
-                };
-                let Some(enclosing) = analyzer.enclosing_code_unit(file, &range) else {
+                let Some(enclosing) =
+                    member_hit_enclosing(analyzer, file, &line_starts, start, end)
+                else {
                     continue;
                 };
-                local_hits.insert(usage_hit(
+                push_member_hit(
                     file,
-                    range.start_line,
+                    &source,
+                    &line_starts,
                     start,
                     end,
                     enclosing,
-                    trimmed_snippet_around_range(
-                        &source,
-                        &line_starts,
-                        start,
-                        end,
-                        SNIPPET_CONTEXT_LINES,
-                    ),
-                ));
+                    &mut local_hits,
+                );
             }
         }
 
