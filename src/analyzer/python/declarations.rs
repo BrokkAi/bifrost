@@ -1,0 +1,571 @@
+use super::imports::parse_python_import_infos;
+use super::*;
+use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
+use std::path::Path;
+use tree_sitter::{Node, Parser, Tree};
+
+pub(super) fn python_is_decorated_function_boundary(node: Node<'_>) -> bool {
+    if node.kind() != "decorated_definition" {
+        return false;
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| child.kind() == "function_definition")
+}
+
+#[derive(Clone)]
+pub(super) struct Scope {
+    kind: ScopeKind,
+    path: String,
+    code_unit: Option<CodeUnit>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScopeKind {
+    Class,
+    Function,
+}
+
+pub(super) struct PythonVisitor<'a> {
+    pub(super) file: &'a ProjectFile,
+    pub(super) source: &'a str,
+    pub(super) package_name: &'a str,
+    pub(super) parsed: &'a mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+    pub(super) module: Option<CodeUnit>,
+}
+
+impl<'a> PythonVisitor<'a> {
+    pub(super) fn visit_container(
+        &mut self,
+        node: Node<'_>,
+        scope: &[Scope],
+        module_control_depth: usize,
+    ) {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            self.visit_statement(child, scope, module_control_depth);
+        }
+    }
+
+    fn visit_statement(&mut self, node: Node<'_>, scope: &[Scope], module_control_depth: usize) {
+        match node.kind() {
+            "decorated_definition" => {
+                if let Some(definition) = node.child_by_field_name("definition") {
+                    self.visit_definition(definition, Some(node), scope, module_control_depth);
+                }
+            }
+            "class_definition" | "function_definition" => {
+                self.visit_definition(node, None, scope, module_control_depth)
+            }
+            "expression_statement" => {
+                self.visit_expression_statement(node, scope, module_control_depth)
+            }
+            "import_statement" | "import_from_statement" => self.visit_import_statement(node),
+            "if_statement" | "try_statement" | "with_statement" | "for_statement"
+            | "while_statement" => {
+                let next_depth = if scope.is_empty() {
+                    module_control_depth + 1
+                } else {
+                    module_control_depth
+                };
+                self.visit_container(node, scope, next_depth);
+            }
+            "elif_clause" | "else_clause" | "except_clause" | "finally_clause" => {
+                self.visit_container(node, scope, module_control_depth);
+            }
+            "block" | "module" => self.visit_container(node, scope, module_control_depth),
+            _ => {}
+        }
+    }
+
+    fn visit_definition(
+        &mut self,
+        definition: Node<'_>,
+        wrapper: Option<Node<'_>>,
+        scope: &[Scope],
+        module_control_depth: usize,
+    ) {
+        match definition.kind() {
+            "class_definition" => self.visit_class_definition(
+                definition,
+                wrapper.unwrap_or(definition),
+                scope,
+                module_control_depth,
+            ),
+            "function_definition" => self.visit_function_definition(
+                definition,
+                wrapper.unwrap_or(definition),
+                scope,
+                module_control_depth,
+            ),
+            _ => {}
+        }
+    }
+
+    fn visit_class_definition(
+        &mut self,
+        node: Node<'_>,
+        range_node: Node<'_>,
+        scope: &[Scope],
+        module_control_depth: usize,
+    ) {
+        let Some(name_node) = node.child_by_field_name("name") else {
+            return;
+        };
+        let name = py_node_text(name_node, self.source).trim();
+        if name.is_empty() {
+            return;
+        }
+
+        let capture = !scope.is_empty() || module_control_depth <= 1;
+
+        let short_name = scope
+            .last()
+            .map(|parent| format!("{}${name}", parent.path))
+            .unwrap_or_else(|| name.to_string());
+        let code_unit = CodeUnit::new(
+            self.file.clone(),
+            CodeUnitType::Class,
+            self.package_name.to_string(),
+            short_name.clone(),
+        );
+        if capture {
+            self.parsed
+                .replace_code_unit(code_unit.clone(), range_node, self.source, None, None);
+            self.parsed.add_signature(
+                code_unit.clone(),
+                python_class_signature(range_node, self.source),
+            );
+            if let Some(module) = &self.module
+                && scope.is_empty()
+            {
+                self.parsed.add_child(module.clone(), code_unit.clone());
+            }
+            if let Some(parent) = scope.last()
+                && let Some(parent_cu) = &parent.code_unit
+            {
+                self.parsed.add_child(parent_cu.clone(), code_unit.clone());
+            }
+            self.parsed.set_raw_supertypes(
+                code_unit.clone(),
+                extract_python_supertypes(node, self.source),
+            );
+        }
+
+        let mut next_scope = scope.to_vec();
+        if capture {
+            next_scope.push(Scope {
+                kind: ScopeKind::Class,
+                path: short_name,
+                code_unit: Some(code_unit),
+            });
+        }
+        if let Some(body) = node.child_by_field_name("body") {
+            self.visit_container(body, &next_scope, module_control_depth);
+        }
+    }
+
+    fn visit_function_definition(
+        &mut self,
+        node: Node<'_>,
+        range_node: Node<'_>,
+        scope: &[Scope],
+        module_control_depth: usize,
+    ) {
+        let Some(name_node) = node.child_by_field_name("name") else {
+            return;
+        };
+        let name = py_node_text(name_node, self.source).trim();
+        if name.is_empty() {
+            return;
+        }
+
+        let capture = !python_is_property_mutator(range_node, self.source)
+            && ((scope.is_empty() && module_control_depth <= 1)
+                || scope
+                    .last()
+                    .is_some_and(|parent| parent.kind == ScopeKind::Class));
+        let short_name = if let Some(parent) = scope.last() {
+            match parent.kind {
+                ScopeKind::Class => format!("{}.{}", parent.path, name),
+                ScopeKind::Function => format!("{}${name}", parent.path),
+            }
+        } else {
+            name.to_string()
+        };
+
+        if capture {
+            let signature = node
+                .child_by_field_name("parameters")
+                .map(|parameters| py_node_text(parameters, self.source).trim().to_string());
+            let code_unit = CodeUnit::with_signature(
+                self.file.clone(),
+                CodeUnitType::Function,
+                self.package_name.to_string(),
+                short_name.clone(),
+                signature,
+                false,
+            );
+            self.parsed
+                .replace_code_unit(code_unit.clone(), range_node, self.source, None, None);
+            self.parsed.add_signature(
+                code_unit.clone(),
+                python_function_signature(range_node, self.source),
+            );
+            if let Some(module) = &self.module
+                && scope.is_empty()
+            {
+                self.parsed.add_child(module.clone(), code_unit.clone());
+            }
+            if let Some(parent) = scope.last()
+                && parent.kind == ScopeKind::Class
+                && let Some(parent_cu) = &parent.code_unit
+            {
+                self.parsed.add_child(parent_cu.clone(), code_unit.clone());
+            }
+            let scope_code_unit = Some(code_unit);
+            let mut next_scope = scope.to_vec();
+            next_scope.push(Scope {
+                kind: ScopeKind::Function,
+                path: short_name,
+                code_unit: scope_code_unit,
+            });
+            if let Some(body) = node.child_by_field_name("body") {
+                self.visit_container(body, &next_scope, module_control_depth);
+            }
+            return;
+        }
+
+        let mut next_scope = scope.to_vec();
+        next_scope.push(Scope {
+            kind: ScopeKind::Function,
+            path: short_name,
+            code_unit: None,
+        });
+        if let Some(body) = node.child_by_field_name("body") {
+            self.visit_container(body, &next_scope, module_control_depth);
+        }
+    }
+
+    fn visit_expression_statement(
+        &mut self,
+        node: Node<'_>,
+        scope: &[Scope],
+        module_control_depth: usize,
+    ) {
+        let Some(assignment) = node.named_child(0) else {
+            return;
+        };
+        if assignment.kind() != "assignment" {
+            return;
+        }
+        let Some(left) = assignment.child_by_field_name("left") else {
+            return;
+        };
+        let names = collect_assigned_names(left, self.source);
+        for name in names {
+            let short_name = if let Some(parent) = scope.last() {
+                if parent.kind != ScopeKind::Class {
+                    continue;
+                }
+                format!("{}.{}", parent.path, name)
+            } else if module_control_depth <= 1 {
+                name.clone()
+            } else {
+                continue;
+            };
+            let code_unit = CodeUnit::new(
+                self.file.clone(),
+                CodeUnitType::Field,
+                self.package_name.to_string(),
+                short_name,
+            );
+            self.parsed
+                .replace_code_unit(code_unit.clone(), node, self.source, None, None);
+            self.parsed.add_signature(
+                code_unit.clone(),
+                py_node_text(node, self.source).trim().to_string(),
+            );
+            if let Some(module) = &self.module
+                && scope.is_empty()
+            {
+                self.parsed.add_child(module.clone(), code_unit.clone());
+            }
+            if let Some(parent) = scope.last()
+                && parent.kind == ScopeKind::Class
+                && let Some(parent_cu) = &parent.code_unit
+            {
+                self.parsed.add_child(parent_cu.clone(), code_unit);
+            }
+        }
+    }
+
+    fn visit_import_statement(&mut self, node: Node<'_>) {
+        let raw = py_node_text(node, self.source).trim();
+        for info in parse_python_import_infos(raw) {
+            self.parsed.import_statements.push(info.raw_snippet.clone());
+            self.parsed.imports.push(info);
+        }
+    }
+}
+
+pub(super) fn py_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    source.get(node.start_byte()..node.end_byte()).unwrap_or("")
+}
+
+struct PythonModuleInfo {
+    package_name: String,
+    module_name: String,
+}
+
+impl PythonModuleInfo {
+    fn module_qualified_package(&self) -> String {
+        if self.package_name.is_empty() {
+            self.module_name.clone()
+        } else {
+            format!("{}.{}", self.package_name, self.module_name)
+        }
+    }
+}
+
+pub(super) fn python_module_name(file: &ProjectFile) -> String {
+    python_module_info(file).module_qualified_package()
+}
+
+pub(super) fn build_python_module_code_units(
+    inner: &TreeSitterAnalyzer<PythonAdapter>,
+) -> HashMap<String, CodeUnit> {
+    inner
+        .all_files()
+        .filter_map(|file| {
+            let module_fq = python_module_name(file);
+            module_code_unit(file, &module_fq).map(|code_unit| (module_fq, code_unit))
+        })
+        .collect()
+}
+
+fn python_module_info(file: &ProjectFile) -> PythonModuleInfo {
+    let raw_package = python_package_name_for_file(file);
+    let module_name = file
+        .rel_path()
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default()
+        .to_string();
+
+    if module_name == "__init__" && !raw_package.is_empty() {
+        if let Some((package_name, last_segment)) = raw_package.rsplit_once('.') {
+            return PythonModuleInfo {
+                package_name: package_name.to_string(),
+                module_name: last_segment.to_string(),
+            };
+        }
+        return PythonModuleInfo {
+            package_name: String::new(),
+            module_name: raw_package,
+        };
+    }
+
+    PythonModuleInfo {
+        package_name: raw_package,
+        module_name,
+    }
+}
+
+fn python_package_name_for_file(file: &ProjectFile) -> String {
+    let Some(parent_rel) = file.rel_path().parent() else {
+        return String::new();
+    };
+    if parent_rel.as_os_str().is_empty() {
+        return String::new();
+    }
+
+    let mut effective_package_root_rel: Option<&Path> = None;
+    let mut current_rel = Some(parent_rel);
+    while let Some(path) = current_rel {
+        if file.root().join(path).join("__init__.py").exists() {
+            effective_package_root_rel = Some(path);
+        }
+        current_rel = path.parent();
+    }
+
+    let Some(package_root_rel) = effective_package_root_rel else {
+        return dotted_path(parent_rel);
+    };
+
+    let Some(import_root_rel) = package_root_rel.parent() else {
+        return dotted_path(parent_rel);
+    };
+
+    dotted_path(
+        import_root_rel
+            .strip_prefix("")
+            .ok()
+            .and_then(|_| parent_rel.strip_prefix(import_root_rel).ok())
+            .unwrap_or(parent_rel),
+    )
+}
+
+fn dotted_path(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy().to_string())
+        .filter(|component| !component.is_empty())
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+pub(super) fn module_code_unit(file: &ProjectFile, module_fq: &str) -> Option<CodeUnit> {
+    if module_fq.is_empty() {
+        return None;
+    }
+    let mut parts = module_fq.rsplitn(2, '.');
+    let short_name = parts.next().unwrap_or(module_fq);
+    let package_name = parts.next().unwrap_or_default();
+    Some(CodeUnit::new(
+        file.clone(),
+        CodeUnitType::Module,
+        package_name.to_string(),
+        short_name.to_string(),
+    ))
+}
+
+fn python_class_signature(node: Node<'_>, source: &str) -> String {
+    python_header_with_decorators(node, source)
+}
+
+fn python_function_signature(node: Node<'_>, source: &str) -> String {
+    let header = python_header_with_decorators(node, source);
+    if let Some((head, tail)) = header.rsplit_once('\n') {
+        format!("{head}\n{} ...", tail.trim_end_matches(':'))
+    } else {
+        format!("{} ...", header.trim_end_matches(':'))
+    }
+}
+
+fn python_is_property_mutator(node: Node<'_>, source: &str) -> bool {
+    python_header_with_decorators(node, source)
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with('@'))
+        .any(|decorator| decorator.ends_with(".setter") || decorator.ends_with(".deleter"))
+}
+
+pub(super) fn python_expanded_comment_start(source: &str, start_byte: usize) -> usize {
+    let line_starts = compute_line_starts(source);
+    let line_index = find_line_index_for_offset(&line_starts, start_byte);
+
+    let mut comment_start = start_byte;
+    for line_idx in (0..line_index).rev() {
+        let line_start = line_starts[line_idx];
+        let line_end = line_starts
+            .get(line_idx + 1)
+            .copied()
+            .unwrap_or(source.len());
+        let line = &source[line_start..line_end];
+        let trimmed = line.trim_start();
+
+        if trimmed.trim().is_empty() {
+            continue;
+        }
+
+        if trimmed.starts_with('#') {
+            comment_start = line_start;
+            continue;
+        }
+
+        break;
+    }
+
+    comment_start
+}
+
+fn python_header_with_decorators(node: Node<'_>, source: &str) -> String {
+    let raw = py_node_text(node, source);
+    let lines: Vec<_> = raw
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let mut relevant = Vec::new();
+    for line in lines {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('@')
+            || trimmed.starts_with("def ")
+            || trimmed.starts_with("async def ")
+            || trimmed.starts_with("class ")
+        {
+            relevant.push(trimmed.to_string());
+            if trimmed.starts_with("def ")
+                || trimmed.starts_with("async def ")
+                || trimmed.starts_with("class ")
+            {
+                break;
+            }
+        }
+    }
+    relevant.join("\n")
+}
+
+fn extract_python_supertypes(node: Node<'_>, source: &str) -> Vec<String> {
+    let Some(superclasses) = node.child_by_field_name("superclasses") else {
+        return Vec::new();
+    };
+    let mut result = Vec::new();
+    let mut cursor = superclasses.walk();
+    for child in superclasses.named_children(&mut cursor) {
+        match child.kind() {
+            "identifier" | "attribute" => {
+                let text = py_node_text(child, source).trim();
+                if !text.is_empty() {
+                    result.push(text.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    result
+}
+
+fn collect_assigned_names(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    match node.kind() {
+        "identifier" => {
+            let text = py_node_text(node, source).trim();
+            if !text.is_empty() {
+                names.push(text.to_string());
+            }
+        }
+        _ => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                names.extend(collect_assigned_names(child, source));
+            }
+        }
+    }
+    names
+}
+
+pub(super) fn collect_python_identifiers(
+    node: Node<'_>,
+    source: &str,
+    identifiers: &mut HashSet<String>,
+) {
+    if node.kind() == "identifier" {
+        let text = py_node_text(node, source).trim();
+        if !text.is_empty() {
+            identifiers.insert(text.to_string());
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_python_identifiers(child, source, identifiers);
+    }
+}
+
+pub(super) fn parse_python_tree(source: &str) -> Option<Tree> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .expect("failed to load python parser");
+    parser.parse(source, None)
+}
