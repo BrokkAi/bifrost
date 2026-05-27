@@ -17,7 +17,7 @@ use std::path::Path;
 use std::sync::{Arc, LazyLock, OnceLock};
 use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
 
-use super::javascript_analyzer::build_weighted_cache;
+use super::js_ts::build_weighted_cache;
 
 /// Tree-sitter node-kind mapping used by the cognitive-complexity scorer
 /// for Rust. Mirrors `ai.brokk.analyzer.rust.CognitiveComplexityAnalysis`

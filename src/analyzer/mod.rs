@@ -10,7 +10,8 @@ mod csharp_analyzer;
 mod go_analyzer;
 mod i_analyzer;
 mod java;
-mod javascript_analyzer;
+mod javascript;
+mod js_ts;
 mod model;
 mod multi_analyzer;
 pub mod persistence;
@@ -22,7 +23,7 @@ mod scala_analyzer;
 mod source_content;
 pub(crate) mod symbol_lookup;
 pub(crate) mod tree_sitter_analyzer;
-mod typescript_analyzer;
+mod typescript;
 pub mod usages;
 mod workspace;
 
@@ -41,8 +42,8 @@ pub use csharp_analyzer::CSharpAnalyzer;
 pub use go_analyzer::GoAnalyzer;
 pub use i_analyzer::IAnalyzer;
 pub use java::JavaAnalyzer;
-pub use javascript_analyzer::JavascriptAnalyzer;
-pub(crate) use javascript_analyzer::resolve_js_ts_module_specifier;
+pub use javascript::JavascriptAnalyzer;
+pub(crate) use js_ts::resolve_js_ts_module_specifier;
 pub use model::{
     CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType, CommentDensityStats,
     DeclarationInfo, DeclarationKind, ExceptionHandlingSmell, ExceptionSmellWeights, ImportInfo,
@@ -63,5 +64,5 @@ pub use rust_analyzer::RustAnalyzer;
 pub use scala_analyzer::ScalaAnalyzer;
 pub use source_content::SourceContent;
 pub use tree_sitter_analyzer::{LanguageAdapter, TreeSitterAnalyzer};
-pub use typescript_analyzer::TypescriptAnalyzer;
+pub use typescript::TypescriptAnalyzer;
 pub use workspace::{EmptyAnalyzer, WorkspaceAnalyzer};

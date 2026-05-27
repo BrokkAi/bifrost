@@ -8,7 +8,7 @@ mod tests;
 
 use crate::analyzer::clone_detection::{CloneCandidateProfile, detect_structural_clone_smells};
 use crate::analyzer::common::language_for_file as file_language;
-use crate::analyzer::javascript_analyzer::build_weighted_cache;
+use crate::analyzer::js_ts::build_weighted_cache;
 use crate::analyzer::usages::{
     ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind, ReexportStar,
 };
