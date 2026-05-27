@@ -9,7 +9,7 @@ mod cpp_analyzer;
 mod csharp_analyzer;
 mod go_analyzer;
 mod i_analyzer;
-mod java_analyzer;
+mod java;
 mod javascript_analyzer;
 mod model;
 mod multi_analyzer;
@@ -40,7 +40,7 @@ pub(crate) use cpp_analyzer::{
 pub use csharp_analyzer::CSharpAnalyzer;
 pub use go_analyzer::GoAnalyzer;
 pub use i_analyzer::IAnalyzer;
-pub use java_analyzer::JavaAnalyzer;
+pub use java::JavaAnalyzer;
 pub use javascript_analyzer::JavascriptAnalyzer;
 pub(crate) use javascript_analyzer::resolve_js_ts_module_specifier;
 pub use model::{
