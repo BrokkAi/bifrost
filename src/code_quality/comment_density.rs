@@ -10,6 +10,7 @@
 //! shared helper's silent-skip contract.
 
 use super::sanitize_table_cell;
+use crate::analyzer::common::language_for_file;
 use crate::analyzer::{CodeUnit, CommentDensityStats, IAnalyzer, Language};
 use crate::path_utils::{rel_path_string, workspace_rel_path};
 use serde::{Deserialize, Serialize};
@@ -147,13 +148,7 @@ pub fn report_comment_density_for_files(
             continue;
         }
         let rel_display = rel_path_string(&file);
-        let is_java = file
-            .rel_path()
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .map(Language::from_extension)
-            == Some(Language::Java);
-        if !is_java {
+        if language_for_file(&file) != Language::Java {
             lines.push(format!("### `{rel_display}`"));
             lines.push("(not a Java file; skipped)".to_string());
             lines.push(String::new());

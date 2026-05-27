@@ -4,6 +4,7 @@
 //! cases.
 
 use super::{ReportLines, resolve_project_files, sanitize_table_cell};
+use crate::analyzer::common::language_for_target;
 use crate::analyzer::usages::ImportGraphCandidateProvider;
 use crate::analyzer::usages::{
     CandidateFileProvider, FallbackCandidateProvider, FuzzyResult, JsTsExportUsageGraphStrategy,
@@ -485,13 +486,7 @@ fn graph_strategy_for(candidate: &CodeUnit) -> Option<Box<dyn UsageAnalyzer>> {
 }
 
 fn code_unit_language(code_unit: &CodeUnit) -> Language {
-    code_unit
-        .source()
-        .rel_path()
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(Language::from_extension)
-        .unwrap_or(Language::None)
+    language_for_target(code_unit)
 }
 
 fn language_label(language: Language) -> &'static str {
