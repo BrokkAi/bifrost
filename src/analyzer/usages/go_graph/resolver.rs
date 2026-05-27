@@ -1,4 +1,4 @@
-use crate::analyzer::common::language_for_file;
+use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::usages::graph_core::{ImportEdgeKind, ProjectUsageGraph};
 use crate::analyzer::usages::model::{
     ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind,

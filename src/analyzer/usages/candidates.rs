@@ -1,4 +1,4 @@
-use crate::analyzer::common::{language_for_file, language_for_target};
+use crate::analyzer::usages::common::{language_for_file, language_for_target};
 use crate::analyzer::usages::traits::CandidateFileProvider;
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::{HashSet, set_with_capacity};

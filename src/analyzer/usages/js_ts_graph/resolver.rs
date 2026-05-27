@@ -1,4 +1,4 @@
-use crate::analyzer::common::language_for_target_filtered;
+use crate::analyzer::usages::common::language_for_target_filtered;
 use crate::analyzer::usages::graph_core::ProjectUsageGraph;
 use crate::analyzer::usages::js_ts_graph::extractor::{
     compute_export_index, compute_import_binder,

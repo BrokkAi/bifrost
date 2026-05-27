@@ -5,6 +5,7 @@ use lsp_types::{
 };
 use tree_sitter::{Language as TsLanguage, Parser};
 
+use crate::analyzer::common::language_for_file;
 use crate::analyzer::tree_sitter_analyzer::collect_parse_errors;
 use crate::analyzer::{Language, ParseError, ParseErrorKind, Project, WorkspaceAnalyzer};
 use crate::lsp::conversion::byte_range_to_lsp_range;
@@ -50,11 +51,7 @@ fn build_report(
     uri: &Uri,
 ) -> Option<Vec<Diagnostic>> {
     let project_file = project_file_for_uri(project.root(), uri)?;
-    let extension = project_file
-        .rel_path()
-        .extension()
-        .and_then(|ext| ext.to_str())?;
-    let language = Language::from_extension(extension);
+    let language = language_for_file(&project_file);
     let ts_language = ts_language_for(language)?;
 
     // The cached byte offsets and `content` come from independent reads, but

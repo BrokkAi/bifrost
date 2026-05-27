@@ -5,6 +5,7 @@
 //! to bifrost. Output is byte-for-byte equivalent to brokk-core MCP.
 
 use super::{ReportLines, cyclomatic_complexity_for, pick_positive, resolve_project_files};
+use crate::analyzer::common::language_for_target;
 use crate::analyzer::{
     CodeUnit, IAnalyzer, Language, MaintainabilitySizeSmell, MaintainabilitySizeSmellWeights,
     ProjectFile, Range,
@@ -333,22 +334,14 @@ fn is_file_level_module(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit, top_leve
     if !top_level || !code_unit.is_module() || analyzer.parent_of(code_unit).is_some() {
         return false;
     }
-    let Some(extension) = code_unit
-        .source()
-        .rel_path()
-        .extension()
-        .and_then(|ext| ext.to_str())
-    else {
-        return false;
-    };
-    let extension_lower = extension.to_ascii_lowercase();
-    if Language::from_extension(&extension_lower) == Language::Java {
+    let language = language_for_target(code_unit);
+    if matches!(language, Language::None | Language::Java) {
         return false;
     }
     analyzer
         .languages()
         .iter()
-        .any(|language| language.extensions().contains(&extension_lower.as_str()))
+        .any(|loaded| *loaded == language)
 }
 
 /// Params for [`report_long_method_and_god_object_smells`].

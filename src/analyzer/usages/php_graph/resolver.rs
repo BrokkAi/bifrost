@@ -1,4 +1,4 @@
-use crate::analyzer::common::language_for_file;
+use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::{
     AnalyzerDelegate, CodeUnit, IAnalyzer, Language, MultiAnalyzer, PhpAnalyzer, PhpUseAliases,
     ProjectFile, Range, parse_php_use_aliases_from_source, php_namespace_to_fq,

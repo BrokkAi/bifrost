@@ -1,3 +1,4 @@
+use crate::analyzer::common::language_for_target;
 use crate::analyzer::symbol_lookup::{
     CodeUnitKindFilter, CodeUnitResolution, resolve_codeunit_fuzzy, strip_trailing_call_suffix,
 };
@@ -1175,13 +1176,7 @@ fn source_blocks_for_code_unit(
         return Vec::new();
     };
 
-    let language = code_unit
-        .source()
-        .rel_path()
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(Language::from_extension)
-        .unwrap_or(Language::None);
+    let language = language_for_target(code_unit);
 
     let mut ranges = if code_unit.is_function() {
         let mut grouped = Vec::new();
