@@ -2,7 +2,7 @@ mod extractor;
 mod hits;
 mod resolver;
 
-use crate::analyzer::common::{language_for_file, language_for_target};
+use crate::analyzer::usages::common::{language_for_file, language_for_target};
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::php_graph::extractor::scan_file;

@@ -2,7 +2,7 @@ mod extractor;
 mod hits;
 mod resolver;
 
-use crate::analyzer::common::language_for_target;
+use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::go_graph::extractor::scan_files_for_target;
 use crate::analyzer::usages::go_graph::resolver::{
     TargetSpec, build_go_graph, resolve_go_analyzer,

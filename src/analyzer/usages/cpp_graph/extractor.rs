@@ -1,4 +1,4 @@
-use crate::analyzer::common::language_for_file;
+use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::usages::cpp_graph::hits::{
     enclosing_context, is_member_field_declaration_context, push_hit, push_text_constructor_hit,
     push_text_hit,

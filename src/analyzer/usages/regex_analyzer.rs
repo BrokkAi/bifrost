@@ -1,4 +1,4 @@
-use crate::analyzer::common::language_for_target;
+use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::traits::UsageAnalyzer;
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range};

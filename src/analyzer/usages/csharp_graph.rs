@@ -2,7 +2,7 @@ mod extractor;
 mod hits;
 mod resolver;
 
-use crate::analyzer::common::{language_for_file, language_for_target};
+use crate::analyzer::usages::common::{language_for_file, language_for_target};
 use crate::analyzer::usages::csharp_graph::extractor::{ScanState, scan_file};
 use crate::analyzer::usages::csharp_graph::resolver::{
     TargetKind, TargetSpec, resolve_csharp_analyzer,
