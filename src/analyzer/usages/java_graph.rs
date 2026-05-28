@@ -1,9 +1,11 @@
 mod extractor;
 mod hits;
+mod jvm_scala;
 mod resolver;
 
 use crate::analyzer::usages::common::{language_for_file, language_for_target};
 use crate::analyzer::usages::java_graph::extractor::{ScanState, scan_file};
+use crate::analyzer::usages::java_graph::jvm_scala::scan_scala_files_for_java_type;
 use crate::analyzer::usages::java_graph::resolver::{TargetSpec, resolve_java_analyzer};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
@@ -88,6 +90,7 @@ impl JavaUsageGraphStrategy {
                 break;
             }
         }
+        scan_scala_files_for_java_type(analyzer, candidate_files, &spec, &mut state);
 
         if hits.is_empty() && saw_unproven_match {
             return GraphUsageOutcome::fallback_safe(

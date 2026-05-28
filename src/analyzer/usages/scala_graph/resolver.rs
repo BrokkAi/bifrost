@@ -1,4 +1,4 @@
-use crate::analyzer::usages::scala_graph::syntax::parenthesized_arity;
+use crate::analyzer::usages::scala_graph::syntax::{parenthesized_arity, scala_import_path};
 use crate::analyzer::{
     AnalyzerDelegate, CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language,
     MultiAnalyzer, ProjectFile, ScalaAnalyzer,
@@ -268,29 +268,6 @@ fn package_name_of(scala: &ScalaAnalyzer, file: &ProjectFile) -> Option<String> 
         .declarations(file)
         .next()
         .map(|unit| unit.package_name().to_string())
-}
-
-fn scala_import_path(info: &ImportInfo) -> Option<String> {
-    let trimmed = info
-        .raw_snippet
-        .trim()
-        .strip_prefix("import ")
-        .unwrap_or(info.raw_snippet.trim())
-        .trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if info.is_wildcard {
-        return Some(trimmed.trim_end_matches(".*").to_string());
-    }
-    Some(
-        trimmed
-            .split_once(" as ")
-            .map(|(path, _)| path)
-            .unwrap_or(trimmed)
-            .trim()
-            .to_string(),
-    )
 }
 
 fn scala_normalized_fq_name(fq_name: &str) -> String {
