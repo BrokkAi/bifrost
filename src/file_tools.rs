@@ -23,7 +23,7 @@ const MAX_LINES_PER_FILE_SCAN: usize = 200_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetFileContentsParams {
-    pub filenames: Vec<String>,
+    pub file_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,7 +46,7 @@ pub struct FindFilesContainingParams {
 pub struct SearchFileContentsParams {
     pub patterns: Vec<String>,
     #[serde(default)]
-    pub filepath: Option<String>,
+    pub file_path: Option<String>,
     #[serde(default = "default_search_file_contents_context")]
     pub context_lines: usize,
     #[serde(default)]
@@ -147,7 +147,7 @@ pub fn get_file_contents(
     let mut files = Vec::new();
     let mut not_found = Vec::new();
 
-    for input in params.filenames {
+    for input in params.file_paths {
         let trimmed = input.trim();
         if trimmed.is_empty() {
             continue;
@@ -310,7 +310,7 @@ pub fn search_file_contents(
         };
     }
 
-    let glob = params.filepath.as_deref().and_then(|raw| {
+    let glob = params.file_path.as_deref().and_then(|raw| {
         let normalized = normalize_pattern(raw.trim());
         if normalized.is_empty() {
             None
@@ -579,7 +579,7 @@ mod tests {
         let result = get_file_contents(
             fix.analyzer.analyzer(),
             GetFileContentsParams {
-                filenames: vec!["src/a.rs".to_string(), "missing.rs".to_string()],
+                file_paths: vec!["src/a.rs".to_string(), "missing.rs".to_string()],
             },
         );
         assert_eq!(result.files.len(), 1);
@@ -594,7 +594,7 @@ mod tests {
         let result = get_file_contents(
             fix.analyzer.analyzer(),
             GetFileContentsParams {
-                filenames: vec!["src\\a.rs".to_string()],
+                file_paths: vec!["src\\a.rs".to_string()],
             },
         );
         assert_eq!(result.files.len(), 1);
@@ -607,7 +607,7 @@ mod tests {
         let result = get_file_contents(
             fix.analyzer.analyzer(),
             GetFileContentsParams {
-                filenames: vec![
+                file_paths: vec![
                     "/etc/passwd".to_string(),
                     "/".to_string(),
                     "src/a.rs".to_string(),
@@ -628,7 +628,7 @@ mod tests {
         let result = get_file_contents(
             fix.analyzer.analyzer(),
             GetFileContentsParams {
-                filenames: vec![
+                file_paths: vec![
                     "C:foo".to_string(),
                     "C:".to_string(),
                     "d:secrets".to_string(),
@@ -656,7 +656,7 @@ mod tests {
             fix.analyzer.analyzer(),
             SearchFileContentsParams {
                 patterns: vec!["x".to_string()],
-                filepath: None,
+                file_path: None,
                 context_lines: 0,
                 case_insensitive: false,
             },
@@ -760,7 +760,7 @@ mod tests {
             fix.analyzer.analyzer(),
             SearchFileContentsParams {
                 patterns: vec!["NEEDLE".to_string()],
-                filepath: None,
+                file_path: None,
                 context_lines: 1,
                 case_insensitive: false,
             },
@@ -784,7 +784,7 @@ mod tests {
             fix.analyzer.analyzer(),
             SearchFileContentsParams {
                 patterns: vec!["NEEDLE".to_string()],
-                filepath: Some("**/*.rs".to_string()),
+                file_path: Some("**/*.rs".to_string()),
                 context_lines: 0,
                 case_insensitive: false,
             },
@@ -804,7 +804,7 @@ mod tests {
             fix.analyzer.analyzer(),
             SearchFileContentsParams {
                 patterns: vec!["NEEDLE".to_string()],
-                filepath: None,
+                file_path: None,
                 context_lines: 0,
                 case_insensitive: false,
             },
@@ -822,7 +822,7 @@ mod tests {
             fix.analyzer.analyzer(),
             SearchFileContentsParams {
                 patterns: vec!["NEEDLE".to_string()],
-                filepath: None,
+                file_path: None,
                 context_lines: usize::MAX,
                 case_insensitive: false,
             },

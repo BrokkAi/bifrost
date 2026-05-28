@@ -61,7 +61,7 @@ pub struct SummariesParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MostRelevantFilesParams {
-    pub seed_files: Vec<String>,
+    pub seed_file_paths: Vec<String>,
     #[serde(default = "default_limit")]
     pub limit: usize,
 }
@@ -750,7 +750,7 @@ pub fn most_relevant_files(
 
     {
         let _scope = profiling::scope("searchtools::most_relevant_files.resolve_seeds");
-        for input in params.seed_files {
+        for input in params.seed_file_paths {
             let trimmed = input.trim();
             if trimmed.is_empty() {
                 continue;

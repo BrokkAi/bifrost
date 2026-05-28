@@ -20,7 +20,7 @@ const DEFAULT_MATCHES_PER_FILE: usize = 100;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JqParams {
-    pub filepath: String,
+    pub file_path: String,
     pub filter: String,
     #[serde(default = "default_max_files")]
     pub max_files: usize,
@@ -30,7 +30,7 @@ pub struct JqParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct XmlSkimParams {
-    pub filepath: String,
+    pub file_path: String,
     #[serde(default = "default_max_files")]
     pub max_files: usize,
 }
@@ -46,7 +46,7 @@ pub enum XmlSelectOutput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct XmlSelectParams {
-    pub filepath: String,
+    pub file_path: String,
     pub xpath: String,
     #[serde(default)]
     pub output: XmlSelectOutput,
@@ -107,7 +107,7 @@ pub struct XmlSelectFile {
 
 pub fn jq(analyzer: &dyn IAnalyzer, params: JqParams) -> JqResult {
     let project = analyzer.project();
-    let files = match resolve_files(project, &params.filepath, params.max_files) {
+    let files = match resolve_files(project, &params.file_path, params.max_files) {
         Ok(out) => out,
         Err(err) => {
             return JqResult {
@@ -156,7 +156,7 @@ pub fn jq(analyzer: &dyn IAnalyzer, params: JqParams) -> JqResult {
 
 pub fn xml_skim(analyzer: &dyn IAnalyzer, params: XmlSkimParams) -> XmlSkimResult {
     let project = analyzer.project();
-    let files = match resolve_files(project, &params.filepath, params.max_files) {
+    let files = match resolve_files(project, &params.file_path, params.max_files) {
         Ok(out) => out,
         Err(_) => {
             return XmlSkimResult {
@@ -206,7 +206,7 @@ pub fn xml_select(analyzer: &dyn IAnalyzer, params: XmlSelectParams) -> XmlSelec
     }
 
     let project = analyzer.project();
-    let files = match resolve_files(project, &params.filepath, params.max_files) {
+    let files = match resolve_files(project, &params.file_path, params.max_files) {
         Ok(out) => out,
         Err(err) => {
             return XmlSelectResult {
@@ -266,7 +266,7 @@ fn resolve_files(
     let max = max_files.max(1);
     let pattern_norm = normalize_pattern(raw_pattern.trim());
     if pattern_norm.is_empty() {
-        return Err("filepath must not be empty".to_string());
+        return Err("file_path must not be empty".to_string());
     }
 
     if !is_glob_pattern(&pattern_norm) {
@@ -504,7 +504,7 @@ mod tests {
         let result = jq(
             fix.analyzer.analyzer(),
             JqParams {
-                filepath: "pkg.json".to_string(),
+                file_path: "pkg.json".to_string(),
                 filter: ".name".to_string(),
                 max_files: 10,
                 matches_per_file: 10,
@@ -523,7 +523,7 @@ mod tests {
         let result = jq(
             fix.analyzer.analyzer(),
             JqParams {
-                filepath: "bad.json".to_string(),
+                file_path: "bad.json".to_string(),
                 filter: ".".to_string(),
                 max_files: 10,
                 matches_per_file: 10,
@@ -543,7 +543,7 @@ mod tests {
         let result = jq(
             fix.analyzer.analyzer(),
             JqParams {
-                filepath: "*.json".to_string(),
+                file_path: "*.json".to_string(),
                 filter: ".n".to_string(),
                 max_files: 10,
                 matches_per_file: 10,
@@ -562,7 +562,7 @@ mod tests {
         let result = xml_skim(
             fix.analyzer.analyzer(),
             XmlSkimParams {
-                filepath: "pom.xml".to_string(),
+                file_path: "pom.xml".to_string(),
                 max_files: 10,
             },
         );
@@ -580,7 +580,7 @@ mod tests {
         let result = xml_skim(
             fix.analyzer.analyzer(),
             XmlSkimParams {
-                filepath: "bad.xml".to_string(),
+                file_path: "bad.xml".to_string(),
                 max_files: 10,
             },
         );
@@ -597,7 +597,7 @@ mod tests {
         let result = xml_select(
             fix.analyzer.analyzer(),
             XmlSelectParams {
-                filepath: "data.xml".to_string(),
+                file_path: "data.xml".to_string(),
                 xpath: "//item".to_string(),
                 output: XmlSelectOutput::Text,
                 attr_name: None,
@@ -616,7 +616,7 @@ mod tests {
         let result = xml_select(
             fix.analyzer.analyzer(),
             XmlSelectParams {
-                filepath: "data.xml".to_string(),
+                file_path: "data.xml".to_string(),
                 xpath: "//item".to_string(),
                 output: XmlSelectOutput::Attribute,
                 attr_name: Some("id".to_string()),
@@ -633,7 +633,7 @@ mod tests {
         let result = xml_select(
             fix.analyzer.analyzer(),
             XmlSelectParams {
-                filepath: "data.xml".to_string(),
+                file_path: "data.xml".to_string(),
                 xpath: "//root".to_string(),
                 output: XmlSelectOutput::Attribute,
                 attr_name: None,

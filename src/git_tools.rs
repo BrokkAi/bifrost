@@ -78,7 +78,7 @@ pub struct SearchGitCommitMessagesParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetGitLogParams {
     #[serde(default)]
-    pub path: Option<String>,
+    pub file_path: Option<String>,
     #[serde(default = "default_log_limit")]
     pub limit: usize,
 }
@@ -213,7 +213,7 @@ pub fn get_git_log(analyzer: &dyn IAnalyzer, params: GetGitLogParams) -> String 
 
     let effective_limit = params.limit.clamp(1, MAX_LOG_LIMIT);
     let trimmed_path = params
-        .path
+        .file_path
         .as_deref()
         .map(|raw| raw.trim().replace('\\', "/"))
         .filter(|s| !s.is_empty());
@@ -1270,7 +1270,7 @@ mod tests {
         let out = get_git_log(
             fix.analyzer.analyzer(),
             GetGitLogParams {
-                path: Some("b.txt".to_string()),
+                file_path: Some("b.txt".to_string()),
                 limit: 10,
             },
         );
@@ -1289,7 +1289,7 @@ mod tests {
         let out = get_git_log(
             fix.analyzer.analyzer(),
             GetGitLogParams {
-                path: None,
+                file_path: None,
                 limit: 10,
             },
         );
@@ -1338,7 +1338,7 @@ mod tests {
         let out = get_git_log(
             fix.analyzer.analyzer(),
             GetGitLogParams {
-                path: Some("renamed.txt".to_string()),
+                file_path: Some("renamed.txt".to_string()),
                 limit: 10,
             },
         );
@@ -1365,7 +1365,7 @@ mod tests {
         let out = get_git_log(
             fix.analyzer.analyzer(),
             GetGitLogParams {
-                path: Some("nonexistent.txt".to_string()),
+                file_path: Some("nonexistent.txt".to_string()),
                 limit: 10,
             },
         );
@@ -1651,7 +1651,7 @@ mod tests {
             let out = get_git_log(
                 fix.analyzer.analyzer(),
                 GetGitLogParams {
-                    path: Some(magic.to_string()),
+                    file_path: Some(magic.to_string()),
                     limit: 10,
                 },
             );
@@ -1675,7 +1675,7 @@ mod tests {
         let out = get_git_log(
             workspace.analyzer(),
             GetGitLogParams {
-                path: None,
+                file_path: None,
                 limit: 10,
             },
         );

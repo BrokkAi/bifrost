@@ -248,7 +248,7 @@ fn python_boundary_returns_most_relevant_files_json() {
     let payload = service
         .call_tool_json(
             "most_relevant_files",
-            r#"{"seed_files":["A.java"],"limit":5}"#,
+            r#"{"seed_file_paths":["A.java"],"limit":5}"#,
         )
         .unwrap();
     let value: Value = serde_json::from_str(&payload).unwrap();

@@ -516,7 +516,7 @@ fn bifrost_split_servers_reject_tools_outside_their_registry() {
         &fixture_root,
         "core",
         "most_relevant_files",
-        json!({ "seed_files": ["A.java"] }),
+        json!({ "seed_file_paths": ["A.java"] }),
     );
     assert_unknown_tool(
         &fixture_root,
@@ -528,7 +528,7 @@ fn bifrost_split_servers_reject_tools_outside_their_registry() {
         &fixture_root,
         "slopcop",
         "get_file_contents",
-        json!({ "filenames": ["A.java"] }),
+        json!({ "file_paths": ["A.java"] }),
     );
 }
 
@@ -806,7 +806,7 @@ fn bifrost_mcp_normalizes_absolute_paths_inside_workspace() {
             "method": "tools/call",
             "params": {
                 "name": "get_file_contents",
-                "arguments": { "filenames": [java_path.display().to_string()] }
+                "arguments": { "file_paths": [java_path.display().to_string()] }
             }
         }),
     );
@@ -853,7 +853,7 @@ fn bifrost_mcp_normalizes_absolute_paths_inside_workspace() {
                 "name": "search_file_contents",
                 "arguments": {
                     "patterns": ["NEEDLE"],
-                    "filepath": absolute_glob,
+                    "file_path": absolute_glob,
                     "context_lines": 0
                 }
             }
@@ -897,7 +897,7 @@ fn bifrost_mcp_reports_absolute_paths_outside_workspace_as_tool_errors() {
             "method": "tools/call",
             "params": {
                 "name": "get_file_contents",
-                "arguments": { "filenames": [outside_file.display().to_string()] }
+                "arguments": { "file_paths": [outside_file.display().to_string()] }
             }
         }),
     );
@@ -962,7 +962,7 @@ fn bifrost_mcp_absolute_paths_follow_activated_workspace() {
             "method": "tools/call",
             "params": {
                 "name": "get_file_contents",
-                "arguments": { "filenames": [switched_file.display().to_string()] }
+                "arguments": { "file_paths": [switched_file.display().to_string()] }
             }
         }),
     );

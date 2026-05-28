@@ -41,13 +41,13 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
             json!({
                 "type": "object",
                 "properties": {
-                    "filenames": {
+                    "file_paths": {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Project-relative paths of files to read, or absolute paths inside the active workspace."
                     }
                 },
-                "required": ["filenames"]
+                "required": ["file_paths"]
             }),
         ),
         tool_descriptor(
@@ -59,7 +59,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                     "patterns": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Glob patterns to match against filenames."
+                        "description": "Glob patterns to match against file paths."
                     },
                     "limit": {
                         "type": "integer",
@@ -108,7 +108,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "items": { "type": "string" },
                         "description": "Regular expressions to search for in file contents."
                     },
-                    "filepath": {
+                    "file_path": {
                         "type": "string",
                         "description": "Optional glob to restrict the search to matching paths, or an absolute path/glob inside the active workspace."
                     },
@@ -168,7 +168,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
             json!({
                 "type": "object",
                 "properties": {
-                    "seed_files": {
+                    "seed_file_paths": {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Project-relative seed files used to rank related files, or absolute paths inside the active workspace."
@@ -180,7 +180,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "description": "Maximum number of related files to return."
                     }
                 },
-                "required": ["seed_files"]
+                "required": ["seed_file_paths"]
             }),
         ),
         tool_descriptor(
@@ -210,7 +210,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
             json!({
                 "type": "object",
                 "properties": {
-                    "path": {
+                    "file_path": {
                         "type": "string",
                         "description": "Optional project-relative file or directory path to filter by, or an absolute path inside the active workspace."
                     },
@@ -258,7 +258,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
             json!({
                 "type": "object",
                 "properties": {
-                    "filepath": {
+                    "file_path": {
                         "type": "string",
                         "description": "Project-relative glob or literal path to JSON file(s), or an absolute path/glob inside the active workspace."
                     },
@@ -279,7 +279,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "description": "Maximum number of filter outputs to collect per file."
                     }
                 },
-                "required": ["filepath", "filter"]
+                "required": ["file_path", "filter"]
             }),
         ),
         tool_descriptor(
@@ -288,7 +288,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
             json!({
                 "type": "object",
                 "properties": {
-                    "filepath": {
+                    "file_path": {
                         "type": "string",
                         "description": "Project-relative glob or literal path to XML file(s), or an absolute path/glob inside the active workspace."
                     },
@@ -299,7 +299,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "description": "Maximum number of files to process."
                     }
                 },
-                "required": ["filepath"]
+                "required": ["file_path"]
             }),
         ),
         tool_descriptor(
@@ -308,7 +308,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
             json!({
                 "type": "object",
                 "properties": {
-                    "filepath": {
+                    "file_path": {
                         "type": "string",
                         "description": "Project-relative glob or literal path to XML file(s), or an absolute path/glob inside the active workspace."
                     },
@@ -333,7 +333,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "description": "Maximum number of files to process."
                     }
                 },
-                "required": ["filepath", "xpath"]
+                "required": ["file_path", "xpath"]
             }),
         ),
     ]

@@ -235,16 +235,16 @@ fn normalize_tool_arguments(
             normalize_string_array_field(&mut arguments, "file_patterns", workspace_root)?
         }
         "most_relevant_files" => {
-            normalize_string_array_field(&mut arguments, "seed_files", workspace_root)?
+            normalize_string_array_field(&mut arguments, "seed_file_paths", workspace_root)?
         }
         "get_file_contents" => {
-            normalize_string_array_field(&mut arguments, "filenames", workspace_root)?
+            normalize_string_array_field(&mut arguments, "file_paths", workspace_root)?
         }
         "find_filenames" => {
             normalize_string_array_field(&mut arguments, "patterns", workspace_root)?
         }
         "search_file_contents" | "jq" | "xml_skim" | "xml_select" => {
-            normalize_optional_string_field(&mut arguments, "filepath", workspace_root)?
+            normalize_optional_string_field(&mut arguments, "file_path", workspace_root)?
         }
         "list_files" => {
             normalize_optional_string_field(&mut arguments, "directory_path", workspace_root)?
@@ -260,7 +260,9 @@ fn normalize_tool_arguments(
         | "report_dead_code_and_unused_abstraction_smells" => {
             normalize_string_array_field(&mut arguments, "file_paths", workspace_root)?
         }
-        "get_git_log" => normalize_optional_string_field(&mut arguments, "path", workspace_root)?,
+        "get_git_log" => {
+            normalize_optional_string_field(&mut arguments, "file_path", workspace_root)?
+        }
         _ => {}
     }
     Ok(arguments)
@@ -597,12 +599,12 @@ mod tests {
 
         let normalized = normalize_tool_arguments(
             "get_file_contents",
-            json!({ "filenames": [file.display().to_string()] }),
+            json!({ "file_paths": [file.display().to_string()] }),
             root.path(),
         )
         .expect("normalize");
 
-        assert_eq!(normalized["filenames"][0], "src/A.java");
+        assert_eq!(normalized["file_paths"][0], "src/A.java");
     }
 
     #[test]
@@ -629,7 +631,7 @@ mod tests {
 
         let err = normalize_tool_arguments(
             "get_file_contents",
-            json!({ "filenames": [file.display().to_string()] }),
+            json!({ "file_paths": [file.display().to_string()] }),
             root.path(),
         )
         .expect_err("outside path should fail");
@@ -645,12 +647,12 @@ mod tests {
 
         let normalized = normalize_tool_arguments(
             "get_file_contents",
-            json!({ "filenames": [missing.display().to_string()] }),
+            json!({ "file_paths": [missing.display().to_string()] }),
             root.path(),
         )
         .expect("normalize");
 
-        assert_eq!(normalized["filenames"][0], "src/Missing.java");
+        assert_eq!(normalized["file_paths"][0], "src/Missing.java");
     }
 
     #[test]
@@ -660,7 +662,7 @@ mod tests {
 
         let err = normalize_tool_arguments(
             "get_file_contents",
-            json!({ "filenames": [raw] }),
+            json!({ "file_paths": [raw] }),
             root.path(),
         )
         .expect_err("escaping path should fail");

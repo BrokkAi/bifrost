@@ -292,7 +292,7 @@ fn no_git_fallback_uses_import_page_ranker() {
     let results = most_relevant_files(
         &analyzer,
         MostRelevantFilesParams {
-            seed_files: vec!["test/A.java".to_string()],
+            seed_file_paths: vec!["test/A.java".to_string()],
             limit: 5,
         },
     );
@@ -427,7 +427,7 @@ fn hybrid_git_and_import_results_are_merged_without_duplicates() {
     let results = most_relevant_files(
         &analyzer,
         MostRelevantFilesParams {
-            seed_files: vec!["test/A.java".to_string()],
+            seed_file_paths: vec!["test/A.java".to_string()],
             limit: 3,
         },
     );
@@ -457,7 +457,7 @@ fn git_results_are_filled_with_import_ranking_when_needed() {
     let results = most_relevant_files(
         &analyzer,
         MostRelevantFilesParams {
-            seed_files: vec!["test/A.java".to_string()],
+            seed_file_paths: vec!["test/A.java".to_string()],
             limit: 2,
         },
     );
@@ -503,7 +503,7 @@ fn git_ties_are_sorted_by_normalized_path_name() {
     let results = most_relevant_files(
         &analyzer,
         MostRelevantFilesParams {
-            seed_files: vec!["Seed.java".to_string()],
+            seed_file_paths: vec!["Seed.java".to_string()],
             limit: 3,
         },
     );
@@ -547,7 +547,7 @@ fn untracked_seed_skips_git_and_uses_import_results() {
     let results = most_relevant_files(
         &analyzer,
         MostRelevantFilesParams {
-            seed_files: vec!["test/A.java".to_string()],
+            seed_file_paths: vec!["test/A.java".to_string()],
             limit: 2,
         },
     );
@@ -628,7 +628,7 @@ fn rename_history_is_canonicalized_to_current_paths() {
     let results = most_relevant_files(
         &analyzer,
         MostRelevantFilesParams {
-            seed_files: vec!["UserService.java".to_string()],
+            seed_file_paths: vec!["UserService.java".to_string()],
             limit: 10,
         },
     );
@@ -694,7 +694,7 @@ fn consolidation_commit_does_not_merge_deleted_file_history_into_new_file() {
     let results = most_relevant_files(
         &analyzer,
         MostRelevantFilesParams {
-            seed_files: vec!["Seed.java".to_string()],
+            seed_file_paths: vec!["Seed.java".to_string()],
             limit: 10,
         },
     );
@@ -716,7 +716,7 @@ fn missing_seed_files_are_reported() {
     let results = most_relevant_files(
         &analyzer,
         MostRelevantFilesParams {
-            seed_files: vec!["missing.java".to_string(), "test/A.java".to_string()],
+            seed_file_paths: vec!["missing.java".to_string(), "test/A.java".to_string()],
             limit: 5,
         },
     );
@@ -739,7 +739,7 @@ fn matches_brokk_reference_for_project_filtering_git_repo_seed() {
     let bifrost = most_relevant_files(
         workspace.analyzer(),
         MostRelevantFilesParams {
-            seed_files: vec![seed.to_string()],
+            seed_file_paths: vec![seed.to_string()],
             limit: 100,
         },
     );
@@ -776,7 +776,7 @@ fn matches_brokk_reference_for_preview_text_panel_seed() {
     let bifrost = most_relevant_files(
         workspace.analyzer(),
         MostRelevantFilesParams {
-            seed_files: vec![seed.to_string()],
+            seed_file_paths: vec![seed.to_string()],
             limit: 100,
         },
     );
@@ -813,7 +813,7 @@ fn matches_brokk_reference_for_content_diff_utils_seed() {
     let bifrost = most_relevant_files(
         workspace.analyzer(),
         MostRelevantFilesParams {
-            seed_files: vec![seed.to_string()],
+            seed_file_paths: vec![seed.to_string()],
             limit: 100,
         },
     );
@@ -850,7 +850,7 @@ fn matches_brokk_reference_for_typescript_lookup_seed() {
     let bifrost = most_relevant_files(
         workspace.analyzer(),
         MostRelevantFilesParams {
-            seed_files: vec![seed.to_string()],
+            seed_file_paths: vec![seed.to_string()],
             limit: 100,
         },
     );
@@ -887,7 +887,7 @@ fn matches_brokk_reference_for_architect_agent_test_seed() {
     let bifrost = most_relevant_files(
         workspace.analyzer(),
         MostRelevantFilesParams {
-            seed_files: vec![seed.to_string()],
+            seed_file_paths: vec![seed.to_string()],
             limit: 100,
         },
     );
@@ -927,7 +927,7 @@ fn matches_brokk_reference_for_history_store_and_console_logging_pair() {
     let bifrost = most_relevant_files(
         workspace.analyzer(),
         MostRelevantFilesParams {
-            seed_files: seeds.iter().map(|seed| (*seed).to_string()).collect(),
+            seed_file_paths: seeds.iter().map(|seed| (*seed).to_string()).collect(),
             limit: 100,
         },
     );
@@ -970,7 +970,7 @@ fn matches_brokk_reference_for_plume_imports_test2_goal_seed() {
     let bifrost = most_relevant_files(
         workspace.analyzer(),
         MostRelevantFilesParams {
-            seed_files: vec![seed.to_string()],
+            seed_file_paths: vec![seed.to_string()],
             limit: 100,
         },
     );
@@ -995,7 +995,7 @@ fn matches_brokk_reference_for_plume_imports_test8_base_seed() {
     let bifrost = most_relevant_files(
         workspace.analyzer(),
         MostRelevantFilesParams {
-            seed_files: vec![seed.to_string()],
+            seed_file_paths: vec![seed.to_string()],
             limit: 100,
         },
     );
@@ -1021,7 +1021,7 @@ fn matches_brokk_reference_for_autogen_checker_seed() {
     let bifrost = most_relevant_files(
         workspace.analyzer(),
         MostRelevantFilesParams {
-            seed_files: vec![seed.to_string()],
+            seed_file_paths: vec![seed.to_string()],
             limit: 100,
         },
     );
@@ -1047,7 +1047,7 @@ fn matches_brokk_reference_for_autogen_hello_ai_agents_program_seed() {
     let bifrost = most_relevant_files(
         workspace.analyzer(),
         MostRelevantFilesParams {
-            seed_files: vec![seed.to_string()],
+            seed_file_paths: vec![seed.to_string()],
             limit: 100,
         },
     );
@@ -1073,7 +1073,7 @@ fn matches_brokk_reference_for_autogen_hello_agent_program_seed() {
     let bifrost = most_relevant_files(
         workspace.analyzer(),
         MostRelevantFilesParams {
-            seed_files: vec![seed.to_string()],
+            seed_file_paths: vec![seed.to_string()],
             limit: 100,
         },
     );
@@ -1103,7 +1103,7 @@ fn matches_brokk_reference_for_autogen_topicid_and_inmemoryruntime_pair() {
     let bifrost = most_relevant_files(
         workspace.analyzer(),
         MostRelevantFilesParams {
-            seed_files: seeds.clone(),
+            seed_file_paths: seeds.clone(),
             limit: 100,
         },
     );
@@ -1128,7 +1128,7 @@ fn matches_brokk_reference_for_gin_context_go_seed() {
     let bifrost = most_relevant_files(
         workspace.analyzer(),
         MostRelevantFilesParams {
-            seed_files: vec![seed.to_string()],
+            seed_file_paths: vec![seed.to_string()],
             limit: 100,
         },
     );
@@ -1153,7 +1153,7 @@ fn matches_brokk_reference_for_axios_github_api_seed() {
     let bifrost = most_relevant_files(
         workspace.analyzer(),
         MostRelevantFilesParams {
-            seed_files: vec![seed.to_string()],
+            seed_file_paths: vec![seed.to_string()],
             limit: 100,
         },
     );
@@ -1178,7 +1178,7 @@ fn matches_brokk_reference_for_vector_similarity_query_result_struct_seed() {
     let bifrost = most_relevant_files(
         workspace.analyzer(),
         MostRelevantFilesParams {
-            seed_files: vec![seed.to_string()],
+            seed_file_paths: vec![seed.to_string()],
             limit: 100,
         },
     );
@@ -1203,7 +1203,7 @@ fn matches_brokk_reference_for_astrapy_collection_seed() {
     let bifrost = most_relevant_files(
         workspace.analyzer(),
         MostRelevantFilesParams {
-            seed_files: vec![seed.to_string()],
+            seed_file_paths: vec![seed.to_string()],
             limit: 100,
         },
     );
@@ -1238,7 +1238,7 @@ fn matches_brokk_reference_for_100_random_seed_files() {
         let bifrost = most_relevant_files(
             workspace.analyzer(),
             MostRelevantFilesParams {
-                seed_files: seeds.clone(),
+                seed_file_paths: seeds.clone(),
                 limit: 100,
             },
         );
@@ -1339,7 +1339,7 @@ fn matches_brokk_reference_for_100_random_seed_pairs() {
         let bifrost = most_relevant_files(
             workspace.analyzer(),
             MostRelevantFilesParams {
-                seed_files: seeds.clone(),
+                seed_file_paths: seeds.clone(),
                 limit: 100,
             },
         );

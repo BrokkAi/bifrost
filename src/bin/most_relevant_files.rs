@@ -24,7 +24,7 @@ fn run() -> Result<(), String> {
     let mut args = env::args().skip(1);
     let mut root =
         env::current_dir().map_err(|err| format!("Failed to get current directory: {err}"))?;
-    let mut seed_files = Vec::new();
+    let mut seed_file_paths = Vec::new();
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -38,11 +38,11 @@ fn run() -> Result<(), String> {
                 print_help();
                 return Ok(());
             }
-            other => seed_files.push(other.to_string()),
+            other => seed_file_paths.push(other.to_string()),
         }
     }
 
-    if seed_files.is_empty() {
+    if seed_file_paths.is_empty() {
         print_help();
         return Err("At least one seed filename is required".to_string());
     }
@@ -56,7 +56,7 @@ fn run() -> Result<(), String> {
     };
     let workspace = {
         let _scope = brokk_bifrost::profiling::scope("cli.workspace_build");
-        let seed_languages: std::collections::BTreeSet<_> = seed_files
+        let seed_languages: std::collections::BTreeSet<_> = seed_file_paths
             .iter()
             .filter_map(|seed| {
                 Path::new(seed)
@@ -81,7 +81,7 @@ fn run() -> Result<(), String> {
         most_relevant_files(
             workspace.analyzer(),
             MostRelevantFilesParams {
-                seed_files,
+                seed_file_paths,
                 limit: DEFAULT_LIMIT,
             },
         )
