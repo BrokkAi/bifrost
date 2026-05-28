@@ -7,7 +7,7 @@ pub(crate) mod common;
 mod config;
 mod cpp;
 mod csharp;
-mod go_analyzer;
+mod go;
 mod i_analyzer;
 mod java;
 mod javascript;
@@ -39,7 +39,7 @@ pub(crate) use cpp::{
     resolve_include_targets,
 };
 pub use csharp::CSharpAnalyzer;
-pub use go_analyzer::GoAnalyzer;
+pub use go::GoAnalyzer;
 pub use i_analyzer::IAnalyzer;
 pub use java::JavaAnalyzer;
 pub use javascript::JavascriptAnalyzer;
