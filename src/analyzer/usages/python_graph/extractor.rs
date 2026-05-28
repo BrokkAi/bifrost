@@ -13,9 +13,8 @@ use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, PythonAnalyzer
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::compute_line_starts;
 use rayon::prelude::*;
-use regex::Regex;
 use std::collections::{BTreeSet, VecDeque};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 use tree_sitter::{Node, Parser, Tree};
 
 struct ParsedFile {
@@ -577,38 +576,13 @@ fn collect_scope_facts_from_source(
     _target_self_file: bool,
     allow_self_receivers: bool,
 ) -> LocalBindingsSnapshot<String> {
-    static PARAM_ANNOTATION_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"([A-Za-z_][A-Za-z0-9_\.]*)\s*:\s*([^=,\)\n]+)").unwrap());
-    static PARAM_NAME_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"def\s+[A-Za-z_][A-Za-z0-9_]*\s*\((?P<params>[^)]*)\)").unwrap()
-    });
-    static ASSIGNMENT_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"^\s*([A-Za-z_][A-Za-z0-9_\.]*)\s*=\s*([A-Za-z_][A-Za-z0-9_\.()]*)\s*$")
-            .unwrap()
-    });
-
+    let events = collect_scope_fact_events(source);
     let mut engine = LocalInferenceEngine::new(LocalInferenceConfig::default());
-    for captures in PARAM_NAME_RE.captures_iter(source) {
-        let params = captures
-            .name("params")
-            .map(|m| m.as_str())
-            .unwrap_or_default();
-        for param in params.split(',') {
-            let param = param.trim();
-            if param.is_empty() || matches!(param, "self" | "cls" | "/") {
-                continue;
-            }
-            let param_name = param
-                .split(':')
-                .next()
-                .unwrap_or(param)
-                .split('=')
-                .next()
-                .unwrap_or(param)
-                .trim();
-            if !param_name.is_empty() && !engine.is_shadowed(param_name) {
-                engine.declare_shadow(param_name.to_string());
-            }
+    for event in &events {
+        if let ScopeFactEvent::Parameter { symbol, .. } = event
+            && !engine.is_shadowed(symbol)
+        {
+            engine.declare_shadow(symbol.clone());
         }
     }
 
@@ -616,53 +590,53 @@ fn collect_scope_facts_from_source(
     while changed {
         changed = false;
         let mut aliases = Vec::new();
-        for line in source.lines() {
-            for captures in PARAM_ANNOTATION_RE.captures_iter(line) {
-                let lhs = captures.get(1).map(|m| m.as_str()).unwrap_or_default();
-                let annotation = captures.get(2).map(|m| m.as_str()).unwrap_or_default();
-                if lhs.starts_with("self.") && !allow_self_receivers {
-                    continue;
+        for event in &events {
+            match event {
+                ScopeFactEvent::Parameter {
+                    symbol,
+                    annotation: Some(annotation),
                 }
-                if let Some(receiver_type) = normalized_receiver_type(annotation)
-                    && engine.resolve_symbol(lhs).is_unknown()
-                {
-                    engine.seed_symbol(lhs.to_string(), receiver_type);
-                    changed = true;
+                | ScopeFactEvent::Annotation { symbol, annotation } => {
+                    apply_annotation_event(
+                        symbol,
+                        annotation,
+                        allow_self_receivers,
+                        &mut engine,
+                        &mut changed,
+                    );
                 }
-            }
+                ScopeFactEvent::Parameter {
+                    annotation: None, ..
+                } => {}
+                ScopeFactEvent::Assignment { lhs, rhs } => {
+                    if !engine.is_shadowed(lhs) {
+                        engine.declare_shadow(lhs.clone());
+                    }
+                    if lhs.starts_with("self.") && !allow_self_receivers {
+                        continue;
+                    }
 
-            let Some(captures) = ASSIGNMENT_RE.captures(line) else {
-                continue;
-            };
-            let lhs = captures.get(1).map(|m| m.as_str()).unwrap_or_default();
-            let rhs = captures.get(2).map(|m| m.as_str()).unwrap_or_default();
-            if lhs.is_empty() || rhs.is_empty() {
-                continue;
-            }
-            let rhs_symbol = rhs.strip_suffix("()").unwrap_or(rhs).trim();
-            if !engine.is_shadowed(lhs) {
-                engine.declare_shadow(lhs.to_string());
-            }
-            if lhs.starts_with("self.") && !allow_self_receivers {
-                continue;
-            }
+                    match rhs {
+                        AssignmentRhs::Symbol(rhs_symbol) => {
+                            if !engine.is_shadowed(rhs_symbol)
+                                && let Some(receiver_type) = normalized_receiver_type(rhs_symbol)
+                                && engine.resolve_symbol(lhs).is_unknown()
+                            {
+                                engine.seed_symbol(lhs.clone(), receiver_type);
+                                changed = true;
+                                continue;
+                            }
 
-            if !engine.is_shadowed(rhs_symbol)
-                && let Some(receiver_type) = normalized_receiver_type(rhs_symbol)
-                && engine.resolve_symbol(lhs).is_unknown()
-            {
-                engine.seed_symbol(lhs.to_string(), receiver_type);
-                changed = true;
-                continue;
-            }
-
-            match engine.resolve_symbol(rhs_symbol) {
-                SymbolResolution::Precise(targets) if !targets.is_empty() => {
-                    aliases.push((lhs.to_string(), rhs_symbol.to_string()));
+                            if let SymbolResolution::Precise(targets) =
+                                engine.resolve_symbol(rhs_symbol)
+                                && !targets.is_empty()
+                            {
+                                aliases.push((lhs.clone(), rhs_symbol.clone()));
+                            }
+                        }
+                        AssignmentRhs::Unknown => {}
+                    }
                 }
-                SymbolResolution::Unknown
-                | SymbolResolution::Ambiguous
-                | SymbolResolution::Precise(_) => {}
             }
         }
         let before = engine.snapshot();
@@ -673,4 +647,167 @@ fn collect_scope_facts_from_source(
     }
 
     engine.snapshot()
+}
+
+fn apply_annotation_event(
+    symbol: &str,
+    annotation: &str,
+    allow_self_receivers: bool,
+    engine: &mut LocalInferenceEngine<String>,
+    changed: &mut bool,
+) {
+    if symbol.starts_with("self.") && !allow_self_receivers {
+        return;
+    }
+    if let Some(receiver_type) = normalized_receiver_type(annotation)
+        && engine.resolve_symbol(symbol).is_unknown()
+    {
+        engine.seed_symbol(symbol.to_string(), receiver_type);
+        *changed = true;
+    }
+}
+
+enum ScopeFactEvent {
+    Parameter {
+        symbol: String,
+        annotation: Option<String>,
+    },
+    Annotation {
+        symbol: String,
+        annotation: String,
+    },
+    Assignment {
+        lhs: String,
+        rhs: AssignmentRhs,
+    },
+}
+
+enum AssignmentRhs {
+    Symbol(String),
+    Unknown,
+}
+
+fn collect_scope_fact_events(source: &str) -> Vec<ScopeFactEvent> {
+    if source.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
+
+    let mut events = Vec::new();
+    collect_scope_fact_events_from_node(tree.root_node(), source, &mut events);
+    events
+}
+
+fn collect_scope_fact_events_from_node(
+    root: Node<'_>,
+    source: &str,
+    events: &mut Vec<ScopeFactEvent>,
+) {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "parameters" => collect_parameter_events(node, source, events),
+            "assignment" => collect_assignment_events(node, source, events),
+            _ => {}
+        }
+
+        let mut cursor = node.walk();
+        let mut children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
+        children.reverse();
+        stack.extend(children);
+    }
+}
+
+fn collect_parameter_events(node: Node<'_>, source: &str, events: &mut Vec<ScopeFactEvent>) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "type_parameter" {
+            continue;
+        }
+        let Some(symbol) = parameter_symbol(child, source) else {
+            continue;
+        };
+        if matches!(symbol.as_str(), "self" | "cls" | "/") {
+            continue;
+        }
+        let annotation = child
+            .child_by_field_name("type")
+            .map(|annotation| slice(annotation, source).trim().to_string())
+            .filter(|annotation| !annotation.is_empty());
+        events.push(ScopeFactEvent::Parameter { symbol, annotation });
+    }
+}
+
+fn parameter_symbol(node: Node<'_>, source: &str) -> Option<String> {
+    if node.kind() == "identifier" {
+        return non_empty_node_text(node, source);
+    }
+    if let Some(name) = node.child_by_field_name("name") {
+        return non_empty_node_text(name, source);
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| child.kind() == "identifier")
+        .and_then(|identifier| non_empty_node_text(identifier, source))
+}
+
+fn collect_assignment_events(node: Node<'_>, source: &str, events: &mut Vec<ScopeFactEvent>) {
+    let Some(left) = node.child_by_field_name("left") else {
+        return;
+    };
+    let Some(lhs) = receiver_symbol(left, source) else {
+        return;
+    };
+
+    if let Some(annotation) = node
+        .child_by_field_name("type")
+        .map(|annotation| slice(annotation, source).trim().to_string())
+        .filter(|annotation| !annotation.is_empty())
+    {
+        events.push(ScopeFactEvent::Annotation {
+            symbol: lhs,
+            annotation,
+        });
+        return;
+    }
+
+    let rhs = node
+        .child_by_field_name("right")
+        .and_then(|right| rhs_symbol(right, source))
+        .map(AssignmentRhs::Symbol)
+        .unwrap_or(AssignmentRhs::Unknown);
+    events.push(ScopeFactEvent::Assignment { lhs, rhs });
+}
+
+fn receiver_symbol(node: Node<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "identifier" | "attribute" => non_empty_node_text(node, source),
+        _ => None,
+    }
+}
+
+fn rhs_symbol(node: Node<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "identifier" | "attribute" => non_empty_node_text(node, source),
+        "call" => node
+            .child_by_field_name("function")
+            .or_else(|| node.named_child(0))
+            .and_then(|callee| receiver_symbol(callee, source)),
+        _ => None,
+    }
+}
+
+fn non_empty_node_text(node: Node<'_>, source: &str) -> Option<String> {
+    let text = slice(node, source).trim();
+    (!text.is_empty()).then(|| text.to_string())
 }

@@ -17,7 +17,7 @@ After this work, the team should have an evidence-backed inventory of the import
 - [x] (2026-05-28 16:48Z) Captured initial audit evidence for PHP, Python, Rust, and Go usage graph mini-parser clusters.
 - [x] (2026-05-28 16:57Z) Audited PHP usage graph mini parsers and replaced the small constructor/function/constant classification probes with tree-sitter parent-node checks.
 - [x] (2026-05-28 16:57Z) Created PHP follow-up issues for the larger receiver/member regex and hierarchy regex clusters: `#154` and `#155`.
-- [ ] Audit Python usage graph mini parsers and classify each candidate as actionable now, follow-up issue, or intentionally text-based.
+- [x] (2026-05-28 17:09Z) Audited Python usage graph mini parsers and replaced regex/line-based receiver fact extraction with tree-sitter event collection.
 - [ ] Audit Rust usage graph mini parsers and classify each candidate as actionable now, follow-up issue, or intentionally text-based.
 - [ ] Audit Go usage graph mini parsers and classify each candidate as actionable now, follow-up issue, or intentionally text-based.
 - [ ] Audit C++ and C# usage graph and analyzer mini parsers and classify each candidate as actionable now, follow-up issue, or intentionally text-based.
@@ -42,6 +42,12 @@ After this work, the team should have an evidence-backed inventory of the import
 - Observation: The remaining PHP mini-parser clusters are too broad for the first narrow cleanup.
   Evidence: `STATIC_MEMBER_RE`, `INSTANCE_MEMBER_RE`, `ASSIGNMENT_RE`, and `PARAMETER_VARIABLE_RE` cooperate with ordered local receiver inference in `scan_instance_members_in_order`, while `TYPE_DECLARATION_RE` feeds `PhpHierarchyIndex`; both areas need dedicated follow-up issues or PRs.
 
+- Observation: Python receiver inference has an actionable narrow cleanup because tree-sitter exposes the same syntax facts that the regexes were extracting.
+  Evidence: `parameters`, `typed_parameter`, `typed_default_parameter`, `assignment`, `type`, `attribute`, and `call` nodes cover the old `PARAM_NAME_RE`, `PARAM_ANNOTATION_RE`, and `ASSIGNMENT_RE` roles; `cargo test --test usages_python_graph_test` passed with `multiline_constructed_local_receiver_resolves_member_usage`.
+
+- Observation: Python type-expression normalization remains intentionally text-based in this pass.
+  Evidence: `normalized_receiver_type` and `receiver_annotation_matches_target` still enforce the existing supported annotation subset, including `Optional[...]` unwrapping and rejection of unions or complex generic expressions.
+
 ## Decision Log
 
 - Decision: Treat GitHub issue `BrokkAi/bifrost#141` as an audit-and-follow-up epic before attempting broad rewrites.
@@ -64,6 +70,10 @@ After this work, the team should have an evidence-backed inventory of the import
   Rationale: Constructor, function-call, member/scoped-access, const-declaration, and function-declaration classification can be answered by immediate semantic parent nodes after ascending through `namespace_name` and `qualified_name`. Receiver inference and hierarchy parsing have wider behavior and ordering implications.
   Date/Author: 2026-05-28 / Codex.
 
+- Decision: Replace Python scope-fact discovery with tree-sitter event collection while preserving the existing fixed-point local inference loop.
+  Rationale: The brittle part was discovering parameters, annotations, and assignments from source lines. The fixed-point alias behavior is a semantic policy already covered by tests and should stay unchanged.
+  Date/Author: 2026-05-28 / Codex.
+
 ## Outcomes & Retrospective
 
 Initial outcome 2026-05-28: This ExecPlan exists and defines the epic as a sequence of evidence-backed language audits. No Rust behavior has changed yet. The next useful milestone is the PHP audit because it can turn the issue's seed examples into concrete follow-up issues or a first small cleanup PR.
@@ -71,6 +81,8 @@ Initial outcome 2026-05-28: This ExecPlan exists and defines the epic as a seque
 PHP milestone outcome 2026-05-28: The first small PHP cleanup is implemented. `qualified_candidate_text` now ascends by PHP syntax node kinds instead of checking whether ancestor text looks like a qualified name, and constructor/function/constant classification uses tree-sitter parent nodes instead of raw adjacency helpers. The focused PHP usage graph test suite passed. Remaining PHP work should be split into follow-up issues for receiver/member regex inference and `TYPE_DECLARATION_RE` hierarchy parsing.
 
 PHP follow-up issue outcome 2026-05-28: Created `#154`, "Replace PHP usage graph receiver/member regex scans with tree-sitter traversal", for `PARAMETER_VARIABLE_RE`, `ASSIGNMENT_RE`, `INSTANCE_MEMBER_RE`, `STATIC_MEMBER_RE`, and ordered local receiver inference. Created `#155`, "Replace PHP usage graph hierarchy regex with tree-sitter declaration traversal", for `TYPE_DECLARATION_RE` and `PhpHierarchyIndex::extend_file`.
+
+Python milestone outcome 2026-05-28: The Python receiver fact collector now parses code-unit snippets with tree-sitter and collects parameter, annotation, and assignment events from syntax nodes. The old regexes `PARAM_NAME_RE`, `PARAM_ANNOTATION_RE`, and `ASSIGNMENT_RE` are no longer needed. The focused Python usage graph test suite passed, including a new regression for `x = Foo(\n)` followed by `x.bar()`.
 
 ## Context and Orientation
 
@@ -93,7 +105,7 @@ Then update the branch:
 
 Milestone 1 is the PHP audit. This milestone has completed its first narrow cleanup: source adjacency helpers for constructor, function, constant, member/scoped, and declaration classification have been replaced with tree-sitter parent-node checks. The remaining PHP work is now tracked in issue `#154` for receiver/member regex inference and issue `#155` for `TYPE_DECLARATION_RE` hierarchy parsing.
 
-Milestone 2 is the Python audit. Read `src/analyzer/usages/python_graph/extractor.rs` and `src/analyzer/usages/python_graph/resolver.rs`. Focus first on `collect_scope_facts_from_source`, where `PARAM_ANNOTATION_RE`, `PARAM_NAME_RE`, and `ASSIGNMENT_RE` infer receiver bindings from function text and individual lines. Decide whether a Python tree walk can collect parameter, annotation, assignment, and receiver facts without changing behavior. Validate any cleanup with `cargo test --test usages_python_graph_test`, and include `cargo test --test python_analyzer_test --test python_analyzer_update_test` if analyzer files change.
+Milestone 2 is the Python audit. This milestone has completed its cleanup: `collect_scope_facts_from_source` now uses tree-sitter to collect parameter, annotation, assignment, constructor, and alias events while preserving the existing fixed-point local inference behavior. Remaining Python text handling in `normalized_receiver_type`, `receiver_annotation_matches_target`, module-name resolution, and import strings is intentional normalization rather than syntax discovery.
 
 Milestone 3 is the Rust audit. Read `src/analyzer/usages/rust_graph/extractor.rs`, `src/analyzer/usages/rust_graph/resolver.rs`, and `src/analyzer/rust/graph_support.rs`. Focus on `LET_TYPED_RE`, `LET_CONSTRUCTED_RE`, `LET_ALIAS_RE`, `PARAM_TYPED_RE`, `TYPE_ALIAS_RE`, `OPTION_FIELD_RE`, `SELF_FIELD_AS_REF_LET_ELSE_RE`, and any visibility checks that inspect declaration source text. A good Rust follow-up issue should explain which tree-sitter node kinds or fields can replace the regex and which receiver/type inference behavior must stay unchanged. Validate any cleanup with `cargo test --test usages_rust_graph_test`, and include Rust analyzer tests if analyzer files change.
 
@@ -189,6 +201,11 @@ Initial Python, Rust, and Go inventory:
     src/analyzer/usages/rust_graph/extractor.rs:317 SELF_FIELD_AS_REF_LET_ELSE_RE
     src/analyzer/usages/go_graph/extractor.rs:544 VAR_TYPED_LIST_RE
 
+Python cleanup validation:
+
+    cargo test --test usages_python_graph_test
+    test result: ok. 53 passed; 0 failed; 3 ignored
+
 ## Interfaces and Dependencies
 
 This plan does not require a public API change. Future cleanup issues should prefer private helper functions inside the language module being changed. A helper should accept `tree_sitter::Node` when it needs syntax structure and should accept `&str` source only when it needs exact source text for byte ranges, rendered snippets, or names that tree-sitter stores only as source spans.
@@ -200,3 +217,5 @@ Revision note 2026-05-28: Created this ExecPlan from the GitHub issue and initia
 Revision note 2026-05-28: Recorded the first PHP cleanup, its validation result, and the remaining PHP follow-up clusters after replacing raw adjacency checks with tree-sitter parent-node classification.
 
 Revision note 2026-05-28: Added the GitHub issue numbers for the two PHP follow-up clusters created from the completed PHP audit.
+
+Revision note 2026-05-28: Recorded the Python cleanup, its validation result, and the decision to keep receiver type-expression normalization text-based while replacing syntax discovery with tree-sitter traversal.
