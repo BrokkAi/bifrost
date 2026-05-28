@@ -13,7 +13,7 @@ use std::path::Path;
 use std::sync::{Arc, LazyLock, OnceLock};
 use tree_sitter::{Language as TsLanguage, Node, Tree};
 
-use super::javascript_analyzer::build_weighted_cache;
+use super::js_ts::build_weighted_cache;
 
 #[derive(Debug, Clone, Default)]
 pub struct GoAdapter;

@@ -17,7 +17,7 @@ use std::mem::size_of;
 use std::sync::{Arc, LazyLock, OnceLock};
 use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
 
-use super::javascript_analyzer::build_weighted_cache;
+use super::js_ts::build_weighted_cache;
 
 #[derive(Debug, Clone, Default)]
 pub struct CSharpAdapter;
