@@ -186,7 +186,7 @@ class SearchToolsClient:
     ) -> MostRelevantFilesResult:
         payload = self._call_tool_payload(
             "most_relevant_files",
-            {"seed_files": seed_files, "limit": limit},
+            {"seed_file_paths": seed_files, "limit": limit},
         )
         return MostRelevantFilesResult.from_dict(
             payload.structured,
