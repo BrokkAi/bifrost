@@ -5,7 +5,7 @@ pub mod cognitive_complexity;
 mod cognitive_complexity_tests;
 pub(crate) mod common;
 mod config;
-mod cpp_analyzer;
+mod cpp;
 mod csharp_analyzer;
 mod go_analyzer;
 mod i_analyzer;
@@ -33,8 +33,8 @@ pub use capabilities::{
 };
 pub(crate) use capabilities::{build_reverse_import_index, direct_descendants_via_ancestors};
 pub use config::AnalyzerConfig;
-pub use cpp_analyzer::CppAnalyzer;
-pub(crate) use cpp_analyzer::{
+pub use cpp::CppAnalyzer;
+pub(crate) use cpp::{
     node_text as cpp_node_text, normalize_cpp_whitespace, parse_quoted_include,
     resolve_include_targets,
 };
