@@ -1,7 +1,11 @@
-use crate::analyzer::usages::common::{SNIPPET_CONTEXT_LINES, usage_hit};
+use crate::analyzer::usages::common::{SNIPPET_CONTEXT_LINES, language_for_file, usage_hit};
 use crate::analyzer::usages::java_graph::extractor::ScanState;
 use crate::analyzer::usages::java_graph::resolver::{TargetKind, TargetSpec};
 use crate::analyzer::usages::model::UsageHit;
+use crate::analyzer::usages::scala_graph::syntax::{
+    dotted_qualifier_before, has_ancestor_kind, is_identifier_node, is_type_like_reference,
+    node_text, scala_import_path,
+};
 use crate::analyzer::{
     AnalyzerDelegate, CodeUnit, IAnalyzer, ImportAnalysisProvider, Language, MultiAnalyzer,
     ProjectFile, Range, ScalaAnalyzer,
@@ -13,6 +17,7 @@ use tree_sitter::{Node, Parser};
 
 pub(super) fn scan_scala_files_for_java_type(
     analyzer: &dyn IAnalyzer,
+    candidate_files: &HashSet<ProjectFile>,
     spec: &TargetSpec,
     state: &mut ScanState<'_>,
 ) {
@@ -23,8 +28,11 @@ pub(super) fn scan_scala_files_for_java_type(
         return;
     };
 
-    for file in scala.get_analyzed_files() {
-        scan_scala_file(analyzer, scala, &file, spec, state);
+    for file in candidate_files
+        .iter()
+        .filter(|file| language_for_file(file) == Language::Scala)
+    {
+        scan_scala_file(analyzer, scala, file, spec, state);
         if *state.limit_exceeded {
             break;
         }
@@ -90,6 +98,7 @@ fn scan_scala_file(
         line_starts: &line_starts,
         spec,
         visibility,
+        type_shadow_scopes: vec![HashSet::default()],
         max_usages: state.max_usages,
         hits: state.hits,
         raw_match_count: state.raw_match_count,
@@ -109,7 +118,9 @@ impl Visibility {
         let target_fq_name = spec.owner.fq_name();
         let mut visible_type_names = HashSet::default();
 
-        if scala_file_package(scala, file).as_deref() == Some(target_package) {
+        if is_top_level_type(&spec.owner)
+            && scala_file_package(scala, file).as_deref() == Some(target_package)
+        {
             visible_type_names.insert(target_name.to_string());
         }
 
@@ -150,6 +161,7 @@ struct ScalaJavaScanCtx<'a, 'state> {
     line_starts: &'a [usize],
     spec: &'a TargetSpec,
     visibility: Visibility,
+    type_shadow_scopes: Vec<HashSet<String>>,
     max_usages: usize,
     hits: &'state mut BTreeSet<UsageHit>,
     raw_match_count: &'state mut usize,
@@ -159,6 +171,11 @@ struct ScalaJavaScanCtx<'a, 'state> {
 fn scan_node(node: Node<'_>, ctx: &mut ScalaJavaScanCtx<'_, '_>) {
     if *ctx.limit_exceeded {
         return;
+    }
+    seed_type_shadow(node, ctx);
+    let enters_scope = enters_local_scope(node);
+    if enters_scope {
+        ctx.type_shadow_scopes.push(HashSet::default());
     }
     if is_identifier_node(node) {
         maybe_record_java_type_hit(node, ctx);
@@ -170,6 +187,9 @@ fn scan_node(node: Node<'_>, ctx: &mut ScalaJavaScanCtx<'_, '_>) {
         if *ctx.limit_exceeded {
             break;
         }
+    }
+    if enters_scope {
+        ctx.type_shadow_scopes.pop();
     }
 }
 
@@ -185,11 +205,17 @@ fn maybe_record_java_type_hit(node: Node<'_>, ctx: &mut ScalaJavaScanCtx<'_, '_>
 
     let target_name = ctx.spec.owner.identifier();
     let proven = if text == target_name {
-        ctx.visibility.contains(text) && is_type_like_reference(node, ctx.source)
-            || dotted_qualifier_before(node, ctx.source)
-                .is_some_and(|qualifier| qualifier == ctx.spec.owner.package_name())
+        if let Some(qualifier) = dotted_qualifier_before(node, ctx.source) {
+            qualifier_matches_target_owner(&qualifier, ctx.spec)
+        } else {
+            ctx.visibility.contains(text)
+                && !is_type_shadowed(ctx, text)
+                && is_type_like_reference(node, ctx.source)
+        }
     } else {
-        ctx.visibility.contains(text) && is_type_like_reference(node, ctx.source)
+        ctx.visibility.contains(text)
+            && !is_type_shadowed(ctx, text)
+            && is_type_like_reference(node, ctx.source)
     };
 
     if proven {
@@ -242,94 +268,70 @@ fn scala_file_package(scala: &ScalaAnalyzer, file: &ProjectFile) -> Option<Strin
         .map(|unit| unit.package_name().to_string())
 }
 
-fn scala_import_path(info: &crate::analyzer::ImportInfo) -> Option<String> {
-    let trimmed = info
-        .raw_snippet
-        .trim()
-        .strip_prefix("import ")
-        .unwrap_or(info.raw_snippet.trim())
-        .trim();
-    if trimmed.is_empty() {
-        return None;
+fn is_top_level_type(target: &CodeUnit) -> bool {
+    !target.short_name().contains('.')
+}
+
+fn nested_owner_qualifier(target: &CodeUnit) -> Option<&str> {
+    target.short_name().rsplit_once('.').map(|(owner, _)| owner)
+}
+
+fn qualifier_matches_target_owner(qualifier: &str, spec: &TargetSpec) -> bool {
+    if is_top_level_type(&spec.owner) {
+        return qualifier == spec.owner.package_name();
     }
-    if info.is_wildcard {
-        return Some(
-            trimmed
-                .trim_end_matches(".*")
-                .trim_end_matches("._")
-                .to_string(),
-        );
+
+    let Some(owner_qualifier) = nested_owner_qualifier(&spec.owner) else {
+        return false;
+    };
+    qualifier == owner_qualifier
+        || qualifier == format!("{}.{}", spec.owner.package_name(), owner_qualifier)
+}
+
+fn seed_type_shadow(node: Node<'_>, ctx: &mut ScalaJavaScanCtx<'_, '_>) {
+    if !matches!(
+        node.kind(),
+        "class_definition" | "object_definition" | "trait_definition" | "enum_definition"
+    ) {
+        return;
     }
-    Some(
-        trimmed
-            .split_once(" as ")
-            .map(|(path, _)| path)
-            .or_else(|| trimmed.split_once(" => ").map(|(path, _)| path))
-            .unwrap_or(trimmed)
-            .trim()
-            .to_string(),
+    let Some(name) = node.child_by_field_name("name") else {
+        return;
+    };
+    let name = node_text(name, ctx.source).trim_end_matches('$');
+    if !name.is_empty()
+        && ctx.visibility.contains(name)
+        && let Some(scope) = ctx.type_shadow_scopes.last_mut()
+    {
+        scope.insert(name.to_string());
+    }
+}
+
+fn enters_local_scope(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "class_definition"
+            | "object_definition"
+            | "trait_definition"
+            | "enum_definition"
+            | "function_definition"
+            | "block"
+            | "block_expression"
+            | "case_clause"
+            | "lambda_expression"
+            | "anonymous_function"
     )
 }
 
-fn is_identifier_node(node: Node<'_>) -> bool {
-    matches!(node.kind(), "identifier" | "type_identifier")
-}
-
-fn is_type_like_reference(node: Node<'_>, source: &str) -> bool {
-    node.kind() == "type_identifier"
-        || is_constructor_like_reference(node, source)
-        || parent_kind(node).is_some_and(|kind| {
-            matches!(
-                kind,
-                "type" | "generic_type" | "parameterized_type" | "extends_clause"
-            )
-        })
-}
-
-fn is_constructor_like_reference(node: Node<'_>, source: &str) -> bool {
-    let prefix = source[..node.start_byte()].trim_end();
-    prefix.ends_with("new")
-        || parent_kind(node).is_some_and(|kind| matches!(kind, "call_expression" | "type"))
+fn is_type_shadowed(ctx: &ScalaJavaScanCtx<'_, '_>, name: &str) -> bool {
+    ctx.type_shadow_scopes
+        .iter()
+        .rev()
+        .any(|scope| scope.contains(name))
 }
 
 fn is_declaration_name(node: Node<'_>) -> bool {
     node.parent()
         .and_then(|parent| parent.child_by_field_name("name"))
         == Some(node)
-}
-
-fn parent_kind(node: Node<'_>) -> Option<&str> {
-    node.parent().map(|parent| parent.kind())
-}
-
-fn has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {
-    let mut current = node.parent();
-    while let Some(parent) = current {
-        if parent.kind() == kind {
-            return true;
-        }
-        current = parent.parent();
-    }
-    false
-}
-
-fn dotted_qualifier_before(node: Node<'_>, source: &str) -> Option<String> {
-    let before = source[..node.start_byte()].trim_end();
-    let without_dot = before.strip_suffix('.')?;
-    let qualifier: String = without_dot
-        .chars()
-        .rev()
-        .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$' | '.'))
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect();
-    (!qualifier.is_empty()).then_some(qualifier.trim_end_matches('$').to_string())
-}
-
-fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    source
-        .get(node.start_byte()..node.end_byte())
-        .unwrap_or_default()
-        .trim()
 }

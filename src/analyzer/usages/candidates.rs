@@ -86,7 +86,40 @@ impl CandidateFileProvider for ImportGraphCandidateProvider {
             }
         }
 
+        add_scala_candidates_for_java_type(target, analyzer, &mut candidates);
+
         candidates
+    }
+}
+
+fn add_scala_candidates_for_java_type(
+    target: &CodeUnit,
+    analyzer: &dyn IAnalyzer,
+    candidates: &mut HashSet<ProjectFile>,
+) {
+    if language_for_target(target) != Language::Java || !target.is_class() {
+        return;
+    }
+
+    let Ok(files) = analyzer.project().analyzable_files(Language::Scala) else {
+        return;
+    };
+    if files.is_empty() {
+        return;
+    }
+
+    let target_name = target.identifier();
+    let target_fq_name = target.fq_name();
+    for file in files {
+        if file.is_binary().unwrap_or(true) {
+            continue;
+        }
+        let Ok(source) = file.read_to_string() else {
+            continue;
+        };
+        if source.contains(target_name) || source.contains(&target_fq_name) {
+            candidates.insert(file);
+        }
     }
 }
 

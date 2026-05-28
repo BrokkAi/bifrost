@@ -90,7 +90,7 @@ impl JavaUsageGraphStrategy {
                 break;
             }
         }
-        scan_scala_files_for_java_type(analyzer, &spec, &mut state);
+        scan_scala_files_for_java_type(analyzer, candidate_files, &spec, &mut state);
 
         if hits.is_empty() && saw_unproven_match {
             return GraphUsageOutcome::fallback_safe(

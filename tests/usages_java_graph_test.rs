@@ -89,6 +89,13 @@ fn assert_hit_line(hits: &[UsageHit], line: usize) {
     );
 }
 
+fn assert_no_hit_line(hits: &[UsageHit], line: usize) {
+    assert!(
+        hits.iter().all(|hit| hit.line != line),
+        "expected no hit on line {line}, got {hits:#?}"
+    );
+}
+
 fn line_of(source: &str, needle: &str) -> usize {
     source
         .lines()
@@ -1330,6 +1337,122 @@ class WildcardConsumer {
 
     assert_hit_contains(&hits, "class SamePackage");
     assert_hit_contains(&hits, "class WildcardConsumer");
+}
+
+#[test]
+fn java_type_usage_lookup_respects_usage_finder_file_filter_for_scala_hits() {
+    let (_project, java, _scala, multi) = mixed_jvm_analyzer_with_files(&[
+        (
+            "com/example/Target.java",
+            "package com.example; public class Target {}\n",
+        ),
+        (
+            "app/Included.scala",
+            r#"
+package app
+
+import com.example.Target
+
+class Included {
+  val target: Target = new Target()
+}
+"#,
+        ),
+        (
+            "app/Excluded.scala",
+            r#"
+package app
+
+import com.example.Target
+
+class Excluded {
+  val target: Target = new Target()
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&java, "com.example.Target");
+    let hits = hits(
+        UsageFinder::new()
+            .with_file_filter(|file| !file.rel_path().to_string_lossy().contains("Excluded.scala"))
+            .find_usages_default(&multi, std::slice::from_ref(&target)),
+    );
+
+    assert_hit_contains(&hits, "class Included");
+    assert_no_hit_contains(&hits, "class Excluded");
+}
+
+#[test]
+fn java_type_usage_lookup_ignores_scala_local_type_shadowing() {
+    let consumer_source = r#"
+package app
+
+import com.example.Target
+
+class Consumer {
+  class Target
+  val shadowed: Target = new Target()
+  val fq: com.example.Target = new com.example.Target()
+}
+"#;
+    let (_project, java, _scala, multi) = mixed_jvm_analyzer_with_files(&[
+        (
+            "com/example/Target.java",
+            "package com.example; public class Target {}\n",
+        ),
+        ("app/Consumer.scala", consumer_source),
+    ]);
+
+    let target = definition(&java, "com.example.Target");
+    let hits = hits(UsageFinder::new().find_usages_default(&multi, std::slice::from_ref(&target)));
+
+    assert_no_hit_line(&hits, line_of(consumer_source, "shadowed: Target"));
+    assert_hit_contains(&hits, "com.example.Target");
+}
+
+#[test]
+fn java_nested_type_usage_lookup_requires_import_or_qualification_in_scala() {
+    let same_package_source = r#"
+package com.example
+
+class SamePackage {
+  val plain: Inner = ???
+  val qualified: Outer.Inner = new Outer.Inner()
+}
+"#;
+    let (_project, java, _scala, multi) = mixed_jvm_analyzer_with_files(&[
+        (
+            "com/example/Outer.java",
+            r#"
+package com.example;
+
+public class Outer {
+    public static class Inner {}
+}
+"#,
+        ),
+        ("com/example/SamePackage.scala", same_package_source),
+        (
+            "app/Imported.scala",
+            r#"
+package app
+
+import com.example.Outer.Inner
+
+class Imported {
+  val imported: Inner = new Inner()
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&java, "com.example.Outer.Inner");
+    let hits = hits(UsageFinder::new().find_usages_default(&multi, std::slice::from_ref(&target)));
+
+    assert_no_hit_line(&hits, line_of(same_package_source, "plain: Inner"));
+    assert_hit_contains(&hits, "qualified: Outer.Inner");
+    assert_hit_contains(&hits, "imported: Inner");
 }
 
 #[test]

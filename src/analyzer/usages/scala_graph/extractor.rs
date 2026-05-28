@@ -2,7 +2,11 @@ use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInfere
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::usages::scala_graph::hits::add_hit;
 use crate::analyzer::usages::scala_graph::resolver::{TargetKind, TargetSpec, Visibility};
-use crate::analyzer::usages::scala_graph::syntax::{parenthesized_arity, split_top_level_commas};
+use crate::analyzer::usages::scala_graph::syntax::{
+    dot_qualifier_before, dotted_qualifier_before, has_ancestor_kind,
+    is_constructor_like_reference, is_identifier_node, is_type_like_reference, node_text,
+    parenthesized_arity, split_top_level_commas,
+};
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range, ScalaAnalyzer};
 use crate::hash::HashMap;
 use crate::text_utils::compute_line_starts;
@@ -506,30 +510,6 @@ fn enclosing_matches_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
             .is_some_and(|rest| rest.starts_with('.'))
 }
 
-fn is_identifier_node(node: Node<'_>) -> bool {
-    matches!(
-        node.kind(),
-        "identifier" | "type_identifier" | "operator_identifier"
-    )
-}
-
-fn is_type_like_reference(node: Node<'_>, source: &str) -> bool {
-    node.kind() == "type_identifier"
-        || is_constructor_like_reference(node, source)
-        || parent_kind(node).is_some_and(|kind| {
-            matches!(
-                kind,
-                "type" | "generic_type" | "parameterized_type" | "extends_clause"
-            )
-        })
-}
-
-fn is_constructor_like_reference(node: Node<'_>, source: &str) -> bool {
-    let prefix = source[..node.start_byte()].trim_end();
-    prefix.ends_with("new")
-        || parent_kind(node).is_some_and(|kind| matches!(kind, "call_expression" | "type"))
-}
-
 fn member_call_arity_matches(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     if ctx.spec.kind != TargetKind::Method {
         return true;
@@ -548,21 +528,6 @@ fn call_arity_after(node: Node<'_>, source: &str) -> Option<usize> {
     parenthesized_arity(after)
 }
 
-fn parent_kind(node: Node<'_>) -> Option<&str> {
-    node.parent().map(|parent| parent.kind())
-}
-
-fn has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {
-    let mut current = node.parent();
-    while let Some(parent) = current {
-        if parent.kind() == kind {
-            return true;
-        }
-        current = parent.parent();
-    }
-    false
-}
-
 fn has_dot_qualifier(node: Node<'_>, source: &str) -> bool {
     dot_qualifier_before(node, source).is_some()
 }
@@ -573,37 +538,4 @@ fn is_simple_assignment_lhs(node: Node<'_>, source: &str) -> bool {
     }
     let after = source[node.end_byte()..].trim_start();
     after.starts_with('=') && !after.starts_with("=>") && !after.starts_with("==")
-}
-
-fn dot_qualifier_before(node: Node<'_>, source: &str) -> Option<String> {
-    let before = &source[..node.start_byte()];
-    let before = before.trim_end();
-    let without_dot = before.strip_suffix('.')?;
-    let qualifier: String = without_dot
-        .chars()
-        .rev()
-        .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$'))
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect();
-    (!qualifier.is_empty()).then_some(qualifier.trim_end_matches('$').to_string())
-}
-
-fn dotted_qualifier_before(node: Node<'_>, source: &str) -> Option<String> {
-    let before = source[..node.start_byte()].trim_end();
-    let without_dot = before.strip_suffix('.')?;
-    let qualifier: String = without_dot
-        .chars()
-        .rev()
-        .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$' | '.'))
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect();
-    (!qualifier.is_empty()).then_some(qualifier.trim_end_matches('$').to_string())
-}
-
-pub(super) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    &source[node.byte_range()]
 }
