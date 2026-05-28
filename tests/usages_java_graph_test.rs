@@ -82,6 +82,21 @@ fn assert_no_hit_contains(hits: &[UsageHit], needle: &str) {
     );
 }
 
+fn assert_hit_line(hits: &[UsageHit], line: usize) {
+    assert!(
+        hits.iter().any(|hit| hit.line == line),
+        "expected hit on line {line}, got {hits:#?}"
+    );
+}
+
+fn line_of(source: &str, needle: &str) -> usize {
+    source
+        .lines()
+        .position(|line| line.contains(needle))
+        .map(|line| line + 1)
+        .unwrap_or_else(|| panic!("missing line containing {needle:?}"))
+}
+
 #[test]
 fn usage_finder_routes_java_targets_through_graph_strategy() {
     let (_project, analyzer) = java_analyzer_with_files(&[
@@ -1197,7 +1212,22 @@ public class Consumer {
 }
 
 #[test]
-fn java_type_usage_lookup_includes_proven_scala_source_hits() {
+fn java_graph_finds_java_type_usages_from_scala_source() {
+    let consumer_source = r#"
+package app
+
+import com.example.Target
+
+class ScalaConsumer {
+  val annotated: Target = new Target()
+}
+
+class ScalaChild extends Target
+
+class ScalaFq {
+  val fq: com.example.Target = new com.example.Target()
+}
+"#;
     let (_project, java, _scala, multi) = mixed_jvm_analyzer_with_files(&[
         (
             "com/example/Target.java",
@@ -1208,6 +1238,30 @@ public class Target {
     public void run() {}
 }
 "#,
+        ),
+        ("app/ScalaConsumer.scala", consumer_source),
+    ]);
+
+    let target = definition(&java, "com.example.Target");
+    let result = UsageFinder::new().find_usages_default(&multi, std::slice::from_ref(&target));
+    let hits = hits(result);
+
+    assert_hit_contains(&hits, "annotated: Target");
+    assert_hit_contains(&hits, "new Target()");
+    assert_hit_contains(&hits, "extends Target");
+    assert_hit_contains(&hits, "com.example.Target");
+
+    assert_hit_line(&hits, line_of(consumer_source, "val annotated"));
+    assert_hit_line(&hits, line_of(consumer_source, "class ScalaChild"));
+    assert_hit_line(&hits, line_of(consumer_source, "val fq"));
+}
+
+#[test]
+fn java_type_usage_lookup_merges_java_and_scala_source_hits() {
+    let (_project, java, _scala, multi) = mixed_jvm_analyzer_with_files(&[
+        (
+            "com/example/Target.java",
+            "package com.example; public class Target {}\n",
         ),
         (
             "com/example/JavaConsumer.java",
@@ -1227,41 +1281,17 @@ package app
 import com.example.Target
 
 class ScalaConsumer {
-  val annotated: Target = new Target()
-}
-"#,
-        ),
-        (
-            "app/ScalaChild.scala",
-            r#"
-package app
-
-import com.example.Target
-
-class ScalaChild extends Target
-"#,
-        ),
-        (
-            "app/ScalaFq.scala",
-            r#"
-package app
-
-class ScalaFq {
-  val fq: com.example.Target = new com.example.Target()
+  val target: Target = new Target()
 }
 "#,
         ),
     ]);
 
     let target = definition(&java, "com.example.Target");
-    let result = UsageFinder::new().find_usages_default(&multi, std::slice::from_ref(&target));
-    let hits = hits(result);
+    let hits = hits(UsageFinder::new().find_usages_default(&multi, std::slice::from_ref(&target)));
 
     assert_hit_contains(&hits, "Target target");
-    assert_hit_contains(&hits, "annotated: Target");
-    assert_hit_contains(&hits, "new Target()");
-    assert_hit_contains(&hits, "extends Target");
-    assert_hit_contains(&hits, "com.example.Target");
+    assert_hit_contains(&hits, "target: Target");
 }
 
 #[test]
