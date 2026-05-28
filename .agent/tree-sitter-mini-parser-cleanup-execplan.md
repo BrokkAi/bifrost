@@ -19,7 +19,7 @@ After this work, the team should have an evidence-backed inventory of the import
 - [x] (2026-05-28 16:57Z) Created PHP follow-up issues for the larger receiver/member regex and hierarchy regex clusters: `#154` and `#155`.
 - [x] (2026-05-28 17:09Z) Audited Python usage graph mini parsers and replaced regex/line-based receiver fact extraction with tree-sitter event collection.
 - [x] (2026-05-28 17:18Z) Audited Rust usage graph mini parsers and replaced receiver-inference regexes with tree-sitter traversal.
-- [ ] Audit Go usage graph mini parsers and classify each candidate as actionable now, follow-up issue, or intentionally text-based.
+- [x] (2026-05-28 17:23Z) Audited Go usage graph mini parsers and replaced typed local receiver regex inference with tree-sitter `var_spec` traversal.
 - [ ] Audit C++ and C# usage graph and analyzer mini parsers and classify each candidate as actionable now, follow-up issue, or intentionally text-based.
 - [ ] Audit JS/TS usage graph and analyzer mini parsers and classify each candidate as actionable now, follow-up issue, or intentionally text-based.
 - [ ] Audit Scala and Java usage graph and analyzer mini parsers and classify each candidate as actionable now, follow-up issue, or intentionally text-based.
@@ -51,6 +51,9 @@ After this work, the team should have an evidence-backed inventory of the import
 - Observation: Rust receiver inference has a safe tree-sitter cleanup, but other Rust mini-parser clusters are separate follow-up work.
   Evidence: `type_item`, `parameter`, `let_declaration`, `field_declaration`, `struct_expression`, `call_expression`, `scoped_identifier`, and `tuple_struct_pattern` nodes cover `TYPE_ALIAS_RE`, `PARAM_TYPED_RE`, `LET_TYPED_RE`, `LET_CONSTRUCTED_RE`, `LET_ALIAS_RE`, `OPTION_FIELD_RE`, and `SELF_FIELD_AS_REF_LET_ELSE_RE`; `detect_shadowed_names`, member hit regex matching, `TRAIT_IMPL_RE`, and visibility prefix checks remain intentionally untouched in this pass.
 
+- Observation: Go had one actionable usage-graph regex cleanup in typed local receiver inference; most other Go text operations are import-path or display/signature handling.
+  Evidence: `var_spec` exposes repeated `name` fields and an optional `type` field, replacing `VAR_TYPED_LIST_RE`; Go import path parsing in `src/analyzer/usages/go_graph/resolver.rs` and declaration signature/source shaping in `src/analyzer/go/declarations.rs` still operate on rendered strings and are intentionally text-based.
+
 ## Decision Log
 
 - Decision: Treat GitHub issue `BrokkAi/bifrost#141` as an audit-and-follow-up epic before attempting broad rewrites.
@@ -81,6 +84,10 @@ After this work, the team should have an evidence-backed inventory of the import
   Rationale: Receiver inference has direct node equivalents and focused test coverage. The remaining clusters affect graph seeding, hit localization, trait ownership, or export visibility and should not be folded into the same review.
   Date/Author: 2026-05-28 / Codex.
 
+- Decision: Replace Go's `VAR_TYPED_LIST_RE` path with `var_spec` traversal, but leave Go import-path parsing and declaration rendering unchanged.
+  Rationale: `var_spec` gives the exact receiver names and declared type without line-sensitive regex parsing. Import module strings and user-facing signatures are not syntax classification in this milestone.
+  Date/Author: 2026-05-28 / Codex.
+
 ## Outcomes & Retrospective
 
 Initial outcome 2026-05-28: This ExecPlan exists and defines the epic as a sequence of evidence-backed language audits. No Rust behavior has changed yet. The next useful milestone is the PHP audit because it can turn the issue's seed examples into concrete follow-up issues or a first small cleanup PR.
@@ -92,6 +99,8 @@ PHP follow-up issue outcome 2026-05-28: Created `#154`, "Replace PHP usage graph
 Python milestone outcome 2026-05-28: The Python receiver fact collector now parses code-unit snippets with tree-sitter and collects parameter, annotation, and assignment events from syntax nodes. The old regexes `PARAM_NAME_RE`, `PARAM_ANNOTATION_RE`, and `ASSIGNMENT_RE` are no longer needed. The focused Python usage graph test suite passed, including a new regression for `x = Foo(\n)` followed by `x.bar()`.
 
 Rust milestone outcome 2026-05-28: Rust member receiver inference now parses source with tree-sitter to collect type aliases, typed parameters, typed lets, constructor lets, simple aliases, `Option<T>` field types, and `let Some(name) = self.field.as_ref() else ...` bindings. The old receiver-inference regexes are no longer needed. The focused Rust usage graph test suite passed, including a new regression for `let a = Foo::new(\n); a.bar();`.
+
+Go milestone outcome 2026-05-28: Go typed local receiver inference now walks tree-sitter `var_spec` nodes, including grouped and multiline declarations, instead of scanning declaration text with `VAR_TYPED_LIST_RE`. Import-path parsing and analyzer signature/source rendering remain intentionally text-based. The focused Go usage graph test suite passed, including a regression for multiline names with an inline comment before the receiver type.
 
 ## Context and Orientation
 
@@ -118,7 +127,7 @@ Milestone 2 is the Python audit. This milestone has completed its cleanup: `coll
 
 Milestone 3 is the Rust audit. This milestone has completed its receiver-inference cleanup: `LET_TYPED_RE`, `LET_CONSTRUCTED_RE`, `LET_ALIAS_RE`, `PARAM_TYPED_RE`, `TYPE_ALIAS_RE`, `OPTION_FIELD_RE`, and `SELF_FIELD_AS_REF_LET_ELSE_RE` have been replaced by tree-sitter traversal. Remaining Rust follow-up candidates are `detect_shadowed_names`, member call/static hit regex matching, `TRAIT_IMPL_RE`, and string-prefix visibility/trait checks in `src/analyzer/usages/rust_graph/resolver.rs` and `src/analyzer/rust/graph_support.rs`.
 
-Milestone 4 is the Go audit. Read `src/analyzer/usages/go_graph/extractor.rs`, `src/analyzer/usages/go_graph/resolver.rs`, and `src/analyzer/go/declarations.rs`. Start with `VAR_TYPED_LIST_RE` and checks that split declaration headers or inspect text around Go type declarations. Distinguish import-path string logic from source syntax classification; import path comparisons are usually intentionally text-based. Validate any cleanup with `cargo test --test usages_go_graph_test`, and include Go analyzer tests if analyzer files change.
+Milestone 4 is the Go audit. This milestone has completed its cleanup: `VAR_TYPED_LIST_RE` has been replaced with tree-sitter `var_spec` traversal for typed local receiver inference. Remaining Go text handling in import-path resolution, module name derivation, and analyzer declaration signature/source rendering is intentional string semantics or display shaping rather than syntax discovery.
 
 Milestone 5 is the C++ and C# audit. Read `src/analyzer/usages/cpp_graph/extractor.rs`, `src/analyzer/usages/cpp_graph/resolver.rs`, `src/analyzer/usages/csharp_graph/extractor.rs`, `src/analyzer/usages/csharp_graph/resolver.rs`, and the corresponding analyzer declaration modules. Focus on declaration header splitting, class/struct/enum text probes, and regexes that parse declarations or attributes. Keep operator-name normalization and C++ symbol spelling logic text-based unless the same grammar fact is available from a parsed node. Validate with the focused usage graph tests for the affected language.
 
@@ -220,6 +229,11 @@ Rust cleanup validation:
     cargo test --test usages_rust_graph_test
     test result: ok. 57 passed; 0 failed; 0 ignored
 
+Go cleanup validation:
+
+    cargo test --test usages_go_graph_test
+    test result: ok. 29 passed; 0 failed; 0 ignored
+
 ## Interfaces and Dependencies
 
 This plan does not require a public API change. Future cleanup issues should prefer private helper functions inside the language module being changed. A helper should accept `tree_sitter::Node` when it needs syntax structure and should accept `&str` source only when it needs exact source text for byte ranges, rendered snippets, or names that tree-sitter stores only as source spans.
@@ -235,3 +249,5 @@ Revision note 2026-05-28: Added the GitHub issue numbers for the two PHP follow-
 Revision note 2026-05-28: Recorded the Python cleanup, its validation result, and the decision to keep receiver type-expression normalization text-based while replacing syntax discovery with tree-sitter traversal.
 
 Revision note 2026-05-28: Recorded the Rust receiver-inference cleanup, its validation result, and the remaining Rust mini-parser follow-up candidates.
+
+Revision note 2026-05-28: Recorded the Go typed local receiver cleanup, its validation result, and the decision to keep Go import-path and declaration rendering text-based.

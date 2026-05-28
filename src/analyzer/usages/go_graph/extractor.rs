@@ -8,9 +8,8 @@ use crate::analyzer::{IAnalyzer, ProjectFile};
 use crate::hash::HashSet;
 use crate::text_utils::compute_line_starts;
 use rayon::prelude::*;
-use regex::Regex;
 use std::collections::BTreeSet;
-use std::sync::{LazyLock, Mutex};
+use std::sync::Mutex;
 use tree_sitter::Node;
 
 const OWNER_TOKEN: &str = "__go_target_owner__";
@@ -175,13 +174,7 @@ fn seed_local_bindings(
 ) {
     match node.kind() {
         "var_declaration" => {
-            seed_typed_var_lines(node, ctx, locals);
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                if child.kind() == "var_spec" {
-                    seed_var_spec(child, ctx, locals);
-                }
-            }
+            for_each_var_spec(node, &mut |var_spec| seed_var_spec(var_spec, ctx, locals));
         }
         "var_spec" => seed_var_spec(node, ctx, locals),
         "short_var_declaration" | "assignment_statement" => seed_assignment_like(node, ctx, locals),
@@ -189,44 +182,13 @@ fn seed_local_bindings(
     }
 }
 
-fn seed_typed_var_lines(
-    node: Node<'_>,
-    ctx: &ScanCtx<'_>,
-    locals: &mut LocalInferenceEngine<String>,
-) {
-    let text = node_text(node, ctx.source);
-    for caps in VAR_TYPED_LIST_RE.captures_iter(text) {
-        let ty = TypeRef {
-            qualifier: caps.name("qualifier").map(|m| m.as_str().to_string()),
-            name: caps.name("name").map(|m| m.as_str().to_string()),
-        };
-        if !ctx.bindings.matches_owner_type(&ty) {
-            continue;
-        }
-        let Some(vars) = caps.name("vars") else {
-            continue;
-        };
-        for name in vars
-            .as_str()
-            .split(',')
-            .map(str::trim)
-            .filter(|name| *name != "_" && IDENT_RE.is_match(name))
-        {
-            locals.seed_symbol(name.to_string(), OWNER_TOKEN.to_string());
-        }
-    }
-}
-
 fn declared_names(node: Node<'_>, source: &str) -> Vec<String> {
     match node.kind() {
         "var_declaration" => {
             let mut out = Vec::new();
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                if child.kind() == "var_spec" {
-                    out.extend(declared_names(child, source));
-                }
-            }
+            for_each_var_spec(node, &mut |var_spec| {
+                out.extend(declared_names(var_spec, source))
+            });
             out
         }
         "var_spec" => var_spec_names(node, source),
@@ -288,25 +250,26 @@ fn seed_names_from_values(
 }
 
 fn var_spec_names(node: Node<'_>, source: &str) -> Vec<String> {
-    let boundary = node
-        .child_by_field_name("type")
-        .or_else(|| node.child_by_field_name("value"))
-        .map(|child| child.start_byte())
-        .unwrap_or(node.end_byte());
     let mut out = Vec::new();
     let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.start_byte() >= boundary {
-            continue;
-        }
-        if is_identifier_node(child) {
-            let name = node_text(child, source);
-            if name != "_" {
-                out.push(name.to_string());
-            }
+    for name_node in node.children_by_field_name("name", &mut cursor) {
+        let name = node_text(name_node, source);
+        if name != "_" {
+            out.push(name.to_string());
         }
     }
     out
+}
+
+fn for_each_var_spec(node: Node<'_>, f: &mut impl FnMut(Node<'_>)) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "var_spec" => f(child),
+            "var_spec_list" => for_each_var_spec(child, f),
+            _ => {}
+        }
+    }
 }
 
 fn lhs_identifiers(node: Node<'_>, source: &str) -> Vec<String> {
@@ -540,12 +503,3 @@ fn next_non_whitespace_is_colon(node: Node<'_>, source: &str) -> bool {
         .and_then(|rest| rest.chars().find(|ch| !ch.is_whitespace()))
         == Some(':')
 }
-
-static VAR_TYPED_LIST_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?m)^\s*(?:var\s+)?(?P<vars>[A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*)\s+\*?(?:(?P<qualifier>[A-Za-z_][A-Za-z0-9_]*)\.)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)\b",
-    )
-    .expect("valid Go typed var-list regex")
-});
-static IDENT_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$").expect("valid Go identifier regex"));
