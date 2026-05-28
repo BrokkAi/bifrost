@@ -2,8 +2,9 @@ use crate::analyzer::usages::local_inference::{LocalInferenceEngine, SymbolResol
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::usages::php_graph::hits::{push_hit, push_hit_range};
 use crate::analyzer::usages::php_graph::resolver::{
-    FileContext, PhpHierarchyIndex, TargetKind, TargetSpec, has_open_paren_after,
-    has_operator_before, has_token_before, qualified_candidate_text, receiver_is_enclosing_subtype,
+    FileContext, PhpHierarchyIndex, TargetKind, TargetSpec, is_const_declaration_name,
+    is_function_call_name, is_function_declaration_name, is_member_or_scoped_access_name,
+    is_object_creation_type_name, qualified_candidate_text, receiver_is_enclosing_subtype,
     receiver_type_matches, resolve_php_constant, resolve_php_function, resolve_php_type,
     static_receiver_matches,
 };
@@ -187,7 +188,7 @@ fn is_constructor_reference(
     if !is_reference_context(node) {
         return false;
     }
-    if !has_token_before(node.start_byte(), source, "new") {
+    if !is_object_creation_type_name(node) {
         return false;
     }
     let raw = qualified_candidate_text(node, source);
@@ -204,10 +205,9 @@ fn is_constant_reference(
         return false;
     }
     let raw = qualified_candidate_text(node, source);
-    if has_open_paren_after(node.end_byte(), source)
-        || has_operator_before(node.start_byte(), source, "->")
-        || has_operator_before(node.start_byte(), source, "::")
-        || has_token_before(node.start_byte(), source, "const")
+    if is_function_call_name(node)
+        || is_member_or_scoped_access_name(node)
+        || is_const_declaration_name(node)
     {
         return false;
     }
@@ -224,13 +224,10 @@ fn is_function_reference(
         return false;
     }
     let raw = qualified_candidate_text(node, source);
-    if !has_open_paren_after(node.end_byte(), source) {
+    if !is_function_call_name(node) {
         return false;
     }
-    if has_operator_before(node.start_byte(), source, "->")
-        || has_operator_before(node.start_byte(), source, "::")
-        || has_token_before(node.start_byte(), source, "function")
-    {
+    if is_member_or_scoped_access_name(node) || is_function_declaration_name(node) {
         return false;
     }
     resolve_php_function(&raw, ctx).is_some_and(|fq| fq == spec.target_fq_name)

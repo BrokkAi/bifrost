@@ -1,0 +1,202 @@
+# Replace analyzer and usage graph mini parsers with tree-sitter classification
+
+This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
+
+This document follows `.agent/PLANS.md`. It is self-contained and describes how to audit and break down GitHub issue `BrokkAi/bifrost#141`, "Epic: Replace analyzer and usage graph mini parsers with tree-sitter classification."
+
+## Purpose / Big Picture
+
+Bifrost uses tree-sitter parsers to understand source code, but some analyzer and usage graph paths still classify syntax by reading raw source text with regular expressions, prefix and suffix checks, operator probes, or manual token scanning. Those mini parsers are brittle because they duplicate facts that the syntax tree already knows, such as whether a PHP name is part of a function call, a constructor call, a constant declaration, a member access, or a type reference.
+
+After this work, the team should have an evidence-backed inventory of the important mini-parser clusters and a sequence of focused language-scoped follow-up issues or small pull requests. A human can see progress by reading this plan, then checking the linked follow-up issues or the focused regression tests added for each cleanup. The goal is not to remove every text operation from the analyzer. The goal is to replace source-text syntax classification when tree-sitter already exposes the same structure more robustly.
+
+## Progress
+
+- [x] (2026-05-28 16:48Z) Read `.agent/PLANS.md`, confirmed this issue branch is attached to `141-epic-replace-analyzer-and-usage-graph-mini-parsers-with-tree-sitter-classification`, and rebased against `origin/master`.
+- [x] (2026-05-28 16:48Z) Recorded the initial mini-parser definition, PHP seed area, language order, and validation policy in this ExecPlan.
+- [x] (2026-05-28 16:48Z) Captured initial audit evidence for PHP, Python, Rust, and Go usage graph mini-parser clusters.
+- [x] (2026-05-28 16:57Z) Audited PHP usage graph mini parsers and replaced the small constructor/function/constant classification probes with tree-sitter parent-node checks.
+- [x] (2026-05-28 16:57Z) Created PHP follow-up issues for the larger receiver/member regex and hierarchy regex clusters: `#154` and `#155`.
+- [ ] Audit Python usage graph mini parsers and classify each candidate as actionable now, follow-up issue, or intentionally text-based.
+- [ ] Audit Rust usage graph mini parsers and classify each candidate as actionable now, follow-up issue, or intentionally text-based.
+- [ ] Audit Go usage graph mini parsers and classify each candidate as actionable now, follow-up issue, or intentionally text-based.
+- [ ] Audit C++ and C# usage graph and analyzer mini parsers and classify each candidate as actionable now, follow-up issue, or intentionally text-based.
+- [ ] Audit JS/TS usage graph and analyzer mini parsers and classify each candidate as actionable now, follow-up issue, or intentionally text-based.
+- [ ] Audit Scala and Java usage graph and analyzer mini parsers and classify each candidate as actionable now, follow-up issue, or intentionally text-based.
+- [ ] Summarize the follow-up issue set in `Outcomes & Retrospective` and close this epic only when every actionable cluster is tracked or intentionally deferred.
+
+## Surprises & Discoveries
+
+- Observation: The first PHP seed area is broader than the three small helper names in the issue. It also includes regex-driven receiver inference and hierarchy parsing.
+  Evidence: `rg` found `TYPE_DECLARATION_RE` in `src/analyzer/usages/php_graph/resolver.rs`, plus `PARAMETER_VARIABLE_RE`, `ASSIGNMENT_RE`, `INSTANCE_MEMBER_RE`, and `STATIC_MEMBER_RE` in `src/analyzer/usages/php_graph/extractor.rs`.
+
+- Observation: Python and Rust already have concentrated receiver/type inference mini parsers inside usage graph extractors, making them good follow-up milestones after PHP.
+  Evidence: `src/analyzer/usages/python_graph/extractor.rs` defines `PARAM_ANNOTATION_RE`, `PARAM_NAME_RE`, and `ASSIGNMENT_RE`; `src/analyzer/usages/rust_graph/extractor.rs` defines `LET_TYPED_RE`, `LET_CONSTRUCTED_RE`, `LET_ALIAS_RE`, `PARAM_TYPED_RE`, `TYPE_ALIAS_RE`, `OPTION_FIELD_RE`, and `SELF_FIELD_AS_REF_LET_ELSE_RE`.
+
+- Observation: Not every regex or string check is a mini parser that should be replaced. Generic fallback search and text rendering are intentionally text-based.
+  Evidence: `src/analyzer/usages/regex_analyzer.rs` is the documented fallback path for languages or cases without graph strategy support, and usage hit snippets must still read source text for display.
+
+- Observation: PHP tree-sitter keeps comments between tokens inside semantic parent nodes, so parent-node classification is more robust than adjacency checks.
+  Evidence: `new /* constructor target */ Target()` parses with `Target` under `object_creation_expression`, and `helper /* call target */ ()` parses with `helper` under `function_call_expression`; `cargo test --test usages_php_graph_test` passed with `php_graph_uses_parse_tree_for_commented_constructor_and_function_calls`.
+
+- Observation: The remaining PHP mini-parser clusters are too broad for the first narrow cleanup.
+  Evidence: `STATIC_MEMBER_RE`, `INSTANCE_MEMBER_RE`, `ASSIGNMENT_RE`, and `PARAMETER_VARIABLE_RE` cooperate with ordered local receiver inference in `scan_instance_members_in_order`, while `TYPE_DECLARATION_RE` feeds `PhpHierarchyIndex`; both areas need dedicated follow-up issues or PRs.
+
+## Decision Log
+
+- Decision: Treat GitHub issue `BrokkAi/bifrost#141` as an audit-and-follow-up epic before attempting broad rewrites.
+  Rationale: The issue acceptance criteria ask for an inventory and focused follow-up issues, and explicitly warn against large language-specific rewrites unless a change is small and self-contained.
+  Date/Author: 2026-05-28 / Codex.
+
+- Decision: Start with PHP, then audit Python, Rust, Go, C++/C#, JS/TS, and Scala/Java one language group at a time.
+  Rationale: PHP is the first known example from PR `#133`. Python, Rust, and Go have concentrated usage graph regex clusters that can be audited independently. The paired language groups share implementation patterns and review risk.
+  Date/Author: 2026-05-28 / Codex.
+
+- Decision: Prefer language-local helper replacements until at least two languages need the same tree-sitter abstraction.
+  Rationale: The current mini-parser clusters are language-specific. A premature shared abstraction could hide important tree-sitter grammar differences and make later language work harder to review.
+  Date/Author: 2026-05-28 / Codex.
+
+- Decision: Keep `RegexUsageAnalyzer` out of scope.
+  Rationale: It is an intentional best-effort fallback for unsupported graph cases. This plan targets language graph and analyzer code that already has a parsed tree but still uses source-text probes to classify syntax.
+  Date/Author: 2026-05-28 / Codex.
+
+- Decision: Replace PHP adjacency helpers with language-local tree-sitter parent checks, but leave receiver/member regexes and hierarchy regex parsing for dedicated follow-ups.
+  Rationale: Constructor, function-call, member/scoped-access, const-declaration, and function-declaration classification can be answered by immediate semantic parent nodes after ascending through `namespace_name` and `qualified_name`. Receiver inference and hierarchy parsing have wider behavior and ordering implications.
+  Date/Author: 2026-05-28 / Codex.
+
+## Outcomes & Retrospective
+
+Initial outcome 2026-05-28: This ExecPlan exists and defines the epic as a sequence of evidence-backed language audits. No Rust behavior has changed yet. The next useful milestone is the PHP audit because it can turn the issue's seed examples into concrete follow-up issues or a first small cleanup PR.
+
+PHP milestone outcome 2026-05-28: The first small PHP cleanup is implemented. `qualified_candidate_text` now ascends by PHP syntax node kinds instead of checking whether ancestor text looks like a qualified name, and constructor/function/constant classification uses tree-sitter parent nodes instead of raw adjacency helpers. The focused PHP usage graph test suite passed. Remaining PHP work should be split into follow-up issues for receiver/member regex inference and `TYPE_DECLARATION_RE` hierarchy parsing.
+
+PHP follow-up issue outcome 2026-05-28: Created `#154`, "Replace PHP usage graph receiver/member regex scans with tree-sitter traversal", for `PARAMETER_VARIABLE_RE`, `ASSIGNMENT_RE`, `INSTANCE_MEMBER_RE`, `STATIC_MEMBER_RE`, and ordered local receiver inference. Created `#155`, "Replace PHP usage graph hierarchy regex with tree-sitter declaration traversal", for `TYPE_DECLARATION_RE` and `PhpHierarchyIndex::extend_file`.
+
+## Context and Orientation
+
+The repository root is the current `bifrost` checkout. The usage graph code lives under `src/analyzer/usages`. A usage graph strategy tries to find references to a target symbol by walking language-specific import, export, and syntax relationships. A tree-sitter node is a parsed syntax-tree node from the `tree_sitter` crate. It has a `kind`, byte range, parent, children, named children, and sometimes named fields supplied by the language grammar.
+
+In this plan, a mini parser means source-text classification that decides syntax meaning with a regular expression, prefix or suffix probe, operator probe, manual character scanning, or brace and parenthesis splitting when tree-sitter already exposes the same fact through node kind, parent kind, child fields, sibling relationships, or an existing analyzer parse abstraction. A text operation is intentionally text-based when it renders snippets, normalizes symbol names, manipulates import paths or module strings, performs fallback search, or extracts exact source ranges after tree-sitter has already identified the syntax.
+
+The key issue says to audit usage graph strategies under `src/analyzer/usages`, especially language-specific extractor and resolver modules, and analyzer implementations under `src/analyzer` where source regex or token probes duplicate information available from tree-sitter. The issue names the PHP helpers `has_token_before`, `has_operator_before`, `has_open_paren_after`, `qualified_candidate_text`, and related reference classification helpers as the first known example.
+
+## Plan of Work
+
+Begin every implementation session from the issue branch. If the worktree is detached, reattach it with:
+
+    git checkout 141-epic-replace-analyzer-and-usage-graph-mini-parsers-with-tree-sitter-classification
+
+Then update the branch:
+
+    git fetch
+    git rebase origin/master
+
+Milestone 1 is the PHP audit. This milestone has completed its first narrow cleanup: source adjacency helpers for constructor, function, constant, member/scoped, and declaration classification have been replaced with tree-sitter parent-node checks. The remaining PHP work is now tracked in issue `#154` for receiver/member regex inference and issue `#155` for `TYPE_DECLARATION_RE` hierarchy parsing.
+
+Milestone 2 is the Python audit. Read `src/analyzer/usages/python_graph/extractor.rs` and `src/analyzer/usages/python_graph/resolver.rs`. Focus first on `collect_scope_facts_from_source`, where `PARAM_ANNOTATION_RE`, `PARAM_NAME_RE`, and `ASSIGNMENT_RE` infer receiver bindings from function text and individual lines. Decide whether a Python tree walk can collect parameter, annotation, assignment, and receiver facts without changing behavior. Validate any cleanup with `cargo test --test usages_python_graph_test`, and include `cargo test --test python_analyzer_test --test python_analyzer_update_test` if analyzer files change.
+
+Milestone 3 is the Rust audit. Read `src/analyzer/usages/rust_graph/extractor.rs`, `src/analyzer/usages/rust_graph/resolver.rs`, and `src/analyzer/rust/graph_support.rs`. Focus on `LET_TYPED_RE`, `LET_CONSTRUCTED_RE`, `LET_ALIAS_RE`, `PARAM_TYPED_RE`, `TYPE_ALIAS_RE`, `OPTION_FIELD_RE`, `SELF_FIELD_AS_REF_LET_ELSE_RE`, and any visibility checks that inspect declaration source text. A good Rust follow-up issue should explain which tree-sitter node kinds or fields can replace the regex and which receiver/type inference behavior must stay unchanged. Validate any cleanup with `cargo test --test usages_rust_graph_test`, and include Rust analyzer tests if analyzer files change.
+
+Milestone 4 is the Go audit. Read `src/analyzer/usages/go_graph/extractor.rs`, `src/analyzer/usages/go_graph/resolver.rs`, and `src/analyzer/go/declarations.rs`. Start with `VAR_TYPED_LIST_RE` and checks that split declaration headers or inspect text around Go type declarations. Distinguish import-path string logic from source syntax classification; import path comparisons are usually intentionally text-based. Validate any cleanup with `cargo test --test usages_go_graph_test`, and include Go analyzer tests if analyzer files change.
+
+Milestone 5 is the C++ and C# audit. Read `src/analyzer/usages/cpp_graph/extractor.rs`, `src/analyzer/usages/cpp_graph/resolver.rs`, `src/analyzer/usages/csharp_graph/extractor.rs`, `src/analyzer/usages/csharp_graph/resolver.rs`, and the corresponding analyzer declaration modules. Focus on declaration header splitting, class/struct/enum text probes, and regexes that parse declarations or attributes. Keep operator-name normalization and C++ symbol spelling logic text-based unless the same grammar fact is available from a parsed node. Validate with the focused usage graph tests for the affected language.
+
+Milestone 6 is the JS/TS audit. Read `src/analyzer/usages/js_ts_graph/extractor.rs`, `src/analyzer/usages/js_ts_graph/resolver.rs`, `src/analyzer/javascript/mod.rs`, `src/analyzer/typescript/mod.rs`, and `src/analyzer/js_ts/imports.rs`. JS/TS has legitimate source rendering and import-specifier string work; do not classify that as cleanup by default. Focus on any source split or prefix check that decides whether syntax is a function, import, export, alias, or assignment when tree-sitter node kinds already encode it. Validate with `cargo test --test usages_js_ts_graph_test` and matching JS/TS analyzer tests if analyzer files change.
+
+Milestone 7 is the Scala and Java audit. Read `src/analyzer/usages/scala_graph`, `src/analyzer/usages/java_graph`, `src/analyzer/scala`, and `src/analyzer/java`. Scala has `src/analyzer/usages/scala_graph/syntax.rs`, so decide whether existing helpers should be strengthened rather than replaced. Java has mature tree-sitter declaration and import handling, so focus on residual source-prefix checks and avoid changing JVM cross-language behavior unless the cleanup is directly related. Validate with the focused Scala and Java usage graph tests.
+
+When a candidate becomes a follow-up issue, include the language, affected files, the brittle text operation, a short example of syntax it is trying to classify, the suggested tree-sitter replacement direction, and the focused test command. If using `gh issue create`, do it only after the audit has enough concrete evidence.
+
+## Concrete Steps
+
+Use these commands from the repository root:
+
+    git status --short --branch
+    git fetch
+    git rebase origin/master
+
+To refresh the initial inventory, run:
+
+    rg -n "has_token_before|has_operator_before|has_open_paren_after|qualified_candidate_text|PARAMETER_VARIABLE_RE|ASSIGNMENT_RE|INSTANCE_MEMBER_RE|STATIC_MEMBER_RE|TYPE_DECLARATION_RE" src/analyzer/usages/php_graph
+    rg -n "PARAM_ANNOTATION_RE|PARAM_NAME_RE|ASSIGNMENT_RE|LET_TYPED_RE|LET_CONSTRUCTED_RE|LET_ALIAS_RE|PARAM_TYPED_RE|TYPE_ALIAS_RE|OPTION_FIELD_RE|SELF_FIELD_AS_REF_LET_ELSE_RE|VAR_TYPED_LIST_RE" src/analyzer/usages/{python_graph,rust_graph,go_graph}
+    rg -n "LazyLock<Regex>|Regex::new|trim_start\\(\\)\\.starts_with|split\\('\\{|split\\(\"\\{\" src/analyzer/usages src/analyzer -g '*.rs'
+
+During each milestone, update `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` before stopping. If the milestone creates follow-up issues, paste the issue URLs or numbers into `Outcomes & Retrospective` and keep the summary short enough that a future contributor can resume from this file alone.
+
+## Validation and Acceptance
+
+The ExecPlan-only change is accepted when this file exists, follows `.agent/PLANS.md`, and contains enough concrete audit evidence for the next contributor to start with PHP without external context.
+
+For a language cleanup that edits Rust code, run the focused test for that language. The expected result is that the new or existing regression test fails before the cleanup if it exposes a bug, then passes after the cleanup, or that existing focused tests continue to pass for behavior-preserving refactors. Use these commands as the default focused validations:
+
+    cargo test --test usages_php_graph_test
+    cargo test --test usages_python_graph_test
+    cargo test --test usages_rust_graph_test
+    cargo test --test usages_go_graph_test
+    cargo test --test usages_cpp_graph_test
+    cargo test --test usages_csharp_graph_test
+    cargo test --test usages_js_ts_graph_test
+    cargo test --test usages_scala_graph_test
+    cargo test --test usages_java_graph_test
+
+If analyzer implementation files under `src/analyzer/<language>` change, also run the matching analyzer tests, such as:
+
+    cargo test --test php_analyzer_test --test php_analyzer_update_test
+
+At the end of a cleanup PR, run:
+
+    cargo fmt --check
+    cargo clippy --all-targets --all-features -- -D warnings
+
+Do not run the full clippy command for a documentation-only update unless the branch already contains Rust code changes that need final validation.
+
+## Idempotence and Recovery
+
+The audit steps are safe to repeat. `rg` commands only read files, and the language test commands only build and run tests. If a rebase fails, resolve the conflict by preserving the newest `origin/master` behavior and then reapply this plan's documentation or language-local cleanup. Do not use `git reset --hard` or discard unrelated user changes.
+
+When replacing a mini parser, keep the old behavior visible in tests before removing the helper. Prefer additive tests first, then change the implementation. If a tree-sitter rewrite changes hit ranges, enclosing code-unit selection, or fallback behavior unexpectedly, stop and record the discovery in this plan before continuing.
+
+## Artifacts and Notes
+
+Initial PHP inventory:
+
+    src/analyzer/usages/php_graph/resolver.rs:158 TYPE_DECLARATION_RE
+    src/analyzer/usages/php_graph/resolver.rs:241 qualified_candidate_text
+    src/analyzer/usages/php_graph/resolver.rs:343 has_token_before
+    src/analyzer/usages/php_graph/resolver.rs:351 has_operator_before
+    src/analyzer/usages/php_graph/resolver.rs:359 has_open_paren_after
+    src/analyzer/usages/php_graph/extractor.rs:75 PARAMETER_VARIABLE_RE
+    src/analyzer/usages/php_graph/extractor.rs:82 ASSIGNMENT_RE
+    src/analyzer/usages/php_graph/extractor.rs:87 INSTANCE_MEMBER_RE
+    src/analyzer/usages/php_graph/extractor.rs:92 STATIC_MEMBER_RE
+
+PHP cleanup validation:
+
+    cargo test --test usages_php_graph_test
+    test result: ok. 26 passed; 0 failed; 0 ignored
+
+Initial Python, Rust, and Go inventory:
+
+    src/analyzer/usages/python_graph/extractor.rs:580 PARAM_ANNOTATION_RE
+    src/analyzer/usages/python_graph/extractor.rs:582 PARAM_NAME_RE
+    src/analyzer/usages/python_graph/extractor.rs:585 ASSIGNMENT_RE
+    src/analyzer/usages/rust_graph/extractor.rs:291 LET_TYPED_RE
+    src/analyzer/usages/rust_graph/extractor.rs:295 LET_CONSTRUCTED_RE
+    src/analyzer/usages/rust_graph/extractor.rs:301 LET_ALIAS_RE
+    src/analyzer/usages/rust_graph/extractor.rs:305 PARAM_TYPED_RE
+    src/analyzer/usages/rust_graph/extractor.rs:309 TYPE_ALIAS_RE
+    src/analyzer/usages/rust_graph/extractor.rs:313 OPTION_FIELD_RE
+    src/analyzer/usages/rust_graph/extractor.rs:317 SELF_FIELD_AS_REF_LET_ELSE_RE
+    src/analyzer/usages/go_graph/extractor.rs:544 VAR_TYPED_LIST_RE
+
+## Interfaces and Dependencies
+
+This plan does not require a public API change. Future cleanup issues should prefer private helper functions inside the language module being changed. A helper should accept `tree_sitter::Node` when it needs syntax structure and should accept `&str` source only when it needs exact source text for byte ranges, rendered snippets, or names that tree-sitter stores only as source spans.
+
+If a shared abstraction becomes justified after at least two language cleanups need the same shape, place it under `src/analyzer/usages` only when it is usage-graph-specific. Place it under `src/analyzer` only when normal analyzer implementations outside the usage graph also need it. Keep any new helper small, object-free, and explicit about the tree-sitter node kinds it expects.
+
+Revision note 2026-05-28: Created this ExecPlan from the GitHub issue and initial repository audit so the epic can proceed language by language instead of as an omnibus rewrite.
+
+Revision note 2026-05-28: Recorded the first PHP cleanup, its validation result, and the remaining PHP follow-up clusters after replacing raw adjacency checks with tree-sitter parent-node classification.
+
+Revision note 2026-05-28: Added the GitHub issue numbers for the two PHP follow-up clusters created from the completed PHP audit.
