@@ -11,7 +11,7 @@ use crate::text_utils::compute_line_starts;
 use rayon::prelude::*;
 use regex::Regex;
 use std::collections::BTreeSet;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 use tree_sitter::{Node, Parser, Tree};
 
 struct ParsedFile {
@@ -288,39 +288,6 @@ fn detect_shadowed_names(
         .collect()
 }
 
-static LET_TYPED_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\blet\s+([A-Za-z_][A-Za-z0-9_]*)\s*:\s*([A-Za-z_][A-Za-z0-9_]*)")
-        .expect("valid typed let regex")
-});
-static LET_CONSTRUCTED_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"\blet\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([A-Za-z_][A-Za-z0-9_]*)(?:::\s*([A-Za-z_][A-Za-z0-9_]*))?\s*(?:\{|\(|\.)",
-    )
-        .expect("valid constructed let regex")
-});
-static LET_ALIAS_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\blet\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*;")
-        .expect("valid alias let regex")
-});
-static PARAM_TYPED_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"([A-Za-z_][A-Za-z0-9_]*)\s*:\s*([A-Za-z_][A-Za-z0-9_]*)")
-        .expect("valid typed param regex")
-});
-static TYPE_ALIAS_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\btype\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*;")
-        .expect("valid type alias regex")
-});
-static OPTION_FIELD_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*:\s*Option<\s*([A-Za-z_][A-Za-z0-9_]*)\s*>")
-        .expect("valid option field regex")
-});
-static SELF_FIELD_AS_REF_LET_ELSE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"\blet\s+Some\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)\s*=\s*self\.([A-Za-z_][A-Za-z0-9_]*)\.as_ref\(\)\s*else",
-    )
-    .expect("valid self field as_ref let-else regex")
-});
-
 pub(super) fn scan_files_for_member_target(
     analyzer: &dyn IAnalyzer,
     graph: &RustProjectGraph,
@@ -478,19 +445,14 @@ fn expanded_receiver_type_names(
     owner_local_names: &HashSet<String>,
 ) -> HashSet<String> {
     let mut owner_type_names = owner_local_names.clone();
+    let aliases = parse_rust_source(source)
+        .map(|tree| collect_type_aliases(tree.root_node(), source))
+        .unwrap_or_default();
 
     loop {
         let mut changed = false;
-        for captures in TYPE_ALIAS_RE.captures_iter(source) {
-            let Some(alias) = captures.get(1) else {
-                continue;
-            };
-            let Some(target) = captures.get(2) else {
-                continue;
-            };
-            if owner_type_names.contains(target.as_str())
-                && owner_type_names.insert(alias.as_str().to_string())
-            {
+        for (alias, target) in &aliases {
+            if owner_type_names.contains(target) && owner_type_names.insert(alias.clone()) {
                 changed = true;
             }
         }
@@ -509,28 +471,13 @@ fn receiver_explicitly_mismatched(
     receiver_name: &str,
 ) -> bool {
     let owner_type_names = expanded_receiver_type_names(file_source, owner_local_names);
+    let Some(tree) = parse_rust_source(enclosing_source) else {
+        return false;
+    };
 
-    for captures in PARAM_TYPED_RE.captures_iter(enclosing_source) {
-        let Some(name) = captures.get(1) else {
-            continue;
-        };
-        let Some(ty) = captures.get(2) else {
-            continue;
-        };
-        if name.as_str() == receiver_name {
-            return !owner_type_names.contains(ty.as_str());
-        }
-    }
-
-    for captures in LET_TYPED_RE.captures_iter(enclosing_source) {
-        let Some(name) = captures.get(1) else {
-            continue;
-        };
-        let Some(ty) = captures.get(2) else {
-            continue;
-        };
-        if name.as_str() == receiver_name {
-            return !owner_type_names.contains(ty.as_str());
+    for (name, ty) in collect_explicit_receiver_annotations(tree.root_node(), enclosing_source) {
+        if name == receiver_name {
+            return ty.as_ref().is_none_or(|ty| !owner_type_names.contains(ty));
         }
     }
 
@@ -559,82 +506,364 @@ fn collect_receiver_bindings(
     self_like_constructors: &HashSet<String>,
 ) -> LocalInferenceEngine<String> {
     let mut engine = LocalInferenceEngine::new(LocalInferenceConfig::default());
+    let Some(tree) = parse_rust_source(source) else {
+        return engine;
+    };
+    let root = tree.root_node();
 
-    let option_field_types: HashMap<String, String> = OPTION_FIELD_RE
-        .captures_iter(source)
-        .filter_map(|captures| {
-            Some((
-                captures.get(1)?.as_str().to_string(),
-                captures.get(2)?.as_str().to_string(),
-            ))
-        })
-        .collect();
-
-    for captures in LET_TYPED_RE.captures_iter(source) {
-        let Some(name) = captures.get(1) else {
-            continue;
-        };
-        let Some(ty) = captures.get(2) else {
-            continue;
-        };
-        if owner_type_names.contains(ty.as_str()) {
-            engine.seed_symbol(name.as_str().to_string(), ty.as_str().to_string());
+    let option_field_types = collect_option_field_types(root, source);
+    let mut aliases = Vec::new();
+    for event in collect_receiver_events(root, source, &option_field_types) {
+        match event {
+            ReceiverEvent::TypedBinding { name, ty } => {
+                if owner_type_names.contains(&ty) {
+                    engine.seed_symbol(name, ty);
+                }
+            }
+            ReceiverEvent::Constructed {
+                name,
+                ty,
+                constructor,
+            } => {
+                let allowed_constructor =
+                    constructor.is_none_or(|name| self_like_constructors.contains(&name));
+                if owner_type_names.contains(&ty) && allowed_constructor {
+                    engine.seed_symbol(name, ty);
+                }
+            }
+            ReceiverEvent::Alias { name, source } => aliases.push((name, source)),
         }
     }
-
-    for captures in LET_CONSTRUCTED_RE.captures_iter(source) {
-        let Some(name) = captures.get(1) else {
-            continue;
-        };
-        let Some(ty) = captures.get(2) else {
-            continue;
-        };
-        let constructor_name = captures.get(3).map(|name| name.as_str());
-        let allowed_constructor =
-            constructor_name.is_none_or(|name| self_like_constructors.contains(name));
-        if owner_type_names.contains(ty.as_str()) && allowed_constructor {
-            engine.seed_symbol(name.as_str().to_string(), ty.as_str().to_string());
-        }
-    }
-
-    for captures in PARAM_TYPED_RE.captures_iter(source) {
-        let Some(name) = captures.get(1) else {
-            continue;
-        };
-        let Some(ty) = captures.get(2) else {
-            continue;
-        };
-        if owner_type_names.contains(ty.as_str()) {
-            engine.seed_symbol(name.as_str().to_string(), ty.as_str().to_string());
-        }
-    }
-
-    for captures in SELF_FIELD_AS_REF_LET_ELSE_RE.captures_iter(source) {
-        let Some(name) = captures.get(1) else {
-            continue;
-        };
-        let Some(field_name) = captures.get(2) else {
-            continue;
-        };
-        if option_field_types
-            .get(field_name.as_str())
-            .is_some_and(|ty| owner_type_names.contains(ty))
-            && let Some(ty) = option_field_types.get(field_name.as_str())
-        {
-            engine.seed_symbol(name.as_str().to_string(), ty.clone());
-        }
-    }
-
-    let aliases: Vec<_> = LET_ALIAS_RE
-        .captures_iter(source)
-        .filter_map(|captures| {
-            Some((
-                captures.get(1)?.as_str().to_string(),
-                captures.get(2)?.as_str().to_string(),
-            ))
-        })
-        .collect();
     engine.apply_aliases_until_stable(aliases);
 
     engine
+}
+
+enum ReceiverEvent {
+    TypedBinding {
+        name: String,
+        ty: String,
+    },
+    Constructed {
+        name: String,
+        ty: String,
+        constructor: Option<String>,
+    },
+    Alias {
+        name: String,
+        source: String,
+    },
+}
+
+fn parse_rust_source(source: &str) -> Option<Tree> {
+    if source.trim().is_empty() {
+        return None;
+    }
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .ok()?;
+    parser.parse(source, None)
+}
+
+fn collect_type_aliases(root: Node<'_>, source: &str) -> Vec<(String, String)> {
+    let mut aliases = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "type_item"
+            && let (Some(alias), Some(target)) = (
+                node.child_by_field_name("name")
+                    .and_then(|name| simple_node_text(name, source)),
+                node.child_by_field_name("type")
+                    .and_then(|ty| simple_type_name(ty, source)),
+            )
+        {
+            aliases.push((alias, target));
+        }
+
+        let mut cursor = node.walk();
+        let mut children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
+        children.reverse();
+        stack.extend(children);
+    }
+    aliases
+}
+
+fn collect_explicit_receiver_annotations(
+    root: Node<'_>,
+    source: &str,
+) -> Vec<(String, Option<String>)> {
+    let mut bindings = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "parameter" | "let_declaration" => {
+                if let Some((name, ty)) = explicit_receiver_annotation(node, source) {
+                    bindings.push((name, ty));
+                }
+            }
+            _ => {}
+        }
+
+        let mut cursor = node.walk();
+        let mut children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
+        children.reverse();
+        stack.extend(children);
+    }
+    bindings
+}
+
+fn collect_option_field_types(root: Node<'_>, source: &str) -> HashMap<String, String> {
+    let mut fields = HashMap::default();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "field_declaration"
+            && let (Some(name), Some(ty)) = (
+                node.child_by_field_name("name")
+                    .and_then(|name| simple_node_text(name, source)),
+                node.child_by_field_name("type")
+                    .and_then(|ty| option_inner_type_name(ty, source)),
+            )
+        {
+            fields.insert(name, ty);
+        }
+
+        let mut cursor = node.walk();
+        let mut children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
+        children.reverse();
+        stack.extend(children);
+    }
+    fields
+}
+
+fn collect_receiver_events(
+    root: Node<'_>,
+    source: &str,
+    option_field_types: &HashMap<String, String>,
+) -> Vec<ReceiverEvent> {
+    let mut events = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "parameter" => {
+                if let Some((name, ty)) = typed_parameter_binding(node, source) {
+                    events.push(ReceiverEvent::TypedBinding { name, ty });
+                }
+            }
+            "let_declaration" => {
+                collect_let_receiver_event(node, source, option_field_types, &mut events)
+            }
+            _ => {}
+        }
+
+        let mut cursor = node.walk();
+        let mut children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
+        children.reverse();
+        stack.extend(children);
+    }
+    events
+}
+
+fn collect_let_receiver_event(
+    node: Node<'_>,
+    source: &str,
+    option_field_types: &HashMap<String, String>,
+    events: &mut Vec<ReceiverEvent>,
+) {
+    if let Some((name, ty)) = typed_let_binding(node, source) {
+        events.push(ReceiverEvent::TypedBinding { name, ty });
+        return;
+    }
+
+    if let Some((name, ty)) = self_field_as_ref_let_else_binding(node, source, option_field_types) {
+        events.push(ReceiverEvent::TypedBinding { name, ty });
+        return;
+    }
+
+    let Some(pattern) = node.child_by_field_name("pattern") else {
+        return;
+    };
+    let Some(name) = simple_pattern_name(pattern, source) else {
+        return;
+    };
+    let Some(value) = node.child_by_field_name("value") else {
+        return;
+    };
+
+    if let Some((ty, constructor)) = constructed_receiver_type(value, source) {
+        events.push(ReceiverEvent::Constructed {
+            name,
+            ty,
+            constructor,
+        });
+    } else if let Some(source) = simple_node_text(value, source) {
+        events.push(ReceiverEvent::Alias { name, source });
+    }
+}
+
+fn typed_parameter_binding(node: Node<'_>, source: &str) -> Option<(String, String)> {
+    let name = node
+        .child_by_field_name("pattern")
+        .and_then(|pattern| simple_pattern_name(pattern, source))?;
+    let ty = node
+        .child_by_field_name("type")
+        .and_then(|ty| simple_type_name(ty, source))?;
+    Some((name, ty))
+}
+
+fn typed_let_binding(node: Node<'_>, source: &str) -> Option<(String, String)> {
+    let name = node
+        .child_by_field_name("pattern")
+        .and_then(|pattern| simple_pattern_name(pattern, source))?;
+    let ty = node
+        .child_by_field_name("type")
+        .and_then(|ty| simple_type_name(ty, source))?;
+    Some((name, ty))
+}
+
+fn explicit_receiver_annotation(node: Node<'_>, source: &str) -> Option<(String, Option<String>)> {
+    let pattern = node.child_by_field_name("pattern")?;
+    let name = simple_pattern_name(pattern, source)?;
+    let ty = node.child_by_field_name("type")?;
+    Some((name, simple_type_name(ty, source)))
+}
+
+fn self_field_as_ref_let_else_binding(
+    node: Node<'_>,
+    source: &str,
+    option_field_types: &HashMap<String, String>,
+) -> Option<(String, String)> {
+    let pattern = node.child_by_field_name("pattern")?;
+    let name = some_tuple_pattern_name(pattern, source)?;
+    let value = node.child_by_field_name("value")?;
+    let field_name = self_field_as_ref_field_name(value, source)?;
+    let ty = option_field_types.get(&field_name)?.clone();
+    Some((name, ty))
+}
+
+fn some_tuple_pattern_name(node: Node<'_>, source: &str) -> Option<String> {
+    if node.kind() != "tuple_struct_pattern" {
+        return None;
+    }
+    let type_name = node
+        .child_by_field_name("type")
+        .and_then(|ty| simple_node_text(ty, source))?;
+    if type_name != "Some" {
+        return None;
+    }
+    let type_id = node.child_by_field_name("type").map(|ty| ty.id());
+    let mut cursor = node.walk();
+    let identifiers: Vec<_> = node
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "identifier" && Some(child.id()) != type_id)
+        .filter_map(|child| simple_node_text(child, source))
+        .collect();
+    (identifiers.len() == 1).then(|| identifiers[0].clone())
+}
+
+fn self_field_as_ref_field_name(node: Node<'_>, source: &str) -> Option<String> {
+    if node.kind() != "call_expression" {
+        return None;
+    }
+    let function = node.child_by_field_name("function")?;
+    if function.kind() != "field_expression" {
+        return None;
+    }
+    if function
+        .child_by_field_name("field")
+        .and_then(|field| simple_node_text(field, source))
+        .as_deref()
+        != Some("as_ref")
+    {
+        return None;
+    }
+    let receiver = function.child_by_field_name("value")?;
+    if receiver.kind() != "field_expression" {
+        return None;
+    }
+    if receiver
+        .child_by_field_name("value")
+        .is_some_and(|value| value.kind() == "self")
+    {
+        receiver
+            .child_by_field_name("field")
+            .and_then(|field| simple_node_text(field, source))
+    } else {
+        None
+    }
+}
+
+fn constructed_receiver_type(node: Node<'_>, source: &str) -> Option<(String, Option<String>)> {
+    match node.kind() {
+        "struct_expression" => node
+            .child_by_field_name("name")
+            .and_then(|name| simple_type_name(name, source))
+            .map(|name| (name, None)),
+        "call_expression" => {
+            let function = node.child_by_field_name("function")?;
+            match function.kind() {
+                "identifier" | "type_identifier" => {
+                    simple_node_text(function, source).map(|name| (name, None))
+                }
+                "scoped_identifier" => {
+                    let ty = function
+                        .child_by_field_name("path")
+                        .and_then(|path| simple_type_name(path, source))?;
+                    let constructor = function
+                        .child_by_field_name("name")
+                        .and_then(|name| simple_node_text(name, source));
+                    Some((ty, constructor))
+                }
+                "field_expression" => function
+                    .child_by_field_name("value")
+                    .and_then(|value| constructed_receiver_type(value, source)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn option_inner_type_name(node: Node<'_>, source: &str) -> Option<String> {
+    if node.kind() != "generic_type" {
+        return None;
+    }
+    if node
+        .child_by_field_name("type")
+        .and_then(|ty| simple_node_text(ty, source))
+        .as_deref()
+        != Some("Option")
+    {
+        return None;
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .filter(|child| child.kind() != "type_identifier")
+        .find_map(|child| first_simple_type_name(child, source))
+}
+
+fn first_simple_type_name(node: Node<'_>, source: &str) -> Option<String> {
+    if let Some(name) = simple_type_name(node, source) {
+        return Some(name);
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find_map(|child| first_simple_type_name(child, source))
+}
+
+fn simple_type_name(node: Node<'_>, source: &str) -> Option<String> {
+    matches!(node.kind(), "type_identifier" | "identifier")
+        .then(|| simple_node_text(node, source))
+        .flatten()
+}
+
+fn simple_pattern_name(node: Node<'_>, source: &str) -> Option<String> {
+    (node.kind() == "identifier")
+        .then(|| simple_node_text(node, source))
+        .flatten()
+}
+
+fn simple_node_text(node: Node<'_>, source: &str) -> Option<String> {
+    let text = source.get(node.start_byte()..node.end_byte())?.trim();
+    (!text.is_empty()).then(|| text.to_string())
 }
