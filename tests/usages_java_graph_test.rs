@@ -1,9 +1,14 @@
 mod common;
 
 use brokk_bifrost::usages::FuzzyResult;
-use brokk_bifrost::usages::{JavaUsageGraphStrategy, UsageAnalyzer, UsageFinder};
-use brokk_bifrost::{CodeUnit, IAnalyzer, JavaAnalyzer, Language};
+use brokk_bifrost::usages::{
+    JavaUsageGraphStrategy, ScalaUsageGraphStrategy, UsageAnalyzer, UsageFinder, UsageHit,
+};
+use brokk_bifrost::{
+    AnalyzerDelegate, CodeUnit, IAnalyzer, JavaAnalyzer, Language, MultiAnalyzer, ScalaAnalyzer,
+};
 use common::InlineTestProject;
+use std::collections::BTreeMap;
 
 fn definition(analyzer: &JavaAnalyzer, fq_name: &str) -> CodeUnit {
     analyzer
@@ -23,6 +28,58 @@ fn java_analyzer_with_files(
     let project = builder.build();
     let analyzer = JavaAnalyzer::from_project(project.project().clone());
     (project, analyzer)
+}
+
+fn mixed_jvm_analyzer_with_files(
+    files: &[(&str, &str)],
+) -> (
+    common::BuiltInlineTestProject,
+    JavaAnalyzer,
+    ScalaAnalyzer,
+    MultiAnalyzer,
+) {
+    let mut builder = InlineTestProject::new();
+    for (path, contents) in files {
+        builder = builder.file(path, *contents);
+    }
+    let project = builder.build();
+    let java = JavaAnalyzer::from_project(project.project().clone());
+    let scala = ScalaAnalyzer::from_project(project.project().clone());
+    let multi = MultiAnalyzer::new(BTreeMap::from([
+        (Language::Java, AnalyzerDelegate::Java(java.clone())),
+        (Language::Scala, AnalyzerDelegate::Scala(scala.clone())),
+    ]));
+    (project, java, scala, multi)
+}
+
+fn scala_definition(analyzer: &ScalaAnalyzer, fq_name: &str) -> CodeUnit {
+    analyzer
+        .get_definitions(fq_name)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("missing Scala definition for {fq_name}"))
+}
+
+fn hits(result: FuzzyResult) -> Vec<UsageHit> {
+    result
+        .into_either()
+        .expect("expected usage graph success")
+        .into_iter()
+        .collect()
+}
+
+fn assert_hit_contains(hits: &[UsageHit], needle: &str) {
+    assert!(
+        hits.iter().any(|hit| hit.snippet.contains(needle)),
+        "expected hit containing {needle:?}, got {hits:#?}"
+    );
+}
+
+fn assert_no_hit_contains(hits: &[UsageHit], needle: &str) {
+    assert!(
+        hits.iter().all(|hit| !hit.snippet.contains(needle)),
+        "expected no hit containing {needle:?}, got {hits:#?}"
+    );
 }
 
 #[test]
@@ -1137,4 +1194,182 @@ public class Consumer {
         }
         other => panic!("expected TooManyCallsites, got {other:?}"),
     }
+}
+
+#[test]
+fn java_type_usage_lookup_includes_proven_scala_source_hits() {
+    let (_project, java, _scala, multi) = mixed_jvm_analyzer_with_files(&[
+        (
+            "com/example/Target.java",
+            r#"
+package com.example;
+
+public class Target {
+    public void run() {}
+}
+"#,
+        ),
+        (
+            "com/example/JavaConsumer.java",
+            r#"
+package com.example;
+
+public class JavaConsumer {
+    Target target;
+}
+"#,
+        ),
+        (
+            "app/ScalaConsumer.scala",
+            r#"
+package app
+
+import com.example.Target
+
+class ScalaConsumer {
+  val annotated: Target = new Target()
+}
+"#,
+        ),
+        (
+            "app/ScalaChild.scala",
+            r#"
+package app
+
+import com.example.Target
+
+class ScalaChild extends Target
+"#,
+        ),
+        (
+            "app/ScalaFq.scala",
+            r#"
+package app
+
+class ScalaFq {
+  val fq: com.example.Target = new com.example.Target()
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&java, "com.example.Target");
+    let result = UsageFinder::new().find_usages_default(&multi, std::slice::from_ref(&target));
+    let hits = hits(result);
+
+    assert_hit_contains(&hits, "Target target");
+    assert_hit_contains(&hits, "annotated: Target");
+    assert_hit_contains(&hits, "new Target()");
+    assert_hit_contains(&hits, "extends Target");
+    assert_hit_contains(&hits, "com.example.Target");
+}
+
+#[test]
+fn java_type_usage_lookup_handles_same_package_and_wildcard_scala_imports() {
+    let (_project, java, _scala, multi) = mixed_jvm_analyzer_with_files(&[
+        (
+            "com/example/Target.java",
+            "package com.example; public class Target {}\n",
+        ),
+        (
+            "com/example/SamePackage.scala",
+            r#"
+package com.example
+
+class SamePackage {
+  val target: Target = new Target()
+}
+"#,
+        ),
+        (
+            "app/WildcardConsumer.scala",
+            r#"
+package app
+
+import com.example._
+
+class WildcardConsumer {
+  val target: Target = new Target()
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&java, "com.example.Target");
+    let hits = hits(UsageFinder::new().find_usages_default(&multi, std::slice::from_ref(&target)));
+
+    assert_hit_contains(&hits, "class SamePackage");
+    assert_hit_contains(&hits, "class WildcardConsumer");
+}
+
+#[test]
+fn java_member_usage_lookup_does_not_claim_scala_source_hits() {
+    let (_project, java, _scala, multi) = mixed_jvm_analyzer_with_files(&[
+        (
+            "com/example/Target.java",
+            r#"
+package com.example;
+
+public class Target {
+    public void run() {}
+}
+"#,
+        ),
+        (
+            "app/ScalaConsumer.scala",
+            r#"
+package app
+
+import com.example.Target
+
+class ScalaConsumer {
+  def call(target: Target): Unit = target.run()
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&java, "com.example.Target.run");
+    let hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &multi,
+        std::slice::from_ref(&target),
+        &multi.get_analyzed_files().into_iter().collect(),
+        1000,
+    ));
+
+    assert_no_hit_contains(&hits, "target.run()");
+}
+
+#[test]
+fn scala_target_usage_lookup_does_not_scan_java_source() {
+    let (_project, _java, scala, multi) = mixed_jvm_analyzer_with_files(&[
+        (
+            "pkg/ScalaTarget.scala",
+            r#"
+package pkg
+
+class ScalaTarget
+"#,
+        ),
+        (
+            "com/example/JavaConsumer.java",
+            r#"
+package com.example;
+
+public class JavaConsumer {
+    Object target = new ScalaTarget();
+}
+"#,
+        ),
+    ]);
+
+    let target = scala_definition(&scala, "pkg.ScalaTarget");
+    let hits = hits(ScalaUsageGraphStrategy::new().find_usages(
+        &multi,
+        std::slice::from_ref(&target),
+        &multi.get_analyzed_files().into_iter().collect(),
+        1000,
+    ));
+
+    assert_no_hit_contains(&hits, "new ScalaTarget()");
 }
