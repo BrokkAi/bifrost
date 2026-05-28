@@ -6,7 +6,7 @@ mod cognitive_complexity_tests;
 pub(crate) mod common;
 mod config;
 mod cpp;
-mod csharp_analyzer;
+mod csharp;
 mod go_analyzer;
 mod i_analyzer;
 mod java;
@@ -38,7 +38,7 @@ pub(crate) use cpp::{
     node_text as cpp_node_text, normalize_cpp_whitespace, parse_quoted_include,
     resolve_include_targets,
 };
-pub use csharp_analyzer::CSharpAnalyzer;
+pub use csharp::CSharpAnalyzer;
 pub use go_analyzer::GoAnalyzer;
 pub use i_analyzer::IAnalyzer;
 pub use java::JavaAnalyzer;

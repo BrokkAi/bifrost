@@ -1,0 +1,182 @@
+use crate::analyzer::{
+    CodeUnit, CodeUnitType, IAnalyzer, ImportAnalysisProvider, ImportInfo, ProjectFile,
+    build_reverse_import_index,
+};
+use crate::hash::HashSet;
+use std::sync::Arc;
+
+use super::CSharpAnalyzer;
+
+impl ImportAnalysisProvider for CSharpAnalyzer {
+    fn imported_code_units_of(&self, file: &ProjectFile) -> HashSet<CodeUnit> {
+        if let Some(cached) = self.memo_caches.imported_code_units.get(file) {
+            return (*cached).clone();
+        }
+        let namespaces = self.using_namespaces_of(file);
+        if namespaces.is_empty() {
+            return HashSet::default();
+        }
+        let imported: HashSet<CodeUnit> = self
+            .get_all_declarations()
+            .into_iter()
+            .filter(|unit| unit.kind() == CodeUnitType::Class)
+            .filter(|unit| {
+                namespaces
+                    .iter()
+                    .any(|namespace| unit.package_name() == namespace)
+            })
+            .collect();
+        self.memo_caches
+            .imported_code_units
+            .insert(file.clone(), Arc::new(imported.clone()));
+        imported
+    }
+
+    fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
+        if let Some(cached) = self.memo_caches.referencing_files.get(file) {
+            return (*cached).clone();
+        }
+        let target_namespaces: HashSet<String> = self
+            .get_declarations(file)
+            .into_iter()
+            .filter(|unit| unit.kind() == CodeUnitType::Class)
+            .map(|unit| unit.package_name().to_string())
+            .collect();
+        if target_namespaces.is_empty() {
+            return HashSet::default();
+        }
+        let target_identifiers: HashSet<String> = self
+            .get_declarations(file)
+            .into_iter()
+            .filter(|unit| unit.kind() == CodeUnitType::Class)
+            .map(|unit| unit.identifier().to_string())
+            .collect();
+        let target_fq_names: HashSet<String> = self
+            .get_declarations(file)
+            .into_iter()
+            .filter(|unit| unit.kind() == CodeUnitType::Class)
+            .flat_map(|unit| [unit.fq_name(), unit.fq_name().replace('$', ".")])
+            .collect();
+
+        let reverse_index = self.memo_caches.reverse_import_index.get_or_init(|| {
+            let files: Vec<_> = self.inner.all_files().cloned().collect();
+            build_reverse_import_index(&files, |candidate| self.imported_code_units_of(candidate))
+        });
+        let mut result = reverse_index
+            .get(file)
+            .map(|files| (**files).clone())
+            .unwrap_or_default();
+
+        for candidate in self.inner.all_files() {
+            if candidate == file || result.contains(candidate) {
+                continue;
+            }
+            let Some(identifiers) = self.inner.type_identifiers_of(candidate) else {
+                continue;
+            };
+            let candidate_namespace = self.namespace_of_file(candidate);
+            let same_namespace = target_namespaces
+                .iter()
+                .any(|namespace| namespace == &candidate_namespace);
+            if same_namespace
+                && identifiers
+                    .iter()
+                    .any(|name| target_identifiers.contains(name))
+            {
+                result.insert(candidate.clone());
+                continue;
+            }
+            if identifiers
+                .iter()
+                .any(|name| target_fq_names.contains(name))
+            {
+                result.insert(candidate.clone());
+            }
+        }
+
+        self.memo_caches
+            .referencing_files
+            .insert(file.clone(), Arc::new(result.clone()));
+        result
+    }
+
+    fn import_info_of<'a>(&'a self, file: &ProjectFile) -> &'a [crate::analyzer::ImportInfo] {
+        self.inner.import_info_of(file)
+    }
+
+    fn could_import_file(
+        &self,
+        source_file: &ProjectFile,
+        imports: &[crate::analyzer::ImportInfo],
+        target: &ProjectFile,
+    ) -> bool {
+        if self.namespace_of_file(source_file) == self.namespace_of_file(target) {
+            return true;
+        }
+        let target_namespaces: HashSet<String> = self
+            .get_declarations(target)
+            .into_iter()
+            .filter(|unit| unit.kind() == CodeUnitType::Class)
+            .map(|unit| unit.package_name().to_string())
+            .collect();
+        let source_imports = self.using_namespaces_of(source_file);
+        imports
+            .iter()
+            .filter_map(|import| csharp_using_namespace(&import.raw_snippet))
+            .chain(source_imports)
+            .any(|namespace| target_namespaces.contains(&namespace))
+    }
+}
+
+pub(super) fn csharp_using_namespace(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_end_matches(';').trim();
+    let rest = trimmed
+        .strip_prefix("global ")
+        .unwrap_or(trimmed)
+        .strip_prefix("using ")?
+        .trim();
+    if rest.starts_with("static ") || rest.contains('=') || rest.is_empty() {
+        return None;
+    }
+    Some(rest.to_string())
+}
+
+pub(super) fn csharp_import_info(raw: String) -> ImportInfo {
+    let identifier = csharp_using_namespace(&raw)
+        .and_then(|namespace| namespace.rsplit('.').next().map(str::to_string));
+    ImportInfo {
+        raw_snippet: raw,
+        is_wildcard: true,
+        identifier,
+        alias: None,
+    }
+}
+
+pub(super) fn csharp_type_name_matches(unit: &CodeUnit, raw_name: &str) -> bool {
+    let normalized = normalize_csharp_type_name(raw_name);
+    if normalized.is_empty() {
+        return false;
+    }
+    normalized == unit.fq_name()
+        || normalized == unit.fq_name().replace('$', ".")
+        || (normalized.contains('$') && normalized == unit.short_name())
+        || (normalized.contains('.')
+            && unit
+                .fq_name()
+                .strip_suffix(unit.identifier())
+                .is_some_and(|prefix| normalized == format!("{prefix}{}", unit.identifier())))
+}
+
+pub(super) fn normalize_csharp_type_name(raw_name: &str) -> String {
+    let without_nullable = raw_name.trim().trim_end_matches('?').trim();
+    let without_arrays = without_nullable
+        .trim_end_matches("[]")
+        .trim_end_matches('?')
+        .trim();
+    without_arrays
+        .split('<')
+        .next()
+        .unwrap_or(without_arrays)
+        .trim()
+        .to_string()
+}
