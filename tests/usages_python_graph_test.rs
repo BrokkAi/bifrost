@@ -917,6 +917,25 @@ def run():
 }
 
 #[test]
+fn multiline_constructed_local_receiver_resolves_member_usage() {
+    assert_single_python_member_hit(
+        r#"
+class Foo:
+    def bar(self):
+        pass
+"#,
+        r#"
+from service import Foo
+
+def run():
+    x = Foo(
+    )
+    x.bar()
+"#,
+    );
+}
+
+#[test]
 fn simple_alias_receiver_resolves_member_usage() {
     assert_single_python_member_hit(
         r#"

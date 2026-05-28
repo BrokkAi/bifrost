@@ -242,28 +242,14 @@ pub(super) fn qualified_candidate_text(node: Node<'_>, source: &str) -> String {
     let mut candidate = node;
     let mut parent = node.parent();
     while let Some(ancestor) = parent {
-        let text = node_text(ancestor, source).trim();
-        if is_php_qualified_name_text(text) {
+        if matches!(ancestor.kind(), "namespace_name" | "qualified_name") {
             candidate = ancestor;
             parent = ancestor.parent();
         } else {
             break;
         }
     }
-    let start = candidate.start_byte();
-    let text = node_text(candidate, source).trim().to_string();
-    if source.get(..start).unwrap_or_default().ends_with('\\') {
-        format!("\\{text}")
-    } else {
-        text
-    }
-}
-
-fn is_php_qualified_name_text(text: &str) -> bool {
-    !text.is_empty()
-        && text
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '\\'))
+    node_text(candidate, source).trim().to_string()
 }
 
 pub(super) fn resolve_php_type(raw: &str, ctx: &FileContext) -> Option<String> {
@@ -340,28 +326,50 @@ fn join_namespace(namespace: &str, name: &str) -> String {
     }
 }
 
-pub(super) fn has_token_before(start: usize, source: &str, token: &str) -> bool {
-    source
-        .get(..start)
-        .unwrap_or_default()
-        .trim_end()
-        .ends_with(token)
+pub(super) fn is_object_creation_type_name(node: Node<'_>) -> bool {
+    semantic_parent(node).is_some_and(|parent| parent.kind() == "object_creation_expression")
 }
 
-pub(super) fn has_operator_before(start: usize, source: &str, op: &str) -> bool {
-    source
-        .get(..start)
-        .unwrap_or_default()
-        .trim_end()
-        .ends_with(op)
+pub(super) fn is_function_call_name(node: Node<'_>) -> bool {
+    semantic_parent(node).is_some_and(|parent| parent.kind() == "function_call_expression")
 }
 
-pub(super) fn has_open_paren_after(end: usize, source: &str) -> bool {
-    source
-        .get(end..)
-        .unwrap_or_default()
-        .trim_start()
-        .starts_with('(')
+pub(super) fn is_member_or_scoped_access_name(node: Node<'_>) -> bool {
+    semantic_parent(node).is_some_and(|parent| {
+        matches!(
+            parent.kind(),
+            "member_access_expression"
+                | "member_call_expression"
+                | "class_constant_access_expression"
+                | "scoped_call_expression"
+        )
+    })
+}
+
+pub(super) fn is_const_declaration_name(node: Node<'_>) -> bool {
+    node.parent()
+        .is_some_and(|parent| parent.kind() == "const_element")
+}
+
+pub(super) fn is_function_declaration_name(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        matches!(
+            parent.kind(),
+            "function_definition" | "method_declaration" | "anonymous_function_creation"
+        )
+    })
+}
+
+fn semantic_parent(node: Node<'_>) -> Option<Node<'_>> {
+    let mut candidate = node;
+    while let Some(parent) = candidate.parent() {
+        if matches!(parent.kind(), "namespace_name" | "qualified_name") {
+            candidate = parent;
+        } else {
+            return Some(parent);
+        }
+    }
+    None
 }
 
 pub(super) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {

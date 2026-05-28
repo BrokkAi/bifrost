@@ -734,8 +734,9 @@ import "example.com/app/model"
 func Read() string {
     var (
         album model.Album
+        first,
+            second /* receiver type comment */ model.Album
     )
-    var first, second model.Album
     return album.Title() + first.Title() + second.Title()
 }
 "#,

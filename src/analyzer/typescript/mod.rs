@@ -23,7 +23,8 @@ use crate::analyzer::js_ts::clones::{
 };
 use crate::analyzer::js_ts::identifiers::collect_js_ts_identifiers;
 use crate::analyzer::js_ts::imports::{
-    extract_js_ts_call_receiver, imported_tokens, parse_js_import_infos, resolve_js_ts_import_paths,
+    extract_js_ts_call_receiver, imported_tokens, parse_es_import_infos_from_node,
+    parse_js_import_infos, resolve_js_ts_import_paths,
 };
 use crate::analyzer::js_ts::model::{module_code_unit, node_text, trim_statement};
 use crate::analyzer::js_ts::tests::detect_js_ts_test_assertion_smells;
@@ -86,7 +87,9 @@ impl crate::analyzer::LanguageAdapter for TypescriptAdapter {
                     let raw = node_text(child, source).trim().to_string();
                     module_has_imports = true;
                     parsed.import_statements.push(raw.clone());
-                    parsed.imports.extend(parse_js_import_infos(&raw));
+                    parsed
+                        .imports
+                        .extend(parse_es_import_infos_from_node(child, source));
                 }
                 "expression_statement" => {
                     let raw = node_text(child, source).trim();

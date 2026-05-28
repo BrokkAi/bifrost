@@ -5,7 +5,7 @@ use crate::analyzer::usages::scala_graph::resolver::{TargetKind, TargetSpec, Vis
 use crate::analyzer::usages::scala_graph::syntax::{
     dot_qualifier_before, dotted_qualifier_before, has_ancestor_kind,
     is_constructor_like_reference, is_identifier_node, is_type_like_reference, node_text,
-    parenthesized_arity, split_top_level_commas,
+    parenthesized_arity,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range, ScalaAnalyzer};
 use crate::hash::HashMap;
@@ -234,25 +234,31 @@ fn seed_parameter_bindings(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         if child.kind() != "parameters" {
             continue;
         }
-        for (name, type_name) in typed_parameter_pairs(node_text(child, ctx.source)) {
-            seed_or_shadow_typed_symbol(name, Some(type_name), None, ctx);
+        seed_parameters(child, ctx);
+    }
+}
+
+fn seed_parameters(parameters: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let mut cursor = parameters.walk();
+    for parameter in parameters.named_children(&mut cursor) {
+        if parameter.kind() == "parameter" {
+            seed_parameter(parameter, ctx);
         }
     }
 }
 
-fn typed_parameter_pairs(parameters: &str) -> Vec<(&str, &str)> {
-    let inner = parameters
-        .trim()
-        .trim_start_matches('(')
-        .trim_end_matches(')');
-    split_top_level_commas(inner)
-        .filter_map(|part| {
-            let (name, type_text) = part.split_once(':')?;
-            let name = name.trim();
-            let type_name = simple_type_name(type_text.trim())?;
-            (!name.is_empty()).then_some((name, type_name))
-        })
-        .collect()
+fn seed_parameter(parameter: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let Some(name) = parameter.child_by_field_name("name") else {
+        return;
+    };
+    let name = node_text(name, ctx.source).trim();
+    if name.is_empty() {
+        return;
+    }
+    let type_name = parameter
+        .child_by_field_name("type")
+        .and_then(|type_node| simple_type_name(node_text(type_node, ctx.source).trim()));
+    seed_or_shadow_typed_symbol(name, type_name, None, ctx);
 }
 
 fn seed_value_definition(node: Node<'_>, ctx: &mut ScanCtx<'_>) {

@@ -1,6 +1,109 @@
 use crate::analyzer::{ImportInfo, Language, ProjectFile};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use tree_sitter::Node;
+
+pub(crate) fn parse_es_import_infos_from_node(node: Node<'_>, source: &str) -> Vec<ImportInfo> {
+    if node.kind() != "import_statement" {
+        return Vec::new();
+    }
+    let raw = node_text(node, source).trim().to_string();
+    let Some(source_node) = node.child_by_field_name("source") else {
+        return Vec::new();
+    };
+    if node_text(source_node, source).trim().is_empty() {
+        return Vec::new();
+    }
+
+    let Some(import_clause) = named_child_of_kind(node, "import_clause") else {
+        return vec![ImportInfo {
+            raw_snippet: raw,
+            is_wildcard: false,
+            identifier: None,
+            alias: None,
+        }];
+    };
+
+    let mut imports = Vec::new();
+    let mut cursor = import_clause.walk();
+    for child in import_clause.named_children(&mut cursor) {
+        match child.kind() {
+            "identifier" => {
+                let identifier = node_text(child, source).trim();
+                if !identifier.is_empty() {
+                    imports.push(ImportInfo {
+                        raw_snippet: raw.clone(),
+                        is_wildcard: false,
+                        identifier: Some(identifier.to_string()),
+                        alias: None,
+                    });
+                }
+            }
+            "namespace_import" => {
+                if let Some(alias) = first_identifier_child(child, source) {
+                    imports.push(ImportInfo {
+                        raw_snippet: raw.clone(),
+                        is_wildcard: true,
+                        identifier: None,
+                        alias: Some(alias),
+                    });
+                }
+            }
+            "named_imports" => collect_named_es_imports(child, source, &raw, &mut imports),
+            _ => {}
+        }
+    }
+    imports
+}
+
+fn collect_named_es_imports(
+    node: Node<'_>,
+    source: &str,
+    raw: &str,
+    imports: &mut Vec<ImportInfo>,
+) {
+    let mut cursor = node.walk();
+    for spec in node.named_children(&mut cursor) {
+        if spec.kind() != "import_specifier" {
+            continue;
+        }
+        let identifier = spec
+            .child_by_field_name("name")
+            .map(|name| node_text(name, source).trim().to_string());
+        let alias = spec
+            .child_by_field_name("alias")
+            .map(|alias| node_text(alias, source).trim().to_string());
+        if identifier.as_deref().is_none_or(str::is_empty) {
+            continue;
+        }
+        imports.push(ImportInfo {
+            raw_snippet: raw.to_string(),
+            is_wildcard: false,
+            identifier,
+            alias,
+        });
+    }
+}
+
+fn named_child_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| child.kind() == kind)
+}
+
+fn first_identifier_child(node: Node<'_>, source: &str) -> Option<String> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| matches!(child.kind(), "identifier" | "type_identifier"))
+        .map(|child| node_text(child, source).trim().to_string())
+        .filter(|text| !text.is_empty())
+}
+
+fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    source
+        .get(node.start_byte()..node.end_byte())
+        .unwrap_or_default()
+}
 
 pub(crate) fn parse_js_import_infos(raw: &str) -> Vec<ImportInfo> {
     let trimmed = raw.trim().trim_end_matches(';').trim();

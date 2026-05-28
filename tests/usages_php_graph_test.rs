@@ -275,6 +275,35 @@ function consume(): void {
 }
 
 #[test]
+fn php_graph_uses_parse_tree_for_commented_constructor_and_function_calls() {
+    let (_project, analyzer) = php_analyzer_with_files(&[
+        (
+            "Symbols.php",
+            r#"<?php
+namespace App;
+class Target {
+    public function __construct() {}
+}
+function helper(): void {}
+"#,
+        ),
+        (
+            "Consumer.php",
+            r#"<?php
+namespace App;
+function consume(): void {
+    new /* constructor target */ Target();
+    helper /* call target */ ();
+}
+"#,
+        ),
+    ]);
+
+    assert_eq!(1, graph_hits(&analyzer, "App.Target.__construct").len());
+    assert_eq!(1, graph_hits(&analyzer, "App.helper").len());
+}
+
+#[test]
 fn php_graph_ignores_unrelated_same_name_symbols_in_other_namespaces() {
     let (_project, analyzer) = php_analyzer_with_files(&[
         (

@@ -337,19 +337,21 @@ pub(super) fn is_type_reference_node(mut node: Node<'_>) -> bool {
     false
 }
 
-pub(super) fn argument_count(node: Node<'_>, source: &str) -> usize {
+pub(super) fn argument_count(node: Node<'_>, _source: &str) -> usize {
     let Some(arguments) = node
         .child_by_field_name("arguments")
         .or_else(|| first_named_child_of_kind(node, "argument_list"))
     else {
         return 0;
     };
-    let inner = node_text(arguments, source)
-        .trim()
-        .trim_start_matches('(')
-        .trim_end_matches(')')
-        .trim();
-    count_top_level_comma_separated(inner)
+    count_named_children_of_kind(arguments, "argument")
+}
+
+fn count_named_children_of_kind(node: Node<'_>, kind: &str) -> usize {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .filter(|child| child.kind() == kind)
+        .count()
 }
 
 fn count_top_level_comma_separated(text: &str) -> usize {

@@ -781,6 +781,46 @@ fn run() {
 }
 
 #[test]
+fn rust_graph_strategy_resolves_multiline_constructor_receiver() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/service.rs",
+            r#"
+pub struct Foo;
+impl Foo {
+    pub fn new() -> Foo { Foo }
+    pub fn bar(&self) {}
+}
+"#,
+        ),
+        (
+            "src/main.rs",
+            r#"
+use crate::service::Foo;
+
+fn run() {
+    let a = Foo::new(
+    );
+    a.bar();
+}
+"#,
+        ),
+    ]);
+
+    let target = member(&analyzer, &project.file("src/service.rs"), "Foo", "bar");
+    let hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &analyzer.get_analyzed_files().into_iter().collect(),
+            1000,
+        )
+        .into_either()
+        .expect("multiline constructor receiver success");
+    assert_eq!(1, hits.len());
+}
+
+#[test]
 fn rust_graph_strategy_resolves_associated_method_and_const_without_receiver_inference() {
     let (project, analyzer) = rust_analyzer_with_files(&[
         (
