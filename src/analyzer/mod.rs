@@ -18,7 +18,7 @@ pub mod persistence;
 mod php;
 mod project;
 mod python;
-mod rust_analyzer;
+mod rust;
 mod scala;
 mod source_content;
 pub(crate) mod symbol_lookup;
@@ -60,7 +60,7 @@ pub use project::{
     DEFAULT_MAX_OVERLAY_BYTES, FilesystemProject, OverlayProject, Project, TestProject,
 };
 pub use python::PythonAnalyzer;
-pub use rust_analyzer::RustAnalyzer;
+pub use rust::RustAnalyzer;
 pub use scala::ScalaAnalyzer;
 pub use source_content::SourceContent;
 pub use tree_sitter_analyzer::{LanguageAdapter, TreeSitterAnalyzer};
