@@ -22,8 +22,8 @@ After this work, the team should have an evidence-backed inventory of the import
 - [x] (2026-05-28 17:23Z) Audited Go usage graph mini parsers and replaced typed local receiver regex inference with tree-sitter `var_spec` traversal.
 - [x] (2026-05-28 17:35Z) Audited C++/C# usage graph and analyzer mini parsers and replaced comment-sensitive arity classification with tree-sitter argument/initializer node counting.
 - [x] (2026-05-28 17:47Z) Audited JS/TS usage graph and analyzer mini parsers and replaced ES import clause string parsing with tree-sitter import-node extraction.
-- [ ] Audit Scala and Java usage graph and analyzer mini parsers and classify each candidate as actionable now, follow-up issue, or intentionally text-based.
-- [ ] Summarize the follow-up issue set in `Outcomes & Retrospective` and close this epic only when every actionable cluster is tracked or intentionally deferred.
+- [x] (2026-05-28 17:56Z) Audited Scala/Java usage graph and analyzer mini parsers and replaced Scala typed-parameter receiver inference with tree-sitter `parameter` node extraction.
+- [x] (2026-05-28 17:56Z) Summarized the follow-up issue set in `Outcomes & Retrospective`; all audited language clusters are now implemented, tracked, or intentionally deferred.
 
 ## Surprises & Discoveries
 
@@ -59,6 +59,9 @@ After this work, the team should have an evidence-backed inventory of the import
 
 - Observation: JS/TS usage graph import/export extraction already uses tree-sitter, but analyzer import-info extraction still string-parsed ES import clauses.
   Evidence: `compute_import_binder` and `compute_export_index` walk `import_statement` and `export_statement` nodes; `JavascriptAnalyzer` and `TypescriptAnalyzer` previously called `parse_js_import_infos` for `import_statement` raw text. ES import clauses now use tree-sitter `import_clause`, `namespace_import`, `named_imports`, and `import_specifier` nodes. CommonJS `require(...)`, module specifier/path strings, analyzer signature rendering, JSX/test detection, and clone/test regexes remain intentionally text-based or follow-up-only.
+
+- Observation: Scala had a narrow actionable receiver-inference cleanup in function parameters, while Java's usage graph is already mostly node-driven.
+  Evidence: `src/analyzer/usages/scala_graph/extractor.rs` parsed `parameters` text with comma splitting and `split_once(':')`; tree-sitter Scala exposes direct `parameter` children with `name` and `type` fields. `src/analyzer/usages/java_graph/extractor.rs` already seeds parameters, variables, constructors, methods, and fields from tree-sitter nodes. Java static import strings, signature arity strings, type-name normalization, analyzer rendering, and import path logic are intentionally text-based or broader follow-up-only concerns.
 
 ## Decision Log
 
@@ -102,6 +105,10 @@ After this work, the team should have an evidence-backed inventory of the import
   Rationale: ES import binding shape is available directly from `import_statement` children. CommonJS assignment/destructuring and path resolution are broader string-semantics areas and should not be mixed into this small cleanup.
   Date/Author: 2026-05-28 / Codex.
 
+- Decision: Replace Scala typed-parameter receiver inference with tree-sitter `parameter` node extraction, and leave Java code unchanged in this milestone.
+  Rationale: Scala parameter names and types are direct node fields, so this removes a brittle comma/colon text parser without changing receiver-inference policy. Java's remaining string logic is static import/path/signature normalization or analyzer display behavior rather than a small duplicated syntax classification path.
+  Date/Author: 2026-05-28 / Codex.
+
 ## Outcomes & Retrospective
 
 Initial outcome 2026-05-28: This ExecPlan exists and defines the epic as a sequence of evidence-backed language audits. No Rust behavior has changed yet. The next useful milestone is the PHP audit because it can turn the issue's seed examples into concrete follow-up issues or a first small cleanup PR.
@@ -119,6 +126,10 @@ Go milestone outcome 2026-05-28: Go typed local receiver inference now walks tre
 C++/C# milestone outcome 2026-05-28: C# overload arity and C++ declaration constructor arity now count parsed argument/initializer nodes instead of scanning argument-list text. Comment-only constructor and method argument lists now stay zero-arity. Remaining C++ source-text fallback scans and analyzer display rendering are documented follow-up candidates rather than part of this cleanup.
 
 JS/TS milestone outcome 2026-05-28: JavaScript and TypeScript analyzer import-info extraction now reads ES import bindings from tree-sitter nodes instead of splitting import clause text. CommonJS `require(...)` parsing, module path resolution, signature rendering, JSX/test detection, and clone/test regexes remain text-based or follow-up-only. The focused JS/TS import and usage graph suites passed.
+
+Scala/Java milestone outcome 2026-05-28: Scala typed-parameter receiver inference now walks tree-sitter `parameters` and `parameter` nodes, reading `name` and `type` fields instead of splitting parameter-list text. The Scala cleanup preserves existing owner-visibility and shadowing policy while handling comments between `:` and the type. Java was audited and left unchanged because its usage graph already relies on tree-sitter for receiver/type/member syntax; static import strings, signature arity strings, type-name normalization, import paths, analyzer rendering, and test/clone heuristics remain intentionally text-based or broader follow-up-only areas.
+
+Epic outcome 2026-05-28: The implemented small cleanups are PHP parent-node classification, Python receiver fact collection, Rust receiver inference, Go typed `var_spec` inference, C++/C# parsed arity counting, JS/TS ES import parsing, and Scala typed-parameter receiver inference. Dedicated PHP follow-up issues `#154` and `#155` track the two concrete larger PHP clusters. Remaining non-PHP follow-up candidates recorded in this plan are Rust shadow/member/trait/visibility classification, C++ fallback scans and alias parsing, Scala qualifier/call-arity/value-binding text helpers, and CommonJS or import-path/rendering/test-smell string logic where tree-sitter replacement is not currently the right narrow cleanup.
 
 ## Context and Orientation
 
@@ -151,7 +162,7 @@ Milestone 5 is the C++ and C# audit. This milestone has completed its narrow cle
 
 Milestone 6 is the JS/TS audit. This milestone has completed its narrow cleanup: analyzer ES import clause extraction now uses tree-sitter `import_statement` nodes. The usage graph import/export binder was already node-based. Remaining JS/TS text work in CommonJS `require(...)`, module specifier/path resolution, analyzer signature rendering, JSX/test detection, and clone/test regexes is intentionally text-based or follow-up-only.
 
-Milestone 7 is the Scala and Java audit. Read `src/analyzer/usages/scala_graph`, `src/analyzer/usages/java_graph`, `src/analyzer/scala`, and `src/analyzer/java`. Scala has `src/analyzer/usages/scala_graph/syntax.rs`, so decide whether existing helpers should be strengthened rather than replaced. Java has mature tree-sitter declaration and import handling, so focus on residual source-prefix checks and avoid changing JVM cross-language behavior unless the cleanup is directly related. Validate with the focused Scala and Java usage graph tests.
+Milestone 7 is the Scala and Java audit. This milestone has completed its narrow cleanup: Scala typed-parameter receiver inference now reads tree-sitter `parameter` node `name` and `type` fields. Remaining Scala follow-up candidates are qualifier-before source scans, call-arity text parsing, value-binding text fallback parsing, constructor type-name text normalization, and Scala import group/path string parsing. Java remains unchanged because the usage graph already uses tree-sitter for the direct receiver/type/member syntax in scope; Java static import strings, signature arity strings, type-name normalization, import path logic, analyzer rendering, and test/clone heuristics are intentionally text-based or broader follow-up-only areas.
 
 When a candidate becomes a follow-up issue, include the language, affected files, the brittle text operation, a short example of syntax it is trying to classify, the suggested tree-sitter replacement direction, and the focused test command. If using `gh issue create`, do it only after the audit has enough concrete evidence.
 

@@ -1250,6 +1250,42 @@ class Other
 }
 
 #[test]
+fn scala_graph_resolves_commented_typed_parameter_receiver() {
+    let consumer_source = r#"
+package app
+
+import pkg.Target
+
+class Consumer {
+  def call(target: /* receiver type */ Target): Int = target.run()
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "pkg/Target.scala",
+            r#"
+package pkg
+
+class Target {
+  def run(): Int = 1
+}
+"#,
+        ),
+        ("app/Consumer.scala", consumer_source),
+    ]);
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let run = definition(&analyzer, "pkg.Target.run");
+    let run_hits = hits(ScalaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&run),
+        &candidates,
+        1000,
+    ));
+
+    assert_hit_line(&run_hits, line_of(consumer_source, "target.run()"));
+}
+
+#[test]
 fn scala_graph_enforces_max_usages_limit() {
     let (_project, analyzer) = scala_analyzer_with_files(&[
         (
