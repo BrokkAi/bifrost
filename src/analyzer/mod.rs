@@ -15,11 +15,11 @@ mod js_ts;
 mod model;
 mod multi_analyzer;
 pub mod persistence;
-mod php_analyzer;
+mod php;
 mod project;
 mod python;
 mod rust_analyzer;
-mod scala_analyzer;
+mod scala;
 mod source_content;
 pub(crate) mod symbol_lookup;
 pub(crate) mod tree_sitter_analyzer;
@@ -52,7 +52,7 @@ pub use model::{
     metrics_from_declarations,
 };
 pub use multi_analyzer::{AnalyzerDelegate, MultiAnalyzer};
-pub use php_analyzer::{
+pub use php::{
     PhpAnalyzer, PhpUseAliases, parse_php_use_aliases, parse_php_use_aliases_by_kind,
     parse_php_use_aliases_from_source, php_namespace_to_fq,
 };
@@ -61,7 +61,7 @@ pub use project::{
 };
 pub use python::PythonAnalyzer;
 pub use rust_analyzer::RustAnalyzer;
-pub use scala_analyzer::ScalaAnalyzer;
+pub use scala::ScalaAnalyzer;
 pub use source_content::SourceContent;
 pub use tree_sitter_analyzer::{LanguageAdapter, TreeSitterAnalyzer};
 pub use typescript::TypescriptAnalyzer;
