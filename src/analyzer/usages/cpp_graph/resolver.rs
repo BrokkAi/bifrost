@@ -388,33 +388,43 @@ pub(super) fn declaration_mentions_type(
         .resolves_to_type(ctx.file, node_text(type_node, ctx.source), owner)
 }
 
-pub(super) fn declaration_constructor_arity(node: Node<'_>, ctx: &ScanCtx<'_>) -> usize {
-    let Some(type_node) = node.child_by_field_name("type") else {
-        return 0;
-    };
-    let declaration = node_text(node, ctx.source);
-    let type_text = node_text(type_node, ctx.source);
-    let Some(after_type) = declaration.split_once(type_text).map(|(_, rest)| rest) else {
-        return 0;
-    };
-    let after_type = after_type.trim();
-    if after_type.contains('=') {
-        return 1;
+pub(super) fn declaration_constructor_arity(node: Node<'_>, _ctx: &ScanCtx<'_>) -> usize {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "init_declarator" {
+            return child
+                .child_by_field_name("value")
+                .map(declaration_init_value_arity)
+                .unwrap_or(0);
+        }
+        if is_declarator_node(child) {
+            return declaration_declarator_arity(child);
+        }
     }
-    let Some(open_index) = after_type.find(['(', '{']) else {
-        return 0;
-    };
-    let opener = after_type.as_bytes()[open_index] as char;
-    let closer = if opener == '(' { ')' } else { '}' };
-    let Some(close_index) = after_type[open_index + 1..].find(closer) else {
-        return 0;
-    };
-    let inner = after_type[open_index + 1..open_index + 1 + close_index].trim();
-    if inner.is_empty() {
-        0
-    } else {
-        split_top_level_commas(inner).count()
+    0
+}
+
+fn declaration_init_value_arity(value: Node<'_>) -> usize {
+    match value.kind() {
+        "argument_list" | "initializer_list" => count_non_comment_named_children(value),
+        _ => 1,
     }
+}
+
+fn declaration_declarator_arity(node: Node<'_>) -> usize {
+    if let Some(parameters) = node.child_by_field_name("parameters") {
+        return count_non_comment_named_children(parameters);
+    }
+    node.child_by_field_name("declarator")
+        .map(declaration_declarator_arity)
+        .unwrap_or(0)
+}
+
+fn count_non_comment_named_children(node: Node<'_>) -> usize {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .filter(|child| child.kind() != "comment")
+        .count()
 }
 
 pub(super) fn split_top_level_commas(value: &str) -> impl Iterator<Item = &str> {

@@ -406,10 +406,12 @@ namespace App {
     public class Consumer {
         public void Execute(Target target) {
             var first = new Target();
+            var commented = new Target(/* constructor comment */);
             var second = new Target("named");
             Target.Create();
             Target.Create("named");
             target.Run();
+            target.Run(/* method comment */);
             target.Run(1);
         }
     }
@@ -425,11 +427,11 @@ namespace App {
     let run_zero = member_function_with_arity(&analyzer, "Domain.Target", "Run", 0);
     let run_one = member_function_with_arity(&analyzer, "Domain.Target", "Run", 1);
 
-    assert_eq!(1, graph_hits(&analyzer, &ctor_zero).len());
+    assert_eq!(2, graph_hits(&analyzer, &ctor_zero).len());
     assert_eq!(1, graph_hits(&analyzer, &ctor_one).len());
     assert_eq!(1, graph_hits(&analyzer, &create_zero).len());
     assert_eq!(1, graph_hits(&analyzer, &create_one).len());
-    assert_eq!(1, graph_hits(&analyzer, &run_zero).len());
+    assert_eq!(2, graph_hits(&analyzer, &run_zero).len());
     assert_eq!(1, graph_hits(&analyzer, &run_one).len());
 }
 

@@ -837,6 +837,8 @@ struct Target {
 void call() {
     Target stack;
     Target braced{};
+    Target commented_paren(/* constructor comment */);
+    Target commented_brace{/* constructor comment */};
     Target paren(1);
     auto direct = Target{1};
     auto heap0 = new Target;
@@ -852,6 +854,8 @@ void call() {
     let zero_hits = usage_hits(&analyzer, &zero_arg);
     assert_hit_contains(&zero_hits, "consumer.cpp", "Target stack");
     assert_hit_contains(&zero_hits, "consumer.cpp", "Target braced{}");
+    assert_hit_contains(&zero_hits, "consumer.cpp", "Target commented_paren");
+    assert_hit_contains(&zero_hits, "consumer.cpp", "Target commented_brace");
     assert_hit_contains(&zero_hits, "consumer.cpp", "new Target");
     assert_no_hit_contains(&zero_hits, "Target paren(1)");
     assert_no_hit_contains(&zero_hits, "Target{1}");
@@ -863,6 +867,8 @@ void call() {
     assert_hit_contains(&one_hits, "consumer.cpp", "new Target(1)");
     assert_no_hit_contains(&one_hits, "Target stack");
     assert_no_hit_contains(&one_hits, "Target braced{}");
+    assert_no_hit_contains(&one_hits, "Target commented_paren");
+    assert_no_hit_contains(&one_hits, "Target commented_brace");
 }
 
 #[test]
