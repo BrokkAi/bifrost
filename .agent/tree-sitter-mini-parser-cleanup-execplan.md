@@ -21,7 +21,7 @@ After this work, the team should have an evidence-backed inventory of the import
 - [x] (2026-05-28 17:18Z) Audited Rust usage graph mini parsers and replaced receiver-inference regexes with tree-sitter traversal.
 - [x] (2026-05-28 17:23Z) Audited Go usage graph mini parsers and replaced typed local receiver regex inference with tree-sitter `var_spec` traversal.
 - [x] (2026-05-28 17:35Z) Audited C++/C# usage graph and analyzer mini parsers and replaced comment-sensitive arity classification with tree-sitter argument/initializer node counting.
-- [ ] Audit JS/TS usage graph and analyzer mini parsers and classify each candidate as actionable now, follow-up issue, or intentionally text-based.
+- [x] (2026-05-28 17:47Z) Audited JS/TS usage graph and analyzer mini parsers and replaced ES import clause string parsing with tree-sitter import-node extraction.
 - [ ] Audit Scala and Java usage graph and analyzer mini parsers and classify each candidate as actionable now, follow-up issue, or intentionally text-based.
 - [ ] Summarize the follow-up issue set in `Outcomes & Retrospective` and close this epic only when every actionable cluster is tracked or intentionally deferred.
 
@@ -56,6 +56,9 @@ After this work, the team should have an evidence-backed inventory of the import
 
 - Observation: C++/C# had a small actionable arity cleanup, but most remaining text paths are broader fallback or rendering behavior.
   Evidence: C# `argument_list` exposes direct `argument` children, and C++ declaration `init_declarator` values expose `argument_list` or `initializer_list` nodes. C++ text constructor/operator/member fallback scans, textual owner context, alias statement fallback parsing, and analyzer signature rendering need dedicated follow-up work if they are replaced. C# declaration literal/signature rendering and using/import string parsing are intentionally text-based.
+
+- Observation: JS/TS usage graph import/export extraction already uses tree-sitter, but analyzer import-info extraction still string-parsed ES import clauses.
+  Evidence: `compute_import_binder` and `compute_export_index` walk `import_statement` and `export_statement` nodes; `JavascriptAnalyzer` and `TypescriptAnalyzer` previously called `parse_js_import_infos` for `import_statement` raw text. ES import clauses now use tree-sitter `import_clause`, `namespace_import`, `named_imports`, and `import_specifier` nodes. CommonJS `require(...)`, module specifier/path strings, analyzer signature rendering, JSX/test detection, and clone/test regexes remain intentionally text-based or follow-up-only.
 
 ## Decision Log
 
@@ -95,6 +98,10 @@ After this work, the team should have an evidence-backed inventory of the import
   Rationale: Comment-only argument lists are direct syntax facts and safe to classify from tree-sitter nodes. The remaining C++ fallback scans and analyzer rendering paths affect hit recovery, symbol spelling, and display output and should not be folded into this narrow cleanup.
   Date/Author: 2026-05-28 / Codex.
 
+- Decision: Replace analyzer ES import clause parsing with tree-sitter node extraction, but leave CommonJS `require(...)` and import path strings on existing text logic.
+  Rationale: ES import binding shape is available directly from `import_statement` children. CommonJS assignment/destructuring and path resolution are broader string-semantics areas and should not be mixed into this small cleanup.
+  Date/Author: 2026-05-28 / Codex.
+
 ## Outcomes & Retrospective
 
 Initial outcome 2026-05-28: This ExecPlan exists and defines the epic as a sequence of evidence-backed language audits. No Rust behavior has changed yet. The next useful milestone is the PHP audit because it can turn the issue's seed examples into concrete follow-up issues or a first small cleanup PR.
@@ -110,6 +117,8 @@ Rust milestone outcome 2026-05-28: Rust member receiver inference now parses sou
 Go milestone outcome 2026-05-28: Go typed local receiver inference now walks tree-sitter `var_spec` nodes, including grouped and multiline declarations, instead of scanning declaration text with `VAR_TYPED_LIST_RE`. Import-path parsing and analyzer signature/source rendering remain intentionally text-based. The focused Go usage graph test suite passed, including a regression for multiline names with an inline comment before the receiver type.
 
 C++/C# milestone outcome 2026-05-28: C# overload arity and C++ declaration constructor arity now count parsed argument/initializer nodes instead of scanning argument-list text. Comment-only constructor and method argument lists now stay zero-arity. Remaining C++ source-text fallback scans and analyzer display rendering are documented follow-up candidates rather than part of this cleanup.
+
+JS/TS milestone outcome 2026-05-28: JavaScript and TypeScript analyzer import-info extraction now reads ES import bindings from tree-sitter nodes instead of splitting import clause text. CommonJS `require(...)` parsing, module path resolution, signature rendering, JSX/test detection, and clone/test regexes remain text-based or follow-up-only. The focused JS/TS import and usage graph suites passed.
 
 ## Context and Orientation
 
@@ -140,7 +149,7 @@ Milestone 4 is the Go audit. This milestone has completed its cleanup: `VAR_TYPE
 
 Milestone 5 is the C++ and C# audit. This milestone has completed its narrow cleanup: C# argument counting and C++ declaration constructor arity now use tree-sitter argument/initializer nodes. Remaining C++ follow-up candidates are text constructor/operator/member fallback scans, textual owner context, alias statement fallback parsing, and analyzer signature rendering. C# declaration signature/literal rendering and using/import string parsing remain intentionally text-based.
 
-Milestone 6 is the JS/TS audit. Read `src/analyzer/usages/js_ts_graph/extractor.rs`, `src/analyzer/usages/js_ts_graph/resolver.rs`, `src/analyzer/javascript/mod.rs`, `src/analyzer/typescript/mod.rs`, and `src/analyzer/js_ts/imports.rs`. JS/TS has legitimate source rendering and import-specifier string work; do not classify that as cleanup by default. Focus on any source split or prefix check that decides whether syntax is a function, import, export, alias, or assignment when tree-sitter node kinds already encode it. Validate with `cargo test --test usages_js_ts_graph_test` and matching JS/TS analyzer tests if analyzer files change.
+Milestone 6 is the JS/TS audit. This milestone has completed its narrow cleanup: analyzer ES import clause extraction now uses tree-sitter `import_statement` nodes. The usage graph import/export binder was already node-based. Remaining JS/TS text work in CommonJS `require(...)`, module specifier/path resolution, analyzer signature rendering, JSX/test detection, and clone/test regexes is intentionally text-based or follow-up-only.
 
 Milestone 7 is the Scala and Java audit. Read `src/analyzer/usages/scala_graph`, `src/analyzer/usages/java_graph`, `src/analyzer/scala`, and `src/analyzer/java`. Scala has `src/analyzer/usages/scala_graph/syntax.rs`, so decide whether existing helpers should be strengthened rather than replaced. Java has mature tree-sitter declaration and import handling, so focus on residual source-prefix checks and avoid changing JVM cross-language behavior unless the cleanup is directly related. Validate with the focused Scala and Java usage graph tests.
 
@@ -250,6 +259,15 @@ C++/C# cleanup validation:
     cargo test --test usages_cpp_graph_test
     test result: ok. 25 passed; 0 failed; 0 ignored
 
+JS/TS cleanup validation:
+
+    cargo test --test javascript_import_test
+    test result: ok. 6 passed; 0 failed; 0 ignored
+    cargo test --test typescript_import_test
+    test result: ok. 3 passed; 0 failed; 0 ignored
+    cargo test --test usages_js_ts_graph_test
+    test result: ok. 23 passed; 0 failed; 3 ignored
+
 ## Interfaces and Dependencies
 
 This plan does not require a public API change. Future cleanup issues should prefer private helper functions inside the language module being changed. A helper should accept `tree_sitter::Node` when it needs syntax structure and should accept `&str` source only when it needs exact source text for byte ranges, rendered snippets, or names that tree-sitter stores only as source spans.
@@ -269,3 +287,5 @@ Revision note 2026-05-28: Recorded the Rust receiver-inference cleanup, its vali
 Revision note 2026-05-28: Recorded the Go typed local receiver cleanup, its validation result, and the decision to keep Go import-path and declaration rendering text-based.
 
 Revision note 2026-05-28: Recorded the C++/C# arity cleanup and the remaining C++ source-text fallback follow-up candidates.
+
+Revision note 2026-05-28: Recorded the JS/TS ES import-node cleanup and the decision to keep CommonJS, path, signature, JSX/test, and clone/test text handling out of this pass.

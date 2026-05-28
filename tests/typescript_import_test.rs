@@ -134,8 +134,18 @@ fn test_resolve_imports_relevant_imports_and_could_import_file() {
     write_file(root, "mod2.ts", "export const otherVal: number = 200;\n");
     write_file(
         root,
+        "mod3.ts",
+        "export type Foo = { id: string };\nexport const Bar: number = 1;\n",
+    );
+    write_file(
+        root,
         "mixed.ts",
         "import { val } from './mod1';\nconst { otherVal } = require('./mod2');\n",
+    );
+    write_file(
+        root,
+        "typed_alias_import.ts",
+        "import { type Foo, Bar as Baz } from './mod3';\ntype Local = Foo;\nBaz;\n",
     );
     write_file(
         root,
@@ -289,6 +299,20 @@ fn test_resolve_imports_relevant_imports_and_could_import_file() {
         mixed_imports
             .iter()
             .any(|code_unit| code_unit.identifier().ends_with("otherVal"))
+    );
+    let typed_alias_imports = analyzer.imported_code_units_of(&ProjectFile::new(
+        root.to_path_buf(),
+        "typed_alias_import.ts",
+    ));
+    assert!(
+        typed_alias_imports
+            .iter()
+            .any(|code_unit| code_unit.identifier() == "Foo")
+    );
+    assert!(
+        typed_alias_imports
+            .iter()
+            .any(|code_unit| code_unit.identifier() == "Bar")
     );
     assert!(
         analyzer
