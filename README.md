@@ -78,33 +78,33 @@ Run it against a project root:
 ./target/debug/bifrost --root /path/to/project --server searchtools
 ```
 
-Additional MCP modes expose subsets of the tool surface:
+`--server` accepts ordered compositions of toolsets separated by `|`:
+
+- `searchtools` expands to all toolsets in the canonical order `symbol|workspace|extended|text|slopcop`
+- `core` expands to `symbol|workspace`
+- `slopcop` stays available as its own set
+
+Examples:
 
 ```bash
 ./target/debug/bifrost --root /path/to/project --server core
+./target/debug/bifrost --root /path/to/project --server "symbol|workspace"
 ./target/debug/bifrost --root /path/to/project --server extended
+./target/debug/bifrost --root /path/to/project --server "text|extended"
 ./target/debug/bifrost --root /path/to/project --server slopcop
 ```
 
-`searchtools` remains the compatibility mode and exposes the full current union of MCP tools. Pass `--no-line-numbers` to remove rendered line and line-range prefixes from the MCP text preview while keeping `structuredContent` unchanged.
+`searchtools` remains the compatibility mode and exposes the full current union of MCP tools in toolset order. Pass `--no-line-numbers` to remove rendered line and line-range prefixes from the MCP text preview while keeping `structuredContent` unchanged.
 
 This starts a stdio MCP server that publishes these tools:
 
-- `refresh`
-- `activate_workspace`
-- `get_active_workspace`
-- `search_symbols`
-- `get_symbol_locations`
-- `get_symbol_sources`
-- `get_summaries`
-- `list_symbols`
-- `most_relevant_files`
+- `symbol`: `search_symbols`, `get_symbol_locations`, `get_symbol_sources`, `get_summaries`, `list_symbols`, `scan_usages`
+- `workspace`: `refresh`, `activate_workspace`, `get_active_workspace`
+- `extended`: `find_filenames`, `list_files`, `most_relevant_files`, `search_git_commit_messages`, `get_git_log`, `get_commit_diff`, `jq`, `xml_skim`, `xml_select`
+- `text`: `get_file_contents`, `search_file_contents`, `find_files_containing`
+- `slopcop`: `compute_cyclomatic_complexity`, `compute_cognitive_complexity`, `report_comment_density_for_code_unit`, `report_exception_handling_smells`, `report_comment_density_for_files`, `analyze_git_hotspots`, `report_test_assertion_smells`, `report_structural_clone_smells`, `report_long_method_and_god_object_smells`, `report_dead_code_and_unused_abstraction_smells`, `report_secret_like_code`
 
-The subset servers publish:
-
-- `core`: the original analyzer/search navigation tools, excluding the higher-context relevance-ranking helpers
-- `extended`: file, grep-like, relevance-ranking, git, and jq/XML tools added on `2026-05-29`
-- `slopcop`: hotspot, complexity, comment-density, and smell-detection tools added after `2026-05-15`
+The subset toolsets are now composable rather than fixed server modes. `core` is the `symbol|workspace` alias, and `searchtools` is the alias for the full union.
 
 `activate_workspace` lets a host swap the analyzer's root mid-session without respawning the subprocess. The path must be absolute and is normalized to the nearest enclosing git root when one exists.
 

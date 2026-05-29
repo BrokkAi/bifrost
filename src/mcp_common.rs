@@ -2,6 +2,7 @@ use crate::{
     SearchToolsService, SearchToolsServiceErrorCode, ToolOutput, searchtools_render::RenderOptions,
 };
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
@@ -29,10 +30,30 @@ impl Default for McpRenderOptions {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct McpServerSpec {
     pub instructions: &'static str,
-    pub tool_names: &'static [&'static str],
-    pub tool_descriptors: fn() -> Vec<Value>,
+    pub tool_names: HashSet<String>,
+    pub tool_descriptors: Vec<Value>,
+}
+
+pub fn build_server_spec(
+    instructions: &'static str,
+    tool_descriptors: Vec<Value>,
+) -> Result<McpServerSpec, String> {
+    let mut tool_names = HashSet::with_capacity(tool_descriptors.len());
+    for descriptor in &tool_descriptors {
+        let Some(name) = descriptor.get("name").and_then(Value::as_str) else {
+            return Err("tool descriptor missing string name".to_string());
+        };
+        tool_names.insert(name.to_string());
+    }
+
+    Ok(McpServerSpec {
+        instructions,
+        tool_names,
+        tool_descriptors,
+    })
 }
 
 pub fn run_stdio_server(
@@ -172,7 +193,7 @@ fn initialize_result(instructions: &str) -> Value {
 
 fn list_tools_result(spec: &McpServerSpec) -> Value {
     json!({
-        "tools": (spec.tool_descriptors)(),
+        "tools": &spec.tool_descriptors,
     })
 }
 
@@ -193,7 +214,7 @@ fn handle_tool_call(
         return Err((INVALID_PARAMS, "tools/call params missing name".to_string()));
     };
 
-    if !spec.tool_names.contains(&name) {
+    if !spec.tool_names.contains(name) {
         return Ok(tool_error_result(format!("Unknown tool: {name}")));
     }
 

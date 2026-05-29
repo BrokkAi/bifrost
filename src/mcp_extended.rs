@@ -1,14 +1,9 @@
-use crate::mcp_common::{
-    McpRenderOptions, McpServerSpec, SEARCHTOOLS_INSTRUCTIONS, run_stdio_server, tool_descriptor,
-};
+use crate::mcp_common::{McpRenderOptions, run_stdio_server, tool_descriptor};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
 pub const EXTENDED_TOOL_NAMES: &[&str] = &[
-    "get_file_contents",
     "find_filenames",
-    "find_files_containing",
-    "search_file_contents",
     "list_files",
     "most_relevant_files",
     "search_git_commit_messages",
@@ -19,36 +14,16 @@ pub const EXTENDED_TOOL_NAMES: &[&str] = &[
     "xml_select",
 ];
 
-const EXTENDED_SPEC: McpServerSpec = McpServerSpec {
-    instructions: SEARCHTOOLS_INSTRUCTIONS,
-    tool_names: EXTENDED_TOOL_NAMES,
-    tool_descriptors: extended_tool_descriptors,
-};
-
 pub fn run_extended_stdio_server(
     root: PathBuf,
     render_options: McpRenderOptions,
 ) -> Result<(), String> {
-    run_stdio_server(root, render_options, &EXTENDED_SPEC)
+    let spec = crate::mcp_registry::resolve_server_spec("extended")?;
+    run_stdio_server(root, render_options, &spec)
 }
 
 pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
     vec![
-        tool_descriptor(
-            "get_file_contents",
-            "Return the raw text contents of one or more files in the workspace, given project-relative paths or absolute paths inside the active workspace.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "file_paths": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Project-relative paths of files to read, or absolute paths inside the active workspace."
-                    }
-                },
-                "required": ["file_paths"]
-            }),
-        ),
         tool_descriptor(
             "find_filenames",
             "Find files in the workspace whose path matches any of the given glob patterns. Patterns without '/' match against the file basename; patterns with '/' match against the full project-relative path. Absolute patterns inside the active workspace are converted to project-relative patterns before matching.",
@@ -65,62 +40,6 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "default": 100,
                         "minimum": 1,
                         "description": "Maximum number of matching files to return."
-                    }
-                },
-                "required": ["patterns"]
-            }),
-        ),
-        tool_descriptor(
-            "find_files_containing",
-            "Find files whose contents match any of the given regular expressions. Binary files and files outside the workspace's gitignore-respecting walk are skipped.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "patterns": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Regular expressions to match against file contents."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "default": 50,
-                        "minimum": 1,
-                        "description": "Maximum number of matching files to return."
-                    },
-                    "case_insensitive": {
-                        "type": "boolean",
-                        "default": false,
-                        "description": "Whether to ignore case when matching."
-                    }
-                },
-                "required": ["patterns"]
-            }),
-        ),
-        tool_descriptor(
-            "search_file_contents",
-            "Search file contents with regular expressions, returning matching lines with surrounding context. Optionally restrict the search to files matching a glob or absolute glob inside the active workspace.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "patterns": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Regular expressions to search for in file contents."
-                    },
-                    "file_path": {
-                        "type": "string",
-                        "description": "Optional glob to restrict the search to matching paths, or an absolute path/glob inside the active workspace."
-                    },
-                    "context_lines": {
-                        "type": "integer",
-                        "default": 2,
-                        "minimum": 0,
-                        "description": "Number of context lines to include before and after each match."
-                    },
-                    "case_insensitive": {
-                        "type": "boolean",
-                        "default": false,
-                        "description": "Whether to ignore case when matching."
                     }
                 },
                 "required": ["patterns"]

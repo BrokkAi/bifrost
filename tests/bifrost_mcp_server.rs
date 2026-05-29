@@ -101,54 +101,42 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     let tools = list_tools["result"]["tools"]
         .as_array()
         .expect("tools array");
-    assert!(tools.iter().any(|tool| tool["name"] == "search_symbols"));
-    assert!(tools.iter().any(|tool| tool["name"] == "get_summaries"));
-    assert!(
-        !tools
-            .iter()
-            .any(|tool| tool["name"] == "get_file_summaries")
-    );
-    assert!(tools.iter().any(|tool| tool["name"] == "list_symbols"));
-    assert!(
-        tools
-            .iter()
-            .any(|tool| tool["name"] == "most_relevant_files")
-    );
-    assert!(tools.iter().any(|tool| tool["name"] == "scan_usages"));
-    assert!(
-        tools
-            .iter()
-            .any(|tool| tool["name"] == "compute_cyclomatic_complexity")
-    );
-    assert!(
-        tools
-            .iter()
-            .any(|tool| tool["name"] == "compute_cognitive_complexity")
-    );
-    assert!(
-        tools
-            .iter()
-            .any(|tool| tool["name"] == "analyze_git_hotspots")
-    );
-    assert!(
-        tools
-            .iter()
-            .any(|tool| tool["name"] == "report_test_assertion_smells")
-    );
-    assert!(
-        tools
-            .iter()
-            .any(|tool| tool["name"] == "report_structural_clone_smells")
-    );
-    assert!(
-        tools
-            .iter()
-            .any(|tool| tool["name"] == "report_dead_code_and_unused_abstraction_smells")
-    );
-    assert!(
-        tools
-            .iter()
-            .any(|tool| tool["name"] == "report_secret_like_code")
+    assert_eq!(
+        tool_names(tools),
+        vec![
+            "search_symbols",
+            "get_symbol_locations",
+            "get_symbol_sources",
+            "get_summaries",
+            "list_symbols",
+            "scan_usages",
+            "refresh",
+            "activate_workspace",
+            "get_active_workspace",
+            "find_filenames",
+            "list_files",
+            "most_relevant_files",
+            "search_git_commit_messages",
+            "get_git_log",
+            "get_commit_diff",
+            "jq",
+            "xml_skim",
+            "xml_select",
+            "get_file_contents",
+            "search_file_contents",
+            "find_files_containing",
+            "compute_cyclomatic_complexity",
+            "compute_cognitive_complexity",
+            "report_comment_density_for_code_unit",
+            "report_exception_handling_smells",
+            "report_comment_density_for_files",
+            "analyze_git_hotspots",
+            "report_test_assertion_smells",
+            "report_structural_clone_smells",
+            "report_long_method_and_god_object_smells",
+            "report_dead_code_and_unused_abstraction_smells",
+            "report_secret_like_code",
+        ]
     );
 
     let ping = round_trip(
@@ -461,34 +449,70 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
         .join("fixtures")
         .join("testcode-java");
 
-    assert_server_tools(
+    assert_server_tool_names(
         &fixture_root,
         "core",
         &[
+            "search_symbols",
+            "get_symbol_locations",
+            "get_symbol_sources",
+            "get_summaries",
+            "list_symbols",
+            "scan_usages",
             "refresh",
             "activate_workspace",
-            "get_summaries",
-            "scan_usages",
-        ],
-        &[
-            "get_file_contents",
-            "most_relevant_files",
-            "report_secret_like_code",
+            "get_active_workspace",
         ],
     );
-    assert_server_tools(
+    assert_server_tool_names(
         &fixture_root,
-        "extended",
-        &["get_file_contents", "find_filenames", "most_relevant_files"],
+        "workspace|symbol",
         &[
             "refresh",
+            "activate_workspace",
+            "get_active_workspace",
+            "search_symbols",
+            "get_symbol_locations",
+            "get_symbol_sources",
             "get_summaries",
-            "compute_cyclomatic_complexity",
-            "report_comment_density_for_files",
-            "report_secret_like_code",
+            "list_symbols",
+            "scan_usages",
         ],
     );
-    assert_server_tools(
+    assert_server_tool_names(
+        &fixture_root,
+        "text|extended",
+        &[
+            "get_file_contents",
+            "search_file_contents",
+            "find_files_containing",
+            "find_filenames",
+            "list_files",
+            "most_relevant_files",
+            "search_git_commit_messages",
+            "get_git_log",
+            "get_commit_diff",
+            "jq",
+            "xml_skim",
+            "xml_select",
+        ],
+    );
+    assert_server_tool_names(
+        &fixture_root,
+        "extended",
+        &[
+            "find_filenames",
+            "list_files",
+            "most_relevant_files",
+            "search_git_commit_messages",
+            "get_git_log",
+            "get_commit_diff",
+            "jq",
+            "xml_skim",
+            "xml_select",
+        ],
+    );
+    assert_server_tool_names(
         &fixture_root,
         "slopcop",
         &[
@@ -499,9 +523,11 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
             "report_comment_density_for_files",
             "analyze_git_hotspots",
             "report_test_assertion_smells",
+            "report_structural_clone_smells",
+            "report_long_method_and_god_object_smells",
+            "report_dead_code_and_unused_abstraction_smells",
             "report_secret_like_code",
         ],
-        &["refresh", "get_file_contents", "get_summaries"],
     );
 }
 
@@ -977,7 +1003,7 @@ fn bifrost_mcp_absolute_paths_follow_activated_workspace() {
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");
 }
 
-fn assert_server_tools(root: &std::path::Path, mode: &str, expected: &[&str], unexpected: &[&str]) {
+fn assert_server_tool_names(root: &std::path::Path, mode: &str, expected: &[&str]) {
     let mut child = spawn_server(root, mode, &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
@@ -995,22 +1021,22 @@ fn assert_server_tools(root: &std::path::Path, mode: &str, expected: &[&str], un
     let tools = list_tools["result"]["tools"]
         .as_array()
         .expect("tools array");
-    for name in expected {
-        assert!(
-            tools.iter().any(|tool| tool["name"] == *name),
-            "mode {mode} missing tool {name}: {list_tools}"
-        );
-    }
-    for name in unexpected {
-        assert!(
-            !tools.iter().any(|tool| tool["name"] == *name),
-            "mode {mode} unexpectedly exposed tool {name}: {list_tools}"
-        );
-    }
+    assert_eq!(
+        tool_names(tools),
+        expected,
+        "mode {mode} published unexpected tools"
+    );
 
     drop(stdin);
     let status = child.wait().expect("wait bifrost");
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+fn tool_names(tools: &[Value]) -> Vec<&str> {
+    tools
+        .iter()
+        .map(|tool| tool["name"].as_str().expect("tool name"))
+        .collect()
 }
 
 fn assert_unknown_tool(root: &std::path::Path, mode: &str, tool_name: &str, arguments: Value) {

@@ -1,6 +1,5 @@
 use crate::mcp_common::{
-    McpRenderOptions, McpServerSpec, SEARCHTOOLS_INSTRUCTIONS, WeightThreshold, run_stdio_server,
-    tool_descriptor, weight_knob_descriptor,
+    McpRenderOptions, WeightThreshold, run_stdio_server, tool_descriptor, weight_knob_descriptor,
 };
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -19,17 +18,12 @@ pub const SLOPCOP_TOOL_NAMES: &[&str] = &[
     "report_secret_like_code",
 ];
 
-const SLOPCOP_SPEC: McpServerSpec = McpServerSpec {
-    instructions: SEARCHTOOLS_INSTRUCTIONS,
-    tool_names: SLOPCOP_TOOL_NAMES,
-    tool_descriptors: slopcop_tool_descriptors,
-};
-
 pub fn run_slopcop_stdio_server(
     root: PathBuf,
     render_options: McpRenderOptions,
 ) -> Result<(), String> {
-    run_stdio_server(root, render_options, &SLOPCOP_SPEC)
+    let spec = crate::mcp_registry::resolve_server_spec("slopcop")?;
+    run_stdio_server(root, render_options, &spec)
 }
 
 pub(crate) fn slopcop_tool_descriptors() -> Vec<Value> {
