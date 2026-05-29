@@ -528,6 +528,9 @@ class Target {
     this.run()
     field + run()
   }
+  class Inner {
+    def callOuter(): Int = Target.this.run()
+  }
 }
 
 class Other {
@@ -537,6 +540,9 @@ class Other {
     this.field = 4
     this.run()
     field + run()
+  }
+  class Inner {
+    def callOuter(): Int = Other.this.run()
   }
 }
 "#;
@@ -555,6 +561,8 @@ class Other {
     let run_hits =
         hits(strategy.find_usages(&analyzer, std::slice::from_ref(&run), &candidates, 1000));
     assert_hit_line(&run_hits, line_of(target_source, "this.run()"));
+    assert_hit_line(&run_hits, line_of(target_source, "Target.this.run()"));
+    assert_no_hit_line(&run_hits, line_of(target_source, "Other.this.run()"));
     assert_no_hit_in_enclosing(&run_hits, "pkg.Other.call");
 }
 

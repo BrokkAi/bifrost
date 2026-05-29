@@ -3,8 +3,9 @@ use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::usages::scala_graph::hits::add_hit;
 use crate::analyzer::usages::scala_graph::resolver::{TargetKind, TargetSpec, Visibility};
 use crate::analyzer::usages::scala_graph::syntax::{
-    call_arity_for_reference, has_ancestor_kind, is_assignment_lhs, is_constructor_like_reference,
-    is_identifier_node, is_type_like_reference, member_qualifier, node_text,
+    call_arity_for_reference, has_ancestor_kind, has_member_qualifier, is_assignment_lhs,
+    is_constructor_like_reference, is_identifier_node, is_owner_qualified_this,
+    is_type_like_reference, member_qualifier, member_qualifier_node, node_text,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range, ScalaAnalyzer};
 use crate::hash::HashMap;
@@ -403,7 +404,7 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if proven {
         add_hit(node, ctx);
     }
-    if is_simple_assignment_lhs(node) && !ctx.bindings.resolve_symbol(text).is_unknown() {
+    if is_assignment_lhs(node) && !ctx.bindings.resolve_symbol(text).is_unknown() {
         ctx.bindings.declare_shadow(text.to_string());
     }
 }
@@ -456,21 +457,27 @@ fn member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> 
             .is_some_and(|qualifier| qualifier == ctx.spec.target.package_name());
     }
 
-    let Some(qualifier) = member_qualifier(node, ctx.source) else {
+    let Some(qualifier_node) = member_qualifier_node(node) else {
         return !is_locally_shadowed(ctx, text)
             && enclosing_matches_owner(node, ctx)
             && member_call_arity_matches(node, ctx);
     };
+    if is_owner_qualified_this(qualifier_node, ctx.source) {
+        return enclosing_matches_owner(node, ctx) && member_call_arity_matches(node, ctx);
+    }
+    let qualifier = node_text(qualifier_node, ctx.source)
+        .trim()
+        .trim_end_matches('$');
     if qualifier == "this" {
         return enclosing_matches_owner(node, ctx) && member_call_arity_matches(node, ctx);
     }
-    if ctx.visibility.owner_names.contains(&qualifier)
-        && !is_locally_shadowed(ctx, &qualifier)
+    if ctx.visibility.owner_names.contains(qualifier)
+        && !is_locally_shadowed(ctx, qualifier)
         && member_call_arity_matches(node, ctx)
     {
         return true;
     }
-    receiver_binding_matches(node, &qualifier, ctx)
+    receiver_binding_matches(node, qualifier, ctx)
 }
 
 fn is_locally_shadowed(ctx: &ScanCtx<'_>, name: &str) -> bool {
@@ -525,12 +532,4 @@ fn member_call_arity_matches(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
         Some(call_arity) => call_arity == target_arity,
         None => target_arity == 0,
     }
-}
-
-fn has_member_qualifier(node: Node<'_>) -> bool {
-    crate::analyzer::usages::scala_graph::syntax::field_expression_for_member(node).is_some()
-}
-
-fn is_simple_assignment_lhs(node: Node<'_>) -> bool {
-    is_assignment_lhs(node)
 }

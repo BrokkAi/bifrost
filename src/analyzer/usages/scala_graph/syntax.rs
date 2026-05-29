@@ -127,9 +127,16 @@ pub(crate) fn field_expression_for_member(node: Node<'_>) -> Option<Node<'_>> {
     }
 }
 
+pub(crate) fn has_member_qualifier(node: Node<'_>) -> bool {
+    field_expression_for_member(node).is_some()
+}
+
+pub(crate) fn member_qualifier_node(node: Node<'_>) -> Option<Node<'_>> {
+    field_expression_for_member(node)?.child_by_field_name("value")
+}
+
 pub(crate) fn member_qualifier(node: Node<'_>, source: &str) -> Option<String> {
-    field_expression_for_member(node)
-        .and_then(|field| field.child_by_field_name("value"))
+    member_qualifier_node(node)
         .map(|value| {
             node_text(value, source)
                 .trim()
@@ -137,6 +144,13 @@ pub(crate) fn member_qualifier(node: Node<'_>, source: &str) -> Option<String> {
                 .to_string()
         })
         .filter(|qualifier| !qualifier.is_empty())
+}
+
+pub(crate) fn is_owner_qualified_this(qualifier: Node<'_>, source: &str) -> bool {
+    qualifier.kind() == "field_expression"
+        && qualifier
+            .child_by_field_name("field")
+            .is_some_and(|field| node_text(field, source).trim() == "this")
 }
 
 pub(crate) fn stable_type_qualifier(node: Node<'_>, source: &str) -> Option<String> {
