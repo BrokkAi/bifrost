@@ -1112,6 +1112,8 @@ template <typename K, typename V> struct Map {};
 template <typename T> void templated(T value);
 using Alias = Target;
 typedef Target LegacyAlias;
+typedef Target* TargetPtrAlias;
+typedef Target& TargetRefAlias;
 void overloaded();
 template <typename T> void overloaded(T value);
 "#,
@@ -1128,6 +1130,8 @@ void call(Target target) {
     templated<Target>(target);
     Alias alias;
     LegacyAlias legacy;
+    TargetPtrAlias ptr_alias;
+    TargetRefAlias ref_alias = target;
     overloaded();
     overloaded<Target>(target);
 }
@@ -1143,6 +1147,8 @@ void call(Target target) {
     assert_hit_contains(&type_hits, "consumer.cpp", "templated<Target>(target)");
     assert_hit_contains(&type_hits, "consumer.cpp", "Alias alias");
     assert_hit_contains(&type_hits, "consumer.cpp", "LegacyAlias legacy");
+    assert_hit_contains(&type_hits, "consumer.cpp", "TargetPtrAlias ptr_alias");
+    assert_hit_contains(&type_hits, "consumer.cpp", "TargetRefAlias ref_alias");
     assert_no_hit_contains(&type_hits, "struct Target {}");
 
     let zero_arg = function_definition_with_short_name_and_arity(&analyzer, "overloaded", 0);

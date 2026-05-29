@@ -6,7 +6,7 @@ use crate::analyzer::{
 };
 use crate::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
-use tree_sitter::Node;
+use tree_sitter::{Node, Parser};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum TargetKind {
@@ -103,6 +103,12 @@ impl TargetSpec {
 
 pub(super) struct VisibilityIndex {
     pub(super) visible_by_file: HashMap<ProjectFile, HashSet<CodeUnit>>,
+    aliases_by_file: HashMap<ProjectFile, Vec<CppAlias>>,
+}
+
+struct CppAlias {
+    name: String,
+    target: String,
 }
 
 impl VisibilityIndex {
@@ -133,7 +139,11 @@ impl VisibilityIndex {
             );
             visible_by_file.insert(file.clone(), visible);
         }
-        Self { visible_by_file }
+        let aliases_by_file = build_alias_index(&files);
+        Self {
+            visible_by_file,
+            aliases_by_file,
+        }
     }
 
     pub(super) fn is_visible(&self, file: &ProjectFile, target: &CodeUnit) -> bool {
@@ -161,14 +171,14 @@ impl VisibilityIndex {
         target: &CodeUnit,
     ) -> bool {
         let Some(resolved) = self.resolve_type(file, raw_name) else {
-            return self.text_alias_resolves_to_type(file, raw_name, target);
+            return self.parser_alias_resolves_to_type(file, raw_name, target);
         };
         same_symbol(&resolved, target)
             || same_visible_symbol(&resolved, target)
             || self
                 .alias_target(&resolved)
                 .is_some_and(|alias_target| same_visible_symbol(&alias_target, target))
-            || self.text_alias_resolves_to_type(file, raw_name, target)
+            || self.parser_alias_resolves_to_type(file, raw_name, target)
     }
 
     pub(super) fn alias_target(&self, alias: &CodeUnit) -> Option<CodeUnit> {
@@ -192,7 +202,7 @@ impl VisibilityIndex {
             .cloned()
     }
 
-    pub(super) fn text_alias_resolves_to_type(
+    pub(super) fn parser_alias_resolves_to_type(
         &self,
         file: &ProjectFile,
         raw_name: &str,
@@ -204,11 +214,14 @@ impl VisibilityIndex {
         self.visible_source_files(file)
             .into_iter()
             .any(|source_file| {
-                source_file.read_to_string().is_ok_and(|source| {
-                    source.split(';').any(|statement| {
-                        alias_statement_matches_target(statement, &alias_name, target)
+                self.aliases_by_file
+                    .get(&source_file)
+                    .is_some_and(|aliases| {
+                        aliases.iter().any(|alias| {
+                            alias.name == alias_name
+                                && type_text_matches_target(&alias.target, target)
+                        })
                     })
-                })
             })
     }
 
@@ -254,6 +267,109 @@ impl VisibilityIndex {
                     && same_visible_symbol(unit, target)
             })
         })
+    }
+}
+
+fn build_alias_index(files: &HashSet<ProjectFile>) -> HashMap<ProjectFile, Vec<CppAlias>> {
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&tree_sitter_cpp::LANGUAGE.into())
+        .is_err()
+    {
+        return HashMap::default();
+    }
+
+    let mut aliases_by_file = HashMap::default();
+    for file in files {
+        let Ok(source) = file.read_to_string() else {
+            continue;
+        };
+        let Some(tree) = parser.parse(source.as_str(), None) else {
+            continue;
+        };
+        let mut aliases = Vec::new();
+        collect_cpp_aliases(tree.root_node(), &source, &mut aliases);
+        if !aliases.is_empty() {
+            aliases_by_file.insert(file.clone(), aliases);
+        }
+    }
+    aliases_by_file
+}
+
+fn collect_cpp_aliases(node: Node<'_>, source: &str, out: &mut Vec<CppAlias>) {
+    match node.kind() {
+        "alias_declaration" => {
+            if let Some(alias) = cpp_alias_from_alias_declaration(node, source) {
+                out.push(alias);
+            }
+        }
+        "type_definition" => collect_typedef_aliases(node, source, out),
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_cpp_aliases(child, source, out);
+    }
+}
+
+fn cpp_alias_from_alias_declaration(node: Node<'_>, source: &str) -> Option<CppAlias> {
+    let name = node
+        .child_by_field_name("name")
+        .and_then(|node| normalize_reference_name(node_text(node, source)))?;
+    let target = node
+        .child_by_field_name("type")
+        .and_then(|node| normalize_reference_name(node_text(node, source)))?;
+    Some(CppAlias { name, target })
+}
+
+fn collect_typedef_aliases(node: Node<'_>, source: &str, out: &mut Vec<CppAlias>) {
+    let Some(type_node) = node.child_by_field_name("type") else {
+        return;
+    };
+    let Some(target) = normalize_reference_name(node_text(type_node, source)) else {
+        return;
+    };
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if same_node(child, type_node) {
+            continue;
+        }
+        if let Some(name) = extract_typedef_declarator_name(child, source) {
+            out.push(CppAlias {
+                name,
+                target: target.clone(),
+            });
+        }
+    }
+}
+
+fn extract_typedef_declarator_name(node: Node<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "identifier" | "field_identifier" | "type_identifier" | "qualified_identifier" => {
+            normalize_reference_name(node_text(node, source))
+        }
+        _ => node
+            .child_by_field_name("declarator")
+            .or_else(|| node.child_by_field_name("name"))
+            .or_else(|| last_named_child(node))
+            .and_then(|child| extract_typedef_declarator_name(child, source)),
+    }
+}
+
+fn same_node(left: Node<'_>, right: Node<'_>) -> bool {
+    left.kind() == right.kind()
+        && left.start_byte() == right.start_byte()
+        && left.end_byte() == right.end_byte()
+}
+
+fn last_named_child(node: Node<'_>) -> Option<Node<'_>> {
+    let count = node.named_child_count();
+    if count == 0 {
+        None
+    } else {
+        node.named_child(count - 1)
     }
 }
 
@@ -643,25 +759,6 @@ pub(super) fn is_type_alias(unit: &CodeUnit) -> bool {
         && unit.signature().is_some_and(|signature| {
             signature.starts_with("typedef ") || signature.starts_with("using ")
         })
-}
-
-pub(super) fn alias_statement_matches_target(
-    statement: &str,
-    alias_name: &str,
-    target: &CodeUnit,
-) -> bool {
-    let normalized = normalize_cpp_whitespace(statement).trim().to_string();
-    if let Some(rest) = normalized.strip_prefix("using ")
-        && let Some((alias, rhs)) = rest.split_once('=')
-    {
-        return alias.trim() == alias_name && type_text_matches_target(rhs, target);
-    }
-    if let Some(rest) = normalized.strip_prefix("typedef ")
-        && let Some((lhs, alias)) = rest.rsplit_once(' ')
-    {
-        return alias.trim() == alias_name && type_text_matches_target(lhs, target);
-    }
-    false
 }
 
 pub(super) fn type_text_matches_target(type_text: &str, target: &CodeUnit) -> bool {
