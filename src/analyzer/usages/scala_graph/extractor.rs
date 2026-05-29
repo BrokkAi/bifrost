@@ -3,9 +3,9 @@ use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::usages::scala_graph::hits::add_hit;
 use crate::analyzer::usages::scala_graph::resolver::{TargetKind, TargetSpec, Visibility};
 use crate::analyzer::usages::scala_graph::syntax::{
-    dot_qualifier_before, dotted_qualifier_before, has_ancestor_kind,
-    is_constructor_like_reference, is_identifier_node, is_type_like_reference, node_text,
-    parenthesized_arity,
+    call_arity_for_reference, has_ancestor_kind, has_member_qualifier, is_assignment_lhs,
+    is_constructor_like_reference, is_identifier_node, is_owner_qualified_this,
+    is_type_like_reference, member_qualifier, member_qualifier_node, node_text,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range, ScalaAnalyzer};
 use crate::hash::HashMap;
@@ -116,7 +116,7 @@ fn scan_call_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     };
     let text = node_text(function, ctx.source).trim();
-    if text != ctx.spec.member_name || has_dot_qualifier(function, ctx.source) {
+    if text != ctx.spec.member_name || has_member_qualifier(function) {
         return;
     }
     if !is_locally_shadowed(ctx, text)
@@ -404,8 +404,7 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if proven {
         add_hit(node, ctx);
     }
-    if is_simple_assignment_lhs(node, ctx.source) && !ctx.bindings.resolve_symbol(text).is_unknown()
-    {
+    if is_assignment_lhs(node) && !ctx.bindings.resolve_symbol(text).is_unknown() {
         ctx.bindings.declare_shadow(text.to_string());
     }
 }
@@ -442,7 +441,7 @@ fn previous_word(value: &str) -> Option<&str> {
 fn member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> bool {
     if ctx.visibility.direct_member_names.contains(text)
         && !ctx.visibility.ambiguous_direct_member_names.contains(text)
-        && !has_dot_qualifier(node, ctx.source)
+        && !has_member_qualifier(node)
         && !is_locally_shadowed(ctx, text)
         && member_call_arity_matches(node, ctx)
     {
@@ -454,25 +453,31 @@ fn member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> 
     }
 
     if ctx.spec.owner.is_none() {
-        return dotted_qualifier_before(node, ctx.source)
+        return member_qualifier(node, ctx.source)
             .is_some_and(|qualifier| qualifier == ctx.spec.target.package_name());
     }
 
-    let Some(qualifier) = dot_qualifier_before(node, ctx.source) else {
+    let Some(qualifier_node) = member_qualifier_node(node) else {
         return !is_locally_shadowed(ctx, text)
             && enclosing_matches_owner(node, ctx)
             && member_call_arity_matches(node, ctx);
     };
+    if is_owner_qualified_this(qualifier_node, ctx.source) {
+        return enclosing_matches_owner(node, ctx) && member_call_arity_matches(node, ctx);
+    }
+    let qualifier = node_text(qualifier_node, ctx.source)
+        .trim()
+        .trim_end_matches('$');
     if qualifier == "this" {
         return enclosing_matches_owner(node, ctx) && member_call_arity_matches(node, ctx);
     }
-    if ctx.visibility.owner_names.contains(&qualifier)
-        && !is_locally_shadowed(ctx, &qualifier)
+    if ctx.visibility.owner_names.contains(qualifier)
+        && !is_locally_shadowed(ctx, qualifier)
         && member_call_arity_matches(node, ctx)
     {
         return true;
     }
-    receiver_binding_matches(node, &qualifier, ctx)
+    receiver_binding_matches(node, qualifier, ctx)
 }
 
 fn is_locally_shadowed(ctx: &ScanCtx<'_>, name: &str) -> bool {
@@ -523,25 +528,8 @@ fn member_call_arity_matches(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     let Some(target_arity) = ctx.spec.arity else {
         return true;
     };
-    match call_arity_after(node, ctx.source) {
+    match call_arity_for_reference(node) {
         Some(call_arity) => call_arity == target_arity,
         None => target_arity == 0,
     }
-}
-
-fn call_arity_after(node: Node<'_>, source: &str) -> Option<usize> {
-    let after = source[node.end_byte()..].trim_start();
-    parenthesized_arity(after)
-}
-
-fn has_dot_qualifier(node: Node<'_>, source: &str) -> bool {
-    dot_qualifier_before(node, source).is_some()
-}
-
-fn is_simple_assignment_lhs(node: Node<'_>, source: &str) -> bool {
-    if has_dot_qualifier(node, source) {
-        return false;
-    }
-    let after = source[node.end_byte()..].trim_start();
-    after.starts_with('=') && !after.starts_with("=>") && !after.starts_with("==")
 }

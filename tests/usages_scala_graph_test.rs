@@ -528,6 +528,9 @@ class Target {
     this.run()
     field + run()
   }
+  class Inner {
+    def callOuter(): Int = Target.this.run()
+  }
 }
 
 class Other {
@@ -537,6 +540,9 @@ class Other {
     this.field = 4
     this.run()
     field + run()
+  }
+  class Inner {
+    def callOuter(): Int = Other.this.run()
   }
 }
 "#;
@@ -555,6 +561,8 @@ class Other {
     let run_hits =
         hits(strategy.find_usages(&analyzer, std::slice::from_ref(&run), &candidates, 1000));
     assert_hit_line(&run_hits, line_of(target_source, "this.run()"));
+    assert_hit_line(&run_hits, line_of(target_source, "Target.this.run()"));
+    assert_no_hit_line(&run_hits, line_of(target_source, "Other.this.run()"));
     assert_no_hit_in_enclosing(&run_hits, "pkg.Other.call");
 }
 
@@ -1283,6 +1291,136 @@ class Target {
     ));
 
     assert_hit_line(&run_hits, line_of(consumer_source, "target.run()"));
+}
+
+#[test]
+fn scala_graph_uses_tree_sitter_for_member_qualifiers_and_call_arity() {
+    let consumer_source = r#"
+package app
+
+import pkg.Target
+
+class Consumer {
+  def calls(target: Target): Int = {
+    target.zero() +
+      target.zero(1) +
+      target.one(1) +
+      target.one(nested(1, 2)) +
+      target.one() +
+      target.one(1, 2) +
+      pkg.helper(target.one(2))
+  }
+
+  def nested(left: Int, right: Int): Int = left + right
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "pkg/Target.scala",
+            r#"
+package pkg
+
+class Target {
+  def zero(): Int = 0
+  def one(value: Int): Int = value
+}
+
+def helper(value: Int): Int = value
+"#,
+        ),
+        ("app/Consumer.scala", consumer_source),
+    ]);
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = ScalaUsageGraphStrategy::new();
+
+    let zero_arg_run = definition(&analyzer, "pkg.Target.zero");
+    let zero_arg_hits = hits(strategy.find_usages(
+        &analyzer,
+        std::slice::from_ref(&zero_arg_run),
+        &candidates,
+        1000,
+    ));
+    assert_hit_line(&zero_arg_hits, line_of(consumer_source, "target.zero() +"));
+    assert_no_hit_line(&zero_arg_hits, line_of(consumer_source, "target.zero(1) +"));
+
+    let one_arg_run = definition(&analyzer, "pkg.Target.one");
+    let one_arg_hits = hits(strategy.find_usages(
+        &analyzer,
+        std::slice::from_ref(&one_arg_run),
+        &candidates,
+        1000,
+    ));
+    assert_hit_line(&one_arg_hits, line_of(consumer_source, "target.one(1) +"));
+    assert_hit_line(
+        &one_arg_hits,
+        line_of(consumer_source, "target.one(nested(1, 2))"),
+    );
+    assert_hit_line(&one_arg_hits, line_of(consumer_source, "pkg.helper"));
+    assert_no_hit_line(&one_arg_hits, line_of(consumer_source, "target.one() +"));
+    assert_no_hit_line(&one_arg_hits, line_of(consumer_source, "target.one(1, 2)"));
+
+    let helper = definition(&analyzer, "pkg.helper");
+    let helper_hits =
+        hits(strategy.find_usages(&analyzer, std::slice::from_ref(&helper), &candidates, 1000));
+    assert_hit_line(&helper_hits, line_of(consumer_source, "pkg.helper"));
+}
+
+#[test]
+fn scala_graph_uses_assignment_expression_for_receiver_shadowing() {
+    let consumer_source = r#"
+package app
+
+import pkg.{Other, Target}
+
+class Consumer {
+  var field: Int = 0
+
+  def qualifiedAssignment(target: Target): Int = {
+    this.field = 2
+    target.run()
+  }
+
+  def reassigned(): Int = {
+    var target: Target = new Target()
+    target = new Other()
+    target.run()
+  }
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "pkg/Target.scala",
+            r#"
+package pkg
+
+class Target {
+  def run(): Int = 1
+}
+"#,
+        ),
+        (
+            "pkg/Other.scala",
+            r#"
+package pkg
+
+class Other {
+  def run(): Int = 2
+}
+"#,
+        ),
+        ("app/Consumer.scala", consumer_source),
+    ]);
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let run = definition(&analyzer, "pkg.Target.run");
+    let run_hits = hits(ScalaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&run),
+        &candidates,
+        1000,
+    ));
+
+    assert_hit_line(&run_hits, line_of(consumer_source, "target.run()"));
+    assert_no_hit_in_enclosing(&run_hits, "app.Consumer.reassigned");
 }
 
 #[test]

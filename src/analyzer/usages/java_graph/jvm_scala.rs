@@ -3,8 +3,8 @@ use crate::analyzer::usages::java_graph::extractor::ScanState;
 use crate::analyzer::usages::java_graph::resolver::{TargetKind, TargetSpec};
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::usages::scala_graph::syntax::{
-    dotted_qualifier_before, has_ancestor_kind, is_identifier_node, is_type_like_reference,
-    node_text, scala_import_path,
+    has_ancestor_kind, is_identifier_node, is_type_like_reference, member_qualifier, node_text,
+    scala_import_path, stable_type_qualifier,
 };
 use crate::analyzer::{
     AnalyzerDelegate, CodeUnit, IAnalyzer, ImportAnalysisProvider, Language, MultiAnalyzer,
@@ -205,7 +205,9 @@ fn maybe_record_java_type_hit(node: Node<'_>, ctx: &mut ScalaJavaScanCtx<'_, '_>
 
     let target_name = ctx.spec.owner.identifier();
     let proven = if text == target_name {
-        if let Some(qualifier) = dotted_qualifier_before(node, ctx.source) {
+        if let Some(qualifier) =
+            member_qualifier(node, ctx.source).or_else(|| stable_type_qualifier(node, ctx.source))
+        {
             qualifier_matches_target_owner(&qualifier, ctx.spec)
         } else {
             ctx.visibility.contains(text)
