@@ -1,7 +1,6 @@
 use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::usages::cpp_graph::hits::{
-    enclosing_context, is_member_field_declaration_context, push_hit, push_text_constructor_hit,
-    push_text_hit,
+    enclosing_context, is_member_field_declaration_context, push_hit, push_text_hit,
 };
 use crate::analyzer::usages::cpp_graph::resolver::*;
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
@@ -90,9 +89,6 @@ pub(super) fn scan_file(
         enclosing_cache: HashMap::default(),
     };
     scan_node(tree.root_node(), &mut ctx);
-    if matches!(ctx.spec.kind, TargetKind::Method) && ctx.spec.member_name.starts_with("operator") {
-        scan_text_operator_method_hits(&mut ctx);
-    }
     if matches!(
         ctx.spec.kind,
         TargetKind::GlobalField | TargetKind::MemberField
@@ -364,6 +360,24 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if node.kind() != "call_expression" {
         return;
     }
+    if let Some((receiver, operator)) = explicit_operator_call(node) {
+        let text = node_text(operator, ctx.source);
+        if !name_matches_callable(text, &ctx.spec.member_name) {
+            return;
+        }
+        *ctx.raw_match_count += 1;
+        if let Some(expected) = ctx.spec.method_arity
+            && call_arity(node) != expected
+        {
+            return;
+        }
+        if receiver_matches_target(receiver, ctx) {
+            push_hit(operator, ctx);
+        } else if !receiver_has_known_non_target(receiver, ctx) {
+            *ctx.saw_unproven_match = true;
+        }
+        return;
+    }
     let Some(function) = node.child_by_field_name("function") else {
         return;
     };
@@ -384,6 +398,36 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     {
         *ctx.saw_unproven_match = true;
     }
+}
+
+fn explicit_operator_call(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
+    let mut receiver = None;
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "argument_list" {
+            continue;
+        }
+        if let Some(operator) = first_descendant_of_kind(child, "operator_name") {
+            return receiver.map(|receiver| (receiver, operator));
+        }
+        if receiver.is_none() {
+            receiver = Some(child);
+        }
+    }
+    None
+}
+
+fn first_descendant_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
+    if node.kind() == kind {
+        return Some(node);
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if let Some(found) = first_descendant_of_kind(child, kind) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 fn maybe_record_global_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -552,43 +596,6 @@ fn owner_is_scoped_enum(owner: &CodeUnit, ctx: &ScanCtx<'_>) -> bool {
             .analyzer
             .get_source(owner, false)
             .is_some_and(|source| source.trim_start().starts_with("enum class "))
-}
-
-fn scan_text_operator_method_hits(ctx: &mut ScanCtx<'_>) {
-    let Some(operator_suffix) = ctx.spec.member_name.strip_prefix("operator") else {
-        return;
-    };
-    if operator_suffix.is_empty() {
-        return;
-    }
-    let pattern = format!(".operator{operator_suffix}(");
-    let mut start = 0usize;
-    while let Some(relative) = ctx.source[start..].find(&pattern) {
-        let dot = start + relative;
-        let operator_start = dot + 1;
-        let end = operator_start + ctx.spec.member_name.len();
-        start = end;
-        let Some(receiver) = receiver_token_before(ctx.source, dot) else {
-            continue;
-        };
-        if ctx
-            .bindings
-            .resolve_symbol(receiver)
-            .as_precise()
-            .is_some_and(|targets| {
-                ctx.spec
-                    .owner
-                    .as_ref()
-                    .is_some_and(|owner| targets.iter().any(|target| same_symbol(target, owner)))
-            })
-            || text_receiver_has_target_type(ctx.source, receiver, ctx)
-        {
-            push_text_constructor_hit(operator_start, end, ctx);
-        }
-        if *ctx.limit_exceeded {
-            return;
-        }
-    }
 }
 
 fn text_receiver_has_target_type(source: &str, receiver: &str, ctx: &ScanCtx<'_>) -> bool {

@@ -95,45 +95,6 @@ fn is_out_of_line_member_definition_line(ctx: &ScanCtx<'_>, line_idx: usize, sta
     };
     !line.starts_with(&qualified) && !prefix.contains('=') && start >= line_start
 }
-pub(super) fn push_text_constructor_hit(start: usize, end: usize, ctx: &mut ScanCtx<'_>) {
-    if *ctx.limit_exceeded || ctx.file == ctx.spec.target.source() {
-        return;
-    }
-    if !is_code_text_range(ctx, start, end) {
-        return;
-    }
-    let line_idx = find_line_index_for_offset(ctx.line_starts, start);
-    if ctx
-        .hits
-        .iter()
-        .any(|hit| hit.file == *ctx.file && hit.line == line_idx + 1)
-    {
-        return;
-    }
-    let range = Range {
-        start_byte: start,
-        end_byte: end,
-        start_line: line_idx,
-        end_line: find_line_index_for_offset(ctx.line_starts, end),
-    };
-    let Some(enclosing) = ctx.analyzer.enclosing_code_unit(ctx.file, &range) else {
-        return;
-    };
-    if enclosing == ctx.spec.target || same_logical_symbol(&enclosing, &ctx.spec.target) {
-        return;
-    }
-    ctx.hits.insert(usage_hit(
-        ctx.file,
-        line_idx,
-        start,
-        end,
-        enclosing,
-        snippet_around_line(ctx.source, ctx.line_starts, line_idx, SNIPPET_CONTEXT_LINES),
-    ));
-    if ctx.hits.len() > ctx.max_usages {
-        *ctx.limit_exceeded = true;
-    }
-}
 pub(super) fn push_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if *ctx.limit_exceeded {
         return;

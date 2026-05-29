@@ -1245,6 +1245,9 @@ struct Target {
     void mutate();
     void operator()();
 };
+struct Other {
+    void operator()();
+};
 bool operator==(const Target& left, const Target& right);
 "#,
         ),
@@ -1254,12 +1257,14 @@ bool operator==(const Target& left, const Target& right);
 #include "target.h"
 
 void call(Target& target, const Target& frozen) {
+    Other other;
     target.run();
     target.run(1);
     target.run(1, 2);
     frozen.inspect();
     target.mutate();
     target.operator()();
+    other.operator()();
     target();
     bool same = target == target;
 }
@@ -1291,7 +1296,9 @@ void call(Target& target, const Target& frozen) {
     let call_operator =
         function_definition_with_short_name_and_arity(&analyzer, "Target.operator()", 0);
     let operator_hits = usage_hits(&analyzer, &call_operator);
+    assert_eq!(1, operator_hits.len());
     assert_hit_contains(&operator_hits, "consumer.cpp", "target.operator()()");
+    assert_no_hit_contains(&operator_hits, "other.operator()()");
 
     let equality = function_definition_with_short_name_and_arity(&analyzer, "operator==", 2);
     let equality_hits = CppUsageGraphStrategy::new()
