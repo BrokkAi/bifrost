@@ -405,8 +405,30 @@ fn ts_inline_analyzer(
     (project, analyzer)
 }
 
+fn js_inline_analyzer(
+    build: impl FnOnce(InlineTestProject) -> common::BuiltInlineTestProject,
+) -> (common::BuiltInlineTestProject, JavascriptAnalyzer) {
+    let project = build(InlineTestProject::with_language(
+        brokk_bifrost::Language::JavaScript,
+    ));
+    let analyzer = JavascriptAnalyzer::from_project(project.project().clone());
+    (project, analyzer)
+}
+
 fn find_ts_target(
     analyzer: &TypescriptAnalyzer,
+    source_file: &ProjectFile,
+    predicate: impl Fn(&CodeUnit) -> bool,
+) -> CodeUnit {
+    analyzer
+        .all_declarations()
+        .find(|cu| cu.source() == source_file && predicate(cu))
+        .cloned()
+        .expect("target definition not found")
+}
+
+fn find_js_target(
+    analyzer: &JavascriptAnalyzer,
     source_file: &ProjectFile,
     predicate: impl Fn(&CodeUnit) -> bool,
 ) -> CodeUnit {
@@ -752,6 +774,184 @@ fn ts_static_member_on_namespace_import_resolves_member_usage() {
     );
 
     assert_eq!(1, hits.len());
+}
+
+#[test]
+fn js_commonjs_exports_property_resolves_destructured_require() {
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file("lib.js", "class Foo {}\nexports.Foo = Foo;\n")
+            .file(
+                "consumer.js",
+                "const { Foo } = require('./lib');\nfunction run() { return new Foo(); }\n",
+            )
+            .build()
+    });
+
+    let target = find_js_target(&analyzer, &project.file("lib.js"), |cu| {
+        cu.identifier() == "Foo" && cu.is_class()
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == project.file("consumer.js"))
+    );
+}
+
+#[test]
+fn js_commonjs_module_exports_object_resolves_required_module_member() {
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file("lib.js", "class Foo {}\nmodule.exports = { Foo };\n")
+            .file(
+                "consumer.js",
+                "const lib = require('./lib');\nfunction run() { return new lib.Foo(); }\n",
+            )
+            .build()
+    });
+
+    let target = find_js_target(&analyzer, &project.file("lib.js"), |cu| {
+        cu.identifier() == "Foo" && cu.is_class()
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == project.file("consumer.js"))
+    );
+}
+
+#[test]
+fn js_commonjs_module_exports_default_resolves_required_value() {
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file("lib.js", "class Foo {}\nmodule.exports = Foo;\n")
+            .file(
+                "consumer.js",
+                "const Foo = require('./lib');\nfunction run() { return new Foo(); }\n",
+            )
+            .build()
+    });
+
+    let target = find_js_target(&analyzer, &project.file("lib.js"), |cu| {
+        cu.identifier() == "Foo" && cu.is_class()
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == project.file("consumer.js"))
+    );
+}
+
+#[test]
+fn ts_commonjs_exports_property_resolves_destructured_require() {
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file("lib.ts", "class Foo {}\nexports.Foo = Foo;\n")
+            .file(
+                "consumer.ts",
+                "const { Foo } = require('./lib');\nexport function run() { return new Foo(); }\n",
+            )
+            .build()
+    });
+
+    let target = find_ts_target(&analyzer, &project.file("lib.ts"), |cu| {
+        cu.identifier() == "Foo" && cu.is_class()
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == project.file("consumer.ts"))
+    );
+}
+
+#[test]
+fn js_esm_import_resolves_commonjs_named_export() {
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file("lib.js", "class Foo {}\nmodule.exports = { Foo };\n")
+            .file(
+                "consumer.js",
+                "import { Foo } from './lib';\nfunction run() { return new Foo(); }\n",
+            )
+            .build()
+    });
+
+    let target = find_js_target(&analyzer, &project.file("lib.js"), |cu| {
+        cu.identifier() == "Foo" && cu.is_class()
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == project.file("consumer.js"))
+    );
+}
+
+#[test]
+fn js_commonjs_side_effect_and_dynamic_require_do_not_create_graph_usages() {
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file("lib.js", "class Foo {}\nexports.Foo = Foo;\n")
+            .file(
+                "consumer.js",
+                "require('./lib');\nconst name = './lib';\nconst dynamic = require(name);\nfunction run() { return dynamic.Foo; }\n",
+            )
+            .build()
+    });
+
+    let target = find_js_target(&analyzer, &project.file("lib.js"), |cu| {
+        cu.identifier() == "Foo" && cu.is_class()
+    });
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = JsTsExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("commonjs graph success");
+
+    assert!(hits.is_empty());
+}
+
+#[test]
+fn js_commonjs_required_binding_shadowing_does_not_count() {
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file("lib.js", "class Foo {}\nexports.Foo = Foo;\n")
+            .file("other.js", "class Other {}\nexports.Other = Other;\n")
+            .file(
+                "consumer.js",
+                "const { Foo } = require('./lib');\nconst { Other } = require('./other');\nfunction run() { const Foo = Other; return new Foo(); }\n",
+            )
+            .build()
+    });
+
+    let target = find_js_target(&analyzer, &project.file("lib.js"), |cu| {
+        cu.identifier() == "Foo" && cu.is_class()
+    });
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = JsTsExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("commonjs graph success");
+
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file != project.file("consumer.js")),
+        "shadowed required binding must not count as a consumer usage"
+    );
 }
 
 #[test]

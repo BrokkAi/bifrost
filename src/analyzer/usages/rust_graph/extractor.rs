@@ -147,7 +147,7 @@ pub(super) fn scan_files_for_target(
                     (HashSet::default(), HashSet::default()),
                     |(mut direct, mut namespaces), edge| {
                         match edge.kind {
-                            ImportEdgeKind::Namespace => {
+                            ImportEdgeKind::Namespace | ImportEdgeKind::CommonJsRequire => {
                                 namespaces.insert(edge.local_name);
                             }
                             ImportEdgeKind::Named(_) | ImportEdgeKind::Default => {

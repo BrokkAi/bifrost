@@ -8,9 +8,10 @@
 //!
 //! Pipeline overview:
 //! 1. Per-file [`ExportIndex`]: tree-sitter walk that captures local exports, named
-//!    re-exports, star re-exports, and default exports.
+//!    re-exports, star re-exports, default exports, and structured CommonJS export
+//!    assignments.
 //! 2. Per-file [`ImportBinder`]: extracts default/named/namespace import bindings from
-//!    ESM `import` statements.
+//!    ESM `import` statements and structured CommonJS `require(...)` declarations.
 //! 3. Project indices, rebuilt per query so file edits are picked up immediately:
 //!    - reverse re-export index: `(target_file, exported_name) -> {(reexporting_file, alias)}`
 //!    - reverse export-seed index: `(short_name) -> {(file, exported_name)}` for fast seed
@@ -20,10 +21,9 @@
 //!    identifier / member / type / heritage references that resolve back to the target.
 //!
 //! Scope notes:
-//! - **ESM only.** `require(...)` calls and `module.exports = …` assignments are not
-//!   walked. Mixed-ESM/CJS projects fall back to the regex analyzer for any CJS-only
-//!   edges. CJS support is tracked as future work alongside richer module resolution
-//!   (`package.json` `exports`, tsconfig `paths`).
+//! - **Structured local modules only.** Static relative ESM specifiers and CommonJS
+//!   `require(...)` calls are walked. Dynamic requires, bare package specifiers,
+//!   `package.json` `exports`, and tsconfig `paths` remain outside this graph.
 //! - **Per-call indices.** No cross-call cache: each query rebuilds the graph for the
 //!   target's language. This keeps results consistent after file edits at the cost of
 //!   re-parsing JS/TS files on every query. Hosts with stable file sets that need lower
