@@ -1,6 +1,6 @@
 use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::usages::cpp_graph::hits::{
-    enclosing_context, is_member_field_declaration_context, push_hit, push_text_hit,
+    enclosing_context, is_member_field_declaration_context, push_hit,
 };
 use crate::analyzer::usages::cpp_graph::resolver::*;
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
@@ -27,7 +27,6 @@ pub(super) struct ScanCtx<'a> {
     pub(super) visibility: &'a VisibilityIndex,
     pub(super) file: &'a ProjectFile,
     pub(super) source: &'a str,
-    pub(super) root: Node<'a>,
     pub(super) line_starts: &'a [usize],
     pub(super) spec: &'a TargetSpec,
     pub(super) bindings: LocalInferenceEngine<CodeUnit>,
@@ -77,7 +76,6 @@ pub(super) fn scan_file(
         visibility,
         file,
         source: &source,
-        root: tree.root_node(),
         line_starts: &line_starts,
         spec,
         bindings: LocalInferenceEngine::new(LocalInferenceConfig::default()),
@@ -89,9 +87,6 @@ pub(super) fn scan_file(
         enclosing_cache: HashMap::default(),
     };
     scan_node(tree.root_node(), &mut ctx);
-    if matches!(ctx.spec.kind, TargetKind::MemberField) {
-        scan_text_symbol_hits(&mut ctx);
-    }
 }
 
 fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -512,97 +507,8 @@ fn maybe_record_member_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
-fn scan_text_symbol_hits(ctx: &mut ScanCtx<'_>) {
-    if !ctx.visibility.is_visible(ctx.file, &ctx.spec.target) {
-        return;
-    }
-    let symbol = ctx.spec.member_name.as_str();
-    let mut start = 0usize;
-    while let Some(relative) = ctx.source[start..].find(symbol) {
-        let absolute = start + relative;
-        let end = absolute + symbol.len();
-        start = end;
-        if !is_word_boundary(ctx.source, absolute, end) {
-            continue;
-        }
-        if !field_text_qualifier_matches(ctx.source, absolute, ctx) {
-            continue;
-        }
-        push_text_hit(absolute, end, ctx);
-        if *ctx.limit_exceeded {
-            break;
-        }
-    }
-}
-
-fn is_word_boundary(source: &str, start: usize, end: usize) -> bool {
-    let before = source[..start].chars().next_back();
-    let after = source[end..].chars().next();
-    !before.is_some_and(is_identifier_char) && !after.is_some_and(is_identifier_char)
-}
-
-fn is_identifier_char(ch: char) -> bool {
-    ch == '_' || ch.is_ascii_alphanumeric()
-}
-
 fn is_nested_in_qualified_identifier(node: Node<'_>) -> bool {
     node.kind() != "qualified_identifier" && has_ancestor_kind(node, "qualified_identifier")
-}
-
-fn field_text_qualifier_matches(source: &str, start: usize, ctx: &ScanCtx<'_>) -> bool {
-    if !matches!(ctx.spec.kind, TargetKind::MemberField) {
-        return true;
-    }
-    let Some(owner) = ctx.spec.owner.as_ref() else {
-        return true;
-    };
-    let Some(owner_cpp_name) = ctx.spec.owner_cpp_name.as_deref() else {
-        return true;
-    };
-    let prefix = &source[..start];
-    if let Some(prefix) = prefix.strip_suffix("::") {
-        let qualifier = prefix
-            .rsplit(|ch: char| !(ch == '_' || ch == ':' || ch.is_ascii_alphanumeric()))
-            .next()
-            .unwrap_or("");
-        return qualifier == owner_cpp_name || qualifier == owner.identifier();
-    }
-    if let Some(prefix) = prefix.strip_suffix('.') {
-        return text_receiver_matches_target(prefix, ctx);
-    }
-    if let Some(prefix) = prefix.strip_suffix("->") {
-        return text_receiver_matches_target(prefix, ctx);
-    }
-    if owner_is_class_like(owner, ctx) {
-        return false;
-    }
-    !owner_is_scoped_enum(owner, ctx)
-}
-
-fn text_receiver_matches_target(prefix: &str, ctx: &ScanCtx<'_>) -> bool {
-    let receiver = receiver_token_before(prefix, prefix.len());
-    if receiver == Some("this") {
-        return textual_owner_context_at(prefix)
-            .zip(ctx.spec.owner_cpp_name.as_deref())
-            .is_some_and(|(owner, target)| owner == target)
-            || textual_owner_context_at(prefix)
-                .zip(ctx.spec.owner.as_ref())
-                .is_some_and(|(owner_text, owner)| owner_text == owner.identifier());
-    }
-    receiver.is_some_and(|receiver| text_receiver_has_target_type(ctx.source, receiver, ctx))
-}
-
-fn owner_is_class_like(owner: &CodeUnit, ctx: &ScanCtx<'_>) -> bool {
-    owner.signature().is_some_and(|signature| {
-        signature.starts_with("class ")
-            || signature.starts_with("struct ")
-            || signature.starts_with("union ")
-    }) || ctx.analyzer.get_source(owner, false).is_some_and(|source| {
-        let trimmed = source.trim_start();
-        trimmed.starts_with("class ")
-            || trimmed.starts_with("struct ")
-            || trimmed.starts_with("union ")
-    })
 }
 
 fn owner_is_scoped_enum(owner: &CodeUnit, ctx: &ScanCtx<'_>) -> bool {
@@ -622,31 +528,6 @@ fn owner_is_unscoped_enum(owner: &CodeUnit, ctx: &ScanCtx<'_>) -> bool {
         let trimmed = source.trim_start();
         trimmed.starts_with("enum ") && !trimmed.starts_with("enum class ")
     })
-}
-
-fn text_receiver_has_target_type(source: &str, receiver: &str, ctx: &ScanCtx<'_>) -> bool {
-    let Some(owner_name) = ctx.spec.owner_cpp_name.as_deref() else {
-        return false;
-    };
-    [
-        format!("{owner_name}& {receiver}"),
-        format!("{owner_name} &{receiver}"),
-        format!("{owner_name}* {receiver}"),
-        format!("{owner_name} *{receiver}"),
-        format!("{owner_name} {receiver}"),
-    ]
-    .iter()
-    .any(|pattern| source.contains(pattern))
-}
-
-fn receiver_token_before(source: &str, end: usize) -> Option<&str> {
-    let prefix = source[..end].trim_end();
-    let start = prefix
-        .rfind(|ch: char| !(ch == '_' || ch.is_ascii_alphanumeric()))
-        .map(|index| index + 1)
-        .unwrap_or(0);
-    let token = prefix[start..].trim();
-    (!token.is_empty()).then_some(token)
 }
 
 fn receiver_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
