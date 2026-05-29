@@ -25,26 +25,11 @@ pub(super) fn is_member_target(analyzer: &RustAnalyzer, target: &CodeUnit) -> bo
 }
 
 pub(super) fn is_trait_owner(rust: &RustAnalyzer, owner: &CodeUnit) -> bool {
-    rust.get_source(owner, false)
-        .or_else(|| rust.get_skeleton_header(owner))
-        .map(|source| {
-            let trimmed = source.trim_start();
-            trimmed.starts_with("pub trait ") || trimmed.starts_with("trait ")
-        })
-        .unwrap_or(false)
+    rust.is_rust_trait_declaration(owner)
 }
 
 fn is_public_like_declaration(rust: &RustAnalyzer, code_unit: &CodeUnit) -> bool {
-    rust.get_source(code_unit, false)
-        .or_else(|| rust.get_skeleton_header(code_unit))
-        .map(|source| {
-            let trimmed = source.trim_start();
-            trimmed.starts_with("pub ")
-                || trimmed.starts_with("pub(")
-                || trimmed.starts_with("pub(crate)")
-                || trimmed.starts_with("pub(in ")
-        })
-        .unwrap_or(false)
+    rust.is_rust_public_like_declaration(code_unit)
 }
 
 pub(super) fn is_graph_visible_member_target(rust: &RustAnalyzer, target: &CodeUnit) -> bool {
@@ -59,14 +44,8 @@ pub(super) fn is_graph_visible_member_target(rust: &RustAnalyzer, target: &CodeU
         return false;
     }
 
-    let owner_source = rust
-        .get_source(&owner, false)
-        .or_else(|| rust.get_skeleton_header(&owner))
-        .unwrap_or_default();
-    let trimmed = owner_source.trim_start();
-
-    (trimmed.starts_with("pub trait ") && target.is_function())
-        || (trimmed.starts_with("pub enum ") && target.is_field())
+    (rust.is_rust_trait_declaration(&owner) && target.is_function())
+        || (rust.is_rust_enum_declaration(&owner) && target.is_field())
 }
 
 pub(super) fn infer_graph_seeds(
