@@ -249,8 +249,7 @@ fn normalize_tool_arguments(
         "list_files" => {
             normalize_optional_string_field(&mut arguments, "directory_path", workspace_root)?
         }
-        "skim_files"
-        | "compute_cyclomatic_complexity"
+        "compute_cyclomatic_complexity"
         | "compute_cognitive_complexity"
         | "report_comment_density_for_files"
         | "report_exception_handling_smells"

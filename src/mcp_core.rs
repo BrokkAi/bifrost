@@ -34,7 +34,6 @@ pub const SEARCHTOOLS_TOOL_NAMES: &[&str] = &[
     "find_files_containing",
     "search_file_contents",
     "list_files",
-    "skim_files",
     "search_git_commit_messages",
     "get_git_log",
     "get_commit_diff",

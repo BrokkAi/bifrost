@@ -102,8 +102,8 @@ This starts a stdio MCP server that publishes these tools:
 
 The subset servers publish:
 
-- `core`: the original analyzer/search navigation tools, excluding the higher-context symbol-summary and relevance-ranking helpers
-- `extended`: file, grep-like, symbol-summary, relevance-ranking, git, and jq/XML tools added on `2026-05-29`
+- `core`: the original analyzer/search navigation tools, excluding the higher-context relevance-ranking helpers
+- `extended`: file, grep-like, relevance-ranking, git, and jq/XML tools added on `2026-05-29`
 - `slopcop`: hotspot, complexity, comment-density, and smell-detection tools added after `2026-05-15`
 
 `activate_workspace` lets a host swap the analyzer's root mid-session without respawning the subprocess. The path must be absolute and is normalized to the nearest enclosing git root when one exists.

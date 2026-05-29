@@ -106,11 +106,6 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     assert!(
         !tools
             .iter()
-            .any(|tool| tool["name"] == "get_symbol_summaries")
-    );
-    assert!(
-        !tools
-            .iter()
             .any(|tool| tool["name"] == "get_file_summaries")
     );
     assert!(tools.iter().any(|tool| tool["name"] == "list_symbols"));

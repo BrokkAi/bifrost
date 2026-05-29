@@ -10,7 +10,6 @@ pub const EXTENDED_TOOL_NAMES: &[&str] = &[
     "find_files_containing",
     "search_file_contents",
     "list_files",
-    "skim_files",
     "most_relevant_files",
     "search_git_commit_messages",
     "get_git_log",
@@ -145,21 +144,6 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                     }
                 },
                 "required": ["directory_path"]
-            }),
-        ),
-        tool_descriptor(
-            "skim_files",
-            "Return a top-level declaration outline (class/function/field/module) for each given file. Like list_symbols but constrained to top-level declarations only.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "file_paths": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Project-relative paths of files to skim, or absolute paths inside the active workspace."
-                    }
-                },
-                "required": ["file_paths"]
             }),
         ),
         tool_descriptor(

@@ -10,7 +10,6 @@ use crate::{
     },
     file_tools::{
         find_filenames, find_files_containing, get_file_contents, list_files, search_file_contents,
-        skim_files,
     },
     git_tools::{get_commit_diff, get_git_log, search_git_commit_messages},
     searchtools::{
@@ -239,9 +238,6 @@ impl SearchToolsService {
             }),
             "list_files" => self.decode_and_run(arguments, |workspace, params| {
                 list_files(workspace.analyzer(), params)
-            }),
-            "skim_files" => self.decode_and_run(arguments, |workspace, params| {
-                skim_files(workspace.analyzer(), params)
             }),
             "search_git_commit_messages" => self.decode_and_run(arguments, |workspace, params| {
                 search_git_commit_messages(workspace.analyzer(), params)
