@@ -24,6 +24,7 @@ After this work, the team should have an evidence-backed inventory of the import
 - [x] (2026-05-28 17:47Z) Audited JS/TS usage graph and analyzer mini parsers and replaced ES import clause string parsing with tree-sitter import-node extraction.
 - [x] (2026-05-28 17:56Z) Audited Scala/Java usage graph and analyzer mini parsers and replaced Scala typed-parameter receiver inference with tree-sitter `parameter` node extraction.
 - [x] (2026-05-28 17:56Z) Summarized the follow-up issue set in `Outcomes & Retrospective`; all audited language clusters are now implemented, tracked, or intentionally deferred.
+- [x] (2026-05-29) Implemented Rust follow-up `#156`: shadow-name discovery, member/static hits, trait implementation discovery, and visibility/trait-owner checks now use tree-sitter classification.
 
 ## Surprises & Discoveries
 
@@ -131,6 +132,8 @@ Scala/Java milestone outcome 2026-05-28: Scala typed-parameter receiver inferenc
 
 Epic outcome 2026-05-28: The implemented small cleanups are PHP parent-node classification, Python receiver fact collection, Rust receiver inference, Go typed `var_spec` inference, C++/C# parsed arity counting, JS/TS ES import parsing, and Scala typed-parameter receiver inference. Dedicated PHP follow-up issues `#154` and `#155` track the two concrete larger PHP clusters. Remaining non-PHP follow-up issues are `#156` for Rust shadow/member/trait/visibility classification, `#157` for Scala qualifier/call-arity/value-binding/import helper cleanup, `#158` for JS/TS CommonJS `require(...)` parsing, and `#159` for C++ fallback scans and alias parsing. Import-path/rendering/test-smell string logic remains intentionally text-based unless a focused future bug shows otherwise.
 
+Rust follow-up outcome 2026-05-29: Issue `#156` is implemented. Rust usage graph shadow-name discovery, module-qualified hits, member/static hit localization, trait implementation discovery, and graph visibility/trait-owner classification now use tree-sitter nodes instead of regex or declaration-source prefix checks. Focused regressions cover comment-separated shadow declarations, member/static references, trait impl headers, and visibility modifiers. `cargo test --test usages_rust_graph_test` passed with 61 tests.
+
 ## Context and Orientation
 
 The repository root is the current `bifrost` checkout. The usage graph code lives under `src/analyzer/usages`. A usage graph strategy tries to find references to a target symbol by walking language-specific import, export, and syntax relationships. A tree-sitter node is a parsed syntax-tree node from the `tree_sitter` crate. It has a `kind`, byte range, parent, children, named children, and sometimes named fields supplied by the language grammar.
@@ -154,7 +157,7 @@ Milestone 1 is the PHP audit. This milestone has completed its first narrow clea
 
 Milestone 2 is the Python audit. This milestone has completed its cleanup: `collect_scope_facts_from_source` now uses tree-sitter to collect parameter, annotation, assignment, constructor, and alias events while preserving the existing fixed-point local inference behavior. Remaining Python text handling in `normalized_receiver_type`, `receiver_annotation_matches_target`, module-name resolution, and import strings is intentional normalization rather than syntax discovery.
 
-Milestone 3 is the Rust audit. This milestone has completed its receiver-inference cleanup: `LET_TYPED_RE`, `LET_CONSTRUCTED_RE`, `LET_ALIAS_RE`, `PARAM_TYPED_RE`, `TYPE_ALIAS_RE`, `OPTION_FIELD_RE`, and `SELF_FIELD_AS_REF_LET_ELSE_RE` have been replaced by tree-sitter traversal. Remaining Rust follow-up candidates are tracked in `#156`: `detect_shadowed_names`, member call/static hit regex matching, `TRAIT_IMPL_RE`, and string-prefix visibility/trait checks in `src/analyzer/usages/rust_graph/resolver.rs` and `src/analyzer/rust/graph_support.rs`.
+Milestone 3 is the Rust audit. The receiver-inference cleanup replaced `LET_TYPED_RE`, `LET_CONSTRUCTED_RE`, `LET_ALIAS_RE`, `PARAM_TYPED_RE`, `TYPE_ALIAS_RE`, `OPTION_FIELD_RE`, and `SELF_FIELD_AS_REF_LET_ELSE_RE` with tree-sitter traversal. Follow-up `#156` has also replaced `detect_shadowed_names`, member call/static hit regex matching, `TRAIT_IMPL_RE`, and string-prefix visibility/trait checks in `src/analyzer/usages/rust_graph/resolver.rs` and `src/analyzer/rust/graph_support.rs`.
 
 Milestone 4 is the Go audit. This milestone has completed its cleanup: `VAR_TYPED_LIST_RE` has been replaced with tree-sitter `var_spec` traversal for typed local receiver inference. Remaining Go text handling in import-path resolution, module name derivation, and analyzer declaration signature/source rendering is intentional string semantics or display shaping rather than syntax discovery.
 

@@ -9,7 +9,6 @@ use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, RustAnalyzer};
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::compute_line_starts;
 use rayon::prelude::*;
-use regex::Regex;
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use tree_sitter::{Node, Parser, Tree};
@@ -172,6 +171,7 @@ pub(super) fn scan_files_for_target(
             direct_names: &direct_names,
             namespace_names: &namespace_names,
             shadowed_names: detect_shadowed_names(
+                tree.root_node(),
                 source,
                 &direct_names,
                 &namespace_names,
@@ -182,7 +182,7 @@ pub(super) fn scan_files_for_target(
             hits: &mut local_hits,
         };
         scan_node(tree.root_node(), &mut ctx);
-        record_module_qualified_hits(&mut ctx);
+        record_module_qualified_hits(tree.root_node(), &mut ctx);
 
         if !local_hits.is_empty() {
             let mut sink = hits.lock().expect("poisoned Rust graph collector");
@@ -252,6 +252,7 @@ fn is_shadowed_identifier(text: &str, node: Node<'_>, ctx: &ScanCtx<'_>) -> bool
 }
 
 fn detect_shadowed_names(
+    root: Node<'_>,
     source: &str,
     direct_names: &HashSet<String>,
     namespace_names: &HashSet<String>,
@@ -264,28 +265,60 @@ fn detect_shadowed_names(
         names.insert(target_short.to_string());
     }
 
-    names
-        .into_iter()
-        .filter(|name| {
-            let ident = regex::escape(name);
-            let patterns = if target_self_file && name == target_short {
-                vec![format!(r"\blet\s+{}\b", ident)]
-            } else {
-                vec![
-                    format!(r"\blet\s+{}\b", ident),
-                    format!(r"\bstruct\s+{}\b", ident),
-                    format!(r"\benum\s+{}\b", ident),
-                    format!(r"\btype\s+{}\b", ident),
-                    format!(r"\bfn\s+{}\b", ident),
-                ]
-            };
-            patterns.iter().any(|pattern| {
-                Regex::new(pattern)
-                    .ok()
-                    .is_some_and(|re| re.is_match(source))
-            })
-        })
-        .collect()
+    let mut shadowed = HashSet::default();
+    collect_shadowed_names(
+        root,
+        source,
+        &names,
+        target_short,
+        target_self_file,
+        &mut shadowed,
+    );
+    shadowed
+}
+
+fn collect_shadowed_names(
+    node: Node<'_>,
+    source: &str,
+    names: &HashSet<String>,
+    target_short: &str,
+    target_self_file: bool,
+    shadowed: &mut HashSet<String>,
+) {
+    match node.kind() {
+        "let_declaration" => {
+            if let Some(name) = node
+                .child_by_field_name("pattern")
+                .and_then(|pattern| simple_pattern_name(pattern, source))
+                && names.contains(&name)
+            {
+                shadowed.insert(name);
+            }
+        }
+        "struct_item" | "enum_item" | "type_item" | "function_item" => {
+            if let Some(name) = node
+                .child_by_field_name("name")
+                .and_then(|name| simple_node_text(name, source))
+                && names.contains(&name)
+                && !(target_self_file && name == target_short)
+            {
+                shadowed.insert(name);
+            }
+        }
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_shadowed_names(
+            child,
+            source,
+            names,
+            target_short,
+            target_self_file,
+            shadowed,
+        );
+    }
 }
 
 pub(super) fn scan_files_for_member_target(
@@ -299,14 +332,34 @@ pub(super) fn scan_files_for_member_target(
     let Some(owner) = rust.parent_of(target) else {
         return BTreeSet::new();
     };
-    let member_name = regex::escape(target.identifier());
+    let member_name = target.identifier().to_string();
+    let parser_language = tree_sitter_rust::LANGUAGE.into();
     let hits = Mutex::new(BTreeSet::new());
 
     files.par_iter().for_each(|file| {
-        let Ok(source) = file.read_to_string() else {
-            return;
+        let owned_source: Option<Arc<String>>;
+        let owned_tree: Option<Tree>;
+        let (source, tree) = if let Some(parsed) = graph.parsed.get(file) {
+            (parsed.source.as_str(), &parsed.tree)
+        } else {
+            let Ok(source) = file.read_to_string() else {
+                return;
+            };
+            let mut parser = Parser::new();
+            if parser.set_language(&parser_language).is_err() {
+                return;
+            }
+            let Some(tree) = parser.parse(source.as_str(), None) else {
+                return;
+            };
+            owned_source = Some(Arc::new(source));
+            owned_tree = Some(tree);
+            (
+                owned_source.as_deref().expect("owned source").as_str(),
+                owned_tree.as_ref().expect("owned tree"),
+            )
         };
-        let line_starts = compute_line_starts(&source);
+        let line_starts = compute_line_starts(source);
         let owner_local_names: HashSet<String> = if file == target.source() {
             [owner.identifier().to_string()].into_iter().collect()
         } else {
@@ -328,85 +381,25 @@ pub(super) fn scan_files_for_member_target(
         }
         let self_like_constructors = self_like_constructor_names(rust, &owner);
         let receiver_names =
-            infer_receiver_names(&source, &receiver_type_names, &self_like_constructors);
-        let static_owner_names: Vec<_> = owner_local_names
-            .iter()
-            .map(|name| regex::escape(name))
-            .collect();
+            infer_receiver_names(source, &receiver_type_names, &self_like_constructors);
+        let static_owner_names = owner_local_names;
         if receiver_names.is_empty() && static_owner_names.is_empty() {
             return;
         }
 
-        let call_re = if receiver_names.is_empty() {
-            None
-        } else {
-            let pattern = format!(r"\b({})\.{}\s*\(", receiver_names.join("|"), member_name);
-            Regex::new(&pattern).ok()
-        };
-        let static_pattern = format!(r"\b({})::{}\b", static_owner_names.join("|"), member_name);
-        let static_re = Regex::new(&static_pattern).ok();
-
         let mut local_hits = BTreeSet::new();
-        if let Some(call_re) = call_re {
-            for captures in call_re.captures_iter(&source) {
-                let Some(matched) = captures.get(0) else {
-                    continue;
-                };
-                let Some(receiver_name) = captures.get(1).map(|receiver| receiver.as_str()) else {
-                    continue;
-                };
-                let start = matched.end().saturating_sub(target.identifier().len() + 1);
-                let end = matched.end().saturating_sub(1);
-                let Some(enclosing) =
-                    member_hit_enclosing(analyzer, file, &line_starts, start, end)
-                else {
-                    continue;
-                };
-                let receiver_mismatched = analyzer
-                    .get_source(&enclosing, false)
-                    .map(|enclosing_source| {
-                        receiver_explicitly_mismatched(
-                            &source,
-                            &enclosing_source,
-                            &receiver_type_names,
-                            receiver_name,
-                        )
-                    })
-                    .unwrap_or(false);
-                if receiver_mismatched {
-                    continue;
-                }
-                push_member_hit(
-                    file,
-                    &source,
-                    &line_starts,
-                    start,
-                    end,
-                    enclosing,
-                    &mut local_hits,
-                );
-            }
-        }
-        if let Some(static_re) = static_re {
-            for matched in static_re.find_iter(&source) {
-                let start = matched.end().saturating_sub(target.identifier().len());
-                let end = matched.end();
-                let Some(enclosing) =
-                    member_hit_enclosing(analyzer, file, &line_starts, start, end)
-                else {
-                    continue;
-                };
-                push_member_hit(
-                    file,
-                    &source,
-                    &line_starts,
-                    start,
-                    end,
-                    enclosing,
-                    &mut local_hits,
-                );
-            }
-        }
+        let mut ctx = MemberScanCtx {
+            analyzer,
+            file,
+            source,
+            line_starts: &line_starts,
+            member_name: &member_name,
+            receiver_names: &receiver_names,
+            receiver_type_names: &receiver_type_names,
+            static_owner_names: &static_owner_names,
+            hits: &mut local_hits,
+        };
+        scan_member_node(tree.root_node(), &mut ctx);
 
         if !local_hits.is_empty() {
             let mut sink = hits.lock().expect("poisoned Rust member collector");
@@ -415,6 +408,132 @@ pub(super) fn scan_files_for_member_target(
     });
 
     hits.into_inner().expect("poisoned Rust member collector")
+}
+
+struct MemberScanCtx<'a> {
+    analyzer: &'a dyn IAnalyzer,
+    file: &'a ProjectFile,
+    source: &'a str,
+    line_starts: &'a [usize],
+    member_name: &'a str,
+    receiver_names: &'a Vec<String>,
+    receiver_type_names: &'a HashSet<String>,
+    static_owner_names: &'a HashSet<String>,
+    hits: &'a mut BTreeSet<UsageHit>,
+}
+
+fn scan_member_node(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
+    match node.kind() {
+        "field_expression" => record_instance_member_hit(node, ctx),
+        "scoped_identifier" | "scoped_type_identifier" => record_static_member_hit(node, ctx),
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        scan_member_node(child, ctx);
+    }
+}
+
+fn record_instance_member_hit(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
+    if !field_expression_is_called(node) {
+        return;
+    }
+    let Some(field) = node.child_by_field_name("field") else {
+        return;
+    };
+    if simple_node_text(field, ctx.source).as_deref() != Some(ctx.member_name) {
+        return;
+    }
+    let Some(receiver_name) = node
+        .child_by_field_name("value")
+        .and_then(|receiver| simple_node_text(receiver, ctx.source))
+    else {
+        return;
+    };
+    if !ctx.receiver_names.contains(&receiver_name) {
+        return;
+    }
+
+    let start = field.start_byte();
+    let end = field.end_byte();
+    let Some(enclosing) = member_hit_enclosing(ctx.analyzer, ctx.file, ctx.line_starts, start, end)
+    else {
+        return;
+    };
+    let receiver_mismatched = ctx
+        .analyzer
+        .get_source(&enclosing, false)
+        .map(|enclosing_source| {
+            receiver_explicitly_mismatched(
+                ctx.source,
+                &enclosing_source,
+                ctx.receiver_type_names,
+                &receiver_name,
+            )
+        })
+        .unwrap_or(false);
+    if receiver_mismatched {
+        return;
+    }
+    push_member_hit(
+        ctx.file,
+        ctx.source,
+        ctx.line_starts,
+        start,
+        end,
+        enclosing,
+        ctx.hits,
+    );
+}
+
+fn field_expression_is_called(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        parent.kind() == "call_expression"
+            && parent
+                .child_by_field_name("function")
+                .is_some_and(|function| same_node(function, node))
+    })
+}
+
+fn record_static_member_hit(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
+    let Some(name) = node.child_by_field_name("name") else {
+        return;
+    };
+    if simple_node_text(name, ctx.source).as_deref() != Some(ctx.member_name) {
+        return;
+    }
+    let Some(path) = node.child_by_field_name("path") else {
+        return;
+    };
+    let Some(owner_name) = simple_node_text(path, ctx.source) else {
+        return;
+    };
+    if !ctx.static_owner_names.contains(&owner_name) {
+        return;
+    }
+
+    let start = name.start_byte();
+    let end = name.end_byte();
+    let Some(enclosing) = member_hit_enclosing(ctx.analyzer, ctx.file, ctx.line_starts, start, end)
+    else {
+        return;
+    };
+    push_member_hit(
+        ctx.file,
+        ctx.source,
+        ctx.line_starts,
+        start,
+        end,
+        enclosing,
+        ctx.hits,
+    );
+}
+
+fn same_node(left: Node<'_>, right: Node<'_>) -> bool {
+    left.start_byte() == right.start_byte()
+        && left.end_byte() == right.end_byte()
+        && left.kind() == right.kind()
 }
 
 fn self_like_constructor_names(rust: &RustAnalyzer, owner: &CodeUnit) -> HashSet<String> {

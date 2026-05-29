@@ -359,6 +359,40 @@ fn run() {
 }
 
 #[test]
+fn rust_graph_shadow_detection_uses_tree_sitter_declaration_nodes() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        ("src/service.rs", "pub struct Service;\n"),
+        (
+            "src/main.rs",
+            r#"
+use crate::service::Service;
+
+struct /* local shadow */ Service;
+
+fn run() {
+    let _ = Service {};
+}
+"#,
+        ),
+    ]);
+    let target = definition(&analyzer, "service.Service");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = brokk_bifrost::usages::RustExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    assert!(
+        result
+            .into_either()
+            .expect("tree-sitter shadowed success")
+            .is_empty()
+    );
+}
+
+#[test]
 fn private_unseeded_rust_target_falls_back_to_no_graph_hits() {
     let (_project, analyzer) = rust_analyzer_with_files(&[("src/service.rs", "struct Service;\n")]);
     let target = definition(&analyzer, "service.Service");
@@ -875,6 +909,71 @@ fn run() {
 }
 
 #[test]
+fn rust_graph_strategy_resolves_comment_separated_member_references() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/service.rs",
+            r#"
+pub struct Foo;
+impl Foo {
+    pub const CONST: usize = 1;
+    pub fn make() -> Foo { Foo }
+    pub fn bar(&self) {}
+}
+"#,
+        ),
+        (
+            "src/main.rs",
+            r#"
+use crate::service::Foo;
+
+fn run(x: Foo) {
+    x. /* member */ bar();
+    let _ = Foo:: /* static */ make();
+    let _ = Foo:: /* const */ CONST;
+}
+"#,
+        ),
+    ]);
+
+    let bar = member(&analyzer, &project.file("src/service.rs"), "Foo", "bar");
+    let make = member(&analyzer, &project.file("src/service.rs"), "Foo", "make");
+    let constant = member(&analyzer, &project.file("src/service.rs"), "Foo", "CONST");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = brokk_bifrost::usages::RustExportUsageGraphStrategy::new();
+
+    assert_eq!(
+        1,
+        strategy
+            .find_usages(&analyzer, std::slice::from_ref(&bar), &candidates, 1000)
+            .into_either()
+            .expect("commented instance member success")
+            .len()
+    );
+    assert_eq!(
+        1,
+        strategy
+            .find_usages(&analyzer, std::slice::from_ref(&make), &candidates, 1000)
+            .into_either()
+            .expect("commented static method success")
+            .len()
+    );
+    assert_eq!(
+        1,
+        strategy
+            .find_usages(
+                &analyzer,
+                std::slice::from_ref(&constant),
+                &candidates,
+                1000
+            )
+            .into_either()
+            .expect("commented static const success")
+            .len()
+    );
+}
+
+#[test]
 fn rust_graph_strategy_does_not_resolve_public_member_on_private_owner() {
     let (project, analyzer) = rust_analyzer_with_files(&[
         (
@@ -1126,6 +1225,63 @@ fn run() {
         .into_either()
         .expect("pub(crate) success");
     assert_eq!(1, hits.len());
+}
+
+#[test]
+fn rust_graph_strategy_reads_visibility_from_tree_sitter_nodes() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/service.rs",
+            r#"
+pub(in crate::service) struct Scoped;
+pub/**/ struct CommentedPublic;
+struct Private;
+"#,
+        ),
+        (
+            "src/main.rs",
+            r#"
+use crate::service::{CommentedPublic, Private, Scoped};
+
+fn run() {
+    let _ = Scoped {};
+    let _ = CommentedPublic {};
+    let _ = Private {};
+}
+"#,
+        ),
+    ]);
+    let scoped = definition(&analyzer, "service.Scoped");
+    let commented = definition(&analyzer, "service.CommentedPublic");
+    let private = definition(&analyzer, "service.Private");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = brokk_bifrost::usages::RustExportUsageGraphStrategy::new();
+
+    assert_eq!(
+        1,
+        strategy
+            .find_usages(&analyzer, std::slice::from_ref(&scoped), &candidates, 1000)
+            .into_either()
+            .expect("scoped visibility success")
+            .len()
+    );
+    assert_eq!(
+        1,
+        strategy
+            .find_usages(
+                &analyzer,
+                std::slice::from_ref(&commented),
+                &candidates,
+                1000,
+            )
+            .into_either()
+            .expect("commented pub visibility success")
+            .len()
+    );
+    assert!(matches!(
+        strategy.find_usages(&analyzer, std::slice::from_ref(&private), &candidates, 1000),
+        FuzzyResult::Failure { .. }
+    ));
 }
 
 #[test]
@@ -1726,6 +1882,51 @@ fn run() {
         .into_either()
         .expect("trait method success");
     assert_eq!(2, hits.len());
+}
+
+#[test]
+fn rust_graph_strategy_reads_trait_impls_from_tree_sitter_nodes() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/traits.rs",
+            r#"
+pub trait Worker {
+    fn work(&self);
+}
+"#,
+        ),
+        (
+            "src/service.rs",
+            r#"
+pub struct Foo;
+impl /* trait impl */ crate::traits::Worker for Foo {
+    fn work(&self) {}
+}
+"#,
+        ),
+        (
+            "src/main.rs",
+            r#"
+use crate::service::Foo;
+
+fn run(x: Foo) {
+    x.work();
+}
+"#,
+        ),
+    ]);
+
+    let target = member(&analyzer, &project.file("src/traits.rs"), "Worker", "work");
+    let hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &analyzer.get_analyzed_files().into_iter().collect(),
+            1000,
+        )
+        .into_either()
+        .expect("commented trait impl success");
+    assert_eq!(1, hits.len());
 }
 
 #[test]

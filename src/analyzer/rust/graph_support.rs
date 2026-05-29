@@ -3,8 +3,7 @@ use crate::analyzer::usages::{
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, ImportAnalysisProvider, ProjectFile};
 use crate::hash::HashSet;
-use regex::Regex;
-use std::sync::LazyLock;
+use tree_sitter::{Node, Parser};
 
 use super::RustAnalyzer;
 use super::declarations::rust_package_name;
@@ -230,40 +229,40 @@ impl RustAnalyzer {
             })
             .flat_map(|(file, source)| {
                 let binder = self.import_binder_of(&file);
-                TRAIT_IMPL_RE
-                    .captures_iter(&source)
-                    .filter_map(|captures| {
-                        let trait_ref = captures.get(1)?.as_str().trim();
-                        let implementer = captures.get(2)?.as_str().trim();
-                        trait_reference_matches(self, trait_owner, &file, trait_ref, &binder)
-                            .then(|| implementer.to_string())
-                    })
-                    .collect::<Vec<_>>()
+                trait_implementer_names_from_source(self, trait_owner, &file, &source, &binder)
             })
             .collect()
     }
 
-    fn is_public_declaration(&self, code_unit: &CodeUnit) -> bool {
-        self.get_source(code_unit, false)
-            .or_else(|| self.get_skeleton_header(code_unit))
-            .map(|source| {
-                let trimmed = source.trim_start();
-                trimmed.starts_with("pub ")
-                    || trimmed.starts_with("pub(crate)")
-                    || trimmed.starts_with("pub(in crate")
-                    || code_unit.is_module() && trimmed.starts_with("pub mod ")
-            })
-            .unwrap_or(false)
+    pub(crate) fn is_rust_trait_declaration(&self, code_unit: &CodeUnit) -> bool {
+        self.rust_declaration_node_is(code_unit, |node, _source| node.kind() == "trait_item")
+    }
+
+    pub(crate) fn is_rust_enum_declaration(&self, code_unit: &CodeUnit) -> bool {
+        self.rust_declaration_node_is(code_unit, |node, _source| node.kind() == "enum_item")
+    }
+
+    pub(crate) fn is_rust_public_like_declaration(&self, code_unit: &CodeUnit) -> bool {
+        self.rust_declaration_node_is(code_unit, |node, source| {
+            rust_visibility_text(node, source)
+                .is_some_and(|visibility| visibility.starts_with("pub"))
+        })
+    }
+
+    fn is_export_public_declaration(&self, code_unit: &CodeUnit) -> bool {
+        self.rust_declaration_node_is(code_unit, |node, source| {
+            rust_visibility_text(node, source).is_some_and(is_export_visibility)
+        })
     }
 
     fn is_module_export_candidate(&self, code_unit: &CodeUnit) -> bool {
-        if !self.is_public_declaration(code_unit) {
+        if !self.is_export_public_declaration(code_unit) {
             return false;
         }
 
         let mut current = code_unit.clone();
         while let Some(parent) = self.parent_of(&current) {
-            if !parent.is_module() || !self.is_public_declaration(&parent) {
+            if !parent.is_module() || !self.is_export_public_declaration(&parent) {
                 return false;
             }
             current = parent;
@@ -275,7 +274,7 @@ impl RustAnalyzer {
     fn is_visible_module_path(&self, code_unit: &CodeUnit) -> bool {
         let mut current = code_unit.clone();
         loop {
-            if !current.is_module() || !self.is_public_declaration(&current) {
+            if !current.is_module() || !self.is_export_public_declaration(&current) {
                 return false;
             }
             let Some(parent) = self.parent_of(&current) else {
@@ -284,6 +283,133 @@ impl RustAnalyzer {
             current = parent;
         }
     }
+
+    fn rust_declaration_node_is<F>(&self, code_unit: &CodeUnit, predicate: F) -> bool
+    where
+        F: FnOnce(Node<'_>, &str) -> bool,
+    {
+        let Ok(source) = self.inner.project().read_source(code_unit.source()) else {
+            return false;
+        };
+        let Some(range) = self.ranges(code_unit).first() else {
+            return false;
+        };
+        let Some(tree) = parse_rust_tree(&source) else {
+            return false;
+        };
+        tree.root_node()
+            .descendant_for_byte_range(range.start_byte, range.end_byte)
+            .map(|node| predicate(node, &source))
+            .unwrap_or(false)
+    }
+}
+
+fn parse_rust_tree(source: &str) -> Option<tree_sitter::Tree> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .ok()?;
+    parser.parse(source, None)
+}
+
+fn rust_visibility_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
+    (0..node.child_count())
+        .filter_map(|index| node.child(index))
+        .find(|child| child.kind() == "visibility_modifier")
+        .and_then(|child| source.get(child.start_byte()..child.end_byte()))
+        .map(str::trim)
+}
+
+fn is_export_visibility(visibility: &str) -> bool {
+    let compact: String = visibility
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect();
+    compact == "pub" || compact == "pub(crate)" || compact.starts_with("pub(incrate")
+}
+
+fn trait_implementer_names_from_source(
+    analyzer: &RustAnalyzer,
+    trait_owner: &CodeUnit,
+    impl_file: &ProjectFile,
+    source: &str,
+    binder: &ImportBinder,
+) -> Vec<String> {
+    let Some(tree) = parse_rust_tree(source) else {
+        return Vec::new();
+    };
+    let mut implementers = Vec::new();
+    collect_trait_implementer_names(
+        tree.root_node(),
+        analyzer,
+        trait_owner,
+        impl_file,
+        source,
+        binder,
+        &mut implementers,
+    );
+    implementers
+}
+
+fn collect_trait_implementer_names(
+    node: Node<'_>,
+    analyzer: &RustAnalyzer,
+    trait_owner: &CodeUnit,
+    impl_file: &ProjectFile,
+    source: &str,
+    binder: &ImportBinder,
+    implementers: &mut Vec<String>,
+) {
+    if node.kind() == "impl_item"
+        && let Some((trait_ref, implementer)) = trait_impl_parts(node, source)
+        && trait_reference_matches(analyzer, trait_owner, impl_file, &trait_ref, binder)
+    {
+        implementers.push(implementer);
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_trait_implementer_names(
+            child,
+            analyzer,
+            trait_owner,
+            impl_file,
+            source,
+            binder,
+            implementers,
+        );
+    }
+}
+
+fn trait_impl_parts(node: Node<'_>, source: &str) -> Option<(String, String)> {
+    let trait_node = node.child_by_field_name("trait")?;
+    let type_node = node.child_by_field_name("type")?;
+    Some((
+        node_text(trait_node, source).to_string(),
+        simple_type_name(type_node, source)?,
+    ))
+}
+
+fn simple_type_name(node: Node<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "type_identifier" | "identifier" => Some(node_text(node, source).to_string()),
+        "scoped_type_identifier" | "scoped_identifier" => node
+            .child_by_field_name("name")
+            .map(|name| node_text(name, source).to_string()),
+        "generic_type" | "reference_type" => node
+            .named_children(&mut node.walk())
+            .find_map(|child| simple_type_name(child, source)),
+        _ => node
+            .named_children(&mut node.walk())
+            .find_map(|child| simple_type_name(child, source)),
+    }
+}
+
+fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    source
+        .get(node.start_byte()..node.end_byte())
+        .unwrap_or("")
+        .trim()
 }
 
 fn trait_reference_matches(
@@ -316,8 +442,3 @@ fn trait_reference_matches(
                 .any(|file| file == *trait_owner.source())
         })
 }
-
-static TRAIT_IMPL_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\bimpl\s+([A-Za-z_][A-Za-z0-9_:]*)\s+for\s+([A-Za-z_][A-Za-z0-9_]*)")
-        .expect("valid trait impl regex")
-});
