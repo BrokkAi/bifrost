@@ -1,3 +1,7 @@
+use crate::analyzer::js_ts::imports::{
+    CommonJsRequireBindingKind, commonjs_require_module_specifier_from_declarator,
+    parse_commonjs_require_bindings_from_node,
+};
 use crate::analyzer::usages::graph_core::{ImportEdge, ImportEdgeKind};
 use crate::analyzer::usages::js_ts_graph::hits::record_hit;
 use crate::analyzer::usages::js_ts_graph::resolver::{
@@ -78,7 +82,9 @@ pub(super) fn scan_files_for_seeds(
         let target_self_file = *file == target.source();
         let mut binding_engine = LocalInferenceEngine::new(LocalInferenceConfig::default());
         for edge in &edges {
-            binding_engine.seed_symbol(edge.local_name.clone(), TARGET_BINDING);
+            if edge_binds_bare_identifier(edge) {
+                binding_engine.seed_symbol(edge.local_name.clone(), TARGET_BINDING);
+            }
         }
         if target_self_file {
             binding_engine.seed_symbol(target_short.clone(), TARGET_BINDING);
@@ -154,7 +160,11 @@ impl ScanCtx<'_> {
         if self.binding_engine.is_shadowed(ident) {
             return false;
         }
-        if self.edges.iter().any(|edge| edge.local_name == ident) {
+        if self
+            .edges
+            .iter()
+            .any(|edge| edge.local_name == ident && edge_binds_bare_identifier(edge))
+        {
             return true;
         }
         // In the target's own file, the bare class/function name is itself a reference
@@ -162,6 +172,13 @@ impl ScanCtx<'_> {
         // the same file).
         self.target_self_file && ident == self.target_short
     }
+}
+
+fn edge_binds_bare_identifier(edge: &ImportEdge) -> bool {
+    !matches!(
+        edge.kind,
+        ImportEdgeKind::Namespace | ImportEdgeKind::CommonJsRequire(_)
+    )
 }
 
 fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -192,7 +209,8 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             | "namespace_import"
             | "export_clause"
             | "export_specifier"
-    ) {
+    ) || (kind == "expression_statement" && is_commonjs_export_statement(node, ctx.source))
+    {
         if introduces_scope {
             ctx.scope_stack.pop();
             ctx.binding_engine.exit_scope();
@@ -200,7 +218,7 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
 
-    if kind == "variable_declarator" {
+    if kind == "variable_declarator" && !is_commonjs_require_declarator(node, ctx.source) {
         register_local_binding(node, ctx);
         register_declaration(node, ctx);
     }
@@ -393,12 +411,18 @@ fn handle_member_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let object_text = slice(object, ctx.source);
     let property_text = slice(property, ctx.source);
 
-    // `Namespace.Foo` style access — namespace binds to target's file, property matches
-    // the target's own short name (or the requested member).
+    // `Namespace.Foo` / `require("./mod").Foo` style access. ESM namespace imports
+    // still key by the target's local name; CommonJS module-object edges carry the
+    // exported property name so aliases such as `module.exports = { Bar: Foo }` work.
     let namespace_match = ctx.edges.iter().any(|edge| {
-        matches!(edge.kind, ImportEdgeKind::Namespace) && edge.local_name == object_text
+        edge.local_name == object_text
+            && match &edge.kind {
+                ImportEdgeKind::Namespace => property_text == ctx.target_short,
+                ImportEdgeKind::CommonJsRequire(export_name) => property_text == export_name,
+                ImportEdgeKind::Named(_) | ImportEdgeKind::Default => false,
+            }
     });
-    if namespace_match && property_text == ctx.target_short {
+    if namespace_match {
         record_hit(property, ctx);
         return;
     }
@@ -566,6 +590,46 @@ fn slice<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     source.get(node.start_byte()..node.end_byte()).unwrap_or("")
 }
 
+fn simple_identifier_text_for_source<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
+    match node.kind() {
+        "identifier" | "type_identifier" | "property_identifier" => {
+            let text = slice(node, source).trim();
+            (!text.is_empty()).then_some(text)
+        }
+        _ => None,
+    }
+}
+
+fn property_name_text(node: Node<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "identifier"
+        | "type_identifier"
+        | "property_identifier"
+        | "shorthand_property_identifier"
+        | "shorthand_property_identifier_pattern" => {
+            let text = slice(node, source)
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'');
+            (!text.is_empty()).then(|| text.to_string())
+        }
+        "string" => {
+            let text = unquote(slice(node, source));
+            (!text.is_empty()).then_some(text)
+        }
+        _ => None,
+    }
+}
+
+fn first_named_child_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
+    if node.kind() == kind {
+        return Some(node);
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| child.kind() == kind)
+}
+
 // ===================================================================================
 // AST predicates
 // ===================================================================================
@@ -669,10 +733,148 @@ pub(super) fn compute_export_index(source: &str, tree: &Tree) -> ExportIndex {
         };
         if child.kind() == "export_statement" {
             visit_export_statement(child, source, &mut index);
+        } else if child.kind() == "expression_statement" {
+            visit_commonjs_export_statement(child, source, &mut index);
         }
     }
 
     index
+}
+
+fn visit_commonjs_export_statement(node: Node<'_>, source: &str, index: &mut ExportIndex) {
+    let Some(assignment) = first_named_child_of_kind(node, "assignment_expression") else {
+        return;
+    };
+    let Some(left) = assignment.child_by_field_name("left") else {
+        return;
+    };
+    let Some(right) = assignment.child_by_field_name("right") else {
+        return;
+    };
+
+    match commonjs_export_target(left, source) {
+        Some(CommonJsExportTarget::Named(exported_name)) => {
+            if let Some(local_name) = local_export_name(right, source) {
+                index
+                    .exports_by_name
+                    .insert(exported_name, ExportEntry::Local { local_name });
+            }
+        }
+        Some(CommonJsExportTarget::ModuleExports) => {
+            register_module_exports_assignment(right, source, index);
+        }
+        None => {}
+    }
+}
+
+fn is_commonjs_export_statement(node: Node<'_>, source: &str) -> bool {
+    let Some(assignment) = first_named_child_of_kind(node, "assignment_expression") else {
+        return false;
+    };
+    assignment
+        .child_by_field_name("left")
+        .is_some_and(|left| commonjs_export_target(left, source).is_some())
+}
+
+enum CommonJsExportTarget {
+    Named(String),
+    ModuleExports,
+}
+
+fn commonjs_export_target(node: Node<'_>, source: &str) -> Option<CommonJsExportTarget> {
+    if node.kind() != "member_expression" {
+        return None;
+    }
+    let object = node.child_by_field_name("object")?;
+    let property = node.child_by_field_name("property")?;
+    let property_name = property_name_text(property, source)?;
+
+    if simple_identifier_text_for_source(object, source) == Some("exports") {
+        return Some(CommonJsExportTarget::Named(property_name));
+    }
+
+    if commonjs_module_exports_object(object, source) {
+        return Some(CommonJsExportTarget::Named(property_name));
+    }
+
+    if simple_identifier_text_for_source(object, source) == Some("module")
+        && property_name == "exports"
+    {
+        return Some(CommonJsExportTarget::ModuleExports);
+    }
+
+    None
+}
+
+fn commonjs_module_exports_object(node: Node<'_>, source: &str) -> bool {
+    if node.kind() != "member_expression" {
+        return false;
+    }
+    let Some(object) = node.child_by_field_name("object") else {
+        return false;
+    };
+    let Some(property) = node.child_by_field_name("property") else {
+        return false;
+    };
+    simple_identifier_text_for_source(object, source) == Some("module")
+        && property_name_text(property, source).as_deref() == Some("exports")
+}
+
+fn register_module_exports_assignment(right: Node<'_>, source: &str, index: &mut ExportIndex) {
+    if right.kind() == "object" {
+        register_module_exports_object(right, source, index);
+        return;
+    }
+
+    if let Some(local_name) = local_export_name(right, source) {
+        index.exports_by_name.insert(
+            "default".to_string(),
+            ExportEntry::Default {
+                local_name: Some(local_name),
+            },
+        );
+    }
+}
+
+fn register_module_exports_object(node: Node<'_>, source: &str, index: &mut ExportIndex) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "shorthand_property_identifier" | "shorthand_property_identifier_pattern" => {
+                let name = slice(child, source).trim();
+                if !name.is_empty() {
+                    index.exports_by_name.insert(
+                        name.to_string(),
+                        ExportEntry::Local {
+                            local_name: name.to_string(),
+                        },
+                    );
+                }
+            }
+            "pair" => {
+                let Some(key) = child.child_by_field_name("key") else {
+                    continue;
+                };
+                let Some(value) = child.child_by_field_name("value") else {
+                    continue;
+                };
+                let Some(exported_name) = property_name_text(key, source) else {
+                    continue;
+                };
+                let Some(local_name) = local_export_name(value, source) else {
+                    continue;
+                };
+                index
+                    .exports_by_name
+                    .insert(exported_name, ExportEntry::Local { local_name });
+            }
+            _ => {}
+        }
+    }
+}
+
+fn local_export_name(node: Node<'_>, source: &str) -> Option<String> {
+    simple_identifier_text_for_source(node, source).map(str::to_string)
 }
 
 fn visit_export_statement(node: Node<'_>, source: &str, index: &mut ExportIndex) {
@@ -850,9 +1052,33 @@ pub(super) fn compute_import_binder(source: &str, tree: &Tree) -> ImportBinder {
         };
         if child.kind() == "import_statement" {
             visit_import_statement(child, source, &mut binder);
+        } else if matches!(child.kind(), "lexical_declaration" | "variable_declaration") {
+            visit_commonjs_require_statement(child, source, &mut binder);
         }
     }
     binder
+}
+
+fn visit_commonjs_require_statement(node: Node<'_>, source: &str, binder: &mut ImportBinder) {
+    for binding in parse_commonjs_require_bindings_from_node(node, source) {
+        let (kind, imported_name) = match binding.kind {
+            CommonJsRequireBindingKind::ModuleObject => (ImportKind::CommonJsRequire, None),
+            CommonJsRequireBindingKind::Named => (ImportKind::Named, Some(binding.imported_name)),
+        };
+        binder.bindings.insert(
+            binding.local_name,
+            ImportBinding {
+                module_specifier: binding.module_specifier,
+                kind,
+                imported_name,
+            },
+        );
+    }
+}
+
+fn is_commonjs_require_declarator(node: Node<'_>, source: &str) -> bool {
+    node.kind() == "variable_declarator"
+        && commonjs_require_module_specifier_from_declarator(node, source).is_some()
 }
 
 fn visit_import_statement(node: Node<'_>, source: &str, binder: &mut ImportBinder) {

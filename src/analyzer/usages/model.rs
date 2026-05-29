@@ -276,6 +276,7 @@ pub enum ImportKind {
     Default,
     Named,
     Namespace,
+    CommonJsRequire,
     Glob,
 }
 

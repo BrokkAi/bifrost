@@ -16,6 +16,7 @@ pub enum ImportEdgeKind {
     Named(String),
     Default,
     Namespace,
+    CommonJsRequire(String),
 }
 
 pub struct ProjectUsageGraph {
@@ -197,6 +198,9 @@ fn edge_matches_seed(edge: &ImportEdge, seeds: &BTreeSet<(ProjectFile, String)>)
             seeds.contains(&(edge.target_file.clone(), "default".to_string()))
         }
         ImportEdgeKind::Namespace => seeds.iter().any(|(file, _)| file == &edge.target_file),
+        ImportEdgeKind::CommonJsRequire(export_name) => {
+            seeds.contains(&(edge.target_file.clone(), export_name.clone()))
+        }
     }
 }
 
@@ -231,9 +235,41 @@ where
                     }
                     continue;
                 }
+                if matches!(binding.kind, ImportKind::CommonJsRequire) {
+                    let Some(exports) = exports_by_file.get(&target_file) else {
+                        continue;
+                    };
+                    if exports.exports_by_name.contains_key("default") {
+                        reverse
+                            .entry(target_file.clone())
+                            .or_default()
+                            .push(ImportEdge {
+                                importer: file.clone(),
+                                local_name: local_name.clone(),
+                                target_file: target_file.clone(),
+                                kind: ImportEdgeKind::Default,
+                            });
+                    }
+                    for export_name in exports.exports_by_name.keys() {
+                        reverse
+                            .entry(target_file.clone())
+                            .or_default()
+                            .push(ImportEdge {
+                                importer: file.clone(),
+                                local_name: local_name.clone(),
+                                target_file: target_file.clone(),
+                                kind: ImportEdgeKind::CommonJsRequire(export_name.clone()),
+                            });
+                    }
+                    continue;
+                }
+
                 let kind = match (binding.kind, binding.imported_name.as_deref()) {
                     (ImportKind::Default, _) => ImportEdgeKind::Default,
                     (ImportKind::Namespace, _) => ImportEdgeKind::Namespace,
+                    (ImportKind::CommonJsRequire, _) => {
+                        unreachable!("commonjs require handled above")
+                    }
                     (ImportKind::Glob, _) => unreachable!("glob handled above"),
                     (ImportKind::Named, Some(name)) => ImportEdgeKind::Named(name.to_string()),
                     (ImportKind::Named, None) => ImportEdgeKind::Named(local_name.clone()),
