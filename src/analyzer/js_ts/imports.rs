@@ -56,6 +56,139 @@ pub(crate) fn parse_es_import_infos_from_node(node: Node<'_>, source: &str) -> V
     imports
 }
 
+pub(crate) fn parse_commonjs_require_import_infos_from_node(
+    node: Node<'_>,
+    source: &str,
+) -> Vec<ImportInfo> {
+    if matches!(node.kind(), "lexical_declaration" | "variable_declaration") {
+        let mut imports = Vec::new();
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.kind() == "variable_declarator" {
+                imports.extend(parse_require_declarator(child, node, source));
+            }
+        }
+        return imports;
+    }
+
+    if node.kind() == "expression_statement" {
+        let raw = node_text(node, source).trim();
+        if raw.is_empty() || !direct_require_expression(node, source) {
+            return Vec::new();
+        }
+        return vec![ImportInfo {
+            raw_snippet: raw.to_string(),
+            is_wildcard: false,
+            identifier: None,
+            alias: None,
+        }];
+    }
+
+    Vec::new()
+}
+
+fn parse_require_declarator(
+    declarator: Node<'_>,
+    statement: Node<'_>,
+    source: &str,
+) -> Vec<ImportInfo> {
+    let Some(value) = declarator.child_by_field_name("value") else {
+        return Vec::new();
+    };
+    if !is_require_call(value, source) {
+        return Vec::new();
+    }
+    let raw = node_text(statement, source).trim().to_string();
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    let Some(name) = declarator.child_by_field_name("name") else {
+        return Vec::new();
+    };
+    import_infos_from_require_binding(name, &raw, source)
+}
+
+fn import_infos_from_require_binding(node: Node<'_>, raw: &str, source: &str) -> Vec<ImportInfo> {
+    match node.kind() {
+        "identifier" | "type_identifier" => {
+            let identifier = node_text(node, source).trim();
+            if identifier.is_empty() {
+                Vec::new()
+            } else {
+                vec![ImportInfo {
+                    raw_snippet: raw.to_string(),
+                    is_wildcard: false,
+                    identifier: Some(identifier.to_string()),
+                    alias: None,
+                }]
+            }
+        }
+        "object_pattern" => {
+            let mut imports = Vec::new();
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                match child.kind() {
+                    "shorthand_property_identifier_pattern" => {
+                        let identifier = node_text(child, source).trim();
+                        if !identifier.is_empty() {
+                            imports.push(ImportInfo {
+                                raw_snippet: raw.to_string(),
+                                is_wildcard: false,
+                                identifier: Some(identifier.to_string()),
+                                alias: None,
+                            });
+                        }
+                    }
+                    "pair_pattern" => {
+                        let identifier = child
+                            .child_by_field_name("key")
+                            .or_else(|| first_child_of_kind(child, "property_identifier"))
+                            .map(|key| node_text(key, source).trim().to_string())
+                            .filter(|text| !text.is_empty());
+                        let alias = child
+                            .child_by_field_name("value")
+                            .map(|value| node_text(value, source).trim().to_string())
+                            .filter(|text| !text.is_empty());
+                        if let Some(identifier) = identifier {
+                            imports.push(ImportInfo {
+                                raw_snippet: raw.to_string(),
+                                is_wildcard: false,
+                                identifier: Some(identifier),
+                                alias,
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            imports
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn first_child_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| child.kind() == kind)
+}
+
+fn direct_require_expression(node: Node<'_>, source: &str) -> bool {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| is_require_call(child, source))
+}
+
+fn is_require_call(node: Node<'_>, source: &str) -> bool {
+    if node.kind() != "call_expression" {
+        return false;
+    }
+    node.child_by_field_name("function")
+        .is_some_and(|function| {
+            function.kind() == "identifier" && node_text(function, source).trim() == "require"
+        })
+}
+
 fn collect_named_es_imports(
     node: Node<'_>,
     source: &str,
@@ -105,141 +238,6 @@ fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
         .unwrap_or_default()
 }
 
-pub(crate) fn parse_js_import_infos(raw: &str) -> Vec<ImportInfo> {
-    let trimmed = raw.trim().trim_end_matches(';').trim();
-    if trimmed.starts_with("import ") {
-        parse_es_import_infos(raw)
-    } else if trimmed.contains("require(") {
-        parse_require_import_infos(raw)
-    } else {
-        Vec::new()
-    }
-}
-
-fn parse_es_import_infos(raw: &str) -> Vec<ImportInfo> {
-    let trimmed = raw.trim().trim_end_matches(';').trim();
-    if !trimmed.starts_with("import ") {
-        return Vec::new();
-    }
-    let Some((head, _path)) = trimmed[7..].rsplit_once(" from ") else {
-        return vec![ImportInfo {
-            raw_snippet: raw.trim().to_string(),
-            is_wildcard: false,
-            identifier: None,
-            alias: None,
-        }];
-    };
-    let head = strip_import_type_prefix(head.trim());
-    if head.starts_with('*') {
-        return vec![ImportInfo {
-            raw_snippet: raw.trim().to_string(),
-            is_wildcard: true,
-            identifier: None,
-            alias: head.split_whitespace().last().map(str::to_string),
-        }];
-    }
-    if head.starts_with('{') {
-        return parse_named_imports(raw, head);
-    }
-    let mut imports = Vec::new();
-    if let Some((default_import, named)) = head.split_once(',') {
-        let default_import = default_import.trim();
-        if !default_import.is_empty() {
-            imports.push(ImportInfo {
-                raw_snippet: raw.trim().to_string(),
-                is_wildcard: false,
-                identifier: Some(default_import.to_string()),
-                alias: None,
-            });
-        }
-        imports.extend(parse_named_imports(raw, named));
-        return imports;
-    }
-    vec![ImportInfo {
-        raw_snippet: raw.trim().to_string(),
-        is_wildcard: false,
-        identifier: Some(head.to_string()),
-        alias: None,
-    }]
-}
-
-fn parse_named_imports(raw: &str, named: &str) -> Vec<ImportInfo> {
-    named
-        .trim()
-        .trim_start_matches('{')
-        .trim_end_matches('}')
-        .split(',')
-        .filter_map(|entry| {
-            let entry = strip_import_type_prefix(entry.trim());
-            if entry.is_empty() {
-                return None;
-            }
-            let (identifier, alias) = entry
-                .split_once(" as ")
-                .map(|(identifier, alias)| (identifier.trim(), Some(alias.trim().to_string())))
-                .unwrap_or((entry, None));
-            Some(ImportInfo {
-                raw_snippet: raw.trim().to_string(),
-                is_wildcard: false,
-                identifier: Some(identifier.to_string()),
-                alias,
-            })
-        })
-        .collect()
-}
-
-fn strip_import_type_prefix(input: &str) -> &str {
-    input.strip_prefix("type ").unwrap_or(input)
-}
-
-fn parse_require_import_infos(raw: &str) -> Vec<ImportInfo> {
-    let trimmed = raw.trim().trim_end_matches(';').trim();
-    let Some((left, _)) = trimmed.split_once("require(") else {
-        return Vec::new();
-    };
-    let left = left.trim();
-    if let Some(pattern) = left
-        .strip_prefix("const ")
-        .or_else(|| left.strip_prefix("let "))
-        .or_else(|| left.strip_prefix("var "))
-    {
-        let pattern = pattern.trim().trim_end_matches('=').trim();
-        if pattern.starts_with('{') {
-            return pattern
-                .trim_start_matches('{')
-                .trim_end_matches('}')
-                .split(',')
-                .filter_map(|entry| {
-                    let entry = entry.trim();
-                    if entry.is_empty() {
-                        return None;
-                    }
-                    let (identifier, alias) = entry
-                        .split_once(':')
-                        .map(|(identifier, alias)| {
-                            (identifier.trim(), Some(alias.trim().to_string()))
-                        })
-                        .unwrap_or((entry, None));
-                    Some(ImportInfo {
-                        raw_snippet: raw.trim().to_string(),
-                        is_wildcard: false,
-                        identifier: Some(identifier.to_string()),
-                        alias,
-                    })
-                })
-                .collect();
-        }
-        if !pattern.is_empty() {
-            return vec![ImportInfo {
-                raw_snippet: raw.trim().to_string(),
-                is_wildcard: false,
-                identifier: Some(pattern.to_string()),
-                alias: None,
-            }];
-        }
-    }
-    Vec::new()
-}
 pub(crate) fn resolve_js_ts_import_paths(
     source_file: &ProjectFile,
     raw_import: &str,
@@ -322,10 +320,12 @@ fn collect_candidate_paths(
     }
 }
 
-pub(crate) fn imported_tokens(raw_import: &str) -> BTreeSet<String> {
-    parse_js_import_infos(raw_import)
+pub(crate) fn import_info_tokens(import: &ImportInfo) -> BTreeSet<String> {
+    import
+        .alias
+        .clone()
+        .or_else(|| import.identifier.clone())
         .into_iter()
-        .filter_map(|import| import.alias.or(import.identifier))
         .collect()
 }
 
@@ -344,11 +344,26 @@ pub(crate) fn extract_js_ts_call_receiver(reference: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_js_import_infos;
+    use super::parse_es_import_infos_from_node;
+    use tree_sitter::Parser;
+
+    fn parse_typescript_import_infos(source: &str) -> Vec<crate::analyzer::ImportInfo> {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let root = tree.root_node();
+        let import_node = root
+            .named_children(&mut root.walk())
+            .find(|child| child.kind() == "import_statement")
+            .unwrap();
+        parse_es_import_infos_from_node(import_node, source)
+    }
 
     #[test]
     fn parses_typescript_type_only_named_imports() {
-        let imports = parse_js_import_infos("import type { BubbleState } from '../types';");
+        let imports = parse_typescript_import_infos("import type { BubbleState } from '../types';");
         assert_eq!(1, imports.len());
         assert_eq!(Some("BubbleState"), imports[0].identifier.as_deref());
         assert_eq!(None, imports[0].alias.as_deref());
@@ -356,8 +371,9 @@ mod tests {
 
     #[test]
     fn parses_mixed_typescript_named_imports_with_inline_type_modifiers() {
-        let imports =
-            parse_js_import_infos("import { type BubbleState, SummaryState } from '../types';");
+        let imports = parse_typescript_import_infos(
+            "import { type BubbleState, SummaryState } from '../types';",
+        );
         let identifiers = imports
             .into_iter()
             .map(|import| import.identifier.unwrap_or_default())

@@ -37,6 +37,8 @@ fn test_import_and_require_statements() {
             const fs = require('fs');
             const local = require('./local-module');
             const { func } = require('../other');
+            const { renamed: alias } = require('./aliased-module');
+            require('./side-effect');
 
             function app(): void {}
         "#,
@@ -73,7 +75,39 @@ fn test_import_and_require_statements() {
             .iter()
             .any(|line| line.contains("require('../other')"))
     );
-    assert_eq!(4, require_imports.len());
+    assert!(
+        require_imports
+            .iter()
+            .any(|line| line.contains("require('./side-effect')"))
+    );
+    assert_eq!(6, require_imports.len());
+
+    let infos = analyzer.import_info_of(&require_file);
+    assert!(infos.iter().any(
+        |info| info.raw_snippet.contains("const path = require('path')")
+            && info.identifier.as_deref() == Some("path")
+            && info.alias.is_none()
+    ));
+    assert!(infos.iter().any(|info| {
+        info.raw_snippet
+            .contains("const { func } = require('../other')")
+            && info.identifier.as_deref() == Some("func")
+            && info.alias.is_none()
+    }));
+    assert!(
+        infos
+            .iter()
+            .any(|info| info.raw_snippet.contains("const { renamed: alias }")
+                && info.identifier.as_deref() == Some("renamed")
+                && info.alias.as_deref() == Some("alias"))
+    );
+    assert!(
+        infos
+            .iter()
+            .any(|info| info.raw_snippet.contains("require('./side-effect')")
+                && info.identifier.is_none()
+                && info.alias.is_none())
+    );
 }
 
 #[test]

@@ -23,8 +23,8 @@ use crate::analyzer::js_ts::clones::{
 };
 use crate::analyzer::js_ts::identifiers::collect_js_ts_identifiers;
 use crate::analyzer::js_ts::imports::{
-    extract_js_ts_call_receiver, imported_tokens, parse_es_import_infos_from_node,
-    parse_js_import_infos, resolve_js_ts_import_paths,
+    extract_js_ts_call_receiver, import_info_tokens, parse_commonjs_require_import_infos_from_node,
+    parse_es_import_infos_from_node, resolve_js_ts_import_paths,
 };
 use crate::analyzer::js_ts::model::{module_code_unit, node_text, trim_statement};
 use crate::analyzer::js_ts::tests::detect_js_ts_test_assertion_smells;
@@ -92,11 +92,12 @@ impl crate::analyzer::LanguageAdapter for TypescriptAdapter {
                         .extend(parse_es_import_infos_from_node(child, source));
                 }
                 "expression_statement" => {
-                    let raw = node_text(child, source).trim();
-                    if raw.contains("require(") {
+                    let imports = parse_commonjs_require_import_infos_from_node(child, source);
+                    if !imports.is_empty() {
+                        let raw = node_text(child, source).trim().to_string();
                         module_has_imports = true;
-                        parsed.import_statements.push(raw.to_string());
-                        parsed.imports.extend(parse_js_import_infos(raw));
+                        parsed.import_statements.push(raw);
+                        parsed.imports.extend(imports);
                     }
                 }
                 "export_statement" => visit_ts_export(file, source, child, None, &mut parsed),
@@ -112,11 +113,12 @@ impl crate::analyzer::LanguageAdapter for TypescriptAdapter {
                 }
                 "lexical_declaration" | "variable_declaration" | "type_alias_declaration" => {
                     if matches!(child.kind(), "lexical_declaration" | "variable_declaration") {
-                        let raw = node_text(child, source).trim();
-                        if raw.contains("require(") {
+                        let imports = parse_commonjs_require_import_infos_from_node(child, source);
+                        if !imports.is_empty() {
+                            let raw = node_text(child, source).trim().to_string();
                             module_has_imports = true;
-                            parsed.import_statements.push(raw.to_string());
-                            parsed.imports.extend(parse_js_import_infos(raw));
+                            parsed.import_statements.push(raw);
+                            parsed.imports.extend(imports);
                         }
                     }
                     visit_ts_value(file, source, child, None, &mut parsed, false);
@@ -302,7 +304,7 @@ impl ImportAnalysisProvider for TypescriptAnalyzer {
             .import_info_of(code_unit.source())
             .iter()
             .filter(|import| {
-                let tokens = imported_tokens(&import.raw_snippet);
+                let tokens = import_info_tokens(import);
                 tokens.is_empty() || tokens.iter().any(|token| source.contains(token))
             })
             .map(|import| import.raw_snippet.clone())

@@ -12,8 +12,8 @@ use crate::analyzer::js_ts::clones::{
 use crate::analyzer::js_ts::identifiers::collect_js_ts_identifiers;
 use crate::analyzer::js_ts::imports::extract_js_ts_call_receiver;
 use crate::analyzer::js_ts::imports::{
-    imported_tokens, parse_es_import_infos_from_node, parse_js_import_infos,
-    resolve_js_ts_import_paths,
+    import_info_tokens, parse_commonjs_require_import_infos_from_node,
+    parse_es_import_infos_from_node, resolve_js_ts_import_paths,
 };
 use crate::analyzer::js_ts::model::{module_code_unit, node_text, trim_statement};
 use crate::analyzer::js_ts::tests::detect_js_ts_test_assertion_smells;
@@ -88,10 +88,12 @@ impl LanguageAdapter for JavascriptAdapter {
                         .extend(parse_es_import_infos_from_node(child, source));
                 }
                 "expression_statement" => {
-                    if let Some(raw) = extract_require_statement(child, source) {
+                    let imports = parse_commonjs_require_import_infos_from_node(child, source);
+                    if !imports.is_empty() {
+                        let raw = node_text(child, source).trim().to_string();
                         module_has_imports = true;
-                        parsed.import_statements.push(raw.clone());
-                        parsed.imports.extend(parse_js_import_infos(&raw));
+                        parsed.import_statements.push(raw);
+                        parsed.imports.extend(imports);
                     }
                 }
                 "export_statement" => {
@@ -104,10 +106,12 @@ impl LanguageAdapter for JavascriptAdapter {
                     visit_js_function(file, source, child, None, &mut parsed, false);
                 }
                 "lexical_declaration" | "variable_declaration" => {
-                    if let Some(raw) = extract_require_statement(child, source) {
+                    let imports = parse_commonjs_require_import_infos_from_node(child, source);
+                    if !imports.is_empty() {
+                        let raw = node_text(child, source).trim().to_string();
                         module_has_imports = true;
-                        parsed.import_statements.push(raw.clone());
-                        parsed.imports.extend(parse_js_import_infos(&raw));
+                        parsed.import_statements.push(raw);
+                        parsed.imports.extend(imports);
                     }
                     visit_js_variable_statement(file, source, child, None, &mut parsed, false);
                 }
@@ -293,7 +297,7 @@ impl ImportAnalysisProvider for JavascriptAnalyzer {
         let source = self.inner.get_source(code_unit, false).unwrap_or_default();
         let mut relevant = HashSet::default();
         for import in self.inner.import_info_of(code_unit.source()) {
-            let tokens = imported_tokens(&import.raw_snippet);
+            let tokens = import_info_tokens(import);
             if tokens.is_empty() || tokens.iter().any(|token| source.contains(token)) {
                 relevant.insert(import.raw_snippet.clone());
             }
@@ -1099,10 +1103,6 @@ fn mutation_target_name(node: Node<'_>, source: &str) -> Option<String> {
     }
 }
 
-fn extract_require_statement(node: Node<'_>, source: &str) -> Option<String> {
-    let text = node_text(node, source).trim();
-    text.contains("require(").then(|| text.to_string())
-}
 fn extract_js_type_identifiers(source: &str) -> BTreeSet<String> {
     let mut parser = Parser::new();
     parser
