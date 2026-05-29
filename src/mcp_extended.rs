@@ -1,5 +1,6 @@
 use crate::mcp_common::{
-    McpRenderOptions, McpServerSpec, SEARCHTOOLS_INSTRUCTIONS, run_stdio_server, tool_descriptor,
+    McpRenderOptions, McpServerSpec, SEARCHTOOLS_INSTRUCTIONS, run_stdio_server,
+    symbol_names_schema, tool_descriptor,
 };
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -11,6 +12,7 @@ pub const EXTENDED_TOOL_NAMES: &[&str] = &[
     "search_file_contents",
     "list_files",
     "skim_files",
+    "get_symbol_summaries",
     "most_relevant_files",
     "search_git_commit_messages",
     "get_git_log",
@@ -161,6 +163,11 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                 },
                 "required": ["file_paths"]
             }),
+        ),
+        tool_descriptor(
+            "get_symbol_summaries",
+            "Preview compact line-ranged summaries for known symbols after search_symbols; cheaper than reading whole files.",
+            symbol_names_schema(),
         ),
         tool_descriptor(
             "most_relevant_files",

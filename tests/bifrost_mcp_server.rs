@@ -102,6 +102,11 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
         .as_array()
         .expect("tools array");
     assert!(tools.iter().any(|tool| tool["name"] == "search_symbols"));
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool["name"] == "get_symbol_summaries")
+    );
     assert!(tools.iter().any(|tool| tool["name"] == "get_summaries"));
     assert!(
         !tools
@@ -472,6 +477,7 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
         ],
         &[
             "get_file_contents",
+            "get_symbol_summaries",
             "most_relevant_files",
             "report_secret_like_code",
         ],
@@ -479,7 +485,12 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
     assert_server_tools(
         &fixture_root,
         "extended",
-        &["get_file_contents", "find_filenames", "most_relevant_files"],
+        &[
+            "get_file_contents",
+            "find_filenames",
+            "get_symbol_summaries",
+            "most_relevant_files",
+        ],
         &[
             "refresh",
             "get_summaries",
@@ -517,6 +528,12 @@ fn bifrost_split_servers_reject_tools_outside_their_registry() {
         "core",
         "most_relevant_files",
         json!({ "seed_file_paths": ["A.java"] }),
+    );
+    assert_unknown_tool(
+        &fixture_root,
+        "core",
+        "get_symbol_summaries",
+        json!({ "symbols": ["A"] }),
     );
     assert_unknown_tool(
         &fixture_root,

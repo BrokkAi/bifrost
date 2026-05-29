@@ -12,7 +12,6 @@ pub const CORE_TOOL_NAMES: &[&str] = &[
     "get_active_workspace",
     "search_symbols",
     "get_symbol_locations",
-    "get_symbol_summaries",
     "get_symbol_sources",
     "get_summaries",
     "list_symbols",
@@ -137,11 +136,6 @@ pub(crate) fn core_tool_descriptors() -> Vec<Value> {
         tool_descriptor(
             "get_symbol_locations",
             "Get project-relative file paths and line ranges for known symbols after search_symbols; use before opening exact definitions.",
-            symbol_names_schema(),
-        ),
-        tool_descriptor(
-            "get_symbol_summaries",
-            "Preview compact line-ranged summaries for known symbols after search_symbols; cheaper than reading whole files.",
             symbol_names_schema(),
         ),
         tool_descriptor(
