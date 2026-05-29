@@ -61,14 +61,15 @@ pub(crate) fn parse_commonjs_require_import_infos_from_node(
     source: &str,
 ) -> Vec<ImportInfo> {
     if matches!(node.kind(), "lexical_declaration" | "variable_declaration") {
-        let mut imports = Vec::new();
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            if child.kind() == "variable_declarator" {
-                imports.extend(parse_require_declarator(child, node, source));
-            }
-        }
-        return imports;
+        return parse_commonjs_require_bindings_from_node(node, source)
+            .into_iter()
+            .map(|binding| ImportInfo {
+                raw_snippet: binding.raw_snippet,
+                is_wildcard: false,
+                identifier: Some(binding.imported_name),
+                alias: binding.alias,
+            })
+            .collect();
     }
 
     if node.kind() == "expression_statement" {
@@ -87,55 +88,99 @@ pub(crate) fn parse_commonjs_require_import_infos_from_node(
     Vec::new()
 }
 
-fn parse_require_declarator(
-    declarator: Node<'_>,
-    statement: Node<'_>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommonJsRequireBinding {
+    pub(crate) raw_snippet: String,
+    pub(crate) module_specifier: String,
+    pub(crate) local_name: String,
+    pub(crate) imported_name: String,
+    pub(crate) alias: Option<String>,
+    pub(crate) kind: CommonJsRequireBindingKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommonJsRequireBindingKind {
+    ModuleObject,
+    Named,
+}
+
+pub(crate) fn parse_commonjs_require_bindings_from_node(
+    node: Node<'_>,
     source: &str,
-) -> Vec<ImportInfo> {
-    let Some(value) = declarator.child_by_field_name("value") else {
-        return Vec::new();
-    };
-    if !is_require_call(value, source) {
+) -> Vec<CommonJsRequireBinding> {
+    if !matches!(node.kind(), "lexical_declaration" | "variable_declaration") {
         return Vec::new();
     }
-    let raw = node_text(statement, source).trim().to_string();
+    let raw = node_text(node, source).trim().to_string();
     if raw.is_empty() {
         return Vec::new();
     }
+
+    let mut bindings = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "variable_declarator" {
+            bindings.extend(commonjs_require_bindings_from_declarator(
+                child, &raw, source,
+            ));
+        }
+    }
+    bindings
+}
+
+fn commonjs_require_bindings_from_declarator(
+    declarator: Node<'_>,
+    raw: &str,
+    source: &str,
+) -> Vec<CommonJsRequireBinding> {
+    let Some(module_specifier) =
+        commonjs_require_module_specifier_from_declarator(declarator, source)
+    else {
+        return Vec::new();
+    };
     let Some(name) = declarator.child_by_field_name("name") else {
         return Vec::new();
     };
-    import_infos_from_require_binding(name, &raw, source)
+    commonjs_require_bindings_from_name(name, raw, &module_specifier, source)
 }
 
-fn import_infos_from_require_binding(node: Node<'_>, raw: &str, source: &str) -> Vec<ImportInfo> {
+fn commonjs_require_bindings_from_name(
+    node: Node<'_>,
+    raw: &str,
+    module_specifier: &str,
+    source: &str,
+) -> Vec<CommonJsRequireBinding> {
     match node.kind() {
         "identifier" | "type_identifier" => {
             let identifier = node_text(node, source).trim();
             if identifier.is_empty() {
                 Vec::new()
             } else {
-                vec![ImportInfo {
+                vec![CommonJsRequireBinding {
                     raw_snippet: raw.to_string(),
-                    is_wildcard: false,
-                    identifier: Some(identifier.to_string()),
+                    module_specifier: module_specifier.to_string(),
+                    local_name: identifier.to_string(),
+                    imported_name: identifier.to_string(),
                     alias: None,
+                    kind: CommonJsRequireBindingKind::ModuleObject,
                 }]
             }
         }
         "object_pattern" => {
-            let mut imports = Vec::new();
+            let mut bindings = Vec::new();
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
                 match child.kind() {
                     "shorthand_property_identifier_pattern" => {
                         let identifier = node_text(child, source).trim();
                         if !identifier.is_empty() {
-                            imports.push(ImportInfo {
+                            bindings.push(CommonJsRequireBinding {
                                 raw_snippet: raw.to_string(),
-                                is_wildcard: false,
-                                identifier: Some(identifier.to_string()),
+                                module_specifier: module_specifier.to_string(),
+                                local_name: identifier.to_string(),
+                                imported_name: identifier.to_string(),
                                 alias: None,
+                                kind: CommonJsRequireBindingKind::Named,
                             });
                         }
                     }
@@ -147,23 +192,65 @@ fn import_infos_from_require_binding(node: Node<'_>, raw: &str, source: &str) ->
                             .filter(|text| !text.is_empty());
                         let alias = child
                             .child_by_field_name("value")
-                            .map(|value| node_text(value, source).trim().to_string())
+                            .and_then(|value| commonjs_pattern_local_name(value, source))
                             .filter(|text| !text.is_empty());
                         if let Some(identifier) = identifier {
-                            imports.push(ImportInfo {
+                            let local_name = alias.clone().unwrap_or_else(|| identifier.clone());
+                            bindings.push(CommonJsRequireBinding {
                                 raw_snippet: raw.to_string(),
-                                is_wildcard: false,
-                                identifier: Some(identifier),
+                                module_specifier: module_specifier.to_string(),
+                                local_name,
+                                imported_name: identifier,
                                 alias,
+                                kind: CommonJsRequireBindingKind::Named,
                             });
                         }
                     }
                     _ => {}
                 }
             }
-            imports
+            bindings
         }
         _ => Vec::new(),
+    }
+}
+
+pub(crate) fn commonjs_require_module_specifier_from_declarator(
+    declarator: Node<'_>,
+    source: &str,
+) -> Option<String> {
+    let value = declarator.child_by_field_name("value")?;
+    require_call_module_specifier(value, source)
+}
+
+fn require_call_module_specifier(node: Node<'_>, source: &str) -> Option<String> {
+    if node.kind() != "call_expression" {
+        return None;
+    }
+    let function = node.child_by_field_name("function")?;
+    if function.kind() != "identifier" || node_text(function, source).trim() != "require" {
+        return None;
+    }
+
+    let arguments = node.child_by_field_name("arguments")?;
+    let mut cursor = arguments.walk();
+    let first_argument = arguments.named_children(&mut cursor).next()?;
+    if !matches!(first_argument.kind(), "string" | "string_fragment") {
+        return None;
+    }
+    Some(unquote(node_text(first_argument, source)))
+}
+
+fn commonjs_pattern_local_name(node: Node<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "identifier" | "type_identifier" | "shorthand_property_identifier_pattern" => {
+            let text = node_text(node, source).trim();
+            (!text.is_empty()).then(|| text.to_string())
+        }
+        "assignment_pattern" => node
+            .child_by_field_name("left")
+            .and_then(|left| commonjs_pattern_local_name(left, source)),
+        _ => None,
     }
 }
 
@@ -180,13 +267,7 @@ fn direct_require_expression(node: Node<'_>, source: &str) -> bool {
 }
 
 fn is_require_call(node: Node<'_>, source: &str) -> bool {
-    if node.kind() != "call_expression" {
-        return false;
-    }
-    node.child_by_field_name("function")
-        .is_some_and(|function| {
-            function.kind() == "identifier" && node_text(function, source).trim() == "require"
-        })
+    require_call_module_specifier(node, source).is_some()
 }
 
 fn collect_named_es_imports(
@@ -236,6 +317,19 @@ fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     source
         .get(node.start_byte()..node.end_byte())
         .unwrap_or_default()
+}
+
+fn unquote(text: &str) -> String {
+    let trimmed = text.trim();
+    let stripped = trimmed
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .or_else(|| {
+            trimmed
+                .strip_prefix('\'')
+                .and_then(|value| value.strip_suffix('\''))
+        });
+    stripped.unwrap_or(trimmed).to_string()
 }
 
 pub(crate) fn resolve_js_ts_import_paths(

@@ -349,7 +349,7 @@ impl ScanBindings {
         if let Some(seeds) = &spec.top_level_seeds {
             for edge in graph.usage_graph.matching_edges_for_importer(file, seeds) {
                 match edge.kind {
-                    ImportEdgeKind::Namespace | ImportEdgeKind::CommonJsRequire => {
+                    ImportEdgeKind::Namespace | ImportEdgeKind::CommonJsRequire(_) => {
                         namespace_names.insert(edge.local_name);
                     }
                     ImportEdgeKind::Named(_) | ImportEdgeKind::Default => {
@@ -367,7 +367,7 @@ impl ScanBindings {
         if let Some(seeds) = &spec.owner_seeds {
             for edge in graph.usage_graph.matching_edges_for_importer(file, seeds) {
                 match edge.kind {
-                    ImportEdgeKind::Namespace | ImportEdgeKind::CommonJsRequire => {
+                    ImportEdgeKind::Namespace | ImportEdgeKind::CommonJsRequire(_) => {
                         owner_namespace_names.insert(edge.local_name);
                     }
                     ImportEdgeKind::Named(_) | ImportEdgeKind::Default => {

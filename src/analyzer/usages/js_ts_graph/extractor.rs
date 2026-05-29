@@ -1,3 +1,7 @@
+use crate::analyzer::js_ts::imports::{
+    CommonJsRequireBindingKind, commonjs_require_module_specifier_from_declarator,
+    parse_commonjs_require_bindings_from_node,
+};
 use crate::analyzer::usages::graph_core::{ImportEdge, ImportEdgeKind};
 use crate::analyzer::usages::js_ts_graph::hits::record_hit;
 use crate::analyzer::usages::js_ts_graph::resolver::{
@@ -78,7 +82,9 @@ pub(super) fn scan_files_for_seeds(
         let target_self_file = *file == target.source();
         let mut binding_engine = LocalInferenceEngine::new(LocalInferenceConfig::default());
         for edge in &edges {
-            binding_engine.seed_symbol(edge.local_name.clone(), TARGET_BINDING);
+            if edge_binds_bare_identifier(edge) {
+                binding_engine.seed_symbol(edge.local_name.clone(), TARGET_BINDING);
+            }
         }
         if target_self_file {
             binding_engine.seed_symbol(target_short.clone(), TARGET_BINDING);
@@ -171,7 +177,7 @@ impl ScanCtx<'_> {
 fn edge_binds_bare_identifier(edge: &ImportEdge) -> bool {
     !matches!(
         edge.kind,
-        ImportEdgeKind::Namespace | ImportEdgeKind::CommonJsRequire
+        ImportEdgeKind::Namespace | ImportEdgeKind::CommonJsRequire(_)
     )
 }
 
@@ -405,15 +411,18 @@ fn handle_member_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let object_text = slice(object, ctx.source);
     let property_text = slice(property, ctx.source);
 
-    // `Namespace.Foo` style access — namespace binds to target's file, property matches
-    // the target's own short name (or the requested member).
+    // `Namespace.Foo` / `require("./mod").Foo` style access. ESM namespace imports
+    // still key by the target's local name; CommonJS module-object edges carry the
+    // exported property name so aliases such as `module.exports = { Bar: Foo }` work.
     let namespace_match = ctx.edges.iter().any(|edge| {
-        matches!(
-            edge.kind,
-            ImportEdgeKind::Namespace | ImportEdgeKind::CommonJsRequire
-        ) && edge.local_name == object_text
+        edge.local_name == object_text
+            && match &edge.kind {
+                ImportEdgeKind::Namespace => property_text == ctx.target_short,
+                ImportEdgeKind::CommonJsRequire(export_name) => property_text == export_name,
+                ImportEdgeKind::Named(_) | ImportEdgeKind::Default => false,
+            }
     });
-    if namespace_match && property_text == ctx.target_short {
+    if namespace_match {
         record_hit(property, ctx);
         return;
     }
@@ -1043,10 +1052,7 @@ pub(super) fn compute_import_binder(source: &str, tree: &Tree) -> ImportBinder {
         };
         if child.kind() == "import_statement" {
             visit_import_statement(child, source, &mut binder);
-        } else if matches!(
-            child.kind(),
-            "lexical_declaration" | "variable_declaration" | "expression_statement"
-        ) {
+        } else if matches!(child.kind(), "lexical_declaration" | "variable_declaration") {
             visit_commonjs_require_statement(child, source, &mut binder);
         }
     }
@@ -1054,132 +1060,25 @@ pub(super) fn compute_import_binder(source: &str, tree: &Tree) -> ImportBinder {
 }
 
 fn visit_commonjs_require_statement(node: Node<'_>, source: &str, binder: &mut ImportBinder) {
-    if node.kind() == "expression_statement" {
-        return;
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.kind() != "variable_declarator" {
-            continue;
-        }
-        let Some(name) = child.child_by_field_name("name") else {
-            continue;
+    for binding in parse_commonjs_require_bindings_from_node(node, source) {
+        let (kind, imported_name) = match binding.kind {
+            CommonJsRequireBindingKind::ModuleObject => (ImportKind::CommonJsRequire, None),
+            CommonJsRequireBindingKind::Named => (ImportKind::Named, Some(binding.imported_name)),
         };
-        let Some(value) = child.child_by_field_name("value") else {
-            continue;
-        };
-        let Some(module_specifier) = require_call_module_specifier(value, source) else {
-            continue;
-        };
-        register_commonjs_require_binding(name, source, &module_specifier, binder);
+        binder.bindings.insert(
+            binding.local_name,
+            ImportBinding {
+                module_specifier: binding.module_specifier,
+                kind,
+                imported_name,
+            },
+        );
     }
-}
-
-fn register_commonjs_require_binding(
-    name: Node<'_>,
-    source: &str,
-    module_specifier: &str,
-    binder: &mut ImportBinder,
-) {
-    match name.kind() {
-        "identifier" | "type_identifier" => {
-            let local = slice(name, source).trim();
-            if local.is_empty() {
-                return;
-            }
-            binder.bindings.insert(
-                local.to_string(),
-                ImportBinding {
-                    module_specifier: module_specifier.to_string(),
-                    kind: ImportKind::CommonJsRequire,
-                    imported_name: None,
-                },
-            );
-        }
-        "object_pattern" => {
-            let mut cursor = name.walk();
-            for child in name.named_children(&mut cursor) {
-                match child.kind() {
-                    "shorthand_property_identifier_pattern" => {
-                        let imported = slice(child, source).trim();
-                        if imported.is_empty() {
-                            continue;
-                        }
-                        binder.bindings.insert(
-                            imported.to_string(),
-                            ImportBinding {
-                                module_specifier: module_specifier.to_string(),
-                                kind: ImportKind::Named,
-                                imported_name: Some(imported.to_string()),
-                            },
-                        );
-                    }
-                    "pair_pattern" => {
-                        let Some(key) = child.child_by_field_name("key") else {
-                            continue;
-                        };
-                        let Some(value) = child.child_by_field_name("value") else {
-                            continue;
-                        };
-                        let Some(imported) = property_name_text(key, source) else {
-                            continue;
-                        };
-                        let Some(local) = pattern_local_name(value, source) else {
-                            continue;
-                        };
-                        binder.bindings.insert(
-                            local,
-                            ImportBinding {
-                                module_specifier: module_specifier.to_string(),
-                                kind: ImportKind::Named,
-                                imported_name: Some(imported.to_string()),
-                            },
-                        );
-                    }
-                    _ => {}
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-fn require_call_module_specifier(node: Node<'_>, source: &str) -> Option<String> {
-    if node.kind() != "call_expression" {
-        return None;
-    }
-    let function = node.child_by_field_name("function")?;
-    if simple_identifier_text_for_source(function, source) != Some("require") {
-        return None;
-    }
-
-    let arguments = node.child_by_field_name("arguments")?;
-    let mut cursor = arguments.walk();
-    let first_argument = arguments.named_children(&mut cursor).next()?;
-    if !matches!(first_argument.kind(), "string" | "string_fragment") {
-        return None;
-    }
-    Some(unquote(slice(first_argument, source)))
 }
 
 fn is_commonjs_require_declarator(node: Node<'_>, source: &str) -> bool {
     node.kind() == "variable_declarator"
-        && node
-            .child_by_field_name("value")
-            .is_some_and(|value| require_call_module_specifier(value, source).is_some())
-}
-
-fn pattern_local_name(node: Node<'_>, source: &str) -> Option<String> {
-    match node.kind() {
-        "identifier" | "type_identifier" | "shorthand_property_identifier_pattern" => {
-            simple_identifier_text_for_source(node, source).map(str::to_string)
-        }
-        "assignment_pattern" => node
-            .child_by_field_name("left")
-            .and_then(|left| pattern_local_name(left, source)),
-        _ => None,
-    }
+        && commonjs_require_module_specifier_from_declarator(node, source).is_some()
 }
 
 fn visit_import_statement(node: Node<'_>, source: &str, binder: &mut ImportBinder) {

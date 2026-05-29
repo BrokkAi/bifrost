@@ -955,6 +955,59 @@ fn js_commonjs_required_binding_shadowing_does_not_count() {
 }
 
 #[test]
+fn js_commonjs_module_object_bare_identifier_does_not_count() {
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file("lib.js", "class Foo {}\nexports.Foo = Foo;\n")
+            .file(
+                "consumer.js",
+                "const lib = require('./lib');\nfunction run() { return lib; }\n",
+            )
+            .build()
+    });
+
+    let target = find_js_target(&analyzer, &project.file("lib.js"), |cu| {
+        cu.identifier() == "Foo" && cu.is_class()
+    });
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = JsTsExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("commonjs graph success");
+
+    assert!(
+        hits.is_empty(),
+        "bare required module object must not count"
+    );
+}
+
+#[test]
+fn js_commonjs_module_object_uses_exported_alias_name() {
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file("lib.js", "class Foo {}\nmodule.exports = { Bar: Foo };\n")
+            .file(
+                "consumer.js",
+                "const lib = require('./lib');\nfunction run() { return [new lib.Bar(), lib.Foo]; }\n",
+            )
+            .build()
+    });
+
+    let target = find_js_target(&analyzer, &project.file("lib.js"), |cu| {
+        cu.identifier() == "Foo" && cu.is_class()
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert_eq!(1, hits.len());
+    assert!(
+        hits.iter().all(|hit| hit.snippet.contains("lib.Bar")),
+        "only the exported property alias should count"
+    );
+}
+
+#[test]
 #[ignore = "Brokk parity marker: tsconfig paths and baseUrl resolution stay out of scope for issue #78"]
 fn parity_tsconfig_paths_alias_resolution_is_follow_up_work() {}
 

@@ -16,7 +16,7 @@ pub enum ImportEdgeKind {
     Named(String),
     Default,
     Namespace,
-    CommonJsRequire,
+    CommonJsRequire(String),
 }
 
 pub struct ProjectUsageGraph {
@@ -197,8 +197,9 @@ fn edge_matches_seed(edge: &ImportEdge, seeds: &BTreeSet<(ProjectFile, String)>)
         ImportEdgeKind::Default => {
             seeds.contains(&(edge.target_file.clone(), "default".to_string()))
         }
-        ImportEdgeKind::Namespace | ImportEdgeKind::CommonJsRequire => {
-            seeds.iter().any(|(file, _)| file == &edge.target_file)
+        ImportEdgeKind::Namespace => seeds.iter().any(|(file, _)| file == &edge.target_file),
+        ImportEdgeKind::CommonJsRequire(export_name) => {
+            seeds.contains(&(edge.target_file.clone(), export_name.clone()))
         }
     }
 }
@@ -249,15 +250,17 @@ where
                                 kind: ImportEdgeKind::Default,
                             });
                     }
-                    reverse
-                        .entry(target_file.clone())
-                        .or_default()
-                        .push(ImportEdge {
-                            importer: file.clone(),
-                            local_name: local_name.clone(),
-                            target_file,
-                            kind: ImportEdgeKind::CommonJsRequire,
-                        });
+                    for export_name in exports.exports_by_name.keys() {
+                        reverse
+                            .entry(target_file.clone())
+                            .or_default()
+                            .push(ImportEdge {
+                                importer: file.clone(),
+                                local_name: local_name.clone(),
+                                target_file: target_file.clone(),
+                                kind: ImportEdgeKind::CommonJsRequire(export_name.clone()),
+                            });
+                    }
                     continue;
                 }
 
