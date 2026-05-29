@@ -19,7 +19,6 @@ from .models import (
     SkimFilesResult,
     SymbolLocationsResult,
     SymbolSourcesResult,
-    SymbolSummariesResult,
 )
 
 
@@ -123,22 +122,6 @@ class SearchToolsClient:
             {"symbols": symbols, "kind_filter": kind_filter.value},
         )
         return SymbolLocationsResult.from_dict(
-            payload.structured,
-            render_line_numbers=self._render_line_numbers,
-            rendered_text=payload.rendered_text,
-        )
-
-    def get_symbol_summaries(
-        self,
-        symbols: list[str],
-        *,
-        kind_filter: SymbolKindFilter = SymbolKindFilter.ANY,
-    ) -> SymbolSummariesResult:
-        payload = self._call_tool_payload(
-            "get_symbol_summaries",
-            {"symbols": symbols, "kind_filter": kind_filter.value},
-        )
-        return SymbolSummariesResult.from_dict(
             payload.structured,
             render_line_numbers=self._render_line_numbers,
             rendered_text=payload.rendered_text,

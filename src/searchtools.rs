@@ -431,78 +431,6 @@ pub fn get_symbol_locations(
     }
 }
 
-pub fn get_symbol_summaries(analyzer: &dyn IAnalyzer, params: SymbolNamesParams) -> SummaryResult {
-    let mut outcomes: Vec<_> = params
-        .symbols
-        .into_par_iter()
-        .enumerate()
-        .filter_map(|(index, symbol)| {
-            if symbol.trim().is_empty() {
-                return None;
-            }
-
-            let blocks = match resolve_codeunit_fuzzy(
-                analyzer,
-                &symbol,
-                code_unit_kind_filter(params.kind_filter),
-            ) {
-                CodeUnitResolution::Resolved(definitions) => definitions
-                    .into_iter()
-                    .filter_map(|code_unit| {
-                        let elements = summary_elements_for_code_unit(analyzer, &code_unit);
-                        if elements.is_empty() {
-                            return None;
-                        }
-
-                        Some(SummaryBlock {
-                            label: code_unit.fq_name(),
-                            path: rel_path_string(code_unit.source()),
-                            preamble: file_preamble(code_unit.source(), &elements),
-                            elements,
-                        })
-                    })
-                    .collect::<Vec<_>>(),
-                CodeUnitResolution::Ambiguous(matches) => {
-                    return Some((
-                        index,
-                        Err(SymbolSummaryLookupError::Ambiguous(AmbiguousSymbol {
-                            target: symbol,
-                            matches,
-                        })),
-                    ));
-                }
-                CodeUnitResolution::NotFound => {
-                    return Some((index, Err(SymbolSummaryLookupError::NotFound(symbol))));
-                }
-            };
-
-            if blocks.is_empty() {
-                Some((index, Err(SymbolSummaryLookupError::NotFound(symbol))))
-            } else {
-                Some((index, Ok(blocks)))
-            }
-        })
-        .collect();
-    outcomes.sort_by_key(|(index, _)| *index);
-
-    let mut summaries = Vec::new();
-    let mut not_found = Vec::new();
-    let mut ambiguous = Vec::new();
-    for (_, outcome) in outcomes {
-        match outcome {
-            Ok(blocks) => summaries.extend(blocks),
-            Err(SymbolSummaryLookupError::NotFound(symbol)) => not_found.push(symbol),
-            Err(SymbolSummaryLookupError::Ambiguous(item)) => ambiguous.push(item),
-        }
-    }
-
-    SummaryResult {
-        summaries,
-        not_found,
-        ambiguous,
-    }
-}
-
 #[derive(Debug)]
 struct SummaryTargets {
     file_targets: Vec<ProjectFile>,
@@ -512,11 +440,6 @@ struct SummaryTargets {
 
 enum SourceLookupOutcome {
     Found(Vec<SourceBlock>),
-    NotFound(String),
-    Ambiguous(AmbiguousSymbol),
-}
-
-enum SymbolSummaryLookupError {
     NotFound(String),
     Ambiguous(AmbiguousSymbol),
 }

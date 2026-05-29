@@ -24,7 +24,6 @@ pub const SEARCHTOOLS_TOOL_NAMES: &[&str] = &[
     "get_active_workspace",
     "search_symbols",
     "get_symbol_locations",
-    "get_symbol_summaries",
     "get_symbol_sources",
     "get_summaries",
     "list_symbols",

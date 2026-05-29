@@ -14,7 +14,6 @@ from .models import (
     SymbolSourcesResult,
     SummaryBlock,
     SummaryElement,
-    SymbolSummariesResult,
 )
 
 __all__ = [
@@ -35,5 +34,4 @@ __all__ = [
     "SymbolSourcesResult",
     "SummaryBlock",
     "SummaryElement",
-    "SymbolSummariesResult",
 ]

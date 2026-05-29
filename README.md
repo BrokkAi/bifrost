@@ -95,7 +95,6 @@ This starts a stdio MCP server that publishes these tools:
 - `get_active_workspace`
 - `search_symbols`
 - `get_symbol_locations`
-- `get_symbol_summaries`
 - `get_symbol_sources`
 - `get_summaries`
 - `list_symbols`
@@ -157,7 +156,6 @@ The client exposes:
 - `refresh()`
 - `search_symbols(...)`
 - `get_symbol_locations(...)`
-- `get_symbol_summaries(...)`
 - `get_symbol_sources(...)`
 - `get_summaries(...)`
 - `list_symbols(...)`
