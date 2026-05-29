@@ -1114,6 +1114,7 @@ using Alias = Target;
 typedef Target LegacyAlias;
 typedef Target* TargetPtrAlias;
 typedef Target& TargetRefAlias;
+void hidden_alias_scope() { using HiddenAlias = Target; }
 void overloaded();
 template <typename T> void overloaded(T value);
 "#,
@@ -1132,6 +1133,7 @@ void call(Target target) {
     LegacyAlias legacy;
     TargetPtrAlias ptr_alias;
     TargetRefAlias ref_alias = target;
+    HiddenAlias hidden;
     overloaded();
     overloaded<Target>(target);
 }
@@ -1149,6 +1151,7 @@ void call(Target target) {
     assert_hit_contains(&type_hits, "consumer.cpp", "LegacyAlias legacy");
     assert_hit_contains(&type_hits, "consumer.cpp", "TargetPtrAlias ptr_alias");
     assert_hit_contains(&type_hits, "consumer.cpp", "TargetRefAlias ref_alias");
+    assert_no_hit_contains(&type_hits, "HiddenAlias hidden");
     assert_no_hit_contains(&type_hits, "struct Target {}");
 
     let zero_arg = function_definition_with_short_name_and_arity(&analyzer, "overloaded", 0);
@@ -1330,7 +1333,7 @@ struct Target {
     Target(const Target& other);
 };
 struct Owner {
-    Target target;
+    const Target target;
     Owner();
     Owner(int value);
 };

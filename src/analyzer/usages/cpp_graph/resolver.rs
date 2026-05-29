@@ -298,12 +298,14 @@ fn build_alias_index(files: &HashSet<ProjectFile>) -> HashMap<ProjectFile, Vec<C
 
 fn collect_cpp_aliases(node: Node<'_>, source: &str, out: &mut Vec<CppAlias>) {
     match node.kind() {
-        "alias_declaration" => {
+        "alias_declaration" if alias_has_visible_file_scope(node) => {
             if let Some(alias) = cpp_alias_from_alias_declaration(node, source) {
                 out.push(alias);
             }
         }
-        "type_definition" => collect_typedef_aliases(node, source, out),
+        "type_definition" if alias_has_visible_file_scope(node) => {
+            collect_typedef_aliases(node, source, out)
+        }
         _ => {}
     }
 
@@ -311,6 +313,20 @@ fn collect_cpp_aliases(node: Node<'_>, source: &str, out: &mut Vec<CppAlias>) {
     for child in node.named_children(&mut cursor) {
         collect_cpp_aliases(child, source, out);
     }
+}
+
+fn alias_has_visible_file_scope(node: Node<'_>) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        match parent.kind() {
+            "translation_unit"
+            | "namespace_definition"
+            | "declaration_list"
+            | "linkage_specification" => current = parent.parent(),
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn cpp_alias_from_alias_declaration(node: Node<'_>, source: &str) -> Option<CppAlias> {
@@ -498,20 +514,74 @@ pub(super) fn field_initializer_constructs_target(
 
 fn field_declares_type(unit: &CodeUnit, ctx: &ScanCtx<'_>, owner: &CodeUnit) -> bool {
     unit.signature()
-        .is_some_and(|declaration| field_declaration_type_matches(declaration, ctx, owner))
+        .is_some_and(|declaration| field_declaration_type_matches(declaration, unit, ctx, owner))
         || ctx
             .analyzer
             .get_source(unit, false)
-            .is_some_and(|declaration| field_declaration_type_matches(&declaration, ctx, owner))
+            .is_some_and(|declaration| {
+                field_declaration_type_matches(&declaration, unit, ctx, owner)
+            })
 }
 
-fn field_declaration_type_matches(declaration: &str, ctx: &ScanCtx<'_>, owner: &CodeUnit) -> bool {
+fn field_declaration_type_matches(
+    declaration: &str,
+    unit: &CodeUnit,
+    ctx: &ScanCtx<'_>,
+    owner: &CodeUnit,
+) -> bool {
     ctx.visibility
         .resolves_to_type(ctx.file, declaration, owner)
-        || declaration
-            .split_whitespace()
-            .next()
-            .is_some_and(|type_text| ctx.visibility.resolves_to_type(ctx.file, type_text, owner))
+        || field_type_prefix(declaration, unit.identifier()).is_some_and(|type_text| {
+            let normalized = normalize_field_type_text(type_text);
+            ctx.visibility.resolves_to_type(ctx.file, type_text, owner)
+                || ctx
+                    .visibility
+                    .resolves_to_type(ctx.file, normalized.as_str(), owner)
+        })
+}
+
+fn field_type_prefix<'a>(declaration: &'a str, field_name: &str) -> Option<&'a str> {
+    let declaration = declaration
+        .split(['=', ';'])
+        .next()
+        .unwrap_or(declaration)
+        .trim();
+    let index = declaration.rfind(field_name)?;
+    let before = &declaration[..index];
+    let after = &declaration[index + field_name.len()..];
+    if before.chars().next_back().is_some_and(is_identifier_char)
+        || after.chars().next().is_some_and(is_identifier_char)
+    {
+        return None;
+    }
+    Some(before.trim())
+}
+
+fn normalize_field_type_text(type_text: &str) -> String {
+    const FIELD_SPECIFIERS: [&str; 7] = [
+        "static ",
+        "mutable ",
+        "constexpr ",
+        "constinit ",
+        "inline ",
+        "volatile ",
+        "const ",
+    ];
+
+    let mut normalized = normalize_type_text(type_text);
+    loop {
+        let Some(stripped) = FIELD_SPECIFIERS
+            .iter()
+            .find_map(|specifier| normalized.strip_prefix(specifier))
+        else {
+            return normalized;
+        };
+        normalized = normalize_type_text(stripped);
+    }
+}
+
+fn is_identifier_char(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphanumeric()
 }
 
 pub(super) fn declaration_mentions_type(
