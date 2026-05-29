@@ -672,13 +672,19 @@ pub(super) fn first_type_child(node: Node<'_>) -> Option<Node<'_>> {
 }
 
 pub(super) fn is_declaration_name(node: Node<'_>) -> bool {
-    node.parent()
-        .and_then(|parent| parent.child_by_field_name("name"))
-        == Some(node)
-        || matches!(
-            node.parent().map(|parent| parent.kind()),
-            Some("function_declarator" | "init_declarator")
-        )
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    parent.child_by_field_name("name") == Some(node)
+        || parent.kind() == "enumerator"
+        || matches!(parent.kind(), "function_declarator" | "init_declarator")
+            && parent
+                .child_by_field_name("declarator")
+                .is_some_and(|declarator| node_contains(declarator, node))
+}
+
+fn node_contains(parent: Node<'_>, child: Node<'_>) -> bool {
+    parent.start_byte() <= child.start_byte() && child.end_byte() <= parent.end_byte()
 }
 
 pub(super) fn has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {
@@ -769,6 +775,9 @@ pub(super) fn name_mentions(value: &str, expected: &str) -> bool {
 
 pub(super) fn reference_matches_unit(reference: &str, unit: &CodeUnit) -> bool {
     let cpp_name = cpp_name_for(unit);
+    if reference.contains("::") {
+        return reference == cpp_name;
+    }
     reference == cpp_name
         || terminal_name(reference) == unit.identifier()
             && (unit.package_name().is_empty() || reference == unit.identifier())

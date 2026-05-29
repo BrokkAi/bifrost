@@ -89,10 +89,7 @@ pub(super) fn scan_file(
         enclosing_cache: HashMap::default(),
     };
     scan_node(tree.root_node(), &mut ctx);
-    if matches!(
-        ctx.spec.kind,
-        TargetKind::GlobalField | TargetKind::MemberField
-    ) {
+    if matches!(ctx.spec.kind, TargetKind::MemberField) {
         scan_text_symbol_hits(&mut ctx);
     }
 }
@@ -438,6 +435,7 @@ fn maybe_record_global_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         || is_declaration_name(node)
         || is_member_field_declaration_context(node, ctx)
         || has_ancestor_kind(node, "field_expression")
+        || is_nested_in_qualified_identifier(node)
     {
         return;
     }
@@ -481,6 +479,7 @@ fn maybe_record_member_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         || is_declaration_name(node)
         || is_member_field_declaration_context(node, ctx)
         || has_ancestor_kind(node, "field_expression")
+        || is_nested_in_qualified_identifier(node)
     {
         return;
     }
@@ -492,8 +491,22 @@ fn maybe_record_member_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             .resolve_named(ctx.file, text, TargetKind::MemberField)
             .is_some_and(|resolved| same_visible_symbol(&resolved, &ctx.spec.target))
             || qualified_owner_matches(text, ctx));
-    if qualified_match || same_owner_context(node, ctx) {
+    let unscoped_enum_match = ctx.spec.owner.as_ref().is_some_and(|owner| {
+        !text.contains("::")
+            && owner_is_unscoped_enum(owner, ctx)
+            && ctx.visibility.is_visible(ctx.file, &ctx.spec.target)
+    });
+    if qualified_match || same_owner_context(node, ctx) || unscoped_enum_match {
         push_hit(node, ctx);
+    } else if ctx
+        .spec
+        .owner
+        .as_ref()
+        .is_some_and(|owner| owner_is_scoped_enum(owner, ctx) && !text.contains("::"))
+    {
+        // Scoped enum values must be qualified, so an unqualified same-name value is not this target.
+    } else if text.contains("::") {
+        // Explicitly qualified fields that do not match the target owner are known non-targets.
     } else if !known_non_target_owner_context(node, ctx) {
         *ctx.saw_unproven_match = true;
     }
@@ -530,6 +543,10 @@ fn is_word_boundary(source: &str, start: usize, end: usize) -> bool {
 
 fn is_identifier_char(ch: char) -> bool {
     ch == '_' || ch.is_ascii_alphanumeric()
+}
+
+fn is_nested_in_qualified_identifier(node: Node<'_>) -> bool {
+    node.kind() != "qualified_identifier" && has_ancestor_kind(node, "qualified_identifier")
 }
 
 fn field_text_qualifier_matches(source: &str, start: usize, ctx: &ScanCtx<'_>) -> bool {
@@ -596,6 +613,15 @@ fn owner_is_scoped_enum(owner: &CodeUnit, ctx: &ScanCtx<'_>) -> bool {
             .analyzer
             .get_source(owner, false)
             .is_some_and(|source| source.trim_start().starts_with("enum class "))
+}
+
+fn owner_is_unscoped_enum(owner: &CodeUnit, ctx: &ScanCtx<'_>) -> bool {
+    owner.signature().is_some_and(|signature| {
+        signature.starts_with("enum ") && !signature.starts_with("enum class ")
+    }) || ctx.analyzer.get_source(owner, false).is_some_and(|source| {
+        let trimmed = source.trim_start();
+        trimmed.starts_with("enum ") && !trimmed.starts_with("enum class ")
+    })
 }
 
 fn text_receiver_has_target_type(source: &str, receiver: &str, ctx: &ScanCtx<'_>) -> bool {
