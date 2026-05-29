@@ -90,9 +90,6 @@ pub(super) fn scan_file(
         enclosing_cache: HashMap::default(),
     };
     scan_node(tree.root_node(), &mut ctx);
-    if matches!(ctx.spec.kind, TargetKind::Constructor) {
-        scan_text_constructor_hits(&mut ctx);
-    }
     if matches!(ctx.spec.kind, TargetKind::Method) && ctx.spec.member_name.starts_with("operator") {
         scan_text_operator_method_hits(&mut ctx);
     }
@@ -281,7 +278,11 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if !matches!(
         node.kind(),
-        "call_expression" | "new_expression" | "declaration" | "field_initializer"
+        "call_expression"
+            | "new_expression"
+            | "compound_literal_expression"
+            | "declaration"
+            | "field_initializer"
     ) {
         return;
     }
@@ -553,120 +554,6 @@ fn owner_is_scoped_enum(owner: &CodeUnit, ctx: &ScanCtx<'_>) -> bool {
             .is_some_and(|source| source.trim_start().starts_with("enum class "))
 }
 
-fn scan_text_constructor_hits(ctx: &mut ScanCtx<'_>) {
-    let Some(owner) = ctx.spec.owner.as_ref() else {
-        return;
-    };
-    if !ctx.visibility.is_visible(ctx.file, owner) {
-        return;
-    }
-    let Some(expected_arity) = ctx.spec.method_arity else {
-        return;
-    };
-    let owner_name = ctx.spec.member_name.as_str();
-    for pattern in [
-        format!("{owner_name}("),
-        format!("{owner_name}{{"),
-        format!("new {owner_name}("),
-        format!("new {owner_name};"),
-    ] {
-        let mut start = 0usize;
-        while let Some(relative) = ctx.source[start..].find(&pattern) {
-            let absolute = start + relative;
-            let end = absolute + owner_name.len();
-            start = absolute + pattern.len();
-            if !is_word_boundary(ctx.source, absolute, end) {
-                continue;
-            }
-            if text_constructor_arity(ctx.source, absolute, &pattern) != expected_arity {
-                continue;
-            }
-            push_text_constructor_hit(absolute, end, ctx);
-            if *ctx.limit_exceeded {
-                return;
-            }
-        }
-    }
-    for field_name in constructor_member_names(ctx, owner) {
-        for pattern in [format!(": {field_name}("), format!(", {field_name}(")] {
-            let mut start = 0usize;
-            while let Some(relative) = ctx.source[start..].find(&pattern) {
-                let absolute = start + relative + 2;
-                let end = absolute + field_name.len();
-                start = absolute + pattern.len();
-                if text_constructor_arity(ctx.source, absolute, &format!("{field_name}("))
-                    != expected_arity
-                {
-                    continue;
-                }
-                push_text_constructor_hit(absolute, end, ctx);
-                if *ctx.limit_exceeded {
-                    return;
-                }
-            }
-        }
-    }
-}
-
-fn constructor_member_names(ctx: &ScanCtx<'_>, owner: &CodeUnit) -> Vec<String> {
-    let mut names: Vec<String> = ctx
-        .visibility
-        .visible_by_file
-        .get(ctx.file)
-        .into_iter()
-        .flatten()
-        .filter(|unit| unit.is_field())
-        .filter_map(|unit| {
-            unit.signature()
-                .filter(|signature| field_signature_type_matches(signature, owner, ctx))
-                .map(|_| unit.identifier().to_string())
-        })
-        .collect();
-    let fallback = lower_initial(owner.identifier());
-    if !names.iter().any(|name| name == &fallback) {
-        names.push(fallback);
-    }
-    names
-}
-
-fn field_signature_type_matches(signature: &str, owner: &CodeUnit, ctx: &ScanCtx<'_>) -> bool {
-    ctx.visibility.resolves_to_type(ctx.file, signature, owner)
-        || signature
-            .split_whitespace()
-            .next()
-            .is_some_and(|type_text| ctx.visibility.resolves_to_type(ctx.file, type_text, owner))
-}
-
-fn lower_initial(value: &str) -> String {
-    let mut chars = value.chars();
-    let Some(first) = chars.next() else {
-        return String::new();
-    };
-    first.to_ascii_lowercase().to_string() + chars.as_str()
-}
-
-fn text_constructor_arity(source: &str, start: usize, pattern: &str) -> usize {
-    if pattern.ends_with(';') {
-        return 0;
-    }
-    let opener = if pattern.ends_with('(') { '(' } else { '{' };
-    let closer = if opener == '(' { ')' } else { '}' };
-    let Some(open_index) = source[start..].find(opener).map(|index| start + index) else {
-        return 0;
-    };
-    let Some(close_index) = source[open_index + 1..]
-        .find(closer)
-        .map(|index| open_index + 1 + index)
-    else {
-        return 0;
-    };
-    let inner = source[open_index + 1..close_index].trim();
-    if inner.is_empty() {
-        0
-    } else {
-        split_top_level_commas(inner).count()
-    }
-}
 fn scan_text_operator_method_hits(ctx: &mut ScanCtx<'_>) {
     let Some(operator_suffix) = ctx.spec.member_name.strip_prefix("operator") else {
         return;

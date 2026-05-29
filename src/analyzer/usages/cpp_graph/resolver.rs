@@ -456,6 +456,9 @@ pub(super) fn signature_arity(signature: Option<&str>) -> usize {
 pub(super) fn call_arity(node: Node<'_>) -> usize {
     node.child_by_field_name("arguments")
         .or_else(|| node.child_by_field_name("parameters"))
+        .or_else(|| node.child_by_field_name("value"))
+        .or_else(|| first_named_child_of_kind(node, "argument_list"))
+        .or_else(|| first_named_child_of_kind(node, "initializer_list"))
         .map(|args| args.named_child_count())
         .unwrap_or(0)
 }
@@ -465,6 +468,7 @@ pub(super) fn constructor_type_node(node: Node<'_>) -> Option<Node<'_>> {
         "new_expression" => node
             .child_by_field_name("type")
             .or_else(|| node.named_child(0)),
+        "compound_literal_expression" => node.child_by_field_name("type"),
         "call_expression" => node.child_by_field_name("function"),
         _ => None,
     }
@@ -475,7 +479,11 @@ pub(super) fn field_initializer_constructs_target(
     ctx: &ScanCtx<'_>,
     owner: &CodeUnit,
 ) -> bool {
-    let Some(name) = node.child_by_field_name("name") else {
+    let Some(name) = node
+        .child_by_field_name("name")
+        .or_else(|| first_named_child_of_kind(node, "field_identifier"))
+        .or_else(|| first_named_child_of_kind(node, "qualified_identifier"))
+    else {
         return false;
     };
     let field_name = node_text(name, ctx.source);
@@ -485,11 +493,25 @@ pub(super) fn field_initializer_constructs_target(
         .into_iter()
         .flatten()
         .filter(|unit| unit.is_field() && unit.identifier() == field_name)
-        .any(|unit| {
-            unit.signature().is_some_and(|signature| {
-                ctx.visibility.resolves_to_type(ctx.file, signature, owner)
-            })
-        })
+        .any(|unit| field_declares_type(unit, ctx, owner))
+}
+
+fn field_declares_type(unit: &CodeUnit, ctx: &ScanCtx<'_>, owner: &CodeUnit) -> bool {
+    unit.signature()
+        .is_some_and(|declaration| field_declaration_type_matches(declaration, ctx, owner))
+        || ctx
+            .analyzer
+            .get_source(unit, false)
+            .is_some_and(|declaration| field_declaration_type_matches(&declaration, ctx, owner))
+}
+
+fn field_declaration_type_matches(declaration: &str, ctx: &ScanCtx<'_>, owner: &CodeUnit) -> bool {
+    ctx.visibility
+        .resolves_to_type(ctx.file, declaration, owner)
+        || declaration
+            .split_whitespace()
+            .next()
+            .is_some_and(|type_text| ctx.visibility.resolves_to_type(ctx.file, type_text, owner))
 }
 
 pub(super) fn declaration_mentions_type(
@@ -510,6 +532,8 @@ pub(super) fn declaration_constructor_arity(node: Node<'_>, _ctx: &ScanCtx<'_>) 
         if child.kind() == "init_declarator" {
             return child
                 .child_by_field_name("value")
+                .or_else(|| first_named_child_of_kind(child, "initializer_list"))
+                .or_else(|| first_named_child_of_kind(child, "compound_literal_expression"))
                 .map(declaration_init_value_arity)
                 .unwrap_or(0);
         }
@@ -523,6 +547,7 @@ pub(super) fn declaration_constructor_arity(node: Node<'_>, _ctx: &ScanCtx<'_>) 
 fn declaration_init_value_arity(value: Node<'_>) -> usize {
     match value.kind() {
         "argument_list" | "initializer_list" => count_non_comment_named_children(value),
+        "compound_literal_expression" => call_arity(value),
         _ => 1,
     }
 }
@@ -541,6 +566,12 @@ fn count_non_comment_named_children(node: Node<'_>) -> usize {
     node.named_children(&mut cursor)
         .filter(|child| child.kind() != "comment")
         .count()
+}
+
+fn first_named_child_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| child.kind() == kind)
 }
 
 pub(super) fn split_top_level_commas(value: &str) -> impl Iterator<Item = &str> {
