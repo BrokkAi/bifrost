@@ -1112,6 +1112,9 @@ template <typename K, typename V> struct Map {};
 template <typename T> void templated(T value);
 using Alias = Target;
 typedef Target LegacyAlias;
+typedef Target* TargetPtrAlias;
+typedef Target& TargetRefAlias;
+void hidden_alias_scope() { using HiddenAlias = Target; }
 void overloaded();
 template <typename T> void overloaded(T value);
 "#,
@@ -1128,6 +1131,9 @@ void call(Target target) {
     templated<Target>(target);
     Alias alias;
     LegacyAlias legacy;
+    TargetPtrAlias ptr_alias;
+    TargetRefAlias ref_alias = target;
+    HiddenAlias hidden;
     overloaded();
     overloaded<Target>(target);
 }
@@ -1143,6 +1149,9 @@ void call(Target target) {
     assert_hit_contains(&type_hits, "consumer.cpp", "templated<Target>(target)");
     assert_hit_contains(&type_hits, "consumer.cpp", "Alias alias");
     assert_hit_contains(&type_hits, "consumer.cpp", "LegacyAlias legacy");
+    assert_hit_contains(&type_hits, "consumer.cpp", "TargetPtrAlias ptr_alias");
+    assert_hit_contains(&type_hits, "consumer.cpp", "TargetRefAlias ref_alias");
+    assert_no_hit_contains(&type_hits, "HiddenAlias hidden");
     assert_no_hit_contains(&type_hits, "struct Target {}");
 
     let zero_arg = function_definition_with_short_name_and_arity(&analyzer, "overloaded", 0);
@@ -1239,6 +1248,9 @@ struct Target {
     void mutate();
     void operator()();
 };
+struct Other {
+    void operator()();
+};
 bool operator==(const Target& left, const Target& right);
 "#,
         ),
@@ -1248,12 +1260,14 @@ bool operator==(const Target& left, const Target& right);
 #include "target.h"
 
 void call(Target& target, const Target& frozen) {
+    Other other;
     target.run();
     target.run(1);
     target.run(1, 2);
     frozen.inspect();
     target.mutate();
     target.operator()();
+    other.operator()();
     target();
     bool same = target == target;
 }
@@ -1285,7 +1299,9 @@ void call(Target& target, const Target& frozen) {
     let call_operator =
         function_definition_with_short_name_and_arity(&analyzer, "Target.operator()", 0);
     let operator_hits = usage_hits(&analyzer, &call_operator);
+    assert_eq!(1, operator_hits.len());
     assert_hit_contains(&operator_hits, "consumer.cpp", "target.operator()()");
+    assert_no_hit_contains(&operator_hits, "other.operator()()");
 
     let equality = function_definition_with_short_name_and_arity(&analyzer, "operator==", 2);
     let equality_hits = CppUsageGraphStrategy::new()
@@ -1317,7 +1333,7 @@ struct Target {
     Target(const Target& other);
 };
 struct Owner {
-    Target target;
+    const Target target;
     Owner();
     Owner(int value);
 };

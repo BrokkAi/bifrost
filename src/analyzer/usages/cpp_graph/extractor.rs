@@ -1,7 +1,6 @@
 use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::usages::cpp_graph::hits::{
-    enclosing_context, is_member_field_declaration_context, push_hit, push_text_constructor_hit,
-    push_text_hit,
+    enclosing_context, is_member_field_declaration_context, push_hit,
 };
 use crate::analyzer::usages::cpp_graph::resolver::*;
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
@@ -28,7 +27,6 @@ pub(super) struct ScanCtx<'a> {
     pub(super) visibility: &'a VisibilityIndex,
     pub(super) file: &'a ProjectFile,
     pub(super) source: &'a str,
-    pub(super) root: Node<'a>,
     pub(super) line_starts: &'a [usize],
     pub(super) spec: &'a TargetSpec,
     pub(super) bindings: LocalInferenceEngine<CodeUnit>,
@@ -78,7 +76,6 @@ pub(super) fn scan_file(
         visibility,
         file,
         source: &source,
-        root: tree.root_node(),
         line_starts: &line_starts,
         spec,
         bindings: LocalInferenceEngine::new(LocalInferenceConfig::default()),
@@ -90,18 +87,6 @@ pub(super) fn scan_file(
         enclosing_cache: HashMap::default(),
     };
     scan_node(tree.root_node(), &mut ctx);
-    if matches!(ctx.spec.kind, TargetKind::Constructor) {
-        scan_text_constructor_hits(&mut ctx);
-    }
-    if matches!(ctx.spec.kind, TargetKind::Method) && ctx.spec.member_name.starts_with("operator") {
-        scan_text_operator_method_hits(&mut ctx);
-    }
-    if matches!(
-        ctx.spec.kind,
-        TargetKind::GlobalField | TargetKind::MemberField
-    ) {
-        scan_text_symbol_hits(&mut ctx);
-    }
 }
 
 fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -281,7 +266,11 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if !matches!(
         node.kind(),
-        "call_expression" | "new_expression" | "declaration" | "field_initializer"
+        "call_expression"
+            | "new_expression"
+            | "compound_literal_expression"
+            | "declaration"
+            | "field_initializer"
     ) {
         return;
     }
@@ -363,6 +352,24 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if node.kind() != "call_expression" {
         return;
     }
+    if let Some((receiver, operator)) = explicit_operator_call(node) {
+        let text = node_text(operator, ctx.source);
+        if !name_matches_callable(text, &ctx.spec.member_name) {
+            return;
+        }
+        *ctx.raw_match_count += 1;
+        if let Some(expected) = ctx.spec.method_arity
+            && call_arity(node) != expected
+        {
+            return;
+        }
+        if receiver_matches_target(receiver, ctx) {
+            push_hit(operator, ctx);
+        } else if !receiver_has_known_non_target(receiver, ctx) {
+            *ctx.saw_unproven_match = true;
+        }
+        return;
+    }
     let Some(function) = node.child_by_field_name("function") else {
         return;
     };
@@ -385,6 +392,36 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
+fn explicit_operator_call(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
+    let mut receiver = None;
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "argument_list" {
+            continue;
+        }
+        if let Some(operator) = first_descendant_of_kind(child, "operator_name") {
+            return receiver.map(|receiver| (receiver, operator));
+        }
+        if receiver.is_none() {
+            receiver = Some(child);
+        }
+    }
+    None
+}
+
+fn first_descendant_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
+    if node.kind() == kind {
+        return Some(node);
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if let Some(found) = first_descendant_of_kind(child, kind) {
+            return Some(found);
+        }
+    }
+    None
+}
+
 fn maybe_record_global_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if !matches!(
         node.kind(),
@@ -393,6 +430,7 @@ fn maybe_record_global_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         || is_declaration_name(node)
         || is_member_field_declaration_context(node, ctx)
         || has_ancestor_kind(node, "field_expression")
+        || is_nested_in_qualified_identifier(node)
     {
         return;
     }
@@ -436,6 +474,7 @@ fn maybe_record_member_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         || is_declaration_name(node)
         || is_member_field_declaration_context(node, ctx)
         || has_ancestor_kind(node, "field_expression")
+        || is_nested_in_qualified_identifier(node)
     {
         return;
     }
@@ -447,100 +486,29 @@ fn maybe_record_member_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             .resolve_named(ctx.file, text, TargetKind::MemberField)
             .is_some_and(|resolved| same_visible_symbol(&resolved, &ctx.spec.target))
             || qualified_owner_matches(text, ctx));
-    if qualified_match || same_owner_context(node, ctx) {
+    let unscoped_enum_match = ctx.spec.owner.as_ref().is_some_and(|owner| {
+        !text.contains("::")
+            && owner_is_unscoped_enum(owner, ctx)
+            && ctx.visibility.is_visible(ctx.file, &ctx.spec.target)
+    });
+    if qualified_match || same_owner_context(node, ctx) || unscoped_enum_match {
         push_hit(node, ctx);
+    } else if ctx
+        .spec
+        .owner
+        .as_ref()
+        .is_some_and(|owner| owner_is_scoped_enum(owner, ctx) && !text.contains("::"))
+    {
+        // Scoped enum values must be qualified, so an unqualified same-name value is not this target.
+    } else if text.contains("::") {
+        // Explicitly qualified fields that do not match the target owner are known non-targets.
     } else if !known_non_target_owner_context(node, ctx) {
         *ctx.saw_unproven_match = true;
     }
 }
 
-fn scan_text_symbol_hits(ctx: &mut ScanCtx<'_>) {
-    if !ctx.visibility.is_visible(ctx.file, &ctx.spec.target) {
-        return;
-    }
-    let symbol = ctx.spec.member_name.as_str();
-    let mut start = 0usize;
-    while let Some(relative) = ctx.source[start..].find(symbol) {
-        let absolute = start + relative;
-        let end = absolute + symbol.len();
-        start = end;
-        if !is_word_boundary(ctx.source, absolute, end) {
-            continue;
-        }
-        if !field_text_qualifier_matches(ctx.source, absolute, ctx) {
-            continue;
-        }
-        push_text_hit(absolute, end, ctx);
-        if *ctx.limit_exceeded {
-            break;
-        }
-    }
-}
-
-fn is_word_boundary(source: &str, start: usize, end: usize) -> bool {
-    let before = source[..start].chars().next_back();
-    let after = source[end..].chars().next();
-    !before.is_some_and(is_identifier_char) && !after.is_some_and(is_identifier_char)
-}
-
-fn is_identifier_char(ch: char) -> bool {
-    ch == '_' || ch.is_ascii_alphanumeric()
-}
-
-fn field_text_qualifier_matches(source: &str, start: usize, ctx: &ScanCtx<'_>) -> bool {
-    if !matches!(ctx.spec.kind, TargetKind::MemberField) {
-        return true;
-    }
-    let Some(owner) = ctx.spec.owner.as_ref() else {
-        return true;
-    };
-    let Some(owner_cpp_name) = ctx.spec.owner_cpp_name.as_deref() else {
-        return true;
-    };
-    let prefix = &source[..start];
-    if let Some(prefix) = prefix.strip_suffix("::") {
-        let qualifier = prefix
-            .rsplit(|ch: char| !(ch == '_' || ch == ':' || ch.is_ascii_alphanumeric()))
-            .next()
-            .unwrap_or("");
-        return qualifier == owner_cpp_name || qualifier == owner.identifier();
-    }
-    if let Some(prefix) = prefix.strip_suffix('.') {
-        return text_receiver_matches_target(prefix, ctx);
-    }
-    if let Some(prefix) = prefix.strip_suffix("->") {
-        return text_receiver_matches_target(prefix, ctx);
-    }
-    if owner_is_class_like(owner, ctx) {
-        return false;
-    }
-    !owner_is_scoped_enum(owner, ctx)
-}
-
-fn text_receiver_matches_target(prefix: &str, ctx: &ScanCtx<'_>) -> bool {
-    let receiver = receiver_token_before(prefix, prefix.len());
-    if receiver == Some("this") {
-        return textual_owner_context_at(prefix)
-            .zip(ctx.spec.owner_cpp_name.as_deref())
-            .is_some_and(|(owner, target)| owner == target)
-            || textual_owner_context_at(prefix)
-                .zip(ctx.spec.owner.as_ref())
-                .is_some_and(|(owner_text, owner)| owner_text == owner.identifier());
-    }
-    receiver.is_some_and(|receiver| text_receiver_has_target_type(ctx.source, receiver, ctx))
-}
-
-fn owner_is_class_like(owner: &CodeUnit, ctx: &ScanCtx<'_>) -> bool {
-    owner.signature().is_some_and(|signature| {
-        signature.starts_with("class ")
-            || signature.starts_with("struct ")
-            || signature.starts_with("union ")
-    }) || ctx.analyzer.get_source(owner, false).is_some_and(|source| {
-        let trimmed = source.trim_start();
-        trimmed.starts_with("class ")
-            || trimmed.starts_with("struct ")
-            || trimmed.starts_with("union ")
-    })
+fn is_nested_in_qualified_identifier(node: Node<'_>) -> bool {
+    node.kind() != "qualified_identifier" && has_ancestor_kind(node, "qualified_identifier")
 }
 
 fn owner_is_scoped_enum(owner: &CodeUnit, ctx: &ScanCtx<'_>) -> bool {
@@ -553,180 +521,13 @@ fn owner_is_scoped_enum(owner: &CodeUnit, ctx: &ScanCtx<'_>) -> bool {
             .is_some_and(|source| source.trim_start().starts_with("enum class "))
 }
 
-fn scan_text_constructor_hits(ctx: &mut ScanCtx<'_>) {
-    let Some(owner) = ctx.spec.owner.as_ref() else {
-        return;
-    };
-    if !ctx.visibility.is_visible(ctx.file, owner) {
-        return;
-    }
-    let Some(expected_arity) = ctx.spec.method_arity else {
-        return;
-    };
-    let owner_name = ctx.spec.member_name.as_str();
-    for pattern in [
-        format!("{owner_name}("),
-        format!("{owner_name}{{"),
-        format!("new {owner_name}("),
-        format!("new {owner_name};"),
-    ] {
-        let mut start = 0usize;
-        while let Some(relative) = ctx.source[start..].find(&pattern) {
-            let absolute = start + relative;
-            let end = absolute + owner_name.len();
-            start = absolute + pattern.len();
-            if !is_word_boundary(ctx.source, absolute, end) {
-                continue;
-            }
-            if text_constructor_arity(ctx.source, absolute, &pattern) != expected_arity {
-                continue;
-            }
-            push_text_constructor_hit(absolute, end, ctx);
-            if *ctx.limit_exceeded {
-                return;
-            }
-        }
-    }
-    for field_name in constructor_member_names(ctx, owner) {
-        for pattern in [format!(": {field_name}("), format!(", {field_name}(")] {
-            let mut start = 0usize;
-            while let Some(relative) = ctx.source[start..].find(&pattern) {
-                let absolute = start + relative + 2;
-                let end = absolute + field_name.len();
-                start = absolute + pattern.len();
-                if text_constructor_arity(ctx.source, absolute, &format!("{field_name}("))
-                    != expected_arity
-                {
-                    continue;
-                }
-                push_text_constructor_hit(absolute, end, ctx);
-                if *ctx.limit_exceeded {
-                    return;
-                }
-            }
-        }
-    }
-}
-
-fn constructor_member_names(ctx: &ScanCtx<'_>, owner: &CodeUnit) -> Vec<String> {
-    let mut names: Vec<String> = ctx
-        .visibility
-        .visible_by_file
-        .get(ctx.file)
-        .into_iter()
-        .flatten()
-        .filter(|unit| unit.is_field())
-        .filter_map(|unit| {
-            unit.signature()
-                .filter(|signature| field_signature_type_matches(signature, owner, ctx))
-                .map(|_| unit.identifier().to_string())
-        })
-        .collect();
-    let fallback = lower_initial(owner.identifier());
-    if !names.iter().any(|name| name == &fallback) {
-        names.push(fallback);
-    }
-    names
-}
-
-fn field_signature_type_matches(signature: &str, owner: &CodeUnit, ctx: &ScanCtx<'_>) -> bool {
-    ctx.visibility.resolves_to_type(ctx.file, signature, owner)
-        || signature
-            .split_whitespace()
-            .next()
-            .is_some_and(|type_text| ctx.visibility.resolves_to_type(ctx.file, type_text, owner))
-}
-
-fn lower_initial(value: &str) -> String {
-    let mut chars = value.chars();
-    let Some(first) = chars.next() else {
-        return String::new();
-    };
-    first.to_ascii_lowercase().to_string() + chars.as_str()
-}
-
-fn text_constructor_arity(source: &str, start: usize, pattern: &str) -> usize {
-    if pattern.ends_with(';') {
-        return 0;
-    }
-    let opener = if pattern.ends_with('(') { '(' } else { '{' };
-    let closer = if opener == '(' { ')' } else { '}' };
-    let Some(open_index) = source[start..].find(opener).map(|index| start + index) else {
-        return 0;
-    };
-    let Some(close_index) = source[open_index + 1..]
-        .find(closer)
-        .map(|index| open_index + 1 + index)
-    else {
-        return 0;
-    };
-    let inner = source[open_index + 1..close_index].trim();
-    if inner.is_empty() {
-        0
-    } else {
-        split_top_level_commas(inner).count()
-    }
-}
-fn scan_text_operator_method_hits(ctx: &mut ScanCtx<'_>) {
-    let Some(operator_suffix) = ctx.spec.member_name.strip_prefix("operator") else {
-        return;
-    };
-    if operator_suffix.is_empty() {
-        return;
-    }
-    let pattern = format!(".operator{operator_suffix}(");
-    let mut start = 0usize;
-    while let Some(relative) = ctx.source[start..].find(&pattern) {
-        let dot = start + relative;
-        let operator_start = dot + 1;
-        let end = operator_start + ctx.spec.member_name.len();
-        start = end;
-        let Some(receiver) = receiver_token_before(ctx.source, dot) else {
-            continue;
-        };
-        if ctx
-            .bindings
-            .resolve_symbol(receiver)
-            .as_precise()
-            .is_some_and(|targets| {
-                ctx.spec
-                    .owner
-                    .as_ref()
-                    .is_some_and(|owner| targets.iter().any(|target| same_symbol(target, owner)))
-            })
-            || text_receiver_has_target_type(ctx.source, receiver, ctx)
-        {
-            push_text_constructor_hit(operator_start, end, ctx);
-        }
-        if *ctx.limit_exceeded {
-            return;
-        }
-    }
-}
-
-fn text_receiver_has_target_type(source: &str, receiver: &str, ctx: &ScanCtx<'_>) -> bool {
-    let Some(owner_name) = ctx.spec.owner_cpp_name.as_deref() else {
-        return false;
-    };
-    [
-        format!("{owner_name}& {receiver}"),
-        format!("{owner_name} &{receiver}"),
-        format!("{owner_name}* {receiver}"),
-        format!("{owner_name} *{receiver}"),
-        format!("{owner_name} {receiver}"),
-    ]
-    .iter()
-    .any(|pattern| source.contains(pattern))
-}
-
-fn receiver_token_before(source: &str, end: usize) -> Option<&str> {
-    let prefix = source[..end].trim_end();
-    let start = prefix
-        .rfind(|ch: char| !(ch == '_' || ch.is_ascii_alphanumeric()))
-        .map(|index| index + 1)
-        .unwrap_or(0);
-    let token = prefix[start..].trim();
-    (!token.is_empty()).then_some(token)
+fn owner_is_unscoped_enum(owner: &CodeUnit, ctx: &ScanCtx<'_>) -> bool {
+    owner.signature().is_some_and(|signature| {
+        signature.starts_with("enum ") && !signature.starts_with("enum class ")
+    }) || ctx.analyzer.get_source(owner, false).is_some_and(|source| {
+        let trimmed = source.trim_start();
+        trimmed.starts_with("enum ") && !trimmed.starts_with("enum class ")
+    })
 }
 
 fn receiver_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
