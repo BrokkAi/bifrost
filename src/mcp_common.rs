@@ -572,7 +572,7 @@ pub fn summaries_schema() -> Value {
             "targets": {
                 "type": "array",
                 "items": { "type": "string" },
-                "description": "Project-relative file paths, glob patterns, class names, or absolute paths/globs inside the active workspace."
+                "description": "Project-relative file paths, glob patterns, class names, or absolute paths/globs inside the active workspace. Examples: \"src/auth/**/*.rs\", \"crates/polars-core/src/frame/**/*.rs\", \"MyClass\"."
             }
         },
         "required": ["targets"]

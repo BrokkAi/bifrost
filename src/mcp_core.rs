@@ -61,7 +61,7 @@ pub(crate) fn symbol_tool_descriptors() -> Vec<Value> {
         ),
         tool_descriptor(
             "get_summaries",
-            "Summarize matching source files, globs, or classes with line ranges; use to orient in code before reading full files.",
+            "Summarize matching source files, globs, classes, or modules with line ranges. Use before repeated read_file/grep calls when you need a compact map of related code before choosing exact definitions to inspect. Example targets: [\"src/auth/**/*.rs\"], [\"crates/polars-core/src/frame/**/*.rs\"], [\"MyClass\"].",
             summaries_schema(),
         ),
         tool_descriptor(
@@ -71,7 +71,7 @@ pub(crate) fn symbol_tool_descriptors() -> Vec<Value> {
         ),
         tool_descriptor(
             "scan_usages",
-            "Find references and call sites for known fully qualified symbols; use search_symbols first for partial names. Static analysis may include false positives. Graph-analysis fallbacks and resolved-symbol failures are returned with structured reasons.",
+            "Find references, call sites, and related tests for known fully qualified symbols. Prefer over grep when changing existing behavior and callers may matter; use search_symbols first for partial names. Static analysis may include false positives. Graph-analysis fallbacks and resolved-symbol failures are returned with structured reasons.",
             json!({
                 "type": "object",
                 "properties": {
