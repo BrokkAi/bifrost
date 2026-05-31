@@ -8,18 +8,21 @@ use crate::{
         report_long_method_and_god_object_smells, report_secret_like_code,
         report_structural_clone_smells, report_test_assertion_smells,
     },
+    file_access::FileAccessTracker,
     file_tools::{
-        find_filenames, find_files_containing, get_file_contents, list_files, search_file_contents,
+        find_filenames, find_files_containing_with_reader, get_file_contents_with_reader,
+        list_files, search_file_contents_with_reader,
     },
     git_tools::{get_commit_diff, get_git_log, search_git_commit_messages},
     searchtools::{
         ActivateWorkspaceParams, ActiveWorkspaceResult, GetActiveWorkspaceParams,
-        MostRelevantFilesParams, RefreshParams, get_summaries, get_symbol_locations,
-        get_symbol_sources, list_symbols, most_relevant_files, refresh_result, scan_usages,
-        search_symbols,
+        MostRelevantFilesParams, RefreshParams, get_summaries_with_reader,
+        get_symbol_locations_with_reader, get_symbol_sources_with_reader, list_symbols_with_reader,
+        most_relevant_files, refresh_result, scan_usages_with_file_observer,
+        search_symbols_with_reader,
     },
     searchtools_render::{RenderOptions, RenderText},
-    structured_data::{jq, xml_select, xml_skim},
+    structured_data::{jq_with_reader, xml_select_with_reader, xml_skim_with_reader},
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -114,12 +117,14 @@ impl ToolOutput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UpdateStrategy {
     WatchFiles,
+    Manual,
 }
 
 pub struct SearchToolsService {
     workspace: WorkspaceAnalyzer,
     watcher: Option<ProjectChangeWatcher>,
     update_strategy: UpdateStrategy,
+    file_access: FileAccessTracker,
 }
 
 impl SearchToolsService {
@@ -129,6 +134,11 @@ impl SearchToolsService {
 
     pub fn new_for_python(root: PathBuf) -> Result<Self, String> {
         Self::new_with_strategy(root, UpdateStrategy::WatchFiles)
+    }
+
+    #[doc(hidden)]
+    pub fn new_without_watcher_for_tests(root: PathBuf) -> Result<Self, String> {
+        Self::new_with_strategy(root, UpdateStrategy::Manual)
     }
 
     pub fn call_tool_json(
@@ -190,28 +200,33 @@ impl SearchToolsService {
         self.prepare_for_call();
         match name {
             "search_symbols" => {
+                let read_file = self.tracked_reader();
                 self.decode_render_and_run(arguments, render_options, |workspace, params| {
-                    search_symbols(workspace.analyzer(), params)
+                    search_symbols_with_reader(workspace.analyzer(), params, &read_file)
                 })
             }
             "get_symbol_locations" => {
+                let read_file = self.tracked_reader();
                 self.decode_render_and_run(arguments, render_options, |workspace, params| {
-                    get_symbol_locations(workspace.analyzer(), params)
+                    get_symbol_locations_with_reader(workspace.analyzer(), params, &read_file)
                 })
             }
             "get_symbol_sources" => {
+                let read_file = self.tracked_reader();
                 self.decode_render_and_run(arguments, render_options, |workspace, params| {
-                    get_symbol_sources(workspace.analyzer(), params)
+                    get_symbol_sources_with_reader(workspace.analyzer(), params, &read_file)
                 })
             }
             "get_summaries" => {
+                let read_file = self.tracked_reader();
                 self.decode_render_and_run(arguments, render_options, |workspace, params| {
-                    get_summaries(workspace.analyzer(), params)
+                    get_summaries_with_reader(workspace.analyzer(), params, &read_file)
                 })
             }
             "list_symbols" => {
+                let read_file = self.tracked_reader();
                 self.decode_render_and_run(arguments, render_options, |workspace, params| {
-                    list_symbols(workspace.analyzer(), params)
+                    list_symbols_with_reader(workspace.analyzer(), params, &read_file)
                 })
             }
             "most_relevant_files" => self.decode_render_and_run(
@@ -221,21 +236,34 @@ impl SearchToolsService {
                     most_relevant_files(workspace.analyzer(), params)
                 },
             ),
-            "scan_usages" => self.decode_and_run(arguments, |workspace, params| {
-                scan_usages(workspace.analyzer(), params)
-            }),
-            "get_file_contents" => self.decode_and_run(arguments, |workspace, params| {
-                get_file_contents(workspace.analyzer(), params)
-            }),
+            "scan_usages" => {
+                let tracker = self.file_access.clone();
+                let observe_file = move |file: &ProjectFile| tracker.record_current(file);
+                self.decode_and_run(arguments, |workspace, params| {
+                    scan_usages_with_file_observer(workspace.analyzer(), params, &observe_file)
+                })
+            }
+            "get_file_contents" => {
+                let read_file = self.tracked_reader();
+                self.decode_and_run(arguments, |workspace, params| {
+                    get_file_contents_with_reader(workspace.analyzer(), params, &read_file)
+                })
+            }
             "find_filenames" => self.decode_and_run(arguments, |workspace, params| {
                 find_filenames(workspace.analyzer(), params)
             }),
-            "find_files_containing" => self.decode_and_run(arguments, |workspace, params| {
-                find_files_containing(workspace.analyzer(), params)
-            }),
-            "search_file_contents" => self.decode_and_run(arguments, |workspace, params| {
-                search_file_contents(workspace.analyzer(), params)
-            }),
+            "find_files_containing" => {
+                let read_file = self.tracked_reader();
+                self.decode_and_run(arguments, |workspace, params| {
+                    find_files_containing_with_reader(workspace.analyzer(), params, &read_file)
+                })
+            }
+            "search_file_contents" => {
+                let read_file = self.tracked_reader();
+                self.decode_and_run(arguments, |workspace, params| {
+                    search_file_contents_with_reader(workspace.analyzer(), params, &read_file)
+                })
+            }
             "list_files" => self.decode_and_run(arguments, |workspace, params| {
                 list_files(workspace.analyzer(), params)
             }),
@@ -248,23 +276,40 @@ impl SearchToolsService {
             "get_commit_diff" => self.decode_and_run(arguments, |workspace, params| {
                 get_commit_diff(workspace.analyzer(), params)
             }),
-            "jq" => self.decode_and_run(arguments, |workspace, params| {
-                jq(workspace.analyzer(), params)
-            }),
-            "xml_skim" => self.decode_and_run(arguments, |workspace, params| {
-                xml_skim(workspace.analyzer(), params)
-            }),
-            "xml_select" => self.decode_and_run(arguments, |workspace, params| {
-                xml_select(workspace.analyzer(), params)
-            }),
-            "compute_cyclomatic_complexity" => self
-                .decode_and_run(arguments, |workspace, params| {
+            "jq" => {
+                let read_file = self.tracked_reader();
+                self.decode_and_run(arguments, |workspace, params| {
+                    jq_with_reader(workspace.analyzer(), params, &read_file)
+                })
+            }
+            "xml_skim" => {
+                let read_file = self.tracked_reader();
+                self.decode_and_run(arguments, |workspace, params| {
+                    xml_skim_with_reader(workspace.analyzer(), params, &read_file)
+                })
+            }
+            "xml_select" => {
+                let read_file = self.tracked_reader();
+                self.decode_and_run(arguments, |workspace, params| {
+                    xml_select_with_reader(workspace.analyzer(), params, &read_file)
+                })
+            }
+            "compute_cyclomatic_complexity" => self.decode_and_run(arguments, {
+                let tracker = self.file_access.clone();
+                move |workspace, params: crate::code_quality::ComputeCyclomaticComplexityParams| {
+                    tracker
+                        .record_project_files(workspace.analyzer().project(), &params.file_paths);
                     compute_cyclomatic_complexity(workspace.analyzer(), params)
-                }),
-            "compute_cognitive_complexity" => self
-                .decode_and_run(arguments, |workspace, params| {
+                }
+            }),
+            "compute_cognitive_complexity" => self.decode_and_run(arguments, {
+                let tracker = self.file_access.clone();
+                move |workspace, params: crate::code_quality::ComputeCognitiveComplexityParams| {
+                    tracker
+                        .record_project_files(workspace.analyzer().project(), &params.file_paths);
                     compute_cognitive_complexity(workspace.analyzer(), params)
-                }),
+                }
+            }),
             "report_comment_density_for_code_unit" => {
                 self.decode_and_run(arguments, |workspace, params| {
                     report_comment_density_for_code_unit(workspace.analyzer(), params)
@@ -299,9 +344,15 @@ impl SearchToolsService {
             "report_secret_like_code" => self.decode_and_run(arguments, |workspace, params| {
                 report_secret_like_code(workspace.analyzer(), params)
             }),
-            "analyze_git_hotspots" => self.decode_and_run(arguments, |workspace, params| {
-                analyze_git_hotspots(workspace.analyzer(), params)
-            }),
+            "analyze_git_hotspots" => {
+                let tracker = self.file_access.clone();
+                self.decode_and_run(arguments, |workspace, params| {
+                    for file in workspace.analyzer().analyzed_files() {
+                        tracker.record_current(file);
+                    }
+                    analyze_git_hotspots(workspace.analyzer(), params)
+                })
+            }
             _ => Err(SearchToolsServiceError::unknown_tool(format!(
                 "Unknown tool: {name}"
             ))),
@@ -327,6 +378,7 @@ impl SearchToolsService {
             workspace,
             watcher,
             update_strategy,
+            file_access: FileAccessTracker::default(),
         })
     }
 
@@ -334,7 +386,10 @@ impl SearchToolsService {
         let _params = serde_json::from_value::<RefreshParams>(arguments).map_err(|err| {
             SearchToolsServiceError::invalid_params(format!("Invalid tool arguments: {err}"))
         })?;
-        self.workspace = self.workspace.update_all();
+        let changed_files = self.file_access.take_changed_files();
+        if !changed_files.is_empty() {
+            self.workspace = self.workspace.update(&changed_files);
+        }
         self.structured_only(refresh_result(self.workspace.analyzer()))
     }
 
@@ -379,6 +434,7 @@ impl SearchToolsService {
         // before we start watching the same tree from the new root.
         self.watcher = None;
         self.workspace = new_workspace;
+        self.file_access = FileAccessTracker::default();
         self.watcher = maybe_start_watcher(new_project, self.update_strategy);
 
         active_workspace_result(&resolved)
@@ -395,9 +451,15 @@ impl SearchToolsService {
         active_workspace_result(self.workspace.analyzer().project().root())
     }
 
+    fn tracked_reader(&self) -> impl Fn(&ProjectFile) -> std::io::Result<String> + Sync + use<> {
+        let tracker = self.file_access.clone();
+        move |file| tracker.read_to_string(file)
+    }
+
     fn prepare_for_call(&mut self) {
         match self.update_strategy {
             UpdateStrategy::WatchFiles => self.apply_watcher_delta(),
+            UpdateStrategy::Manual => {}
         }
     }
 
@@ -497,6 +559,7 @@ fn maybe_start_watcher(
 ) -> Option<ProjectChangeWatcher> {
     match update_strategy {
         UpdateStrategy::WatchFiles => ProjectChangeWatcher::start(project).ok(),
+        UpdateStrategy::Manual => None,
     }
 }
 

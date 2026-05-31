@@ -6,6 +6,7 @@ use crate::analyzer::usages::{
     CONFIDENCE_THRESHOLD, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, FuzzyResult, UsageFinder, UsageHit,
 };
 use crate::analyzer::{CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, Range};
+use crate::file_tools::FileReader;
 use crate::path_utils::{normalize_pattern, rel_path_string};
 use crate::profiling;
 use crate::relevance::{most_important_project_files, most_relevant_project_files};
@@ -15,6 +16,7 @@ use rayon::prelude::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -310,6 +312,14 @@ pub fn search_symbols(
     analyzer: &dyn IAnalyzer,
     params: SearchSymbolsParams,
 ) -> SearchSymbolsResult {
+    search_symbols_with_reader(analyzer, params, &default_read_file)
+}
+
+pub fn search_symbols_with_reader(
+    analyzer: &dyn IAnalyzer,
+    params: SearchSymbolsParams,
+    read_file: FileReader<'_>,
+) -> SearchSymbolsResult {
     let patterns: Vec<String> = strip_params(params.patterns)
         .into_iter()
         .filter(|pattern| !pattern.trim().is_empty())
@@ -348,8 +358,7 @@ pub fn search_symbols(
         .filter_map(|file| grouped.remove(&file).map(|code_units| (file, code_units)))
         .map(|(file, code_units)| SearchSymbolsFile {
             path: rel_path_string(&file),
-            loc: file
-                .read_to_string()
+            loc: read_file(&file)
                 .map(|content| line_count(&content))
                 .unwrap_or(0),
             classes: collect_kind_names(analyzer, &code_units, CodeUnitType::Class),
@@ -370,6 +379,14 @@ pub fn search_symbols(
 pub fn get_symbol_locations(
     analyzer: &dyn IAnalyzer,
     params: SymbolNamesParams,
+) -> SymbolLocationsResult {
+    get_symbol_locations_with_reader(analyzer, params, &default_read_file)
+}
+
+pub fn get_symbol_locations_with_reader(
+    analyzer: &dyn IAnalyzer,
+    params: SymbolNamesParams,
+    read_file: FileReader<'_>,
 ) -> SymbolLocationsResult {
     let mut outcomes: Vec<_> = params
         .symbols
@@ -396,9 +413,7 @@ pub fn get_symbol_locations(
                 return Some((index, Err(symbol)));
             };
 
-            let loc = code_unit
-                .source()
-                .read_to_string()
+            let loc = read_file(code_unit.source())
                 .map(|content| line_count(&content))
                 .unwrap_or(0);
 
@@ -475,7 +490,11 @@ fn route_summary_targets(analyzer: &dyn IAnalyzer, targets: &[String]) -> Summar
     }
 }
 
-fn summarize_symbol_targets(analyzer: &dyn IAnalyzer, targets: Vec<String>) -> SummaryResult {
+fn summarize_symbol_targets(
+    analyzer: &dyn IAnalyzer,
+    targets: Vec<String>,
+    read_file: FileReader<'_>,
+) -> SummaryResult {
     let mut summaries = Vec::new();
     let mut not_found = Vec::new();
     let mut ambiguous = Vec::new();
@@ -485,7 +504,9 @@ fn summarize_symbol_targets(analyzer: &dyn IAnalyzer, targets: Vec<String>) -> S
             CodeUnitResolution::Resolved(code_units) => {
                 let start_len = summaries.len();
                 for code_unit in code_units {
-                    if let Some(block) = summary_block_for_code_unit(analyzer, &code_unit) {
+                    if let Some(block) =
+                        summary_block_for_code_unit(analyzer, &code_unit, read_file)
+                    {
                         summaries.push(block);
                     }
                 }
@@ -510,6 +531,14 @@ fn summarize_symbol_targets(analyzer: &dyn IAnalyzer, targets: Vec<String>) -> S
 pub fn get_symbol_sources(
     analyzer: &dyn IAnalyzer,
     params: SymbolNamesParams,
+) -> SymbolSourcesResult {
+    get_symbol_sources_with_reader(analyzer, params, &default_read_file)
+}
+
+pub fn get_symbol_sources_with_reader(
+    analyzer: &dyn IAnalyzer,
+    params: SymbolNamesParams,
+    read_file: FileReader<'_>,
 ) -> SymbolSourcesResult {
     let max_symbols = if params.kind_filter == SymbolKindFilter::Class {
         CLASS_COUNT_LIMIT
@@ -537,7 +566,7 @@ pub fn get_symbol_sources(
                     let sources = code_units
                         .iter()
                         .flat_map(|code_unit| {
-                            source_blocks_for_code_unit(analyzer, code_unit, true)
+                            source_blocks_for_code_unit(analyzer, code_unit, true, read_file)
                         })
                         .collect::<Vec<_>>();
                     if sources.is_empty() {
@@ -578,10 +607,19 @@ pub fn get_symbol_sources(
 }
 
 pub fn get_summaries(analyzer: &dyn IAnalyzer, params: SummariesParams) -> SummaryResult {
+    get_summaries_with_reader(analyzer, params, &default_read_file)
+}
+
+pub fn get_summaries_with_reader(
+    analyzer: &dyn IAnalyzer,
+    params: SummariesParams,
+    read_file: FileReader<'_>,
+) -> SummaryResult {
     let targets = params.targets;
     let summary_targets = route_summary_targets(analyzer, &targets);
-    let mut file_output = summarize_files(analyzer, summary_targets.file_targets);
-    let symbol_output = summarize_symbol_targets(analyzer, summary_targets.symbol_targets);
+    let mut file_output = summarize_files(analyzer, summary_targets.file_targets, read_file);
+    let symbol_output =
+        summarize_symbol_targets(analyzer, summary_targets.symbol_targets, read_file);
 
     file_output.summaries.extend(symbol_output.summaries);
     file_output
@@ -597,7 +635,11 @@ pub fn get_summaries(analyzer: &dyn IAnalyzer, params: SummariesParams) -> Summa
     file_output
 }
 
-fn summarize_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>) -> SummaryResult {
+fn summarize_files(
+    analyzer: &dyn IAnalyzer,
+    files: Vec<ProjectFile>,
+    read_file: FileReader<'_>,
+) -> SummaryResult {
     let mut summaries: Vec<_> = files
         .into_par_iter()
         .filter_map(|file| {
@@ -613,7 +655,7 @@ fn summarize_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>) -> Summary
             Some(SummaryBlock {
                 label: rel_path_string(&file),
                 path: rel_path_string(&file),
-                preamble: file_preamble(&file, &elements),
+                preamble: file_preamble(&file, &elements, read_file),
                 elements,
             })
         })
@@ -632,6 +674,14 @@ fn summarize_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>) -> Summary
 }
 
 pub fn list_symbols(analyzer: &dyn IAnalyzer, params: FilePatternsParams) -> SkimFilesResult {
+    list_symbols_with_reader(analyzer, params, &default_read_file)
+}
+
+pub fn list_symbols_with_reader(
+    analyzer: &dyn IAnalyzer,
+    params: FilePatternsParams,
+    read_file: FileReader<'_>,
+) -> SkimFilesResult {
     let expanded = resolve_file_patterns(analyzer, &params.file_patterns);
     let total_files = expanded.len();
     let truncated = total_files > FILE_SKIM_LIMIT;
@@ -639,8 +689,7 @@ pub fn list_symbols(analyzer: &dyn IAnalyzer, params: FilePatternsParams) -> Ski
     let files: Vec<_> = selected
         .into_par_iter()
         .map(|file| {
-            let loc = file
-                .read_to_string()
+            let loc = read_file(&file)
                 .map(|content| line_count(&content))
                 .unwrap_or(0);
             let lines = analyzer
@@ -699,6 +748,14 @@ pub fn most_relevant_files(
 }
 
 pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUsagesResult {
+    scan_usages_with_file_observer(analyzer, params, &|_| {})
+}
+
+pub fn scan_usages_with_file_observer(
+    analyzer: &dyn IAnalyzer,
+    params: ScanUsagesParams,
+    observe_file: &(dyn Fn(&ProjectFile) + Sync),
+) -> ScanUsagesResult {
     let _scope = profiling::scope("searchtools::scan_usages");
 
     let symbols: Vec<String> = params
@@ -747,6 +804,9 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
                 continue;
             }
         };
+        for overload in &overloads {
+            observe_file(overload.source());
+        }
 
         let mut finder = UsageFinder::new();
         if let Some(test_files) = test_files.as_ref() {
@@ -772,6 +832,9 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
                     .into_values()
                     .flat_map(BTreeSet::into_iter)
                     .collect();
+                for hit in &hits {
+                    observe_file(&hit.file);
+                }
                 // A resolved symbol with no call sites is still emitted with
                 // zero hits, so callers can distinguish "unknown symbol" (not_found)
                 // from "symbol exists but has no callers" (usages with total_hits = 0).
@@ -792,6 +855,9 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
                     .flat_map(BTreeSet::into_iter)
                     .filter(|hit| hit.confidence >= CONFIDENCE_THRESHOLD)
                     .collect();
+                for hit in &high_confidence {
+                    observe_file(&hit.file);
+                }
                 ambiguous.push(AmbiguousUsageSymbol {
                     symbol,
                     short_name,
@@ -919,6 +985,7 @@ fn code_unit_kind_filter(filter: SymbolKindFilter) -> CodeUnitKindFilter {
 fn summary_block_for_code_unit(
     analyzer: &dyn IAnalyzer,
     code_unit: &CodeUnit,
+    read_file: FileReader<'_>,
 ) -> Option<SummaryBlock> {
     let elements = summary_elements_for_code_unit(analyzer, code_unit);
     if elements.is_empty() {
@@ -928,7 +995,7 @@ fn summary_block_for_code_unit(
     Some(SummaryBlock {
         label: code_unit.fq_name(),
         path: rel_path_string(code_unit.source()),
-        preamble: file_preamble(code_unit.source(), &elements),
+        preamble: file_preamble(code_unit.source(), &elements, read_file),
         elements,
     })
 }
@@ -1052,14 +1119,18 @@ fn code_unit_kind_name(kind: CodeUnitType) -> &'static str {
     }
 }
 
-fn file_preamble(file: &ProjectFile, elements: &[SummaryElement]) -> String {
+fn file_preamble(
+    file: &ProjectFile,
+    elements: &[SummaryElement],
+    read_file: FileReader<'_>,
+) -> String {
     let Some(first_start_line) = elements.iter().map(|element| element.start_line).min() else {
         return String::new();
     };
     if first_start_line <= 1 {
         return String::new();
     }
-    let Ok(content) = file.read_to_string() else {
+    let Ok(content) = read_file(file) else {
         return String::new();
     };
     content
@@ -1094,8 +1165,9 @@ fn source_blocks_for_code_unit(
     analyzer: &dyn IAnalyzer,
     code_unit: &CodeUnit,
     include_comments: bool,
+    read_file: FileReader<'_>,
 ) -> Vec<SourceBlock> {
-    let Ok(content) = code_unit.source().read_to_string() else {
+    let Ok(content) = read_file(code_unit.source()) else {
         return Vec::new();
     };
 
@@ -1436,6 +1508,10 @@ fn strip_params(symbols: Vec<String>) -> Vec<String> {
 
 fn default_limit() -> usize {
     20
+}
+
+fn default_read_file(file: &ProjectFile) -> io::Result<String> {
+    file.read_to_string()
 }
 
 fn language_name(language: Language) -> String {

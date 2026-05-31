@@ -1,5 +1,6 @@
 pub mod analyzer;
 pub mod code_quality;
+mod file_access;
 pub mod file_tools;
 pub mod git_tools;
 pub mod hash;

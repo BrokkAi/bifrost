@@ -4,6 +4,9 @@ use glob::{MatchOptions, Pattern};
 use rayon::prelude::*;
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
+use std::io;
+
+pub type FileReader<'a> = &'a (dyn Fn(&ProjectFile) -> io::Result<String> + Sync);
 
 const STRICT_SEPARATOR: MatchOptions = MatchOptions {
     case_sensitive: true,
@@ -143,6 +146,14 @@ pub fn get_file_contents(
     analyzer: &dyn IAnalyzer,
     params: GetFileContentsParams,
 ) -> GetFileContentsResult {
+    get_file_contents_with_reader(analyzer, params, &default_read_file)
+}
+
+pub fn get_file_contents_with_reader(
+    analyzer: &dyn IAnalyzer,
+    params: GetFileContentsParams,
+    read_file: FileReader<'_>,
+) -> GetFileContentsResult {
     let project = analyzer.project();
     let mut files = Vec::new();
     let mut not_found = Vec::new();
@@ -159,7 +170,7 @@ pub fn get_file_contents(
         };
 
         match project.file_by_rel_path(&rel) {
-            Some(file) => match file.read_to_string() {
+            Some(file) => match read_file(&file) {
                 Ok(content) => files.push(FileContent {
                     path: rel_path_string(&file),
                     content,
@@ -245,6 +256,14 @@ pub fn find_files_containing(
     analyzer: &dyn IAnalyzer,
     params: FindFilesContainingParams,
 ) -> FindFilesContainingResult {
+    find_files_containing_with_reader(analyzer, params, &default_read_file)
+}
+
+pub fn find_files_containing_with_reader(
+    analyzer: &dyn IAnalyzer,
+    params: FindFilesContainingParams,
+    read_file: FileReader<'_>,
+) -> FindFilesContainingResult {
     let project = analyzer.project();
     let limit = params.limit.max(1);
 
@@ -275,7 +294,7 @@ pub fn find_files_containing(
             if !is_searchable_text_file(&file) {
                 return None;
             }
-            let contents = file.read_to_string().ok()?;
+            let contents = read_file(&file).ok()?;
             if regexes.iter().any(|regex| regex.is_match(&contents)) {
                 Some(rel_path_string(&file))
             } else {
@@ -298,6 +317,14 @@ pub fn find_files_containing(
 pub fn search_file_contents(
     analyzer: &dyn IAnalyzer,
     params: SearchFileContentsParams,
+) -> SearchFileContentsResult {
+    search_file_contents_with_reader(analyzer, params, &default_read_file)
+}
+
+pub fn search_file_contents_with_reader(
+    analyzer: &dyn IAnalyzer,
+    params: SearchFileContentsParams,
+    read_file: FileReader<'_>,
 ) -> SearchFileContentsResult {
     let project = analyzer.project();
 
@@ -347,7 +374,7 @@ pub fn search_file_contents(
             if !is_searchable_text_file(&file) {
                 return None;
             }
-            let contents = file.read_to_string().ok()?;
+            let contents = read_file(&file).ok()?;
             // Bound the per-file line count before allocating `Vec<&str>`.
             // A 5 MB single-byte-line file would otherwise produce ~5M slices
             // (≈120 MB of Vec headers) across rayon workers — a memory-pressure
@@ -562,6 +589,10 @@ fn default_find_files_containing_limit() -> usize {
 
 fn default_search_file_contents_context() -> usize {
     DEFAULT_SEARCH_FILE_CONTENTS_CONTEXT
+}
+
+fn default_read_file(file: &ProjectFile) -> io::Result<String> {
+    file.read_to_string()
 }
 
 fn default_list_files_max_entries() -> usize {
