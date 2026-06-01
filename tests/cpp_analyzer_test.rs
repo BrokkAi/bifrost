@@ -303,6 +303,7 @@ fn test_cpp_imported_code_units_only_resolve_relative_quoted_includes() {
             "src/main.cpp",
             r#"
             #include "helper.h"
+            #include "/tmp/not-in-project.h"
 
             int main() { return 0; }
             "#,
@@ -315,6 +316,28 @@ fn test_cpp_imported_code_units_only_resolve_relative_quoted_includes() {
     let imports = analyzer.imported_code_units_of(&main_cpp);
 
     assert!(imports.is_empty(), "{imports:?}");
+}
+
+#[test]
+fn test_cpp_absolute_quoted_include_inside_project_is_normalized() {
+    let project = inline_cpp_project(&[
+        ("src/main.cpp", "int main() { return 0; }\n"),
+        ("include/helper.h", "struct Helper {};"),
+    ]);
+    let root = project.root().to_path_buf();
+    let helper_abs = root.join("include/helper.h");
+    ProjectFile::new(root.clone(), "src/main.cpp")
+        .write(format!(
+            "#include \"{}\"\nint main() {{ return 0; }}\n",
+            helper_abs.display()
+        ))
+        .unwrap();
+    let analyzer = CppAnalyzer::from_project(project.clone());
+    let main_cpp = ProjectFile::new(root, "src/main.cpp");
+
+    let imports = analyzer.imported_code_units_of(&main_cpp);
+
+    assert!(imports.iter().any(|cu| cu.short_name() == "Helper"));
 }
 
 #[test]

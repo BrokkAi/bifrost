@@ -102,14 +102,21 @@ pub(crate) fn parse_quoted_include(line: &str) -> Option<String> {
 }
 
 pub(crate) fn resolve_include_targets(
-    _project: &dyn Project,
+    project: &dyn Project,
     source_file: &ProjectFile,
     include: &str,
 ) -> Vec<ProjectFile> {
     let mut candidates = Vec::new();
     let include_path = Path::new(include);
-    let relative_path = source_file.parent().join(include_path);
-    let source_root = source_file.root().to_path_buf();
+    let source_root = project.root().to_path_buf();
+    let relative_path = if include_path.is_absolute() {
+        match include_path.strip_prefix(project.root()) {
+            Ok(path) => path.to_path_buf(),
+            Err(_) => return candidates,
+        }
+    } else {
+        source_file.parent().join(include_path)
+    };
     let relative_file = ProjectFile::new(source_root.clone(), relative_path);
     if relative_file.exists() {
         candidates.push(relative_file);
