@@ -16,6 +16,7 @@ permissions:
 
 env:
   BIN_NAME: bifrost
+  ANDROID_API: '21'
 
 jobs:
   build:
@@ -32,6 +33,10 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             rust_targets: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
+            archive: tar.gz
+          - target: aarch64-linux-android
+            rust_targets: aarch64-linux-android
+            runner: ubuntu-latest
             archive: tar.gz
           - target: universal-apple-darwin
             rust_targets: x86_64-apple-darwin,aarch64-apple-darwin
@@ -66,6 +71,28 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.rust_targets }}
+
+      - name: Set up Android NDK
+        if: matrix.target == 'aarch64-linux-android'
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27d
+          add-to-path: false
+
+      - name: Configure Android toolchain
+        if: matrix.target == 'aarch64-linux-android'
+        shell: bash
+        run: |
+          toolchain_bin="${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          api="${ANDROID_API}"
+          {
+            echo "CC_aarch64_linux_android=${toolchain_bin}/aarch64-linux-android${api}-clang"
+            echo "CXX_aarch64_linux_android=${toolchain_bin}/aarch64-linux-android${api}-clang++"
+            echo "AR_aarch64_linux_android=${toolchain_bin}/llvm-ar"
+            echo "RANLIB_aarch64_linux_android=${toolchain_bin}/llvm-ranlib"
+            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${toolchain_bin}/aarch64-linux-android${api}-clang"
+          } >> "$GITHUB_ENV"
 
       - name: Cache cargo + target
         uses: Swatinem/rust-cache@v2
