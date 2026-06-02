@@ -449,6 +449,7 @@ pub fn get_symbol_locations_with_reader(
 #[derive(Debug)]
 struct SummaryTargets {
     file_targets: Vec<ProjectFile>,
+    directory_targets: Vec<ProjectFile>,
     unmatched_file_targets: Vec<String>,
     symbol_targets: Vec<String>,
 }
@@ -461,6 +462,7 @@ enum SourceLookupOutcome {
 
 fn route_summary_targets(analyzer: &dyn IAnalyzer, targets: &[String]) -> SummaryTargets {
     let mut file_targets = BTreeSet::new();
+    let mut directory_targets = BTreeSet::new();
     let mut unmatched_file_targets = Vec::new();
     let mut symbol_targets = Vec::new();
 
@@ -469,6 +471,12 @@ fn route_summary_targets(analyzer: &dyn IAnalyzer, targets: &[String]) -> Summar
         .map(|target| target.trim())
         .filter(|target| !target.is_empty())
     {
+        let directory_matches = resolve_directory_target(analyzer, target);
+        if !directory_matches.is_empty() {
+            directory_targets.extend(directory_matches);
+            continue;
+        }
+
         let matches = resolve_file_patterns(analyzer, &[target.to_string()]);
         if !matches.is_empty() {
             file_targets.extend(matches);
@@ -485,6 +493,7 @@ fn route_summary_targets(analyzer: &dyn IAnalyzer, targets: &[String]) -> Summar
 
     SummaryTargets {
         file_targets: file_targets.into_iter().collect(),
+        directory_targets: directory_targets.into_iter().collect(),
         unmatched_file_targets,
         symbol_targets,
     }
@@ -618,9 +627,12 @@ pub fn get_summaries_with_reader(
     let targets = params.targets;
     let summary_targets = route_summary_targets(analyzer, &targets);
     let mut file_output = summarize_files(analyzer, summary_targets.file_targets, read_file);
+    let directory_output =
+        summarize_directory_symbol_inventory(analyzer, summary_targets.directory_targets, read_file);
     let symbol_output =
         summarize_symbol_targets(analyzer, summary_targets.symbol_targets, read_file);
 
+    file_output.summaries.extend(directory_output.summaries);
     file_output.summaries.extend(symbol_output.summaries);
     file_output
         .not_found
@@ -633,6 +645,64 @@ pub fn get_summaries_with_reader(
             .then(left.label.cmp(&right.label))
     });
     file_output
+}
+
+fn summarize_directory_symbol_inventory(
+    analyzer: &dyn IAnalyzer,
+    files: Vec<ProjectFile>,
+    read_file: FileReader<'_>,
+) -> SummaryResult {
+    let total_files = files.len();
+    let truncated = total_files > FILE_SKIM_LIMIT;
+    let selected = select_files_for_display(analyzer, files, FILE_SKIM_LIMIT);
+    let mut summaries: Vec<_> = selected
+        .into_par_iter()
+        .filter_map(|file| {
+            let lines: Vec<_> = analyzer
+                .list_symbols(&file)
+                .lines()
+                .map(str::to_string)
+                .collect();
+            if lines.is_empty() {
+                return None;
+            }
+            let path = rel_path_string(&file);
+            let loc = read_file(&file)
+                .map(|content| line_count(&content))
+                .unwrap_or(0);
+            Some(SummaryBlock {
+                label: path.clone(),
+                path,
+                preamble: format!("{} lines\n{}", loc, lines.join("\n")),
+                elements: Vec::new(),
+            })
+        })
+        .collect();
+    summaries.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then(left.label.cmp(&right.label))
+    });
+    if truncated {
+        summaries.insert(
+            0,
+            SummaryBlock {
+                label: "directory-summary-truncated".to_string(),
+                path: "directory-summary-truncated".to_string(),
+                preamble: format!(
+                    "Showing symbol inventory for {} of {} matching files. Use a narrower path or glob for more detail.",
+                    FILE_SKIM_LIMIT, total_files
+                ),
+                elements: Vec::new(),
+            },
+        );
+    }
+
+    SummaryResult {
+        summaries,
+        not_found: Vec::new(),
+        ambiguous: Vec::new(),
+    }
 }
 
 fn summarize_files(
@@ -1277,8 +1347,15 @@ fn resolve_file_patterns(analyzer: &dyn IAnalyzer, patterns: &[String]) -> Vec<P
         let rel_path = Path::new(&normalized);
         if !rel_path.is_absolute()
             && let Some(file) = analyzer.project().file_by_rel_path(rel_path)
+            && file.abs_path().is_file()
         {
             matched.insert(file);
+            continue;
+        }
+
+        let directory_matches = resolve_directory_target(analyzer, &normalized);
+        if !directory_matches.is_empty() {
+            matched.extend(directory_matches);
         }
     }
 
@@ -1297,6 +1374,18 @@ fn resolve_file_patterns(analyzer: &dyn IAnalyzer, patterns: &[String]) -> Vec<P
     }
 
     matched.into_iter().collect()
+}
+
+fn resolve_directory_target(analyzer: &dyn IAnalyzer, target: &str) -> Vec<ProjectFile> {
+    if target == "." {
+        return analyzer.analyzed_files().cloned().collect();
+    }
+    let prefix = format!("{}/", target.trim_end_matches('/'));
+    analyzer
+        .analyzed_files()
+        .filter(|file| rel_path_string(file).starts_with(&prefix))
+        .cloned()
+        .collect()
 }
 
 fn select_files_for_display(
@@ -1735,6 +1824,10 @@ mod tests {
         fn search_definitions(&self, _pattern: &str, _auto_quote: bool) -> BTreeSet<CodeUnit> {
             BTreeSet::new()
         }
+
+        fn list_symbols(&self, file: &ProjectFile) -> String {
+            format!("- {}", super::rel_path_string(file).replace('/', "_"))
+        }
     }
 
     #[test]
@@ -1824,6 +1917,29 @@ mod tests {
         );
 
         assert_eq!(0, analyzer.analyzed_files_calls());
+    }
+
+    #[test]
+    fn directory_get_summaries_uses_skim_file_limit() {
+        let root = std::env::current_dir().unwrap();
+        let rel_paths: Vec<_> = (0..25).map(|index| format!("src/File{index}.java")).collect();
+        let rel_path_refs: Vec<_> = rel_paths.iter().map(String::as_str).collect();
+        let analyzer = CountingAnalyzer::new(root, &rel_path_refs);
+
+        let result = super::get_summaries(
+            &analyzer,
+            super::SummariesParams {
+                targets: vec!["src".to_string()],
+            },
+        );
+
+        assert_eq!(super::FILE_SKIM_LIMIT + 1, result.summaries.len());
+        assert!(
+            result
+                .summaries
+                .iter()
+                .any(|summary| summary.path == "directory-summary-truncated")
+        );
     }
 
     fn rel_paths(files: &[ProjectFile]) -> Vec<String> {

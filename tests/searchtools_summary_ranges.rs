@@ -135,6 +135,50 @@ fn get_summaries_accepts_mixed_file_and_class_targets() {
 }
 
 #[test]
+fn get_summaries_accepts_directory_targets() {
+    let analyzer = go_fixture_analyzer();
+    let result = get_summaries(
+        &analyzer,
+        SummariesParams {
+            targets: vec!["anotherpkg".to_string()],
+        },
+    );
+
+    assert!(result.not_found.is_empty(), "{:?}", result.not_found);
+    assert!(result.ambiguous.is_empty(), "{:?}", result.ambiguous);
+    assert!(
+        result
+            .summaries
+            .iter()
+            .any(|summary| summary.path == "anotherpkg/another.go"),
+        "{:?}",
+        result.summaries
+    );
+}
+
+#[test]
+fn get_summaries_accepts_workspace_root_directory_target() {
+    let analyzer = go_fixture_analyzer();
+    let result = get_summaries(
+        &analyzer,
+        SummariesParams {
+            targets: vec![".".to_string()],
+        },
+    );
+
+    assert!(result.not_found.is_empty(), "{:?}", result.not_found);
+    assert!(result.ambiguous.is_empty(), "{:?}", result.ambiguous);
+    assert!(
+        result
+            .summaries
+            .iter()
+            .any(|summary| summary.path == "declarations.go"),
+        "{:?}",
+        result.summaries
+    );
+}
+
+#[test]
 fn file_summaries_do_not_include_same_package_sibling_elements() {
     let analyzer = java_fixture_analyzer();
     let result = get_summaries(
