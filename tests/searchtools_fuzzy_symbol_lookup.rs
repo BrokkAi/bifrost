@@ -200,6 +200,45 @@ fn scan_usages_uses_the_common_fuzzy_symbol_resolver() {
     assert_eq!("A::method", result.usages[0].symbol);
 }
 
+#[test]
+fn scan_usages_finds_c_function_callers_through_header_declaration() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("repository.h", "void initialize_the_repository(void);\n")
+        .file(
+            "repository.c",
+            "#include \"repository.h\"\nvoid initialize_the_repository(void) {}\n",
+        )
+        .file(
+            "common-main.c",
+            "#include \"repository.h\"\nint main(void) { initialize_the_repository(); }\n",
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+
+    let result = scan_usages(
+        &analyzer,
+        ScanUsagesParams {
+            symbols: vec!["initialize_the_repository".to_string()],
+            include_tests: true,
+        },
+    );
+
+    assert!(result.not_found.is_empty(), "{result:#?}");
+    assert!(result.ambiguous.is_empty(), "{result:#?}");
+    assert_eq!(1, result.usages.len(), "{result:#?}");
+    assert!(
+        result.usages[0]
+            .files
+            .iter()
+            .any(|file| file.path == "common-main.c"
+                && file
+                    .hits
+                    .iter()
+                    .any(|hit| hit.snippet.contains("initialize_the_repository()"))),
+        "{result:#?}",
+    );
+}
+
 fn source_for(
     analyzer: &dyn IAnalyzer,
     symbol: &str,

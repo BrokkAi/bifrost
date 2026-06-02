@@ -463,7 +463,7 @@ pub(super) fn signature_arity(signature: Option<&str>) -> usize {
         })
         .unwrap_or(signature)
         .trim();
-    if inner.is_empty() {
+    if inner.is_empty() || inner == "void" {
         return 0;
     }
     split_top_level_commas(inner).count()
