@@ -24,8 +24,7 @@ filesystem behavior that is awkward to express inline.
 
 Before pushing Rust changes, run the same core checks that CI enforces locally when practical.
 
-At minimum, run `cargo fmt --check` and `cargo clippy --all-targets --all-features -- -D warnings`. If clippy or fmt
-fails, fix that locally before pushing rather than waiting for the CI matrix to report it back.
+At minimum, run `cargo fmt` and `cargo clippy --all-targets --all-features -- -D warnings`. If clippy fails, fix that locally before pushing rather than waiting for the CI matrix to report it back.
 
 # Implementation details
 
