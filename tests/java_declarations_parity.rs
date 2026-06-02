@@ -59,6 +59,7 @@ fn lists_all_fixture_classes() {
             "UsePackaged",
             "XExtendsY",
             "io.github.jbellis.brokk.Foo",
+            "io.github.jbellis.brokk.PackagedSibling",
         ]
         .into_iter()
         .map(str::to_string)

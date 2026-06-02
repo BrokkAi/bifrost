@@ -1,5 +1,5 @@
 use super::*;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 impl TestDetectionProvider for CppAnalyzer {}
@@ -11,11 +11,13 @@ impl ImportAnalysisProvider for CppAnalyzer {
         }
 
         let mut resolved = HashSet::default();
-        for line in self.inner.import_statements(file) {
-            if let Some(path) = parse_quoted_include(line) {
-                for target in resolve_include_targets(self.inner.project(), file, &path) {
-                    resolved.extend(self.inner.top_level_declarations(&target).cloned());
-                }
+        for path in quoted_include_paths(
+            self.inner.project(),
+            file,
+            self.inner.import_statements(file),
+        ) {
+            for target in resolve_include_targets(self.inner.project(), file, &path) {
+                resolved.extend(self.inner.top_level_declarations(&target).cloned());
             }
         }
 
@@ -35,11 +37,15 @@ impl ImportAnalysisProvider for CppAnalyzer {
             if candidate == file {
                 continue;
             }
-            if self.inner.import_statements(candidate).iter().any(|line| {
-                parse_quoted_include(line).is_some_and(|include| {
-                    file.rel_path() == Path::new(&include)
-                        || file_name.is_some_and(|name| include.ends_with(name))
-                })
+            if quoted_include_paths(
+                self.inner.project(),
+                candidate,
+                self.inner.import_statements(candidate),
+            )
+            .iter()
+            .any(|include| {
+                file.rel_path() == Path::new(include)
+                    || file_name.is_some_and(|name| include.ends_with(name))
             }) {
                 references.insert(candidate.clone());
             }
@@ -58,20 +64,21 @@ impl ImportAnalysisProvider for CppAnalyzer {
         let source = code_unit.source();
         let identifiers = self
             .extract_type_identifiers(&self.inner.get_source(code_unit, true).unwrap_or_default());
-        self.inner
-            .import_statements(source)
-            .iter()
-            .filter(|line| {
-                parse_quoted_include(line).is_some_and(|path| {
-                    let stem = Path::new(&path)
-                        .file_stem()
-                        .and_then(|value| value.to_str())
-                        .unwrap_or("");
-                    identifiers.contains(stem)
-                })
-            })
-            .cloned()
-            .collect()
+        quoted_include_paths(
+            self.inner.project(),
+            source,
+            self.inner.import_statements(source),
+        )
+        .iter()
+        .filter(|path| {
+            let stem = Path::new(path)
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("");
+            identifiers.contains(stem)
+        })
+        .map(|path| format!("#include \"{path}\""))
+        .collect()
     }
 
     fn could_import_file(
@@ -110,9 +117,9 @@ pub(crate) fn resolve_include_targets(
     let include_path = Path::new(include);
     let source_root = project.root().to_path_buf();
     let relative_path = if include_path.is_absolute() {
-        match include_path.strip_prefix(project.root()) {
-            Ok(path) => path.to_path_buf(),
-            Err(_) => return candidates,
+        match project_relative_include_path(project.root(), include_path) {
+            Some(path) => path,
+            None => return candidates,
         }
     } else {
         source_file.parent().join(include_path)
@@ -125,4 +132,101 @@ pub(crate) fn resolve_include_targets(
     candidates.sort();
     candidates.dedup();
     candidates
+}
+
+fn project_relative_include_path(project_root: &Path, include_path: &Path) -> Option<PathBuf> {
+    let canonical_root = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    let canonical_include = include_path
+        .canonicalize()
+        .unwrap_or_else(|_| include_path.to_path_buf());
+    canonical_include
+        .strip_prefix(&canonical_root)
+        .map(Path::to_path_buf)
+        .or_else(|_| {
+            include_path
+                .strip_prefix(project_root)
+                .map(Path::to_path_buf)
+        })
+        .ok()
+        .or_else(|| lexical_project_relative_include_path(&canonical_root, &canonical_include))
+        .or_else(|| lexical_project_relative_include_path(project_root, include_path))
+}
+
+pub(crate) fn quoted_include_paths(
+    project: &dyn Project,
+    file: &ProjectFile,
+    parsed: &[String],
+) -> Vec<String> {
+    let mut includes: Vec<String> = parsed
+        .iter()
+        .filter_map(|line| parse_quoted_include(line))
+        .collect();
+    if !includes.is_empty() {
+        return includes;
+    }
+
+    let Ok(source) = project.read_source(file) else {
+        return includes;
+    };
+    for line in source.lines() {
+        if !looks_like_quoted_include_line(line) {
+            continue;
+        }
+        if let Some(include) = parse_quoted_include(line)
+            && !includes.contains(&include)
+        {
+            includes.push(include);
+        }
+    }
+    includes
+}
+
+fn looks_like_quoted_include_line(line: &str) -> bool {
+    let Some(rest) = line.trim_start().strip_prefix('#') else {
+        return false;
+    };
+    let Some(rest) = rest.trim_start().strip_prefix("include") else {
+        return false;
+    };
+    rest.trim_start().starts_with('"')
+}
+
+fn lexical_project_relative_include_path(
+    project_root: &Path,
+    include_path: &Path,
+) -> Option<PathBuf> {
+    let root = slash_path(project_root);
+    let include = slash_path(include_path);
+    strip_slash_prefix(&include, &root).map(PathBuf::from)
+}
+
+fn slash_path(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    let raw = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
+    raw.replace('\\', "/").trim_end_matches('/').to_string()
+}
+
+#[cfg(windows)]
+fn strip_slash_prefix<'a>(path: &'a str, root: &str) -> Option<&'a str> {
+    if path.eq_ignore_ascii_case(root) {
+        return Some("");
+    }
+    if path.len() > root.len()
+        && path.as_bytes().get(root.len()) == Some(&b'/')
+        && path[..root.len()].eq_ignore_ascii_case(root)
+    {
+        return Some(&path[root.len() + 1..]);
+    }
+    None
+}
+
+#[cfg(not(windows))]
+fn strip_slash_prefix<'a>(path: &'a str, root: &str) -> Option<&'a str> {
+    if path == root {
+        return Some("");
+    }
+    path.strip_prefix(root)
+        .and_then(|rest| rest.strip_prefix('/'))
 }
