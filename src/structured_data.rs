@@ -6,10 +6,8 @@
 //! HTML-to-XML normalization step or a CSS-selector-based variant.
 
 use crate::analyzer::{IAnalyzer, ProjectFile};
-use crate::file_tools::FileReader;
 use glob::{MatchOptions, Pattern};
 use serde::{Deserialize, Serialize};
-use std::io;
 
 const STRICT_SEPARATOR: MatchOptions = MatchOptions {
     case_sensitive: true,
@@ -108,14 +106,6 @@ pub struct XmlSelectFile {
 }
 
 pub fn jq(analyzer: &dyn IAnalyzer, params: JqParams) -> JqResult {
-    jq_with_reader(analyzer, params, &default_read_file)
-}
-
-pub fn jq_with_reader(
-    analyzer: &dyn IAnalyzer,
-    params: JqParams,
-    read_file: FileReader<'_>,
-) -> JqResult {
     let project = analyzer.project();
     let files = match resolve_files(project, &params.file_path, params.max_files) {
         Ok(out) => out,
@@ -133,7 +123,7 @@ pub fn jq_with_reader(
 
     for file in files.files {
         let path = rel_path_string(&file);
-        match read_file(&file) {
+        match file.read_to_string() {
             Ok(content) => match run_jq_filter(&content, &params.filter, matches_per_file) {
                 Ok((matches, truncated)) => file_results.push(JqFileResult {
                     path,
@@ -165,14 +155,6 @@ pub fn jq_with_reader(
 }
 
 pub fn xml_skim(analyzer: &dyn IAnalyzer, params: XmlSkimParams) -> XmlSkimResult {
-    xml_skim_with_reader(analyzer, params, &default_read_file)
-}
-
-pub fn xml_skim_with_reader(
-    analyzer: &dyn IAnalyzer,
-    params: XmlSkimParams,
-    read_file: FileReader<'_>,
-) -> XmlSkimResult {
     let project = analyzer.project();
     let files = match resolve_files(project, &params.file_path, params.max_files) {
         Ok(out) => out,
@@ -187,7 +169,7 @@ pub fn xml_skim_with_reader(
     let mut file_results = Vec::new();
     for file in files.files {
         let path = rel_path_string(&file);
-        match read_file(&file) {
+        match file.read_to_string() {
             Ok(content) => match skim_xml_string(&content) {
                 Ok(elements) => file_results.push(XmlSkimFile {
                     path,
@@ -215,14 +197,6 @@ pub fn xml_skim_with_reader(
 }
 
 pub fn xml_select(analyzer: &dyn IAnalyzer, params: XmlSelectParams) -> XmlSelectResult {
-    xml_select_with_reader(analyzer, params, &default_read_file)
-}
-
-pub fn xml_select_with_reader(
-    analyzer: &dyn IAnalyzer,
-    params: XmlSelectParams,
-    read_file: FileReader<'_>,
-) -> XmlSelectResult {
     if matches!(params.output, XmlSelectOutput::Attribute) && params.attr_name.is_none() {
         return XmlSelectResult {
             files: Vec::new(),
@@ -246,7 +220,7 @@ pub fn xml_select_with_reader(
     let mut file_results = Vec::new();
     for file in files.files {
         let path = rel_path_string(&file);
-        match read_file(&file) {
+        match file.read_to_string() {
             Ok(content) => match run_xpath(
                 &content,
                 &params.xpath,
@@ -513,10 +487,6 @@ fn rel_path_string(file: &ProjectFile) -> String {
 
 fn default_max_files() -> usize {
     DEFAULT_MAX_FILES
-}
-
-fn default_read_file(file: &ProjectFile) -> io::Result<String> {
-    file.read_to_string()
 }
 
 fn default_matches_per_file() -> usize {

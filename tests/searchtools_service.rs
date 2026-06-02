@@ -5,8 +5,6 @@ use git2::{Repository, Signature};
 use serde_json::Value;
 use std::fs;
 use std::path::{MAIN_SEPARATOR, PathBuf};
-use std::thread;
-use std::time::Duration;
 use tempfile::TempDir;
 
 fn fixture_root() -> PathBuf {
@@ -287,179 +285,6 @@ fn python_boundary_returns_most_relevant_files_json() {
         "payload: {value}"
     );
     assert_eq!(0, value["not_found"].as_array().unwrap().len());
-}
-
-#[test]
-fn refresh_updates_file_read_by_tracked_tool_when_mtime_changes() {
-    let temp = TempDir::new().unwrap();
-    let file = temp.path().join("Tracked.java");
-    fs::write(&file, "public class Tracked { void beforeRefresh() {} }\n").unwrap();
-
-    let mut service =
-        SearchToolsService::new_without_watcher_for_tests(temp.path().to_path_buf()).unwrap();
-    service
-        .call_tool_json("get_file_contents", r#"{"file_paths":["Tracked.java"]}"#)
-        .unwrap();
-
-    sleep_for_mtime_tick();
-    fs::write(&file, "public class Tracked { void afterRefresh() {} }\n").unwrap();
-    service.call_tool_json("refresh", "{}").unwrap();
-
-    let payload = service
-        .call_tool_json(
-            "search_symbols",
-            r#"{"patterns":["afterRefresh"],"include_tests":true,"limit":10}"#,
-        )
-        .unwrap();
-    let value: Value = serde_json::from_str(&payload).unwrap();
-    assert_eq!(
-        value["files"][0]["functions"][0]["symbol"],
-        "Tracked.afterRefresh"
-    );
-}
-
-#[test]
-fn refresh_removes_deleted_file_that_was_read_by_tracked_tool() {
-    let temp = TempDir::new().unwrap();
-    let file = temp.path().join("Gone.java");
-    fs::write(&file, "public class Gone { }\n").unwrap();
-
-    let mut service =
-        SearchToolsService::new_without_watcher_for_tests(temp.path().to_path_buf()).unwrap();
-    service
-        .call_tool_json("get_file_contents", r#"{"file_paths":["Gone.java"]}"#)
-        .unwrap();
-
-    fs::remove_file(&file).unwrap();
-    service.call_tool_json("refresh", "{}").unwrap();
-
-    let payload = service
-        .call_tool_json(
-            "search_symbols",
-            r#"{"patterns":["Gone"],"include_tests":true,"limit":10}"#,
-        )
-        .unwrap();
-    let value: Value = serde_json::from_str(&payload).unwrap();
-    assert_eq!(
-        value["files"].as_array().unwrap().len(),
-        0,
-        "payload: {value}"
-    );
-}
-
-#[test]
-fn refresh_ignores_untracked_file_even_when_mtime_changes() {
-    let temp = TempDir::new().unwrap();
-    let file = temp.path().join("Untracked.java");
-    fs::write(&file, "public class Untracked { void beforeOnly() {} }\n").unwrap();
-
-    let mut service =
-        SearchToolsService::new_without_watcher_for_tests(temp.path().to_path_buf()).unwrap();
-
-    sleep_for_mtime_tick();
-    fs::write(&file, "public class Untracked { void afterOnly() {} }\n").unwrap();
-    service.call_tool_json("refresh", "{}").unwrap();
-
-    let payload = service
-        .call_tool_json(
-            "search_symbols",
-            r#"{"patterns":["afterOnly"],"include_tests":true,"limit":10}"#,
-        )
-        .unwrap();
-    let value: Value = serde_json::from_str(&payload).unwrap();
-    assert_eq!(
-        value["files"].as_array().unwrap().len(),
-        0,
-        "payload: {value}"
-    );
-}
-
-#[test]
-fn report_tools_do_not_enroll_files_for_mtime_refresh() {
-    let temp = TempDir::new().unwrap();
-    let file = temp.path().join("ReportOnly.java");
-    fs::write(
-        &file,
-        "public class ReportOnly { void beforeReport() { try { risky(); } catch (Exception e) { } } void risky() {} }\n",
-    )
-    .unwrap();
-
-    let mut service =
-        SearchToolsService::new_without_watcher_for_tests(temp.path().to_path_buf()).unwrap();
-    service
-        .call_tool_json(
-            "report_exception_handling_smells",
-            r#"{"file_paths":["ReportOnly.java"],"max_findings":5}"#,
-        )
-        .unwrap();
-
-    sleep_for_mtime_tick();
-    fs::write(&file, "public class ReportOnly { void afterReport() {} }\n").unwrap();
-    service.call_tool_json("refresh", "{}").unwrap();
-
-    let payload = service
-        .call_tool_json(
-            "search_symbols",
-            r#"{"patterns":["afterReport"],"include_tests":true,"limit":10}"#,
-        )
-        .unwrap();
-    let value: Value = serde_json::from_str(&payload).unwrap();
-    assert_eq!(
-        value["files"].as_array().unwrap().len(),
-        0,
-        "payload: {value}"
-    );
-}
-
-#[test]
-fn activate_workspace_clears_tracked_mtimes_from_previous_workspace() {
-    let old_root = TempDir::new().unwrap();
-    let old_file = old_root.path().join("Old.java");
-    fs::write(&old_file, "public class Old { void beforeOld() {} }\n").unwrap();
-
-    let new_root = TempDir::new().unwrap();
-    fs::write(
-        new_root.path().join("New.java"),
-        "public class New { void staysNew() {} }\n",
-    )
-    .unwrap();
-
-    let mut service =
-        SearchToolsService::new_without_watcher_for_tests(old_root.path().to_path_buf()).unwrap();
-    service
-        .call_tool_json("get_file_contents", r#"{"file_paths":["Old.java"]}"#)
-        .unwrap();
-
-    let new_root_path = new_root.path().canonicalize().unwrap();
-    let arguments = format!(
-        r#"{{"workspace_path":{}}}"#,
-        serde_json::to_string(&new_root_path.display().to_string()).unwrap()
-    );
-    service
-        .call_tool_json("activate_workspace", &arguments)
-        .unwrap();
-
-    sleep_for_mtime_tick();
-    fs::write(&old_file, "public class Old { void afterOld() {} }\n").unwrap();
-    service.call_tool_json("refresh", "{}").unwrap();
-
-    let active_payload = service
-        .call_tool_json("get_active_workspace", "{}")
-        .unwrap();
-    let active_value: Value = serde_json::from_str(&active_payload).unwrap();
-    assert_eq!(
-        active_value["workspace_path"],
-        new_root_path.display().to_string()
-    );
-
-    let payload = service
-        .call_tool_json(
-            "search_symbols",
-            r#"{"patterns":["staysNew"],"include_tests":true,"limit":10}"#,
-        )
-        .unwrap();
-    let value: Value = serde_json::from_str(&payload).unwrap();
-    assert_eq!(value["files"][0]["functions"][0]["symbol"], "New.staysNew");
 }
 
 #[test]
@@ -874,10 +699,6 @@ fn activate_workspace_normalizes_to_git_root() {
     let value: Value = serde_json::from_str(&payload).unwrap();
 
     assert_eq!(value["workspace_path"], repo_root.display().to_string());
-}
-
-fn sleep_for_mtime_tick() {
-    thread::sleep(Duration::from_millis(25));
 }
 
 fn commit_paths(repo: &Repository, paths: &[&str], message: &str) {
