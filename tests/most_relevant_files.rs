@@ -71,6 +71,22 @@ fn brokk_app_root() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("/home/jonathan/Projects/brokk"))
 }
 
+fn require_mrf_parity_harness(label: &str, brokk_root: &Path, project_root: &Path) -> bool {
+    if env::var("BIFROST_ENABLE_MRF_PARITY").ok().as_deref() != Some("1") {
+        eprintln!(
+            "skipping {label}: set BIFROST_ENABLE_MRF_PARITY=1 to enable external Brokk parity harness"
+        );
+        return false;
+    }
+
+    if !brokk_root.is_dir() || !project_root.is_dir() {
+        eprintln!("skipping {label}: required repo checkout not present");
+        return false;
+    }
+
+    true
+}
+
 fn parity_project_root() -> PathBuf {
     env::var("BROKK_PARITY_PROJECT_ROOT")
         .map(PathBuf::from)
@@ -726,10 +742,10 @@ fn missing_seed_files_are_reported() {
 }
 
 #[test]
+#[ignore = "requires external Brokk parity harness"]
 fn matches_brokk_reference_for_project_filtering_git_repo_seed() {
     let brokk_root = PathBuf::from("/home/jonathan/Projects/brokk");
-    if !brokk_root.is_dir() {
-        eprintln!("skipping brokk parity regression: sibling repo not present");
+    if !require_mrf_parity_harness("brokk parity regression", &brokk_root, &brokk_root) {
         return;
     }
 
@@ -763,10 +779,10 @@ fn matches_brokk_reference_for_project_filtering_git_repo_seed() {
 }
 
 #[test]
+#[ignore = "requires external Brokk parity harness"]
 fn matches_brokk_reference_for_preview_text_panel_seed() {
     let brokk_root = PathBuf::from("/home/jonathan/Projects/brokk");
-    if !brokk_root.is_dir() {
-        eprintln!("skipping brokk parity regression: sibling repo not present");
+    if !require_mrf_parity_harness("brokk parity regression", &brokk_root, &brokk_root) {
         return;
     }
 
@@ -800,10 +816,10 @@ fn matches_brokk_reference_for_preview_text_panel_seed() {
 }
 
 #[test]
+#[ignore = "requires external Brokk parity harness"]
 fn matches_brokk_reference_for_content_diff_utils_seed() {
     let brokk_root = PathBuf::from("/home/jonathan/Projects/brokk");
-    if !brokk_root.is_dir() {
-        eprintln!("skipping brokk parity regression: sibling repo not present");
+    if !require_mrf_parity_harness("brokk parity regression", &brokk_root, &brokk_root) {
         return;
     }
 
@@ -837,10 +853,10 @@ fn matches_brokk_reference_for_content_diff_utils_seed() {
 }
 
 #[test]
+#[ignore = "requires external Brokk parity harness"]
 fn matches_brokk_reference_for_typescript_lookup_seed() {
     let brokk_root = PathBuf::from("/home/jonathan/Projects/brokk");
-    if !brokk_root.is_dir() {
-        eprintln!("skipping brokk parity regression: sibling repo not present");
+    if !require_mrf_parity_harness("brokk parity regression", &brokk_root, &brokk_root) {
         return;
     }
 
@@ -874,10 +890,10 @@ fn matches_brokk_reference_for_typescript_lookup_seed() {
 }
 
 #[test]
+#[ignore = "requires external Brokk parity harness"]
 fn matches_brokk_reference_for_architect_agent_test_seed() {
     let brokk_root = PathBuf::from("/home/jonathan/Projects/brokk");
-    if !brokk_root.is_dir() {
-        eprintln!("skipping brokk parity regression: sibling repo not present");
+    if !require_mrf_parity_harness("brokk parity regression", &brokk_root, &brokk_root) {
         return;
     }
 
@@ -911,10 +927,10 @@ fn matches_brokk_reference_for_architect_agent_test_seed() {
 }
 
 #[test]
+#[ignore = "requires external Brokk parity harness"]
 fn matches_brokk_reference_for_history_store_and_console_logging_pair() {
     let brokk_root = PathBuf::from("/home/jonathan/Projects/brokk");
-    if !brokk_root.is_dir() {
-        eprintln!("skipping brokk parity regression: sibling repo not present");
+    if !require_mrf_parity_harness("brokk parity regression", &brokk_root, &brokk_root) {
         return;
     }
 
@@ -956,11 +972,11 @@ fn matches_brokk_reference_for_history_store_and_console_logging_pair() {
 }
 
 #[test]
+#[ignore = "requires external Brokk parity harness"]
 fn matches_brokk_reference_for_plume_imports_test2_goal_seed() {
     let project_root = PathBuf::from("/home/jonathan/Projects/plume-merge");
     let brokk_root = brokk_app_root();
-    if !brokk_root.is_dir() || !project_root.is_dir() {
-        eprintln!("skipping plume parity regression: repo not present");
+    if !require_mrf_parity_harness("plume parity regression", &brokk_root, &project_root) {
         return;
     }
 
@@ -981,11 +997,11 @@ fn matches_brokk_reference_for_plume_imports_test2_goal_seed() {
 }
 
 #[test]
+#[ignore = "requires external Brokk parity harness"]
 fn matches_brokk_reference_for_plume_imports_test8_base_seed() {
     let project_root = PathBuf::from("/home/jonathan/Projects/plume-merge");
     let brokk_root = brokk_app_root();
-    if !brokk_root.is_dir() || !project_root.is_dir() {
-        eprintln!("skipping plume parity regression: repo not present");
+    if !require_mrf_parity_harness("plume parity regression", &brokk_root, &project_root) {
         return;
     }
 
@@ -1006,12 +1022,12 @@ fn matches_brokk_reference_for_plume_imports_test8_base_seed() {
 }
 
 #[test]
+#[ignore = "requires external Brokk parity harness"]
 fn matches_brokk_reference_for_autogen_checker_seed() {
     let project_root =
         PathBuf::from("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
     let brokk_root = brokk_app_root();
-    if !brokk_root.is_dir() || !project_root.is_dir() {
-        eprintln!("skipping autogen parity regression: repo not present");
+    if !require_mrf_parity_harness("autogen parity regression", &brokk_root, &project_root) {
         return;
     }
 
@@ -1032,12 +1048,12 @@ fn matches_brokk_reference_for_autogen_checker_seed() {
 }
 
 #[test]
+#[ignore = "requires external Brokk parity harness"]
 fn matches_brokk_reference_for_autogen_hello_ai_agents_program_seed() {
     let project_root =
         PathBuf::from("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
     let brokk_root = brokk_app_root();
-    if !brokk_root.is_dir() || !project_root.is_dir() {
-        eprintln!("skipping autogen parity regression: repo not present");
+    if !require_mrf_parity_harness("autogen parity regression", &brokk_root, &project_root) {
         return;
     }
 
@@ -1058,12 +1074,12 @@ fn matches_brokk_reference_for_autogen_hello_ai_agents_program_seed() {
 }
 
 #[test]
+#[ignore = "requires external Brokk parity harness"]
 fn matches_brokk_reference_for_autogen_hello_agent_program_seed() {
     let project_root =
         PathBuf::from("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
     let brokk_root = brokk_app_root();
-    if !brokk_root.is_dir() || !project_root.is_dir() {
-        eprintln!("skipping autogen parity regression: repo not present");
+    if !require_mrf_parity_harness("autogen parity regression", &brokk_root, &project_root) {
         return;
     }
 
@@ -1084,12 +1100,12 @@ fn matches_brokk_reference_for_autogen_hello_agent_program_seed() {
 }
 
 #[test]
+#[ignore = "requires external Brokk parity harness"]
 fn matches_brokk_reference_for_autogen_topicid_and_inmemoryruntime_pair() {
     let project_root =
         PathBuf::from("/home/jonathan/Projects/brokkbench/clones/microsoft__autogen");
     let brokk_root = brokk_app_root();
-    if !brokk_root.is_dir() || !project_root.is_dir() {
-        eprintln!("skipping autogen parity regression: repo not present");
+    if !require_mrf_parity_harness("autogen parity regression", &brokk_root, &project_root) {
         return;
     }
 
@@ -1114,11 +1130,11 @@ fn matches_brokk_reference_for_autogen_topicid_and_inmemoryruntime_pair() {
 }
 
 #[test]
+#[ignore = "requires external Brokk parity harness"]
 fn matches_brokk_reference_for_gin_context_go_seed() {
     let project_root = PathBuf::from("/home/jonathan/Projects/brokkbench/clones/gin-gonic__gin");
     let brokk_root = brokk_app_root();
-    if !brokk_root.is_dir() || !project_root.is_dir() {
-        eprintln!("skipping gin parity regression: repo not present");
+    if !require_mrf_parity_harness("gin parity regression", &brokk_root, &project_root) {
         return;
     }
 
@@ -1139,11 +1155,11 @@ fn matches_brokk_reference_for_gin_context_go_seed() {
 }
 
 #[test]
+#[ignore = "requires external Brokk parity harness"]
 fn matches_brokk_reference_for_axios_github_api_seed() {
     let project_root = PathBuf::from("/home/jonathan/Projects/axios");
     let brokk_root = brokk_app_root();
-    if !brokk_root.is_dir() || !project_root.is_dir() {
-        eprintln!("skipping axios parity regression: repo not present");
+    if !require_mrf_parity_harness("axios parity regression", &brokk_root, &project_root) {
         return;
     }
 
@@ -1164,11 +1180,15 @@ fn matches_brokk_reference_for_axios_github_api_seed() {
 }
 
 #[test]
+#[ignore = "requires external Brokk parity harness"]
 fn matches_brokk_reference_for_vector_similarity_query_result_struct_seed() {
     let project_root = PathBuf::from("/home/jonathan/Projects/VectorSimilarity");
     let brokk_root = brokk_app_root();
-    if !brokk_root.is_dir() || !project_root.is_dir() {
-        eprintln!("skipping VectorSimilarity parity regression: repo not present");
+    if !require_mrf_parity_harness(
+        "VectorSimilarity parity regression",
+        &brokk_root,
+        &project_root,
+    ) {
         return;
     }
 
@@ -1189,11 +1209,11 @@ fn matches_brokk_reference_for_vector_similarity_query_result_struct_seed() {
 }
 
 #[test]
+#[ignore = "requires external Brokk parity harness"]
 fn matches_brokk_reference_for_astrapy_collection_seed() {
     let project_root = PathBuf::from("/home/jonathan/Projects/astrapy");
     let brokk_root = brokk_app_root();
-    if !brokk_root.is_dir() || !project_root.is_dir() {
-        eprintln!("skipping astrapy parity regression: repo not present");
+    if !require_mrf_parity_harness("astrapy parity regression", &brokk_root, &project_root) {
         return;
     }
 
@@ -1214,12 +1234,11 @@ fn matches_brokk_reference_for_astrapy_collection_seed() {
 }
 
 #[test]
-#[ignore = "cross-repo parity batch"]
+#[ignore = "requires external Brokk parity harness"]
 fn matches_brokk_reference_for_100_random_seed_files() {
     let brokk_root = brokk_app_root();
     let project_root = parity_project_root();
-    if !brokk_root.is_dir() || !project_root.is_dir() {
-        eprintln!("skipping brokk parity regression: sibling repo not present");
+    if !require_mrf_parity_harness("brokk parity regression", &brokk_root, &project_root) {
         return;
     }
 
@@ -1315,12 +1334,11 @@ fn matches_brokk_reference_for_100_random_seed_files() {
 }
 
 #[test]
-#[ignore = "cross-repo parity batch"]
+#[ignore = "requires external Brokk parity harness"]
 fn matches_brokk_reference_for_100_random_seed_pairs() {
     let brokk_root = brokk_app_root();
     let project_root = parity_project_root();
-    if !brokk_root.is_dir() || !project_root.is_dir() {
-        eprintln!("skipping brokk parity regression: sibling repo not present");
+    if !require_mrf_parity_harness("brokk parity regression", &brokk_root, &project_root) {
         return;
     }
 
