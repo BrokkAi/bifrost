@@ -2,6 +2,8 @@ use serde_json::{Value, json};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::Duration;
 use tempfile::TempDir;
 
 #[test]
@@ -272,18 +274,40 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
         "#,
     )
     .expect("write clone java fixture");
+    let tracked_clone_inputs = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 7_2,
+            "method": "tools/call",
+            "params": {
+                "name": "get_file_contents",
+                "arguments": {
+                    "file_paths": ["SampleClone.java", "PeerTest.java"]
+                }
+            }
+        }),
+    );
+    assert_eq!(
+        2,
+        tracked_clone_inputs["result"]["structuredContent"]["files"]
+            .as_array()
+            .expect("tracked clone files array")
+            .len()
+    );
+    sleep_for_mtime_tick();
     fs::write(
         fixture_root.path().join("SampleClone.java"),
         r#"
         public class SampleClone {
-            int sameValue(int input) {
-                int total = input + 1;
+            int sameValue(int number) {
+                int total = number + 1;
                 if (total > 10) {
-                    total = total * 2;
-                } else {
-                    total = total - 3;
+                    return total * 2;
                 }
-                return total;
+                return total - 3;
             }
         }
         "#,
@@ -294,13 +318,11 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
         r#"
         public class PeerTest {
             int sameValue(int seed) {
-                int amount = seed + 1;
-                if (amount > 10) {
-                    amount = amount * 2;
-                } else {
-                    amount = amount - 3;
+                int result = seed + 1;
+                if (result > 10) {
+                    return result * 2;
                 }
-                return amount;
+                return result - 3;
             }
         }
         "#,
@@ -1030,6 +1052,10 @@ fn assert_server_tool_names(root: &std::path::Path, mode: &str, expected: &[&str
     drop(stdin);
     let status = child.wait().expect("wait bifrost");
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+fn sleep_for_mtime_tick() {
+    thread::sleep(Duration::from_millis(25));
 }
 
 fn tool_names(tools: &[Value]) -> Vec<&str> {

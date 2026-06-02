@@ -627,8 +627,11 @@ pub fn get_summaries_with_reader(
     let targets = params.targets;
     let summary_targets = route_summary_targets(analyzer, &targets);
     let mut file_output = summarize_files(analyzer, summary_targets.file_targets, read_file);
-    let directory_output =
-        summarize_directory_symbol_inventory(analyzer, summary_targets.directory_targets, read_file);
+    let directory_output = summarize_directory_symbol_inventory(
+        analyzer,
+        summary_targets.directory_targets,
+        read_file,
+    );
     let symbol_output =
         summarize_symbol_targets(analyzer, summary_targets.symbol_targets, read_file);
 
@@ -1347,7 +1350,6 @@ fn resolve_file_patterns(analyzer: &dyn IAnalyzer, patterns: &[String]) -> Vec<P
         let rel_path = Path::new(&normalized);
         if !rel_path.is_absolute()
             && let Some(file) = analyzer.project().file_by_rel_path(rel_path)
-            && file.abs_path().is_file()
         {
             matched.insert(file);
             continue;
@@ -1922,7 +1924,9 @@ mod tests {
     #[test]
     fn directory_get_summaries_uses_skim_file_limit() {
         let root = std::env::current_dir().unwrap();
-        let rel_paths: Vec<_> = (0..25).map(|index| format!("src/File{index}.java")).collect();
+        let rel_paths: Vec<_> = (0..25)
+            .map(|index| format!("src/File{index}.java"))
+            .collect();
         let rel_path_refs: Vec<_> = rel_paths.iter().map(String::as_str).collect();
         let analyzer = CountingAnalyzer::new(root, &rel_path_refs);
 

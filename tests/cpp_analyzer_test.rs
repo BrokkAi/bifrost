@@ -341,6 +341,29 @@ fn test_cpp_absolute_quoted_include_inside_project_is_normalized() {
 }
 
 #[test]
+fn test_cpp_absolute_quoted_include_with_slash_normalization_inside_project() {
+    let project = inline_cpp_project(&[
+        ("src/main.cpp", "int main() { return 0; }\n"),
+        ("include/helper.h", "struct Helper {};"),
+    ]);
+    let root = project.root().to_path_buf();
+    let helper_abs = root.join("include/helper.h");
+    let helper_slash_path = helper_abs.to_string_lossy().replace('\\', "/");
+    ProjectFile::new(root.clone(), "src/main.cpp")
+        .write(format!(
+            "#include \"{}\"\nint main() {{ return 0; }}\n",
+            helper_slash_path
+        ))
+        .unwrap();
+    let analyzer = CppAnalyzer::from_project(project.clone());
+    let main_cpp = ProjectFile::new(root, "src/main.cpp");
+
+    let imports = analyzer.imported_code_units_of(&main_cpp);
+
+    assert!(imports.iter().any(|cu| cu.short_name() == "Helper"));
+}
+
+#[test]
 fn test_cpp_qualifiers_templates_and_operators() {
     let analyzer = fixture_analyzer();
     let qualifiers = ProjectFile::new(analyzer.project().root().to_path_buf(), "qualifiers.h");
