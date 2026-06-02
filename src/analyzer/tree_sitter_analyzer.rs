@@ -167,7 +167,11 @@ impl ParsedFile {
         }
     }
 
-    pub fn add_code_unit_without_range(
+    /// Registers a declaration-like code unit for analysis without giving it a source range.
+    ///
+    /// This is for synthetic owners that should participate in import or usage resolution but
+    /// should not render as user-visible declarations in summary output.
+    pub fn add_synthetic_code_unit(
         &mut self,
         code_unit: CodeUnit,
         parent: Option<CodeUnit>,

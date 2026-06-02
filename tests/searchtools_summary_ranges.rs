@@ -1,7 +1,9 @@
 use brokk_bifrost::{
-    GoAnalyzer, JavaAnalyzer, Language, TestProject,
+    GoAnalyzer, JavaAnalyzer, JavascriptAnalyzer, Language, TestProject, TypescriptAnalyzer,
     searchtools::{SummariesParams, SummaryElement, get_summaries},
 };
+
+mod common;
 
 fn java_fixture_analyzer() -> JavaAnalyzer {
     let root = std::env::current_dir()
@@ -275,6 +277,87 @@ fn go_file_summaries_use_full_declaration_ranges() {
     assert!(rendered.contains(&"14..16: MyInterface interface".to_string()));
     assert!(rendered.contains(&"19..21: func (s MyStruct) GetFieldA() int { ... }".to_string()));
     assert!(rendered.contains(&"34: func anotherFunc() { ... }".to_string()));
+}
+
+#[test]
+fn js_file_summaries_skip_synthetic_module_import_entries() {
+    let project = common::InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "main.js",
+            "import { absVal } from './abs';\n\nexport function run() {\n  return absVal(1);\n}\n",
+        )
+        .file(
+            "abs.js",
+            "export function absVal(value) {\n  return value;\n}\n",
+        )
+        .build();
+    let analyzer = JavascriptAnalyzer::from_project(project.project().clone());
+
+    let result = get_summaries(
+        &analyzer,
+        SummariesParams {
+            targets: vec!["main.js".to_string()],
+        },
+    );
+
+    assert!(result.not_found.is_empty(), "{:?}", result.not_found);
+    assert_eq!(1, result.summaries.len());
+    let summary = &result.summaries[0];
+    assert!(
+        summary
+            .elements
+            .iter()
+            .all(|element| !(element.kind == "module" && element.text.contains("import "))),
+        "{:?}",
+        summary.elements
+    );
+    assert!(
+        summary
+            .elements
+            .iter()
+            .any(|element| element.symbol == "run" && element.kind == "function"),
+        "{:?}",
+        summary.elements
+    );
+}
+
+#[test]
+fn ts_file_summaries_skip_synthetic_module_import_entries() {
+    let project = common::InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "main.ts",
+            "import { absVal } from './abs';\n\nexport function run(): number {\n  return absVal(1);\n}\n",
+        )
+        .file("abs.ts", "export function absVal(value: number): number {\n  return value;\n}\n")
+        .build();
+    let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
+
+    let result = get_summaries(
+        &analyzer,
+        SummariesParams {
+            targets: vec!["main.ts".to_string()],
+        },
+    );
+
+    assert!(result.not_found.is_empty(), "{:?}", result.not_found);
+    assert_eq!(1, result.summaries.len());
+    let summary = &result.summaries[0];
+    assert!(
+        summary
+            .elements
+            .iter()
+            .all(|element| !(element.kind == "module" && element.text.contains("import "))),
+        "{:?}",
+        summary.elements
+    );
+    assert!(
+        summary
+            .elements
+            .iter()
+            .any(|element| element.symbol == "run" && element.kind == "function"),
+        "{:?}",
+        summary.elements
+    );
 }
 
 #[test]

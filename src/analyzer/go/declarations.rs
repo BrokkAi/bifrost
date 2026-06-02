@@ -381,7 +381,7 @@ fn visit_go_struct_fields(
                         Some(parent.clone()),
                     );
                 } else {
-                    parsed.add_code_unit_without_range(
+                    parsed.add_synthetic_code_unit(
                         code_unit.clone(),
                         Some(parent.clone()),
                         Some(parent.clone()),
@@ -468,7 +468,7 @@ fn visit_go_interface_methods(
                 Some(parent.clone()),
             );
         } else {
-            parsed.add_code_unit_without_range(
+            parsed.add_synthetic_code_unit(
                 code_unit.clone(),
                 Some(parent.clone()),
                 Some(parent.clone()),

@@ -128,8 +128,7 @@ impl crate::analyzer::LanguageAdapter for TypescriptAdapter {
         }
 
         if module_has_imports {
-            parsed.add_code_unit(module.clone(), root, source, None, None);
-            parsed.add_signature(module, parsed.import_statements.join("\n"));
+            parsed.add_code_unit(module, root, source, None, None);
         }
 
         parsed
@@ -206,6 +205,15 @@ impl TypescriptAnalyzer {
         let mut identifiers = HashSet::default();
         collect_js_ts_identifiers(tree.root_node(), source, &mut identifiers);
         identifiers.into_iter().collect()
+    }
+
+    fn module_import_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
+        if !code_unit.is_module() {
+            return None;
+        }
+
+        let imports = self.inner.import_statements(code_unit.source());
+        (!imports.is_empty()).then(|| imports.join("\n"))
     }
 }
 
@@ -472,10 +480,12 @@ impl IAnalyzer for TypescriptAnalyzer {
         self.inner.ranges_of(code_unit)
     }
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
-        self.inner.get_skeleton(code_unit)
+        self.module_import_skeleton(code_unit)
+            .or_else(|| self.inner.get_skeleton(code_unit))
     }
     fn get_skeleton_header(&self, code_unit: &CodeUnit) -> Option<String> {
-        self.inner.get_skeleton_header(code_unit)
+        self.module_import_skeleton(code_unit)
+            .or_else(|| self.inner.get_skeleton_header(code_unit))
     }
     fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String> {
         self.inner.get_source(code_unit, include_comments)

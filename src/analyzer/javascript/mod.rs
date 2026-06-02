@@ -120,8 +120,7 @@ impl LanguageAdapter for JavascriptAdapter {
         }
 
         if module_has_imports {
-            parsed.add_code_unit(module.clone(), root, source, None, None);
-            parsed.add_signature(module, parsed.import_statements.join("\n"));
+            parsed.add_code_unit(module, root, source, None, None);
         }
 
         parsed
@@ -199,6 +198,15 @@ impl JavascriptAnalyzer {
 
     pub fn extract_type_identifiers(&self, source: &str) -> BTreeSet<String> {
         extract_js_type_identifiers(source)
+    }
+
+    fn module_import_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
+        if !code_unit.is_module() {
+            return None;
+        }
+
+        let imports = self.inner.import_statements(code_unit.source());
+        (!imports.is_empty()).then(|| imports.join("\n"))
     }
 }
 impl ImportAnalysisProvider for JavascriptAnalyzer {
@@ -471,11 +479,13 @@ impl IAnalyzer for JavascriptAnalyzer {
     }
 
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
-        self.inner.get_skeleton(code_unit)
+        self.module_import_skeleton(code_unit)
+            .or_else(|| self.inner.get_skeleton(code_unit))
     }
 
     fn get_skeleton_header(&self, code_unit: &CodeUnit) -> Option<String> {
-        self.inner.get_skeleton_header(code_unit)
+        self.module_import_skeleton(code_unit)
+            .or_else(|| self.inner.get_skeleton_header(code_unit))
     }
 
     fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String> {
