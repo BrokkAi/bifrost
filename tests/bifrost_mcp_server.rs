@@ -162,6 +162,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
         vec![
             "search_symbols",
             "get_symbol_locations",
+            "get_symbol_ancestors",
             "get_symbol_sources",
             "get_summaries",
             "list_symbols",
@@ -516,6 +517,7 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
         &[
             "search_symbols",
             "get_symbol_locations",
+            "get_symbol_ancestors",
             "get_symbol_sources",
             "get_summaries",
             "list_symbols",
@@ -534,6 +536,7 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
             "get_active_workspace",
             "search_symbols",
             "get_symbol_locations",
+            "get_symbol_ancestors",
             "get_symbol_sources",
             "get_summaries",
             "list_symbols",

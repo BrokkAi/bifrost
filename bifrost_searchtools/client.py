@@ -17,6 +17,7 @@ from .models import (
     MostRelevantFilesResult,
     SearchSymbolsResult,
     SkimFilesResult,
+    SymbolAncestorsResult,
     SymbolLocationsResult,
     SymbolSourcesResult,
 )
@@ -126,6 +127,21 @@ class SearchToolsClient:
         return SymbolLocationsResult.from_dict(
             payload.structured,
             render_line_numbers=self._render_line_numbers,
+            rendered_text=payload.rendered_text,
+        )
+
+    def get_symbol_ancestors(
+        self,
+        symbols: list[str],
+        *,
+        kind_filter: SymbolKindFilter = SymbolKindFilter.CLASS,
+    ) -> SymbolAncestorsResult:
+        payload = self._call_tool_payload(
+            "get_symbol_ancestors",
+            {"symbols": symbols, "kind_filter": kind_filter.value},
+        )
+        return SymbolAncestorsResult.from_dict(
+            payload.structured,
             rendered_text=payload.rendered_text,
         )
 

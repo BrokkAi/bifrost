@@ -108,6 +108,7 @@ mod tests {
             vec![
                 "search_symbols",
                 "get_symbol_locations",
+                "get_symbol_ancestors",
                 "get_symbol_sources",
                 "get_summaries",
                 "list_symbols",
@@ -126,6 +127,7 @@ mod tests {
             vec![
                 "search_symbols",
                 "get_symbol_locations",
+                "get_symbol_ancestors",
                 "get_symbol_sources",
                 "get_summaries",
                 "list_symbols",
@@ -170,6 +172,7 @@ mod tests {
                 "find_files_containing",
                 "search_symbols",
                 "get_symbol_locations",
+                "get_symbol_ancestors",
                 "get_symbol_sources",
                 "get_summaries",
                 "list_symbols",

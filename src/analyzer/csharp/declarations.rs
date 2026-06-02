@@ -126,6 +126,10 @@ impl<'a> CSharpVisitor<'a> {
             scope.class_unit.clone(),
             None,
         );
+        self.parsed.set_raw_supertypes(
+            code_unit.clone(),
+            extract_csharp_supertypes(node, self.source),
+        );
         self.parsed
             .add_signature(code_unit.clone(), csharp_type_signature(node, self.source));
 
@@ -388,6 +392,32 @@ fn csharp_type_signature(node: Node<'_>, source: &str) -> String {
     let text = normalize_cs_whitespace(cs_node_text(node, source));
     let head = text.split('{').next().unwrap_or(text.as_str()).trim();
     format!("{head} {{")
+}
+
+fn extract_csharp_supertypes(node: Node<'_>, source: &str) -> Vec<String> {
+    let Some(base_list) = first_named_child_of_kind(node, "base_list") else {
+        return Vec::new();
+    };
+    let mut supertypes = Vec::new();
+    let mut cursor = base_list.walk();
+    for child in base_list.named_children(&mut cursor) {
+        match child.kind() {
+            "identifier"
+            | "qualified_name"
+            | "generic_name"
+            | "alias_qualified_name"
+            | "nullable_type"
+            | "array_type"
+            | "predefined_type" => {
+                let text = normalize_cs_whitespace(cs_node_text(child, source));
+                if !text.is_empty() {
+                    supertypes.push(text);
+                }
+            }
+            _ => {}
+        }
+    }
+    supertypes
 }
 
 fn csharp_method_skeleton(node: Node<'_>, source: &str) -> String {

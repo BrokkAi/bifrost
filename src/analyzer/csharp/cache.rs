@@ -11,6 +11,8 @@ pub(super) struct CSharpMemoCaches {
     pub(super) using_namespaces: Cache<ProjectFile, Arc<Vec<String>>>,
     pub(super) imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
     pub(super) referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
+    pub(super) direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
+    pub(super) direct_descendants: Cache<CodeUnit, Arc<HashSet<CodeUnit>>>,
     pub(super) reverse_import_index: OnceLock<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
     pub(super) global_using_namespaces: OnceLock<HashSet<String>>,
 }
@@ -20,8 +22,16 @@ impl CSharpMemoCaches {
         Self {
             budget_bytes,
             using_namespaces: build_weighted_cache(budget_bytes / 8, weight_string_vec),
-            imported_code_units: build_weighted_cache(budget_bytes / 4, weight_code_unit_set),
+            imported_code_units: build_weighted_cache(
+                budget_bytes / 4,
+                weight_project_code_unit_set,
+            ),
             referencing_files: build_weighted_cache(budget_bytes / 8, weight_project_file_set),
+            direct_ancestors: build_weighted_cache(budget_bytes / 8, weight_code_unit_vec),
+            direct_descendants: build_weighted_cache(
+                budget_bytes / 8,
+                weight_hierarchy_code_unit_set,
+            ),
             reverse_import_index: OnceLock::new(),
             global_using_namespaces: OnceLock::new(),
         }
@@ -38,7 +48,15 @@ fn weight_string_vec(_key: &ProjectFile, value: &Arc<Vec<String>>) -> u32 {
     )
 }
 
-fn weight_code_unit_set(_key: &ProjectFile, value: &Arc<HashSet<CodeUnit>>) -> u32 {
+fn weight_project_code_unit_set(_key: &ProjectFile, value: &Arc<HashSet<CodeUnit>>) -> u32 {
+    weight_bytes(estimate_code_unit_set(value.as_ref()))
+}
+
+fn weight_code_unit_vec(_key: &CodeUnit, value: &Arc<Vec<CodeUnit>>) -> u32 {
+    weight_bytes(estimate_code_unit_vec(value.as_ref()))
+}
+
+fn weight_hierarchy_code_unit_set(_key: &CodeUnit, value: &Arc<HashSet<CodeUnit>>) -> u32 {
     weight_bytes(estimate_code_unit_set(value.as_ref()))
 }
 
@@ -68,6 +86,10 @@ fn estimate_code_unit(code_unit: &CodeUnit) -> u64 {
 
 fn estimate_code_unit_set(values: &HashSet<CodeUnit>) -> u64 {
     size_of::<HashSet<CodeUnit>>() as u64 + values.iter().map(estimate_code_unit).sum::<u64>()
+}
+
+fn estimate_code_unit_vec(values: &[CodeUnit]) -> u64 {
+    size_of::<Vec<CodeUnit>>() as u64 + values.iter().map(estimate_code_unit).sum::<u64>()
 }
 
 fn estimate_project_file_set(files: &HashSet<ProjectFile>) -> u64 {

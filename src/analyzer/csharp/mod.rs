@@ -2,6 +2,7 @@ mod adapter;
 mod cache;
 mod clones;
 mod declarations;
+mod hierarchy;
 mod imports;
 mod tests;
 
@@ -10,7 +11,7 @@ use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::{
     AnalyzerConfig, CodeUnit, CodeUnitType, IAnalyzer, ImportAnalysisProvider, Language, Project,
     ProjectFile, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
-    TreeSitterAnalyzer,
+    TreeSitterAnalyzer, TypeHierarchyProvider,
 };
 use crate::hash::HashSet;
 use crate::{CloneSmell, CloneSmellWeights};
@@ -379,6 +380,10 @@ impl IAnalyzer for CSharpAnalyzer {
     }
 
     fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {
+        Some(self)
+    }
+
+    fn type_hierarchy_provider(&self) -> Option<&dyn TypeHierarchyProvider> {
         Some(self)
     }
 }

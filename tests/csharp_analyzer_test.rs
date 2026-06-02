@@ -2,6 +2,7 @@ mod common;
 
 use brokk_bifrost::{
     CSharpAnalyzer, CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, TestProject,
+    TypeHierarchyProvider,
 };
 use common::{assert_code_eq, csharp_fixture_project};
 use tempfile::tempdir;
@@ -157,6 +158,36 @@ fn test_csharp_get_method_sources() {
         "public void NestedMethod() {}",
         &analyzer.get_source(&nested, true).unwrap(),
     );
+}
+
+#[test]
+fn test_csharp_resolves_direct_ancestors() {
+    let project = inline_csharp_project(&[(
+        "Inheritance.cs",
+        r#"
+namespace Demo
+{
+    public class BaseType {}
+    public interface IService {}
+    public class ChildType : BaseType, IService {}
+}
+"#,
+    )]);
+    let analyzer = CSharpAnalyzer::from_project(project);
+
+    let child = analyzer
+        .get_definitions("Demo.ChildType")
+        .into_iter()
+        .find(|unit| unit.kind() == CodeUnitType::Class)
+        .expect("child type");
+
+    let ancestors = analyzer
+        .get_direct_ancestors(&child)
+        .into_iter()
+        .map(|unit| unit.fq_name().to_string())
+        .collect::<Vec<_>>();
+
+    assert_eq!(ancestors, vec!["Demo.BaseType", "Demo.IService"]);
 }
 
 #[test]

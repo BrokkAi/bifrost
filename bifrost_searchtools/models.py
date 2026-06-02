@@ -211,6 +211,57 @@ class SymbolLocationsResult:
 
 
 @dataclass(frozen=True)
+class SymbolAncestors:
+    symbol: str
+    ancestors: list[str]
+
+    @classmethod
+    def from_dict(cls, data: dict) -> SymbolAncestors:
+        return cls(
+            symbol=data["symbol"],
+            ancestors=list(data["ancestors"]),
+        )
+
+    def render_text(self) -> str:
+        if not self.ancestors:
+            return f"{self.symbol}: <none>"
+        return "\n".join([self.symbol, *[f"  - {ancestor}" for ancestor in self.ancestors]])
+
+
+@dataclass(frozen=True)
+class SymbolAncestorsResult:
+    ancestors: list[SymbolAncestors]
+    not_found: list[str]
+    ambiguous: list[AmbiguousSymbol]
+    rendered_text: str | None = None
+
+    @classmethod
+    def from_dict(
+        cls, data: dict, rendered_text: str | None = None
+    ) -> SymbolAncestorsResult:
+        return cls(
+            ancestors=[SymbolAncestors.from_dict(item) for item in data["ancestors"]],
+            not_found=list(data["not_found"]),
+            ambiguous=[AmbiguousSymbol.from_dict(item) for item in data.get("ambiguous", [])],
+            rendered_text=rendered_text,
+        )
+
+    @property
+    def count(self) -> int:
+        return len(self.ancestors)
+
+    def render_text(self) -> str:
+        if self.rendered_text is not None:
+            return self.rendered_text
+        blocks = [item.render_text() for item in self.ancestors]
+        if self.not_found:
+            blocks.append(f"Not found: {', '.join(self.not_found)}")
+        if self.ambiguous:
+            blocks.extend(item.render_text() for item in self.ambiguous)
+        return "\n\n".join(blocks) if blocks else "No matching ancestors found."
+
+
+@dataclass(frozen=True)
 class AmbiguousSymbol:
     target: str
     matches: list[str]
