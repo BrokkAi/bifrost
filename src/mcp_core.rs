@@ -96,7 +96,7 @@ pub(crate) fn workspace_tool_descriptors() -> Vec<Value> {
     vec![
         mutating_tool_descriptor(
             "refresh",
-            "Update the code index after files change so symbol, usage, and workspace search results reflect the current checkout.",
+            "Force a full rebuild of the code index. Normal tool calls already apply watcher-detected file changes automatically, so use this only when you want to blow away cached analyzer state and rescan the entire workspace.",
             json_schema_object(&[]),
         ),
         mutating_tool_descriptor(
