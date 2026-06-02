@@ -1458,6 +1458,35 @@ fn cpp_graph_v3_resolves_include_path_ambiguity_precisely() {
 }
 
 #[test]
+fn cpp_graph_v3_follows_absolute_slash_normalized_includes() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("include/target.h", "struct Target { void run(); };\n")
+        .file(
+            "consumer.cpp",
+            "void call(Target& target) { target.run(); }\n",
+        )
+        .build();
+    let include_path = project
+        .root()
+        .join("include/target.h")
+        .to_string_lossy()
+        .replace('\\', "/");
+    project
+        .file("consumer.cpp")
+        .write(format!(
+            "# include \"{include_path}\"\nvoid call(Target& target) {{ target.run(); }}\n"
+        ))
+        .unwrap();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+
+    let run = member_function_definition_in_source(&analyzer, "Target", "run", "include/target.h");
+    let hits = usage_hits(&analyzer, &run);
+
+    assert_eq!(1, hits.len());
+    assert_hit_contains(&hits, "consumer.cpp", "target.run()");
+}
+
+#[test]
 fn cpp_graph_v3_preserves_declaration_filtering_and_fallback_boundaries() {
     let (project, analyzer) = cpp_analyzer_with_files(&[
         (

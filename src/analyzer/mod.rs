@@ -35,7 +35,7 @@ pub(crate) use capabilities::{build_reverse_import_index, direct_descendants_via
 pub use config::AnalyzerConfig;
 pub use cpp::CppAnalyzer;
 pub(crate) use cpp::{
-    node_text as cpp_node_text, normalize_cpp_whitespace, parse_quoted_include,
+    node_text as cpp_node_text, normalize_cpp_whitespace, quoted_include_paths,
     resolve_include_targets,
 };
 pub use csharp::CSharpAnalyzer;

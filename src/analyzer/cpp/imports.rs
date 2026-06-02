@@ -154,7 +154,7 @@ fn project_relative_include_path(project_root: &Path, include_path: &Path) -> Op
         .or_else(|| lexical_project_relative_include_path(project_root, include_path))
 }
 
-fn quoted_include_paths(
+pub(crate) fn quoted_include_paths(
     project: &dyn Project,
     file: &ProjectFile,
     parsed: &[String],
