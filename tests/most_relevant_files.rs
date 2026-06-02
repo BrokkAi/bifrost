@@ -1,8 +1,11 @@
+mod common;
+
 use brokk_bifrost::{
     FilesystemProject, GoAnalyzer, ImportAnalysisProvider, JavaAnalyzer, Language, ProjectFile,
     TestProject,
     searchtools::{MostRelevantFilesParams, most_relevant_files},
 };
+use common::InlineTestProject;
 use git2::{Repository, Signature};
 use std::fs;
 use std::path::Path;
@@ -169,6 +172,71 @@ fn go_stdlib_import_does_not_resolve_internal_package_by_last_segment() {
 }
 
 #[test]
+fn repo_root_go_seed_is_resolved_and_ranked() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "go.mod",
+            r#"
+            module example.com/demo
+
+            go 1.23
+            "#,
+        )
+        .file(
+            "context.go",
+            r#"
+            package demo
+
+            import "example.com/demo/internal/engine"
+
+            type Context struct {
+                engine *engine.Engine
+            }
+            "#,
+        )
+        .file(
+            "internal/engine/engine.go",
+            r#"
+            package engine
+
+            import "example.com/demo/internal/config"
+
+            type Engine struct {
+                Config config.Config
+            }
+            "#,
+        )
+        .file(
+            "internal/config/config.go",
+            r#"
+            package config
+
+            type Config struct {
+                Name string
+            }
+            "#,
+        )
+        .build();
+
+    let analyzer = GoAnalyzer::new(Arc::new(FilesystemProject::new(project.root()).unwrap()));
+    let results = most_relevant_files(
+        &analyzer,
+        MostRelevantFilesParams {
+            seed_file_paths: vec!["context.go".to_string()],
+            limit: 5,
+        },
+    );
+
+    assert!(results.not_found.is_empty(), "{:?}", results.not_found);
+    assert_eq!("internal/engine/engine.go", results.files[0]);
+    assert!(
+        results
+            .files
+            .contains(&"internal/config/config.go".to_string())
+    );
+}
+
+#[test]
 fn hybrid_git_and_import_results_are_merged_without_duplicates() {
     let temp = TempDir::new().unwrap();
     let root = temp.path();
@@ -228,6 +296,75 @@ fn hybrid_git_and_import_results_are_merged_without_duplicates() {
     assert_eq!("test/D.java", results.files[0]);
     assert!(results.files.contains(&"test/B.java".to_string()));
     assert!(results.files.contains(&"test/C.java".to_string()));
+}
+
+#[test]
+fn multi_seed_ranking_merges_shared_targets_without_duplicates() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "test/LeftSeed.java",
+            r#"
+            package test;
+            import test.SharedTarget;
+            import test.LeftOnly;
+            public class LeftSeed { }
+            "#,
+        )
+        .file(
+            "test/RightSeed.java",
+            r#"
+            package test;
+            import test.SharedTarget;
+            import test.RightOnly;
+            public class RightSeed { }
+            "#,
+        )
+        .file(
+            "test/SharedTarget.java",
+            r#"
+            package test;
+            import test.SharedLeaf;
+            public class SharedTarget { }
+            "#,
+        )
+        .file(
+            "test/LeftOnly.java",
+            "package test; public class LeftOnly { }",
+        )
+        .file(
+            "test/RightOnly.java",
+            "package test; public class RightOnly { }",
+        )
+        .file(
+            "test/SharedLeaf.java",
+            "package test; public class SharedLeaf { }",
+        )
+        .build();
+
+    let analyzer = java_analyzer(project.root());
+    let results = most_relevant_files(
+        &analyzer,
+        MostRelevantFilesParams {
+            seed_file_paths: vec![
+                "test/LeftSeed.java".to_string(),
+                "test/RightSeed.java".to_string(),
+            ],
+            limit: 4,
+        },
+    );
+
+    assert!(results.not_found.is_empty(), "{:?}", results.not_found);
+    assert_eq!("test/SharedTarget.java", results.files[0]);
+    assert_eq!(
+        1,
+        results
+            .files
+            .iter()
+            .filter(|path| *path == "test/SharedTarget.java")
+            .count()
+    );
+    assert!(results.files.contains(&"test/LeftOnly.java".to_string()));
+    assert!(results.files.contains(&"test/RightOnly.java".to_string()));
 }
 
 #[test]
