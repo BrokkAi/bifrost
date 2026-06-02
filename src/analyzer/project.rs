@@ -155,7 +155,7 @@ impl Project for TestProject {
 
     fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile> {
         let file = ProjectFile::new(self.root.clone(), rel_path.to_path_buf());
-        file.exists().then_some(file)
+        file.abs_path().is_file().then_some(file)
     }
 }
 
@@ -221,7 +221,7 @@ impl Project for FilesystemProject {
 
     fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile> {
         let file = ProjectFile::new(self.root.clone(), rel_path.to_path_buf());
-        file.exists().then_some(file)
+        file.abs_path().is_file().then_some(file)
     }
 
     fn is_gitignored(&self, rel_path: &Path) -> bool {
@@ -503,6 +503,34 @@ mod tests {
 
         // Clearing a missing overlay returns false.
         assert!(!overlay.clear(&file.abs_path()));
+    }
+
+    #[test]
+    fn file_by_rel_path_rejects_directories() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src/nested")).unwrap();
+        write_file(&root, "src/lib.rs", "fn lib() {}\n");
+
+        let test_project = TestProject::new(root.clone(), Language::Rust);
+        assert!(
+            test_project
+                .file_by_rel_path(Path::new("src/lib.rs"))
+                .is_some()
+        );
+        assert!(test_project.file_by_rel_path(Path::new("src")).is_none());
+
+        let filesystem_project = FilesystemProject::new(&root).unwrap();
+        assert!(
+            filesystem_project
+                .file_by_rel_path(Path::new("src/lib.rs"))
+                .is_some()
+        );
+        assert!(
+            filesystem_project
+                .file_by_rel_path(Path::new("src"))
+                .is_none()
+        );
     }
 
     #[test]

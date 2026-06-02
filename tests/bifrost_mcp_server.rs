@@ -2,6 +2,8 @@ use serde_json::{Value, json};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::Duration;
 use tempfile::TempDir;
 
 #[test]
@@ -311,6 +313,60 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
         "{dead_code_report}"
     );
 
+    let tracked_clone_inputs = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 7_2,
+            "method": "tools/call",
+            "params": {
+                "name": "get_file_contents",
+                "arguments": {
+                    "file_paths": ["SampleClone.java", "PeerClone.java"]
+                }
+            }
+        }),
+    );
+    assert_eq!(
+        2,
+        tracked_clone_inputs["result"]["structuredContent"]["files"]
+            .as_array()
+            .expect("tracked clone files array")
+            .len()
+    );
+    sleep_for_mtime_tick();
+    fs::write(
+        fixture_root.path().join("SampleClone.java"),
+        r#"
+        public class SampleClone {
+            int sameValue(int number) {
+                int total = number + 1;
+                if (total > 10) {
+                    return total * 2;
+                }
+                return total - 3;
+            }
+        }
+        "#,
+    )
+    .expect("rewrite clone java fixture");
+    fs::write(
+        fixture_root.path().join("PeerClone.java"),
+        r#"
+        public class PeerClone {
+            int sameValue(int seed) {
+                int result = seed + 1;
+                if (result > 10) {
+                    return result * 2;
+                }
+                return result - 3;
+            }
+        }
+        "#,
+    )
+    .expect("rewrite peer java fixture");
     let refresh = round_trip(
         &mut stdin,
         &mut reader,
@@ -1035,6 +1091,10 @@ fn assert_server_tool_names(root: &std::path::Path, mode: &str, expected: &[&str
     drop(stdin);
     let status = child.wait().expect("wait bifrost");
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+fn sleep_for_mtime_tick() {
+    thread::sleep(Duration::from_millis(25));
 }
 
 fn tool_names(tools: &[Value]) -> Vec<&str> {

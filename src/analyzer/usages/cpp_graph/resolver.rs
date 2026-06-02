@@ -1,7 +1,7 @@
 use crate::analyzer::usages::cpp_graph::extractor::ScanCtx;
 use crate::analyzer::{
     AnalyzerDelegate, CodeUnit, CodeUnitType, CppAnalyzer, IAnalyzer, Language, MultiAnalyzer,
-    ProjectFile, cpp_node_text as node_text, normalize_cpp_whitespace, parse_quoted_include,
+    ProjectFile, cpp_node_text as node_text, normalize_cpp_whitespace, quoted_include_paths,
     resolve_include_targets,
 };
 use crate::hash::{HashMap, HashSet};
@@ -398,10 +398,7 @@ pub(super) fn collect_include_closure(
     if !out.insert(file.clone()) {
         return;
     }
-    for line in analyzer.import_statements(file) {
-        let Some(include) = parse_quoted_include(line) else {
-            continue;
-        };
+    for include in quoted_include_paths(cpp.project(), file, analyzer.import_statements(file)) {
         for target in resolve_include_targets(cpp.project(), file, &include) {
             collect_include_closure(cpp, analyzer, &target, out);
         }
@@ -422,10 +419,7 @@ pub(super) fn collect_visible_declarations(
     if let Some(declarations) = declarations_by_file.get(file) {
         out.extend(declarations.iter().cloned());
     }
-    for line in analyzer.import_statements(file) {
-        let Some(include) = parse_quoted_include(line) else {
-            continue;
-        };
+    for include in quoted_include_paths(cpp.project(), file, analyzer.import_statements(file)) {
         for target in resolve_include_targets(cpp.project(), file, &include) {
             collect_visible_declarations(
                 cpp,

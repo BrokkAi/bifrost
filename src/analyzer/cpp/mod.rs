@@ -25,7 +25,7 @@ use clones::{build_clone_candidate_data, refine_cpp_clone_similarity};
 use tests::detect_cpp_test_assertion_smells;
 
 pub(crate) use declarations::{node_text, normalize_cpp_whitespace};
-pub(crate) use imports::{parse_quoted_include, resolve_include_targets};
+pub(crate) use imports::{quoted_include_paths, resolve_include_targets};
 #[derive(Clone)]
 pub struct CppAnalyzer {
     inner: TreeSitterAnalyzer<CppAdapter>,
