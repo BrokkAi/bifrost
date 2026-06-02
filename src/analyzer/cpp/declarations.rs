@@ -479,6 +479,119 @@ impl<'a> CppVisitor<'a> {
     }
 }
 
+pub(crate) fn recover_quoted_includes(
+    source: &str,
+    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+) {
+    let mut in_block_comment = false;
+    for line in source.lines() {
+        let stripped = strip_cpp_comments_from_line(line, &mut in_block_comment);
+        let trimmed = stripped.trim();
+        if !looks_like_quoted_include_line(trimmed) {
+            continue;
+        }
+
+        let raw = normalize_cpp_whitespace(trimmed);
+        if parsed.import_statements.contains(&raw) {
+            continue;
+        }
+
+        parsed.import_statements.push(raw.clone());
+        parsed.imports.push(ImportInfo {
+            raw_snippet: raw,
+            is_wildcard: false,
+            identifier: None,
+            alias: None,
+        });
+    }
+}
+
+fn looks_like_quoted_include_line(line: &str) -> bool {
+    let Some(rest) = line.trim_start().strip_prefix('#') else {
+        return false;
+    };
+    let Some(rest) = rest.trim_start().strip_prefix("include") else {
+        return false;
+    };
+    rest.trim_start().starts_with('"')
+}
+
+fn strip_cpp_comments_from_line(line: &str, in_block_comment: &mut bool) -> String {
+    let mut out = String::new();
+    let chars: Vec<char> = line.chars().collect();
+    let mut index = 0;
+    let mut in_string = false;
+    let mut in_char = false;
+    let mut escape = false;
+
+    while index < chars.len() {
+        let ch = chars[index];
+        let next = chars.get(index + 1).copied();
+
+        if *in_block_comment {
+            if ch == '*' && next == Some('/') {
+                *in_block_comment = false;
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+
+        if in_string {
+            out.push(ch);
+            if escape {
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+
+        if in_char {
+            out.push(ch);
+            if escape {
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == '\'' {
+                in_char = false;
+            }
+            index += 1;
+            continue;
+        }
+
+        if ch == '/' && next == Some('/') {
+            break;
+        }
+        if ch == '/' && next == Some('*') {
+            *in_block_comment = true;
+            index += 2;
+            continue;
+        }
+        if ch == '"' {
+            in_string = true;
+            out.push(ch);
+            index += 1;
+            continue;
+        }
+        if ch == '\'' {
+            in_char = true;
+            out.push(ch);
+            index += 1;
+            continue;
+        }
+
+        out.push(ch);
+        index += 1;
+    }
+
+    out
+}
+
 #[derive(Clone)]
 struct FunctionInfo {
     package_name: String,

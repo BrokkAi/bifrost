@@ -398,7 +398,7 @@ pub(super) fn collect_include_closure(
     if !out.insert(file.clone()) {
         return;
     }
-    for include in quoted_include_paths(cpp.project(), file, analyzer.import_statements(file)) {
+    for include in quoted_include_paths(analyzer.import_statements(file)) {
         for target in resolve_include_targets(cpp.project(), file, &include) {
             collect_include_closure(cpp, analyzer, &target, out);
         }
@@ -419,7 +419,7 @@ pub(super) fn collect_visible_declarations(
     if let Some(declarations) = declarations_by_file.get(file) {
         out.extend(declarations.iter().cloned());
     }
-    for include in quoted_include_paths(cpp.project(), file, analyzer.import_statements(file)) {
+    for include in quoted_include_paths(analyzer.import_statements(file)) {
         for target in resolve_include_targets(cpp.project(), file, &include) {
             collect_visible_declarations(
                 cpp,

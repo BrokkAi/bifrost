@@ -4,7 +4,7 @@ use brokk_bifrost::{
     CodeUnit, CodeUnitType, CppAnalyzer, IAnalyzer, ImportAnalysisProvider, Language, Project,
     ProjectFile, TestProject,
 };
-use common::{assert_code_eq, cpp_fixture_project};
+use common::{InlineTestProject, assert_code_eq, cpp_fixture_project};
 use std::collections::BTreeSet;
 use tempfile::tempdir;
 
@@ -361,6 +361,28 @@ fn test_cpp_absolute_quoted_include_with_slash_normalization_inside_project() {
     let imports = analyzer.imported_code_units_of(&main_cpp);
 
     assert!(imports.iter().any(|cu| cu.short_name() == "Helper"));
+}
+
+#[test]
+fn test_cpp_spaced_include_extraction_ignores_commented_out_includes() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("include/helper.h", "struct Helper {};\n")
+        .file(
+            "src/main.cpp",
+            "/*\n# include \"commented.h\"\n*/\n// # include \"line_comment.h\"\n# include \"../include/helper.h\"\nint main() { return 0; }\n",
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let main_cpp = project.file("src/main.cpp");
+
+    let imports = analyzer.import_statements_of(&main_cpp);
+    assert_eq!(
+        vec!["# include \"../include/helper.h\"".to_string()],
+        imports
+    );
+
+    let imported = analyzer.imported_code_units_of(&main_cpp);
+    assert!(imported.iter().any(|cu| cu.short_name() == "Helper"));
 }
 
 #[test]

@@ -11,11 +11,7 @@ impl ImportAnalysisProvider for CppAnalyzer {
         }
 
         let mut resolved = HashSet::default();
-        for path in quoted_include_paths(
-            self.inner.project(),
-            file,
-            self.inner.import_statements(file),
-        ) {
+        for path in quoted_include_paths(self.inner.import_statements(file)) {
             for target in resolve_include_targets(self.inner.project(), file, &path) {
                 resolved.extend(self.inner.top_level_declarations(&target).cloned());
             }
@@ -37,16 +33,13 @@ impl ImportAnalysisProvider for CppAnalyzer {
             if candidate == file {
                 continue;
             }
-            if quoted_include_paths(
-                self.inner.project(),
-                candidate,
-                self.inner.import_statements(candidate),
-            )
-            .iter()
-            .any(|include| {
-                file.rel_path() == Path::new(include)
-                    || file_name.is_some_and(|name| include.ends_with(name))
-            }) {
+            if quoted_include_paths(self.inner.import_statements(candidate))
+                .iter()
+                .any(|include| {
+                    file.rel_path() == Path::new(include)
+                        || file_name.is_some_and(|name| include.ends_with(name))
+                })
+            {
                 references.insert(candidate.clone());
             }
         }
@@ -64,21 +57,20 @@ impl ImportAnalysisProvider for CppAnalyzer {
         let source = code_unit.source();
         let identifiers = self
             .extract_type_identifiers(&self.inner.get_source(code_unit, true).unwrap_or_default());
-        quoted_include_paths(
-            self.inner.project(),
-            source,
-            self.inner.import_statements(source),
-        )
-        .iter()
-        .filter(|path| {
-            let stem = Path::new(path)
-                .file_stem()
-                .and_then(|value| value.to_str())
-                .unwrap_or("");
-            identifiers.contains(stem)
-        })
-        .map(|path| format!("#include \"{path}\""))
-        .collect()
+        self.inner
+            .import_statements(source)
+            .iter()
+            .filter(|line| {
+                parse_quoted_include(line).is_some_and(|path| {
+                    let stem = Path::new(&path)
+                        .file_stem()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("");
+                    identifiers.contains(stem)
+                })
+            })
+            .cloned()
+            .collect()
     }
 
     fn could_import_file(
@@ -154,43 +146,11 @@ fn project_relative_include_path(project_root: &Path, include_path: &Path) -> Op
         .or_else(|| lexical_project_relative_include_path(project_root, include_path))
 }
 
-pub(crate) fn quoted_include_paths(
-    project: &dyn Project,
-    file: &ProjectFile,
-    parsed: &[String],
-) -> Vec<String> {
-    let mut includes: Vec<String> = parsed
+pub(crate) fn quoted_include_paths(parsed: &[String]) -> Vec<String> {
+    parsed
         .iter()
         .filter_map(|line| parse_quoted_include(line))
-        .collect();
-    if !includes.is_empty() {
-        return includes;
-    }
-
-    let Ok(source) = project.read_source(file) else {
-        return includes;
-    };
-    for line in source.lines() {
-        if !looks_like_quoted_include_line(line) {
-            continue;
-        }
-        if let Some(include) = parse_quoted_include(line)
-            && !includes.contains(&include)
-        {
-            includes.push(include);
-        }
-    }
-    includes
-}
-
-fn looks_like_quoted_include_line(line: &str) -> bool {
-    let Some(rest) = line.trim_start().strip_prefix('#') else {
-        return false;
-    };
-    let Some(rest) = rest.trim_start().strip_prefix("include") else {
-        return false;
-    };
-    rest.trim_start().starts_with('"')
+        .collect()
 }
 
 fn lexical_project_relative_include_path(

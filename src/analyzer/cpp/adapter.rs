@@ -1,4 +1,4 @@
-use super::declarations::{CppVisitor, collect_cpp_identifiers};
+use super::declarations::{CppVisitor, collect_cpp_identifiers, recover_quoted_includes};
 use super::tests::cpp_contains_tests;
 use super::*;
 use crate::analyzer::LanguageAdapter;
@@ -61,6 +61,7 @@ impl LanguageAdapter for CppAdapter {
             parsed: &mut parsed,
         };
         visitor.visit_container(root, "", None, None, None);
+        recover_quoted_includes(source, &mut parsed);
         parsed
     }
 }
