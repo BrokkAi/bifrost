@@ -141,6 +141,8 @@ pub struct SymbolLocation {
 #[derive(Debug, Clone, Serialize)]
 pub struct SummaryResult {
     pub summaries: Vec<SummaryBlock>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub directory_symbols: Option<SkimFilesResult>,
     pub not_found: Vec<String>,
     pub ambiguous: Vec<AmbiguousSymbol>,
 }
@@ -532,6 +534,7 @@ fn summarize_symbol_targets(
 
     SummaryResult {
         summaries,
+        directory_symbols: None,
         not_found,
         ambiguous,
     }
@@ -627,13 +630,20 @@ pub fn get_summaries_with_reader(
     let targets = params.targets;
     let summary_targets = route_summary_targets(analyzer, &targets);
     let mut file_output = summarize_files(analyzer, summary_targets.file_targets, read_file);
-    let directory_output =
-        summarize_directory_symbol_inventory(analyzer, summary_targets.directory_targets, read_file);
+    let directory_symbols = if summary_targets.directory_targets.is_empty() {
+        None
+    } else {
+        Some(skim_files_for_files(
+            analyzer,
+            summary_targets.directory_targets,
+            read_file,
+        ))
+    };
     let symbol_output =
         summarize_symbol_targets(analyzer, summary_targets.symbol_targets, read_file);
 
-    file_output.summaries.extend(directory_output.summaries);
     file_output.summaries.extend(symbol_output.summaries);
+    file_output.directory_symbols = directory_symbols;
     file_output
         .not_found
         .extend(summary_targets.unmatched_file_targets);
@@ -647,61 +657,35 @@ pub fn get_summaries_with_reader(
     file_output
 }
 
-fn summarize_directory_symbol_inventory(
+fn skim_files_for_files(
     analyzer: &dyn IAnalyzer,
     files: Vec<ProjectFile>,
     read_file: FileReader<'_>,
-) -> SummaryResult {
+) -> SkimFilesResult {
     let total_files = files.len();
     let truncated = total_files > FILE_SKIM_LIMIT;
     let selected = select_files_for_display(analyzer, files, FILE_SKIM_LIMIT);
-    let mut summaries: Vec<_> = selected
+    let mut files: Vec<_> = selected
         .into_par_iter()
-        .filter_map(|file| {
+        .map(|file| {
             let lines: Vec<_> = analyzer
                 .list_symbols(&file)
                 .lines()
                 .map(str::to_string)
                 .collect();
-            if lines.is_empty() {
-                return None;
-            }
             let path = rel_path_string(&file);
             let loc = read_file(&file)
                 .map(|content| line_count(&content))
                 .unwrap_or(0);
-            Some(SummaryBlock {
-                label: path.clone(),
-                path,
-                preamble: format!("{} lines\n{}", loc, lines.join("\n")),
-                elements: Vec::new(),
-            })
+            SkimFile { path, loc, lines }
         })
         .collect();
-    summaries.sort_by(|left, right| {
-        left.path
-            .cmp(&right.path)
-            .then(left.label.cmp(&right.label))
-    });
-    if truncated {
-        summaries.insert(
-            0,
-            SummaryBlock {
-                label: "directory-summary-truncated".to_string(),
-                path: "directory-summary-truncated".to_string(),
-                preamble: format!(
-                    "Showing symbol inventory for {} of {} matching files. Use a narrower path or glob for more detail.",
-                    FILE_SKIM_LIMIT, total_files
-                ),
-                elements: Vec::new(),
-            },
-        );
-    }
+    files.sort_by(|left, right| left.path.cmp(&right.path));
 
-    SummaryResult {
-        summaries,
-        not_found: Vec::new(),
-        ambiguous: Vec::new(),
+    SkimFilesResult {
+        truncated,
+        total_files,
+        files,
     }
 }
 
@@ -740,6 +724,7 @@ fn summarize_files(
 
     SummaryResult {
         summaries,
+        directory_symbols: None,
         not_found: Vec::new(),
         ambiguous: Vec::new(),
     }
@@ -755,33 +740,7 @@ pub fn list_symbols_with_reader(
     read_file: FileReader<'_>,
 ) -> SkimFilesResult {
     let expanded = resolve_file_patterns(analyzer, &params.file_patterns);
-    let total_files = expanded.len();
-    let truncated = total_files > FILE_SKIM_LIMIT;
-    let selected = select_files_for_display(analyzer, expanded, FILE_SKIM_LIMIT);
-    let files: Vec<_> = selected
-        .into_par_iter()
-        .map(|file| {
-            let loc = read_file(&file)
-                .map(|content| line_count(&content))
-                .unwrap_or(0);
-            let lines = analyzer
-                .list_symbols(&file)
-                .lines()
-                .map(str::to_string)
-                .collect();
-            SkimFile {
-                path: rel_path_string(&file),
-                loc,
-                lines,
-            }
-        })
-        .collect();
-
-    SkimFilesResult {
-        truncated,
-        total_files,
-        files,
-    }
+    skim_files_for_files(analyzer, expanded, read_file)
 }
 
 pub fn most_relevant_files(
@@ -1921,7 +1880,9 @@ mod tests {
     #[test]
     fn directory_get_summaries_uses_skim_file_limit() {
         let root = std::env::current_dir().unwrap();
-        let rel_paths: Vec<_> = (0..25).map(|index| format!("src/File{index}.java")).collect();
+        let rel_paths: Vec<_> = (0..25)
+            .map(|index| format!("src/File{index}.java"))
+            .collect();
         let rel_path_refs: Vec<_> = rel_paths.iter().map(String::as_str).collect();
         let analyzer = CountingAnalyzer::new(root, &rel_path_refs);
 
@@ -1932,13 +1893,13 @@ mod tests {
             },
         );
 
-        assert_eq!(super::FILE_SKIM_LIMIT + 1, result.summaries.len());
-        assert!(
-            result
-                .summaries
-                .iter()
-                .any(|summary| summary.path == "directory-summary-truncated")
-        );
+        let directory_symbols = result
+            .directory_symbols
+            .as_ref()
+            .expect("directory target should return symbol inventory");
+        assert!(directory_symbols.truncated);
+        assert_eq!(25, directory_symbols.total_files);
+        assert_eq!(super::FILE_SKIM_LIMIT, directory_symbols.files.len());
     }
 
     fn rel_paths(files: &[ProjectFile]) -> Vec<String> {

@@ -146,13 +146,17 @@ fn get_summaries_accepts_directory_targets() {
 
     assert!(result.not_found.is_empty(), "{:?}", result.not_found);
     assert!(result.ambiguous.is_empty(), "{:?}", result.ambiguous);
+    let directory_symbols = result
+        .directory_symbols
+        .as_ref()
+        .expect("directory target should return symbol inventory");
     assert!(
-        result
-            .summaries
+        directory_symbols
+            .files
             .iter()
-            .any(|summary| summary.path == "anotherpkg/another.go"),
+            .any(|file| file.path == "anotherpkg/another.go"),
         "{:?}",
-        result.summaries
+        directory_symbols.files
     );
 }
 
@@ -168,13 +172,17 @@ fn get_summaries_accepts_workspace_root_directory_target() {
 
     assert!(result.not_found.is_empty(), "{:?}", result.not_found);
     assert!(result.ambiguous.is_empty(), "{:?}", result.ambiguous);
+    let directory_symbols = result
+        .directory_symbols
+        .as_ref()
+        .expect("workspace root target should return symbol inventory");
     assert!(
-        result
-            .summaries
+        directory_symbols
+            .files
             .iter()
-            .any(|summary| summary.path == "declarations.go"),
+            .any(|file| file.path == "declarations.go"),
         "{:?}",
-        result.summaries
+        directory_symbols.files
     );
 }
 

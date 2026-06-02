@@ -77,6 +77,9 @@ impl RenderText for SummaryResult {
             .iter()
             .map(|summary| summary.render_text(options))
             .collect();
+        if let Some(directory_symbols) = &self.directory_symbols {
+            blocks.push(directory_symbols.render_text(options));
+        }
         if !self.not_found.is_empty() {
             blocks.push(format!("Not found: {}", self.not_found.join(", ")));
         }

@@ -293,6 +293,7 @@ class SummaryBlock:
 @dataclass(frozen=True)
 class SymbolSummariesResult:
     summaries: list[SummaryBlock]
+    directory_symbols: SkimFilesResult | None
     not_found: list[str]
     ambiguous: list[AmbiguousSymbol]
     render_line_numbers: bool = True
@@ -307,6 +308,11 @@ class SymbolSummariesResult:
                 SummaryBlock.from_dict(item, render_line_numbers)
                 for item in data["summaries"]
             ],
+            directory_symbols=(
+                SkimFilesResult.from_dict(data["directory_symbols"], render_line_numbers)
+                if data.get("directory_symbols") is not None
+                else None
+            ),
             not_found=list(data["not_found"]),
             ambiguous=[
                 AmbiguousSymbol.from_dict(item) for item in data.get("ambiguous", [])
@@ -317,12 +323,17 @@ class SymbolSummariesResult:
 
     @property
     def count(self) -> int:
-        return len(self.summaries)
+        directory_count = (
+            self.directory_symbols.count if self.directory_symbols is not None else 0
+        )
+        return len(self.summaries) + directory_count
 
     def render_text(self) -> str:
         if self.rendered_text is not None:
             return self.rendered_text
         blocks = [summary.render_text() for summary in self.summaries]
+        if self.directory_symbols is not None:
+            blocks.append(self.directory_symbols.render_text())
         if self.not_found:
             blocks.append(f"Not found: {', '.join(self.not_found)}")
         blocks.extend(item.render_text() for item in self.ambiguous)
