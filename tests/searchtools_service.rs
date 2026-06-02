@@ -140,6 +140,33 @@ fn get_summaries_directory_target_returns_skim_symbol_inventory() {
 }
 
 #[test]
+fn get_summaries_mixed_targets_return_summaries_and_directory_inventory() {
+    let service = SearchToolsService::new_for_python(fixture_root()).unwrap();
+    let payload = service
+        .call_tool_payload_json(
+            "get_summaries",
+            r#"{"targets":["A.java","."]}"#,
+            RenderOptions::default(),
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert_eq!(value["structured"]["summaries"][0]["path"], "A.java");
+    let directory_symbols = &value["structured"]["directory_symbols"];
+    assert!(
+        directory_symbols["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| file["path"] == "A.java"),
+        "{directory_symbols}"
+    );
+    let rendered = value["rendered_text"].as_str().expect("rendered text");
+    assert!(rendered.contains("A.java"), "{rendered}");
+    assert!(rendered.contains("A.java ("), "{rendered}");
+}
+
+#[test]
 fn python_boundary_returns_canonical_rendered_text_payload() {
     let service = SearchToolsService::new_for_python(fixture_root()).unwrap();
     let payload = service

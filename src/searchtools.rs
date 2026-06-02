@@ -128,6 +128,19 @@ pub struct SymbolLocationsResult {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct SymbolAncestorsResult {
+    pub ancestors: Vec<SymbolAncestors>,
+    pub not_found: Vec<String>,
+    pub ambiguous: Vec<AmbiguousSymbol>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SymbolAncestors {
+    pub symbol: String,
+    pub ancestors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct SymbolLocation {
     pub symbol: String,
     pub path: String,
@@ -139,8 +152,6 @@ pub struct SymbolLocation {
 #[derive(Debug, Clone, Serialize)]
 pub struct SummaryResult {
     pub summaries: Vec<SummaryBlock>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub directory_symbols: Option<SkimFilesResult>,
     pub not_found: Vec<String>,
     pub ambiguous: Vec<AmbiguousSymbol>,
 }
@@ -433,10 +444,68 @@ pub fn get_symbol_locations(
     }
 }
 
+pub fn get_symbol_ancestors(
+    analyzer: &dyn IAnalyzer,
+    params: SymbolNamesParams,
+) -> SymbolAncestorsResult {
+    let Some(provider) = analyzer.type_hierarchy_provider() else {
+        return SymbolAncestorsResult {
+            ancestors: Vec::new(),
+            not_found: params
+                .symbols
+                .into_iter()
+                .filter(|symbol| !symbol.trim().is_empty())
+                .collect(),
+            ambiguous: Vec::new(),
+        };
+    };
+
+    let mut ancestors = Vec::new();
+    let mut not_found = Vec::new();
+    let mut ambiguous = Vec::new();
+
+    for symbol in params
+        .symbols
+        .into_iter()
+        .filter(|symbol| !symbol.trim().is_empty())
+    {
+        match resolve_codeunit_fuzzy(analyzer, &symbol, code_unit_kind_filter(params.kind_filter)) {
+            CodeUnitResolution::Resolved(code_units) => {
+                let Some(code_unit) = code_units.into_iter().next() else {
+                    not_found.push(symbol);
+                    continue;
+                };
+                ancestors.push(SymbolAncestors {
+                    symbol,
+                    ancestors: provider
+                        .get_ancestors(&code_unit)
+                        .into_iter()
+                        .map(|ancestor| ancestor.fq_name().to_string())
+                        .collect(),
+                });
+            }
+            CodeUnitResolution::Ambiguous(matches) => {
+                ambiguous.push(AmbiguousSymbol {
+                    target: symbol,
+                    matches,
+                });
+            }
+            CodeUnitResolution::NotFound => not_found.push(symbol),
+        }
+    }
+
+    SymbolAncestorsResult {
+        ancestors,
+        not_found,
+        ambiguous,
+    }
+}
+
 #[derive(Debug)]
 struct SummaryTargets {
     file_targets: Vec<ProjectFile>,
     directory_targets: Vec<ProjectFile>,
+    directory_target_inputs: Vec<String>,
     unmatched_file_targets: Vec<String>,
     symbol_targets: Vec<String>,
 }
@@ -450,6 +519,7 @@ enum SourceLookupOutcome {
 fn route_summary_targets(analyzer: &dyn IAnalyzer, targets: &[String]) -> SummaryTargets {
     let mut file_targets = BTreeSet::new();
     let mut directory_targets = BTreeSet::new();
+    let mut directory_target_inputs = Vec::new();
     let mut unmatched_file_targets = Vec::new();
     let mut symbol_targets = Vec::new();
 
@@ -461,6 +531,7 @@ fn route_summary_targets(analyzer: &dyn IAnalyzer, targets: &[String]) -> Summar
         let directory_matches = resolve_directory_target(analyzer, target);
         if !directory_matches.is_empty() {
             directory_targets.extend(directory_matches);
+            directory_target_inputs.push(target.to_string());
             continue;
         }
 
@@ -481,6 +552,7 @@ fn route_summary_targets(analyzer: &dyn IAnalyzer, targets: &[String]) -> Summar
     SummaryTargets {
         file_targets: file_targets.into_iter().collect(),
         directory_targets: directory_targets.into_iter().collect(),
+        directory_target_inputs,
         unmatched_file_targets,
         symbol_targets,
     }
@@ -513,10 +585,24 @@ fn summarize_symbol_targets(analyzer: &dyn IAnalyzer, targets: Vec<String>) -> S
 
     SummaryResult {
         summaries,
-        directory_symbols: None,
         not_found,
         ambiguous,
     }
+}
+
+pub(crate) fn summarize_targets_with_directory_inventory(
+    analyzer: &dyn IAnalyzer,
+    targets: &[String],
+) -> (SummaryResult, Option<SkimFilesResult>, Vec<String>) {
+    let summary_targets = route_summary_targets(analyzer, targets);
+    let summary_result = summarize_routed_targets(analyzer, &summary_targets);
+    let directory_symbols = (!summary_targets.directory_targets.is_empty())
+        .then(|| skim_files_for_files(analyzer, summary_targets.directory_targets));
+    (
+        summary_result,
+        directory_symbols,
+        summary_targets.directory_target_inputs,
+    )
 }
 
 pub fn get_symbol_sources(
@@ -590,32 +676,10 @@ pub fn get_symbol_sources(
 }
 
 pub fn get_summaries(analyzer: &dyn IAnalyzer, params: SummariesParams) -> SummaryResult {
-    let targets = params.targets;
-    let summary_targets = route_summary_targets(analyzer, &targets);
-    let mut file_output = summarize_files(analyzer, summary_targets.file_targets);
-    let directory_symbols = if summary_targets.directory_targets.is_empty() {
-        None
-    } else {
-        Some(skim_files_for_files(
-            analyzer,
-            summary_targets.directory_targets,
-        ))
-    };
-    let symbol_output = summarize_symbol_targets(analyzer, summary_targets.symbol_targets);
-
-    file_output.summaries.extend(symbol_output.summaries);
-    file_output.directory_symbols = directory_symbols;
-    file_output
-        .not_found
-        .extend(summary_targets.unmatched_file_targets);
-    file_output.not_found.extend(symbol_output.not_found);
-    file_output.ambiguous.extend(symbol_output.ambiguous);
-    file_output.summaries.sort_by(|left, right| {
-        left.path
-            .cmp(&right.path)
-            .then(left.label.cmp(&right.label))
-    });
-    file_output
+    let (mut summaries, _directory_symbols, directory_target_inputs) =
+        summarize_targets_with_directory_inventory(analyzer, &params.targets);
+    summaries.not_found.extend(directory_target_inputs);
+    summaries
 }
 
 fn skim_files_for_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>) -> SkimFilesResult {
@@ -678,10 +742,30 @@ fn summarize_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>) -> Summary
 
     SummaryResult {
         summaries,
-        directory_symbols: None,
         not_found: Vec::new(),
         ambiguous: Vec::new(),
     }
+}
+
+fn summarize_routed_targets(
+    analyzer: &dyn IAnalyzer,
+    summary_targets: &SummaryTargets,
+) -> SummaryResult {
+    let mut file_output = summarize_files(analyzer, summary_targets.file_targets.clone());
+    let symbol_output = summarize_symbol_targets(analyzer, summary_targets.symbol_targets.clone());
+
+    file_output.summaries.extend(symbol_output.summaries);
+    file_output
+        .not_found
+        .extend(summary_targets.unmatched_file_targets.clone());
+    file_output.not_found.extend(symbol_output.not_found);
+    file_output.ambiguous.extend(symbol_output.ambiguous);
+    file_output.summaries.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then(left.label.cmp(&right.label))
+    });
+    file_output
 }
 
 pub fn list_symbols(analyzer: &dyn IAnalyzer, params: FilePatternsParams) -> SkimFilesResult {
@@ -1797,7 +1881,7 @@ mod tests {
     }
 
     #[test]
-    fn directory_get_summaries_uses_skim_file_limit() {
+    fn directory_targets_are_reported_as_not_found() {
         let root = std::env::current_dir().unwrap();
         let rel_paths: Vec<_> = (0..25)
             .map(|index| format!("src/File{index}.java"))
@@ -1812,13 +1896,8 @@ mod tests {
             },
         );
 
-        let directory_symbols = result
-            .directory_symbols
-            .as_ref()
-            .expect("directory target should return symbol inventory");
-        assert!(directory_symbols.truncated);
-        assert_eq!(25, directory_symbols.total_files);
-        assert_eq!(super::FILE_SKIM_LIMIT, directory_symbols.files.len());
+        assert!(result.summaries.is_empty());
+        assert_eq!(vec!["src"], result.not_found);
     }
 
     fn rel_paths(files: &[ProjectFile]) -> Vec<String> {

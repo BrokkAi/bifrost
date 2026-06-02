@@ -93,6 +93,17 @@ class SearchToolsClientTest(unittest.TestCase):
         self.assertIn("    - AInnerInner", text)
         self.assertIn("      - method7", text)
 
+    def test_get_summaries_keeps_directory_inventory_for_wrapper_callers(self) -> None:
+        with SearchToolsClient(root=self.fixture_root) as client:
+            summaries = client.get_summaries(["."])
+            text = summaries.render_text()
+
+        self.assertEqual(0, len(summaries.summaries))
+        self.assertIsNotNone(summaries.directory_symbols)
+        assert summaries.directory_symbols is not None
+        self.assertGreaterEqual(summaries.directory_symbols.count, 1)
+        self.assertIn("A.java", text)
+
     def test_native_errors_are_raised_as_searchtools_error(self) -> None:
         with SearchToolsClient(root=self.fixture_root) as client:
             with self.assertRaisesRegex(SearchToolsError, "Unknown tool: nope"):
@@ -154,6 +165,34 @@ class SearchToolsClientTest(unittest.TestCase):
         self.assertIn("B.java", result.files)
         self.assertEqual([], result.not_found)
         self.assertIn("B.java", text)
+
+    def test_get_symbol_ancestors_returns_csharp_hierarchy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "Types.cs").write_text(
+                """
+namespace Demo
+{
+    public class BaseType {}
+    public interface IService {}
+    public class ChildType : BaseType, IService {}
+}
+""".strip()
+                + "\n"
+            )
+
+            with SearchToolsClient(root=root) as client:
+                result = client.get_symbol_ancestors(["Demo.ChildType"])
+                text = result.render_text()
+
+        self.assertEqual(1, result.count)
+        self.assertEqual("Demo.ChildType", result.ancestors[0].symbol)
+        self.assertEqual(
+            ["Demo.BaseType", "Demo.IService"],
+            result.ancestors[0].ancestors,
+        )
+        self.assertIn("Demo.BaseType", text)
+        self.assertIn("Demo.IService", text)
 
 
 if __name__ == "__main__":

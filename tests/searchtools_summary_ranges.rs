@@ -137,7 +137,7 @@ fn get_summaries_accepts_mixed_file_and_class_targets() {
 }
 
 #[test]
-fn get_summaries_accepts_directory_targets() {
+fn get_summaries_reports_directory_targets_as_not_found() {
     let analyzer = go_fixture_analyzer();
     let result = get_summaries(
         &analyzer,
@@ -146,24 +146,13 @@ fn get_summaries_accepts_directory_targets() {
         },
     );
 
-    assert!(result.not_found.is_empty(), "{:?}", result.not_found);
+    assert_eq!(vec!["anotherpkg"], result.not_found);
     assert!(result.ambiguous.is_empty(), "{:?}", result.ambiguous);
-    let directory_symbols = result
-        .directory_symbols
-        .as_ref()
-        .expect("directory target should return symbol inventory");
-    assert!(
-        directory_symbols
-            .files
-            .iter()
-            .any(|file| file.path == "anotherpkg/another.go"),
-        "{:?}",
-        directory_symbols.files
-    );
+    assert!(result.summaries.is_empty(), "{:?}", result.summaries);
 }
 
 #[test]
-fn get_summaries_accepts_workspace_root_directory_target() {
+fn get_summaries_reports_workspace_root_directory_target_as_not_found() {
     let analyzer = go_fixture_analyzer();
     let result = get_summaries(
         &analyzer,
@@ -172,20 +161,9 @@ fn get_summaries_accepts_workspace_root_directory_target() {
         },
     );
 
-    assert!(result.not_found.is_empty(), "{:?}", result.not_found);
+    assert_eq!(vec!["."], result.not_found);
     assert!(result.ambiguous.is_empty(), "{:?}", result.ambiguous);
-    let directory_symbols = result
-        .directory_symbols
-        .as_ref()
-        .expect("workspace root target should return symbol inventory");
-    assert!(
-        directory_symbols
-            .files
-            .iter()
-            .any(|file| file.path == "declarations.go"),
-        "{:?}",
-        directory_symbols.files
-    );
+    assert!(result.summaries.is_empty(), "{:?}", result.summaries);
 }
 
 #[test]

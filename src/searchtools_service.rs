@@ -13,10 +13,11 @@ use crate::{
     },
     git_tools::{get_commit_diff, get_git_log, search_git_commit_messages},
     searchtools::{
-        ActivateWorkspaceParams, ActiveWorkspaceResult, GetActiveWorkspaceParams,
-        MostRelevantFilesParams, RefreshParams, get_summaries, get_symbol_locations,
-        get_symbol_sources, list_symbols, most_relevant_files, refresh_result, scan_usages,
-        search_symbols,
+        ActivateWorkspaceParams, ActiveWorkspaceResult, AmbiguousSymbol, GetActiveWorkspaceParams,
+        MostRelevantFilesParams, RefreshParams, SkimFilesResult, SummariesParams, SummaryBlock,
+        SummaryResult, get_symbol_ancestors, get_symbol_locations, get_symbol_sources,
+        list_symbols, most_relevant_files, refresh_result, scan_usages, search_symbols,
+        summarize_targets_with_directory_inventory,
     },
     searchtools_render::{RenderOptions, RenderText},
     structured_data::{jq, xml_select, xml_skim},
@@ -86,6 +87,40 @@ struct PythonToolPayload {
     structured: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     rendered_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct GetSummariesCompatibilityResult {
+    summaries: Vec<SummaryBlock>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    directory_symbols: Option<SkimFilesResult>,
+    not_found: Vec<String>,
+    ambiguous: Vec<AmbiguousSymbol>,
+}
+
+impl RenderText for GetSummariesCompatibilityResult {
+    fn render_text(&self, options: RenderOptions) -> String {
+        let mut blocks = Vec::new();
+        if !self.summaries.is_empty() || !self.not_found.is_empty() || !self.ambiguous.is_empty() {
+            let summary_text = SummaryResult {
+                summaries: self.summaries.clone(),
+                not_found: self.not_found.clone(),
+                ambiguous: self.ambiguous.clone(),
+            }
+            .render_text(options);
+            if summary_text != "No matching summaries found." {
+                blocks.push(summary_text);
+            }
+        }
+        if let Some(directory_symbols) = &self.directory_symbols {
+            blocks.push(directory_symbols.render_text(options));
+        }
+        if blocks.is_empty() {
+            "No matching summaries found.".to_string()
+        } else {
+            blocks.join("\n\n")
+        }
+    }
 }
 
 impl ToolOutput {
@@ -205,18 +240,19 @@ impl SearchToolsService {
                 render_options,
                 |workspace, params| get_symbol_locations(workspace.analyzer(), params),
             ),
+            "get_symbol_ancestors" => Self::decode_render_and_run(
+                &snapshot,
+                arguments,
+                render_options,
+                |workspace, params| get_symbol_ancestors(workspace.analyzer(), params),
+            ),
             "get_symbol_sources" => Self::decode_render_and_run(
                 &snapshot,
                 arguments,
                 render_options,
                 |workspace, params| get_symbol_sources(workspace.analyzer(), params),
             ),
-            "get_summaries" => Self::decode_render_and_run(
-                &snapshot,
-                arguments,
-                render_options,
-                |workspace, params| get_summaries(workspace.analyzer(), params),
-            ),
+            "get_summaries" => Self::handle_get_summaries(&snapshot, arguments, render_options),
             "list_symbols" => Self::decode_render_and_run(
                 &snapshot,
                 arguments,
@@ -516,6 +552,32 @@ impl SearchToolsService {
         let result = handler(workspace, params);
         let rendered_text = result.render_text(render_options);
         let structured = serde_json::to_value(result).map_err(|err| {
+            SearchToolsServiceError::internal(format!("Failed to serialize tool result: {err}"))
+        })?;
+        Ok(ToolOutput::Structured {
+            structured,
+            rendered_text: Some(rendered_text),
+        })
+    }
+
+    fn handle_get_summaries(
+        workspace: &WorkspaceAnalyzer,
+        arguments: Value,
+        render_options: RenderOptions,
+    ) -> Result<ToolOutput, SearchToolsServiceError> {
+        let params = serde_json::from_value::<SummariesParams>(arguments).map_err(|err| {
+            SearchToolsServiceError::invalid_params(format!("Invalid tool arguments: {err}"))
+        })?;
+        let (summary_result, directory_symbols, _directory_target_inputs) =
+            summarize_targets_with_directory_inventory(workspace.analyzer(), &params.targets);
+        let compatibility_result = GetSummariesCompatibilityResult {
+            summaries: summary_result.summaries,
+            directory_symbols,
+            not_found: summary_result.not_found,
+            ambiguous: summary_result.ambiguous,
+        };
+        let rendered_text = compatibility_result.render_text(render_options);
+        let structured = serde_json::to_value(&compatibility_result).map_err(|err| {
             SearchToolsServiceError::internal(format!("Failed to serialize tool result: {err}"))
         })?;
         Ok(ToolOutput::Structured {

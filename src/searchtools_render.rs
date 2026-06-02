@@ -1,7 +1,8 @@
 use crate::searchtools::{
     AmbiguousSymbol, MostRelevantFilesResult, SearchSymbolHit, SearchSymbolsFile,
     SearchSymbolsResult, SkimFile, SkimFilesResult, SourceBlock, SummaryBlock, SummaryElement,
-    SummaryResult, SymbolLocation, SymbolLocationsResult, SymbolSourcesResult,
+    SummaryResult, SymbolAncestors, SymbolAncestorsResult, SymbolLocation, SymbolLocationsResult,
+    SymbolSourcesResult,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +71,27 @@ impl RenderText for SymbolLocationsResult {
     }
 }
 
+impl RenderText for SymbolAncestorsResult {
+    fn render_text(&self, _options: RenderOptions) -> String {
+        let mut blocks: Vec<String> = self
+            .ancestors
+            .iter()
+            .map(SymbolAncestors::render_text)
+            .collect();
+        if !self.not_found.is_empty() {
+            blocks.push(render_not_found(&self.not_found));
+        }
+        if !self.ambiguous.is_empty() {
+            blocks.push(render_ambiguous_symbols_table(&self.ambiguous));
+        }
+        if blocks.is_empty() {
+            "No matching ancestors found.".to_string()
+        } else {
+            blocks.join("\n\n")
+        }
+    }
+}
+
 impl RenderText for SummaryResult {
     fn render_text(&self, options: RenderOptions) -> String {
         let mut blocks: Vec<String> = self
@@ -77,9 +99,6 @@ impl RenderText for SummaryResult {
             .iter()
             .map(|summary| summary.render_text(options))
             .collect();
-        if let Some(directory_symbols) = &self.directory_symbols {
-            blocks.push(directory_symbols.render_text(options));
-        }
         if !self.not_found.is_empty() {
             blocks.push(format!("Not found: {}", self.not_found.join(", ")));
         }
@@ -248,6 +267,25 @@ impl SymbolLocation {
             );
         }
         format!("{}: {}", self.symbol, self.path)
+    }
+}
+
+impl SymbolAncestors {
+    fn render_text(&self) -> String {
+        let mut lines = vec![
+            format!("## {}", escape_markdown_heading(&self.symbol)),
+            String::new(),
+        ];
+        if self.ancestors.is_empty() {
+            lines.push("No ancestors.".to_string());
+        } else {
+            lines.extend(
+                self.ancestors
+                    .iter()
+                    .map(|ancestor| format!("- {}", escape_markdown_inline_code(ancestor))),
+            );
+        }
+        lines.join("\n")
     }
 }
 
