@@ -512,14 +512,19 @@ fn bifrost_defaults_to_cwd_searchtools_server() {
         "public class DefaultRoot {}\n",
     )
     .expect("write java fixture");
+    let repo = git2::Repository::init(fixture_root.path()).expect("init fixture repo");
+    let mut index = repo.index().expect("repo index");
+    index
+        .add_path(std::path::Path::new("DefaultRoot.java"))
+        .expect("add java file");
+    index.write().expect("write index");
+    let tree_id = index.write_tree().expect("write tree");
+    let tree = repo.find_tree(tree_id).expect("find tree");
+    let sig = git2::Signature::now("Test User", "test@example.com").expect("signature");
+    repo.commit(Some("HEAD"), &sig, &sig, "initial", &tree, &[])
+        .expect("initial commit");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
-        .current_dir(fixture_root.path())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn bifrost");
+    let mut child = spawn_server_no_args(fixture_root.path());
 
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
@@ -1243,6 +1248,16 @@ fn spawn_server(root: &std::path::Path, mode: &str, extra_args: &[&str]) -> std:
         command.arg(arg);
     }
     command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bifrost")
+}
+
+fn spawn_server_no_args(cwd: &std::path::Path) -> std::process::Child {
+    Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

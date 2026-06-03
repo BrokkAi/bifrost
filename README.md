@@ -82,10 +82,10 @@ Or just start it from the project root and let the defaults kick in:
 
 ```bash
 cd /path/to/project
-../bifrost/target/debug/bifrost
+bifrost
 ```
 
-By default, `bifrost` uses the current working directory as `--root` and `searchtools` as `--server`.
+By default, `bifrost` uses the current working directory as `--root` and `searchtools` as `--server`. Run `bifrost --help` to see all options.
 
 `--server` accepts ordered compositions of toolsets separated by `|`:
 
