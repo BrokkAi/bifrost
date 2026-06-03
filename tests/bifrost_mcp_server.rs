@@ -505,6 +505,79 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
 }
 
 #[test]
+fn bifrost_defaults_to_cwd_searchtools_server() {
+    let fixture_root = TempDir::new().expect("temp dir");
+    fs::write(
+        fixture_root.path().join("DefaultRoot.java"),
+        "public class DefaultRoot {}\n",
+    )
+    .expect("write java fixture");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .current_dir(fixture_root.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bifrost");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+
+    let active_workspace = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "get_active_workspace",
+                "arguments": {}
+            }
+        }),
+    );
+    assert_eq!(
+        active_workspace["result"]["structuredContent"]["workspace_path"],
+        fixture_root
+            .path()
+            .canonicalize()
+            .expect("canonicalize fixture")
+            .display()
+            .to_string()
+    );
+
+    let list_symbols = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "list_symbols",
+                "arguments": { "file_patterns": ["DefaultRoot.java"] }
+            }
+        }),
+    );
+    assert_eq!(list_symbols["result"]["isError"], false, "{list_symbols}");
+    assert_eq!(
+        list_symbols["result"]["structuredContent"]["files"][0]["path"],
+        "DefaultRoot.java"
+    );
+
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
 fn bifrost_split_servers_publish_expected_tool_sets() {
     let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
