@@ -78,6 +78,15 @@ Run it against a project root:
 ./target/debug/bifrost --root /path/to/project --server searchtools
 ```
 
+Or just start it from the project root and let the defaults kick in:
+
+```bash
+cd /path/to/project
+bifrost
+```
+
+By default, `bifrost` uses the current working directory as `--root` and `searchtools` as `--server`. Run `bifrost --help` to see all options.
+
 `--server` accepts ordered compositions of toolsets separated by `|`:
 
 - `searchtools` expands to all toolsets in the canonical order `symbol|workspace|extended|text|slopcop`
