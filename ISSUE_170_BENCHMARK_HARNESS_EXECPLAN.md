@@ -21,7 +21,10 @@ After this change, `bifrost` will have its own lightweight benchmark harness for
 - [x] (2026-06-04T12:22Z) Verified the new manifest layer with `cargo test --test benchmark_manifest`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings`.
 - [x] (2026-06-04T13:25Z) Started Milestone 2 by adding `src/bin/bifrost_benchmark.rs` with a real `validate` subcommand and adding `tests/bifrost_benchmark_cli.rs` so the checked-in manifest can be exercised through a user-facing entrypoint.
 - [x] (2026-06-04T13:25Z) Extended the manifest schema and corpus to include `scan_usages` plus explicit `usage_symbols`, initially on the Java and Go corpus entries where symbol naming is likely to be stable.
-- [ ] Add the remaining benchmark runtime modules, report comparison, and workflow described below.
+- [x] (2026-06-04T15:05Z) Added the first runnable benchmark runtime slice: `src/benchmark/repo_cache.rs`, `src/benchmark/mcp_session.rs`, `src/benchmark/report.rs`, `src/benchmark/runner.rs`, and a `bifrost_benchmark run` path that executes `workspace_build` plus real MCP calls from the manifest.
+- [x] (2026-06-04T15:05Z) Added `tests/bifrost_benchmark_run.rs`, which copies the existing Java fixture corpus into a temporary committed git repo and drives all six scenarios end-to-end through the actual CLI, including `scan_usages`.
+- [x] (2026-06-04T15:08Z) Verified the runtime slice with `cargo test --test benchmark_manifest --test bifrost_benchmark_cli --test bifrost_benchmark_run`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings`.
+- [ ] Add richer per-scenario failure reporting, baseline comparison, and the scheduled workflow described below.
 
 ## Surprises & Discoveries
 
@@ -48,6 +51,9 @@ After this change, `bifrost` will have its own lightweight benchmark harness for
 
 - Observation: a manifest-only validation layer was not enough once `scan_usages` became a required scenario; a real CLI entrypoint was needed immediately to keep the operator path concrete.
   Evidence: Milestone 2 started by adding `bifrost_benchmark validate` and its integration test instead of waiting for the full runner, so the checked-in corpus is now executable via a stable command rather than only library tests.
+
+- Observation: the local end-to-end runtime slice was easiest to stabilize against the existing Java fixture corpus rather than a hand-written mini-project.
+  Evidence: `tests/bifrost_benchmark_run.rs` copies `tests/fixtures/testcode-java` into a temporary git repo and successfully exercises `workspace_build`, `search_symbols`, `get_symbol_locations`, `get_summaries`, `most_relevant_files`, and `scan_usages` through the real `bifrost_benchmark` CLI.
 
 ## Decision Log
 
@@ -87,9 +93,13 @@ After this change, `bifrost` will have its own lightweight benchmark harness for
   Rationale: the user explicitly called out usages as high-value and regression-prone, so the scenario should be mandatory overall. Starting with Java and Go keeps the first runtime slice anchored to symbols that are likely to remain stable while the harness is still being built.
   Date/Author: 2026-06-04 / Codex + user
 
+- Decision: the first runnable `run` path will stop on scenario failure instead of trying to emit partial per-scenario failure reports.
+  Rationale: getting the real repo-cache, MCP session, and scenario execution path working end-to-end was the higher-priority milestone. Richer failure aggregation is still desirable, but it can be layered on top of a working runner instead of complicating the first execution slice.
+  Date/Author: 2026-06-04 / Codex
+
 ## Outcomes & Retrospective
 
-Milestone 1 is implemented, and Milestone 2 is started. The repository now has a real manifest schema, a checked-in pinned corpus draft, tests that fail when language coverage, minimum scenario coverage, or required probe inputs drift, and a first user-facing `bifrost_benchmark validate` command. The remaining work is the rest of the runtime and operations path: repo-cache orchestration, the MCP subprocess session, benchmark execution/reporting, comparison logic, and the scheduled GitHub workflow.
+Milestone 1 is implemented, and Milestone 2 now has a real execution path. The repository now has a manifest schema, a checked-in pinned corpus draft, a `bifrost_benchmark validate` command, a `bifrost_benchmark run` command, repo-cache preparation, a production MCP subprocess client, JSON report output, and a local end-to-end runtime test that covers all six scenarios on a committed Java repo. The remaining work is to enrich failure aggregation, add baseline comparison, broaden runtime coverage across more corpus entries, and wire the scheduled GitHub workflow.
 
 ## Context and Orientation
 
@@ -308,4 +318,4 @@ In `src/benchmark/runner.rs`, define a runner entrypoint similar to:
 
 In `src/bin/bifrost_benchmark.rs`, provide the thin CLI wrapper that parses arguments, calls `validate`, `run`, or `compare`, prints a concise human summary, and writes JSON files.
 
-Revision note: initial ExecPlan draft created on 2026-06-04 after reading issue `#170`, local planning rules, current analyzer/MCP code, existing workflows, and sibling Brokk/SlopCop benchmark precedents. Updated later on 2026-06-04 after implementing Milestone 1 and the first Milestone 2 slice so the progress log, discoveries, decisions, and retrospective reflect the checked-in manifest layer, `scan_usages` additions, and the new `bifrost_benchmark validate` entrypoint.
+Revision note: initial ExecPlan draft created on 2026-06-04 after reading issue `#170`, local planning rules, current analyzer/MCP code, existing workflows, and sibling Brokk/SlopCop benchmark precedents. Updated later on 2026-06-04 after implementing Milestone 1, adding `scan_usages` to the required scenario set, and building the first runnable `bifrost_benchmark run` path so the progress log, discoveries, decisions, and retrospective reflect the checked-in runtime slice as well as the manifest layer.

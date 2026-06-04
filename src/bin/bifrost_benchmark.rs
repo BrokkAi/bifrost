@@ -1,6 +1,10 @@
-use brokk_bifrost::benchmark::{BenchmarkManifest, BenchmarkScenario, ManifestLanguage};
+use brokk_bifrost::benchmark::{
+    BenchmarkManifest, BenchmarkRunReport, BenchmarkScenario, ManifestLanguage, RunRequest,
+    run_benchmark,
+};
+use chrono::Utc;
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -41,6 +45,38 @@ fn run() -> Result<(), String> {
             }
             validate_manifest(manifest_path)
         }
+        "run" => {
+            let mut selected_repo = None;
+            let mut output_dir = None;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--manifest" => {
+                        let value = args
+                            .next()
+                            .ok_or_else(|| "--manifest requires a path".to_string())?;
+                        manifest_path = value.into();
+                    }
+                    "--repo" => {
+                        selected_repo = Some(
+                            args.next()
+                                .ok_or_else(|| "--repo requires a repo name".to_string())?,
+                        );
+                    }
+                    "--output" => {
+                        output_dir =
+                            Some(PathBuf::from(args.next().ok_or_else(|| {
+                                "--output requires a directory path".to_string()
+                            })?));
+                    }
+                    "--help" | "-h" => {
+                        print_run_help();
+                        return Ok(());
+                    }
+                    other => return Err(format!("unknown run argument: {other}")),
+                }
+            }
+            run_manifest(manifest_path, selected_repo, output_dir)
+        }
         "--help" | "-h" => {
             print_help();
             Ok(())
@@ -73,11 +109,103 @@ fn validate_manifest(path: PathBuf) -> Result<(), String> {
     Ok(())
 }
 
+fn run_manifest(
+    manifest_path: PathBuf,
+    selected_repo: Option<String>,
+    output_dir_override: Option<PathBuf>,
+) -> Result<(), String> {
+    let manifest = BenchmarkManifest::load_from_path(&manifest_path)
+        .map_err(|err| format!("failed to load `{}`: {err}", manifest_path.display()))?;
+    let manifest_dir = manifest_root(&manifest_path)?;
+    let repo_cache_dir = resolve_from_manifest_root(&manifest_dir, &manifest.repo_cache_dir);
+    let output_dir = output_dir_override
+        .map(|path| resolve_from_manifest_root(&manifest_dir, &path))
+        .unwrap_or_else(|| resolve_from_manifest_root(&manifest_dir, &manifest.output_dir));
+    std::fs::create_dir_all(&output_dir).map_err(|err| {
+        format!(
+            "failed to create output dir `{}`: {err}",
+            output_dir.display()
+        )
+    })?;
+
+    let report = run_benchmark(
+        &manifest,
+        &RunRequest {
+            manifest_path: manifest_path.clone(),
+            repo_cache_dir,
+            selected_repo,
+        },
+    )?;
+    let report_path = output_dir.join(format!("run-{}.json", Utc::now().format("%Y%m%dT%H%M%SZ")));
+    write_report(&report, &report_path)?;
+    print_run_summary(&report, &report_path);
+    Ok(())
+}
+
+fn manifest_root(manifest_path: &Path) -> Result<PathBuf, String> {
+    let absolute = if manifest_path.is_absolute() {
+        manifest_path.to_path_buf()
+    } else {
+        env::current_dir()
+            .map_err(|err| format!("failed to resolve current directory: {err}"))?
+            .join(manifest_path)
+    };
+    absolute
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| format!("manifest path has no parent: {}", manifest_path.display()))
+}
+
+fn resolve_from_manifest_root(manifest_root: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        manifest_root.join(path)
+    }
+}
+
+fn write_report(report: &BenchmarkRunReport, report_path: &Path) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(report)
+        .map_err(|err| format!("failed to serialize report: {err}"))?;
+    std::fs::write(report_path, json)
+        .map_err(|err| format!("failed to write report `{}`: {err}", report_path.display()))
+}
+
+fn print_run_summary(report: &BenchmarkRunReport, report_path: &Path) {
+    for repo in &report.repos {
+        println!("repo {}", repo.name);
+        for scenario in &repo.scenarios {
+            let status = if scenario.success { "ok" } else { "failed" };
+            match scenario.median_ms {
+                Some(median) => {
+                    println!(
+                        "  {}: {status} median={median:.1} ms",
+                        scenario.name.label()
+                    );
+                }
+                None => {
+                    println!("  {}: {status}", scenario.name.label());
+                }
+            }
+            if let Some(message) = &scenario.failure_message {
+                println!("    failure: {message}");
+            }
+        }
+    }
+    println!("wrote {}", report_path.display());
+}
+
 fn print_help() {
-    println!("Usage: bifrost_benchmark validate [--manifest PATH]");
-    println!("Defaults: --manifest is benchmark/targets.toml");
+    println!("Usage: bifrost_benchmark <subcommand> [options]");
+    println!("Subcommands:");
+    println!("  validate [--manifest PATH]");
+    println!("  run [--manifest PATH] [--repo NAME] [--output DIR]");
 }
 
 fn print_validate_help() {
     println!("Usage: bifrost_benchmark validate [--manifest PATH]");
+}
+
+fn print_run_help() {
+    println!("Usage: bifrost_benchmark run [--manifest PATH] [--repo NAME] [--output DIR]");
 }
