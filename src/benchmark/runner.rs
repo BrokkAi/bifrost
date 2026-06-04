@@ -3,6 +3,7 @@ use crate::benchmark::repo_cache::prepare_repo;
 use crate::benchmark::report::{
     BenchmarkRepoReport, BenchmarkRunReport, ScenarioReport, ScenarioTransport,
 };
+use crate::benchmark::subset_workspace::prepare_subset_workspace;
 use crate::benchmark::{BenchmarkManifest, BenchmarkRepoTarget, BenchmarkScenario};
 use crate::{AnalyzerConfig, FilesystemProject, WorkspaceAnalyzer};
 use chrono::Utc;
@@ -17,6 +18,7 @@ pub struct RunRequest {
     pub manifest_path: PathBuf,
     pub repo_cache_dir: PathBuf,
     pub selected_repo: Option<String>,
+    pub max_files: Option<usize>,
 }
 
 pub fn run_benchmark(
@@ -40,7 +42,7 @@ pub fn run_benchmark(
     let bifrost_commit = current_bifrost_commit();
     let mut repos = Vec::with_capacity(selected_targets.len());
     for target in selected_targets {
-        repos.push(run_repo(target, manifest, &request.repo_cache_dir)?);
+        repos.push(run_repo(target, manifest, request)?);
     }
 
     Ok(BenchmarkRunReport {
@@ -48,6 +50,7 @@ pub fn run_benchmark(
         manifest_path: request.manifest_path.display().to_string(),
         bifrost_commit,
         selected_repo: request.selected_repo.clone(),
+        max_files: request.max_files,
         repos,
     })
 }
@@ -55,16 +58,22 @@ pub fn run_benchmark(
 fn run_repo(
     target: &BenchmarkRepoTarget,
     manifest: &BenchmarkManifest,
-    repo_cache_dir: &Path,
+    request: &RunRequest,
 ) -> Result<BenchmarkRepoReport, String> {
-    let checkout_path = prepare_repo(target, repo_cache_dir)?;
+    let checkout_path = prepare_repo(target, &request.repo_cache_dir)?;
+    let workspace_path = match request.max_files {
+        Some(max_files) => {
+            prepare_subset_workspace(&checkout_path, &request.repo_cache_dir, target, max_files)?
+        }
+        None => checkout_path.clone(),
+    };
     let mut scenario_reports = Vec::with_capacity(target.scenarios.len());
 
     if target
         .scenario_set()
         .contains(&BenchmarkScenario::WorkspaceBuild)
     {
-        scenario_reports.push(run_workspace_build(target, manifest, &checkout_path)?);
+        scenario_reports.push(run_workspace_build(target, manifest, &workspace_path)?);
     }
 
     let mcp_scenarios: Vec<_> = target
@@ -74,7 +83,7 @@ fn run_repo(
         .filter(|scenario| *scenario != BenchmarkScenario::WorkspaceBuild)
         .collect();
     if !mcp_scenarios.is_empty() {
-        let mut session = McpSession::start(&checkout_path)?;
+        let mut session = McpSession::start(&workspace_path)?;
         session.initialize()?;
         for scenario in mcp_scenarios {
             scenario_reports.push(run_mcp_scenario(target, manifest, &mut session, scenario)?);
@@ -86,6 +95,8 @@ fn run_repo(
         url: target.url.clone(),
         commit: target.commit.clone(),
         checkout_path,
+        workspace_path,
+        subset_max_files: request.max_files,
         scenarios: scenario_reports,
     })
 }

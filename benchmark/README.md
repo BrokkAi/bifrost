@@ -26,3 +26,5 @@ Milestone 1 validation fails when any of these drift:
 - a repo enables a scenario without the exact inputs that scenario needs
 
 The initial corpus is kept small on purpose. It is meant to be stable enough for daily CI, not a clone of Brokk's much larger baseline suite.
+
+For faster local iteration, `bifrost_benchmark run` also supports `--max-files N`. That mode creates a deterministic subset workspace under the benchmark repo cache, pins the manifest's explicit probe files first, then fills the remaining slots with source files from the repo's configured language slice. It is intended for smoke-checking the harness itself, not for baseline-quality timing comparisons.

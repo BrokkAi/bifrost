@@ -24,6 +24,8 @@ After this change, `bifrost` will have its own lightweight benchmark harness for
 - [x] (2026-06-04T15:05Z) Added the first runnable benchmark runtime slice: `src/benchmark/repo_cache.rs`, `src/benchmark/mcp_session.rs`, `src/benchmark/report.rs`, `src/benchmark/runner.rs`, and a `bifrost_benchmark run` path that executes `workspace_build` plus real MCP calls from the manifest.
 - [x] (2026-06-04T15:05Z) Added `tests/bifrost_benchmark_run.rs`, which copies the existing Java fixture corpus into a temporary committed git repo and drives all six scenarios end-to-end through the actual CLI, including `scan_usages`.
 - [x] (2026-06-04T15:08Z) Verified the runtime slice with `cargo test --test benchmark_manifest --test bifrost_benchmark_cli --test bifrost_benchmark_run`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings`.
+- [x] (2026-06-04T15:47Z) Added `--max-files` subset mode to `bifrost_benchmark run`, which builds a deterministic trimmed workspace rooted under the repo cache, records the subset paths in the JSON report, and keeps manifest probe files pinned into the subset before filling the remaining file budget.
+- [x] (2026-06-04T15:47Z) Added subset-mode coverage in `tests/bifrost_benchmark_run.rs` and verified a live quick run against the checked-in `gin-go` corpus entry with `./target/debug/bifrost_benchmark run --repo gin-go --max-files 100`, including a successful `scan_usages` call.
 - [ ] Add richer per-scenario failure reporting, baseline comparison, and the scheduled workflow described below.
 
 ## Surprises & Discoveries
@@ -54,6 +56,9 @@ After this change, `bifrost` will have its own lightweight benchmark harness for
 
 - Observation: the local end-to-end runtime slice was easiest to stabilize against the existing Java fixture corpus rather than a hand-written mini-project.
   Evidence: `tests/bifrost_benchmark_run.rs` copies `tests/fixtures/testcode-java` into a temporary git repo and successfully exercises `workspace_build`, `search_symbols`, `get_symbol_locations`, `get_summaries`, `most_relevant_files`, and `scan_usages` through the real `bifrost_benchmark` CLI.
+
+- Observation: quick subset runs need explicit probe-file pinning to stay meaningful.
+  Evidence: the `--max-files` implementation now includes `summary_targets` and `seed_file_paths` before filling the remaining budget, and the live `gin-go` smoke run succeeded with `--max-files 100` once the subset workspace preserved those probe files.
 
 ## Decision Log
 
@@ -96,6 +101,10 @@ After this change, `bifrost` will have its own lightweight benchmark harness for
 - Decision: the first runnable `run` path will stop on scenario failure instead of trying to emit partial per-scenario failure reports.
   Rationale: getting the real repo-cache, MCP session, and scenario execution path working end-to-end was the higher-priority milestone. Richer failure aggregation is still desirable, but it can be layered on top of a working runner instead of complicating the first execution slice.
   Date/Author: 2026-06-04 / Codex
+
+- Decision: quick local smoke runs will use a harness-local subset workspace instead of adding a new analyzer-wide file-cap configuration.
+  Rationale: `scan_usages`, MCP startup, and direct `workspace_build` all need to observe the same reduced corpus, while the analyzers currently expose no shared "analyze at most N files" seam. A deterministic copied subset under the benchmark repo cache keeps the fast path isolated to the harness and avoids threading benchmark-only config through every language analyzer.
+  Date/Author: 2026-06-04 / Codex + user
 
 ## Outcomes & Retrospective
 
@@ -191,6 +200,15 @@ Expected output should mention one direct warm-up scenario plus the configured M
       get_summaries: ok median=44 ms
       most_relevant_files: ok median=29 ms
     wrote benchmark-output/local/run-2026-06-04T11-30-00Z.json
+
+For faster harness iteration, the same command can trim the checked-out workspace to a deterministic subset:
+
+    cargo run --bin bifrost_benchmark -- run \
+      --manifest benchmark/targets.toml \
+      --repo gin-go \
+      --max-files 100
+
+Expected output should state that subset mode is active and print the subset workspace path alongside the scenario timings.
 
 Compare a candidate report against the blessed baseline:
 

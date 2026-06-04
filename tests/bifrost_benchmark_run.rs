@@ -101,6 +101,101 @@ usage_symbols = ["E.iMethod"]
     assert!(names.contains(&"scan_usages"), "report: {report}");
 }
 
+#[test]
+fn run_subcommand_supports_max_files_subset_mode() {
+    let temp = TempDir::new().expect("temp dir");
+    let repo_root = temp.path().join("fixture-repo");
+    copy_dir_recursively(&fixture_root(), &repo_root).expect("copy fixture repo");
+    init_git_repo(&repo_root);
+
+    let manifest_dir = temp.path().join("manifest");
+    fs::create_dir_all(&manifest_dir).expect("manifest dir");
+    let manifest_path = manifest_dir.join("benchmark.toml");
+    fs::write(
+        &manifest_path,
+        format!(
+            r#"
+warmup_iterations = 1
+measured_iterations = 1
+output_dir = "out"
+repo_cache_dir = "cache"
+required_languages = ["java"]
+required_scenarios = [
+  "workspace_build",
+  "search_symbols",
+  "get_symbol_locations",
+  "get_summaries",
+  "scan_usages",
+]
+
+[[repos]]
+name = "fixture-java"
+url = "{}"
+commit = "{}"
+languages = ["java"]
+extensions = ["java"]
+scenarios = [
+  "workspace_build",
+  "search_symbols",
+  "get_symbol_locations",
+  "get_summaries",
+  "scan_usages",
+]
+search_patterns = ["method2"]
+location_symbols = ["A.method2"]
+summary_targets = ["A.java", "B.java"]
+seed_file_paths = ["B.java"]
+usage_symbols = ["A.method2"]
+"#,
+            repo_root.display(),
+            head_commit(&repo_root)
+        ),
+    )
+    .expect("write manifest");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bifrost_benchmark"))
+        .arg("run")
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .arg("--max-files")
+        .arg("2")
+        .env(
+            "BIFROST_BENCHMARK_BIFROST_BIN",
+            env!("CARGO_BIN_EXE_bifrost"),
+        )
+        .output()
+        .expect("run bifrost_benchmark");
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let report_path = single_json_file(&manifest_dir.join("out"));
+    let report: Value =
+        serde_json::from_str(&fs::read_to_string(report_path).expect("read report"))
+            .expect("parse report");
+    assert_eq!(report["max_files"], 2, "report: {report}");
+    assert_eq!(
+        report["repos"][0]["subset_max_files"], 2,
+        "report: {report}"
+    );
+    assert_ne!(
+        report["repos"][0]["checkout_path"], report["repos"][0]["workspace_path"],
+        "report: {report}"
+    );
+
+    let scenarios = report["repos"][0]["scenarios"]
+        .as_array()
+        .expect("scenario array");
+    assert_eq!(scenarios.len(), 5, "report: {report}");
+    for scenario in scenarios {
+        assert_eq!(scenario["success"], true, "report: {report}");
+    }
+}
+
 fn fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")

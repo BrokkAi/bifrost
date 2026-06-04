@@ -48,6 +48,7 @@ fn run() -> Result<(), String> {
         "run" => {
             let mut selected_repo = None;
             let mut output_dir = None;
+            let mut max_files = None;
             while let Some(arg) = args.next() {
                 match arg.as_str() {
                     "--manifest" => {
@@ -68,6 +69,18 @@ fn run() -> Result<(), String> {
                                 "--output requires a directory path".to_string()
                             })?));
                     }
+                    "--max-files" => {
+                        let value = args
+                            .next()
+                            .ok_or_else(|| "--max-files requires a positive integer".to_string())?;
+                        let parsed = value.parse::<usize>().map_err(|_| {
+                            format!("--max-files expects a positive integer, got `{value}`")
+                        })?;
+                        if parsed == 0 {
+                            return Err("--max-files must be greater than zero".to_string());
+                        }
+                        max_files = Some(parsed);
+                    }
                     "--help" | "-h" => {
                         print_run_help();
                         return Ok(());
@@ -75,7 +88,7 @@ fn run() -> Result<(), String> {
                     other => return Err(format!("unknown run argument: {other}")),
                 }
             }
-            run_manifest(manifest_path, selected_repo, output_dir)
+            run_manifest(manifest_path, selected_repo, output_dir, max_files)
         }
         "--help" | "-h" => {
             print_help();
@@ -113,6 +126,7 @@ fn run_manifest(
     manifest_path: PathBuf,
     selected_repo: Option<String>,
     output_dir_override: Option<PathBuf>,
+    max_files: Option<usize>,
 ) -> Result<(), String> {
     let manifest = BenchmarkManifest::load_from_path(&manifest_path)
         .map_err(|err| format!("failed to load `{}`: {err}", manifest_path.display()))?;
@@ -134,6 +148,7 @@ fn run_manifest(
             manifest_path: manifest_path.clone(),
             repo_cache_dir,
             selected_repo,
+            max_files,
         },
     )?;
     let report_path = output_dir.join(format!("run-{}.json", Utc::now().format("%Y%m%dT%H%M%SZ")));
@@ -172,8 +187,19 @@ fn write_report(report: &BenchmarkRunReport, report_path: &Path) -> Result<(), S
 }
 
 fn print_run_summary(report: &BenchmarkRunReport, report_path: &Path) {
+    if let Some(max_files) = report.max_files {
+        println!("subset max_files={max_files}");
+    }
     for repo in &report.repos {
-        println!("repo {}", repo.name);
+        match repo.subset_max_files {
+            Some(max_files) => println!(
+                "repo {} subset={} workspace={}",
+                repo.name,
+                max_files,
+                repo.workspace_path.display()
+            ),
+            None => println!("repo {}", repo.name),
+        }
         for scenario in &repo.scenarios {
             let status = if scenario.success { "ok" } else { "failed" };
             match scenario.median_ms {
@@ -199,7 +225,7 @@ fn print_help() {
     println!("Usage: bifrost_benchmark <subcommand> [options]");
     println!("Subcommands:");
     println!("  validate [--manifest PATH]");
-    println!("  run [--manifest PATH] [--repo NAME] [--output DIR]");
+    println!("  run [--manifest PATH] [--repo NAME] [--output DIR] [--max-files N]");
 }
 
 fn print_validate_help() {
@@ -207,5 +233,7 @@ fn print_validate_help() {
 }
 
 fn print_run_help() {
-    println!("Usage: bifrost_benchmark run [--manifest PATH] [--repo NAME] [--output DIR]");
+    println!(
+        "Usage: bifrost_benchmark run [--manifest PATH] [--repo NAME] [--output DIR] [--max-files N]"
+    );
 }

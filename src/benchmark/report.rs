@@ -8,6 +8,7 @@ pub struct BenchmarkRunReport {
     pub manifest_path: String,
     pub bifrost_commit: Option<String>,
     pub selected_repo: Option<String>,
+    pub max_files: Option<usize>,
     pub repos: Vec<BenchmarkRepoReport>,
 }
 
@@ -17,6 +18,8 @@ pub struct BenchmarkRepoReport {
     pub url: String,
     pub commit: String,
     pub checkout_path: PathBuf,
+    pub workspace_path: PathBuf,
+    pub subset_max_files: Option<usize>,
     pub scenarios: Vec<ScenarioReport>,
 }
 
