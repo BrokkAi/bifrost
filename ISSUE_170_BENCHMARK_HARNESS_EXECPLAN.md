@@ -26,6 +26,10 @@ After this change, `bifrost` will have its own lightweight benchmark harness for
 - [x] (2026-06-04T15:08Z) Verified the runtime slice with `cargo test --test benchmark_manifest --test bifrost_benchmark_cli --test bifrost_benchmark_run`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings`.
 - [x] (2026-06-04T15:47Z) Added `--max-files` subset mode to `bifrost_benchmark run`, which builds a deterministic trimmed workspace rooted under the repo cache, records the subset paths in the JSON report, and keeps manifest probe files pinned into the subset before filling the remaining file budget.
 - [x] (2026-06-04T15:47Z) Added subset-mode coverage in `tests/bifrost_benchmark_run.rs` and verified a live quick run against the checked-in `gin-go` corpus entry with `./target/debug/bifrost_benchmark run --repo gin-go --max-files 100`, including a successful `scan_usages` call.
+- [x] (2026-06-04T13:11Z) Moved benchmark runtime artifacts into ignored benchmark-local directories: `benchmark/.cache/repos` for cached clones and `benchmark/benchmark-output` for JSON reports. The checked-in manifest now points `repo_cache_dir` at `.cache/repos`, and `.gitignore` ignores both cache and output.
+- [x] (2026-06-04T13:18Z) Hardened repo cache reuse in `src/benchmark/repo_cache.rs` so a run skips `git fetch` when the pinned commit is already present locally. Added `tests/benchmark_repo_cache.rs` to lock down this offline cached-run behavior.
+- [x] (2026-06-04T13:30Z) Expanded the checked-in MCP probe set with runtime-validated `location_symbols` on every corpus repo and `usage_symbols` on Java, Go, JavaScript, TypeScript, Python, PHP, Scala, and C#. Direct MCP validation confirmed these symbols resolve and produce non-empty usage results on the pinned commits.
+- [x] (2026-06-04T13:31Z) Verified the expanded probes through real subset harness runs on `fmt-cpp`, `express-js`, `click-py`, and `serde-json-rs`, and through direct per-scenario MCP validation on the remaining updated repos. This also exposed that some repos, notably `ky-ts` and `fastroute-php`, still need denser subset selection for `most_relevant_files` at `--max-files 100`.
 - [ ] Add richer per-scenario failure reporting, baseline comparison, and the scheduled workflow described below.
 
 ## Surprises & Discoveries
@@ -59,6 +63,12 @@ After this change, `bifrost` will have its own lightweight benchmark harness for
 
 - Observation: quick subset runs need explicit probe-file pinning to stay meaningful.
   Evidence: the `--max-files` implementation now includes `summary_targets` and `seed_file_paths` before filling the remaining budget, and the live `gin-go` smoke run succeeded with `--max-files 100` once the subset workspace preserved those probe files.
+
+- Observation: cached benchmark runs must not assume network access once the pinned commits have already been cloned.
+  Evidence: the first expanded subset sweep failed immediately because `prepare_repo(...)` always attempted `git fetch`, even though `benchmark/.cache/repos/*` already contained the exact pinned commits. The repo cache now checks commit presence locally before fetching, and `tests/benchmark_repo_cache.rs` proves the offline reuse path.
+
+- Observation: full-repo MCP validity and `--max-files 100` subset validity are different bars, especially for `most_relevant_files`.
+  Evidence: direct MCP validation on the pinned repos confirmed the new location/usages probes for JavaScript, TypeScript, Python, PHP, Scala, and C#, while subset harness runs still showed `most_relevant_files` going empty on `ky-ts` and `fastroute-php` under a 100-file trimmed workspace.
 
 ## Decision Log
 
@@ -106,9 +116,19 @@ After this change, `bifrost` will have its own lightweight benchmark harness for
   Rationale: `scan_usages`, MCP startup, and direct `workspace_build` all need to observe the same reduced corpus, while the analyzers currently expose no shared "analyze at most N files" seam. A deterministic copied subset under the benchmark repo cache keeps the fast path isolated to the harness and avoids threading benchmark-only config through every language analyzer.
   Date/Author: 2026-06-04 / Codex + user
 
+- Decision: the checked-in benchmark repo cache belongs under `benchmark/.cache/repos`, and cached runs should stay offline when the pinned commit is already available locally.
+  Rationale: the user explicitly wanted repo pulls in a gitignored directory inside this checkout. Keeping clones and subset workspaces under `benchmark/.cache/` makes the runtime artifacts obvious and disposable, while skipping fetch when the commit already exists makes local smoke runs reliable without requiring repeated network access.
+  Date/Author: 2026-06-04 / Codex + user
+
+- Decision: expand MCP probe coverage incrementally using only symbols proven through the real stdio server, even if some repos temporarily gain `get_symbol_locations` before they gain `scan_usages`.
+  Rationale: exact fully qualified symbol spelling varies materially by language and analyzer. Probes chosen only from grep are too fragile. The current milestone therefore promotes location coverage across all corpus repos, usage coverage across the repos with proven non-empty hits, and leaves subset-tuning for `most_relevant_files` as a follow-up seam instead of pretending every repo is equally subset-friendly.
+  Date/Author: 2026-06-04 / Codex
+
 ## Outcomes & Retrospective
 
 Milestone 1 is implemented, and Milestone 2 now has a real execution path. The repository now has a manifest schema, a checked-in pinned corpus draft, a `bifrost_benchmark validate` command, a `bifrost_benchmark run` command, repo-cache preparation, a production MCP subprocess client, JSON report output, and a local end-to-end runtime test that covers all six scenarios on a committed Java repo. The remaining work is to enrich failure aggregation, add baseline comparison, broaden runtime coverage across more corpus entries, and wire the scheduled GitHub workflow.
+
+The current corpus now exercises `get_symbol_locations` on every pinned repo and exercises `scan_usages` on most of them, using symbols validated against the real MCP server on the pinned commits. The remaining practical gap is not raw MCP wiring; it is fast-path robustness. Full-repo probes are in much better shape than the `--max-files 100` subset path for `most_relevant_files` on some repos, so the next milestone should focus on per-scenario failure aggregation plus better subset selection or scenario-aware subset expectations.
 
 ## Context and Orientation
 

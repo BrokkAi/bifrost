@@ -1,4 +1,6 @@
 /target
+/benchmark/.cache/
+/benchmark/benchmark-output/
 __pycache__/
 .codex
 .claude/

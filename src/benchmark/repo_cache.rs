@@ -23,7 +23,7 @@ pub fn prepare_repo(
             None,
             format!("clone `{}` into `{}`", target.url, checkout_path.display()),
         )?;
-    } else {
+    } else if !repo_has_commit(&checkout_path, &target.commit)? {
         run_git_command(
             Command::new("git")
                 .arg("-C")
@@ -57,6 +57,24 @@ pub fn prepare_repo(
             checkout_path.display()
         )
     })
+}
+
+fn repo_has_commit(checkout_path: &Path, commit: &str) -> Result<bool, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(checkout_path)
+        .arg("rev-parse")
+        .arg("--verify")
+        .arg("--quiet")
+        .arg(format!("{commit}^{{commit}}"))
+        .output()
+        .map_err(|err| {
+            format!(
+                "failed to inspect cached commit `{commit}` in `{}`: {err}",
+                checkout_path.display()
+            )
+        })?;
+    Ok(output.status.success())
 }
 
 fn run_git_command(
