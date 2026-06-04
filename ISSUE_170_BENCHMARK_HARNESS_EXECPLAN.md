@@ -19,7 +19,9 @@ After this change, `bifrost` will have its own lightweight benchmark harness for
 - [x] (2026-06-04T12:05Z) Implemented the Milestone 1 manifest layer in `src/benchmark/manifest.rs`, exported it from `src/lib.rs`, and added a checked-in corpus manifest plus operator notes under `benchmark/`.
 - [x] (2026-06-04T12:12Z) Added `tests/benchmark_manifest.rs` to lock down probe-input validation, required-language coverage, required-scenario coverage, and successful loading of the checked-in manifest.
 - [x] (2026-06-04T12:22Z) Verified the new manifest layer with `cargo test --test benchmark_manifest`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings`.
-- [ ] Add the benchmark runtime modules, binary, report comparison, and workflow described below.
+- [x] (2026-06-04T13:25Z) Started Milestone 2 by adding `src/bin/bifrost_benchmark.rs` with a real `validate` subcommand and adding `tests/bifrost_benchmark_cli.rs` so the checked-in manifest can be exercised through a user-facing entrypoint.
+- [x] (2026-06-04T13:25Z) Extended the manifest schema and corpus to include `scan_usages` plus explicit `usage_symbols`, initially on the Java and Go corpus entries where symbol naming is likely to be stable.
+- [ ] Add the remaining benchmark runtime modules, report comparison, and workflow described below.
 
 ## Surprises & Discoveries
 
@@ -43,6 +45,9 @@ After this change, `bifrost` will have its own lightweight benchmark harness for
 
 - Observation: exact pinned repo SHAs were cheap to capture live, while verifying probe-file existence was more important than proving every symbol upfront during Milestone 1.
   Evidence: `gh api` was used on 2026-06-04 to pin the first ten repo commits and confirm the summary/seed file paths, while symbol correctness is left for runtime smoke execution in later milestones.
+
+- Observation: a manifest-only validation layer was not enough once `scan_usages` became a required scenario; a real CLI entrypoint was needed immediately to keep the operator path concrete.
+  Evidence: Milestone 2 started by adding `bifrost_benchmark validate` and its integration test instead of waiting for the full runner, so the checked-in corpus is now executable via a stable command rather than only library tests.
 
 ## Decision Log
 
@@ -78,9 +83,13 @@ After this change, `bifrost` will have its own lightweight benchmark harness for
   Rationale: Milestone 1 optimized for complete language coverage plus realistic checked-in probe inputs without over-committing to fragile symbol assumptions in every language before the runtime harness exists.
   Date/Author: 2026-06-04 / Codex
 
+- Decision: `scan_usages` is part of the required minimum scenario set, but the first explicit `usage_symbols` are only attached to the Java and Go corpus entries.
+  Rationale: the user explicitly called out usages as high-value and regression-prone, so the scenario should be mandatory overall. Starting with Java and Go keeps the first runtime slice anchored to symbols that are likely to remain stable while the harness is still being built.
+  Date/Author: 2026-06-04 / Codex + user
+
 ## Outcomes & Retrospective
 
-Milestone 1 is now implemented. The repository contains a real manifest schema, a checked-in pinned corpus draft, and tests that fail when language coverage, minimum scenario coverage, or required probe inputs drift. The remaining work is runtime and operations work: the benchmark binary, repo-cache orchestration, MCP subprocess session, JSON reporting/comparison, and the scheduled GitHub workflow.
+Milestone 1 is implemented, and Milestone 2 is started. The repository now has a real manifest schema, a checked-in pinned corpus draft, tests that fail when language coverage, minimum scenario coverage, or required probe inputs drift, and a first user-facing `bifrost_benchmark validate` command. The remaining work is the rest of the runtime and operations path: repo-cache orchestration, the MCP subprocess session, benchmark execution/reporting, comparison logic, and the scheduled GitHub workflow.
 
 ## Context and Orientation
 
@@ -299,4 +308,4 @@ In `src/benchmark/runner.rs`, define a runner entrypoint similar to:
 
 In `src/bin/bifrost_benchmark.rs`, provide the thin CLI wrapper that parses arguments, calls `validate`, `run`, or `compare`, prints a concise human summary, and writes JSON files.
 
-Revision note: initial ExecPlan draft created on 2026-06-04 after reading issue `#170`, local planning rules, current analyzer/MCP code, existing workflows, and sibling Brokk/SlopCop benchmark precedents. Updated later on 2026-06-04 after implementing Milestone 1 so the progress log, discoveries, decisions, and retrospective reflect the checked-in manifest layer and pinned corpus draft.
+Revision note: initial ExecPlan draft created on 2026-06-04 after reading issue `#170`, local planning rules, current analyzer/MCP code, existing workflows, and sibling Brokk/SlopCop benchmark precedents. Updated later on 2026-06-04 after implementing Milestone 1 and the first Milestone 2 slice so the progress log, discoveries, decisions, and retrospective reflect the checked-in manifest layer, `scan_usages` additions, and the new `bifrost_benchmark validate` entrypoint.

@@ -20,6 +20,7 @@ required_scenarios = [
   "get_symbol_locations",
   "get_summaries",
   "most_relevant_files",
+  "scan_usages",
 ]
 
 [[repos]]
@@ -34,11 +35,13 @@ scenarios = [
   "get_symbol_locations",
   "get_summaries",
   "most_relevant_files",
+  "scan_usages",
 ]
 search_patterns = ["Gson"]
 location_symbols = ["Gson.fromJson"]
 summary_targets = ["gson/src/main/java/com/google/gson/Gson.java"]
 seed_file_paths = ["gson/src/main/java/com/google/gson/Gson.java"]
+usage_symbols = ["Gson.fromJson"]
 
 [[repos]]
 name = "gin-go"
@@ -52,11 +55,13 @@ scenarios = [
   "get_symbol_locations",
   "get_summaries",
   "most_relevant_files",
+  "scan_usages",
 ]
 search_patterns = ["Engine"]
 location_symbols = ["gin.New"]
 summary_targets = ["gin.go"]
 seed_file_paths = ["gin.go"]
+usage_symbols = ["gin.New"]
 
 [[repos]]
 name = "fmt-cpp"

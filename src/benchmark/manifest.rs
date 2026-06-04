@@ -166,15 +166,18 @@ pub enum BenchmarkScenario {
     GetSummaries,
     #[serde(rename = "most_relevant_files")]
     MostRelevantFiles,
+    #[serde(rename = "scan_usages")]
+    ScanUsages,
 }
 
 impl BenchmarkScenario {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::WorkspaceBuild,
         Self::SearchSymbols,
         Self::GetSymbolLocations,
         Self::GetSummaries,
         Self::MostRelevantFiles,
+        Self::ScanUsages,
     ];
 
     pub fn label(self) -> &'static str {
@@ -184,6 +187,7 @@ impl BenchmarkScenario {
             Self::GetSymbolLocations => "get_symbol_locations",
             Self::GetSummaries => "get_summaries",
             Self::MostRelevantFiles => "most_relevant_files",
+            Self::ScanUsages => "scan_usages",
         }
     }
 }
@@ -284,6 +288,20 @@ impl BenchmarkManifest {
             Err(ManifestValidationError::new(errors))
         }
     }
+
+    pub fn covered_languages(&self) -> BTreeSet<ManifestLanguage> {
+        self.repos
+            .iter()
+            .flat_map(BenchmarkRepoTarget::language_set)
+            .collect()
+    }
+
+    pub fn covered_scenarios(&self) -> BTreeSet<BenchmarkScenario> {
+        self.repos
+            .iter()
+            .flat_map(BenchmarkRepoTarget::scenario_set)
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -303,6 +321,8 @@ pub struct BenchmarkRepoTarget {
     pub summary_targets: Vec<String>,
     #[serde(default)]
     pub seed_file_paths: Vec<String>,
+    #[serde(default)]
+    pub usage_symbols: Vec<String>,
 }
 
 impl BenchmarkRepoTarget {
@@ -392,6 +412,14 @@ impl BenchmarkRepoTarget {
         {
             errors.push(format!(
                 "repo `{name}` enables `most_relevant_files` but does not define seed_file_paths"
+            ));
+        }
+
+        if scenarios.contains(&BenchmarkScenario::ScanUsages)
+            && !has_non_blank_values(&self.usage_symbols)
+        {
+            errors.push(format!(
+                "repo `{name}` enables `scan_usages` but does not define usage_symbols"
             ));
         }
     }

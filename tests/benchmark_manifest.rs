@@ -87,6 +87,13 @@ scenarios = ["workspace_build", "search_symbols", "get_symbol_locations", "get_s
             .any(|message| message.contains("most_relevant_files")),
         "{validation}"
     );
+    assert!(
+        validation
+            .messages()
+            .iter()
+            .any(|message| message.contains("scan_usages")),
+        "{validation}"
+    );
 }
 
 #[test]

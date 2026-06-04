@@ -11,6 +11,14 @@ The manifest is intentionally explicit. Each repo entry carries:
 - the enabled benchmark scenarios
 - the deterministic probe inputs those scenarios need
 
+Current probe-input fields are:
+
+- `search_patterns` for `search_symbols`
+- `location_symbols` for `get_symbol_locations`
+- `summary_targets` for `get_summaries`
+- `seed_file_paths` for `most_relevant_files`
+- `usage_symbols` for `scan_usages`
+
 Milestone 1 validation fails when any of these drift:
 
 - the union of repo languages no longer covers every supported analyzer language from `README.md`
