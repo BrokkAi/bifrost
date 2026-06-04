@@ -9,5 +9,8 @@ pub use manifest::{
     BenchmarkManifest, BenchmarkRepoTarget, BenchmarkScenario, ManifestLanguage, ManifestLoadError,
     ManifestValidationError,
 };
-pub use report::{BenchmarkRepoReport, BenchmarkRunReport, ScenarioReport, ScenarioTransport};
+pub use report::{
+    BenchmarkCompareReport, BenchmarkRepoReport, BenchmarkRunReport, CompareThresholds,
+    ScenarioCompareOutcome, ScenarioCompareReport, ScenarioReport, ScenarioTransport,
+};
 pub use runner::{RunRequest, run_benchmark};

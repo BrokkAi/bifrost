@@ -39,7 +39,7 @@ The important checked-in files in this directory are:
 
 - `targets.toml`: pinned corpus, per-repo probes, and default local paths
 - `README.md`: operator documentation for the harness and the planned daily workflow
-- `baselines/`: intended home for blessed compare targets once `compare` lands
+- `baselines/`: blessed compare targets and promotion notes for the scheduled workflow
 
 ## Local Use
 
@@ -66,6 +66,17 @@ cargo run --bin bifrost_benchmark -- run \
 
 That mode creates a deterministic subset workspace under the benchmark repo cache, pins the manifest's explicit probe files first, and preserves `.git` metadata so `most_relevant_files` keeps its git-churn relevance signal. It is intended for smoke-checking the harness itself, not for baseline-quality timing comparisons.
 
+Compare a candidate report against the blessed baseline:
+
+```bash
+cargo run --bin bifrost_benchmark -- compare \
+  --baseline benchmark/baselines/ubuntu-latest.json \
+  --candidate benchmark/benchmark-output/run-20260604T130836Z.json \
+  --output benchmark/benchmark-output/compare-local.json
+```
+
+Add `--strict` when you want the command to exit nonzero on regressions instead of only writing the compare JSON and human summary.
+
 ## Daily Harness Shape
 
 The intended daily workflow contract is:
@@ -73,13 +84,20 @@ The intended daily workflow contract is:
 1. Run `bifrost_benchmark validate` against the checked-in manifest.
 2. Run `bifrost_benchmark run` against the same manifest on `ubuntu-latest`.
 3. Upload the JSON report artifact from `benchmark/benchmark-output`.
-4. Compare that report against a blessed baseline once `compare` is implemented.
+4. Compare that report against `benchmark/baselines/ubuntu-latest.json` when that blessed baseline exists.
 5. Publish a short human-readable summary, with optional Slack notification, after the compare step.
 
 The harness already guarantees two useful operator properties for that workflow:
 
 - cached repos can be reused offline once the pinned commit is present locally
 - failed scenarios still produce a written report before the CLI exits nonzero
+
+The checked-in GitHub Actions workflow lives at `.github/workflows/benchmark.yml`.
+
+- Scheduled runs always validate and run the harness on `ubuntu-latest`.
+- Manual runs can optionally scope to one manifest repo and/or `--max-files`.
+- Compare runs are strict only when `workflow_dispatch` sets `strict_compare = true`.
+- If `benchmark/baselines/ubuntu-latest.json` is not present yet, the workflow uploads the run artifact and records that compare was skipped.
 
 ## Configuration Surface
 

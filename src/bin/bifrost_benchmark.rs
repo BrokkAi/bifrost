@@ -1,8 +1,9 @@
 use brokk_bifrost::benchmark::{
-    BenchmarkManifest, BenchmarkRunReport, BenchmarkScenario, ManifestLanguage, RunRequest,
-    run_benchmark,
+    BenchmarkCompareReport, BenchmarkManifest, BenchmarkRunReport, BenchmarkScenario,
+    ManifestLanguage, RunRequest, run_benchmark,
 };
 use chrono::Utc;
+use serde::Serialize;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -90,6 +91,46 @@ fn run() -> Result<(), String> {
             }
             run_manifest(manifest_path, selected_repo, output_dir, max_files)
         }
+        "compare" => {
+            let mut baseline_path = None;
+            let mut candidate_path = None;
+            let mut output_path = None;
+            let mut strict = false;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--baseline" => {
+                        baseline_path = Some(PathBuf::from(
+                            args.next()
+                                .ok_or_else(|| "--baseline requires a path".to_string())?,
+                        ));
+                    }
+                    "--candidate" => {
+                        candidate_path = Some(PathBuf::from(
+                            args.next()
+                                .ok_or_else(|| "--candidate requires a path".to_string())?,
+                        ));
+                    }
+                    "--output" => {
+                        output_path =
+                            Some(PathBuf::from(args.next().ok_or_else(|| {
+                                "--output requires a file path".to_string()
+                            })?));
+                    }
+                    "--strict" => strict = true,
+                    "--help" | "-h" => {
+                        print_compare_help();
+                        return Ok(());
+                    }
+                    other => return Err(format!("unknown compare argument: {other}")),
+                }
+            }
+            compare_reports(
+                baseline_path.ok_or_else(|| "--baseline is required".to_string())?,
+                candidate_path.ok_or_else(|| "--candidate is required".to_string())?,
+                output_path,
+                strict,
+            )
+        }
         "--help" | "-h" => {
             print_help();
             Ok(())
@@ -164,6 +205,33 @@ fn run_manifest(
     Ok(())
 }
 
+fn compare_reports(
+    baseline_path: PathBuf,
+    candidate_path: PathBuf,
+    output_path: Option<PathBuf>,
+    strict: bool,
+) -> Result<(), String> {
+    let baseline = load_report(&baseline_path)?;
+    let candidate = load_report(&candidate_path)?;
+    let comparison = BenchmarkCompareReport::from_reports(&baseline, &candidate);
+
+    if let Some(path) = output_path {
+        write_json(&comparison, &path, "compare report")?;
+        println!("wrote {}", path.display());
+    }
+
+    print_compare_summary(&comparison);
+
+    if strict && comparison.has_regressions {
+        return Err(format!(
+            "benchmark compare recorded {} regression(s)",
+            comparison.regression_count
+        ));
+    }
+
+    Ok(())
+}
+
 fn manifest_root(manifest_path: &Path) -> Result<PathBuf, String> {
     let absolute = if manifest_path.is_absolute() {
         manifest_path.to_path_buf()
@@ -187,10 +255,21 @@ fn resolve_from_manifest_root(manifest_root: &Path, path: &Path) -> PathBuf {
 }
 
 fn write_report(report: &BenchmarkRunReport, report_path: &Path) -> Result<(), String> {
-    let json = serde_json::to_string_pretty(report)
-        .map_err(|err| format!("failed to serialize report: {err}"))?;
-    std::fs::write(report_path, json)
-        .map_err(|err| format!("failed to write report `{}`: {err}", report_path.display()))
+    write_json(report, report_path, "report")
+}
+
+fn write_json<T: Serialize>(value: &T, path: &Path, label: &str) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(value)
+        .map_err(|err| format!("failed to serialize {label}: {err}"))?;
+    std::fs::write(path, json)
+        .map_err(|err| format!("failed to write {label} `{}`: {err}", path.display()))
+}
+
+fn load_report(path: &Path) -> Result<BenchmarkRunReport, String> {
+    let json = std::fs::read_to_string(path)
+        .map_err(|err| format!("failed to read report `{}`: {err}", path.display()))?;
+    serde_json::from_str(&json)
+        .map_err(|err| format!("failed to parse report `{}`: {err}", path.display()))
 }
 
 fn print_run_summary(report: &BenchmarkRunReport, report_path: &Path) {
@@ -228,11 +307,72 @@ fn print_run_summary(report: &BenchmarkRunReport, report_path: &Path) {
     println!("wrote {}", report_path.display());
 }
 
+fn print_compare_summary(report: &BenchmarkCompareReport) {
+    if report.has_regressions {
+        println!("regressions detected: {}", report.regression_count);
+    } else {
+        println!("no regressions over threshold");
+    }
+    println!("compared {} scenarios", report.compared_scenarios_count);
+    println!(
+        "threshold: {:.1}% and {:.1} ms absolute floor",
+        report.thresholds.relative_pct, report.thresholds.absolute_ms
+    );
+    if report.improvement_count > 0 {
+        println!("improvements: {}", report.improvement_count);
+    }
+    if report.missing_candidate_count > 0 {
+        println!(
+            "missing candidate scenarios: {}",
+            report.missing_candidate_count
+        );
+    }
+    if report.new_candidate_count > 0 {
+        println!("new candidate scenarios: {}", report.new_candidate_count);
+    }
+
+    for scenario in &report.scenarios {
+        if matches!(
+            scenario.outcome,
+            brokk_bifrost::benchmark::ScenarioCompareOutcome::Unchanged
+        ) {
+            continue;
+        }
+        let detail = scenario.detail.as_deref().unwrap_or("state changed");
+        match scenario.delta_ms {
+            Some(delta_ms) => match scenario.delta_pct {
+                Some(delta_pct) => println!(
+                    "  {} {} {:?}: {:?} delta={delta_ms:.1} ms ({delta_pct:.1}%)",
+                    scenario.repo_name,
+                    scenario.scenario.label(),
+                    scenario.transport,
+                    scenario.outcome
+                ),
+                None => println!(
+                    "  {} {} {:?}: {:?} delta={delta_ms:.1} ms",
+                    scenario.repo_name,
+                    scenario.scenario.label(),
+                    scenario.transport,
+                    scenario.outcome
+                ),
+            },
+            None => println!(
+                "  {} {} {:?}: {:?} ({detail})",
+                scenario.repo_name,
+                scenario.scenario.label(),
+                scenario.transport,
+                scenario.outcome
+            ),
+        }
+    }
+}
+
 fn print_help() {
     println!("Usage: bifrost_benchmark <subcommand> [options]");
     println!("Subcommands:");
     println!("  validate [--manifest PATH]");
     println!("  run [--manifest PATH] [--repo NAME] [--output DIR] [--max-files N]");
+    println!("  compare --baseline PATH --candidate PATH [--output PATH] [--strict]");
 }
 
 fn print_validate_help() {
@@ -242,5 +382,11 @@ fn print_validate_help() {
 fn print_run_help() {
     println!(
         "Usage: bifrost_benchmark run [--manifest PATH] [--repo NAME] [--output DIR] [--max-files N]"
+    );
+}
+
+fn print_compare_help() {
+    println!(
+        "Usage: bifrost_benchmark compare --baseline PATH --candidate PATH [--output PATH] [--strict]"
     );
 }

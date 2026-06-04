@@ -33,7 +33,8 @@ After this change, `bifrost` will have its own lightweight benchmark harness for
 - [x] (2026-06-04T13:17Z) Implemented per-scenario failure aggregation in the runner and CLI. Failed direct or MCP scenarios now produce structured `ScenarioReport` failures with `failure_message`, later scenarios continue to run, and `bifrost_benchmark run` exits nonzero only after writing the JSON report.
 - [x] (2026-06-04T13:18Z) Added a regression test that forces `get_symbol_locations` to fail while `scan_usages` still succeeds later in the same repo run, and verified the new reporting path on real subset runs for `ky-ts` and `fastroute-php` where `most_relevant_files` still fails under `--max-files 100`.
 - [x] (2026-06-04T13:24Z) Improved subset workspaces for `most_relevant_files` by preserving `.git` metadata inside the copied subset root. The subset-mode regression tests now include a successful `most_relevant_files` case, and real `--max-files 100` runs on `ky-ts` and `fastroute-php` now pass all configured scenarios.
-- [ ] Add richer per-scenario failure reporting, baseline comparison, and the scheduled workflow described below.
+- [x] (2026-06-04T14:20Z) Added baseline comparison support to `bifrost_benchmark`. The CLI now supports `compare --baseline ... --candidate ... [--output ...] [--strict]`, the report layer emits structured compare JSON, and tests now lock down unchanged scenarios, below-threshold slowdowns, above-threshold regressions, and pass/fail transitions.
+- [x] (2026-06-04T14:28Z) Added `.github/workflows/benchmark.yml` as the dedicated daily/manual benchmark workflow on `ubuntu-latest`. It validates the manifest, runs the harness, uploads JSON artifacts, compares against `benchmark/baselines/ubuntu-latest.json` when that file exists, and supports a manual `strict_compare` gate without making the first scheduled runs depend on a yet-to-be-promoted baseline.
 
 ## Surprises & Discoveries
 
@@ -78,6 +79,9 @@ After this change, `bifrost` will have its own lightweight benchmark harness for
 
 - Observation: the key missing signal in subset mode was git history, not only source-file choice.
   Evidence: `ky-ts` and `fastroute-php` each fit within the 100-file source budget already, yet `most_relevant_files` still returned nothing until the subset workspace included `.git` metadata. After preserving `.git`, the same 100-file subset runs returned meaningful related files and passed end-to-end.
+
+- Observation: the workflow needs to remain useful before the first blessed Ubuntu baseline is checked in.
+  Evidence: the compare logic is now implemented locally, but the repository still has no reviewed `benchmark/baselines/ubuntu-latest.json` artifact. The workflow therefore uploads the run artifact unconditionally, skips compare cleanly when that file is absent, and documents the promotion path in `benchmark/baselines/README.md`.
 
 ## Decision Log
 
