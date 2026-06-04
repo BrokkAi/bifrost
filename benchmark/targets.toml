@@ -1,0 +1,187 @@
+warmup_iterations = 1
+measured_iterations = 3
+output_dir = "benchmark-output"
+repo_cache_dir = "target/benchmark-repos"
+required_languages = [
+  "java",
+  "go",
+  "cpp",
+  "javascript",
+  "typescript",
+  "python",
+  "rust",
+  "php",
+  "scala",
+  "csharp",
+]
+required_scenarios = [
+  "workspace_build",
+  "search_symbols",
+  "get_symbol_locations",
+  "get_summaries",
+  "most_relevant_files",
+]
+
+[[repos]]
+name = "google-gson"
+url = "https://github.com/google/gson"
+commit = "ed2397502708ebaba53643e5c3d60e0974d7045f"
+languages = ["java"]
+extensions = ["java"]
+scenarios = [
+  "workspace_build",
+  "search_symbols",
+  "get_symbol_locations",
+  "get_summaries",
+  "most_relevant_files",
+]
+search_patterns = ["Gson"]
+location_symbols = ["Gson.fromJson"]
+summary_targets = ["gson/src/main/java/com/google/gson/Gson.java"]
+seed_file_paths = ["gson/src/main/java/com/google/gson/Gson.java"]
+
+[[repos]]
+name = "gin-go"
+url = "https://github.com/gin-gonic/gin"
+commit = "d75fcd4c9ab260e5225de590f1f0f8c0e0e12d11"
+languages = ["go"]
+extensions = ["go"]
+scenarios = [
+  "workspace_build",
+  "search_symbols",
+  "get_symbol_locations",
+  "get_summaries",
+  "most_relevant_files",
+]
+search_patterns = ["Engine"]
+location_symbols = ["gin.New"]
+summary_targets = ["gin.go"]
+seed_file_paths = ["gin.go"]
+
+[[repos]]
+name = "fmt-cpp"
+url = "https://github.com/fmtlib/fmt"
+commit = "9afcd929ba675d942371de8ca1832f9d5d09b4bd"
+languages = ["cpp"]
+extensions = ["h", "hpp", "cc", "cpp"]
+scenarios = [
+  "workspace_build",
+  "search_symbols",
+  "get_summaries",
+  "most_relevant_files",
+]
+search_patterns = ["format"]
+summary_targets = ["include/fmt/format.h"]
+seed_file_paths = ["include/fmt/format.h"]
+
+[[repos]]
+name = "express-js"
+url = "https://github.com/expressjs/express"
+commit = "dae209ae6559c29cfca2a1f4414c51d89ea643d5"
+languages = ["javascript"]
+extensions = ["js"]
+scenarios = [
+  "workspace_build",
+  "search_symbols",
+  "get_summaries",
+  "most_relevant_files",
+]
+search_patterns = ["listen"]
+summary_targets = ["lib/application.js"]
+seed_file_paths = ["lib/application.js"]
+
+[[repos]]
+name = "ky-ts"
+url = "https://github.com/sindresorhus/ky"
+commit = "61d6d66d27911001b9b4d57ab93139f9ad61384b"
+languages = ["typescript"]
+extensions = ["ts"]
+scenarios = [
+  "workspace_build",
+  "search_symbols",
+  "get_summaries",
+  "most_relevant_files",
+]
+search_patterns = ["Ky"]
+summary_targets = ["source/core/Ky.ts"]
+seed_file_paths = ["source/core/Ky.ts"]
+
+[[repos]]
+name = "click-py"
+url = "https://github.com/pallets/click"
+commit = "c48021040a50c659b74e24ac2b11c9c9c6620a21"
+languages = ["python"]
+extensions = ["py"]
+scenarios = [
+  "workspace_build",
+  "search_symbols",
+  "get_summaries",
+  "most_relevant_files",
+]
+search_patterns = ["Command"]
+summary_targets = ["src/click/core.py"]
+seed_file_paths = ["src/click/core.py"]
+
+[[repos]]
+name = "serde-json-rs"
+url = "https://github.com/serde-rs/json"
+commit = "a1ae73ac6a6940a4a57c673aebaa13ed4dfe3e8c"
+languages = ["rust"]
+extensions = ["rs"]
+scenarios = [
+  "workspace_build",
+  "search_symbols",
+  "get_summaries",
+  "most_relevant_files",
+]
+search_patterns = ["Value"]
+summary_targets = ["src/value/mod.rs"]
+seed_file_paths = ["src/value/mod.rs"]
+
+[[repos]]
+name = "fastroute-php"
+url = "https://github.com/nikic/FastRoute"
+commit = "1c961398bef1ff6ecd8b273bef651d7afe90312b"
+languages = ["php"]
+extensions = ["php"]
+scenarios = [
+  "workspace_build",
+  "search_symbols",
+  "get_summaries",
+  "most_relevant_files",
+]
+search_patterns = ["RouteCollector"]
+summary_targets = ["src/RouteCollector.php"]
+seed_file_paths = ["src/RouteCollector.php"]
+
+[[repos]]
+name = "scala-xml"
+url = "https://github.com/scala/scala-xml"
+commit = "5af150b1a68c61f8e39221535e8fcd291ba644d9"
+languages = ["scala"]
+extensions = ["scala"]
+scenarios = [
+  "workspace_build",
+  "search_symbols",
+  "get_summaries",
+  "most_relevant_files",
+]
+search_patterns = ["Elem"]
+summary_targets = ["shared/src/main/scala/scala/xml/Elem.scala"]
+seed_file_paths = ["shared/src/main/scala/scala/xml/Elem.scala"]
+
+[[repos]]
+name = "dapper-csharp"
+url = "https://github.com/DapperLib/Dapper"
+commit = "72a54c475f75e18cb93cba0809d00a5e6e49efd9"
+languages = ["csharp"]
+extensions = ["cs"]
+scenarios = [
+  "workspace_build",
+  "search_symbols",
+  "get_summaries",
+  "most_relevant_files",
+]
+search_patterns = ["SqlMapper"]
+summary_targets = ["Dapper/SqlMapper.cs"]
+seed_file_paths = ["Dapper/SqlMapper.cs"]
