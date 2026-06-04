@@ -11,4 +11,5 @@ bifrost_searchtools/*.so
 !**/.brokk/style.md
 !**/.brokk/project.properties
 
+.mjolnir
 .idea
