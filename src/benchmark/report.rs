@@ -65,6 +65,28 @@ impl ScenarioReport {
     }
 }
 
+impl BenchmarkRunReport {
+    pub fn failed_scenarios_count(&self) -> usize {
+        self.repos
+            .iter()
+            .map(BenchmarkRepoReport::failed_scenarios_count)
+            .sum()
+    }
+
+    pub fn has_failures(&self) -> bool {
+        self.failed_scenarios_count() > 0
+    }
+}
+
+impl BenchmarkRepoReport {
+    pub fn failed_scenarios_count(&self) -> usize {
+        self.scenarios
+            .iter()
+            .filter(|scenario| !scenario.success)
+            .count()
+    }
+}
+
 fn mean_ms(values: &[f64]) -> Option<f64> {
     (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
 }

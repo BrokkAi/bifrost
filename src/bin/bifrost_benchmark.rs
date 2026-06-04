@@ -154,6 +154,13 @@ fn run_manifest(
     let report_path = output_dir.join(format!("run-{}.json", Utc::now().format("%Y%m%dT%H%M%SZ")));
     write_report(&report, &report_path)?;
     print_run_summary(&report, &report_path);
+    if report.has_failures() {
+        return Err(format!(
+            "benchmark run recorded {} failed scenario(s); report: {}",
+            report.failed_scenarios_count(),
+            report_path.display()
+        ));
+    }
     Ok(())
 }
 

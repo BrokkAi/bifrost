@@ -30,6 +30,8 @@ After this change, `bifrost` will have its own lightweight benchmark harness for
 - [x] (2026-06-04T13:18Z) Hardened repo cache reuse in `src/benchmark/repo_cache.rs` so a run skips `git fetch` when the pinned commit is already present locally. Added `tests/benchmark_repo_cache.rs` to lock down this offline cached-run behavior.
 - [x] (2026-06-04T13:30Z) Expanded the checked-in MCP probe set with runtime-validated `location_symbols` on every corpus repo and `usage_symbols` on Java, Go, JavaScript, TypeScript, Python, PHP, Scala, and C#. Direct MCP validation confirmed these symbols resolve and produce non-empty usage results on the pinned commits.
 - [x] (2026-06-04T13:31Z) Verified the expanded probes through real subset harness runs on `fmt-cpp`, `express-js`, `click-py`, and `serde-json-rs`, and through direct per-scenario MCP validation on the remaining updated repos. This also exposed that some repos, notably `ky-ts` and `fastroute-php`, still need denser subset selection for `most_relevant_files` at `--max-files 100`.
+- [x] (2026-06-04T13:17Z) Implemented per-scenario failure aggregation in the runner and CLI. Failed direct or MCP scenarios now produce structured `ScenarioReport` failures with `failure_message`, later scenarios continue to run, and `bifrost_benchmark run` exits nonzero only after writing the JSON report.
+- [x] (2026-06-04T13:18Z) Added a regression test that forces `get_symbol_locations` to fail while `scan_usages` still succeeds later in the same repo run, and verified the new reporting path on real subset runs for `ky-ts` and `fastroute-php` where `most_relevant_files` still fails under `--max-files 100`.
 - [ ] Add richer per-scenario failure reporting, baseline comparison, and the scheduled workflow described below.
 
 ## Surprises & Discoveries
@@ -69,6 +71,9 @@ After this change, `bifrost` will have its own lightweight benchmark harness for
 
 - Observation: full-repo MCP validity and `--max-files 100` subset validity are different bars, especially for `most_relevant_files`.
   Evidence: direct MCP validation on the pinned repos confirmed the new location/usages probes for JavaScript, TypeScript, Python, PHP, Scala, and C#, while subset harness runs still showed `most_relevant_files` going empty on `ky-ts` and `fastroute-php` under a 100-file trimmed workspace.
+
+- Observation: the harness needed failure aggregation before more subset tuning, because otherwise the first weak scenario hid the rest of the repo's usable signal.
+  Evidence: before this milestone, `bifrost_benchmark run --repo ky-ts --max-files 100` and `--repo fastroute-php --max-files 100` aborted immediately on `most_relevant_files`. After the runner change, both runs now write full reports, record `most_relevant_files` as failed, and still execute the later `scan_usages` scenario successfully.
 
 ## Decision Log
 
@@ -124,11 +129,15 @@ After this change, `bifrost` will have its own lightweight benchmark harness for
   Rationale: exact fully qualified symbol spelling varies materially by language and analyzer. Probes chosen only from grep are too fragile. The current milestone therefore promotes location coverage across all corpus repos, usage coverage across the repos with proven non-empty hits, and leaves subset-tuning for `most_relevant_files` as a follow-up seam instead of pretending every repo is equally subset-friendly.
   Date/Author: 2026-06-04 / Codex
 
+- Decision: `bifrost_benchmark run` should return a nonzero exit code when any scenario fails, but only after writing the JSON report and printing the per-scenario summary.
+  Rationale: CI and scheduled workflows need a failure signal, but operators also need the artifact and the surviving scenario timings from the same run. Recording structured failures first and exiting afterward preserves both.
+  Date/Author: 2026-06-04 / Codex
+
 ## Outcomes & Retrospective
 
 Milestone 1 is implemented, and Milestone 2 now has a real execution path. The repository now has a manifest schema, a checked-in pinned corpus draft, a `bifrost_benchmark validate` command, a `bifrost_benchmark run` command, repo-cache preparation, a production MCP subprocess client, JSON report output, and a local end-to-end runtime test that covers all six scenarios on a committed Java repo. The remaining work is to enrich failure aggregation, add baseline comparison, broaden runtime coverage across more corpus entries, and wire the scheduled GitHub workflow.
 
-The current corpus now exercises `get_symbol_locations` on every pinned repo and exercises `scan_usages` on most of them, using symbols validated against the real MCP server on the pinned commits. The remaining practical gap is not raw MCP wiring; it is fast-path robustness. Full-repo probes are in much better shape than the `--max-files 100` subset path for `most_relevant_files` on some repos, so the next milestone should focus on per-scenario failure aggregation plus better subset selection or scenario-aware subset expectations.
+The current corpus now exercises `get_symbol_locations` on every pinned repo and exercises `scan_usages` on most of them, using symbols validated against the real MCP server on the pinned commits. Per-scenario failure aggregation is now in place, so weak subset scenarios no longer erase the rest of a repo run. The remaining practical gap is fast-path robustness: full-repo probes are in much better shape than the `--max-files 100` subset path for `most_relevant_files` on some repos, so the next milestone should focus on compare/baseline support plus either better subset selection or scenario-aware subset expectations.
 
 ## Context and Orientation
 

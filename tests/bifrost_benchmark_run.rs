@@ -196,6 +196,98 @@ usage_symbols = ["A.method2"]
     }
 }
 
+#[test]
+fn run_subcommand_writes_failure_report_without_aborting_following_scenarios() {
+    let temp = TempDir::new().expect("temp dir");
+    let repo_root = temp.path().join("fixture-repo");
+    copy_dir_recursively(&fixture_root(), &repo_root).expect("copy fixture repo");
+    init_git_repo(&repo_root);
+
+    let manifest_dir = temp.path().join("manifest");
+    fs::create_dir_all(&manifest_dir).expect("manifest dir");
+    let manifest_path = manifest_dir.join("benchmark.toml");
+    fs::write(
+        &manifest_path,
+        format!(
+            r#"
+warmup_iterations = 1
+measured_iterations = 1
+output_dir = "out"
+repo_cache_dir = "cache"
+required_languages = ["java"]
+required_scenarios = [
+  "workspace_build",
+  "get_symbol_locations",
+  "scan_usages",
+]
+
+[[repos]]
+name = "fixture-java"
+url = "{}"
+commit = "{}"
+languages = ["java"]
+extensions = ["java"]
+scenarios = [
+  "workspace_build",
+  "get_symbol_locations",
+  "scan_usages",
+]
+location_symbols = ["does.not.Exist"]
+usage_symbols = ["E.iMethod"]
+"#,
+            repo_root.display(),
+            head_commit(&repo_root)
+        ),
+    )
+    .expect("write manifest");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bifrost_benchmark"))
+        .arg("run")
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .env(
+            "BIFROST_BENCHMARK_BIFROST_BIN",
+            env!("CARGO_BIN_EXE_bifrost"),
+        )
+        .output()
+        .expect("run bifrost_benchmark");
+
+    assert!(
+        !output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let report_path = single_json_file(&manifest_dir.join("out"));
+    let report: Value =
+        serde_json::from_str(&fs::read_to_string(report_path).expect("read report"))
+            .expect("parse report");
+    let scenarios = report["repos"][0]["scenarios"]
+        .as_array()
+        .expect("scenario array");
+    assert_eq!(scenarios.len(), 3, "report: {report}");
+
+    let failing = scenarios
+        .iter()
+        .find(|scenario| scenario["name"] == "get_symbol_locations")
+        .expect("get_symbol_locations scenario");
+    assert_eq!(failing["success"], false, "report: {report}");
+    assert!(
+        failing["failure_message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("returned no locations"),
+        "report: {report}"
+    );
+
+    let surviving = scenarios
+        .iter()
+        .find(|scenario| scenario["name"] == "scan_usages")
+        .expect("scan_usages scenario");
+    assert_eq!(surviving["success"], true, "report: {report}");
+}
+
 fn fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")

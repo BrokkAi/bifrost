@@ -73,7 +73,7 @@ fn run_repo(
         .scenario_set()
         .contains(&BenchmarkScenario::WorkspaceBuild)
     {
-        scenario_reports.push(run_workspace_build(target, manifest, &workspace_path)?);
+        scenario_reports.push(run_workspace_build(target, manifest, &workspace_path));
     }
 
     let mcp_scenarios: Vec<_> = target
@@ -83,10 +83,35 @@ fn run_repo(
         .filter(|scenario| *scenario != BenchmarkScenario::WorkspaceBuild)
         .collect();
     if !mcp_scenarios.is_empty() {
-        let mut session = McpSession::start(&workspace_path)?;
-        session.initialize()?;
-        for scenario in mcp_scenarios {
-            scenario_reports.push(run_mcp_scenario(target, manifest, &mut session, scenario)?);
+        match McpSession::start(&workspace_path).and_then(|mut session| {
+            session.initialize()?;
+            Ok(session)
+        }) {
+            Ok(mut session) => {
+                for scenario in mcp_scenarios {
+                    scenario_reports.push(run_mcp_scenario(
+                        target,
+                        manifest,
+                        &mut session,
+                        scenario,
+                    ));
+                }
+            }
+            Err(err) => {
+                for scenario in mcp_scenarios {
+                    scenario_reports.push(ScenarioReport::from_timings(
+                        scenario,
+                        ScenarioTransport::Mcp,
+                        false,
+                        Vec::new(),
+                        Vec::new(),
+                        Some(format!(
+                            "failed to start MCP session for `{}`: {err}",
+                            target.name
+                        )),
+                    ));
+                }
+            }
         }
     }
 
@@ -105,7 +130,7 @@ fn run_workspace_build(
     target: &BenchmarkRepoTarget,
     manifest: &BenchmarkManifest,
     checkout_path: &Path,
-) -> Result<ScenarioReport, String> {
+) -> ScenarioReport {
     let mut warmup_durations_ms = Vec::with_capacity(manifest.warmup_iterations);
     let mut measured_durations_ms = Vec::with_capacity(manifest.measured_iterations);
     let selected_languages = target
@@ -115,21 +140,45 @@ fn run_workspace_build(
         .collect::<BTreeSet<_>>();
 
     for _ in 0..manifest.warmup_iterations {
-        warmup_durations_ms.push(measure_workspace_build(checkout_path, &selected_languages)?);
+        match measure_workspace_build(checkout_path, &selected_languages) {
+            Ok(duration) => warmup_durations_ms.push(duration),
+            Err(err) => {
+                return ScenarioReport::from_timings(
+                    BenchmarkScenario::WorkspaceBuild,
+                    ScenarioTransport::Direct,
+                    false,
+                    warmup_durations_ms,
+                    measured_durations_ms,
+                    Some(err),
+                );
+            }
+        }
     }
 
     for _ in 0..manifest.measured_iterations {
-        measured_durations_ms.push(measure_workspace_build(checkout_path, &selected_languages)?);
+        match measure_workspace_build(checkout_path, &selected_languages) {
+            Ok(duration) => measured_durations_ms.push(duration),
+            Err(err) => {
+                return ScenarioReport::from_timings(
+                    BenchmarkScenario::WorkspaceBuild,
+                    ScenarioTransport::Direct,
+                    false,
+                    warmup_durations_ms,
+                    measured_durations_ms,
+                    Some(err),
+                );
+            }
+        }
     }
 
-    Ok(ScenarioReport::from_timings(
+    ScenarioReport::from_timings(
         BenchmarkScenario::WorkspaceBuild,
         ScenarioTransport::Direct,
         true,
         warmup_durations_ms,
         measured_durations_ms,
         None,
-    ))
+    )
 }
 
 fn measure_workspace_build(
@@ -160,32 +209,58 @@ fn run_mcp_scenario(
     manifest: &BenchmarkManifest,
     session: &mut McpSession,
     scenario: BenchmarkScenario,
-) -> Result<ScenarioReport, String> {
+) -> ScenarioReport {
     let mut warmup_durations_ms = Vec::with_capacity(manifest.warmup_iterations);
     let mut measured_durations_ms = Vec::with_capacity(manifest.measured_iterations);
 
     for _ in 0..manifest.warmup_iterations {
         let start = Instant::now();
-        let result = session.call_tool(scenario.label(), tool_arguments(target, scenario))?;
-        assert_scenario_result(target, scenario, &result)?;
-        warmup_durations_ms.push(elapsed_ms(start));
+        let outcome = session
+            .call_tool(scenario.label(), tool_arguments(target, scenario))
+            .and_then(|result| assert_scenario_result(target, scenario, &result));
+        match outcome {
+            Ok(()) => warmup_durations_ms.push(elapsed_ms(start)),
+            Err(err) => {
+                return ScenarioReport::from_timings(
+                    scenario,
+                    ScenarioTransport::Mcp,
+                    false,
+                    warmup_durations_ms,
+                    measured_durations_ms,
+                    Some(err),
+                );
+            }
+        }
     }
 
     for _ in 0..manifest.measured_iterations {
         let start = Instant::now();
-        let result = session.call_tool(scenario.label(), tool_arguments(target, scenario))?;
-        assert_scenario_result(target, scenario, &result)?;
-        measured_durations_ms.push(elapsed_ms(start));
+        let outcome = session
+            .call_tool(scenario.label(), tool_arguments(target, scenario))
+            .and_then(|result| assert_scenario_result(target, scenario, &result));
+        match outcome {
+            Ok(()) => measured_durations_ms.push(elapsed_ms(start)),
+            Err(err) => {
+                return ScenarioReport::from_timings(
+                    scenario,
+                    ScenarioTransport::Mcp,
+                    false,
+                    warmup_durations_ms,
+                    measured_durations_ms,
+                    Some(err),
+                );
+            }
+        }
     }
 
-    Ok(ScenarioReport::from_timings(
+    ScenarioReport::from_timings(
         scenario,
         ScenarioTransport::Mcp,
         true,
         warmup_durations_ms,
         measured_durations_ms,
         None,
-    ))
+    )
 }
 
 fn tool_arguments(target: &BenchmarkRepoTarget, scenario: BenchmarkScenario) -> Value {
