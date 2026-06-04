@@ -109,6 +109,8 @@ pub fn prepare_subset_workspace(
         }
     }
 
+    copy_git_metadata(source_root, &subset_root)?;
+
     Ok(subset_root)
 }
 
@@ -205,6 +207,66 @@ fn copy_relative_file(
             source.display()
         )
     })?;
+    Ok(())
+}
+
+fn copy_git_metadata(source_root: &Path, subset_root: &Path) -> Result<(), String> {
+    let source_git = source_root.join(".git");
+    if source_git.is_dir() {
+        copy_directory_recursively(&source_git, &subset_root.join(".git"))?;
+    } else if source_git.is_file() {
+        let destination_git = subset_root.join(".git");
+        fs::copy(&source_git, &destination_git).map_err(|err| {
+            format!(
+                "failed to copy git metadata `{}` into subset workspace: {err}",
+                source_git.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn copy_directory_recursively(source: &Path, destination: &Path) -> Result<(), String> {
+    fs::create_dir_all(destination).map_err(|err| {
+        format!(
+            "failed to create copied directory `{}`: {err}",
+            destination.display()
+        )
+    })?;
+
+    for entry in fs::read_dir(source).map_err(|err| {
+        format!(
+            "failed to read directory `{}` for subset copy: {err}",
+            source.display()
+        )
+    })? {
+        let entry = entry.map_err(|err| {
+            format!(
+                "failed to read directory entry in `{}`: {err}",
+                source.display()
+            )
+        })?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let file_type = entry.file_type().map_err(|err| {
+            format!(
+                "failed to inspect `{}` for subset copy: {err}",
+                source_path.display()
+            )
+        })?;
+
+        if file_type.is_dir() {
+            copy_directory_recursively(&source_path, &destination_path)?;
+        } else {
+            fs::copy(&source_path, &destination_path).map_err(|err| {
+                format!(
+                    "failed to copy `{}` into subset workspace: {err}",
+                    source_path.display()
+                )
+            })?;
+        }
+    }
+
     Ok(())
 }
 

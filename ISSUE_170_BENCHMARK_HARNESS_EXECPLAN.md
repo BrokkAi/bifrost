@@ -32,6 +32,7 @@ After this change, `bifrost` will have its own lightweight benchmark harness for
 - [x] (2026-06-04T13:31Z) Verified the expanded probes through real subset harness runs on `fmt-cpp`, `express-js`, `click-py`, and `serde-json-rs`, and through direct per-scenario MCP validation on the remaining updated repos. This also exposed that some repos, notably `ky-ts` and `fastroute-php`, still need denser subset selection for `most_relevant_files` at `--max-files 100`.
 - [x] (2026-06-04T13:17Z) Implemented per-scenario failure aggregation in the runner and CLI. Failed direct or MCP scenarios now produce structured `ScenarioReport` failures with `failure_message`, later scenarios continue to run, and `bifrost_benchmark run` exits nonzero only after writing the JSON report.
 - [x] (2026-06-04T13:18Z) Added a regression test that forces `get_symbol_locations` to fail while `scan_usages` still succeeds later in the same repo run, and verified the new reporting path on real subset runs for `ky-ts` and `fastroute-php` where `most_relevant_files` still fails under `--max-files 100`.
+- [x] (2026-06-04T13:24Z) Improved subset workspaces for `most_relevant_files` by preserving `.git` metadata inside the copied subset root. The subset-mode regression tests now include a successful `most_relevant_files` case, and real `--max-files 100` runs on `ky-ts` and `fastroute-php` now pass all configured scenarios.
 - [ ] Add richer per-scenario failure reporting, baseline comparison, and the scheduled workflow described below.
 
 ## Surprises & Discoveries
@@ -74,6 +75,9 @@ After this change, `bifrost` will have its own lightweight benchmark harness for
 
 - Observation: the harness needed failure aggregation before more subset tuning, because otherwise the first weak scenario hid the rest of the repo's usable signal.
   Evidence: before this milestone, `bifrost_benchmark run --repo ky-ts --max-files 100` and `--repo fastroute-php --max-files 100` aborted immediately on `most_relevant_files`. After the runner change, both runs now write full reports, record `most_relevant_files` as failed, and still execute the later `scan_usages` scenario successfully.
+
+- Observation: the key missing signal in subset mode was git history, not only source-file choice.
+  Evidence: `ky-ts` and `fastroute-php` each fit within the 100-file source budget already, yet `most_relevant_files` still returned nothing until the subset workspace included `.git` metadata. After preserving `.git`, the same 100-file subset runs returned meaningful related files and passed end-to-end.
 
 ## Decision Log
 
@@ -133,11 +137,15 @@ After this change, `bifrost` will have its own lightweight benchmark harness for
   Rationale: CI and scheduled workflows need a failure signal, but operators also need the artifact and the surviving scenario timings from the same run. Recording structured failures first and exiting afterward preserves both.
   Date/Author: 2026-06-04 / Codex
 
+- Decision: subset workspaces should preserve repository git metadata, because `most_relevant_files` depends on commit-churn relevance in addition to import relationships.
+  Rationale: copying only the selected source files made the fast path unrepresentative for repos whose `most_relevant_files` results were primarily driven by recent related-file churn. Preserving `.git` inside the subset root restores that signal without abandoning the copied-workspace approach.
+  Date/Author: 2026-06-04 / Codex
+
 ## Outcomes & Retrospective
 
 Milestone 1 is implemented, and Milestone 2 now has a real execution path. The repository now has a manifest schema, a checked-in pinned corpus draft, a `bifrost_benchmark validate` command, a `bifrost_benchmark run` command, repo-cache preparation, a production MCP subprocess client, JSON report output, and a local end-to-end runtime test that covers all six scenarios on a committed Java repo. The remaining work is to enrich failure aggregation, add baseline comparison, broaden runtime coverage across more corpus entries, and wire the scheduled GitHub workflow.
 
-The current corpus now exercises `get_symbol_locations` on every pinned repo and exercises `scan_usages` on most of them, using symbols validated against the real MCP server on the pinned commits. Per-scenario failure aggregation is now in place, so weak subset scenarios no longer erase the rest of a repo run. The remaining practical gap is fast-path robustness: full-repo probes are in much better shape than the `--max-files 100` subset path for `most_relevant_files` on some repos, so the next milestone should focus on compare/baseline support plus either better subset selection or scenario-aware subset expectations.
+The current corpus now exercises `get_symbol_locations` on every pinned repo and exercises `scan_usages` on most of them, using symbols validated against the real MCP server on the pinned commits. Per-scenario failure aggregation is in place, and the 100-file fast path is materially more representative now that subset workspaces preserve git metadata for `most_relevant_files`. The next milestone should shift to compare/baseline support and the scheduled workflow, with any remaining subset tuning treated as follow-up polish rather than a prerequisite.
 
 ## Context and Orientation
 
