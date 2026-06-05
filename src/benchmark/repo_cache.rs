@@ -18,6 +18,7 @@ pub fn prepare_repo(
         run_git_command(
             Command::new("git")
                 .arg("clone")
+                .arg("--filter=blob:none")
                 .arg(&target.url)
                 .arg(&checkout_path),
             None,
@@ -29,6 +30,7 @@ pub fn prepare_repo(
                 .arg("-C")
                 .arg(&checkout_path)
                 .arg("fetch")
+                .arg("--filter=blob:none")
                 .arg("--all")
                 .arg("--tags"),
             None,
