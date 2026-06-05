@@ -234,6 +234,70 @@ impl Project for FilesystemProject {
     }
 }
 
+/// A [`Project`] backed by an explicit, fixed set of files rather than a
+/// directory walk. `bifrost --summarize` uses this to parse only the requested
+/// files instead of indexing the whole workspace: building a
+/// [`WorkspaceAnalyzer`](crate::WorkspaceAnalyzer) over it analyzes exactly
+/// these files and nothing else.
+#[derive(Debug, Clone)]
+pub struct FileSetProject {
+    root: PathBuf,
+    files: BTreeSet<ProjectFile>,
+    languages: BTreeSet<Language>,
+}
+
+impl FileSetProject {
+    /// Build a project rooted at `root` containing exactly the files at the
+    /// given project-relative paths. Analyzer languages are inferred from the
+    /// file extensions; files of unsupported types stay listed but contribute
+    /// no language (and so are never parsed).
+    pub fn new(root: impl Into<PathBuf>, rel_paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        let root = root.into();
+        let files: BTreeSet<ProjectFile> = rel_paths
+            .into_iter()
+            .map(|rel| ProjectFile::new(root.clone(), rel))
+            .collect();
+        let languages = files
+            .iter()
+            .map(language_for_file)
+            .filter(|language| *language != Language::None)
+            .collect();
+        Self {
+            root,
+            files,
+            languages,
+        }
+    }
+}
+
+impl Project for FileSetProject {
+    fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn analyzer_languages(&self) -> BTreeSet<Language> {
+        self.languages.clone()
+    }
+
+    fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>> {
+        Ok(self.files.clone())
+    }
+
+    fn analyzable_files(&self, language: Language) -> io::Result<BTreeSet<ProjectFile>> {
+        Ok(self
+            .files
+            .iter()
+            .filter(|file| language_for_file(file) == language)
+            .cloned()
+            .collect())
+    }
+
+    fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile> {
+        let file = ProjectFile::new(self.root.clone(), rel_path.to_path_buf());
+        self.files.contains(&file).then_some(file)
+    }
+}
+
 fn collect_project_files(root: &Path) -> io::Result<BTreeSet<ProjectFile>> {
     let mut files = BTreeSet::new();
     let walker = WalkBuilder::new(root)

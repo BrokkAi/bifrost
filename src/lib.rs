@@ -29,7 +29,7 @@ pub use analyzer::usages;
 pub use analyzer::{
     AnalyzerConfig, AnalyzerDelegate, CSharpAnalyzer, CapabilityProvider, CloneSmell,
     CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType, CppAnalyzer, DeclarationInfo,
-    DeclarationKind, EmptyAnalyzer, FilesystemProject, GoAnalyzer, IAnalyzer,
+    DeclarationKind, EmptyAnalyzer, FileSetProject, FilesystemProject, GoAnalyzer, IAnalyzer,
     ImportAnalysisProvider, ImportInfo, JavaAnalyzer, JavascriptAnalyzer, Language, MultiAnalyzer,
     OverlayProject, ParseError, ParseErrorKind, PhpAnalyzer, Project, ProjectFile, PythonAnalyzer,
     Range, RustAnalyzer, ScalaAnalyzer, SourceContent, TestAssertionSmell, TestAssertionWeights,

@@ -57,7 +57,8 @@ pub use php::{
     parse_php_use_aliases_from_source, php_namespace_to_fq,
 };
 pub use project::{
-    DEFAULT_MAX_OVERLAY_BYTES, FilesystemProject, OverlayProject, Project, TestProject,
+    DEFAULT_MAX_OVERLAY_BYTES, FileSetProject, FilesystemProject, OverlayProject, Project,
+    TestProject,
 };
 pub use python::PythonAnalyzer;
 pub use rust::RustAnalyzer;
