@@ -122,6 +122,7 @@ The webhook payload is benchmark-specific. The workflow sends these fields:
 - `error_text`
 - `workflow_run_url`
 - `head_sha_short`
+- `base_sha_short`
 - `event_name`
 - `repo_input`
 - `max_files_input`
@@ -147,8 +148,8 @@ The webhook payload is benchmark-specific. The workflow sends these fields:
 Slack-side setup:
 
 - update the Slack Workflow Builder message template to consume the benchmark payload above rather than the older Brokk perf-only fields
-- the existing shared fields `ok`, `error_text`, `workflow_run_url`, and `head_sha_short` can be reused directly
-- replace old perf-specific fields such as `base_sha_short`, `time_*`, `fps_*`, and `coarse_memory_ok` with benchmark-oriented summary content
+- the existing shared fields `ok`, `error_text`, `workflow_run_url`, `head_sha_short`, and `base_sha_short` can be reused directly
+- replace old perf-specific fields such as `time_*`, `fps_*`, and `coarse_memory_ok` with benchmark-oriented summary content
 - keep the current two-message shape if desired: a top-level run summary plus a threaded follow-up with benchmark-specific operator guidance
 - do not assume the old Brokk bisect guidance still applies unless the Slack-side thread text is intentionally updated for this workflow
 

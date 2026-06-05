@@ -176,10 +176,15 @@ jobs:
           compare_summary_path="${{ steps.paths.outputs.compare_summary_path }}"
 
           generated_at=""
+          base_sha_short=""
           selected_repo=""
           report_max_files="null"
           repo_count="0"
           failed_scenarios_count="0"
+          baseline_path="${{ steps.paths.outputs.baseline_path }}"
+          if [ -f "$baseline_path" ]; then
+            base_sha_short="$(jq -r '.bifrost_commit // ""' "$baseline_path" | cut -c1-7)"
+          fi
           if [ -n "$report_path" ] && [ -f "$report_path" ]; then
             generated_at="$(jq -r '.generated_at // ""' "$report_path")"
             selected_repo="$(jq -r '.selected_repo // ""' "$report_path")"
@@ -236,6 +241,7 @@ jobs:
               --arg error_text "$error_text" \
               --arg workflow_run_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
               --arg head_sha_short "$head_sha_short" \
+              --arg base_sha_short "$base_sha_short" \
               --arg event_name "${{ github.event_name }}" \
               --arg repo_input "${{ inputs.repo || '' }}" \
               --arg max_files_input "${{ inputs.max_files || '' }}" \
@@ -263,6 +269,7 @@ jobs:
                 error_text: $error_text,
                 workflow_run_url: $workflow_run_url,
                 head_sha_short: $head_sha_short,
+                base_sha_short: $base_sha_short,
                 event_name: $event_name,
                 repo_input: $repo_input,
                 max_files_input: $max_files_input,
