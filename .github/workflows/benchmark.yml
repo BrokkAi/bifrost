@@ -1,0 +1,164 @@
+name: Benchmark
+
+on:
+  schedule:
+    - cron: '17 9 * * *'
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: 'Optional repo name from benchmark/targets.toml'
+        required: false
+        type: string
+      max_files:
+        description: 'Optional subset limit for manual smoke runs'
+        required: false
+        type: string
+      strict_compare:
+        description: 'Fail the workflow if compare detects regressions'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Cache benchmark repos
+        uses: actions/cache@v4
+        with:
+          path: benchmark/.cache/repos
+          key: benchmark-repos-${{ runner.os }}-${{ hashFiles('benchmark/targets.toml') }}
+          restore-keys: |
+            benchmark-repos-${{ runner.os }}-
+
+      - name: Build benchmark binaries
+        run: cargo build --locked --bin bifrost --bin bifrost_benchmark
+
+      - name: Validate benchmark manifest
+        run: ./target/debug/bifrost_benchmark validate --manifest benchmark/targets.toml
+
+      - name: Run benchmark harness
+        id: run_benchmark
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark/benchmark-output
+          args=(run --manifest benchmark/targets.toml --output benchmark-output)
+          if [ -n "${{ inputs.repo || '' }}" ]; then
+            args+=(--repo "${{ inputs.repo }}")
+          fi
+          if [ -n "${{ inputs.max_files || '' }}" ]; then
+            args+=(--max-files "${{ inputs.max_files }}")
+          fi
+          BIFROST_BENCHMARK_BIFROST_BIN=./target/debug/bifrost \
+            ./target/debug/bifrost_benchmark "${args[@]}"
+
+      - name: Resolve benchmark paths
+        id: paths
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          report_path=""
+          if compgen -G "benchmark/benchmark-output/run-*.json" > /dev/null; then
+            report_path="$(ls -t benchmark/benchmark-output/run-*.json | head -n1)"
+          fi
+          echo "report_path=${report_path}" >> "$GITHUB_OUTPUT"
+          echo "baseline_path=benchmark/baselines/ubuntu-latest.json" >> "$GITHUB_OUTPUT"
+          echo "compare_path=benchmark/benchmark-output/compare-${GITHUB_RUN_ID}.json" >> "$GITHUB_OUTPUT"
+          echo "compare_summary_path=benchmark/benchmark-output/compare-summary.txt" >> "$GITHUB_OUTPUT"
+
+      - name: Compare against blessed baseline
+        id: compare
+        if: always() && steps.paths.outputs.report_path != '' && hashFiles('benchmark/baselines/ubuntu-latest.json') != ''
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(
+            compare
+            --baseline "${{ steps.paths.outputs.baseline_path }}"
+            --candidate "${{ steps.paths.outputs.report_path }}"
+            --output "${{ steps.paths.outputs.compare_path }}"
+          )
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.strict_compare }}" = "true" ]; then
+            args+=(--strict)
+          fi
+          ./target/debug/bifrost_benchmark "${args[@]}" | tee "${{ steps.paths.outputs.compare_summary_path }}"
+
+      - name: Note missing baseline
+        if: always() && steps.paths.outputs.report_path != '' && hashFiles('benchmark/baselines/ubuntu-latest.json') == ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "No blessed ubuntu-latest baseline is checked in yet."
+            echo "Promote a reviewed report artifact to benchmark/baselines/ubuntu-latest.json to enable compare."
+          } | tee "${{ steps.paths.outputs.compare_summary_path }}"
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-${{ github.run_id }}
+          path: benchmark/benchmark-output
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Publish benchmark summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "# Benchmark Harness"
+            echo
+            echo "- Run step: ${{ steps.run_benchmark.outcome }}"
+            if [ -n "${{ steps.paths.outputs.report_path }}" ]; then
+              echo "- Report: \`${{ steps.paths.outputs.report_path }}\`"
+            else
+              echo "- Report: none written"
+            fi
+            if [ -f "${{ steps.paths.outputs.compare_path }}" ]; then
+              echo "- Compare JSON: \`${{ steps.paths.outputs.compare_path }}\`"
+            fi
+            if [ -f "${{ steps.paths.outputs.compare_summary_path }}" ]; then
+              echo
+              echo "## Compare"
+              echo
+              cat "${{ steps.paths.outputs.compare_summary_path }}"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Enforce benchmark outcome
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.run_benchmark.outcome }}" != "success" ]; then
+            echo "benchmark run failed" >&2
+            exit 1
+          fi
+          if [ "${{ steps.compare.outcome }}" = "failure" ]; then
+            echo "benchmark compare reported regressions in strict mode" >&2
+            exit 1
+          fi

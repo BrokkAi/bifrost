@@ -1,4 +1,5 @@
 pub mod analyzer;
+pub mod benchmark;
 pub mod code_quality;
 pub mod file_tools;
 pub mod git_tools;
