@@ -29,6 +29,8 @@ concurrency:
 jobs:
   benchmark:
     runs-on: ubuntu-latest
+    env:
+      SLACK_DAILY_PERF_WEBHOOK_URL: ${{ secrets.SLACK_DAILY_PERF_WEBHOOK_URL }}
 
     steps:
       - uses: actions/checkout@v4
@@ -148,6 +150,158 @@ jobs:
               cat "${{ steps.paths.outputs.compare_summary_path }}"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Prepare Slack payload
+        id: slack_payload
+        if: always() && env.SLACK_DAILY_PERF_WEBHOOK_URL != ''
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          run_outcome="${{ steps.run_benchmark.outcome }}"
+          compare_outcome="${{ steps.compare.outcome }}"
+          if [ -z "$compare_outcome" ]; then
+            compare_outcome="skipped"
+          fi
+
+          report_path="${{ steps.paths.outputs.report_path }}"
+          compare_path="${{ steps.paths.outputs.compare_path }}"
+          compare_summary_path="${{ steps.paths.outputs.compare_summary_path }}"
+
+          generated_at=""
+          base_sha_short=""
+          selected_repo=""
+          report_max_files="null"
+          repo_count="0"
+          failed_scenarios_count="0"
+          baseline_path="${{ steps.paths.outputs.baseline_path }}"
+          if [ -f "$baseline_path" ]; then
+            base_sha_short="$(jq -r '.bifrost_commit // ""' "$baseline_path" | cut -c1-7)"
+          fi
+          if [ -n "$report_path" ] && [ -f "$report_path" ]; then
+            generated_at="$(jq -r '.generated_at // ""' "$report_path")"
+            selected_repo="$(jq -r '.selected_repo // ""' "$report_path")"
+            report_max_files="$(jq -c '.max_files // null' "$report_path")"
+            repo_count="$(jq -r '.repos | length' "$report_path")"
+            failed_scenarios_count="$(jq -r '[.repos[].scenarios[] | select(.success == false)] | length' "$report_path")"
+          fi
+
+          compared_scenarios_count="0"
+          regression_count="0"
+          improvement_count="0"
+          missing_candidate_count="0"
+          new_candidate_count="0"
+          has_regressions="false"
+          if [ -f "$compare_path" ]; then
+            compared_scenarios_count="$(jq -r '.compared_scenarios_count // 0' "$compare_path")"
+            regression_count="$(jq -r '.regression_count // 0' "$compare_path")"
+            improvement_count="$(jq -r '.improvement_count // 0' "$compare_path")"
+            missing_candidate_count="$(jq -r '.missing_candidate_count // 0' "$compare_path")"
+            new_candidate_count="$(jq -r '.new_candidate_count // 0' "$compare_path")"
+            has_regressions="$(jq -r '.has_regressions // false' "$compare_path")"
+          fi
+
+          summary_text=""
+          if [ -f "$compare_summary_path" ]; then
+            summary_text="$(cat "$compare_summary_path")"
+          fi
+
+          strict_compare="false"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.strict_compare || false }}" = "true" ]; then
+            strict_compare="true"
+          fi
+
+          ok="true"
+          error_text=""
+          if [ "$run_outcome" != "success" ]; then
+            ok="false"
+            error_text="benchmark run failed"
+          elif [ "$failed_scenarios_count" != "0" ]; then
+            ok="false"
+            error_text="benchmark report recorded scenario failures"
+          elif [ "$has_regressions" = "true" ]; then
+            ok="false"
+            error_text="benchmark compare detected regressions"
+          elif [ "$compare_outcome" = "failure" ]; then
+            ok="false"
+            error_text="benchmark compare failed"
+          fi
+
+          head_sha_short="$(git rev-parse --short "$GITHUB_SHA")"
+
+          payload="$(
+            jq -nc \
+              --arg error_text "$error_text" \
+              --arg workflow_run_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+              --arg head_sha_short "$head_sha_short" \
+              --arg base_sha_short "$base_sha_short" \
+              --arg event_name "${{ github.event_name }}" \
+              --arg repo_input "${{ inputs.repo || '' }}" \
+              --arg max_files_input "${{ inputs.max_files || '' }}" \
+              --arg run_outcome "$run_outcome" \
+              --arg compare_outcome "$compare_outcome" \
+              --arg report_path "$report_path" \
+              --arg compare_path "$compare_path" \
+              --arg compare_summary_path "$compare_summary_path" \
+              --arg generated_at "$generated_at" \
+              --arg selected_repo "$selected_repo" \
+              --arg summary_text "$summary_text" \
+              --argjson ok "$ok" \
+              --argjson strict_compare "$strict_compare" \
+              --argjson report_max_files "$report_max_files" \
+              --argjson repo_count "$repo_count" \
+              --argjson failed_scenarios_count "$failed_scenarios_count" \
+              --argjson compared_scenarios_count "$compared_scenarios_count" \
+              --argjson regression_count "$regression_count" \
+              --argjson improvement_count "$improvement_count" \
+              --argjson missing_candidate_count "$missing_candidate_count" \
+              --argjson new_candidate_count "$new_candidate_count" \
+              --argjson has_regressions "$has_regressions" \
+              '{
+                ok: $ok,
+                error_text: $error_text,
+                workflow_run_url: $workflow_run_url,
+                head_sha_short: $head_sha_short,
+                base_sha_short: $base_sha_short,
+                event_name: $event_name,
+                repo_input: $repo_input,
+                max_files_input: $max_files_input,
+                strict_compare: $strict_compare,
+                run_outcome: $run_outcome,
+                compare_outcome: $compare_outcome,
+                report_path: $report_path,
+                compare_path: $compare_path,
+                compare_summary_path: $compare_summary_path,
+                generated_at: $generated_at,
+                selected_repo: $selected_repo,
+                report_max_files: $report_max_files,
+                repo_count: $repo_count,
+                failed_scenarios_count: $failed_scenarios_count,
+                compared_scenarios_count: $compared_scenarios_count,
+                regression_count: $regression_count,
+                improvement_count: $improvement_count,
+                missing_candidate_count: $missing_candidate_count,
+                new_candidate_count: $new_candidate_count,
+                has_regressions: $has_regressions,
+                summary_text: $summary_text
+              }'
+          )"
+
+          {
+            echo 'payload<<EOF'
+            echo "$payload"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Send benchmark data to Slack Workflow
+        if: always() && env.SLACK_DAILY_PERF_WEBHOOK_URL != '' && steps.slack_payload.outputs.payload != ''
+        continue-on-error: true
+        uses: slackapi/slack-github-action@v2.1.1
+        with:
+          webhook: ${{ env.SLACK_DAILY_PERF_WEBHOOK_URL }}
+          webhook-type: webhook-trigger
+          payload: ${{ steps.slack_payload.outputs.payload }}
 
       - name: Enforce benchmark outcome
         if: always()

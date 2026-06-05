@@ -14,8 +14,8 @@ fn checked_in_targets_manifest_loads_and_validates() {
     let manifest = BenchmarkManifest::load_from_path(checked_in_manifest_path())
         .expect("checked-in benchmark manifest should validate");
 
-    assert_eq!(manifest.warmup_iterations, 1);
-    assert_eq!(manifest.measured_iterations, 3);
+    assert_eq!(manifest.warmup_iterations, 2);
+    assert_eq!(manifest.measured_iterations, 10);
     assert_eq!(manifest.repos.len(), 10);
 
     let covered_languages = manifest
