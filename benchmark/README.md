@@ -105,6 +105,53 @@ The manual workflow inputs are:
 - `max_files`: optional subset cap for smoke runs, for example `100`
 - `strict_compare`: when `true`, fail the workflow if the compare step finds regressions
 
+## Slack Hook
+
+The benchmark workflow can optionally trigger a Slack Workflow Builder webhook after the run summary is prepared.
+
+GitHub-side setup:
+
+- configure a repository secret named `SLACK_DAILY_PERF_WEBHOOK_URL`
+- keep the webhook URL in that secret, not in a GitHub variable
+- if the secret is absent, the workflow skips Slack delivery cleanly
+- Slack delivery is best-effort only; webhook or Slack-side failures do not change the benchmark workflow outcome
+
+The webhook payload is benchmark-specific. The workflow sends these fields:
+
+- `ok`
+- `error_text`
+- `workflow_run_url`
+- `head_sha_short`
+- `event_name`
+- `repo_input`
+- `max_files_input`
+- `strict_compare`
+- `run_outcome`
+- `compare_outcome`
+- `report_path`
+- `compare_path`
+- `compare_summary_path`
+- `generated_at`
+- `selected_repo`
+- `report_max_files`
+- `repo_count`
+- `failed_scenarios_count`
+- `compared_scenarios_count`
+- `regression_count`
+- `improvement_count`
+- `missing_candidate_count`
+- `new_candidate_count`
+- `has_regressions`
+- `summary_text`
+
+Slack-side setup:
+
+- update the Slack Workflow Builder message template to consume the benchmark payload above rather than the older Brokk perf-only fields
+- the existing shared fields `ok`, `error_text`, `workflow_run_url`, and `head_sha_short` can be reused directly
+- replace old perf-specific fields such as `base_sha_short`, `time_*`, `fps_*`, and `coarse_memory_ok` with benchmark-oriented summary content
+- keep the current two-message shape if desired: a top-level run summary plus a threaded follow-up with benchmark-specific operator guidance
+- do not assume the old Brokk bisect guidance still applies unless the Slack-side thread text is intentionally updated for this workflow
+
 ## Configuration Surface
 
 This directory should be the first place to document any new benchmark-specific workflow variables or secrets.
@@ -123,10 +170,11 @@ Future workflow-level settings should stay documented here rather than being int
 - baseline report path for `compare`
 - strict-vs-summary failure mode for scheduled runs
 - artifact retention knobs
-- Slack webhook or channel-routing variables for daily notifications
+- Slack channel-routing variables for daily notifications
 
-If Slack reporting is added, keep the variables benchmark-scoped and document them here alongside:
+Slack-facing settings should stay benchmark-scoped and documented here alongside:
 
 - when the notification fires
 - what report path or compare summary it links to
 - whether a nonzero benchmark exit suppresses or changes the Slack message
+- which Slack workflow fields or message templates are expected to consume the payload
