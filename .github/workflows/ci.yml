@@ -12,7 +12,6 @@ concurrency:
 jobs:
   fmt:
     name: fmt
-    if: github.event_name != 'pull_request' || github.head_ref != 'dave/170-add-pinned-repo-analyzer-benchmark-harness-and-daily-smoke-perf-workflow'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -28,7 +27,6 @@ jobs:
 
   rust:
     name: rust (${{ matrix.target }})
-    if: github.event_name != 'pull_request' || github.head_ref != 'dave/170-add-pinned-repo-analyzer-benchmark-harness-and-daily-smoke-perf-workflow'
     runs-on: ${{ matrix.runner }}
     env:
       RUSTFLAGS: ${{ matrix.rustflags }}
@@ -118,7 +116,6 @@ jobs:
 
   python:
     name: python (${{ matrix.target }})
-    if: github.event_name != 'pull_request' || github.head_ref != 'dave/170-add-pinned-repo-analyzer-benchmark-harness-and-daily-smoke-perf-workflow'
     needs: rust
     runs-on: ${{ matrix.runner }}
     env:

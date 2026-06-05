@@ -94,10 +94,16 @@ The harness already guarantees two useful operator properties for that workflow:
 
 The checked-in GitHub Actions workflow lives at `.github/workflows/benchmark.yml`.
 
-- Scheduled runs always validate and run the harness on `ubuntu-latest`.
-- Manual runs can optionally scope to one manifest repo and/or `--max-files`.
+- Scheduled runs execute from the workflow cron at `17 9 * * *` on `ubuntu-latest`.
+- Manual runs use `workflow_dispatch` and can optionally scope to one manifest repo and/or `--max-files`.
 - Compare runs are strict only when `workflow_dispatch` sets `strict_compare = true`.
 - If `benchmark/baselines/ubuntu-latest.json` is not present yet, the workflow uploads the run artifact and records that compare was skipped.
+
+The manual workflow inputs are:
+
+- `repo`: optional manifest repo name, for example `gin-go`
+- `max_files`: optional subset cap for smoke runs, for example `100`
+- `strict_compare`: when `true`, fail the workflow if the compare step finds regressions
 
 ## Configuration Surface
 
