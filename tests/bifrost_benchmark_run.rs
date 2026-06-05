@@ -53,7 +53,7 @@ summary_targets = ["A.java"]
 seed_file_paths = ["A.java"]
 usage_symbols = ["E.iMethod"]
 "#,
-            repo_root.display(),
+            toml_basic_string(&repo_root.display().to_string()),
             head_commit(&repo_root)
         ),
     )
@@ -147,7 +147,7 @@ summary_targets = ["A.java", "B.java"]
 seed_file_paths = ["B.java"]
 usage_symbols = ["A.method2"]
 "#,
-            repo_root.display(),
+            toml_basic_string(&repo_root.display().to_string()),
             head_commit(&repo_root)
         ),
     )
@@ -244,7 +244,7 @@ summary_targets = ["A.java"]
 seed_file_paths = ["A.java"]
 usage_symbols = ["A.method2"]
 "#,
-            repo_root.display(),
+            toml_basic_string(&repo_root.display().to_string()),
             head_commit(&repo_root)
         ),
     )
@@ -323,7 +323,7 @@ scenarios = [
 location_symbols = ["does.not.Exist"]
 usage_symbols = ["E.iMethod"]
 "#,
-            repo_root.display(),
+            toml_basic_string(&repo_root.display().to_string()),
             head_commit(&repo_root)
         ),
     )
@@ -430,4 +430,8 @@ fn single_json_file(dir: &Path) -> PathBuf {
         .collect::<Vec<_>>();
     assert_eq!(files.len(), 1, "expected one JSON report file in {dir:?}");
     files[0].clone()
+}
+
+fn toml_basic_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
