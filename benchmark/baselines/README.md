@@ -2,6 +2,8 @@
 
 `ubuntu-latest.json` is the intended blessed baseline for the scheduled benchmark workflow.
 
+The first blessed Ubuntu baseline was promoted from the successful PR-path benchmark run on June 5, 2026 (`run-20260605T072813Z.json` from PR #172).
+
 It is not written automatically. Promote it deliberately:
 
 1. Run the benchmark workflow or a local `bifrost_benchmark run`.
