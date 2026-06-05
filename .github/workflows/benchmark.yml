@@ -3,6 +3,9 @@ name: Benchmark
 on:
   schedule:
     - cron: '17 9 * * *'
+  pull_request:
+    branches:
+      - master
   workflow_dispatch:
     inputs:
       repo:
@@ -28,6 +31,7 @@ concurrency:
 
 jobs:
   benchmark:
+    if: github.event_name != 'pull_request' || github.head_ref == 'dave/170-add-pinned-repo-analyzer-benchmark-harness-and-daily-smoke-perf-workflow'
     runs-on: ubuntu-latest
 
     steps:
