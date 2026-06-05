@@ -1,12 +1,6 @@
 name: Benchmark
 
 on:
-  push:
-    branches:
-      - 173-add-slack-webhook-reporting-to-benchmark-workflow
-    paths:
-      - .github/workflows/benchmark.yml
-      - benchmark/**
   schedule:
     - cron: '17 9 * * *'
   workflow_dispatch:

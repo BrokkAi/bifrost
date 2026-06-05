@@ -1,5 +1,5 @@
 warmup_iterations = 2
-measured_iterations = 7
+measured_iterations = 10
 output_dir = "benchmark-output"
 repo_cache_dir = ".cache/repos"
 required_languages = [
