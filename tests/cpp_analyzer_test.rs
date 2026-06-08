@@ -53,6 +53,55 @@ fn is_empty_test() {
 }
 
 #[test]
+fn cpp_iterative_visitor_preserves_top_level_source_order() {
+    let project = inline_cpp_project(&[(
+        "ordered.cpp",
+        r#"
+#include "a.h"
+#include "b.h"
+struct First {};
+struct Second {};
+"#,
+    )]);
+    let analyzer = CppAnalyzer::from_project(project);
+    let file = ProjectFile::new(analyzer.project().root().to_path_buf(), "ordered.cpp");
+
+    let top_level: Vec<_> = analyzer
+        .get_top_level_declarations(&file)
+        .into_iter()
+        .map(|unit| unit.fq_name())
+        .collect();
+    assert_eq!(vec!["First", "Second"], top_level);
+    assert_eq!(
+        vec!["#include \"a.h\"", "#include \"b.h\""],
+        analyzer.import_statements_of(&file)
+    );
+}
+
+#[test]
+fn cpp_identifier_collection_handles_deep_template_shape_iteratively() {
+    let mut source = String::from("template <typename T> struct Box {};\nusing Deep = ");
+    for _ in 0..256 {
+        source.push_str("Box<");
+    }
+    source.push_str("int");
+    for _ in 0..256 {
+        source.push('>');
+    }
+    source.push_str(";\n");
+
+    let project = inline_cpp_project(&[("deep.cpp", &source)]);
+    let analyzer = CppAnalyzer::from_project(project);
+
+    assert!(
+        analyzer
+            .get_all_declarations()
+            .into_iter()
+            .any(|unit| unit.fq_name() == "Box")
+    );
+}
+
+#[test]
 fn test_namespace_class_struct_and_global_analysis() {
     let analyzer = fixture_analyzer();
     let all = all_declarations(&analyzer);

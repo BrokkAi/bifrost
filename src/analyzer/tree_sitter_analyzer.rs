@@ -26,15 +26,31 @@ pub(crate) fn walk_tree_preorder<'tree>(
     include_root: bool,
     mut visit: impl FnMut(Node<'tree>) -> WalkControl,
 ) {
-    let mut stack = vec![(root, true)];
-    while let Some((node, is_root)) = stack.pop() {
-        if (include_root || !is_root) && visit(node) == WalkControl::SkipChildren {
+    let mut cursor = root.walk();
+    let mut is_root = true;
+
+    loop {
+        let node = cursor.node();
+        let should_descend = if include_root || !is_root {
+            visit(node) != WalkControl::SkipChildren
+        } else {
+            true
+        };
+
+        if should_descend && cursor.goto_first_child() {
+            is_root = false;
             continue;
         }
 
-        let mut cursor = node.walk();
-        let children = node.children(&mut cursor).collect::<Vec<_>>();
-        stack.extend(children.into_iter().rev().map(|child| (child, false)));
+        loop {
+            if cursor.goto_next_sibling() {
+                is_root = false;
+                break;
+            }
+            if !cursor.goto_parent() {
+                return;
+            }
+        }
     }
 }
 
@@ -43,13 +59,19 @@ pub(crate) fn walk_named_tree_preorder<'tree>(
     include_root: bool,
     mut visit: impl FnMut(Node<'tree>) -> WalkControl,
 ) {
-    walk_tree_preorder(root, include_root, |node| {
-        if node.is_named() {
-            visit(node)
-        } else {
-            WalkControl::Continue
+    let mut stack = vec![(root, true)];
+    while let Some((node, is_root)) = stack.pop() {
+        if node.is_named() && (include_root || !is_root) && visit(node) == WalkControl::SkipChildren
+        {
+            continue;
         }
-    });
+
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index) {
+                stack.push((child, false));
+            }
+        }
+    }
 }
 
 pub trait LanguageAdapter: Send + Sync + 'static {

@@ -1,8 +1,9 @@
 mod common;
 
 use brokk_bifrost::analyzer::{parse_php_use_aliases, parse_php_use_aliases_by_kind};
-use brokk_bifrost::{CodeUnit, IAnalyzer, PhpAnalyzer, ProjectFile};
+use brokk_bifrost::{CodeUnit, IAnalyzer, Language, PhpAnalyzer, ProjectFile, TestProject};
 use common::{assert_code_eq, definition, normalize_nonempty_lines, php_fixture_project};
+use tempfile::tempdir;
 
 fn fixture_analyzer() -> PhpAnalyzer {
     PhpAnalyzer::from_project(php_fixture_project())
@@ -12,6 +13,31 @@ fn fixture_analyzer() -> PhpAnalyzer {
 fn test_php_initialization() {
     let analyzer = fixture_analyzer();
     assert!(!analyzer.is_empty());
+}
+
+#[test]
+fn test_php_iterative_visitor_preserves_top_level_source_order() {
+    let temp = tempdir().unwrap();
+    ProjectFile::new(temp.path().to_path_buf(), "Ordered.php")
+        .write(
+            r#"<?php
+class First {}
+class Second {}
+function after_classes() {}
+"#,
+        )
+        .unwrap();
+    let project = TestProject::new(temp.keep(), Language::Php);
+    let analyzer = PhpAnalyzer::from_project(project);
+    let file = ProjectFile::new(analyzer.project().root().to_path_buf(), "Ordered.php");
+
+    let top_level: Vec<_> = analyzer
+        .get_top_level_declarations(&file)
+        .into_iter()
+        .map(|unit| unit.fq_name())
+        .collect();
+
+    assert_eq!(vec!["First", "Second", "after_classes"], top_level);
 }
 
 #[test]

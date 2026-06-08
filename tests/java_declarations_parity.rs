@@ -1,4 +1,5 @@
 use brokk_bifrost::{IAnalyzer, JavaAnalyzer, Language, ProjectFile, TestProject};
+use tempfile::tempdir;
 
 fn fixture_analyzer() -> JavaAnalyzer {
     let root = std::env::current_dir()
@@ -65,6 +66,33 @@ fn lists_all_fixture_classes() {
         .map(str::to_string)
         .collect::<Vec<_>>(),
         classes
+    );
+}
+
+#[test]
+fn java_supertype_collection_handles_deep_generic_shape_iteratively() {
+    let temp = tempdir().unwrap();
+    let mut source = String::from("class Box<T> {}\nclass Deep extends ");
+    for _ in 0..256 {
+        source.push_str("Box<");
+    }
+    source.push_str("String");
+    for _ in 0..256 {
+        source.push('>');
+    }
+    source.push_str(" {}\n");
+    ProjectFile::new(temp.path().to_path_buf(), "Deep.java")
+        .write(&source)
+        .unwrap();
+
+    let project = TestProject::new(temp.keep(), Language::Java);
+    let analyzer = JavaAnalyzer::from_project(project);
+
+    assert!(
+        analyzer
+            .get_all_declarations()
+            .into_iter()
+            .any(|unit| unit.fq_name() == "Deep")
     );
 }
 

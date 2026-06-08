@@ -18,6 +18,7 @@ pub(super) fn parse_php_file(
     parsed
 }
 
+#[derive(Clone)]
 struct PhpScope {
     package_name: String,
     class_unit: Option<CodeUnit>,
@@ -37,6 +38,27 @@ struct PhpContainer<'tree> {
     scope: PhpScope,
 }
 
+struct PhpNodeWork<'tree> {
+    node: Node<'tree>,
+    scope: PhpScope,
+}
+
+enum PhpWork<'tree> {
+    Container(PhpContainer<'tree>),
+    Node(PhpNodeWork<'tree>),
+}
+
+fn push_php_child_work<'tree>(node: Node<'tree>, scope: PhpScope, stack: &mut Vec<PhpWork<'tree>>) {
+    for index in (0..node.named_child_count()).rev() {
+        if let Some(child) = node.named_child(index) {
+            stack.push(PhpWork::Node(PhpNodeWork {
+                node: child,
+                scope: scope.clone(),
+            }));
+        }
+    }
+}
+
 struct PhpVisitor<'a> {
     file: &'a ProjectFile,
     source: &'a str,
@@ -45,18 +67,18 @@ struct PhpVisitor<'a> {
 
 impl<'a> PhpVisitor<'a> {
     fn visit_children(&mut self, node: Node<'_>, scope: &PhpScope) {
-        let mut stack = vec![PhpContainer {
+        let mut stack = vec![PhpWork::Container(PhpContainer {
             node,
             scope: PhpScope::new(scope.package_name.clone(), scope.class_unit.clone()),
-        }];
-        while let Some(container) = stack.pop() {
-            let mut cursor = container.node.walk();
-            let children = container
-                .node
-                .named_children(&mut cursor)
-                .collect::<Vec<_>>();
-            for child in children.into_iter().rev() {
-                self.visit_node(child, &container.scope, &mut stack);
+        })];
+        while let Some(work) = stack.pop() {
+            match work {
+                PhpWork::Container(container) => {
+                    push_php_child_work(container.node, container.scope, &mut stack);
+                }
+                PhpWork::Node(work) => {
+                    self.visit_node(work.node, &work.scope, &mut stack);
+                }
             }
         }
     }
@@ -65,7 +87,7 @@ impl<'a> PhpVisitor<'a> {
         &mut self,
         node: Node<'tree>,
         scope: &PhpScope,
-        stack: &mut Vec<PhpContainer<'tree>>,
+        stack: &mut Vec<PhpWork<'tree>>,
     ) {
         match node.kind() {
             "namespace_definition" => self.visit_namespace(node, scope, stack),
@@ -76,10 +98,12 @@ impl<'a> PhpVisitor<'a> {
             "method_declaration" => self.visit_method(node, scope),
             "property_declaration" => self.visit_property_declaration(node, scope),
             "const_declaration" => self.visit_const_declaration(node, scope),
-            "declaration_list" | "compound_statement" => stack.push(PhpContainer {
-                node,
-                scope: PhpScope::new(scope.package_name.clone(), scope.class_unit.clone()),
-            }),
+            "declaration_list" | "compound_statement" => {
+                stack.push(PhpWork::Container(PhpContainer {
+                    node,
+                    scope: PhpScope::new(scope.package_name.clone(), scope.class_unit.clone()),
+                }))
+            }
             _ => {}
         }
     }
@@ -88,19 +112,22 @@ impl<'a> PhpVisitor<'a> {
         &mut self,
         node: Node<'tree>,
         scope: &PhpScope,
-        stack: &mut Vec<PhpContainer<'tree>>,
+        stack: &mut Vec<PhpWork<'tree>>,
     ) {
         let Some(name_node) = node.child_by_field_name("name") else {
             return;
         };
         let package_name = php_node_text(name_node, self.source).replace('\\', ".");
         let scope = PhpScope::new(package_name, scope.class_unit.clone());
-        let mut cursor = node.walk();
-        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
-        for child in children.into_iter().rev() {
-            match child.kind() {
-                "namespace_name" | "name" => {}
-                _ => self.visit_node(child, &scope, stack),
+        for index in (0..node.named_child_count()).rev() {
+            let Some(child) = node.named_child(index) else {
+                continue;
+            };
+            if !matches!(child.kind(), "namespace_name" | "name") {
+                stack.push(PhpWork::Node(PhpNodeWork {
+                    node: child,
+                    scope: scope.clone(),
+                }));
             }
         }
     }
@@ -109,7 +136,7 @@ impl<'a> PhpVisitor<'a> {
         &mut self,
         node: Node<'tree>,
         scope: &PhpScope,
-        stack: &mut Vec<PhpContainer<'tree>>,
+        stack: &mut Vec<PhpWork<'tree>>,
     ) {
         let Some(name_node) = node.child_by_field_name("name") else {
             return;
@@ -143,10 +170,10 @@ impl<'a> PhpVisitor<'a> {
             .add_signature(code_unit.clone(), php_type_signature(node, self.source));
 
         if let Some(body) = php_class_body(node) {
-            stack.push(PhpContainer {
+            stack.push(PhpWork::Container(PhpContainer {
                 node: body,
                 scope: PhpScope::new(scope.package_name.clone(), Some(code_unit)),
-            });
+            }));
         }
     }
 

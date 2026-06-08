@@ -972,18 +972,16 @@ pub(super) fn extract_raw_supertypes(node: Node<'_>, source: &str) -> Vec<String
 }
 
 fn collect_supertype_nodes(node: Node<'_>, source: &str, raw: &mut Vec<String>) {
-    match node.kind() {
-        "type_identifier" | "scoped_type_identifier" => {
-            let text = node_text(node, source).trim();
-            if !text.is_empty() {
-                raw.push(text.to_string());
+    walk_named_tree_preorder(node, true, |node| {
+        match node.kind() {
+            "type_identifier" | "scoped_type_identifier" => {
+                let text = node_text(node, source).trim();
+                if !text.is_empty() {
+                    raw.push(text.to_string());
+                }
             }
+            _ => {}
         }
-        _ => {}
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_supertype_nodes(child, source, raw);
-    }
+        WalkControl::Continue
+    });
 }
