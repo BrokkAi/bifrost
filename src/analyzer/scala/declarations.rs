@@ -24,11 +24,48 @@ struct ScalaVisitor<'a> {
     parsed: &'a mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
 }
 
+enum ScalaWork<'tree> {
+    CompilationUnit {
+        node: Node<'tree>,
+        package_name: String,
+    },
+    TemplateBody {
+        node: Node<'tree>,
+        package_name: String,
+        parent: CodeUnit,
+    },
+}
+
 impl<'a> ScalaVisitor<'a> {
     fn visit_compilation_unit(&mut self, node: Node<'_>, package_name: &str) {
+        let mut stack = vec![ScalaWork::CompilationUnit {
+            node,
+            package_name: package_name.to_string(),
+        }];
+        while let Some(work) = stack.pop() {
+            match work {
+                ScalaWork::CompilationUnit { node, package_name } => {
+                    self.process_compilation_unit(node, &package_name, &mut stack)
+                }
+                ScalaWork::TemplateBody {
+                    node,
+                    package_name,
+                    parent,
+                } => self.process_template_body(node, &package_name, &parent, &mut stack),
+            }
+        }
+    }
+
+    fn process_compilation_unit<'tree>(
+        &mut self,
+        node: Node<'tree>,
+        package_name: &str,
+        stack: &mut Vec<ScalaWork<'tree>>,
+    ) {
         let mut current_package = package_name.to_string();
         let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
+        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+        for child in children {
             match child.kind() {
                 "package_clause" => {
                     let package = scala_package_name(child, self.source);
@@ -43,7 +80,10 @@ impl<'a> ScalaVisitor<'a> {
                         }
                     }
                     if let Some(body) = child.child_by_field_name("body") {
-                        self.visit_compilation_unit(body, &current_package);
+                        stack.push(ScalaWork::CompilationUnit {
+                            node: body,
+                            package_name: current_package.clone(),
+                        });
                     }
                 }
                 "import_declaration" => {
@@ -54,7 +94,9 @@ impl<'a> ScalaVisitor<'a> {
                     }
                 }
                 "class_definition" | "object_definition" | "trait_definition"
-                | "enum_definition" => self.visit_type_declaration(child, &current_package, None),
+                | "enum_definition" => {
+                    self.visit_type_declaration(child, &current_package, None, stack)
+                }
                 "function_definition" => self.visit_function(child, &current_package, None),
                 "val_definition" | "var_definition" => {
                     self.visit_field_declaration(child, &current_package, None)
@@ -64,11 +106,12 @@ impl<'a> ScalaVisitor<'a> {
         }
     }
 
-    fn visit_type_declaration(
+    fn visit_type_declaration<'tree>(
         &mut self,
-        node: Node<'_>,
+        node: Node<'tree>,
         package_name: &str,
         parent: Option<CodeUnit>,
+        stack: &mut Vec<ScalaWork<'tree>>,
     ) {
         let Some(name_node) = node.child_by_field_name("name") else {
             return;
@@ -127,13 +170,24 @@ impl<'a> ScalaVisitor<'a> {
         }
 
         if let Some(body) = node.child_by_field_name("body") {
-            self.visit_template_body(body, package_name, &code_unit);
+            stack.push(ScalaWork::TemplateBody {
+                node: body,
+                package_name: package_name.to_string(),
+                parent: code_unit,
+            });
         }
     }
 
-    fn visit_template_body(&mut self, body: Node<'_>, package_name: &str, parent: &CodeUnit) {
+    fn process_template_body<'tree>(
+        &mut self,
+        body: Node<'tree>,
+        package_name: &str,
+        parent: &CodeUnit,
+        stack: &mut Vec<ScalaWork<'tree>>,
+    ) {
         let mut cursor = body.walk();
-        for child in body.named_children(&mut cursor) {
+        let children = body.named_children(&mut cursor).collect::<Vec<_>>();
+        for child in children {
             match child.kind() {
                 "function_definition" => {
                     self.visit_function(child, package_name, Some(parent.clone()))
@@ -143,11 +197,15 @@ impl<'a> ScalaVisitor<'a> {
                 }
                 "class_definition" | "object_definition" | "trait_definition"
                 | "enum_definition" => {
-                    self.visit_type_declaration(child, package_name, Some(parent.clone()))
+                    self.visit_type_declaration(child, package_name, Some(parent.clone()), stack)
                 }
                 "simple_enum_case" => self.visit_enum_case(child, package_name, parent),
                 "enum_case_definitions" | "enum_body" => {
-                    self.visit_template_body(child, package_name, parent)
+                    stack.push(ScalaWork::TemplateBody {
+                        node: child,
+                        package_name: package_name.to_string(),
+                        parent: parent.clone(),
+                    });
                 }
                 _ => {}
             }

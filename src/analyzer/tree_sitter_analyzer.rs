@@ -15,6 +15,43 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WalkControl {
+    Continue,
+    SkipChildren,
+}
+
+pub(crate) fn walk_tree_preorder<'tree>(
+    root: Node<'tree>,
+    include_root: bool,
+    mut visit: impl FnMut(Node<'tree>) -> WalkControl,
+) {
+    let mut stack = vec![(root, true)];
+    while let Some((node, is_root)) = stack.pop() {
+        if (include_root || !is_root) && visit(node) == WalkControl::SkipChildren {
+            continue;
+        }
+
+        let mut cursor = node.walk();
+        let children = node.children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev().map(|child| (child, false)));
+    }
+}
+
+pub(crate) fn walk_named_tree_preorder<'tree>(
+    root: Node<'tree>,
+    include_root: bool,
+    mut visit: impl FnMut(Node<'tree>) -> WalkControl,
+) {
+    walk_tree_preorder(root, include_root, |node| {
+        if node.is_named() {
+            visit(node)
+        } else {
+            WalkControl::Continue
+        }
+    });
+}
+
 pub trait LanguageAdapter: Send + Sync + 'static {
     fn language(&self) -> Language;
     fn query_directory(&self) -> &'static str;
@@ -1459,25 +1496,80 @@ fn first_comment_offset(line: &str) -> Option<usize> {
 /// share one source of truth for the walk semantics and the
 /// `end_byte.max(start_byte)` clamp.
 pub(crate) fn collect_parse_errors(node: Node, out: &mut Vec<crate::analyzer::ParseError>) {
-    if node.is_error() || node.is_missing() {
-        let range = Range {
-            start_byte: node.start_byte(),
-            end_byte: node.end_byte().max(node.start_byte()),
-            start_line: node.start_position().row,
-            end_line: node.end_position().row,
-        };
-        let kind = if node.is_missing() {
-            crate::analyzer::ParseErrorKind::Missing(node.kind().to_string())
-        } else {
-            crate::analyzer::ParseErrorKind::Error
-        };
-        out.push(crate::analyzer::ParseError { range, kind });
-        if node.is_error() {
-            return;
+    walk_tree_preorder(node, true, |node| {
+        if node.is_error() || node.is_missing() {
+            let range = Range {
+                start_byte: node.start_byte(),
+                end_byte: node.end_byte().max(node.start_byte()),
+                start_line: node.start_position().row,
+                end_line: node.end_position().row,
+            };
+            let kind = if node.is_missing() {
+                crate::analyzer::ParseErrorKind::Missing(node.kind().to_string())
+            } else {
+                crate::analyzer::ParseErrorKind::Error
+            };
+            out.push(crate::analyzer::ParseError { range, kind });
+            if node.is_error() {
+                return WalkControl::SkipChildren;
+            }
         }
+        WalkControl::Continue
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_javascript(source: &str) -> Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_javascript::LANGUAGE.into())
+            .expect("javascript parser");
+        parser.parse(source, None).expect("parse javascript")
     }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_parse_errors(child, out);
+
+    #[test]
+    fn tree_preorder_walk_preserves_source_order_without_recursion() {
+        let tree = parse_javascript("const first = 1; function second() { return first; }\n");
+        let mut declarations = Vec::new();
+
+        walk_named_tree_preorder(tree.root_node(), false, |node| {
+            if matches!(node.kind(), "lexical_declaration" | "function_declaration") {
+                declarations.push(node.kind().to_string());
+            }
+            WalkControl::Continue
+        });
+
+        assert_eq!(
+            declarations,
+            vec!["lexical_declaration", "function_declaration"]
+        );
+    }
+
+    #[test]
+    fn parse_error_collection_skips_error_descendants_iteratively() {
+        let tree = parse_javascript("function broken( { const value = ; }\n");
+        let mut errors = Vec::new();
+
+        collect_parse_errors(tree.root_node(), &mut errors);
+
+        assert!(!errors.is_empty(), "expected parse errors");
+        for index in 0..errors.len() {
+            for other in 0..errors.len() {
+                if index == other {
+                    continue;
+                }
+                let left = &errors[index].range;
+                let right = &errors[other].range;
+                assert!(
+                    !(left.start_byte <= right.start_byte
+                        && right.end_byte <= left.end_byte
+                        && (left.start_byte, left.end_byte) != (right.start_byte, right.end_byte)),
+                    "error descendant should have been skipped: {errors:?}"
+                );
+            }
+        }
     }
 }

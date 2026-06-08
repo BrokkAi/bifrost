@@ -1,4 +1,5 @@
 use super::*;
+use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use regex::Regex;
 use tree_sitter::Node;
 
@@ -8,6 +9,11 @@ struct ScopeInfo {
     module: Option<CodeUnit>,
     class_unit: Option<CodeUnit>,
     template_signature: Option<String>,
+}
+
+struct CppContainer<'tree> {
+    node: Node<'tree>,
+    scope: ScopeInfo,
 }
 
 pub(super) struct CppVisitor<'a> {
@@ -25,23 +31,38 @@ impl<'a> CppVisitor<'a> {
         class_unit: Option<CodeUnit>,
         template_signature: Option<String>,
     ) {
-        let scope = ScopeInfo {
-            package_name: package_name.to_string(),
-            module,
-            class_unit,
-            template_signature,
-        };
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            self.visit_node(child, &scope);
+        let mut stack = vec![CppContainer {
+            node,
+            scope: ScopeInfo {
+                package_name: package_name.to_string(),
+                module,
+                class_unit,
+                template_signature,
+            },
+        }];
+        while let Some(container) = stack.pop() {
+            let mut cursor = container.node.walk();
+            let children = container
+                .node
+                .named_children(&mut cursor)
+                .collect::<Vec<_>>();
+            for child in children.into_iter().rev() {
+                self.visit_node(child, &container.scope, &mut stack);
+            }
         }
     }
 
-    fn visit_node(&mut self, node: Node<'_>, scope: &ScopeInfo) {
+    fn visit_node<'tree>(
+        &mut self,
+        node: Node<'tree>,
+        scope: &ScopeInfo,
+        stack: &mut Vec<CppContainer<'tree>>,
+    ) {
         match node.kind() {
             "template_declaration" => {
                 let mut cursor = node.walk();
-                for child in node.named_children(&mut cursor) {
+                let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+                for child in children.into_iter().rev() {
                     match child.kind() {
                         "class_specifier"
                         | "struct_specifier"
@@ -54,19 +75,19 @@ impl<'a> CppVisitor<'a> {
                             let mut template_scope = scope.clone();
                             template_scope.template_signature =
                                 cpp_template_signature(node, child, self.source);
-                            self.visit_node(child, &template_scope)
+                            self.visit_node(child, &template_scope, stack)
                         }
                         _ => {}
                     }
                 }
             }
-            "namespace_definition" => self.visit_namespace(node, scope),
+            "namespace_definition" => self.visit_namespace(node, scope, stack),
             "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier" => {
-                self.visit_class_like(node, scope)
+                self.visit_class_like(node, scope, stack)
             }
             "function_definition" => self.visit_function_definition(node, scope),
-            "declaration" => self.visit_declaration(node, scope, false),
-            "field_declaration" => self.visit_declaration(node, scope, true),
+            "declaration" => self.visit_declaration(node, scope, false, stack),
+            "field_declaration" => self.visit_declaration(node, scope, true, stack),
             "type_definition" | "alias_declaration" => {}
             "preproc_include" => self.visit_include(node),
             "preproc_if"
@@ -74,28 +95,27 @@ impl<'a> CppVisitor<'a> {
             | "preproc_ifndef"
             | "preproc_else"
             | "preproc_elif"
-            | "preproc_function_def" => self.visit_container(
+            | "preproc_function_def" => stack.push(CppContainer {
                 node,
-                &scope.package_name,
-                scope.module.clone(),
-                scope.class_unit.clone(),
-                scope.template_signature.clone(),
-            ),
+                scope: scope.clone(),
+            }),
             _ => {}
         }
     }
 
-    fn visit_namespace(&mut self, node: Node<'_>, scope: &ScopeInfo) {
+    fn visit_namespace<'tree>(
+        &mut self,
+        node: Node<'tree>,
+        scope: &ScopeInfo,
+        stack: &mut Vec<CppContainer<'tree>>,
+    ) {
         let name_node = node.child_by_field_name("name");
         let Some(name_node) = name_node else {
             if let Some(body) = cpp_body_node(node) {
-                self.visit_container(
-                    body,
-                    &scope.package_name,
-                    scope.module.clone(),
-                    scope.class_unit.clone(),
-                    scope.template_signature.clone(),
-                );
+                stack.push(CppContainer {
+                    node: body,
+                    scope: scope.clone(),
+                });
             }
             return;
         };
@@ -120,17 +140,24 @@ impl<'a> CppVisitor<'a> {
         }
 
         if let Some(body) = cpp_body_node(node) {
-            self.visit_container(
-                body,
-                &full_name,
-                Some(module),
-                scope.class_unit.clone(),
-                scope.template_signature.clone(),
-            );
+            stack.push(CppContainer {
+                node: body,
+                scope: ScopeInfo {
+                    package_name: full_name,
+                    module: Some(module),
+                    class_unit: scope.class_unit.clone(),
+                    template_signature: scope.template_signature.clone(),
+                },
+            });
         }
     }
 
-    fn visit_class_like(&mut self, node: Node<'_>, scope: &ScopeInfo) {
+    fn visit_class_like<'tree>(
+        &mut self,
+        node: Node<'tree>,
+        scope: &ScopeInfo,
+        stack: &mut Vec<CppContainer<'tree>>,
+    ) {
         let Some(name_node) = node.child_by_field_name("name") else {
             return;
         };
@@ -177,13 +204,10 @@ impl<'a> CppVisitor<'a> {
             let mut nested_scope = scope.clone();
             nested_scope.class_unit = Some(code_unit.clone());
             nested_scope.template_signature = scope.template_signature.clone();
-            self.visit_container(
-                body,
-                &nested_scope.package_name,
-                nested_scope.module.clone(),
-                nested_scope.class_unit.clone(),
-                nested_scope.template_signature.clone(),
-            );
+            stack.push(CppContainer {
+                node: body,
+                scope: nested_scope,
+            });
         }
         if node.kind() == "enum_specifier" {
             self.visit_enum_enumerators(node, scope, &code_unit);
@@ -204,28 +228,16 @@ impl<'a> CppVisitor<'a> {
     }
 
     fn visit_enum_enumerators(&mut self, node: Node<'_>, scope: &ScopeInfo, parent: &CodeUnit) {
-        if node.kind() == "enumerator_list" {
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                self.visit_enum_enumerators(child, scope, parent);
-            }
-            return;
-        }
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            if child.kind() == "enumerator_list" {
-                self.visit_enum_enumerators(child, scope, parent);
-                continue;
-            }
+        walk_named_tree_preorder(node, false, |child| {
             if child.kind() != "enumerator" {
-                continue;
+                return WalkControl::Continue;
             }
             let Some(name_node) = child.child_by_field_name("name") else {
-                continue;
+                return WalkControl::Continue;
             };
             let name = normalize_cpp_whitespace(node_text(name_node, self.source));
             if name.is_empty() {
-                continue;
+                return WalkControl::Continue;
             }
             let code_unit = CodeUnit::new(
                 self.file.clone(),
@@ -234,7 +246,7 @@ impl<'a> CppVisitor<'a> {
                 format!("{}.{}", parent.short_name(), name),
             );
             if self.parsed.declarations.contains(&code_unit) {
-                continue;
+                return WalkControl::Continue;
             }
             self.parsed
                 .add_code_unit(code_unit.clone(), child, self.source, None, None);
@@ -243,7 +255,8 @@ impl<'a> CppVisitor<'a> {
                 normalize_cpp_whitespace(node_text(child, self.source)),
             );
             self.parsed.add_child(parent.clone(), code_unit);
-        }
+            WalkControl::Continue
+        });
     }
 
     fn visit_enum_enumerators_from_text(
@@ -314,7 +327,13 @@ impl<'a> CppVisitor<'a> {
         }
     }
 
-    fn visit_declaration(&mut self, node: Node<'_>, scope: &ScopeInfo, in_class_body: bool) {
+    fn visit_declaration<'tree>(
+        &mut self,
+        node: Node<'tree>,
+        scope: &ScopeInfo,
+        in_class_body: bool,
+        stack: &mut Vec<CppContainer<'tree>>,
+    ) {
         let mut handled_function = false;
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
@@ -324,7 +343,7 @@ impl<'a> CppVisitor<'a> {
                     "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier"
                 )
             {
-                self.visit_class_like(child, scope);
+                self.visit_class_like(child, scope, stack);
                 continue;
             }
             if child.kind() == "function_declarator" {

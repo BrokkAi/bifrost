@@ -28,6 +28,10 @@ At minimum, run `cargo fmt` and `cargo clippy --all-targets --all-features -- -D
 
 # Implementation details
 
+- Prefer stack-safe iterative traversal over recursive Rust calls for analyzer tree/graph walks, especially during
+  workspace initialization, parser declaration collection, usage analysis, and other paths that may touch many files or
+  deeply nested ASTs. Use an explicit stack/queue or shared traversal helper unless the recursion depth is provably
+  bounded and small.
 - Design APIs to avoid cloning, especially in hot loops; prefer iterators/slices where possible.
 - Avoid sorted data structures (e.g. BTreeMap) in favor of lighter-weight alternatives
   (HashMap) unless ordering is required for semantic correctness, or when it is preferable

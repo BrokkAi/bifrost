@@ -654,79 +654,89 @@ fn visit_ts_class_like(
     parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
     exported: bool,
 ) -> Option<CodeUnit> {
-    let definition = if node.kind() == "export_statement" {
-        node.child_by_field_name("declaration").unwrap_or(node)
-    } else {
-        node
-    };
-    let name_node = definition.child_by_field_name("name")?;
-    let name = trim_statement(node_text(name_node, source));
-    if name.is_empty() {
-        return None;
-    }
-    let short_name = parent
-        .map(|parent| format!("{}.{}", parent.short_name(), name))
-        .unwrap_or(name.clone());
-    let code_unit = CodeUnit::new(
-        file.clone(),
-        crate::analyzer::CodeUnitType::Class,
-        "",
-        short_name,
-    );
-    let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
-    let range_node = if exported { node } else { definition };
-    parsed.add_code_unit(
-        code_unit.clone(),
-        range_node,
-        source,
-        parent.cloned(),
-        Some(top_level.clone()),
-    );
-    parsed.add_signature(
-        code_unit.clone(),
-        ts_class_signature(node, source, exported),
-    );
+    let mut first = None;
+    let mut stack = vec![(node, parent.cloned(), exported)];
+    while let Some((node, parent, exported)) = stack.pop() {
+        let definition = if node.kind() == "export_statement" {
+            node.child_by_field_name("declaration").unwrap_or(node)
+        } else {
+            node
+        };
+        let Some(name_node) = definition.child_by_field_name("name") else {
+            continue;
+        };
+        let name = trim_statement(node_text(name_node, source));
+        if name.is_empty() {
+            continue;
+        }
+        let short_name = parent
+            .as_ref()
+            .map(|parent| format!("{}.{}", parent.short_name(), name))
+            .unwrap_or(name.clone());
+        let code_unit = CodeUnit::new(
+            file.clone(),
+            crate::analyzer::CodeUnitType::Class,
+            "",
+            short_name,
+        );
+        if first.is_none() {
+            first = Some(code_unit.clone());
+        }
+        let top_level = parent.clone().unwrap_or_else(|| code_unit.clone());
+        let range_node = if exported { node } else { definition };
+        parsed.add_code_unit(
+            code_unit.clone(),
+            range_node,
+            source,
+            parent.clone(),
+            Some(top_level.clone()),
+        );
+        parsed.add_signature(
+            code_unit.clone(),
+            ts_class_signature(node, source, exported),
+        );
 
-    if definition.kind() == "enum_declaration" {
+        if definition.kind() == "enum_declaration" {
+            if let Some(body) = definition.child_by_field_name("body") {
+                for index in 0..body.named_child_count() {
+                    let Some(child) = body.named_child(index) else {
+                        continue;
+                    };
+                    if child.kind() == "enum_assignment"
+                        || child.kind() == "property_identifier"
+                        || child.kind() == "identifier"
+                    {
+                        visit_ts_enum_member(file, source, child, &code_unit, &top_level, parsed);
+                    }
+                }
+            }
+            continue;
+        }
+
         if let Some(body) = definition.child_by_field_name("body") {
-            for index in 0..body.named_child_count() {
+            for index in (0..body.named_child_count()).rev() {
                 let Some(child) = body.named_child(index) else {
                     continue;
                 };
-                if child.kind() == "enum_assignment"
-                    || child.kind() == "property_identifier"
-                    || child.kind() == "identifier"
-                {
-                    visit_ts_enum_member(file, source, child, &code_unit, &top_level, parsed);
+                match child.kind() {
+                    "method_definition" | "method_signature" | "abstract_method_signature" => {
+                        visit_ts_method(file, source, child, &code_unit, &top_level, parsed);
+                    }
+                    "public_field_definition" | "property_signature" | "index_signature" => {
+                        visit_ts_field(file, source, child, &code_unit, &top_level, parsed);
+                    }
+                    "class_declaration"
+                    | "interface_declaration"
+                    | "enum_declaration"
+                    | "internal_module" => {
+                        stack.push((child, Some(code_unit.clone()), false));
+                    }
+                    _ => {}
                 }
             }
         }
-        return Some(code_unit);
     }
-
-    if let Some(body) = definition.child_by_field_name("body") {
-        for index in 0..body.named_child_count() {
-            let Some(child) = body.named_child(index) else {
-                continue;
-            };
-            match child.kind() {
-                "method_definition" | "method_signature" | "abstract_method_signature" => {
-                    visit_ts_method(file, source, child, &code_unit, &top_level, parsed);
-                }
-                "public_field_definition" | "property_signature" | "index_signature" => {
-                    visit_ts_field(file, source, child, &code_unit, &top_level, parsed);
-                }
-                "class_declaration"
-                | "interface_declaration"
-                | "enum_declaration"
-                | "internal_module" => {
-                    visit_ts_class_like(file, source, child, Some(&code_unit), parsed, false);
-                }
-                _ => {}
-            }
-        }
-    }
-    Some(code_unit)
+    first
 }
 
 fn visit_ts_function(

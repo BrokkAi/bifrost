@@ -1,5 +1,6 @@
 use super::imports::parse_python_import_infos;
 use super::*;
+use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use std::path::Path;
 use tree_sitter::{Node, Parser, Tree};
@@ -34,6 +35,21 @@ pub(super) struct PythonVisitor<'a> {
     pub(super) module: Option<CodeUnit>,
 }
 
+struct PythonContainer<'tree> {
+    node: Node<'tree>,
+    scope: Vec<Scope>,
+    module_control_depth: usize,
+}
+
+enum PythonWork<'tree> {
+    Container(PythonContainer<'tree>),
+    Statement {
+        node: Node<'tree>,
+        scope: Vec<Scope>,
+        module_control_depth: usize,
+    },
+}
+
 impl<'a> PythonVisitor<'a> {
     pub(super) fn visit_container(
         &mut self,
@@ -41,21 +57,57 @@ impl<'a> PythonVisitor<'a> {
         scope: &[Scope],
         module_control_depth: usize,
     ) {
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            self.visit_statement(child, scope, module_control_depth);
+        let mut stack = vec![PythonWork::Container(PythonContainer {
+            node,
+            scope: scope.to_vec(),
+            module_control_depth,
+        })];
+        while let Some(work) = stack.pop() {
+            match work {
+                PythonWork::Container(container) => {
+                    let mut cursor = container.node.walk();
+                    let children = container
+                        .node
+                        .named_children(&mut cursor)
+                        .collect::<Vec<_>>();
+                    for child in children.into_iter().rev() {
+                        stack.push(PythonWork::Statement {
+                            node: child,
+                            scope: container.scope.clone(),
+                            module_control_depth: container.module_control_depth,
+                        });
+                    }
+                }
+                PythonWork::Statement {
+                    node,
+                    scope,
+                    module_control_depth,
+                } => self.visit_statement(node, &scope, module_control_depth, &mut stack),
+            }
         }
     }
 
-    fn visit_statement(&mut self, node: Node<'_>, scope: &[Scope], module_control_depth: usize) {
+    fn visit_statement<'tree>(
+        &mut self,
+        node: Node<'tree>,
+        scope: &[Scope],
+        module_control_depth: usize,
+        stack: &mut Vec<PythonWork<'tree>>,
+    ) {
         match node.kind() {
             "decorated_definition" => {
                 if let Some(definition) = node.child_by_field_name("definition") {
-                    self.visit_definition(definition, Some(node), scope, module_control_depth);
+                    self.visit_definition(
+                        definition,
+                        Some(node),
+                        scope,
+                        module_control_depth,
+                        stack,
+                    );
                 }
             }
             "class_definition" | "function_definition" => {
-                self.visit_definition(node, None, scope, module_control_depth)
+                self.visit_definition(node, None, scope, module_control_depth, stack)
             }
             "expression_statement" => {
                 self.visit_expression_statement(node, scope, module_control_depth)
@@ -68,22 +120,35 @@ impl<'a> PythonVisitor<'a> {
                 } else {
                     module_control_depth
                 };
-                self.visit_container(node, scope, next_depth);
+                stack.push(PythonWork::Container(PythonContainer {
+                    node,
+                    scope: scope.to_vec(),
+                    module_control_depth: next_depth,
+                }));
             }
             "elif_clause" | "else_clause" | "except_clause" | "finally_clause" => {
-                self.visit_container(node, scope, module_control_depth);
+                stack.push(PythonWork::Container(PythonContainer {
+                    node,
+                    scope: scope.to_vec(),
+                    module_control_depth,
+                }));
             }
-            "block" | "module" => self.visit_container(node, scope, module_control_depth),
+            "block" | "module" => stack.push(PythonWork::Container(PythonContainer {
+                node,
+                scope: scope.to_vec(),
+                module_control_depth,
+            })),
             _ => {}
         }
     }
 
-    fn visit_definition(
+    fn visit_definition<'tree>(
         &mut self,
-        definition: Node<'_>,
-        wrapper: Option<Node<'_>>,
+        definition: Node<'tree>,
+        wrapper: Option<Node<'tree>>,
         scope: &[Scope],
         module_control_depth: usize,
+        stack: &mut Vec<PythonWork<'tree>>,
     ) {
         match definition.kind() {
             "class_definition" => self.visit_class_definition(
@@ -91,23 +156,26 @@ impl<'a> PythonVisitor<'a> {
                 wrapper.unwrap_or(definition),
                 scope,
                 module_control_depth,
+                stack,
             ),
             "function_definition" => self.visit_function_definition(
                 definition,
                 wrapper.unwrap_or(definition),
                 scope,
                 module_control_depth,
+                stack,
             ),
             _ => {}
         }
     }
 
-    fn visit_class_definition(
+    fn visit_class_definition<'tree>(
         &mut self,
-        node: Node<'_>,
-        range_node: Node<'_>,
+        node: Node<'tree>,
+        range_node: Node<'tree>,
         scope: &[Scope],
         module_control_depth: usize,
+        stack: &mut Vec<PythonWork<'tree>>,
     ) {
         let Some(name_node) = node.child_by_field_name("name") else {
             return;
@@ -161,16 +229,21 @@ impl<'a> PythonVisitor<'a> {
             });
         }
         if let Some(body) = node.child_by_field_name("body") {
-            self.visit_container(body, &next_scope, module_control_depth);
+            stack.push(PythonWork::Container(PythonContainer {
+                node: body,
+                scope: next_scope,
+                module_control_depth,
+            }));
         }
     }
 
-    fn visit_function_definition(
+    fn visit_function_definition<'tree>(
         &mut self,
-        node: Node<'_>,
-        range_node: Node<'_>,
+        node: Node<'tree>,
+        range_node: Node<'tree>,
         scope: &[Scope],
         module_control_depth: usize,
+        stack: &mut Vec<PythonWork<'tree>>,
     ) {
         let Some(name_node) = node.child_by_field_name("name") else {
             return;
@@ -231,7 +304,11 @@ impl<'a> PythonVisitor<'a> {
                 code_unit: scope_code_unit,
             });
             if let Some(body) = node.child_by_field_name("body") {
-                self.visit_container(body, &next_scope, module_control_depth);
+                stack.push(PythonWork::Container(PythonContainer {
+                    node: body,
+                    scope: next_scope,
+                    module_control_depth,
+                }));
             }
             return;
         }
@@ -243,7 +320,11 @@ impl<'a> PythonVisitor<'a> {
             code_unit: None,
         });
         if let Some(body) = node.child_by_field_name("body") {
-            self.visit_container(body, &next_scope, module_control_depth);
+            stack.push(PythonWork::Container(PythonContainer {
+                node: body,
+                scope: next_scope,
+                module_control_depth,
+            }));
         }
     }
 
@@ -528,20 +609,15 @@ fn extract_python_supertypes(node: Node<'_>, source: &str) -> Vec<String> {
 
 fn collect_assigned_names(node: Node<'_>, source: &str) -> Vec<String> {
     let mut names = Vec::new();
-    match node.kind() {
-        "identifier" => {
+    walk_named_tree_preorder(node, true, |node| {
+        if node.kind() == "identifier" {
             let text = py_node_text(node, source).trim();
             if !text.is_empty() {
                 names.push(text.to_string());
             }
         }
-        _ => {
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                names.extend(collect_assigned_names(child, source));
-            }
-        }
-    }
+        WalkControl::Continue
+    });
     names
 }
 
@@ -550,16 +626,15 @@ pub(super) fn collect_python_identifiers(
     source: &str,
     identifiers: &mut HashSet<String>,
 ) {
-    if node.kind() == "identifier" {
-        let text = py_node_text(node, source).trim();
-        if !text.is_empty() {
-            identifiers.insert(text.to_string());
+    walk_named_tree_preorder(node, true, |node| {
+        if node.kind() == "identifier" {
+            let text = py_node_text(node, source).trim();
+            if !text.is_empty() {
+                identifiers.insert(text.to_string());
+            }
         }
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_python_identifiers(child, source, identifiers);
-    }
+        WalkControl::Continue
+    });
 }
 
 pub(super) fn parse_python_tree(source: &str) -> Option<Tree> {

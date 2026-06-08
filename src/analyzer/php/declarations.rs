@@ -32,6 +32,11 @@ impl PhpScope {
     }
 }
 
+struct PhpContainer<'tree> {
+    node: Node<'tree>,
+    scope: PhpScope,
+}
+
 struct PhpVisitor<'a> {
     file: &'a ProjectFile,
     source: &'a str,
@@ -40,43 +45,72 @@ struct PhpVisitor<'a> {
 
 impl<'a> PhpVisitor<'a> {
     fn visit_children(&mut self, node: Node<'_>, scope: &PhpScope) {
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            self.visit_node(child, scope);
+        let mut stack = vec![PhpContainer {
+            node,
+            scope: PhpScope::new(scope.package_name.clone(), scope.class_unit.clone()),
+        }];
+        while let Some(container) = stack.pop() {
+            let mut cursor = container.node.walk();
+            let children = container
+                .node
+                .named_children(&mut cursor)
+                .collect::<Vec<_>>();
+            for child in children.into_iter().rev() {
+                self.visit_node(child, &container.scope, &mut stack);
+            }
         }
     }
 
-    fn visit_node(&mut self, node: Node<'_>, scope: &PhpScope) {
+    fn visit_node<'tree>(
+        &mut self,
+        node: Node<'tree>,
+        scope: &PhpScope,
+        stack: &mut Vec<PhpContainer<'tree>>,
+    ) {
         match node.kind() {
-            "namespace_definition" => self.visit_namespace(node, scope),
+            "namespace_definition" => self.visit_namespace(node, scope, stack),
             "class_declaration" | "interface_declaration" | "trait_declaration" => {
-                self.visit_type_declaration(node, scope)
+                self.visit_type_declaration(node, scope, stack)
             }
             "function_definition" => self.visit_function(node, scope),
             "method_declaration" => self.visit_method(node, scope),
             "property_declaration" => self.visit_property_declaration(node, scope),
             "const_declaration" => self.visit_const_declaration(node, scope),
-            "declaration_list" | "compound_statement" => self.visit_children(node, scope),
+            "declaration_list" | "compound_statement" => stack.push(PhpContainer {
+                node,
+                scope: PhpScope::new(scope.package_name.clone(), scope.class_unit.clone()),
+            }),
             _ => {}
         }
     }
 
-    fn visit_namespace(&mut self, node: Node<'_>, scope: &PhpScope) {
+    fn visit_namespace<'tree>(
+        &mut self,
+        node: Node<'tree>,
+        scope: &PhpScope,
+        stack: &mut Vec<PhpContainer<'tree>>,
+    ) {
         let Some(name_node) = node.child_by_field_name("name") else {
             return;
         };
         let package_name = php_node_text(name_node, self.source).replace('\\', ".");
         let scope = PhpScope::new(package_name, scope.class_unit.clone());
         let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
+        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+        for child in children.into_iter().rev() {
             match child.kind() {
                 "namespace_name" | "name" => {}
-                _ => self.visit_node(child, &scope),
+                _ => self.visit_node(child, &scope, stack),
             }
         }
     }
 
-    fn visit_type_declaration(&mut self, node: Node<'_>, scope: &PhpScope) {
+    fn visit_type_declaration<'tree>(
+        &mut self,
+        node: Node<'tree>,
+        scope: &PhpScope,
+        stack: &mut Vec<PhpContainer<'tree>>,
+    ) {
         let Some(name_node) = node.child_by_field_name("name") else {
             return;
         };
@@ -109,10 +143,10 @@ impl<'a> PhpVisitor<'a> {
             .add_signature(code_unit.clone(), php_type_signature(node, self.source));
 
         if let Some(body) = php_class_body(node) {
-            self.visit_children(
-                body,
-                &PhpScope::new(scope.package_name.clone(), Some(code_unit)),
-            );
+            stack.push(PhpContainer {
+                node: body,
+                scope: PhpScope::new(scope.package_name.clone(), Some(code_unit)),
+            });
         }
     }
 
@@ -410,14 +444,14 @@ fn php_const_value(node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn php_find_named_descendant<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
-    if node.kind() == kind {
-        return Some(node);
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if let Some(found) = php_find_named_descendant(child, kind) {
-            return Some(found);
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        if node.kind() == kind {
+            return Some(node);
         }
+        let mut cursor = node.walk();
+        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
     }
     None
 }

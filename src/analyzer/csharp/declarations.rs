@@ -1,3 +1,4 @@
+use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use crate::analyzer::{CodeUnit, CodeUnitType, ProjectFile};
 use crate::hash::HashSet;
 use tree_sitter::{Node, Tree};
@@ -20,9 +21,15 @@ pub(super) fn parse_csharp_file(
     parsed
 }
 
+#[derive(Clone)]
 struct CSharpScope {
     package_name: String,
     class_unit: Option<CodeUnit>,
+}
+
+struct CSharpWork<'tree> {
+    node: Node<'tree>,
+    scope: CSharpScope,
 }
 
 struct CSharpVisitor<'a> {
@@ -38,26 +45,51 @@ impl<'a> CSharpVisitor<'a> {
         package_name: &str,
         class_unit: Option<CodeUnit>,
     ) {
-        let scope = CSharpScope {
-            package_name: package_name.to_string(),
-            class_unit,
-        };
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            self.visit_node(child, &scope);
+        let mut stack = Vec::new();
+        self.push_children(
+            node,
+            CSharpScope {
+                package_name: package_name.to_string(),
+                class_unit,
+            },
+            &mut stack,
+        );
+        while let Some(work) = stack.pop() {
+            self.visit_node(work.node, &work.scope, &mut stack);
         }
     }
 
-    fn visit_node(&mut self, node: Node<'_>, scope: &CSharpScope) {
+    fn push_children<'tree>(
+        &self,
+        node: Node<'tree>,
+        scope: CSharpScope,
+        stack: &mut Vec<CSharpWork<'tree>>,
+    ) {
+        let mut cursor = node.walk();
+        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+        for child in children.into_iter().rev() {
+            stack.push(CSharpWork {
+                node: child,
+                scope: scope.clone(),
+            });
+        }
+    }
+
+    fn visit_node<'tree>(
+        &mut self,
+        node: Node<'tree>,
+        scope: &CSharpScope,
+        stack: &mut Vec<CSharpWork<'tree>>,
+    ) {
         match node.kind() {
             "namespace_declaration" | "file_scoped_namespace_declaration" => {
-                self.visit_namespace(node, scope)
+                self.queue_namespace(node, scope, stack)
             }
             "class_declaration"
             | "interface_declaration"
             | "struct_declaration"
             | "record_declaration"
-            | "record_struct_declaration" => self.visit_type_declaration(node, scope),
+            | "record_struct_declaration" => self.visit_type_declaration(node, scope, stack),
             "method_declaration" => self.visit_method(node, scope),
             "constructor_declaration" => self.visit_constructor(node, scope),
             "property_declaration" => self.visit_property(node, scope),
@@ -78,7 +110,12 @@ impl<'a> CSharpVisitor<'a> {
         }
     }
 
-    fn visit_namespace(&mut self, node: Node<'_>, scope: &CSharpScope) {
+    fn queue_namespace<'tree>(
+        &mut self,
+        node: Node<'tree>,
+        scope: &CSharpScope,
+        stack: &mut Vec<CSharpWork<'tree>>,
+    ) {
         let Some(name_node) = node.child_by_field_name("name") else {
             return;
         };
@@ -92,11 +129,23 @@ impl<'a> CSharpVisitor<'a> {
             format!("{}.{}", scope.package_name, raw_name)
         };
         if let Some(body) = cs_namespace_body(node) {
-            self.visit_container(body, &package_name, scope.class_unit.clone());
+            self.push_children(
+                body,
+                CSharpScope {
+                    package_name,
+                    class_unit: scope.class_unit.clone(),
+                },
+                stack,
+            );
         }
     }
 
-    fn visit_type_declaration(&mut self, node: Node<'_>, scope: &CSharpScope) {
+    fn visit_type_declaration<'tree>(
+        &mut self,
+        node: Node<'tree>,
+        scope: &CSharpScope,
+        stack: &mut Vec<CSharpWork<'tree>>,
+    ) {
         let Some(name_node) = node.child_by_field_name("name") else {
             return;
         };
@@ -134,7 +183,14 @@ impl<'a> CSharpVisitor<'a> {
             .add_signature(code_unit.clone(), csharp_type_signature(node, self.source));
 
         if let Some(body) = cs_type_body(node) {
-            self.visit_container(body, &scope.package_name, Some(code_unit));
+            self.push_children(
+                body,
+                CSharpScope {
+                    package_name: scope.package_name.clone(),
+                    class_unit: Some(code_unit),
+                },
+                stack,
+            );
         }
     }
 
@@ -283,27 +339,25 @@ fn collect_csharp_type_identifiers(
     source: &str,
     identifiers: &mut HashSet<String>,
 ) {
-    if is_csharp_type_position_node(node)
-        && matches!(
-            node.kind(),
-            "identifier"
-                | "qualified_name"
-                | "generic_name"
-                | "nullable_type"
-                | "array_type"
-                | "type"
-        )
-    {
-        let text = normalize_csharp_type_name(cs_node_text(node, source));
-        if !text.is_empty() {
-            identifiers.insert(text);
+    walk_named_tree_preorder(node, true, |node| {
+        if is_csharp_type_position_node(node)
+            && matches!(
+                node.kind(),
+                "identifier"
+                    | "qualified_name"
+                    | "generic_name"
+                    | "nullable_type"
+                    | "array_type"
+                    | "type"
+            )
+        {
+            let text = normalize_csharp_type_name(cs_node_text(node, source));
+            if !text.is_empty() {
+                identifiers.insert(text);
+            }
         }
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_csharp_type_identifiers(child, source, identifiers);
-    }
+        WalkControl::Continue
+    });
 }
 
 fn is_csharp_type_position_node(mut node: Node<'_>) -> bool {

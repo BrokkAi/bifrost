@@ -17,6 +17,7 @@ use crate::analyzer::js_ts::imports::{
 };
 use crate::analyzer::js_ts::model::{module_code_unit, node_text, trim_statement};
 use crate::analyzer::js_ts::tests::detect_js_ts_test_assertion_smells;
+use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use crate::analyzer::{
     AnalyzerConfig, CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language,
     LanguageAdapter, Project, ProjectFile, TestAssertionSmell, TestAssertionWeights,
@@ -1043,55 +1044,49 @@ fn with_mutation_comment(signature: String, node: Node<'_>, source: &str) -> Str
 
 fn mutation_names(node: Node<'_>, source: &str) -> Vec<String> {
     let mut names = BTreeSet::new();
-    collect_mutation_names(node, source, node, &mut names);
+    collect_mutation_names(node, source, &mut names);
     names.into_iter().collect()
 }
 
-fn collect_mutation_names(
-    root: Node<'_>,
-    source: &str,
-    node: Node<'_>,
-    names: &mut BTreeSet<String>,
-) {
-    if node.id() != root.id()
-        && matches!(
-            node.kind(),
-            "function_declaration"
-                | "function_expression"
-                | "arrow_function"
-                | "method_definition"
-                | "class_declaration"
-        )
-    {
-        return;
-    }
-
-    match node.kind() {
-        "assignment_expression" => {
-            if let Some(left) = node.child_by_field_name("left")
-                && let Some(name) = mutation_target_name(left, source)
-            {
-                names.insert(name);
-            }
+fn collect_mutation_names(root: Node<'_>, source: &str, names: &mut BTreeSet<String>) {
+    walk_named_tree_preorder(root, true, |node| {
+        if node.id() != root.id()
+            && matches!(
+                node.kind(),
+                "function_declaration"
+                    | "function_expression"
+                    | "arrow_function"
+                    | "method_definition"
+                    | "class_declaration"
+            )
+        {
+            return WalkControl::SkipChildren;
         }
-        "update_expression" => {
-            let target = node
-                .child_by_field_name("argument")
-                .or_else(|| node.named_child(0))
-                .or_else(|| node.named_child(1));
-            if let Some(target) = target
-                && let Some(name) = mutation_target_name(target, source)
-            {
-                names.insert(name);
-            }
-        }
-        _ => {}
-    }
 
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_mutation_names(root, source, child, names);
-    }
+        match node.kind() {
+            "assignment_expression" => {
+                if let Some(left) = node.child_by_field_name("left")
+                    && let Some(name) = mutation_target_name(left, source)
+                {
+                    names.insert(name);
+                }
+            }
+            "update_expression" => {
+                let target = node
+                    .child_by_field_name("argument")
+                    .or_else(|| node.named_child(0))
+                    .or_else(|| node.named_child(1));
+                if let Some(target) = target
+                    && let Some(name) = mutation_target_name(target, source)
+                {
+                    names.insert(name);
+                }
+            }
+            _ => {}
+        }
+
+        WalkControl::Continue
+    });
 }
 
 fn mutation_target_name(node: Node<'_>, source: &str) -> Option<String> {
