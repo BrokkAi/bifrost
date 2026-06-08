@@ -93,6 +93,28 @@ fn test_simple_qualified_classes() {
 }
 
 #[test]
+fn test_braced_package_bodies_preserve_top_level_source_order() {
+    let project = inline_scala_project(&[(
+        "Packages.scala",
+        r#"
+        package alpha { class A }
+        class C
+        package beta { class B }
+        "#,
+    )]);
+    let analyzer = ScalaAnalyzer::from_project(project);
+    let file = ProjectFile::new(analyzer.project().root().to_path_buf(), "Packages.scala");
+
+    let top_level: Vec<_> = analyzer
+        .get_top_level_declarations(&file)
+        .into_iter()
+        .map(|unit| unit.fq_name())
+        .collect();
+
+    assert_eq!(vec!["alpha.A", "alpha.C", "alpha.beta.B"], top_level);
+}
+
+#[test]
 fn test_simple_methods_within_classes() {
     let project = inline_scala_project(&[(
         "ai/brokk/Foo.scala",

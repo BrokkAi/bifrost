@@ -639,6 +639,39 @@ fn test_function_overload_signatures() {
 }
 
 #[test]
+fn test_interface_overload_signatures_preserve_source_order() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    let file = write_file(
+        root,
+        "InterfaceOverloads.ts",
+        r#"
+            interface Parser {
+                parse(value: string): string;
+                parse(value: number): number;
+                parse(value: unknown): unknown;
+            }
+        "#,
+    );
+    let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+    let parse = analyzer
+        .get_declarations(&file)
+        .into_iter()
+        .find(|code_unit| code_unit.short_name() == "Parser.parse" && code_unit.is_function())
+        .unwrap();
+
+    let signatures = analyzer.signatures_of(&parse);
+    assert_eq!(
+        vec![
+            "parse(value: string): string",
+            "parse(value: number): number",
+            "parse(value: unknown): unknown",
+        ],
+        signatures
+    );
+}
+
+#[test]
 fn test_identical_overloads_merged_by_lookup_key() {
     let temp = tempdir().unwrap();
     let root = temp.path();

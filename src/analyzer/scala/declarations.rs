@@ -26,7 +26,8 @@ struct ScalaVisitor<'a> {
 
 enum ScalaWork<'tree> {
     CompilationUnit {
-        node: Node<'tree>,
+        children: Vec<Node<'tree>>,
+        index: usize,
         package_name: String,
     },
     TemplateBody {
@@ -38,15 +39,19 @@ enum ScalaWork<'tree> {
 
 impl<'a> ScalaVisitor<'a> {
     fn visit_compilation_unit(&mut self, node: Node<'_>, package_name: &str) {
+        let mut cursor = node.walk();
         let mut stack = vec![ScalaWork::CompilationUnit {
-            node,
+            children: node.named_children(&mut cursor).collect(),
+            index: 0,
             package_name: package_name.to_string(),
         }];
         while let Some(work) = stack.pop() {
             match work {
-                ScalaWork::CompilationUnit { node, package_name } => {
-                    self.process_compilation_unit(node, &package_name, &mut stack)
-                }
+                ScalaWork::CompilationUnit {
+                    children,
+                    index,
+                    package_name,
+                } => self.process_compilation_unit(children, index, package_name, &mut stack),
                 ScalaWork::TemplateBody {
                     node,
                     package_name,
@@ -58,14 +63,14 @@ impl<'a> ScalaVisitor<'a> {
 
     fn process_compilation_unit<'tree>(
         &mut self,
-        node: Node<'tree>,
-        package_name: &str,
+        children: Vec<Node<'tree>>,
+        mut index: usize,
+        mut current_package: String,
         stack: &mut Vec<ScalaWork<'tree>>,
     ) {
-        let mut current_package = package_name.to_string();
-        let mut cursor = node.walk();
-        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
-        for child in children {
+        while index < children.len() {
+            let child = children[index];
+            index += 1;
             match child.kind() {
                 "package_clause" => {
                     let package = scala_package_name(child, self.source);
@@ -81,9 +86,17 @@ impl<'a> ScalaVisitor<'a> {
                     }
                     if let Some(body) = child.child_by_field_name("body") {
                         stack.push(ScalaWork::CompilationUnit {
-                            node: body,
+                            children,
+                            index,
                             package_name: current_package.clone(),
                         });
+                        let mut cursor = body.walk();
+                        stack.push(ScalaWork::CompilationUnit {
+                            children: body.named_children(&mut cursor).collect(),
+                            index: 0,
+                            package_name: current_package.clone(),
+                        });
+                        return;
                     }
                 }
                 "import_declaration" => {

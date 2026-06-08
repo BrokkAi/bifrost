@@ -714,7 +714,8 @@ fn visit_ts_class_like(
         }
 
         if let Some(body) = definition.child_by_field_name("body") {
-            for index in (0..body.named_child_count()).rev() {
+            let mut nested_class_like = Vec::new();
+            for index in 0..body.named_child_count() {
                 let Some(child) = body.named_child(index) else {
                     continue;
                 };
@@ -729,11 +730,17 @@ fn visit_ts_class_like(
                     | "interface_declaration"
                     | "enum_declaration"
                     | "internal_module" => {
-                        stack.push((child, Some(code_unit.clone()), false));
+                        nested_class_like.push(child);
                     }
                     _ => {}
                 }
             }
+            stack.extend(
+                nested_class_like
+                    .into_iter()
+                    .rev()
+                    .map(|child| (child, Some(code_unit.clone()), false)),
+            );
         }
     }
     first
