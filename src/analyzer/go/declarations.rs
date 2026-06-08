@@ -1,3 +1,4 @@
+use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use crate::analyzer::{CodeUnit, CodeUnitType, ImportInfo, ProjectFile};
 use crate::hash::HashSet;
 use tree_sitter::{Node, Tree};
@@ -653,20 +654,18 @@ fn extract_go_type_name(node: Node<'_>, source: &str) -> Option<String> {
 }
 
 fn collect_go_type_identifiers(node: Node<'_>, source: &str, identifiers: &mut HashSet<String>) {
-    match node.kind() {
-        "identifier" | "type_identifier" | "field_identifier" | "package_identifier" => {
-            let text = go_node_text(node, source).trim();
-            if !text.is_empty() {
-                identifiers.insert(text.to_string());
+    walk_named_tree_preorder(node, true, |node| {
+        match node.kind() {
+            "identifier" | "type_identifier" | "field_identifier" | "package_identifier" => {
+                let text = go_node_text(node, source).trim();
+                if !text.is_empty() {
+                    identifiers.insert(text.to_string());
+                }
             }
+            _ => {}
         }
-        _ => {}
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_go_type_identifiers(child, source, identifiers);
-    }
+        WalkControl::Continue
+    });
 }
 
 fn go_struct_field_suffix(node: Node<'_>, source: &str) -> String {

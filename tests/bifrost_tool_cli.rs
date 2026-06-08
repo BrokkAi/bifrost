@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use tempfile::TempDir;
@@ -9,6 +9,10 @@ fn fixture_root() -> PathBuf {
         .join("tests")
         .join("fixtures")
         .join("testcode-java")
+}
+
+fn get_file_contents_args(path: &Path) -> String {
+    serde_json::json!({ "file_paths": [path] }).to_string()
 }
 
 #[test]
@@ -67,10 +71,7 @@ fn tool_normalizes_absolute_paths_inside_workspace() {
         .arg("--tool")
         .arg("get_file_contents")
         .arg("--args")
-        .arg(format!(
-            r#"{{"file_paths":["{}"]}}"#,
-            fixture_root().join("A.java").display()
-        ))
+        .arg(get_file_contents_args(&fixture_root().join("A.java")))
         .output()
         .expect("run bifrost --tool get_file_contents");
 
@@ -97,10 +98,7 @@ fn tool_rejects_absolute_paths_outside_workspace() {
         .arg("--tool")
         .arg("get_file_contents")
         .arg("--args")
-        .arg(format!(
-            r#"{{"file_paths":["{}"]}}"#,
-            outside_file.display()
-        ))
+        .arg(get_file_contents_args(&outside_file))
         .output()
         .expect("run bifrost --tool get_file_contents");
 

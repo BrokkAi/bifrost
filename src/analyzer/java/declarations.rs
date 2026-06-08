@@ -1,4 +1,5 @@
 use super::*;
+use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use tree_sitter::{Node, Parser, Tree};
 
 pub(super) fn determine_package_name(root: Node<'_>, source: &str) -> String {
@@ -186,20 +187,18 @@ pub(super) fn collect_type_identifiers(
     source: &str,
     identifiers: &mut HashSet<String>,
 ) {
-    match node.kind() {
-        "type_identifier" | "scoped_type_identifier" => {
-            let text = node_text(node, source).trim();
-            if !text.is_empty() {
-                identifiers.insert(text.to_string());
+    walk_named_tree_preorder(node, true, |node| {
+        match node.kind() {
+            "type_identifier" | "scoped_type_identifier" => {
+                let text = node_text(node, source).trim();
+                if !text.is_empty() {
+                    identifiers.insert(text.to_string());
+                }
             }
+            _ => {}
         }
-        _ => {}
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_type_identifiers(child, source, identifiers);
-    }
+        WalkControl::Continue
+    });
 }
 
 pub(super) fn visit_class_like(
@@ -211,129 +210,129 @@ pub(super) fn visit_class_like(
     top_level_owner: Option<&CodeUnit>,
     parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
 ) -> Option<CodeUnit> {
-    let name_node = node.child_by_field_name("name")?;
+    let mut first = None;
+    let mut stack = vec![(node, parent.cloned(), top_level_owner.cloned())];
+    while let Some((node, parent, top_level_owner)) = stack.pop() {
+        let Some(name_node) = node.child_by_field_name("name") else {
+            continue;
+        };
 
-    let simple_name = node_text(name_node, source).trim().to_string();
-    if simple_name.is_empty() {
-        return None;
-    }
+        let simple_name = node_text(name_node, source).trim().to_string();
+        if simple_name.is_empty() {
+            continue;
+        }
 
-    let short_name = parent
-        .map(|parent| format!("{}.{}", parent.short_name(), simple_name))
-        .unwrap_or(simple_name.clone());
+        let short_name = parent
+            .as_ref()
+            .map(|parent| format!("{}.{}", parent.short_name(), simple_name))
+            .unwrap_or(simple_name.clone());
 
-    let code_unit = CodeUnit::new(
-        file.clone(),
-        crate::analyzer::CodeUnitType::Class,
-        package_name.to_string(),
-        short_name,
-    );
-    let raw_supertypes = extract_raw_supertypes(node, source);
-    let signature = class_signature(node, source);
-
-    let top_level = top_level_owner
-        .cloned()
-        .unwrap_or_else(|| code_unit.clone());
-    parsed.add_code_unit(
-        code_unit.clone(),
-        node,
-        source,
-        parent.cloned(),
-        Some(top_level.clone()),
-    );
-    parsed.set_raw_supertypes(code_unit.clone(), raw_supertypes);
-    parsed.add_signature(code_unit.clone(), signature);
-
-    if node.kind() == "record_declaration" {
-        visit_record_components(
-            file,
-            source,
-            node,
-            package_name,
-            &code_unit,
-            &top_level,
-            parsed,
+        let code_unit = CodeUnit::new(
+            file.clone(),
+            crate::analyzer::CodeUnitType::Class,
+            package_name.to_string(),
+            short_name,
         );
-    }
+        if first.is_none() {
+            first = Some(code_unit.clone());
+        }
+        let raw_supertypes = extract_raw_supertypes(node, source);
+        let signature = class_signature(node, source);
 
-    let mut has_explicit_constructor = false;
-    if let Some(body) = node.child_by_field_name("body") {
-        for index in 0..body.named_child_count() {
-            let Some(child) = body.named_child(index) else {
-                continue;
-            };
+        let top_level = top_level_owner.unwrap_or_else(|| code_unit.clone());
+        parsed.add_code_unit(
+            code_unit.clone(),
+            node,
+            source,
+            parent.clone(),
+            Some(top_level.clone()),
+        );
+        parsed.set_raw_supertypes(code_unit.clone(), raw_supertypes);
+        parsed.add_signature(code_unit.clone(), signature);
 
-            match child.kind() {
-                "class_declaration"
-                | "interface_declaration"
-                | "enum_declaration"
-                | "record_declaration"
-                | "annotation_type_declaration" => {
-                    visit_class_like(
-                        file,
-                        source,
-                        child,
-                        package_name,
-                        Some(&code_unit),
-                        Some(&top_level),
-                        parsed,
-                    );
-                }
-                "method_declaration" | "constructor_declaration" => {
-                    if child.kind() == "constructor_declaration" {
-                        has_explicit_constructor = true;
+        if node.kind() == "record_declaration" {
+            visit_record_components(
+                file,
+                source,
+                node,
+                package_name,
+                &code_unit,
+                &top_level,
+                parsed,
+            );
+        }
+
+        let mut has_explicit_constructor = false;
+        if let Some(body) = node.child_by_field_name("body") {
+            for index in (0..body.named_child_count()).rev() {
+                let Some(child) = body.named_child(index) else {
+                    continue;
+                };
+
+                match child.kind() {
+                    "class_declaration"
+                    | "interface_declaration"
+                    | "enum_declaration"
+                    | "record_declaration"
+                    | "annotation_type_declaration" => {
+                        stack.push((child, Some(code_unit.clone()), Some(top_level.clone())));
                     }
-                    visit_callable(
-                        file,
-                        source,
-                        child,
-                        package_name,
-                        &code_unit,
-                        &top_level,
-                        parsed,
-                    );
+                    "method_declaration" | "constructor_declaration" => {
+                        if child.kind() == "constructor_declaration" {
+                            has_explicit_constructor = true;
+                        }
+                        visit_callable(
+                            file,
+                            source,
+                            child,
+                            package_name,
+                            &code_unit,
+                            &top_level,
+                            parsed,
+                        );
+                    }
+                    "field_declaration" | "constant_declaration" => {
+                        visit_field_declaration(
+                            file,
+                            source,
+                            child,
+                            package_name,
+                            &code_unit,
+                            &top_level,
+                            parsed,
+                        );
+                    }
+                    "enum_constant" => {
+                        visit_enum_constant(
+                            file,
+                            source,
+                            child,
+                            package_name,
+                            &code_unit,
+                            &top_level,
+                            parsed,
+                        );
+                    }
+                    _ => {}
                 }
-                "field_declaration" | "constant_declaration" => {
-                    visit_field_declaration(
-                        file,
-                        source,
-                        child,
-                        package_name,
-                        &code_unit,
-                        &top_level,
-                        parsed,
-                    );
-                }
-                "enum_constant" => {
-                    visit_enum_constant(
-                        file,
-                        source,
-                        child,
-                        package_name,
-                        &code_unit,
-                        &top_level,
-                        parsed,
-                    );
-                }
-                _ => {}
             }
+        }
+
+        if should_create_implicit_constructor(node.kind(), has_explicit_constructor) {
+            let ctor = CodeUnit::with_signature(
+                file.clone(),
+                crate::analyzer::CodeUnitType::Function,
+                package_name.to_string(),
+                format!("{}.{}", code_unit.short_name(), simple_name),
+                None,
+                true,
+            );
+            parsed.declarations.insert(ctor.clone());
+            parsed.add_child(code_unit.clone(), ctor);
         }
     }
 
-    if should_create_implicit_constructor(node.kind(), has_explicit_constructor) {
-        let ctor = CodeUnit::with_signature(
-            file.clone(),
-            crate::analyzer::CodeUnitType::Function,
-            package_name.to_string(),
-            format!("{}.{}", code_unit.short_name(), simple_name),
-            None,
-            true,
-        );
-        parsed.declarations.insert(ctor.clone());
-        parsed.add_child(code_unit.clone(), ctor);
-    }
-
-    Some(code_unit)
+    first
 }
 
 fn visit_callable(
@@ -531,33 +530,29 @@ fn collect_lambda_expressions(
     top_level: &CodeUnit,
     parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
 ) {
-    if node.kind() == "lambda_expression" {
-        let lambda = lambda_code_unit(file, package_name, parent, node);
-        parsed.add_code_unit(
-            lambda.clone(),
-            node,
-            source,
-            Some(parent.clone()),
-            Some(top_level.clone()),
-        );
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            collect_lambda_expressions(
-                file,
+    let mut stack = vec![(node, parent.clone())];
+    while let Some((node, parent)) = stack.pop() {
+        let next_parent = if node.kind() == "lambda_expression" {
+            let lambda = lambda_code_unit(file, package_name, &parent, node);
+            parsed.add_code_unit(
+                lambda.clone(),
+                node,
                 source,
-                child,
-                package_name,
-                &lambda,
-                top_level,
-                parsed,
+                Some(parent),
+                Some(top_level.clone()),
             );
-        }
-        return;
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_lambda_expressions(file, source, child, package_name, parent, top_level, parsed);
+            lambda
+        } else {
+            parent
+        };
+        let mut cursor = node.walk();
+        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(
+            children
+                .into_iter()
+                .rev()
+                .map(|child| (child, next_parent.clone())),
+        );
     }
 }
 
@@ -977,18 +972,16 @@ pub(super) fn extract_raw_supertypes(node: Node<'_>, source: &str) -> Vec<String
 }
 
 fn collect_supertype_nodes(node: Node<'_>, source: &str, raw: &mut Vec<String>) {
-    match node.kind() {
-        "type_identifier" | "scoped_type_identifier" => {
-            let text = node_text(node, source).trim();
-            if !text.is_empty() {
-                raw.push(text.to_string());
+    walk_named_tree_preorder(node, true, |node| {
+        match node.kind() {
+            "type_identifier" | "scoped_type_identifier" => {
+                let text = node_text(node, source).trim();
+                if !text.is_empty() {
+                    raw.push(text.to_string());
+                }
             }
+            _ => {}
         }
-        _ => {}
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_supertype_nodes(child, source, raw);
-    }
+        WalkControl::Continue
+    });
 }

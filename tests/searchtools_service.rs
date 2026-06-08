@@ -815,6 +815,106 @@ fn activate_workspace_normalizes_to_git_root() {
     assert_eq!(value["workspace_path"], repo_root.display().to_string());
 }
 
+#[test]
+fn service_initializes_generated_large_workspace_with_deep_java_shape() {
+    let temp = generated_java_workspace(1_000, 256, false);
+    let service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
+
+    let payload = service
+        .call_tool_json(
+            "search_symbols",
+            r#"{"patterns":["DeepRoot"],"include_tests":true,"limit":5}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    assert!(
+        value["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| file["path"] == "DeepRoot.java"),
+        "payload: {value}"
+    );
+}
+
+#[test]
+#[ignore = "expensive 10k-file smoke test for issue #175"]
+fn service_initializes_ten_thousand_tracked_java_files_without_stack_overflow() {
+    let temp = generated_java_workspace(10_000, 512, true);
+    let service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
+
+    let payload = service
+        .call_tool_json(
+            "search_symbols",
+            r#"{"patterns":["Generated9999"],"include_tests":true,"limit":5}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    assert!(
+        value["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| file["path"] == "Generated9999.java"),
+        "payload: {value}"
+    );
+}
+
+fn generated_java_workspace(file_count: usize, nested_depth: usize, tracked: bool) -> TempDir {
+    let temp = TempDir::new().unwrap();
+    let mut paths = Vec::with_capacity(file_count + 1);
+
+    let deep_path = temp.path().join("DeepRoot.java");
+    fs::write(&deep_path, deep_java_source(nested_depth)).unwrap();
+    paths.push(PathBuf::from("DeepRoot.java"));
+
+    for index in 0..file_count {
+        let rel = PathBuf::from(format!("Generated{index}.java"));
+        fs::write(
+            temp.path().join(&rel),
+            format!("public class Generated{index} {{ int value() {{ return {index}; }} }}\n"),
+        )
+        .unwrap();
+        paths.push(rel);
+    }
+
+    if tracked {
+        let repo = Repository::init(temp.path()).unwrap();
+        let mut index = repo.index().unwrap();
+        for path in &paths {
+            index.add_path(path).unwrap();
+        }
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let signature = Signature::now("Test User", "test@example.com").unwrap();
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "generated",
+            &tree,
+            &[],
+        )
+        .unwrap();
+    }
+
+    temp
+}
+
+fn deep_java_source(depth: usize) -> String {
+    let mut source = String::from("public class DeepRoot {\n");
+    for index in 0..depth {
+        source.push_str(&format!("static class Nested{index} {{\n"));
+    }
+    source.push_str("int value() { return 1; }\n");
+    for _ in 0..depth {
+        source.push_str("}\n");
+    }
+    source.push_str("}\n");
+    source
+}
+
 fn commit_paths(repo: &Repository, paths: &[&str], message: &str) {
     let mut index = repo.index().unwrap();
     for path in paths {
