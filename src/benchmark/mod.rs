@@ -1,0 +1,16 @@
+pub mod manifest;
+pub mod mcp_session;
+pub mod repo_cache;
+pub mod report;
+pub mod runner;
+pub mod subset_workspace;
+
+pub use manifest::{
+    BenchmarkManifest, BenchmarkRepoTarget, BenchmarkScenario, ManifestLanguage, ManifestLoadError,
+    ManifestValidationError,
+};
+pub use report::{
+    BenchmarkCompareReport, BenchmarkRepoReport, BenchmarkRunReport, CompareThresholds,
+    ScenarioCompareOutcome, ScenarioCompareReport, ScenarioReport, ScenarioTransport,
+};
+pub use runner::{RunRequest, run_benchmark};

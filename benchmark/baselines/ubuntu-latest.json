@@ -1,0 +1,1269 @@
+{
+  "generated_at": "2026-06-05T12:43:58.177355140+00:00",
+  "manifest_path": "benchmark/targets.toml",
+  "bifrost_commit": "80aec4c70aeb9c225b989584fe96427d173507c3",
+  "selected_repo": null,
+  "max_files": null,
+  "repos": [
+    {
+      "name": "google-gson",
+      "url": "https://github.com/google/gson",
+      "commit": "ed2397502708ebaba53643e5c3d60e0974d7045f",
+      "checkout_path": "/home/runner/work/bifrost/bifrost/benchmark/.cache/repos/google-gson",
+      "workspace_path": "/home/runner/work/bifrost/bifrost/benchmark/.cache/repos/google-gson",
+      "subset_max_files": null,
+      "scenarios": [
+        {
+          "name": "workspace_build",
+          "transport": "direct",
+          "success": true,
+          "warmup_durations_ms": [
+            719.205915,
+            707.266324
+          ],
+          "measured_durations_ms": [
+            727.794433,
+            691.0044039999999,
+            728.766933,
+            699.098018,
+            686.533754,
+            727.801523,
+            737.409353
+          ],
+          "median_ms": 727.794433,
+          "mean_ms": 714.0583454285714
+        },
+        {
+          "name": "search_symbols",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            219.777537,
+            220.833527
+          ],
+          "measured_durations_ms": [
+            216.942763,
+            216.42973400000002,
+            217.597922,
+            217.06250999999997,
+            223.08124600000002,
+            229.358296,
+            230.908568
+          ],
+          "median_ms": 217.597922,
+          "mean_ms": 221.62586271428572
+        },
+        {
+          "name": "get_symbol_locations",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            533.552416,
+            531.495864
+          ],
+          "measured_durations_ms": [
+            534.555338,
+            541.444068,
+            532.484767,
+            532.1697899999999,
+            531.6529760000001,
+            532.877998,
+            531.4459099999999
+          ],
+          "median_ms": 532.484767,
+          "mean_ms": 533.8044067142857
+        },
+        {
+          "name": "get_summaries",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            8.350150000000001,
+            7.0939119999999996
+          ],
+          "measured_durations_ms": [
+            6.55161,
+            9.065508,
+            9.065799,
+            9.063425,
+            7.408498000000001,
+            7.162433999999999,
+            7.092019
+          ],
+          "median_ms": 7.408498000000001,
+          "mean_ms": 7.915613285714286
+        },
+        {
+          "name": "most_relevant_files",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            154.402925,
+            159.939964
+          ],
+          "measured_durations_ms": [
+            159.445373,
+            159.62322600000002,
+            158.803835,
+            159.928357,
+            160.45543700000002,
+            160.830501,
+            160.86931900000002
+          ],
+          "median_ms": 159.928357,
+          "mean_ms": 159.99372114285714
+        },
+        {
+          "name": "scan_usages",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            1930.410346,
+            1843.717545
+          ],
+          "measured_durations_ms": [
+            1850.59912,
+            1853.693194,
+            1854.002727,
+            1834.2345450000003,
+            1833.376647,
+            1829.916691,
+            1851.3798339999998
+          ],
+          "median_ms": 1850.59912,
+          "mean_ms": 1843.8861082857145
+        }
+      ]
+    },
+    {
+      "name": "gin-go",
+      "url": "https://github.com/gin-gonic/gin",
+      "commit": "d75fcd4c9ab260e5225de590f1f0f8c0e0e12d11",
+      "checkout_path": "/home/runner/work/bifrost/bifrost/benchmark/.cache/repos/gin-go",
+      "workspace_path": "/home/runner/work/bifrost/bifrost/benchmark/.cache/repos/gin-go",
+      "subset_max_files": null,
+      "scenarios": [
+        {
+          "name": "workspace_build",
+          "transport": "direct",
+          "success": true,
+          "warmup_durations_ms": [
+            299.205565,
+            369.017255
+          ],
+          "measured_durations_ms": [
+            297.618417,
+            295.42312999999996,
+            292.226371,
+            281.64274500000005,
+            294.93437700000004,
+            293.78204200000005,
+            364.706909
+          ],
+          "median_ms": 294.93437700000004,
+          "mean_ms": 302.90485585714293
+        },
+        {
+          "name": "search_symbols",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            12.740126,
+            11.705536
+          ],
+          "measured_durations_ms": [
+            11.663503,
+            11.591818,
+            11.667449,
+            11.568463,
+            11.579379000000001,
+            11.58062,
+            11.650594
+          ],
+          "median_ms": 11.591818,
+          "mean_ms": 11.614546571428573
+        },
+        {
+          "name": "get_symbol_locations",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            1.229509,
+            1.157933
+          ],
+          "measured_durations_ms": [
+            1.114999,
+            1.113698,
+            1.105746,
+            1.102621,
+            1.1040729999999999,
+            1.1044640000000001,
+            1.104955
+          ],
+          "median_ms": 1.104955,
+          "mean_ms": 1.1072222857142857
+        },
+        {
+          "name": "get_summaries",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            4.003623,
+            3.916584
+          ],
+          "measured_durations_ms": [
+            3.884747,
+            3.94788,
+            3.886369,
+            3.926238,
+            3.892888,
+            3.902383,
+            3.870886
+          ],
+          "median_ms": 3.892888,
+          "mean_ms": 3.901627285714286
+        },
+        {
+          "name": "most_relevant_files",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            47.797565999999996,
+            46.834541
+          ],
+          "measured_durations_ms": [
+            46.808332,
+            47.085122,
+            53.616682999999995,
+            46.635326,
+            46.751118,
+            46.40808,
+            46.471704
+          ],
+          "median_ms": 46.751118,
+          "mean_ms": 47.68233785714285
+        },
+        {
+          "name": "scan_usages",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            736.990246,
+            686.394321
+          ],
+          "measured_durations_ms": [
+            689.153852,
+            691.0484749999999,
+            688.661561,
+            687.547428,
+            688.895171,
+            696.236538,
+            693.97228
+          ],
+          "median_ms": 689.153852,
+          "mean_ms": 690.7879007142857
+        }
+      ]
+    },
+    {
+      "name": "fmt-cpp",
+      "url": "https://github.com/fmtlib/fmt",
+      "commit": "9afcd929ba675d942371de8ca1832f9d5d09b4bd",
+      "checkout_path": "/home/runner/work/bifrost/bifrost/benchmark/.cache/repos/fmt-cpp",
+      "workspace_path": "/home/runner/work/bifrost/bifrost/benchmark/.cache/repos/fmt-cpp",
+      "subset_max_files": null,
+      "scenarios": [
+        {
+          "name": "workspace_build",
+          "transport": "direct",
+          "success": true,
+          "warmup_durations_ms": [
+            1524.1077870000001,
+            1501.153511
+          ],
+          "measured_durations_ms": [
+            1508.1770780000002,
+            1512.3212740000001,
+            1575.5009989999999,
+            1533.437227,
+            1515.283989,
+            1484.866301,
+            1517.0400829999999
+          ],
+          "median_ms": 1515.283989,
+          "mean_ms": 1520.9467072857144
+        },
+        {
+          "name": "search_symbols",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            88.22587299999999,
+            88.292552
+          ],
+          "measured_durations_ms": [
+            87.698733,
+            87.791631,
+            88.206915,
+            87.944307,
+            87.95459199999999,
+            87.947601,
+            87.821335
+          ],
+          "median_ms": 87.944307,
+          "mean_ms": 87.909302
+        },
+        {
+          "name": "get_symbol_locations",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            0.927001,
+            0.712154
+          ],
+          "measured_durations_ms": [
+            0.680316,
+            0.694798,
+            0.7044119999999999,
+            0.677802,
+            0.695438,
+            0.703651,
+            0.6729550000000001
+          ],
+          "median_ms": 0.694798,
+          "mean_ms": 0.6899102857142857
+        },
+        {
+          "name": "get_summaries",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            25.750808,
+            25.419377
+          ],
+          "measured_durations_ms": [
+            25.316626,
+            25.428611,
+            25.388431999999998,
+            25.319429,
+            25.420579,
+            25.327872000000003,
+            25.368071999999998
+          ],
+          "median_ms": 25.368071999999998,
+          "mean_ms": 25.36708871428571
+        },
+        {
+          "name": "most_relevant_files",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            37.081357000000004,
+            36.14405
+          ],
+          "measured_durations_ms": [
+            36.179753000000005,
+            36.194875,
+            35.978004,
+            35.995028999999995,
+            36.064451999999996,
+            38.409681,
+            38.82828
+          ],
+          "median_ms": 36.179753000000005,
+          "mean_ms": 36.807153428571425
+        }
+      ]
+    },
+    {
+      "name": "express-js",
+      "url": "https://github.com/expressjs/express",
+      "commit": "dae209ae6559c29cfca2a1f4414c51d89ea643d5",
+      "checkout_path": "/home/runner/work/bifrost/bifrost/benchmark/.cache/repos/express-js",
+      "workspace_path": "/home/runner/work/bifrost/bifrost/benchmark/.cache/repos/express-js",
+      "subset_max_files": null,
+      "scenarios": [
+        {
+          "name": "workspace_build",
+          "transport": "direct",
+          "success": true,
+          "warmup_durations_ms": [
+            161.798503,
+            166.125523
+          ],
+          "measured_durations_ms": [
+            172.592539,
+            171.106069,
+            171.941916,
+            163.510876,
+            163.934302,
+            165.031946,
+            164.608389
+          ],
+          "median_ms": 165.031946,
+          "mean_ms": 167.532291
+        },
+        {
+          "name": "search_symbols",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            3.647054,
+            2.6836490000000004
+          ],
+          "measured_durations_ms": [
+            2.547969,
+            2.506227,
+            2.532225,
+            2.4962220000000004,
+            2.547858,
+            2.557393,
+            2.5614689999999998
+          ],
+          "median_ms": 2.547858,
+          "mean_ms": 2.5356232857142857
+        },
+        {
+          "name": "get_symbol_locations",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            0.714526,
+            0.6065969999999999
+          ],
+          "measured_durations_ms": [
+            0.616823,
+            0.600808,
+            0.616582,
+            0.615471,
+            0.605746,
+            0.614028,
+            0.596693
+          ],
+          "median_ms": 0.614028,
+          "mean_ms": 0.6094501428571428
+        },
+        {
+          "name": "get_summaries",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            1.23722,
+            0.9919169999999999
+          ],
+          "measured_durations_ms": [
+            0.985618,
+            1.089872,
+            0.985918,
+            0.9823930000000001,
+            0.9814120000000001,
+            0.978077,
+            0.9794490000000001
+          ],
+          "median_ms": 0.9823930000000001,
+          "mean_ms": 0.9975341428571428
+        },
+        {
+          "name": "most_relevant_files",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            51.521905,
+            50.137918
+          ],
+          "measured_durations_ms": [
+            49.923411,
+            49.965142,
+            49.999514000000005,
+            50.03125,
+            49.961186,
+            49.930571,
+            53.708669
+          ],
+          "median_ms": 49.965142,
+          "mean_ms": 50.50282042857143
+        },
+        {
+          "name": "scan_usages",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            151.539298,
+            140.075903
+          ],
+          "measured_durations_ms": [
+            145.008369,
+            141.38046300000002,
+            141.56780999999998,
+            143.080357,
+            140.00396700000002,
+            144.050082,
+            139.91134
+          ],
+          "median_ms": 141.56780999999998,
+          "mean_ms": 142.14319828571428
+        }
+      ]
+    },
+    {
+      "name": "ky-ts",
+      "url": "https://github.com/sindresorhus/ky",
+      "commit": "61d6d66d27911001b9b4d57ab93139f9ad61384b",
+      "checkout_path": "/home/runner/work/bifrost/bifrost/benchmark/.cache/repos/ky-ts",
+      "workspace_path": "/home/runner/work/bifrost/bifrost/benchmark/.cache/repos/ky-ts",
+      "subset_max_files": null,
+      "scenarios": [
+        {
+          "name": "workspace_build",
+          "transport": "direct",
+          "success": true,
+          "warmup_durations_ms": [
+            134.058112,
+            131.998627
+          ],
+          "measured_durations_ms": [
+            136.130087,
+            134.688585,
+            135.621655,
+            140.378741,
+            138.507589,
+            134.72594800000002,
+            133.09135
+          ],
+          "median_ms": 135.621655,
+          "mean_ms": 136.16342214285717
+        },
+        {
+          "name": "search_symbols",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            11.515493999999999,
+            10.636985999999998
+          ],
+          "measured_durations_ms": [
+            10.579119,
+            10.683273,
+            10.642303,
+            10.59265,
+            10.562174,
+            10.665417,
+            10.583986
+          ],
+          "median_ms": 10.59265,
+          "mean_ms": 10.615560285714285
+        },
+        {
+          "name": "get_symbol_locations",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            1.530174,
+            1.386821
+          ],
+          "measured_durations_ms": [
+            1.39975,
+            1.3772179999999998,
+            1.412469,
+            1.407912,
+            1.391718,
+            1.394884,
+            1.375975
+          ],
+          "median_ms": 1.394884,
+          "mean_ms": 1.394275142857143
+        },
+        {
+          "name": "get_summaries",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            2.784609,
+            2.619014
+          ],
+          "measured_durations_ms": [
+            2.618223,
+            2.623711,
+            2.6068160000000002,
+            2.612284,
+            2.628969,
+            2.603251,
+            2.619965
+          ],
+          "median_ms": 2.618223,
+          "mean_ms": 2.616174142857143
+        },
+        {
+          "name": "most_relevant_files",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            39.053331,
+            38.045669999999994
+          ],
+          "measured_durations_ms": [
+            37.981616,
+            37.949268000000004,
+            38.134833,
+            38.033322,
+            38.053432,
+            38.41,
+            38.041584
+          ],
+          "median_ms": 38.041584,
+          "mean_ms": 38.08629357142858
+        },
+        {
+          "name": "scan_usages",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            121.334939,
+            118.183427
+          ],
+          "measured_durations_ms": [
+            121.784534,
+            114.25122999999999,
+            115.112905,
+            114.88669999999999,
+            119.06918700000001,
+            112.70996,
+            121.74705800000001
+          ],
+          "median_ms": 115.112905,
+          "mean_ms": 117.08022485714287
+        }
+      ]
+    },
+    {
+      "name": "click-py",
+      "url": "https://github.com/pallets/click",
+      "commit": "c48021040a50c659b74e24ac2b11c9c9c6620a21",
+      "checkout_path": "/home/runner/work/bifrost/bifrost/benchmark/.cache/repos/click-py",
+      "workspace_path": "/home/runner/work/bifrost/bifrost/benchmark/.cache/repos/click-py",
+      "subset_max_files": null,
+      "scenarios": [
+        {
+          "name": "workspace_build",
+          "transport": "direct",
+          "success": true,
+          "warmup_durations_ms": [
+            385.322492,
+            325.994298
+          ],
+          "measured_durations_ms": [
+            360.436228,
+            374.49166,
+            353.652032,
+            389.183002,
+            339.76761300000004,
+            337.187686,
+            327.085213
+          ],
+          "median_ms": 353.652032,
+          "mean_ms": 354.5433477142857
+        },
+        {
+          "name": "search_symbols",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            202.564571,
+            202.59553599999998
+          ],
+          "measured_durations_ms": [
+            198.287763,
+            197.808525,
+            198.202417,
+            198.490525,
+            201.65423399999997,
+            199.17458599999998,
+            198.449523
+          ],
+          "median_ms": 198.449523,
+          "mean_ms": 198.86679614285714
+        },
+        {
+          "name": "get_symbol_locations",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            5.072985,
+            4.911225
+          ],
+          "measured_durations_ms": [
+            4.883524,
+            4.881802,
+            4.889894,
+            4.9031530000000005,
+            4.8752819999999994,
+            4.892246999999999,
+            4.900469
+          ],
+          "median_ms": 4.889894,
+          "mean_ms": 4.889481571428571
+        },
+        {
+          "name": "get_summaries",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            19.348371999999998,
+            19.049588999999997
+          ],
+          "measured_durations_ms": [
+            18.871847,
+            18.851306,
+            18.849494,
+            18.949442,
+            18.799409999999998,
+            18.830506,
+            18.933387999999997
+          ],
+          "median_ms": 18.851306,
+          "mean_ms": 18.869341857142853
+        },
+        {
+          "name": "most_relevant_files",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            189.906856,
+            187.70583699999997
+          ],
+          "measured_durations_ms": [
+            187.261545,
+            186.925437,
+            186.75800900000002,
+            193.98364700000002,
+            187.893689,
+            190.643035,
+            187.504894
+          ],
+          "median_ms": 187.504894,
+          "mean_ms": 188.7100365714286
+        },
+        {
+          "name": "scan_usages",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            2001.077952,
+            1889.409321
+          ],
+          "measured_durations_ms": [
+            1917.147779,
+            1921.1464270000001,
+            1921.02037,
+            1930.8043129999999,
+            1941.234361,
+            1925.476623,
+            1924.577902
+          ],
+          "median_ms": 1924.577902,
+          "mean_ms": 1925.9153964285713
+        }
+      ]
+    },
+    {
+      "name": "serde-json-rs",
+      "url": "https://github.com/serde-rs/json",
+      "commit": "a1ae73ac6a6940a4a57c673aebaa13ed4dfe3e8c",
+      "checkout_path": "/home/runner/work/bifrost/bifrost/benchmark/.cache/repos/serde-json-rs",
+      "workspace_path": "/home/runner/work/bifrost/bifrost/benchmark/.cache/repos/serde-json-rs",
+      "subset_max_files": null,
+      "scenarios": [
+        {
+          "name": "workspace_build",
+          "transport": "direct",
+          "success": true,
+          "warmup_durations_ms": [
+            249.837006,
+            250.760331
+          ],
+          "measured_durations_ms": [
+            249.003253,
+            275.603975,
+            253.82382199999998,
+            248.898639,
+            265.398696,
+            249.726313,
+            250.54542400000003
+          ],
+          "median_ms": 250.54542400000003,
+          "mean_ms": 256.14287457142854
+        },
+        {
+          "name": "search_symbols",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            45.589258,
+            44.205402
+          ],
+          "measured_durations_ms": [
+            44.113286,
+            43.700865,
+            44.054939000000005,
+            43.917206,
+            44.090342,
+            43.90685,
+            44.754864
+          ],
+          "median_ms": 44.054939000000005,
+          "mean_ms": 44.07690742857143
+        },
+        {
+          "name": "get_symbol_locations",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            1.574909,
+            1.349876
+          ],
+          "measured_durations_ms": [
+            1.256648,
+            1.2393720000000001,
+            1.247705,
+            1.238702,
+            1.234495,
+            1.2414049999999999,
+            1.238451
+          ],
+          "median_ms": 1.2393720000000001,
+          "mean_ms": 1.2423968571428572
+        },
+        {
+          "name": "get_summaries",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            2.8143510000000003,
+            2.5307720000000002
+          ],
+          "measured_durations_ms": [
+            2.493186,
+            2.5101709999999997,
+            2.484884,
+            2.493998,
+            2.4793060000000002,
+            2.508439,
+            2.505144
+          ],
+          "median_ms": 2.493998,
+          "mean_ms": 2.4964468571428573
+        },
+        {
+          "name": "most_relevant_files",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            34.447883999999995,
+            40.837120999999996
+          ],
+          "measured_durations_ms": [
+            34.005630000000004,
+            33.908106000000004,
+            34.062965,
+            34.146909,
+            34.137365,
+            34.129654,
+            33.84306
+          ],
+          "median_ms": 34.062965,
+          "mean_ms": 34.033384142857145
+        }
+      ]
+    },
+    {
+      "name": "fastroute-php",
+      "url": "https://github.com/nikic/FastRoute",
+      "commit": "1c961398bef1ff6ecd8b273bef651d7afe90312b",
+      "checkout_path": "/home/runner/work/bifrost/bifrost/benchmark/.cache/repos/fastroute-php",
+      "workspace_path": "/home/runner/work/bifrost/bifrost/benchmark/.cache/repos/fastroute-php",
+      "subset_max_files": null,
+      "scenarios": [
+        {
+          "name": "workspace_build",
+          "transport": "direct",
+          "success": true,
+          "warmup_durations_ms": [
+            54.941395,
+            52.911244
+          ],
+          "measured_durations_ms": [
+            51.072725,
+            51.442943,
+            49.721778,
+            50.036323,
+            52.025305,
+            46.230236,
+            50.217470999999996
+          ],
+          "median_ms": 50.217470999999996,
+          "mean_ms": 50.106683
+        },
+        {
+          "name": "search_symbols",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            5.192107,
+            4.2853259999999995
+          ],
+          "measured_durations_ms": [
+            4.249524,
+            4.217606,
+            4.179239000000001,
+            4.266178,
+            4.218387,
+            4.286088,
+            4.187822
+          ],
+          "median_ms": 4.218387,
+          "mean_ms": 4.2292634285714295
+        },
+        {
+          "name": "get_symbol_locations",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            0.468583,
+            0.35837
+          ],
+          "measured_durations_ms": [
+            0.341145,
+            0.354614,
+            0.37266099999999996,
+            0.349878,
+            0.36446900000000004,
+            0.33774899999999997,
+            0.333193
+          ],
+          "median_ms": 0.349878,
+          "mean_ms": 0.35052985714285717
+        },
+        {
+          "name": "get_summaries",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            1.236708,
+            1.097433
+          ],
+          "measured_durations_ms": [
+            1.092616,
+            1.090702,
+            1.0875780000000002,
+            1.090823,
+            1.08888,
+            1.083552,
+            1.084413
+          ],
+          "median_ms": 1.08888,
+          "mean_ms": 1.088366285714286
+        },
+        {
+          "name": "most_relevant_files",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            17.564782,
+            16.689907
+          ],
+          "measured_durations_ms": [
+            16.59673,
+            16.642448,
+            16.625372,
+            18.599821,
+            17.380269000000002,
+            17.072502999999998,
+            16.776455
+          ],
+          "median_ms": 16.776455,
+          "mean_ms": 17.099085428571428
+        },
+        {
+          "name": "scan_usages",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            36.2303,
+            23.961249
+          ],
+          "measured_durations_ms": [
+            23.866028,
+            24.035788999999998,
+            23.822684,
+            23.841903000000002,
+            23.980788,
+            24.093445000000003,
+            24.071181
+          ],
+          "median_ms": 23.980788,
+          "mean_ms": 23.958831142857143
+        }
+      ]
+    },
+    {
+      "name": "scala-xml",
+      "url": "https://github.com/scala/scala-xml",
+      "commit": "5af150b1a68c61f8e39221535e8fcd291ba644d9",
+      "checkout_path": "/home/runner/work/bifrost/bifrost/benchmark/.cache/repos/scala-xml",
+      "workspace_path": "/home/runner/work/bifrost/bifrost/benchmark/.cache/repos/scala-xml",
+      "subset_max_files": null,
+      "scenarios": [
+        {
+          "name": "workspace_build",
+          "transport": "direct",
+          "success": true,
+          "warmup_durations_ms": [
+            228.817477,
+            229.919017
+          ],
+          "measured_durations_ms": [
+            231.146295,
+            228.975494,
+            222.549177,
+            240.74153900000002,
+            228.97727600000002,
+            237.113041,
+            229.23912299999998
+          ],
+          "median_ms": 229.23912299999998,
+          "mean_ms": 231.24884928571433
+        },
+        {
+          "name": "search_symbols",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            80.1409,
+            78.54841
+          ],
+          "measured_durations_ms": [
+            78.41121700000001,
+            78.637031,
+            82.16068299999999,
+            78.55841500000001,
+            78.60975,
+            78.83448299999999,
+            78.81503500000001
+          ],
+          "median_ms": 78.637031,
+          "mean_ms": 79.14665914285715
+        },
+        {
+          "name": "get_symbol_locations",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            0.6154510000000001,
+            0.420271
+          ],
+          "measured_durations_ms": [
+            0.413051,
+            0.441814,
+            0.419661,
+            0.43703600000000004,
+            0.413842,
+            0.434333,
+            0.413953
+          ],
+          "median_ms": 0.419661,
+          "mean_ms": 0.4248128571428572
+        },
+        {
+          "name": "get_summaries",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            1.248847,
+            1.088801
+          ],
+          "measured_durations_ms": [
+            1.0860159999999999,
+            1.107008,
+            1.0784449999999999,
+            1.071625,
+            1.07502,
+            1.070273,
+            1.080328
+          ],
+          "median_ms": 1.0784449999999999,
+          "mean_ms": 1.081245
+        },
+        {
+          "name": "most_relevant_files",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            85.067785,
+            85.17216900000001
+          ],
+          "measured_durations_ms": [
+            85.624278,
+            85.018822,
+            84.994446,
+            85.15985099999999,
+            87.711916,
+            85.07104,
+            84.793639
+          ],
+          "median_ms": 85.07104,
+          "mean_ms": 85.48199885714287
+        },
+        {
+          "name": "scan_usages",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            854.819972,
+            854.490054
+          ],
+          "measured_durations_ms": [
+            857.653183,
+            858.001679,
+            856.419518,
+            857.1898100000001,
+            854.893209,
+            855.8042270000001,
+            874.798541
+          ],
+          "median_ms": 857.1898100000001,
+          "mean_ms": 859.2514524285715
+        }
+      ]
+    },
+    {
+      "name": "dapper-csharp",
+      "url": "https://github.com/DapperLib/Dapper",
+      "commit": "72a54c475f75e18cb93cba0809d00a5e6e49efd9",
+      "checkout_path": "/home/runner/work/bifrost/bifrost/benchmark/.cache/repos/dapper-csharp",
+      "workspace_path": "/home/runner/work/bifrost/bifrost/benchmark/.cache/repos/dapper-csharp",
+      "subset_max_files": null,
+      "scenarios": [
+        {
+          "name": "workspace_build",
+          "transport": "direct",
+          "success": true,
+          "warmup_durations_ms": [
+            1041.965795,
+            1051.5260959999998
+          ],
+          "measured_durations_ms": [
+            1078.606741,
+            1070.9693149999998,
+            1030.711059,
+            1093.848912,
+            1089.7590340000002,
+            1083.561298,
+            1021.6874570000001
+          ],
+          "median_ms": 1078.606741,
+          "mean_ms": 1067.0205451428574
+        },
+        {
+          "name": "search_symbols",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            7957.943074,
+            7949.476896
+          ],
+          "measured_durations_ms": [
+            7947.137205999999,
+            8000.559594,
+            8010.596201,
+            8004.892218,
+            7944.0621519999995,
+            7972.9789279999995,
+            7951.876148
+          ],
+          "median_ms": 7972.9789279999995,
+          "mean_ms": 7976.014635285714
+        },
+        {
+          "name": "get_symbol_locations",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            0.46637,
+            0.23508700000000002
+          ],
+          "measured_durations_ms": [
+            0.232824,
+            0.252163,
+            0.23069099999999998,
+            0.22440200000000002,
+            0.222239,
+            0.241667,
+            0.227607
+          ],
+          "median_ms": 0.23069099999999998,
+          "mean_ms": 0.23308471428571428
+        },
+        {
+          "name": "get_summaries",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            8.433339,
+            8.334493
+          ],
+          "measured_durations_ms": [
+            8.290618,
+            8.393981,
+            8.452398,
+            8.430695,
+            8.461300999999999,
+            8.419409,
+            8.436434
+          ],
+          "median_ms": 8.430695,
+          "mean_ms": 8.412119428571428
+        },
+        {
+          "name": "most_relevant_files",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            7909.699181,
+            7905.998033000001
+          ],
+          "measured_durations_ms": [
+            7904.974705,
+            7934.443181,
+            7917.684073,
+            7907.5143020000005,
+            7956.027921999999,
+            7919.225149,
+            7924.255297000001
+          ],
+          "median_ms": 7919.225149,
+          "mean_ms": 7923.446375571429
+        },
+        {
+          "name": "scan_usages",
+          "transport": "mcp",
+          "success": true,
+          "warmup_durations_ms": [
+            904.263187,
+            710.5546780000001
+          ],
+          "measured_durations_ms": [
+            709.399781,
+            715.369601,
+            710.639426,
+            710.683884,
+            711.9133720000001,
+            709.858974,
+            711.097276
+          ],
+          "median_ms": 710.683884,
+          "mean_ms": 711.2803305714286
+        }
+      ]
+    }
+  ]
+}

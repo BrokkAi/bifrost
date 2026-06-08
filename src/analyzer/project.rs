@@ -235,7 +235,7 @@ impl Project for FilesystemProject {
 }
 
 /// A [`Project`] backed by an explicit, fixed set of files rather than a
-/// directory walk. `bifrost --summarize` uses this to parse only the requested
+/// directory walk. One-shot CLI paths can use this to parse only requested
 /// files instead of indexing the whole workspace: building a
 /// [`WorkspaceAnalyzer`](crate::WorkspaceAnalyzer) over it analyzes exactly
 /// these files and nothing else.

@@ -1,4 +1,5 @@
 pub mod analyzer;
+pub mod benchmark;
 pub mod code_quality;
 pub mod file_tools;
 pub mod git_tools;
@@ -24,6 +25,7 @@ pub mod summary;
 #[cfg(test)]
 mod test_support;
 mod text_utils;
+pub mod tool_arguments;
 pub use analyzer::usages;
 
 pub use analyzer::{

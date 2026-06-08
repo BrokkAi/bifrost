@@ -505,6 +505,84 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
 }
 
 #[test]
+fn bifrost_defaults_to_cwd_searchtools_server() {
+    let fixture_root = TempDir::new().expect("temp dir");
+    fs::write(
+        fixture_root.path().join("DefaultRoot.java"),
+        "public class DefaultRoot {}\n",
+    )
+    .expect("write java fixture");
+    let repo = git2::Repository::init(fixture_root.path()).expect("init fixture repo");
+    let mut index = repo.index().expect("repo index");
+    index
+        .add_path(std::path::Path::new("DefaultRoot.java"))
+        .expect("add java file");
+    index.write().expect("write index");
+    let tree_id = index.write_tree().expect("write tree");
+    let tree = repo.find_tree(tree_id).expect("find tree");
+    let sig = git2::Signature::now("Test User", "test@example.com").expect("signature");
+    repo.commit(Some("HEAD"), &sig, &sig, "initial", &tree, &[])
+        .expect("initial commit");
+
+    let mut child = spawn_server_no_args(fixture_root.path());
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+
+    let active_workspace = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "get_active_workspace",
+                "arguments": {}
+            }
+        }),
+    );
+    assert_eq!(
+        active_workspace["result"]["structuredContent"]["workspace_path"],
+        fixture_root
+            .path()
+            .canonicalize()
+            .expect("canonicalize fixture")
+            .display()
+            .to_string()
+    );
+
+    let list_symbols = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "list_symbols",
+                "arguments": { "file_patterns": ["DefaultRoot.java"] }
+            }
+        }),
+    );
+    assert_eq!(list_symbols["result"]["isError"], false, "{list_symbols}");
+    assert_eq!(
+        list_symbols["result"]["structuredContent"]["files"][0]["path"],
+        "DefaultRoot.java"
+    );
+
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
 fn bifrost_split_servers_publish_expected_tool_sets() {
     let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -1170,6 +1248,16 @@ fn spawn_server(root: &std::path::Path, mode: &str, extra_args: &[&str]) -> std:
         command.arg(arg);
     }
     command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bifrost")
+}
+
+fn spawn_server_no_args(cwd: &std::path::Path) -> std::process::Child {
+    Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

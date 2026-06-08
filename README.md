@@ -78,6 +78,23 @@ Run it against a project root:
 ./target/debug/bifrost --root /path/to/project --server searchtools
 ```
 
+Or just start it from the project root and let the defaults kick in:
+
+```bash
+cd /path/to/project
+bifrost
+```
+
+By default, `bifrost` uses the current working directory as `--root` and `searchtools` as `--server`. Run `bifrost --help` to see all options.
+
+For one-shot terminal use, `bifrost` can also invoke a tool directly without starting an MCP session:
+
+```bash
+./target/debug/bifrost --root /path/to/project --tool get_summaries --args '{"targets":["src/main.rs"]}'
+```
+
+Direct `--tool` mode prints rendered text by default. The `--args` payload is inline JSON matching the existing tool argument objects, and absolute paths inside the selected workspace are normalized the same way they are for MCP calls.
+
 `--server` accepts ordered compositions of toolsets separated by `|`:
 
 - `searchtools` expands to all toolsets in the canonical order `symbol|workspace|extended|text|slopcop`
