@@ -370,6 +370,10 @@ impl CodeUnit {
         }
     }
 
+    // This is the structural identifier used by lookup, import, and usage code.
+    // For user-facing names, prefer the display helpers in `analyzer::common`
+    // so languages like Scala can render idiomatic names without changing the
+    // matching semantics encoded here.
     pub fn identifier(&self) -> &str {
         let member_name = self
             .0
@@ -377,9 +381,9 @@ impl CodeUnit {
             .rsplit('.')
             .next()
             .unwrap_or(&self.0.short_name);
-        if matches!(self.0.kind, CodeUnitType::Function | CodeUnitType::Field) {
-            member_name
-        } else if member_name.ends_with('$') {
+        if matches!(self.0.kind, CodeUnitType::Function | CodeUnitType::Field)
+            || member_name.ends_with('$')
+        {
             member_name
         } else {
             member_name.rsplit('$').next().unwrap_or(member_name)

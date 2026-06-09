@@ -26,10 +26,7 @@ fn service_allows_concurrent_read_only_calls() {
             "search_symbols",
             r#"{"patterns":["A"],"include_tests":true,"limit":5}"#,
         ),
-        (
-            "get_symbol_sources",
-            r#"{"symbols":["A.method2"],"kind_filter":"function"}"#,
-        ),
+        ("get_symbol_sources", r#"{"symbols":["A.method2"]}"#),
         ("get_summaries", r#"{"targets":["A.java"]}"#),
         (
             "most_relevant_files",
@@ -172,7 +169,7 @@ fn python_boundary_returns_canonical_rendered_text_payload() {
     let payload = service
         .call_tool_payload_json(
             "get_symbol_sources",
-            r#"{"symbols":["A.method2"],"kind_filter":"function"}"#,
+            r#"{"symbols":["A.method2"]}"#,
             RenderOptions::default(),
         )
         .unwrap();
@@ -185,6 +182,50 @@ fn python_boundary_returns_canonical_rendered_text_payload() {
     assert!(
         rendered.contains("8: public String method2(String input)"),
         "{rendered}"
+    );
+}
+
+#[test]
+fn legacy_kind_filter_is_ignored_for_symbol_sources_and_locations() {
+    let service = SearchToolsService::new_for_python(fixture_root()).unwrap();
+
+    let source_payload = service
+        .call_tool_json(
+            "get_symbol_sources",
+            r#"{"symbols":["A.method2"],"kind_filter":"function"}"#,
+        )
+        .unwrap();
+    let source_value: Value = serde_json::from_str(&source_payload).unwrap();
+    assert_eq!("A.method2", source_value["sources"][0]["label"]);
+
+    let location_payload = service
+        .call_tool_json(
+            "get_symbol_locations",
+            r#"{"symbols":["A.method2"],"kind_filter":"function"}"#,
+        )
+        .unwrap();
+    let location_value: Value = serde_json::from_str(&location_payload).unwrap();
+    assert_eq!("A.method2", location_value["locations"][0]["symbol"]);
+}
+
+#[test]
+fn get_symbol_ancestors_rejects_non_type_targets() {
+    let temp = TempDir::new().unwrap();
+    fs::write(
+        temp.path().join("Thing.java"),
+        "class Base {}\nclass Thing extends Base { void run() {} }\n",
+    )
+    .unwrap();
+    let service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
+
+    let err = service
+        .call_tool_json("get_symbol_ancestors", r#"{"symbols":["Thing.run"]}"#)
+        .unwrap_err();
+
+    assert_eq!(SearchToolsServiceErrorCode::InvalidParams, err.code);
+    assert!(
+        err.message
+            .contains("only accepts class/module/type symbols")
     );
 }
 

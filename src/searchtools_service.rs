@@ -236,19 +236,19 @@ impl SearchToolsService {
             ),
             "get_symbol_locations" => Self::decode_render_and_run(
                 &snapshot,
-                arguments,
+                strip_legacy_kind_filter(arguments),
                 render_options,
                 |workspace, params| get_symbol_locations(workspace.analyzer(), params),
             ),
-            "get_symbol_ancestors" => Self::decode_render_and_run(
+            "get_symbol_ancestors" => Self::decode_render_and_try_run(
                 &snapshot,
-                arguments,
+                strip_legacy_kind_filter(arguments),
                 render_options,
                 |workspace, params| get_symbol_ancestors(workspace.analyzer(), params),
             ),
             "get_symbol_sources" => Self::decode_render_and_run(
                 &snapshot,
-                arguments,
+                strip_legacy_kind_filter(arguments),
                 render_options,
                 |workspace, params| get_symbol_sources(workspace.analyzer(), params),
             ),
@@ -560,6 +560,30 @@ impl SearchToolsService {
         })
     }
 
+    fn decode_render_and_try_run<P, R>(
+        workspace: &WorkspaceAnalyzer,
+        arguments: Value,
+        render_options: RenderOptions,
+        handler: impl FnOnce(&WorkspaceAnalyzer, P) -> Result<R, String>,
+    ) -> Result<ToolOutput, SearchToolsServiceError>
+    where
+        P: serde::de::DeserializeOwned,
+        R: Serialize + RenderText,
+    {
+        let params = serde_json::from_value::<P>(arguments).map_err(|err| {
+            SearchToolsServiceError::invalid_params(format!("Invalid tool arguments: {err}"))
+        })?;
+        let result = handler(workspace, params).map_err(SearchToolsServiceError::invalid_params)?;
+        let rendered_text = result.render_text(render_options);
+        let structured = serde_json::to_value(result).map_err(|err| {
+            SearchToolsServiceError::internal(format!("Failed to serialize tool result: {err}"))
+        })?;
+        Ok(ToolOutput::Structured {
+            structured,
+            rendered_text: Some(rendered_text),
+        })
+    }
+
     fn handle_get_summaries(
         workspace: &WorkspaceAnalyzer,
         arguments: Value,
@@ -617,6 +641,13 @@ impl SearchToolsService {
     fn closed_error() -> SearchToolsServiceError {
         SearchToolsServiceError::internal("SearchToolsService is closed")
     }
+}
+
+fn strip_legacy_kind_filter(mut arguments: Value) -> Value {
+    if let Some(object) = arguments.as_object_mut() {
+        object.remove("kind_filter");
+    }
+    arguments
 }
 
 fn build_workspace(root: PathBuf) -> Result<(Arc<dyn Project>, WorkspaceAnalyzer), String> {

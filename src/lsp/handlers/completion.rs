@@ -6,6 +6,7 @@ use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionList, CompletionParams, CompletionResponse,
 };
 
+use crate::analyzer::common::display_identifier_for_target;
 use crate::analyzer::{CodeUnit, CodeUnitType, Project, WorkspaceAnalyzer};
 use crate::lsp::conversion::position_to_byte_offset;
 use crate::lsp::handlers::util::{identifier_prefix_before_offset, project_file_for_uri};
@@ -247,7 +248,7 @@ fn maybe_log_failure(
 
 fn build_item(code_unit: &CodeUnit) -> CompletionItem {
     CompletionItem {
-        label: code_unit.identifier().to_string(),
+        label: display_identifier_for_target(code_unit),
         kind: Some(map_completion_kind(code_unit.kind())),
         detail: code_unit.signature().map(str::to_string),
         ..CompletionItem::default()

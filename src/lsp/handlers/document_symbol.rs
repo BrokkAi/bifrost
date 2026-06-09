@@ -1,5 +1,6 @@
 use lsp_types::{DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, SymbolKind};
 
+use crate::analyzer::common::display_identifier_for_target;
 use crate::analyzer::{
     CodeUnit, CodeUnitType, IAnalyzer, Project, Range as ByteRange, WorkspaceAnalyzer,
 };
@@ -50,7 +51,7 @@ fn build_symbol(
 
     #[allow(deprecated)] // `deprecated` field is present on lsp-types DocumentSymbol.
     DocumentSymbol {
-        name: code_unit.identifier().to_string(),
+        name: display_identifier_for_target(code_unit),
         detail: code_unit.signature().map(str::to_string),
         kind,
         tags: None,

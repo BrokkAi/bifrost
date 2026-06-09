@@ -260,14 +260,21 @@ fn go_file_summaries_use_full_declaration_ranges() {
 }
 
 #[test]
-fn get_summaries_accepts_scala_companion_object_targets_with_dollar_suffix() {
+fn get_summaries_accept_nested_scala_object_targets_in_idiomatic_and_jvm_forms() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(
-            "src/ai/brokk/Baz.scala",
+            "src/ai/brokk/ScalaObjects.scala",
             r#"package ai.brokk
 
-object Baz {
-  def test3: Unit = {}
+object ir {
+  object PrimOp {
+    case object AsClockOp
+    case object AsAsyncResetOp
+  }
+}
+
+object InstanceChoiceControl {
+  def select: Unit = {}
 }
 "#,
         )
@@ -277,22 +284,45 @@ object Baz {
     let result = get_summaries(
         &analyzer,
         SummariesParams {
-            targets: vec!["ai.brokk.Baz$".to_string()],
+            targets: vec![
+                "ai.brokk.ir$.PrimOp$".to_string(),
+                "ai.brokk.InstanceChoiceControl".to_string(),
+            ],
         },
     );
 
     assert!(result.not_found.is_empty(), "{:?}", result.not_found);
     assert!(result.ambiguous.is_empty(), "{:?}", result.ambiguous);
-    assert_eq!(1, result.summaries.len());
-    assert_eq!("ai.brokk.Baz$", result.summaries[0].label);
-    assert_eq!("src/ai/brokk/Baz.scala", result.summaries[0].path);
+    assert_eq!(2, result.summaries.len());
     assert!(
-        result.summaries[0]
-            .elements
+        result
+            .summaries
             .iter()
-            .any(|element| element.symbol == "ai.brokk.Baz$.test3" && element.kind == "function"),
+            .flat_map(|summary| summary.elements.iter())
+            .any(|element| element.symbol == "ai.brokk.ir.PrimOp.AsClockOp"
+                && element.kind == "class"),
         "{:#?}",
-        result.summaries[0].elements
+        result.summaries
+    );
+    assert!(
+        result
+            .summaries
+            .iter()
+            .any(|summary| summary.label == "ai.brokk.ir.PrimOp"
+                && summary.path == "src/ai/brokk/ScalaObjects.scala"),
+        "{:#?}",
+        result.summaries
+    );
+    assert!(
+        result
+            .summaries
+            .iter()
+            .any(|summary| summary.label == "ai.brokk.InstanceChoiceControl"
+                && summary.elements.iter().any(|element| element.symbol
+                    == "ai.brokk.InstanceChoiceControl.select"
+                    && element.kind == "function")),
+        "{:#?}",
+        result.summaries
     );
 }
 

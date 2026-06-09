@@ -1,6 +1,10 @@
-use crate::analyzer::common::language_for_target;
+use crate::analyzer::common::{
+    display_identifier_for_target, display_symbol_for_target, display_symbol_name,
+    is_scala_object_like, language_for_target,
+};
 use crate::analyzer::symbol_lookup::{
-    CodeUnitKindFilter, CodeUnitResolution, resolve_codeunit_fuzzy, strip_trailing_call_suffix,
+    CodeUnitResolution, resolve_codeunit_fuzzy, resolve_typeish_codeunit_fuzzy,
+    strip_trailing_call_suffix,
 };
 use crate::analyzer::usages::{
     CONFIDENCE_THRESHOLD, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, FuzzyResult, UsageFinder, UsageHit,
@@ -20,8 +24,6 @@ use std::sync::Arc;
 
 const FILE_SEARCH_LIMIT: usize = 100;
 const FILE_SKIM_LIMIT: usize = 20;
-const CLASS_COUNT_LIMIT: usize = 10;
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefreshParams {}
 
@@ -43,10 +45,8 @@ pub struct SearchSymbolsParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SymbolNamesParams {
+pub struct SymbolLookupParams {
     pub symbols: Vec<String>,
-    #[serde(default)]
-    pub kind_filter: SymbolKindFilter,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,17 +71,6 @@ pub struct ScanUsagesParams {
     pub symbols: Vec<String>,
     #[serde(default)]
     pub include_tests: bool,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum SymbolKindFilter {
-    #[default]
-    Any,
-    Class,
-    Function,
-    Field,
-    Module,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -194,6 +183,8 @@ pub struct SourceBlock {
     pub start_line: usize,
     pub end_line: usize,
     pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presentation: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -382,7 +373,7 @@ pub fn search_symbols(
 
 pub fn get_symbol_locations(
     analyzer: &dyn IAnalyzer,
-    params: SymbolNamesParams,
+    params: SymbolLookupParams,
 ) -> SymbolLocationsResult {
     let mut outcomes: Vec<_> = params
         .symbols
@@ -393,38 +384,36 @@ pub fn get_symbol_locations(
                 return None;
             }
 
-            let code_unit = match resolve_codeunit_fuzzy(
-                analyzer,
-                &symbol,
-                code_unit_kind_filter(params.kind_filter),
-            ) {
-                CodeUnitResolution::Resolved(code_units) => code_units.into_iter().next(),
+            let code_units = match resolve_codeunit_fuzzy(analyzer, &symbol) {
+                CodeUnitResolution::Resolved(code_units) => Some(code_units),
                 CodeUnitResolution::Ambiguous(_) | CodeUnitResolution::NotFound => None,
             };
-            let Some(code_unit) = code_unit else {
+            let Some(code_units) = code_units else {
                 return Some((index, Err(symbol)));
             };
-
-            let Some(primary_range) = primary_range(analyzer, &code_unit) else {
-                return Some((index, Err(symbol)));
-            };
-
-            let loc = code_unit
-                .source()
-                .read_to_string()
-                .map(|content| line_count(&content))
-                .unwrap_or(0);
-
-            Some((
-                index,
-                Ok(SymbolLocation {
-                    symbol,
-                    path: rel_path_string(code_unit.source()),
-                    loc,
-                    start_line: primary_range.start_line,
-                    end_line: primary_range.end_line,
-                }),
-            ))
+            let locations: Vec<_> = code_units
+                .into_iter()
+                .filter_map(|code_unit| {
+                    let primary_range = primary_range(analyzer, &code_unit)?;
+                    let loc = code_unit
+                        .source()
+                        .read_to_string()
+                        .map(|content| line_count(&content))
+                        .unwrap_or(0);
+                    Some(SymbolLocation {
+                        symbol: display_symbol_for_target(&code_unit),
+                        path: rel_path_string(code_unit.source()),
+                        loc,
+                        start_line: primary_range.start_line,
+                        end_line: primary_range.end_line,
+                    })
+                })
+                .collect();
+            if locations.is_empty() {
+                Some((index, Err(symbol)))
+            } else {
+                Some((index, Ok(locations)))
+            }
         })
         .collect();
     outcomes.sort_by_key(|(index, _)| *index);
@@ -433,7 +422,7 @@ pub fn get_symbol_locations(
     let mut not_found = Vec::new();
     for (_, outcome) in outcomes {
         match outcome {
-            Ok(location) => locations.push(location),
+            Ok(found) => locations.extend(found),
             Err(symbol) => not_found.push(symbol),
         }
     }
@@ -446,10 +435,10 @@ pub fn get_symbol_locations(
 
 pub fn get_symbol_ancestors(
     analyzer: &dyn IAnalyzer,
-    params: SymbolNamesParams,
-) -> SymbolAncestorsResult {
+    params: SymbolLookupParams,
+) -> Result<SymbolAncestorsResult, String> {
     let Some(provider) = analyzer.type_hierarchy_provider() else {
-        return SymbolAncestorsResult {
+        return Ok(SymbolAncestorsResult {
             ancestors: Vec::new(),
             not_found: params
                 .symbols
@@ -457,7 +446,7 @@ pub fn get_symbol_ancestors(
                 .filter(|symbol| !symbol.trim().is_empty())
                 .collect(),
             ambiguous: Vec::new(),
-        };
+        });
     };
 
     let mut ancestors = Vec::new();
@@ -469,18 +458,24 @@ pub fn get_symbol_ancestors(
         .into_iter()
         .filter(|symbol| !symbol.trim().is_empty())
     {
-        match resolve_codeunit_fuzzy(analyzer, &symbol, code_unit_kind_filter(params.kind_filter)) {
+        match resolve_codeunit_fuzzy(analyzer, &symbol) {
             CodeUnitResolution::Resolved(code_units) => {
                 let Some(code_unit) = code_units.into_iter().next() else {
                     not_found.push(symbol);
                     continue;
                 };
+                if !is_ancestor_target(&code_unit) {
+                    return Err(format!(
+                        "get_symbol_ancestors only accepts class/module/type symbols; `{symbol}` resolved to a {}",
+                        code_unit_kind_name(code_unit.kind())
+                    ));
+                }
                 ancestors.push(SymbolAncestors {
-                    symbol,
+                    symbol: display_symbol_for_target(&code_unit),
                     ancestors: provider
                         .get_ancestors(&code_unit)
                         .into_iter()
-                        .map(|ancestor| ancestor.fq_name().to_string())
+                        .map(|ancestor| display_symbol_for_target(&ancestor))
                         .collect(),
                 });
             }
@@ -494,11 +489,11 @@ pub fn get_symbol_ancestors(
         }
     }
 
-    SymbolAncestorsResult {
+    Ok(SymbolAncestorsResult {
         ancestors,
         not_found,
         ambiguous,
-    }
+    })
 }
 
 #[derive(Debug)]
@@ -564,7 +559,7 @@ fn summarize_symbol_targets(analyzer: &dyn IAnalyzer, targets: Vec<String>) -> S
     let mut ambiguous = Vec::new();
 
     for target in targets {
-        match resolve_codeunit_fuzzy(analyzer, &target, CodeUnitKindFilter::Class) {
+        match resolve_typeish_codeunit_fuzzy(analyzer, &target) {
             CodeUnitResolution::Resolved(code_units) => {
                 let start_len = summaries.len();
                 for code_unit in code_units {
@@ -607,35 +602,28 @@ pub(crate) fn summarize_targets_with_directory_inventory(
 
 pub fn get_symbol_sources(
     analyzer: &dyn IAnalyzer,
-    params: SymbolNamesParams,
+    params: SymbolLookupParams,
 ) -> SymbolSourcesResult {
-    let max_symbols = if params.kind_filter == SymbolKindFilter::Class {
-        CLASS_COUNT_LIMIT
-    } else {
-        usize::MAX
-    };
-
     let selected_symbols: Vec<_> = params
         .symbols
         .into_iter()
         .filter(|symbol| !symbol.trim().is_empty())
-        .take(max_symbols)
         .collect();
 
     let mut outcomes: Vec<_> = selected_symbols
         .into_par_iter()
         .enumerate()
-        .map(|(index, symbol)| {
-            match resolve_codeunit_fuzzy(
-                analyzer,
-                &symbol,
-                code_unit_kind_filter(params.kind_filter),
-            ) {
+        .map(
+            |(index, symbol)| match resolve_codeunit_fuzzy(analyzer, &symbol) {
                 CodeUnitResolution::Resolved(code_units) => {
                     let sources = code_units
                         .iter()
                         .flat_map(|code_unit| {
-                            source_blocks_for_code_unit(analyzer, code_unit, true)
+                            if is_file_listing_target(code_unit) {
+                                module_file_listing_blocks(code_unit)
+                            } else {
+                                source_blocks_for_code_unit(analyzer, code_unit, true)
+                            }
                         })
                         .collect::<Vec<_>>();
                     if sources.is_empty() {
@@ -652,8 +640,8 @@ pub fn get_symbol_sources(
                     }),
                 ),
                 CodeUnitResolution::NotFound => (index, SourceLookupOutcome::NotFound(symbol)),
-            }
-        })
+            },
+        )
         .collect();
     outcomes.sort_by_key(|(index, _)| *index);
 
@@ -840,7 +828,7 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
     let mut too_many_callsites = Vec::new();
 
     for symbol in symbols {
-        let overloads = match resolve_codeunit_fuzzy(analyzer, &symbol, CodeUnitKindFilter::Any) {
+        let overloads = match resolve_codeunit_fuzzy(analyzer, &symbol) {
             CodeUnitResolution::Resolved(overloads) => overloads,
             CodeUnitResolution::Ambiguous(candidate_targets) => {
                 ambiguous.push(AmbiguousUsageSymbol {
@@ -997,7 +985,7 @@ fn collect_kind_names(
             display_signatures(analyzer, code_unit)
                 .into_iter()
                 .map(move |signature| SearchSymbolHit {
-                    symbol: code_unit.fq_name(),
+                    symbol: display_symbol_for_target(code_unit),
                     signature,
                     line,
                 })
@@ -1016,16 +1004,6 @@ fn collect_kind_names(
     hits
 }
 
-fn code_unit_kind_filter(filter: SymbolKindFilter) -> CodeUnitKindFilter {
-    match filter {
-        SymbolKindFilter::Any => CodeUnitKindFilter::Any,
-        SymbolKindFilter::Class => CodeUnitKindFilter::Class,
-        SymbolKindFilter::Function => CodeUnitKindFilter::Function,
-        SymbolKindFilter::Field => CodeUnitKindFilter::Field,
-        SymbolKindFilter::Module => CodeUnitKindFilter::Module,
-    }
-}
-
 fn summary_block_for_code_unit(
     analyzer: &dyn IAnalyzer,
     code_unit: &CodeUnit,
@@ -1036,7 +1014,7 @@ fn summary_block_for_code_unit(
     }
 
     Some(SummaryBlock {
-        label: code_unit.fq_name(),
+        label: display_symbol_for_target(code_unit),
         path: rel_path_string(code_unit.source()),
         preamble: file_preamble(code_unit.source(), &elements),
         elements,
@@ -1096,13 +1074,15 @@ fn display_signatures(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> Vec<Str
     }
 
     let fallback = match code_unit.kind() {
-        CodeUnitType::Class => format!("class {}", code_unit.identifier()),
+        CodeUnitType::Class => format!("class {}", display_identifier_for_target(code_unit)),
         CodeUnitType::Function => code_unit
             .signature()
-            .map(|signature| format!("{}{}", code_unit.identifier(), signature))
-            .unwrap_or_else(|| format!("{}()", code_unit.identifier())),
-        CodeUnitType::Field => code_unit.identifier().to_string(),
-        CodeUnitType::Module => code_unit.short_name().to_string(),
+            .map(|signature| format!("{}{}", display_identifier_for_target(code_unit), signature))
+            .unwrap_or_else(|| format!("{}()", display_identifier_for_target(code_unit))),
+        CodeUnitType::Field => display_identifier_for_target(code_unit),
+        CodeUnitType::Module => {
+            display_symbol_name(language_for_target(code_unit), code_unit.short_name())
+        }
     };
     vec![fallback]
 }
@@ -1162,7 +1142,7 @@ fn signature_elements(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> Vec<Sum
             let end_line = start_line + line_count.saturating_sub(1);
             Some(SummaryElement {
                 path: path.clone(),
-                symbol: code_unit.fq_name(),
+                symbol: display_symbol_for_target(code_unit),
                 kind: code_unit_kind_name(code_unit.kind()).to_string(),
                 start_line,
                 end_line,
@@ -1257,14 +1237,27 @@ fn source_blocks_for_code_unit(
             }
             let start_line = line_number_at_offset(&content, start_byte);
             Some(SourceBlock {
-                label: code_unit.fq_name(),
+                label: display_symbol_for_target(code_unit),
                 path: rel_path_string(code_unit.source()),
                 start_line,
                 end_line: start_line + text.lines().count().saturating_sub(1),
                 text,
+                presentation: None,
             })
         })
         .collect()
+}
+
+fn module_file_listing_blocks(code_unit: &CodeUnit) -> Vec<SourceBlock> {
+    vec![SourceBlock {
+        label: display_symbol_for_target(code_unit),
+        path: rel_path_string(code_unit.source()),
+        start_line: 0,
+        end_line: 0,
+        text: "Module/object lookup returns defining files instead of the full source body."
+            .to_string(),
+        presentation: Some("file_listing".to_string()),
+    }]
 }
 
 fn dedup_source_blocks(blocks: Vec<SourceBlock>) -> Vec<SourceBlock> {
@@ -1277,12 +1270,21 @@ fn dedup_source_blocks(blocks: Vec<SourceBlock>) -> Vec<SourceBlock> {
             block.start_line,
             block.end_line,
             block.text.clone(),
+            block.presentation.clone(),
         );
         if seen.insert(key) {
             deduped.push(block);
         }
     }
     deduped
+}
+
+fn is_file_listing_target(code_unit: &CodeUnit) -> bool {
+    code_unit.is_module() || is_scala_object_like(code_unit)
+}
+
+fn is_ancestor_target(code_unit: &CodeUnit) -> bool {
+    code_unit.is_class() || code_unit.is_module()
 }
 
 fn primary_range(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> Option<Range> {
@@ -1817,6 +1819,7 @@ mod tests {
             start_line: 10,
             end_line: 12,
             text: "class A {}".to_string(),
+            presentation: None,
         };
         let _element = SummaryElement {
             path: "A.java".to_string(),

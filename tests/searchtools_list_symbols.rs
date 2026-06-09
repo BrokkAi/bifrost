@@ -36,14 +36,20 @@ fn list_symbols_preserves_package_headers() {
 }
 
 #[test]
-fn list_symbols_renders_scala_companion_object_names_with_dollar_suffix() {
+fn list_symbols_renders_scala_objects_idiomatically() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(
-            "src/ai/brokk/Baz.scala",
+            "src/ai/brokk/ScalaObjects.scala",
             r#"package ai.brokk
 
-object Baz {
-  def test3: Unit = {}
+object ir {
+  object PrimOp {
+    case object AsClockOp
+  }
+}
+
+object InstanceChoiceControl {
+  def select: Unit = {}
 }
 "#,
         )
@@ -53,19 +59,38 @@ object Baz {
     let result = list_symbols(
         &analyzer,
         FilePatternsParams {
-            file_patterns: vec!["src/ai/brokk/Baz.scala".to_string()],
+            file_patterns: vec!["src/ai/brokk/ScalaObjects.scala".to_string()],
         },
     );
 
     assert_eq!(1, result.files.len());
-    assert_eq!("src/ai/brokk/Baz.scala", result.files[0].path);
+    assert_eq!("src/ai/brokk/ScalaObjects.scala", result.files[0].path);
     assert!(
-        result.files[0].lines.contains(&"- Baz$".to_string()),
+        result.files[0].lines.contains(&"- ir".to_string()),
         "{:#?}",
         result.files[0].lines
     );
     assert!(
-        result.files[0].lines.contains(&"  - test3".to_string()),
+        result.files[0].lines.contains(&"  - PrimOp".to_string()),
+        "{:#?}",
+        result.files[0].lines
+    );
+    assert!(
+        result.files[0]
+            .lines
+            .contains(&"    - AsClockOp".to_string()),
+        "{:#?}",
+        result.files[0].lines
+    );
+    assert!(
+        result.files[0]
+            .lines
+            .contains(&"- InstanceChoiceControl".to_string()),
+        "{:#?}",
+        result.files[0].lines
+    );
+    assert!(
+        result.files[0].lines.contains(&"  - select".to_string()),
         "{:#?}",
         result.files[0].lines
     );

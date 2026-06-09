@@ -363,12 +363,6 @@ pub fn symbol_names_schema() -> Value {
                 "type": "array",
                 "items": { "type": "string" },
                 "description": "Fully qualified or short symbol names to resolve."
-            },
-            "kind_filter": {
-                "type": "string",
-                "enum": ["any", "class", "function", "field", "module"],
-                "default": "any",
-                "description": "Optional symbol kind filter."
             }
         },
         "required": ["symbols"]

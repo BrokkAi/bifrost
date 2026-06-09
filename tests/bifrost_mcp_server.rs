@@ -242,8 +242,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "params": {
                 "name": "get_symbol_sources",
                 "arguments": {
-                    "symbols": ["SampleTest.sameValue"],
-                    "kind_filter": "function"
+                    "symbols": ["SampleTest.sameValue"]
                 }
             }
         }),

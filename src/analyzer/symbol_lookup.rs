@@ -1,15 +1,6 @@
 use crate::analyzer::common::language_for_target as code_unit_language;
-use crate::analyzer::{CodeUnit, CodeUnitType, IAnalyzer, Language};
+use crate::analyzer::{CodeUnit, IAnalyzer, Language};
 use std::collections::{BTreeMap, BTreeSet};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CodeUnitKindFilter {
-    Any,
-    Class,
-    Function,
-    Field,
-    Module,
-}
 
 #[derive(Debug, Clone)]
 pub(crate) enum CodeUnitResolution {
@@ -18,23 +9,36 @@ pub(crate) enum CodeUnitResolution {
     NotFound,
 }
 
-pub(crate) fn resolve_codeunit_fuzzy(
+pub(crate) fn resolve_codeunit_fuzzy(analyzer: &dyn IAnalyzer, input: &str) -> CodeUnitResolution {
+    resolve_codeunit_fuzzy_with(analyzer, input, |_| true)
+}
+
+pub(crate) fn resolve_typeish_codeunit_fuzzy(
     analyzer: &dyn IAnalyzer,
     input: &str,
-    kind_filter: CodeUnitKindFilter,
+) -> CodeUnitResolution {
+    resolve_codeunit_fuzzy_with(analyzer, input, |code_unit| {
+        code_unit.is_class() || code_unit.is_module()
+    })
+}
+
+fn resolve_codeunit_fuzzy_with(
+    analyzer: &dyn IAnalyzer,
+    input: &str,
+    include: impl Copy + Fn(&CodeUnit) -> bool,
 ) -> CodeUnitResolution {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return CodeUnitResolution::NotFound;
     }
 
-    if let Some(resolved) = exact_resolution(analyzer, trimmed, kind_filter) {
+    if let Some(resolved) = exact_resolution(analyzer, trimmed, include) {
         return resolved;
     }
 
     let stripped = strip_trailing_call_suffix(trimmed);
     if stripped != trimmed
-        && let Some(resolved) = exact_resolution(analyzer, &stripped, kind_filter)
+        && let Some(resolved) = exact_resolution(analyzer, &stripped, include)
     {
         return resolved;
     }
@@ -59,7 +63,7 @@ pub(crate) fn resolve_codeunit_fuzzy(
         collect_fuzzy_matches(
             analyzer,
             candidate,
-            kind_filter,
+            include,
             &query_paths,
             &mut full_matches,
             &mut suffix_matches,
@@ -69,7 +73,7 @@ pub(crate) fn resolve_codeunit_fuzzy(
                 collect_fuzzy_matches(
                     analyzer,
                     &member,
-                    kind_filter,
+                    include,
                     &query_paths,
                     &mut full_matches,
                     &mut suffix_matches,
@@ -78,8 +82,8 @@ pub(crate) fn resolve_codeunit_fuzzy(
         }
     }
 
-    resolution_from_matches(analyzer, full_matches, kind_filter)
-        .or_else(|| resolution_from_matches(analyzer, suffix_matches, kind_filter))
+    resolution_from_matches(analyzer, full_matches, include)
+        .or_else(|| resolution_from_matches(analyzer, suffix_matches, include))
         .unwrap_or(CodeUnitResolution::NotFound)
 }
 
@@ -109,20 +113,20 @@ pub(crate) fn strip_trailing_call_suffix(symbol: &str) -> String {
 fn exact_resolution(
     analyzer: &dyn IAnalyzer,
     symbol: &str,
-    kind_filter: CodeUnitKindFilter,
+    include: impl Copy + Fn(&CodeUnit) -> bool,
 ) -> Option<CodeUnitResolution> {
-    let definitions = matching_definitions(analyzer, symbol, kind_filter);
+    let definitions = matching_definitions(analyzer, symbol, include);
     (!definitions.is_empty()).then_some(CodeUnitResolution::Resolved(definitions))
 }
 
 fn matching_definitions(
     analyzer: &dyn IAnalyzer,
     symbol: &str,
-    kind_filter: CodeUnitKindFilter,
+    include: impl Copy + Fn(&CodeUnit) -> bool,
 ) -> Vec<CodeUnit> {
     analyzer
         .definitions(symbol)
-        .filter(|code_unit| matches_kind_filter(code_unit, kind_filter))
+        .filter(|code_unit| include(code_unit))
         .cloned()
         .collect()
 }
@@ -130,12 +134,12 @@ fn matching_definitions(
 fn collect_fuzzy_matches(
     analyzer: &dyn IAnalyzer,
     candidate: &CodeUnit,
-    kind_filter: CodeUnitKindFilter,
+    include: impl Copy + Fn(&CodeUnit) -> bool,
     query_paths: &BTreeSet<Vec<String>>,
     full_matches: &mut BTreeMap<String, CodeUnit>,
     suffix_matches: &mut BTreeMap<String, CodeUnit>,
 ) {
-    if !matches_kind_filter(candidate, kind_filter) {
+    if !include(candidate) {
         return;
     }
 
@@ -158,7 +162,7 @@ fn collect_fuzzy_matches(
             .any(|candidate_path| path_ends_with(candidate_path, query_path))
     });
     if suffix_match {
-        let definitions = matching_definitions(analyzer, &candidate.fq_name(), kind_filter);
+        let definitions = matching_definitions(analyzer, &candidate.fq_name(), include);
         if definitions.is_empty() {
             insert_match(suffix_matches, candidate);
         } else {
@@ -178,13 +182,13 @@ fn insert_match(matches: &mut BTreeMap<String, CodeUnit>, candidate: &CodeUnit) 
 fn resolution_from_matches(
     analyzer: &dyn IAnalyzer,
     matches: BTreeMap<String, CodeUnit>,
-    kind_filter: CodeUnitKindFilter,
+    include: impl Copy + Fn(&CodeUnit) -> bool,
 ) -> Option<CodeUnitResolution> {
     match matches.len() {
         0 => None,
         1 => {
             let fq_name = matches.keys().next().expect("one match").clone();
-            let definitions = matching_definitions(analyzer, &fq_name, kind_filter);
+            let definitions = matching_definitions(analyzer, &fq_name, include);
             if definitions.is_empty() {
                 Some(CodeUnitResolution::Resolved(
                     matches.into_values().collect(),
@@ -335,14 +339,4 @@ fn path_ends_with(candidate: &[String], query: &[String]) -> bool {
     !query.is_empty()
         && query.len() <= candidate.len()
         && candidate[candidate.len() - query.len()..] == *query
-}
-
-fn matches_kind_filter(code_unit: &CodeUnit, filter: CodeUnitKindFilter) -> bool {
-    match filter {
-        CodeUnitKindFilter::Any => true,
-        CodeUnitKindFilter::Class => code_unit.kind() == CodeUnitType::Class,
-        CodeUnitKindFilter::Function => code_unit.kind() == CodeUnitType::Function,
-        CodeUnitKindFilter::Field => code_unit.kind() == CodeUnitType::Field,
-        CodeUnitKindFilter::Module => code_unit.kind() == CodeUnitType::Module,
-    }
 }

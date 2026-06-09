@@ -6,6 +6,7 @@ use lsp_types::{
     WorkspaceSymbolResponse,
 };
 
+use crate::analyzer::common::display_identifier_for_target;
 use crate::analyzer::{CodeUnit, CodeUnitType, IAnalyzer, Range as ByteRange, WorkspaceAnalyzer};
 use crate::lsp::conversion::{byte_range_to_lsp_range, path_to_uri_string};
 use crate::text_utils::compute_line_starts;
@@ -94,7 +95,7 @@ fn build_symbol(
     };
 
     Some(WorkspaceSymbol {
-        name: code_unit.identifier().to_string(),
+        name: display_identifier_for_target(code_unit),
         kind: map_kind(code_unit.kind()),
         tags: None,
         container_name: container_name(code_unit),

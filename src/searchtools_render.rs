@@ -318,6 +318,14 @@ impl SummaryElement {
 
 impl SourceBlock {
     fn render_text(&self, options: RenderOptions) -> String {
+        if self.presentation.as_deref() == Some("file_listing") {
+            return format!(
+                "## {}\n\n- Defining file: {}\n- Note: {}",
+                escape_markdown_heading(&self.label),
+                self.path,
+                self.text
+            );
+        }
         let header = if options.render_line_numbers {
             format!(
                 "## {}\n\n- Location: {}:{}..{}",
@@ -487,6 +495,7 @@ mod tests {
                 start_line: 12,
                 end_line: 14,
                 text: "fn bar() {\n    println!(\"hi\");\n}".to_string(),
+                presentation: None,
             }],
             not_found: vec!["Missing".to_string()],
             ambiguous: vec![AmbiguousSymbol {

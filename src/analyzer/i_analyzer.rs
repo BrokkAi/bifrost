@@ -1,3 +1,4 @@
+use crate::analyzer::common::display_identifier_for_target;
 use crate::analyzer::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, FuzzyResult, UsageFinder};
 use crate::analyzer::{
     CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType, CommentDensityStats,
@@ -509,7 +510,7 @@ fn render_symbol_summary<A: IAnalyzer + ?Sized>(
 ) {
     summary.push_str(indent_str);
     summary.push_str("- ");
-    summary.push_str(code_unit.identifier());
+    summary.push_str(&display_identifier_for_target(code_unit));
 
     let children: Vec<_> = ordered_summary_children(
         analyzer,
