@@ -1,7 +1,10 @@
 use brokk_bifrost::{
-    JavaAnalyzer, Language, TestProject,
+    JavaAnalyzer, Language, ScalaAnalyzer, TestProject,
     searchtools::{FilePatternsParams, list_symbols},
 };
+
+mod common;
+use common::InlineTestProject;
 
 fn fixture_analyzer() -> JavaAnalyzer {
     let root = std::env::current_dir()
@@ -30,4 +33,40 @@ fn list_symbols_preserves_package_headers() {
     );
     assert!(result.files[0].lines.contains(&"- Foo".to_string()));
     assert!(result.files[0].lines.contains(&"  - bar".to_string()));
+}
+
+#[test]
+fn list_symbols_renders_scala_companion_object_names_with_dollar_suffix() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "src/ai/brokk/Baz.scala",
+            r#"package ai.brokk
+
+object Baz {
+  def test3: Unit = {}
+}
+"#,
+        )
+        .build();
+    let analyzer = ScalaAnalyzer::from_project(project.project().clone());
+
+    let result = list_symbols(
+        &analyzer,
+        FilePatternsParams {
+            file_patterns: vec!["src/ai/brokk/Baz.scala".to_string()],
+        },
+    );
+
+    assert_eq!(1, result.files.len());
+    assert_eq!("src/ai/brokk/Baz.scala", result.files[0].path);
+    assert!(
+        result.files[0].lines.contains(&"- Baz$".to_string()),
+        "{:#?}",
+        result.files[0].lines
+    );
+    assert!(
+        result.files[0].lines.contains(&"  - test3".to_string()),
+        "{:#?}",
+        result.files[0].lines
+    );
 }

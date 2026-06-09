@@ -371,16 +371,18 @@ impl CodeUnit {
     }
 
     pub fn identifier(&self) -> &str {
-        let name = self
+        let member_name = self
             .0
             .short_name
-            .rsplit(['.', '$'])
+            .rsplit('.')
             .next()
             .unwrap_or(&self.0.short_name);
         if matches!(self.0.kind, CodeUnitType::Function | CodeUnitType::Field) {
-            self.0.short_name.rsplit('.').next().unwrap_or(name)
+            member_name
+        } else if member_name.ends_with('$') {
+            member_name
         } else {
-            name
+            member_name.rsplit('$').next().unwrap_or(member_name)
         }
     }
 

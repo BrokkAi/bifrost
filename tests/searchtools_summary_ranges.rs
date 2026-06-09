@@ -1,9 +1,11 @@
 use brokk_bifrost::{
-    GoAnalyzer, JavaAnalyzer, JavascriptAnalyzer, Language, TestProject, TypescriptAnalyzer,
+    GoAnalyzer, JavaAnalyzer, JavascriptAnalyzer, Language, ScalaAnalyzer, TestProject,
+    TypescriptAnalyzer,
     searchtools::{SummariesParams, SummaryElement, get_summaries},
 };
 
 mod common;
+use common::InlineTestProject;
 
 fn java_fixture_analyzer() -> JavaAnalyzer {
     let root = std::env::current_dir()
@@ -255,6 +257,43 @@ fn go_file_summaries_use_full_declaration_ranges() {
     assert!(rendered.contains(&"14..16: MyInterface interface".to_string()));
     assert!(rendered.contains(&"19..21: func (s MyStruct) GetFieldA() int { ... }".to_string()));
     assert!(rendered.contains(&"34: func anotherFunc() { ... }".to_string()));
+}
+
+#[test]
+fn get_summaries_accepts_scala_companion_object_targets_with_dollar_suffix() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "src/ai/brokk/Baz.scala",
+            r#"package ai.brokk
+
+object Baz {
+  def test3: Unit = {}
+}
+"#,
+        )
+        .build();
+    let analyzer = ScalaAnalyzer::from_project(project.project().clone());
+
+    let result = get_summaries(
+        &analyzer,
+        SummariesParams {
+            targets: vec!["ai.brokk.Baz$".to_string()],
+        },
+    );
+
+    assert!(result.not_found.is_empty(), "{:?}", result.not_found);
+    assert!(result.ambiguous.is_empty(), "{:?}", result.ambiguous);
+    assert_eq!(1, result.summaries.len());
+    assert_eq!("ai.brokk.Baz$", result.summaries[0].label);
+    assert_eq!("src/ai/brokk/Baz.scala", result.summaries[0].path);
+    assert!(
+        result.summaries[0]
+            .elements
+            .iter()
+            .any(|element| element.symbol == "ai.brokk.Baz$.test3" && element.kind == "function"),
+        "{:#?}",
+        result.summaries[0].elements
+    );
 }
 
 #[test]

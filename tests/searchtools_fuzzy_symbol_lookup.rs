@@ -1,7 +1,7 @@
 mod common;
 
 use brokk_bifrost::{
-    CSharpAnalyzer, CppAnalyzer, IAnalyzer, JavaAnalyzer, Language, PhpAnalyzer,
+    CSharpAnalyzer, CppAnalyzer, IAnalyzer, JavaAnalyzer, Language, PhpAnalyzer, ScalaAnalyzer,
     searchtools::{
         ScanUsagesParams, SymbolKindFilter, SymbolNamesParams, SymbolSourcesResult,
         get_symbol_sources, scan_usages,
@@ -91,6 +91,28 @@ class Outer {
     let csharp = CSharpAnalyzer::from_project(csharp_project.project().clone());
     let csharp_result = source_for(&csharp, "N.Outer+Inner.Method", SymbolKindFilter::Function);
     assert_eq!("N.Outer$Inner.Method", csharp_result.sources[0].label);
+}
+
+#[test]
+fn scala_symbol_sources_accept_companion_object_dollar_delimiters() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "src/ai/brokk/Baz.scala",
+            r#"package ai.brokk
+
+object Baz {
+  def test3: Unit = {}
+}
+"#,
+        )
+        .build();
+    let analyzer = ScalaAnalyzer::from_project(project.project().clone());
+
+    let result = source_for(&analyzer, "ai.brokk.Baz$.test3", SymbolKindFilter::Function);
+    assert!(result.not_found.is_empty(), "{:?}", result.not_found);
+    assert!(result.ambiguous.is_empty(), "{:?}", result.ambiguous);
+    assert_eq!(1, result.sources.len());
+    assert_eq!("ai.brokk.Baz$.test3", result.sources[0].label);
 }
 
 #[test]
