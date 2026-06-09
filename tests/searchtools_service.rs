@@ -322,11 +322,15 @@ fn get_summaries_renders_include_and_excerpt_fallbacks() {
         .find(|summary| summary["path"] == "src/emptyish.h")
         .unwrap();
     assert_eq!(
-        "no indexed declarations or top-level includes found; showing first 20 lines",
+        "no indexed declarations or top-level includes found; showing head/tail sample",
         excerpt_summary["fallback_reason"]
     );
     assert_eq!("excerpt", excerpt_summary["elements"][0]["kind"]);
-    assert_eq!(20, excerpt_summary["elements"][0]["end_line"]);
+    assert_eq!(25, excerpt_summary["elements"][0]["end_line"]);
+    assert_eq!(
+        "sampled_excerpt",
+        excerpt_summary["elements"][0]["presentation"]
+    );
 
     let rendered = value["rendered_text"].as_str().expect("rendered text");
     assert!(
@@ -339,11 +343,11 @@ fn get_summaries_renders_include_and_excerpt_fallbacks() {
     );
     assert!(
         rendered.contains(
-            "Note: no indexed declarations or top-level includes found; showing first 20 lines"
+            "Note: no indexed declarations or top-level includes found; showing head/tail sample"
         ),
         "{rendered}"
     );
-    assert!(rendered.contains("1..20: // line 1"), "{rendered}");
+    assert!(rendered.contains("// line 1"), "{rendered}");
 }
 
 #[test]

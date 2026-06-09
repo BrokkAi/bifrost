@@ -11,6 +11,7 @@ pub mod mcp_extended;
 pub mod mcp_registry;
 pub mod mcp_slopcop;
 pub mod mcp_text;
+mod model_context;
 mod path_utils;
 pub mod profiling;
 mod project_watcher;

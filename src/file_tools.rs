@@ -1,4 +1,5 @@
 use crate::analyzer::{IAnalyzer, ProjectFile};
+use crate::model_context;
 use crate::path_utils::{normalize_pattern, rel_path_string, workspace_rel_path};
 use glob::{MatchOptions, Pattern};
 use rayon::prelude::*;
@@ -75,6 +76,13 @@ pub struct GetFileContentsResult {
 pub struct FileContent {
     pub path: String,
     pub content: String,
+    pub truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_lines: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head_lines: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tail_lines: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -160,10 +168,17 @@ pub fn get_file_contents(
 
         match project.file_by_rel_path(&rel) {
             Some(file) => match file.read_to_string() {
-                Ok(content) => files.push(FileContent {
-                    path: rel_path_string(&file),
-                    content,
-                }),
+                Ok(content) => {
+                    let sampled = model_context::sample(&content);
+                    files.push(FileContent {
+                        path: rel_path_string(&file),
+                        content: sampled.text,
+                        truncated: sampled.truncated,
+                        total_lines: Some(sampled.total_lines),
+                        head_lines: sampled.truncated.then_some(sampled.head_shown),
+                        tail_lines: sampled.truncated.then_some(sampled.tail_shown),
+                    })
+                }
                 Err(_) => not_found.push(trimmed.to_string()),
             },
             None => not_found.push(trimmed.to_string()),
@@ -367,16 +382,16 @@ pub fn search_file_contents(
                     let before_start = idx.saturating_sub(context);
                     let before = lines[before_start..idx]
                         .iter()
-                        .map(|l| l.to_string())
+                        .map(|l| model_context::truncate_line(l))
                         .collect();
                     let after_end = (idx + 1 + context).min(lines.len());
                     let after = lines[idx + 1..after_end]
                         .iter()
-                        .map(|l| l.to_string())
+                        .map(|l| model_context::truncate_line(l))
                         .collect();
                     hits.push(LineMatch {
                         line: idx + 1,
-                        text: line.to_string(),
+                        text: model_context::truncate_line(line),
                         before,
                         after,
                     });
@@ -586,6 +601,10 @@ mod tests {
         assert_eq!(result.files.len(), 1);
         assert_eq!(result.files[0].path, "src/a.rs");
         assert_eq!(result.files[0].content, "fn a() {}\n");
+        assert!(!result.files[0].truncated);
+        assert_eq!(Some(1), result.files[0].total_lines);
+        assert_eq!(None, result.files[0].head_lines);
+        assert_eq!(None, result.files[0].tail_lines);
         assert_eq!(result.not_found, vec!["missing.rs"]);
     }
 
@@ -666,6 +685,54 @@ mod tests {
             result.matches.is_empty(),
             "expected no matches, got {result:?}"
         );
+    }
+
+    #[test]
+    fn get_file_contents_truncates_very_long_lines() {
+        let long = "x".repeat(2050);
+        let fix = Fixture::new(&[("src/a.rs", long.as_str())]);
+        let result = get_file_contents(
+            fix.analyzer.analyzer(),
+            GetFileContentsParams {
+                file_paths: vec!["src/a.rs".to_string()],
+            },
+        );
+
+        assert_eq!(1, result.files.len());
+        assert!(!result.files[0].truncated);
+        assert_eq!(Some(1), result.files[0].total_lines);
+        assert!(
+            result.files[0]
+                .content
+                .ends_with(" [TRUNCATED at 2048 chars]")
+        );
+    }
+
+    #[test]
+    fn get_file_contents_samples_large_files_as_head_tail() {
+        let body = (1..=60)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let fix = Fixture::new(&[("src/a.rs", body.as_str())]);
+        let result = get_file_contents(
+            fix.analyzer.analyzer(),
+            GetFileContentsParams {
+                file_paths: vec!["src/a.rs".to_string()],
+            },
+        );
+
+        assert_eq!(1, result.files.len());
+        let file = &result.files[0];
+        assert!(file.truncated);
+        assert_eq!(Some(60), file.total_lines);
+        assert_eq!(Some(25), file.head_lines);
+        assert_eq!(Some(25), file.tail_lines);
+        assert!(file.content.contains("line 1"));
+        assert!(file.content.contains("line 25"));
+        assert!(file.content.contains("----- OMITTED 10 LINES -----"));
+        assert!(file.content.contains("line 36"));
+        assert!(file.content.contains("line 60"));
     }
 
     #[test]
@@ -893,5 +960,32 @@ mod tests {
         assert!(result.files.is_empty());
         assert_eq!(result.not_found, vec!["missing.rs"]);
         let _ = fix.project_root();
+    }
+
+    #[test]
+    fn search_file_contents_truncates_long_match_and_context_lines() {
+        let long = "x".repeat(2050);
+        let fix = Fixture::new(&[(
+            "src/a.rs",
+            format!("before\nneedle {long}\nafter {long}\n").as_str(),
+        )]);
+        let result = search_file_contents(
+            fix.analyzer.analyzer(),
+            SearchFileContentsParams {
+                patterns: vec!["needle".to_string()],
+                file_path: None,
+                context_lines: 1,
+                case_insensitive: false,
+            },
+        );
+
+        let group = &result.matches[0];
+        assert!(
+            group.matches[0]
+                .text
+                .ends_with(" [TRUNCATED at 2048 chars]")
+        );
+        assert_eq!(vec!["before".to_string()], group.matches[0].before);
+        assert!(group.matches[0].after[0].ends_with(" [TRUNCATED at 2048 chars]"));
     }
 }

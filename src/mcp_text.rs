@@ -5,7 +5,7 @@ pub(crate) fn text_tool_descriptors() -> Vec<Value> {
     vec![
         tool_descriptor(
             "get_file_contents",
-            "Return the raw text contents of one or more files in the workspace, given project-relative paths or absolute paths inside the active workspace.",
+            "Return the text contents of one or more files in the workspace, given project-relative paths or absolute paths inside the active workspace. Very long lines are truncated, and files larger than the line sample cap are returned as a head/tail sample.",
             json!({
                 "type": "object",
                 "properties": {

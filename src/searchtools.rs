@@ -10,6 +10,7 @@ use crate::analyzer::usages::{
     CONFIDENCE_THRESHOLD, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, FuzzyResult, UsageFinder, UsageHit,
 };
 use crate::analyzer::{CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, Range};
+use crate::model_context;
 use crate::path_utils::{normalize_pattern, rel_path_string};
 use crate::profiling;
 use crate::relevance::{most_important_project_files, most_relevant_project_files};
@@ -170,6 +171,8 @@ pub struct SummaryElement {
     pub start_line: usize,
     pub end_line: usize,
     pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presentation: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -772,7 +775,7 @@ fn summary_fallback_for_file(
         (
             elements,
             Some(
-                "no indexed declarations or top-level includes found; showing first 20 lines"
+                "no indexed declarations or top-level includes found; showing head/tail sample"
                     .to_string(),
             ),
         )
@@ -826,6 +829,7 @@ fn include_fallback_elements(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> Ve
             start_line: line_index + 1,
             end_line: line_index + 1,
             text: line_text.trim_end().to_string(),
+            presentation: None,
         });
     }
     elements
@@ -833,18 +837,18 @@ fn include_fallback_elements(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> Ve
 
 fn excerpt_fallback_elements(file: &ProjectFile) -> Option<Vec<SummaryElement>> {
     let content = file.read_to_string().ok()?;
-    let excerpt_lines: Vec<&str> = content.lines().take(20).collect();
-    if excerpt_lines.is_empty() {
+    let sampled = model_context::sample(&content);
+    if sampled.text.is_empty() {
         return None;
     }
-    let end_line = excerpt_lines.len();
     Some(vec![SummaryElement {
         path: rel_path_string(file),
         symbol: rel_path_string(file),
         kind: "excerpt".to_string(),
         start_line: 1,
-        end_line,
-        text: excerpt_lines.join("\n"),
+        end_line: sampled.total_lines,
+        text: sampled.text,
+        presentation: Some("sampled_excerpt".to_string()),
     }])
 }
 
@@ -1285,6 +1289,7 @@ fn signature_elements(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> Vec<Sum
                 start_line,
                 end_line,
                 text,
+                presentation: None,
             })
         })
         .collect()
@@ -1618,11 +1623,7 @@ fn is_glob_pattern(pattern: &str) -> bool {
 }
 
 fn line_count(content: &str) -> usize {
-    if content.is_empty() {
-        0
-    } else {
-        split_logical_lines(content).len()
-    }
+    model_context::count_lines(content)
 }
 
 fn line_number_at_offset(content: &str, offset: usize) -> usize {
@@ -1715,29 +1716,9 @@ fn first_comment_offset(line: &str) -> Option<usize> {
         .map(|capture| capture.start())
 }
 
+#[cfg(test)]
 fn split_logical_lines(content: &str) -> Vec<&str> {
-    if content.is_empty() {
-        return Vec::new();
-    }
-
-    let mut lines = Vec::new();
-    let mut start = 0usize;
-    let mut iter = content.char_indices().peekable();
-    while let Some((index, ch)) = iter.next() {
-        if ch == '\n' || ch == '\r' {
-            lines.push(&content[start..index]);
-            if ch == '\r' && matches!(iter.peek(), Some((_, '\n'))) {
-                let (next_index, _) = iter.next().unwrap();
-                start = next_index + 1;
-            } else {
-                start = index + 1;
-            }
-        }
-    }
-    if start < content.len() {
-        lines.push(&content[start..]);
-    }
-    lines
+    model_context::logical_lines(content)
 }
 
 fn strip_params(symbols: Vec<String>) -> Vec<String> {
@@ -1992,6 +1973,7 @@ mod tests {
             start_line: 10,
             end_line: 10,
             text: "class A {".to_string(),
+            presentation: None,
         };
     }
 

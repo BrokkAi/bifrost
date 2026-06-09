@@ -1,3 +1,4 @@
+use crate::model_context;
 use crate::searchtools::{
     AmbiguousSymbol, MostRelevantFilesResult, SearchSymbolHit, SearchSymbolsFile,
     SearchSymbolsResult, SkimFile, SkimFilesResult, SourceBlock, SummaryBlock, SummaryElement,
@@ -301,12 +302,16 @@ impl SummaryBlock {
 
 impl SummaryElement {
     fn render_text(&self, options: RenderOptions) -> String {
-        let lines: Vec<&str> = self.text.lines().collect();
+        let safe_text = model_context::cap_lines(&self.text);
+        if self.presentation.as_deref() == Some("sampled_excerpt") {
+            return safe_text;
+        }
+        let lines: Vec<&str> = safe_text.lines().collect();
         if lines.is_empty() {
             return String::new();
         }
         if !options.render_line_numbers {
-            return self.text.clone();
+            return safe_text;
         }
         let prefix = if self.start_line == self.end_line {
             format!("{}: {}", self.start_line, lines[0])
@@ -353,10 +358,12 @@ impl SourceBlock {
 }
 
 fn render_source_body(text: &str, start_line: usize, options: RenderOptions) -> String {
+    let safe_text = model_context::cap_lines(text);
     if !options.render_line_numbers {
-        return text.to_string();
+        return safe_text;
     }
-    text.lines()
+    safe_text
+        .lines()
         .enumerate()
         .map(|(idx, line)| format!("{}: {}", start_line + idx, line))
         .collect::<Vec<String>>()
@@ -521,6 +528,42 @@ mod tests {
         assert!(
             text.contains("| Foo | crate::foo::Foo, other::Foo |"),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn summary_elements_truncate_very_long_lines_when_rendered() {
+        let long = "x".repeat(2050);
+        let element = SummaryElement {
+            path: "a.rs".to_string(),
+            symbol: "a".to_string(),
+            kind: "excerpt".to_string(),
+            start_line: 1,
+            end_line: 1,
+            text: long,
+            presentation: None,
+        };
+
+        let rendered = element.render_text(RenderOptions::default());
+        assert!(rendered.contains("[TRUNCATED at 2048 chars]"), "{rendered}");
+    }
+
+    #[test]
+    fn sampled_excerpt_rendering_preserves_omitted_delimiter_without_fake_ranges() {
+        let element = SummaryElement {
+            path: "a.rs".to_string(),
+            symbol: "a.rs".to_string(),
+            kind: "excerpt".to_string(),
+            start_line: 1,
+            end_line: 60,
+            text: "// line 1\n\n----- OMITTED 10 LINES -----\n\n// line 60".to_string(),
+            presentation: Some("sampled_excerpt".to_string()),
+        };
+
+        let rendered = element.render_text(RenderOptions::default());
+        assert_eq!(
+            "// line 1\n\n----- OMITTED 10 LINES -----\n\n// line 60",
+            rendered
         );
     }
 }

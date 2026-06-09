@@ -416,6 +416,7 @@ fn summary_renderer_uses_ranges_for_multiline_elements() {
         start_line: 12,
         end_line: 14,
         text: "class Foo(\n  x: int,\n  y: int".to_string(),
+        presentation: None,
     });
 
     assert_eq!("12..14: class Foo(\n  x: int,\n  y: int", rendered);
@@ -526,7 +527,7 @@ fn empty_cpp_headers_use_excerpt_summary_fallback() {
     assert_eq!(1, result.summaries.len(), "{result:#?}");
     let summary = &result.summaries[0];
     assert_eq!(
-        Some("no indexed declarations or top-level includes found; showing first 20 lines"),
+        Some("no indexed declarations or top-level includes found; showing head/tail sample"),
         summary.fallback_reason.as_deref()
     );
     assert_eq!(1, summary.elements.len(), "{:#?}", summary.elements);
@@ -534,8 +535,39 @@ fn empty_cpp_headers_use_excerpt_summary_fallback() {
     assert_eq!("excerpt", excerpt.kind);
     assert_eq!("src/emptyish.h", excerpt.symbol);
     assert_eq!(1, excerpt.start_line);
-    assert_eq!(20, excerpt.end_line);
+    assert_eq!(25, excerpt.end_line);
+    assert_eq!(Some("sampled_excerpt"), excerpt.presentation.as_deref());
     assert!(excerpt.text.contains("// line 1"), "{excerpt:#?}");
-    assert!(excerpt.text.contains("// line 20"), "{excerpt:#?}");
-    assert!(!excerpt.text.contains("// line 21"), "{excerpt:#?}");
+    assert!(excerpt.text.contains("// line 25"), "{excerpt:#?}");
+    assert!(!excerpt.text.contains("OMITTED"), "{excerpt:#?}");
+}
+
+#[test]
+fn larger_empty_cpp_headers_use_head_tail_excerpt_summary_fallback() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "src/emptyish_large.h",
+            (1..=60)
+                .map(|line| format!("// line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .build();
+    let analyzer = brokk_bifrost::CppAnalyzer::from_project(project.project().clone());
+
+    let result = get_summaries(
+        &analyzer,
+        SummariesParams {
+            targets: vec!["src/emptyish_large.h".to_string()],
+        },
+    );
+
+    let excerpt = &result.summaries[0].elements[0];
+    assert_eq!(Some("sampled_excerpt"), excerpt.presentation.as_deref());
+    assert_eq!(60, excerpt.end_line);
+    assert!(excerpt.text.contains("// line 1"));
+    assert!(excerpt.text.contains("// line 25"));
+    assert!(excerpt.text.contains("----- OMITTED 10 LINES -----"));
+    assert!(excerpt.text.contains("// line 36"));
+    assert!(excerpt.text.contains("// line 60"));
 }
