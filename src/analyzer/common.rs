@@ -19,6 +19,11 @@ pub(crate) fn display_symbol_name(language: Language, symbol: &str) -> String {
             .map(|segment| segment.trim_end_matches('$'))
             .collect::<Vec<_>>()
             .join("."),
+        Language::CSharp => symbol
+            .split('.')
+            .map(|segment| segment.replace('$', "."))
+            .collect::<Vec<_>>()
+            .join("."),
         _ => symbol.to_string(),
     }
 }
@@ -43,4 +48,22 @@ pub(crate) fn is_scala_object_like(target: &CodeUnit) -> bool {
             .short_name()
             .split('.')
             .any(|segment| segment.ends_with('$'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::display_symbol_name;
+    use crate::analyzer::Language;
+
+    #[test]
+    fn display_symbol_name_normalizes_scala_and_csharp_user_facing_names() {
+        assert_eq!(
+            "ai.brokk.ir.PrimOp.AsClockOp",
+            display_symbol_name(Language::Scala, "ai.brokk.ir$.PrimOp$.AsClockOp$")
+        );
+        assert_eq!(
+            "N.Outer.Inner.Method",
+            display_symbol_name(Language::CSharp, "N.Outer$Inner.Method")
+        );
+    }
 }

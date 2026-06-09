@@ -18,7 +18,8 @@ The visible proof is a focused Scala fixture with nested objects and case object
 - [x] (2026-06-09T20:53:45Z) Removed `kind_filter` from `get_symbol_sources`, `get_symbol_locations`, and `get_symbol_ancestors`, including MCP schemas and legacy compatibility stripping in the service layer.
 - [x] (2026-06-09T20:53:45Z) Added `get_symbol_ancestors` invalid-params behavior for non-type targets and kept provider-unavailable behavior unchanged for valid type-like symbols in unsupported languages.
 - [x] (2026-06-09T20:53:45Z) Added focused Scala regression tests, updated MCP/service expectations, and ran focused searchtools/MCP tests, `cargo fmt --all`, and `cargo clippy --all-targets --all-features -- -D warnings`.
-- [ ] (2026-06-09T20:53:45Z) Cut a checkpoint commit for the Scala/API work, then start the follow-on C# display-only normalization pass.
+- [x] (2026-06-09T20:53:45Z) Cut a checkpoint commit for the Scala/API work, then start the follow-on C# display-only normalization pass.
+- [x] (2026-06-09T21:18:42Z) Normalized C# nested-type display names at the same user-facing display helper boundary, updated the delimiter regression expectation, and reran focused tests plus `cargo fmt --all` and `cargo clippy --all-targets --all-features -- -D warnings`.
 
 ## Surprises & Discoveries
 
@@ -34,6 +35,9 @@ The visible proof is a focused Scala fixture with nested objects and case object
 - Observation: the nested Scala trace failures did not require a wholesale parser rewrite in `symbol_lookup.rs`; once `kind_filter` was removed from the affected tools, the existing path normalization already handled the observed `$` object/member spellings well enough for the new regression fixture.
   Evidence: the focused Scala fixture passes for both `ai.brokk.ir.PrimOp.AsClockOp` and `ai.brokk.ir$.PrimOp$.AsClockOp` after the API/display changes, without adding a new Scala-only path parser.
 
+- Observation: C# user-facing nested-type names can be normalized cleanly at the same display helper boundary used for Scala, without changing lookup aliases or canonical storage.
+  Evidence: replacing `$` with `.` per path segment in `display_symbol_name(Language::CSharp, ...)` updates rendered labels while the existing `N.Outer+Inner.Method` lookup test still passes.
+
 ## Decision Log
 
 - Decision: Keep internal analyzer canonical names unchanged and solve Scala liberalization in shared lookup aliases plus searchtools display formatting.
@@ -48,9 +52,15 @@ The visible proof is a focused Scala fixture with nested objects and case object
   Rationale: The user called out that ancestors only make sense against classes, and the tool is semantically different from source/location lookup because it is not just “best effort resolution.”
   Date/Author: 2026-06-09 / Codex
 
+- Decision: Extend the same user-facing display helper boundary to C# nested types so searchtools and LSP labels render `Outer.Inner` while lookup continues accepting `$`, `.`, and `+`.
+  Rationale: This improves displayed output for the other major internal-name outlier without widening the blast radius into analyzer storage or resolver semantics.
+  Date/Author: 2026-06-09 / Codex
+
 ## Outcomes & Retrospective
 
 Midpoint outcome 2026-06-09: the Scala/API milestone is complete. Bifrost now accepts the traced Scala `$` spellings without caller-supplied kind filters, renders idiomatic Scala names in searchtools and LSP labels, and rejects non-type ancestor requests with invalid params. The next follow-on task is explicit C# display-only normalization, which should stay separate from canonical storage and lookup semantics.
+
+Update 2026-06-09T21:18:42Z: the C# follow-on is complete. User-facing nested-type names now render idiomatically as `Outer.Inner` in the same surfaces that were switched to Scala-aware display helpers, while lookup semantics and canonical internal names remain unchanged.
 
 ## Context and Orientation
 

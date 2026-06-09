@@ -90,7 +90,7 @@ class Outer {
         .build();
     let csharp = CSharpAnalyzer::from_project(csharp_project.project().clone());
     let csharp_result = source_for(&csharp, "N.Outer+Inner.Method");
-    assert_eq!("N.Outer$Inner.Method", csharp_result.sources[0].label);
+    assert_eq!("N.Outer.Inner.Method", csharp_result.sources[0].label);
 }
 
 #[test]
