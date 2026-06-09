@@ -186,6 +186,54 @@ fn python_boundary_returns_canonical_rendered_text_payload() {
 }
 
 #[test]
+fn get_symbol_sources_file_input_returns_top_level_outline_payload() {
+    let temp = TempDir::new().unwrap();
+    fs::create_dir_all(temp.path().join("src").join("pkg")).unwrap();
+    fs::write(
+        temp.path().join("src").join("pkg").join("Thing.java"),
+        r#"package pkg;
+class Thing {
+    void method() {}
+    static class Inner {}
+}
+"#,
+    )
+    .unwrap();
+
+    let service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_payload_json(
+            "get_symbol_sources",
+            r#"{"symbols":["src/pkg/Thing.java"]}"#,
+            RenderOptions::default(),
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    let source = &value["structured"]["sources"][0];
+    assert_eq!("src/pkg/Thing.java", source["label"]);
+    assert_eq!("src/pkg/Thing.java", source["path"]);
+    assert_eq!(1, source["start_line"]);
+    assert_eq!(2, source["end_line"]);
+    let source_text = source["text"].as_str().expect("source text");
+    assert!(source_text.contains("# pkg"), "{source_text}");
+    assert!(source_text.contains("- Thing"), "{source_text}");
+    assert!(!source_text.contains("method"), "{source_text}");
+    assert!(!source_text.contains("Inner"), "{source_text}");
+
+    let rendered = value["rendered_text"].as_str().expect("rendered text");
+    assert!(rendered.contains("## src/pkg/Thing.java"), "{rendered}");
+    assert!(
+        rendered.contains("- Location: src/pkg/Thing.java:1..2"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("```text\n1: # pkg\n2: - Thing\n```"),
+        "{rendered}"
+    );
+}
+
+#[test]
 fn legacy_kind_filter_is_ignored_for_symbol_sources_and_locations() {
     let service = SearchToolsService::new_for_python(fixture_root()).unwrap();
 

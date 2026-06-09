@@ -576,6 +576,41 @@ fn bifrost_defaults_to_cwd_searchtools_server() {
         "DefaultRoot.java"
     );
 
+    let symbol_sources = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "get_symbol_sources",
+                "arguments": { "symbols": ["DefaultRoot.java"] }
+            }
+        }),
+    );
+    assert_eq!(
+        symbol_sources["result"]["isError"], false,
+        "{symbol_sources}"
+    );
+    assert_eq!(
+        symbol_sources["result"]["structuredContent"]["sources"][0]["path"],
+        "DefaultRoot.java"
+    );
+    let source_preview = symbol_sources["result"]["content"][0]["text"]
+        .as_str()
+        .expect("source preview text");
+    assert!(
+        source_preview.contains("## DefaultRoot.java"),
+        "{source_preview}"
+    );
+    assert!(
+        source_preview.contains("- Location: DefaultRoot.java:1.."),
+        "{source_preview}"
+    );
+    assert!(source_preview.contains("```text\n"), "{source_preview}");
+
     drop(stdin);
     let status = child.wait().expect("wait bifrost");
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");

@@ -379,12 +379,22 @@ pub trait IAnalyzer: Send + Sync + Any {
         self.list_symbols_with_types(file, &all_code_unit_types())
     }
 
+    fn list_top_level_symbols(&self, file: &ProjectFile) -> String {
+        summarize_code_units_impl(
+            self,
+            &summary_root_units(self, file),
+            &all_code_unit_types(),
+            0,
+            false,
+        )
+    }
+
     fn list_symbols_with_types(
         &self,
         file: &ProjectFile,
         types: &BTreeSet<CodeUnitType>,
     ) -> String {
-        summarize_code_units_impl(self, &summary_root_units(self, file), types, 0)
+        summarize_code_units_impl(self, &summary_root_units(self, file), types, 0, true)
     }
 
     fn parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
@@ -435,6 +445,7 @@ fn summarize_code_units_impl<A: IAnalyzer + ?Sized>(
     units: &[CodeUnit],
     types: &BTreeSet<CodeUnitType>,
     indent: usize,
+    recursive: bool,
 ) -> String {
     let indent_str = "  ".repeat(indent);
     let mut summary = String::new();
@@ -478,6 +489,7 @@ fn summarize_code_units_impl<A: IAnalyzer + ?Sized>(
                     types,
                     indent,
                     &indent_str,
+                    recursive,
                 );
             }
         }
@@ -493,6 +505,7 @@ fn summarize_code_units_impl<A: IAnalyzer + ?Sized>(
                 types,
                 indent,
                 &indent_str,
+                recursive,
             );
         }
     }
@@ -507,28 +520,32 @@ fn render_symbol_summary<A: IAnalyzer + ?Sized>(
     types: &BTreeSet<CodeUnitType>,
     indent: usize,
     indent_str: &str,
+    recursive: bool,
 ) {
     summary.push_str(indent_str);
     summary.push_str("- ");
     summary.push_str(&display_identifier_for_target(code_unit));
 
-    let children: Vec<_> = ordered_summary_children(
-        analyzer,
-        code_unit,
-        analyzer
-            .direct_children(code_unit)
-            .filter(|child| types.contains(&child.kind()))
-            .cloned()
-            .collect(),
-    );
-    if !children.is_empty() {
-        summary.push('\n');
-        summary.push_str(&summarize_code_units_impl(
+    if recursive {
+        let children: Vec<_> = ordered_summary_children(
             analyzer,
-            &children,
-            types,
-            indent + 1,
-        ));
+            code_unit,
+            analyzer
+                .direct_children(code_unit)
+                .filter(|child| types.contains(&child.kind()))
+                .cloned()
+                .collect(),
+        );
+        if !children.is_empty() {
+            summary.push('\n');
+            summary.push_str(&summarize_code_units_impl(
+                analyzer,
+                &children,
+                types,
+                indent + 1,
+                recursive,
+            ));
+        }
     }
     summary.push('\n');
 }

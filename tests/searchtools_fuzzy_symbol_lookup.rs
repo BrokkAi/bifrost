@@ -180,6 +180,86 @@ object InstanceChoiceControl {
 }
 
 #[test]
+fn get_symbol_sources_returns_flat_top_level_symbols_for_file_paths() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "src/pkg/Thing.java",
+            r#"package pkg;
+class Thing {
+    void method() {}
+    static class Inner {}
+}
+"#,
+        )
+        .build();
+    let analyzer = JavaAnalyzer::from_project(project.project().clone());
+
+    let result = source_for(&analyzer, "src/pkg/Thing.java");
+    assert!(result.not_found.is_empty(), "{result:#?}");
+    assert!(result.ambiguous.is_empty(), "{result:#?}");
+    assert_eq!(1, result.sources.len(), "{result:#?}");
+
+    let source = &result.sources[0];
+    assert_eq!("src/pkg/Thing.java", source.label);
+    assert_eq!("src/pkg/Thing.java", source.path);
+    assert_eq!(1, source.start_line);
+    assert_eq!(2, source.end_line);
+    assert_eq!(None, source.presentation.as_deref());
+    assert!(source.text.contains("# pkg"), "{source:#?}");
+    assert!(source.text.contains("- Thing"), "{source:#?}");
+    assert!(!source.text.contains("method"), "{source:#?}");
+    assert!(!source.text.contains("Inner"), "{source:#?}");
+}
+
+#[test]
+fn get_symbol_sources_supports_mixed_file_and_symbol_inputs() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "src/pkg/Thing.java",
+            r#"package pkg;
+class Thing {
+    void method() {}
+}
+"#,
+        )
+        .file(
+            "src/pkg/Other.java",
+            r#"package pkg;
+class Other {
+    void run() {}
+}
+"#,
+        )
+        .build();
+    let analyzer = JavaAnalyzer::from_project(project.project().clone());
+
+    let result = get_symbol_sources(
+        &analyzer,
+        SymbolLookupParams {
+            symbols: vec![
+                "src/pkg/Thing.java".to_string(),
+                "pkg.Other.run".to_string(),
+                "src/pkg/Missing.java".to_string(),
+            ],
+        },
+    );
+
+    assert!(result.ambiguous.is_empty(), "{result:#?}");
+    assert_eq!(vec!["src/pkg/Missing.java".to_string()], result.not_found);
+    assert_eq!(
+        vec![
+            "src/pkg/Thing.java".to_string(),
+            "pkg.Other.run".to_string()
+        ],
+        result
+            .sources
+            .iter()
+            .map(|source| source.label.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn fuzzy_lookup_reports_ambiguity_instead_of_picking_a_suffix_match() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(

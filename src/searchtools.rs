@@ -613,8 +613,22 @@ pub fn get_symbol_sources(
     let mut outcomes: Vec<_> = selected_symbols
         .into_par_iter()
         .enumerate()
-        .map(
-            |(index, symbol)| match resolve_codeunit_fuzzy(analyzer, &symbol) {
+        .map(|(index, symbol)| {
+            let file_matches = resolve_file_patterns(analyzer, std::slice::from_ref(&symbol));
+            if !file_matches.is_empty() {
+                let sources = top_level_symbol_outline_blocks_for_files(analyzer, file_matches);
+                return if sources.is_empty() {
+                    (index, SourceLookupOutcome::NotFound(symbol))
+                } else {
+                    (index, SourceLookupOutcome::Found(sources))
+                };
+            }
+
+            if looks_like_file_target(&symbol) {
+                return (index, SourceLookupOutcome::NotFound(symbol));
+            }
+
+            match resolve_codeunit_fuzzy(analyzer, &symbol) {
                 CodeUnitResolution::Resolved(code_units) => {
                     let sources = code_units
                         .iter()
@@ -640,8 +654,8 @@ pub fn get_symbol_sources(
                     }),
                 ),
                 CodeUnitResolution::NotFound => (index, SourceLookupOutcome::NotFound(symbol)),
-            },
-        )
+            }
+        })
         .collect();
     outcomes.sort_by_key(|(index, _)| *index);
 
@@ -1248,6 +1262,28 @@ fn source_blocks_for_code_unit(
         .collect()
 }
 
+fn top_level_symbol_outline_blocks_for_files(
+    analyzer: &dyn IAnalyzer,
+    files: Vec<ProjectFile>,
+) -> Vec<SourceBlock> {
+    files
+        .into_iter()
+        .map(|file| {
+            let text = analyzer.list_top_level_symbols(&file);
+            let end_line = text.lines().count().max(1);
+            let path = rel_path_string(&file);
+            SourceBlock {
+                label: path.clone(),
+                path,
+                start_line: 1,
+                end_line,
+                text,
+                presentation: None,
+            }
+        })
+        .collect()
+}
+
 fn module_file_listing_blocks(code_unit: &CodeUnit) -> Vec<SourceBlock> {
     vec![SourceBlock {
         label: display_symbol_for_target(code_unit),
@@ -1385,16 +1421,19 @@ fn select_files_for_display(
 
 fn looks_like_file_target(target: &str) -> bool {
     if target == "."
-        || target.starts_with('.')
-        || target.contains('/')
-        || target.contains('\\')
+        || target.starts_with("./")
+        || target.starts_with("../")
+        || target.starts_with('/')
+        || target.starts_with('\\')
         || target.contains('*')
         || target.contains('?')
     {
         return true;
     }
 
-    let Some((_, extension)) = target.rsplit_once('.') else {
+    let normalized = target.replace('\\', "/");
+    let leaf = normalized.rsplit('/').next().unwrap_or(target);
+    let Some((_, extension)) = leaf.rsplit_once('.') else {
         return false;
     };
     !extension.is_empty() && likely_file_target_extension(extension)

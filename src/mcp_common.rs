@@ -362,7 +362,7 @@ pub fn symbol_names_schema() -> Value {
             "symbols": {
                 "type": "array",
                 "items": { "type": "string" },
-                "description": "Fully qualified or short symbol names to resolve."
+                "description": "Fully qualified or short symbol names to resolve, or project-relative file paths/globs for file-backed symbol views."
             }
         },
         "required": ["symbols"]
