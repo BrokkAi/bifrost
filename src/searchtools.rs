@@ -10,6 +10,7 @@ use crate::analyzer::usages::{
     CONFIDENCE_THRESHOLD, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, FuzzyResult, UsageFinder, UsageHit,
 };
 use crate::analyzer::{CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, Range};
+use crate::hash::HashMap;
 use crate::model_context;
 use crate::path_utils::{normalize_pattern, rel_path_string};
 use crate::profiling;
@@ -19,6 +20,7 @@ use glob::Pattern;
 use rayon::prelude::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -110,6 +112,45 @@ pub struct SearchSymbolHit {
     pub symbol: String,
     pub signature: String,
     pub line: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchPatternKind {
+    LiteralIdentifier,
+    LiteralQualified,
+    RegexLike,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct SymbolMatchScore {
+    tier: u8,
+    exact_patterns: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct SymbolCandidateScore {
+    match_score: SymbolMatchScore,
+    path_tier: u8,
+    implementation_tier: u8,
+    source_quality_tier: u8,
+    synthetic_tier: u8,
+}
+
+#[derive(Debug, Clone)]
+struct RankedSearchCandidate {
+    code_unit: CodeUnit,
+    score: SymbolCandidateScore,
+    line: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct FileRankingKey {
+    top1: SymbolCandidateScore,
+    cohesion_tier: u8,
+    focus_tier: u8,
+    top2: SymbolCandidateScore,
+    top3: SymbolCandidateScore,
+    git_tier: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -335,38 +376,60 @@ pub fn search_symbols(
 
     let filtered: Vec<_> = definitions
         .into_par_iter()
-        .filter(|code_unit| params.include_tests || !analyzer.contains_tests(code_unit.source()))
+        .filter(|code_unit| {
+            params.include_tests || !is_test_candidate(analyzer, code_unit.source())
+        })
         .collect::<Vec<_>>()
         .into_iter()
         .collect();
 
-    let mut grouped: BTreeMap<ProjectFile, Vec<CodeUnit>> = BTreeMap::new();
-    for code_unit in filtered {
+    let ranked = rank_search_symbol_candidates(analyzer, &patterns, filtered);
+
+    let mut grouped: HashMap<ProjectFile, Vec<RankedSearchCandidate>> = HashMap::default();
+    for candidate in ranked {
         grouped
-            .entry(code_unit.source().clone())
+            .entry(candidate.code_unit.source().clone())
             .or_default()
-            .push(code_unit);
+            .push(candidate);
     }
 
     let effective_limit = params.limit.clamp(1, FILE_SEARCH_LIMIT);
     let total_files = grouped.len();
     let truncated = total_files > effective_limit;
-    let selected_files =
-        select_files_for_display(analyzer, grouped.keys().cloned().collect(), effective_limit);
-    let files = selected_files
+    let mut file_entries: Vec<_> = grouped.into_iter().collect();
+    let git_tiers = search_symbol_git_tiers(
+        analyzer,
+        &file_entries
+            .iter()
+            .map(|(file, _)| file.clone())
+            .collect::<Vec<_>>(),
+    );
+    file_entries.sort_by(
+        |(left_file, left_candidates), (right_file, right_candidates)| {
+            compare_search_symbol_files(
+                left_file,
+                left_candidates,
+                right_file,
+                right_candidates,
+                &git_tiers,
+            )
+        },
+    );
+    file_entries.truncate(effective_limit);
+
+    let files = file_entries
         .into_iter()
-        .filter_map(|file| grouped.remove(&file).map(|code_units| (file, code_units)))
         .map(|(file, code_units)| SearchSymbolsFile {
             path: rel_path_string(&file),
             loc: file
                 .read_to_string()
                 .map(|content| line_count(&content))
                 .unwrap_or(0),
-            classes: collect_kind_names(analyzer, &code_units, CodeUnitType::Class),
-            functions: collect_kind_names(analyzer, &code_units, CodeUnitType::Function),
-            fields: collect_kind_names(analyzer, &code_units, CodeUnitType::Field),
-            modules: collect_kind_names(analyzer, &code_units, CodeUnitType::Module),
-            macros: collect_kind_names(analyzer, &code_units, CodeUnitType::Macro),
+            classes: collect_ranked_kind_names(analyzer, &code_units, CodeUnitType::Class),
+            functions: collect_ranked_kind_names(analyzer, &code_units, CodeUnitType::Function),
+            fields: collect_ranked_kind_names(analyzer, &code_units, CodeUnitType::Field),
+            modules: collect_ranked_kind_names(analyzer, &code_units, CodeUnitType::Module),
+            macros: collect_ranked_kind_names(analyzer, &code_units, CodeUnitType::Macro),
         })
         .collect();
 
@@ -1107,33 +1170,450 @@ fn group_hits_by_file(hits: BTreeSet<UsageHit>) -> Vec<UsageFileGroup> {
         .collect()
 }
 
-fn collect_kind_names(
+fn rank_search_symbol_candidates(
     analyzer: &dyn IAnalyzer,
-    code_units: &[CodeUnit],
+    patterns: &[String],
+    code_units: Vec<CodeUnit>,
+) -> Vec<RankedSearchCandidate> {
+    let mut ranked: Vec<_> = code_units
+        .into_iter()
+        .map(|code_unit| RankedSearchCandidate {
+            line: primary_range(analyzer, &code_unit)
+                .map(|range| range.start_line)
+                .unwrap_or(0),
+            score: score_search_symbol_candidate(analyzer, patterns, &code_unit),
+            code_unit,
+        })
+        .collect();
+    ranked.sort_by(compare_ranked_search_candidates);
+    ranked
+}
+
+fn score_search_symbol_candidate(
+    analyzer: &dyn IAnalyzer,
+    patterns: &[String],
+    code_unit: &CodeUnit,
+) -> SymbolCandidateScore {
+    let mut best_match = SymbolMatchScore {
+        tier: 0,
+        exact_patterns: 0,
+    };
+    for pattern in patterns {
+        let match_score = score_symbol_match(pattern, code_unit);
+        if match_score > best_match {
+            best_match = match_score;
+        }
+    }
+
+    SymbolCandidateScore {
+        match_score: best_match,
+        path_tier: search_symbol_path_tier(patterns, code_unit.source()),
+        implementation_tier: search_symbol_implementation_tier(analyzer, code_unit),
+        source_quality_tier: search_symbol_source_quality_tier(analyzer, code_unit.source()),
+        synthetic_tier: u8::from(!code_unit.is_synthetic()),
+    }
+}
+
+fn score_symbol_match(pattern: &str, code_unit: &CodeUnit) -> SymbolMatchScore {
+    let normalized = pattern.trim();
+    if normalized.is_empty() {
+        return SymbolMatchScore {
+            tier: 0,
+            exact_patterns: 0,
+        };
+    }
+
+    let pattern_kind = classify_search_pattern(normalized);
+    let query = normalized.to_ascii_lowercase();
+    let identifier_raw = code_unit.identifier();
+    let short_name_raw = code_unit.short_name();
+    let fq_name_raw = code_unit.fq_name();
+    let identifier = identifier_raw.to_ascii_lowercase();
+    let short_name = short_name_raw.to_ascii_lowercase();
+    let fq_name = fq_name_raw.to_ascii_lowercase();
+    let normalized_short = normalize_symbol_name_for_search(code_unit.short_name());
+    let normalized_fq = normalize_symbol_name_for_search(&code_unit.fq_name());
+
+    let tier = match pattern_kind {
+        SearchPatternKind::LiteralIdentifier => {
+            if query == identifier {
+                9
+            } else if query == short_name {
+                8
+            } else if query == fq_name {
+                7
+            } else if contains_exact_symbol_component(short_name_raw, &query)
+                || contains_exact_symbol_component(&fq_name_raw, &query)
+            {
+                6
+            } else if contains_prefix_symbol_component(short_name_raw, &query)
+                || contains_prefix_symbol_component(&fq_name_raw, &query)
+            {
+                5
+            } else if short_name.contains(&query) {
+                3
+            } else if fq_name.contains(&query) {
+                2
+            } else {
+                1
+            }
+        }
+        SearchPatternKind::LiteralQualified => {
+            if query == normalized_short || query == normalized_fq {
+                9
+            } else if normalized_short.starts_with(&query) || normalized_fq.starts_with(&query) {
+                7
+            } else if normalized_short.contains(&query) || normalized_fq.contains(&query) {
+                5
+            } else if query == identifier {
+                3
+            } else if identifier.starts_with(&query) {
+                2
+            } else {
+                1
+            }
+        }
+        SearchPatternKind::RegexLike => {
+            if normalized == ".*" {
+                1
+            } else if short_name.contains(&query)
+                || fq_name.contains(&query)
+                || identifier.contains(&query)
+            {
+                2
+            } else {
+                1
+            }
+        }
+    };
+
+    SymbolMatchScore {
+        tier,
+        exact_patterns: usize::from(
+            (pattern_kind == SearchPatternKind::LiteralIdentifier && query == identifier)
+                || (pattern_kind == SearchPatternKind::LiteralQualified
+                    && (query == normalized_short || query == normalized_fq)),
+        ),
+    }
+}
+
+fn classify_search_pattern(pattern: &str) -> SearchPatternKind {
+    if pattern.is_empty()
+        || pattern.chars().any(|ch| {
+            matches!(
+                ch,
+                '*' | '?' | '[' | ']' | '(' | ')' | '{' | '}' | '|' | '^' | ' '
+            )
+        })
+    {
+        return SearchPatternKind::RegexLike;
+    }
+
+    if pattern.contains("::")
+        || pattern.contains('.')
+        || pattern.contains('/')
+        || pattern.contains('\\')
+        || pattern.contains('$')
+        || pattern.contains('+')
+    {
+        SearchPatternKind::LiteralQualified
+    } else {
+        SearchPatternKind::LiteralIdentifier
+    }
+}
+
+fn normalize_symbol_name_for_search(symbol: &str) -> String {
+    let mut out = String::with_capacity(symbol.len());
+    let mut chars = symbol.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            ':' if chars.peek() == Some(&':') => {
+                chars.next();
+                out.push('.');
+            }
+            '/' | '\\' | '$' | '+' => out.push('.'),
+            _ => out.push(ch.to_ascii_lowercase()),
+        }
+    }
+    out
+}
+
+fn contains_exact_symbol_component(haystack: &str, query: &str) -> bool {
+    symbol_components(haystack).any(|component| component == query)
+}
+
+fn contains_prefix_symbol_component(haystack: &str, query: &str) -> bool {
+    symbol_components(haystack).any(|component| component.starts_with(query))
+}
+
+fn symbol_components(haystack: &str) -> impl Iterator<Item = String> + '_ {
+    haystack
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|component| !component.is_empty())
+        .flat_map(split_camel_case_component)
+}
+
+fn split_camel_case_component(component: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let chars: Vec<_> = component.char_indices().collect();
+    for window in chars.windows(2) {
+        let (_, current) = window[0];
+        let (next_index, next) = window[1];
+        if current.is_ascii_lowercase() && next.is_ascii_uppercase() {
+            parts.push(component[start..next_index].to_ascii_lowercase());
+            start = next_index;
+        }
+    }
+    parts.push(component[start..].to_ascii_lowercase());
+    parts
+}
+
+fn search_symbol_source_quality_tier(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> u8 {
+    if is_generated_like_path(file) {
+        return 0;
+    }
+    if is_test_candidate(analyzer, file) {
+        return 1;
+    }
+    2
+}
+
+fn search_symbol_path_tier(patterns: &[String], file: &ProjectFile) -> u8 {
+    let path = rel_path_string(file).to_ascii_lowercase();
+    patterns
+        .iter()
+        .map(|pattern| pattern.trim())
+        .filter(|pattern| !pattern.is_empty())
+        .filter(|pattern| classify_search_pattern(pattern) != SearchPatternKind::RegexLike)
+        .map(|pattern| pattern.to_ascii_lowercase())
+        .map(|query| {
+            if path.contains(&query) {
+                3
+            } else if path
+                .split(|ch: char| !ch.is_ascii_alphanumeric())
+                .any(|component| !component.is_empty() && component.eq_ignore_ascii_case(&query))
+            {
+                2
+            } else {
+                0
+            }
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+fn is_test_candidate(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> bool {
+    analyzer.contains_tests(file) || is_test_like_path(file)
+}
+
+fn is_test_like_path(file: &ProjectFile) -> bool {
+    let path = rel_path_string(file).to_ascii_lowercase();
+    if path
+        .split('/')
+        .any(|segment| matches!(segment, "test" | "tests" | "__tests__" | "spec" | "specs"))
+    {
+        return true;
+    }
+
+    let stem = file
+        .rel_path()
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(|stem| stem.to_ascii_lowercase())
+        .unwrap_or_default();
+    stem.ends_with("_test")
+        || stem.ends_with("test")
+        || stem.ends_with("_spec")
+        || stem.ends_with("spec")
+}
+
+fn is_generated_like_path(file: &ProjectFile) -> bool {
+    let path = rel_path_string(file).to_ascii_lowercase();
+    path.split('/').any(|segment| {
+        matches!(
+            segment,
+            "vendor"
+                | "third_party"
+                | "third-party"
+                | "node_modules"
+                | "dist"
+                | "build"
+                | "target"
+                | "out"
+                | "gen"
+                | "generated"
+        )
+    })
+}
+
+fn search_symbol_implementation_tier(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> u8 {
+    if language_for_target(code_unit) != Language::Cpp || code_unit.kind() != CodeUnitType::Function
+    {
+        return 1;
+    }
+
+    let signatures = display_signatures(analyzer, code_unit);
+    let has_body = signatures
+        .iter()
+        .any(|signature| signature.ends_with("{...}"));
+    let is_source_file = matches!(
+        code_unit
+            .source()
+            .rel_path()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .as_deref(),
+        Some("c" | "cc" | "cpp" | "cxx" | "m" | "mm")
+    );
+
+    match (has_body, is_source_file) {
+        (true, true) => 3,
+        (true, false) => 2,
+        (false, true) => 1,
+        (false, false) => 0,
+    }
+}
+
+fn compare_ranked_search_candidates(
+    left: &RankedSearchCandidate,
+    right: &RankedSearchCandidate,
+) -> Ordering {
+    right
+        .score
+        .cmp(&left.score)
+        .then(left.line.cmp(&right.line))
+        .then_with(|| {
+            left.code_unit
+                .identifier()
+                .cmp(right.code_unit.identifier())
+        })
+        .then_with(|| left.code_unit.fq_name().cmp(&right.code_unit.fq_name()))
+        .then_with(|| left.code_unit.source().cmp(right.code_unit.source()))
+}
+
+fn search_symbol_git_tiers(
+    analyzer: &dyn IAnalyzer,
+    files: &[ProjectFile],
+) -> HashMap<ProjectFile, usize> {
+    let ranked = most_important_project_files(analyzer, files, files.len());
+    let max_rank = ranked.len();
+    ranked
+        .into_iter()
+        .enumerate()
+        .map(|(index, file)| (file, max_rank.saturating_sub(index)))
+        .collect()
+}
+
+fn compare_search_symbol_files(
+    left_file: &ProjectFile,
+    left_candidates: &[RankedSearchCandidate],
+    right_file: &ProjectFile,
+    right_candidates: &[RankedSearchCandidate],
+    git_tiers: &HashMap<ProjectFile, usize>,
+) -> Ordering {
+    search_symbol_file_ranking_key(left_file, left_candidates, git_tiers)
+        .cmp(&search_symbol_file_ranking_key(
+            right_file,
+            right_candidates,
+            git_tiers,
+        ))
+        .reverse()
+        .then_with(|| left_file.cmp(right_file))
+}
+
+fn search_symbol_file_ranking_key(
+    file: &ProjectFile,
+    candidates: &[RankedSearchCandidate],
+    git_tiers: &HashMap<ProjectFile, usize>,
+) -> FileRankingKey {
+    let top1 = candidates
+        .first()
+        .map(|candidate| candidate.score)
+        .unwrap_or(SymbolCandidateScore {
+            match_score: SymbolMatchScore {
+                tier: 0,
+                exact_patterns: 0,
+            },
+            path_tier: 0,
+            implementation_tier: 0,
+            source_quality_tier: 0,
+            synthetic_tier: 0,
+        });
+    let top2 = candidates
+        .get(1)
+        .map(|candidate| candidate.score)
+        .unwrap_or(top1);
+    let top3 = candidates
+        .get(2)
+        .map(|candidate| candidate.score)
+        .unwrap_or(top2);
+
+    let cohesion_tier = if candidates.len() < 2 {
+        2
+    } else {
+        let min_line = candidates
+            .iter()
+            .take(3)
+            .map(|candidate| candidate.line)
+            .min()
+            .unwrap_or(0);
+        let max_line = candidates
+            .iter()
+            .take(3)
+            .map(|candidate| candidate.line)
+            .max()
+            .unwrap_or(0);
+        let span = max_line.saturating_sub(min_line);
+        if span <= 120 {
+            2
+        } else if span <= 400 {
+            1
+        } else {
+            0
+        }
+    };
+
+    let focus_tier = match candidates.len() {
+        0..=4 => 2,
+        5..=8 => 1,
+        _ => 0,
+    };
+
+    FileRankingKey {
+        top1,
+        cohesion_tier,
+        focus_tier,
+        top2,
+        top3,
+        git_tier: git_tiers.get(file).copied().unwrap_or(0),
+    }
+}
+
+fn collect_ranked_kind_names(
+    analyzer: &dyn IAnalyzer,
+    code_units: &[RankedSearchCandidate],
     kind: CodeUnitType,
 ) -> Vec<SearchSymbolHit> {
     let mut hits: Vec<_> = code_units
         .iter()
-        .filter(|code_unit| code_unit.kind() == kind)
-        .flat_map(|code_unit| {
-            let line = primary_range(analyzer, code_unit)
-                .map(|range| range.start_line)
-                .unwrap_or(0);
-            display_signatures(analyzer, code_unit)
+        .filter(|candidate| candidate.code_unit.kind() == kind)
+        .flat_map(|candidate| {
+            display_signatures(analyzer, &candidate.code_unit)
                 .into_iter()
                 .map(move |signature| SearchSymbolHit {
-                    symbol: display_symbol_for_target(code_unit),
+                    symbol: display_symbol_for_target(&candidate.code_unit),
                     signature,
-                    line,
+                    line: candidate.line,
                 })
         })
         .collect();
     hits.sort_by(|left, right| {
-        left.signature
-            .to_ascii_lowercase()
-            .cmp(&right.signature.to_ascii_lowercase())
-            .then(left.line.cmp(&right.line))
-            .then(left.symbol.cmp(&right.symbol))
+        left.line
+            .cmp(&right.line)
+            .then_with(|| left.symbol.cmp(&right.symbol))
+            .then_with(|| left.signature.cmp(&right.signature))
     });
     hits.dedup_by(|left, right| {
         left.symbol == right.symbol && left.signature == right.signature && left.line == right.line

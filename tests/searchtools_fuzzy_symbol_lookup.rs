@@ -373,7 +373,7 @@ const char* ffDetectBootmgr(FFBootmgrResult* result) {
     );
     assert_eq!(1, search.files.len(), "{search:#?}");
     assert_eq!(
-        vec!["FF_AUTO_CLOSE".to_string(), "FF_CODEC_UNKNOWN".to_string()],
+        vec!["FF_CODEC_UNKNOWN".to_string(), "FF_AUTO_CLOSE".to_string()],
         search.files[0]
             .macros
             .iter()
@@ -423,6 +423,158 @@ const char* ffDetectBootmgr(FFBootmgrResult* result) {
             .contains("return \"iBoot\";"),
         "{function_source:#?}"
     );
+}
+
+#[test]
+fn search_symbols_ranks_cpp_implementations_ahead_of_headers_and_noise() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "src/detection/bootmgr/bootmgr.h",
+            r#"#pragma once
+
+const char* ffDetectBootmgr(void);
+"#,
+        )
+        .file(
+            "src/detection/bootmgr/bootmgr_apple.c",
+            r#"#include "bootmgr.h"
+
+static const char* detectSecureBoot(void) {
+    return NULL;
+}
+
+const char* ffDetectBootmgr(void) {
+    return "iBoot";
+}
+"#,
+        )
+        .file(
+            "src/common/bootmgr_utils.c",
+            r#"const char* ffDetectBootmgrFallback(void) {
+    return "fallback";
+}
+"#,
+        )
+        .file(
+            "generated/bootmgr.generated.h",
+            r#"const char* ffDetectBootmgrGenerated(void);
+"#,
+        )
+        .file(
+            "tests/bootmgr_test.cpp",
+            r#"const char* ffDetectBootmgr(void) {
+    return "test";
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+
+    let result = search_symbols(
+        &analyzer,
+        SearchSymbolsParams {
+            patterns: vec!["ffDetectBootmgr".to_string()],
+            include_tests: false,
+            limit: 10,
+        },
+    );
+
+    assert!(
+        result.files.len() >= 3,
+        "expected implementation, header, and noise files: {result:#?}"
+    );
+    assert_eq!(
+        "src/detection/bootmgr/bootmgr_apple.c",
+        result.files[0].path
+    );
+    assert_eq!(
+        vec!["ffDetectBootmgr".to_string()],
+        result.files[0]
+            .functions
+            .iter()
+            .map(|hit| hit.symbol.clone())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!("src/detection/bootmgr/bootmgr.h", result.files[1].path);
+    assert!(
+        result
+            .files
+            .iter()
+            .all(|file| file.path != "tests/bootmgr_test.cpp"),
+        "{result:#?}"
+    );
+    let generated_index = result
+        .files
+        .iter()
+        .position(|file| file.path == "generated/bootmgr.generated.h")
+        .unwrap();
+    let header_index = result
+        .files
+        .iter()
+        .position(|file| file.path == "src/detection/bootmgr/bootmgr.h")
+        .unwrap();
+    assert!(generated_index > header_index, "{result:#?}");
+}
+
+#[test]
+fn search_symbols_prefers_concrete_bootmgr_declarations_over_broad_utility_files() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "src/detection/bootmgr/bootmgr_apple.c",
+            r#"const char* ffDetectBootmgr(void) {
+    return "iBoot";
+}
+
+const char* detectBootmgrDevice(void) {
+    return "apfs";
+}
+"#,
+        )
+        .file(
+            "src/detection/bootmgr/bootmgr.h",
+            r#"const char* ffDetectBootmgr(void);
+"#,
+        )
+        .file(
+            "src/common/utility.c",
+            r#"const char* BootmgrSupportName(void) { return "support"; }
+const char* normalizeBootmgrInput(void) { return "normalize"; }
+const char* BootmgrTelemetryKey(void) { return "telemetry"; }
+const char* BootmgrFormatterValue(void) { return "formatter"; }
+const char* BootmgrLegacyAlias(void) { return "legacy"; }
+const char* BootmgrRuntimeLabel(void) { return "runtime"; }
+const char* BootmgrCacheValue(void) { return "cache"; }
+const char* BootmgrExtraInfo(void) { return "extra"; }
+const char* BootmgrBroadNoise(void) { return "noise"; }
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+
+    let result = search_symbols(
+        &analyzer,
+        SearchSymbolsParams {
+            patterns: vec!["Bootmgr".to_string()],
+            include_tests: false,
+            limit: 10,
+        },
+    );
+
+    assert_eq!(
+        "src/detection/bootmgr/bootmgr_apple.c",
+        result.files[0].path
+    );
+    let utility_index = result
+        .files
+        .iter()
+        .position(|file| file.path == "src/common/utility.c")
+        .unwrap();
+    let header_index = result
+        .files
+        .iter()
+        .position(|file| file.path == "src/detection/bootmgr/bootmgr.h")
+        .unwrap();
+    assert!(utility_index > header_index, "{result:#?}");
 }
 
 #[test]

@@ -670,6 +670,48 @@ fn search_symbols_limit_selects_git_important_file_then_renders_alphabetically()
 }
 
 #[test]
+fn search_symbols_prefers_exact_match_over_hot_partial_match_file() {
+    let temp = TempDir::new().unwrap();
+    fs::write(
+        temp.path().join("BootmgrApple.java"),
+        "class BootmgrApple { void ffDetectBootmgr() {} }\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("BootmgrUtility.java"),
+        "class BootmgrUtility {\n    void ffDetectBootmgrFallback() {}\n}\n",
+    )
+    .unwrap();
+    let repo = Repository::init(temp.path()).unwrap();
+    commit_paths(&repo, &["BootmgrApple.java"], "add exact match");
+    commit_paths(&repo, &["BootmgrUtility.java"], "add utility");
+    fs::write(
+        temp.path().join("BootmgrUtility.java"),
+        "class BootmgrUtility {\n    void ffDetectBootmgrFallback() {}\n    void ffDetectBootmgrTelemetry() {}\n}\n",
+    )
+    .unwrap();
+    commit_paths(&repo, &["BootmgrUtility.java"], "heat utility");
+
+    let service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "search_symbols",
+            r#"{"patterns":["ffDetectBootmgr"],"include_tests":true,"limit":1}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert_eq!(true, value["truncated"]);
+    let files = value["files"].as_array().unwrap();
+    assert_eq!(1, files.len(), "payload: {value}");
+    assert_eq!("BootmgrApple.java", files[0]["path"], "payload: {value}");
+    assert_eq!(
+        "void ffDetectBootmgr()",
+        files[0]["functions"][0]["signature"]
+    );
+}
+
+#[test]
 fn get_active_workspace_returns_initial_root() {
     let service = SearchToolsService::new_for_python(fixture_root()).unwrap();
     let payload = service

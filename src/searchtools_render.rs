@@ -44,7 +44,7 @@ impl RenderText for SearchSymbolsResult {
         ];
         if self.truncated {
             lines.push(
-                "- Truncated: yes; files selected by recent activity when available and displayed alphabetically."
+                "- Truncated: yes; files ranked by symbol relevance, with recent activity used only as a tie-breaker when available."
                     .to_string(),
             );
         }
@@ -483,6 +483,7 @@ mod tests {
         assert!(text.contains("- Patterns: `Foo`"), "{text}");
         assert!(text.contains("- Files: 1 of 3"), "{text}");
         assert!(text.contains("- Truncated: yes;"), "{text}");
+        assert!(text.contains("ranked by symbol relevance"), "{text}");
         assert!(text.contains("## src/foo.rs (42 lines)"), "{text}");
         assert!(
             text.contains("| Kind | Line | Symbol | Signature |"),
