@@ -2,10 +2,12 @@ use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use crate::profiling;
 use git2::{Oid, Repository};
+use moka::sync::Cache;
 use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 const ALPHA: f64 = 0.85;
@@ -17,6 +19,7 @@ const COMMITS_TO_PROCESS: usize = 1_000;
 pub(crate) const DEFAULT_RECENCY_HALF_LIFE: f64 = 250.0;
 const NATIVE_RENAME_THRESHOLD: u16 = 50;
 const NATIVE_RENAME_TOKEN_OVERLAP_THRESHOLD: f64 = 0.90;
+const COMMIT_CHANGE_CACHE_MAX_ENTRIES: u64 = 50_000;
 static GIT_COMMITS_SCANNED: AtomicUsize = AtomicUsize::new(0);
 static GIT_COMMITS_WITH_CHURN: AtomicUsize = AtomicUsize::new(0);
 static GIT_STATUS_ADDED: AtomicUsize = AtomicUsize::new(0);
@@ -703,6 +706,51 @@ struct GitProjectContext {
     repo_prefix: PathBuf,
 }
 
+struct RepoCommitChangeCache {
+    commits: Cache<Oid, Arc<CommitChange>>,
+    fill_lock: Mutex<()>,
+    fill_commits_scanned: AtomicUsize,
+}
+
+impl RepoCommitChangeCache {
+    fn new(max_entries: u64) -> Self {
+        Self {
+            commits: Cache::builder().max_capacity(max_entries.max(1)).build(),
+            fill_lock: Mutex::new(()),
+            fill_commits_scanned: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MissingCommitRange {
+    start: usize,
+    end: usize,
+}
+
+fn repo_commit_change_caches() -> &'static Mutex<HashMap<PathBuf, Arc<RepoCommitChangeCache>>> {
+    static CACHES: OnceLock<Mutex<HashMap<PathBuf, Arc<RepoCommitChangeCache>>>> = OnceLock::new();
+    CACHES.get_or_init(|| Mutex::new(HashMap::default()))
+}
+
+fn repo_commit_change_cache(repo_root: &Path) -> Arc<RepoCommitChangeCache> {
+    let mut caches = repo_commit_change_caches()
+        .lock()
+        .expect("repo cache mutex");
+    caches
+        .entry(repo_root.to_path_buf())
+        .or_insert_with(|| Arc::new(RepoCommitChangeCache::new(COMMIT_CHANGE_CACHE_MAX_ENTRIES)))
+        .clone()
+}
+
+#[cfg(test)]
+fn clear_repo_commit_change_cache_for_root(repo_root: &Path) {
+    let mut caches = repo_commit_change_caches()
+        .lock()
+        .expect("repo cache mutex");
+    caches.remove(repo_root);
+}
+
 impl GitProjectContext {
     fn discover(project_root: &Path) -> Option<Self> {
         // Keep the caller's project_root as-given so ProjectFiles we build from
@@ -740,20 +788,149 @@ impl GitProjectContext {
     }
 
     fn recent_commit_changes(&self, limit: usize) -> Result<Vec<CommitChange>, String> {
+        let cache = repo_commit_change_cache(&self.repo_root);
+        self.recent_commit_changes_with_cache(limit, &cache)
+    }
+
+    fn recent_commit_changes_with_cache(
+        &self,
+        limit: usize,
+        cache: &RepoCommitChangeCache,
+    ) -> Result<Vec<CommitChange>, String> {
+        let ordered_oids = self.recent_commit_oids(limit)?;
+        if ordered_oids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        self.fill_missing_commit_ranges(&ordered_oids, cache)?;
+        cache.commits.run_pending_tasks();
+        self.collect_cached_commit_changes(&ordered_oids, cache)
+    }
+
+    #[cfg(test)]
+    fn recent_commit_changes_uncached(&self, limit: usize) -> Result<Vec<CommitChange>, String> {
+        self.run_git_log_command(limit, None)
+    }
+
+    fn recent_commit_oids(&self, limit: usize) -> Result<Vec<Oid>, String> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.repo_root)
+            .arg("rev-list")
+            .arg("--topo-order")
+            .arg("--first-parent")
+            .arg("-n")
+            .arg(limit.to_string())
+            .arg("HEAD")
+            .output()
+            .map_err(|err| format!("failed to run git rev-list: {err}"))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "git rev-list exited with {}: {stderr}",
+                output.status
+            ));
+        }
+
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                Oid::from_str(line).map_err(|err| format!("invalid rev-list oid `{line}`: {err}"))
+            })
+            .collect()
+    }
+
+    fn fill_missing_commit_ranges(
+        &self,
+        ordered_oids: &[Oid],
+        cache: &RepoCommitChangeCache,
+    ) -> Result<(), String> {
+        let mut missing_ranges = missing_commit_ranges(ordered_oids, &cache.commits);
+        if missing_ranges.is_empty() {
+            return Ok(());
+        }
+
+        let _guard = cache.fill_lock.lock().expect("repo fill mutex");
+        missing_ranges = missing_commit_ranges(ordered_oids, &cache.commits);
+        for range in missing_ranges {
+            self.populate_commit_range(ordered_oids, range, cache)?;
+        }
+
+        Ok(())
+    }
+
+    fn populate_commit_range(
+        &self,
+        ordered_oids: &[Oid],
+        range: MissingCommitRange,
+        cache: &RepoCommitChangeCache,
+    ) -> Result<(), String> {
+        let newest = ordered_oids[range.start];
+        let oldest = ordered_oids[range.end];
+        let range_len = range.end - range.start + 1;
+        let changes = self.run_git_log_command(range_len, Some((newest, oldest)))?;
+        cache
+            .fill_commits_scanned
+            .fetch_add(changes.len(), Ordering::Relaxed);
+
+        for change in changes {
+            cache.commits.insert(change.id, Arc::new(change));
+        }
+
+        Ok(())
+    }
+
+    fn collect_cached_commit_changes(
+        &self,
+        ordered_oids: &[Oid],
+        cache: &RepoCommitChangeCache,
+    ) -> Result<Vec<CommitChange>, String> {
+        let mut changes = Vec::with_capacity(ordered_oids.len());
+        for oid in ordered_oids {
+            let Some(change) = cache.commits.get(oid) else {
+                return Err(format!("missing cached commit change for {}", oid));
+            };
+            changes.push((*change).clone());
+        }
+        Ok(changes)
+    }
+
+    fn run_git_log_command(
+        &self,
+        limit: usize,
+        range: Option<(Oid, Oid)>,
+    ) -> Result<Vec<CommitChange>, String> {
         let output = Command::new("git")
             .arg("-C")
             .arg(&self.repo_root)
             .arg("log")
             .arg("--topo-order")
+            .arg("--first-parent")
             .arg("--no-color")
             .arg("--diff-merges=first-parent")
-            .arg("--root")
             .arg(format!("-M{NATIVE_RENAME_THRESHOLD}"))
             .arg("--name-status")
             .arg("-z")
             .arg("--format=format:%x1e%H")
             .arg("-n")
             .arg(limit.to_string())
+            .args(match range {
+                Some((newest, oldest)) => {
+                    let parent = self.first_parent_oid(oldest);
+                    let mut args = Vec::with_capacity(2);
+                    if parent.is_none() {
+                        args.push("--root".to_string());
+                    }
+                    args.push(match parent {
+                        Some(parent) => format!("{parent}..{newest}"),
+                        None => newest.to_string(),
+                    });
+                    args
+                }
+                None => vec!["--root".to_string()],
+            })
             .output()
             .map_err(|err| format!("failed to run git log: {err}"))?;
 
@@ -763,6 +940,10 @@ impl GitProjectContext {
         }
 
         Ok(self.parse_git_log_name_status(&output.stdout))
+    }
+
+    fn first_parent_oid(&self, oid: Oid) -> Option<Oid> {
+        self.repo.find_commit(oid).ok()?.parent_ids().next()
     }
 
     fn parse_git_log_name_status(&self, output: &[u8]) -> Vec<CommitChange> {
@@ -912,7 +1093,38 @@ impl GitProjectContext {
     }
 }
 
-#[derive(Clone, Debug)]
+fn missing_commit_ranges(
+    ordered_oids: &[Oid],
+    cache: &Cache<Oid, Arc<CommitChange>>,
+) -> Vec<MissingCommitRange> {
+    let mut ranges = Vec::new();
+    let mut current_start = None;
+
+    for (index, oid) in ordered_oids.iter().enumerate() {
+        if cache.get(oid).is_some() {
+            if let Some(start) = current_start.take() {
+                ranges.push(MissingCommitRange {
+                    start,
+                    end: index - 1,
+                });
+            }
+            continue;
+        }
+
+        current_start.get_or_insert(index);
+    }
+
+    if let Some(start) = current_start {
+        ranges.push(MissingCommitRange {
+            start,
+            end: ordered_oids.len() - 1,
+        });
+    }
+
+    ranges
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct CommitChange {
     #[allow(dead_code)]
     id: Oid,
@@ -1051,8 +1263,10 @@ fn compare_file_relevance(left: &FileRelevance, right: &FileRelevance) -> std::c
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_RECENCY_HALF_LIFE, FileRelevance, commit_age_weight,
+        DEFAULT_RECENCY_HALF_LIFE, FileRelevance, GitProjectContext, RepoCommitChangeCache,
+        clear_repo_commit_change_cache_for_root, commit_age_weight,
         most_relevant_project_files_with_half_life, related_files_by_git, related_files_by_imports,
+        repo_commit_change_cache,
     };
     use crate::analyzer::{
         AnalyzerDelegate, JavaAnalyzer, Language, MultiAnalyzer, ProjectFile, PythonAnalyzer,
@@ -1063,6 +1277,9 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
     use tempfile::TempDir;
 
     fn write_file(root: &Path, rel_path: &str, contents: &str) -> ProjectFile {
@@ -1160,6 +1377,51 @@ mod tests {
             &parents,
         )
         .unwrap();
+    }
+
+    fn commit_paths_at(
+        repo: &Repository,
+        message: &str,
+        add: &[&str],
+        remove: &[&str],
+        seconds: i64,
+    ) {
+        let mut index = repo.index().unwrap();
+        for path in remove {
+            index.remove_path(Path::new(path)).unwrap();
+        }
+        for path in add {
+            index.add_path(Path::new(path)).unwrap();
+        }
+        index.write().unwrap();
+
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let signature = Signature::new(
+            "Test User",
+            "test@example.com",
+            &git2::Time::new(seconds, 0),
+        )
+        .unwrap();
+        let parent = repo
+            .head()
+            .ok()
+            .and_then(|head| head.target())
+            .and_then(|oid| repo.find_commit(oid).ok());
+        let parents = parent.iter().collect::<Vec<_>>();
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            message,
+            &tree,
+            &parents,
+        )
+        .unwrap();
+    }
+
+    fn git_context(root: &Path) -> GitProjectContext {
+        GitProjectContext::discover(root).expect("git project context")
     }
 
     fn file_by_name<'a>(result: &'a [FileRelevance], file_name: &str) -> Option<&'a FileRelevance> {
@@ -1686,5 +1948,308 @@ mod tests {
         assert_eq!(1.0, commit_age_weight(0, None));
         assert_eq!(1.0, commit_age_weight(250, None));
         assert_eq!(1.0, commit_age_weight(1_000, None));
+    }
+
+    #[test]
+    fn cached_commit_window_matches_uncached_history_with_renames_and_merge_commit() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        write_file(root, "Seed.java", "public class Seed { }");
+        fs::create_dir_all(root.join("legacy")).unwrap();
+        write_file(
+            root,
+            "legacy/RenameTarget.java",
+            "public class RenameTarget { }",
+        );
+        write_file(root, "MergeTarget.java", "public class MergeTarget { }");
+
+        let repo = Repository::init(root).unwrap();
+        commit_paths(
+            &repo,
+            "initial",
+            &["Seed.java", "legacy/RenameTarget.java", "MergeTarget.java"],
+            &[],
+        );
+
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["checkout", "-b", "feature"])
+            .status()
+            .unwrap()
+            .success()
+            .then_some(())
+            .expect("create feature branch");
+        fs::write(
+            root.join("MergeTarget.java"),
+            "public class MergeTarget { int feature() { return 1; } }",
+        )
+        .unwrap();
+        commit_paths(&repo, "feature change", &["MergeTarget.java"], &[]);
+
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["checkout", "-"])
+            .status()
+            .unwrap()
+            .success()
+            .then_some(())
+            .expect("checkout original branch");
+        fs::write(
+            root.join("Seed.java"),
+            "public class Seed { int main() { return 1; } }",
+        )
+        .unwrap();
+        fs::write(
+            root.join("legacy/RenameTarget.java"),
+            "public class RenameTarget { int main() { return 1; } }",
+        )
+        .unwrap();
+        commit_paths(
+            &repo,
+            "main cochange before rename",
+            &["Seed.java", "legacy/RenameTarget.java"],
+            &[],
+        );
+
+        fs::create_dir_all(root.join("modern")).unwrap();
+        fs::rename(
+            root.join("legacy/RenameTarget.java"),
+            root.join("modern/RenameTarget.java"),
+        )
+        .unwrap();
+        commit_paths(
+            &repo,
+            "rename",
+            &["modern/RenameTarget.java"],
+            &["legacy/RenameTarget.java"],
+        );
+
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args([
+                "-c",
+                "user.name=Test User",
+                "-c",
+                "user.email=test@example.com",
+                "merge",
+                "--no-ff",
+                "feature",
+                "-m",
+                "merge feature",
+            ])
+            .status()
+            .unwrap()
+            .success()
+            .then_some(())
+            .expect("merge feature branch");
+
+        let context = git_context(root);
+        let uncached = context.recent_commit_changes_uncached(10).unwrap();
+        let cache = Arc::new(RepoCommitChangeCache::new(64));
+        let cached = context
+            .recent_commit_changes_with_cache(10, &cache)
+            .unwrap();
+
+        assert_eq!(uncached, cached);
+        assert!(cached.iter().any(|change| {
+            change.renames.iter().any(|(old_path, new_path)| {
+                old_path == Path::new("legacy/RenameTarget.java")
+                    && new_path == Path::new("modern/RenameTarget.java")
+            })
+        }));
+        assert!(cached.iter().any(|change| {
+            change
+                .paths
+                .iter()
+                .any(|path| path == Path::new("MergeTarget.java"))
+        }));
+    }
+
+    #[test]
+    fn incremental_fill_scans_only_new_commits() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        write_file(root, "Seed.java", "public class Seed { }");
+        write_file(root, "Target.java", "public class Target { }");
+
+        let repo = Repository::init(root).unwrap();
+        commit_paths_at(&repo, "initial", &["Seed.java", "Target.java"], &[], 1);
+        fs::write(
+            root.join("Seed.java"),
+            "public class Seed { int one() { return 1; } }",
+        )
+        .unwrap();
+        commit_paths_at(&repo, "seed one", &["Seed.java"], &[], 2);
+        fs::write(
+            root.join("Target.java"),
+            "public class Target { int one() { return 1; } }",
+        )
+        .unwrap();
+        commit_paths_at(&repo, "target one", &["Target.java"], &[], 3);
+
+        let context = git_context(root);
+        let cache = RepoCommitChangeCache::new(64);
+
+        context
+            .recent_commit_changes_with_cache(10, &cache)
+            .unwrap();
+        assert_eq!(3, cache.fill_commits_scanned.load(Ordering::Relaxed));
+
+        context
+            .recent_commit_changes_with_cache(10, &cache)
+            .unwrap();
+        assert_eq!(3, cache.fill_commits_scanned.load(Ordering::Relaxed));
+
+        fs::write(
+            root.join("Seed.java"),
+            "public class Seed { int two() { return 2; } }",
+        )
+        .unwrap();
+        commit_paths_at(&repo, "seed two", &["Seed.java"], &[], 4);
+        fs::write(
+            root.join("Target.java"),
+            "public class Target { int two() { return 2; } }",
+        )
+        .unwrap();
+        commit_paths_at(&repo, "target two", &["Target.java"], &[], 5);
+
+        context
+            .recent_commit_changes_with_cache(10, &cache)
+            .unwrap();
+        assert_eq!(5, cache.fill_commits_scanned.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn commit_change_cache_eviction_respects_bound() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        write_file(root, "File.java", "class File {}");
+
+        let repo = Repository::init(root).unwrap();
+        commit_paths_at(&repo, "initial", &["File.java"], &[], 1);
+        for index in 0..4 {
+            fs::write(
+                root.join("File.java"),
+                format!("class File {{ int value() {{ return {index}; }} }}"),
+            )
+            .unwrap();
+            commit_paths_at(
+                &repo,
+                &format!("change {index}"),
+                &["File.java"],
+                &[],
+                index + 2,
+            );
+        }
+
+        let context = git_context(root);
+        let cache = RepoCommitChangeCache::new(2);
+        let ordered_oids = context.recent_commit_oids(10).unwrap();
+        let last_range = super::MissingCommitRange {
+            start: ordered_oids.len() - 2,
+            end: ordered_oids.len() - 1,
+        };
+        context
+            .populate_commit_range(&ordered_oids, last_range, &cache)
+            .unwrap();
+        cache.commits.run_pending_tasks();
+
+        assert!(
+            cache.commits.entry_count() <= 2,
+            "entry count should stay within the configured cap"
+        );
+    }
+
+    #[test]
+    fn repo_commit_change_caches_are_isolated_per_repo_root() {
+        let left = TempDir::new().unwrap();
+        write_file(left.path(), "Left.java", "class Left {}");
+        let _left_repo = Repository::init(left.path()).unwrap();
+
+        let right = TempDir::new().unwrap();
+        write_file(right.path(), "Right.java", "class Right {}");
+        let _right_repo = Repository::init(right.path()).unwrap();
+
+        let left_cache = repo_commit_change_cache(left.path());
+        let left_cache_again = repo_commit_change_cache(left.path());
+        let right_cache = repo_commit_change_cache(right.path());
+
+        assert!(Arc::ptr_eq(&left_cache, &left_cache_again));
+        assert!(!Arc::ptr_eq(&left_cache, &right_cache));
+    }
+
+    #[test]
+    #[ignore = "benchmark helper for repeated most_relevant_files calls"]
+    fn benchmark_repeat_calls_with_cached_git_history() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        write_file(root, "Seed.java", "public class Seed { }");
+        write_file(root, "Target.java", "public class Target { }");
+        write_file(root, "Helper.java", "public class Helper { }");
+
+        let repo = Repository::init(root).unwrap();
+        commit_paths_at(
+            &repo,
+            "initial",
+            &["Seed.java", "Target.java", "Helper.java"],
+            &[],
+            1,
+        );
+        for index in 0..120 {
+            fs::write(
+                root.join("Seed.java"),
+                format!("public class Seed {{ int value{index}() {{ return {index}; }} }}"),
+            )
+            .unwrap();
+            let changed = if index % 3 == 0 {
+                vec!["Seed.java", "Target.java"]
+            } else {
+                vec!["Seed.java", "Helper.java"]
+            };
+            commit_paths_at(
+                &repo,
+                &format!("change {index}"),
+                &changed,
+                &[],
+                index as i64 + 2,
+            );
+        }
+
+        let analyzer = java_analyzer(root);
+        let seeds = [(ProjectFile::new(root.to_path_buf(), "Seed.java"), 1.0)];
+
+        clear_repo_commit_change_cache_for_root(root);
+        let cold_started = Instant::now();
+        for _ in 0..28 {
+            clear_repo_commit_change_cache_for_root(root);
+            let _ = most_relevant_project_files_with_half_life(
+                &analyzer,
+                &seeds,
+                5,
+                Some(DEFAULT_RECENCY_HALF_LIFE),
+            );
+        }
+        let cold_elapsed = cold_started.elapsed();
+
+        clear_repo_commit_change_cache_for_root(root);
+        let warm_started = Instant::now();
+        for _ in 0..28 {
+            let _ = most_relevant_project_files_with_half_life(
+                &analyzer,
+                &seeds,
+                5,
+                Some(DEFAULT_RECENCY_HALF_LIFE),
+            );
+        }
+        let warm_elapsed = warm_started.elapsed();
+
+        eprintln!(
+            "benchmark_repeat_calls_with_cached_git_history cold_28={:.3}s warm_28={:.3}s",
+            cold_elapsed.as_secs_f64(),
+            warm_elapsed.as_secs_f64()
+        );
     }
 }

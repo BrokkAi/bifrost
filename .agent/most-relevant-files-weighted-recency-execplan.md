@@ -17,6 +17,10 @@ After this change, `most_relevant_files` can accept explicit per-seed weights ag
 - [x] (2026-06-10T21:59:00Z) Extracted shared commit-age weighting, renamed the raw seed-weight helper, added half-life-driven git scoring in `related_files_by_git`, and kept an explicit legacy uniform path available through `most_relevant_project_files_with_half_life(..., None)` for parity-sensitive tests.
 - [x] (2026-06-10T22:05:00Z) Added Rust tests for weighted seed ranking, invalid weights, duplicate resolved seeds, public recency ranking, recency-vs-uniform internal sanity, legacy `None` pinning, and half-life-shape coverage; added Python client tests for `seed_weights`, `recency_half_life`, and duplicate-seed reporting.
 - [x] (2026-06-10T22:05:00Z) Ran `cargo fmt --all`, `cargo test`, `cargo clippy --all-targets --all-features -- -D warnings`, and `uv run --python 3.12 --with maturin python -m unittest python_tests.test_searchtools_client`.
+- [x] (2026-06-10T23:05:00Z) Re-read this ExecPlan for the git-history follow-up, inspected `src/relevance.rs` again, and confirmed the recency port still re-ran a full rename-aware `git log` on every `most_relevant_files` call.
+- [x] (2026-06-10T23:05:00Z) Restored Brokk-grade git-history caching semantics in `src/relevance.rs`: a process-lifetime per-repo commit cache keyed by commit oid, `rev-list --topo-order --first-parent` window discovery, contiguous-range fills via a single rename-aware `git log` per missing run, and a per-repo fill mutex so concurrent callers do not duplicate the expensive scan.
+- [x] (2026-06-10T23:35:00Z) Added cache-focused Rust tests: cold-vs-cached equivalence on rename-plus-merge history, incremental fill counting only newly scanned commits, eviction respecting a tiny entry cap, cross-repo cache isolation by repo root, and an ignored repeat-call benchmark harness.
+- [x] (2026-06-10T23:35:00Z) Re-ran `cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test` after the cache changes. Also ran `cargo test benchmark_repeat_calls_with_cached_git_history -- --ignored --nocapture` to capture a before/after number for 28 repeated calls at one HEAD.
 - [ ] Cut a multiline checkpoint commit after material progress, per `AGENTS.md`.
 
 ## Surprises & Discoveries
@@ -29,6 +33,12 @@ After this change, `most_relevant_files` can accept explicit per-seed weights ag
 
 - Observation: the parity-sensitive git scorer is explicitly documented as shared with Brokk, so the recency change must be isolated behind an optional half-life to keep legacy parity fixtures stable until Brokk mirrors it.
   Evidence: the doc comment above `src/relevance.rs::related_files_by_git` says to keep behavior in sync with Brokk and rerun external parity fixtures when rules change.
+
+- Observation: the post-`383e15e` scorer still paid the full rename-detection cost on every call because `GitProjectContext::recent_commit_changes` always spawned a one-shot `git log`, even when the HEAD and most of the commit window were unchanged.
+  Evidence: `src/relevance.rs` called `recent_commit_changes(COMMITS_TO_PROCESS)` directly from both relevance entry points, and that method had no memoization around the `git log --name-status -M50` subprocess.
+
+- Observation: cache tests that relied on global counters or global cache cardinality were flaky under Rust’s default parallel test runner, even though the implementation itself was correct.
+  Evidence: the first full `cargo test` pass failed only in `incremental_fill_scans_only_new_commits` and `repo_commit_change_caches_are_isolated_per_repo_root`, with mismatches caused by shared process-global test state rather than ranking behavior.
 
 ## Decision Log
 
@@ -44,9 +54,21 @@ After this change, `most_relevant_files` can accept explicit per-seed weights ag
   Rationale: this preserves legacy parity fixtures for the uniform `None` path while enabling the intended new behavior for the user-facing tool and targeted tests.
   Date/Author: 2026-06-10 / Codex
 
+- Decision: restore Brokk-style process-lifetime commit caching in Bifrost instead of caching whole windows by HEAD.
+  Rationale: commit windows at adjacent HEADs share most of their history, so per-commit reuse avoids rescanning old rename-heavy history and mirrors Brokk’s `getChangedFilesByCommit`/canonicalizer behavior without any Brokk-side change.
+  Date/Author: 2026-06-10 / Codex
+
+- Decision: make cached window assembly explicitly first-parent ordered by driving it from `git rev-list --topo-order --first-parent` and matching the fill path with `git log --topo-order --first-parent --diff-merges=first-parent`.
+  Rationale: the cache only works if the cheap oid walk and the expensive range fills enumerate commits in the same order; matching both commands avoids edge-case drift around merge-heavy histories and keeps canonicalization deterministic.
+  Date/Author: 2026-06-10 / Codex
+
 ## Outcomes & Retrospective
 
-Implementation outcome 2026-06-10T22:05:00Z: `most_relevant_files` once again accepts explicit raw seed weights, rejects duplicate resolved seeds before ranking, and uses half-life-aware git affinity on the public path while preserving a legacy uniform path for parity-sensitive checks. The Rust and Python layers now agree on the expanded request/result shape. The only follow-up outside this repo is the Brokk mirror: the git scorer should use `2^(-index/half_life)` with the default half-life of 250 commits, apply that weight to both joint mass and the seed denominator while keeping IDF unweighted, and use the same decay in `most_important_project_files` before external parity fixtures can move from the legacy path to the default path.
+Implementation outcome 2026-06-10T22:05:00Z: `most_relevant_files` once again accepts explicit raw seed weights, rejects duplicate resolved seeds before ranking, and uses half-life-aware git affinity on the public path while preserving a legacy uniform path for parity-sensitive checks. The Rust and Python layers now agree on the expanded request/result shape.
+
+Caching follow-up outcome 2026-06-10T23:05:00Z: the remaining performance regression is internal to Bifrost, not Brokk. This follow-up restores the Brokk-side caching semantics that the port dropped by introducing a per-repo process cache of parsed `CommitChange` records and assembling windows from cheap `rev-list` oid walks plus incremental contiguous-range fills. No Brokk change is needed for this step because the user-visible scoring contract stays the same; only the Bifrost implementation now amortizes the expensive rename-aware history scan the way Brokk already does.
+
+Validation outcome 2026-06-10T23:35:00Z: the cache path is now covered by direct behavior tests and the existing relevance suite still passes unchanged. The local ignored benchmark on a 121-commit Java fixture reported `cold_28=0.546s` when the per-repo cache was cleared before every call and `warm_28=0.192s` for 28 repeated calls at one HEAD with the cache retained, a roughly 2.8x improvement on that small fixture.
 
 ## Context and Orientation
 
