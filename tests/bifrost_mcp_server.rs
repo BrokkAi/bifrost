@@ -169,6 +169,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "activate_workspace",
             "get_active_workspace",
             "get_symbol_locations",
+            "get_symbol_ancestors",
             "find_filenames",
             "list_files",
             "most_relevant_files",
