@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 pub const EXTENDED_TOOL_NAMES: &[&str] = &[
     "get_symbol_locations",
+    "get_symbol_ancestors",
     "find_filenames",
     "list_files",
     "most_relevant_files",
@@ -28,6 +29,11 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
         tool_descriptor(
             "get_symbol_locations",
             "Get project-relative file paths and line ranges for known symbols after search_symbols; use before opening exact definitions.",
+            crate::mcp_common::symbol_names_schema(),
+        ),
+        tool_descriptor(
+            "get_symbol_ancestors",
+            "Get nearest-parent-first ancestor class symbols for known classes after search_symbols; use when class inheritance context matters.",
             crate::mcp_common::symbol_names_schema(),
         ),
         tool_descriptor(

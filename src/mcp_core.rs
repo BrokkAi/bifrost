@@ -50,11 +50,6 @@ pub(crate) fn symbol_tool_descriptors() -> Vec<Value> {
             }),
         ),
         tool_descriptor(
-            "get_symbol_ancestors",
-            "Get nearest-parent-first ancestor class symbols for known classes after search_symbols; use when class inheritance context matters.",
-            symbol_names_schema(),
-        ),
-        tool_descriptor(
             "get_symbol_sources",
             "Read exact source blocks for known symbols after search_symbols; file paths/globs return flat top-level symbol outlines for matching files.",
             symbol_names_schema(),

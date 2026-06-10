@@ -107,7 +107,6 @@ mod tests {
             tool_names("core"),
             vec![
                 "search_symbols",
-                "get_symbol_ancestors",
                 "get_symbol_sources",
                 "get_summaries",
                 "list_symbols",
@@ -125,7 +124,6 @@ mod tests {
             tool_names("searchtools"),
             vec![
                 "search_symbols",
-                "get_symbol_ancestors",
                 "get_symbol_sources",
                 "get_summaries",
                 "list_symbols",
@@ -134,6 +132,7 @@ mod tests {
                 "activate_workspace",
                 "get_active_workspace",
                 "get_symbol_locations",
+                "get_symbol_ancestors",
                 "find_filenames",
                 "list_files",
                 "most_relevant_files",
@@ -170,7 +169,6 @@ mod tests {
                 "search_file_contents",
                 "find_files_containing",
                 "search_symbols",
-                "get_symbol_ancestors",
                 "get_symbol_sources",
                 "get_summaries",
                 "list_symbols",
