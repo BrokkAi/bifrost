@@ -8,6 +8,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 const DEFAULT_LIMIT: usize = 100;
+const DEFAULT_RECENCY_HALF_LIFE: f64 = 250.0;
 
 fn main() -> ExitCode {
     match run() {
@@ -25,6 +26,7 @@ fn run() -> Result<(), String> {
     let mut root =
         env::current_dir().map_err(|err| format!("Failed to get current directory: {err}"))?;
     let mut seed_file_paths = Vec::new();
+    let mut recency_half_life = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -33,6 +35,12 @@ fn run() -> Result<(), String> {
                     .next()
                     .ok_or_else(|| "--root requires a path".to_string())?;
                 root = value.into();
+            }
+            "--recency-half-life" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--recency-half-life requires a number or 'none'".to_string())?;
+                recency_half_life = Some(parse_recency_half_life(&value)?);
             }
             "--help" | "-h" => {
                 print_help();
@@ -83,6 +91,7 @@ fn run() -> Result<(), String> {
             MostRelevantFilesParams {
                 seed_file_paths,
                 seed_weights: None,
+                recency_half_life: recency_half_life.unwrap_or(Some(DEFAULT_RECENCY_HALF_LIFE)),
                 limit: DEFAULT_LIMIT,
             },
         )
@@ -109,6 +118,24 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
+fn parse_recency_half_life(value: &str) -> Result<Option<f64>, String> {
+    if value.eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+
+    let parsed = value
+        .parse::<f64>()
+        .map_err(|err| format!("Invalid --recency-half-life value {value:?}: {err}"))?;
+    if !parsed.is_finite() || parsed <= 0.0 {
+        return Err(format!(
+            "--recency-half-life must be finite and > 0, got {parsed}"
+        ));
+    }
+    Ok(Some(parsed))
+}
+
 fn print_help() {
-    println!("Usage: most_relevant_files [--root PROJECT_ROOT] <seed-file>...");
+    println!(
+        "Usage: most_relevant_files [--root PROJECT_ROOT] [--recency-half-life COMMITS|none] <seed-file>..."
+    );
 }

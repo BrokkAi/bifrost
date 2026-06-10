@@ -89,6 +89,7 @@ fn no_git_fallback_uses_import_page_ranker() {
         MostRelevantFilesParams {
             seed_file_paths: vec!["test/A.java".to_string()],
             seed_weights: None,
+            recency_half_life: Some(250.0),
             limit: 5,
         },
     )
@@ -226,6 +227,7 @@ fn repo_root_go_seed_is_resolved_and_ranked() {
         MostRelevantFilesParams {
             seed_file_paths: vec!["context.go".to_string()],
             seed_weights: None,
+            recency_half_life: Some(250.0),
             limit: 5,
         },
     )
@@ -293,6 +295,7 @@ fn hybrid_git_and_import_results_are_merged_without_duplicates() {
         MostRelevantFilesParams {
             seed_file_paths: vec!["test/A.java".to_string()],
             seed_weights: None,
+            recency_half_life: Some(250.0),
             limit: 3,
         },
     )
@@ -356,6 +359,7 @@ fn multi_seed_ranking_merges_shared_targets_without_duplicates() {
                 "test/RightSeed.java".to_string(),
             ],
             seed_weights: None,
+            recency_half_life: Some(250.0),
             limit: 4,
         },
     )
@@ -396,6 +400,7 @@ fn git_results_are_filled_with_import_ranking_when_needed() {
         MostRelevantFilesParams {
             seed_file_paths: vec!["test/A.java".to_string()],
             seed_weights: None,
+            recency_half_life: Some(250.0),
             limit: 2,
         },
     )
@@ -444,6 +449,7 @@ fn git_ties_are_sorted_by_normalized_path_name() {
         MostRelevantFilesParams {
             seed_file_paths: vec!["Seed.java".to_string()],
             seed_weights: None,
+            recency_half_life: Some(250.0),
             limit: 3,
         },
     )
@@ -490,6 +496,7 @@ fn untracked_seed_skips_git_and_uses_import_results() {
         MostRelevantFilesParams {
             seed_file_paths: vec!["test/A.java".to_string()],
             seed_weights: None,
+            recency_half_life: Some(250.0),
             limit: 2,
         },
     )
@@ -573,6 +580,7 @@ fn rename_history_is_canonicalized_to_current_paths() {
         MostRelevantFilesParams {
             seed_file_paths: vec!["UserService.java".to_string()],
             seed_weights: None,
+            recency_half_life: Some(250.0),
             limit: 10,
         },
     )
@@ -641,6 +649,7 @@ fn consolidation_commit_does_not_merge_deleted_file_history_into_new_file() {
         MostRelevantFilesParams {
             seed_file_paths: vec!["Seed.java".to_string()],
             seed_weights: None,
+            recency_half_life: Some(250.0),
             limit: 10,
         },
     )
@@ -665,6 +674,7 @@ fn missing_seed_files_are_reported() {
         MostRelevantFilesParams {
             seed_file_paths: vec!["missing.java".to_string(), "test/A.java".to_string()],
             seed_weights: None,
+            recency_half_life: Some(250.0),
             limit: 5,
         },
     )
@@ -712,6 +722,7 @@ fn weighted_seeds_change_import_ranking() {
                 "test/ZetaSeed.java".to_string(),
             ],
             seed_weights: None,
+            recency_half_life: Some(250.0),
             limit: 2,
         },
     )
@@ -724,6 +735,7 @@ fn weighted_seeds_change_import_ranking() {
                 "test/ZetaSeed.java".to_string(),
             ],
             seed_weights: Some(vec![1.0, 10.0]),
+            recency_half_life: Some(250.0),
             limit: 2,
         },
     )
@@ -745,6 +757,7 @@ fn invalid_seed_weights_are_rejected() {
         MostRelevantFilesParams {
             seed_file_paths: vec!["test/A.java".to_string()],
             seed_weights: Some(vec![1.0, 2.0]),
+            recency_half_life: Some(250.0),
             limit: 5,
         },
     )
@@ -766,6 +779,7 @@ fn duplicate_resolved_seeds_fail_before_ranking() {
         MostRelevantFilesParams {
             seed_file_paths: vec!["test/A.java".to_string(), "./test/A.java".to_string()],
             seed_weights: Some(vec![1.0, 2.0]),
+            recency_half_life: Some(250.0),
             limit: 5,
         },
     )
@@ -773,6 +787,27 @@ fn duplicate_resolved_seeds_fail_before_ranking() {
 
     assert!(results.files.is_empty());
     assert_eq!(vec!["test/A.java".to_string()], results.duplicates);
+}
+
+#[test]
+fn invalid_recency_half_life_is_rejected() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    write_file(root, "test/A.java", "package test; public class A { }");
+
+    let analyzer = java_analyzer(root);
+    let error = most_relevant_files(
+        &analyzer,
+        MostRelevantFilesParams {
+            seed_file_paths: vec!["test/A.java".to_string()],
+            seed_weights: None,
+            recency_half_life: Some(0.0),
+            limit: 5,
+        },
+    )
+    .unwrap_err();
+
+    assert!(error.contains("recency_half_life"), "{error}");
 }
 
 #[test]
@@ -823,10 +858,66 @@ fn recency_weighting_prefers_recent_cochange_targets() {
         MostRelevantFilesParams {
             seed_file_paths: vec!["Seed.java".to_string()],
             seed_weights: None,
+            recency_half_life: Some(250.0),
             limit: 2,
         },
     )
     .unwrap();
 
     assert_eq!("RecentTarget.java", results.files[0], "{:?}", results.files);
+}
+
+#[test]
+fn recency_half_life_none_pins_legacy_uniform_behavior() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    write_file(root, "Seed.java", "public class Seed { }");
+    write_file(root, "OldTarget.java", "public class OldTarget { }");
+    write_file(root, "RecentTarget.java", "public class RecentTarget { }");
+
+    let repo = Repository::init(root).unwrap();
+    commit_paths(&repo, "initial seed", &["Seed.java"], &[]);
+    commit_paths(&repo, "add old target", &["OldTarget.java"], &[]);
+    fs::write(
+        root.join("Seed.java"),
+        "public class Seed { int oldUse() { return 1; } }",
+    )
+    .unwrap();
+    fs::write(
+        root.join("OldTarget.java"),
+        "public class OldTarget { int value() { return 1; } }",
+    )
+    .unwrap();
+    commit_paths(&repo, "old cochange", &["Seed.java", "OldTarget.java"], &[]);
+    commit_paths(&repo, "add recent target", &["RecentTarget.java"], &[]);
+    fs::write(
+        root.join("Seed.java"),
+        "public class Seed { int recentUse() { return 2; } }",
+    )
+    .unwrap();
+    fs::write(
+        root.join("RecentTarget.java"),
+        "public class RecentTarget { int value() { return 2; } }",
+    )
+    .unwrap();
+    commit_paths(
+        &repo,
+        "recent cochange",
+        &["Seed.java", "RecentTarget.java"],
+        &[],
+    );
+
+    let analyzer = java_analyzer(root);
+    let results = most_relevant_files(
+        &analyzer,
+        MostRelevantFilesParams {
+            seed_file_paths: vec!["Seed.java".to_string()],
+            seed_weights: None,
+            recency_half_life: None,
+            limit: 2,
+        },
+    )
+    .unwrap();
+
+    assert_eq!("OldTarget.java", results.files[0], "{:?}", results.files);
 }

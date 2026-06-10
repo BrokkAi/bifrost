@@ -160,7 +160,7 @@ class SearchToolsClientTest(unittest.TestCase):
 
             with SearchToolsClient(root=root) as client:
                 result = client.most_relevant_files(
-                    ["A.java"], limit=5, seed_weights=[2.0]
+                    ["A.java"], limit=5, seed_weights=[2.0], recency_half_life=250.0
                 )
                 text = result.render_text()
 
@@ -183,6 +183,110 @@ class SearchToolsClientTest(unittest.TestCase):
         self.assertEqual([], result.files)
         self.assertEqual(["A.java"], result.duplicates)
         self.assertIn("Duplicate seeds: A.java", text)
+
+    def test_most_relevant_files_explicit_none_pins_uniform_git_weighting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "Seed.java").write_text("public class Seed { }\n")
+            (root / "OldTarget.java").write_text("public class OldTarget { }\n")
+            (root / "RecentTarget.java").write_text("public class RecentTarget { }\n")
+            subprocess.run(["git", "init"], cwd=root, check=True)
+            subprocess.run(["git", "add", "Seed.java"], cwd=root, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Test User",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "-m",
+                    "initial seed",
+                ],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(["git", "add", "OldTarget.java"], cwd=root, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Test User",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "-m",
+                    "add old target",
+                ],
+                cwd=root,
+                check=True,
+            )
+            (root / "Seed.java").write_text(
+                "public class Seed { int oldUse() { return 1; } }\n"
+            )
+            (root / "OldTarget.java").write_text(
+                "public class OldTarget { int value() { return 1; } }\n"
+            )
+            subprocess.run(["git", "add", "Seed.java", "OldTarget.java"], cwd=root, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Test User",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "-m",
+                    "old cochange",
+                ],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(["git", "add", "RecentTarget.java"], cwd=root, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Test User",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "-m",
+                    "add recent target",
+                ],
+                cwd=root,
+                check=True,
+            )
+            (root / "Seed.java").write_text(
+                "public class Seed { int recentUse() { return 2; } }\n"
+            )
+            (root / "RecentTarget.java").write_text(
+                "public class RecentTarget { int value() { return 2; } }\n"
+            )
+            subprocess.run(
+                ["git", "add", "Seed.java", "RecentTarget.java"], cwd=root, check=True
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Test User",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "-m",
+                    "recent cochange",
+                ],
+                cwd=root,
+                check=True,
+            )
+
+            with SearchToolsClient(root=root) as client:
+                result = client.most_relevant_files(
+                    ["Seed.java"], limit=2, recency_half_life=None
+                )
+
+        self.assertEqual("OldTarget.java", result.files[0])
 
     def test_get_symbol_ancestors_returns_csharp_hierarchy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

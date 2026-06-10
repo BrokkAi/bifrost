@@ -10,7 +10,7 @@ from pathlib import Path
 import sys
 import threading
 from types import ModuleType
-from typing import Any
+from typing import Any, overload
 
 from .models import (
     FileSummariesResult,
@@ -31,6 +31,7 @@ _NATIVE_MODULE_NAME = "bifrost_searchtools._native"
 _NATIVE_MODULE_LOCK = threading.Lock()
 _EXPLICIT_NATIVE_MODULE: ModuleType | None = None
 _EXPLICIT_NATIVE_PATH: Path | None = None
+_UNSET = object()
 
 
 class SymbolKindFilter(StrEnum):
@@ -179,16 +180,38 @@ class SearchToolsClient:
             rendered_text=payload.rendered_text,
         )
 
+    @overload
     def most_relevant_files(
         self,
         seed_files: list[str],
         *,
         limit: int = 20,
         seed_weights: list[float] | None = None,
+    ) -> MostRelevantFilesResult: ...
+
+    @overload
+    def most_relevant_files(
+        self,
+        seed_files: list[str],
+        *,
+        limit: int = 20,
+        seed_weights: list[float] | None = None,
+        recency_half_life: float | None = None,
+    ) -> MostRelevantFilesResult: ...
+
+    def most_relevant_files(
+        self,
+        seed_files: list[str],
+        *,
+        limit: int = 20,
+        seed_weights: list[float] | None = None,
+        recency_half_life: float | None | object = _UNSET,
     ) -> MostRelevantFilesResult:
         arguments: dict[str, Any] = {"seed_file_paths": seed_files, "limit": limit}
         if seed_weights is not None:
             arguments["seed_weights"] = seed_weights
+        if recency_half_life is not _UNSET:
+            arguments["recency_half_life"] = recency_half_life
         payload = self._call_tool_payload(
             "most_relevant_files",
             arguments,

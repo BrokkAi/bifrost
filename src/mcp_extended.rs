@@ -93,6 +93,12 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "items": { "type": "number", "exclusiveMinimum": 0.0 },
                         "description": "Optional raw per-seed weights aligned by index with seed_file_paths. When omitted, every seed uses weight 1.0."
                     },
+                    "recency_half_life": {
+                        "type": ["number", "null"],
+                        "default": 250.0,
+                        "exclusiveMinimum": 0.0,
+                        "description": "Optional git recency half-life in commits. Omit for the default 250-commit exponential decay, or pass null for uniform weighting."
+                    },
                     "limit": {
                         "type": "integer",
                         "default": 20,

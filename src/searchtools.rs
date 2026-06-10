@@ -18,7 +18,10 @@ use crate::path_utils::{
     rel_path_string,
 };
 use crate::profiling;
-use crate::relevance::{most_important_project_files, most_relevant_project_files};
+use crate::relevance::{
+    DEFAULT_RECENCY_HALF_LIFE, most_important_project_files, most_relevant_project_files,
+    most_relevant_project_files_with_half_life,
+};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use glob::MatchOptions;
 use glob::Pattern;
@@ -75,6 +78,8 @@ pub struct MostRelevantFilesParams {
     pub seed_file_paths: Vec<String>,
     #[serde(default)]
     pub seed_weights: Option<Vec<f64>>,
+    #[serde(default = "default_recency_half_life")]
+    pub recency_half_life: Option<f64>,
     #[serde(default = "default_limit")]
     pub limit: usize,
 }
@@ -267,6 +272,10 @@ pub struct MostRelevantFilesResult {
     pub ambiguous_paths: Vec<AmbiguousPathInput>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub duplicates: Vec<String>,
+}
+
+fn default_recency_half_life() -> Option<f64> {
+    Some(DEFAULT_RECENCY_HALF_LIFE)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1077,6 +1086,7 @@ pub fn most_relevant_files(
     let seed_weights = params
         .seed_weights
         .unwrap_or_else(|| vec![1.0; params.seed_file_paths.len()]);
+    let recency_half_life = params.recency_half_life;
     let mut resolved_by_file = HashMap::default();
 
     {
@@ -1115,7 +1125,17 @@ pub fn most_relevant_files(
 
     let files = {
         let _scope = profiling::scope("searchtools::most_relevant_files.rank");
-        most_relevant_project_files(analyzer, &seeds, params.limit)
+        let ranked = if recency_half_life == Some(DEFAULT_RECENCY_HALF_LIFE) {
+            most_relevant_project_files(analyzer, &seeds, params.limit)
+        } else {
+            most_relevant_project_files_with_half_life(
+                analyzer,
+                &seeds,
+                params.limit,
+                recency_half_life,
+            )
+        };
+        ranked
             .into_iter()
             .map(|file| rel_path_string(&file))
             .collect()
@@ -1130,24 +1150,30 @@ pub fn most_relevant_files(
 }
 
 fn validate_most_relevant_files_params(params: &MostRelevantFilesParams) -> Result<(), String> {
-    let Some(seed_weights) = params.seed_weights.as_ref() else {
-        return Ok(());
-    };
-
-    if seed_weights.len() != params.seed_file_paths.len() {
-        return Err(format!(
-            "seed_weights length {} must match seed_file_paths length {}",
-            seed_weights.len(),
-            params.seed_file_paths.len()
-        ));
-    }
-
-    for (index, weight) in seed_weights.iter().enumerate() {
-        if !weight.is_finite() || *weight <= 0.0 {
+    if let Some(seed_weights) = params.seed_weights.as_ref() {
+        if seed_weights.len() != params.seed_file_paths.len() {
             return Err(format!(
-                "seed_weights[{index}] must be finite and > 0, got {weight}"
+                "seed_weights length {} must match seed_file_paths length {}",
+                seed_weights.len(),
+                params.seed_file_paths.len()
             ));
         }
+
+        for (index, weight) in seed_weights.iter().enumerate() {
+            if !weight.is_finite() || *weight <= 0.0 {
+                return Err(format!(
+                    "seed_weights[{index}] must be finite and > 0, got {weight}"
+                ));
+            }
+        }
+    }
+
+    if let Some(half_life) = params.recency_half_life
+        && (!half_life.is_finite() || half_life <= 0.0)
+    {
+        return Err(format!(
+            "recency_half_life must be finite and > 0, got {half_life}"
+        ));
     }
 
     Ok(())
