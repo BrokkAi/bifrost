@@ -3,6 +3,7 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 
 pub const EXTENDED_TOOL_NAMES: &[&str] = &[
+    "get_symbol_locations",
     "find_filenames",
     "list_files",
     "most_relevant_files",
@@ -24,6 +25,11 @@ pub fn run_extended_stdio_server(
 
 pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
     vec![
+        tool_descriptor(
+            "get_symbol_locations",
+            "Get project-relative file paths and line ranges for known symbols after search_symbols; use before opening exact definitions.",
+            crate::mcp_common::symbol_names_schema(),
+        ),
         tool_descriptor(
             "find_filenames",
             "Find files in the workspace whose path matches any of the given glob patterns. Patterns without '/' match against the file basename; patterns with '/' match against the full project-relative path. Absolute patterns inside the active workspace are converted to project-relative patterns before matching.",

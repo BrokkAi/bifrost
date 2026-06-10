@@ -161,7 +161,6 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
         tool_names(tools),
         vec![
             "search_symbols",
-            "get_symbol_locations",
             "get_symbol_ancestors",
             "get_symbol_sources",
             "get_summaries",
@@ -170,6 +169,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "refresh",
             "activate_workspace",
             "get_active_workspace",
+            "get_symbol_locations",
             "find_filenames",
             "list_files",
             "most_relevant_files",
@@ -628,7 +628,6 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
         "core",
         &[
             "search_symbols",
-            "get_symbol_locations",
             "get_symbol_ancestors",
             "get_symbol_sources",
             "get_summaries",
@@ -647,7 +646,6 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
             "activate_workspace",
             "get_active_workspace",
             "search_symbols",
-            "get_symbol_locations",
             "get_symbol_ancestors",
             "get_symbol_sources",
             "get_summaries",
@@ -662,6 +660,7 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
             "get_file_contents",
             "search_file_contents",
             "find_files_containing",
+            "get_symbol_locations",
             "find_filenames",
             "list_files",
             "most_relevant_files",
@@ -677,6 +676,7 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
         &fixture_root,
         "extended",
         &[
+            "get_symbol_locations",
             "find_filenames",
             "list_files",
             "most_relevant_files",
