@@ -12,7 +12,10 @@ use crate::analyzer::usages::{
 use crate::analyzer::{CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, Range};
 use crate::hash::HashMap;
 use crate::model_context;
-use crate::path_utils::{normalize_pattern, rel_path_string};
+use crate::path_utils::{
+    AmbiguousPathInput, ResolvedFileInput, WorkspaceFileResolver, normalize_pattern,
+    rel_path_string,
+};
 use crate::profiling;
 use crate::relevance::{most_important_project_files, most_relevant_project_files};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
@@ -22,7 +25,6 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const FILE_SEARCH_LIMIT: usize = 100;
@@ -186,6 +188,8 @@ pub struct SummaryResult {
     pub summaries: Vec<SummaryBlock>,
     pub not_found: Vec<String>,
     pub ambiguous: Vec<AmbiguousSymbol>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub ambiguous_paths: Vec<AmbiguousPathInput>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -221,6 +225,8 @@ pub struct SymbolSourcesResult {
     pub sources: Vec<SourceBlock>,
     pub not_found: Vec<String>,
     pub ambiguous: Vec<AmbiguousSymbol>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub ambiguous_paths: Vec<AmbiguousPathInput>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -239,12 +245,16 @@ pub struct SkimFilesResult {
     pub truncated: bool,
     pub total_files: usize,
     pub files: Vec<SkimFile>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub ambiguous_paths: Vec<AmbiguousPathInput>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct MostRelevantFilesResult {
     pub files: Vec<String>,
     pub not_found: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub ambiguous_paths: Vec<AmbiguousPathInput>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -573,12 +583,19 @@ struct SummaryTargets {
     directory_target_inputs: Vec<String>,
     unmatched_file_targets: Vec<String>,
     symbol_targets: Vec<String>,
+    ambiguous_paths: Vec<AmbiguousPathInput>,
+}
+
+struct ResolvedFilePatterns {
+    files: Vec<ProjectFile>,
+    ambiguous_paths: Vec<AmbiguousPathInput>,
 }
 
 enum SourceLookupOutcome {
     Found(Vec<SourceBlock>),
     NotFound(String),
     Ambiguous(AmbiguousSymbol),
+    AmbiguousPath(AmbiguousPathInput),
 }
 
 fn route_summary_targets(analyzer: &dyn IAnalyzer, targets: &[String]) -> SummaryTargets {
@@ -587,6 +604,7 @@ fn route_summary_targets(analyzer: &dyn IAnalyzer, targets: &[String]) -> Summar
     let mut directory_target_inputs = Vec::new();
     let mut unmatched_file_targets = Vec::new();
     let mut symbol_targets = Vec::new();
+    let mut ambiguous_paths = Vec::new();
 
     for target in targets
         .iter()
@@ -601,8 +619,12 @@ fn route_summary_targets(analyzer: &dyn IAnalyzer, targets: &[String]) -> Summar
         }
 
         let matches = resolve_file_patterns(analyzer, &[target.to_string()]);
-        if !matches.is_empty() {
-            file_targets.extend(matches);
+        if !matches.ambiguous_paths.is_empty() {
+            ambiguous_paths.extend(matches.ambiguous_paths);
+            continue;
+        }
+        if !matches.files.is_empty() {
+            file_targets.extend(matches.files);
             continue;
         }
 
@@ -620,6 +642,7 @@ fn route_summary_targets(analyzer: &dyn IAnalyzer, targets: &[String]) -> Summar
         directory_target_inputs,
         unmatched_file_targets,
         symbol_targets,
+        ambiguous_paths,
     }
 }
 
@@ -652,6 +675,7 @@ fn summarize_symbol_targets(analyzer: &dyn IAnalyzer, targets: Vec<String>) -> S
         summaries,
         not_found,
         ambiguous,
+        ambiguous_paths: Vec::new(),
     }
 }
 
@@ -685,8 +709,11 @@ pub fn get_symbol_sources(
         .enumerate()
         .map(|(index, symbol)| {
             let file_matches = resolve_file_patterns(analyzer, std::slice::from_ref(&symbol));
-            if !file_matches.is_empty() {
-                let sources = source_blocks_for_files(analyzer, file_matches);
+            if let Some(item) = file_matches.ambiguous_paths.first() {
+                return (index, SourceLookupOutcome::AmbiguousPath(item.clone()));
+            }
+            if !file_matches.files.is_empty() {
+                let sources = source_blocks_for_files(analyzer, file_matches.files);
                 return if sources.is_empty() {
                     (index, SourceLookupOutcome::NotFound(symbol))
                 } else {
@@ -732,11 +759,13 @@ pub fn get_symbol_sources(
     let mut sources = Vec::new();
     let mut not_found = Vec::new();
     let mut ambiguous = Vec::new();
+    let mut ambiguous_paths = Vec::new();
     for (_, outcome) in outcomes {
         match outcome {
             SourceLookupOutcome::Found(blocks) => sources.extend(dedup_source_blocks(blocks)),
             SourceLookupOutcome::NotFound(symbol) => not_found.push(symbol),
             SourceLookupOutcome::Ambiguous(item) => ambiguous.push(item),
+            SourceLookupOutcome::AmbiguousPath(item) => ambiguous_paths.push(item),
         }
     }
 
@@ -744,6 +773,7 @@ pub fn get_symbol_sources(
         sources,
         not_found,
         ambiguous,
+        ambiguous_paths,
     }
 }
 
@@ -780,6 +810,7 @@ fn skim_files_for_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>) -> Sk
         truncated,
         total_files,
         files,
+        ambiguous_paths: Vec::new(),
     }
 }
 
@@ -819,6 +850,7 @@ fn summarize_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>) -> Summary
         summaries,
         not_found: Vec::new(),
         ambiguous: Vec::new(),
+        ambiguous_paths: Vec::new(),
     }
 }
 
@@ -948,6 +980,12 @@ fn summarize_routed_targets(
         .extend(summary_targets.unmatched_file_targets.clone());
     file_output.not_found.extend(symbol_output.not_found);
     file_output.ambiguous.extend(symbol_output.ambiguous);
+    file_output
+        .ambiguous_paths
+        .extend(symbol_output.ambiguous_paths);
+    file_output
+        .ambiguous_paths
+        .extend(summary_targets.ambiguous_paths.clone());
     file_output.summaries.sort_by(|left, right| {
         left.path
             .cmp(&right.path)
@@ -958,7 +996,9 @@ fn summarize_routed_targets(
 
 pub fn list_symbols(analyzer: &dyn IAnalyzer, params: FilePatternsParams) -> SkimFilesResult {
     let expanded = resolve_file_patterns(analyzer, &params.file_patterns);
-    skim_files_for_files(analyzer, expanded)
+    let mut result = skim_files_for_files(analyzer, expanded.files);
+    result.ambiguous_paths = expanded.ambiguous_paths;
+    result
 }
 
 pub fn most_relevant_files(
@@ -966,8 +1006,10 @@ pub fn most_relevant_files(
     params: MostRelevantFilesParams,
 ) -> MostRelevantFilesResult {
     let _scope = profiling::scope("searchtools::most_relevant_files");
+    let resolver = WorkspaceFileResolver::new(analyzer.project());
     let mut seeds = Vec::new();
     let mut not_found = Vec::new();
+    let mut ambiguous_paths = Vec::new();
 
     {
         let _scope = profiling::scope("searchtools::most_relevant_files.resolve_seeds");
@@ -977,10 +1019,10 @@ pub fn most_relevant_files(
                 continue;
             }
 
-            let rel_path = PathBuf::from(normalize_pattern(trimmed));
-            match analyzer.project().file_by_rel_path(&rel_path) {
-                Some(file) => seeds.push(file),
-                None => not_found.push(trimmed.to_string()),
+            match resolver.resolve_literal(trimmed) {
+                ResolvedFileInput::File(file) => seeds.push(file),
+                ResolvedFileInput::Ambiguous(item) => ambiguous_paths.push(item),
+                ResolvedFileInput::NotFound(item) => not_found.push(item),
             }
         }
     }
@@ -993,7 +1035,11 @@ pub fn most_relevant_files(
             .collect()
     };
 
-    MostRelevantFilesResult { files, not_found }
+    MostRelevantFilesResult {
+        files,
+        not_found,
+        ambiguous_paths,
+    }
 }
 
 pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUsagesResult {
@@ -1992,9 +2038,11 @@ fn primary_range(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> Option<Range
         .min_by_key(|range| (range.start_line, range.start_byte))
 }
 
-fn resolve_file_patterns(analyzer: &dyn IAnalyzer, patterns: &[String]) -> Vec<ProjectFile> {
+fn resolve_file_patterns(analyzer: &dyn IAnalyzer, patterns: &[String]) -> ResolvedFilePatterns {
     let mut matched = BTreeSet::new();
     let mut globs = Vec::new();
+    let resolver = WorkspaceFileResolver::new(analyzer.project());
+    let mut ambiguous_paths = Vec::new();
 
     for pattern in patterns {
         let normalized = normalize_pattern(pattern.trim());
@@ -2009,12 +2057,16 @@ fn resolve_file_patterns(analyzer: &dyn IAnalyzer, patterns: &[String]) -> Vec<P
             continue;
         }
 
-        let rel_path = Path::new(&normalized);
-        if !rel_path.is_absolute()
-            && let Some(file) = analyzer.project().file_by_rel_path(rel_path)
-        {
-            matched.insert(file);
-            continue;
+        match resolver.resolve_literal(&normalized) {
+            ResolvedFileInput::File(file) => {
+                matched.insert(file);
+                continue;
+            }
+            ResolvedFileInput::Ambiguous(item) => {
+                ambiguous_paths.push(item);
+                continue;
+            }
+            ResolvedFileInput::NotFound(_) => {}
         }
 
         let directory_matches = resolve_directory_target(analyzer, &normalized);
@@ -2037,7 +2089,10 @@ fn resolve_file_patterns(analyzer: &dyn IAnalyzer, patterns: &[String]) -> Vec<P
         matched.extend(glob_matches);
     }
 
-    matched.into_iter().collect()
+    ResolvedFilePatterns {
+        files: matched.into_iter().collect(),
+        ambiguous_paths,
+    }
 }
 
 fn resolve_directory_target(analyzer: &dyn IAnalyzer, target: &str) -> Vec<ProjectFile> {
@@ -2514,7 +2569,8 @@ mod tests {
         let analyzer = CountingAnalyzer::new(root, &["A.java", "nested/B.java"]);
         let files = resolve_file_patterns(&analyzer, &["nested/B.java".to_string()]);
 
-        assert_eq!(vec!["nested/B.java"], rel_paths(&files));
+        assert_eq!(vec!["nested/B.java"], rel_paths(&files.files));
+        assert!(files.ambiguous_paths.is_empty());
         assert_eq!(0, analyzer.analyzed_files_calls());
     }
 
@@ -2524,7 +2580,8 @@ mod tests {
         let analyzer = CountingAnalyzer::new(root, &["A.java", "nested/B.java", "notes.txt"]);
         let files = resolve_file_patterns(&analyzer, &["nested/*.java".to_string()]);
 
-        assert_eq!(vec!["nested/B.java"], rel_paths(&files));
+        assert_eq!(vec!["nested/B.java"], rel_paths(&files.files));
+        assert!(files.ambiguous_paths.is_empty());
         assert_eq!(1, analyzer.analyzed_files_calls());
     }
 
@@ -2541,8 +2598,36 @@ mod tests {
             ],
         );
 
-        assert_eq!(vec!["nested/B.java"], rel_paths(&files));
+        assert_eq!(vec!["nested/B.java"], rel_paths(&files.files));
+        assert!(files.ambiguous_paths.is_empty());
         assert_eq!(1, analyzer.analyzed_files_calls());
+    }
+
+    #[test]
+    fn bare_filename_repairs_uniquely_without_scanning_analyzed_files() {
+        let root = std::env::current_dir().unwrap();
+        let analyzer = CountingAnalyzer::new(root, &["nested/B.java", "other/C.java"]);
+        let files = resolve_file_patterns(&analyzer, &["B.java".to_string()]);
+
+        assert_eq!(vec!["nested/B.java"], rel_paths(&files.files));
+        assert!(files.ambiguous_paths.is_empty());
+        assert_eq!(0, analyzer.analyzed_files_calls());
+    }
+
+    #[test]
+    fn bare_filename_reports_ambiguity_without_guessing() {
+        let root = std::env::current_dir().unwrap();
+        let analyzer = CountingAnalyzer::new(root, &["src/B.java", "nested/B.java"]);
+        let files = resolve_file_patterns(&analyzer, &["B.java".to_string()]);
+
+        assert!(files.files.is_empty());
+        assert_eq!(1, files.ambiguous_paths.len());
+        assert_eq!("B.java", files.ambiguous_paths[0].input);
+        assert_eq!(
+            vec!["nested/B.java".to_string(), "src/B.java".to_string()],
+            files.ambiguous_paths[0].matches
+        );
+        assert_eq!(0, analyzer.analyzed_files_calls());
     }
 
     #[test]

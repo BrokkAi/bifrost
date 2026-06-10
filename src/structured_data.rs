@@ -6,6 +6,7 @@
 //! HTML-to-XML normalization step or a CSS-selector-based variant.
 
 use crate::analyzer::{IAnalyzer, ProjectFile};
+use crate::path_utils::{AmbiguousPathInput, ResolvedFileInput, WorkspaceFileResolver};
 use glob::{MatchOptions, Pattern};
 use serde::{Deserialize, Serialize};
 
@@ -61,6 +62,8 @@ pub struct JqResult {
     pub files: Vec<JqFileResult>,
     pub truncated_files: bool,
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub ambiguous_paths: Vec<AmbiguousPathInput>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -75,6 +78,8 @@ pub struct JqFileResult {
 pub struct XmlSkimResult {
     pub files: Vec<XmlSkimFile>,
     pub truncated_files: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub ambiguous_paths: Vec<AmbiguousPathInput>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -96,6 +101,8 @@ pub struct XmlSelectResult {
     pub files: Vec<XmlSelectFile>,
     pub truncated_files: bool,
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub ambiguous_paths: Vec<AmbiguousPathInput>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -114,6 +121,7 @@ pub fn jq(analyzer: &dyn IAnalyzer, params: JqParams) -> JqResult {
                 files: Vec::new(),
                 truncated_files: false,
                 error: Some(err),
+                ambiguous_paths: Vec::new(),
             };
         }
     };
@@ -151,6 +159,7 @@ pub fn jq(analyzer: &dyn IAnalyzer, params: JqParams) -> JqResult {
         files: file_results,
         truncated_files: files.truncated,
         error: None,
+        ambiguous_paths: files.ambiguous_paths,
     }
 }
 
@@ -162,6 +171,7 @@ pub fn xml_skim(analyzer: &dyn IAnalyzer, params: XmlSkimParams) -> XmlSkimResul
             return XmlSkimResult {
                 files: Vec::new(),
                 truncated_files: false,
+                ambiguous_paths: Vec::new(),
             };
         }
     };
@@ -193,6 +203,7 @@ pub fn xml_skim(analyzer: &dyn IAnalyzer, params: XmlSkimParams) -> XmlSkimResul
     XmlSkimResult {
         files: file_results,
         truncated_files: files.truncated,
+        ambiguous_paths: files.ambiguous_paths,
     }
 }
 
@@ -202,6 +213,7 @@ pub fn xml_select(analyzer: &dyn IAnalyzer, params: XmlSelectParams) -> XmlSelec
             files: Vec::new(),
             truncated_files: false,
             error: Some("attr_name is required when output is \"attribute\"".to_string()),
+            ambiguous_paths: Vec::new(),
         };
     }
 
@@ -213,6 +225,7 @@ pub fn xml_select(analyzer: &dyn IAnalyzer, params: XmlSelectParams) -> XmlSelec
                 files: Vec::new(),
                 truncated_files: false,
                 error: Some(err),
+                ambiguous_paths: Vec::new(),
             };
         }
     };
@@ -250,12 +263,14 @@ pub fn xml_select(analyzer: &dyn IAnalyzer, params: XmlSelectParams) -> XmlSelec
         files: file_results,
         truncated_files: files.truncated,
         error: None,
+        ambiguous_paths: files.ambiguous_paths,
     }
 }
 
 struct ResolvedFiles {
     files: Vec<ProjectFile>,
     truncated: bool,
+    ambiguous_paths: Vec<AmbiguousPathInput>,
 }
 
 fn resolve_files(
@@ -270,15 +285,22 @@ fn resolve_files(
     }
 
     if !is_glob_pattern(&pattern_norm) {
-        let rel = std::path::Path::new(&pattern_norm);
-        return match project.file_by_rel_path(rel) {
-            Some(file) => Ok(ResolvedFiles {
+        let resolver = WorkspaceFileResolver::new(project);
+        return match resolver.resolve_literal(&pattern_norm) {
+            ResolvedFileInput::File(file) => Ok(ResolvedFiles {
                 files: vec![file],
                 truncated: false,
+                ambiguous_paths: Vec::new(),
             }),
-            None => Ok(ResolvedFiles {
+            ResolvedFileInput::Ambiguous(item) => Ok(ResolvedFiles {
                 files: Vec::new(),
                 truncated: false,
+                ambiguous_paths: vec![item],
+            }),
+            ResolvedFileInput::NotFound(_) => Ok(ResolvedFiles {
+                files: Vec::new(),
+                truncated: false,
+                ambiguous_paths: Vec::new(),
             }),
         };
     }
@@ -300,6 +322,7 @@ fn resolve_files(
     Ok(ResolvedFiles {
         files: matched,
         truncated,
+        ambiguous_paths: Vec::new(),
     })
 }
 
@@ -551,6 +574,39 @@ mod tests {
         );
         let paths: Vec<_> = result.files.iter().map(|f| f.path.as_str()).collect();
         assert_eq!(paths, vec!["a.json", "b.json"]);
+    }
+
+    #[test]
+    fn jq_repairs_unique_bare_filename_and_reports_ambiguity() {
+        let unique = Fixture::new(&[("nested/pom.xml", "{\"name\":\"one\"}")]);
+        let unique_result = jq(
+            unique.analyzer.analyzer(),
+            JqParams {
+                file_path: "pom.xml".to_string(),
+                filter: ".name".to_string(),
+                max_files: 10,
+                matches_per_file: 10,
+            },
+        );
+        assert_eq!(1, unique_result.files.len());
+        assert_eq!("nested/pom.xml", unique_result.files[0].path);
+        assert!(unique_result.ambiguous_paths.is_empty());
+
+        let ambiguous = Fixture::new(&[
+            ("a/pom.xml", "{\"name\":\"a\"}"),
+            ("b/pom.xml", "{\"name\":\"b\"}"),
+        ]);
+        let ambiguous_result = jq(
+            ambiguous.analyzer.analyzer(),
+            JqParams {
+                file_path: "pom.xml".to_string(),
+                filter: ".name".to_string(),
+                max_files: 10,
+                matches_per_file: 10,
+            },
+        );
+        assert!(ambiguous_result.files.is_empty());
+        assert_eq!(1, ambiguous_result.ambiguous_paths.len());
     }
 
     #[test]

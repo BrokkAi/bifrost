@@ -1,6 +1,9 @@
 use crate::analyzer::{IAnalyzer, ProjectFile};
 use crate::model_context;
-use crate::path_utils::{normalize_pattern, rel_path_string, workspace_rel_path};
+use crate::path_utils::{
+    AmbiguousPathInput, ResolvedFileInput, WorkspaceFileResolver, normalize_pattern,
+    rel_path_string,
+};
 use glob::{MatchOptions, Pattern};
 use rayon::prelude::*;
 use regex::{Regex, RegexBuilder};
@@ -70,6 +73,8 @@ pub struct SkimFilesParams {
 pub struct GetFileContentsResult {
     pub files: Vec<FileContent>,
     pub not_found: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub ambiguous_paths: Vec<AmbiguousPathInput>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -103,6 +108,8 @@ pub struct SearchFileContentsResult {
     pub matches: Vec<FileMatchGroup>,
     pub truncated: bool,
     pub invalid_patterns: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub ambiguous_paths: Vec<AmbiguousPathInput>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -131,6 +138,8 @@ pub struct ListFilesResult {
 pub struct SkimFilesResult {
     pub files: Vec<SkimFileEntry>,
     pub not_found: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub ambiguous_paths: Vec<AmbiguousPathInput>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -152,8 +161,10 @@ pub fn get_file_contents(
     params: GetFileContentsParams,
 ) -> GetFileContentsResult {
     let project = analyzer.project();
+    let resolver = WorkspaceFileResolver::new(project);
     let mut files = Vec::new();
     let mut not_found = Vec::new();
+    let mut ambiguous_paths = Vec::new();
 
     for input in params.file_paths {
         let trimmed = input.trim();
@@ -161,13 +172,8 @@ pub fn get_file_contents(
             continue;
         }
 
-        let Some(rel) = workspace_rel_path(trimmed) else {
-            not_found.push(trimmed.to_string());
-            continue;
-        };
-
-        match project.file_by_rel_path(&rel) {
-            Some(file) => match file.read_to_string() {
+        match resolver.resolve_literal(trimmed) {
+            ResolvedFileInput::File(file) => match file.read_to_string() {
                 Ok(content) => {
                     let sampled = model_context::sample(&content);
                     files.push(FileContent {
@@ -181,11 +187,16 @@ pub fn get_file_contents(
                 }
                 Err(_) => not_found.push(trimmed.to_string()),
             },
-            None => not_found.push(trimmed.to_string()),
+            ResolvedFileInput::Ambiguous(item) => ambiguous_paths.push(item),
+            ResolvedFileInput::NotFound(item) => not_found.push(item),
         }
     }
 
-    GetFileContentsResult { files, not_found }
+    GetFileContentsResult {
+        files,
+        not_found,
+        ambiguous_paths,
+    }
 }
 
 pub fn find_filenames(
@@ -315,6 +326,7 @@ pub fn search_file_contents(
     params: SearchFileContentsParams,
 ) -> SearchFileContentsResult {
     let project = analyzer.project();
+    let resolver = WorkspaceFileResolver::new(project);
 
     let (regexes, invalid_patterns) = compile_regexes(&params.patterns, params.case_insensitive);
     if regexes.is_empty() {
@@ -322,15 +334,35 @@ pub fn search_file_contents(
             matches: Vec::new(),
             truncated: false,
             invalid_patterns,
+            ambiguous_paths: Vec::new(),
         };
     }
 
-    let glob = params.file_path.as_deref().and_then(|raw| {
+    enum PathFilter {
+        Glob(Pattern),
+        Exact(String),
+    }
+
+    let mut ambiguous_paths = Vec::new();
+    let filter_requested = params
+        .file_path
+        .as_deref()
+        .is_some_and(|raw| !raw.trim().is_empty());
+    let path_filter = params.file_path.as_deref().and_then(|raw| {
         let normalized = normalize_pattern(raw.trim());
         if normalized.is_empty() {
             None
+        } else if is_glob_pattern(&normalized) {
+            Pattern::new(&normalized).ok().map(PathFilter::Glob)
         } else {
-            Pattern::new(&normalized).ok()
+            match resolver.resolve_literal(&normalized) {
+                ResolvedFileInput::File(file) => Some(PathFilter::Exact(rel_path_string(&file))),
+                ResolvedFileInput::Ambiguous(item) => {
+                    ambiguous_paths.push(item);
+                    None
+                }
+                ResolvedFileInput::NotFound(_) => Some(PathFilter::Exact(normalized)),
+            }
         }
     });
 
@@ -341,20 +373,29 @@ pub fn search_file_contents(
                 matches: Vec::new(),
                 truncated: false,
                 invalid_patterns,
+                ambiguous_paths,
             };
         }
     };
 
     let context = params.context_lines.min(MAX_CONTEXT_LINES);
-    let candidates: Vec<ProjectFile> = all_files
-        .into_iter()
-        .filter(|file| {
-            let rel = rel_path_string(file);
-            glob.as_ref()
-                .map(|g| g.matches_with(&rel, STRICT_SEPARATOR))
-                .unwrap_or(true)
-        })
-        .collect();
+    let candidates: Vec<ProjectFile> = if filter_requested && !ambiguous_paths.is_empty() {
+        Vec::new()
+    } else {
+        all_files
+            .into_iter()
+            .filter(|file| {
+                let rel = rel_path_string(file);
+                path_filter
+                    .as_ref()
+                    .map(|filter| match filter {
+                        PathFilter::Glob(glob) => glob.matches_with(&rel, STRICT_SEPARATOR),
+                        PathFilter::Exact(path) => rel == *path,
+                    })
+                    .unwrap_or(true)
+            })
+            .collect()
+    };
 
     let mut groups: Vec<FileMatchGroup> = candidates
         .into_par_iter()
@@ -428,6 +469,7 @@ pub fn search_file_contents(
         matches: groups,
         truncated,
         invalid_patterns,
+        ambiguous_paths,
     }
 }
 
@@ -477,8 +519,10 @@ pub fn list_files(analyzer: &dyn IAnalyzer, params: ListFilesParams) -> ListFile
 
 pub fn skim_files(analyzer: &dyn IAnalyzer, params: SkimFilesParams) -> SkimFilesResult {
     let project = analyzer.project();
+    let resolver = WorkspaceFileResolver::new(project);
     let mut files = Vec::new();
     let mut not_found = Vec::new();
+    let mut ambiguous_paths = Vec::new();
 
     for input in params.file_paths {
         let trimmed = input.trim();
@@ -486,14 +530,16 @@ pub fn skim_files(analyzer: &dyn IAnalyzer, params: SkimFilesParams) -> SkimFile
             continue;
         }
 
-        let Some(rel) = workspace_rel_path(trimmed) else {
-            not_found.push(trimmed.to_string());
-            continue;
-        };
-
-        let Some(file) = project.file_by_rel_path(&rel) else {
-            not_found.push(trimmed.to_string());
-            continue;
+        let file = match resolver.resolve_literal(trimmed) {
+            ResolvedFileInput::File(file) => file,
+            ResolvedFileInput::Ambiguous(item) => {
+                ambiguous_paths.push(item);
+                continue;
+            }
+            ResolvedFileInput::NotFound(item) => {
+                not_found.push(item);
+                continue;
+            }
         };
 
         let declarations: Vec<SkimDeclaration> = analyzer
@@ -517,7 +563,11 @@ pub fn skim_files(analyzer: &dyn IAnalyzer, params: SkimFilesParams) -> SkimFile
         });
     }
 
-    SkimFilesResult { files, not_found }
+    SkimFilesResult {
+        files,
+        not_found,
+        ambiguous_paths,
+    }
 }
 
 fn code_unit_kind_label(code_unit: &crate::analyzer::CodeUnit) -> String {
@@ -553,6 +603,10 @@ fn compile_regexes(patterns: &[String], case_insensitive: bool) -> (Vec<Regex>, 
         })
         .collect();
     (regexes, invalid_patterns)
+}
+
+fn is_glob_pattern(pattern: &str) -> bool {
+    pattern.contains(['*', '?', '['])
 }
 
 // Reject binary files and files large enough to risk OOM if read into memory.
@@ -619,6 +673,40 @@ mod tests {
         );
         assert_eq!(result.files.len(), 1);
         assert_eq!(result.files[0].path, "src/a.rs");
+    }
+
+    #[test]
+    fn get_file_contents_repairs_unique_bare_filename() {
+        let fix = Fixture::new(&[("src/Foo.java", "class Foo {}\n"), ("src/Bar.java", "")]);
+        let result = get_file_contents(
+            fix.analyzer.analyzer(),
+            GetFileContentsParams {
+                file_paths: vec!["Foo.java".to_string()],
+            },
+        );
+        assert_eq!(1, result.files.len());
+        assert_eq!("src/Foo.java", result.files[0].path);
+        assert!(result.not_found.is_empty());
+        assert!(result.ambiguous_paths.is_empty());
+    }
+
+    #[test]
+    fn get_file_contents_reports_ambiguous_bare_filename() {
+        let fix = Fixture::new(&[("src/Foo.java", "a"), ("test/Foo.java", "b")]);
+        let result = get_file_contents(
+            fix.analyzer.analyzer(),
+            GetFileContentsParams {
+                file_paths: vec!["Foo.java".to_string()],
+            },
+        );
+        assert!(result.files.is_empty());
+        assert!(result.not_found.is_empty());
+        assert_eq!(1, result.ambiguous_paths.len());
+        assert_eq!("Foo.java", result.ambiguous_paths[0].input);
+        assert_eq!(
+            vec!["src/Foo.java".to_string(), "test/Foo.java".to_string()],
+            result.ambiguous_paths[0].matches
+        );
     }
 
     #[test]
@@ -862,6 +950,39 @@ mod tests {
     }
 
     #[test]
+    fn search_file_contents_repairs_unique_bare_filename_filter() {
+        let fix = Fixture::new(&[("src/Foo.java", "needle\n"), ("other/Bar.java", "needle\n")]);
+        let result = search_file_contents(
+            fix.analyzer.analyzer(),
+            SearchFileContentsParams {
+                patterns: vec!["needle".to_string()],
+                file_path: Some("Foo.java".to_string()),
+                context_lines: 0,
+                case_insensitive: false,
+            },
+        );
+        assert_eq!(1, result.matches.len());
+        assert_eq!("src/Foo.java", result.matches[0].path);
+        assert!(result.ambiguous_paths.is_empty());
+    }
+
+    #[test]
+    fn search_file_contents_reports_ambiguous_bare_filename_filter() {
+        let fix = Fixture::new(&[("src/Foo.java", "needle\n"), ("test/Foo.java", "needle\n")]);
+        let result = search_file_contents(
+            fix.analyzer.analyzer(),
+            SearchFileContentsParams {
+                patterns: vec!["needle".to_string()],
+                file_path: Some("Foo.java".to_string()),
+                context_lines: 0,
+                case_insensitive: false,
+            },
+        );
+        assert!(result.matches.is_empty());
+        assert_eq!(1, result.ambiguous_paths.len());
+    }
+
+    #[test]
     fn search_file_contents_marks_per_file_truncation() {
         let mut body = String::new();
         for _ in 0..(MAX_PER_FILE_SEARCH_MATCHES + 5) {
@@ -960,6 +1081,33 @@ mod tests {
         assert!(result.files.is_empty());
         assert_eq!(result.not_found, vec!["missing.rs"]);
         let _ = fix.project_root();
+    }
+
+    #[test]
+    fn skim_files_repairs_and_reports_ambiguous_basenames() {
+        let fix = Fixture::new(&[
+            ("src/Foo.java", "class Foo {}\n"),
+            ("nested/Only.java", "class Only {}\n"),
+            ("test/Foo.java", "class FooTest {}\n"),
+        ]);
+        let unique = skim_files(
+            fix.analyzer.analyzer(),
+            SkimFilesParams {
+                file_paths: vec!["Only.java".to_string()],
+            },
+        );
+        assert_eq!(1, unique.files.len());
+        assert_eq!("nested/Only.java", unique.files[0].path);
+        assert!(unique.ambiguous_paths.is_empty());
+
+        let ambiguous = skim_files(
+            fix.analyzer.analyzer(),
+            SkimFilesParams {
+                file_paths: vec!["Foo.java".to_string()],
+            },
+        );
+        assert!(ambiguous.files.is_empty());
+        assert_eq!(1, ambiguous.ambiguous_paths.len());
     }
 
     #[test]

@@ -4,13 +4,16 @@
 //! brokk-core's `CodeQualityToolsMcp.reportLongMethodAndGodObjectSmells`
 //! to bifrost. Output is byte-for-byte equivalent to brokk-core MCP.
 
-use super::{ReportLines, cyclomatic_complexity_for, pick_positive, resolve_project_files};
+use super::{
+    ReportLines, append_ambiguous_path_notes, cyclomatic_complexity_for, pick_positive,
+    resolve_project_files,
+};
 use crate::analyzer::common::language_for_target;
 use crate::analyzer::{
     CodeUnit, IAnalyzer, Language, MaintainabilitySizeSmell, MaintainabilitySizeSmellWeights,
     ProjectFile, Range,
 };
-use crate::path_utils::rel_path_string;
+use crate::path_utils::{AmbiguousPathInput, rel_path_string};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -388,6 +391,8 @@ pub struct ReportLongMethodAndGodObjectSmellsResult {
     /// clipped to `max_files`, or the findings list was clipped to
     /// `max_findings` rows.
     pub truncated: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub ambiguous_paths: Vec<AmbiguousPathInput>,
 }
 
 pub fn report_long_method_and_god_object_smells(
@@ -445,6 +450,7 @@ pub fn report_long_method_and_god_object_smells(
     let resolved = resolve_project_files(analyzer.project(), params.file_paths);
     let mut input_truncated = resolved.input_truncated;
     let skipped_inputs = resolved.skipped_inputs;
+    let ambiguous_paths = resolved.ambiguous_paths.clone();
 
     let mut selected_files: Vec<ProjectFile> = Vec::new();
     let mut seen_files: HashSet<ProjectFile> = HashSet::new();
@@ -501,9 +507,11 @@ pub fn report_long_method_and_god_object_smells(
                 "- Note: skipped {skipped_inputs} input(s) (empty, unresolvable, or missing)."
             ));
         }
+        append_ambiguous_path_notes(&mut lines, &ambiguous_paths);
         return ReportLongMethodAndGodObjectSmellsResult {
             report: lines.build(),
             truncated: input_truncated,
+            ambiguous_paths,
         };
     }
     for smell in findings.iter().take(shown) {
@@ -532,10 +540,12 @@ pub fn report_long_method_and_god_object_smells(
             "- Note: skipped {skipped_inputs} input(s) (empty, unresolvable, or missing)."
         ));
     }
+    append_ambiguous_path_notes(&mut lines, &ambiguous_paths);
 
     ReportLongMethodAndGodObjectSmellsResult {
         report: lines.build(),
         truncated: input_truncated,
+        ambiguous_paths,
     }
 }
 

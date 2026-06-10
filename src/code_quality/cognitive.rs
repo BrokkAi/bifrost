@@ -4,8 +4,9 @@
 //! mirrors brokk-core's `CodeQualityToolsMcp.computeCognitiveComplexity`
 //! byte-for-byte (`- <fqName>: <complexity>`, no source-path suffix).
 
-use super::{MAX_REPORT_LINES, ReportLines, resolve_project_files};
+use super::{MAX_REPORT_LINES, ReportLines, append_ambiguous_path_notes, resolve_project_files};
 use crate::analyzer::IAnalyzer;
+use crate::path_utils::AmbiguousPathInput;
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_COGNITIVE_THRESHOLD: i32 = 15;
@@ -24,6 +25,8 @@ pub struct ComputeCognitiveComplexityResult {
     /// `MAX_FILE_PATHS` paths were supplied, or the report hit
     /// `MAX_REPORT_LINES` flagged functions.
     pub truncated: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub ambiguous_paths: Vec<AmbiguousPathInput>,
 }
 
 pub fn compute_cognitive_complexity(
@@ -37,9 +40,11 @@ pub fn compute_cognitive_complexity(
     };
     let resolved = resolve_project_files(analyzer.project(), params.file_paths);
     let mut truncated = resolved.input_truncated;
+    let ambiguous_paths = resolved.ambiguous_paths.clone();
 
     let mut lines = ReportLines::new();
     lines.line(format!("Cognitive complexity (threshold: {limit}):"));
+    append_ambiguous_path_notes(&mut lines, &ambiguous_paths);
     let mut found_any = false;
     let mut report_full = false;
 
@@ -71,7 +76,11 @@ pub fn compute_cognitive_complexity(
     } else {
         format!("No methods exceeded the cognitive complexity threshold of {limit}.")
     };
-    ComputeCognitiveComplexityResult { report, truncated }
+    ComputeCognitiveComplexityResult {
+        report,
+        truncated,
+        ambiguous_paths,
+    }
 }
 
 #[cfg(test)]

@@ -10,7 +10,7 @@
 //! `crate::code_quality::compute_cyclomatic_complexity` etc.
 
 use crate::analyzer::{CodeUnit, IAnalyzer, Project, ProjectFile};
-use crate::path_utils::workspace_rel_path;
+use crate::path_utils::{AmbiguousPathInput, ResolvedFileInput, WorkspaceFileResolver};
 use regex::Regex;
 use std::sync::LazyLock;
 
@@ -55,6 +55,9 @@ pub(crate) struct ResolvedFiles {
     /// `true` when the caller supplied more than [`MAX_FILE_PATHS`] inputs.
     /// The tail beyond the cap is dropped without further inspection.
     pub input_truncated: bool,
+    /// Non-empty when a bare filename matched multiple project files and the
+    /// helper refused to guess.
+    pub ambiguous_paths: Vec<AmbiguousPathInput>,
 }
 
 /// Resolve a flat list of caller-supplied paths to [`ProjectFile`]s. Trims
@@ -67,32 +70,40 @@ pub(crate) struct ResolvedFiles {
 /// language gating).
 pub(crate) fn resolve_project_files(project: &dyn Project, inputs: Vec<String>) -> ResolvedFiles {
     let input_truncated = inputs.len() > MAX_FILE_PATHS;
+    let resolver = WorkspaceFileResolver::new(project);
     let mut files: Vec<ProjectFile> = Vec::new();
     let mut skipped_inputs: usize = 0;
+    let mut ambiguous_paths: Vec<AmbiguousPathInput> = Vec::new();
     for input in inputs.into_iter().take(MAX_FILE_PATHS) {
         let trimmed = input.trim();
         if trimmed.is_empty() {
             skipped_inputs += 1;
             continue;
         }
-        let Some(rel) = workspace_rel_path(trimmed) else {
-            skipped_inputs += 1;
-            continue;
-        };
-        let Some(file) = project.file_by_rel_path(&rel) else {
-            skipped_inputs += 1;
-            continue;
-        };
-        if !file.exists() {
-            skipped_inputs += 1;
-            continue;
+        match resolver.resolve_literal(trimmed) {
+            ResolvedFileInput::File(file) if file.exists() => files.push(file),
+            ResolvedFileInput::File(_) | ResolvedFileInput::NotFound(_) => skipped_inputs += 1,
+            ResolvedFileInput::Ambiguous(item) => ambiguous_paths.push(item),
         }
-        files.push(file);
     }
     ResolvedFiles {
         files,
         skipped_inputs,
         input_truncated,
+        ambiguous_paths,
+    }
+}
+
+pub(crate) fn append_ambiguous_path_notes(
+    lines: &mut ReportLines,
+    ambiguous: &[AmbiguousPathInput],
+) {
+    for item in ambiguous {
+        lines.line(format!(
+            "- Note: ambiguous input `{}`; matches: {}",
+            item.input,
+            item.matches.join(", ")
+        ));
     }
 }
 

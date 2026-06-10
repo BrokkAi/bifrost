@@ -3,7 +3,7 @@
 //! likely dead code and one-call abstractions while skipping inconclusive
 //! cases.
 
-use super::{ReportLines, resolve_project_files, sanitize_table_cell};
+use super::{ReportLines, append_ambiguous_path_notes, resolve_project_files, sanitize_table_cell};
 use crate::analyzer::common::language_for_target;
 use crate::analyzer::usages::ImportGraphCandidateProvider;
 use crate::analyzer::usages::{
@@ -12,7 +12,7 @@ use crate::analyzer::usages::{
     UsageAnalyzer, UsageHit,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
-use crate::path_utils::rel_path_string;
+use crate::path_utils::{AmbiguousPathInput, rel_path_string};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
@@ -47,6 +47,8 @@ pub struct ReportDeadCodeAndUnusedAbstractionSmellsParams {
 pub struct ReportDeadCodeAndUnusedAbstractionSmellsResult {
     pub report: String,
     pub truncated: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub ambiguous_paths: Vec<AmbiguousPathInput>,
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +95,7 @@ pub fn report_dead_code_and_unused_abstraction_smells(
     ) as usize;
 
     let resolved = resolve_project_files(analyzer.project(), params.file_paths);
+    let ambiguous_paths = resolved.ambiguous_paths.clone();
     let resolved_file_count = resolved.files.len();
     let input_files: Vec<ProjectFile> = resolved.files.into_iter().take(input_file_cap).collect();
     let mut truncated = resolved.input_truncated || resolved_file_count > input_file_cap;
@@ -161,6 +164,7 @@ pub fn report_dead_code_and_unused_abstraction_smells(
     if !skipped.is_empty() {
         lines.line(format!("- Skipped symbols: {}", skipped.len()));
     }
+    append_ambiguous_path_notes(&mut lines, &ambiguous_paths);
     lines.blank();
 
     if findings.is_empty() {
@@ -171,6 +175,7 @@ pub fn report_dead_code_and_unused_abstraction_smells(
         return ReportDeadCodeAndUnusedAbstractionSmellsResult {
             report: lines.build(),
             truncated,
+            ambiguous_paths,
         };
     }
 
@@ -209,6 +214,7 @@ pub fn report_dead_code_and_unused_abstraction_smells(
     ReportDeadCodeAndUnusedAbstractionSmellsResult {
         report: lines.build(),
         truncated,
+        ambiguous_paths,
     }
 }
 

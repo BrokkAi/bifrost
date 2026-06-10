@@ -12,6 +12,7 @@ use crate::{
         find_filenames, find_files_containing, get_file_contents, list_files, search_file_contents,
     },
     git_tools::{get_commit_diff, get_git_log, search_git_commit_messages},
+    path_utils::AmbiguousPathInput,
     searchtools::{
         ActivateWorkspaceParams, ActiveWorkspaceResult, AmbiguousSymbol, GetActiveWorkspaceParams,
         MostRelevantFilesParams, RefreshParams, SkimFilesResult, SummariesParams, SummaryBlock,
@@ -96,6 +97,8 @@ struct GetSummariesCompatibilityResult {
     directory_symbols: Option<SkimFilesResult>,
     not_found: Vec<String>,
     ambiguous: Vec<AmbiguousSymbol>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    ambiguous_paths: Vec<AmbiguousPathInput>,
 }
 
 impl RenderText for GetSummariesCompatibilityResult {
@@ -106,6 +109,7 @@ impl RenderText for GetSummariesCompatibilityResult {
                 summaries: self.summaries.clone(),
                 not_found: self.not_found.clone(),
                 ambiguous: self.ambiguous.clone(),
+                ambiguous_paths: self.ambiguous_paths.clone(),
             }
             .render_text(options);
             if summary_text != "No matching summaries found." {
@@ -599,6 +603,7 @@ impl SearchToolsService {
             directory_symbols,
             not_found: summary_result.not_found,
             ambiguous: summary_result.ambiguous,
+            ambiguous_paths: summary_result.ambiguous_paths,
         };
         let rendered_text = compatibility_result.render_text(render_options);
         let structured = serde_json::to_value(&compatibility_result).map_err(|err| {

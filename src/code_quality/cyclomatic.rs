@@ -4,9 +4,12 @@
 //! exceeds the supplied threshold. Output format mirrors brokk-core's
 //! `CodeQualityToolsMcp.computeCyclomaticComplexity` byte-for-byte.
 
-use super::{MAX_REPORT_LINES, ReportLines, cyclomatic_complexity_for, resolve_project_files};
+use super::{
+    MAX_REPORT_LINES, ReportLines, append_ambiguous_path_notes, cyclomatic_complexity_for,
+    resolve_project_files,
+};
 use crate::analyzer::{CodeUnit, IAnalyzer};
-use crate::path_utils::rel_path_string;
+use crate::path_utils::{AmbiguousPathInput, rel_path_string};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
@@ -26,6 +29,8 @@ pub struct ComputeCyclomaticComplexityResult {
     /// `MAX_FILE_PATHS` paths were supplied, or the report hit
     /// `MAX_REPORT_LINES` flagged functions.
     pub truncated: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub ambiguous_paths: Vec<AmbiguousPathInput>,
 }
 
 pub fn compute_cyclomatic_complexity(
@@ -39,9 +44,11 @@ pub fn compute_cyclomatic_complexity(
     };
     let resolved = resolve_project_files(analyzer.project(), params.file_paths);
     let mut truncated = resolved.input_truncated;
+    let ambiguous_paths = resolved.ambiguous_paths.clone();
 
     let mut lines = ReportLines::new();
     lines.line(format!("Cyclomatic complexity (threshold: {limit}):"));
+    append_ambiguous_path_notes(&mut lines, &ambiguous_paths);
     let mut found_any = false;
     let mut report_full = false;
 
@@ -85,7 +92,11 @@ pub fn compute_cyclomatic_complexity(
     } else {
         format!("No methods exceeded the complexity threshold of {limit}.")
     };
-    ComputeCyclomaticComplexityResult { report, truncated }
+    ComputeCyclomaticComplexityResult {
+        report,
+        truncated,
+        ambiguous_paths,
+    }
 }
 
 #[cfg(test)]

@@ -12,7 +12,9 @@
 use super::sanitize_table_cell;
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::{CodeUnit, CommentDensityStats, IAnalyzer, Language};
-use crate::path_utils::{rel_path_string, workspace_rel_path};
+use crate::path_utils::{
+    AmbiguousPathInput, ResolvedFileInput, WorkspaceFileResolver, rel_path_string,
+};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_COMMENT_DENSITY_MAX_LINES: i32 = 120;
@@ -56,6 +58,8 @@ pub struct ReportCommentDensityForFilesResult {
     /// already reports the exact counts, so this flag is for callers that
     /// short-circuit on any truncation.
     pub truncated: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub ambiguous_paths: Vec<AmbiguousPathInput>,
 }
 
 /// MCP `report_comment_density_for_code_unit` handler. Looks up the requested
@@ -119,11 +123,13 @@ pub fn report_comment_density_for_files(
         DEFAULT_COMMENT_DENSITY_MAX_FILES
     };
     let project = analyzer.project();
+    let resolver = WorkspaceFileResolver::new(project);
     let mut lines: Vec<String> = vec!["## Comment density by file".to_string(), String::new()];
     let mut files_shown: i32 = 0;
     let mut rows_emitted: i32 = 0;
     let mut rows_truncated = false;
     let mut files_truncated = false;
+    let mut ambiguous_paths = Vec::new();
 
     'outer: for input in params.file_paths.iter() {
         if files_shown >= file_cap {
@@ -132,21 +138,24 @@ pub fn report_comment_density_for_files(
         }
         let trimmed = input.trim();
         let display = if trimmed.is_empty() { input } else { trimmed };
-        let Some(rel) = workspace_rel_path(trimmed) else {
-            lines.push(format!("- Missing file (skipped): `{display}`"));
-            files_shown += 1;
-            continue;
+        let file = match resolver.resolve_literal(trimmed) {
+            ResolvedFileInput::File(file) if file.exists() => file,
+            ResolvedFileInput::File(_) | ResolvedFileInput::NotFound(_) => {
+                lines.push(format!("- Missing file (skipped): `{display}`"));
+                files_shown += 1;
+                continue;
+            }
+            ResolvedFileInput::Ambiguous(item) => {
+                lines.push(format!(
+                    "- Ambiguous file (skipped): `{}` -> {}",
+                    item.input,
+                    item.matches.join(", ")
+                ));
+                ambiguous_paths.push(item);
+                files_shown += 1;
+                continue;
+            }
         };
-        let Some(file) = project.file_by_rel_path(&rel) else {
-            lines.push(format!("- Missing file (skipped): `{display}`"));
-            files_shown += 1;
-            continue;
-        };
-        if !file.exists() {
-            lines.push(format!("- Missing file (skipped): `{display}`"));
-            files_shown += 1;
-            continue;
-        }
         let rel_display = rel_path_string(&file);
         if language_for_file(&file) != Language::Java {
             lines.push(format!("### `{rel_display}`"));
@@ -211,6 +220,7 @@ pub fn report_comment_density_for_files(
     ReportCommentDensityForFilesResult {
         report: lines.join("\n"),
         truncated: rows_truncated || files_truncated,
+        ambiguous_paths,
     }
 }
 

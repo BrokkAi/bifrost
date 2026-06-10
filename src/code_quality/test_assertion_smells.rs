@@ -4,9 +4,12 @@
 //! report whose layout matches brokk-core `CodeQualityToolsMcp
 //! .reportTestAssertionSmells`.
 
-use super::{ReportLines, pick_weight, resolve_project_files, sanitize_table_cell};
+use super::{
+    ReportLines, append_ambiguous_path_notes, pick_weight, resolve_project_files,
+    sanitize_table_cell,
+};
 use crate::analyzer::{IAnalyzer, TestAssertionSmell, TestAssertionWeights};
-use crate::path_utils::rel_path_string;
+use crate::path_utils::{AmbiguousPathInput, rel_path_string};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_TEST_ASSERTION_MIN_SCORE: i32 = 4;
@@ -75,6 +78,8 @@ impl Default for ReportTestAssertionSmellsParams {
 pub struct ReportTestAssertionSmellsResult {
     pub report: String,
     pub truncated: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub ambiguous_paths: Vec<AmbiguousPathInput>,
 }
 
 pub fn report_test_assertion_smells(
@@ -142,6 +147,7 @@ pub fn report_test_assertion_smells(
 
     let resolved = resolve_project_files(analyzer.project(), params.file_paths);
     let mut truncated = resolved.input_truncated;
+    let ambiguous_paths = resolved.ambiguous_paths.clone();
     let mut findings: Vec<TestAssertionSmell> = Vec::new();
     for file in &resolved.files {
         if !analyzer.contains_tests(file) {
@@ -160,6 +166,7 @@ pub fn report_test_assertion_smells(
         return ReportTestAssertionSmellsResult {
             report: format!("No test assertion smells met minScore {threshold}."),
             truncated,
+            ambiguous_paths,
         };
     }
 
@@ -190,6 +197,7 @@ pub fn report_test_assertion_smells(
             "largeLiteralThreshold" => weights.large_literal_length_threshold,
         )
     ));
+    append_ambiguous_path_notes(&mut lines, &ambiguous_paths);
     lines.blank();
     lines.line("| Score | Kind | Assertions | Symbol | File | Reasons | Excerpt |");
     lines.line("|------:|------|-----------:|--------|------|---------|---------|");
@@ -213,6 +221,7 @@ pub fn report_test_assertion_smells(
     ReportTestAssertionSmellsResult {
         report: lines.build(),
         truncated,
+        ambiguous_paths,
     }
 }
 

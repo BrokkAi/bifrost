@@ -1,4 +1,5 @@
 use crate::model_context;
+use crate::path_utils::AmbiguousPathInput;
 use crate::searchtools::{
     AmbiguousSymbol, MostRelevantFilesResult, SearchSymbolHit, SearchSymbolsFile,
     SearchSymbolsResult, SkimFile, SkimFilesResult, SourceBlock, SummaryBlock, SummaryElement,
@@ -104,6 +105,9 @@ impl RenderText for SummaryResult {
             blocks.push(format!("Not found: {}", self.not_found.join(", ")));
         }
         blocks.extend(self.ambiguous.iter().map(render_ambiguous_symbol));
+        if !self.ambiguous_paths.is_empty() {
+            blocks.push(render_ambiguous_paths(&self.ambiguous_paths));
+        }
         if blocks.is_empty() {
             "No matching summaries found.".to_string()
         } else {
@@ -124,6 +128,9 @@ impl RenderText for SymbolSourcesResult {
         }
         if !self.ambiguous.is_empty() {
             blocks.push(render_ambiguous_symbols_table(&self.ambiguous));
+        }
+        if !self.ambiguous_paths.is_empty() {
+            blocks.push(render_ambiguous_paths(&self.ambiguous_paths));
         }
         if blocks.is_empty() {
             "No matching sources found.".to_string()
@@ -147,6 +154,10 @@ impl RenderText for SkimFilesResult {
                 self.total_files
             ));
         }
+        if !self.ambiguous_paths.is_empty() {
+            text.push_str("\n\n");
+            text.push_str(&render_ambiguous_paths(&self.ambiguous_paths));
+        }
         text
     }
 }
@@ -160,6 +171,10 @@ impl RenderText for MostRelevantFilesResult {
         let mut lines = self.files.clone();
         if !self.not_found.is_empty() {
             lines.push(format!("Not found: {}", self.not_found.join(", ")));
+        }
+        if !self.ambiguous_paths.is_empty() {
+            lines.push(String::new());
+            lines.push(render_ambiguous_paths(&self.ambiguous_paths));
         }
         lines.join("\n")
     }
@@ -249,6 +264,16 @@ fn render_summary_block(block: &SummaryBlock, options: RenderOptions) -> String 
 
 fn render_ambiguous_symbol(symbol: &AmbiguousSymbol) -> String {
     format!("Ambiguous {}: {}", symbol.target, symbol.matches.join(", "))
+}
+
+fn render_ambiguous_paths(paths: &[AmbiguousPathInput]) -> String {
+    let mut lines = vec!["Ambiguous paths:".to_string()];
+    lines.extend(
+        paths
+            .iter()
+            .map(|item| format!("- {} -> {}", item.input, item.matches.join(", "))),
+    );
+    lines.join("\n")
 }
 
 fn render_skim_file(file: &SkimFile) -> String {
@@ -515,6 +540,10 @@ mod tests {
                 target: "Foo".to_string(),
                 matches: vec!["crate::foo::Foo".to_string(), "other::Foo".to_string()],
             }],
+            ambiguous_paths: vec![AmbiguousPathInput {
+                input: "Foo.java".to_string(),
+                matches: vec!["app/Foo.java".to_string(), "lib/Foo.java".to_string()],
+            }],
         };
 
         let text = result.render_text(RenderOptions::default());
@@ -524,6 +553,11 @@ mod tests {
         assert!(text.contains("```text\n12: fn bar() {"), "{text}");
         assert!(text.contains("13:     println!(\"hi\");"), "{text}");
         assert!(text.contains("## Not found\n\n- `Missing`"), "{text}");
+        assert!(text.contains("Ambiguous paths:"), "{text}");
+        assert!(
+            text.contains("- Foo.java -> app/Foo.java, lib/Foo.java"),
+            "{text}"
+        );
         assert!(text.contains("## Ambiguous symbols"), "{text}");
         assert!(text.contains("| Target | Matches |"), "{text}");
         assert!(

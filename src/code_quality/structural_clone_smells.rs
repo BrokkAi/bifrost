@@ -3,8 +3,9 @@
 //! Brokk-compatible defaults, dedupes symmetric findings, and renders the
 //! same markdown table shape as brokk-core MCP.
 
-use super::{ReportLines, resolve_project_files, sanitize_table_cell};
+use super::{ReportLines, append_ambiguous_path_notes, resolve_project_files, sanitize_table_cell};
 use crate::analyzer::{CloneSmell, CloneSmellWeights, IAnalyzer};
+use crate::path_utils::AmbiguousPathInput;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -31,6 +32,8 @@ pub struct ReportStructuralCloneSmellsParams {
 pub struct ReportStructuralCloneSmellsResult {
     pub report: String,
     pub truncated: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub ambiguous_paths: Vec<AmbiguousPathInput>,
 }
 
 pub fn report_structural_clone_smells(
@@ -75,6 +78,7 @@ pub fn report_structural_clone_smells(
     let resolved = resolve_project_files(analyzer.project(), params.file_paths);
     let findings = analyzer.find_structural_clone_smells_for_files(&resolved.files, weights);
     let mut truncated = resolved.input_truncated;
+    let ambiguous_paths = resolved.ambiguous_paths.clone();
     let mut deduped: BTreeMap<String, CloneSmell> = BTreeMap::new();
     for finding in findings {
         let left = format!("{}#{}", finding.file, finding.enclosing_fq_name);
@@ -103,6 +107,7 @@ pub fn report_structural_clone_smells(
         return ReportStructuralCloneSmellsResult {
             report: format!("No structural clone smells met minScore {threshold}."),
             truncated,
+            ambiguous_paths,
         };
     }
 
@@ -122,6 +127,7 @@ pub fn report_structural_clone_smells(
         weights.min_shared_shingles,
         weights.ast_similarity_percent
     ));
+    append_ambiguous_path_notes(&mut lines, &ambiguous_paths);
     lines.blank();
     lines.line("| Score | Tokens | Symbol | Peer Symbol | Reasons | Excerpt |");
     lines.line("|------:|-------:|--------|-------------|---------|---------|");
@@ -146,6 +152,7 @@ pub fn report_structural_clone_smells(
     ReportStructuralCloneSmellsResult {
         report: lines.build(),
         truncated,
+        ambiguous_paths,
     }
 }
 

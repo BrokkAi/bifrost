@@ -28,6 +28,7 @@ mod cache;
 mod text_utils;
 
 use crate::analyzer::IAnalyzer;
+use crate::path_utils::{ResolvedFileInput, WorkspaceFileResolver};
 use cache::{CommitSearchKey, commit_search_cache};
 use git2::{
     Commit, Delta, Diff, DiffFindOptions, DiffOptions, ObjectType, Patch, Repository, Sort,
@@ -215,14 +216,30 @@ pub fn get_git_log(analyzer: &dyn IAnalyzer, params: GetGitLogParams) -> String 
     let trimmed_path = params
         .file_path
         .as_deref()
-        .map(|raw| raw.trim().replace('\\', "/"))
+        .map(str::trim)
         .filter(|s| !s.is_empty());
-    if let Some(raw) = trimmed_path.as_deref()
+    if let Some(raw) = trimmed_path
         && raw.starts_with(':')
     {
         return "Cannot retrieve git log: path filter starts with ':' — pathspec magic is not supported, pass a plain workspace-relative path".to_string();
     }
-    let filter_path = trimmed_path
+    let display_path = match trimmed_path {
+        Some(raw) => match WorkspaceFileResolver::new(analyzer.project()).resolve_literal(raw) {
+            ResolvedFileInput::File(file) => {
+                Some(file.rel_path().to_string_lossy().replace('\\', "/"))
+            }
+            ResolvedFileInput::Ambiguous(item) => {
+                return format!(
+                    "Ambiguous path: {} matches {}",
+                    item.input,
+                    item.matches.join(", ")
+                );
+            }
+            ResolvedFileInput::NotFound(item) => Some(item.replace('\\', "/")),
+        },
+        None => None,
+    };
+    let filter_path = display_path
         .clone()
         .map(|rel| context.project_rel_to_repo_rel(Path::new(&rel)));
 
@@ -235,7 +252,7 @@ pub fn get_git_log(analyzer: &dyn IAnalyzer, params: GetGitLogParams) -> String 
         return rename_aware_log(
             &context,
             repo_rel,
-            trimmed_path.as_deref().unwrap_or(""),
+            display_path.as_deref().unwrap_or(""),
             effective_limit,
         );
     }
@@ -262,7 +279,13 @@ pub fn get_git_log(analyzer: &dyn IAnalyzer, params: GetGitLogParams) -> String 
     }
 
     if commits.is_empty() {
-        return match trimmed_path.as_deref() {
+        return match trimmed_path {
+            Some(_) if display_path.is_some() => {
+                format!(
+                    "No history found for path: {}",
+                    display_path.as_deref().unwrap_or("")
+                )
+            }
             Some(p) => format!("No history found for path: {p}"),
             None => "No history found for path: (repo root)".to_string(),
         };
@@ -270,7 +293,7 @@ pub fn get_git_log(analyzer: &dyn IAnalyzer, params: GetGitLogParams) -> String 
 
     let mut out = String::new();
     out.push_str("<git_log");
-    if let Some(p) = trimmed_path.as_deref() {
+    if let Some(p) = display_path.as_deref() {
         let _ = write!(out, " path=\"{}\"", escape_xml_attr(p));
     }
     out.push_str(">\n");
@@ -1370,6 +1393,23 @@ mod tests {
             },
         );
         assert!(out.starts_with("No history found for path: nonexistent.txt"));
+    }
+
+    #[test]
+    fn get_git_log_reports_ambiguous_bare_filename() {
+        let fix = GitFixture::new();
+        fix.commit("c1", &[("app/Foo.java", "1"), ("lib/Foo.java", "2")]);
+        let out = get_git_log(
+            fix.analyzer.analyzer(),
+            GetGitLogParams {
+                file_path: Some("Foo.java".to_string()),
+                limit: 10,
+            },
+        );
+        assert_eq!(
+            "Ambiguous path: Foo.java matches app/Foo.java, lib/Foo.java",
+            out
+        );
     }
 
     #[test]

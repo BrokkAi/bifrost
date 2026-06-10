@@ -5,9 +5,12 @@
 //! truncation note) matches brokk-core `CodeQualityToolsMcp
 //! .reportExceptionHandlingSmells` byte-for-byte.
 
-use super::{ReportLines, pick_weight, resolve_project_files, sanitize_table_cell};
+use super::{
+    ReportLines, append_ambiguous_path_notes, pick_weight, resolve_project_files,
+    sanitize_table_cell,
+};
 use crate::analyzer::{ExceptionHandlingSmell, ExceptionSmellWeights, IAnalyzer};
-use crate::path_utils::rel_path_string;
+use crate::path_utils::{AmbiguousPathInput, rel_path_string};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_EXCEPTION_MIN_SCORE: i32 = 4;
@@ -81,6 +84,8 @@ pub struct ReportExceptionHandlingSmellsResult {
     /// `true` when the findings list was clipped to `max_findings` rows or
     /// when more file paths were supplied than [`super::MAX_FILE_PATHS`].
     pub truncated: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub ambiguous_paths: Vec<AmbiguousPathInput>,
 }
 
 pub fn report_exception_handling_smells(
@@ -134,6 +139,7 @@ pub fn report_exception_handling_smells(
 
     let resolved = resolve_project_files(analyzer.project(), params.file_paths);
     let mut input_truncated = resolved.input_truncated;
+    let ambiguous_paths = resolved.ambiguous_paths.clone();
     let mut findings: Vec<ExceptionHandlingSmell> = Vec::new();
     for file in &resolved.files {
         findings.extend(analyzer.find_exception_handling_smells(file, weights));
@@ -158,6 +164,7 @@ pub fn report_exception_handling_smells(
         return ReportExceptionHandlingSmellsResult {
             report: format!("No exception-handling smells met minScore {threshold}."),
             truncated: input_truncated,
+            ambiguous_paths,
         };
     }
     let total = filtered.len();
@@ -185,6 +192,7 @@ pub fn report_exception_handling_smells(
             "smallBodyMax" => weights.small_body_max_statements,
         )
     ));
+    append_ambiguous_path_notes(&mut lines, &ambiguous_paths);
     lines.blank();
     lines.line("| Score | Catch Type | Statements | Symbol | File | Reasons | Excerpt |");
     lines.line("|------:|------------|-----------:|--------|------|---------|---------|");
@@ -208,6 +216,7 @@ pub fn report_exception_handling_smells(
     ReportExceptionHandlingSmellsResult {
         report: lines.build(),
         truncated: input_truncated,
+        ambiguous_paths,
     }
 }
 

@@ -1,5 +1,91 @@
-use crate::analyzer::ProjectFile;
+use crate::analyzer::{Project, ProjectFile};
+use crate::hash::HashMap;
+use serde::Serialize;
 use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AmbiguousPathInput {
+    pub input: String,
+    pub matches: Vec<String>,
+}
+
+pub(crate) enum ResolvedFileInput {
+    File(ProjectFile),
+    Ambiguous(AmbiguousPathInput),
+    NotFound(String),
+}
+
+pub(crate) struct WorkspaceFileResolver<'a> {
+    project: &'a dyn Project,
+    basename_index: OnceLock<HashMap<String, Vec<ProjectFile>>>,
+}
+
+impl<'a> WorkspaceFileResolver<'a> {
+    pub fn new(project: &'a dyn Project) -> Self {
+        Self {
+            project,
+            basename_index: OnceLock::new(),
+        }
+    }
+
+    pub fn resolve_literal(&self, input: &str) -> ResolvedFileInput {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return ResolvedFileInput::NotFound(trimmed.to_string());
+        }
+
+        let Some(rel) = workspace_rel_path(trimmed) else {
+            return ResolvedFileInput::NotFound(trimmed.to_string());
+        };
+
+        if let Some(file) = self.project.file_by_rel_path(&rel) {
+            return ResolvedFileInput::File(file);
+        }
+
+        if !is_bare_literal_candidate(trimmed, &rel) {
+            return ResolvedFileInput::NotFound(trimmed.to_string());
+        }
+
+        let basename = rel
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(trimmed)
+            .to_string();
+        let Some(matches) = self.basename_matches(&basename) else {
+            return ResolvedFileInput::NotFound(trimmed.to_string());
+        };
+
+        match matches {
+            [] => ResolvedFileInput::NotFound(trimmed.to_string()),
+            [file] => ResolvedFileInput::File(file.clone()),
+            _ => ResolvedFileInput::Ambiguous(AmbiguousPathInput {
+                input: trimmed.to_string(),
+                matches: matches.iter().map(rel_path_string).collect(),
+            }),
+        }
+    }
+
+    fn basename_matches(&self, basename: &str) -> Option<&[ProjectFile]> {
+        let index = self.basename_index.get_or_init(|| {
+            let mut index: HashMap<String, Vec<ProjectFile>> = HashMap::default();
+            if let Ok(files) = self.project.all_files() {
+                for file in files {
+                    let Some(name) = file.rel_path().file_name().and_then(|name| name.to_str())
+                    else {
+                        continue;
+                    };
+                    index.entry(name.to_string()).or_default().push(file);
+                }
+                for matches in index.values_mut() {
+                    matches.sort();
+                }
+            }
+            index
+        });
+        index.get(basename).map(Vec::as_slice)
+    }
+}
 
 pub(crate) fn normalize_pattern(pattern: &str) -> String {
     pattern.replace('\\', "/")
@@ -37,6 +123,13 @@ pub(crate) fn workspace_rel_path(input: &str) -> Option<PathBuf> {
         return None;
     }
     Some(rel)
+}
+
+fn is_bare_literal_candidate(input: &str, rel: &Path) -> bool {
+    if input.contains('/') || input.contains('\\') || input.contains('*') || input.contains('?') {
+        return false;
+    }
+    rel.components().count() == 1
 }
 
 pub(crate) fn has_drive_letter_prefix(s: &str) -> bool {
