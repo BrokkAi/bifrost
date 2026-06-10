@@ -88,6 +88,11 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "items": { "type": "string" },
                         "description": "Project-relative seed files used to rank related files, or absolute paths inside the active workspace."
                     },
+                    "seed_weights": {
+                        "type": "array",
+                        "items": { "type": "number", "exclusiveMinimum": 0.0 },
+                        "description": "Optional raw per-seed weights aligned by index with seed_file_paths. When omitted, every seed uses weight 1.0."
+                    },
                     "limit": {
                         "type": "integer",
                         "default": 20,

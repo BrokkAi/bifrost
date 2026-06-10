@@ -164,13 +164,20 @@ impl RenderText for SkimFilesResult {
 
 impl RenderText for MostRelevantFilesResult {
     fn render_text(&self, _options: RenderOptions) -> String {
-        if self.files.is_empty() && self.not_found.is_empty() {
+        if self.files.is_empty()
+            && self.not_found.is_empty()
+            && self.duplicates.is_empty()
+            && self.ambiguous_paths.is_empty()
+        {
             return "No related files found.".to_string();
         }
 
         let mut lines = self.files.clone();
         if !self.not_found.is_empty() {
             lines.push(format!("Not found: {}", self.not_found.join(", ")));
+        }
+        if !self.duplicates.is_empty() {
+            lines.push(format!("Duplicate seeds: {}", self.duplicates.join(", ")));
         }
         if !self.ambiguous_paths.is_empty() {
             lines.push(String::new());

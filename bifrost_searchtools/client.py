@@ -184,10 +184,14 @@ class SearchToolsClient:
         seed_files: list[str],
         *,
         limit: int = 20,
+        seed_weights: list[float] | None = None,
     ) -> MostRelevantFilesResult:
+        arguments: dict[str, Any] = {"seed_file_paths": seed_files, "limit": limit}
+        if seed_weights is not None:
+            arguments["seed_weights"] = seed_weights
         payload = self._call_tool_payload(
             "most_relevant_files",
-            {"seed_file_paths": seed_files, "limit": limit},
+            arguments,
         )
         return MostRelevantFilesResult.from_dict(
             payload.structured,

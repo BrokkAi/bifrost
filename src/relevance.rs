@@ -69,15 +69,24 @@ struct FileRelevance {
 
 pub(crate) fn most_relevant_project_files(
     analyzer: &dyn IAnalyzer,
-    seeds: &[ProjectFile],
+    seeds: &[(ProjectFile, f64)],
     top_k: usize,
+) -> Vec<ProjectFile> {
+    most_relevant_project_files_with_git_recency(analyzer, seeds, top_k, true)
+}
+
+pub(crate) fn most_relevant_project_files_with_git_recency(
+    analyzer: &dyn IAnalyzer,
+    seeds: &[(ProjectFile, f64)],
+    top_k: usize,
+    git_recency: bool,
 ) -> Vec<ProjectFile> {
     let _scope = profiling::scope("relevance::most_relevant_project_files");
     if top_k == 0 {
         return Vec::new();
     }
 
-    let seed_weights = normalized_seed_weights(seeds);
+    let seed_weights = seed_weight_map(seeds);
     if seed_weights.is_empty() {
         return Vec::new();
     }
@@ -88,7 +97,9 @@ pub(crate) fn most_relevant_project_files(
 
     {
         let _scope = profiling::scope("relevance::git");
-        for candidate in related_files_by_git(analyzer, &seed_weights, top_k).unwrap_or_default() {
+        for candidate in
+            related_files_by_git(analyzer, &seed_weights, top_k, git_recency).unwrap_or_default()
+        {
             if append_candidate(&mut results, &mut seen, &excluded, candidate.file, top_k) {
                 return results;
             }
@@ -139,7 +150,7 @@ pub(crate) fn most_important_project_files(
     let mut canonicalizer = RenameCanonicalizer::default();
     for (index, change) in changes.into_iter().enumerate() {
         canonicalizer.record_renames(&change.renames);
-        let age_weight = 1.0 / ((index + 1) as f64);
+        let age_weight = commit_age_weight(index);
         for path in change.paths {
             let canonical = canonicalizer.canonicalize(&path);
             let Some(file) = repo.repo_path_to_project_file(&canonical) else {
@@ -160,6 +171,10 @@ pub(crate) fn most_important_project_files(
     ranked.into_iter().map(|item| item.file).collect()
 }
 
+fn commit_age_weight(index: usize) -> f64 {
+    1.0 / ((index + 1) as f64)
+}
+
 fn append_candidate(
     results: &mut Vec<ProjectFile>,
     seen: &mut HashSet<ProjectFile>,
@@ -175,10 +190,10 @@ fn append_candidate(
     results.len() >= top_k
 }
 
-fn normalized_seed_weights(seeds: &[ProjectFile]) -> HashMap<ProjectFile, f64> {
+fn seed_weight_map(seeds: &[(ProjectFile, f64)]) -> HashMap<ProjectFile, f64> {
     let mut weights = HashMap::default();
-    for seed in seeds.iter().filter(|seed| seed.exists()) {
-        *weights.entry(seed.clone()).or_insert(0.0) += 1.0;
+    for (seed, weight) in seeds.iter().filter(|(seed, _)| seed.exists()) {
+        *weights.entry(seed.clone()).or_insert(0.0) += *weight;
     }
     weights
 }
@@ -523,6 +538,10 @@ fn referencing_files_for(
 ///   match and the directly compared old/new blobs must retain near-exact token overlap. This keeps libgit2/JGit
 ///   aligned on borderline rename scores without reintroducing add/delete continuation scoring
 /// - copy/split history is intentionally not recovered by custom blob-similarity heuristics
+/// - when `recency` is enabled, apply the same hyperbolic `1 / (index + 1)` age weight to both
+///   seed mass and joint mass so the seed->target conditional remains a proper conditional; keep
+///   document frequency / IDF unweighted because it measures corpus-wide commonness rather than
+///   recency-biased affinity
 /// - treat near-equal scores as ties using a relative epsilon of `1e-9 * max(1, |score|)` and break them by
 ///   normalized path so ordering is stable across platforms and implementations
 ///
@@ -531,6 +550,7 @@ fn related_files_by_git(
     analyzer: &dyn IAnalyzer,
     seed_weights: &HashMap<ProjectFile, f64>,
     k: usize,
+    recency: bool,
 ) -> Result<Vec<FileRelevance>, git2::Error> {
     let _scope = profiling::scope("relevance::related_files_by_git");
     reset_git_counters();
@@ -562,7 +582,7 @@ fn related_files_by_git(
 
     let mut file_doc_freq: HashMap<ProjectFile, usize> = HashMap::default();
     let mut joint_mass: HashMap<(ProjectFile, ProjectFile), f64> = HashMap::default();
-    let mut seed_commit_count: HashMap<ProjectFile, usize> = HashMap::default();
+    let mut seed_mass: HashMap<ProjectFile, f64> = HashMap::default();
     let mut canonicalizer = RenameCanonicalizer::default();
     let find_commit_ms = 0.0;
     let change_ms = 0.0;
@@ -572,7 +592,7 @@ fn related_files_by_git(
     let baseline_commit_count = changes.len() as f64;
     {
         let _scope = profiling::scope("relevance::git.score_commits");
-        for change in changes {
+        for (index, change) in changes.into_iter().enumerate() {
             let started = Instant::now();
             canonicalizer.record_renames(&change.renames);
             let changed_files: BTreeSet<_> = change
@@ -610,11 +630,16 @@ fn related_files_by_git(
                 continue;
             }
 
+            let commit_weight = if recency {
+                commit_age_weight(index)
+            } else {
+                1.0
+            };
             for seed in &seeds_in_commit {
-                *seed_commit_count.entry(seed.clone()).or_insert(0) += 1;
+                *seed_mass.entry(seed.clone()).or_insert(0.0) += commit_weight;
             }
 
-            let commit_pair_mass = 1.0 / changed_files.len() as f64;
+            let commit_pair_mass = commit_weight / changed_files.len() as f64;
             for seed in &seeds_in_commit {
                 for target in &changed_files {
                     if seed_weights.contains_key(target) {
@@ -640,13 +665,15 @@ fn related_files_by_git(
 
     let mut scores = HashMap::default();
     for ((seed, target), joint) in joint_mass {
-        let seed_denom = seed_commit_count.get(&seed).copied().unwrap_or(0);
-        if seed_denom == 0 {
+        let seed_denom = seed_mass.get(&seed).copied().unwrap_or(0.0);
+        if seed_denom <= 0.0 {
             continue;
         }
 
-        let conditional = joint / seed_denom as f64;
+        let conditional = joint / seed_denom;
         let target_doc_freq = file_doc_freq.get(&target).copied().unwrap_or(0).max(1) as f64;
+        // Keep document frequency unweighted: IDF measures how globally common a file is
+        // across the commit corpus, not how recent its affinity is to the seed set.
         let idf = (1.0 + baseline_commit_count / target_doc_freq).ln();
         let seed_weight = seed_weights.get(&seed).copied().unwrap_or(0.0);
         let contribution = seed_weight * conditional * idf;
@@ -1018,13 +1045,18 @@ fn compare_file_relevance(left: &FileRelevance, right: &FileRelevance) -> std::c
 
 #[cfg(test)]
 mod tests {
-    use super::{FileRelevance, related_files_by_imports};
+    use super::{
+        FileRelevance, most_relevant_project_files_with_git_recency, related_files_by_git,
+        related_files_by_imports,
+    };
     use crate::analyzer::{
         AnalyzerDelegate, JavaAnalyzer, Language, MultiAnalyzer, ProjectFile, PythonAnalyzer,
         TestProject,
     };
     use crate::hash::HashMap;
+    use git2::{Repository, Signature};
     use std::collections::BTreeMap;
+    use std::fs;
     use std::path::Path;
     use tempfile::TempDir;
 
@@ -1093,6 +1125,36 @@ mod tests {
 
     fn java_analyzer(root: &Path) -> JavaAnalyzer {
         JavaAnalyzer::from_project(TestProject::new(root.to_path_buf(), Language::Java))
+    }
+
+    fn commit_paths(repo: &Repository, message: &str, add: &[&str], remove: &[&str]) {
+        let mut index = repo.index().unwrap();
+        for path in remove {
+            index.remove_path(Path::new(path)).unwrap();
+        }
+        for path in add {
+            index.add_path(Path::new(path)).unwrap();
+        }
+        index.write().unwrap();
+
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let signature = Signature::now("Test User", "test@example.com").unwrap();
+        let parent = repo
+            .head()
+            .ok()
+            .and_then(|head| head.target())
+            .and_then(|oid| repo.find_commit(oid).ok());
+        let parents = parent.iter().collect::<Vec<_>>();
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            message,
+            &tree,
+            &parents,
+        )
+        .unwrap();
     }
 
     fn file_by_name<'a>(result: &'a [FileRelevance], file_name: &str) -> Option<&'a FileRelevance> {
@@ -1388,5 +1450,113 @@ mod tests {
 
         assert!(file_by_name(&results, "B.java").is_some());
         assert!(file_by_name(&results, "C.java").is_some());
+    }
+
+    #[test]
+    fn recency_weighted_git_scores_downweight_old_only_targets_against_uniform_scores() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        write_file(root, "Seed.java", "public class Seed { }");
+        write_file(root, "OldTarget.java", "public class OldTarget { }");
+
+        let repo = Repository::init(root).unwrap();
+        commit_paths(&repo, "initial seed", &["Seed.java"], &[]);
+        commit_paths(&repo, "add old target", &["OldTarget.java"], &[]);
+        fs::write(
+            root.join("Seed.java"),
+            "public class Seed { int oldUse() { return 1; } }",
+        )
+        .unwrap();
+        fs::write(
+            root.join("OldTarget.java"),
+            "public class OldTarget { int value() { return 1; } }",
+        )
+        .unwrap();
+        commit_paths(&repo, "old cochange", &["Seed.java", "OldTarget.java"], &[]);
+        fs::write(
+            root.join("Seed.java"),
+            "public class Seed { int newerOnly() { return 2; } }",
+        )
+        .unwrap();
+        commit_paths(&repo, "seed only recent", &["Seed.java"], &[]);
+
+        let analyzer = java_analyzer(root);
+        let seed = ProjectFile::new(root.to_path_buf(), "Seed.java");
+        let seed_weights = hash_map([(seed, 1.0)]);
+        let uniform_scores = related_files_by_git(&analyzer, &seed_weights, 10, false).unwrap();
+        let recency_scores = related_files_by_git(&analyzer, &seed_weights, 10, true).unwrap();
+
+        let uniform_old = file_by_name(&uniform_scores, "OldTarget.java")
+            .expect("uniform old target score")
+            .score;
+        let recency_old = file_by_name(&recency_scores, "OldTarget.java")
+            .expect("recency old target score")
+            .score;
+
+        assert!(recency_old < uniform_old, "{recency_old} !< {uniform_old}");
+    }
+
+    #[test]
+    fn legacy_git_path_remains_available_for_parity_sensitive_tests() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        write_file(root, "Seed.java", "public class Seed { }");
+        write_file(root, "OldTarget.java", "public class OldTarget { }");
+        write_file(root, "RecentTarget.java", "public class RecentTarget { }");
+
+        let repo = Repository::init(root).unwrap();
+        commit_paths(&repo, "initial seed", &["Seed.java"], &[]);
+        commit_paths(&repo, "add old target", &["OldTarget.java"], &[]);
+        fs::write(
+            root.join("Seed.java"),
+            "public class Seed { int oldUse() { return 1; } }",
+        )
+        .unwrap();
+        fs::write(
+            root.join("OldTarget.java"),
+            "public class OldTarget { int value() { return 1; } }",
+        )
+        .unwrap();
+        commit_paths(&repo, "old cochange", &["Seed.java", "OldTarget.java"], &[]);
+        commit_paths(&repo, "add recent target", &["RecentTarget.java"], &[]);
+        fs::write(
+            root.join("Seed.java"),
+            "public class Seed { int recentUse() { return 2; } }",
+        )
+        .unwrap();
+        fs::write(
+            root.join("RecentTarget.java"),
+            "public class RecentTarget { int value() { return 2; } }",
+        )
+        .unwrap();
+        commit_paths(
+            &repo,
+            "recent cochange",
+            &["Seed.java", "RecentTarget.java"],
+            &[],
+        );
+
+        let analyzer = java_analyzer(root);
+        let recency_ranked = most_relevant_project_files_with_git_recency(
+            &analyzer,
+            &[(ProjectFile::new(root.to_path_buf(), "Seed.java"), 1.0)],
+            2,
+            true,
+        );
+        let legacy_ranked = most_relevant_project_files_with_git_recency(
+            &analyzer,
+            &[(ProjectFile::new(root.to_path_buf(), "Seed.java"), 1.0)],
+            2,
+            false,
+        );
+
+        assert_eq!(
+            "RecentTarget.java",
+            recency_ranked[0].rel_path().display().to_string()
+        );
+        assert_eq!(
+            "OldTarget.java",
+            legacy_ranked[0].rel_path().display().to_string()
+        );
     }
 }

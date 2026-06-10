@@ -530,6 +530,7 @@ class SkimFilesResult:
 class MostRelevantFilesResult:
     files: list[str]
     not_found: list[str]
+    duplicates: list[str]
     render_line_numbers: bool = True
     rendered_text: str | None = None
 
@@ -540,6 +541,7 @@ class MostRelevantFilesResult:
         return cls(
             files=list(data["files"]),
             not_found=list(data["not_found"]),
+            duplicates=list(data.get("duplicates", [])),
             render_line_numbers=render_line_numbers,
             rendered_text=rendered_text,
         )
@@ -551,10 +553,12 @@ class MostRelevantFilesResult:
     def render_text(self) -> str:
         if self.rendered_text is not None:
             return self.rendered_text
-        if not self.files and not self.not_found:
+        if not self.files and not self.not_found and not self.duplicates:
             return "No related files found."
 
         lines = list(self.files)
         if self.not_found:
             lines.append(f"Not found: {', '.join(self.not_found)}")
+        if self.duplicates:
+            lines.append(f"Duplicate seeds: {', '.join(self.duplicates)}")
         return "\n".join(lines)

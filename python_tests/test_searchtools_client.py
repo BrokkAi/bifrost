@@ -159,12 +159,30 @@ class SearchToolsClientTest(unittest.TestCase):
             )
 
             with SearchToolsClient(root=root) as client:
-                result = client.most_relevant_files(["A.java"], limit=5)
+                result = client.most_relevant_files(
+                    ["A.java"], limit=5, seed_weights=[2.0]
+                )
                 text = result.render_text()
 
         self.assertIn("B.java", result.files)
         self.assertEqual([], result.not_found)
+        self.assertEqual([], result.duplicates)
         self.assertIn("B.java", text)
+
+    def test_most_relevant_files_reports_duplicate_resolved_seeds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "A.java").write_text("public class A { }\n")
+
+            with SearchToolsClient(root=root) as client:
+                result = client.most_relevant_files(
+                    ["A.java", "./A.java"], limit=5, seed_weights=[1.0, 2.0]
+                )
+                text = result.render_text()
+
+        self.assertEqual([], result.files)
+        self.assertEqual(["A.java"], result.duplicates)
+        self.assertIn("Duplicate seeds: A.java", text)
 
     def test_get_symbol_ancestors_returns_csharp_hierarchy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

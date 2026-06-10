@@ -263,7 +263,7 @@ impl SearchToolsService {
                 render_options,
                 |workspace, params| list_symbols(workspace.analyzer(), params),
             ),
-            "most_relevant_files" => Self::decode_render_and_run(
+            "most_relevant_files" => Self::decode_render_and_try_run(
                 &snapshot,
                 arguments,
                 render_options,

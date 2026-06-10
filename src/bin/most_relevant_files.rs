@@ -82,15 +82,23 @@ fn run() -> Result<(), String> {
             workspace.analyzer(),
             MostRelevantFilesParams {
                 seed_file_paths,
+                seed_weights: None,
                 limit: DEFAULT_LIMIT,
             },
         )
+        .map_err(|err| format!("Failed to rank relevant files: {err}"))?
     };
 
     if !result.not_found.is_empty() {
         return Err(format!(
             "Seed files not found: {}",
             result.not_found.join(", ")
+        ));
+    }
+    if !result.duplicates.is_empty() {
+        return Err(format!(
+            "Duplicate seed files: {}",
+            result.duplicates.join(", ")
         ));
     }
 

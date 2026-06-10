@@ -73,6 +73,8 @@ pub struct SummariesParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MostRelevantFilesParams {
     pub seed_file_paths: Vec<String>,
+    #[serde(default)]
+    pub seed_weights: Option<Vec<f64>>,
     #[serde(default = "default_limit")]
     pub limit: usize,
 }
@@ -263,6 +265,8 @@ pub struct MostRelevantFilesResult {
     pub not_found: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub ambiguous_paths: Vec<AmbiguousPathInput>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub duplicates: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1062,27 +1066,51 @@ pub fn list_symbols(analyzer: &dyn IAnalyzer, params: FilePatternsParams) -> Ski
 pub fn most_relevant_files(
     analyzer: &dyn IAnalyzer,
     params: MostRelevantFilesParams,
-) -> MostRelevantFilesResult {
+) -> Result<MostRelevantFilesResult, String> {
     let _scope = profiling::scope("searchtools::most_relevant_files");
+    validate_most_relevant_files_params(&params)?;
     let resolver = WorkspaceFileResolver::new(analyzer.project());
     let mut seeds = Vec::new();
     let mut not_found = Vec::new();
     let mut ambiguous_paths = Vec::new();
+    let mut duplicates = Vec::new();
+    let seed_weights = params
+        .seed_weights
+        .unwrap_or_else(|| vec![1.0; params.seed_file_paths.len()]);
+    let mut resolved_by_file = HashMap::default();
 
     {
         let _scope = profiling::scope("searchtools::most_relevant_files.resolve_seeds");
-        for input in params.seed_file_paths {
+        for (input, weight) in params.seed_file_paths.into_iter().zip(seed_weights) {
             let trimmed = input.trim();
             if trimmed.is_empty() {
                 continue;
             }
 
             match resolver.resolve_literal(trimmed) {
-                ResolvedFileInput::File(file) => seeds.push(file),
+                ResolvedFileInput::File(file) => {
+                    let display_path = rel_path_string(&file);
+                    if resolved_by_file.insert(file.clone(), ()).is_some() {
+                        duplicates.push(display_path);
+                        continue;
+                    }
+                    seeds.push((file, weight));
+                }
                 ResolvedFileInput::Ambiguous(item) => ambiguous_paths.push(item),
                 ResolvedFileInput::NotFound(item) => not_found.push(item),
             }
         }
+    }
+
+    duplicates.sort();
+    duplicates.dedup();
+    if !duplicates.is_empty() {
+        return Ok(MostRelevantFilesResult {
+            files: Vec::new(),
+            not_found,
+            ambiguous_paths,
+            duplicates,
+        });
     }
 
     let files = {
@@ -1093,11 +1121,36 @@ pub fn most_relevant_files(
             .collect()
     };
 
-    MostRelevantFilesResult {
+    Ok(MostRelevantFilesResult {
         files,
         not_found,
         ambiguous_paths,
+        duplicates,
+    })
+}
+
+fn validate_most_relevant_files_params(params: &MostRelevantFilesParams) -> Result<(), String> {
+    let Some(seed_weights) = params.seed_weights.as_ref() else {
+        return Ok(());
+    };
+
+    if seed_weights.len() != params.seed_file_paths.len() {
+        return Err(format!(
+            "seed_weights length {} must match seed_file_paths length {}",
+            seed_weights.len(),
+            params.seed_file_paths.len()
+        ));
     }
+
+    for (index, weight) in seed_weights.iter().enumerate() {
+        if !weight.is_finite() || *weight <= 0.0 {
+            return Err(format!(
+                "seed_weights[{index}] must be finite and > 0, got {weight}"
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUsagesResult {
@@ -1597,11 +1650,11 @@ fn truncate_largest_summary_symbol(states: &mut [SymbolUsageRenderState]) -> boo
         state.file_limit = Some(SCAN_USAGES_SUMMARY_FILE_LIMIT);
         return true;
     }
-    if let Some(limit) = state.file_limit {
-        if limit > 1 {
-            state.file_limit = Some((limit / 2).max(1));
-            return true;
-        }
+    if let Some(limit) = state.file_limit
+        && limit > 1
+    {
+        state.file_limit = Some((limit / 2).max(1));
+        return true;
     }
     if state.top_enclosing_limit > 0 {
         state.top_enclosing_limit /= 2;
