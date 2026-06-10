@@ -11,9 +11,7 @@ pub fn normalize_tool_arguments(
         "list_symbols" => {
             normalize_string_array_field(&mut arguments, "file_patterns", workspace_root)?
         }
-        "scan_usages" => {
-            normalize_string_array_field(&mut arguments, "paths", workspace_root)?
-        }
+        "scan_usages" => normalize_string_array_field(&mut arguments, "paths", workspace_root)?,
         "most_relevant_files" => {
             normalize_string_array_field(&mut arguments, "seed_file_paths", workspace_root)?
         }
@@ -282,6 +280,27 @@ mod tests {
         .expect("normalize");
 
         assert_eq!(normalized["symbols"][0], absolute_looking_symbol);
+    }
+
+    #[test]
+    fn normalizes_scan_usages_paths_field() {
+        let root = TempDir::new().expect("temp dir");
+        let src = root.path().join("src");
+        fs::create_dir(&src).expect("src dir");
+        let file = src.join("lib.rs");
+        fs::write(&file, "fn helper() {}\n").expect("write file");
+
+        let normalized = normalize_tool_arguments(
+            "scan_usages",
+            json!({
+                "symbols": ["pkg.helper"],
+                "paths": [file.display().to_string()]
+            }),
+            root.path(),
+        )
+        .expect("normalize");
+
+        assert_eq!(normalized["paths"][0], "src/lib.rs");
     }
 
     #[test]

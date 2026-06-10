@@ -675,6 +675,7 @@ fn scan_usages_uses_the_common_fuzzy_symbol_resolver() {
         ScanUsagesParams {
             symbols: vec!["A::method".to_string()],
             include_tests: true,
+            paths: None,
         },
     );
 
@@ -704,6 +705,7 @@ fn scan_usages_finds_c_function_callers_through_header_declaration() {
         ScanUsagesParams {
             symbols: vec!["initialize_the_repository".to_string()],
             include_tests: true,
+            paths: None,
         },
     );
 
@@ -715,10 +717,12 @@ fn scan_usages_finds_c_function_callers_through_header_declaration() {
             .files
             .iter()
             .any(|file| file.path == "common-main.c"
-                && file
-                    .hits
-                    .iter()
-                    .any(|hit| hit.snippet.contains("initialize_the_repository()"))),
+                && file.hits.iter().any(|hit| {
+                    hit.snippet
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("initialize_the_repository()")
+                })),
         "{result:#?}",
     );
 }

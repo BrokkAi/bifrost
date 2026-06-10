@@ -7,8 +7,8 @@ use crate::analyzer::symbol_lookup::{
     strip_trailing_call_suffix,
 };
 use crate::analyzer::usages::{
-    CONFIDENCE_THRESHOLD, DEFAULT_MAX_FILES, FuzzyResult, RegexUsageAnalyzer, UsageFinder,
-    UsageHit, UsageAnalyzer,
+    CONFIDENCE_THRESHOLD, DEFAULT_MAX_FILES, FuzzyResult, RegexUsageAnalyzer, UsageAnalyzer,
+    UsageFinder, UsageHit,
 };
 use crate::analyzer::{CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, Range};
 use crate::hash::HashMap;
@@ -20,8 +20,8 @@ use crate::path_utils::{
 use crate::profiling;
 use crate::relevance::{most_important_project_files, most_relevant_project_files};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
-use glob::Pattern;
 use glob::MatchOptions;
+use glob::Pattern;
 use rayon::prelude::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -1125,7 +1125,6 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
         Some(Arc::new(set))
     };
 
-    let mut usages = Vec::new();
     let mut not_found = Vec::new();
     let mut fallbacks = Vec::new();
     let mut failures = Vec::new();
@@ -1342,7 +1341,7 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
         }
     }
 
-    usages = render_scan_usages_with_budget(render_states);
+    let usages = render_scan_usages_with_budget(render_states);
 
     ScanUsagesResult {
         usages,
@@ -1539,7 +1538,9 @@ fn render_scan_usages_with_budget(states: Vec<SymbolUsageRenderState>) -> Vec<Sy
 }
 
 fn demote_largest_symbol(states: &mut [SymbolUsageRenderState]) -> bool {
-    let any_full = states.iter().any(|state| state.rendering == UsageRendering::Full);
+    let any_full = states
+        .iter()
+        .any(|state| state.rendering == UsageRendering::Full);
     let mut best_index = None;
     let mut best_size = 0usize;
     for (idx, state) in states.iter().enumerate() {
@@ -1575,8 +1576,8 @@ fn truncate_largest_summary_symbol(states: &mut [SymbolUsageRenderState]) -> boo
         if state.rendering != UsageRendering::Summary {
             continue;
         }
-        let can_limit_files = state.summary_files.len()
-            > state.file_limit.unwrap_or(SCAN_USAGES_SUMMARY_FILE_LIMIT);
+        let can_limit_files =
+            state.summary_files.len() > state.file_limit.unwrap_or(SCAN_USAGES_SUMMARY_FILE_LIMIT);
         let can_reduce_files = state.file_limit.is_some_and(|limit| limit > 1);
         let can_reduce_enclosing = state.top_enclosing_limit > 0;
         if !(can_limit_files || can_reduce_files || can_reduce_enclosing) {
@@ -1637,7 +1638,8 @@ fn render_symbol_usages(state: &SymbolUsageRenderState) -> SymbolUsages {
             (
                 kept,
                 some_if_nonzero(truncated),
-                state.top_enclosing
+                state
+                    .top_enclosing
                     .iter()
                     .take(state.top_enclosing_limit)
                     .cloned()
@@ -1756,11 +1758,7 @@ fn build_scan_usages_path_filter(
                 rules.push(ScanUsagesPathRule::Exact(rel_path_string(&file)));
             }
             ResolvedFileInput::Ambiguous(item) => {
-                rules.extend(
-                    item.matches
-                        .into_iter()
-                        .map(ScanUsagesPathRule::Exact),
-                );
+                rules.extend(item.matches.into_iter().map(ScanUsagesPathRule::Exact));
             }
             ResolvedFileInput::NotFound(_) => {
                 rules.push(ScanUsagesPathRule::Exact(normalized));
@@ -1779,7 +1777,9 @@ fn strict_separator_options() -> MatchOptions {
 }
 
 fn serialized_len<T: Serialize>(value: &T) -> usize {
-    serde_json::to_string(value).map(|text| text.len()).unwrap_or(0)
+    serde_json::to_string(value)
+        .map(|text| text.len())
+        .unwrap_or(0)
 }
 
 fn dedupe_preserving_order(values: Vec<String>) -> Vec<String> {

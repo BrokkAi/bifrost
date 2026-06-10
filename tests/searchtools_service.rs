@@ -18,6 +18,14 @@ fn fixture_root() -> PathBuf {
         .join("testcode-java")
 }
 
+fn array_len(value: &Value, key: &str) -> usize {
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|items| items.len())
+        .unwrap_or(0)
+}
+
 #[test]
 fn service_allows_concurrent_read_only_calls() {
     let service = Arc::new(SearchToolsService::new_for_python(fixture_root()).unwrap());
@@ -871,7 +879,10 @@ fn scan_usages_returns_call_sites_grouped_by_file() {
         usages[0]["total_hits"].as_u64().unwrap() >= 1,
         "expected >=1 hit, payload: {value}"
     );
-    assert_eq!(false, usages[0]["candidate_files_truncated"]);
+    assert!(
+        usages[0]["candidate_files_truncated"].is_null(),
+        "candidate_files_truncated should be omitted when false: {value}"
+    );
 
     let files = usages[0]["files"].as_array().unwrap();
     let use_e = files
@@ -887,11 +898,11 @@ fn scan_usages_returns_call_sites_grouped_by_file() {
         "expected snippet to contain `e.iMethod()`: {value}"
     );
 
-    assert_eq!(0, value["not_found"].as_array().unwrap().len());
-    assert_eq!(0, value["ambiguous"].as_array().unwrap().len());
-    assert_eq!(0, value["fallbacks"].as_array().unwrap().len());
-    assert_eq!(0, value["failures"].as_array().unwrap().len());
-    assert_eq!(0, value["too_many_callsites"].as_array().unwrap().len());
+    assert_eq!(0, array_len(&value, "not_found"));
+    assert_eq!(0, array_len(&value, "ambiguous"));
+    assert_eq!(0, array_len(&value, "fallbacks"));
+    assert_eq!(0, array_len(&value, "failures"));
+    assert_eq!(0, array_len(&value, "too_many_callsites"));
 }
 
 #[test]
@@ -905,12 +916,12 @@ fn scan_usages_reports_unknown_symbol_as_not_found() {
         .unwrap();
     let value: Value = serde_json::from_str(&payload).unwrap();
 
-    assert_eq!(0, value["usages"].as_array().unwrap().len());
+    assert_eq!(0, array_len(&value, "usages"));
     let not_found = value["not_found"].as_array().unwrap();
     assert_eq!(1, not_found.len());
     assert_eq!("does.not.Exist", not_found[0]);
-    assert_eq!(0, value["fallbacks"].as_array().unwrap().len());
-    assert_eq!(0, value["failures"].as_array().unwrap().len());
+    assert_eq!(0, array_len(&value, "fallbacks"));
+    assert_eq!(0, array_len(&value, "failures"));
 }
 
 #[test]
@@ -951,8 +962,8 @@ namespace Domain {
     assert_eq!("CSharpUsageGraphStrategy", fallbacks[0]["strategy"]);
     assert_eq!("unsafe_inference", fallbacks[0]["reason_kind"]);
     assert_eq!("regex", fallbacks[0]["fallback_policy"]);
-    assert_eq!(0, value["not_found"].as_array().unwrap().len());
-    assert_eq!(0, value["failures"].as_array().unwrap().len());
+    assert_eq!(0, array_len(&value, "not_found"));
+    assert_eq!(0, array_len(&value, "failures"));
 }
 
 #[test]
@@ -966,10 +977,10 @@ fn scan_usages_skips_blank_symbols_without_error() {
         .unwrap();
     let value: Value = serde_json::from_str(&payload).unwrap();
 
-    assert_eq!(0, value["usages"].as_array().unwrap().len());
-    assert_eq!(0, value["not_found"].as_array().unwrap().len());
-    assert_eq!(0, value["fallbacks"].as_array().unwrap().len());
-    assert_eq!(0, value["failures"].as_array().unwrap().len());
+    assert_eq!(0, array_len(&value, "usages"));
+    assert_eq!(0, array_len(&value, "not_found"));
+    assert_eq!(0, array_len(&value, "fallbacks"));
+    assert_eq!(0, array_len(&value, "failures"));
 }
 
 #[test]
@@ -1043,6 +1054,86 @@ fn scan_usages_excludes_test_files_when_include_tests_is_false() {
 }
 
 #[test]
+fn scan_usages_paths_filter_limits_candidate_files() {
+    let temp = TempDir::new().unwrap();
+    fs::create_dir_all(temp.path().join("nested")).unwrap();
+    fs::write(
+        temp.path().join("Greeter.java"),
+        "public class Greeter {\n    public String hello() { return \"hi\"; }\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("ProdCaller.java"),
+        "public class ProdCaller {\n    public String run() { return new Greeter().hello(); }\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("nested").join("NestedCaller.java"),
+        "public class NestedCaller {\n    public String run() { return new Greeter().hello(); }\n}\n",
+    )
+    .unwrap();
+
+    let service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "scan_usages",
+            r#"{"symbols":["Greeter.hello"],"include_tests":true,"paths":["nested/*.java"]}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    let files = value["usages"][0]["files"].as_array().unwrap();
+    let paths: Vec<&str> = files
+        .iter()
+        .map(|file| file["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(vec!["nested/NestedCaller.java"], paths, "payload: {value}");
+}
+
+#[test]
+fn scan_usages_demotes_large_result_to_summary_within_budget() {
+    let temp = TempDir::new().unwrap();
+    fs::write(
+        temp.path().join("Target.java"),
+        "public class Target {\n    public void hit() {}\n}\n",
+    )
+    .unwrap();
+    for idx in 0..150 {
+        fs::write(
+            temp.path().join(format!("Caller{idx}.java")),
+            format!(
+                "public class Caller{idx} {{\n    public void run() {{ new Target().hit(); }}\n}}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    let service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "scan_usages",
+            r#"{"symbols":["Target.hit"],"include_tests":true}"#,
+        )
+        .unwrap();
+    assert!(
+        payload.len() <= 24_000,
+        "payload should stay within scan_usages budget, got {} bytes",
+        payload.len()
+    );
+
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let usage = &value["usages"][0];
+    assert_eq!("summary", usage["rendering"]);
+    assert_eq!(150, usage["total_hits"].as_u64().unwrap());
+    assert!(
+        usage["top_enclosing"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+        "payload: {value}"
+    );
+}
+
+#[test]
 fn scan_usages_resolved_symbol_with_no_hits_is_emitted_with_zero_total() {
     // method7 lives on A.AInner.AInnerInner and has no callers in the fixture.
     let service = SearchToolsService::new_for_python(fixture_root()).unwrap();
@@ -1058,10 +1149,10 @@ fn scan_usages_resolved_symbol_with_no_hits_is_emitted_with_zero_total() {
     assert_eq!(1, usages.len(), "payload: {value}");
     assert_eq!("A.AInner.AInnerInner.method7", usages[0]["symbol"]);
     assert_eq!(0, usages[0]["total_hits"].as_u64().unwrap());
-    assert_eq!(0, usages[0]["files"].as_array().unwrap().len());
-    assert_eq!(0, value["not_found"].as_array().unwrap().len());
-    assert_eq!(0, value["fallbacks"].as_array().unwrap().len());
-    assert_eq!(0, value["failures"].as_array().unwrap().len());
+    assert_eq!(0, array_len(&usages[0], "files"));
+    assert_eq!(0, array_len(&value, "not_found"));
+    assert_eq!(0, array_len(&value, "fallbacks"));
+    assert_eq!(0, array_len(&value, "failures"));
 }
 
 #[test]
