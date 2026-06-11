@@ -20,6 +20,7 @@ from .models import (
     SymbolAncestorsResult,
     SymbolLocationsResult,
     SymbolSourcesResult,
+    UsageGraphResult,
 )
 
 
@@ -219,6 +220,33 @@ class SearchToolsClient:
         return MostRelevantFilesResult.from_dict(
             payload.structured,
             render_line_numbers=self._render_line_numbers,
+            rendered_text=payload.rendered_text,
+        )
+
+    def usage_graph(
+        self,
+        *,
+        include_tests: bool = False,
+        paths: list[str] | None = None,
+    ) -> UsageGraphResult:
+        """Build the whole-workspace caller -> callee reference graph.
+
+        Returns classes and functions as nodes and resolved references as
+        weighted edges, ready to feed into a graph library for ranking (e.g.
+        PageRank for a code map). This is the bulk counterpart to a per-symbol
+        ``scan_usages``; expect to cache the result and rebuild on change.
+
+        Args:
+            include_tests: Include references that live in detected test files.
+            paths: Optional project-relative paths or globs bounding the search.
+                Omit to graph the whole workspace.
+        """
+        arguments: dict[str, Any] = {"include_tests": include_tests}
+        if paths is not None:
+            arguments["paths"] = paths
+        payload = self._call_tool_payload("usage_graph", arguments)
+        return UsageGraphResult.from_dict(
+            payload.structured,
             rendered_text=payload.rendered_text,
         )
 

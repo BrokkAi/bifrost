@@ -53,6 +53,42 @@ class SearchToolsClientTest(unittest.TestCase):
         self.assertNotIn("8..10:", text_without_lines)
         self.assertNotIn("41..43:", text_without_lines)
 
+    def test_usage_graph_builds_resolved_reference_graph(self) -> None:
+        python_fixture = ROOT / "tests" / "fixtures" / "usage-graph-python"
+        with SearchToolsClient(root=python_fixture) as client:
+            graph = client.usage_graph()
+
+        node_fqns = {node.fqn for node in graph.nodes}
+        self.assertTrue(any(fqn.endswith("helper") for fqn in node_fqns), node_fqns)
+        self.assertTrue(any(fqn.endswith("run") for fqn in node_fqns), node_fqns)
+        self.assertTrue(any(fqn.endswith("unused") for fqn in node_fqns), node_fqns)
+        for node in graph.nodes:
+            self.assertIn(node.kind, {"function", "class"})
+
+        def edge(from_suffix: str, to_suffix: str):
+            return next(
+                (
+                    candidate
+                    for candidate in graph.edges
+                    if candidate.from_fqn.endswith(from_suffix)
+                    and candidate.to_fqn.endswith(to_suffix)
+                ),
+                None,
+            )
+
+        # Edges are resolved caller -> callee references, weighted by call site.
+        run_edge = edge("run", "helper")
+        self.assertIsNotNone(run_edge, graph.edges)
+        self.assertEqual(run_edge.weight, 1)
+
+        # Two calls on separate lines aggregate into one weight-2 edge.
+        twice_edge = edge("run_twice", "helper")
+        self.assertIsNotNone(twice_edge, graph.edges)
+        self.assertEqual(twice_edge.weight, 2)
+
+        # `a.unused` is never called, so nothing points to it.
+        self.assertFalse(any(e.to_fqn.endswith("unused") for e in graph.edges))
+
     def test_symbol_sources_use_original_file_line_numbers(self) -> None:
         with SearchToolsClient(root=self.fixture_root) as client:
             sources = client.get_symbol_sources(
