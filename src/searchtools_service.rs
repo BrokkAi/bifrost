@@ -169,6 +169,15 @@ struct WorkspaceSession {
     semantic: Option<Arc<SemanticIndexer>>,
 }
 
+impl WorkspaceSession {
+    fn close_semantic(&self) {
+        #[cfg(feature = "nlp")]
+        if let Some(semantic) = &self.semantic {
+            semantic.close();
+        }
+    }
+}
+
 /// Semantic indexing is on by default in nlp builds; `BIFROST_SEMANTIC_INDEX=off`
 /// disables it (useful for tooling that never calls semantic_search).
 fn semantic_indexing_enabled() -> bool {
@@ -272,11 +281,8 @@ impl SearchToolsService {
             _ => {}
         }
 
-        match name {
-            "semantic_search" => {
-                return self.handle_semantic_search(arguments, render_options);
-            }
-            _ => {}
+        if name == "semantic_search" {
+            return self.handle_semantic_search(arguments, render_options);
         }
 
         let snapshot = self.snapshot_for_query()?;
@@ -470,7 +476,11 @@ impl SearchToolsService {
 
     pub fn close(&self) -> Result<(), SearchToolsServiceError> {
         let mut guard = self.write_session()?;
-        *guard = None;
+        let session = guard.take();
+        drop(guard);
+        if let Some(session) = session {
+            session.close_semantic();
+        }
         Ok(())
     }
 
@@ -534,12 +544,17 @@ impl SearchToolsService {
         let new_snapshot = Arc::new(new_workspace);
         #[cfg(feature = "nlp")]
         let semantic = maybe_start_semantic(session.semantic.is_some(), &new_snapshot);
-        *session = WorkspaceSession {
-            snapshot: new_snapshot,
-            watcher: maybe_start_watcher(new_project, self.update_strategy),
-            #[cfg(feature = "nlp")]
-            semantic,
-        };
+        let old_session = std::mem::replace(
+            session,
+            WorkspaceSession {
+                snapshot: new_snapshot,
+                watcher: maybe_start_watcher(new_project, self.update_strategy),
+                #[cfg(feature = "nlp")]
+                semantic,
+            },
+        );
+        drop(guard);
+        old_session.close_semantic();
 
         active_workspace_result(&resolved)
     }
@@ -769,6 +784,17 @@ impl SearchToolsService {
     }
 }
 
+impl Drop for SearchToolsService {
+    fn drop(&mut self) {
+        let Ok(session) = self.session.get_mut() else {
+            return;
+        };
+        if let Some(session) = session.take() {
+            session.close_semantic();
+        }
+    }
+}
+
 fn strip_legacy_kind_filter(mut arguments: Value) -> Value {
     if let Some(object) = arguments.as_object_mut() {
         object.remove("kind_filter");
@@ -826,4 +852,46 @@ fn active_workspace_result(root: &Path) -> Result<ToolOutput, SearchToolsService
         structured,
         rendered_text: None,
     })
+}
+
+#[cfg(all(test, feature = "nlp"))]
+mod tests {
+    use super::*;
+    use crate::nlp::engine::FakeHashEmbedder;
+    use crate::nlp::indexer::FakeEngineProvider;
+    use std::time::Duration;
+
+    #[test]
+    fn service_close_closes_semantic_indexer() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Thing.java"),
+            "public class Thing { public String value() { return \"value\"; } }\n",
+        )
+        .unwrap();
+        let (_project, workspace) = build_workspace(dir.path().to_path_buf()).unwrap();
+        let snapshot = Arc::new(workspace);
+        let indexer = SemanticIndexer::start_with_provider(
+            dir.path().to_path_buf(),
+            snapshot.clone(),
+            FakeEngineProvider {
+                embedder: Arc::new(FakeHashEmbedder::new(16)),
+            },
+        );
+        let service = SearchToolsService {
+            session: RwLock::new(Some(WorkspaceSession {
+                snapshot,
+                watcher: None,
+                semantic: Some(indexer.clone()),
+            })),
+            update_strategy: UpdateStrategy::WatchFiles,
+        };
+
+        service.close().unwrap();
+
+        let err = indexer
+            .wait_ready(Duration::from_secs(30))
+            .expect_err("service close should close semantic indexer");
+        assert_eq!(err, "semantic index closed");
+    }
 }
