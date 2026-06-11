@@ -18,6 +18,8 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use rayon::prelude::*;
+
 use crate::analyzer::{ProjectFile, WorkspaceAnalyzer};
 use crate::path_utils::rel_path_string;
 
@@ -557,99 +559,121 @@ fn index_file_group(
         });
     }
 
-    // Embed component texts the store doesn't have yet.
-    check_cancelled(shared)?;
-    let all_component_keys: Vec<Key> = component_texts.iter().map(|(key, _)| *key).collect();
-    let missing: BTreeSet<Key> = store
-        .missing_component_keys(&all_component_keys)
-        .map_err(|err| BuildError::Failed(err.to_string()))?
-        .into_iter()
-        .collect();
-    let to_embed: Vec<&(Key, String)> = component_texts
-        .iter()
-        .filter(|(key, _)| missing.contains(key))
-        .collect();
-    if !to_embed.is_empty() {
-        check_cancelled(shared)?;
-        let texts: Vec<&str> = to_embed.iter().map(|(_, text)| text.as_str()).collect();
-        let vectors = embedder
-            .embed_passages(&texts)
-            .map_err(BuildError::Failed)?;
-        check_cancelled(shared)?;
-        let items: Vec<(Key, Vec<f32>)> =
-            to_embed.iter().map(|(key, _)| *key).zip(vectors).collect();
-        store
-            .upsert_component_vectors(&items)
-            .map_err(|err| BuildError::Failed(err.to_string()))?;
-    }
+    let (build_result, fts_per_file) = std::thread::scope(|scope| {
+        // BM25 tokenization is pure over chunk text, so hide it under the
+        // embed/store window while the main thread preserves the existing flow.
+        let fts_handle = scope.spawn(|| {
+            pending_files
+                .par_iter()
+                .map(|file| {
+                    file.chunks
+                        .iter()
+                        .map(|chunk| fts_text(&chunk.chunk.text))
+                        .collect()
+                })
+                .collect::<Vec<Vec<String>>>()
+        });
 
-    // Compose missing chunk vectors from their (now cached) components.
-    check_cancelled(shared)?;
-    let composed_keys: Vec<Key> = pending_files
-        .iter()
-        .flat_map(|file| file.chunks.iter().map(|chunk| chunk.composed))
-        .collect();
-    let missing_composed: BTreeSet<Key> = store
-        .missing_composed_keys(&composed_keys)
-        .map_err(|err| BuildError::Failed(err.to_string()))?
-        .into_iter()
-        .collect();
-    let mut needed_components: BTreeSet<Key> = BTreeSet::new();
-    for file in &pending_files {
-        for chunk in &file.chunks {
-            if missing_composed.contains(&chunk.composed) {
-                needed_components.insert(chunk.child_key);
-                if let Some(parent) = chunk.parent_key {
-                    needed_components.insert(parent);
+        let build_result = (|| -> BuildResult {
+            // Embed component texts the store doesn't have yet.
+            check_cancelled(shared)?;
+            let all_component_keys: Vec<Key> =
+                component_texts.iter().map(|(key, _)| *key).collect();
+            let missing: BTreeSet<Key> = store
+                .missing_component_keys(&all_component_keys)
+                .map_err(|err| BuildError::Failed(err.to_string()))?
+                .into_iter()
+                .collect();
+            let to_embed: Vec<&(Key, String)> = component_texts
+                .iter()
+                .filter(|(key, _)| missing.contains(key))
+                .collect();
+            if !to_embed.is_empty() {
+                check_cancelled(shared)?;
+                let texts: Vec<&str> = to_embed.iter().map(|(_, text)| text.as_str()).collect();
+                let vectors = embedder
+                    .embed_passages(&texts)
+                    .map_err(BuildError::Failed)?;
+                check_cancelled(shared)?;
+                let items: Vec<(Key, Vec<f32>)> =
+                    to_embed.iter().map(|(key, _)| *key).zip(vectors).collect();
+                store
+                    .upsert_component_vectors(&items)
+                    .map_err(|err| BuildError::Failed(err.to_string()))?;
+            }
+
+            // Compose missing chunk vectors from their (now cached) components.
+            check_cancelled(shared)?;
+            let composed_keys: Vec<Key> = pending_files
+                .iter()
+                .flat_map(|file| file.chunks.iter().map(|chunk| chunk.composed))
+                .collect();
+            let missing_composed: BTreeSet<Key> = store
+                .missing_composed_keys(&composed_keys)
+                .map_err(|err| BuildError::Failed(err.to_string()))?
+                .into_iter()
+                .collect();
+            let mut needed_components: BTreeSet<Key> = BTreeSet::new();
+            for file in &pending_files {
+                for chunk in &file.chunks {
+                    if missing_composed.contains(&chunk.composed) {
+                        needed_components.insert(chunk.child_key);
+                        if let Some(parent) = chunk.parent_key {
+                            needed_components.insert(parent);
+                        }
+                    }
                 }
             }
-        }
-    }
-    let component_vectors = store
-        .component_vectors(&needed_components.iter().copied().collect::<Vec<_>>())
-        .map_err(|err| BuildError::Failed(err.to_string()))?;
-    let mut composed_items: Vec<(Key, Vec<f32>)> = Vec::new();
-    let mut emitted: BTreeSet<Key> = BTreeSet::new();
-    for file in &pending_files {
-        check_cancelled(shared)?;
-        for chunk in &file.chunks {
-            if !missing_composed.contains(&chunk.composed) || !emitted.insert(chunk.composed) {
-                continue;
-            }
-            let Some(child) = component_vectors.get(&chunk.child_key) else {
-                return Err(BuildError::Failed(
-                    "component vector missing after embed".to_string(),
-                ));
-            };
-            let vector = match chunk.parent_key {
-                Some(parent_key) => {
-                    let Some(parent) = component_vectors.get(&parent_key) else {
+            let component_vectors = store
+                .component_vectors(&needed_components.iter().copied().collect::<Vec<_>>())
+                .map_err(|err| BuildError::Failed(err.to_string()))?;
+            let mut composed_items: Vec<(Key, Vec<f32>)> = Vec::new();
+            let mut emitted: BTreeSet<Key> = BTreeSet::new();
+            for file in &pending_files {
+                check_cancelled(shared)?;
+                for chunk in &file.chunks {
+                    if !missing_composed.contains(&chunk.composed)
+                        || !emitted.insert(chunk.composed)
+                    {
+                        continue;
+                    }
+                    let Some(child) = component_vectors.get(&chunk.child_key) else {
                         return Err(BuildError::Failed(
-                            "parent component vector missing after embed".to_string(),
+                            "component vector missing after embed".to_string(),
                         ));
                     };
-                    compose(child, parent)
+                    let vector = match chunk.parent_key {
+                        Some(parent_key) => {
+                            let Some(parent) = component_vectors.get(&parent_key) else {
+                                return Err(BuildError::Failed(
+                                    "parent component vector missing after embed".to_string(),
+                                ));
+                            };
+                            compose(child, parent)
+                        }
+                        None => child.clone(),
+                    };
+                    composed_items.push((chunk.composed, vector));
                 }
-                None => child.clone(),
-            };
-            composed_items.push((chunk.composed, vector));
-        }
-    }
-    if !composed_items.is_empty() {
-        check_cancelled(shared)?;
-        store
-            .upsert_composed_vectors(&composed_items)
-            .map_err(|err| BuildError::Failed(err.to_string()))?;
-    }
+            }
+            if !composed_items.is_empty() {
+                check_cancelled(shared)?;
+                store
+                    .upsert_composed_vectors(&composed_items)
+                    .map_err(|err| BuildError::Failed(err.to_string()))?;
+            }
+
+            Ok(())
+        })();
+
+        (build_result, fts_handle.join().unwrap())
+    });
+
+    build_result?;
 
     // Replace each file's chunk index rows (and bm25 docs for new texts).
-    for file in &pending_files {
+    for (file, fts) in pending_files.iter().zip(fts_per_file) {
         check_cancelled(shared)?;
-        let fts: Vec<String> = file
-            .chunks
-            .iter()
-            .map(|chunk| fts_text(&chunk.chunk.text))
-            .collect();
         let rows: Vec<ChunkRowIn> = file
             .chunks
             .iter()
