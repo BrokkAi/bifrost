@@ -562,3 +562,108 @@ class MostRelevantFilesResult:
         if self.duplicates:
             lines.append(f"Duplicate seeds: {', '.join(self.duplicates)}")
         return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class UsageGraphNode:
+    """A class or function definition in the workspace usage graph.
+
+    ``fqn`` is the node identity and matches the fully qualified names returned
+    by ``search_symbols``.
+    """
+
+    fqn: str
+    path: str
+    start_line: int
+    kind: str
+    signature: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict) -> UsageGraphNode:
+        return cls(
+            fqn=data["fqn"],
+            path=data["path"],
+            start_line=data["start_line"],
+            kind=data["kind"],
+            signature=data.get("signature"),
+        )
+
+
+@dataclass(frozen=True)
+class UsageGraphEdge:
+    """A weighted caller -> callee reference edge.
+
+    ``from_fqn`` is the enclosing definition of the reference and ``to_fqn`` is
+    the symbol being referenced; ``weight`` is the number of distinct
+    ``(file, line, caller)`` reference sites (two references to the same callee
+    on one line count once). (The JSON keys are ``from``/``to``, renamed here
+    because ``from`` is a Python keyword.)
+    """
+
+    from_fqn: str
+    to_fqn: str
+    weight: int
+
+    @classmethod
+    def from_dict(cls, data: dict) -> UsageGraphEdge:
+        return cls(
+            from_fqn=data["from"],
+            to_fqn=data["to"],
+            weight=data["weight"],
+        )
+
+
+@dataclass(frozen=True)
+class UsageGraphTruncatedSymbol:
+    """A symbol whose call sites exceeded the analyzer's enumeration guardrail.
+
+    It still appears in ``nodes``; only its inbound edges are omitted.
+    """
+
+    fqn: str
+    total_callsites: int
+    limit: int
+
+    @classmethod
+    def from_dict(cls, data: dict) -> UsageGraphTruncatedSymbol:
+        return cls(
+            fqn=data["fqn"],
+            total_callsites=data["total_callsites"],
+            limit=data["limit"],
+        )
+
+
+@dataclass(frozen=True)
+class UsageGraphResult:
+    """The whole-workspace resolved usage graph.
+
+    Feed ``nodes`` and ``edges`` straight into a graph library (e.g. build a
+    ``networkx.DiGraph`` and run ``pagerank``) to rank symbols for a code map.
+    """
+
+    nodes: list[UsageGraphNode]
+    edges: list[UsageGraphEdge]
+    truncated_symbols: list[UsageGraphTruncatedSymbol]
+    rendered_text: str | None = None
+
+    @classmethod
+    def from_dict(
+        cls, data: dict, rendered_text: str | None = None
+    ) -> UsageGraphResult:
+        return cls(
+            nodes=[UsageGraphNode.from_dict(item) for item in data.get("nodes", [])],
+            edges=[UsageGraphEdge.from_dict(item) for item in data.get("edges", [])],
+            truncated_symbols=[
+                UsageGraphTruncatedSymbol.from_dict(item)
+                for item in data.get("truncated_symbols", [])
+            ],
+            rendered_text=rendered_text,
+        )
+
+    def render_text(self) -> str:
+        if self.rendered_text is not None:
+            return self.rendered_text
+        summary = f"{len(self.nodes)} nodes, {len(self.edges)} edges"
+        if self.truncated_symbols:
+            summary += f", {len(self.truncated_symbols)} truncated"
+        return summary

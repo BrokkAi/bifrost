@@ -89,6 +89,25 @@ pub(crate) fn symbol_tool_descriptors() -> Vec<Value> {
                 "required": ["symbols"]
             }),
         ),
+        tool_descriptor(
+            "usage_graph",
+            "Return the whole-workspace caller->callee reference graph in one call: classes and functions as nodes, resolved references as weighted edges. Use to build a code map or rank symbols by importance (e.g. PageRank) instead of issuing one scan_usages call per symbol. Edges reuse scan_usages resolution; symbols whose call sites exceed the enumeration guardrail are listed under truncated_symbols with their inbound edges omitted.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "include_tests": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Include references that live in detected test files."
+                    },
+                    "paths": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional project-relative file paths or glob patterns used to narrow where references are searched. Omit to graph the whole workspace."
+                    }
+                }
+            }),
+        ),
     ]
 }
 
