@@ -24,8 +24,8 @@ use crate::path_utils::rel_path_string;
 use super::bm25::fts_text;
 use super::chunker::{ChunkText, extract_file_chunks};
 use super::engine::{
-    Embedder, FakeHashEmbedder, FakeOverlapReranker, GteEmbedder, GteReranker, Reranker,
-    resolve_embed_model, resolve_rerank_model,
+    Embedder, FakeHashEmbedder, FakeOverlapReranker, Reranker, load_production_embedder,
+    load_production_reranker, resolve_embed_model, resolve_rerank_model,
 };
 use super::keys::{Key, component_key, compose, composed_key, content_hash};
 use super::store::{ChunkRowIn, FileState, SemanticStore, semantic_db_path};
@@ -53,12 +53,12 @@ pub struct DefaultEngineProvider;
 impl EngineProvider for DefaultEngineProvider {
     fn embedder(&self) -> Result<Arc<dyn Embedder>, String> {
         let resolved = resolve_embed_model()?;
-        Ok(Arc::new(GteEmbedder::load(&resolved)?))
+        load_production_embedder(&resolved)
     }
 
     fn reranker(&self) -> Result<Arc<dyn Reranker>, String> {
         let resolved = resolve_rerank_model()?;
-        Ok(Arc::new(GteReranker::load(&resolved)?))
+        load_production_reranker(&resolved)
     }
 }
 

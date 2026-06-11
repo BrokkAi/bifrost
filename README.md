@@ -130,14 +130,18 @@ The subset toolsets are now composable rather than fixed server modes. `core` is
 
 The index lives in `.brokk/semantic_index.db` of the **primary** repository (linked git worktrees share the primary's index). Vectors and BM25 rows are keyed by content hash, so switching branches re-points rows instead of re-embedding. A background build starts when the workspace is activated; `semantic_search` blocks until the index is ready, and the file watcher keeps it updated incrementally.
 
-Models load via ONNX (`gte-rs`). Defaults are downloaded from the HuggingFace hub on first use: `onnx-community/granite-embedding-small-english-r2-ONNX` for embeddings and `Alibaba-NLP/gte-reranker-modernbert-base` for reranking (full-precision variants when a CUDA GPU is available via the `nlp-gpu` cargo feature, int8 variants on CPU). Environment overrides:
+Models load via ONNX (`gte-rs`). Defaults are downloaded from the HuggingFace hub on first use: `onnx-community/granite-embedding-small-english-r2-ONNX` for embeddings and `Alibaba-NLP/gte-reranker-modernbert-base` for reranking (full-precision variants when CUDA/CoreML acceleration is selected, int8 variants on CPU). Environment overrides:
 
 - `BIFROST_SEMANTIC_INDEX=off` disables background indexing (semantic_search then reports itself unavailable)
 - `BIFROST_EMBED_MODEL_DIR` / `BIFROST_RERANK_MODEL_DIR`: local directory containing `tokenizer.json` + `model.onnx` (e.g. a fine-tune); takes precedence over the hub
 - `BIFROST_EMBED_MODEL_ID` / `BIFROST_RERANK_MODEL_ID`: alternate HuggingFace repo ids
-- `BIFROST_CUDA_DEVICE`: CUDA device id for the `nlp-gpu` feature (default 0)
+- `BIFROST_ACCELERATOR=auto|cpu|cuda|coreml`: execution provider preference (default `auto`)
+- `BIFROST_CUDA_DEVICES=auto|0,1,...`: CUDA device ids for embedding workers when built with `nlp-gpu`; ids are logical ids after `CUDA_VISIBLE_DEVICES` masking/remapping
+- `BIFROST_CUDA_DEVICE`: legacy single CUDA device id for `nlp-gpu` when `BIFROST_CUDA_DEVICES` is unset (default 0)
+- `BIFROST_COREML_ANE_ONLY=1`: only enable CoreML on devices with a compatible Apple Neural Engine when built with `nlp-coreml`
+- `BIFROST_EMBED_BATCH_MAX_ITEMS` / `BIFROST_EMBED_BATCH_MAX_TOKENS`: cap scheduler batches by item count and total tokens so similarly sized chunks are embedded together
 
-The `nlp` cargo feature is on by default; build with `--no-default-features` on targets where onnxruntime is unavailable (the `nlp` toolset then publishes no tools and `core` degrades to `symbol|workspace`).
+The `nlp` cargo feature is on by default; build with `--no-default-features` on targets where onnxruntime is unavailable (the `nlp` toolset then publishes no tools and `core` degrades to `symbol|workspace`). Add `--features nlp-gpu` for CUDA or `--features nlp-coreml` for Apple CoreML acceleration.
 
 `refresh` forces a full rebuild of the code index. Normal tool calls already apply watcher-detected file changes automatically, so most hosts should not call it during routine operation. Keep it as a manual recovery tool when you want to discard incremental state and rescan the whole workspace from disk.
 

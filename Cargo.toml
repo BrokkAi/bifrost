@@ -82,6 +82,8 @@ default = ["nlp"]
 nlp = ["dep:gte-rs", "dep:hf-hub", "dep:orp", "dep:ort", "dep:ort-sys", "dep:tokenizers"]
 # Adds the CUDA execution provider; falls back to CPU at runtime if unavailable.
 nlp-gpu = ["nlp", "ort/cuda"]
+# Adds the CoreML execution provider for Apple platforms; falls back to CPU at runtime if unavailable.
+nlp-coreml = ["nlp", "ort/coreml", "orp/coreml"]
 # Enables the pyo3-backed Python extension module (`bifrost_searchtools._native`).
 # Maturin turns this on automatically via pyproject.toml; the `bifrost` CLI
 # binary builds without it on every platform.

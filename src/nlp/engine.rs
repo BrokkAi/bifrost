@@ -5,8 +5,11 @@
 //! back the model-free tests. Model files resolve from env-pointed local
 //! directories first (fine-tune escape hatch), then the HF hub cache.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use sha2::{Digest, Sha256};
 
@@ -19,6 +22,14 @@ const EMBED_BATCH: usize = 16;
 
 /// Query/document pairs scored per ONNX call.
 const RERANK_BATCH: usize = 8;
+
+const ACCELERATOR_ENV: &str = "BIFROST_ACCELERATOR";
+const CUDA_DEVICES_ENV: &str = "BIFROST_CUDA_DEVICES";
+const CUDA_VISIBLE_DEVICES_ENV: &str = "CUDA_VISIBLE_DEVICES";
+#[cfg(feature = "nlp-coreml")]
+const COREML_ANE_ONLY_ENV: &str = "BIFROST_COREML_ANE_ONLY";
+const EMBED_BATCH_MAX_ITEMS_ENV: &str = "BIFROST_EMBED_BATCH_MAX_ITEMS";
+const EMBED_BATCH_MAX_TOKENS_ENV: &str = "BIFROST_EMBED_BATCH_MAX_TOKENS";
 
 pub trait Embedder: Send + Sync {
     fn dim(&self) -> usize;
@@ -76,7 +87,65 @@ pub const EMBED_MODEL_ID_ENV: &str = "BIFROST_EMBED_MODEL_ID";
 pub const RERANK_MODEL_ID_ENV: &str = "BIFROST_RERANK_MODEL_ID";
 pub const CUDA_DEVICE_ENV: &str = "BIFROST_CUDA_DEVICE";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceleratorPreference {
+    Auto,
+    Cpu,
+    Cuda,
+    CoreMl,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeTarget {
+    Cpu,
+    Cuda { device_id: i32 },
+    CoreMl,
+}
+
+impl RuntimeTarget {
+    fn label(self) -> String {
+        match self {
+            RuntimeTarget::Cpu => "cpu".to_string(),
+            RuntimeTarget::Cuda { device_id } => format!("cuda:{device_id}"),
+            RuntimeTarget::CoreMl => "coreml".to_string(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct EmbedJob {
+    original_index: usize,
+    text: String,
+    token_count: usize,
+}
+
+#[derive(Clone)]
+struct EmbedBatch {
+    jobs: Vec<EmbedJob>,
+    token_total: usize,
+}
+
+impl EmbedBatch {
+    fn new(job: EmbedJob) -> Self {
+        Self {
+            token_total: job.token_count,
+            jobs: vec![job],
+        }
+    }
+
+    fn can_accept(&self, job: &EmbedJob, max_items: usize, max_tokens: usize) -> bool {
+        self.jobs.len() < max_items
+            && self.token_total.saturating_add(job.token_count) <= max_tokens
+    }
+
+    fn push(&mut self, job: EmbedJob) {
+        self.token_total = self.token_total.saturating_add(job.token_count);
+        self.jobs.push(job);
+    }
+}
+
 /// Locally resolved model files ready to load.
+#[derive(Clone)]
 pub struct ResolvedModel {
     pub tokenizer: PathBuf,
     pub model: PathBuf,
@@ -87,6 +156,10 @@ pub struct ResolvedModel {
 /// True when the CUDA execution provider can actually run. Always false
 /// without the `nlp-gpu` feature (the CPU onnxruntime binary has no CUDA EP).
 pub fn gpu_available() -> bool {
+    cuda_available()
+}
+
+fn cuda_available() -> bool {
     #[cfg(feature = "nlp-gpu")]
     {
         use ort::execution_providers::{CUDAExecutionProvider, ExecutionProvider};
@@ -100,23 +173,202 @@ pub fn gpu_available() -> bool {
     }
 }
 
-fn runtime_params() -> orp::params::RuntimeParameters {
+fn coreml_available() -> bool {
+    #[cfg(feature = "nlp-coreml")]
+    {
+        use ort::execution_providers::{CoreMLExecutionProvider, ExecutionProvider};
+        CoreMLExecutionProvider::default()
+            .is_available()
+            .unwrap_or(false)
+    }
+    #[cfg(not(feature = "nlp-coreml"))]
+    {
+        false
+    }
+}
+
+fn parse_accelerator_preference() -> Result<AcceleratorPreference, String> {
+    match std::env::var(ACCELERATOR_ENV)
+        .unwrap_or_else(|_| "auto".to_string())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "auto" => Ok(AcceleratorPreference::Auto),
+        "cpu" => Ok(AcceleratorPreference::Cpu),
+        "cuda" => Ok(AcceleratorPreference::Cuda),
+        "coreml" | "core-ml" => Ok(AcceleratorPreference::CoreMl),
+        other => Err(format!(
+            "{ACCELERATOR_ENV} must be one of auto, cpu, cuda, coreml; got {other}"
+        )),
+    }
+}
+
+#[cfg(feature = "nlp-coreml")]
+fn parse_bool_env(name: &str) -> bool {
+    matches!(
+        std::env::var(name).as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES") | Ok("on") | Ok("ON")
+    )
+}
+
+fn parse_usize_env(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn parse_cuda_devices(
+    cuda_devices: Option<&str>,
+    cuda_visible_devices: Option<&str>,
+    legacy_device: Option<&str>,
+) -> Result<Vec<i32>, String> {
+    let mut explicit_auto = false;
+    if let Some(devices) = cuda_devices {
+        let trimmed = devices.trim();
+        if !trimmed.eq_ignore_ascii_case("auto") {
+            let mut parsed = Vec::new();
+            for raw in trimmed.split(',') {
+                let device = raw.trim();
+                if device.is_empty() {
+                    continue;
+                }
+                parsed.push(device.parse::<i32>().map_err(|err| {
+                    format!("invalid {CUDA_DEVICES_ENV} entry `{device}`: {err}")
+                })?);
+            }
+            if parsed.is_empty() {
+                return Err(format!("{CUDA_DEVICES_ENV} did not contain any device ids"));
+            }
+            return Ok(parsed);
+        }
+        explicit_auto = true;
+    }
+
+    if !explicit_auto && let Some(legacy) = legacy_device {
+        let trimmed = legacy.trim();
+        if !trimmed.is_empty() {
+            return Ok(vec![trimmed.parse::<i32>().map_err(|err| {
+                format!("invalid {CUDA_DEVICE_ENV} value `{trimmed}`: {err}")
+            })?]);
+        }
+    }
+
+    if let Some(visible) = cuda_visible_devices {
+        let trimmed = visible.trim();
+        if !trimmed.is_empty() && trimmed != "-1" {
+            let count = trimmed
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .count();
+            if count > 0 {
+                return Ok((0..count as i32).collect());
+            }
+        }
+    }
+
+    Ok(vec![0])
+}
+
+fn selected_embedding_targets() -> Result<Vec<RuntimeTarget>, String> {
+    match parse_accelerator_preference()? {
+        AcceleratorPreference::Cpu => Ok(vec![RuntimeTarget::Cpu]),
+        AcceleratorPreference::Cuda => {
+            if !cuda_available() {
+                return Err("CUDA execution provider is not available".to_string());
+            }
+            parse_cuda_devices(
+                std::env::var(CUDA_DEVICES_ENV).ok().as_deref(),
+                std::env::var(CUDA_VISIBLE_DEVICES_ENV).ok().as_deref(),
+                std::env::var(CUDA_DEVICE_ENV).ok().as_deref(),
+            )
+            .map(|devices| {
+                devices
+                    .into_iter()
+                    .map(|device_id| RuntimeTarget::Cuda { device_id })
+                    .collect()
+            })
+        }
+        AcceleratorPreference::CoreMl => {
+            if !coreml_available() {
+                return Err("CoreML execution provider is not available".to_string());
+            }
+            Ok(vec![RuntimeTarget::CoreMl])
+        }
+        AcceleratorPreference::Auto => {
+            if cuda_available() {
+                return parse_cuda_devices(
+                    std::env::var(CUDA_DEVICES_ENV).ok().as_deref(),
+                    std::env::var(CUDA_VISIBLE_DEVICES_ENV).ok().as_deref(),
+                    std::env::var(CUDA_DEVICE_ENV).ok().as_deref(),
+                )
+                .map(|devices| {
+                    devices
+                        .into_iter()
+                        .map(|device_id| RuntimeTarget::Cuda { device_id })
+                        .collect()
+                });
+            }
+            if coreml_available() {
+                return Ok(vec![RuntimeTarget::CoreMl]);
+            }
+            Ok(vec![RuntimeTarget::Cpu])
+        }
+    }
+}
+
+fn selected_query_target() -> Result<RuntimeTarget, String> {
+    Ok(selected_embedding_targets()?
+        .into_iter()
+        .next()
+        .unwrap_or(RuntimeTarget::Cpu))
+}
+
+fn has_accelerated_target() -> bool {
+    selected_query_target()
+        .map(|target| !matches!(target, RuntimeTarget::Cpu))
+        .unwrap_or(false)
+}
+
+fn runtime_params_for(target: RuntimeTarget) -> orp::params::RuntimeParameters {
     let threads = std::thread::available_parallelism()
         .map(|n| n.get().min(8))
         .unwrap_or(4);
     let params = orp::params::RuntimeParameters::default().with_threads(threads);
-    #[cfg(feature = "nlp-gpu")]
-    if gpu_available() {
-        use ort::execution_providers::CUDAExecutionProvider;
-        let device = std::env::var(CUDA_DEVICE_ENV)
-            .ok()
-            .and_then(|v| v.parse::<i32>().ok())
-            .unwrap_or(0);
-        return params.with_execution_providers([CUDAExecutionProvider::default()
-            .with_device_id(device)
-            .build()]);
+    match target {
+        RuntimeTarget::Cpu => params,
+        RuntimeTarget::Cuda { device_id } => {
+            #[cfg(feature = "nlp-gpu")]
+            {
+                use ort::execution_providers::CUDAExecutionProvider;
+                params.with_execution_providers([CUDAExecutionProvider::default()
+                    .with_device_id(device_id)
+                    .build()])
+            }
+            #[cfg(not(feature = "nlp-gpu"))]
+            {
+                let _ = device_id;
+                params
+            }
+        }
+        RuntimeTarget::CoreMl => {
+            #[cfg(feature = "nlp-coreml")]
+            {
+                use ort::execution_providers::CoreMLExecutionProvider;
+                let mut provider = CoreMLExecutionProvider::default();
+                if parse_bool_env(COREML_ANE_ONLY_ENV) {
+                    provider = provider.with_ane_only();
+                }
+                params.with_execution_providers([provider.build()])
+            }
+            #[cfg(not(feature = "nlp-coreml"))]
+            {
+                params
+            }
+        }
     }
-    params
 }
 
 /// Resolve a model from a local directory containing `tokenizer.json` and
@@ -167,9 +419,9 @@ pub fn resolve_embed_model() -> Result<ResolvedModel, String> {
     }
     let repo_id =
         std::env::var(EMBED_MODEL_ID_ENV).unwrap_or_else(|_| DEFAULT_EMBED_MODEL_ID.to_string());
-    if gpu_available() {
+    if has_accelerated_target() {
         // gte-rs 0.9.1 extracts output tensors as f32, so fp16 exports are
-        // not usable; full precision is fine on GPU.
+        // not usable; full precision is fine on accelerators.
         resolve_hf(&repo_id, "onnx/model.onnx")
     } else {
         resolve_hf(&repo_id, "onnx/model_quantized.onnx")
@@ -182,11 +434,32 @@ pub fn resolve_rerank_model() -> Result<ResolvedModel, String> {
     }
     let repo_id =
         std::env::var(RERANK_MODEL_ID_ENV).unwrap_or_else(|_| DEFAULT_RERANK_MODEL_ID.to_string());
-    if gpu_available() {
+    if has_accelerated_target() {
         resolve_hf(&repo_id, "onnx/model.onnx")
     } else {
         resolve_hf(&repo_id, "onnx/model_int8.onnx")
     }
+}
+
+pub fn load_production_embedder(resolved: &ResolvedModel) -> Result<Arc<dyn Embedder>, String> {
+    let targets = selected_embedding_targets()?;
+    if targets.len() == 1 && matches!(targets[0], RuntimeTarget::Cpu) {
+        return Ok(Arc::new(GteEmbedder::load_for_target(
+            resolved, targets[0],
+        )?));
+    }
+
+    let mut workers = Vec::with_capacity(targets.len());
+    for target in targets {
+        workers
+            .push(Arc::new(GteEmbedder::load_for_target(resolved, target)?) as Arc<dyn Embedder>);
+    }
+    Ok(Arc::new(ScheduledEmbedder::new(workers)))
+}
+
+pub fn load_production_reranker(resolved: &ResolvedModel) -> Result<Arc<dyn Reranker>, String> {
+    let target = selected_query_target()?;
+    Ok(Arc::new(GteReranker::load_for_target(resolved, target)?))
 }
 
 // ---------------------------------------------------------------------------
@@ -204,12 +477,22 @@ pub struct GteEmbedder {
 
 impl GteEmbedder {
     pub fn load(resolved: &ResolvedModel) -> Result<Self, String> {
+        Self::load_for_target(resolved, selected_query_target()?)
+    }
+
+    fn load_for_target(resolved: &ResolvedModel, target: RuntimeTarget) -> Result<Self, String> {
         let params = gte::params::Parameters::default().with_max_length(Some(MAX_SEQ_TOKENS));
         let pipeline =
             gte::embed::pipeline::TextEmbeddingPipeline::new(&resolved.tokenizer, &params)
                 .map_err(|err| format!("embedding pipeline init failed: {err}"))?;
-        let model = orp::model::Model::new(&resolved.model, runtime_params())
-            .map_err(|err| format!("embedding model load failed ({}): {err}", resolved.label))?;
+        let model =
+            orp::model::Model::new(&resolved.model, runtime_params_for(target)).map_err(|err| {
+                format!(
+                    "embedding model load failed ({} on {}): {err}",
+                    resolved.label,
+                    target.label()
+                )
+            })?;
         let token_counter = tokenizers::Tokenizer::from_file(&resolved.tokenizer)
             .map_err(|err| format!("tokenizer load failed: {err}"))?;
         let mut embedder = Self {
@@ -252,6 +535,161 @@ impl GteEmbedder {
     }
 }
 
+struct ScheduledEmbedder {
+    workers: Vec<Arc<dyn Embedder>>,
+    max_items: usize,
+    max_tokens: usize,
+}
+
+impl ScheduledEmbedder {
+    fn new(workers: Vec<Arc<dyn Embedder>>) -> Self {
+        Self::with_limits(
+            workers,
+            parse_usize_env(EMBED_BATCH_MAX_ITEMS_ENV, EMBED_BATCH),
+            parse_usize_env(EMBED_BATCH_MAX_TOKENS_ENV, EMBED_BATCH * MAX_SEQ_TOKENS),
+        )
+    }
+
+    fn with_limits(workers: Vec<Arc<dyn Embedder>>, max_items: usize, max_tokens: usize) -> Self {
+        Self {
+            workers,
+            max_items,
+            max_tokens,
+        }
+    }
+
+    fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let jobs: Vec<EmbedJob> = texts
+            .iter()
+            .enumerate()
+            .map(|(index, text)| EmbedJob {
+                original_index: index,
+                text: text.clone(),
+                token_count: self.count_tokens(text),
+            })
+            .collect();
+        let batches = pack_embed_jobs(jobs, self.max_items, self.max_tokens);
+        let queue = Arc::new(Mutex::new(VecDeque::from(batches)));
+        let results = Arc::new(Mutex::new(vec![None; texts.len()]));
+        let error = Arc::new(Mutex::new(None::<String>));
+
+        thread::scope(|scope| {
+            for worker in &self.workers {
+                let queue = Arc::clone(&queue);
+                let results = Arc::clone(&results);
+                let error = Arc::clone(&error);
+                scope.spawn(move || {
+                    loop {
+                        if error
+                            .lock()
+                            .expect("scheduler error mutex poisoned")
+                            .is_some()
+                        {
+                            return;
+                        }
+                        let Some(batch) = queue
+                            .lock()
+                            .expect("scheduler queue mutex poisoned")
+                            .pop_front()
+                        else {
+                            return;
+                        };
+                        let batch_texts: Vec<&str> =
+                            batch.jobs.iter().map(|job| job.text.as_str()).collect();
+                        let vectors = match worker.embed_passages(&batch_texts) {
+                            Ok(vectors) => vectors,
+                            Err(err) => {
+                                *error.lock().expect("scheduler error mutex poisoned") = Some(err);
+                                return;
+                            }
+                        };
+                        if vectors.len() != batch.jobs.len() {
+                            *error.lock().expect("scheduler error mutex poisoned") = Some(format!(
+                                "embedding worker returned {} vectors for {} texts",
+                                vectors.len(),
+                                batch.jobs.len()
+                            ));
+                            return;
+                        }
+                        let mut results = results.lock().expect("scheduler results mutex poisoned");
+                        for (job, vector) in batch.jobs.iter().zip(vectors) {
+                            results[job.original_index] = Some(vector);
+                        }
+                    }
+                });
+            }
+        });
+
+        if let Some(err) = error.lock().expect("scheduler error mutex poisoned").take() {
+            return Err(err);
+        }
+        let results = Arc::try_unwrap(results)
+            .map_err(|_| "embedding scheduler results still shared".to_string())?
+            .into_inner()
+            .map_err(|_| "embedding scheduler results mutex poisoned".to_string())?;
+        results
+            .into_iter()
+            .map(|maybe_vector| {
+                maybe_vector.ok_or_else(|| "embedding scheduler missing vector".to_string())
+            })
+            .collect()
+    }
+}
+
+impl Embedder for ScheduledEmbedder {
+    fn dim(&self) -> usize {
+        self.workers[0].dim()
+    }
+
+    fn embed_passages(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, String> {
+        let owned: Vec<String> = texts.iter().map(|text| (*text).to_string()).collect();
+        self.embed_texts(&owned)
+    }
+
+    fn embed_query(&self, text: &str) -> Result<Vec<f32>, String> {
+        self.workers[0].embed_query(text)
+    }
+
+    fn count_tokens(&self, text: &str) -> usize {
+        self.workers[0].count_tokens(text)
+    }
+
+    fn fingerprint(&self) -> String {
+        self.workers[0].fingerprint()
+    }
+}
+
+fn pack_embed_jobs(
+    mut jobs: Vec<EmbedJob>,
+    max_items: usize,
+    max_tokens: usize,
+) -> Vec<EmbedBatch> {
+    let max_items = max_items.max(1);
+    let max_tokens = max_tokens.max(1);
+    jobs.sort_by(|left, right| {
+        right
+            .token_count
+            .cmp(&left.token_count)
+            .then_with(|| left.original_index.cmp(&right.original_index))
+    });
+    let mut batches: Vec<EmbedBatch> = Vec::new();
+    for job in jobs {
+        let Some(batch) = batches
+            .iter_mut()
+            .find(|batch| batch.can_accept(&job, max_items, max_tokens))
+        else {
+            batches.push(EmbedBatch::new(job));
+            continue;
+        };
+        batch.push(job);
+    }
+    batches
+}
+
 impl Embedder for GteEmbedder {
     fn dim(&self) -> usize {
         self.dim
@@ -292,13 +730,23 @@ pub struct GteReranker {
 
 impl GteReranker {
     pub fn load(resolved: &ResolvedModel) -> Result<Self, String> {
+        Self::load_for_target(resolved, selected_query_target()?)
+    }
+
+    fn load_for_target(resolved: &ResolvedModel, target: RuntimeTarget) -> Result<Self, String> {
         let params = gte::params::Parameters::default()
             .with_max_length(Some(MAX_SEQ_TOKENS))
             .with_sigmoid(true);
         let pipeline = gte::rerank::pipeline::RerankingPipeline::new(&resolved.tokenizer, &params)
             .map_err(|err| format!("rerank pipeline init failed: {err}"))?;
-        let model = orp::model::Model::new(&resolved.model, runtime_params())
-            .map_err(|err| format!("rerank model load failed ({}): {err}", resolved.label))?;
+        let model =
+            orp::model::Model::new(&resolved.model, runtime_params_for(target)).map_err(|err| {
+                format!(
+                    "rerank model load failed ({} on {}): {err}",
+                    resolved.label,
+                    target.label()
+                )
+            })?;
         Ok(Self {
             model,
             pipeline,
@@ -425,6 +873,59 @@ impl Reranker for FakeOverlapReranker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    struct WorkerFakeEmbedder {
+        id: f32,
+        delay: Duration,
+        calls: AtomicUsize,
+        dim: usize,
+    }
+
+    impl WorkerFakeEmbedder {
+        fn new(id: f32, delay: Duration) -> Self {
+            Self {
+                id,
+                delay,
+                calls: AtomicUsize::new(0),
+                dim: 2,
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Embedder for WorkerFakeEmbedder {
+        fn dim(&self) -> usize {
+            self.dim
+        }
+
+        fn embed_passages(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if !self.delay.is_zero() {
+                std::thread::sleep(self.delay);
+            }
+            Ok(texts
+                .iter()
+                .map(|text| vec![self.id, text.parse::<f32>().unwrap_or(0.0)])
+                .collect())
+        }
+
+        fn embed_query(&self, text: &str) -> Result<Vec<f32>, String> {
+            Ok(vec![self.id, text.parse::<f32>().unwrap_or(0.0)])
+        }
+
+        fn count_tokens(&self, text: &str) -> usize {
+            text.parse::<usize>().unwrap_or(1)
+        }
+
+        fn fingerprint(&self) -> String {
+            format!("worker-fake:{}", self.id)
+        }
+    }
 
     #[test]
     fn fake_embedder_is_deterministic_and_normalized() {
@@ -460,5 +961,114 @@ mod tests {
     fn fingerprint_changes_with_label_and_dim() {
         assert_ne!(fingerprint_for("a", 16), fingerprint_for("b", 16));
         assert_ne!(fingerprint_for("a", 16), fingerprint_for("a", 32));
+    }
+
+    #[test]
+    fn cuda_device_parsing_honors_explicit_list() {
+        assert_eq!(
+            parse_cuda_devices(Some("2, 4"), Some("7,8,9"), Some("1")).unwrap(),
+            vec![2, 4]
+        );
+    }
+
+    #[test]
+    fn cuda_device_parsing_uses_legacy_single_device() {
+        assert_eq!(
+            parse_cuda_devices(None, Some("7,8,9"), Some("3")).unwrap(),
+            vec![3]
+        );
+    }
+
+    #[test]
+    fn cuda_device_auto_maps_visible_devices_to_logical_ids() {
+        assert_eq!(
+            parse_cuda_devices(Some("auto"), Some("7,8,9"), None).unwrap(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            parse_cuda_devices(Some("auto"), Some("7,8,9"), Some("3")).unwrap(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(parse_cuda_devices(None, Some("-1"), None).unwrap(), vec![0]);
+    }
+
+    #[test]
+    fn pack_embed_jobs_groups_similar_lengths_under_caps() {
+        let jobs = [100, 95, 10, 9, 8]
+            .into_iter()
+            .enumerate()
+            .map(|(index, token_count)| EmbedJob {
+                original_index: index,
+                text: token_count.to_string(),
+                token_count,
+            })
+            .collect();
+
+        let batches = pack_embed_jobs(jobs, 2, 120);
+
+        assert_eq!(batches.len(), 3);
+        assert!(batches.iter().all(|batch| batch.jobs.len() <= 2));
+        assert!(batches.iter().all(|batch| batch.token_total <= 120));
+        assert_eq!(
+            batches[0]
+                .jobs
+                .iter()
+                .map(|job| job.token_count)
+                .collect::<Vec<_>>(),
+            vec![100, 10]
+        );
+        assert_eq!(
+            batches[1]
+                .jobs
+                .iter()
+                .map(|job| job.token_count)
+                .collect::<Vec<_>>(),
+            vec![95, 9]
+        );
+    }
+
+    #[test]
+    fn scheduled_embedder_preserves_input_order() {
+        let left = Arc::new(WorkerFakeEmbedder::new(1.0, Duration::from_millis(5)));
+        let right = Arc::new(WorkerFakeEmbedder::new(2.0, Duration::ZERO));
+        let embedder = ScheduledEmbedder::with_limits(
+            vec![left as Arc<dyn Embedder>, right as Arc<dyn Embedder>],
+            1,
+            100,
+        );
+
+        let vectors = embedder.embed_passages(&["0", "1", "2", "3"]).unwrap();
+
+        assert_eq!(vectors.len(), 4);
+        assert_eq!(vectors[0][1], 0.0);
+        assert_eq!(vectors[1][1], 1.0);
+        assert_eq!(vectors[2][1], 2.0);
+        assert_eq!(vectors[3][1], 3.0);
+    }
+
+    #[test]
+    fn scheduled_embedder_lets_faster_workers_pull_more_batches() {
+        let slow = Arc::new(WorkerFakeEmbedder::new(1.0, Duration::from_millis(40)));
+        let fast = Arc::new(WorkerFakeEmbedder::new(2.0, Duration::ZERO));
+        let embedder = ScheduledEmbedder::with_limits(
+            vec![
+                slow.clone() as Arc<dyn Embedder>,
+                fast.clone() as Arc<dyn Embedder>,
+            ],
+            1,
+            100,
+        );
+
+        let inputs: Vec<String> = (0..12).map(|index| index.to_string()).collect();
+        let refs: Vec<&str> = inputs.iter().map(String::as_str).collect();
+        let vectors = embedder.embed_passages(&refs).unwrap();
+
+        assert_eq!(vectors.len(), inputs.len());
+        assert!(
+            fast.calls() > slow.calls(),
+            "fast worker should pull more queue pages; slow={}, fast={}",
+            slow.calls(),
+            fast.calls()
+        );
     }
 }
