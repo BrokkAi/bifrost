@@ -28,7 +28,7 @@ fn array_len(value: &Value, key: &str) -> usize {
 
 #[test]
 fn service_allows_concurrent_read_only_calls() {
-    let service = Arc::new(SearchToolsService::new_for_python(fixture_root()).unwrap());
+    let service = Arc::new(SearchToolsService::new_without_semantic_index(fixture_root()).unwrap());
     let calls = [
         (
             "search_symbols",
@@ -108,7 +108,7 @@ fn workspace_update_publishes_new_snapshot_without_mutating_old_snapshot() {
 
 #[test]
 fn python_boundary_returns_structured_json() {
-    let service = SearchToolsService::new_for_python(fixture_root()).unwrap();
+    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
     let payload = service
         .call_tool_json("get_summaries", r#"{"targets":["A.java"]}"#)
         .unwrap();
@@ -120,7 +120,7 @@ fn python_boundary_returns_structured_json() {
 
 #[test]
 fn get_summaries_directory_target_returns_skim_symbol_inventory() {
-    let service = SearchToolsService::new_for_python(fixture_root()).unwrap();
+    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
     let payload = service
         .call_tool_payload_json(
             "get_summaries",
@@ -146,7 +146,7 @@ fn get_summaries_directory_target_returns_skim_symbol_inventory() {
 
 #[test]
 fn get_summaries_mixed_targets_return_summaries_and_directory_inventory() {
-    let service = SearchToolsService::new_for_python(fixture_root()).unwrap();
+    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
     let payload = service
         .call_tool_payload_json(
             "get_summaries",
@@ -173,7 +173,7 @@ fn get_summaries_mixed_targets_return_summaries_and_directory_inventory() {
 
 #[test]
 fn python_boundary_returns_canonical_rendered_text_payload() {
-    let service = SearchToolsService::new_for_python(fixture_root()).unwrap();
+    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
     let payload = service
         .call_tool_payload_json(
             "get_symbol_sources",
@@ -208,7 +208,8 @@ class Thing {
     )
     .unwrap();
 
-    let service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
+    let service =
+        SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
     let payload = service
         .call_tool_payload_json(
             "get_symbol_sources",
@@ -259,7 +260,8 @@ fn get_symbol_sources_file_input_uses_include_and_sample_fallbacks() {
     )
     .unwrap();
 
-    let service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
+    let service =
+        SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
     let payload = service
         .call_tool_payload_json(
             "get_symbol_sources",
@@ -317,7 +319,7 @@ fn get_symbol_sources_file_input_uses_include_and_sample_fallbacks() {
 
 #[test]
 fn legacy_kind_filter_is_ignored_for_symbol_sources_and_locations() {
-    let service = SearchToolsService::new_for_python(fixture_root()).unwrap();
+    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
 
     let source_payload = service
         .call_tool_json(
@@ -346,7 +348,8 @@ fn get_symbol_ancestors_rejects_non_type_targets() {
         "class Base {}\nclass Thing extends Base { void run() {} }\n",
     )
     .unwrap();
-    let service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
+    let service =
+        SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
 
     let err = service
         .call_tool_json("get_symbol_ancestors", r#"{"symbols":["Thing.run"]}"#)
@@ -377,7 +380,8 @@ fn get_summaries_renders_include_and_excerpt_fallbacks() {
     )
     .unwrap();
 
-    let service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
+    let service =
+        SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
     let payload = service
         .call_tool_payload_json(
             "get_summaries",
@@ -446,7 +450,8 @@ fn python_boundary_returns_structural_clone_report_json() {
     )
     .unwrap();
 
-    let service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
+    let service =
+        SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
     let payload = service
         .call_tool_json(
             "report_structural_clone_smells",
@@ -470,7 +475,8 @@ fn python_boundary_returns_dead_code_smell_report_json() {
     fs::write(temp.path().join("helpers.rs"), "fn helper() {}\n").unwrap();
     fs::write(temp.path().join("main.rs"), "fn main() {}\n").unwrap();
 
-    let service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
+    let service =
+        SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
     let payload = service
         .call_tool_json(
             "report_dead_code_and_unused_abstraction_smells",
@@ -514,7 +520,8 @@ fn python_boundary_returns_secret_scan_report_json() {
     )
     .unwrap();
 
-    let service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
+    let service =
+        SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
     let payload = service
         .call_tool_json(
             "report_secret_like_code",
@@ -559,7 +566,8 @@ fn python_boundary_returns_git_hotspot_report_json() {
         commit_paths(&repo, &["src/ComplexService.java"], &format!("update {i}"));
     }
 
-    let service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
+    let service =
+        SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
     let payload = service
         .call_tool_json(
             "analyze_git_hotspots",
@@ -580,7 +588,7 @@ fn python_boundary_returns_git_hotspot_report_json() {
 
 #[test]
 fn python_boundary_returns_list_symbols_json() {
-    let service = SearchToolsService::new_for_python(fixture_root()).unwrap();
+    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
     let payload = service
         .call_tool_json("list_symbols", r#"{"file_patterns":["A.java"]}"#)
         .unwrap();
@@ -603,7 +611,7 @@ fn python_boundary_returns_list_symbols_json() {
 
 #[test]
 fn python_boundary_surfaces_invalid_params() {
-    let service = SearchToolsService::new_for_python(fixture_root()).unwrap();
+    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
     let err = service
         .call_tool_json("search_symbols", r#"{"patterns":1}"#)
         .unwrap_err();
@@ -628,7 +636,8 @@ fn python_boundary_returns_most_relevant_files_json() {
     repo.commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
         .unwrap();
 
-    let service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
+    let service =
+        SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
     let payload = service
         .call_tool_json(
             "most_relevant_files",
@@ -660,7 +669,8 @@ fn search_symbols_limit_selects_git_important_file_then_renders_alphabetically()
     .unwrap();
     commit_paths(&repo, &["z_high.java"], "update high");
 
-    let service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
+    let service =
+        SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
     let payload = service
         .call_tool_json(
             "search_symbols",
@@ -700,7 +710,8 @@ fn search_symbols_prefers_exact_match_over_hot_partial_match_file() {
     .unwrap();
     commit_paths(&repo, &["BootmgrUtility.java"], "heat utility");
 
-    let service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
+    let service =
+        SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
     let payload = service
         .call_tool_json(
             "search_symbols",
@@ -721,7 +732,7 @@ fn search_symbols_prefers_exact_match_over_hot_partial_match_file() {
 
 #[test]
 fn get_active_workspace_returns_initial_root() {
-    let service = SearchToolsService::new_for_python(fixture_root()).unwrap();
+    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
     let payload = service
         .call_tool_json("get_active_workspace", "{}")
         .unwrap();
@@ -733,7 +744,7 @@ fn get_active_workspace_returns_initial_root() {
 
 #[test]
 fn activate_workspace_rejects_relative_path() {
-    let service = SearchToolsService::new_for_python(fixture_root()).unwrap();
+    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
     let err = service
         .call_tool_json(
             "activate_workspace",
@@ -751,7 +762,7 @@ fn activate_workspace_rejects_relative_path() {
 
 #[test]
 fn activate_workspace_rejects_nonexistent_path() {
-    let service = SearchToolsService::new_for_python(fixture_root()).unwrap();
+    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
     let err = service
         .call_tool_json(
             "activate_workspace",
@@ -772,7 +783,7 @@ fn activate_workspace_idempotent_for_same_root() {
     commit_paths(&repo, &["Same.java"], "initial");
     let same_root = temp.path().canonicalize().unwrap();
 
-    let service = SearchToolsService::new_for_python(same_root.clone()).unwrap();
+    let service = SearchToolsService::new_without_semantic_index(same_root.clone()).unwrap();
     let arguments = format!(
         r#"{{"workspace_path":{}}}"#,
         serde_json::to_string(&same_root.display().to_string()).unwrap()
@@ -794,7 +805,7 @@ fn activate_workspace_switches_to_new_root() {
     .unwrap();
     let new_root = temp.path().canonicalize().unwrap();
 
-    let service = SearchToolsService::new_for_python(fixture_root()).unwrap();
+    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
     let arguments = format!(
         r#"{{"workspace_path":{}}}"#,
         serde_json::to_string(&new_root.display().to_string()).unwrap()
@@ -832,7 +843,7 @@ fn activate_workspace_failure_preserves_existing_workspace() {
     fs::write(&bad_path, "not a directory").unwrap();
     let bad_path = bad_path.canonicalize().unwrap();
 
-    let service = SearchToolsService::new_for_python(fixture_root()).unwrap();
+    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
 
     let arguments = format!(
         r#"{{"workspace_path":{}}}"#,
@@ -863,7 +874,7 @@ fn activate_workspace_failure_preserves_existing_workspace() {
 
 #[test]
 fn scan_usages_returns_call_sites_grouped_by_file() {
-    let service = SearchToolsService::new_for_python(fixture_root()).unwrap();
+    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
     let payload = service
         .call_tool_json(
             "scan_usages",
@@ -907,7 +918,7 @@ fn scan_usages_returns_call_sites_grouped_by_file() {
 
 #[test]
 fn scan_usages_reports_unknown_symbol_as_not_found() {
-    let service = SearchToolsService::new_for_python(fixture_root()).unwrap();
+    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
     let payload = service
         .call_tool_json(
             "scan_usages",
@@ -942,7 +953,8 @@ namespace Domain {
 "#,
     )
     .unwrap();
-    let service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
+    let service =
+        SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
     let payload = service
         .call_tool_json(
             "scan_usages",
@@ -968,7 +980,7 @@ namespace Domain {
 
 #[test]
 fn scan_usages_skips_blank_symbols_without_error() {
-    let service = SearchToolsService::new_for_python(fixture_root()).unwrap();
+    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
     let payload = service
         .call_tool_json(
             "scan_usages",
@@ -1006,7 +1018,8 @@ fn scan_usages_excludes_test_files_when_include_tests_is_false() {
     )
     .unwrap();
 
-    let service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
+    let service =
+        SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
 
     let production_only = service
         .call_tool_json(
@@ -1073,7 +1086,8 @@ fn scan_usages_paths_filter_limits_candidate_files() {
     )
     .unwrap();
 
-    let service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
+    let service =
+        SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
     let payload = service
         .call_tool_json(
             "scan_usages",
@@ -1108,7 +1122,8 @@ fn scan_usages_demotes_large_result_to_summary_within_budget() {
         .unwrap();
     }
 
-    let service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
+    let service =
+        SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
     let payload = service
         .call_tool_json(
             "scan_usages",
@@ -1136,7 +1151,7 @@ fn scan_usages_demotes_large_result_to_summary_within_budget() {
 #[test]
 fn scan_usages_resolved_symbol_with_no_hits_is_emitted_with_zero_total() {
     // method7 lives on A.AInner.AInnerInner and has no callers in the fixture.
-    let service = SearchToolsService::new_for_python(fixture_root()).unwrap();
+    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
     let payload = service
         .call_tool_json(
             "scan_usages",
@@ -1171,7 +1186,7 @@ fn activate_workspace_normalizes_to_git_root() {
     let repo_root = temp.path().canonicalize().unwrap();
     let nested = repo_root.join("nested");
 
-    let service = SearchToolsService::new_for_python(fixture_root()).unwrap();
+    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
     let arguments = format!(
         r#"{{"workspace_path":{}}}"#,
         serde_json::to_string(&nested.display().to_string()).unwrap()
@@ -1187,7 +1202,8 @@ fn activate_workspace_normalizes_to_git_root() {
 #[test]
 fn service_initializes_generated_large_workspace_with_deep_java_shape() {
     let temp = generated_java_workspace(1_000, 256, false);
-    let service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
+    let service =
+        SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
 
     let payload = service
         .call_tool_json(
@@ -1210,7 +1226,8 @@ fn service_initializes_generated_large_workspace_with_deep_java_shape() {
 #[ignore = "expensive 10k-file smoke test for issue #175"]
 fn service_initializes_ten_thousand_tracked_java_files_without_stack_overflow() {
     let temp = generated_java_workspace(10_000, 512, true);
-    let service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
+    let service =
+        SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
 
     let payload = service
         .call_tool_json(
@@ -1308,4 +1325,20 @@ fn commit_paths(repo: &Repository, paths: &[&str], message: &str) {
         &parents,
     )
     .unwrap();
+}
+
+#[test]
+fn semantic_search_reports_disabled_without_indexer() {
+    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
+    let err = service
+        .call_tool_value(
+            "semantic_search",
+            serde_json::json!({ "query": "anything", "k": 1 }),
+        )
+        .expect_err("semantic_search must fail without an indexer");
+    assert!(
+        err.message.contains("disabled") || err.message.contains("not available"),
+        "unexpected error message: {}",
+        err.message
+    );
 }

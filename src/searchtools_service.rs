@@ -1,3 +1,5 @@
+#[cfg(feature = "nlp")]
+use crate::nlp::{indexer::SemanticIndexer, query::semantic_search};
 use crate::{
     AnalyzerConfig, FilesystemProject, Project, ProjectChangeWatcher, ProjectFile,
     WorkspaceAnalyzer,
@@ -163,15 +165,55 @@ pub struct SearchToolsService {
 struct WorkspaceSession {
     snapshot: Arc<WorkspaceAnalyzer>,
     watcher: Option<ProjectChangeWatcher>,
+    #[cfg(feature = "nlp")]
+    semantic: Option<Arc<SemanticIndexer>>,
+}
+
+/// Semantic indexing is on by default in nlp builds; `BIFROST_SEMANTIC_INDEX=off`
+/// disables it (useful for tooling that never calls semantic_search).
+fn semantic_indexing_enabled() -> bool {
+    if cfg!(not(feature = "nlp")) {
+        return false;
+    }
+    !matches!(
+        std::env::var("BIFROST_SEMANTIC_INDEX").as_deref(),
+        Ok("off") | Ok("0") | Ok("disabled")
+    )
+}
+
+#[cfg(feature = "nlp")]
+fn maybe_start_semantic(
+    enabled: bool,
+    snapshot: &Arc<WorkspaceAnalyzer>,
+) -> Option<Arc<SemanticIndexer>> {
+    if !enabled {
+        return None;
+    }
+    let root = snapshot.analyzer().project().root().to_path_buf();
+    Some(SemanticIndexer::start(root, snapshot.clone()))
 }
 
 impl SearchToolsService {
     pub fn new(root: PathBuf) -> Result<Self, String> {
-        Self::new_with_strategy(root, UpdateStrategy::WatchFiles)
+        Self::new_with_strategy(
+            root,
+            UpdateStrategy::WatchFiles,
+            semantic_indexing_enabled(),
+        )
     }
 
     pub fn new_for_python(root: PathBuf) -> Result<Self, String> {
-        Self::new_with_strategy(root, UpdateStrategy::WatchFiles)
+        Self::new_with_strategy(
+            root,
+            UpdateStrategy::WatchFiles,
+            semantic_indexing_enabled(),
+        )
+    }
+
+    /// Construct without a background semantic indexer regardless of env;
+    /// `semantic_search` reports itself unavailable on such a service.
+    pub fn new_without_semantic_index(root: PathBuf) -> Result<Self, String> {
+        Self::new_with_strategy(root, UpdateStrategy::WatchFiles, false)
     }
 
     pub fn call_tool_json(
@@ -227,6 +269,13 @@ impl SearchToolsService {
             "refresh" => return self.handle_refresh(arguments),
             "activate_workspace" => return self.handle_activate_workspace(arguments),
             "get_active_workspace" => return self.handle_get_active_workspace(arguments),
+            _ => {}
+        }
+
+        match name {
+            "semantic_search" => {
+                return self.handle_semantic_search(arguments, render_options);
+            }
             _ => {}
         }
 
@@ -396,13 +445,24 @@ impl SearchToolsService {
     // a git repository. The construction path is intentionally precise; hosts
     // that want git-root semantics should call `activate_workspace` after
     // start.
-    fn new_with_strategy(root: PathBuf, update_strategy: UpdateStrategy) -> Result<Self, String> {
+    fn new_with_strategy(
+        root: PathBuf,
+        update_strategy: UpdateStrategy,
+        semantic_indexing: bool,
+    ) -> Result<Self, String> {
         let (project, workspace) = build_workspace(root)?;
         let watcher = maybe_start_watcher(project, update_strategy);
+        let snapshot = Arc::new(workspace);
+        #[cfg(feature = "nlp")]
+        let semantic = maybe_start_semantic(semantic_indexing, &snapshot);
+        #[cfg(not(feature = "nlp"))]
+        let _ = semantic_indexing;
         Ok(Self {
             session: RwLock::new(Some(WorkspaceSession {
-                snapshot: Arc::new(workspace),
+                snapshot,
                 watcher,
+                #[cfg(feature = "nlp")]
+                semantic,
             })),
             update_strategy,
         })
@@ -422,6 +482,10 @@ impl SearchToolsService {
         let session = guard.as_mut().ok_or_else(Self::closed_error)?;
         let next = session.snapshot.update_all();
         session.snapshot = Arc::new(next);
+        #[cfg(feature = "nlp")]
+        if let Some(semantic) = &session.semantic {
+            semantic.request_full_build(session.snapshot.clone());
+        }
         Self::structured_only(refresh_result(session.snapshot.analyzer()))
     }
 
@@ -467,9 +531,14 @@ impl SearchToolsService {
 
         // Drop the old watcher first so its inotify/kqueue handle is released
         // before we start watching the same tree from the new root.
+        let new_snapshot = Arc::new(new_workspace);
+        #[cfg(feature = "nlp")]
+        let semantic = maybe_start_semantic(session.semantic.is_some(), &new_snapshot);
         *session = WorkspaceSession {
-            snapshot: Arc::new(new_workspace),
+            snapshot: new_snapshot,
             watcher: maybe_start_watcher(new_project, self.update_strategy),
+            #[cfg(feature = "nlp")]
+            semantic,
         };
 
         active_workspace_result(&resolved)
@@ -497,6 +566,19 @@ impl SearchToolsService {
         Ok(Arc::clone(&session.snapshot))
     }
 
+    #[cfg(feature = "nlp")]
+    fn semantic_snapshot_for_query(
+        &self,
+    ) -> Result<(Arc<WorkspaceAnalyzer>, Option<Arc<SemanticIndexer>>), SearchToolsServiceError>
+    {
+        let mut guard = self.write_session()?;
+        let session = guard.as_mut().ok_or_else(Self::closed_error)?;
+        match self.update_strategy {
+            UpdateStrategy::WatchFiles => Self::apply_watcher_delta(session),
+        }
+        Ok((Arc::clone(&session.snapshot), session.semantic.clone()))
+    }
+
     fn apply_watcher_delta(session: &mut WorkspaceSession) {
         let Some(watcher) = session.watcher.as_ref() else {
             return;
@@ -505,6 +587,10 @@ impl SearchToolsService {
         let delta = watcher.take_changed_files();
         if delta.requires_full_refresh {
             session.snapshot = Arc::new(session.snapshot.update_all());
+            #[cfg(feature = "nlp")]
+            if let Some(semantic) = &session.semantic {
+                semantic.request_full_build(session.snapshot.clone());
+            }
             return;
         }
 
@@ -514,6 +600,10 @@ impl SearchToolsService {
 
         let changed_files: BTreeSet<ProjectFile> = delta.files.into_iter().collect();
         session.snapshot = Arc::new(session.snapshot.update(&changed_files));
+        #[cfg(feature = "nlp")]
+        if let Some(semantic) = &session.semantic {
+            semantic.request_update(session.snapshot.clone(), changed_files);
+        }
     }
 
     fn decode_and_run<P, R>(
@@ -613,6 +703,37 @@ impl SearchToolsService {
             structured,
             rendered_text: Some(rendered_text),
         })
+    }
+
+    #[cfg(feature = "nlp")]
+    fn handle_semantic_search(
+        &self,
+        arguments: Value,
+        render_options: RenderOptions,
+    ) -> Result<ToolOutput, SearchToolsServiceError> {
+        let (snapshot, semantic) = self.semantic_snapshot_for_query()?;
+        let Some(indexer) = semantic else {
+            return Err(SearchToolsServiceError::invalid_params(
+                "semantic_search is disabled for this session (BIFROST_SEMANTIC_INDEX=off)",
+            ));
+        };
+        Self::decode_render_and_try_run(
+            &snapshot,
+            arguments,
+            render_options,
+            move |workspace, params| semantic_search(workspace, &indexer, params),
+        )
+    }
+
+    #[cfg(not(feature = "nlp"))]
+    fn handle_semantic_search(
+        &self,
+        _arguments: Value,
+        _render_options: RenderOptions,
+    ) -> Result<ToolOutput, SearchToolsServiceError> {
+        Err(SearchToolsServiceError::invalid_params(
+            "semantic_search is not available in this build (nlp feature disabled)",
+        ))
     }
 
     fn structured_only<R: Serialize>(result: R) -> Result<ToolOutput, SearchToolsServiceError> {

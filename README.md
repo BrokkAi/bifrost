@@ -97,8 +97,8 @@ Direct `--tool` mode prints rendered text by default. The `--args` payload is in
 
 `--server` accepts ordered compositions of toolsets separated by `|`:
 
-- `searchtools` expands to all toolsets in the canonical order `symbol|workspace|extended|text|slopcop`
-- `core` expands to `symbol|workspace`
+- `searchtools` expands to all toolsets in the canonical order `symbol|nlp|workspace|extended|text|slopcop`
+- `core` expands to `symbol|nlp|workspace`
 - `slopcop` stays available as its own set
 
 Examples:
@@ -116,12 +116,28 @@ Examples:
 This starts a stdio MCP server that publishes these tools:
 
 - `symbol`: `search_symbols`, `get_symbol_locations`, `get_symbol_sources`, `get_summaries`, `list_symbols`, `scan_usages`
+- `nlp`: `semantic_search`
 - `workspace`: `refresh`, `activate_workspace`, `get_active_workspace`
 - `extended`: `find_filenames`, `list_files`, `most_relevant_files`, `search_git_commit_messages`, `get_git_log`, `get_commit_diff`, `jq`, `xml_skim`, `xml_select`
 - `text`: `get_file_contents`, `search_file_contents`, `find_files_containing`
 - `slopcop`: `compute_cyclomatic_complexity`, `compute_cognitive_complexity`, `report_comment_density_for_code_unit`, `report_exception_handling_smells`, `report_comment_density_for_files`, `analyze_git_hotspots`, `report_test_assertion_smells`, `report_structural_clone_smells`, `report_long_method_and_god_object_smells`, `report_dead_code_and_unused_abstraction_smells`, `report_secret_like_code`
 
-The subset toolsets are now composable rather than fixed server modes. `core` is the `symbol|workspace` alias, and `searchtools` is the alias for the full union.
+The subset toolsets are now composable rather than fixed server modes. `core` is the `symbol|nlp|workspace` alias, and `searchtools` is the alias for the full union.
+
+### Semantic search
+
+`semantic_search` (in the `nlp` toolset) finds source files by meaning: function-level chunks are embedded (averaged with their enclosing class or file summary), fused with grounded-strings BM25 and git co-edit relevance, then reranked by a cross-encoder. It searches code only, not prose or markdown.
+
+The index lives in `.brokk/semantic_index.db` of the **primary** repository (linked git worktrees share the primary's index). Vectors and BM25 rows are keyed by content hash, so switching branches re-points rows instead of re-embedding. A background build starts when the workspace is activated; `semantic_search` blocks until the index is ready, and the file watcher keeps it updated incrementally.
+
+Models load via ONNX (`gte-rs`). Defaults are downloaded from the HuggingFace hub on first use: `onnx-community/granite-embedding-small-english-r2-ONNX` for embeddings and `Alibaba-NLP/gte-reranker-modernbert-base` for reranking (full-precision variants when a CUDA GPU is available via the `nlp-gpu` cargo feature, int8 variants on CPU). Environment overrides:
+
+- `BIFROST_SEMANTIC_INDEX=off` disables background indexing (semantic_search then reports itself unavailable)
+- `BIFROST_EMBED_MODEL_DIR` / `BIFROST_RERANK_MODEL_DIR`: local directory containing `tokenizer.json` + `model.onnx` (e.g. a fine-tune); takes precedence over the hub
+- `BIFROST_EMBED_MODEL_ID` / `BIFROST_RERANK_MODEL_ID`: alternate HuggingFace repo ids
+- `BIFROST_CUDA_DEVICE`: CUDA device id for the `nlp-gpu` feature (default 0)
+
+The `nlp` cargo feature is on by default; build with `--no-default-features` on targets where onnxruntime is unavailable (the `nlp` toolset then publishes no tools and `core` degrades to `symbol|workspace`).
 
 `refresh` forces a full rebuild of the code index. Normal tool calls already apply watcher-detected file changes automatically, so most hosts should not call it during routine operation. Keep it as a manual recovery tool when you want to discard incremental state and rescan the whole workspace from disk.
 

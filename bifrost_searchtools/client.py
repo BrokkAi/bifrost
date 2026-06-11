@@ -15,6 +15,7 @@ from typing import Any, overload
 from .models import (
     FileSummariesResult,
     MostRelevantFilesResult,
+    SemanticSearchResult,
     SearchSymbolsResult,
     SkimFilesResult,
     SymbolAncestorsResult,
@@ -217,6 +218,17 @@ class SearchToolsClient:
             arguments,
         )
         return MostRelevantFilesResult.from_dict(
+            payload.structured,
+            render_line_numbers=self._render_line_numbers,
+            rendered_text=payload.rendered_text,
+        )
+
+    def semantic_search(self, query: str, *, k: int = 10) -> SemanticSearchResult:
+        payload = self._call_tool_payload(
+            "semantic_search",
+            {"query": query, "k": k},
+        )
+        return SemanticSearchResult.from_dict(
             payload.structured,
             render_line_numbers=self._render_line_numbers,
             rendered_text=payload.rendered_text,

@@ -98,7 +98,9 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     )
     .expect("set remote default");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"));
+    child.env("BIFROST_SEMANTIC_INDEX", "off");
+    let mut child = child
         .arg("--root")
         .arg(fixture_root.path())
         .arg("--server")
@@ -165,6 +167,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "get_summaries",
             "list_symbols",
             "scan_usages",
+            "semantic_search",
             "refresh",
             "activate_workspace",
             "get_active_workspace",
@@ -632,6 +635,7 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
             "get_summaries",
             "list_symbols",
             "scan_usages",
+            "semantic_search",
             "refresh",
             "activate_workspace",
             "get_active_workspace",
@@ -705,6 +709,68 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
             "report_secret_like_code",
         ],
     );
+    assert_server_tool_names(&fixture_root, "nlp", &["semantic_search"]);
+}
+
+/// When the embedding model cannot load, semantic_search must surface a
+/// clean tool error instead of hanging on the background build.
+#[test]
+fn bifrost_semantic_search_fails_cleanly_without_models() {
+    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("testcode-java");
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_bifrost"));
+    command
+        // Re-enable the indexer (spawn helpers disable it) but point the
+        // embedder at a directory that cannot exist: the engine load fails
+        // fast with no network access.
+        .env("BIFROST_SEMANTIC_INDEX", "auto")
+        .env(
+            "BIFROST_EMBED_MODEL_DIR",
+            "/nonexistent/bifrost-test-models",
+        )
+        .arg("--root")
+        .arg(&fixture_root)
+        .arg("--server")
+        .arg("nlp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("spawn bifrost");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+
+    let response = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "semantic_search",
+                "arguments": { "query": "where is the config loaded", "k": 3 }
+            }
+        }),
+    );
+    let message = response["error"]["message"]
+        .as_str()
+        .expect("json-rpc error message");
+    assert!(
+        message.contains("semantic index unavailable"),
+        "unexpected error message: {message}"
+    );
+
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
 }
 
 #[test]
@@ -1277,6 +1343,7 @@ fn initialize_session(stdin: &mut impl Write, reader: &mut impl BufRead, stderr:
 
 fn spawn_server(root: &std::path::Path, mode: &str, extra_args: &[&str]) -> std::process::Child {
     let mut command = Command::new(env!("CARGO_BIN_EXE_bifrost"));
+    command.env("BIFROST_SEMANTIC_INDEX", "off");
     command.arg("--root").arg(root).arg("--server").arg(mode);
     for arg in extra_args {
         command.arg(arg);
@@ -1291,6 +1358,7 @@ fn spawn_server(root: &std::path::Path, mode: &str, extra_args: &[&str]) -> std:
 
 fn spawn_server_no_args(cwd: &std::path::Path) -> std::process::Child {
     Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .env("BIFROST_SEMANTIC_INDEX", "off")
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
