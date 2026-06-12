@@ -2,7 +2,7 @@ use crate::mcp_common::{McpServerSpec, SEARCHTOOLS_INSTRUCTIONS, build_server_sp
 use serde_json::Value;
 use std::collections::HashSet;
 
-const SEARCHTOOLS_ORDER: &[&str] = &["symbol", "workspace", "extended", "text", "slopcop"];
+const SEARCHTOOLS_ORDER: &[&str] = &["symbol", "nlp", "workspace", "extended", "text", "slopcop"];
 
 pub fn resolve_server_spec(mode_expr: &str) -> Result<McpServerSpec, String> {
     let mut descriptors = Vec::new();
@@ -36,12 +36,14 @@ fn expand_toolset(
 ) -> Result<(), String> {
     match name {
         "symbol" => append_named_toolset("symbol", descriptors, seen),
+        "nlp" => append_named_toolset("nlp", descriptors, seen),
         "workspace" => append_named_toolset("workspace", descriptors, seen),
         "text" => append_named_toolset("text", descriptors, seen),
         "extended" => append_named_toolset("extended", descriptors, seen),
         "slopcop" => append_named_toolset("slopcop", descriptors, seen),
         "core" => {
             expand_toolset("symbol", descriptors, seen)?;
+            expand_toolset("nlp", descriptors, seen)?;
             expand_toolset("workspace", descriptors, seen)
         }
         "searchtools" => {
@@ -73,6 +75,7 @@ fn append_named_toolset(
 fn descriptors_for_toolset(name: &str) -> Vec<Value> {
     match name {
         "symbol" => crate::mcp_core::symbol_tool_descriptors(),
+        "nlp" => crate::mcp_nlp::nlp_tool_descriptors(),
         "workspace" => crate::mcp_core::workspace_tool_descriptors(),
         "text" => crate::mcp_text::text_tool_descriptors(),
         "extended" => crate::mcp_extended::extended_tool_descriptors(),
@@ -101,36 +104,49 @@ mod tests {
             .collect()
     }
 
+    fn symbol_tool_names() -> Vec<String> {
+        [
+            "search_symbols",
+            "get_symbol_sources",
+            "get_summaries",
+            "list_symbols",
+            "scan_usages",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    }
+
+    fn nlp_tool_names() -> Vec<String> {
+        if cfg!(feature = "nlp") {
+            vec!["semantic_search".to_string()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn workspace_tool_names() -> Vec<String> {
+        ["refresh", "activate_workspace", "get_active_workspace"]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    }
+
     #[test]
-    fn core_expands_symbol_before_workspace() {
-        assert_eq!(
-            tool_names("core"),
-            vec![
-                "search_symbols",
-                "get_symbol_sources",
-                "get_summaries",
-                "list_symbols",
-                "scan_usages",
-                "refresh",
-                "activate_workspace",
-                "get_active_workspace",
-            ]
-        );
+    fn core_expands_symbol_then_nlp_then_workspace() {
+        let mut expected = symbol_tool_names();
+        expected.extend(nlp_tool_names());
+        expected.extend(workspace_tool_names());
+        assert_eq!(tool_names("core"), expected);
     }
 
     #[test]
     fn searchtools_expands_to_all_toolsets_in_order() {
-        assert_eq!(
-            tool_names("searchtools"),
-            vec![
-                "search_symbols",
-                "get_symbol_sources",
-                "get_summaries",
-                "list_symbols",
-                "scan_usages",
-                "refresh",
-                "activate_workspace",
-                "get_active_workspace",
+        let mut expected = symbol_tool_names();
+        expected.extend(nlp_tool_names());
+        expected.extend(workspace_tool_names());
+        expected.extend(
+            [
                 "get_symbol_locations",
                 "get_symbol_ancestors",
                 "find_filenames",
@@ -157,26 +173,25 @@ mod tests {
                 "report_dead_code_and_unused_abstraction_smells",
                 "report_secret_like_code",
             ]
+            .into_iter()
+            .map(str::to_string),
         );
+        assert_eq!(tool_names("searchtools"), expected);
     }
 
     #[test]
     fn composition_deduplicates_and_preserves_first_occurrence() {
-        assert_eq!(
-            tool_names("text|core|text"),
-            vec![
-                "get_file_contents",
-                "search_file_contents",
-                "find_files_containing",
-                "search_symbols",
-                "get_symbol_sources",
-                "get_summaries",
-                "list_symbols",
-                "scan_usages",
-                "refresh",
-                "activate_workspace",
-                "get_active_workspace",
-            ]
-        );
+        let mut expected: Vec<String> = [
+            "get_file_contents",
+            "search_file_contents",
+            "find_files_containing",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        expected.extend(symbol_tool_names());
+        expected.extend(nlp_tool_names());
+        expected.extend(workspace_tool_names());
+        assert_eq!(tool_names("text|core|text"), expected);
     }
 }

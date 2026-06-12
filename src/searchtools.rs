@@ -885,7 +885,7 @@ fn skim_files_for_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>) -> Sk
     }
 }
 
-fn summarize_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>) -> SummaryResult {
+pub(crate) fn summarize_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>) -> SummaryResult {
     let mut summaries: Vec<_> = files
         .into_par_iter()
         .filter_map(|file| {
@@ -2337,7 +2337,7 @@ fn collect_ranked_kind_names(
     hits
 }
 
-fn summary_block_for_code_unit(
+pub(crate) fn summary_block_for_code_unit(
     analyzer: &dyn IAnalyzer,
     code_unit: &CodeUnit,
 ) -> Option<SummaryBlock> {

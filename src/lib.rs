@@ -8,10 +8,13 @@ pub mod lsp;
 pub mod mcp_common;
 pub mod mcp_core;
 pub mod mcp_extended;
+pub mod mcp_nlp;
 pub mod mcp_registry;
 pub mod mcp_slopcop;
 pub mod mcp_text;
 mod model_context;
+#[cfg(feature = "nlp")]
+pub mod nlp;
 mod path_utils;
 pub mod profiling;
 mod project_watcher;
