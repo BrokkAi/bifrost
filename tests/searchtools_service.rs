@@ -130,15 +130,17 @@ fn get_summaries_directory_target_returns_skim_symbol_inventory() {
         .unwrap();
     let value: Value = serde_json::from_str(&payload).unwrap();
 
-    let directory_symbols = &value["structured"]["directory_symbols"];
-    assert!(directory_symbols["files"].as_array().unwrap().len() <= 20);
+    assert_eq!(false, value["structured"]["degraded"]);
+    assert!(value["structured"]["degradation"].is_null());
+    let compact_symbols = &value["structured"]["compact_symbols"];
+    assert!(compact_symbols["files"].as_array().unwrap().len() <= 20);
     assert!(
-        directory_symbols["files"]
+        compact_symbols["files"]
             .as_array()
             .unwrap()
             .iter()
             .any(|file| file["path"] == "A.java"),
-        "{directory_symbols}"
+        "{compact_symbols}"
     );
     let rendered = value["rendered_text"].as_str().expect("rendered text");
     assert!(rendered.contains("A.java ("), "{rendered}");
@@ -157,18 +159,58 @@ fn get_summaries_mixed_targets_return_summaries_and_directory_inventory() {
     let value: Value = serde_json::from_str(&payload).unwrap();
 
     assert_eq!(value["structured"]["summaries"][0]["path"], "A.java");
-    let directory_symbols = &value["structured"]["directory_symbols"];
+    assert_eq!(false, value["structured"]["degraded"]);
+    let compact_symbols = &value["structured"]["compact_symbols"];
     assert!(
-        directory_symbols["files"]
+        compact_symbols["files"]
             .as_array()
             .unwrap()
             .iter()
             .any(|file| file["path"] == "A.java"),
-        "{directory_symbols}"
+        "{compact_symbols}"
     );
     let rendered = value["rendered_text"].as_str().expect("rendered text");
     assert!(rendered.contains("A.java"), "{rendered}");
     assert!(rendered.contains("A.java ("), "{rendered}");
+}
+
+#[test]
+fn get_summaries_large_file_glob_degrades_to_compact_symbols() {
+    let temp = TempDir::new().unwrap();
+    for class_idx in 0..18 {
+        let mut source = format!("public class Caller{class_idx} {{\n");
+        for method_idx in 0..12 {
+            source.push_str(&format!(
+                "    public int method{method_idx}(int input) {{ return input + {class_idx} + {method_idx}; }}\n"
+            ));
+        }
+        source.push_str("}\n");
+        fs::write(temp.path().join(format!("Caller{class_idx}.java")), source).unwrap();
+    }
+
+    let service =
+        SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_json("get_summaries", r#"{"targets":["*.java"]}"#)
+        .unwrap();
+    assert!(
+        payload.len() <= 4096,
+        "payload should stay within get_summaries budget, got {} bytes: {payload}",
+        payload.len()
+    );
+
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(true, value["degraded"]);
+    assert_eq!("response_budget_exceeded", value["degradation"]["reason"]);
+    assert_eq!("summaries", value["degradation"]["requested_format"]);
+    assert_eq!("compact_symbols", value["degradation"]["returned_format"]);
+    assert!(value["summaries"].as_array().unwrap().is_empty());
+    let compact = &value["compact_symbols"];
+    assert!(compact["truncated"].as_bool().unwrap());
+    assert!(
+        compact["files"].as_array().unwrap().len() < 18,
+        "compact fallback should drop files until it fits: {compact}"
+    );
 }
 
 #[test]
@@ -1131,12 +1173,21 @@ fn scan_usages_demotes_large_result_to_summary_within_budget() {
         )
         .unwrap();
     assert!(
-        payload.len() <= 24_000,
+        payload.len() <= 8_192,
         "payload should stay within scan_usages budget, got {} bytes",
         payload.len()
     );
 
     let value: Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(1, value["summary"]["requested_symbols"].as_u64().unwrap());
+    assert_eq!(1, value["summary"]["resolved_symbols"].as_u64().unwrap());
+    assert_eq!(150, value["summary"]["total_hits"].as_u64().unwrap());
+    assert_eq!(
+        "scan_usages",
+        value["summary"]["recommended_next_call"]["tool"]
+            .as_str()
+            .unwrap()
+    );
     let usage = &value["usages"][0];
     assert_eq!("summary", usage["rendering"]);
     assert_eq!(150, usage["total_hits"].as_u64().unwrap());

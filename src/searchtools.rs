@@ -34,7 +34,9 @@ use std::sync::Arc;
 
 const FILE_SEARCH_LIMIT: usize = 100;
 const FILE_SKIM_LIMIT: usize = 20;
-pub const SCAN_USAGES_RESPONSE_BUDGET_BYTES: usize = 24_000;
+// Keep MCP structured JSON below Codex's default 10 KB function-output
+// truncation limit after JSON escaping and tool wrapper overhead.
+pub const SCAN_USAGES_RESPONSE_BUDGET_BYTES: usize = 8_192;
 const SCAN_USAGES_MAX_EXACT_CALLSITES: usize = 300;
 const SCAN_USAGES_SUMMARY_FILE_LIMIT: usize = 20;
 const SCAN_USAGES_TOP_ENCLOSING_LIMIT: usize = 10;
@@ -287,6 +289,7 @@ pub struct SkimFile {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ScanUsagesResult {
+    pub summary: ScanUsagesSummary,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub usages: Vec<SymbolUsages>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -299,6 +302,51 @@ pub struct ScanUsagesResult {
     pub ambiguous: Vec<AmbiguousUsageSymbol>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub too_many_callsites: Vec<TooManyCallsitesInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScanUsagesSummary {
+    pub requested_symbols: usize,
+    pub resolved_symbols: usize,
+    pub total_hits: usize,
+    pub partial: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub symbols: Vec<ScanUsagesSymbolSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recommended_next_call: Option<ScanUsagesRecommendedNextCall>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScanUsagesSymbolSummary {
+    pub symbol: String,
+    pub total_hits: usize,
+    pub rendering: UsageRendering,
+    pub files_returned: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files_truncated: Option<usize>,
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub candidate_files_truncated: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub top_files: Vec<ScanUsagesFileSummary>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub top_enclosing: Vec<UsageEnclosingCount>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScanUsagesFileSummary {
+    pub path: String,
+    pub hit_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScanUsagesRecommendedNextCall {
+    pub tool: String,
+    pub arguments: serde_json::Value,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -1420,9 +1468,25 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
         }
     }
 
-    let usages = render_scan_usages_with_budget(render_states);
+    let usages = render_scan_usages_with_budget(
+        render_states,
+        &not_found,
+        &fallbacks,
+        &failures,
+        &ambiguous,
+        &too_many_callsites,
+    );
+    let summary = build_scan_usages_summary(
+        &usages,
+        &not_found,
+        &fallbacks,
+        &failures,
+        &ambiguous,
+        &too_many_callsites,
+    );
 
     ScanUsagesResult {
+        summary,
         usages,
         not_found,
         fallbacks,
@@ -1591,17 +1655,33 @@ fn ranges_overlap(range: &Range, hit: &UsageHit) -> bool {
     range.start_byte < hit.end_offset && hit.start_offset < range.end_byte
 }
 
-fn render_scan_usages_with_budget(states: Vec<SymbolUsageRenderState>) -> Vec<SymbolUsages> {
+fn render_scan_usages_with_budget(
+    states: Vec<SymbolUsageRenderState>,
+    not_found: &[String],
+    fallbacks: &[UsageFallbackInfo],
+    failures: &[UsageFailureInfo],
+    ambiguous: &[AmbiguousUsageSymbol],
+    too_many_callsites: &[TooManyCallsitesInfo],
+) -> Vec<SymbolUsages> {
     let mut states = states;
     loop {
         let rendered: Vec<SymbolUsages> = states.iter().map(render_symbol_usages).collect();
+        let summary = build_scan_usages_summary(
+            &rendered,
+            not_found,
+            fallbacks,
+            failures,
+            ambiguous,
+            too_many_callsites,
+        );
         let result = ScanUsagesResult {
+            summary,
             usages: rendered.clone(),
-            not_found: Vec::new(),
-            fallbacks: Vec::new(),
-            failures: Vec::new(),
-            ambiguous: Vec::new(),
-            too_many_callsites: Vec::new(),
+            not_found: not_found.to_vec(),
+            fallbacks: fallbacks.to_vec(),
+            failures: failures.to_vec(),
+            ambiguous: ambiguous.to_vec(),
+            too_many_callsites: too_many_callsites.to_vec(),
         };
         if serde_json::to_string(&result)
             .map(|text| text.len() <= SCAN_USAGES_RESPONSE_BUDGET_BYTES)
@@ -1614,6 +1694,146 @@ fn render_scan_usages_with_budget(states: Vec<SymbolUsageRenderState>) -> Vec<Sy
             return states.iter().map(render_symbol_usages).collect();
         }
     }
+}
+
+fn build_scan_usages_summary(
+    usages: &[SymbolUsages],
+    not_found: &[String],
+    fallbacks: &[UsageFallbackInfo],
+    failures: &[UsageFailureInfo],
+    ambiguous: &[AmbiguousUsageSymbol],
+    too_many_callsites: &[TooManyCallsitesInfo],
+) -> ScanUsagesSummary {
+    let requested_symbols = usages.len()
+        + not_found.len()
+        + failures.len()
+        + ambiguous.len()
+        + too_many_callsites.len();
+    let total_hits = usages.iter().map(|usage| usage.total_hits).sum();
+    let partial = usages
+        .iter()
+        .any(|usage| usage.candidate_files_truncated || usage.files_truncated.is_some())
+        || failures
+            .iter()
+            .any(|failure| failure.candidate_files_truncated)
+        || ambiguous.iter().any(|item| item.candidate_files_truncated)
+        || !too_many_callsites.is_empty();
+
+    let symbols = usages
+        .iter()
+        .map(|usage| ScanUsagesSymbolSummary {
+            symbol: usage.symbol.clone(),
+            total_hits: usage.total_hits,
+            rendering: usage.rendering,
+            files_returned: usage.files.len(),
+            files_truncated: usage.files_truncated,
+            candidate_files_truncated: usage.candidate_files_truncated,
+            top_files: usage
+                .files
+                .iter()
+                .take(5)
+                .map(|file| ScanUsagesFileSummary {
+                    path: file.path.clone(),
+                    hit_count: file.hit_count.unwrap_or(file.hits.len()),
+                })
+                .collect(),
+            top_enclosing: usage.top_enclosing.iter().take(5).cloned().collect(),
+            note: usage.note.clone(),
+        })
+        .collect::<Vec<_>>();
+
+    let recommended_next_call = recommended_scan_usages_next_call(usages, too_many_callsites);
+
+    let mut warnings = Vec::new();
+    if !not_found.is_empty() {
+        warnings.push(format!("not_found: {}", not_found.join(", ")));
+    }
+    if !ambiguous.is_empty() {
+        warnings.push(format!(
+            "ambiguous: {}",
+            ambiguous
+                .iter()
+                .map(|item| item.symbol.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if !too_many_callsites.is_empty() {
+        warnings.push(format!(
+            "too_many_callsites: {}",
+            too_many_callsites
+                .iter()
+                .map(|item| item.symbol.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if !fallbacks.is_empty() {
+        warnings.push(format!(
+            "fallbacks_used: {}",
+            fallbacks
+                .iter()
+                .map(|item| item.symbol.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if !failures.is_empty() {
+        warnings.push(format!(
+            "failures: {}",
+            failures
+                .iter()
+                .map(|item| item.symbol.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    ScanUsagesSummary {
+        requested_symbols,
+        resolved_symbols: usages.len(),
+        total_hits,
+        partial,
+        symbols,
+        recommended_next_call,
+        warnings,
+    }
+}
+
+fn recommended_scan_usages_next_call(
+    usages: &[SymbolUsages],
+    too_many_callsites: &[TooManyCallsitesInfo],
+) -> Option<ScanUsagesRecommendedNextCall> {
+    if let Some(usage) = usages
+        .iter()
+        .find(|usage| usage.rendering == UsageRendering::Summary && !usage.files.is_empty())
+    {
+        let paths = usage
+            .files
+            .iter()
+            .take(3)
+            .map(|file| serde_json::Value::String(file.path.clone()))
+            .collect::<Vec<_>>();
+        return Some(ScanUsagesRecommendedNextCall {
+            tool: "scan_usages".to_string(),
+            arguments: serde_json::json!({
+                "symbols": [usage.symbol.clone()],
+                "paths": paths,
+            }),
+            reason: "Summary-mode result; narrow to top files for line-level detail.".to_string(),
+        });
+    }
+
+    too_many_callsites
+        .first()
+        .map(|item| ScanUsagesRecommendedNextCall {
+            tool: "scan_usages".to_string(),
+            arguments: serde_json::json!({
+                "symbols": [item.symbol.clone()],
+            }),
+            reason: "Callsite count exceeded the exact scan cap; use a more specific symbol or add paths."
+                .to_string(),
+        })
 }
 
 fn demote_largest_symbol(states: &mut [SymbolUsageRenderState]) -> bool {

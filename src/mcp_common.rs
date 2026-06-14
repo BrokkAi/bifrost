@@ -399,7 +399,7 @@ pub fn summaries_schema() -> Value {
             "targets": {
                 "type": "array",
                 "items": { "type": "string" },
-                "description": "Project-relative file paths, directory paths, glob patterns, class names, or absolute paths/globs inside the active workspace. File and glob targets return detailed ranged summaries; directory targets return a compact symbol inventory capped to the most relevant files. Examples: \"src/auth/**/*.rs\", \"crates/polars-core/src/frame/**/*.rs\", \"MyClass\"."
+                "description": "Project-relative file paths, directory paths, glob patterns, class names, or absolute paths/globs inside the active workspace. File and glob targets return detailed ranged summaries when they fit the response budget; oversized results are marked degraded and return compact_symbols declaration outlines. Directory targets return compact_symbols by design. Examples: \"src/auth/**/*.rs\", \"crates/polars-core/src/frame/**/*.rs\", \"MyClass\"."
             }
         },
         "required": ["targets"]

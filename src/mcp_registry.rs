@@ -127,6 +127,7 @@ fn descriptors_for_toolset(name: &str) -> Vec<Value> {
 
 fn hidden_tool_names_for_toolset(name: &str) -> &'static [&'static str] {
     match name {
+        "symbol" => &["list_symbols"],
         #[cfg(feature = "nlp")]
         "nlp" => &["semantic_search_status"],
         _ => &[],
@@ -158,7 +159,6 @@ mod tests {
             "search_symbols",
             "get_symbol_sources",
             "get_summaries",
-            "list_symbols",
             "scan_usages",
         ]
         .into_iter()
@@ -267,5 +267,15 @@ mod tests {
         let accepted = accepted_tool_names("nlp");
         assert!(accepted.contains(&"semantic_search".to_string()));
         assert!(accepted.contains(&"semantic_search_status".to_string()));
+    }
+
+    #[test]
+    fn symbol_accepts_list_symbols_without_advertising_it() {
+        let advertised = tool_names("symbol");
+        assert_eq!(advertised, symbol_tool_names());
+
+        let accepted = accepted_tool_names("symbol");
+        assert!(accepted.contains(&"get_summaries".to_string()));
+        assert!(accepted.contains(&"list_symbols".to_string()));
     }
 }

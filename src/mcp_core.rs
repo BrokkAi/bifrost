@@ -1,6 +1,6 @@
 use crate::mcp_common::{
-    McpRenderOptions, file_patterns_schema, json_schema_object, mutating_tool_descriptor,
-    run_stdio_server, summaries_schema, symbol_names_schema, tool_descriptor,
+    McpRenderOptions, json_schema_object, mutating_tool_descriptor, run_stdio_server,
+    summaries_schema, symbol_names_schema, tool_descriptor,
 };
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -25,7 +25,7 @@ pub(crate) fn symbol_tool_descriptors() -> Vec<Value> {
     vec![
         tool_descriptor(
             "search_symbols",
-            "Find classes, functions, methods, fields, modules, and other indexed declarations by name; prefer over grep when looking for code symbols.",
+            "Find classes, functions, methods, fields, modules, and other indexed declarations by name. Use this first for broad or partial symbol discovery, then pass fully qualified results to get_symbol_sources or scan_usages.",
             json!({
                 "type": "object",
                 "properties": {
@@ -51,29 +51,24 @@ pub(crate) fn symbol_tool_descriptors() -> Vec<Value> {
         ),
         tool_descriptor(
             "get_symbol_sources",
-            "Read exact source blocks for known symbols after search_symbols; file paths/globs return flat top-level symbol outlines for matching files.",
+            "Read exact source blocks for known symbols after search_symbols. File paths/globs return flat top-level symbol outlines as a secondary file-backed view; use get_summaries for broader structure.",
             symbol_names_schema(),
         ),
         tool_descriptor(
             "get_summaries",
-            "Summarize matching source files, globs, classes, or modules with line ranges. Use before repeated read_file/grep calls when you need a compact map of related code before choosing exact definitions to inspect. Example targets: [\"src/auth/**/*.rs\"], [\"crates/polars-core/src/frame/**/*.rs\"], [\"MyClass\"].",
+            "Summarize matching source files, globs, classes, or modules with line ranges. Use before repeated read_file/grep calls when you need a compact map of related code before choosing exact definitions to inspect. If full summaries exceed the response budget, the result is marked degraded and returns compact_symbols declaration outlines instead. Example targets: [\"src/auth/**/*.rs\"], [\"crates/polars-core/src/frame/**/*.rs\"], [\"MyClass\"].",
             summaries_schema(),
         ),
         tool_descriptor(
-            "list_symbols",
-            "Outline declarations recursively for source files; use to understand code structure without reading entire files.",
-            file_patterns_schema(),
-        ),
-        tool_descriptor(
             "scan_usages",
-            "Find references, call sites, usages, callers, and related tests for known fully qualified symbols. Prefer over grep when changing existing behavior and callers may matter; use search_symbols first for partial names. Results are tiered by volume: few callers include code snippets, many callers return per-file counts. Narrow with paths or one symbol at a time for detail. Symbols with zero proven callers are re-checked textually, and explicit notes distinguish no-callers from callers that may be outside visible scopes.",
+            "Find references, call sites, usages, callers, and related tests for known fully qualified symbols. Prefer over grep when changing existing behavior and callers may matter; use search_symbols first for partial names. Results are tiered by volume and budget: few callers include snippets, larger results degrade to lines or per-file summaries. Narrow with paths or one symbol at a time for detail.",
             json!({
                 "type": "object",
                 "properties": {
                     "symbols": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Fully qualified symbol names to find usages for."
+                        "description": "Fully qualified symbol names from search_symbols are preferred; short names may resolve fuzzily or become ambiguous."
                     },
                     "include_tests": {
                         "type": "boolean",
@@ -83,7 +78,7 @@ pub(crate) fn symbol_tool_descriptors() -> Vec<Value> {
                     "paths": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Optional project-relative file paths or glob patterns used to narrow where usages are searched."
+                        "description": "Optional project-relative file paths or glob patterns used to narrow where usages are searched. Use paths from summary-mode scan_usages output to re-call for line or snippet detail."
                     }
                 },
                 "required": ["symbols"]

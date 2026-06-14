@@ -165,7 +165,6 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "search_symbols",
             "get_symbol_sources",
             "get_summaries",
-            "list_symbols",
             "scan_usages",
             "semantic_search",
             "refresh",
@@ -633,7 +632,6 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
             "search_symbols",
             "get_symbol_sources",
             "get_summaries",
-            "list_symbols",
             "scan_usages",
             "semantic_search",
             "refresh",
@@ -651,7 +649,6 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
             "search_symbols",
             "get_symbol_sources",
             "get_summaries",
-            "list_symbols",
             "scan_usages",
         ],
     );
