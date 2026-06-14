@@ -1,0 +1,128 @@
+name: Publish wheels
+
+on:
+  push:
+    tags:
+      - 'py-v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build and publish (e.g. py-v0.2.1). Must already exist.'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify-version:
+    name: verify version matches tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Verify pyproject.toml version matches tag
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          tag_version="${TAG#py-v}"
+          pkg_version=$(grep -m1 '^version' pyproject.toml | sed -E 's/version *= *"([^"]+)"/\1/')
+          if [ "$tag_version" != "$pkg_version" ]; then
+            echo "Tag version $tag_version != pyproject.toml $pkg_version" >&2
+            exit 1
+          fi
+          echo "Version $pkg_version matches tag $TAG"
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: verify-version
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            kind: linux
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            kind: linux
+          - target: x86_64-apple-darwin
+            # macos-latest is arm64; use the Intel runner so the x86_64 wheel
+            # builds natively rather than relying on cross-compilation.
+            runner: macos-13
+            kind: macos
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            kind: macos
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            kind: windows
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          # manylinux2014 only applies on Linux; ignored elsewhere.
+          manylinux: ${{ matrix.kind == 'linux' && '2014' || 'auto' }}
+          args: --release --locked --out dist
+          # Pin Rust to match the rest of the repo's workflows (rust-toolchain.toml is 1.96.0).
+          rust-toolchain: '1.96.0'
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  sdist:
+    name: build sdist
+    needs: verify-version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+
+      - name: Upload sdist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: publish to PyPI
+    needs: [verify-version, build, sdist]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish to PyPI (trusted publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
