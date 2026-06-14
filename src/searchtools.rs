@@ -3,8 +3,8 @@ use crate::analyzer::common::{
     is_scala_object_like, language_for_target,
 };
 use crate::analyzer::symbol_lookup::{
-    CodeUnitResolution, resolve_codeunit_fuzzy, resolve_typeish_codeunit_fuzzy,
-    strip_trailing_call_suffix,
+    CodeUnitResolution, resolve_codeunit_exact, resolve_codeunit_fuzzy,
+    resolve_typeish_codeunit_fuzzy, strip_trailing_call_suffix,
 };
 use crate::analyzer::usages::{
     CONFIDENCE_THRESHOLD, DEFAULT_MAX_FILES, FuzzyResult, RegexUsageAnalyzer, UsageAnalyzer,
@@ -813,6 +813,22 @@ pub(crate) fn summarize_targets_with_directory_inventory(
     )
 }
 
+fn source_blocks_for_resolved_units(
+    analyzer: &dyn IAnalyzer,
+    code_units: &[CodeUnit],
+) -> Vec<SourceBlock> {
+    code_units
+        .iter()
+        .flat_map(|code_unit| {
+            if is_file_listing_target(code_unit) {
+                module_file_listing_blocks(code_unit)
+            } else {
+                source_blocks_for_code_unit(analyzer, code_unit, true)
+            }
+        })
+        .collect()
+}
+
 pub fn get_symbol_sources(
     analyzer: &dyn IAnalyzer,
     params: SymbolLookupParams,
@@ -827,6 +843,19 @@ pub fn get_symbol_sources(
         .into_par_iter()
         .enumerate()
         .map(|(index, symbol)| {
+            // Exact fully-qualified lookup wins before file patterns, so a
+            // canonical symbol containing `/` (e.g. a Go import path) is never
+            // misrouted as a filesystem path.
+            let exact = resolve_codeunit_exact(analyzer, &symbol);
+            if !exact.is_empty() {
+                let sources = source_blocks_for_resolved_units(analyzer, &exact);
+                return if sources.is_empty() {
+                    (index, SourceLookupOutcome::NotFound(symbol))
+                } else {
+                    (index, SourceLookupOutcome::Found(sources))
+                };
+            }
+
             let file_matches = resolve_file_patterns(analyzer, std::slice::from_ref(&symbol));
             if let Some(item) = file_matches.ambiguous_paths.first() {
                 return (index, SourceLookupOutcome::AmbiguousPath(item.clone()));
@@ -846,16 +875,7 @@ pub fn get_symbol_sources(
 
             match resolve_codeunit_fuzzy(analyzer, &symbol) {
                 CodeUnitResolution::Resolved(code_units) => {
-                    let sources = code_units
-                        .iter()
-                        .flat_map(|code_unit| {
-                            if is_file_listing_target(code_unit) {
-                                module_file_listing_blocks(code_unit)
-                            } else {
-                                source_blocks_for_code_unit(analyzer, code_unit, true)
-                            }
-                        })
-                        .collect::<Vec<_>>();
+                    let sources = source_blocks_for_resolved_units(analyzer, &code_units);
                     if sources.is_empty() {
                         (index, SourceLookupOutcome::NotFound(symbol))
                     } else {

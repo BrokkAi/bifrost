@@ -80,10 +80,12 @@ fn test_go_import_alias_dot_blank_comments_and_versioned_paths() {
     assert!(!resolved.iter().any(|cu| cu.package_name() == "png"));
 
     let versioned = analyzer.imported_code_units_of(&yaml_file);
+    // No go.mod, so the canonical package identity is the directory path; the
+    // import `gopkg.in/yaml.v3` still resolves via the directory-suffix fallback.
     assert!(
-        versioned
-            .iter()
-            .any(|cu| cu.package_name() == "yaml" && cu.identifier() == "Marshal")
+        versioned.iter().any(
+            |cu| cu.package_name() == "vendor/gopkg.in/yaml.v3" && cu.identifier() == "Marshal"
+        )
     );
 
     let infos = analyzer.import_info_of(&main_file);

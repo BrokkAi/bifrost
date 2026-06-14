@@ -21,18 +21,27 @@ impl ImportAnalysisProvider for GoAnalyzer {
             let Some(path) = extract_go_import_path(&import.raw_snippet) else {
                 continue;
             };
-            let matching_files: Vec<_> = self
+            // Prefer exact canonical-package identity: with a go.mod present a
+            // package's `package_name` is its import path, so this is
+            // unambiguous. Fall back to the directory-suffix heuristic only
+            // when nothing matches exactly (module-less or vendored layouts
+            // where the import path is a suffix of the directory).
+            let mut matching_files: Vec<_> = self
                 .inner
                 .all_files()
                 .filter(|candidate| *candidate != file)
-                .filter(|candidate| {
-                    let parent = candidate.parent().to_string_lossy().replace('\\', "/");
-                    parent == path
-                        || path.ends_with(&format!("/{parent}"))
-                        || parent.ends_with(&format!("/{path}"))
-                })
+                .filter(|candidate| self.go_package_of(candidate).as_deref() == Some(path.as_str()))
                 .cloned()
                 .collect();
+            if matching_files.is_empty() {
+                matching_files = self
+                    .inner
+                    .all_files()
+                    .filter(|candidate| *candidate != file)
+                    .filter(|candidate| dir_suffix_matches(candidate, &path))
+                    .cloned()
+                    .collect();
+            }
             for target_file in matching_files {
                 resolved.extend(
                     self.inner
@@ -100,19 +109,36 @@ impl ImportAnalysisProvider for GoAnalyzer {
         imports: &[ImportInfo],
         target: &ProjectFile,
     ) -> bool {
-        let target_parent = target.parent().to_string_lossy().replace('\\', "/");
+        let target_pkg = self.go_package_of(target);
         imports.iter().any(|import| {
             let Some(path) = extract_go_import_path(&import.raw_snippet) else {
                 return false;
             };
-            target_parent == path
-                || path.ends_with(&format!("/{target_parent}"))
-                || target_parent.ends_with(&format!("/{path}"))
+            target_pkg.as_deref() == Some(path.as_str()) || dir_suffix_matches(target, &path)
         }) || self
             .imported_code_units_of(source_file)
             .into_iter()
             .any(|code_unit| code_unit.source() == target)
     }
+}
+
+impl GoAnalyzer {
+    /// Canonical package identity (import path) of a file, taken from any of
+    /// its declarations. `None` for files with no top-level declarations.
+    fn go_package_of(&self, file: &ProjectFile) -> Option<String> {
+        self.inner
+            .top_level_declarations(file)
+            .next()
+            .map(|unit| unit.package_name().to_string())
+    }
+}
+
+/// Legacy directory-suffix import match, used only as a fallback when no
+/// declaration's canonical package equals the import path (module-less or
+/// vendored layouts).
+fn dir_suffix_matches(candidate: &ProjectFile, path: &str) -> bool {
+    let parent = candidate.parent().to_string_lossy().replace('\\', "/");
+    parent == path || path.ends_with(&format!("/{parent}")) || parent.ends_with(&format!("/{path}"))
 }
 
 pub(super) fn extract_go_import_path(raw_import: &str) -> Option<String> {

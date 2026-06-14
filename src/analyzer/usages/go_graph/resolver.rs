@@ -1,3 +1,4 @@
+use crate::analyzer::go::packages::read_go_module_path;
 use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::usages::graph_core::{ImportEdgeKind, ProjectUsageGraph};
 use crate::analyzer::usages::model::{
@@ -221,18 +222,6 @@ fn resolve_go_module(
     resolved.sort();
     resolved.dedup();
     resolved
-}
-
-fn read_go_module_path(root: &std::path::Path) -> Option<String> {
-    let contents = std::fs::read_to_string(root.join("go.mod")).ok()?;
-    contents.lines().find_map(|line| {
-        let trimmed = line.trim();
-        trimmed
-            .strip_prefix("module ")
-            .map(str::trim)
-            .filter(|module| !module.is_empty())
-            .map(str::to_string)
-    })
 }
 
 fn local_go_import_rel_path(import_path: &str, module_path: Option<&str>) -> Option<String> {

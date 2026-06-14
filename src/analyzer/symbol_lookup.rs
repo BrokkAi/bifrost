@@ -13,6 +13,18 @@ pub(crate) fn resolve_codeunit_fuzzy(analyzer: &dyn IAnalyzer, input: &str) -> C
     resolve_codeunit_fuzzy_with(analyzer, input, |_| true)
 }
 
+/// Exact, non-fuzzy definition lookup for a fully-qualified name. Returns the
+/// matching definitions verbatim (empty if none). Used to short-circuit before
+/// file-pattern resolution so canonical names containing `/` (e.g. Go import
+/// paths) are never misread as filesystem paths.
+pub(crate) fn resolve_codeunit_exact(analyzer: &dyn IAnalyzer, input: &str) -> Vec<CodeUnit> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    analyzer.definitions(trimmed).cloned().collect()
+}
+
 pub(crate) fn resolve_typeish_codeunit_fuzzy(
     analyzer: &dyn IAnalyzer,
     input: &str,

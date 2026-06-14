@@ -50,6 +50,11 @@ pub(crate) fn epoch_for(language: Language, ts_language: &TsLanguage) -> &'stati
 trait LanguageEpoch {
     const NAME: &'static str;
     const QUERY_DIR: &'static str;
+    /// Manual per-language invalidation knob. Bump this when an analyzer code
+    /// change alters a language's emitted identities (e.g. `fq_name`) without
+    /// touching the grammar, queries, or wire format that the epoch otherwise
+    /// tracks automatically. Empty for languages that have never needed it.
+    const SALT: &'static str;
     fn cell() -> &'static OnceLock<String>;
 }
 
@@ -62,6 +67,8 @@ fn epoch_cell<L: LanguageEpoch>(ts_language: &TsLanguage) -> &'static str {
         hasher.update(PAYLOAD_VERSION.to_le_bytes());
         hasher.update(b"\n");
         hasher.update(L::NAME.as_bytes());
+        hasher.update(b"\n");
+        hasher.update(L::SALT.as_bytes());
         hasher.update(b"\n");
         hash_grammar(&mut hasher, ts_language);
         hasher.update(b"\n");
@@ -240,10 +247,14 @@ const EMBEDDED_QUERIES: &[(&str, &str)] = &[
 
 macro_rules! lang_epoch {
     ($struct:ident, $name:literal, $dir:literal) => {
+        lang_epoch!($struct, $name, $dir, "");
+    };
+    ($struct:ident, $name:literal, $dir:literal, $salt:literal) => {
         struct $struct;
         impl LanguageEpoch for $struct {
             const NAME: &'static str = $name;
             const QUERY_DIR: &'static str = $dir;
+            const SALT: &'static str = $salt;
             fn cell() -> &'static OnceLock<String> {
                 static CELL: OnceLock<String> = OnceLock::new();
                 &CELL
@@ -253,7 +264,14 @@ macro_rules! lang_epoch {
 }
 
 lang_epoch!(Java, "java", "treesitter/java/");
-lang_epoch!(Go, "go", "treesitter/go/");
+// Salt bumped: Go `package_name` is now the canonical import path, changing
+// every persisted Go `fq_name`. Forces stale rows to be re-analyzed.
+lang_epoch!(
+    Go,
+    "go",
+    "treesitter/go/",
+    "go-canonical-import-path-fqn-2026-06"
+);
 lang_epoch!(Cpp, "cpp", "treesitter/cpp/");
 lang_epoch!(JavaScript, "javascript", "treesitter/javascript/");
 lang_epoch!(TypeScript, "typescript", "treesitter/typescript/");

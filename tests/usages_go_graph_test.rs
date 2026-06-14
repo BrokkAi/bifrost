@@ -43,7 +43,7 @@ func run() {
         ),
     ]);
 
-    let target = definition(&analyzer, "util.Helper");
+    let target = definition(&analyzer, "example.com/app/util.Helper");
     let hits = UsageFinder::new()
         .find_usages_default(&analyzer, std::slice::from_ref(&target))
         .into_either()
@@ -69,7 +69,7 @@ func run() {
         ),
     ]);
 
-    let target = definition(&analyzer, "main.helper");
+    let target = definition(&analyzer, "example.com/app.helper");
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let hits = GoUsageGraphStrategy::new()
         .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
@@ -115,9 +115,9 @@ func run() {
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let strategy = GoUsageGraphStrategy::new();
     for fq_name in [
-        "config.Build",
-        "config._module_.Flag",
-        "config._module_.Count",
+        "example.com/app/config.Build",
+        "example.com/app/config._module_.Flag",
+        "example.com/app/config._module_.Count",
     ] {
         let target = definition(&analyzer, fq_name);
         let hits = strategy
@@ -150,8 +150,8 @@ func run() {
 
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let strategy = GoUsageGraphStrategy::new();
-    let util_helper = definition(&analyzer, "util.Helper");
-    let sidefx_helper = definition(&analyzer, "sidefx.Helper");
+    let util_helper = definition(&analyzer, "example.com/app/util.Helper");
+    let sidefx_helper = definition(&analyzer, "example.com/app/sidefx.Helper");
 
     let util_hits = strategy
         .find_usages(
@@ -200,7 +200,7 @@ func run() {
         ),
     ]);
 
-    let target = definition(&analyzer, "yaml.Marshal");
+    let target = definition(&analyzer, "example.com/app/vendor/gopkg.in/yaml.v3.Marshal");
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let hits = GoUsageGraphStrategy::new()
         .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
@@ -229,7 +229,7 @@ func run() {
         ),
     ]);
 
-    let alpha = definition(&analyzer, "alpha.Service");
+    let alpha = definition(&analyzer, "example.com/app/alpha.Service");
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let hits = GoUsageGraphStrategy::new()
         .find_usages(&analyzer, std::slice::from_ref(&alpha), &candidates, 1000)
@@ -257,7 +257,7 @@ func run() {
         ),
     ]);
 
-    let target = definition(&analyzer, "model.Helper");
+    let target = definition(&analyzer, "example.com/app/model.Helper");
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let hits = GoUsageGraphStrategy::new()
         .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
@@ -288,7 +288,7 @@ func run() {
         ),
     ]);
 
-    let target = definition(&analyzer, "model.Helper");
+    let target = definition(&analyzer, "example.com/app/model.Helper");
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let hits = GoUsageGraphStrategy::new()
         .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
@@ -325,14 +325,17 @@ func run() {
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let strategy = GoUsageGraphStrategy::new();
 
-    let router = definition(&analyzer, "chi.NewRouter");
+    let router = definition(
+        &analyzer,
+        "example.com/app/vendor/github.com/go-chi/chi/v5.NewRouter",
+    );
     let router_hits = strategy
         .find_usages(&analyzer, std::slice::from_ref(&router), &candidates, 1000)
         .into_either()
         .expect("semantic import version package clause should resolve");
     assert_eq!(1, router_hits.len(), "router hits: {router_hits:?}");
 
-    let helper = definition(&analyzer, "bar.Helper");
+    let helper = definition(&analyzer, "example.com/app/internal/foo.Helper");
     let helper_hits = strategy
         .find_usages(&analyzer, std::slice::from_ref(&helper), &candidates, 1000)
         .into_either()
@@ -370,7 +373,7 @@ func b() {
         ),
     ]);
 
-    let target = definition(&analyzer, "util.Helper");
+    let target = definition(&analyzer, "example.com/app/util.Helper");
     let candidates = [project.file("a.go")].into_iter().collect();
     let hits = GoUsageGraphStrategy::new()
         .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
@@ -406,7 +409,7 @@ func run() {
     }
     let (project, analyzer) = go_analyzer_with_files(&files);
 
-    let target = definition(&analyzer, "util.Helper");
+    let target = definition(&analyzer, "example.com/app/util.Helper");
     let candidates = [project.file("main.go")].into_iter().collect();
     let hits = GoUsageGraphStrategy::new()
         .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
@@ -443,7 +446,7 @@ func blocked() {
         ),
     ]);
 
-    let target = definition(&analyzer, "main.helper");
+    let target = definition(&analyzer, "example.com/app.helper");
     let allowed = project.file("allowed.go");
     let hits = UsageFinder::new()
         .with_file_filter(move |file| file == &allowed)
@@ -494,7 +497,7 @@ func Build(album model.Album) model.Album {
         ),
     ]);
 
-    let target = definition(&analyzer, "model.Album");
+    let target = definition(&analyzer, "example.com/app/model.Album");
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let hits = GoUsageGraphStrategy::new()
         .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
@@ -532,7 +535,7 @@ type Holder struct {
         ),
     ]);
 
-    let target = definition(&analyzer, "model.Album");
+    let target = definition(&analyzer, "example.com/app/model.Album");
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let hits = GoUsageGraphStrategy::new()
         .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
@@ -584,8 +587,8 @@ func Read(album model.Album) string {
     ]);
 
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
-    let field = definition(&analyzer, "model.Album.ImageFiles");
-    let method = definition(&analyzer, "model.Album.Title");
+    let field = definition(&analyzer, "example.com/app/model.Album.ImageFiles");
+    let method = definition(&analyzer, "example.com/app/model.Album.Title");
     let strategy = GoUsageGraphStrategy::new();
 
     let field_hits = strategy
@@ -648,7 +651,7 @@ func FromConstructors() string {
         ),
     ]);
 
-    let target = definition(&analyzer, "model.Album.Title");
+    let target = definition(&analyzer, "example.com/app/model.Album.Title");
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let hits = GoUsageGraphStrategy::new()
         .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
@@ -697,7 +700,7 @@ func Read() string {
         ),
     ]);
 
-    let target = definition(&analyzer, "model.Album.Title");
+    let target = definition(&analyzer, "example.com/app/model.Album.Title");
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let hits = GoUsageGraphStrategy::new()
         .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
@@ -743,7 +746,7 @@ func Read() string {
         ),
     ]);
 
-    let target = definition(&analyzer, "model.Album.Title");
+    let target = definition(&analyzer, "example.com/app/model.Album.Title");
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let hits = GoUsageGraphStrategy::new()
         .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
@@ -813,8 +816,8 @@ func readEmbedded(wrapper Wrapper) string {
     ]);
 
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
-    let field = definition(&analyzer, "model.Album.ImageFiles");
-    let method = definition(&analyzer, "model.Album.Title");
+    let field = definition(&analyzer, "example.com/app/model.Album.ImageFiles");
+    let method = definition(&analyzer, "example.com/app/model.Album.Title");
     let strategy = GoUsageGraphStrategy::new();
 
     let field_hits = strategy
@@ -864,7 +867,7 @@ func shadowDotImport() {
         ),
     ]);
 
-    let target = definition(&analyzer, "model.Helper");
+    let target = definition(&analyzer, "example.com/app/model.Helper");
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let hits = GoUsageGraphStrategy::new()
         .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
@@ -920,7 +923,7 @@ func callForms() {
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let strategy = GoUsageGraphStrategy::new();
 
-    let imported = definition(&analyzer, "util.Helper");
+    let imported = definition(&analyzer, "example.com/app/util.Helper");
     let imported_hits = strategy
         .find_usages(
             &analyzer,
@@ -932,7 +935,7 @@ func callForms() {
         .expect("imported function forms should resolve");
     assert_eq!(5, imported_hits.len(), "imported hits: {imported_hits:?}");
 
-    let local = definition(&analyzer, "main.helper");
+    let local = definition(&analyzer, "example.com/app.helper");
     let local_hits = strategy
         .find_usages(&analyzer, std::slice::from_ref(&local), &candidates, 1000)
         .into_either()
@@ -969,7 +972,7 @@ func shadowParameter(Helper func()) {
         ),
     ]);
 
-    let target = definition(&analyzer, "util.Helper");
+    let target = definition(&analyzer, "example.com/app/util.Helper");
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let hits = GoUsageGraphStrategy::new()
         .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
@@ -1013,7 +1016,7 @@ func localShadows() {
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let strategy = GoUsageGraphStrategy::new();
 
-    let helper = definition(&analyzer, "main.helper");
+    let helper = definition(&analyzer, "example.com/app.helper");
     let helper_hits = strategy
         .find_usages(&analyzer, std::slice::from_ref(&helper), &candidates, 1000)
         .into_either()
@@ -1023,7 +1026,7 @@ func localShadows() {
         "same-package function shadows should not count: {helper_hits:?}"
     );
 
-    let flag = definition(&analyzer, "main._module_.Flag");
+    let flag = definition(&analyzer, "example.com/app._module_.Flag");
     let flag_hits = strategy
         .find_usages(&analyzer, std::slice::from_ref(&flag), &candidates, 1000)
         .into_either()
@@ -1088,7 +1091,7 @@ func external() {
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let strategy = GoUsageGraphStrategy::new();
 
-    let flag = definition(&analyzer, "config._module_.Flag");
+    let flag = definition(&analyzer, "example.com/app/config._module_.Flag");
     let flag_hits = strategy
         .find_usages(&analyzer, std::slice::from_ref(&flag), &candidates, 1000)
         .into_either()
@@ -1101,7 +1104,7 @@ func external() {
                 || hit.file == project.file("main.go"))
     );
 
-    let count = definition(&analyzer, "config._module_.Count");
+    let count = definition(&analyzer, "example.com/app/config._module_.Count");
     let count_hits = strategy
         .find_usages(&analyzer, std::slice::from_ref(&count), &candidates, 1000)
         .into_either()
@@ -1155,7 +1158,7 @@ func Check(v any) {
         ),
     ]);
 
-    let target = definition(&analyzer, "model.Album");
+    let target = definition(&analyzer, "example.com/app/model.Album");
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let hits = GoUsageGraphStrategy::new()
         .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
@@ -1219,14 +1222,14 @@ func Nested(album model.Album) {
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let strategy = GoUsageGraphStrategy::new();
 
-    let method = definition(&analyzer, "model.Album.Title");
+    let method = definition(&analyzer, "example.com/app/model.Album.Title");
     let method_hits = strategy
         .find_usages(&analyzer, std::slice::from_ref(&method), &candidates, 1000)
         .into_either()
         .expect("nested method receiver usages should resolve");
     assert_eq!(3, method_hits.len(), "method hits: {method_hits:?}");
 
-    let field = definition(&analyzer, "model.Album.ImageFiles");
+    let field = definition(&analyzer, "example.com/app/model.Album.ImageFiles");
     let field_hits = strategy
         .find_usages(&analyzer, std::slice::from_ref(&field), &candidates, 1000)
         .into_either()
@@ -1268,14 +1271,14 @@ func Read(album *model.Album) string {
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let strategy = GoUsageGraphStrategy::new();
 
-    let method = definition(&analyzer, "model.Album.Title");
+    let method = definition(&analyzer, "example.com/app/model.Album.Title");
     let method_hits = strategy
         .find_usages(&analyzer, std::slice::from_ref(&method), &candidates, 1000)
         .into_either()
         .expect("dereferenced method receiver usages should resolve");
     assert_eq!(2, method_hits.len(), "method hits: {method_hits:?}");
 
-    let field = definition(&analyzer, "model.Album.ImageFiles");
+    let field = definition(&analyzer, "example.com/app/model.Album.ImageFiles");
     let field_hits = strategy
         .find_usages(&analyzer, std::slice::from_ref(&field), &candidates, 1000)
         .into_either()
@@ -1318,7 +1321,7 @@ func Later() string {
         ),
     ]);
 
-    let target = definition(&analyzer, "model.Album.Title");
+    let target = definition(&analyzer, "example.com/app/model.Album.Title");
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let hits = GoUsageGraphStrategy::new()
         .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
@@ -1348,7 +1351,7 @@ func run() {
         ),
     ]);
 
-    let target = definition(&analyzer, "main.helper");
+    let target = definition(&analyzer, "example.com/app.helper");
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let result = GoUsageGraphStrategy::new().find_usages(
         &analyzer,

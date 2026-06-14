@@ -8,7 +8,8 @@ pub(super) fn parse_go_file(
     source: &str,
     tree: &Tree,
 ) -> crate::analyzer::tree_sitter_analyzer::ParsedFile {
-    let package_name = determine_go_package_name(tree.root_node(), source);
+    let declared_package = determine_go_package_name(tree.root_node(), source);
+    let package_name = super::packages::canonical_go_package_name(file, &declared_package);
     let mut parsed = crate::analyzer::tree_sitter_analyzer::ParsedFile::new(package_name);
     let root = tree.root_node();
 
