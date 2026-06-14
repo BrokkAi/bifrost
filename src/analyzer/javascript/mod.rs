@@ -19,8 +19,8 @@ use crate::analyzer::js_ts::model::{module_code_unit, node_text, trim_statement}
 use crate::analyzer::js_ts::tests::detect_js_ts_test_assertion_smells;
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use crate::analyzer::{
-    AnalyzerConfig, CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language,
-    LanguageAdapter, Project, ProjectFile, TestAssertionSmell, TestAssertionWeights,
+    AliasResolver, AnalyzerConfig, CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo,
+    Language, LanguageAdapter, Project, ProjectFile, TestAssertionSmell, TestAssertionWeights,
     TestDetectionProvider, TreeSitterAnalyzer, build_reverse_import_index,
 };
 use crate::hash::{HashMap, HashSet};
@@ -133,6 +133,9 @@ pub struct JavascriptAnalyzer {
     inner: TreeSitterAnalyzer<JavascriptAdapter>,
     memo_budget: u64,
     memo_caches: Arc<JsMemoCaches>,
+    /// Shared jsconfig/tsconfig path-alias resolver (parsed configs cached) so the
+    /// import/reference graph resolves `@/`-style aliases like the scan_usages graph.
+    alias_resolver: Arc<AliasResolver>,
 }
 
 #[derive(Clone)]
@@ -161,10 +164,12 @@ impl JavascriptAnalyzer {
 
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
+        let alias_resolver = Arc::new(AliasResolver::new(project.root().to_path_buf()));
         Self {
             inner: TreeSitterAnalyzer::new_with_config(project, JavascriptAdapter, config),
             memo_budget,
             memo_caches: Arc::new(JsMemoCaches::new(memo_budget)),
+            alias_resolver,
         }
     }
 
@@ -174,6 +179,7 @@ impl JavascriptAnalyzer {
         storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
     ) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
+        let alias_resolver = Arc::new(AliasResolver::new(project.root().to_path_buf()));
         Self {
             inner: TreeSitterAnalyzer::new_with_config_and_storage(
                 project,
@@ -183,6 +189,7 @@ impl JavascriptAnalyzer {
             ),
             memo_budget,
             memo_caches: Arc::new(JsMemoCaches::new(memo_budget)),
+            alias_resolver,
         }
     }
 
@@ -218,9 +225,12 @@ impl ImportAnalysisProvider for JavascriptAnalyzer {
 
         let mut resolved = HashSet::default();
         for import in self.inner.import_info_of(file) {
-            for target in
-                resolve_js_ts_import_paths(file, &import.raw_snippet, Language::JavaScript)
-            {
+            for target in resolve_js_ts_import_paths(
+                file,
+                &import.raw_snippet,
+                Language::JavaScript,
+                Some(&self.alias_resolver),
+            ) {
                 let top_level: Vec<_> = self.inner.top_level_declarations(&target).collect();
                 if import.is_wildcard {
                     resolved.extend(
@@ -324,9 +334,14 @@ impl ImportAnalysisProvider for JavascriptAnalyzer {
         target: &ProjectFile,
     ) -> bool {
         imports.iter().any(|import| {
-            resolve_js_ts_import_paths(source_file, &import.raw_snippet, Language::JavaScript)
-                .into_iter()
-                .any(|candidate| candidate == *target)
+            resolve_js_ts_import_paths(
+                source_file,
+                &import.raw_snippet,
+                Language::JavaScript,
+                Some(&self.alias_resolver),
+            )
+            .into_iter()
+            .any(|candidate| candidate == *target)
         })
     }
 }
@@ -395,18 +410,25 @@ impl IAnalyzer for JavascriptAnalyzer {
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
+        let inner = self.inner.update(changed_files);
+        // Rebuild from root so a changed jsconfig/tsconfig drops its stale parse cache.
+        let alias_resolver = Arc::new(AliasResolver::new(inner.project().root().to_path_buf()));
         Self {
-            inner: self.inner.update(changed_files),
+            inner,
             memo_budget: self.memo_budget,
             memo_caches: Arc::new(JsMemoCaches::new(self.memo_budget)),
+            alias_resolver,
         }
     }
 
     fn update_all(&self) -> Self {
+        let inner = self.inner.update_all();
+        let alias_resolver = Arc::new(AliasResolver::new(inner.project().root().to_path_buf()));
         Self {
-            inner: self.inner.update_all(),
+            inner,
             memo_budget: self.memo_budget,
             memo_caches: Arc::new(JsMemoCaches::new(self.memo_budget)),
+            alias_resolver,
         }
     }
 

@@ -4,7 +4,9 @@ use crate::analyzer::usages::js_ts_graph::extractor::{
     compute_export_index, compute_import_binder,
 };
 use crate::analyzer::usages::model::{ExportIndex, ImportBinder};
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, resolve_js_ts_module_specifier};
+use crate::analyzer::{
+    AliasResolver, CodeUnit, IAnalyzer, Language, ProjectFile, resolve_js_ts_module_specifier,
+};
 use crate::hash::{HashMap, map_with_capacity};
 use rayon::prelude::*;
 use std::sync::Arc;
@@ -70,11 +72,14 @@ pub(super) fn build_js_ts_graph(analyzer: &dyn IAnalyzer, language: Language) ->
         binders_by_file.insert(file, binder);
     }
 
+    let aliases = AliasResolver::new(analyzer.project().root().to_path_buf());
     let usage_graph = ProjectUsageGraph::build(
         files,
         exports_by_file,
         &binders_by_file,
-        |file, module_specifier| resolve_js_ts_module_specifier(file, module_specifier, language),
+        |file, module_specifier| {
+            resolve_js_ts_module_specifier(file, module_specifier, language, Some(&aliases))
+        },
     );
 
     JsTsProjectGraph {

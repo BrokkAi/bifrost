@@ -4,9 +4,9 @@ use crate::analyzer::clone_detection::{
 };
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::{
-    AnalyzerConfig, CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language, Project,
-    ProjectFile, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
-    TreeSitterAnalyzer, TypeAliasProvider, build_reverse_import_index,
+    AliasResolver, AnalyzerConfig, CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo,
+    Language, Project, ProjectFile, TestAssertionSmell, TestAssertionWeights,
+    TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider, build_reverse_import_index,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
@@ -143,6 +143,9 @@ pub struct TypescriptAnalyzer {
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     relevant_imports: Cache<CodeUnit, Arc<HashSet<String>>>,
     reverse_import_index: Arc<OnceLock<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
+    /// Shared tsconfig path-alias resolver (parsed configs cached) so the import/reference
+    /// graph resolves `@/`-style aliases the same way the scan_usages graph does.
+    alias_resolver: Arc<AliasResolver>,
 }
 
 impl TypescriptAnalyzer {
@@ -152,6 +155,7 @@ impl TypescriptAnalyzer {
 
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
+        let alias_resolver = Arc::new(AliasResolver::new(project.root().to_path_buf()));
         Self {
             inner: TreeSitterAnalyzer::new_with_config(project, TypescriptAdapter, config),
             memo_budget,
@@ -159,6 +163,7 @@ impl TypescriptAnalyzer {
             referencing_files: build_weighted_cache(memo_budget / 6, weight_project_file_set),
             relevant_imports: build_weighted_cache(memo_budget / 6, weight_string_set),
             reverse_import_index: Arc::new(OnceLock::new()),
+            alias_resolver,
         }
     }
 
@@ -168,6 +173,7 @@ impl TypescriptAnalyzer {
         storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
     ) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
+        let alias_resolver = Arc::new(AliasResolver::new(project.root().to_path_buf()));
         Self {
             inner: TreeSitterAnalyzer::new_with_config_and_storage(
                 project,
@@ -180,6 +186,7 @@ impl TypescriptAnalyzer {
             referencing_files: build_weighted_cache(memo_budget / 6, weight_project_file_set),
             relevant_imports: build_weighted_cache(memo_budget / 6, weight_string_set),
             reverse_import_index: Arc::new(OnceLock::new()),
+            alias_resolver,
         }
     }
 
@@ -225,9 +232,12 @@ impl ImportAnalysisProvider for TypescriptAnalyzer {
 
         let mut resolved = HashSet::default();
         for import in self.inner.import_info_of(file) {
-            for target in
-                resolve_js_ts_import_paths(file, &import.raw_snippet, Language::TypeScript)
-            {
+            for target in resolve_js_ts_import_paths(
+                file,
+                &import.raw_snippet,
+                Language::TypeScript,
+                Some(&self.alias_resolver),
+            ) {
                 let top_level: Vec<_> = self.inner.top_level_declarations(&target).collect();
                 if import.is_wildcard {
                     resolved.extend(
@@ -328,9 +338,14 @@ impl ImportAnalysisProvider for TypescriptAnalyzer {
         target: &ProjectFile,
     ) -> bool {
         imports.iter().any(|import| {
-            resolve_js_ts_import_paths(source_file, &import.raw_snippet, Language::TypeScript)
-                .into_iter()
-                .any(|candidate| candidate == *target)
+            resolve_js_ts_import_paths(
+                source_file,
+                &import.raw_snippet,
+                Language::TypeScript,
+                Some(&self.alias_resolver),
+            )
+            .into_iter()
+            .any(|candidate| candidate == *target)
         })
     }
 }
@@ -403,23 +418,30 @@ impl IAnalyzer for TypescriptAnalyzer {
         self.inner.languages()
     }
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
+        let inner = self.inner.update(changed_files);
+        // Rebuild from root so a changed tsconfig.json drops its stale parse cache.
+        let alias_resolver = Arc::new(AliasResolver::new(inner.project().root().to_path_buf()));
         Self {
-            inner: self.inner.update(changed_files),
+            inner,
             memo_budget: self.memo_budget,
             imported_code_units: build_weighted_cache(self.memo_budget / 3, weight_code_unit_set),
             referencing_files: build_weighted_cache(self.memo_budget / 6, weight_project_file_set),
             relevant_imports: build_weighted_cache(self.memo_budget / 6, weight_string_set),
             reverse_import_index: Arc::new(OnceLock::new()),
+            alias_resolver,
         }
     }
     fn update_all(&self) -> Self {
+        let inner = self.inner.update_all();
+        let alias_resolver = Arc::new(AliasResolver::new(inner.project().root().to_path_buf()));
         Self {
-            inner: self.inner.update_all(),
+            inner,
             memo_budget: self.memo_budget,
             imported_code_units: build_weighted_cache(self.memo_budget / 3, weight_code_unit_set),
             referencing_files: build_weighted_cache(self.memo_budget / 6, weight_project_file_set),
             relevant_imports: build_weighted_cache(self.memo_budget / 6, weight_string_set),
             reverse_import_index: Arc::new(OnceLock::new()),
+            alias_resolver,
         }
     }
     fn project(&self) -> &dyn Project {
