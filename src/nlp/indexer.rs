@@ -11,6 +11,7 @@
 //! converge instead of conflicting.
 
 use std::collections::BTreeSet;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
@@ -79,6 +80,33 @@ impl EngineProvider for FakeEngineProvider {
 
     fn reranker(&self) -> Result<Arc<dyn Reranker>, String> {
         Ok(Arc::new(FakeOverlapReranker))
+    }
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "unknown panic".to_string()
+}
+
+fn tolerate_engine_panic<T>(
+    label: &str,
+    load: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = catch_unwind(AssertUnwindSafe(load));
+    std::panic::set_hook(previous_hook);
+    match result {
+        Ok(result) => result,
+        Err(payload) => Err(format!(
+            "{label} load panicked: {}",
+            panic_payload_message(payload.as_ref())
+        )),
     }
 }
 
@@ -395,7 +423,7 @@ fn worker_loop(
     if check_cancelled(&shared).is_err() {
         return;
     }
-    let embedder = match provider.embedder() {
+    let embedder = match tolerate_engine_panic("embedding model", || provider.embedder()) {
         Ok(embedder) => embedder,
         Err(err) => return fail(&shared, format!("embedding model load failed: {err}")),
     };
@@ -446,7 +474,12 @@ fn worker_loop(
             first_build_done = true;
             // Load the reranker after the index is usable; a failure here
             // degrades reranking but never blocks retrieval.
-            shared.reranker.set(provider.reranker()).ok();
+            shared
+                .reranker
+                .set(tolerate_engine_panic("reranker model", || {
+                    provider.reranker()
+                }))
+                .ok();
             let mut phase = shared
                 .phase
                 .lock()
@@ -896,6 +929,42 @@ mod tests {
         fn reranker(&self) -> Result<Arc<dyn Reranker>, String> {
             Ok(Arc::new(FakeOverlapReranker))
         }
+    }
+
+    struct PanickingEngineProvider;
+
+    impl EngineProvider for PanickingEngineProvider {
+        fn embedder(&self) -> Result<Arc<dyn Embedder>, String> {
+            panic!("missing ONNX runtime")
+        }
+
+        fn reranker(&self) -> Result<Arc<dyn Reranker>, String> {
+            Ok(Arc::new(FakeOverlapReranker))
+        }
+    }
+
+    #[test]
+    fn engine_load_panic_marks_semantic_index_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        write_java(
+            dir.path(),
+            "Thing.java",
+            "public class Thing { public String value() { return \"x\"; } }\n",
+        );
+        let snapshot = snapshot_for(dir.path());
+        let indexer = SemanticIndexer::start_with_provider(
+            dir.path().to_path_buf(),
+            snapshot,
+            PanickingEngineProvider,
+        );
+
+        let err = indexer
+            .wait_ready(Duration::from_secs(30))
+            .expect_err("panicking engine provider should fail semantic indexing");
+
+        assert!(err.contains("semantic index unavailable"));
+        assert!(err.contains("missing ONNX runtime"));
+        indexer.close();
     }
 
     #[test]

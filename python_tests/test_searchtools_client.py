@@ -97,6 +97,14 @@ class SearchToolsClientTest(unittest.TestCase):
         self.assertIn("    - AInnerInner", text)
         self.assertIn("      - method7", text)
 
+    def test_scan_usages_returns_rendered_native_payload(self) -> None:
+        with SearchToolsClient(root=self.fixture_root) as client:
+            usages = client.scan_usages(["A.method2"])
+            text = usages.render_text()
+
+        self.assertIn("A.method2", text)
+        self.assertIsInstance(usages.structured, dict)
+
     def test_get_summaries_keeps_directory_inventory_for_wrapper_callers(self) -> None:
         with SearchToolsClient(root=self.fixture_root) as client:
             summaries = client.get_summaries(["."])

@@ -17,6 +17,7 @@ from .models import (
     MostRelevantFilesResult,
     SemanticSearchResult,
     SemanticSearchStatus,
+    ScanUsagesResult,
     SearchSymbolsResult,
     SkimFilesResult,
     SymbolAncestorsResult,
@@ -179,6 +180,25 @@ class SearchToolsClient:
         return SkimFilesResult.from_dict(
             payload.structured,
             render_line_numbers=self._render_line_numbers,
+            rendered_text=payload.rendered_text,
+        )
+
+    def scan_usages(
+        self,
+        symbols: list[str],
+        *,
+        include_tests: bool = False,
+        paths: list[str] | None = None,
+    ) -> ScanUsagesResult:
+        arguments: dict[str, Any] = {
+            "symbols": symbols,
+            "include_tests": include_tests,
+        }
+        if paths is not None:
+            arguments["paths"] = paths
+        payload = self._call_tool_payload("scan_usages", arguments)
+        return ScanUsagesResult.from_dict(
+            payload.structured,
             rendered_text=payload.rendered_text,
         )
 

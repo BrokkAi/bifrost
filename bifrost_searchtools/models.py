@@ -465,6 +465,47 @@ class SymbolSourcesResult:
 
 
 @dataclass(frozen=True)
+class ScanUsagesResult:
+    structured: dict
+    rendered_text: str | None = None
+
+    @classmethod
+    def from_dict(
+        cls,
+        data: dict,
+        rendered_text: str | None = None,
+    ) -> ScanUsagesResult:
+        return cls(structured=data, rendered_text=rendered_text)
+
+    def render_text(self) -> str:
+        if self.rendered_text is not None:
+            return self.rendered_text
+        usages = self.structured.get("usages", [])
+        if not usages:
+            return "No usages found."
+        blocks: list[str] = []
+        for usage in usages:
+            symbol = str(usage.get("symbol", "<unknown>"))
+            total_hits = int(usage.get("total_hits", 0))
+            lines = [f"{symbol}: {total_hits} usage(s)"]
+            for file_group in usage.get("files", []):
+                path = str(file_group.get("path", "<unknown>"))
+                lines.append(path)
+                for hit in file_group.get("hits", []):
+                    line = hit.get("line")
+                    enclosing = hit.get("enclosing")
+                    prefix = f"  line {line}" if line is not None else "  hit"
+                    if enclosing:
+                        prefix += f" in {enclosing}"
+                    lines.append(prefix)
+                    snippet = str(hit.get("snippet", "")).rstrip()
+                    if snippet:
+                        lines.extend(f"    {snippet_line}" for snippet_line in snippet.splitlines())
+            blocks.append("\n".join(lines))
+        return "\n\n".join(blocks)
+
+
+@dataclass(frozen=True)
 class SkimFile:
     path: str
     loc: int
