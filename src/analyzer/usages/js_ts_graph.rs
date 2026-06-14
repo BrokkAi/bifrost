@@ -22,8 +22,10 @@
 //!
 //! Scope notes:
 //! - **Structured local modules only.** Static relative ESM specifiers and CommonJS
-//!   `require(...)` calls are walked. Dynamic requires, bare package specifiers,
-//!   `package.json` `exports`, and tsconfig `paths` remain outside this graph.
+//!   `require(...)` calls are walked, plus non-relative specifiers that match a
+//!   `tsconfig.json`/`jsconfig.json` path alias (`@/...`, resolved via `AliasResolver`).
+//!   Dynamic requires, bare package specifiers, and `package.json` `exports` remain
+//!   outside this graph.
 //! - **Per-call indices.** No cross-call cache: each query rebuilds the graph for the
 //!   target's language. This keeps results consistent after file edits at the cost of
 //!   re-parsing JS/TS files on every query. Hosts with stable file sets that need lower

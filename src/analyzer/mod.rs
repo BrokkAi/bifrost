@@ -43,7 +43,7 @@ pub use go::GoAnalyzer;
 pub use i_analyzer::IAnalyzer;
 pub use java::JavaAnalyzer;
 pub use javascript::JavascriptAnalyzer;
-pub(crate) use js_ts::resolve_js_ts_module_specifier;
+pub(crate) use js_ts::{AliasResolver, resolve_js_ts_module_specifier};
 pub use model::{
     CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType, CommentDensityStats,
     DeclarationInfo, DeclarationKind, ExceptionHandlingSmell, ExceptionSmellWeights, ImportInfo,

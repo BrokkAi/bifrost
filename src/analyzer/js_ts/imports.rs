@@ -1,3 +1,4 @@
+use crate::analyzer::js_ts::tsconfig::AliasResolver;
 use crate::analyzer::{ImportInfo, Language, ProjectFile};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -336,28 +337,46 @@ pub(crate) fn resolve_js_ts_import_paths(
     source_file: &ProjectFile,
     raw_import: &str,
     language: Language,
+    aliases: Option<&AliasResolver>,
 ) -> Vec<ProjectFile> {
     let Some(module_path) = extract_import_module_path(raw_import) else {
         return Vec::new();
     };
-    resolve_js_ts_module_specifier(source_file, &module_path, language)
+    resolve_js_ts_module_specifier(source_file, &module_path, language, aliases)
 }
 
-/// Resolve a relative module specifier (e.g. `"./foo"`) to project files. Bare specifiers
-/// are intentionally ignored — `package.json` `exports`/`main` resolution and tsconfig
-/// `paths`/`baseUrl` are out of scope. Shared with the JS/TS export-usage graph so both
-/// resolvers stay in lock-step.
+/// Resolve a module specifier to project files. Relative specifiers (`"./foo"`) resolve
+/// against the importing file's directory; non-relative specifiers are matched against
+/// the importing file's governing `tsconfig.json`/`jsconfig.json` path aliases via
+/// `aliases` (when supplied). Bare package specifiers that match no alias are still
+/// ignored — `package.json` `exports`/`main` resolution remains out of scope. Shared with
+/// the JS/TS export-usage graph so both resolvers stay in lock-step.
 pub(crate) fn resolve_js_ts_module_specifier(
     source_file: &ProjectFile,
     module_specifier: &str,
     language: Language,
+    aliases: Option<&AliasResolver>,
 ) -> Vec<ProjectFile> {
+    let exts = language.extensions();
     if !module_specifier.starts_with('.') {
+        // Non-relative: try tsconfig path aliases. Each candidate base is tried in TS
+        // precedence order; the first that resolves to a real file wins.
+        let Some(aliases) = aliases else {
+            return Vec::new();
+        };
+        for base in aliases.candidate_bases(source_file, module_specifier) {
+            let mut candidates = Vec::new();
+            collect_candidate_paths(source_file.root(), &base, exts, &mut candidates);
+            if !candidates.is_empty() {
+                candidates.sort();
+                candidates.dedup();
+                return candidates;
+            }
+        }
         return Vec::new();
     }
     let base = source_file.parent().join(module_specifier);
     let mut candidates = Vec::new();
-    let exts = language.extensions();
     collect_candidate_paths(source_file.root(), &base, exts, &mut candidates);
     candidates.sort();
     candidates.dedup();
