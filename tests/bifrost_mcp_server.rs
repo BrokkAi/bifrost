@@ -159,9 +159,44 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     let tools = list_tools["result"]["tools"]
         .as_array()
         .expect("tools array");
-    assert_eq!(
-        tool_names(tools),
-        vec![
+    assert_eq!(tool_names(tools), {
+        #[cfg(not(feature = "nlp"))]
+        let expected = vec![
+            "search_symbols",
+            "get_symbol_sources",
+            "get_summaries",
+            "scan_usages",
+            "refresh",
+            "activate_workspace",
+            "get_active_workspace",
+            "get_symbol_locations",
+            "get_symbol_ancestors",
+            "find_filenames",
+            "list_files",
+            "most_relevant_files",
+            "search_git_commit_messages",
+            "get_git_log",
+            "get_commit_diff",
+            "jq",
+            "xml_skim",
+            "xml_select",
+            "get_file_contents",
+            "search_file_contents",
+            "find_files_containing",
+            "compute_cyclomatic_complexity",
+            "compute_cognitive_complexity",
+            "report_comment_density_for_code_unit",
+            "report_exception_handling_smells",
+            "report_comment_density_for_files",
+            "analyze_git_hotspots",
+            "report_test_assertion_smells",
+            "report_structural_clone_smells",
+            "report_long_method_and_god_object_smells",
+            "report_dead_code_and_unused_abstraction_smells",
+            "report_secret_like_code",
+        ];
+        #[cfg(feature = "nlp")]
+        let expected = vec![
             "search_symbols",
             "get_symbol_sources",
             "get_summaries",
@@ -195,8 +230,9 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "report_long_method_and_god_object_smells",
             "report_dead_code_and_unused_abstraction_smells",
             "report_secret_like_code",
-        ]
-    );
+        ];
+        expected
+    });
 
     let ping = round_trip(
         &mut stdin,
@@ -634,11 +670,7 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
     core_expected.push("semantic_search");
     core_expected.extend(["refresh", "activate_workspace", "get_active_workspace"]);
 
-    assert_server_tool_names(
-        &fixture_root,
-        "core",
-        &core_expected,
-    );
+    assert_server_tool_names(&fixture_root, "core", &core_expected);
     assert_server_tool_names(
         &fixture_root,
         "workspace|symbol",
@@ -713,6 +745,7 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
 /// When the embedding model cannot load, semantic_search must surface a
 /// clean tool error instead of hanging on the background build.
 #[test]
+#[cfg(feature = "nlp")]
 fn bifrost_semantic_search_fails_cleanly_without_models() {
     let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")

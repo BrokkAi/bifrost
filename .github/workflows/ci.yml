@@ -118,7 +118,7 @@ jobs:
 
       - name: cargo test
         if: matrix.can-test
-        run: cargo test --target ${{ matrix.target }} ${{ matrix.test-args }}
+        run: cargo test --target ${{ matrix.target }} ${{ matrix.cargo-flags }} ${{ matrix.test-args }}
 
   python:
     name: python (${{ matrix.target }})
