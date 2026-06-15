@@ -1,5 +1,30 @@
 use crate::analyzer::{CodeUnit, Language, ProjectFile};
 
+/// Longest single line a source file may contain before tree-sitter parsing is
+/// skipped, from `BIFROST_MAX_LINE_LENGTH` (unset = no limit). Minified/generated
+/// single-line bundles (e.g. committed webpack output) otherwise livelock the
+/// parser. 20000 mirrors VS Code's `editor.maxTokenizationLineLength`.
+pub(crate) fn max_line_length_limit() -> Option<usize> {
+    std::env::var("BIFROST_MAX_LINE_LENGTH")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+}
+
+/// Whether `source` must NOT be handed to tree-sitter: it is binary (contains NUL
+/// bytes) or pathological for the parser (a line longer than the configured cap).
+/// Centralizes the "is this safe to parse?" decision for every parse site so no
+/// consumer livelocks on adversarial input.
+pub(crate) fn is_unparseable_source(source: &str) -> bool {
+    if source.as_bytes().contains(&0) {
+        return true;
+    }
+    match max_line_length_limit() {
+        Some(limit) => source.lines().any(|line| line.len() > limit),
+        None => false,
+    }
+}
+
 pub(crate) fn language_for_target(target: &CodeUnit) -> Language {
     language_for_file(target.source())
 }

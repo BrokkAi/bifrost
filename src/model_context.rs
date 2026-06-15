@@ -27,9 +27,16 @@ pub fn truncate_line_range(content: &str, start_inclusive: usize, end_exclusive:
     if len <= MAX_CHARS_PER_LINE {
         return content[start_inclusive..end_exclusive].to_string();
     }
+    // MAX_CHARS_PER_LINE is applied as a byte budget; snap the cut down to the
+    // nearest UTF-8 char boundary so multibyte content (CJK/Cyrillic) straddling
+    // the offset doesn't panic the slice.
+    let mut cut = start_inclusive + MAX_CHARS_PER_LINE;
+    while cut > start_inclusive && !content.is_char_boundary(cut) {
+        cut -= 1;
+    }
     format!(
         "{} [TRUNCATED at {} chars]",
-        &content[start_inclusive..start_inclusive + MAX_CHARS_PER_LINE],
+        &content[start_inclusive..cut],
         MAX_CHARS_PER_LINE
     )
 }

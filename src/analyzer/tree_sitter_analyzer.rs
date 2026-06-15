@@ -500,7 +500,7 @@ where
         file: &ProjectFile,
     ) -> Option<FileState> {
         let source = project.read_source(file).ok()?;
-        if source.as_bytes().contains(&0) {
+        if crate::analyzer::common::is_unparseable_source(source.as_str()) {
             return None;
         }
         let tree = parser.parse(source.as_str(), None)?;
@@ -1252,6 +1252,9 @@ where
         };
 
         let source = file_state.source.as_str();
+        if crate::analyzer::common::is_unparseable_source(source) {
+            return Vec::new();
+        }
         let mut parser = Self::build_parser(self.adapter.parser_language());
         let Some(tree) = parser.parse(source, None) else {
             return Vec::new();

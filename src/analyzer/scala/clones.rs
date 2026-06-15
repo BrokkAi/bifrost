@@ -123,6 +123,9 @@ pub(super) fn refine_scala_clone_similarity(
 }
 
 fn parse_scala_tree(source: &str) -> Option<Tree> {
+    if crate::analyzer::common::is_unparseable_source(source) {
+        return None;
+    }
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_scala::LANGUAGE.into())

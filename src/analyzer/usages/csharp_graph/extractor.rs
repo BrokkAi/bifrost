@@ -35,6 +35,9 @@ pub(super) fn scan_file(
     if source.is_empty() {
         return;
     }
+    if crate::analyzer::common::is_unparseable_source(&source) {
+        return;
+    }
 
     let mut parser = Parser::new();
     if parser
