@@ -31,6 +31,8 @@ jobs:
     env:
       RUSTFLAGS: ${{ matrix.rustflags }}
       ANDROID_API: '21'
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
     strategy:
       fail-fast: false
       matrix:
@@ -45,7 +47,7 @@ jobs:
             runner: ubuntu-24.04-arm
             can-test: true
             rustflags: ''
-            test-args: ''
+            test-args: '--jobs 1'
             cargo-flags: '--features nlp'
           - target: aarch64-apple-darwin
             runner: macos-latest
