@@ -42,6 +42,14 @@ pub fn build_server_spec(
     instructions: &'static str,
     tool_descriptors: Vec<Value>,
 ) -> Result<McpServerSpec, String> {
+    build_server_spec_with_hidden(instructions, tool_descriptors, Vec::new())
+}
+
+pub fn build_server_spec_with_hidden(
+    instructions: &'static str,
+    tool_descriptors: Vec<Value>,
+    hidden_tool_names: Vec<String>,
+) -> Result<McpServerSpec, String> {
     let mut tool_names = HashSet::with_capacity(tool_descriptors.len());
     for descriptor in &tool_descriptors {
         let Some(name) = descriptor.get("name").and_then(Value::as_str) else {
@@ -49,6 +57,7 @@ pub fn build_server_spec(
         };
         tool_names.insert(name.to_string());
     }
+    tool_names.extend(hidden_tool_names);
 
     Ok(McpServerSpec {
         instructions,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import os
 import shutil
 import subprocess
 import sys
@@ -12,10 +13,13 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from bifrost_searchtools import SearchToolsClient, SearchToolsError, SymbolKindFilter
+from bifrost_searchtools.models import SemanticSearchResult, SemanticSearchStatus
 
 class SearchToolsClientTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
+        # Keep the test suite from starting the background semantic indexer or downloading models.
+        os.environ.setdefault("BIFROST_SEMANTIC_INDEX", "off")
         maturin = shutil.which("maturin")
         if maturin is None:
             raise RuntimeError(
@@ -108,6 +112,11 @@ class SearchToolsClientTest(unittest.TestCase):
         with SearchToolsClient(root=self.fixture_root) as client:
             with self.assertRaisesRegex(SearchToolsError, "Unknown tool: nope"):
                 client._call_tool("nope", {})
+
+    def test_semantic_search_disabled_raises(self) -> None:
+        with SearchToolsClient(root=self.fixture_root) as client:
+            with self.assertRaisesRegex(SearchToolsError, "disabled"):
+                client.semantic_search("anything", k=1)
 
     def test_client_supports_concurrent_requests_from_threads(self) -> None:
         def call_tool(index: int) -> str:
@@ -315,6 +324,51 @@ namespace Demo
         )
         self.assertIn("Demo.BaseType", text)
         self.assertIn("Demo.IService", text)
+
+    def test_semantic_search_result_from_dict_renders_hits_and_notes(self) -> None:
+        result = SemanticSearchResult.from_dict(
+            {
+                "hits": [
+                    {
+                        "path": "src/Foo.java",
+                        "score": 0.87,
+                        "summary": "public class Foo { ... }",
+                    },
+                    {
+                        "path": "src/Bar.java",
+                        "score": 0.1254,
+                        "summary": "public class Bar { ... }",
+                    },
+                ],
+                "notes": ["index warmed from cache"],
+            }
+        )
+
+        self.assertEqual(2, result.count)
+        self.assertEqual("src/Foo.java", result.hits[0].path)
+        self.assertEqual(0.87, result.hits[0].score)
+        self.assertEqual("public class Bar { ... }", result.hits[1].summary)
+        self.assertEqual(["index warmed from cache"], result.notes)
+
+        text = result.render_text()
+        self.assertIn("note: index warmed from cache", text)
+        self.assertIn("=== src/Foo.java (score 0.870) ===", text)
+        self.assertIn("=== src/Bar.java (score 0.125) ===", text)
+
+    def test_semantic_search_status_from_dict(self) -> None:
+        status = SemanticSearchStatus.from_dict(
+            {
+                "indexed_files": 12,
+                "waiting_files": 3,
+                "pending_batches": 1,
+                "phase": "ready",
+            }
+        )
+
+        self.assertEqual(12, status.indexed_files)
+        self.assertEqual(3, status.waiting_files)
+        self.assertEqual(1, status.pending_batches)
+        self.assertEqual("ready", status.phase)
 
 
 if __name__ == "__main__":

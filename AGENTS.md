@@ -41,3 +41,12 @@ At minimum, run `cargo fmt` and `cargo clippy --all-targets --all-features -- -D
 - The above should not be interpreted as a blanket prohibition on clone or refcounting
   when these are genuinely the best option, just be intentional rather than reaching for these
   out of habit.
+
+# Semantic search (nlp toolset)
+
+The `nlp` cargo feature (default-on) adds `semantic_search` and pulls in onnxruntime via `gte-rs`/`ort`; `ort` and
+`ort-sys` are pinned to the exact rc that `gte-rs` requires — do not bump one without the others. Tests must never
+download models or spawn indexer threads: construct services with `SearchToolsService::new_without_semantic_index`,
+spawn the binary with `BIFROST_SEMANTIC_INDEX=off`, or inject `FakeEngineProvider`/`FakeHashEmbedder` from
+`nlp::engine`/`nlp::indexer`. The real-model smoke test is opt-in:
+`BIFROST_NLP_MODEL_TESTS=1 cargo test --test nlp_semantic_search_models -- --ignored`.

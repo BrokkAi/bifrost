@@ -97,8 +97,8 @@ Direct `--tool` mode prints rendered text by default. The `--args` payload is in
 
 `--server` accepts ordered compositions of toolsets separated by `|`:
 
-- `searchtools` expands to all toolsets in the canonical order `symbol|workspace|extended|text|slopcop`
-- `core` expands to `symbol|workspace`
+- `searchtools` expands to all toolsets in the canonical order `symbol|nlp|workspace|extended|text|slopcop`
+- `core` expands to `symbol|nlp|workspace`
 - `slopcop` stays available as its own set
 
 Examples:
@@ -116,12 +116,34 @@ Examples:
 This starts a stdio MCP server that publishes these tools:
 
 - `symbol`: `search_symbols`, `get_symbol_locations`, `get_symbol_sources`, `get_summaries`, `list_symbols`, `scan_usages`
+- `nlp`: `semantic_search`
 - `workspace`: `refresh`, `activate_workspace`, `get_active_workspace`
 - `extended`: `find_filenames`, `list_files`, `most_relevant_files`, `search_git_commit_messages`, `get_git_log`, `get_commit_diff`, `jq`, `xml_skim`, `xml_select`
 - `text`: `get_file_contents`, `search_file_contents`, `find_files_containing`
 - `slopcop`: `compute_cyclomatic_complexity`, `compute_cognitive_complexity`, `report_comment_density_for_code_unit`, `report_exception_handling_smells`, `report_comment_density_for_files`, `analyze_git_hotspots`, `report_test_assertion_smells`, `report_structural_clone_smells`, `report_long_method_and_god_object_smells`, `report_dead_code_and_unused_abstraction_smells`, `report_secret_like_code`
 
-The subset toolsets are now composable rather than fixed server modes. `core` is the `symbol|workspace` alias, and `searchtools` is the alias for the full union.
+The subset toolsets are now composable rather than fixed server modes. `core` is the `symbol|nlp|workspace` alias, and `searchtools` is the alias for the full union.
+
+### Semantic search
+
+`semantic_search` (in the `nlp` toolset) finds source files by meaning: function-level chunks are embedded (averaged with their enclosing class or file summary), fused with grounded-strings BM25 and git co-edit relevance, then reranked by a cross-encoder. It searches code only, not prose or markdown.
+
+The index lives in `.brokk/semantic_index.db` of the **primary** repository (linked git worktrees share the primary's index). Vectors and BM25 rows are keyed by content hash, so switching branches re-points rows instead of re-embedding. Once enabled, a background build starts when the workspace is activated; `semantic_search` blocks until the index is ready, and the file watcher keeps it updated incrementally.
+
+Models load via ONNX (`gte-rs`). Defaults are downloaded from the HuggingFace hub on first use: `onnx-community/granite-embedding-small-english-r2-ONNX` for embeddings and `Alibaba-NLP/gte-reranker-modernbert-base` for reranking (full-precision variants when CUDA/CoreML acceleration is selected, int8 variants on CPU). Environment overrides:
+
+- `BIFROST_SEMANTIC_INDEX=auto` enables background indexing; the default is off
+- `BIFROST_EMBED_MODEL_DIR` / `BIFROST_RERANK_MODEL_DIR`: local directory containing `tokenizer.json` + `model.onnx` (e.g. a fine-tune); takes precedence over the hub
+- `BIFROST_EMBED_MODEL_ID` / `BIFROST_RERANK_MODEL_ID`: alternate HuggingFace repo ids
+- `BIFROST_ACCELERATOR=auto|cpu|cuda|coreml`: execution provider preference (default `auto`)
+- `BIFROST_CUDA_DEVICES=auto|0,1,...`: CUDA device ids for embedding workers when built with `nlp-gpu`; ids are logical ids after `CUDA_VISIBLE_DEVICES` masking/remapping
+- `BIFROST_CUDA_DEVICE`: legacy single CUDA device id for `nlp-gpu` when `BIFROST_CUDA_DEVICES` is unset (default 0)
+- `BIFROST_COREML_ANE_ONLY=1`: only enable CoreML on devices with a compatible Apple Neural Engine when built with `nlp-coreml`
+- `BIFROST_EMBED_BATCH_MAX_ITEMS` / `BIFROST_EMBED_BATCH_MAX_TOKENS`: cap scheduler batches by item count and by padded attention cost. Inputs are padded to the longest text in a batch, so a batch of `n` texts costs `n * longest^2`; `MAX_TOKENS` (default 8192, the model max) budgets each batch at the cost of one sequence of that length — a max-length chunk runs alone, 2k-token chunks batch 4 at a time, short chunks fill `MAX_ITEMS`
+
+`uv run scripts/optimize_onnx_attention.py <model.onnx>...` rewrites a downloaded model's per-head-tiled attention masks into MultiHeadAttention's `key_padding_mask` input plus one shared sliding-window bias, verifying output parity before writing a `.bifrost-opt.onnx` sibling that model resolution then prefers automatically. On the default embedding model this roughly halves peak inference memory and is several times faster at 8k-token chunks. (A head-broadcast `(batch,1,seq,seq)` bias would be smaller still, but the ONNX Runtime 1.20 CPU kernel bundled by `ort` 2.0.0-rc.9 misindexes that shape for batches > 1 — see the script docstring.)
+
+The `nlp` cargo feature is on by default; build with `--no-default-features` on targets where onnxruntime is unavailable (the `nlp` toolset then publishes no tools and `core` degrades to `symbol|workspace`). Add `--features nlp-gpu` for CUDA or `--features nlp-coreml` for Apple CoreML acceleration.
 
 `refresh` forces a full rebuild of the code index. Normal tool calls already apply watcher-detected file changes automatically, so most hosts should not call it during routine operation. Keep it as a manual recovery tool when you want to discard incremental state and rescan the whole workspace from disk.
 

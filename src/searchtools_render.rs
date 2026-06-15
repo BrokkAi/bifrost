@@ -24,6 +24,34 @@ pub trait RenderText {
     fn render_text(&self, options: RenderOptions) -> String;
 }
 
+#[cfg(feature = "nlp")]
+impl RenderText for crate::nlp::query::SemanticSearchResult {
+    fn render_text(&self, _options: RenderOptions) -> String {
+        let mut blocks: Vec<String> = Vec::with_capacity(self.hits.len() + 1);
+        if !self.notes.is_empty() {
+            blocks.push(
+                self.notes
+                    .iter()
+                    .map(|note| format!("note: {note}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+        }
+        for hit in &self.hits {
+            let mut block = format!("=== {} (score {:.3}) ===", hit.path, hit.score);
+            if !hit.summary.is_empty() {
+                block.push('\n');
+                block.push_str(&hit.summary);
+            }
+            blocks.push(block);
+        }
+        if self.hits.is_empty() {
+            blocks.push("No semantically similar code found.".to_string());
+        }
+        blocks.join("\n\n")
+    }
+}
+
 impl RenderText for SearchSymbolsResult {
     fn render_text(&self, options: RenderOptions) -> String {
         let blocks: Vec<String> = self

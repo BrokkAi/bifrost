@@ -562,3 +562,68 @@ class MostRelevantFilesResult:
         if self.duplicates:
             lines.append(f"Duplicate seeds: {', '.join(self.duplicates)}")
         return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class SemanticSearchHit:
+    path: str
+    score: float
+    summary: str
+
+    @classmethod
+    def from_dict(cls, data: dict) -> SemanticSearchHit:
+        return cls(
+            path=data["path"],
+            score=float(data["score"]),
+            summary=data["summary"],
+        )
+
+    def render_text(self) -> str:
+        return f"=== {self.path} (score {self.score:.3f}) ===\n{self.summary}"
+
+
+@dataclass(frozen=True)
+class SemanticSearchResult:
+    hits: list[SemanticSearchHit]
+    notes: list[str]
+    render_line_numbers: bool = True
+    rendered_text: str | None = None
+
+    @classmethod
+    def from_dict(
+        cls, data: dict, render_line_numbers: bool = True, rendered_text: str | None = None
+    ) -> SemanticSearchResult:
+        return cls(
+            hits=[SemanticSearchHit.from_dict(item) for item in data["hits"]],
+            notes=list(data.get("notes", [])),
+            render_line_numbers=render_line_numbers,
+            rendered_text=rendered_text,
+        )
+
+    @property
+    def count(self) -> int:
+        return len(self.hits)
+
+    def render_text(self) -> str:
+        if self.rendered_text is not None:
+            return self.rendered_text
+        lines = [f"note: {note}" for note in self.notes]
+        lines.extend(hit.render_text() for hit in self.hits)
+        return "\n\n".join(lines) if lines else "No semantic search results found."
+
+
+@dataclass(frozen=True)
+class SemanticSearchStatus:
+    indexed_files: int
+    waiting_files: int
+    pending_batches: int
+    phase: str
+
+    @classmethod
+    def from_dict(cls, data: dict) -> SemanticSearchStatus:
+        return cls(
+            indexed_files=int(data["indexed_files"]),
+            waiting_files=int(data["waiting_files"]),
+            pending_batches=int(data["pending_batches"]),
+            phase=str(data["phase"]),
+        )
