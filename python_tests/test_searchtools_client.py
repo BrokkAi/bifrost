@@ -97,6 +97,22 @@ class SearchToolsClientTest(unittest.TestCase):
         self.assertIn("    - AInnerInner", text)
         self.assertIn("      - method7", text)
 
+    def test_contains_tests_classifies_files(self) -> None:
+        py_root = ROOT / "tests" / "fixtures" / "testcode-py"
+        with SearchToolsClient(root=py_root) as client:
+            result = client.contains_tests(
+                [
+                    "tests/units/utils/test_utils.py",
+                    "documented.py",
+                    "does_not_exist.py",
+                ]
+            )
+        # Real analyzer detection: the pytest module is a test, the documented
+        # sample is not, and an unresolved path is omitted from the mapping.
+        self.assertTrue(result["tests/units/utils/test_utils.py"])
+        self.assertFalse(result["documented.py"])
+        self.assertNotIn("does_not_exist.py", result)
+
     def test_scan_usages_returns_rendered_native_payload(self) -> None:
         with SearchToolsClient(root=self.fixture_root) as client:
             usages = client.scan_usages(["A.method2"])

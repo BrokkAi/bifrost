@@ -193,6 +193,19 @@ class SearchToolsClient:
             rendered_text=payload.rendered_text,
         )
 
+    def contains_tests(self, file_paths: list[str]) -> dict[str, bool]:
+        """Per file: whether the language analyzer detects test code in it
+        (tree-sitter based, not a path heuristic). Keyed by workspace-relative
+        path; inputs that do not resolve to a single existing repo file are
+        omitted from the returned mapping."""
+        structured = self._call_tool("contains_tests", {"file_paths": list(file_paths)})
+        result = structured.get("contains_tests", {})
+        if not isinstance(result, dict):
+            raise SearchToolsError(
+                "Native contains_tests did not return a JSON object mapping"
+            )
+        return {str(path): bool(flag) for path, flag in result.items()}
+
     def scan_usages(
         self,
         symbols: list[str],

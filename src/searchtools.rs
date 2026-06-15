@@ -2363,6 +2363,47 @@ fn search_symbol_path_tier(patterns: &[String], file: &ProjectFile) -> u8 {
         .unwrap_or(0)
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContainsTestsParams {
+    pub file_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContainsTestsResult {
+    /// Per resolved file: whether the language analyzer detects test code in it
+    /// (tree-sitter based, not a path heuristic). Keyed by workspace-relative path.
+    pub contains_tests: BTreeMap<String, bool>,
+    /// Inputs that did not resolve to a single existing repo file (missing or
+    /// ambiguous); the caller decides how to treat these.
+    pub unresolved: Vec<String>,
+}
+
+/// Classify whether each given file contains test code, via the per-language
+/// analyzers' `contains_tests`. Exposed so consumers that must treat the test
+/// surface specially (e.g. hermetic acceptance that resets test files to a
+/// reference state) can do so without re-implementing path heuristics.
+pub fn contains_tests(
+    analyzer: &dyn IAnalyzer,
+    params: ContainsTestsParams,
+) -> ContainsTestsResult {
+    let project = analyzer.project();
+    let resolver = WorkspaceFileResolver::new(project);
+    let mut found = BTreeMap::new();
+    let mut unresolved = Vec::new();
+    for input in params.file_paths.iter() {
+        match resolver.resolve_literal(input.trim()) {
+            ResolvedFileInput::File(file) if file.exists() => {
+                found.insert(rel_path_string(&file), analyzer.contains_tests(&file));
+            }
+            _ => unresolved.push(input.clone()),
+        }
+    }
+    ContainsTestsResult {
+        contains_tests: found,
+        unresolved,
+    }
+}
+
 fn is_test_candidate(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> bool {
     analyzer.contains_tests(file) || is_test_like_path(file)
 }
