@@ -1,6 +1,7 @@
 use brokk_bifrost::{
     AnalyzerConfig, FilesystemProject, Project, SearchToolsService, SearchToolsServiceErrorCode,
-    WorkspaceAnalyzer, searchtools_render::RenderOptions,
+    WorkspaceAnalyzer, searchtools::SCAN_USAGES_RESPONSE_BUDGET_BYTES,
+    searchtools_render::RenderOptions,
 };
 use git2::{Repository, Signature};
 use serde_json::Value;
@@ -1154,7 +1155,7 @@ fn scan_usages_demotes_large_result_to_summary_within_budget() {
         "public class Target {\n    public void hit() {}\n}\n",
     )
     .unwrap();
-    for idx in 0..150 {
+    for idx in 0..350 {
         fs::write(
             temp.path().join(format!("Caller{idx}.java")),
             format!(
@@ -1173,7 +1174,7 @@ fn scan_usages_demotes_large_result_to_summary_within_budget() {
         )
         .unwrap();
     assert!(
-        payload.len() <= 8_192,
+        payload.len() <= SCAN_USAGES_RESPONSE_BUDGET_BYTES,
         "payload should stay within scan_usages budget, got {} bytes",
         payload.len()
     );
@@ -1181,16 +1182,25 @@ fn scan_usages_demotes_large_result_to_summary_within_budget() {
     let value: Value = serde_json::from_str(&payload).unwrap();
     assert_eq!(1, value["summary"]["requested_symbols"].as_u64().unwrap());
     assert_eq!(1, value["summary"]["resolved_symbols"].as_u64().unwrap());
-    assert_eq!(150, value["summary"]["total_hits"].as_u64().unwrap());
+    assert_eq!(350, value["summary"]["total_hits"].as_u64().unwrap());
     assert_eq!(
         "scan_usages",
         value["summary"]["recommended_next_call"]["tool"]
             .as_str()
             .unwrap()
     );
+    assert_eq!(0, array_len(&value, "too_many_callsites"));
+    let usages = value["usages"].as_array().unwrap();
+    assert_eq!(1, usages.len(), "payload: {value}");
     let usage = &value["usages"][0];
     assert_eq!("summary", usage["rendering"]);
-    assert_eq!(150, usage["total_hits"].as_u64().unwrap());
+    assert_eq!(350, usage["total_hits"].as_u64().unwrap());
+    assert_eq!(
+        20,
+        usage["files"].as_array().unwrap().len(),
+        "payload: {value}"
+    );
+    assert_eq!(330, usage["files_truncated"].as_u64().unwrap());
     assert!(
         usage["top_enclosing"]
             .as_array()

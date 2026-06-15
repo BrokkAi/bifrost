@@ -7,8 +7,8 @@ use crate::analyzer::symbol_lookup::{
     resolve_typeish_codeunit_fuzzy, strip_trailing_call_suffix,
 };
 use crate::analyzer::usages::{
-    CONFIDENCE_THRESHOLD, DEFAULT_MAX_FILES, FuzzyResult, RegexUsageAnalyzer, UsageAnalyzer,
-    UsageFinder, UsageHit,
+    CONFIDENCE_THRESHOLD, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, FuzzyResult, RegexUsageAnalyzer,
+    UsageAnalyzer, UsageFinder, UsageHit,
 };
 use crate::analyzer::{CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, Range};
 use crate::hash::HashMap;
@@ -37,7 +37,7 @@ const FILE_SKIM_LIMIT: usize = 20;
 // Keep MCP structured JSON below Codex's default 10 KB function-output
 // truncation limit after JSON escaping and tool wrapper overhead.
 pub const SCAN_USAGES_RESPONSE_BUDGET_BYTES: usize = 8_192;
-const SCAN_USAGES_MAX_EXACT_CALLSITES: usize = 300;
+const SCAN_USAGES_MAX_CALLSITES: usize = DEFAULT_MAX_USAGES;
 const SCAN_USAGES_SUMMARY_FILE_LIMIT: usize = 20;
 const SCAN_USAGES_TOP_ENCLOSING_LIMIT: usize = 10;
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1321,7 +1321,7 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
             analyzer,
             &overloads,
             DEFAULT_MAX_FILES,
-            SCAN_USAGES_MAX_EXACT_CALLSITES,
+            SCAN_USAGES_MAX_CALLSITES,
         );
         let truncated = query.candidate_files_truncated;
         if let Some(diagnostic) = query.graph_fallback.as_ref() {
@@ -1348,7 +1348,7 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
                         analyzer,
                         &overloads,
                         &query.candidate_files,
-                        SCAN_USAGES_MAX_EXACT_CALLSITES,
+                        SCAN_USAGES_MAX_CALLSITES,
                     ) {
                         FuzzyResult::Success { hits_by_overload }
                         | FuzzyResult::Ambiguous {
@@ -1595,6 +1595,10 @@ impl SymbolUsageRenderState {
                 .then_with(|| left.enclosing.cmp(&right.enclosing))
         });
 
+        let file_limit = (rendering == UsageRendering::Summary
+            && summary_files.len() > SCAN_USAGES_SUMMARY_FILE_LIMIT)
+            .then_some(SCAN_USAGES_SUMMARY_FILE_LIMIT);
+
         Self {
             symbol,
             total_hits,
@@ -1605,7 +1609,7 @@ impl SymbolUsageRenderState {
             top_enclosing,
             base_note,
             rendering,
-            file_limit: None,
+            file_limit,
             top_enclosing_limit: SCAN_USAGES_TOP_ENCLOSING_LIMIT,
         }
     }
@@ -1871,7 +1875,7 @@ fn demote_largest_symbol(states: &mut [SymbolUsageRenderState]) -> bool {
         if !eligible {
             continue;
         }
-        let size = serialized_len(&render_symbol_usages(state));
+        let size = serialized_char_count(&render_symbol_usages(state));
         if size > best_size {
             best_size = size;
             best_index = Some(idx);
@@ -1902,7 +1906,7 @@ fn truncate_largest_summary_symbol(states: &mut [SymbolUsageRenderState]) -> boo
         if !(can_limit_files || can_reduce_files || can_reduce_enclosing) {
             continue;
         }
-        let size = serialized_len(&render_symbol_usages(state));
+        let size = serialized_char_count(&render_symbol_usages(state));
         if size > best_size {
             best_size = size;
             best_index = Some(idx);
@@ -2095,9 +2099,9 @@ fn strict_separator_options() -> MatchOptions {
     }
 }
 
-fn serialized_len<T: Serialize>(value: &T) -> usize {
+fn serialized_char_count<T: Serialize>(value: &T) -> usize {
     serde_json::to_string(value)
-        .map(|text| text.len())
+        .map(|text| text.chars().count())
         .unwrap_or(0)
 }
 
