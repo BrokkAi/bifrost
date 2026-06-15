@@ -33,7 +33,8 @@ fn flatten_hits(result: FuzzyResult) -> BTreeSet<UsageHit> {
     }
 }
 
-const VALIDATE_SRC: &str = "export function validateWebhookUrl(u: string): string {\n  return u;\n}\n";
+const VALIDATE_SRC: &str =
+    "export function validateWebhookUrl(u: string): string {\n  return u;\n}\n";
 const DELIVER_SRC: &str = "import { validateWebhookUrl } from \"@/lib/validate\";\n\nexport function deliver(u: string) {\n  return validateWebhookUrl(u);\n}\n";
 const TEST_SRC: &str = "import { validateWebhookUrl } from \"./validate\";\n\ndescribe(\"validateWebhookUrl\", () => {\n  it(\"passes through\", () => {\n    validateWebhookUrl(\"https://example.com\");\n  });\n});\n";
 
@@ -105,6 +106,47 @@ fn ts_path_alias_resolves_through_extends_chain() {
         hits.iter()
             .any(|hit| hit.file == project.file("src/app/deliver.ts")),
         "expected the @/-aliased caller to resolve through the extends chain"
+    );
+}
+
+#[test]
+fn ts_path_alias_merges_split_baseurl_and_paths_across_extends_array() {
+    // TS 5 `extends` arrays merge all parents left-to-right. Here `paths` comes from one
+    // parent and `baseUrl` from another; both must survive for the alias to resolve.
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "tsconfig.json",
+            r#"{ "extends": ["./tsconfig.paths.json", "./tsconfig.base.json"] }"#,
+        )
+        .file(
+            "tsconfig.paths.json",
+            r#"{ "compilerOptions": { "paths": { "@/*": ["src/*"] } } }"#,
+        )
+        .file(
+            "tsconfig.base.json",
+            r#"{ "compilerOptions": { "baseUrl": "." } }"#,
+        )
+        .file("src/lib/validate.ts", VALIDATE_SRC)
+        .file("src/app/deliver.ts", DELIVER_SRC)
+        .build();
+    let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
+
+    let target = ts_target(
+        &analyzer,
+        &project.file("src/lib/validate.ts"),
+        "validateWebhookUrl",
+    );
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = JsTsExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph strategy should succeed");
+
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == project.file("src/app/deliver.ts")),
+        "expected baseUrl and paths from different extends-array parents to both apply"
     );
 }
 

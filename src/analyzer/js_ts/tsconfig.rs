@@ -125,10 +125,7 @@ impl AliasResolver {
             return cached.clone();
         }
         let resolved = self.find_config_from(&dir);
-        self.nearest
-            .lock()
-            .unwrap()
-            .insert(dir, resolved.clone());
+        self.nearest.lock().unwrap().insert(dir, resolved.clone());
         resolved
     }
 
@@ -184,7 +181,10 @@ fn best_match(entries: &[AliasEntry], specifier: &str) -> Option<Vec<String>> {
                 {
                     let matched = &specifier[prefix.len()..specifier.len() - suffix.len()];
                     let score = prefix.len();
-                    if best.as_ref().is_none_or(|(best_score, _, _)| score > *best_score) {
+                    if best
+                        .as_ref()
+                        .is_none_or(|(best_score, _, _)| score > *best_score)
+                    {
                         best = Some((score, entry, Some(matched.to_string())));
                     }
                 }
@@ -223,9 +223,23 @@ fn build_alias_map(config_path: &Path, canonical_root: &Path) -> Option<AliasMap
 /// `compilerOptions` values that survive the `extends` merge, each tagged with the
 /// absolute directory of the config file that declared them (so relative `baseUrl`/`paths`
 /// resolve against the right location).
+#[derive(Default)]
 struct EffectiveConfig {
     base_url: Option<(PathBuf, String)>,
     paths: Option<(PathBuf, Vec<AliasEntry>)>,
+}
+
+impl EffectiveConfig {
+    /// Overlay `later` on top of `self`, per-field, with `later` winning on conflict.
+    /// Used to merge `extends` parents left-to-right (rightmost wins) and to apply the
+    /// child config over its inherited base. Fields are independent: a `baseUrl` from one
+    /// config and `paths` from another both survive, matching `tsc`.
+    fn overlay(self, later: EffectiveConfig) -> EffectiveConfig {
+        EffectiveConfig {
+            base_url: later.base_url.or(self.base_url),
+            paths: later.paths.or(self.paths),
+        }
+    }
 }
 
 fn resolve_effective(
@@ -245,15 +259,22 @@ fn resolve_effective(
     }
     let text = std::fs::read_to_string(config_path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&strip_jsonc(&text)).ok()?;
-    let dir = config_path.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
+    let dir = config_path
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .to_path_buf();
 
+    // Fold every resolved `extends` parent left-to-right (rightmost wins), so a `baseUrl`
+    // from one parent and `paths` from another both survive — TS merges all parents, not
+    // just the first.
     let inherited = value
         .get("extends")
         .and_then(extends_targets)
         .into_iter()
         .flatten()
         .filter_map(|target| resolve_extends_path(&dir, &target, canonical_root))
-        .find_map(|path| resolve_effective(&path, depth + 1, visited, canonical_root));
+        .filter_map(|path| resolve_effective(&path, depth + 1, visited, canonical_root))
+        .fold(EffectiveConfig::default(), EffectiveConfig::overlay);
 
     let compiler_options = value.get("compilerOptions");
 
@@ -267,32 +288,27 @@ fn resolve_effective(
         .and_then(parse_paths)
         .map(|entries| (dir.clone(), entries));
 
-    let (inherited_base_url, inherited_paths) = match inherited {
-        Some(config) => (config.base_url, config.paths),
-        None => (None, None),
+    // Child wins over everything it inherits; `paths` are replaced wholesale, not
+    // deep-merged (TS semantics).
+    let own = EffectiveConfig {
+        base_url: own_base_url,
+        paths: own_paths,
     };
-
-    Some(EffectiveConfig {
-        // Child wins; `paths` are replaced wholesale rather than merged (TS semantics).
-        base_url: own_base_url.or(inherited_base_url),
-        paths: own_paths.or(inherited_paths),
-    })
+    Some(inherited.overlay(own))
 }
 
-/// `extends` may be a single string or (TS 5.0+) an array of strings, applied left to
-/// right with later entries winning. We resolve them in reverse so the first successful
-/// (highest-priority) target's map is the one inherited.
+/// `extends` may be a single string or (TS 5.0+) an array of strings applied left to right
+/// with later entries winning. Returned in source order; the caller folds them so the
+/// rightmost wins on conflict.
 fn extends_targets(value: &serde_json::Value) -> Option<Vec<String>> {
     match value {
         serde_json::Value::String(single) => Some(vec![single.clone()]),
-        serde_json::Value::Array(items) => {
-            let mut targets: Vec<String> = items
+        serde_json::Value::Array(items) => Some(
+            items
                 .iter()
                 .filter_map(|item| item.as_str().map(str::to_string))
-                .collect();
-            targets.reverse();
-            Some(targets)
-        }
+                .collect(),
+        ),
         _ => None,
     }
 }
@@ -302,7 +318,11 @@ fn extends_targets(value: &serde_json::Value) -> Option<Vec<String>> {
 /// `node_modules` lookup for package specifiers (`"@repo/tsconfig/base.json"`). Every
 /// candidate is contained to `canonical_root`, and absolute specifiers are refused
 /// outright — the analyzed repo is untrusted, so `extends` must never escape it.
-fn resolve_extends_path(from_dir: &Path, specifier: &str, canonical_root: &Path) -> Option<PathBuf> {
+fn resolve_extends_path(
+    from_dir: &Path,
+    specifier: &str,
+    canonical_root: &Path,
+) -> Option<PathBuf> {
     if Path::new(specifier).is_absolute() {
         return None;
     }
@@ -598,7 +618,11 @@ mod tests {
         std::fs::create_dir_all(root.join("src/app")).unwrap();
         // The escaping target sits beside the repo, reachable only via `../`.
         std::fs::write(base.path().join("secret.json"), OUT_OF_ROOT_CONFIG).unwrap();
-        std::fs::write(root.join("tsconfig.json"), r#"{ "extends": "../secret.json" }"#).unwrap();
+        std::fs::write(
+            root.join("tsconfig.json"),
+            r#"{ "extends": "../secret.json" }"#,
+        )
+        .unwrap();
 
         let bases = resolver_for(&root).candidate_bases(&deliver_in(&root), "@/lib/validate");
         assert!(
@@ -614,7 +638,10 @@ mod tests {
         std::fs::create_dir_all(root.join("src/app")).unwrap();
         let outside = base.path().join("secret.json");
         std::fs::write(&outside, OUT_OF_ROOT_CONFIG).unwrap();
-        let config = format!(r#"{{ "extends": {} }}"#, serde_json::json!(outside.to_string_lossy()));
+        let config = format!(
+            r#"{{ "extends": {} }}"#,
+            serde_json::json!(outside.to_string_lossy())
+        );
         std::fs::write(root.join("tsconfig.json"), config).unwrap();
 
         let bases = resolver_for(&root).candidate_bases(&deliver_in(&root), "@/lib/validate");
@@ -629,7 +656,9 @@ mod tests {
         let base = tempfile::tempdir().unwrap();
         let root = base.path();
         std::fs::create_dir_all(root.join("src/app")).unwrap();
-        let mut huge = String::from(r#"{ "compilerOptions": { "baseUrl": ".", "paths": { "@/*": ["src/*"] } }, "_pad": ""#);
+        let mut huge = String::from(
+            r#"{ "compilerOptions": { "baseUrl": ".", "paths": { "@/*": ["src/*"] } }, "_pad": ""#,
+        );
         huge.push_str(&"x".repeat((MAX_CONFIG_BYTES as usize) + 1));
         huge.push_str("\" }");
         std::fs::write(root.join("tsconfig.json"), huge).unwrap();
