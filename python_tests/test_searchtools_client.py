@@ -105,15 +105,15 @@ class SearchToolsClientTest(unittest.TestCase):
         self.assertIn("A.method2", text)
         self.assertIsInstance(usages.structured, dict)
 
-    def test_get_summaries_keeps_directory_inventory_for_wrapper_callers(self) -> None:
+    def test_get_summaries_keeps_compact_symbols_for_wrapper_callers(self) -> None:
         with SearchToolsClient(root=self.fixture_root) as client:
             summaries = client.get_summaries(["."])
             text = summaries.render_text()
 
         self.assertEqual(0, len(summaries.summaries))
-        self.assertIsNotNone(summaries.directory_symbols)
-        assert summaries.directory_symbols is not None
-        self.assertGreaterEqual(summaries.directory_symbols.count, 1)
+        self.assertIsNotNone(summaries.compact_symbols)
+        assert summaries.compact_symbols is not None
+        self.assertGreaterEqual(summaries.compact_symbols.count, 1)
         self.assertIn("A.java", text)
 
     def test_native_errors_are_raised_as_searchtools_error(self) -> None:
