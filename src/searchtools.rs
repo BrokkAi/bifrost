@@ -11,7 +11,7 @@ use crate::analyzer::usages::{
     UsageAnalyzer, UsageFinder, UsageHit,
 };
 use crate::analyzer::{CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, Range};
-use crate::hash::HashMap;
+use crate::hash::{HashMap, HashSet};
 use crate::model_context;
 use crate::path_utils::{
     AmbiguousPathInput, ResolvedFileInput, WorkspaceFileResolver, normalize_pattern,
@@ -91,6 +91,23 @@ pub struct ScanUsagesParams {
     pub symbols: Vec<String>,
     #[serde(default)]
     pub include_tests: bool,
+    #[serde(default)]
+    pub paths: Option<Vec<String>>,
+}
+
+/// Parameters for [`usage_graph`].
+///
+/// Both fields mirror [`ScanUsagesParams`] so the whole-workspace graph can be
+/// scoped the same way a single-symbol scan is: callers can drop test files or
+/// restrict the search to a subset of paths. Both default off, so an empty
+/// `{}` request returns the full workspace graph.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageGraphParams {
+    /// Include references that live in detected test files.
+    #[serde(default)]
+    pub include_tests: bool,
+    /// Optional project-relative file paths or globs that bound where references
+    /// are searched. `None` searches the whole workspace.
     #[serde(default)]
     pub paths: Option<Vec<String>>,
 }
@@ -1247,6 +1264,50 @@ fn validate_most_relevant_files_params(params: &MostRelevantFilesParams) -> Resu
     Ok(())
 }
 
+/// Pre-compute the set of detected test files to exclude, or `None` when test
+/// files should be kept. Both `scan_usages` and `usage_graph` filter at the
+/// source (before the regex scan and the call-site cap) rather than dropping
+/// test hits after the fact: filtering post-hoc would let test hits eat into
+/// the cap and turn production-only queries into `TooManyCallsites` errors.
+fn excluded_test_files(
+    analyzer: &dyn IAnalyzer,
+    include_tests: bool,
+) -> Option<Arc<HashSet<ProjectFile>>> {
+    if include_tests {
+        return None;
+    }
+    let set: HashSet<ProjectFile> = analyzer
+        .analyzed_files()
+        .filter(|file| analyzer.contains_tests(file))
+        .cloned()
+        .collect();
+    Some(Arc::new(set))
+}
+
+/// Build a [`UsageFinder`] whose file filter drops the excluded test files and
+/// applies the optional path filter — the workspace scoping that both
+/// `scan_usages` and `usage_graph` run before querying call sites.
+fn scoped_usage_finder(
+    test_files: Option<&Arc<HashSet<ProjectFile>>>,
+    path_filter: &Option<ScanUsagesPathFilter>,
+) -> UsageFinder {
+    let mut finder = UsageFinder::new();
+    if let Some(test_files) = test_files {
+        let test_files = Arc::clone(test_files);
+        let path_filter = path_filter.clone();
+        finder = finder.with_file_filter(move |file| {
+            !test_files.contains(file)
+                && path_filter
+                    .as_ref()
+                    .map(|filter| filter.matches(file))
+                    .unwrap_or(true)
+        });
+    } else if let Some(path_filter) = path_filter.clone() {
+        finder = finder.with_file_filter(move |file| path_filter.matches(file));
+    }
+    finder
+}
+
 pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUsagesResult {
     let _scope = profiling::scope("searchtools::scan_usages");
 
@@ -1257,20 +1318,7 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
         .collect();
     let path_filter = build_scan_usages_path_filter(analyzer, params.paths.as_deref());
 
-    // Pre-compute the test-file set once when filtering tests so each per-symbol
-    // UsageFinder can drop test files *before* the regex scan and the
-    // scan_usages cap. Filtering post-hoc would let test hits eat into
-    // the cap and turn production-only queries into TooManyCallsites errors.
-    let test_files: Option<Arc<std::collections::HashSet<ProjectFile>>> = if params.include_tests {
-        None
-    } else {
-        let set: std::collections::HashSet<ProjectFile> = analyzer
-            .analyzed_files()
-            .filter(|file| analyzer.contains_tests(file))
-            .cloned()
-            .collect();
-        Some(Arc::new(set))
-    };
+    let test_files = excluded_test_files(analyzer, params.include_tests);
 
     let mut not_found = Vec::new();
     let mut fallbacks = Vec::new();
@@ -1303,20 +1351,7 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
             }
         };
 
-        let mut finder = UsageFinder::new();
-        if let Some(test_files) = test_files.as_ref() {
-            let test_files = Arc::clone(test_files);
-            let path_filter = path_filter.clone();
-            finder = finder.with_file_filter(move |file| {
-                !test_files.contains(file)
-                    && path_filter
-                        .as_ref()
-                        .map(|filter| filter.matches(file))
-                        .unwrap_or(true)
-            });
-        } else if let Some(path_filter) = path_filter.clone() {
-            finder = finder.with_file_filter(move |file| path_filter.matches(file));
-        }
+        let finder = scoped_usage_finder(test_files.as_ref(), &path_filter);
         let query = finder.query(
             analyzer,
             &overloads,
@@ -1513,6 +1548,263 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
         failures,
         ambiguous,
         too_many_callsites,
+    }
+}
+
+/// A definition node in the workspace usage graph.
+///
+/// Nodes are the classes and functions (methods included) that a consumer can
+/// run PageRank or another centrality analysis over. Fields, modules, and
+/// macros are intentionally excluded to keep the graph focused on the
+/// call/reference structure a code map cares about. `fqn` is the node identity
+/// and matches the fully qualified names returned by [`search_symbols`].
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageGraphNode {
+    pub fqn: String,
+    pub path: String,
+    pub start_line: usize,
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
+/// A directed edge from a caller to a callee, aggregated across call sites.
+///
+/// `from` and `to` are fully qualified names: `from` is the enclosing
+/// definition of each reference, `to` is the symbol being referenced. `weight`
+/// is the number of distinct `(file, line, caller)` reference sites, which
+/// mirrors the reference-count weighting an aider-style repo map uses (two
+/// references to the same callee on one line count once). Per-call-site detail
+/// (snippets, lines) is intentionally left to [`scan_usages`]; this tool returns
+/// the aggregated graph so consumers can rank without re-deriving it.
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageGraphEdge {
+    pub from: String,
+    pub to: String,
+    pub weight: usize,
+}
+
+/// A symbol whose call sites exceeded the analyzer's enumeration guardrail.
+///
+/// These symbols still appear in `nodes`; only their inbound edges are omitted,
+/// because the analyzer stopped before enumerating every caller. Surfacing them
+/// lets a consumer decide whether to re-query the hot symbol with a narrower
+/// `paths` scope. Mirrors the `too_many_callsites` signal from [`scan_usages`].
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageGraphTruncatedSymbol {
+    pub fqn: String,
+    pub total_callsites: usize,
+    pub limit: usize,
+}
+
+/// The resolved definition/reference graph for the whole workspace.
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageGraphResult {
+    pub nodes: Vec<UsageGraphNode>,
+    pub edges: Vec<UsageGraphEdge>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub truncated_symbols: Vec<UsageGraphTruncatedSymbol>,
+}
+
+/// Build the whole-workspace resolved usage graph: classes and functions as
+/// nodes, caller -> callee references as weighted edges.
+///
+/// This is the bulk counterpart to [`scan_usages`]. Where `scan_usages` answers
+/// "who calls this one symbol" with per-call-site detail, `usage_graph` walks
+/// every class and function once and returns the aggregated graph, so a consumer
+/// can run PageRank (or another ranking) to build a code map without issuing one
+/// `scan_usages` call per symbol.
+///
+/// Edges reuse the same resolution path as `scan_usages` (the language usage
+/// graph with a regex fallback) and the same definition-site exclusion, so a
+/// definition's own declaration never counts as a reference to itself. Self
+/// references (a recursive call whose enclosing definition *is* the callee) are
+/// dropped because they do not affect centrality ranking. Every edge endpoint
+/// is guaranteed to be a node: a reference whose enclosing caller is not itself
+/// a class or function (a module- or field-level call site) is dropped, so the
+/// nodes and edges can be loaded into a graph library without phantom nodes.
+///
+/// This is a full-workspace pass and is proportional to the number of
+/// definitions, so consumers are expected to cache the result and rebuild it
+/// only when the workspace changes.
+pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageGraphResult {
+    let _scope = profiling::scope("searchtools::usage_graph");
+
+    let path_filter = build_scan_usages_path_filter(analyzer, params.paths.as_deref());
+    let test_files = excluded_test_files(analyzer, params.include_tests);
+
+    // Group the definitions that become nodes by fully qualified name. Only
+    // classes and functions participate; fields/modules/macros are excluded to
+    // keep the graph focused on call/reference structure. Keying on the fqn does
+    // double duty: it collapses overloads that share a name so a symbol resolves
+    // its callers once (not once per signature, which would multiply its edge
+    // weights), and a BTreeMap gives the nodes/edges/truncated output a
+    // deterministic order independent of the analyzer's declaration iteration.
+    let mut overloads_by_fqn: BTreeMap<String, Vec<CodeUnit>> = BTreeMap::new();
+    for unit in analyzer.all_declarations() {
+        if unit.is_synthetic()
+            || !matches!(unit.kind(), CodeUnitType::Class | CodeUnitType::Function)
+        {
+            continue;
+        }
+        overloads_by_fqn
+            .entry(unit.fq_name())
+            .or_default()
+            .push(unit.clone());
+    }
+
+    // Node metadata, built in one parallel pass over the fqn groups. (The edge
+    // passes need only the set of node fqns; per-file definition ranges are
+    // derived inside the inverted driver and the per-symbol path's dedupe.)
+    let mut nodes: Vec<UsageGraphNode> = overloads_by_fqn
+        .par_iter()
+        .map(|(fqn, overloads)| {
+            // Choose the representative declaration deterministically (lowest
+            // location) so a multi-declaration fqn (overloads, or a name declared
+            // in more than one file) reports stable node metadata across rebuilds
+            // rather than whichever declaration iteration happened to surface first.
+            let primary = overloads
+                .iter()
+                .min_by(|left, right| {
+                    rel_path_string(left.source())
+                        .cmp(&rel_path_string(right.source()))
+                        .then_with(|| {
+                            primary_range(analyzer, left)
+                                .map(|range| range.start_line)
+                                .cmp(&primary_range(analyzer, right).map(|range| range.start_line))
+                        })
+                })
+                .expect("an fqn group always has at least one declaration");
+            UsageGraphNode {
+                fqn: fqn.clone(),
+                path: rel_path_string(primary.source()),
+                start_line: primary_range(analyzer, primary)
+                    .map(|range| range.start_line)
+                    .unwrap_or(0),
+                kind: code_unit_kind_name(primary.kind()).to_string(),
+                signature: primary.signature().map(str::to_string),
+            }
+        })
+        .collect();
+
+    let node_fqns: HashSet<String> = overloads_by_fqn.keys().cloned().collect();
+
+    let mut edge_weights: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let mut truncated_symbols: Vec<UsageGraphTruncatedSymbol> = Vec::new();
+
+    // Go edges in a single inverted pass over the workspace: walk each file once
+    // and resolve every reference to its callee, instead of scanning every
+    // symbol's candidate files (quadratic on real repos). A caller file is in
+    // scope only when it survives the test / path filter, matching the per-symbol
+    // candidate filter.
+    let keep_file = |file: &ProjectFile| {
+        test_files
+            .as_ref()
+            .map(|excluded| !excluded.contains(file))
+            .unwrap_or(true)
+            && path_filter
+                .as_ref()
+                .map(|filter| filter.matches(file))
+                .unwrap_or(true)
+    };
+    // Every supported language has a whole-workspace inverted builder, so all
+    // edges are produced by the passes below; merge each one's result in.
+    let record_inverted =
+        |edges: Option<crate::analyzer::usages::inverted_edges::UsageEdges>,
+         edge_weights: &mut BTreeMap<(String, String), usize>,
+         truncated_symbols: &mut Vec<UsageGraphTruncatedSymbol>| {
+            let Some(edges) = edges else {
+                return;
+            };
+            for (key, weight) in edges.edges {
+                *edge_weights.entry(key).or_insert(0) += weight;
+            }
+            for (fqn, total_callsites) in edges.truncated {
+                truncated_symbols.push(UsageGraphTruncatedSymbol {
+                    fqn,
+                    total_callsites,
+                    limit: crate::analyzer::usages::inverted_edges::MAX_CALLSITES,
+                });
+            }
+        };
+    {
+        let _scope = profiling::scope("usage_graph::resolve_go");
+        let go_edges = crate::analyzer::usages::go_graph::build_go_usage_edges(
+            analyzer, &node_fqns, keep_file,
+        );
+        record_inverted(go_edges, &mut edge_weights, &mut truncated_symbols);
+    }
+    {
+        let _scope = profiling::scope("usage_graph::resolve_jsts");
+        let jsts_edges = crate::analyzer::usages::js_ts_graph::build_jsts_usage_edges(
+            analyzer, &node_fqns, keep_file,
+        );
+        record_inverted(jsts_edges, &mut edge_weights, &mut truncated_symbols);
+    }
+    {
+        let _scope = profiling::scope("usage_graph::resolve_python");
+        let python_edges = crate::analyzer::usages::python_graph::build_python_usage_edges(
+            analyzer, &node_fqns, keep_file,
+        );
+        record_inverted(python_edges, &mut edge_weights, &mut truncated_symbols);
+    }
+    {
+        let _scope = profiling::scope("usage_graph::resolve_rust");
+        let rust_edges = crate::analyzer::usages::rust_graph::build_rust_usage_edges(
+            analyzer, &node_fqns, keep_file,
+        );
+        record_inverted(rust_edges, &mut edge_weights, &mut truncated_symbols);
+    }
+    {
+        let _scope = profiling::scope("usage_graph::resolve_java");
+        let java_edges = crate::analyzer::usages::java_graph::build_java_usage_edges(
+            analyzer, &node_fqns, keep_file,
+        );
+        record_inverted(java_edges, &mut edge_weights, &mut truncated_symbols);
+    }
+    {
+        let _scope = profiling::scope("usage_graph::resolve_csharp");
+        let csharp_edges = crate::analyzer::usages::csharp_graph::build_csharp_usage_edges(
+            analyzer, &node_fqns, keep_file,
+        );
+        record_inverted(csharp_edges, &mut edge_weights, &mut truncated_symbols);
+    }
+    {
+        let _scope = profiling::scope("usage_graph::resolve_php");
+        let php_edges = crate::analyzer::usages::php_graph::build_php_usage_edges(
+            analyzer, &node_fqns, keep_file,
+        );
+        record_inverted(php_edges, &mut edge_weights, &mut truncated_symbols);
+    }
+    {
+        let _scope = profiling::scope("usage_graph::resolve_scala");
+        let scala_edges = crate::analyzer::usages::scala_graph::build_scala_usage_edges(
+            analyzer, &node_fqns, keep_file,
+        );
+        record_inverted(scala_edges, &mut edge_weights, &mut truncated_symbols);
+    }
+    {
+        let _scope = profiling::scope("usage_graph::resolve_cpp");
+        let cpp_edges = crate::analyzer::usages::cpp_graph::build_cpp_usage_edges(
+            analyzer, &node_fqns, keep_file,
+        );
+        record_inverted(cpp_edges, &mut edge_weights, &mut truncated_symbols);
+    }
+
+    // Deterministic output order: `nodes` sorted by fqn, `edge_weights` is a
+    // BTreeMap, and the truncated list sorted by fqn.
+    nodes.sort_by(|left, right| left.fqn.cmp(&right.fqn));
+    truncated_symbols.sort_by(|left, right| left.fqn.cmp(&right.fqn));
+
+    let edges = edge_weights
+        .into_iter()
+        .map(|((from, to), weight)| UsageGraphEdge { from, to, weight })
+        .collect();
+
+    UsageGraphResult {
+        nodes,
+        edges,
+        truncated_symbols,
     }
 }
 

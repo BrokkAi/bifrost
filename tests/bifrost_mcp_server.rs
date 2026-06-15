@@ -166,6 +166,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "get_symbol_sources",
             "get_summaries",
             "scan_usages",
+            "usage_graph",
             "refresh",
             "activate_workspace",
             "get_active_workspace",
@@ -201,6 +202,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "get_symbol_sources",
             "get_summaries",
             "scan_usages",
+            "usage_graph",
             "semantic_search",
             "refresh",
             "activate_workspace",
@@ -665,6 +667,7 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
         "get_symbol_sources",
         "get_summaries",
         "scan_usages",
+        "usage_graph",
     ];
     #[cfg(feature = "nlp")]
     core_expected.push("semantic_search");
@@ -682,6 +685,7 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
             "get_symbol_sources",
             "get_summaries",
             "scan_usages",
+            "usage_graph",
         ],
     );
     assert_server_tool_names(

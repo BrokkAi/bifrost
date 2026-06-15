@@ -147,6 +147,20 @@ impl RustAnalyzer {
         binder
     }
 
+    /// Resolve a `use`-path module specifier (e.g. `crate::util`, `super::svc`)
+    /// to the dotted package it names, relative to `importing_file`. This is the
+    /// `package_name` half of a `CodeUnit::fq_name()` for items in that module, so
+    /// the inverted usage-graph builder can turn `(module_specifier, name)` into a
+    /// callee fqn without re-deriving the path arithmetic.
+    pub fn resolve_module_package(
+        &self,
+        importing_file: &ProjectFile,
+        module_specifier: &str,
+    ) -> Option<String> {
+        let package = rust_package_name(importing_file);
+        resolve_rust_module_path(&package, module_specifier)
+    }
+
     pub fn resolve_module_files(
         &self,
         importing_file: &ProjectFile,

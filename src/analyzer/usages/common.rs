@@ -7,7 +7,7 @@ pub(super) const GRAPH_HIT_CONFIDENCE: f64 = 1.0;
 /// Lines of context to include before/after a match in [`UsageHit::snippet`].
 pub(super) const SNIPPET_CONTEXT_LINES: usize = 1;
 
-pub(super) fn language_for_target(target: &CodeUnit) -> Language {
+pub(crate) fn language_for_target(target: &CodeUnit) -> Language {
     language_for_file(target.source())
 }
 

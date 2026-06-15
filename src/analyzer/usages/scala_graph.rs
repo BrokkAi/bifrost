@@ -1,7 +1,10 @@
 mod extractor;
 mod hits;
+mod inverted;
 mod resolver;
 pub(super) mod syntax;
+
+pub(crate) use inverted::build_scala_usage_edges;
 
 use crate::analyzer::usages::common::{language_for_file, language_for_target};
 use crate::analyzer::usages::model::FuzzyResult;

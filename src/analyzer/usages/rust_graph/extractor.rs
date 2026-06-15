@@ -18,7 +18,7 @@ struct ParsedFile {
     tree: Tree,
 }
 
-pub(super) struct RustProjectGraph {
+pub(crate) struct RustProjectGraph {
     parsed: HashMap<ProjectFile, ParsedFile>,
     pub(super) usage_graph: ProjectUsageGraph,
 }

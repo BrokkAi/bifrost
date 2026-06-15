@@ -160,6 +160,7 @@ mod tests {
             "get_symbol_sources",
             "get_summaries",
             "scan_usages",
+            "usage_graph",
         ]
         .into_iter()
         .map(str::to_string)

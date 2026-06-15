@@ -17,7 +17,7 @@ use std::path::Path;
 /// External test packages (`package foo_test`) live in the same directory as
 /// the package under test but form their own import path, so the canonical
 /// name keeps the `_test` suffix on top of the directory's import path.
-pub(super) fn canonical_go_package_name(file: &ProjectFile, declared_package: &str) -> String {
+pub(crate) fn canonical_go_package_name(file: &ProjectFile, declared_package: &str) -> String {
     let (declared_base, is_external_test) = match declared_package.strip_suffix("_test") {
         Some(stripped) if !stripped.is_empty() => (stripped, true),
         _ => (declared_package, false),

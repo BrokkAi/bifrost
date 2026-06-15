@@ -1,4 +1,4 @@
-use crate::analyzer::go::packages::read_go_module_path;
+use crate::analyzer::go::packages::{canonical_go_package_name, read_go_module_path};
 use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::usages::graph_core::{ImportEdgeKind, ProjectUsageGraph};
 use crate::analyzer::usages::model::{
@@ -9,6 +9,7 @@ use crate::analyzer::{
     MultiAnalyzer, ProjectFile,
 };
 use crate::hash::{HashMap, HashSet};
+use rayon::prelude::*;
 use regex::Regex;
 use std::collections::BTreeSet;
 use std::sync::{Arc, LazyLock};
@@ -26,18 +27,112 @@ pub(super) fn resolve_go_analyzer(analyzer: &dyn IAnalyzer) -> Option<&GoAnalyze
     }
 }
 
-pub(super) struct ParsedFile {
+pub(crate) struct ParsedFile {
     pub(super) source: Arc<String>,
     pub(super) tree: Tree,
+    /// Byte offsets of each line start, computed once at parse time so the
+    /// per-symbol scan does not recompute them for every symbol that scans this
+    /// file.
+    pub(super) line_starts: Vec<usize>,
     package_name: String,
 }
 
-pub(super) struct GoProjectGraph {
-    pub(super) parsed: HashMap<ProjectFile, ParsedFile>,
+/// Workspace-wide cache of parsed Go files, keyed by file.
+///
+/// `usage_graph` resolves callers for every symbol in the workspace, and each
+/// per-symbol query rebuilds a [`GoProjectGraph`] over an overlapping set of
+/// candidate files. Parsing the same file once per symbol that touches it is the
+/// dominant cost on real repos (re-parsing the same files thousands of times).
+/// Pre-parsing every file once and sharing the trees behind `Arc` collapses that
+/// to a single parse per file while leaving the per-query graph construction
+/// (import binders, module resolution) scoped to the candidate set, so there is
+/// no quadratic blow-up in import resolution.
+pub(crate) type ParsedFileCache = HashMap<ProjectFile, Arc<ParsedFile>>;
+
+pub(crate) struct GoProjectGraph {
+    pub(super) parsed: HashMap<ProjectFile, Arc<ParsedFile>>,
     usage_graph: ProjectUsageGraph,
+    /// Retained so the inverted whole-workspace edge builder can resolve a file's
+    /// imports to package names without rescanning every parsed file.
+    dir_index: ParentDirIndex,
+    module_path: Option<String>,
 }
 
 impl GoProjectGraph {
+    pub(super) fn parsed_files(&self) -> impl Iterator<Item = &ProjectFile> {
+        self.parsed.keys()
+    }
+
+    pub(super) fn parsed_file(&self, file: &ProjectFile) -> Option<&ParsedFile> {
+        self.parsed.get(file).map(|parsed| parsed.as_ref())
+    }
+
+    /// The file's canonical (module-qualified) package name, matching the
+    /// `package_name` half of the analyzer's `CodeUnit::fq_name()` so the inverted
+    /// scan's callee fqns line up with the graph's nodes.
+    pub(super) fn package_name_of(&self, file: &ProjectFile) -> Option<String> {
+        self.parsed
+            .get(file)
+            .map(|parsed| canonical_go_package_name(file, &parsed.package_name))
+    }
+
+    /// Resolve `file`'s imports to the workspace package names they bind, so the
+    /// inverted scan can turn a `pkg.Symbol` reference into a candidate node fqn.
+    /// Returns `(alias -> package names, dot-imported package names)`. External
+    /// (non-workspace) imports resolve to nothing and are simply absent.
+    pub(super) fn namespace_packages(
+        &self,
+        analyzer: &GoAnalyzer,
+        file: &ProjectFile,
+    ) -> (HashMap<String, Vec<String>>, Vec<String>) {
+        let mut by_alias: HashMap<String, Vec<String>> = HashMap::default();
+        let mut dot_imports: Vec<String> = Vec::new();
+        for import in analyzer.import_info_of(file) {
+            let alias = import.alias.as_deref();
+            if alias == Some("_") {
+                continue;
+            }
+            let Some(path) = extract_go_import_path(&import.raw_snippet) else {
+                continue;
+            };
+            let resolved = resolve_go_module(&path, &self.dir_index, self.module_path.as_deref());
+            let mut package_names: Vec<String> = resolved
+                .iter()
+                .filter_map(|target| {
+                    let parsed = self.parsed.get(target)?;
+                    Some(canonical_go_package_name(target, &parsed.package_name))
+                })
+                .filter(|name| !name.is_empty())
+                .collect();
+            package_names.sort();
+            package_names.dedup();
+            if package_names.is_empty() {
+                continue;
+            }
+            match alias {
+                Some(".") => dot_imports.extend(package_names),
+                Some(explicit) => by_alias
+                    .entry(default_go_import_local_name(explicit))
+                    .or_default()
+                    .extend(package_names),
+                None => {
+                    // A plain import binds each resolved package under its own
+                    // package-clause name, which is also the node fqn prefix.
+                    for name in package_names {
+                        by_alias.entry(name.clone()).or_default().push(name);
+                    }
+                }
+            }
+        }
+        for names in by_alias.values_mut() {
+            names.sort();
+            names.dedup();
+        }
+        dot_imports.sort();
+        dot_imports.dedup();
+        (by_alias, dot_imports)
+    }
+
     pub(super) fn scan_files(
         &self,
         candidate_files: &HashSet<ProjectFile>,
@@ -53,13 +148,40 @@ impl GoProjectGraph {
     }
 }
 
+/// Read and tree-sitter parse a single Go file. Returns `None` if the file
+/// cannot be read, the grammar fails to load, or parsing fails.
+fn parse_go_file(file: &ProjectFile) -> Option<ParsedFile> {
+    let source = file.read_to_string().ok()?;
+    let mut parser = Parser::new();
+    parser.set_language(&tree_sitter_go::LANGUAGE.into()).ok()?;
+    let tree = parser.parse(source.as_str(), None)?;
+    let package_name = package_name(tree.root_node(), &source);
+    let line_starts = crate::text_utils::compute_line_starts(&source);
+    Some(ParsedFile {
+        source: Arc::new(source),
+        tree,
+        line_starts,
+        package_name,
+    })
+}
+
+/// Parse every Go file in `files` once, in parallel, into a shared cache that
+/// per-symbol [`build_go_graph`] calls can reuse instead of re-parsing.
+pub(crate) fn preparse_go_files(files: &[ProjectFile]) -> ParsedFileCache {
+    files
+        .par_iter()
+        .filter(|file| language_for_file(file) == Language::Go)
+        .filter_map(|file| Some((file.clone(), Arc::new(parse_go_file(file)?))))
+        .collect()
+}
+
 pub(super) fn build_go_graph(
     analyzer: &GoAnalyzer,
     candidate_files: &HashSet<ProjectFile>,
     target_file: &ProjectFile,
+    cache: Option<&ParsedFileCache>,
 ) -> GoProjectGraph {
-    let parser_language = tree_sitter_go::LANGUAGE.into();
-    let mut parsed = HashMap::default();
+    let mut parsed: HashMap<ProjectFile, Arc<ParsedFile>> = HashMap::default();
     let mut files = Vec::new();
     let mut module_path = None;
     let scoped_files: BTreeSet<ProjectFile> = candidate_files
@@ -76,28 +198,18 @@ pub(super) fn build_go_graph(
         if module_path.is_none() {
             module_path = read_go_module_path(file.root());
         }
-        let Ok(source) = file.read_to_string() else {
-            continue;
-        };
-        let mut parser = Parser::new();
-        if parser.set_language(&parser_language).is_err() {
-            continue;
-        }
-        let Some(tree) = parser.parse(source.as_str(), None) else {
-            continue;
-        };
-
-        let package_name = package_name(tree.root_node(), &source);
-        files.push(file.clone());
-        parsed.insert(
-            file,
-            ParsedFile {
-                source: Arc::new(source),
-                tree,
-                package_name,
+        let parsed_file = match cache.and_then(|cache| cache.get(&file).cloned()) {
+            Some(parsed_file) => parsed_file,
+            None => match parse_go_file(&file) {
+                Some(parsed_file) => Arc::new(parsed_file),
+                None => continue,
             },
-        );
+        };
+        files.push(file.clone());
+        parsed.insert(file, parsed_file);
     }
+
+    let dir_index = build_parent_dir_index(&parsed);
 
     let mut exports_by_file = HashMap::default();
     let mut binders_by_file = HashMap::default();
@@ -105,7 +217,7 @@ pub(super) fn build_go_graph(
         exports_by_file.insert(file.clone(), export_index_of(analyzer, file));
         binders_by_file.insert(
             file.clone(),
-            import_binder_of(analyzer, file, &parsed, module_path.as_deref()),
+            import_binder_of(analyzer, file, &parsed, &dir_index, module_path.as_deref()),
         );
     }
 
@@ -113,13 +225,31 @@ pub(super) fn build_go_graph(
         files,
         exports_by_file,
         &binders_by_file,
-        |importer, module| resolve_go_module(importer, module, &parsed, module_path.as_deref()),
+        |_importer, module| resolve_go_module(module, &dir_index, module_path.as_deref()),
     );
 
     GoProjectGraph {
         parsed,
         usage_graph,
+        dir_index,
+        module_path,
     }
+}
+
+/// Build the whole-workspace Go usage graph once (parse + binders + importer
+/// graph) so a bulk caller (`usage_graph`) can share it across every per-symbol
+/// query instead of rebuilding the import graph for each symbol's candidate set —
+/// the rebuild is quadratic in candidate count and the dominant cost at scale.
+pub(crate) fn build_workspace_go_graph(
+    analyzer: &GoAnalyzer,
+    files: &[ProjectFile],
+    cache: Option<&ParsedFileCache>,
+) -> Option<GoProjectGraph> {
+    let target_file = files
+        .iter()
+        .find(|file| language_for_file(file) == Language::Go)?;
+    let all_files: HashSet<ProjectFile> = files.iter().cloned().collect();
+    Some(build_go_graph(analyzer, &all_files, target_file, cache))
 }
 
 fn export_index_of(analyzer: &GoAnalyzer, file: &ProjectFile) -> ExportIndex {
@@ -141,7 +271,8 @@ fn export_index_of(analyzer: &GoAnalyzer, file: &ProjectFile) -> ExportIndex {
 fn import_binder_of(
     analyzer: &GoAnalyzer,
     file: &ProjectFile,
-    parsed: &HashMap<ProjectFile, ParsedFile>,
+    parsed: &HashMap<ProjectFile, Arc<ParsedFile>>,
+    dir_index: &ParentDirIndex,
     module_path: Option<&str>,
 ) -> ImportBinder {
     let mut binder = ImportBinder::empty();
@@ -167,7 +298,7 @@ fn import_binder_of(
                 let locals = match import.alias.clone() {
                     Some(alias) => vec![default_go_import_local_name(&alias)],
                     None => {
-                        let resolved = resolve_go_module(file, &path, parsed, module_path);
+                        let resolved = resolve_go_module(&path, dir_index, module_path);
                         let mut names: Vec<_> = resolved
                             .iter()
                             .filter_map(|target| parsed.get(target))
@@ -200,25 +331,39 @@ fn import_binder_of(
     binder
 }
 
+/// Maps a normalized parent directory to the parsed files it contains, so a Go
+/// import resolves to its package's files with a couple of map lookups instead of
+/// scanning every parsed file. Building this once is what makes a whole-workspace
+/// graph build linear rather than quadratic in the file count.
+type ParentDirIndex = HashMap<String, Vec<ProjectFile>>;
+
+fn build_parent_dir_index(parsed: &HashMap<ProjectFile, Arc<ParsedFile>>) -> ParentDirIndex {
+    let mut index: ParentDirIndex = HashMap::default();
+    for file in parsed.keys() {
+        let parent = file.parent().to_string_lossy().replace('\\', "/");
+        index.entry(parent).or_default().push(file.clone());
+    }
+    index
+}
+
 fn resolve_go_module(
-    _importer: &ProjectFile,
     module: &str,
-    parsed: &HashMap<ProjectFile, ParsedFile>,
+    dir_index: &ParentDirIndex,
     module_path: Option<&str>,
 ) -> Vec<ProjectFile> {
     let local_rel = local_go_import_rel_path(module, module_path);
     let vendor_rel = format!("vendor/{}", module.trim_matches('/'));
-    let mut resolved: Vec<_> = parsed
-        .keys()
-        .filter(|candidate| {
-            let parent = candidate.parent().to_string_lossy().replace('\\', "/");
-            parent == vendor_rel
-                || local_rel
-                    .as_ref()
-                    .is_some_and(|rel| parent == *rel || (rel.is_empty() && parent.is_empty()))
-        })
-        .cloned()
-        .collect();
+    let mut resolved: Vec<ProjectFile> = Vec::new();
+    if let Some(files) = dir_index.get(&vendor_rel) {
+        resolved.extend(files.iter().cloned());
+    }
+    // `local_rel == Some("")` means the import refers to the module root, whose
+    // files have an empty parent — the `index.get("")` lookup covers that case.
+    if let Some(rel) = local_rel.as_ref()
+        && let Some(files) = dir_index.get(rel)
+    {
+        resolved.extend(files.iter().cloned());
+    }
     resolved.sort();
     resolved.dedup();
     resolved
@@ -302,6 +447,14 @@ impl TargetSpec {
 
     pub(super) fn has_scan_seed(&self) -> bool {
         self.top_level_seeds.is_some() || self.owner_seeds.is_some()
+    }
+
+    pub(super) fn identifier(&self) -> &str {
+        &self.identifier
+    }
+
+    pub(super) fn owner(&self) -> Option<&str> {
+        self.owner.as_deref()
     }
 
     pub(super) fn is_member(&self) -> bool {

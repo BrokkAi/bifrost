@@ -263,18 +263,18 @@ fn signature_arity(signature: &str) -> Option<usize> {
     parenthesized_arity(&signature[open..])
 }
 
-fn package_name_of(scala: &ScalaAnalyzer, file: &ProjectFile) -> Option<String> {
+pub(super) fn package_name_of(scala: &ScalaAnalyzer, file: &ProjectFile) -> Option<String> {
     scala
         .declarations(file)
         .next()
         .map(|unit| unit.package_name().to_string())
 }
 
-fn scala_normalized_fq_name(fq_name: &str) -> String {
+pub(super) fn scala_normalized_fq_name(fq_name: &str) -> String {
     fq_name.replace("$.", ".").trim_end_matches('$').to_string()
 }
 
-fn scala_display_name(unit: &CodeUnit) -> String {
+pub(super) fn scala_display_name(unit: &CodeUnit) -> String {
     unit.short_name()
         .rsplit('.')
         .next()

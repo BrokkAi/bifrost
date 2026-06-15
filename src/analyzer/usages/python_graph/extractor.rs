@@ -17,18 +17,29 @@ use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use tree_sitter::{Node, Parser, Tree};
 
-struct ParsedFile {
-    source: Arc<String>,
-    tree: Tree,
+pub(super) struct ParsedFile {
+    pub(super) source: Arc<String>,
+    pub(super) tree: Tree,
+    /// Byte offsets of each line start, computed once at parse time for the
+    /// inverted edge scan.
+    pub(super) line_starts: Vec<usize>,
 }
 
-pub(super) struct PythonProjectGraph {
+pub(crate) struct PythonProjectGraph {
     parsed: HashMap<ProjectFile, ParsedFile>,
     pub(super) usage_graph: ProjectUsageGraph,
     scoped_files: HashSet<ProjectFile>,
 }
 
 impl PythonProjectGraph {
+    pub(super) fn parsed_files(&self) -> impl Iterator<Item = &ProjectFile> {
+        self.parsed.keys()
+    }
+
+    pub(super) fn parsed_file(&self, file: &ProjectFile) -> Option<&ParsedFile> {
+        self.parsed.get(file)
+    }
+
     pub(super) fn scan_files(
         &self,
         candidate_files: &HashSet<ProjectFile>,
@@ -107,11 +118,13 @@ impl<'a> PythonGraphAdapter<'a> {
             let binder = self.analyzer.import_binder_of(&file);
             self.enqueue_frontier_files(&file, &exports, &binder, &mut scoped_files, &mut frontier);
 
+            let line_starts = crate::text_utils::compute_line_starts(&source);
             parsed.insert(
                 file.clone(),
                 ParsedFile {
                     source: Arc::new(source),
                     tree,
+                    line_starts,
                 },
             );
             exports_by_file.insert(file.clone(), exports);
@@ -447,7 +460,7 @@ pub(super) fn slice<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     source.get(node.start_byte()..node.end_byte()).unwrap_or("")
 }
 
-fn is_declaration_identifier(node: Node<'_>) -> bool {
+pub(super) fn is_declaration_identifier(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
@@ -506,7 +519,11 @@ fn collect_top_level_conflicts(root: Node<'_>, source: &str) -> HashSet<String> 
     conflicts
 }
 
-fn collect_assigned_identifiers(node: Node<'_>, source: &str, out: &mut HashSet<String>) {
+pub(super) fn collect_assigned_identifiers(
+    node: Node<'_>,
+    source: &str,
+    out: &mut HashSet<String>,
+) {
     let mut stack = vec![node];
     while let Some(node) = stack.pop() {
         if node.kind() == "identifier" {
