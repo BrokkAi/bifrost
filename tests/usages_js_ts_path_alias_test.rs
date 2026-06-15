@@ -151,6 +151,53 @@ fn ts_path_alias_merges_split_baseurl_and_paths_across_extends_array() {
 }
 
 #[test]
+fn ts_path_alias_resolves_diamond_extends_graph() {
+    // Diamond: the leaf extends [a, b], and both a and b extend a shared base. `tsc`
+    // resolves each extends entry as an independent chain, so base must contribute to b
+    // even though a already pulled it in. Here a overrides baseUrl to a wrong dir and b
+    // inherits the correct baseUrl from base; b must win, so the alias resolves under root.
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "tsconfig.json",
+            r#"{ "extends": ["./tsconfig.a.json", "./tsconfig.b.json"] }"#,
+        )
+        .file(
+            "tsconfig.base.json",
+            r#"{ "compilerOptions": { "baseUrl": "." } }"#,
+        )
+        .file(
+            "tsconfig.a.json",
+            r#"{ "extends": "./tsconfig.base.json", "compilerOptions": { "baseUrl": "./wrong" } }"#,
+        )
+        .file(
+            "tsconfig.b.json",
+            r#"{ "extends": "./tsconfig.base.json", "compilerOptions": { "paths": { "@/*": ["src/*"] } } }"#,
+        )
+        .file("src/lib/validate.ts", VALIDATE_SRC)
+        .file("src/app/deliver.ts", DELIVER_SRC)
+        .build();
+    let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
+
+    let target = ts_target(
+        &analyzer,
+        &project.file("src/lib/validate.ts"),
+        "validateWebhookUrl",
+    );
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = JsTsExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph strategy should succeed");
+
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == project.file("src/app/deliver.ts")),
+        "expected the shared base config to contribute to both diamond branches"
+    );
+}
+
+#[test]
 fn ts_import_reference_index_resolves_alias() {
     // The analyzer's import/reference graph (relevance + code map) should also link the
     // aliased importer to the definition file, not only the scan_usages export graph.

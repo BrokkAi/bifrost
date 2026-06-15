@@ -26,8 +26,14 @@ use std::sync::{Arc, Mutex};
 /// order. `tsconfig.json` wins over `jsconfig.json` when both sit in the same directory.
 const CONFIG_FILENAMES: [&str; 2] = ["tsconfig.json", "jsconfig.json"];
 
-/// Guards against pathological / circular `extends` chains.
+/// Guards against pathological / circular `extends` chains (per ancestor chain).
 const MAX_EXTENDS_DEPTH: usize = 16;
+
+/// Total config reads allowed while resolving one governing config's `extends` graph.
+/// Each `extends` entry resolves as an independent chain (so diamonds resolve correctly,
+/// matching `tsc`), which means a shared parent can be read more than once; this budget
+/// keeps a hostile DAG from fanning out into exponential reads.
+const MAX_CONFIG_READS: u32 = 256;
 
 /// Resolves alias specifiers for one repository root, caching parsed configs so the
 /// hot import-resolution loop parses each `tsconfig.json` at most once. Cheap to
@@ -206,7 +212,8 @@ fn best_match(entries: &[AliasEntry], specifier: &str) -> Option<Vec<String>> {
 /// Parse a config file and flatten its `extends` chain into a single alias map.
 /// `canonical_root` bounds `extends` resolution to the repo (see [`existing_config_path`]).
 fn build_alias_map(config_path: &Path, canonical_root: &Path) -> Option<AliasMap> {
-    let effective = resolve_effective(config_path, 0, &mut Vec::new(), canonical_root)?;
+    let mut budget = MAX_CONFIG_READS;
+    let effective = resolve_effective(config_path, &[], &mut budget, canonical_root)?;
     let (paths_dir, entries) = effective.paths?;
     if entries.is_empty() {
         return None;
@@ -242,16 +249,23 @@ impl EffectiveConfig {
     }
 }
 
+/// Resolve a config's effective `baseUrl`/`paths`, following `extends`. `ancestors` is the
+/// chain of configs currently being resolved on this branch (for cycle detection only, so
+/// sibling `extends` entries resolve independently and diamonds merge correctly). `budget`
+/// is shared across the whole graph and bounds total reads.
 fn resolve_effective(
     config_path: &Path,
-    depth: usize,
-    visited: &mut Vec<PathBuf>,
+    ancestors: &[PathBuf],
+    budget: &mut u32,
     canonical_root: &Path,
 ) -> Option<EffectiveConfig> {
-    if depth > MAX_EXTENDS_DEPTH || visited.iter().any(|seen| seen == config_path) {
+    if ancestors.len() > MAX_EXTENDS_DEPTH
+        || ancestors.iter().any(|seen| seen == config_path)
+        || *budget == 0
+    {
         return None;
     }
-    visited.push(config_path.to_path_buf());
+    *budget -= 1;
 
     // Cap the read so a hostile repo can't OOM the analyzer with a giant config.
     if std::fs::metadata(config_path).ok()?.len() > MAX_CONFIG_BYTES {
@@ -264,16 +278,19 @@ fn resolve_effective(
         .unwrap_or_else(|| Path::new(""))
         .to_path_buf();
 
-    // Fold every resolved `extends` parent left-to-right (rightmost wins), so a `baseUrl`
-    // from one parent and `paths` from another both survive — TS merges all parents, not
-    // just the first.
+    let mut chain = ancestors.to_vec();
+    chain.push(config_path.to_path_buf());
+
+    // Fold every resolved `extends` parent left-to-right: TS merges all parents, not just
+    // the first (rightmost wins on conflict). Each entry gets the same ancestor chain, so a
+    // grandparent shared by two siblings (a diamond) contributes to both, like `tsc`.
     let inherited = value
         .get("extends")
         .and_then(extends_targets)
         .into_iter()
         .flatten()
         .filter_map(|target| resolve_extends_path(&dir, &target, canonical_root))
-        .filter_map(|path| resolve_effective(&path, depth + 1, visited, canonical_root))
+        .filter_map(|path| resolve_effective(&path, &chain, budget, canonical_root))
         .fold(EffectiveConfig::default(), EffectiveConfig::overlay);
 
     let compiler_options = value.get("compilerOptions");
