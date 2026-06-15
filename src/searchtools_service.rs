@@ -317,15 +317,15 @@ impl WorkspaceSession {
     }
 }
 
-/// Semantic indexing is on by default in nlp builds; `BIFROST_SEMANTIC_INDEX=off`
-/// disables it (useful for tooling that never calls semantic_search).
+/// Semantic indexing is off by default. Set `BIFROST_SEMANTIC_INDEX=auto`
+/// (or `on`/`1`/`enabled`) to opt in when semantic_search is needed.
 fn semantic_indexing_enabled() -> bool {
     if cfg!(not(feature = "nlp")) {
         return false;
     }
-    !matches!(
+    matches!(
         std::env::var("BIFROST_SEMANTIC_INDEX").as_deref(),
-        Ok("off") | Ok("0") | Ok("disabled")
+        Ok("auto") | Ok("on") | Ok("1") | Ok("enabled")
     )
 }
 
@@ -1006,7 +1006,7 @@ impl SearchToolsService {
         let (snapshot, semantic) = self.semantic_snapshot_for_query()?;
         let Some(indexer) = semantic else {
             return Err(SearchToolsServiceError::invalid_params(
-                "semantic_search is disabled for this session (BIFROST_SEMANTIC_INDEX=off)",
+                "semantic_search is disabled for this session (set BIFROST_SEMANTIC_INDEX=auto to enable it)",
             ));
         };
         Self::decode_render_and_try_run(
@@ -1028,7 +1028,7 @@ impl SearchToolsService {
         let (snapshot, semantic) = self.semantic_snapshot_for_query()?;
         let Some(indexer) = semantic else {
             return Err(SearchToolsServiceError::invalid_params(
-                "semantic_search_status is disabled for this session (BIFROST_SEMANTIC_INDEX=off)",
+                "semantic_search_status is disabled for this session (set BIFROST_SEMANTIC_INDEX=auto to enable it)",
             ));
         };
         Self::structured_only(indexer.status(&snapshot))
