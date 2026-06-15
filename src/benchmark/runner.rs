@@ -383,6 +383,15 @@ fn assert_scenario_result(
         }
         BenchmarkScenario::ScanUsages => {
             let usages = structured["usages"].as_array().ok_or_else(|| {
+                if structured["too_many_callsites"]
+                    .as_array()
+                    .is_some_and(|items| !items.is_empty())
+                {
+                    return format!(
+                        "scan_usages returned too_many_callsites for `{}`",
+                        target.name
+                    );
+                }
                 format!(
                     "scan_usages result missing usages array for `{}`",
                     target.name
