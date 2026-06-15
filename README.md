@@ -143,7 +143,7 @@ Models load via ONNX (`gte-rs`). Defaults are downloaded from the HuggingFace hu
 
 `uv run scripts/optimize_onnx_attention.py <model.onnx>...` rewrites a downloaded model's per-head-tiled attention masks into MultiHeadAttention's `key_padding_mask` input plus one shared sliding-window bias, verifying output parity before writing a `.bifrost-opt.onnx` sibling that model resolution then prefers automatically. On the default embedding model this roughly halves peak inference memory and is several times faster at 8k-token chunks. (A head-broadcast `(batch,1,seq,seq)` bias would be smaller still, but the ONNX Runtime 1.20 CPU kernel bundled by `ort` 2.0.0-rc.9 misindexes that shape for batches > 1 — see the script docstring.)
 
-The `nlp` cargo feature is on by default; build with `--no-default-features` on targets where onnxruntime is unavailable (the `nlp` toolset then publishes no tools and `core` degrades to `symbol|workspace`). Add `--features nlp-gpu` for CUDA or `--features nlp-coreml` for Apple CoreML acceleration.
+The `nlp` cargo feature is opt-in; build with `--features nlp` on targets where onnxruntime is available. Without that feature, the `nlp` toolset publishes no tools and `core` degrades to `symbol|workspace`. Add `--features nlp,nlp-gpu` for CUDA or `--features nlp,nlp-coreml` for Apple CoreML acceleration.
 
 `refresh` forces a full rebuild of the code index. Normal tool calls already apply watcher-detected file changes automatically, so most hosts should not call it during routine operation. Keep it as a manual recovery tool when you want to discard incremental state and rescan the whole workspace from disk.
 

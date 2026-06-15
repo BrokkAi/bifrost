@@ -40,31 +40,37 @@ jobs:
             can-test: true
             rustflags: ''
             test-args: '--jobs 1'
+            cargo-flags: '--features nlp'
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             can-test: true
             rustflags: ''
             test-args: ''
+            cargo-flags: '--features nlp'
           - target: aarch64-apple-darwin
             runner: macos-latest
             can-test: true
             rustflags: '-C link-arg=-undefined -C link-arg=dynamic_lookup'
             test-args: ''
+            cargo-flags: '--features nlp'
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
             can-test: true
             rustflags: ''
             test-args: ''
+            cargo-flags: '--features nlp'
           - target: aarch64-pc-windows-msvc
             runner: windows-latest
             can-test: false
             rustflags: ''
             test-args: ''
+            cargo-flags: '--features nlp'
           - target: aarch64-linux-android
             runner: ubuntu-latest
             can-test: false
             rustflags: ''
             test-args: ''
+            cargo-flags: ''
     steps:
       - uses: actions/checkout@v4
 
@@ -108,7 +114,7 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: cargo clippy
-        run: cargo clippy --all-targets --all-features --target ${{ matrix.target }} -- -D warnings
+        run: cargo clippy --all-targets ${{ matrix.cargo-flags }} --target ${{ matrix.target }} -- -D warnings
 
       - name: cargo test
         if: matrix.can-test

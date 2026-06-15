@@ -751,10 +751,7 @@ mod tests {
         Repository::init(temp.path()).unwrap();
         let nested = temp.path().join("nested").join("deeper");
         std::fs::create_dir_all(&nested).unwrap();
-        assert_eq!(
-            semantic_db_path(&nested),
-            temp.path().join(".brokk/semantic_index.db")
-        );
+        assert_semantic_db_path_root(&nested, temp.path());
     }
 
     #[test]
@@ -775,9 +772,29 @@ mod tests {
             ["worktree", "add", worktree_root.to_str().unwrap(), "HEAD"],
         );
 
+        assert_semantic_db_path_root(&worktree_root, &repo_root);
+    }
+
+    fn assert_semantic_db_path_root(workspace_root: &Path, expected_root: &Path) {
+        let actual = semantic_db_path(workspace_root);
         assert_eq!(
-            semantic_db_path(&worktree_root),
-            repo_root.join(".brokk/semantic_index.db")
+            actual.file_name().and_then(|name| name.to_str()),
+            Some(DB_FILE_NAME)
+        );
+        assert_eq!(
+            actual
+                .parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|name| name.to_str()),
+            Some(DB_DIR_NAME)
+        );
+        let actual_root = actual
+            .parent()
+            .and_then(Path::parent)
+            .expect("semantic db path should have repo root");
+        assert_eq!(
+            std::fs::canonicalize(actual_root).unwrap(),
+            std::fs::canonicalize(expected_root).unwrap()
         );
     }
 

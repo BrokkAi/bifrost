@@ -76,9 +76,9 @@ xee-xpath = "0.1.5"
 xot = "0.31"
 
 [features]
-default = ["nlp"]
-# Semantic search (embeddings + reranking via ONNX). Default-on; disable with
-# `--no-default-features` on targets where onnxruntime is unavailable.
+default = []
+# Semantic search (embeddings + reranking via ONNX). Opt in with
+# `--features nlp` on targets where onnxruntime is available.
 nlp = ["dep:gte-rs", "dep:hf-hub", "dep:orp", "dep:ort", "dep:ort-sys", "dep:tokenizers"]
 # Adds the CUDA execution provider; falls back to CPU at runtime if unavailable.
 nlp-gpu = ["nlp", "ort/cuda"]

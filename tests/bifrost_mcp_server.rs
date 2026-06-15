@@ -624,20 +624,20 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
         .join("tests")
         .join("fixtures")
         .join("testcode-java");
+    let mut core_expected = vec![
+        "search_symbols",
+        "get_symbol_sources",
+        "get_summaries",
+        "scan_usages",
+    ];
+    #[cfg(feature = "nlp")]
+    core_expected.push("semantic_search");
+    core_expected.extend(["refresh", "activate_workspace", "get_active_workspace"]);
 
     assert_server_tool_names(
         &fixture_root,
         "core",
-        &[
-            "search_symbols",
-            "get_symbol_sources",
-            "get_summaries",
-            "scan_usages",
-            "semantic_search",
-            "refresh",
-            "activate_workspace",
-            "get_active_workspace",
-        ],
+        &core_expected,
     );
     assert_server_tool_names(
         &fixture_root,
@@ -706,6 +706,7 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
             "report_secret_like_code",
         ],
     );
+    #[cfg(feature = "nlp")]
     assert_server_tool_names(&fixture_root, "nlp", &["semantic_search"]);
 }
 
@@ -761,7 +762,7 @@ fn bifrost_semantic_search_fails_cleanly_without_models() {
         .as_str()
         .expect("json-rpc error message");
     assert!(
-        message.contains("semantic index unavailable"),
+        message.contains("semantic index unavailable") || message.contains("disabled"),
         "unexpected error message: {message}"
     );
 
