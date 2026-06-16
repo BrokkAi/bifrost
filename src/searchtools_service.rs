@@ -16,26 +16,21 @@ use crate::{
     git_tools::{get_commit_diff, get_git_log, search_git_commit_messages},
     path_utils::AmbiguousPathInput,
     searchtools::{
-        ActivateWorkspaceParams, ActiveWorkspaceResult, AmbiguousSymbol, FilePatternsParams,
-        GetActiveWorkspaceParams, MostRelevantFilesParams, RefreshParams, SkimFile,
-        SkimFilesResult, SummariesParams, SummaryBlock, SummaryResult, contains_tests,
-        get_symbol_ancestors, get_symbol_locations, get_symbol_sources, list_symbols,
-        most_relevant_files, refresh_result, scan_usages, search_symbols,
-        summarize_targets_with_directory_inventory,
+        ActivateWorkspaceParams, ActiveWorkspaceResult, AmbiguousSymbol,
+        GetActiveWorkspaceParams, MostRelevantFilesParams, RefreshParams, SkimFilesResult,
+        SummariesParams, SummaryBlock, SummaryResult, contains_tests, get_symbol_ancestors,
+        get_symbol_locations, get_symbol_sources, list_symbols, most_relevant_files,
+        refresh_result, scan_usages, search_symbols, summarize_targets_with_directory_inventory,
     },
     searchtools_render::{RenderOptions, RenderText},
     structured_data::{jq, xml_select, xml_skim},
 };
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-
-// Keep `get_summaries` structured JSON well below Codex's default 10 KB
-// MCP/function-output truncation limit after JSON escaping and wrapper overhead.
-const GET_SUMMARIES_RESPONSE_BUDGET_BYTES: usize = 4_096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchToolsServiceErrorCode {
@@ -148,119 +143,6 @@ impl RenderText for GetSummariesCompatibilityResult {
             blocks.join("\n\n")
         }
     }
-}
-
-fn fit_get_summaries_result_to_budget(
-    workspace: &WorkspaceAnalyzer,
-    result: GetSummariesCompatibilityResult,
-) -> GetSummariesCompatibilityResult {
-    let original_bytes = serialized_json_len(&result);
-    if original_bytes <= GET_SUMMARIES_RESPONSE_BUDGET_BYTES || result.summaries.is_empty() {
-        return result;
-    }
-
-    if result.compact_symbols.is_some() {
-        let compact_shrunk = shrink_compact_symbols_to_budget(result.clone());
-        if serialized_json_len(&compact_shrunk) <= GET_SUMMARIES_RESPONSE_BUDGET_BYTES {
-            return compact_shrunk;
-        }
-    }
-
-    let mut degraded =
-        degrade_get_summaries_result(workspace, result.clone(), false, original_bytes);
-    if serialized_json_len(&degraded) > GET_SUMMARIES_RESPONSE_BUDGET_BYTES {
-        degraded = degrade_get_summaries_result(workspace, result, true, original_bytes);
-    }
-    shrink_compact_symbols_to_budget(degraded)
-}
-
-fn degrade_get_summaries_result(
-    workspace: &WorkspaceAnalyzer,
-    mut result: GetSummariesCompatibilityResult,
-    include_symbol_summaries: bool,
-    original_bytes: usize,
-) -> GetSummariesCompatibilityResult {
-    let mut kept_summaries = Vec::new();
-    let mut compact_paths = BTreeSet::new();
-
-    for summary in result.summaries {
-        if include_symbol_summaries || summary.label == summary.path {
-            compact_paths.insert(summary.path.clone());
-        } else {
-            kept_summaries.push(summary);
-        }
-    }
-
-    result.summaries = kept_summaries;
-    if !compact_paths.is_empty() {
-        let compact = list_symbols(
-            workspace.analyzer(),
-            FilePatternsParams {
-                file_patterns: compact_paths.into_iter().collect(),
-            },
-        );
-        result.compact_symbols = merge_compact_symbols(result.compact_symbols.take(), compact);
-    }
-    result.degraded = true;
-    result.degradation = Some(GetSummariesDegradation {
-        reason: "response_budget_exceeded".to_string(),
-        requested_format: "summaries".to_string(),
-        returned_format: "compact_symbols".to_string(),
-        budget_bytes: GET_SUMMARIES_RESPONSE_BUDGET_BYTES,
-        original_bytes,
-        message: "Full summaries exceeded the response budget; returned compact declaration outlines. Re-call get_summaries with narrower targets or get_symbol_sources for exact bodies."
-            .to_string(),
-    });
-    result
-}
-
-fn merge_compact_symbols(
-    existing: Option<SkimFilesResult>,
-    additional: SkimFilesResult,
-) -> Option<SkimFilesResult> {
-    let Some(existing) = existing else {
-        return Some(additional);
-    };
-
-    let mut files_by_path: BTreeMap<String, SkimFile> = BTreeMap::new();
-    for file in existing.files.into_iter().chain(additional.files) {
-        files_by_path.entry(file.path.clone()).or_insert(file);
-    }
-    let files: Vec<_> = files_by_path.into_values().collect();
-    let total_files = existing.total_files + additional.total_files;
-    let mut ambiguous_paths = existing.ambiguous_paths;
-    ambiguous_paths.extend(additional.ambiguous_paths);
-    Some(SkimFilesResult {
-        truncated: existing.truncated || additional.truncated || total_files > files.len(),
-        total_files,
-        files,
-        ambiguous_paths,
-    })
-}
-
-fn shrink_compact_symbols_to_budget(
-    mut result: GetSummariesCompatibilityResult,
-) -> GetSummariesCompatibilityResult {
-    loop {
-        if serialized_json_len(&result) <= GET_SUMMARIES_RESPONSE_BUDGET_BYTES {
-            return result;
-        }
-        let Some(compact) = result.compact_symbols.as_mut() else {
-            return result;
-        };
-        if compact.files.len() <= 1 {
-            compact.truncated = compact.total_files > compact.files.len();
-            return result;
-        }
-        compact.files.pop();
-        compact.truncated = true;
-    }
-}
-
-fn serialized_json_len<T: Serialize>(value: &T) -> usize {
-    serde_json::to_vec(value)
-        .map(|bytes| bytes.len())
-        .unwrap_or(usize::MAX)
 }
 
 impl ToolOutput {
@@ -979,18 +861,15 @@ impl SearchToolsService {
         })?;
         let (summary_result, directory_symbols, _directory_target_inputs) =
             summarize_targets_with_directory_inventory(workspace.analyzer(), &params.targets);
-        let compatibility_result = fit_get_summaries_result_to_budget(
-            workspace,
-            GetSummariesCompatibilityResult {
-                summaries: summary_result.summaries,
-                compact_symbols: directory_symbols,
-                degraded: false,
-                degradation: None,
-                not_found: summary_result.not_found,
-                ambiguous: summary_result.ambiguous,
-                ambiguous_paths: summary_result.ambiguous_paths,
-            },
-        );
+        let compatibility_result = GetSummariesCompatibilityResult {
+            summaries: summary_result.summaries,
+            compact_symbols: directory_symbols,
+            degraded: false,
+            degradation: None,
+            not_found: summary_result.not_found,
+            ambiguous: summary_result.ambiguous,
+            ambiguous_paths: summary_result.ambiguous_paths,
+        };
         let rendered_text = compatibility_result.render_text(render_options);
         let structured = serde_json::to_value(&compatibility_result).map_err(|err| {
             SearchToolsServiceError::internal(format!("Failed to serialize tool result: {err}"))

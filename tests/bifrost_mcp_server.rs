@@ -1276,6 +1276,66 @@ fn bifrost_mcp_absolute_paths_follow_activated_workspace() {
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");
 }
 
+#[test]
+fn bifrost_mcp_budgets_large_get_summaries_responses() {
+    let fixture_root = TempDir::new().expect("temp dir");
+    for class_idx in 0..18 {
+        let mut source = format!("public class Caller{class_idx} {{\n");
+        for method_idx in 0..12 {
+            source.push_str(&format!(
+                "    public int method{method_idx}(int input) {{ return input + {class_idx} + {method_idx}; }}\n"
+            ));
+        }
+        source.push_str("}\n");
+        fs::write(fixture_root.path().join(format!("Caller{class_idx}.java")), source)
+            .expect("write fixture");
+    }
+
+    let mut child = spawn_server(fixture_root.path(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+
+    let response = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "get_summaries",
+                "arguments": { "targets": ["*.java"] }
+            }
+        }),
+    );
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("tool text");
+    assert!(
+        text.len() <= 4096,
+        "mcp text should stay within budget, got {} bytes",
+        text.len()
+    );
+    let structured = &response["result"]["structuredContent"];
+    assert_eq!(true, structured["degraded"], "{structured}");
+    assert_eq!(
+        "response_budget_exceeded",
+        structured["degradation"]["reason"],
+        "{structured}"
+    );
+    assert!(structured["summaries"].as_array().unwrap().is_empty(), "{structured}");
+
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
 fn assert_server_tool_names(root: &std::path::Path, mode: &str, expected: &[&str]) {
     let mut child = spawn_server(root, mode, &[]);
     let mut stdin = child.stdin.take().expect("stdin");

@@ -1,7 +1,8 @@
 use crate::{
-    SearchToolsService, SearchToolsServiceErrorCode, ToolOutput, searchtools_render::RenderOptions,
-    tool_arguments::normalize_tool_arguments,
+    SearchToolsService, SearchToolsServiceError, SearchToolsServiceErrorCode, ToolOutput,
+    searchtools_render::RenderOptions, tool_arguments::normalize_tool_arguments,
 };
+use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
@@ -14,6 +15,7 @@ const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 const INTERNAL_ERROR: i64 = -32603;
+const GET_SUMMARIES_RESPONSE_BUDGET_BYTES: usize = 4_096;
 
 pub const SEARCHTOOLS_INSTRUCTIONS: &str =
     "Analyzer-backed search tools for source code workspaces.";
@@ -238,14 +240,19 @@ fn handle_tool_call(
         Err(message) => return Ok(tool_error_result(message)),
     };
 
-    match service.call_tool_output(
-        name,
-        arguments,
-        RenderOptions {
-            render_line_numbers: render_options.render_line_numbers,
-        },
-    ) {
-        Ok(output) => Ok(tool_success_result(output)),
+    let render_options = RenderOptions {
+        render_line_numbers: render_options.render_line_numbers,
+    };
+    match service.call_tool_output(name, arguments, render_options) {
+        Ok(output) => {
+            let output = if name == "get_summaries" {
+                fit_get_summaries_output_to_budget(service, output, render_options)
+                    .map_err(|err| map_service_error(err.code, err.message))?
+            } else {
+                output
+            };
+            Ok(tool_success_result(output))
+        }
         Err(err) => {
             if err.code == SearchToolsServiceErrorCode::UnknownTool {
                 return Ok(tool_error_result(err.message));
@@ -262,6 +269,197 @@ fn map_service_error(code: SearchToolsServiceErrorCode, message: String) -> (i64
         SearchToolsServiceErrorCode::Internal => INTERNAL_ERROR,
     };
     (jsonrpc_code, message)
+}
+
+fn fit_get_summaries_output_to_budget(
+    service: &SearchToolsService,
+    output: ToolOutput,
+    render_options: RenderOptions,
+) -> Result<ToolOutput, SearchToolsServiceError> {
+    let ToolOutput::Structured {
+        structured,
+        rendered_text,
+    } = output
+    else {
+        return Ok(output);
+    };
+
+    let original_bytes = serialized_json_len(&structured);
+    let summaries_len = structured
+        .get("summaries")
+        .and_then(Value::as_array)
+        .map(|items| items.len())
+        .unwrap_or(0);
+    if original_bytes <= GET_SUMMARIES_RESPONSE_BUDGET_BYTES || summaries_len == 0 {
+        return Ok(ToolOutput::Structured {
+            structured,
+            rendered_text,
+        });
+    }
+
+    let (budgeted, rendered_text) =
+        degrade_get_summaries_value(service, structured, original_bytes, render_options)?;
+    Ok(ToolOutput::Structured {
+        structured: budgeted,
+        rendered_text: Some(rendered_text),
+    })
+}
+
+fn degrade_get_summaries_value(
+    service: &SearchToolsService,
+    mut structured: Value,
+    original_bytes: usize,
+    render_options: RenderOptions,
+) -> Result<(Value, String), SearchToolsServiceError> {
+    let compact_paths = summary_paths_for_compaction(&structured);
+    let list_output = if compact_paths.is_empty() {
+        None
+    } else {
+        Some(service.call_tool_output(
+            "list_symbols",
+            json!({ "file_patterns": compact_paths }),
+            render_options,
+        )?)
+    };
+    let mut compact_text: Option<String> = None;
+    if let Some(paths) = compact_symbols_paths(&structured) {
+        if serialized_json_len(&structured) > GET_SUMMARIES_RESPONSE_BUDGET_BYTES {
+            let compact_output = service.call_tool_output(
+                "list_symbols",
+                json!({ "file_patterns": paths }),
+                render_options,
+            )?;
+            compact_text = rendered_text_for_output(&compact_output);
+            structured = compact_only_get_summaries_value(structured, compact_output, original_bytes)?;
+        }
+    } else if let Some(output) = list_output {
+        compact_text = rendered_text_for_output(&output);
+        structured = compact_only_get_summaries_value(structured, output, original_bytes)?;
+    }
+
+    let text = render_budgeted_get_summaries_text(&structured, compact_text);
+    Ok((shrink_compact_symbols_value_to_budget(structured), text))
+}
+
+fn summary_paths_for_compaction(structured: &Value) -> Vec<String> {
+    structured
+        .get("summaries")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|summary| {
+            let label = summary.get("label")?.as_str()?;
+            let path = summary.get("path")?.as_str()?;
+            (label == path).then(|| path.to_string())
+        })
+        .collect()
+}
+
+fn compact_symbols_paths(structured: &Value) -> Option<Vec<String>> {
+    let files = structured
+        .get("compact_symbols")?
+        .get("files")?
+        .as_array()?;
+    Some(
+        files.iter()
+            .filter_map(|file| file.get("path").and_then(Value::as_str).map(str::to_string))
+            .collect(),
+    )
+}
+
+fn compact_only_get_summaries_value(
+    mut structured: Value,
+    compact_output: ToolOutput,
+    original_bytes: usize,
+) -> Result<Value, SearchToolsServiceError> {
+    let ToolOutput::Structured {
+        structured: compact_structured,
+        ..
+    } = compact_output
+    else {
+        return Err(SearchToolsServiceError {
+            code: SearchToolsServiceErrorCode::Internal,
+            message: "list_symbols returned non-structured output during MCP budgeting".to_string(),
+        });
+    };
+    if let Some(object) = structured.as_object_mut() {
+        object.insert("summaries".to_string(), json!([]));
+        object.insert("compact_symbols".to_string(), compact_structured);
+        object.insert("degraded".to_string(), json!(true));
+        object.insert(
+            "degradation".to_string(),
+            json!({
+                "reason": "response_budget_exceeded",
+                "requested_format": "summaries",
+                "returned_format": "compact_symbols",
+                "budget_bytes": GET_SUMMARIES_RESPONSE_BUDGET_BYTES,
+                "original_bytes": original_bytes,
+                "message": "Full summaries exceeded the response budget; returned compact declaration outlines. Re-call get_summaries with narrower targets or get_symbol_sources for exact bodies."
+            }),
+        );
+    }
+    Ok(structured)
+}
+
+fn shrink_compact_symbols_value_to_budget(mut structured: Value) -> Value {
+    loop {
+        if serialized_json_len(&structured) <= GET_SUMMARIES_RESPONSE_BUDGET_BYTES {
+            return structured;
+        }
+        let Some(files) = structured
+            .get_mut("compact_symbols")
+            .and_then(|value| value.get_mut("files"))
+            .and_then(Value::as_array_mut)
+        else {
+            return structured;
+        };
+        if files.len() <= 1 {
+            if let Some(compact) = structured.get_mut("compact_symbols").and_then(Value::as_object_mut) {
+                compact.insert("truncated".to_string(), json!(true));
+            }
+            return structured;
+        }
+        files.pop();
+        if let Some(compact) = structured.get_mut("compact_symbols").and_then(Value::as_object_mut) {
+            compact.insert("truncated".to_string(), json!(true));
+        }
+    }
+}
+
+fn render_budgeted_get_summaries_text(structured: &Value, compact_text: Option<String>) -> String {
+    let note = structured
+        .get("degradation")
+        .and_then(|value| value.get("message"))
+        .and_then(Value::as_str)
+        .map(|message| format!("Note: {message}"))
+        .unwrap_or_default();
+    let compact_text = compact_text
+        .unwrap_or_else(|| "No matching summaries found.".to_string());
+    let mut text = if note.is_empty() {
+        compact_text
+    } else {
+        format!("{note}\n\n{compact_text}")
+    };
+    if text.len() > GET_SUMMARIES_RESPONSE_BUDGET_BYTES {
+        let suffix = "\n\n[truncated for MCP text budget; inspect structuredContent for full compact result]";
+        let keep = GET_SUMMARIES_RESPONSE_BUDGET_BYTES.saturating_sub(suffix.len());
+        text.truncate(keep);
+        text.push_str(suffix);
+    }
+    text
+}
+
+fn rendered_text_for_output(output: &ToolOutput) -> Option<String> {
+    match output {
+        ToolOutput::Structured { rendered_text, .. } => rendered_text.clone(),
+        ToolOutput::Text(text) => Some(text.clone()),
+    }
+}
+
+fn serialized_json_len<T: Serialize>(value: &T) -> usize {
+    serde_json::to_vec(value)
+        .map(|bytes| bytes.len())
+        .unwrap_or(usize::MAX)
 }
 
 fn tool_success_result(output: ToolOutput) -> Value {

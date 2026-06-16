@@ -176,7 +176,7 @@ fn get_summaries_mixed_targets_return_summaries_and_directory_inventory() {
 }
 
 #[test]
-fn get_summaries_large_file_glob_degrades_to_compact_symbols() {
+fn get_summaries_large_file_glob_stays_full_fidelity_on_service_path() {
     let temp = TempDir::new().unwrap();
     for class_idx in 0..18 {
         let mut source = format!("public class Caller{class_idx} {{\n");
@@ -194,23 +194,14 @@ fn get_summaries_large_file_glob_degrades_to_compact_symbols() {
     let payload = service
         .call_tool_json("get_summaries", r#"{"targets":["*.java"]}"#)
         .unwrap();
-    assert!(
-        payload.len() <= 4096,
-        "payload should stay within get_summaries budget, got {} bytes: {payload}",
-        payload.len()
-    );
 
     let value: Value = serde_json::from_str(&payload).unwrap();
-    assert_eq!(true, value["degraded"]);
-    assert_eq!("response_budget_exceeded", value["degradation"]["reason"]);
-    assert_eq!("summaries", value["degradation"]["requested_format"]);
-    assert_eq!("compact_symbols", value["degradation"]["returned_format"]);
-    assert!(value["summaries"].as_array().unwrap().is_empty());
-    let compact = &value["compact_symbols"];
-    assert!(compact["truncated"].as_bool().unwrap());
+    assert_eq!(false, value["degraded"]);
+    assert!(value["degradation"].is_null(), "{value}");
+    assert_eq!(18, value["summaries"].as_array().unwrap().len(), "{value}");
     assert!(
-        compact["files"].as_array().unwrap().len() < 18,
-        "compact fallback should drop files until it fits: {compact}"
+        value["compact_symbols"].is_null(),
+        "service path should not degrade to compact_symbols: {value}"
     );
 }
 
