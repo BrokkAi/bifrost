@@ -1,8 +1,10 @@
 mod extractor;
 mod hits;
+mod inverted;
 mod resolver;
 
 use crate::analyzer::usages::common::language_for_target;
+use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::python_graph::extractor::{build_python_graph, scan_files_for_seeds};
@@ -13,15 +15,53 @@ use crate::analyzer::usages::traits::UsageAnalyzer;
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::HashSet;
 use std::collections::BTreeSet;
+use std::sync::Arc;
+
+pub(crate) use extractor::PythonProjectGraph;
+
+/// Build the whole Python `caller -> callee` edge set in a single inverted pass
+/// over the workspace (see [`inverted`]). Returns `None` when there are no Python
+/// files. `nodes`/`keep_file` mirror the Go builder.
+pub(crate) fn build_python_usage_edges<F>(
+    analyzer: &dyn IAnalyzer,
+    nodes: &HashSet<String>,
+    keep_file: F,
+) -> Option<UsageEdges>
+where
+    F: Fn(&ProjectFile) -> bool + Sync,
+{
+    let py = resolve_python_analyzer(analyzer)?;
+    let graph = build_python_workspace_graph(analyzer)?;
+    Some(inverted::build_python_edges(
+        analyzer, py, &graph, nodes, keep_file,
+    ))
+}
+
+/// Build the Python project graph once over the whole workspace so a bulk caller
+/// (`usage_graph`) can share it across every per-symbol query instead of
+/// rebuilding it (re-parsing the candidate closure) for each symbol. Module
+/// resolution is index-backed, so the one-time full build stays linear. `None`
+/// when there are no Python files.
+pub(crate) fn build_python_workspace_graph(
+    analyzer: &dyn IAnalyzer,
+) -> Option<Arc<PythonProjectGraph>> {
+    let py = resolve_python_analyzer(analyzer)?;
+    let files: HashSet<ProjectFile> = analyzer
+        .project()
+        .analyzable_files(Language::Python)
+        .ok()?
+        .into_iter()
+        .collect();
+    let target = files.iter().next()?.clone();
+    Some(Arc::new(build_python_graph(py, &files, &target)))
+}
 
 #[derive(Default)]
-pub struct PythonExportUsageGraphStrategy {
-    _private: (),
-}
+pub struct PythonExportUsageGraphStrategy;
 
 impl PythonExportUsageGraphStrategy {
     pub fn new() -> Self {
-        Self { _private: () }
+        Self
     }
 
     pub fn can_handle(target: &CodeUnit) -> bool {

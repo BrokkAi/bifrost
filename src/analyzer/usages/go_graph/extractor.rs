@@ -6,7 +6,6 @@ use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInfere
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::{IAnalyzer, ProjectFile};
 use crate::hash::HashSet;
-use crate::text_utils::compute_line_starts;
 use rayon::prelude::*;
 use std::collections::BTreeSet;
 use std::sync::Mutex;
@@ -28,13 +27,22 @@ pub(super) fn scan_files_for_target(
             return;
         };
         let source = parsed.source.as_str();
-        let line_starts = compute_line_starts(source);
+        // Necessary-condition pre-filter: any structured hit requires the target's
+        // identifier (or, for a method, its owner type name) to appear textually
+        // in the file. Candidate sets include every importer of the target's
+        // package, most of which never reference this specific symbol; skipping
+        // the full tree walk for those is the dominant `usage_graph` speed-up.
+        if !source.contains(spec.identifier())
+            && !spec.owner().is_some_and(|owner| source.contains(owner))
+        {
+            return;
+        }
         let scan_bindings = ScanBindings::new(graph, file, spec);
         let mut local_hits = BTreeSet::new();
         let mut ctx = ScanCtx {
             file,
             source,
-            line_starts: &line_starts,
+            line_starts: &parsed.line_starts,
             analyzer,
             spec,
             bindings: scan_bindings,
@@ -146,7 +154,7 @@ fn seed_parameter_declaration(
     }
 }
 
-fn parameter_names(node: Node<'_>, source: &str) -> Vec<String> {
+pub(super) fn parameter_names(node: Node<'_>, source: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
@@ -182,7 +190,7 @@ fn seed_local_bindings(
     }
 }
 
-fn declared_names(node: Node<'_>, source: &str) -> Vec<String> {
+pub(super) fn declared_names(node: Node<'_>, source: &str) -> Vec<String> {
     match node.kind() {
         "var_declaration" => {
             let mut out = Vec::new();
@@ -249,7 +257,7 @@ fn seed_names_from_values(
     }
 }
 
-fn var_spec_names(node: Node<'_>, source: &str) -> Vec<String> {
+pub(super) fn var_spec_names(node: Node<'_>, source: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cursor = node.walk();
     for name_node in node.children_by_field_name("name", &mut cursor) {
@@ -261,7 +269,7 @@ fn var_spec_names(node: Node<'_>, source: &str) -> Vec<String> {
     out
 }
 
-fn for_each_var_spec(node: Node<'_>, f: &mut impl FnMut(Node<'_>)) {
+pub(super) fn for_each_var_spec(node: Node<'_>, f: &mut impl FnMut(Node<'_>)) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         match child.kind() {
@@ -272,7 +280,7 @@ fn for_each_var_spec(node: Node<'_>, f: &mut impl FnMut(Node<'_>)) {
     }
 }
 
-fn lhs_identifiers(node: Node<'_>, source: &str) -> Vec<String> {
+pub(super) fn lhs_identifiers(node: Node<'_>, source: &str) -> Vec<String> {
     let Some(left) = node
         .child_by_field_name("left")
         .or_else(|| first_named_child(node))
@@ -285,7 +293,7 @@ fn lhs_identifiers(node: Node<'_>, source: &str) -> Vec<String> {
         .collect()
 }
 
-fn rhs_expressions(node: Node<'_>) -> Vec<Node<'_>> {
+pub(super) fn rhs_expressions(node: Node<'_>) -> Vec<Node<'_>> {
     let Some(right) = node
         .child_by_field_name("right")
         .or_else(|| last_named_child(node))
@@ -302,7 +310,7 @@ fn rhs_expressions(node: Node<'_>) -> Vec<Node<'_>> {
     vec![right]
 }
 
-fn identifiers_in_node(node: Node<'_>, source: &str) -> Vec<String> {
+pub(super) fn identifiers_in_node(node: Node<'_>, source: &str) -> Vec<String> {
     if is_identifier_node(node) {
         return vec![node_text(node, source).to_string()];
     }
@@ -325,7 +333,7 @@ fn expression_matches_owner_type(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
         .any(|child| expression_matches_owner_type(child, ctx))
 }
 
-fn is_identifier_node(node: Node<'_>) -> bool {
+pub(super) fn is_identifier_node(node: Node<'_>) -> bool {
     matches!(
         node.kind(),
         "identifier" | "field_identifier" | "type_identifier" | "package_identifier"
@@ -379,7 +387,10 @@ fn scan_direct_identifier(
     }
 }
 
-fn selector_parts<'a>(node: Node<'a>, source: &str) -> Option<(String, Node<'a>, Node<'a>)> {
+pub(super) fn selector_parts<'a>(
+    node: Node<'a>,
+    source: &str,
+) -> Option<(String, Node<'a>, Node<'a>)> {
     let qualifier_node = node
         .child_by_field_name("operand")
         .or_else(|| node.child_by_field_name("package"))
@@ -395,7 +406,7 @@ fn selector_parts<'a>(node: Node<'a>, source: &str) -> Option<(String, Node<'a>,
     ))
 }
 
-fn receiver_symbol_from_qualifier(qualifier: &str) -> &str {
+pub(super) fn receiver_symbol_from_qualifier(qualifier: &str) -> &str {
     qualifier
         .trim()
         .trim_start_matches('(')
@@ -404,7 +415,7 @@ fn receiver_symbol_from_qualifier(qualifier: &str) -> &str {
         .trim()
 }
 
-fn type_ref_from_node(node: Node<'_>, source: &str) -> Option<TypeRef> {
+pub(super) fn type_ref_from_node(node: Node<'_>, source: &str) -> Option<TypeRef> {
     match node.kind() {
         "type_identifier" | "identifier" => Some(TypeRef {
             qualifier: None,
@@ -426,17 +437,17 @@ fn type_ref_from_node(node: Node<'_>, source: &str) -> Option<TypeRef> {
     }
 }
 
-fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
+pub(super) fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor).next()
 }
 
-fn last_named_child(node: Node<'_>) -> Option<Node<'_>> {
+pub(super) fn last_named_child(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor).last()
 }
 
-fn is_definition_identifier(node: Node<'_>, source: &str) -> bool {
+pub(super) fn is_definition_identifier(node: Node<'_>, source: &str) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
@@ -482,11 +493,11 @@ fn is_definition_identifier(node: Node<'_>, source: &str) -> bool {
         })
 }
 
-fn same_node(left: Node<'_>, right: Node<'_>) -> bool {
+pub(super) fn same_node(left: Node<'_>, right: Node<'_>) -> bool {
     left.start_byte() == right.start_byte() && left.end_byte() == right.end_byte()
 }
 
-fn has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {
+pub(super) fn has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {
     let mut current = node.parent();
     while let Some(parent) = current {
         if parent.kind() == kind {
@@ -497,7 +508,7 @@ fn has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {
     false
 }
 
-fn next_non_whitespace_is_colon(node: Node<'_>, source: &str) -> bool {
+pub(super) fn next_non_whitespace_is_colon(node: Node<'_>, source: &str) -> bool {
     source
         .get(node.end_byte()..)
         .and_then(|rest| rest.chars().find(|ch| !ch.is_whitespace()))

@@ -33,6 +33,7 @@
 
 mod extractor;
 mod hits;
+mod inverted;
 mod resolver;
 
 use crate::analyzer::usages::js_ts_graph::extractor::scan_files_for_seeds;
@@ -46,20 +47,59 @@ use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::HashSet;
 use std::collections::BTreeSet;
 
+use crate::analyzer::usages::inverted_edges::UsageEdges;
+
+/// Build the whole JS/TS `caller -> callee` edge set in a single inverted pass per
+/// language present, merging TypeScript and JavaScript. Returns `None` when the
+/// workspace has no JS/TS files. `nodes`/`keep_file` mirror the Go builder; see
+/// [`inverted`].
+pub(crate) fn build_jsts_usage_edges<F>(
+    analyzer: &dyn IAnalyzer,
+    nodes: &HashSet<String>,
+    keep_file: F,
+) -> Option<UsageEdges>
+where
+    F: Fn(&ProjectFile) -> bool + Sync + Copy,
+{
+    let mut edges: std::collections::BTreeMap<(String, String), usize> =
+        std::collections::BTreeMap::new();
+    let mut truncated: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut any = false;
+
+    for language in [Language::TypeScript, Language::JavaScript] {
+        let has_files = analyzer
+            .project()
+            .analyzable_files(language)
+            .map(|set| set.into_iter().next().is_some())
+            .unwrap_or(false);
+        if !has_files {
+            continue;
+        }
+        any = true;
+        let graph = build_js_ts_graph(analyzer, language);
+        let result = inverted::build_jsts_edges(analyzer, &graph, nodes, keep_file);
+        for (key, weight) in result.edges {
+            *edges.entry(key).or_insert(0) += weight;
+        }
+        for (callee, total) in result.truncated {
+            *truncated.entry(callee).or_insert(0) += total;
+        }
+    }
+
+    any.then_some(UsageEdges { edges, truncated })
+}
+
 /// JS/TS export-graph usage analyzer. Resolves usages of a JavaScript or TypeScript
 /// `CodeUnit` by walking the export/import graph rather than scanning text.
 ///
-/// The strategy is stateless: it rebuilds its project graph for every query. When it
-/// cannot infer a seed it returns an internal fallback-safe outcome so the caller
-/// (typically [`UsageFinder`](super::UsageFinder)) can route the query to its regex analyzer.
+/// Stateless: rebuilds its project graph per query.
 #[derive(Default)]
-pub struct JsTsExportUsageGraphStrategy {
-    _private: (),
-}
+pub struct JsTsExportUsageGraphStrategy;
 
 impl JsTsExportUsageGraphStrategy {
     pub fn new() -> Self {
-        Self { _private: () }
+        Self
     }
 
     /// Returns true when the target is a JavaScript or TypeScript code unit and lives in
@@ -90,7 +130,6 @@ impl JsTsExportUsageGraphStrategy {
         }
 
         let graph = build_js_ts_graph(analyzer, language);
-
         let seeds = graph
             .usage_graph
             .seeds_for_target(target.source(), top_level_identifier(target));

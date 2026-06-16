@@ -16,21 +16,22 @@
 
 mod candidates;
 mod common;
-mod cpp_graph;
-mod csharp_graph;
+pub(crate) mod cpp_graph;
+pub(crate) mod csharp_graph;
 mod finder;
-mod go_graph;
+pub(crate) mod go_graph;
 mod graph_core;
-mod java_graph;
-mod js_ts_graph;
+pub(crate) mod inverted_edges;
+pub(crate) mod java_graph;
+pub(crate) mod js_ts_graph;
 mod local_inference;
 mod model;
 mod outcome;
-mod php_graph;
-mod python_graph;
+pub(crate) mod php_graph;
+pub(crate) mod python_graph;
 mod regex_analyzer;
-mod rust_graph;
-mod scala_graph;
+pub(crate) mod rust_graph;
+pub(crate) mod scala_graph;
 mod traits;
 
 pub use candidates::{

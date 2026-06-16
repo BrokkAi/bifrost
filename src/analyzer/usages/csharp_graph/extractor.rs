@@ -238,7 +238,7 @@ fn scan_unqualified_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
-fn is_declaration_name(node: Node<'_>) -> bool {
+pub(super) fn is_declaration_name(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
@@ -263,12 +263,12 @@ fn is_declaration_name(node: Node<'_>) -> bool {
     false
 }
 
-fn member_access_receiver(node: Node<'_>) -> Option<Node<'_>> {
+pub(super) fn member_access_receiver(node: Node<'_>) -> Option<Node<'_>> {
     node.child_by_field_name("expression")
         .or_else(|| node.named_child(0))
 }
 
-fn member_access_name(node: Node<'_>) -> Option<Node<'_>> {
+pub(super) fn member_access_name(node: Node<'_>) -> Option<Node<'_>> {
     node.child_by_field_name("name").or_else(|| {
         let mut cursor = node.walk();
         let mut last = None;

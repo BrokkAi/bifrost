@@ -1,4 +1,5 @@
 mod inline_project;
+pub mod usage_graph;
 
 use brokk_bifrost::{CodeUnit, IAnalyzer, Language, ProjectFile, TestProject};
 use pretty_assertions::assert_eq;

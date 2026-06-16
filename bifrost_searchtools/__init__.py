@@ -18,6 +18,10 @@ from .models import (
     SymbolSourcesResult,
     SummaryBlock,
     SummaryElement,
+    UsageGraphEdge,
+    UsageGraphNode,
+    UsageGraphResult,
+    UsageGraphTruncatedSymbol,
 )
 
 __all__ = [
@@ -42,4 +46,8 @@ __all__ = [
     "SymbolSourcesResult",
     "SummaryBlock",
     "SummaryElement",
+    "UsageGraphEdge",
+    "UsageGraphNode",
+    "UsageGraphResult",
+    "UsageGraphTruncatedSymbol",
 ]

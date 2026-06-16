@@ -458,7 +458,10 @@ fn handle_jsx_element(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 
 /// Walks a JSX element name (identifier or member_expression) and returns the rightmost
 /// identifier node together with its text. For `<Foo.Bar />` the leaf is `Bar`.
-fn rightmost_jsx_identifier<'a>(node: Node<'a>, source: &'a str) -> Option<(Node<'a>, &'a str)> {
+pub(super) fn rightmost_jsx_identifier<'a>(
+    node: Node<'a>,
+    source: &'a str,
+) -> Option<(Node<'a>, &'a str)> {
     match node.kind() {
         "identifier" | "type_identifier" | "property_identifier" => {
             let text = slice(node, source);
@@ -503,7 +506,7 @@ fn member_object_matches_target(node: Node<'_>, object_text: &str, ctx: &ScanCtx
     false
 }
 
-fn simple_identifier_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
+pub(super) fn simple_identifier_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
     match node.kind() {
         "identifier" | "type_identifier" => {
             let text = slice(node, source);
@@ -586,7 +589,7 @@ fn name_subtree_mentions_target_type(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool 
         .any(|child| name_subtree_mentions_target_type(child, ctx))
 }
 
-fn slice<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+pub(super) fn slice<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     source.get(node.start_byte()..node.end_byte()).unwrap_or("")
 }
 
@@ -634,7 +637,7 @@ fn first_named_child_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>>
 // AST predicates
 // ===================================================================================
 
-fn is_declaration_identifier(node: Node<'_>) -> bool {
+pub(super) fn is_declaration_identifier(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
@@ -689,7 +692,7 @@ fn is_declaration_identifier(node: Node<'_>) -> bool {
     false
 }
 
-fn is_property_key_in_member(node: Node<'_>) -> bool {
+pub(super) fn is_property_key_in_member(node: Node<'_>) -> bool {
     // Avoid double-counting: when scanning a member_expression we report the property
     // node directly. The recursive walk also visits the property child, so we must
     // suppress the visit-time report (handled in handle_member_expression by reporting
@@ -706,7 +709,7 @@ fn is_property_key_in_member(node: Node<'_>) -> bool {
         .unwrap_or(false)
 }
 
-fn is_object_in_member_expression(node: Node<'_>) -> bool {
+pub(super) fn is_object_in_member_expression(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };

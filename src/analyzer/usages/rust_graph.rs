@@ -1,8 +1,10 @@
 mod extractor;
 mod hits;
+mod inverted;
 mod resolver;
 
 use crate::analyzer::usages::common::language_for_target;
+use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::model::{FuzzyResult, ReferenceGraphResult};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::rust_graph::extractor::{
@@ -17,14 +19,32 @@ use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, RustAnalyzer};
 use crate::hash::HashSet;
 use std::collections::BTreeSet;
 
-#[derive(Default)]
-pub struct RustExportUsageGraphStrategy {
-    _private: (),
+/// Build the whole Rust `caller -> callee` edge set in a single inverted pass
+/// over the workspace (see [`inverted`]). Returns `None` when there are no Rust
+/// files. `nodes`/`keep_file` mirror the Go builder.
+///
+/// The inverted scan resolves references through each file's own import binder, so
+/// it deliberately skips the cross-file `ProjectUsageGraph` (export reverse
+/// indices, module resolution) that the per-symbol path needs — building only the
+/// parsed trees it reads.
+pub(crate) fn build_rust_usage_edges<F>(
+    analyzer: &dyn IAnalyzer,
+    nodes: &HashSet<String>,
+    keep_file: F,
+) -> Option<UsageEdges>
+where
+    F: Fn(&ProjectFile) -> bool + Sync,
+{
+    let rust = resolve_rust_analyzer(analyzer)?;
+    Some(inverted::build_rust_edges(analyzer, rust, nodes, keep_file))
 }
+
+#[derive(Default)]
+pub struct RustExportUsageGraphStrategy;
 
 impl RustExportUsageGraphStrategy {
     pub fn new() -> Self {
-        Self { _private: () }
+        Self
     }
 
     pub fn can_handle(target: &CodeUnit) -> bool {
@@ -91,12 +111,13 @@ impl RustExportUsageGraphStrategy {
         };
 
         let graph = build_rust_graph(rust);
-        let seeds = infer_graph_seeds(rust, &graph, target);
+        let graph = &graph;
+        let seeds = infer_graph_seeds(rust, graph, target);
 
         let hits = if seeds.is_empty() && supports_same_file_local_scan(rust, target) {
             scan_files_for_target(
                 analyzer,
-                &graph,
+                graph,
                 [target.source().clone()].into_iter().collect(),
                 target,
                 None,
@@ -114,11 +135,11 @@ impl RustExportUsageGraphStrategy {
                     BTreeSet::new(),
                 ));
             }
-            let scan_files = effective_scan_files(rust, &graph, candidate_files, target, &seeds);
-            scan_files_for_member_target(analyzer, &graph, rust, scan_files, target, &seeds)
+            let scan_files = effective_scan_files(rust, graph, candidate_files, target, &seeds);
+            scan_files_for_member_target(analyzer, graph, rust, scan_files, target, &seeds)
         } else {
-            let scan_files = effective_scan_files(rust, &graph, candidate_files, target, &seeds);
-            scan_files_for_target(analyzer, &graph, scan_files, target, Some(&seeds))
+            let scan_files = effective_scan_files(rust, graph, candidate_files, target, &seeds);
+            scan_files_for_target(analyzer, graph, scan_files, target, Some(&seeds))
         };
 
         let hits: BTreeSet<_> = hits

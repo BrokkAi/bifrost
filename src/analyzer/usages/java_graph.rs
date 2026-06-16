@@ -1,7 +1,10 @@
 mod extractor;
 mod hits;
+mod inverted;
 mod jvm_scala;
 mod resolver;
+
+pub(crate) use inverted::build_java_usage_edges;
 
 use crate::analyzer::usages::common::{language_for_file, language_for_target};
 use crate::analyzer::usages::java_graph::extractor::{ScanState, scan_file};
