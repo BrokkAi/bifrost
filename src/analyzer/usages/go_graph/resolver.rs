@@ -96,30 +96,36 @@ impl GoProjectGraph {
                 continue;
             };
             let resolved = resolve_go_module(&path, &self.dir_index, self.module_path.as_deref());
-            let mut package_names: Vec<String> = resolved
+            // Each resolved package is `(clause name, canonical fqn prefix)`: the
+            // source refers to it by its `package` clause name (`row`), while the
+            // node fqn it must map to uses the canonical, module-qualified path
+            // (`example.com/.../row`).
+            let mut packages: Vec<(String, String)> = resolved
                 .iter()
                 .filter_map(|target| {
                     let parsed = self.parsed.get(target)?;
-                    Some(canonical_go_package_name(target, &parsed.package_name))
+                    let clause = parsed.package_name.clone();
+                    let canonical = canonical_go_package_name(target, &parsed.package_name);
+                    (!clause.is_empty() && !canonical.is_empty()).then_some((clause, canonical))
                 })
-                .filter(|name| !name.is_empty())
                 .collect();
-            package_names.sort();
-            package_names.dedup();
-            if package_names.is_empty() {
+            packages.sort();
+            packages.dedup();
+            if packages.is_empty() {
                 continue;
             }
+            let canonicals = || packages.iter().map(|(_, canonical)| canonical.clone());
             match alias {
-                Some(".") => dot_imports.extend(package_names),
+                Some(".") => dot_imports.extend(canonicals()),
                 Some(explicit) => by_alias
                     .entry(default_go_import_local_name(explicit))
                     .or_default()
-                    .extend(package_names),
+                    .extend(canonicals()),
                 None => {
-                    // A plain import binds each resolved package under its own
-                    // package-clause name, which is also the node fqn prefix.
-                    for name in package_names {
-                        by_alias.entry(name.clone()).or_default().push(name);
+                    // A plain import is referred to by its package-clause name;
+                    // map that local name to the canonical node fqn prefix.
+                    for (clause, canonical) in packages {
+                        by_alias.entry(clause).or_default().push(canonical);
                     }
                 }
             }

@@ -1,5 +1,13 @@
 package app
 
+import "example.com/app/sub"
+
+// callsCrossPackage calls an exported function in another package through a
+// plain package selector (`sub.Helper`); the edge must resolve to sub.Helper.
+func callsCrossPackage() int {
+	return sub.Helper()
+}
+
 // describeAlpha calls a method on a receiver typed `*Alpha`, so the edge must
 // resolve to Alpha.Channel specifically (not Beta.Channel, which shares the name).
 func describeAlpha(a *Alpha) string {

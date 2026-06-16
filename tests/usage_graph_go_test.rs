@@ -42,6 +42,22 @@ fn edge_weight(value: &Value, from: &str, to: &str) -> Option<u64> {
 }
 
 #[test]
+fn cross_package_selector_call_resolves_to_an_edge() {
+    let graph = go_usage_graph();
+    // `callsCrossPackage` calls `sub.Helper()` through an imported-package
+    // selector; the edge must resolve to the callee in the other package.
+    assert!(
+        has_edge(
+            &graph,
+            "example.com/app.callsCrossPackage",
+            "example.com/app/sub.Helper"
+        ),
+        "cross-package selector call should produce an edge; edges: {:?}",
+        graph["edges"]
+    );
+}
+
+#[test]
 fn member_call_resolves_to_the_receivers_type() {
     let graph = go_usage_graph();
     // `describeAlpha` calls `a.Channel()` where `a` is typed `*Alpha`.
