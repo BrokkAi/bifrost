@@ -131,7 +131,10 @@ fn get_summaries_directory_target_stays_narrow_on_service_path() {
         .unwrap();
     let value: Value = serde_json::from_str(&payload).unwrap();
 
-    assert!(value["structured"].get("compact_symbols").is_none(), "{value}");
+    assert!(
+        value["structured"].get("compact_symbols").is_none(),
+        "{value}"
+    );
     assert!(value["structured"].get("degraded").is_none(), "{value}");
     assert!(
         value["structured"]["not_found"]
@@ -166,7 +169,10 @@ fn get_summaries_mixed_targets_stay_narrow_on_service_path() {
             .any(|item| item == "."),
         "{value}"
     );
-    assert!(value["structured"].get("compact_symbols").is_none(), "{value}");
+    assert!(
+        value["structured"].get("compact_symbols").is_none(),
+        "{value}"
+    );
     let rendered = value["rendered_text"].as_str().expect("rendered text");
     assert!(rendered.contains("A.java"), "{rendered}");
     assert!(!rendered.contains("A.java ("), "{rendered}");
@@ -193,8 +199,14 @@ fn get_summaries_large_file_glob_stays_full_fidelity_on_service_path() {
         .unwrap();
 
     let value: Value = serde_json::from_str(&payload).unwrap();
-    assert!(value.get("degraded").is_none() || value["degraded"].is_null(), "{value}");
-    assert!(value.get("degradation").is_none() || value["degradation"].is_null(), "{value}");
+    assert!(
+        value.get("degraded").is_none() || value["degraded"].is_null(),
+        "{value}"
+    );
+    assert!(
+        value.get("degradation").is_none() || value["degradation"].is_null(),
+        "{value}"
+    );
     assert_eq!(18, value["summaries"].as_array().unwrap().len(), "{value}");
     assert!(
         value["compact_symbols"].is_null(),

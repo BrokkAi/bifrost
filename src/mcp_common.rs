@@ -285,12 +285,8 @@ fn fit_get_summaries_output_to_budget(
         return Ok(output);
     };
 
-    let mut compact_text = maybe_add_directory_inventory(
-        service,
-        &mut structured,
-        arguments,
-        render_options,
-    )?;
+    let mut compact_text =
+        maybe_add_directory_inventory(service, &mut structured, arguments, render_options)?;
 
     let original_bytes = serialized_json_len(&structured);
     let summaries_len = structured
@@ -330,7 +326,8 @@ fn maybe_add_directory_inventory(
         .get("targets")
         .and_then(Value::as_array)
         .map(|items| {
-            items.iter()
+            items
+                .iter()
                 .filter_map(|item| item.as_str().map(str::to_string))
                 .collect::<Vec<_>>()
         })
@@ -368,7 +365,9 @@ fn maybe_add_directory_inventory(
 
     if let Some(object) = structured.as_object_mut() {
         object.insert("compact_symbols".to_string(), compact_structured);
-        object.entry("degraded".to_string()).or_insert_with(|| json!(false));
+        object
+            .entry("degraded".to_string())
+            .or_insert_with(|| json!(false));
         object
             .entry("degradation".to_string())
             .or_insert(Value::Null);
@@ -393,7 +392,9 @@ fn unresolved_targets(targets: &[String], structured: &Value) -> Vec<String> {
         .collect();
     targets
         .iter()
-        .filter(|target| not_found.contains(target.as_str()) && !found_summary_paths.contains(target.as_str()))
+        .filter(|target| {
+            not_found.contains(target.as_str()) && !found_summary_paths.contains(target.as_str())
+        })
         .cloned()
         .collect()
 }
@@ -424,7 +425,8 @@ fn degrade_get_summaries_value(
                 render_options,
             )?;
             compact_text = rendered_text_for_output(&compact_output);
-            structured = compact_only_get_summaries_value(structured, compact_output, original_bytes)?;
+            structured =
+                compact_only_get_summaries_value(structured, compact_output, original_bytes)?;
         }
     } else if let Some(output) = list_output {
         compact_text = rendered_text_for_output(&output);
@@ -455,7 +457,8 @@ fn compact_symbols_paths(structured: &Value) -> Option<Vec<String>> {
         .get("files")?
         .as_array()?;
     Some(
-        files.iter()
+        files
+            .iter()
             .filter_map(|file| file.get("path").and_then(Value::as_str).map(str::to_string))
             .collect(),
     )
@@ -508,13 +511,19 @@ fn shrink_compact_symbols_value_to_budget(mut structured: Value) -> Value {
             return structured;
         };
         if files.len() <= 1 {
-            if let Some(compact) = structured.get_mut("compact_symbols").and_then(Value::as_object_mut) {
+            if let Some(compact) = structured
+                .get_mut("compact_symbols")
+                .and_then(Value::as_object_mut)
+            {
                 compact.insert("truncated".to_string(), json!(true));
             }
             return structured;
         }
         files.pop();
-        if let Some(compact) = structured.get_mut("compact_symbols").and_then(Value::as_object_mut) {
+        if let Some(compact) = structured
+            .get_mut("compact_symbols")
+            .and_then(Value::as_object_mut)
+        {
             compact.insert("truncated".to_string(), json!(true));
         }
     }
@@ -527,8 +536,7 @@ fn render_budgeted_get_summaries_text(structured: &Value, compact_text: Option<S
         .and_then(Value::as_str)
         .map(|message| format!("Note: {message}"))
         .unwrap_or_default();
-    let compact_text = compact_text
-        .unwrap_or_else(|| "No matching summaries found.".to_string());
+    let compact_text = compact_text.unwrap_or_else(|| "No matching summaries found.".to_string());
     let mut text = if note.is_empty() {
         compact_text
     } else {

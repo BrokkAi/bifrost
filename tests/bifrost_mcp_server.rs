@@ -1400,8 +1400,11 @@ fn bifrost_mcp_budgets_large_get_summaries_responses() {
             ));
         }
         source.push_str("}\n");
-        fs::write(fixture_root.path().join(format!("Caller{class_idx}.java")), source)
-            .expect("write fixture");
+        fs::write(
+            fixture_root.path().join(format!("Caller{class_idx}.java")),
+            source,
+        )
+        .expect("write fixture");
     }
 
     let mut child = spawn_server(fixture_root.path(), "searchtools", &[]);
@@ -1438,11 +1441,13 @@ fn bifrost_mcp_budgets_large_get_summaries_responses() {
     let structured = &response["result"]["structuredContent"];
     assert_eq!(true, structured["degraded"], "{structured}");
     assert_eq!(
-        "response_budget_exceeded",
-        structured["degradation"]["reason"],
+        "response_budget_exceeded", structured["degradation"]["reason"],
         "{structured}"
     );
-    assert!(structured["summaries"].as_array().unwrap().is_empty(), "{structured}");
+    assert!(
+        structured["summaries"].as_array().unwrap().is_empty(),
+        "{structured}"
+    );
 
     drop(stdin);
     let status = child.wait().expect("wait bifrost");
