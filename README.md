@@ -204,7 +204,7 @@ The client exposes:
 - `list_symbols(...)`
 - `most_relevant_files(...)`
 
-`get_summaries(...)` remains directory-aware for MCP and Python callers: directory targets surface a `compact_symbols` inventory alongside ordinary summaries when mixed with file or class targets. The Rust-level `brokk_bifrost::searchtools::get_summaries(...)` API is narrower and reports directory targets in `not_found` instead of embedding directory inventory in `SummaryResult`.
+`get_summaries(...)` remains directory-aware for MCP callers: directory targets surface a `compact_symbols` inventory alongside ordinary summaries when mixed with file or class targets. The direct Rust `brokk_bifrost::searchtools::get_summaries(...)` API and the Python `searchtools` client are narrower and report directory targets in `not_found` instead of embedding directory inventory in `SummaryResult`.
 
 The client talks directly to Rust through a native extension module. The Python/Rust boundary stays JSON-shaped: Python sends tool names plus JSON arguments and Rust returns structured JSON plus canonical rendered text. The line-number policy now lives in the shared Rust renderer used by both the MCP server and the Python client:
 

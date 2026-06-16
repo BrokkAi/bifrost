@@ -243,10 +243,10 @@ fn handle_tool_call(
     let render_options = RenderOptions {
         render_line_numbers: render_options.render_line_numbers,
     };
-    match service.call_tool_output(name, arguments, render_options) {
+    match service.call_tool_output(name, arguments.clone(), render_options) {
         Ok(output) => {
             let output = if name == "get_summaries" {
-                fit_get_summaries_output_to_budget(service, output, render_options)
+                fit_get_summaries_output_to_budget(service, output, &arguments, render_options)
                     .map_err(|err| map_service_error(err.code, err.message))?
             } else {
                 output
@@ -274,15 +274,23 @@ fn map_service_error(code: SearchToolsServiceErrorCode, message: String) -> (i64
 fn fit_get_summaries_output_to_budget(
     service: &SearchToolsService,
     output: ToolOutput,
+    arguments: &Value,
     render_options: RenderOptions,
 ) -> Result<ToolOutput, SearchToolsServiceError> {
     let ToolOutput::Structured {
-        structured,
-        rendered_text,
+        mut structured,
+        rendered_text: base_rendered_text,
     } = output
     else {
         return Ok(output);
     };
+
+    let mut compact_text = maybe_add_directory_inventory(
+        service,
+        &mut structured,
+        arguments,
+        render_options,
+    )?;
 
     let original_bytes = serialized_json_len(&structured);
     let summaries_len = structured
@@ -291,23 +299,109 @@ fn fit_get_summaries_output_to_budget(
         .map(|items| items.len())
         .unwrap_or(0);
     if original_bytes <= GET_SUMMARIES_RESPONSE_BUDGET_BYTES || summaries_len == 0 {
+        let rendered_text =
+            render_non_degraded_get_summaries_text(base_rendered_text, compact_text.take());
         return Ok(ToolOutput::Structured {
             structured,
-            rendered_text,
+            rendered_text: Some(rendered_text),
         });
     }
 
-    let (budgeted, rendered_text) =
-        degrade_get_summaries_value(service, structured, original_bytes, render_options)?;
+    let (budgeted, rendered_text) = degrade_get_summaries_value(
+        service,
+        structured,
+        compact_text,
+        original_bytes,
+        render_options,
+    )?;
     Ok(ToolOutput::Structured {
         structured: budgeted,
         rendered_text: Some(rendered_text),
     })
 }
 
+fn maybe_add_directory_inventory(
+    service: &SearchToolsService,
+    structured: &mut Value,
+    arguments: &Value,
+    render_options: RenderOptions,
+) -> Result<Option<String>, SearchToolsServiceError> {
+    let targets = arguments
+        .get("targets")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items.iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if targets.is_empty() {
+        return Ok(None);
+    }
+
+    let unresolved = unresolved_targets(&targets, structured);
+    if unresolved.is_empty() {
+        return Ok(None);
+    }
+
+    let compact_output = service.call_tool_output(
+        "list_symbols",
+        json!({ "file_patterns": unresolved }),
+        render_options,
+    )?;
+    let compact_text = rendered_text_for_output(&compact_output);
+    let ToolOutput::Structured {
+        structured: compact_structured,
+        ..
+    } = compact_output
+    else {
+        return Ok(compact_text);
+    };
+    let has_files = compact_structured
+        .get("files")
+        .and_then(Value::as_array)
+        .map(|files| !files.is_empty())
+        .unwrap_or(false);
+    if !has_files {
+        return Ok(compact_text);
+    }
+
+    if let Some(object) = structured.as_object_mut() {
+        object.insert("compact_symbols".to_string(), compact_structured);
+        object.entry("degraded".to_string()).or_insert_with(|| json!(false));
+        object
+            .entry("degradation".to_string())
+            .or_insert(Value::Null);
+    }
+    Ok(compact_text)
+}
+
+fn unresolved_targets(targets: &[String], structured: &Value) -> Vec<String> {
+    let found_summary_paths: std::collections::HashSet<_> = structured
+        .get("summaries")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|summary| summary.get("path").and_then(Value::as_str))
+        .collect();
+    let not_found: std::collections::HashSet<_> = structured
+        .get("not_found")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    targets
+        .iter()
+        .filter(|target| not_found.contains(target.as_str()) && !found_summary_paths.contains(target.as_str()))
+        .cloned()
+        .collect()
+}
+
 fn degrade_get_summaries_value(
     service: &SearchToolsService,
     mut structured: Value,
+    compact_text: Option<String>,
     original_bytes: usize,
     render_options: RenderOptions,
 ) -> Result<(Value, String), SearchToolsServiceError> {
@@ -321,7 +415,7 @@ fn degrade_get_summaries_value(
             render_options,
         )?)
     };
-    let mut compact_text: Option<String> = None;
+    let mut compact_text = compact_text;
     if let Some(paths) = compact_symbols_paths(&structured) {
         if serialized_json_len(&structured) > GET_SUMMARIES_RESPONSE_BUDGET_BYTES {
             let compact_output = service.call_tool_output(
@@ -447,6 +541,18 @@ fn render_budgeted_get_summaries_text(structured: &Value, compact_text: Option<S
         text.push_str(suffix);
     }
     text
+}
+
+fn render_non_degraded_get_summaries_text(
+    base_rendered_text: Option<String>,
+    compact_text: Option<String>,
+) -> String {
+    let base = base_rendered_text.unwrap_or_else(|| "No matching summaries found.".to_string());
+    match compact_text {
+        Some(compact) if base == "No matching summaries found." => compact,
+        Some(compact) => format!("{base}\n\n{compact}"),
+        None => base,
+    }
 }
 
 fn rendered_text_for_output(output: &ToolOutput) -> Option<String> {

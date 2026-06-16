@@ -120,7 +120,7 @@ fn python_boundary_returns_structured_json() {
 }
 
 #[test]
-fn get_summaries_directory_target_returns_skim_symbol_inventory() {
+fn get_summaries_directory_target_stays_narrow_on_service_path() {
     let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
     let payload = service
         .call_tool_payload_json(
@@ -131,24 +131,22 @@ fn get_summaries_directory_target_returns_skim_symbol_inventory() {
         .unwrap();
     let value: Value = serde_json::from_str(&payload).unwrap();
 
-    assert_eq!(false, value["structured"]["degraded"]);
-    assert!(value["structured"]["degradation"].is_null());
-    let compact_symbols = &value["structured"]["compact_symbols"];
-    assert!(compact_symbols["files"].as_array().unwrap().len() <= 20);
+    assert!(value["structured"].get("compact_symbols").is_none(), "{value}");
+    assert!(value["structured"].get("degraded").is_none(), "{value}");
     assert!(
-        compact_symbols["files"]
+        value["structured"]["not_found"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|file| file["path"] == "A.java"),
-        "{compact_symbols}"
+            .any(|item| item == "."),
+        "{value}"
     );
     let rendered = value["rendered_text"].as_str().expect("rendered text");
-    assert!(rendered.contains("A.java ("), "{rendered}");
+    assert_eq!("Not found: .", rendered);
 }
 
 #[test]
-fn get_summaries_mixed_targets_return_summaries_and_directory_inventory() {
+fn get_summaries_mixed_targets_stay_narrow_on_service_path() {
     let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
     let payload = service
         .call_tool_payload_json(
@@ -160,19 +158,18 @@ fn get_summaries_mixed_targets_return_summaries_and_directory_inventory() {
     let value: Value = serde_json::from_str(&payload).unwrap();
 
     assert_eq!(value["structured"]["summaries"][0]["path"], "A.java");
-    assert_eq!(false, value["structured"]["degraded"]);
-    let compact_symbols = &value["structured"]["compact_symbols"];
     assert!(
-        compact_symbols["files"]
+        value["structured"]["not_found"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|file| file["path"] == "A.java"),
-        "{compact_symbols}"
+            .any(|item| item == "."),
+        "{value}"
     );
+    assert!(value["structured"].get("compact_symbols").is_none(), "{value}");
     let rendered = value["rendered_text"].as_str().expect("rendered text");
     assert!(rendered.contains("A.java"), "{rendered}");
-    assert!(rendered.contains("A.java ("), "{rendered}");
+    assert!(!rendered.contains("A.java ("), "{rendered}");
 }
 
 #[test]
@@ -196,8 +193,8 @@ fn get_summaries_large_file_glob_stays_full_fidelity_on_service_path() {
         .unwrap();
 
     let value: Value = serde_json::from_str(&payload).unwrap();
-    assert_eq!(false, value["degraded"]);
-    assert!(value["degradation"].is_null(), "{value}");
+    assert!(value.get("degraded").is_none() || value["degraded"].is_null(), "{value}");
+    assert!(value.get("degradation").is_none() || value["degradation"].is_null(), "{value}");
     assert_eq!(18, value["summaries"].as_array().unwrap().len(), "{value}");
     assert!(
         value["compact_symbols"].is_null(),

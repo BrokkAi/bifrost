@@ -1277,6 +1277,115 @@ fn bifrost_mcp_absolute_paths_follow_activated_workspace() {
 }
 
 #[test]
+fn bifrost_mcp_get_summaries_remains_directory_aware() {
+    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("testcode-java");
+
+    let mut child = spawn_server(&fixture_root, "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+
+    let response = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "get_summaries",
+                "arguments": { "targets": ["."] }
+            }
+        }),
+    );
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    let structured = &response["result"]["structuredContent"];
+    assert_eq!(false, structured["degraded"], "{structured}");
+    assert!(
+        structured["compact_symbols"]["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| file["path"] == "A.java"),
+        "{structured}"
+    );
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("tool text");
+    assert!(text.contains("A.java ("), "{text}");
+
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
+fn bifrost_mcp_get_summaries_mixed_targets_include_compact_symbols() {
+    let fixture_root = TempDir::new().expect("temp dir");
+    fs::write(
+        fixture_root.path().join("A.java"),
+        "public class A { int x() { return 1; } }\n",
+    )
+    .expect("write fixture");
+    fs::write(
+        fixture_root.path().join("B.java"),
+        "public class B { int y() { return 2; } }\n",
+    )
+    .expect("write fixture");
+
+    let mut child = spawn_server(fixture_root.path(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+
+    let response = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "get_summaries",
+                "arguments": { "targets": ["A.java", "."] }
+            }
+        }),
+    );
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    let structured = &response["result"]["structuredContent"];
+    assert_eq!("A.java", structured["summaries"][0]["path"], "{structured}");
+    assert_eq!(false, structured["degraded"], "{structured}");
+    assert!(
+        structured["compact_symbols"]["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| file["path"] == "A.java"),
+        "{structured}"
+    );
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("tool text");
+    assert!(text.contains("A.java"), "{text}");
+    assert!(text.contains("A.java ("), "{text}");
+
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
 fn bifrost_mcp_budgets_large_get_summaries_responses() {
     let fixture_root = TempDir::new().expect("temp dir");
     for class_idx in 0..18 {
