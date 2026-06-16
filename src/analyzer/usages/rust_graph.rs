@@ -23,10 +23,11 @@ use std::collections::BTreeSet;
 /// over the workspace (see [`inverted`]). Returns `None` when there are no Rust
 /// files. `nodes`/`keep_file` mirror the Go builder.
 ///
-/// The inverted scan resolves references through each file's own import binder, so
-/// it deliberately skips the cross-file `ProjectUsageGraph` (export reverse
-/// indices, module resolution) that the per-symbol path needs — building only the
-/// parsed trees it reads.
+/// Both usage paths resolve references through analyzer state: per-reference name
+/// resolution via the cached [`crate::analyzer::RustReferenceContext`], and the
+/// forward path's re-export seeds + importer narrowing via the analyzer's
+/// `usage_*` index (`RustAnalyzer::usage_seeds` / `usage_importers` /
+/// `usage_binding_names`).
 pub(crate) fn build_rust_usage_edges<F>(
     analyzer: &dyn IAnalyzer,
     nodes: &HashSet<String>,
@@ -112,11 +113,12 @@ impl RustExportUsageGraphStrategy {
 
         let graph = build_rust_graph(rust);
         let graph = &graph;
-        let seeds = infer_graph_seeds(rust, graph, target);
+        let seeds = infer_graph_seeds(rust, target);
 
         let hits = if seeds.is_empty() && supports_same_file_local_scan(rust, target) {
             scan_files_for_target(
                 analyzer,
+                rust,
                 graph,
                 [target.source().clone()].into_iter().collect(),
                 target,
@@ -135,11 +137,11 @@ impl RustExportUsageGraphStrategy {
                     BTreeSet::new(),
                 ));
             }
-            let scan_files = effective_scan_files(rust, graph, candidate_files, target, &seeds);
+            let scan_files = effective_scan_files(rust, candidate_files, target, &seeds);
             scan_files_for_member_target(analyzer, graph, rust, scan_files, target, &seeds)
         } else {
-            let scan_files = effective_scan_files(rust, graph, candidate_files, target, &seeds);
-            scan_files_for_target(analyzer, graph, scan_files, target, Some(&seeds))
+            let scan_files = effective_scan_files(rust, candidate_files, target, &seeds);
+            scan_files_for_target(analyzer, rust, graph, scan_files, target, Some(&seeds))
         };
 
         let hits: BTreeSet<_> = hits

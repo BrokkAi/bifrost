@@ -1,4 +1,3 @@
-use crate::analyzer::usages::graph_core::{ImportEdgeKind, ProjectUsageGraph};
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::usages::rust_graph::hits::{
@@ -20,12 +19,16 @@ struct ParsedFile {
 
 pub(crate) struct RustProjectGraph {
     parsed: HashMap<ProjectFile, ParsedFile>,
-    pub(super) usage_graph: ProjectUsageGraph,
 }
 
+/// Parse every Rust file once for tree reuse during the forward scan. Re-export
+/// and importer resolution now lives on the analyzer (`RustAnalyzer::usage_*`,
+/// see [`super::super::rust_graph`]), so this no longer builds a cross-file graph.
 pub(super) fn build_rust_graph(analyzer: &RustAnalyzer) -> RustProjectGraph {
-    let files: Vec<_> = analyzer.get_analyzed_files().into_iter().collect();
-    let parsed_files: Vec<_> = files
+    let parsed: HashMap<ProjectFile, ParsedFile> = analyzer
+        .get_analyzed_files()
+        .into_iter()
+        .collect::<Vec<_>>()
         .par_iter()
         .filter_map(|file| {
             let source = file.read_to_string().ok()?;
@@ -34,46 +37,21 @@ pub(super) fn build_rust_graph(analyzer: &RustAnalyzer) -> RustProjectGraph {
                 .set_language(&tree_sitter_rust::LANGUAGE.into())
                 .ok()?;
             let tree = parser.parse(source.as_str(), None)?;
-            let exports = analyzer.export_index_of(file);
-            let binder = analyzer.import_binder_of(file);
             Some((
                 file.clone(),
                 ParsedFile {
                     source: Arc::new(source),
                     tree,
                 },
-                exports,
-                binder,
             ))
         })
         .collect();
 
-    let mut parsed = HashMap::default();
-    let mut exports_by_file = HashMap::default();
-    let mut binders_by_file = HashMap::default();
-
-    for (file, parsed_file, exports, binder) in parsed_files {
-        parsed.insert(file.clone(), parsed_file);
-        exports_by_file.insert(file.clone(), exports);
-        binders_by_file.insert(file, binder);
-    }
-
-    let usage_graph = ProjectUsageGraph::build(
-        files,
-        exports_by_file,
-        &binders_by_file,
-        |file, module_specifier| analyzer.resolve_module_files(file, module_specifier),
-    );
-
-    RustProjectGraph {
-        parsed,
-        usage_graph,
-    }
+    RustProjectGraph { parsed }
 }
 
 pub(super) fn effective_scan_files(
     analyzer: &RustAnalyzer,
-    graph: &RustProjectGraph,
     candidate_files: &HashSet<ProjectFile>,
     target: &CodeUnit,
     seeds: &BTreeSet<(ProjectFile, String)>,
@@ -93,9 +71,8 @@ pub(super) fn effective_scan_files(
         return filtered_candidates;
     }
 
-    graph
-        .usage_graph
-        .importers_of_seeds(seeds)
+    analyzer
+        .usage_importers(seeds)
         .into_iter()
         .chain(std::iter::once(target.source().clone()))
         .collect()
@@ -103,6 +80,7 @@ pub(super) fn effective_scan_files(
 
 pub(super) fn scan_files_for_target(
     analyzer: &dyn IAnalyzer,
+    rust: &RustAnalyzer,
     graph: &RustProjectGraph,
     files: HashSet<ProjectFile>,
     target: &CodeUnit,
@@ -139,24 +117,7 @@ pub(super) fn scan_files_for_target(
 
         let line_starts = compute_line_starts(source);
         let (direct_names, namespace_names) = match seeds {
-            Some(seeds) => graph
-                .usage_graph
-                .matching_edges_for_importer(file, seeds)
-                .into_iter()
-                .fold(
-                    (HashSet::default(), HashSet::default()),
-                    |(mut direct, mut namespaces), edge| {
-                        match edge.kind {
-                            ImportEdgeKind::Namespace | ImportEdgeKind::CommonJsRequire(_) => {
-                                namespaces.insert(edge.local_name);
-                            }
-                            ImportEdgeKind::Named(_) | ImportEdgeKind::Default => {
-                                direct.insert(edge.local_name);
-                            }
-                        }
-                        (direct, namespaces)
-                    },
-                ),
+            Some(seeds) => rust.usage_binding_names(file, seeds),
             None => (HashSet::default(), HashSet::default()),
         };
         let target_self_file = file == target.source();
@@ -363,12 +324,7 @@ pub(super) fn scan_files_for_member_target(
         let owner_local_names: HashSet<String> = if file == target.source() {
             [owner.identifier().to_string()].into_iter().collect()
         } else {
-            graph
-                .usage_graph
-                .matching_edges_for_importer(file, seeds)
-                .into_iter()
-                .map(|edge| edge.local_name)
-                .collect()
+            rust.usage_binding_local_names(file, seeds)
         };
         let trait_owner = is_trait_owner(rust, &owner);
         let receiver_type_names = if trait_owner {

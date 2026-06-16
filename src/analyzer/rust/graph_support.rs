@@ -2,12 +2,56 @@ use crate::analyzer::usages::{
     ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind, ReexportStar,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, ImportAnalysisProvider, ProjectFile};
-use crate::hash::HashSet;
+use crate::hash::{HashMap, HashSet};
+use std::sync::Arc;
 use tree_sitter::{Node, Parser};
 
 use super::RustAnalyzer;
 use super::declarations::rust_package_name;
 use super::imports::{resolve_rust_module_path, split_rust_import_module_and_name};
+
+/// Per-file reference-resolution context for Rust — the one primitive both usage
+/// paths share. Holds the binder-derived maps a reference resolves through, built
+/// once per file and cached on the analyzer ([`RustAnalyzer::reference_context_of`]).
+///
+/// Rust node fqns are file-independent dotted module paths (`util.format_value`),
+/// so a resolved value *is* the graph node key — projecting to the node fqn is the
+/// identity. (For JS/TS, where fqns are bare, the resolved value must carry the
+/// file; see the execplan's "Identity model".)
+#[derive(Debug, Default)]
+pub struct RustReferenceContext {
+    /// local name -> fqn for `use path::Item;` / `use path::func;` named bindings.
+    pub(super) named: HashMap<String, String>,
+    /// local alias -> package for `use crate::util;` namespace bindings.
+    pub(super) namespace: HashMap<String, String>,
+    /// identifier -> fqn for items declared in this file.
+    pub(super) same_file: HashMap<String, String>,
+}
+
+impl RustReferenceContext {
+    /// The callee fqn a bare `name` refers to: a named import, a same-file item,
+    /// or a free function imported via `use path::func;` (the binder classifies
+    /// the latter as a namespace whose resolved value is the function's own fqn).
+    pub fn resolve_bare(&self, name: &str) -> Option<&str> {
+        self.named
+            .get(name)
+            .or_else(|| self.namespace.get(name))
+            .or_else(|| self.same_file.get(name))
+            .map(String::as_str)
+    }
+
+    /// The callee fqn a `path::name` refers to: a module function via a namespace
+    /// import, or an associated function on an imported / same-file type.
+    pub fn resolve_scoped(&self, path: &str, name: &str) -> Option<String> {
+        if let Some(package) = self.namespace.get(path) {
+            return Some(format!("{package}.{name}"));
+        }
+        self.named
+            .get(path)
+            .or_else(|| self.same_file.get(path))
+            .map(|type_fqn| format!("{type_fqn}.{name}"))
+    }
+}
 
 impl RustAnalyzer {
     pub fn export_index_of(&self, file: &ProjectFile) -> ExportIndex {
@@ -159,6 +203,56 @@ impl RustAnalyzer {
     ) -> Option<String> {
         let package = rust_package_name(importing_file);
         resolve_rust_module_path(&package, module_specifier)
+    }
+
+    /// The cached per-file [`RustReferenceContext`] — the one primitive both the
+    /// inverted usage-graph builder and the forward scan resolve references
+    /// through. Built once per file from its import binder + same-file
+    /// declarations; the cache is dropped on `update`/`update_all`, so a changed
+    /// file rebuilds it.
+    pub fn reference_context_of(&self, file: &ProjectFile) -> Arc<RustReferenceContext> {
+        if let Some(cached) = self.reference_contexts.get(file) {
+            return cached;
+        }
+        let context = Arc::new(self.build_reference_context(file));
+        self.reference_contexts
+            .insert(file.clone(), context.clone());
+        context
+    }
+
+    fn build_reference_context(&self, file: &ProjectFile) -> RustReferenceContext {
+        let binder = self.import_binder_of(file);
+        let mut named: HashMap<String, String> = HashMap::default();
+        let mut namespace: HashMap<String, String> = HashMap::default();
+        for (local, binding) in &binder.bindings {
+            match binding.kind {
+                ImportKind::Named => {
+                    if let Some(imported) = &binding.imported_name
+                        && let Some(package) =
+                            self.resolve_module_package(file, &binding.module_specifier)
+                    {
+                        named.insert(local.clone(), format!("{package}.{imported}"));
+                    }
+                }
+                ImportKind::Namespace => {
+                    if let Some(package) =
+                        self.resolve_module_package(file, &binding.module_specifier)
+                    {
+                        namespace.insert(local.clone(), package);
+                    }
+                }
+                ImportKind::Default | ImportKind::CommonJsRequire | ImportKind::Glob => {}
+            }
+        }
+        let same_file: HashMap<String, String> = self
+            .declarations(file)
+            .map(|unit| (unit.identifier().to_string(), unit.fq_name()))
+            .collect();
+        RustReferenceContext {
+            named,
+            namespace,
+            same_file,
+        }
     }
 
     pub fn resolve_module_files(

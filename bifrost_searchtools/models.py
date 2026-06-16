@@ -672,11 +672,17 @@ class SemanticSearchStatus:
 class UsageGraphNode:
     """A class or function definition in the workspace usage graph.
 
-    ``fqn`` is the node identity and matches the fully qualified names returned
-    by ``search_symbols``.
+    Node identity is ``(language, fqn)``: ``fqn`` matches the fully qualified
+    names returned by ``search_symbols``, and ``language`` is the ecosystem it
+    belongs to (e.g. ``"python"``, ``"go"``, ``"rust"``, with JavaScript and
+    TypeScript sharing ``"js_ts"``), so a name shared across
+    languages stays as distinct nodes. For file-scoped ecosystems
+    (JavaScript/TypeScript) ``path`` also participates in identity, so two files
+    exporting the same name remain distinct nodes that share ``fqn``.
     """
 
     fqn: str
+    language: str
     path: str
     start_line: int
     kind: str
@@ -686,6 +692,7 @@ class UsageGraphNode:
     def from_dict(cls, data: dict) -> UsageGraphNode:
         return cls(
             fqn=data["fqn"],
+            language=data["language"],
             path=data["path"],
             start_line=data["start_line"],
             kind=data["kind"],
@@ -698,14 +705,16 @@ class UsageGraphEdge:
     """A weighted caller -> callee reference edge.
 
     ``from_fqn`` is the enclosing definition of the reference and ``to_fqn`` is
-    the symbol being referenced; ``weight`` is the number of distinct
-    ``(file, line, caller)`` reference sites (two references to the same callee
-    on one line count once). (The JSON keys are ``from``/``to``, renamed here
-    because ``from`` is a Python keyword.)
+    the symbol being referenced; both endpoints are nodes in ``language``'s
+    ecosystem. ``weight`` is the number of distinct ``(file, line, caller)``
+    reference sites (two references to the same callee on one line count once).
+    (The JSON keys are ``from``/``to``, renamed here because ``from`` is a
+    Python keyword.)
     """
 
     from_fqn: str
     to_fqn: str
+    language: str
     weight: int
 
     @classmethod
@@ -713,6 +722,7 @@ class UsageGraphEdge:
         return cls(
             from_fqn=data["from"],
             to_fqn=data["to"],
+            language=data["language"],
             weight=data["weight"],
         )
 
@@ -725,6 +735,7 @@ class UsageGraphTruncatedSymbol:
     """
 
     fqn: str
+    language: str
     total_callsites: int
     limit: int
 
@@ -732,6 +743,7 @@ class UsageGraphTruncatedSymbol:
     def from_dict(cls, data: dict) -> UsageGraphTruncatedSymbol:
         return cls(
             fqn=data["fqn"],
+            language=data["language"],
             total_callsites=data["total_callsites"],
             limit=data["limit"],
         )

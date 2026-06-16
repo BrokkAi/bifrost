@@ -130,9 +130,7 @@ impl JsTsExportUsageGraphStrategy {
         }
 
         let graph = build_js_ts_graph(analyzer, language);
-        let seeds = graph
-            .usage_graph
-            .seeds_for_target(target.source(), top_level_identifier(target));
+        let seeds = graph.seeds_for_target(target.source(), top_level_identifier(target));
         if seeds.is_empty() {
             return GraphUsageOutcome::fallback_safe(
                 target.fq_name(),
@@ -141,7 +139,7 @@ impl JsTsExportUsageGraphStrategy {
             );
         }
 
-        let importers = graph.usage_graph.importers_of_seeds(&seeds);
+        let importers = graph.importers_of_seeds(&seeds);
         let scan_files: HashSet<ProjectFile> =
             candidate_files.iter().cloned().chain(importers).collect();
 

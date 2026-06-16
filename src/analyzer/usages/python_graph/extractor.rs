@@ -1,15 +1,14 @@
-use crate::analyzer::usages::graph_core::{ImportEdge, ImportEdgeKind, ProjectUsageGraph};
+use crate::analyzer::usages::graph_core::{ImportEdge, ImportEdgeKind};
 use crate::analyzer::usages::local_inference::{
     LocalBindingsSnapshot, LocalInferenceConfig, LocalInferenceEngine, SymbolResolution,
 };
 use crate::analyzer::usages::model::{ExportIndex, ImportBinder, UsageHit};
 use crate::analyzer::usages::python_graph::hits::record_hit;
 use crate::analyzer::usages::python_graph::resolver::{
-    member_name, normalized_receiver_type, python_module_name, receiver_annotation_matches_target,
-    resolve_python_relative_module, resolve_receiver_type, target_owner_code_unit,
-    top_level_identifier,
+    member_name, normalized_receiver_type, receiver_annotation_matches_target,
+    resolve_receiver_type, target_owner_code_unit, top_level_identifier,
 };
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, PythonAnalyzer, Range};
+use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, PythonAnalyzer, Range};
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::compute_line_starts;
 use rayon::prelude::*;
@@ -27,7 +26,6 @@ pub(super) struct ParsedFile {
 
 pub(crate) struct PythonProjectGraph {
     parsed: HashMap<ProjectFile, ParsedFile>,
-    pub(super) usage_graph: ProjectUsageGraph,
     scoped_files: HashSet<ProjectFile>,
 }
 
@@ -56,30 +54,16 @@ impl PythonProjectGraph {
 
 struct PythonGraphAdapter<'a> {
     analyzer: &'a PythonAnalyzer,
-    module_index: HashMap<String, Vec<ProjectFile>>,
 }
 
 impl<'a> PythonGraphAdapter<'a> {
     fn new(analyzer: &'a PythonAnalyzer) -> Self {
-        let python_files = collect_python_files(analyzer);
-        let mut module_index: HashMap<String, Vec<ProjectFile>> = HashMap::default();
-        for file in python_files {
-            module_index
-                .entry(python_module_name(&file))
-                .or_default()
-                .push(file);
-        }
-        for files in module_index.values_mut() {
-            files.sort();
-            files.dedup();
-        }
-
-        Self {
-            analyzer,
-            module_index,
-        }
+        Self { analyzer }
     }
 
+    /// Parse the scoped import closure once for tree reuse during the forward
+    /// scan. Re-export / importer resolution now lives on the analyzer
+    /// (`PythonAnalyzer::usage_*`), so this no longer builds a cross-file graph.
     fn build_graph(
         &self,
         candidate_files: &HashSet<ProjectFile>,
@@ -91,8 +75,6 @@ impl<'a> PythonGraphAdapter<'a> {
 
         let mut frontier: VecDeque<ProjectFile> = scoped_files.iter().cloned().collect();
         let mut parsed: HashMap<ProjectFile, ParsedFile> = HashMap::default();
-        let mut exports_by_file: HashMap<ProjectFile, ExportIndex> = HashMap::default();
-        let mut binders_by_file: HashMap<ProjectFile, ImportBinder> = HashMap::default();
 
         while let Some(file) = frontier.pop_front() {
             if parsed.contains_key(&file) {
@@ -127,19 +109,10 @@ impl<'a> PythonGraphAdapter<'a> {
                     line_starts,
                 },
             );
-            exports_by_file.insert(file.clone(), exports);
-            binders_by_file.insert(file, binder);
         }
-
-        let files: Vec<ProjectFile> = parsed.keys().cloned().collect();
-        let usage_graph =
-            ProjectUsageGraph::build(files, exports_by_file, &binders_by_file, |file, module| {
-                self.resolve_module(file, module)
-            });
 
         PythonProjectGraph {
             parsed,
-            usage_graph,
             scoped_files,
         }
     }
@@ -187,18 +160,8 @@ impl<'a> PythonGraphAdapter<'a> {
         importing_file: &ProjectFile,
         module_specifier: &str,
     ) -> Vec<ProjectFile> {
-        let resolved_module = if module_specifier.starts_with('.') {
-            resolve_python_relative_module(importing_file, module_specifier)
-        } else {
-            Some(module_specifier.to_string())
-        };
-        let Some(resolved_module) = resolved_module else {
-            return Vec::new();
-        };
-        self.module_index
-            .get(&resolved_module)
-            .cloned()
-            .unwrap_or_default()
+        self.analyzer
+            .resolve_module_files(importing_file, module_specifier)
     }
 }
 
@@ -210,19 +173,9 @@ pub(super) fn build_python_graph(
     PythonGraphAdapter::new(analyzer).build_graph(candidate_files, target_file)
 }
 
-fn collect_python_files(analyzer: &PythonAnalyzer) -> Vec<ProjectFile> {
-    let mut files: Vec<ProjectFile> = analyzer
-        .project()
-        .analyzable_files(Language::Python)
-        .map(|set| set.into_iter().collect())
-        .unwrap_or_default();
-    files.sort();
-    files.dedup();
-    files
-}
-
 pub(super) fn scan_files_for_seeds(
     analyzer: &dyn IAnalyzer,
+    py: &PythonAnalyzer,
     graph: &PythonProjectGraph,
     files: &HashSet<ProjectFile>,
     target: &CodeUnit,
@@ -262,7 +215,7 @@ pub(super) fn scan_files_for_seeds(
             )
         };
 
-        let edges = graph.usage_graph.matching_edges_for_importer(file, seeds);
+        let edges = py.usage_matching_edges(file, seeds);
         let local_conflicts = collect_top_level_conflicts(tree_ref.root_node(), source_str);
         let target_self_file = *file == target.source();
         let scope_facts = collect_scope_facts(
@@ -321,16 +274,28 @@ pub(super) struct ScanCtx<'a> {
     pub(super) hits: &'a mut BTreeSet<UsageHit>,
 }
 
+/// The per-function receiver-type facts enclosing `node`, if any. Shared by the
+/// forward scan ([`ScanCtx`]) and the inverted builder (`PyScan`) so the two
+/// paths resolve a receiver's scope through one place.
+pub(super) fn enclosing_scope_facts<'a>(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    scope_facts: &'a HashMap<CodeUnit, LocalBindingsSnapshot<String>>,
+    node: Node<'_>,
+) -> Option<&'a LocalBindingsSnapshot<String>> {
+    let range = Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: 0,
+        end_line: 0,
+    };
+    let enclosing = analyzer.enclosing_code_unit(file, &range)?;
+    scope_facts.get(&enclosing)
+}
+
 impl ScanCtx<'_> {
     fn scope_facts_for_node(&self, node: Node<'_>) -> Option<&LocalBindingsSnapshot<String>> {
-        let range = Range {
-            start_byte: node.start_byte(),
-            end_byte: node.end_byte(),
-            start_line: 0,
-            end_line: 0,
-        };
-        let enclosing = self.analyzer.enclosing_code_unit(self.file, &range)?;
-        self.scope_facts.get(&enclosing)
+        enclosing_scope_facts(self.analyzer, self.file, self.scope_facts, node)
     }
 
     fn binds_target(&self, ident: &str, node: Node<'_>) -> bool {
@@ -541,7 +506,7 @@ pub(super) fn collect_assigned_identifiers(
     }
 }
 
-fn collect_scope_facts(
+pub(super) fn collect_scope_facts(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     edges: &[ImportEdge],

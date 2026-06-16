@@ -22,11 +22,11 @@
 //! recall gap, not a wrong edge.
 
 use crate::analyzer::usages::inverted_edges::{EdgeCollector, UsageEdges, build_edges};
-use crate::analyzer::usages::model::ImportKind;
-use crate::analyzer::{IAnalyzer, ProjectFile, RustAnalyzer};
+use crate::analyzer::{IAnalyzer, ProjectFile, RustAnalyzer, RustReferenceContext};
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::compute_line_starts;
 use rayon::prelude::*;
+use std::sync::Arc;
 use tree_sitter::{Node, Parser, Tree};
 
 /// A Rust file parsed once for the inverted scan: source, tree, and line starts.
@@ -81,40 +81,13 @@ where
             };
             let source = parsed.source.as_str();
 
-            // Per-file resolution context from the import binder.
-            let binder = rust.import_binder_of(file);
-            let mut named: HashMap<String, String> = HashMap::default();
-            let mut namespace: HashMap<String, String> = HashMap::default();
-            for (local, binding) in &binder.bindings {
-                match binding.kind {
-                    ImportKind::Named => {
-                        if let Some(imported) = &binding.imported_name
-                            && let Some(package) =
-                                rust.resolve_module_package(file, &binding.module_specifier)
-                        {
-                            named.insert(local.clone(), format!("{package}.{imported}"));
-                        }
-                    }
-                    ImportKind::Namespace => {
-                        if let Some(package) =
-                            rust.resolve_module_package(file, &binding.module_specifier)
-                        {
-                            namespace.insert(local.clone(), package);
-                        }
-                    }
-                    ImportKind::Default | ImportKind::CommonJsRequire | ImportKind::Glob => {}
-                }
-            }
-            let same_file: HashMap<String, String> = analyzer
-                .declarations(file)
-                .map(|unit| (unit.identifier().to_string(), unit.fq_name()))
-                .collect();
-
+            // One shared, cached per-file resolution context. Both this inverted
+            // builder and (from Phase 1b) the forward scan resolve references
+            // through it, so the two paths can't drift.
+            let refs = rust.reference_context_of(file);
             let mut ctx = RustScan {
                 source,
-                named,
-                namespace,
-                same_file,
+                refs,
                 collector,
             };
             let mut shadows: Vec<HashSet<String>> = Vec::new();
@@ -125,9 +98,7 @@ where
 
 struct RustScan<'a, 'b> {
     source: &'a str,
-    named: HashMap<String, String>,
-    namespace: HashMap<String, String>,
-    same_file: HashMap<String, String>,
+    refs: Arc<RustReferenceContext>,
     collector: &'a mut EdgeCollector<'b>,
 }
 
@@ -137,23 +108,13 @@ impl RustScan<'_, '_> {
     /// snake_case heuristic classifies as a namespace whose resolved value is the
     /// function's own fqn (it only forms an edge when that value is a real node).
     fn bare_callee(&self, text: &str) -> Option<String> {
-        self.named
-            .get(text)
-            .or_else(|| self.namespace.get(text))
-            .or_else(|| self.same_file.get(text))
-            .cloned()
+        self.refs.resolve_bare(text).map(str::to_string)
     }
 
     /// The callee fqn a `path::name` refers to: a module function via a namespace
     /// import, or an associated function on an imported / same-file type.
     fn scoped_callee(&self, path: &str, name: &str) -> Option<String> {
-        if let Some(package) = self.namespace.get(path) {
-            return Some(format!("{package}.{name}"));
-        }
-        self.named
-            .get(path)
-            .or_else(|| self.same_file.get(path))
-            .map(|type_fqn| format!("{type_fqn}.{name}"))
+        self.refs.resolve_scoped(path, name)
     }
 
     fn record(&mut self, callee: String, node: Node<'_>) {

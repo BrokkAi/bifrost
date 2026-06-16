@@ -74,7 +74,7 @@ pub(super) fn scan_files_for_seeds(
             )
         };
 
-        let edges = graph.usage_graph.matching_edges_for_importer(file, seeds);
+        let edges = graph.matching_edges_for_importer(file, seeds);
 
         let mut local_hits: BTreeSet<UsageHit> = BTreeSet::new();
         let line_starts = compute_line_starts(source_str);

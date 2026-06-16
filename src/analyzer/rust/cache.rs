@@ -1,7 +1,24 @@
+use super::graph_support::RustReferenceContext;
 use crate::analyzer::{CodeUnit, ProjectFile};
-use crate::hash::HashSet;
+use crate::hash::{HashMap, HashSet};
 use std::mem::size_of;
 use std::sync::Arc;
+
+pub(super) fn weight_reference_context(
+    _key: &ProjectFile,
+    value: &Arc<RustReferenceContext>,
+) -> u32 {
+    let map_bytes = |map: &HashMap<String, String>| {
+        map.iter()
+            .map(|(key, val)| key.len() + val.len() + size_of::<(String, String)>())
+            .sum::<usize>()
+    };
+    let size = map_bytes(&value.named)
+        + map_bytes(&value.namespace)
+        + map_bytes(&value.same_file)
+        + size_of::<RustReferenceContext>();
+    size.min(u32::MAX as usize) as u32
+}
 
 pub(super) fn weight_project_file_set(
     _key: &ProjectFile,
