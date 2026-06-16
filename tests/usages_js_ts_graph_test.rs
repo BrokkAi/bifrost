@@ -1036,9 +1036,8 @@ fn js_commonjs_module_object_uses_exported_alias_name() {
     );
 }
 
-#[test]
-#[ignore = "Brokk parity marker: tsconfig paths and baseUrl resolution stay out of scope for issue #78"]
-fn parity_tsconfig_paths_alias_resolution_is_follow_up_work() {}
+// tsconfig/jsconfig `paths` + `baseUrl` alias resolution acceptance tests live in
+// `usages_js_ts_path_alias_test.rs`.
 
 #[test]
 #[ignore = "Brokk parity marker: external frontier reporting needs a richer result model than bifrost v1"]
