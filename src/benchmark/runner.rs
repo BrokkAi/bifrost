@@ -328,24 +328,27 @@ fn assert_scenario_result(
             Ok(())
         }
         BenchmarkScenario::GetSummaries => {
-            let summaries = structured["summaries"].as_array().ok_or_else(|| {
-                format!(
-                    "get_summaries result missing summaries array for `{}`",
-                    target.name
-                )
-            })?;
-            if summaries.is_empty() {
-                return Err(format!(
-                    "get_summaries returned no summaries for `{}`",
-                    target.name
-                ));
-            }
             if structured["not_found"]
                 .as_array()
                 .is_some_and(|items| !items.is_empty())
             {
                 return Err(format!(
                     "get_summaries reported unresolved targets for `{}`",
+                    target.name
+                ));
+            }
+            let summaries = structured["summaries"].as_array().ok_or_else(|| {
+                format!(
+                    "get_summaries result missing summaries array for `{}`",
+                    target.name
+                )
+            })?;
+            let compact_files = structured["compact_symbols"]["files"].as_array();
+            let has_compact_symbols = structured["degraded"].as_bool() == Some(true)
+                && compact_files.is_some_and(|files| !files.is_empty());
+            if summaries.is_empty() && !has_compact_symbols {
+                return Err(format!(
+                    "get_summaries returned no summaries or compact symbols for `{}`",
                     target.name
                 ));
             }

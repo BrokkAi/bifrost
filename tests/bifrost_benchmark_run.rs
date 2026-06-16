@@ -197,6 +197,74 @@ usage_symbols = ["A.method2"]
 }
 
 #[test]
+fn run_subcommand_accepts_degraded_get_summaries_compact_symbols() {
+    let temp = TempDir::new().expect("temp dir");
+    let repo_root = temp.path().join("fixture-repo");
+    copy_dir_recursively(&fixture_root(), &repo_root).expect("copy fixture repo");
+    fs::write(repo_root.join("LargeSummary.java"), large_java_file()).expect("write large file");
+    init_git_repo(&repo_root);
+
+    let manifest_dir = temp.path().join("manifest");
+    fs::create_dir_all(&manifest_dir).expect("manifest dir");
+    let manifest_path = manifest_dir.join("benchmark.toml");
+    fs::write(
+        &manifest_path,
+        format!(
+            r#"
+warmup_iterations = 1
+measured_iterations = 1
+output_dir = "out"
+repo_cache_dir = "cache"
+required_languages = ["java"]
+required_scenarios = [
+  "get_summaries",
+]
+
+[[repos]]
+name = "fixture-java"
+url = "{}"
+commit = "{}"
+languages = ["java"]
+extensions = ["java"]
+scenarios = [
+  "get_summaries",
+]
+summary_targets = ["LargeSummary.java"]
+"#,
+            toml_basic_string(&repo_root.display().to_string()),
+            head_commit(&repo_root)
+        ),
+    )
+    .expect("write manifest");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bifrost_benchmark"))
+        .arg("run")
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .env(
+            "BIFROST_BENCHMARK_BIFROST_BIN",
+            env!("CARGO_BIN_EXE_bifrost"),
+        )
+        .output()
+        .expect("run bifrost_benchmark");
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let report_path = single_json_file(&manifest_dir.join("out"));
+    let report: Value =
+        serde_json::from_str(&fs::read_to_string(report_path).expect("read report"))
+            .expect("parse report");
+    let scenario = &report["repos"][0]["scenarios"][0];
+    assert_eq!(scenario["name"], "get_summaries", "report: {report}");
+    assert_eq!(scenario["success"], true, "report: {report}");
+}
+
+#[test]
 fn run_subcommand_subset_mode_preserves_most_relevant_files_signal() {
     let temp = TempDir::new().expect("temp dir");
     let repo_root = temp.path().join("fixture-repo");
@@ -434,4 +502,15 @@ fn single_json_file(dir: &Path) -> PathBuf {
 
 fn toml_basic_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn large_java_file() -> String {
+    let mut source = String::from("public class LargeSummary {\n");
+    for index in 0..300 {
+        source.push_str(&format!(
+            "    public String method{index}(String input) {{ return \"method{index}_\" + input; }}\n"
+        ));
+    }
+    source.push_str("}\n");
+    source
 }
