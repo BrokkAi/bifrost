@@ -28,10 +28,9 @@ use super::resolver::{
 };
 use super::shared::CppEdgeGraph;
 use crate::analyzer::usages::inverted_edges::{
-    ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, collect_file_edges, first_precise,
+    ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, first_precise, parse_and_collect,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::analyzer::usages::parsed_tree::parse_tree_sitter_file;
 use crate::analyzer::{
     CodeUnit, IAnalyzer, ProjectFile, cpp_node_text as node_text, normalize_cpp_whitespace,
 };
@@ -51,25 +50,17 @@ where
 {
     let language = tree_sitter_cpp::LANGUAGE.into();
     build_edges(&graph.files, keep_file, |file| {
-        // Parse here and drop the tree when this closure returns, capping live trees.
-        let parsed = parse_tree_sitter_file(file, &language)?;
-        Some(collect_file_edges(
-            analyzer,
-            file,
-            nodes,
-            &parsed.line_starts,
-            |collector| {
-                let mut ctx = CppScan {
-                    visibility: &graph.visibility,
-                    file,
-                    source: parsed.source.as_str(),
-                    class_ranges: ClassRangeIndex::build(analyzer, file),
-                    collector,
-                };
-                let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
-                walk(parsed.tree.root_node(), &mut ctx, &mut bindings);
-            },
-        ))
+        parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
+            let mut ctx = CppScan {
+                visibility: &graph.visibility,
+                file,
+                source: parsed.source.as_str(),
+                class_ranges: ClassRangeIndex::build(analyzer, file),
+                collector,
+            };
+            let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
+            walk(parsed.tree.root_node(), &mut ctx, &mut bindings);
+        })
     })
 }
 

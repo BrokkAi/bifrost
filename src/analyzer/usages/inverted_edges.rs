@@ -21,12 +21,14 @@
 //! [`super::go_graph`] for the reference shape.
 
 use crate::analyzer::usages::local_inference::LocalInferenceEngine;
+use crate::analyzer::usages::parsed_tree::{ParsedTreeFile, parse_tree_sitter_file};
 use crate::analyzer::{IAnalyzer, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::find_line_index_for_offset;
 use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::hash::Hash;
+use tree_sitter::Language as TreeSitterLanguage;
 
 /// Per-file index of class-like declaration spans, for attributing an
 /// unqualified / `this` / `self` reference to its enclosing class. Sources the
@@ -431,6 +433,34 @@ where
     let mut collector = EdgeCollector::new(line_starts, nodes, declarations);
     walk(&mut collector);
     collector.finish()
+}
+
+/// Parse `file` on demand, build its edges via [`collect_file_edges`], and drop the
+/// tree / source / line starts when this returns — bounding live trees to ≈ the rayon
+/// worker count. Returns `None` to skip an unreadable or empty file. The `scan`
+/// closure receives the parsed file and the collector and owns the language AST walk.
+/// Centralizing the parse, the skip-on-failure, and the tree-lifetime scoping here
+/// keeps the six local-parse adapters from each repeating them, and gives a single
+/// home for any later parse-failure handling, tracing, or memory instrumentation.
+/// See the Java builder for the shape.
+pub(crate) fn parse_and_collect<S>(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    nodes: &HashSet<String>,
+    language: &TreeSitterLanguage,
+    scan: S,
+) -> Option<PerFileEdges>
+where
+    S: FnOnce(&ParsedTreeFile, &mut EdgeCollector),
+{
+    let parsed = parse_tree_sitter_file(file, language)?;
+    Some(collect_file_edges(
+        analyzer,
+        file,
+        nodes,
+        &parsed.line_starts,
+        |collector| scan(&parsed, collector),
+    ))
 }
 
 /// Sum per-file results and drop callees past [`MAX_CALLSITES`] into `truncated`.

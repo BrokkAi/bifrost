@@ -33,10 +33,9 @@ use super::resolver::{
     FileContext, node_text, resolve_php_constant, resolve_php_function, resolve_php_type,
 };
 use crate::analyzer::usages::inverted_edges::{
-    ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, collect_file_edges, first_precise,
+    ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, first_precise, parse_and_collect,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::analyzer::usages::parsed_tree::parse_tree_sitter_file;
 use crate::analyzer::{IAnalyzer, PhpAnalyzer, ProjectFile, parse_php_use_aliases_from_source};
 use crate::hash::HashSet;
 use tree_sitter::Node;
@@ -55,28 +54,20 @@ where
 {
     let language = tree_sitter_php::LANGUAGE_PHP.into();
     build_edges(files, keep_file, |file| {
-        // Parse here and drop the tree when this closure returns, capping live trees.
-        let parsed = parse_tree_sitter_file(file, &language)?;
-        Some(collect_file_edges(
-            analyzer,
-            file,
-            nodes,
-            &parsed.line_starts,
-            |collector| {
-                let ctx = FileContext {
-                    namespace: php.namespace_of_file(file),
-                    aliases: parse_php_use_aliases_from_source(&parsed.source),
-                };
-                let mut scan = PhpScan {
-                    ctx,
-                    source: parsed.source.as_str(),
-                    class_ranges: ClassRangeIndex::build(analyzer, file),
-                    collector,
-                };
-                let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
-                walk(parsed.tree.root_node(), &mut scan, &mut bindings);
-            },
-        ))
+        parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
+            let ctx = FileContext {
+                namespace: php.namespace_of_file(file),
+                aliases: parse_php_use_aliases_from_source(&parsed.source),
+            };
+            let mut scan = PhpScan {
+                ctx,
+                source: parsed.source.as_str(),
+                class_ranges: ClassRangeIndex::build(analyzer, file),
+                collector,
+            };
+            let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
+            walk(parsed.tree.root_node(), &mut scan, &mut bindings);
+        })
     })
 }
 

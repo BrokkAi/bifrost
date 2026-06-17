@@ -22,9 +22,8 @@
 //! recall gap, not a wrong edge.
 
 use crate::analyzer::usages::inverted_edges::{
-    EdgeCollector, UsageEdges, build_edges, collect_file_edges,
+    EdgeCollector, UsageEdges, build_edges, parse_and_collect,
 };
-use crate::analyzer::usages::parsed_tree::parse_tree_sitter_file;
 use crate::analyzer::{IAnalyzer, ProjectFile, RustAnalyzer, RustReferenceContext};
 use crate::hash::HashSet;
 use std::sync::Arc;
@@ -43,27 +42,19 @@ where
     let files: Vec<ProjectFile> = rust.get_analyzed_files().into_iter().collect();
     let language = tree_sitter_rust::LANGUAGE.into();
     build_edges(&files, keep_file, |file| {
-        // Parse here and drop the tree when this closure returns, capping live trees.
-        let parsed = parse_tree_sitter_file(file, &language)?;
-        Some(collect_file_edges(
-            analyzer,
-            file,
-            nodes,
-            &parsed.line_starts,
-            |collector| {
-                // One shared, cached per-file resolution context. Both this inverted
-                // builder and (from Phase 1b) the forward scan resolve references
-                // through it, so the two paths can't drift.
-                let refs = rust.reference_context_of(file);
-                let mut ctx = RustScan {
-                    source: parsed.source.as_str(),
-                    refs,
-                    collector,
-                };
-                let mut shadows: Vec<HashSet<String>> = Vec::new();
-                walk(parsed.tree.root_node(), &mut ctx, &mut shadows);
-            },
-        ))
+        parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
+            // One shared, cached per-file resolution context. Both this inverted
+            // builder and (from Phase 1b) the forward scan resolve references
+            // through it, so the two paths can't drift.
+            let refs = rust.reference_context_of(file);
+            let mut ctx = RustScan {
+                source: parsed.source.as_str(),
+                refs,
+                collector,
+            };
+            let mut shadows: Vec<HashSet<String>> = Vec::new();
+            walk(parsed.tree.root_node(), &mut ctx, &mut shadows);
+        })
     })
 }
 

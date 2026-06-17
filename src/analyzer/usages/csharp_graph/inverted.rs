@@ -22,10 +22,9 @@ use super::resolver::{
     first_type_child, is_type_reference_node, node_text, normalize_type_text, reference_type_text,
 };
 use crate::analyzer::usages::inverted_edges::{
-    ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, collect_file_edges, first_precise,
+    ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, first_precise, parse_and_collect,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::analyzer::usages::parsed_tree::parse_tree_sitter_file;
 use crate::analyzer::{CSharpAnalyzer, IAnalyzer, ProjectFile};
 use crate::hash::HashSet;
 use tree_sitter::Node;
@@ -42,25 +41,17 @@ where
 {
     let language = tree_sitter_c_sharp::LANGUAGE.into();
     build_edges(files, keep_file, |file| {
-        // Parse here and drop the tree when this closure returns, capping live trees.
-        let parsed = parse_tree_sitter_file(file, &language)?;
-        Some(collect_file_edges(
-            analyzer,
-            file,
-            nodes,
-            &parsed.line_starts,
-            |collector| {
-                let mut ctx = CsScan {
-                    csharp,
-                    file,
-                    source: parsed.source.as_str(),
-                    class_ranges: ClassRangeIndex::build(analyzer, file),
-                    collector,
-                };
-                let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
-                walk(parsed.tree.root_node(), &mut ctx, &mut bindings);
-            },
-        ))
+        parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
+            let mut ctx = CsScan {
+                csharp,
+                file,
+                source: parsed.source.as_str(),
+                class_ranges: ClassRangeIndex::build(analyzer, file),
+                collector,
+            };
+            let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
+            walk(parsed.tree.root_node(), &mut ctx, &mut bindings);
+        })
     })
 }
 
