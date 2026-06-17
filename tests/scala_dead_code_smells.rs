@@ -239,6 +239,39 @@ class Service {
 }
 
 #[test]
+fn scala_top_level_function_candidate_stays_on_precise_path() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[(
+        "example/Service.scala",
+        r#"
+package example
+
+def helper(): Int = 1
+
+class Consumer {
+  def call(): Int = helper()
+}
+"#,
+    )]);
+    let helper = scala_definition(&analyzer, "example.helper");
+
+    let report = report(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec!["example/Service.scala".to_string()],
+            fq_names: vec![helper.fq_name()],
+            ..Default::default()
+        },
+    );
+
+    assert!(report.contains("example.helper"), "{report}");
+    assert!(
+        report.contains("only usage: example/Service.scala"),
+        "{report}"
+    );
+    assert!(!report.contains("no non-self usages found"), "{report}");
+}
+
+#[test]
 fn scala_field_candidate_stays_on_precise_path_for_bare_identifier_reads() {
     let (_project, analyzer) = scala_analyzer_with_files(&[(
         "example/Service.scala",
@@ -410,6 +443,102 @@ import example.Target._
 
 class Consumer {
   def call(): Int = run()
+}
+"#,
+        ),
+    ]);
+    let run = scala_definition(&analyzer, "example.Target$.run");
+
+    let report = report(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec![
+                "example/Target.scala".to_string(),
+                "example/Consumer.scala".to_string(),
+            ],
+            fq_names: vec![run.fq_name()],
+            ..Default::default()
+        },
+    );
+
+    assert!(report.contains("example.Target$.run"), "{report}");
+    assert!(
+        report.contains("only usage: example/Consumer.scala"),
+        "{report}"
+    );
+    assert!(!report.contains("no non-self usages found"), "{report}");
+}
+
+#[test]
+fn scala_star_import_candidate_stays_on_precise_path() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "example/Target.scala",
+            r#"
+package example
+
+object Target {
+  def run(): Int = 1
+}
+"#,
+        ),
+        (
+            "example/Consumer.scala",
+            r#"
+package example
+
+import example.Target.*
+
+class Consumer {
+  def call(): Int = run()
+}
+"#,
+        ),
+    ]);
+    let run = scala_definition(&analyzer, "example.Target$.run");
+
+    let report = report(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec![
+                "example/Target.scala".to_string(),
+                "example/Consumer.scala".to_string(),
+            ],
+            fq_names: vec![run.fq_name()],
+            ..Default::default()
+        },
+    );
+
+    assert!(report.contains("example.Target$.run"), "{report}");
+    assert!(
+        report.contains("only usage: example/Consumer.scala"),
+        "{report}"
+    );
+    assert!(!report.contains("no non-self usages found"), "{report}");
+}
+
+#[test]
+fn scala_as_alias_import_candidate_stays_on_precise_path() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "example/Target.scala",
+            r#"
+package example
+
+object Target {
+  def run(): Int = 1
+}
+"#,
+        ),
+        (
+            "example/Consumer.scala",
+            r#"
+package example
+
+import example.Target.run as go
+
+class Consumer {
+  def call(): Int = go()
 }
 "#,
         ),

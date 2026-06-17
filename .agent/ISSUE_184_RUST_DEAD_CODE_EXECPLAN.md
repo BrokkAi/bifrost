@@ -50,6 +50,11 @@ The visible result is that Rust dead-code reports still identify unused private 
 - [x] (2026-06-17T13:23:00Z) Added Scala bulk eligibility and report partitioning, then ran `cargo test --test usage_graph_scala_test --no-run`; compilation succeeded.
 - [x] (2026-06-17T13:35:00Z) Added `tests/scala_dead_code_smells.rs` and ran `cargo test --test scala_dead_code_smells -- --nocapture`; all 13 tests passed.
 - [x] (2026-06-17T13:45:00Z) Ran Scala slice regressions: `cargo test --test usage_graph_scala_test`, `cargo test --test rust_dead_code_smells`, `cargo test --test python_js_ts_dead_code_smells`, `cargo test --test java_dead_code_smells`, `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`; all passed.
+- [x] (2026-06-17T14:25:00Z) Ran guided review on the Scala slice and fixed findings: top-level Scala functions now stay precise, import sensitivity uses parsed `ImportInfo`, wildcard guards are candidate-aware, and Scala file-cap skipping avoids preflight source scans.
+- [x] (2026-06-17T14:25:00Z) Re-ran `cargo test --test scala_dead_code_smells -- --nocapture`; all 16 tests passed, including top-level function and Scala 3 `.*`/`as` import regressions.
+- [x] (2026-06-17T14:35:00Z) Re-ran `cargo test --test usage_graph_scala_test`, `cargo test --test rust_dead_code_smells`, `cargo test --test python_js_ts_dead_code_smells`, `cargo test --test java_dead_code_smells`, `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`; all passed after Scala review fixes.
+- [x] (2026-06-17T14:45:00Z) Ran a second guided review on the Scala review-fix diff and fixed the remaining performance finding by caching normalized Scala import exposure once per report.
+- [x] (2026-06-17T14:45:00Z) Re-ran `cargo test --test scala_dead_code_smells -- --nocapture`; all 16 tests passed with the cached Scala bulk eligibility context.
 
 ## Surprises & Discoveries
 
@@ -91,6 +96,15 @@ The visible result is that Rust dead-code reports still identify unused private 
 
 - Observation: Scala field reads are not reliable enough for zero-usage dead-code reporting in this slice, even on the precise path.
   Evidence: the existing precise scanner can treat a same-owner `val` as locally shadowed; the report now skips empty Scala field evidence as inconclusive rather than emitting a zero-inbound finding.
+
+- Observation: Scala 3 top-level functions and imported object members are unsafe for FQN-only bulk scoring unless the eligibility guard is candidate-aware.
+  Evidence: guided review found that unqualified calls to top-level functions can be recorded by the inverted graph as enclosing-class member calls, and that Scala 3 `.*` / `as` imports are already normalized by `ImportInfo` but were missed by the raw import-line parser.
+
+- Observation: Scala import sensitivity should use analyzer import metadata, not source-line parsing in the code-quality layer.
+  Evidence: `scala_graph::dead_code_bulk_eligibility(...)` now uses `ScalaAnalyzer::import_info_of` plus `scala_import_path(...)` to route only imports that can expose the candidate owner/member to precise analysis.
+
+- Observation: Candidate-aware Scala import sensitivity must be cached per report to avoid repeating the same workspace import walk for every candidate.
+  Evidence: `ScalaDeadCodeBulkContext::from_analyzer(...)` now precomputes normalized wildcard-owner and direct-member import exposure sets once, and `report_dead_code_and_unused_abstraction_smells` reuses that context while still avoiding it when the Scala file cap skips bulk evidence.
 
 ## Decision Log
 
@@ -153,6 +167,10 @@ The visible result is that Rust dead-code reports still identify unused private 
 2026-06-17: The Java dead-code report now uses one inverted Java usage graph build per report call for safe Java candidates. Constructors, overloaded Java methods, and Java class candidates in mixed Java/Scala workspaces remain on the precise per-symbol path. Focused Java tests cover graph-derived findings and the guarded precise-path cases.
 
 2026-06-17: The Scala dead-code report now uses one inverted Scala usage graph build per report call for safe Scala candidates. Scala classes/objects and non-overloaded methods without import-sensitive exposure can be scored from inbound graph counts. Fields, constructors, overloaded methods, and direct/wildcard-import-sensitive methods stay conservative or precise; empty Scala field evidence is skipped as inconclusive instead of reported as dead code. Public-like Scala findings use lower score/confidence and workspace/public-surface wording.
+
+2026-06-17: Guided review tightened the Scala slice. Top-level Scala functions now stay on the precise path, import sensitivity is computed with parsed Scala import metadata, wildcard imports only force precise analysis when they can expose the candidate owner, and oversized Scala workspaces skip bulk graph evidence before doing import-sensitive preflight work.
+
+2026-06-17: A second guided review found the candidate-aware import guard was still too expensive when repeated for every method candidate. The Scala slice now builds one `ScalaDeadCodeBulkContext` per report and reuses it for all Scala candidate eligibility checks.
 
 ## Context and Orientation
 
@@ -278,9 +296,10 @@ Java usage graph regression evidence:
 Scala focused test evidence:
 
     cargo test --test scala_dead_code_smells -- --nocapture
-    running 13 tests
+    running 16 tests
     test scala_dead_code_smell_reports_unused_private_method ... ok
     test scala_dead_code_smell_reports_one_call_method ... ok
+    test scala_top_level_function_candidate_stays_on_precise_path ... ok
     test scala_type_usage_prevents_false_dead_code_finding ... ok
     test scala_dead_code_smell_does_not_flag_symbol_with_multiple_inbound_edges ... ok
     test scala_dead_code_smell_honors_usage_candidate_file_cap ... ok
@@ -290,9 +309,11 @@ Scala focused test evidence:
     test scala_overloaded_methods_stay_on_precise_path ... ok
     test scala_direct_member_import_candidate_stays_on_precise_path ... ok
     test scala_wildcard_import_candidate_stays_on_precise_path ... ok
+    test scala_star_import_candidate_stays_on_precise_path ... ok
+    test scala_as_alias_import_candidate_stays_on_precise_path ... ok
     test scala_public_api_uses_conservative_wording_and_score ... ok
     test scala_private_method_keeps_strong_wording ... ok
-    test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+    test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 
 Scala usage graph regression evidence:
 

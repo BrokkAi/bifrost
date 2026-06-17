@@ -125,7 +125,10 @@ pub fn report_dead_code_and_unused_abstraction_smells(
     let mut java_static_imports_present: Option<bool> = None;
     let mut scala_files_present: Option<bool> = None;
     let mut scala_overloaded_fqns: Option<HashSet<String>> = None;
-    let mut scala_import_sensitive_member_names: Option<HashSet<String>> = None;
+    let mut scala_file_count: Option<usize> = None;
+    let mut scala_bulk_context: Option<
+        Option<crate::analyzer::usages::scala_graph::ScalaDeadCodeBulkContext>,
+    > = None;
 
     for candidate in &candidate_selection.candidates {
         match code_unit_language(candidate) {
@@ -156,11 +159,15 @@ pub fn report_dead_code_and_unused_abstraction_smells(
                 continue;
             }
             Language::Scala
-                if !scala_candidate_needs_precise_scan(
+                if scala_bulk_file_count_exceeds_cap(
+                    analyzer,
+                    usage_candidate_file_cap,
+                    &mut scala_file_count,
+                ) || !scala_candidate_needs_precise_scan(
                     analyzer,
                     candidate,
                     &mut scala_overloaded_fqns,
-                    &mut scala_import_sensitive_member_names,
+                    &mut scala_bulk_context,
                 ) =>
             {
                 scala_candidates.push(candidate.clone());
@@ -1448,7 +1455,9 @@ fn scala_candidate_needs_precise_scan(
     analyzer: &dyn IAnalyzer,
     candidate: &CodeUnit,
     overloaded_fqns: &mut Option<HashSet<String>>,
-    import_sensitive_member_names: &mut Option<HashSet<String>>,
+    bulk_context: &mut Option<
+        Option<crate::analyzer::usages::scala_graph::ScalaDeadCodeBulkContext>,
+    >,
 ) -> bool {
     let empty_set = HashSet::default();
     let overloads = if candidate.is_function() {
@@ -1456,24 +1465,30 @@ fn scala_candidate_needs_precise_scan(
     } else {
         &empty_set
     };
-    let import_sensitive_names = if candidate.is_function() {
-        import_sensitive_member_names
-            .get_or_insert_with(|| scala_import_sensitive_member_names(analyzer))
-    } else {
-        &empty_set
+    let Some(context) = bulk_context
+        .get_or_insert_with(|| {
+            crate::analyzer::usages::scala_graph::ScalaDeadCodeBulkContext::from_analyzer(analyzer)
+        })
+        .as_ref()
+    else {
+        return true;
     };
 
-    (candidate.is_function()
-        && scala_source_has_multiple_defs_for_identifier(candidate, candidate.identifier()))
-        || matches!(
-            crate::analyzer::usages::scala_graph::dead_code_bulk_eligibility(
-                analyzer,
-                candidate,
-                overloads,
-                import_sensitive_names,
-            ),
-            crate::analyzer::usages::scala_graph::ScalaDeadCodeBulkEligibility::NeedsPrecise
-        )
+    matches!(
+        crate::analyzer::usages::scala_graph::dead_code_bulk_eligibility(
+            analyzer, candidate, overloads, context,
+        ),
+        crate::analyzer::usages::scala_graph::ScalaDeadCodeBulkEligibility::NeedsPrecise
+    )
+}
+
+fn scala_bulk_file_count_exceeds_cap(
+    analyzer: &dyn IAnalyzer,
+    usage_candidate_file_cap: usize,
+    scala_file_count: &mut Option<usize>,
+) -> bool {
+    *scala_file_count.get_or_insert_with(|| analyzable_file_count(analyzer, Language::Scala))
+        > usage_candidate_file_cap
 }
 
 fn java_overloaded_function_fqns(analyzer: &dyn IAnalyzer) -> HashSet<String> {
@@ -1499,81 +1514,15 @@ fn overloaded_function_fqns(analyzer: &dyn IAnalyzer, language: Language) -> Has
         .collect()
 }
 
-fn scala_import_sensitive_member_names(analyzer: &dyn IAnalyzer) -> HashSet<String> {
-    let mut names = HashSet::default();
-    let Ok(files) = analyzer.project().analyzable_files(Language::Scala) else {
-        return names;
-    };
-
-    let all_method_names: HashSet<String> = analyzer
-        .all_declarations()
-        .filter(|unit| {
-            code_unit_language(unit) == Language::Scala
-                && !unit.is_synthetic()
-                && unit.is_function()
-        })
-        .map(|unit| unit.identifier().to_string())
-        .collect();
-
-    for file in files {
-        let Ok(source) = file.read_to_string() else {
-            continue;
-        };
-        for import in scala_import_lines(&source) {
-            if import.contains("._") || import.contains(".{") {
-                names.extend(all_method_names.iter().cloned());
-                continue;
-            }
-            if let Some(name) = import.rsplit('.').next().and_then(scala_imported_name) {
-                names.insert(name.to_string());
-            }
-        }
-    }
-
-    names
-}
-
-fn scala_source_has_multiple_defs_for_identifier(candidate: &CodeUnit, identifier: &str) -> bool {
-    let Ok(source) = candidate.source().read_to_string() else {
-        return false;
-    };
-    source
-        .match_indices("def ")
-        .filter(|(index, _)| {
-            let after_def = source[*index + 4..].trim_start();
-            after_def.starts_with(identifier)
-                && after_def[identifier.len()..]
-                    .chars()
-                    .next()
-                    .is_some_and(|ch| !(ch.is_ascii_alphanumeric() || ch == '_'))
-        })
-        .take(2)
-        .count()
-        > 1
-}
-
-fn scala_import_lines(source: &str) -> impl Iterator<Item = String> + '_ {
-    source.lines().filter_map(|line| {
-        let trimmed = line.trim();
-        trimmed
-            .strip_prefix("import ")
-            .map(|import| import.trim().to_string())
-    })
-}
-
-fn scala_imported_name(segment: &str) -> Option<&str> {
-    let name = segment.trim();
-    if name.is_empty() || name == "_" {
-        return None;
-    }
-    Some(name.split("=>").last().unwrap_or(name).trim())
-}
-
 fn has_analyzable_files(analyzer: &dyn IAnalyzer, language: Language) -> bool {
+    analyzable_file_count(analyzer, language) > 0
+}
+
+fn analyzable_file_count(analyzer: &dyn IAnalyzer, language: Language) -> usize {
     analyzer
         .project()
         .analyzable_files(language)
-        .is_ok_and(|files| !files.is_empty())
+        .map_or(0, |files| files.len())
 }
 
 fn java_static_imports_present(analyzer: &dyn IAnalyzer) -> bool {
