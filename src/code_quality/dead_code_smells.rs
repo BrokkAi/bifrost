@@ -9,9 +9,9 @@ use crate::analyzer::usages::ImportGraphCandidateProvider;
 use crate::analyzer::usages::inverted_edges::{UsageEdges, UsageNodeKey};
 use crate::analyzer::usages::js_ts_graph::JsTsScopedNodeStatus;
 use crate::analyzer::usages::{
-    CandidateFileProvider, FallbackCandidateProvider, FuzzyResult, JavaUsageGraphStrategy,
-    JsTsExportUsageGraphStrategy, RustExportUsageGraphStrategy, ScalaUsageGraphStrategy,
-    TextSearchCandidateProvider, UsageAnalyzer, UsageHit,
+    CandidateFileProvider, FallbackCandidateProvider, FuzzyResult, GoUsageGraphStrategy,
+    JavaUsageGraphStrategy, JsTsExportUsageGraphStrategy, RustExportUsageGraphStrategy,
+    ScalaUsageGraphStrategy, TextSearchCandidateProvider, UsageAnalyzer, UsageHit,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range, RustAnalyzer};
 use crate::hash::HashSet;
@@ -121,6 +121,7 @@ pub fn report_dead_code_and_unused_abstraction_smells(
     let mut jsts_candidates: Vec<CodeUnit> = Vec::new();
     let mut java_candidates: Vec<CodeUnit> = Vec::new();
     let mut scala_candidates: Vec<CodeUnit> = Vec::new();
+    let mut go_candidates: Vec<CodeUnit> = Vec::new();
     let mut java_overloaded_fqns: Option<HashSet<String>> = None;
     let mut java_static_imports_present: Option<bool> = None;
     let mut scala_files_present: Option<bool> = None;
@@ -144,6 +145,10 @@ pub fn report_dead_code_and_unused_abstraction_smells(
             }
             Language::JavaScript | Language::TypeScript => {
                 jsts_candidates.push(candidate.clone());
+                continue;
+            }
+            Language::Go if !candidate.is_field() && !go_implicit_entry_point(candidate) => {
+                go_candidates.push(candidate.clone());
                 continue;
             }
             Language::Java
@@ -234,6 +239,17 @@ pub fn report_dead_code_and_unused_abstraction_smells(
         analyze_scala_candidates_with_usage_graph(
             analyzer,
             &scala_candidates,
+            usage_candidate_file_cap,
+            usage_cap,
+            &mut skipped,
+        )
+        .into_iter()
+        .filter(|finding| finding.score >= threshold),
+    );
+    findings.extend(
+        analyze_go_candidates_with_usage_graph(
+            analyzer,
+            &go_candidates,
             usage_candidate_file_cap,
             usage_cap,
             &mut skipped,
@@ -442,6 +458,9 @@ fn is_dead_code_candidate(code_unit: &CodeUnit) -> bool {
     if code_unit.is_synthetic() && language != Language::Scala {
         return false;
     }
+    if language == Language::Go && go_implicit_entry_point(code_unit) {
+        return false;
+    }
     matches!(
         language,
         Language::Rust
@@ -450,6 +469,7 @@ fn is_dead_code_candidate(code_unit: &CodeUnit) -> bool {
             | Language::TypeScript
             | Language::Java
             | Language::Scala
+            | Language::Go
     ) && (code_unit.is_function() || code_unit.is_class() || code_unit.is_field())
 }
 
@@ -770,6 +790,28 @@ fn analyze_scala_candidates_with_usage_graph(
             crate::analyzer::usages::scala_graph::build_scala_usage_edges(analyzer, nodes, |_| true)
         },
         scala_graph_finding,
+    )
+}
+
+fn analyze_go_candidates_with_usage_graph(
+    analyzer: &dyn IAnalyzer,
+    candidates: &[CodeUnit],
+    usage_candidate_file_cap: usize,
+    usage_cap: usize,
+    skipped: &mut Vec<String>,
+) -> Vec<DeadCodeFinding> {
+    analyze_fqn_candidates_with_usage_graph(
+        FqnBulkGraphRequest {
+            analyzer,
+            language: Language::Go,
+            candidates,
+            usage_candidate_file_cap,
+            usage_cap,
+            skipped,
+        },
+        |unit| unit.is_function() || unit.is_class() || go_module_level_field(unit),
+        |nodes| crate::analyzer::usages::go_graph::build_go_usage_edges(analyzer, nodes, |_| true),
+        go_graph_finding,
     )
 }
 
@@ -1096,41 +1138,15 @@ fn java_graph_finding(
     candidate: &CodeUnit,
     usage: GraphIncomingUsage,
 ) -> Option<DeadCodeFinding> {
-    if usage.total > 1 {
-        return None;
-    }
-
-    let range = analyzer
-        .ranges_of(candidate)
-        .into_iter()
-        .filter(|range| !range.is_empty())
-        .max_by_key(span_lines)?;
-    let declaration_lines = span_lines(&range);
-    let is_public = java_public_like_declaration(analyzer, candidate);
-    let score = java_graph_score(usage.total, declaration_lines, is_public);
-    let confidence = java_graph_confidence(usage.total, is_public);
-    let evidence = graph_inbound_evidence(&usage);
-    let rationale = java_graph_rationale(usage.total, is_public);
-
-    Some(DeadCodeFinding {
-        language: Language::Java,
-        score,
-        confidence,
-        kind: candidate.kind().display_lowercase().to_string(),
-        symbol: candidate.fq_name(),
-        file: candidate.source().clone(),
-        start_line: range.start_line + 1,
-        end_line: range.end_line + 1,
-        total_usage_count: usage.total,
-        external_usage_count: external_usage_count(
-            analyzer,
-            declarations_by_fqn,
-            candidate,
-            &usage,
-        ),
-        evidence,
-        rationale,
-    })
+    public_surface_graph_finding(
+        analyzer,
+        Language::Java,
+        declarations_by_fqn,
+        candidate,
+        usage,
+        java_public_like_declaration(analyzer, candidate),
+        "public",
+    )
 }
 
 fn scala_graph_finding(
@@ -1138,6 +1154,43 @@ fn scala_graph_finding(
     declarations_by_fqn: &BTreeMap<String, Vec<CodeUnit>>,
     candidate: &CodeUnit,
     usage: GraphIncomingUsage,
+) -> Option<DeadCodeFinding> {
+    public_surface_graph_finding(
+        analyzer,
+        Language::Scala,
+        declarations_by_fqn,
+        candidate,
+        usage,
+        scala_public_like_declaration(analyzer, candidate),
+        "public",
+    )
+}
+
+fn go_graph_finding(
+    analyzer: &dyn IAnalyzer,
+    declarations_by_fqn: &BTreeMap<String, Vec<CodeUnit>>,
+    candidate: &CodeUnit,
+    usage: GraphIncomingUsage,
+) -> Option<DeadCodeFinding> {
+    public_surface_graph_finding(
+        analyzer,
+        Language::Go,
+        declarations_by_fqn,
+        candidate,
+        usage,
+        go_exported_declaration(candidate),
+        "exported",
+    )
+}
+
+fn public_surface_graph_finding(
+    analyzer: &dyn IAnalyzer,
+    language: Language,
+    declarations_by_fqn: &BTreeMap<String, Vec<CodeUnit>>,
+    candidate: &CodeUnit,
+    usage: GraphIncomingUsage,
+    is_public: bool,
+    public_label: &'static str,
 ) -> Option<DeadCodeFinding> {
     if usage.total > 1 {
         return None;
@@ -1149,14 +1202,18 @@ fn scala_graph_finding(
         .filter(|range| !range.is_empty())
         .max_by_key(span_lines)?;
     let declaration_lines = span_lines(&range);
-    let is_public = scala_public_like_declaration(analyzer, candidate);
-    let score = jvm_public_graph_score(usage.total, declaration_lines, is_public);
-    let confidence = jvm_public_graph_confidence(usage.total, is_public);
+    let score = public_api_graph_score(usage.total, declaration_lines, is_public);
+    let confidence = public_api_graph_confidence(usage.total, is_public);
     let evidence = graph_inbound_evidence(&usage);
-    let rationale = scala_graph_rationale(usage.total, is_public);
+    let rationale = public_surface_graph_rationale(
+        usage.total,
+        is_public,
+        language_label(language),
+        public_label,
+    );
 
     Some(DeadCodeFinding {
-        language: Language::Scala,
+        language,
         score,
         confidence,
         kind: candidate.kind().display_lowercase().to_string(),
@@ -1251,11 +1308,7 @@ fn rust_graph_score(total_usage_count: usize, declaration_lines: usize, is_publi
     }
 }
 
-fn java_graph_score(total_usage_count: usize, declaration_lines: usize, is_public: bool) -> i32 {
-    jvm_public_graph_score(total_usage_count, declaration_lines, is_public)
-}
-
-fn jvm_public_graph_score(
+fn public_api_graph_score(
     total_usage_count: usize,
     declaration_lines: usize,
     is_public: bool,
@@ -1277,11 +1330,7 @@ fn rust_graph_confidence(total_usage_count: usize, is_public: bool) -> f64 {
     }
 }
 
-fn java_graph_confidence(total_usage_count: usize, is_public: bool) -> f64 {
-    jvm_public_graph_confidence(total_usage_count, is_public)
-}
-
-fn jvm_public_graph_confidence(total_usage_count: usize, is_public: bool) -> f64 {
+fn public_api_graph_confidence(total_usage_count: usize, is_public: bool) -> f64 {
     match (total_usage_count, is_public) {
         (0, true) => 0.55,
         (0, false) => 0.90,
@@ -1324,52 +1373,35 @@ fn scoped_graph_inbound_evidence(usage: &ScopedGraphIncomingUsage) -> String {
 }
 
 fn rust_graph_rationale(total_usage_count: usize, is_public: bool) -> String {
-    match (total_usage_count, is_public) {
-        (0, true) => {
-            "public Rust symbol is unreferenced in workspace; it may be untested public surface or consumed externally".to_string()
-        }
-        (0, false) => {
-            "symbol has no workspace inbound usage evidence in Rust tree-sitter analysis and may be generated residue".to_string()
-        }
-        (_, true) => {
-            "public Rust symbol has only one workspace inbound reference; it may be lightly tested public surface or consumed externally".to_string()
-        }
-        (_, false) => {
-            "symbol has only one workspace inbound caller in Rust tree-sitter analysis and may be a low-value abstraction".to_string()
-        }
-    }
+    public_surface_graph_rationale(total_usage_count, is_public, "Rust", "public")
 }
 
-fn java_graph_rationale(total_usage_count: usize, is_public: bool) -> String {
+fn public_surface_graph_rationale(
+    total_usage_count: usize,
+    is_public: bool,
+    language_label: &'static str,
+    public_label: &'static str,
+) -> String {
     match (total_usage_count, is_public) {
         (0, true) => {
-            "public Java symbol is unreferenced in workspace; it may be untested public surface or consumed externally".to_string()
+            format!(
+                "{public_label} {language_label} symbol is unreferenced in workspace; it may be untested public surface or consumed externally"
+            )
         }
         (0, false) => {
-            "symbol has no workspace inbound usage evidence in Java tree-sitter analysis and may be generated residue".to_string()
+            format!(
+                "symbol has no workspace inbound usage evidence in {language_label} tree-sitter analysis and may be generated residue"
+            )
         }
         (_, true) => {
-            "public Java symbol has only one workspace inbound reference; it may be lightly tested public surface or consumed externally".to_string()
+            format!(
+                "{public_label} {language_label} symbol has only one workspace inbound reference; it may be lightly tested public surface or consumed externally"
+            )
         }
         (_, false) => {
-            "symbol has only one workspace inbound caller in Java tree-sitter analysis and may be a low-value abstraction".to_string()
-        }
-    }
-}
-
-fn scala_graph_rationale(total_usage_count: usize, is_public: bool) -> String {
-    match (total_usage_count, is_public) {
-        (0, true) => {
-            "public Scala symbol is unreferenced in workspace; it may be untested public surface or consumed externally".to_string()
-        }
-        (0, false) => {
-            "symbol has no workspace inbound usage evidence in Scala tree-sitter analysis and may be generated residue".to_string()
-        }
-        (_, true) => {
-            "public Scala symbol has only one workspace inbound reference; it may be lightly tested public surface or consumed externally".to_string()
-        }
-        (_, false) => {
-            "symbol has only one workspace inbound caller in Scala tree-sitter analysis and may be a low-value abstraction".to_string()
+            format!(
+                "symbol has only one workspace inbound caller in {language_label} tree-sitter analysis and may be a low-value abstraction"
+            )
         }
     }
 }
@@ -1548,6 +1580,53 @@ fn scala_public_like_declaration(analyzer: &dyn IAnalyzer, candidate: &CodeUnit)
     !contains_java_visibility_modifier(&source, "private")
 }
 
+fn go_exported_declaration(candidate: &CodeUnit) -> bool {
+    candidate
+        .identifier()
+        .chars()
+        .next()
+        .is_some_and(char::is_uppercase)
+}
+
+fn go_implicit_entry_point(candidate: &CodeUnit) -> bool {
+    if !candidate.is_function() {
+        return false;
+    }
+    let name = candidate.identifier();
+    name == "init"
+        || name == "main" && go_source_declares_package_main(candidate)
+        || candidate
+            .source()
+            .rel_path()
+            .to_string_lossy()
+            .ends_with("_test.go")
+            && go_test_entry_point_name(name)
+}
+
+fn go_source_declares_package_main(candidate: &CodeUnit) -> bool {
+    candidate
+        .source()
+        .read_to_string()
+        .is_ok_and(|source| source.lines().any(|line| line.trim() == "package main"))
+}
+
+fn go_test_entry_point_name(name: &str) -> bool {
+    ["Test", "Benchmark", "Fuzz", "Example"]
+        .into_iter()
+        .any(|prefix| go_test_name_matches_prefix(name, prefix))
+}
+
+fn go_test_name_matches_prefix(name: &str, prefix: &str) -> bool {
+    let Some(rest) = name.strip_prefix(prefix) else {
+        return false;
+    };
+    rest.chars().next().is_none_or(|ch| !ch.is_lowercase())
+}
+
+fn go_module_level_field(unit: &CodeUnit) -> bool {
+    unit.is_field() && unit.short_name().starts_with("_module_.")
+}
+
 fn contains_java_visibility_modifier(source: &str, modifier: &str) -> bool {
     source
         .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
@@ -1657,6 +1736,9 @@ fn graph_strategy_for(candidate: &CodeUnit) -> Option<Box<dyn UsageAnalyzer>> {
     if ScalaUsageGraphStrategy::can_handle(candidate) {
         return Some(Box::new(ScalaUsageGraphStrategy::new()));
     }
+    if GoUsageGraphStrategy::can_handle(candidate) {
+        return Some(Box::new(GoUsageGraphStrategy::new()));
+    }
     None
 }
 
@@ -1672,6 +1754,7 @@ fn language_label(language: Language) -> &'static str {
         Language::TypeScript => "TypeScript",
         Language::Java => "Java",
         Language::Scala => "Scala",
+        Language::Go => "Go",
         _ => "graph-backed",
     }
 }

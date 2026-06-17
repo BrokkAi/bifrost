@@ -55,6 +55,19 @@ The visible result is that Rust dead-code reports still identify unused private 
 - [x] (2026-06-17T14:35:00Z) Re-ran `cargo test --test usage_graph_scala_test`, `cargo test --test rust_dead_code_smells`, `cargo test --test python_js_ts_dead_code_smells`, `cargo test --test java_dead_code_smells`, `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`; all passed after Scala review fixes.
 - [x] (2026-06-17T14:45:00Z) Ran a second guided review on the Scala review-fix diff and fixed the remaining performance finding by caching normalized Scala import exposure once per report.
 - [x] (2026-06-17T14:45:00Z) Re-ran `cargo test --test scala_dead_code_smells -- --nocapture`; all 16 tests passed with the cached Scala bulk eligibility context.
+- [x] (2026-06-17T15:05:00Z) Committed the Scala review-fix checkpoint as `0cce553` before starting the Go slice.
+- [x] (2026-06-17T15:10:00Z) Started the Go dead-code bulk graph scoring slice; Go functions and types will use the shared FQN scorer, while Go fields stay on the precise path.
+- [x] (2026-06-17T15:25:00Z) Implemented the initial Go report routing, Go public-surface wording, and `tests/go_dead_code_smells.rs`; first focused run passed 8 of 9 tests and exposed a test expectation mismatch for Go top-level external-usage ownership.
+- [x] (2026-06-17T15:30:00Z) Re-ran `cargo test --test go_dead_code_smells -- --nocapture`; all 9 Go dead-code tests passed.
+- [x] (2026-06-17T15:35:00Z) Ran `cargo test --test usages_go_graph_test`, `cargo test --test rust_dead_code_smells`, and `cargo test --test python_js_ts_dead_code_smells`; all passed.
+- [x] (2026-06-17T15:40:00Z) Ran `cargo test --test java_dead_code_smells` and `cargo test --test scala_dead_code_smells`; all passed.
+- [x] (2026-06-17T15:45:00Z) Ran `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`; all completed cleanly.
+- [x] (2026-06-17T16:10:00Z) Ran guided review on the Go slice; reviewers found Go implicit entry points could be false positives, package-level initializer callers were not seeded as graph nodes, and low-severity duplication in public-surface finding/test helpers.
+- [x] (2026-06-17T16:20:00Z) Started Go guided-review fixes: skip Go runtime/test entry points, seed module-level Go fields as caller nodes, centralize public-surface graph finding wording, and move shared Go test fixture setup into `tests/common`.
+- [x] (2026-06-17T16:35:00Z) Implemented Go guided-review fixes and re-ran `cargo test --test go_dead_code_smells -- --nocapture`; all 11 tests passed, including new entry-point and package-initializer regressions.
+- [x] (2026-06-17T16:40:00Z) Re-ran `cargo test --test usages_go_graph_test`; all 29 tests passed after adding explicit module-field caller attribution for top-level initializers.
+- [x] (2026-06-17T16:50:00Z) Re-ran `cargo test --test rust_dead_code_smells`, `cargo test --test python_js_ts_dead_code_smells`, `cargo test --test java_dead_code_smells`, and `cargo test --test scala_dead_code_smells`; all passed after Go review fixes.
+- [x] (2026-06-17T16:55:00Z) Re-ran `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`; all completed cleanly after removing one clippy `useless_conversion`.
 
 ## Surprises & Discoveries
 
@@ -106,6 +119,18 @@ The visible result is that Rust dead-code reports still identify unused private 
 - Observation: Candidate-aware Scala import sensitivity must be cached per report to avoid repeating the same workspace import walk for every candidate.
   Evidence: `ScalaDeadCodeBulkContext::from_analyzer(...)` now precomputes normalized wildcard-owner and direct-member import exposure sets once, and `report_dead_code_and_unused_abstraction_smells` reuses that context while still avoiding it when the Scala file cap skips bulk evidence.
 
+- Observation: Go can reuse the shared FQN bulk scorer without a scoped identity seam or overload guard.
+  Evidence: Go FQNs include the module/package path, and Go has no overloads; field evidence remains riskier because selectors and composite literals need a dedicated parity pass.
+
+- Observation: Go top-level functions do not share a class-like owner, so a top-level caller of another top-level helper is counted as external usage by the shared report schema.
+  Evidence: the first `cargo test --test go_dead_code_smells -- --nocapture` run showed `example.com/app.leaf` with total usages `1` and external usages `1` from `example.com/app.wrapper`.
+
+- Observation: Go package-level `var` and `const` declarations are modeled as field declarations, but can still be callers in package initialization.
+  Evidence: guided review pointed out that the shared inverted edge collector only emits caller-to-callee edges when the enclosing caller is in the seeded node set; a package-level `var x = helper()` needs the module field node seeded so the helper gets inbound evidence.
+
+- Observation: Go has runtime and test entry points that are externally invoked without workspace inbound edges.
+  Evidence: guided review identified `main`, `init`, and `_test.go` `TestXxx`/`BenchmarkXxx`/`ExampleXxx` functions as false-positive candidates if they flow through zero-inbound graph scoring.
+
 ## Decision Log
 
 - Decision: Keep this issue slice Rust-only for implementation, while tracking other language targets in this plan as follow-up slices.
@@ -156,6 +181,18 @@ The visible result is that Rust dead-code reports still identify unused private 
   Rationale: Scala's precise scanner covers richer member and import semantics than the inverted graph. The broad report should skip to precise analysis for fields, constructors, overloads, and direct-member-import/wildcard-ambiguity-sensitive cases.
   Date/Author: 2026-06-17 / Codex
 
+- Decision: Add Go bulk dead-code scoring only for function and type/class candidates, leaving Go fields on the existing precise path.
+  Rationale: Go's package-qualified FQNs and no-overload model make functions and types low-risk for one-pass inbound scoring, while field selector/composite-literal behavior should not be widened without a field-specific parity pass.
+  Date/Author: 2026-06-17 / Codex
+
+- Decision: Seed Go module-level fields in the bulk graph node set, but continue excluding Go field candidates from bulk findings.
+  Rationale: Package initializers can be legitimate callers of functions and types; including those field nodes preserves inbound evidence without widening field dead-code reporting.
+  Date/Author: 2026-06-17 / Codex
+
+- Decision: Exclude Go `main`, `init`, and recognized `_test.go` test entry functions from dead-code candidates.
+  Rationale: These functions are invoked by the Go toolchain/runtime, so zero workspace inbound edges are not meaningful dead-code evidence.
+  Date/Author: 2026-06-17 / Codex
+
 ## Outcomes & Retrospective
 
 2026-06-17: The Rust dead-code report now uses one inverted Rust usage graph build per report call and derives zero-inbound/one-inbound findings from graph edge weights. Rust bulk analysis now honors `max_usage_candidate_files` by skipping inconclusive oversized Rust workspaces and honors `max_usages_per_symbol` by skipping candidates whose inbound count exceeds the requested usage cap. Focused tests and Rust linting passed. Gradle checks were requested by the general project guidance but are not available in this Rust worktree because there is no `./gradlew`.
@@ -171,6 +208,12 @@ The visible result is that Rust dead-code reports still identify unused private 
 2026-06-17: Guided review tightened the Scala slice. Top-level Scala functions now stay on the precise path, import sensitivity is computed with parsed Scala import metadata, wildcard imports only force precise analysis when they can expose the candidate owner, and oversized Scala workspaces skip bulk graph evidence before doing import-sensitive preflight work.
 
 2026-06-17: A second guided review found the candidate-aware import guard was still too expensive when repeated for every method candidate. The Scala slice now builds one `ScalaDeadCodeBulkContext` per report and reuses it for all Scala candidate eligibility checks.
+
+2026-06-17: The Go slice is now in progress. The intended implementation reuses the shared string-keyed FQN scorer for Go functions and types/classes through one `build_go_usage_edges(...)` pass per report, with exported Go symbols reported using conservative public-surface wording and Go fields kept precise.
+
+2026-06-17: The Go dead-code report now bulk-scores Go functions and types/classes with one inverted Go usage graph pass per report. Go fields remain precise, exported Go findings use lower confidence and public-surface wording, and focused Go tests cover zero-inbound, one-inbound, cap handling, exported policy, and field fallback behavior.
+
+2026-06-17: Guided review tightened the Go slice. Go runtime/test entry points are excluded from dead-code candidates, package-level initializer references can now be attributed to module field callers in the inverted graph, and public-surface finding construction/test fixture setup were deduplicated.
 
 ## Context and Orientation
 
@@ -190,7 +233,7 @@ Second, build findings from inbound counts. Zero-inbound and one-inbound candida
 
 Third, update `tests/rust_dead_code_smells.rs`. Existing private helper, one-call wrapper, recursion, explicit FQN targeting, and threshold behavior should still pass after expected wording changes. Add a public `pub fn` test that asserts conservative public-surface wording. Cover `truncated_symbols` behavior with an integration test that creates more than the Rust usage-graph call-site limit and asserts the candidate is skipped as inconclusive.
 
-The Python follow-up slice now uses Python's inverted usage graph for the same one-pass inbound scoring shape. The JS/TS follow-up slice now uses file-scoped identity so same-name exports in different files do not cross-count. The Java follow-up slice uses Java's existing package-qualified FQN graph for safe candidates and keeps overlap-sensitive candidates precise. The Scala follow-up slice uses Scala's existing FQN graph only for safe candidates and keeps richer member/import semantics precise. Deferred follow-up slices remain tracked here but are not implemented in this branch. Go, C#, C++, and PHP parity should only be pursued after the Rust, Python, JS/TS, Java, and Scala slices confirm product value and graph semantics. If broad graph cost still dominates after bulk dead-code scoring, later work can profile resolver/cache micro-optimizations.
+The Python follow-up slice now uses Python's inverted usage graph for the same one-pass inbound scoring shape. The JS/TS follow-up slice now uses file-scoped identity so same-name exports in different files do not cross-count. The Java follow-up slice uses Java's existing package-qualified FQN graph for safe candidates and keeps overlap-sensitive candidates precise. The Scala follow-up slice uses Scala's existing FQN graph only for safe candidates and keeps richer member/import semantics precise. The current Go follow-up slice uses Go's existing package-qualified FQN graph for functions and types/classes while leaving fields precise. Deferred follow-up slices remain tracked here but are not implemented in this branch. C#, C++, and PHP parity should only be pursued after the Rust, Python, JS/TS, Java, Scala, and Go slices confirm product value and graph semantics. If broad graph cost still dominates after bulk dead-code scoring, later work can profile resolver/cache micro-optimizations.
 
 ## Concrete Steps
 
@@ -229,7 +272,7 @@ The implementation is additive and can be retried safely. If tests fail after th
 
 ## Artifacts and Notes
 
-Key implementation artifacts will be recorded here after code changes and test runs. The important proof will be focused test output for Rust dead-code and Python/JS/TS dead-code tests.
+Key implementation artifacts will be recorded here after code changes and test runs. The important proof is focused dead-code test output plus the relevant usage-graph regression suite for each migrated language.
 
 Rust focused test evidence:
 
@@ -327,11 +370,39 @@ Scala usage graph regression evidence:
     test scala3_indented_this_and_block_scoping ... ok
     test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 
+Go focused test evidence:
+
+    cargo test --test go_dead_code_smells -- --nocapture
+    running 11 tests
+    test go_dead_code_smell_reports_unused_unexported_helper ... ok
+    test go_dead_code_smell_reports_one_call_unexported_helper ... ok
+    test go_type_usage_from_another_file_prevents_finding ... ok
+    test go_symbol_with_two_distinct_inbound_callers_is_not_flagged ... ok
+    test go_runtime_and_test_entry_points_are_not_dead_code_candidates ... ok
+    test go_package_initializers_count_as_inbound_callers ... ok
+    test go_dead_code_smell_honors_usage_candidate_file_cap ... ok
+    test go_dead_code_smell_honors_usage_cap ... ok
+    test go_exported_function_uses_conservative_wording_and_score ... ok
+    test go_exported_type_uses_conservative_wording_and_score ... ok
+    test go_field_candidate_stays_on_precise_path ... ok
+    test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+Go usage graph regression evidence:
+
+    cargo test --test usages_go_graph_test
+    running 29 tests
+    test usage_finder_routes_go_targets_through_graph_strategy ... ok
+    test go_graph_strategy_finds_same_package_references_without_imports ... ok
+    test go_graph_strategy_resolves_qualified_and_aliased_import_selectors ... ok
+    test go_graph_strategy_finds_methods_and_fields_through_local_receiver_inference ... ok
+    test go_graph_strategy_enforces_max_usages_limit ... ok
+    test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
 Rust formatting and lint evidence:
 
     cargo fmt
     cargo clippy --all-targets --all-features -- -D warnings
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.41s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.57s
 
 Whitespace evidence:
 

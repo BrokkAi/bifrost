@@ -195,6 +195,19 @@ impl<'a> EdgeCollector<'a> {
             Some(caller) => caller.to_string(),
             None => return,
         };
+        self.record_with_caller(caller, callee, start, end);
+    }
+
+    pub(crate) fn record_with_caller(
+        &mut self,
+        caller: String,
+        callee: String,
+        start: usize,
+        end: usize,
+    ) {
+        if !self.nodes.contains(&callee) {
+            return;
+        }
         // A recursive call's enclosing definition is the callee itself; the
         // per-symbol path excludes it from the call-site count.
         if caller == callee {
