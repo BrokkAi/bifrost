@@ -3,7 +3,7 @@ use crate::analyzer::{
 };
 use std::collections::BTreeSet;
 
-pub(super) fn resolve_rust_analyzer(analyzer: &dyn IAnalyzer) -> Option<&RustAnalyzer> {
+pub(crate) fn resolve_rust_analyzer(analyzer: &dyn IAnalyzer) -> Option<&RustAnalyzer> {
     if let Some(rust) = (analyzer as &dyn std::any::Any).downcast_ref::<RustAnalyzer>() {
         return Some(rust);
     }

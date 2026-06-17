@@ -7,6 +7,9 @@ mod shared;
 
 use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::inverted_edges::UsageEdges;
+use crate::analyzer::usages::java_graph::resolver::{
+    TargetKind, TargetSpec, resolve_java_analyzer,
+};
 use crate::analyzer::usages::java_graph::shared::{JavaEdgeResolver, JavaQueryResolver};
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
@@ -24,6 +27,37 @@ where
 {
     let resolver = JavaEdgeResolver::new(analyzer, &keep_file)?;
     Some(resolver.build_edges(analyzer, nodes, keep_file))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum JavaDeadCodeBulkEligibility {
+    BulkSafe,
+    NeedsPrecise,
+}
+
+pub(crate) fn dead_code_bulk_eligibility(
+    analyzer: &dyn IAnalyzer,
+    target: &CodeUnit,
+    overloaded_fqns: &HashSet<String>,
+    static_imports_present: bool,
+    scala_files_present: bool,
+) -> JavaDeadCodeBulkEligibility {
+    let Some(java) = resolve_java_analyzer(analyzer) else {
+        return JavaDeadCodeBulkEligibility::NeedsPrecise;
+    };
+    let Some(spec) = TargetSpec::from_target(java, target) else {
+        return JavaDeadCodeBulkEligibility::NeedsPrecise;
+    };
+    match spec.kind {
+        TargetKind::Type if scala_files_present => JavaDeadCodeBulkEligibility::NeedsPrecise,
+        TargetKind::Type => JavaDeadCodeBulkEligibility::BulkSafe,
+        TargetKind::Method if static_imports_present => JavaDeadCodeBulkEligibility::NeedsPrecise,
+        TargetKind::Method if overloaded_fqns.contains(target.fq_name().as_str()) => {
+            JavaDeadCodeBulkEligibility::NeedsPrecise
+        }
+        TargetKind::Method => JavaDeadCodeBulkEligibility::BulkSafe,
+        TargetKind::Constructor | TargetKind::Field => JavaDeadCodeBulkEligibility::NeedsPrecise,
+    }
 }
 
 #[derive(Default)]

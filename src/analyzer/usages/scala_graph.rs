@@ -9,9 +9,13 @@ use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
+use crate::analyzer::usages::scala_graph::resolver::{
+    TargetKind, TargetSpec, resolve_scala_analyzer, scala_normalized_fq_name,
+};
 use crate::analyzer::usages::scala_graph::shared::{ScalaEdgeResolver, ScalaQueryResolver};
+use crate::analyzer::usages::scala_graph::syntax::scala_import_path;
 use crate::analyzer::usages::traits::UsageAnalyzer;
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
+use crate::analyzer::{CodeUnit, IAnalyzer, ImportAnalysisProvider, Language, ProjectFile};
 use crate::hash::HashSet;
 
 pub(crate) fn build_scala_usage_edges<F>(
@@ -24,6 +28,77 @@ where
 {
     let resolver = ScalaEdgeResolver::new(analyzer, &keep_file)?;
     Some(resolver.build_edges(analyzer, nodes, keep_file))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScalaDeadCodeBulkEligibility {
+    BulkSafe,
+    NeedsPrecise,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ScalaDeadCodeBulkContext {
+    wildcard_owner_imports: HashSet<String>,
+    direct_member_imports: HashSet<String>,
+}
+
+impl ScalaDeadCodeBulkContext {
+    pub(crate) fn from_analyzer(analyzer: &dyn IAnalyzer) -> Option<Self> {
+        let scala = resolve_scala_analyzer(analyzer)?;
+        let mut context = Self::default();
+        for file in scala.get_analyzed_files() {
+            for import in scala.import_info_of(&file) {
+                let Some(path) = scala_import_path(import) else {
+                    continue;
+                };
+                let normalized_path = scala_normalized_fq_name(&path);
+                if import.is_wildcard {
+                    context.wildcard_owner_imports.insert(normalized_path);
+                } else {
+                    context.direct_member_imports.insert(normalized_path);
+                }
+            }
+        }
+        Some(context)
+    }
+
+    fn imports_can_expose_member(&self, spec: &TargetSpec) -> bool {
+        let Some(owner_fq_name) = spec.owner_fq_name.as_deref() else {
+            return false;
+        };
+        self.wildcard_owner_imports.contains(owner_fq_name)
+            || self.direct_member_imports.contains(&spec.target_fq_name)
+    }
+}
+
+pub(crate) fn dead_code_bulk_eligibility(
+    analyzer: &dyn IAnalyzer,
+    target: &CodeUnit,
+    overloaded_fqns: &HashSet<String>,
+    context: &ScalaDeadCodeBulkContext,
+) -> ScalaDeadCodeBulkEligibility {
+    let Some(scala) = resolve_scala_analyzer(analyzer) else {
+        return ScalaDeadCodeBulkEligibility::NeedsPrecise;
+    };
+    let Some(spec) = TargetSpec::from_target(scala, target) else {
+        return ScalaDeadCodeBulkEligibility::NeedsPrecise;
+    };
+
+    match spec.kind {
+        TargetKind::Type => ScalaDeadCodeBulkEligibility::BulkSafe,
+        TargetKind::Method if spec.owner.is_none() => ScalaDeadCodeBulkEligibility::NeedsPrecise,
+        TargetKind::Method if scala.signatures(target).len() > 1 => {
+            ScalaDeadCodeBulkEligibility::NeedsPrecise
+        }
+        TargetKind::Method if overloaded_fqns.contains(target.fq_name().as_str()) => {
+            ScalaDeadCodeBulkEligibility::NeedsPrecise
+        }
+        TargetKind::Method if context.imports_can_expose_member(&spec) => {
+            ScalaDeadCodeBulkEligibility::NeedsPrecise
+        }
+        TargetKind::Method => ScalaDeadCodeBulkEligibility::BulkSafe,
+        TargetKind::Constructor | TargetKind::Field => ScalaDeadCodeBulkEligibility::NeedsPrecise,
+    }
 }
 
 #[derive(Default)]

@@ -31,10 +31,12 @@ pub(crate) struct JsTsProjectGraph {
     /// export/import indices + analyzer-level module resolution
     /// (`resolve_js_ts_module_specifier` + tsconfig aliases), so the forward scan
     /// resolves seeds + importer edges without a cross-file graph.
-    exports_by_file: HashMap<ProjectFile, ExportIndex>,
-    reexport_edges: HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>>,
-    star_reexports: HashMap<ProjectFile, Vec<ProjectFile>>,
-    importer_reverse: HashMap<ProjectFile, Vec<ImportEdge>>,
+    pub(super) exports_by_file: HashMap<ProjectFile, ExportIndex>,
+    pub(super) reexport_edges: HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>>,
+    pub(super) direct_reexport_edges: HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>>,
+    pub(super) star_reexports: HashMap<ProjectFile, Vec<ProjectFile>>,
+    pub(super) direct_star_reexports: HashMap<ProjectFile, Vec<ProjectFile>>,
+    pub(super) importer_reverse: HashMap<ProjectFile, Vec<ImportEdge>>,
 }
 
 pub(super) fn build_js_ts_graph(analyzer: &dyn IAnalyzer, language: Language) -> JsTsProjectGraph {
@@ -47,7 +49,9 @@ pub(super) fn build_js_ts_graph(analyzer: &dyn IAnalyzer, language: Language) ->
                 parsed: HashMap::default(),
                 exports_by_file: HashMap::default(),
                 reexport_edges: HashMap::default(),
+                direct_reexport_edges: HashMap::default(),
                 star_reexports: HashMap::default(),
+                direct_star_reexports: HashMap::default(),
                 importer_reverse: HashMap::default(),
             };
         }
@@ -92,7 +96,7 @@ pub(super) fn build_js_ts_graph(analyzer: &dyn IAnalyzer, language: Language) ->
     let resolve = |file: &ProjectFile, module_specifier: &str| {
         resolve_js_ts_module_specifier(file, module_specifier, language, Some(&aliases))
     };
-    let (reexport_edges, star_reexports) =
+    let (reexport_edges, direct_reexport_edges, star_reexports, direct_star_reexports) =
         build_reexport_edges(&exports_by_file, &binders_by_file, &resolve);
     let importer_reverse =
         build_importer_reverse(&files, &binders_by_file, &exports_by_file, &resolve);
@@ -101,7 +105,9 @@ pub(super) fn build_js_ts_graph(analyzer: &dyn IAnalyzer, language: Language) ->
         parsed,
         exports_by_file,
         reexport_edges,
+        direct_reexport_edges,
         star_reexports,
+        direct_star_reexports,
         importer_reverse,
     }
 }
@@ -210,11 +216,16 @@ fn build_reexport_edges(
     resolve: &impl Fn(&ProjectFile, &str) -> Vec<ProjectFile>,
 ) -> (
     HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>>,
+    HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>>,
+    HashMap<ProjectFile, Vec<ProjectFile>>,
     HashMap<ProjectFile, Vec<ProjectFile>>,
 ) {
     let mut reexport_edges: HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>> =
         HashMap::default();
+    let mut direct_reexport_edges: HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>> =
+        HashMap::default();
     let mut star_reexports: HashMap<ProjectFile, Vec<ProjectFile>> = HashMap::default();
+    let mut direct_star_reexports: HashMap<ProjectFile, Vec<ProjectFile>> = HashMap::default();
     for (file, exports) in exports_by_file {
         for (exported_name, entry) in &exports.exports_by_name {
             match entry {
@@ -229,6 +240,10 @@ fn build_reexport_edges(
                         continue;
                     };
                     for resolved_file in resolve(file, &binding.module_specifier) {
+                        direct_reexport_edges
+                            .entry((file.clone(), exported_name.clone()))
+                            .or_default()
+                            .push((resolved_file.clone(), imported_name.clone()));
                         reexport_edges
                             .entry((resolved_file, imported_name.clone()))
                             .or_default()
@@ -241,6 +256,10 @@ fn build_reexport_edges(
                     imported_name,
                 } => {
                     for resolved_file in resolve(file, module_specifier) {
+                        direct_reexport_edges
+                            .entry((file.clone(), exported_name.clone()))
+                            .or_default()
+                            .push((resolved_file.clone(), imported_name.clone()));
                         reexport_edges
                             .entry((resolved_file, imported_name.clone()))
                             .or_default()
@@ -251,6 +270,10 @@ fn build_reexport_edges(
         }
         for star in &exports.reexport_stars {
             for resolved_file in resolve(file, &star.module_specifier) {
+                direct_star_reexports
+                    .entry(file.clone())
+                    .or_default()
+                    .push(resolved_file.clone());
                 star_reexports
                     .entry(resolved_file)
                     .or_default()
@@ -258,7 +281,12 @@ fn build_reexport_edges(
             }
         }
     }
-    (reexport_edges, star_reexports)
+    (
+        reexport_edges,
+        direct_reexport_edges,
+        star_reexports,
+        direct_star_reexports,
+    )
 }
 
 fn build_importer_reverse(

@@ -5,6 +5,7 @@ mod resolver;
 mod shared;
 
 use crate::analyzer::usages::common::language_for_target;
+use crate::analyzer::usages::cpp_graph::resolver::{TargetKind, TargetSpec};
 use crate::analyzer::usages::cpp_graph::shared::{CppEdgeResolver, CppQueryResolver};
 use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::model::FuzzyResult;
@@ -23,6 +24,52 @@ where
 {
     let resolver = CppEdgeResolver::new(analyzer, &keep_file)?;
     Some(resolver.build_edges(analyzer, nodes, keep_file))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CppDeadCodeBulkEligibility {
+    BulkSafe,
+    NeedsPrecise,
+}
+
+pub(crate) fn dead_code_bulk_eligibility(
+    analyzer: &dyn IAnalyzer,
+    target: &CodeUnit,
+    overloaded_fqns: &HashSet<String>,
+) -> CppDeadCodeBulkEligibility {
+    let Some(spec) = TargetSpec::from_target(analyzer, target) else {
+        return CppDeadCodeBulkEligibility::NeedsPrecise;
+    };
+    match spec.kind {
+        TargetKind::Type => CppDeadCodeBulkEligibility::BulkSafe,
+        TargetKind::FreeFunction | TargetKind::Method if cpp_effectively_free_function(&spec) => {
+            if overloaded_fqns.contains(target.fq_name().as_str()) || cpp_global_main(&spec) {
+                CppDeadCodeBulkEligibility::NeedsPrecise
+            } else {
+                CppDeadCodeBulkEligibility::BulkSafe
+            }
+        }
+        TargetKind::Constructor
+        | TargetKind::FreeFunction
+        | TargetKind::Method
+        | TargetKind::GlobalField
+        | TargetKind::MemberField => CppDeadCodeBulkEligibility::NeedsPrecise,
+    }
+}
+
+pub(crate) fn is_cpp_global_main(analyzer: &dyn IAnalyzer, target: &CodeUnit) -> bool {
+    TargetSpec::from_target(analyzer, target).is_some_and(|spec| cpp_global_main(&spec))
+}
+
+fn cpp_effectively_free_function(spec: &TargetSpec) -> bool {
+    spec.target.is_function() && spec.owner.as_ref().is_none_or(|owner| owner.is_module())
+}
+
+fn cpp_global_main(spec: &TargetSpec) -> bool {
+    spec.target.is_function()
+        && spec.target.identifier() == "main"
+        && spec.target.package_name().is_empty()
+        && spec.owner.is_none()
 }
 
 #[derive(Default)]

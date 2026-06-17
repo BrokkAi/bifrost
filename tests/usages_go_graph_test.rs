@@ -1,29 +1,8 @@
 mod common;
 
+use brokk_bifrost::IAnalyzer;
 use brokk_bifrost::usages::{FuzzyResult, GoUsageGraphStrategy, UsageAnalyzer, UsageFinder};
-use brokk_bifrost::{CodeUnit, GoAnalyzer, IAnalyzer, Language};
-use common::InlineTestProject;
-
-fn go_analyzer_with_files(files: &[(&str, &str)]) -> (common::BuiltInlineTestProject, GoAnalyzer) {
-    let mut builder = InlineTestProject::with_language(Language::Go);
-    if !files.iter().any(|(path, _)| *path == "go.mod") {
-        builder = builder.file("go.mod", "module example.com/app\n\ngo 1.22\n");
-    }
-    for (path, contents) in files {
-        builder = builder.file(path, *contents);
-    }
-    let project = builder.build();
-    let analyzer = GoAnalyzer::from_project(project.project().clone());
-    (project, analyzer)
-}
-
-fn definition(analyzer: &GoAnalyzer, fq_name: &str) -> CodeUnit {
-    analyzer
-        .get_definitions(fq_name)
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| panic!("missing definition for {fq_name}"))
-}
+use common::{definition, go_analyzer_with_files};
 
 #[test]
 fn usage_finder_routes_go_targets_through_graph_strategy() {

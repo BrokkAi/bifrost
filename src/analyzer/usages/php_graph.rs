@@ -8,6 +8,7 @@ use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
+use crate::analyzer::usages::php_graph::resolver::{TargetKind, TargetSpec, resolve_php_analyzer};
 use crate::analyzer::usages::php_graph::shared::{PhpEdgeResolver, PhpQueryResolver};
 use crate::analyzer::usages::traits::UsageAnalyzer;
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
@@ -23,6 +24,30 @@ where
 {
     let resolver = PhpEdgeResolver::new(analyzer, &keep_file)?;
     Some(resolver.build_edges(analyzer, nodes, keep_file))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PhpDeadCodeBulkEligibility {
+    BulkSafe,
+    NeedsPrecise,
+}
+
+pub(crate) fn dead_code_bulk_eligibility(
+    analyzer: &dyn IAnalyzer,
+    target: &CodeUnit,
+) -> PhpDeadCodeBulkEligibility {
+    let Some(php) = resolve_php_analyzer(analyzer) else {
+        return PhpDeadCodeBulkEligibility::NeedsPrecise;
+    };
+    let Some(spec) = TargetSpec::from_target(php, target) else {
+        return PhpDeadCodeBulkEligibility::NeedsPrecise;
+    };
+    match spec.kind {
+        TargetKind::Type | TargetKind::Function => PhpDeadCodeBulkEligibility::BulkSafe,
+        TargetKind::Constructor | TargetKind::Method | TargetKind::Field | TargetKind::Constant => {
+            PhpDeadCodeBulkEligibility::NeedsPrecise
+        }
+    }
 }
 
 #[derive(Default)]

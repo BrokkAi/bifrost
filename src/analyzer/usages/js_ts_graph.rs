@@ -48,6 +48,8 @@ use crate::hash::HashSet;
 use std::collections::BTreeSet;
 
 use crate::analyzer::usages::inverted_edges::UsageEdges;
+use crate::analyzer::usages::inverted_edges::UsageNodeKey;
+pub(crate) use inverted::{JsTsScopedNodeStatus, JsTsScopedUsageEdges};
 
 /// Build the whole JS/TS `caller -> callee` edge set in a single inverted pass per
 /// language present, merging TypeScript and JavaScript. Returns `None` when the
@@ -88,6 +90,65 @@ where
     }
 
     any.then_some(UsageEdges { edges, truncated })
+}
+
+/// Build the whole JS/TS `caller -> callee` edge set using file-scoped node
+/// identity, so same-name exports in different files do not cross-match.
+pub(crate) fn build_jsts_scoped_usage_edges<F>(
+    analyzer: &dyn IAnalyzer,
+    nodes: &HashSet<UsageNodeKey>,
+    keep_file: F,
+) -> Option<JsTsScopedUsageEdges>
+where
+    F: Fn(&ProjectFile) -> bool + Sync + Copy,
+{
+    let mut edges: std::collections::BTreeMap<(UsageNodeKey, UsageNodeKey), usize> =
+        std::collections::BTreeMap::new();
+    let mut truncated: std::collections::BTreeMap<UsageNodeKey, usize> =
+        std::collections::BTreeMap::new();
+    let mut node_status: std::collections::BTreeMap<UsageNodeKey, JsTsScopedNodeStatus> =
+        std::collections::BTreeMap::new();
+    let mut any = false;
+
+    for language in [Language::TypeScript, Language::JavaScript] {
+        let has_files = analyzer
+            .project()
+            .analyzable_files(language)
+            .map(|set| set.into_iter().next().is_some())
+            .unwrap_or(false);
+        if !has_files {
+            continue;
+        }
+        any = true;
+        let language_nodes: HashSet<UsageNodeKey> = nodes
+            .iter()
+            .filter(|key| crate::analyzer::common::language_for_file(&key.file) == language)
+            .cloned()
+            .collect();
+        if language_nodes.is_empty() {
+            continue;
+        }
+        let graph = build_js_ts_graph(analyzer, language);
+        let result = inverted::build_jsts_scoped_edges(
+            analyzer,
+            &graph,
+            language,
+            &language_nodes,
+            keep_file,
+        );
+        for (key, weight) in result.edges.edges {
+            *edges.entry(key).or_insert(0) += weight;
+        }
+        for (callee, total) in result.edges.truncated {
+            *truncated.entry(callee).or_insert(0) += total;
+        }
+        node_status.extend(result.node_status);
+    }
+
+    any.then_some(JsTsScopedUsageEdges {
+        edges: crate::analyzer::usages::inverted_edges::ScopedUsageEdges { edges, truncated },
+        node_status,
+    })
 }
 
 /// JS/TS export-graph usage analyzer. Resolves usages of a JavaScript or TypeScript

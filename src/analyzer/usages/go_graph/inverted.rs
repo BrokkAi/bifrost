@@ -133,6 +133,11 @@ impl FileScan<'_, '_> {
         self.collector
             .record(callee, node.start_byte(), node.end_byte());
     }
+
+    fn record_with_caller(&mut self, caller: String, callee: String, node: Node<'_>) {
+        self.collector
+            .record_with_caller(caller, callee, node.start_byte(), node.end_byte());
+    }
 }
 
 fn scan_node(
@@ -156,7 +161,13 @@ fn scan_node(
             return;
         }
         "parameter_declaration" => seed_parameter_declaration(node, ctx, locals),
+        "const_declaration" if is_top_level_declaration(node) => {
+            scan_top_level_value_initializers(node, ctx);
+        }
         "var_declaration" | "short_var_declaration" => {
+            if node.kind() == "var_declaration" && is_top_level_declaration(node) {
+                scan_top_level_value_initializers(node, ctx);
+            }
             declare_local_names(node, ctx, locals);
             seed_local_bindings(node, ctx, locals);
         }
@@ -166,6 +177,94 @@ fn scan_node(
         _ => {}
     }
     scan_children(node, ctx, locals);
+}
+
+fn is_top_level_declaration(node: Node<'_>) -> bool {
+    node.parent()
+        .is_some_and(|parent| parent.kind() == "source_file")
+}
+
+fn scan_top_level_value_initializers(node: Node<'_>, ctx: &mut FileScan<'_, '_>) {
+    for_each_value_spec(node, &mut |spec| {
+        let names = var_spec_names(spec, ctx.source);
+        let values = rhs_expressions(spec);
+        if names.is_empty() || values.is_empty() {
+            return;
+        }
+        for (name, value) in names.into_iter().zip(values) {
+            let caller = format!("{}._module_.{name}", ctx.file_pkg);
+            scan_top_level_initializer_value(value, caller.as_str(), ctx);
+        }
+    });
+}
+
+fn for_each_value_spec(node: Node<'_>, f: &mut impl FnMut(Node<'_>)) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "var_spec" | "const_spec" => f(child),
+            "var_spec_list" | "const_spec_list" => for_each_value_spec(child, f),
+            _ => {}
+        }
+    }
+}
+
+fn scan_top_level_initializer_value(node: Node<'_>, caller: &str, ctx: &mut FileScan<'_, '_>) {
+    match node.kind() {
+        "func_literal" | "function_declaration" | "method_declaration" => return,
+        "selector_expression" | "qualified_type" => {
+            scan_top_level_initializer_selector(node, caller, ctx);
+            return;
+        }
+        "identifier" | "type_identifier" => {
+            scan_top_level_initializer_direct(node, caller, ctx);
+        }
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        scan_top_level_initializer_value(child, caller, ctx);
+    }
+}
+
+fn scan_top_level_initializer_selector(node: Node<'_>, caller: &str, ctx: &mut FileScan<'_, '_>) {
+    let Some((qualifier, qualifier_node, field_node)) = selector_parts(node, ctx.source) else {
+        return;
+    };
+    if is_definition_identifier(qualifier_node, ctx.source) {
+        return;
+    }
+    let field = node_text(field_node, ctx.source).to_string();
+    if let Some(packages) = ctx.alias_packages.get(&qualifier) {
+        let callees: Vec<String> = packages
+            .iter()
+            .map(|package| format!("{package}.{field}"))
+            .collect();
+        for callee in callees {
+            ctx.record_with_caller(caller.to_string(), callee, field_node);
+        }
+    }
+}
+
+fn scan_top_level_initializer_direct(node: Node<'_>, caller: &str, ctx: &mut FileScan<'_, '_>) {
+    if is_definition_identifier(node, ctx.source) {
+        return;
+    }
+    let text = node_text(node, ctx.source).to_string();
+    ctx.record_with_caller(
+        caller.to_string(),
+        format!("{}.{}", ctx.file_pkg, text),
+        node,
+    );
+    let dot_callees: Vec<String> = ctx
+        .dot_packages
+        .iter()
+        .map(|package| format!("{package}.{text}"))
+        .collect();
+    for callee in dot_callees {
+        ctx.record_with_caller(caller.to_string(), callee, node);
+    }
 }
 
 fn scan_children(

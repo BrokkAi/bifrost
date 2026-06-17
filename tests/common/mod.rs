@@ -1,7 +1,7 @@
 mod inline_project;
 pub mod usage_graph;
 
-use brokk_bifrost::{CodeUnit, IAnalyzer, Language, ProjectFile, TestProject};
+use brokk_bifrost::{CodeUnit, GoAnalyzer, IAnalyzer, Language, ProjectFile, TestProject};
 use pretty_assertions::assert_eq;
 use std::path::Path;
 
@@ -62,6 +62,20 @@ pub fn go_fixture_project() -> TestProject {
         std::fs::canonicalize("tests/fixtures/testcode-go").unwrap(),
         Language::Go,
     )
+}
+
+#[allow(dead_code)]
+pub fn go_analyzer_with_files(files: &[(&str, &str)]) -> (BuiltInlineTestProject, GoAnalyzer) {
+    let mut builder = InlineTestProject::with_language(Language::Go);
+    if !files.iter().any(|(path, _)| *path == "go.mod") {
+        builder = builder.file("go.mod", "module example.com/app\n\ngo 1.22\n");
+    }
+    for (path, contents) in files {
+        builder = builder.file(*path, *contents);
+    }
+    let project = builder.build();
+    let analyzer = GoAnalyzer::from_project(project.project().clone());
+    (project, analyzer)
 }
 
 #[allow(dead_code)]
