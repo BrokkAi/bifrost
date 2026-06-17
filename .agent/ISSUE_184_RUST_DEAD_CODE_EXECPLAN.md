@@ -569,6 +569,71 @@ Unavailable Gradle evidence:
     ./gradlew fix tidy
     zsh:1: no such file or directory: ./gradlew
 
+## Review Fix Follow-Up: Cross-Language Bulk Routing Guards
+
+Brokk guided review against `origin/master...HEAD` found three correctness gaps in the accumulated language slices:
+
+1. JS/TS namespace import member edges were still using bare property text and same-file lookup, so `import * as api` could misattribute `api.helper()` to an importer-local `helper`, miss barrel/re-export canonicalization, and miss chained static member references like `api.Foo.make()`.
+2. C++/PHP candidates needing precise fallback could disappear without evidence because PHP was not registered in `graph_strategy_for` and C++ intentionally has no safe precise strategy for the unsafe fallback shapes.
+3. Java/C#/C++ eligibility checks could run whole-language overload/static-import scans before honoring `max_usage_candidate_files`.
+
+The fix plan is to canonicalize JS/TS namespace members through scoped export identity, register PHP precise usage strategy, keep C++ unsupported precise fallback explicit and inconclusive, and gate Java/C#/C++ global eligibility scans behind the existing file cap before falling back to bounded per-symbol analysis.
+
+Implemented review fixes:
+
+* JS/TS scoped namespace member resolution now resolves `namespace.member` through `canonical_export_keys`, so same-file declarations cannot steal namespace import edges and unambiguous barrel re-exports are followed. Chained namespace static calls like `api.Foo.make()` now emit a scoped edge to `Foo.make$static`.
+* PHP is registered in `graph_strategy_for` for candidates that need precise fallback. C++ remains intentionally unregistered for unsafe fallback shapes; those candidates now emit explicit inconclusive evidence instead of disappearing silently.
+* Java, C#, and C++ candidate partitioning now checks the per-language analyzable file count before running overload/static-import/global eligibility scans. When the cap is exceeded, candidates route to bounded per-symbol fallback, or to explicit inconclusive evidence for C++.
+
+Focused validation:
+
+    cargo test --test python_js_ts_dead_code_smells -- --nocapture
+    running 17 tests
+    test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+    cargo test --test php_dead_code_smells -- --nocapture
+    running 10 tests
+    test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+    cargo test --test cpp_dead_code_smells -- --nocapture
+    running 15 tests
+    test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+    cargo test --test usages_js_ts_graph_test
+    running 35 tests
+    test result: ok. 33 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out
+
+    cargo test --test java_dead_code_smells -- --nocapture
+    running 11 tests
+    test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+    cargo test --test csharp_dead_code_smells -- --nocapture
+    running 16 tests
+    test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+Additional regression validation after the generic precise-fallback skip change:
+
+    cargo test --test rust_dead_code_smells -- --nocapture
+    running 11 tests
+    test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+    cargo test --test scala_dead_code_smells -- --nocapture
+    running 16 tests
+    test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+    cargo test --test go_dead_code_smells -- --nocapture
+    running 11 tests
+    test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+Final hygiene validation:
+
+    cargo fmt
+    cargo clippy --all-targets --all-features -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 6.55s
+
+    git diff --check
+    no output
+
 ## Interfaces and Dependencies
 
 At the end of this work, `src/code_quality/dead_code_smells.rs` should contain a crate-internal Rust bulk helper with behavior equivalent to:

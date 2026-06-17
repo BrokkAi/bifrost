@@ -181,7 +181,7 @@ fn java_dead_code_smell_honors_usage_candidate_file_cap() {
     );
 
     assert!(
-        report.contains("Java usage graph candidate files exceeded cap 1"),
+        report.contains("usage candidate files exceeded cap 1"),
         "{report}"
     );
     assert!(

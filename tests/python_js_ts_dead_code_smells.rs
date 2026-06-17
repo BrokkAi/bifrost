@@ -604,6 +604,156 @@ export function run(): number {
 }
 
 #[test]
+fn ts_dead_code_smell_namespace_import_uses_target_module_not_local_name() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "service.ts",
+            "export function helper(): number { return 1; }\n",
+        )
+        .file(
+            "consumer.ts",
+            r#"
+import * as api from "./service";
+
+export function helper(): number {
+  return 0;
+}
+
+export function run(): number {
+  return api.helper();
+}
+"#,
+        )
+        .build();
+    let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
+    let service_file = project.file("service.ts");
+    let helper = ts_definition(&analyzer, |cu| {
+        cu.is_function() && cu.fq_name() == "helper" && cu.source() == &service_file
+    });
+
+    let result = report_dead_code_and_unused_abstraction_smells(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec!["service.ts".to_string()],
+            fq_names: vec![helper.fq_name()],
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        result
+            .report
+            .contains("one workspace inbound edge from run"),
+        "{}",
+        result.report
+    );
+    assert!(
+        !result.report.contains("no non-self usages found"),
+        "{}",
+        result.report
+    );
+}
+
+#[test]
+fn ts_dead_code_smell_namespace_import_follows_unambiguous_barrel_reexport() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "service.ts",
+            "export function adapter(): number { return 1; }\n",
+        )
+        .file("barrel.ts", "export * from \"./service\";\n")
+        .file(
+            "consumer.ts",
+            r#"
+import * as api from "./barrel";
+
+export function run(): number {
+  return api.adapter();
+}
+"#,
+        )
+        .build();
+    let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
+    let adapter = ts_definition(&analyzer, |cu| {
+        cu.is_function() && cu.fq_name() == "adapter"
+    });
+
+    let result = report_dead_code_and_unused_abstraction_smells(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec!["service.ts".to_string()],
+            fq_names: vec![adapter.fq_name()],
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        result
+            .report
+            .contains("one workspace inbound edge from run"),
+        "{}",
+        result.report
+    );
+    assert!(
+        !result.report.contains("no non-self usages found"),
+        "{}",
+        result.report
+    );
+}
+
+#[test]
+fn ts_dead_code_smell_namespace_import_counts_static_member_chain() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "service.ts",
+            r#"
+export class Foo {
+  static make(): number {
+    return 1;
+  }
+}
+"#,
+        )
+        .file(
+            "consumer.ts",
+            r#"
+import * as api from "./service";
+
+export function run(): number {
+  return api.Foo.make();
+}
+"#,
+        )
+        .build();
+    let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
+    let make = ts_definition(&analyzer, |cu| {
+        cu.is_function() && cu.fq_name() == "Foo.make$static"
+    });
+
+    let result = report_dead_code_and_unused_abstraction_smells(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec!["service.ts".to_string()],
+            fq_names: vec![make.fq_name()],
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        result
+            .report
+            .contains("one workspace inbound edge from run"),
+        "{}",
+        result.report
+    );
+    assert!(
+        !result.report.contains("no non-self usages found"),
+        "{}",
+        result.report
+    );
+}
+
+#[test]
 fn ts_dead_code_smell_skips_ambiguous_star_reexport_alias() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file("a.ts", "export function helper(): number { return 1; }\n")

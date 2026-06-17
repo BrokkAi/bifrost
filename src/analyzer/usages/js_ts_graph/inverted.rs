@@ -149,6 +149,8 @@ where
 
             let mut ctx = ScopedTsScan {
                 source,
+                graph,
+                declarations: &declarations,
                 imports,
                 same_file,
                 collector,
@@ -168,12 +170,14 @@ struct ScopedImportBindings {
 
 struct ScopedTsScan<'a, 'b> {
     source: &'a str,
+    graph: &'a JsTsProjectGraph,
+    declarations: &'a HashMap<(ProjectFile, String), BTreeSet<UsageNodeKey>>,
     imports: ScopedImportBindings,
     same_file: HashMap<String, UsageNodeKey>,
     collector: &'a mut ScopedEdgeCollector<'b>,
 }
 
-impl ScopedTsScan<'_, '_> {
+impl<'a> ScopedTsScan<'a, '_> {
     fn bare_callee(&self, text: &str) -> Option<UsageNodeKey> {
         if let Some(key) = self.imports.named.get(text) {
             return Some(key.clone());
@@ -182,6 +186,16 @@ impl ScopedTsScan<'_, '_> {
             return Some(key.clone());
         }
         None
+    }
+
+    fn namespace_member_callee(&self, namespace: &str, member: &str) -> Option<UsageNodeKey> {
+        let target_file = self.imports.namespace.get(namespace)?;
+        single_key(canonical_export_keys(
+            self.graph,
+            self.declarations,
+            target_file,
+            member,
+        ))
     }
 
     fn record(&mut self, callee: UsageNodeKey, node: Node<'_>) {
@@ -670,27 +684,36 @@ fn handle_scoped_member(
     ) else {
         return;
     };
-    if object.kind() != "identifier" {
-        return;
-    }
-    let object_text = slice(object, ctx.source);
     let property_text = slice(property, ctx.source);
-    if object_text.is_empty() || property_text.is_empty() || locals.is_shadowed(object_text) {
+    if property_text.is_empty() {
         return;
     }
 
-    if let Some(target_file) = ctx.imports.namespace.get(object_text)
-        && let Some(callee) = ctx.same_file.get(property_text).cloned().or_else(|| {
-            Some(UsageNodeKey::new(
-                target_file.clone(),
-                property_text.to_string(),
-            ))
-        })
-    {
-        ctx.record(callee, property);
+    if object.kind() == "identifier" {
+        let object_text = slice(object, ctx.source);
+        if object_text.is_empty() || locals.is_shadowed(object_text) {
+            return;
+        }
+
+        if let Some(callee) = ctx.namespace_member_callee(object_text, property_text) {
+            ctx.record(callee, property);
+            return;
+        }
+        if let Some(class) = ctx.bare_callee(object_text) {
+            ctx.record(
+                UsageNodeKey::new(
+                    class.file,
+                    format!("{}.{}$static", class.fqn, property_text),
+                ),
+                property,
+            );
+        }
         return;
     }
-    if let Some(class) = ctx.bare_callee(object_text) {
+
+    if object.kind() == "member_expression"
+        && let Some(class) = scoped_namespace_member_class(object, ctx, locals)
+    {
         ctx.record(
             UsageNodeKey::new(
                 class.file,
@@ -699,6 +722,27 @@ fn handle_scoped_member(
             property,
         );
     }
+}
+
+fn scoped_namespace_member_class(
+    node: Node<'_>,
+    ctx: &ScopedTsScan<'_, '_>,
+    locals: &LocalInferenceEngine<String>,
+) -> Option<UsageNodeKey> {
+    let object = node.child_by_field_name("object")?;
+    let property = node.child_by_field_name("property")?;
+    if object.kind() != "identifier" {
+        return None;
+    }
+    let namespace = slice(object, ctx.source);
+    if namespace.is_empty() || locals.is_shadowed(namespace) {
+        return None;
+    }
+    let class_name = slice(property, ctx.source);
+    if class_name.is_empty() {
+        return None;
+    }
+    ctx.namespace_member_callee(namespace, class_name)
 }
 
 fn handle_jsx(node: Node<'_>, ctx: &mut TsScan<'_, '_>, locals: &LocalInferenceEngine<String>) {

@@ -258,7 +258,7 @@ fn cpp_dead_code_smell_honors_usage_candidate_file_cap() {
     );
 
     assert!(
-        report.contains("C++ usage graph candidate files exceeded cap 1"),
+        report.contains("C++ precise usage strategy is unavailable"),
         "{report}"
     );
     assert!(!report.contains("helper |"), "{report}");
@@ -350,6 +350,10 @@ Target build() { return Target(); }
 
     assert!(!report.contains("no non-self usages found"), "{report}");
     assert!(!report.contains("one workspace inbound edge"), "{report}");
+    assert!(
+        report.contains("C++ precise usage strategy is unavailable"),
+        "{report}"
+    );
 }
 
 #[test]
@@ -379,6 +383,10 @@ void use() { make().run(); }
 
     assert!(!report.contains("no non-self usages found"), "{report}");
     assert!(!report.contains("one workspace inbound edge"), "{report}");
+    assert!(
+        report.contains("C++ precise usage strategy is unavailable"),
+        "{report}"
+    );
 }
 
 #[test]
@@ -404,6 +412,10 @@ void use() { run(1); }
 
     assert!(!report.contains("one workspace inbound edge"), "{report}");
     assert!(!report.contains("no non-self usages found"), "{report}");
+    assert!(
+        report.contains("C++ precise usage strategy is unavailable"),
+        "{report}"
+    );
 }
 
 #[test]
@@ -432,6 +444,10 @@ int read(Target target) { return target.value; }
 
     assert!(!report.contains("no non-self usages found"), "{report}");
     assert!(!report.contains("one workspace inbound edge"), "{report}");
+    assert!(
+        report.contains("C++ precise usage strategy is unavailable"),
+        "{report}"
+    );
 }
 
 #[test]

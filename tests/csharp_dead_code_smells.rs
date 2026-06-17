@@ -248,7 +248,7 @@ namespace App {
     );
 
     assert!(
-        report.contains("C# usage graph candidate files exceeded cap 1"),
+        report.contains("usage candidate files exceeded cap 1"),
         "{report}"
     );
     assert!(!report.contains("App.Service.Helper |"), "{report}");

@@ -11,8 +11,8 @@ use crate::analyzer::usages::js_ts_graph::JsTsScopedNodeStatus;
 use crate::analyzer::usages::{
     CSharpUsageGraphStrategy, CandidateFileProvider, FallbackCandidateProvider, FuzzyResult,
     GoUsageGraphStrategy, JavaUsageGraphStrategy, JsTsExportUsageGraphStrategy,
-    RustExportUsageGraphStrategy, ScalaUsageGraphStrategy, TextSearchCandidateProvider,
-    UsageAnalyzer, UsageHit,
+    PhpUsageGraphStrategy, RustExportUsageGraphStrategy, ScalaUsageGraphStrategy,
+    TextSearchCandidateProvider, UsageAnalyzer, UsageHit,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range, RustAnalyzer};
 use crate::hash::HashSet;
@@ -132,6 +132,9 @@ pub fn report_dead_code_and_unused_abstraction_smells(
     let mut csharp_overloaded_fqns: Option<HashSet<String>> = None;
     let mut csharp_unsafe_using_member_forms_present: Option<bool> = None;
     let mut cpp_overloaded_fqns: Option<HashSet<String>> = None;
+    let mut java_file_count: Option<usize> = None;
+    let mut csharp_file_count: Option<usize> = None;
+    let mut cpp_file_count: Option<usize> = None;
     let mut scala_files_present: Option<bool> = None;
     let mut scala_overloaded_fqns: Option<HashSet<String>> = None;
     let mut scala_file_count: Option<usize> = None;
@@ -160,7 +163,12 @@ pub fn report_dead_code_and_unused_abstraction_smells(
                 continue;
             }
             Language::CSharp
-                if !csharp_candidate_needs_precise_scan(
+                if !language_bulk_file_count_exceeds_cap(
+                    analyzer,
+                    Language::CSharp,
+                    usage_candidate_file_cap,
+                    &mut csharp_file_count,
+                ) && !csharp_candidate_needs_precise_scan(
                     analyzer,
                     candidate,
                     &mut csharp_overloaded_fqns,
@@ -171,7 +179,12 @@ pub fn report_dead_code_and_unused_abstraction_smells(
                 continue;
             }
             Language::Cpp
-                if !cpp_candidate_needs_precise_scan(
+                if !language_bulk_file_count_exceeds_cap(
+                    analyzer,
+                    Language::Cpp,
+                    usage_candidate_file_cap,
+                    &mut cpp_file_count,
+                ) && !cpp_candidate_needs_precise_scan(
                     analyzer,
                     candidate,
                     &mut cpp_overloaded_fqns,
@@ -185,7 +198,12 @@ pub fn report_dead_code_and_unused_abstraction_smells(
                 continue;
             }
             Language::Java
-                if !java_candidate_needs_precise_scan(
+                if !language_bulk_file_count_exceeds_cap(
+                    analyzer,
+                    Language::Java,
+                    usage_candidate_file_cap,
+                    &mut java_file_count,
+                ) && !java_candidate_needs_precise_scan(
                     analyzer,
                     candidate,
                     &mut java_overloaded_fqns,
@@ -575,6 +593,15 @@ fn analyze_candidate(
         .into_iter()
         .filter(|range| !range.is_empty())
         .max_by_key(span_lines)?;
+
+    if graph_strategy_for(candidate).is_none() {
+        skipped.push(format!(
+            "`{}`: {} precise usage strategy is unavailable; evidence is inconclusive",
+            candidate.fq_name(),
+            language_label(language)
+        ));
+        return None;
+    }
 
     let query = query_graph_usages(analyzer, candidate, usage_candidate_file_cap, usage_cap)?;
 
@@ -1787,6 +1814,16 @@ fn scala_bulk_file_count_exceeds_cap(
         > usage_candidate_file_cap
 }
 
+fn language_bulk_file_count_exceeds_cap(
+    analyzer: &dyn IAnalyzer,
+    language: Language,
+    usage_candidate_file_cap: usize,
+    file_count: &mut Option<usize>,
+) -> bool {
+    *file_count.get_or_insert_with(|| analyzable_file_count(analyzer, language))
+        > usage_candidate_file_cap
+}
+
 fn java_overloaded_function_fqns(analyzer: &dyn IAnalyzer) -> HashSet<String> {
     overloaded_function_fqns(analyzer, Language::Java)
 }
@@ -2090,6 +2127,9 @@ fn graph_strategy_for(candidate: &CodeUnit) -> Option<Box<dyn UsageAnalyzer>> {
     }
     if CSharpUsageGraphStrategy::can_handle(candidate) {
         return Some(Box::new(CSharpUsageGraphStrategy::new()));
+    }
+    if PhpUsageGraphStrategy::can_handle(candidate) {
+        return Some(Box::new(PhpUsageGraphStrategy::new()));
     }
     None
 }
