@@ -339,3 +339,123 @@ class Consumer {
         "{report}"
     );
 }
+
+#[test]
+fn java_field_candidate_stays_on_precise_path_for_bare_identifier_reads() {
+    let (_project, analyzer) = java_analyzer_with_files(&[(
+        "com/example/Service.java",
+        r#"
+package com.example;
+
+class Service {
+    private int cached;
+
+    int read() {
+        return cached;
+    }
+}
+"#,
+    )]);
+    let cached = java_definition(&analyzer, "com.example.Service.cached");
+
+    let report = report(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec!["com/example/Service.java".to_string()],
+            fq_names: vec![cached.fq_name()],
+            ..Default::default()
+        },
+    );
+
+    assert!(report.contains("com.example.Service.cached"), "{report}");
+    assert!(
+        report.contains("only usage: com/example/Service.java"),
+        "{report}"
+    );
+    assert!(!report.contains("no non-self usages found"), "{report}");
+}
+
+#[test]
+fn java_method_candidate_stays_on_precise_path_when_static_imports_are_present() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "com/example/Target.java",
+            r#"
+package com.example;
+
+public class Target {
+    static void run() {}
+}
+"#,
+        ),
+        (
+            "com/example/Consumer.java",
+            r#"
+package com.example;
+
+import static com.example.Target.run;
+
+class Consumer {
+    void call() {
+        run();
+    }
+}
+"#,
+        ),
+    ]);
+    let run = java_definition(&analyzer, "com.example.Target.run");
+
+    let report = report(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec![
+                "com/example/Target.java".to_string(),
+                "com/example/Consumer.java".to_string(),
+            ],
+            fq_names: vec![run.fq_name()],
+            ..Default::default()
+        },
+    );
+
+    assert!(report.contains("com.example.Target.run"), "{report}");
+    assert!(
+        report.contains("only usage: com/example/Consumer.java"),
+        "{report}"
+    );
+    assert!(!report.contains("no non-self usages found"), "{report}");
+}
+
+#[test]
+fn java_public_api_uses_conservative_wording_and_score() {
+    let (_project, analyzer) = java_analyzer_with_files(&[(
+        "com/example/PublicApi.java",
+        r#"
+package com.example;
+
+public class PublicApi {
+    public void extensionPoint() {}
+}
+"#,
+    )]);
+    let extension_point = java_definition(&analyzer, "com.example.PublicApi.extensionPoint");
+
+    let report = report(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec!["com/example/PublicApi.java".to_string()],
+            fq_names: vec![extension_point.fq_name()],
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        report.contains("com.example.PublicApi.extensionPoint"),
+        "{report}"
+    );
+    assert!(
+        report.contains("public Java symbol is unreferenced in workspace"),
+        "{report}"
+    );
+    assert!(report.contains("0.55"), "{report}");
+    assert!(!report.contains("generated residue"), "{report}");
+}

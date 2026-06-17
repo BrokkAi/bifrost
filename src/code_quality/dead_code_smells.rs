@@ -6,7 +6,7 @@
 use super::{ReportLines, append_ambiguous_path_notes, resolve_project_files, sanitize_table_cell};
 use crate::analyzer::common::language_for_target;
 use crate::analyzer::usages::ImportGraphCandidateProvider;
-use crate::analyzer::usages::inverted_edges::UsageNodeKey;
+use crate::analyzer::usages::inverted_edges::{UsageEdges, UsageNodeKey};
 use crate::analyzer::usages::js_ts_graph::JsTsScopedNodeStatus;
 use crate::analyzer::usages::{
     CandidateFileProvider, FallbackCandidateProvider, FuzzyResult, JavaUsageGraphStrategy,
@@ -120,8 +120,9 @@ pub fn report_dead_code_and_unused_abstraction_smells(
     let mut python_candidates: Vec<CodeUnit> = Vec::new();
     let mut jsts_candidates: Vec<CodeUnit> = Vec::new();
     let mut java_candidates: Vec<CodeUnit> = Vec::new();
-    let java_overloaded_fqns = java_overloaded_function_fqns(analyzer);
-    let scala_files_present = has_analyzable_files(analyzer, Language::Scala);
+    let mut java_overloaded_fqns: Option<HashSet<String>> = None;
+    let mut java_static_imports_present: Option<bool> = None;
+    let mut scala_files_present: Option<bool> = None;
 
     for candidate in &candidate_selection.candidates {
         match code_unit_language(candidate) {
@@ -143,8 +144,9 @@ pub fn report_dead_code_and_unused_abstraction_smells(
                 if !java_candidate_needs_precise_scan(
                     analyzer,
                     candidate,
-                    &java_overloaded_fqns,
-                    scala_files_present,
+                    &mut java_overloaded_fqns,
+                    &mut java_static_imports_present,
+                    &mut scala_files_present,
                 ) =>
             {
                 java_candidates.push(candidate.clone());
@@ -653,83 +655,31 @@ fn analyze_python_candidates_with_usage_graph(
     usage_cap: usize,
     skipped: &mut Vec<String>,
 ) -> Vec<DeadCodeFinding> {
-    if candidates.is_empty() {
-        return Vec::new();
-    }
-
-    let python_file_count = analyzer
-        .project()
-        .analyzable_files(Language::Python)
-        .map_or(0, |files| files.len());
-    if python_file_count > usage_candidate_file_cap {
-        for candidate in candidates {
-            skipped.push(format!(
-                "`{}`: Python usage graph candidate files exceeded cap {usage_candidate_file_cap} ({python_file_count} Python files); evidence is inconclusive",
-                candidate.fq_name()
-            ));
-        }
-        return Vec::new();
-    }
-
-    let mut nodes: HashSet<String> = analyzer
-        .all_declarations()
-        .filter(|unit| {
-            code_unit_language(unit) == Language::Python
-                && !unit.is_synthetic()
-                && (unit.is_function() || unit.is_class())
-        })
-        .map(CodeUnit::fq_name)
-        .collect();
-    nodes.extend(candidates.iter().map(CodeUnit::fq_name));
-
-    let Some(edges) =
-        crate::analyzer::usages::python_graph::build_python_usage_edges(analyzer, &nodes, |_| true)
-    else {
-        for candidate in candidates {
-            skipped.push(format!(
-                "`{}`: Python usage graph could not be built; evidence is inconclusive",
-                candidate.fq_name()
-            ));
-        }
-        return Vec::new();
-    };
-
-    let declarations_by_fqn = declarations_by_fqn_for_language(analyzer, Language::Python);
-    let mut incoming: BTreeMap<String, GraphIncomingUsage> = BTreeMap::new();
-    for ((caller, callee), weight) in edges.edges {
-        let usage = incoming.entry(callee).or_default();
-        usage.total += weight;
-        usage.callers.entry(caller.clone()).or_insert(weight);
-    }
-
-    candidates
-        .iter()
-        .filter_map(|candidate| {
-            let candidate_fqn = candidate.fq_name();
-            if let Some(total_callsites) = edges.truncated.get(&candidate_fqn) {
-                skipped.push(format!(
-                    "`{candidate_fqn}`: too many workspace inbound call sites ({total_callsites}, limit {}); evidence is inconclusive",
-                    crate::analyzer::usages::inverted_edges::MAX_CALLSITES
-                ));
-                return None;
-            }
-            let usage = incoming.get(&candidate_fqn).cloned().unwrap_or_default();
-            if usage.total > usage_cap {
-                skipped.push(format!(
-                    "`{candidate_fqn}`: too many workspace inbound call sites ({}, limit {usage_cap}); evidence is inconclusive",
-                    usage.total
-                ));
-                return None;
-            }
+    analyze_fqn_candidates_with_usage_graph(
+        FqnBulkGraphRequest {
+            analyzer,
+            language: Language::Python,
+            candidates,
+            usage_candidate_file_cap,
+            usage_cap,
+            skipped,
+        },
+        |unit| unit.is_function() || unit.is_class(),
+        |nodes| {
+            crate::analyzer::usages::python_graph::build_python_usage_edges(analyzer, nodes, |_| {
+                true
+            })
+        },
+        |analyzer, declarations_by_fqn, candidate, usage| {
             graph_finding_for_language(
                 analyzer,
                 Language::Python,
-                &declarations_by_fqn,
+                declarations_by_fqn,
                 candidate,
                 usage,
             )
-        })
-        .collect()
+        },
+    )
 }
 
 fn analyze_java_candidates_with_usage_graph(
@@ -739,18 +689,70 @@ fn analyze_java_candidates_with_usage_graph(
     usage_cap: usize,
     skipped: &mut Vec<String>,
 ) -> Vec<DeadCodeFinding> {
+    analyze_fqn_candidates_with_usage_graph(
+        FqnBulkGraphRequest {
+            analyzer,
+            language: Language::Java,
+            candidates,
+            usage_candidate_file_cap,
+            usage_cap,
+            skipped,
+        },
+        |unit| unit.is_function() || unit.is_class(),
+        |nodes| {
+            crate::analyzer::usages::java_graph::build_java_usage_edges(analyzer, nodes, |_| true)
+        },
+        java_graph_finding,
+    )
+}
+
+struct FqnBulkGraphRequest<'a, 's> {
+    analyzer: &'a dyn IAnalyzer,
+    language: Language,
+    candidates: &'a [CodeUnit],
+    usage_candidate_file_cap: usize,
+    usage_cap: usize,
+    skipped: &'s mut Vec<String>,
+}
+
+fn analyze_fqn_candidates_with_usage_graph<BuildEdges, NodePredicate, BuildFinding>(
+    request: FqnBulkGraphRequest<'_, '_>,
+    node_predicate: NodePredicate,
+    build_edges: BuildEdges,
+    build_finding: BuildFinding,
+) -> Vec<DeadCodeFinding>
+where
+    BuildEdges: FnOnce(&HashSet<String>) -> Option<UsageEdges>,
+    NodePredicate: Fn(&CodeUnit) -> bool,
+    BuildFinding: Fn(
+        &dyn IAnalyzer,
+        &BTreeMap<String, Vec<CodeUnit>>,
+        &CodeUnit,
+        GraphIncomingUsage,
+    ) -> Option<DeadCodeFinding>,
+{
+    let FqnBulkGraphRequest {
+        analyzer,
+        language,
+        candidates,
+        usage_candidate_file_cap,
+        usage_cap,
+        skipped,
+    } = request;
+
     if candidates.is_empty() {
         return Vec::new();
     }
 
-    let java_file_count = analyzer
+    let file_count = analyzer
         .project()
-        .analyzable_files(Language::Java)
+        .analyzable_files(language)
         .map_or(0, |files| files.len());
-    if java_file_count > usage_candidate_file_cap {
+    let label = language_label(language);
+    if file_count > usage_candidate_file_cap {
         for candidate in candidates {
             skipped.push(format!(
-                "`{}`: Java usage graph candidate files exceeded cap {usage_candidate_file_cap} ({java_file_count} Java files); evidence is inconclusive",
+                "`{}`: {label} usage graph candidate files exceeded cap {usage_candidate_file_cap} ({file_count} {label} files); evidence is inconclusive",
                 candidate.fq_name()
             ));
         }
@@ -760,27 +762,23 @@ fn analyze_java_candidates_with_usage_graph(
     let mut nodes: HashSet<String> = analyzer
         .all_declarations()
         .filter(|unit| {
-            code_unit_language(unit) == Language::Java
-                && !unit.is_synthetic()
-                && (unit.is_function() || unit.is_class() || unit.is_field())
+            code_unit_language(unit) == language && !unit.is_synthetic() && node_predicate(unit)
         })
         .map(CodeUnit::fq_name)
         .collect();
     nodes.extend(candidates.iter().map(CodeUnit::fq_name));
 
-    let Some(edges) =
-        crate::analyzer::usages::java_graph::build_java_usage_edges(analyzer, &nodes, |_| true)
-    else {
+    let Some(edges) = build_edges(&nodes) else {
         for candidate in candidates {
             skipped.push(format!(
-                "`{}`: Java usage graph could not be built; evidence is inconclusive",
+                "`{}`: {label} usage graph could not be built; evidence is inconclusive",
                 candidate.fq_name()
             ));
         }
         return Vec::new();
     };
 
-    let declarations_by_fqn = declarations_by_fqn_for_language(analyzer, Language::Java);
+    let declarations_by_fqn = declarations_by_fqn_for_language(analyzer, language);
     let mut incoming: BTreeMap<String, GraphIncomingUsage> = BTreeMap::new();
     for ((caller, callee), weight) in edges.edges {
         let usage = incoming.entry(callee).or_default();
@@ -807,13 +805,7 @@ fn analyze_java_candidates_with_usage_graph(
                 ));
                 return None;
             }
-            graph_finding_for_language(
-                analyzer,
-                Language::Java,
-                &declarations_by_fqn,
-                candidate,
-                usage,
-            )
+            build_finding(analyzer, &declarations_by_fqn, candidate, usage)
         })
         .collect()
 }
@@ -1031,6 +1023,49 @@ fn graph_finding_for_language(
     })
 }
 
+fn java_graph_finding(
+    analyzer: &dyn IAnalyzer,
+    declarations_by_fqn: &BTreeMap<String, Vec<CodeUnit>>,
+    candidate: &CodeUnit,
+    usage: GraphIncomingUsage,
+) -> Option<DeadCodeFinding> {
+    if usage.total > 1 {
+        return None;
+    }
+
+    let range = analyzer
+        .ranges_of(candidate)
+        .into_iter()
+        .filter(|range| !range.is_empty())
+        .max_by_key(span_lines)?;
+    let declaration_lines = span_lines(&range);
+    let is_public = java_public_like_declaration(analyzer, candidate);
+    let score = java_graph_score(usage.total, declaration_lines, is_public);
+    let confidence = java_graph_confidence(usage.total, is_public);
+    let evidence = graph_inbound_evidence(&usage);
+    let rationale = java_graph_rationale(usage.total, is_public);
+
+    Some(DeadCodeFinding {
+        language: Language::Java,
+        score,
+        confidence,
+        kind: candidate.kind().display_lowercase().to_string(),
+        symbol: candidate.fq_name(),
+        file: candidate.source().clone(),
+        start_line: range.start_line + 1,
+        end_line: range.end_line + 1,
+        total_usage_count: usage.total,
+        external_usage_count: external_usage_count(
+            analyzer,
+            declarations_by_fqn,
+            candidate,
+            &usage,
+        ),
+        evidence,
+        rationale,
+    })
+}
+
 #[derive(Clone, Debug, Default)]
 struct ScopedGraphIncomingUsage {
     total: usize,
@@ -1106,7 +1141,25 @@ fn rust_graph_score(total_usage_count: usize, declaration_lines: usize, is_publi
     }
 }
 
+fn java_graph_score(total_usage_count: usize, declaration_lines: usize, is_public: bool) -> i32 {
+    match (total_usage_count, is_public) {
+        (0, true) => 10 + (declaration_lines / 8).min(8) as i32,
+        (0, false) => graph_score(total_usage_count, declaration_lines),
+        (_, true) => 8 + (declaration_lines / 16).min(6) as i32,
+        (_, false) => graph_score(total_usage_count, declaration_lines),
+    }
+}
+
 fn rust_graph_confidence(total_usage_count: usize, is_public: bool) -> f64 {
+    match (total_usage_count, is_public) {
+        (0, true) => 0.55,
+        (0, false) => 0.90,
+        (_, true) => 0.45,
+        (_, false) => 0.70,
+    }
+}
+
+fn java_graph_confidence(total_usage_count: usize, is_public: bool) -> f64 {
     match (total_usage_count, is_public) {
         (0, true) => 0.55,
         (0, false) => 0.90,
@@ -1165,6 +1218,23 @@ fn rust_graph_rationale(total_usage_count: usize, is_public: bool) -> String {
     }
 }
 
+fn java_graph_rationale(total_usage_count: usize, is_public: bool) -> String {
+    match (total_usage_count, is_public) {
+        (0, true) => {
+            "public Java symbol is unreferenced in workspace; it may be untested public surface or consumed externally".to_string()
+        }
+        (0, false) => {
+            "symbol has no workspace inbound usage evidence in Java tree-sitter analysis and may be generated residue".to_string()
+        }
+        (_, true) => {
+            "public Java symbol has only one workspace inbound reference; it may be lightly tested public surface or consumed externally".to_string()
+        }
+        (_, false) => {
+            "symbol has only one workspace inbound caller in Java tree-sitter analysis and may be a low-value abstraction".to_string()
+        }
+    }
+}
+
 fn scoped_declarations_by_key_for_languages(
     analyzer: &dyn IAnalyzer,
     languages: &[Language],
@@ -1215,24 +1285,31 @@ fn scoped_key_for(unit: &CodeUnit) -> UsageNodeKey {
 fn java_candidate_needs_precise_scan(
     analyzer: &dyn IAnalyzer,
     candidate: &CodeUnit,
-    overloaded_fqns: &HashSet<String>,
-    scala_files_present: bool,
+    overloaded_fqns: &mut Option<HashSet<String>>,
+    static_imports_present: &mut Option<bool>,
+    scala_files_present: &mut Option<bool>,
 ) -> bool {
-    if candidate.is_class() && scala_files_present {
-        return true;
-    }
-    if !candidate.is_function() {
-        return false;
-    }
-    java_function_is_constructor(analyzer, candidate)
-        || overloaded_fqns.contains(candidate.fq_name().as_str())
-}
+    let empty_overloads = HashSet::default();
+    let overloads = if candidate.is_function() {
+        overloaded_fqns.get_or_insert_with(|| java_overloaded_function_fqns(analyzer))
+    } else {
+        &empty_overloads
+    };
+    let has_static_imports = candidate.is_function()
+        && *static_imports_present.get_or_insert_with(|| java_static_imports_present(analyzer));
+    let has_scala_files =
+        *scala_files_present.get_or_insert_with(|| has_analyzable_files(analyzer, Language::Scala));
 
-fn java_function_is_constructor(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bool {
-    candidate.is_function()
-        && analyzer
-            .parent_of(candidate)
-            .is_some_and(|owner| candidate.identifier() == owner.identifier())
+    matches!(
+        crate::analyzer::usages::java_graph::dead_code_bulk_eligibility(
+            analyzer,
+            candidate,
+            overloads,
+            has_static_imports,
+            has_scala_files,
+        ),
+        crate::analyzer::usages::java_graph::JavaDeadCodeBulkEligibility::NeedsPrecise
+    )
 }
 
 fn java_overloaded_function_fqns(analyzer: &dyn IAnalyzer) -> HashSet<String> {
@@ -1253,6 +1330,30 @@ fn has_analyzable_files(analyzer: &dyn IAnalyzer, language: Language) -> bool {
         .project()
         .analyzable_files(language)
         .is_ok_and(|files| !files.is_empty())
+}
+
+fn java_static_imports_present(analyzer: &dyn IAnalyzer) -> bool {
+    analyzer
+        .project()
+        .analyzable_files(Language::Java)
+        .is_ok_and(|files| {
+            files.into_iter().any(|file| {
+                file.read_to_string()
+                    .is_ok_and(|source| source.contains("import static "))
+            })
+        })
+}
+
+fn java_public_like_declaration(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bool {
+    analyzer
+        .get_source(candidate, true)
+        .is_some_and(|source| contains_java_visibility_modifier(&source, "public"))
+}
+
+fn contains_java_visibility_modifier(source: &str, modifier: &str) -> bool {
+    source
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .any(|token| token == modifier)
 }
 
 fn rust_declarations_by_fqn(analyzer: &dyn IAnalyzer) -> BTreeMap<String, Vec<CodeUnit>> {

@@ -43,6 +43,9 @@ The visible result is that Rust dead-code reports still identify unused private 
 - [x] (2026-06-17T12:20:00Z) Added `tests/java_dead_code_smells.rs` covering graph-derived Java findings, caps, constructor and overload precise-path guards, and Java class references from Scala files.
 - [x] (2026-06-17T12:20:00Z) Ran `cargo test --test java_dead_code_smells`; all 8 tests passed.
 - [x] (2026-06-17T12:30:00Z) Ran `cargo test --test usages_java_graph_test`, `cargo test --test rust_dead_code_smells`, `cargo test --test python_js_ts_dead_code_smells`, `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`; all passed.
+- [x] (2026-06-17T13:10:00Z) Ran guided review on the Java slice and fixed findings: Java fields and static-import-sensitive methods now stay precise, Java overload/static-import metadata is lazy, Java public API findings use conservative wording, and Python/Java share the FQN bulk scorer.
+- [x] (2026-06-17T13:10:00Z) Re-ran `cargo test --test java_dead_code_smells`; all 11 tests passed.
+- [x] (2026-06-17T13:20:00Z) Re-ran `cargo test --test usages_java_graph_test`, `cargo test --test rust_dead_code_smells`, `cargo test --test python_js_ts_dead_code_smells`, `cargo fmt`, and `cargo clippy --all-targets --all-features -- -D warnings`; all passed.
 
 ## Surprises & Discoveries
 
@@ -69,6 +72,9 @@ The visible result is that Rust dead-code reports still identify unused private 
 
 - Observation: The Java constructor guard routes constructor candidates to the precise path as intended; precise analysis can still report a one-call constructor with a concrete `new Target()` call site.
   Evidence: `java_constructor_candidate_stays_on_precise_path` asserts precise `only usage:` evidence rather than graph-derived zero-inbound evidence.
+
+- Observation: Java's inverted graph still misses bare identifier field reads and static-imported method calls that the precise Java strategy handles.
+  Evidence: guided review identified false-positive scenarios for `return cached;` and `import static com.example.Target.run; run();`; regression tests now assert those candidates use precise `only usage:` evidence.
 
 ## Decision Log
 
@@ -110,6 +116,10 @@ The visible result is that Rust dead-code reports still identify unused private 
 
 - Decision: Add Java bulk dead-code scoring only for Java candidates whose FQN-only graph evidence is safe: non-constructor, non-overloaded candidates, and Java class candidates only when no Scala files are present.
   Rationale: Java FQNs are package-qualified, so scoped identity is unnecessary, but constructors/overloads need arity-aware precise analysis and Java classes can be referenced from Scala through the existing per-symbol strategy.
+  Date/Author: 2026-06-17 / Codex
+
+- Decision: Keep Java fields and Java methods in workspaces with static imports on the precise path until the inverted Java graph reaches parity for those reference forms.
+  Rationale: The precise Java scanner handles bare identifier field reads and static imports; using bulk graph evidence for those shapes can create false zero-inbound dead-code findings.
   Date/Author: 2026-06-17 / Codex
 
 ## Outcomes & Retrospective
@@ -219,7 +229,7 @@ JS/TS usage graph regression evidence:
 Java focused test evidence:
 
     cargo test --test java_dead_code_smells
-    running 8 tests
+    running 11 tests
     test java_dead_code_smell_reports_unused_private_helper ... ok
     test java_dead_code_smell_reports_one_call_wrapper ... ok
     test java_dead_code_smell_does_not_flag_symbol_with_multiple_inbound_edges ... ok
@@ -228,7 +238,10 @@ Java focused test evidence:
     test java_constructor_candidate_stays_on_precise_path ... ok
     test java_overloaded_methods_stay_on_precise_path ... ok
     test java_class_candidate_uses_precise_path_when_scala_files_are_present ... ok
-    test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+    test java_field_candidate_stays_on_precise_path_for_bare_identifier_reads ... ok
+    test java_method_candidate_stays_on_precise_path_when_static_imports_are_present ... ok
+    test java_public_api_uses_conservative_wording_and_score ... ok
+    test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 
 Java usage graph regression evidence:
 
