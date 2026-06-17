@@ -11,13 +11,15 @@ use crate::analyzer::usages::rust_graph::extractor::{
     build_rust_graph, effective_scan_files, scan_files_for_member_target, scan_files_for_target,
 };
 use crate::analyzer::usages::rust_graph::resolver::{
-    infer_graph_seeds, is_graph_visible_member_target, is_member_target, resolve_rust_analyzer,
+    infer_graph_seeds, is_graph_visible_member_target, is_member_target,
     supports_same_file_local_scan, unresolved_external_frontier_specifiers,
 };
 use crate::analyzer::usages::traits::UsageAnalyzer;
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, RustAnalyzer};
 use crate::hash::HashSet;
 use std::collections::BTreeSet;
+
+pub(crate) use resolver::resolve_rust_analyzer;
 
 /// Build the whole Rust `caller -> callee` edge set in a single inverted pass
 /// over the workspace (see [`inverted`]). Returns `None` when there are no Rust

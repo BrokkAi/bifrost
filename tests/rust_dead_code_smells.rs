@@ -89,7 +89,10 @@ fn entry() {
     );
 
     assert!(report.contains("helpers.wrapper"), "{report}");
-    assert!(report.contains("only usage: src/helpers.rs"), "{report}");
+    assert!(
+        report.contains("one workspace inbound edge from helpers.entry"),
+        "{report}"
+    );
     assert!(report.contains("| 1 | 1 |"), "{report}");
 }
 
@@ -121,22 +124,28 @@ fn recurse(n: u32) {
 
 #[test]
 fn rust_dead_code_smell_skips_truncated_usage_candidates() {
-    let (_project, analyzer) = rust_analyzer_with_files(&[
-        ("src/helpers.rs", "fn helper() {}\n"),
-        ("src/other1.rs", "fn other1() {}\n"),
-        ("src/other2.rs", "fn other2() {}\n"),
-    ]);
+    let mut files = vec![(
+        "src/helpers.rs".to_string(),
+        "pub fn helper() {}\n".to_string(),
+    )];
+    for index in 0..=1000 {
+        files.push((
+            format!("src/caller_{index}.rs"),
+            format!("use crate::helpers::helper;\n\nfn caller_{index}() {{\n    helper();\n}}\n"),
+        ));
+    }
+    let borrowed_files: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(path, contents)| (path.as_str(), contents.as_str()))
+        .collect();
+    let (_project, analyzer) = rust_analyzer_with_files(&borrowed_files);
 
     let result = report_dead_code_and_unused_abstraction_smells(
         &analyzer,
         ReportDeadCodeAndUnusedAbstractionSmellsParams {
-            file_paths: vec![
-                "src/helpers.rs".to_string(),
-                "src/other1.rs".to_string(),
-                "src/other2.rs".to_string(),
-            ],
+            file_paths: vec!["src/helpers.rs".to_string()],
             fq_names: vec!["helpers.helper".to_string()],
-            max_usage_candidate_files: 1,
+            max_usage_candidate_files: 2000,
             ..Default::default()
         },
     );
@@ -144,7 +153,7 @@ fn rust_dead_code_smell_skips_truncated_usage_candidates() {
     assert!(
         result
             .report
-            .contains("usage candidate files exceeded cap 1"),
+            .contains("too many workspace inbound call sites"),
         "{}",
         result.report
     );
@@ -155,6 +164,117 @@ fn rust_dead_code_smell_skips_truncated_usage_candidates() {
         "{}",
         result.report
     );
+}
+
+#[test]
+fn rust_dead_code_smell_honors_usage_candidate_file_cap() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        ("src/helpers.rs", "fn helper() {}\n"),
+        ("src/other.rs", "fn other() {}\n"),
+    ]);
+
+    let result = report_dead_code_and_unused_abstraction_smells(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec!["src/helpers.rs".to_string(), "src/other.rs".to_string()],
+            fq_names: vec!["helpers.helper".to_string()],
+            max_usage_candidate_files: 1,
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        result
+            .report
+            .contains("Rust usage graph candidate files exceeded cap 1"),
+        "{}",
+        result.report
+    );
+    assert!(
+        result
+            .report
+            .contains("No dead code or unused abstraction smells met minScore 8."),
+        "{}",
+        result.report
+    );
+}
+
+#[test]
+fn rust_dead_code_smell_honors_usage_cap() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        ("src/helpers.rs", "pub fn helper() {}\n"),
+        (
+            "src/callers.rs",
+            r#"
+use crate::helpers::helper;
+
+fn caller_one() {
+    helper();
+}
+
+fn caller_two() {
+    helper();
+}
+"#,
+        ),
+    ]);
+
+    let result = report_dead_code_and_unused_abstraction_smells(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec!["src/helpers.rs".to_string(), "src/callers.rs".to_string()],
+            fq_names: vec!["helpers.helper".to_string()],
+            max_usages_per_symbol: 1,
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        result
+            .report
+            .contains("too many workspace inbound call sites (2, limit 1)"),
+        "{}",
+        result.report
+    );
+    assert!(
+        result
+            .report
+            .contains("No dead code or unused abstraction smells met minScore 8."),
+        "{}",
+        result.report
+    );
+}
+
+#[test]
+fn rust_dead_code_smell_reports_public_api_with_conservative_wording() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/helpers.rs",
+            r#"
+pub fn public_surface() {}
+"#,
+        ),
+        (
+            "src/main.rs",
+            r#"
+fn main() {}
+"#,
+        ),
+    ]);
+
+    let report = report(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec!["src/helpers.rs".to_string(), "src/main.rs".to_string()],
+            fq_names: vec!["helpers.public_surface".to_string()],
+            ..Default::default()
+        },
+    );
+
+    assert!(report.contains("helpers.public_surface"), "{report}");
+    assert!(report.contains("unreferenced in workspace"), "{report}");
+    assert!(report.contains("consumed externally"), "{report}");
+    assert!(report.contains("| 10 | 0.55 |"), "{report}");
 }
 
 #[test]

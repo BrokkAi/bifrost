@@ -117,7 +117,9 @@ def run():
         result.report
     );
     assert!(
-        result.report.contains("only usage: consumer.py"),
+        result
+            .report
+            .contains("one workspace inbound edge from consumer.run"),
         "{}",
         result.report
     );
@@ -157,6 +159,153 @@ def run():
         },
     );
 
+    assert!(
+        result
+            .report
+            .contains("No dead code or unused abstraction smells met minScore 8."),
+        "{}",
+        result.report
+    );
+}
+
+#[test]
+fn python_dead_code_smell_skips_truncated_usage_candidates() {
+    let mut builder = InlineTestProject::with_language(Language::Python).file(
+        "service.py",
+        r#"
+def helper():
+    return 1
+"#,
+    );
+    for index in 0..=1000 {
+        builder = builder.file(
+            format!("consumer_{index}.py"),
+            format!(
+                r#"
+from service import helper
+
+def run_{index}():
+    return helper()
+"#
+            ),
+        );
+    }
+    let project = builder.build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let helper = python_definition(&analyzer, "service.helper");
+
+    let mut file_paths = vec!["service.py".to_string()];
+    file_paths.extend((0..=1000).map(|index| format!("consumer_{index}.py")));
+    let result = report_dead_code_and_unused_abstraction_smells(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths,
+            fq_names: vec![helper.fq_name()],
+            max_usage_candidate_files: 2000,
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        result
+            .report
+            .contains("too many workspace inbound call sites (1001, limit 1000)"),
+        "{}",
+        result.report
+    );
+    assert!(
+        result
+            .report
+            .contains("No dead code or unused abstraction smells met minScore 8."),
+        "{}",
+        result.report
+    );
+}
+
+#[test]
+fn python_dead_code_smell_honors_usage_candidate_file_cap() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+def helper():
+    return 1
+"#,
+        )
+        .file("consumer.py", "def run():\n    return 2\n")
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let helper = python_definition(&analyzer, "service.helper");
+
+    let result = report_dead_code_and_unused_abstraction_smells(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec!["service.py".to_string(), "consumer.py".to_string()],
+            fq_names: vec![helper.fq_name()],
+            max_usage_candidate_files: 1,
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        result
+            .report
+            .contains("Python usage graph candidate files exceeded cap 1 (2 Python files)"),
+        "{}",
+        result.report
+    );
+    assert!(
+        result
+            .report
+            .contains("No dead code or unused abstraction smells met minScore 8."),
+        "{}",
+        result.report
+    );
+}
+
+#[test]
+fn python_dead_code_smell_honors_usage_cap() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+def helper():
+    return 1
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+from service import helper
+
+def first():
+    return helper()
+
+def second():
+    return helper()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let helper = python_definition(&analyzer, "service.helper");
+
+    let result = report_dead_code_and_unused_abstraction_smells(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec!["service.py".to_string(), "consumer.py".to_string()],
+            fq_names: vec![helper.fq_name()],
+            max_usages_per_symbol: 1,
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        result
+            .report
+            .contains("too many workspace inbound call sites (2, limit 1)"),
+        "{}",
+        result.report
+    );
     assert!(
         result
             .report
