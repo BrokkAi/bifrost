@@ -5,9 +5,7 @@ mod resolver;
 mod shared;
 
 use crate::analyzer::usages::common::language_for_target;
-use crate::analyzer::usages::cpp_graph::resolver::{
-    TargetKind, TargetSpec,
-};
+use crate::analyzer::usages::cpp_graph::resolver::{TargetKind, TargetSpec};
 use crate::analyzer::usages::cpp_graph::shared::{CppEdgeResolver, CppQueryResolver};
 use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::model::FuzzyResult;

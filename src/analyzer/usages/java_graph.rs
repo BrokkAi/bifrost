@@ -5,14 +5,12 @@ mod jvm_scala;
 mod resolver;
 mod shared;
 
-pub(crate) use inverted::build_java_usage_edges;
-
 use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::inverted_edges::UsageEdges;
-use crate::analyzer::usages::java_graph::shared::{JavaEdgeResolver, JavaQueryResolver};
 use crate::analyzer::usages::java_graph::resolver::{
     TargetKind, TargetSpec, resolve_java_analyzer,
 };
+use crate::analyzer::usages::java_graph::shared::{JavaEdgeResolver, JavaQueryResolver};
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::UsageAnalyzer;
