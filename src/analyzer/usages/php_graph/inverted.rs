@@ -46,8 +46,7 @@ use tree_sitter::Node;
 pub(super) type ParsedPhpFile = ParsedTreeFile;
 
 /// Build the whole PHP `caller -> callee` edge set in a single inverted pass over
-/// the workspace. Returns `None` when there are no PHP files. `nodes`/`keep_file`
-/// mirror the Go builder.
+/// the resolver-owned file set. `nodes`/`keep_file` mirror the Go builder.
 pub(super) fn build_php_edges<F>(
     analyzer: &dyn IAnalyzer,
     graph: &PhpEdgeGraph,

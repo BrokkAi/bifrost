@@ -42,8 +42,7 @@ use tree_sitter::Node;
 pub(super) type ParsedCppFile = ParsedTreeFile;
 
 /// Build the whole C++ `caller -> callee` edge set in a single inverted pass over
-/// the workspace. Returns `None` when there are no C++ files. `nodes`/`keep_file`
-/// mirror the Go builder.
+/// the resolver-owned file set. `nodes`/`keep_file` mirror the Go builder.
 pub(super) fn build_cpp_edges<F>(
     analyzer: &dyn IAnalyzer,
     graph: &CppEdgeGraph,
