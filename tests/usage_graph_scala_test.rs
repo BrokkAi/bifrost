@@ -1,18 +1,24 @@
 mod common;
 
-use brokk_bifrost::SearchToolsService;
+use brokk_bifrost::{Language, SearchToolsService};
+use common::InlineTestProject;
 use common::usage_graph::{assert_every_edge_endpoint_is_a_node, has_edge};
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn usage_graph() -> Value {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures")
         .join("usage-graph-scala");
-    let service = SearchToolsService::new(root).expect("service");
+    usage_graph_at(root, "{}")
+}
+
+fn usage_graph_at(root: impl AsRef<Path>, args: &str) -> Value {
+    let service = SearchToolsService::new_without_semantic_index(root.as_ref().to_path_buf())
+        .expect("service");
     let payload = service
-        .call_tool_json("usage_graph", "{}")
+        .call_tool_json("usage_graph", args)
         .expect("usage_graph call failed");
     serde_json::from_str(&payload).expect("invalid JSON")
 }
@@ -159,6 +165,90 @@ fn scala3_indented_this_and_block_scoping() {
             "example.Service.run"
         ),
         "indented-block shadow must not leak to the method scope: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn path_filter_only_emits_matching_scala_callers() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "example/Helpers.scala",
+            r#"package example
+
+object Helpers {
+  def help(): Int = 1
+}
+"#,
+        )
+        .file(
+            "example/Kept.scala",
+            r#"package example
+
+class Kept {
+  def call(): Int = Helpers.help()
+}
+"#,
+        )
+        .file(
+            "example/Ignored.scala",
+            r#"package example
+
+class Ignored {
+  def call(): Int = Helpers.help()
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), r#"{"paths":["example/Kept.scala"]}"#);
+    assert!(
+        has_edge(&value, "example.Kept.call", "example.Helpers$.help"),
+        "kept Scala caller should still resolve object callee nodes: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "example.Ignored.call", "example.Helpers$.help"),
+        "path-filtered usage_graph must not emit edges from ignored callers: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn scoped_usage_graph_skips_unrelated_invalid_scala_callers() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "example/Helpers.scala",
+            r#"package example
+
+object Helpers {
+  def help(): Int = 1
+}
+"#,
+        )
+        .file(
+            "example/Kept.scala",
+            r#"package example
+
+class Kept {
+  def call(): Int = Helpers.help()
+}
+"#,
+        )
+        .file(
+            "broken/Broken.scala",
+            r#"package broken
+
+class Broken {
+  def nope(
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), r#"{"paths":["example/Kept.scala"]}"#);
+    assert!(
+        has_edge(&value, "example.Kept.call", "example.Helpers$.help"),
+        "filtered Scala edge graph should not require parsing unrelated callers: {}",
         value["edges"]
     );
 }
