@@ -8,8 +8,8 @@ mod common;
 use brokk_bifrost::{
     GoAnalyzer, IAnalyzer, ImportAnalysisProvider, Language, ProjectFile,
     searchtools::{
-        ScanUsagesParams, SearchSymbolsParams, SymbolLookupParams, get_symbol_sources, scan_usages,
-        search_symbols,
+        ScanUsagesParams, SearchSymbolsParams, SymbolLookupParams, get_symbol_locations,
+        get_symbol_sources, scan_usages, search_symbols,
     },
 };
 use common::InlineTestProject;
@@ -127,6 +127,35 @@ fn get_symbol_sources_resolves_exact_canonical_and_flags_bare_ambiguity() {
             && matches.contains("example.com/repo/b/list.TestListRun"),
         "ambiguity matches must be canonical: {matches:#?}"
     );
+}
+
+#[test]
+fn get_symbol_locations_uses_canonical_suffix_without_losing_ambiguity() {
+    let project = canonical_project();
+    let analyzer = GoAnalyzer::from_project(project.project().clone());
+
+    let exact = get_symbol_locations(
+        &analyzer,
+        SymbolLookupParams {
+            symbols: vec!["example.com/repo/a/list.Run".to_string()],
+        },
+    );
+    assert!(exact.not_found.is_empty(), "{exact:#?}");
+    assert_eq!(1, exact.locations.len(), "{exact:#?}");
+    assert_eq!("example.com/repo/a/list.Run", exact.locations[0].symbol);
+
+    let bare = get_symbol_locations(
+        &analyzer,
+        SymbolLookupParams {
+            symbols: vec!["list.Run".to_string()],
+        },
+    );
+    assert_eq!(
+        vec!["list.Run".to_string()],
+        bare.not_found,
+        "ambiguous bare suffix must not collapse to one location: {bare:#?}"
+    );
+    assert!(bare.locations.is_empty(), "{bare:#?}");
 }
 
 #[test]
