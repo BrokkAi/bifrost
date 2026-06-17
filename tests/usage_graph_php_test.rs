@@ -1,10 +1,10 @@
 mod common;
 
-use brokk_bifrost::{Language, SearchToolsService};
+use brokk_bifrost::Language;
 use common::InlineTestProject;
-use common::usage_graph::{assert_every_edge_endpoint_is_a_node, has_edge};
+use common::usage_graph::{assert_every_edge_endpoint_is_a_node, has_edge, usage_graph_at};
 use serde_json::Value;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn usage_graph() -> Value {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -12,15 +12,6 @@ fn usage_graph() -> Value {
         .join("fixtures")
         .join("usage-graph-php");
     usage_graph_at(root, "{}")
-}
-
-fn usage_graph_at(root: impl AsRef<Path>, args: &str) -> Value {
-    let service = SearchToolsService::new_without_semantic_index(root.as_ref().to_path_buf())
-        .expect("service");
-    let payload = service
-        .call_tool_json("usage_graph", args)
-        .expect("usage_graph call failed");
-    serde_json::from_str(&payload).expect("invalid JSON")
 }
 
 #[test]

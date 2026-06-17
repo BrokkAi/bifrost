@@ -85,9 +85,9 @@ The observable outcome is that existing `scan_usages` and `usage_graph` response
 
 ## Outcomes & Retrospective
 
-Java and C# have been brought forward onto the post-#189 codebase as internal resolver/cache ownership refactors, and their focused graph/forward usage suites plus clippy pass. The public tool schema remains owned by #189. C++, PHP, and Scala remain to be migrated under #192.
+Java and C# were brought forward onto the post-#189 codebase as internal resolver/cache ownership refactors, and their focused graph/forward usage suites plus clippy pass. The public tool schema remains owned by #189.
 
-The C++ slice now also uses internal mode-specific resolver/cache ownership. `CppQueryResolver` owns forward query setup, and `CppEdgeResolver` owns edge-side file discovery, filtered parsing, include-closure visibility construction, and delegation to the inverted C++ edge walker. PHP and Scala remain to be migrated under #192.
+The C++ slice now also uses internal mode-specific resolver/cache ownership. `CppQueryResolver` owns forward query setup, and `CppEdgeResolver` owns edge-side file discovery, filtered parsing, include-closure visibility construction, and delegation to the inverted C++ edge walker.
 
 The PHP slice now also uses internal mode-specific resolver/cache ownership. `PhpQueryResolver` owns forward query setup, including optional `PhpHierarchyIndex` construction for method and field targets. `PhpEdgeResolver` owns edge-side file discovery and filtered parsing before delegating to the inverted PHP edge walker.
 
@@ -283,8 +283,8 @@ Scala now exposes internal resolver types in `src/analyzer/usages/scala_graph/sh
 
 2026-06-17: Updated progress, outcomes, and artifacts after running formatting, focused Java/C# tests, combined usage graph regression tests, and clippy successfully.
 
-2026-06-17: Completed the C++ shared resolver/cache ownership slice, added edge-scope regression tests, and recorded validation evidence. PHP and Scala remain.
+2026-06-17: Completed the C++ shared resolver/cache ownership slice, added edge-scope regression tests, and recorded validation evidence.
 
-2026-06-17: Completed the PHP shared resolver/cache ownership slice, added edge-scope regression tests, and recorded validation evidence. Scala remains.
+2026-06-17: Completed the PHP shared resolver/cache ownership slice, added edge-scope regression tests, and recorded validation evidence.
 
 2026-06-17: Completed the Scala shared resolver/cache ownership slice, added edge-scope regression tests, and completed the analyzer-backed language migration plan.

@@ -1,10 +1,10 @@
 mod common;
 
-use brokk_bifrost::{Language, SearchToolsService};
+use brokk_bifrost::Language;
 use common::InlineTestProject;
-use common::usage_graph::assert_every_edge_endpoint_is_a_node;
+use common::usage_graph::{assert_every_edge_endpoint_is_a_node, usage_graph_at};
 use serde_json::Value;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -15,15 +15,6 @@ fn fixture_root() -> PathBuf {
 
 fn usage_graph() -> Value {
     usage_graph_at(fixture_root(), "{}")
-}
-
-fn usage_graph_at(root: impl AsRef<Path>, args: &str) -> Value {
-    let service = SearchToolsService::new_without_semantic_index(root.as_ref().to_path_buf())
-        .expect("service");
-    let payload = service
-        .call_tool_json("usage_graph", args)
-        .expect("usage_graph call failed");
-    serde_json::from_str(&payload).expect("invalid JSON")
 }
 
 fn find_edge<'a>(value: &'a Value, from_suffix: &str, to: &str) -> Option<&'a Value> {
