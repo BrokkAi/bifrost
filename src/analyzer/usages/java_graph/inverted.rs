@@ -18,75 +18,43 @@
 //! typing are not resolved — a recall gap, not a wrong edge. This mirrors the
 //! receiver shapes the forward Java scan proves.
 
-use super::resolver::{is_ignored_type_context, node_text, resolve_java_analyzer};
+use super::resolver::{is_ignored_type_context, node_text};
+use super::shared::JavaEdgeGraph;
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, first_precise,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::analyzer::{IAnalyzer, JavaAnalyzer, Language, ProjectFile};
-use crate::hash::{HashMap, HashSet};
-use crate::text_utils::compute_line_starts;
-use rayon::prelude::*;
-use tree_sitter::{Node, Parser, Tree};
+use crate::analyzer::usages::parsed_tree::ParsedTreeFile;
+use crate::analyzer::{IAnalyzer, JavaAnalyzer, ProjectFile};
+use crate::hash::HashSet;
+use tree_sitter::Node;
 
 /// A Java file parsed once for the inverted scan: source, tree, and line starts.
-struct ParsedFile {
-    source: String,
-    tree: Tree,
-    line_starts: Vec<usize>,
-}
+pub(super) type ParsedJavaFile = ParsedTreeFile;
 
-/// Build the whole Java `caller -> callee` edge set in a single inverted pass
-/// over the workspace. Returns `None` when there are no Java files.
-/// `nodes`/`keep_file` mirror the Go builder.
-pub(crate) fn build_java_usage_edges<F>(
+pub(super) fn build_java_edges<F>(
     analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    graph: &JavaEdgeGraph,
     nodes: &HashSet<String>,
     keep_file: F,
-) -> Option<UsageEdges>
+) -> UsageEdges
 where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
-    let java = resolve_java_analyzer(analyzer)?;
-    let files: Vec<ProjectFile> = analyzer
-        .project()
-        .analyzable_files(Language::Java)
-        .ok()?
-        .into_iter()
-        .collect();
-    let parsed: HashMap<ProjectFile, ParsedFile> = files
-        .par_iter()
-        .filter(|file| keep_file(file))
-        .filter_map(|file| {
-            let source = file.read_to_string().ok()?;
-            if source.is_empty() {
-                return None;
-            }
-            let mut parser = Parser::new();
-            parser
-                .set_language(&tree_sitter_java::LANGUAGE.into())
-                .ok()?;
-            let tree = parser.parse(source.as_str(), None)?;
-            let line_starts = compute_line_starts(&source);
-            Some((
-                file.clone(),
-                ParsedFile {
-                    source,
-                    tree,
-                    line_starts,
-                },
-            ))
-        })
-        .collect();
-
-    Some(build_edges(
+    build_edges(
         analyzer,
-        &files,
+        &graph.files,
         nodes,
         keep_file,
-        |file| parsed.get(file).map(|parsed| parsed.line_starts.as_slice()),
+        |file| {
+            graph
+                .parsed
+                .get(file)
+                .map(|parsed| parsed.line_starts.as_slice())
+        },
         |file, collector| {
-            let Some(parsed) = parsed.get(file) else {
+            let Some(parsed) = graph.parsed.get(file) else {
                 return;
             };
             let mut ctx = JavaScan {
@@ -99,7 +67,7 @@ where
             let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
             walk(parsed.tree.root_node(), &mut ctx, &mut bindings);
         },
-    ))
+    )
 }
 
 struct JavaScan<'a, 'b> {

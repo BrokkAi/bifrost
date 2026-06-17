@@ -23,97 +23,52 @@
 //! receiver shapes the forward C++ scan proves.
 
 use super::resolver::{
-    VisibilityIndex, collect_include_closure, extract_variable_name, first_type_child,
-    is_declaration_name, is_declarator_node, normalize_type_text, resolve_cpp_analyzer,
+    VisibilityIndex, extract_variable_name, first_type_child, is_declaration_name,
+    is_declarator_node, normalize_type_text,
 };
+use super::shared::CppEdgeGraph;
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, first_precise,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
+use crate::analyzer::usages::parsed_tree::ParsedTreeFile;
 use crate::analyzer::{
-    CodeUnit, IAnalyzer, Language, ProjectFile, cpp_node_text as node_text,
-    normalize_cpp_whitespace,
+    CodeUnit, IAnalyzer, ProjectFile, cpp_node_text as node_text, normalize_cpp_whitespace,
 };
-use crate::hash::{HashMap, HashSet};
-use crate::text_utils::compute_line_starts;
-use rayon::prelude::*;
-use tree_sitter::{Node, Parser, Tree};
+use crate::hash::HashSet;
+use tree_sitter::Node;
 
 /// A C++ file parsed once for the inverted scan: source, tree, and line starts.
-struct ParsedFile {
-    source: String,
-    tree: Tree,
-    line_starts: Vec<usize>,
-}
+pub(super) type ParsedCppFile = ParsedTreeFile;
 
 /// Build the whole C++ `caller -> callee` edge set in a single inverted pass over
-/// the workspace. Returns `None` when there are no C++ files. `nodes`/`keep_file`
-/// mirror the Go builder.
-pub(crate) fn build_cpp_usage_edges<F>(
+/// the resolver-owned file set. `nodes`/`keep_file` mirror the Go builder.
+pub(super) fn build_cpp_edges<F>(
     analyzer: &dyn IAnalyzer,
+    graph: &CppEdgeGraph,
     nodes: &HashSet<String>,
     keep_file: F,
-) -> Option<UsageEdges>
+) -> UsageEdges
 where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
-    let cpp = resolve_cpp_analyzer(analyzer)?;
-    let files: Vec<ProjectFile> = analyzer
-        .project()
-        .analyzable_files(Language::Cpp)
-        .ok()?
-        .into_iter()
-        .collect();
-
-    // Resolution honors each caller file's include closure, so the visibility
-    // index is seeded with every in-scope caller file as a root (mirroring the
-    // forward scan, which builds it from the query's candidate files).
-    let roots: HashSet<ProjectFile> = {
-        let mut roots = HashSet::default();
-        for file in files.iter().filter(|file| keep_file(file)) {
-            collect_include_closure(cpp, analyzer, file, &mut roots);
-        }
-        roots
-    };
-    let visibility = VisibilityIndex::build(cpp, analyzer, &roots);
-
-    let parsed: HashMap<ProjectFile, ParsedFile> = files
-        .par_iter()
-        .filter(|file| keep_file(file))
-        .filter_map(|file| {
-            let source = file.read_to_string().ok()?;
-            if source.is_empty() {
-                return None;
-            }
-            let mut parser = Parser::new();
-            parser
-                .set_language(&tree_sitter_cpp::LANGUAGE.into())
-                .ok()?;
-            let tree = parser.parse(source.as_str(), None)?;
-            let line_starts = compute_line_starts(&source);
-            Some((
-                file.clone(),
-                ParsedFile {
-                    source,
-                    tree,
-                    line_starts,
-                },
-            ))
-        })
-        .collect();
-
-    Some(build_edges(
+    build_edges(
         analyzer,
-        &files,
+        &graph.files,
         nodes,
         keep_file,
-        |file| parsed.get(file).map(|parsed| parsed.line_starts.as_slice()),
+        |file| {
+            graph
+                .parsed
+                .get(file)
+                .map(|parsed| parsed.line_starts.as_slice())
+        },
         |file, collector| {
-            let Some(parsed) = parsed.get(file) else {
+            let Some(parsed) = graph.parsed.get(file) else {
                 return;
             };
             let mut ctx = CppScan {
-                visibility: &visibility,
+                visibility: &graph.visibility,
                 file,
                 source: parsed.source.as_str(),
                 class_ranges: ClassRangeIndex::build(analyzer, file),
@@ -122,7 +77,7 @@ where
             let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
             walk(parsed.tree.root_node(), &mut ctx, &mut bindings);
         },
-    ))
+    )
 }
 
 struct CppScan<'a, 'b> {

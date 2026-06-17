@@ -1,6 +1,19 @@
 //! Shared assertion helpers for the `usage_graph_*` end-to-end tests.
 
+use brokk_bifrost::SearchToolsService;
 use serde_json::Value;
+use std::path::Path;
+
+/// Invoke the `usage_graph` tool without starting semantic indexing.
+#[allow(dead_code)]
+pub fn usage_graph_at(root: impl AsRef<Path>, args: &str) -> Value {
+    let service = SearchToolsService::new_without_semantic_index(root.as_ref().to_path_buf())
+        .expect("service");
+    let payload = service
+        .call_tool_json("usage_graph", args)
+        .expect("usage_graph call failed");
+    serde_json::from_str(&payload).expect("invalid JSON")
+}
 
 /// True when an edge with exactly this `from` and `to` exists.
 #[allow(dead_code)]

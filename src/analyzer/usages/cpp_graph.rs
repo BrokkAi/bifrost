@@ -2,20 +2,28 @@ mod extractor;
 mod hits;
 mod inverted;
 mod resolver;
+mod shared;
 
-pub(crate) use inverted::build_cpp_usage_edges;
-
-use crate::analyzer::usages::common::{language_for_file, language_for_target};
-use crate::analyzer::usages::cpp_graph::extractor::{ScanState, scan_file};
-use crate::analyzer::usages::cpp_graph::resolver::{
-    TargetSpec, VisibilityIndex, resolve_cpp_analyzer,
-};
+use crate::analyzer::usages::common::language_for_target;
+use crate::analyzer::usages::cpp_graph::shared::{CppEdgeResolver, CppQueryResolver};
+use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::UsageAnalyzer;
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::HashSet;
-use std::collections::BTreeSet;
+
+pub(crate) fn build_cpp_usage_edges<F>(
+    analyzer: &dyn IAnalyzer,
+    nodes: &HashSet<String>,
+    keep_file: F,
+) -> Option<UsageEdges>
+where
+    F: Fn(&ProjectFile) -> bool + Sync,
+{
+    let resolver = CppEdgeResolver::new(analyzer, &keep_file)?;
+    Some(resolver.build_edges(analyzer, nodes, keep_file))
+}
 
 #[derive(Default)]
 pub struct CppUsageGraphStrategy {
@@ -51,7 +59,7 @@ impl CppUsageGraphStrategy {
             );
         }
 
-        let Some(cpp) = resolve_cpp_analyzer(analyzer) else {
+        let Some(resolver) = CppQueryResolver::new(analyzer) else {
             return GraphUsageOutcome::fallback_safe(
                 target.fq_name(),
                 GraphFailureReason::MissingAnalyzerCapability(
@@ -61,58 +69,7 @@ impl CppUsageGraphStrategy {
             );
         };
 
-        let Some(spec) = TargetSpec::from_target(analyzer, target) else {
-            return GraphUsageOutcome::fallback_safe(
-                target.fq_name(),
-                GraphFailureReason::UnsupportedTargetShape("target shape is unsupported"),
-                "CppUsageGraphStrategy",
-            );
-        };
-
-        let files: HashSet<ProjectFile> = candidate_files
-            .iter()
-            .filter(|file| language_for_file(file) == Language::Cpp)
-            .cloned()
-            .chain(std::iter::once(target.source().clone()))
-            .collect();
-        let visibility = VisibilityIndex::build(cpp, analyzer, &files);
-
-        let mut hits = BTreeSet::new();
-        let mut saw_unproven_match = false;
-        let mut raw_match_count = 0usize;
-        let mut limit_exceeded = false;
-        let mut state = ScanState {
-            max_usages,
-            hits: &mut hits,
-            saw_unproven_match: &mut saw_unproven_match,
-            raw_match_count: &mut raw_match_count,
-            limit_exceeded: &mut limit_exceeded,
-        };
-
-        for file in files {
-            scan_file(analyzer, &visibility, &file, &spec, &mut state);
-            if *state.limit_exceeded {
-                break;
-            }
-        }
-
-        if saw_unproven_match {
-            return GraphUsageOutcome::fallback_safe(
-                target.fq_name(),
-                GraphFailureReason::UnsafeInference("no proven structured hits"),
-                "CppUsageGraphStrategy",
-            );
-        }
-
-        if limit_exceeded || hits.len() > max_usages {
-            return GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites {
-                short_name: target.short_name().to_string(),
-                total_callsites: hits.len(),
-                limit: max_usages,
-            });
-        }
-
-        GraphUsageOutcome::Resolved(FuzzyResult::success(target.clone(), hits))
+        resolver.find_usages(analyzer, target, candidate_files, max_usages)
     }
 }
 

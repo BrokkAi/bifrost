@@ -1,7 +1,8 @@
 mod common;
 
-use brokk_bifrost::SearchToolsService;
-use common::usage_graph::assert_every_edge_endpoint_is_a_node;
+use brokk_bifrost::Language;
+use common::InlineTestProject;
+use common::usage_graph::{assert_every_edge_endpoint_is_a_node, usage_graph_at};
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -13,11 +14,7 @@ fn fixture_root() -> PathBuf {
 }
 
 fn usage_graph() -> Value {
-    let service = SearchToolsService::new(fixture_root()).expect("service");
-    let payload = service
-        .call_tool_json("usage_graph", "{}")
-        .expect("usage_graph call failed");
-    serde_json::from_str(&payload).expect("invalid JSON")
+    usage_graph_at(fixture_root(), "{}")
 }
 
 fn find_edge<'a>(value: &'a Value, from_suffix: &str, to: &str) -> Option<&'a Value> {
@@ -135,6 +132,160 @@ fn untyped_local_named_like_a_type_produces_no_static_edge() {
     assert!(
         find_edge(&value, "shadowFallback", "com.example.Service.run").is_none(),
         "an untyped local must not fall back to static type resolution: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn path_filter_only_emits_matching_java_callers() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "com/example/Util.java",
+            r#"
+package com.example;
+
+public class Util {
+    public static void helper() {}
+}
+"#,
+        )
+        .file(
+            "com/example/Kept.java",
+            r#"
+package com.example;
+
+public class Kept {
+    void run() {
+        Util.helper();
+    }
+}
+"#,
+        )
+        .file(
+            "com/example/Ignored.java",
+            r#"
+package com.example;
+
+public class Ignored {
+    void run() {
+        Util.helper();
+    }
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), r#"{"paths":["com/example/Kept.java"]}"#);
+    assert!(
+        find_edge(&value, "com.example.Kept.run", "com.example.Util.helper").is_some(),
+        "kept caller should still resolve static callee nodes: {}",
+        value["edges"]
+    );
+    assert!(
+        find_edge(&value, "com.example.Ignored.run", "com.example.Util.helper").is_none(),
+        "path-filtered usage_graph must not emit edges from ignored callers: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn include_tests_false_excludes_java_test_callers() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "com/example/Util.java",
+            r#"
+package com.example;
+
+public class Util {
+    public static void helper() {}
+}
+"#,
+        )
+        .file(
+            "com/example/Prod.java",
+            r#"
+package com.example;
+
+public class Prod {
+    void run() {
+        Util.helper();
+    }
+}
+"#,
+        )
+        .file(
+            "com/example/ProdTest.java",
+            r#"
+package com.example;
+
+public class ProdTest {
+    @Test
+    void testRun() {
+        Util.helper();
+    }
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), r#"{"include_tests":false}"#);
+    assert!(
+        find_edge(&value, "com.example.Prod.run", "com.example.Util.helper").is_some(),
+        "production caller should remain in the graph: {}",
+        value["edges"]
+    );
+    assert!(
+        find_edge(
+            &value,
+            "com.example.ProdTest.testRun",
+            "com.example.Util.helper"
+        )
+        .is_none(),
+        "test callers should be excluded when include_tests is false: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn scoped_usage_graph_skips_unrelated_invalid_java_callers() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "com/example/Util.java",
+            r#"
+package com.example;
+
+public class Util {
+    public static void helper() {}
+}
+"#,
+        )
+        .file(
+            "com/example/Kept.java",
+            r#"
+package com.example;
+
+public class Kept {
+    void run() {
+        Util.helper();
+    }
+}
+"#,
+        )
+        .file(
+            "broken/Broken.java",
+            r#"
+package broken;
+
+public class Broken {
+    void nope(
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), r#"{"paths":["com/example/Kept.java"]}"#);
+    assert!(
+        find_edge(&value, "com.example.Kept.run", "com.example.Util.helper").is_some(),
+        "filtered Java edge graph should not require parsing unrelated callers: {}",
         value["edges"]
     );
 }

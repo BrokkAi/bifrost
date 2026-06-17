@@ -2,19 +2,29 @@ mod extractor;
 mod hits;
 mod inverted;
 mod resolver;
+mod shared;
 pub(super) mod syntax;
 
-pub(crate) use inverted::build_scala_usage_edges;
-
-use crate::analyzer::usages::common::{language_for_file, language_for_target};
+use crate::analyzer::usages::common::language_for_target;
+use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::usages::scala_graph::extractor::scan_file;
-use crate::analyzer::usages::scala_graph::resolver::{TargetSpec, resolve_scala_analyzer};
+use crate::analyzer::usages::scala_graph::shared::{ScalaEdgeResolver, ScalaQueryResolver};
 use crate::analyzer::usages::traits::UsageAnalyzer;
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::HashSet;
-use std::collections::BTreeSet;
+
+pub(crate) fn build_scala_usage_edges<F>(
+    analyzer: &dyn IAnalyzer,
+    nodes: &HashSet<String>,
+    keep_file: F,
+) -> Option<UsageEdges>
+where
+    F: Fn(&ProjectFile) -> bool + Sync,
+{
+    let resolver = ScalaEdgeResolver::new(analyzer, &keep_file)?;
+    Some(resolver.build_edges(analyzer, nodes, keep_file))
+}
 
 #[derive(Default)]
 pub struct ScalaUsageGraphStrategy {
@@ -50,7 +60,7 @@ impl ScalaUsageGraphStrategy {
             );
         }
 
-        let Some(scala) = resolve_scala_analyzer(analyzer) else {
+        let Some(resolver) = ScalaQueryResolver::new(analyzer) else {
             return GraphUsageOutcome::fallback_safe(
                 target.fq_name(),
                 GraphFailureReason::MissingAnalyzerCapability(
@@ -60,46 +70,7 @@ impl ScalaUsageGraphStrategy {
             );
         };
 
-        let Some(spec) = TargetSpec::from_target(scala, target) else {
-            return GraphUsageOutcome::fallback_safe(
-                target.fq_name(),
-                GraphFailureReason::UnsupportedTargetShape("target shape is unsupported"),
-                "ScalaUsageGraphStrategy",
-            );
-        };
-
-        let files: HashSet<ProjectFile> = candidate_files
-            .iter()
-            .filter(|file| language_for_file(file) == Language::Scala)
-            .cloned()
-            .chain(std::iter::once(target.source().clone()))
-            .collect();
-
-        let mut hits = BTreeSet::new();
-        let mut limit_exceeded = false;
-        for file in files {
-            scan_file(
-                scala,
-                analyzer,
-                &file,
-                &spec,
-                &mut hits,
-                max_usages,
-                &mut limit_exceeded,
-            );
-            if hits.len() > max_usages {
-                return GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites {
-                    short_name: target.short_name().to_string(),
-                    total_callsites: hits.len(),
-                    limit: max_usages,
-                });
-            }
-            if limit_exceeded {
-                break;
-            }
-        }
-
-        GraphUsageOutcome::Resolved(FuzzyResult::success(target.clone(), hits))
+        resolver.find_usages(analyzer, target, candidate_files, max_usages)
     }
 }
 

@@ -21,30 +21,24 @@
 //! `$`-encoded object). Receivers needing return-type inference (method chains)
 //! are an unhandled recall gap, not a wrong edge.
 
-use super::resolver::{
-    package_name_of, resolve_scala_analyzer, scala_display_name, scala_normalized_fq_name,
-};
+use super::resolver::{package_name_of, scala_display_name, scala_normalized_fq_name};
+use super::shared::ScalaEdgeGraph;
 use super::syntax::{node_text, scala_import_path};
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, first_precise,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::analyzer::{IAnalyzer, ImportAnalysisProvider, Language, ProjectFile, ScalaAnalyzer};
+use crate::analyzer::usages::parsed_tree::ParsedTreeFile;
+use crate::analyzer::{IAnalyzer, ImportAnalysisProvider, ProjectFile, ScalaAnalyzer};
 use crate::hash::{HashMap, HashSet};
-use crate::text_utils::compute_line_starts;
-use rayon::prelude::*;
-use tree_sitter::{Node, Parser, Tree};
+use tree_sitter::Node;
 
 /// A Scala file parsed once for the inverted scan: source, tree, and line starts.
-struct ParsedFile {
-    source: String,
-    tree: Tree,
-    line_starts: Vec<usize>,
-}
+pub(super) type ParsedScalaFile = ParsedTreeFile;
 
 /// Every class/object/trait/enum the project declares, indexed for the per-file
 /// name->fqn rebuild. Built once and shared across all files' scans.
-struct ProjectTypes {
+pub(super) struct ProjectTypes {
     /// `(package, source_name) -> fqn` — a type reachable by simple name from a
     /// file in the same package (or via a wildcard import of that package).
     by_package: HashMap<(String, String), String>,
@@ -54,7 +48,7 @@ struct ProjectTypes {
 }
 
 impl ProjectTypes {
-    fn build(scala: &ScalaAnalyzer) -> Self {
+    pub(super) fn build(scala: &ScalaAnalyzer) -> Self {
         let mut by_package = HashMap::default();
         let mut by_normalized_fqn = HashMap::default();
         for unit in scala.all_declarations().filter(|unit| unit.is_class()) {
@@ -135,60 +129,33 @@ fn simple_type_name(type_text: &str) -> Option<&str> {
 }
 
 /// Build the whole Scala `caller -> callee` edge set in a single inverted pass
-/// over the workspace. Returns `None` when there are no Scala files.
+/// over the workspace.
 /// `nodes`/`keep_file` mirror the Go builder.
-pub(crate) fn build_scala_usage_edges<F>(
+pub(super) fn build_scala_edges<F>(
     analyzer: &dyn IAnalyzer,
+    graph: &ScalaEdgeGraph<'_>,
     nodes: &HashSet<String>,
     keep_file: F,
-) -> Option<UsageEdges>
+) -> UsageEdges
 where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
-    let scala = resolve_scala_analyzer(analyzer)?;
-    let files: Vec<ProjectFile> = analyzer
-        .project()
-        .analyzable_files(Language::Scala)
-        .ok()?
-        .into_iter()
-        .collect();
-    let types = ProjectTypes::build(scala);
-    let parsed: HashMap<ProjectFile, ParsedFile> = files
-        .par_iter()
-        .filter(|file| keep_file(file))
-        .filter_map(|file| {
-            let source = file.read_to_string().ok()?;
-            if source.is_empty() {
-                return None;
-            }
-            let mut parser = Parser::new();
-            parser
-                .set_language(&tree_sitter_scala::LANGUAGE.into())
-                .ok()?;
-            let tree = parser.parse(source.as_str(), None)?;
-            let line_starts = compute_line_starts(&source);
-            Some((
-                file.clone(),
-                ParsedFile {
-                    source,
-                    tree,
-                    line_starts,
-                },
-            ))
-        })
-        .collect();
-
-    Some(build_edges(
+    build_edges(
         analyzer,
-        &files,
+        &graph.files,
         nodes,
         keep_file,
-        |file| parsed.get(file).map(|parsed| parsed.line_starts.as_slice()),
+        |file| {
+            graph
+                .parsed
+                .get(file)
+                .map(|parsed| parsed.line_starts.as_slice())
+        },
         |file, collector| {
-            let Some(parsed) = parsed.get(file) else {
+            let Some(parsed) = graph.parsed.get(file) else {
                 return;
             };
-            let resolver = NameResolver::for_file(scala, file, &types);
+            let resolver = NameResolver::for_file(graph.scala, file, &graph.types);
             let mut ctx = ScalaScan {
                 source: parsed.source.as_str(),
                 resolver: &resolver,
@@ -198,7 +165,7 @@ where
             let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
             walk(parsed.tree.root_node(), &mut ctx, &mut bindings);
         },
-    ))
+    )
 }
 
 struct ScalaScan<'a, 'b> {

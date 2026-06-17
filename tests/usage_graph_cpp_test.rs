@@ -1,7 +1,8 @@
 mod common;
 
-use brokk_bifrost::SearchToolsService;
-use common::usage_graph::{assert_every_edge_endpoint_is_a_node, has_edge};
+use brokk_bifrost::Language;
+use common::InlineTestProject;
+use common::usage_graph::{assert_every_edge_endpoint_is_a_node, has_edge, usage_graph_at};
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -10,11 +11,7 @@ fn usage_graph() -> Value {
         .join("tests")
         .join("fixtures")
         .join("usage-graph-cpp");
-    let service = SearchToolsService::new(root).expect("service");
-    let payload = service
-        .call_tool_json("usage_graph", "{}")
-        .expect("usage_graph call failed");
-    serde_json::from_str(&payload).expect("invalid JSON")
+    usage_graph_at(root, "{}")
 }
 
 #[test]
@@ -137,4 +134,121 @@ fn unused_member_has_no_incoming_edge_and_no_self_edges() {
 #[test]
 fn every_edge_endpoint_is_a_node() {
     assert_every_edge_endpoint_is_a_node(&usage_graph());
+}
+
+#[test]
+fn path_filter_only_emits_matching_cpp_callers() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "service.h",
+            r#"
+namespace example {
+
+class Service {
+public:
+    static void helper() {}
+};
+
+} // namespace example
+"#,
+        )
+        .file(
+            "kept.cpp",
+            r#"
+#include "service.h"
+
+namespace example {
+
+class Kept {
+public:
+    void run() {
+        Service::helper();
+    }
+};
+
+} // namespace example
+"#,
+        )
+        .file(
+            "ignored.cpp",
+            r#"
+#include "service.h"
+
+namespace example {
+
+class Ignored {
+public:
+    void run() {
+        Service::helper();
+    }
+};
+
+} // namespace example
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), r#"{"paths":["kept.cpp"]}"#);
+    assert!(
+        has_edge(&value, "example.Kept.run", "example.Service.helper"),
+        "kept caller should still resolve static callee nodes: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "example.Ignored.run", "example.Service.helper"),
+        "path-filtered usage_graph must not emit edges from ignored callers: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn scoped_usage_graph_skips_unrelated_invalid_cpp_callers() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "service.h",
+            r#"
+namespace example {
+
+class Service {
+public:
+    static void helper() {}
+};
+
+} // namespace example
+"#,
+        )
+        .file(
+            "kept.cpp",
+            r#"
+#include "service.h"
+
+namespace example {
+
+class Kept {
+public:
+    void run() {
+        Service::helper();
+    }
+};
+
+} // namespace example
+"#,
+        )
+        .file(
+            "broken.cpp",
+            r#"
+namespace broken {
+
+class Broken {
+    void nope(
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), r#"{"paths":["kept.cpp"]}"#);
+    assert!(
+        has_edge(&value, "example.Kept.run", "example.Service.helper"),
+        "filtered C++ edge graph should not require parsing unrelated callers: {}",
+        value["edges"]
+    );
 }
