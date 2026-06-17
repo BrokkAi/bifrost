@@ -3,7 +3,7 @@ mod common;
 use brokk_bifrost::code_quality::{
     ReportDeadCodeAndUnusedAbstractionSmellsParams, report_dead_code_and_unused_abstraction_smells,
 };
-use brokk_bifrost::{IAnalyzer, Language, RustAnalyzer};
+use brokk_bifrost::{CodeUnit, IAnalyzer, Language, RustAnalyzer};
 use common::InlineTestProject;
 
 fn rust_analyzer_with_files(
@@ -23,6 +23,14 @@ fn report(
     params: ReportDeadCodeAndUnusedAbstractionSmellsParams,
 ) -> String {
     report_dead_code_and_unused_abstraction_smells(analyzer, params).report
+}
+
+fn rust_definition(analyzer: &RustAnalyzer, fq_name: &str) -> CodeUnit {
+    analyzer
+        .get_definitions(fq_name)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("missing definition for {fq_name}"))
 }
 
 #[test]
@@ -240,6 +248,73 @@ fn caller_two() {
         result
             .report
             .contains("No dead code or unused abstraction smells met minScore 8."),
+        "{}",
+        result.report
+    );
+}
+
+#[test]
+fn rust_dead_code_smell_does_not_undercount_instance_method_usage() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[(
+        "src/service.rs",
+        r#"
+pub struct Service {}
+
+impl Service {
+    pub fn used(&self) {}
+}
+
+fn entry() {
+    let service = Service {};
+    service.used();
+    service.used();
+}
+"#,
+    )]);
+    let used = rust_definition(&analyzer, "service.Service.used");
+
+    let result = report_dead_code_and_unused_abstraction_smells(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec!["src/service.rs".to_string()],
+            fq_names: vec![used.fq_name()],
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        result
+            .report
+            .contains("No dead code or unused abstraction smells met minScore 8."),
+        "{}",
+        result.report
+    );
+    assert!(
+        !result.report.contains("Skipped symbols"),
+        "{}",
+        result.report
+    );
+}
+
+#[test]
+fn rust_dead_code_smell_clamps_usage_cap_to_graph_callsite_limit() {
+    let (_project, analyzer) =
+        rust_analyzer_with_files(&[("src/helpers.rs", "pub fn helper() {}\n")]);
+
+    let result = report_dead_code_and_unused_abstraction_smells(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec!["src/helpers.rs".to_string()],
+            fq_names: vec!["helpers.helper".to_string()],
+            max_usages_per_symbol: 2000,
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        result
+            .report
+            .contains("Usage cap per symbol: 1000 (clamped from 2000 by graph call-site cap)"),
         "{}",
         result.report
     );

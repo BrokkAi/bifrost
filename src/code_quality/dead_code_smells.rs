@@ -8,7 +8,7 @@ use crate::analyzer::common::language_for_target;
 use crate::analyzer::usages::ImportGraphCandidateProvider;
 use crate::analyzer::usages::{
     CandidateFileProvider, FallbackCandidateProvider, FuzzyResult, JsTsExportUsageGraphStrategy,
-    TextSearchCandidateProvider, UsageAnalyzer, UsageHit,
+    RustExportUsageGraphStrategy, TextSearchCandidateProvider, UsageAnalyzer, UsageHit,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range, RustAnalyzer};
 use crate::hash::HashSet;
@@ -89,10 +89,11 @@ pub fn report_dead_code_and_unused_abstraction_smells(
         params.max_usage_candidate_files,
         DEFAULT_MAX_USAGE_CANDIDATE_FILES as i32,
     ) as usize;
-    let usage_cap = positive_or(
+    let requested_usage_cap = positive_or(
         params.max_usages_per_symbol,
         DEFAULT_MAX_USAGES_PER_SYMBOL as i32,
     ) as usize;
+    let usage_cap = requested_usage_cap.min(crate::analyzer::usages::inverted_edges::MAX_CALLSITES);
 
     let resolved = resolve_project_files(analyzer.project(), params.file_paths);
     let ambiguous_paths = resolved.ambiguous_paths.clone();
@@ -118,8 +119,10 @@ pub fn report_dead_code_and_unused_abstraction_smells(
     for candidate in &candidate_selection.candidates {
         match code_unit_language(candidate) {
             Language::Rust => {
-                rust_candidates.push(candidate.clone());
-                continue;
+                if !rust_candidate_needs_precise_member_scan(analyzer, candidate) {
+                    rust_candidates.push(candidate.clone());
+                    continue;
+                }
             }
             Language::Python => {
                 python_candidates.push(candidate.clone());
@@ -189,7 +192,13 @@ pub fn report_dead_code_and_unused_abstraction_smells(
     lines.line(format!(
         "- Usage candidate file cap: {usage_candidate_file_cap}"
     ));
-    lines.line(format!("- Usage cap per symbol: {usage_cap}"));
+    if usage_cap == requested_usage_cap {
+        lines.line(format!("- Usage cap per symbol: {usage_cap}"));
+    } else {
+        lines.line(format!(
+            "- Usage cap per symbol: {usage_cap} (clamped from {requested_usage_cap} by graph call-site cap)"
+        ));
+    }
     lines.line("- Analysis mode: graph-backed tree-sitter usage analysis (best-effort).");
     lines.line(format!(
         "- Candidate symbols analyzed: {}",
@@ -475,6 +484,19 @@ fn analyze_candidate(
         evidence,
         rationale,
     })
+}
+
+fn rust_candidate_needs_precise_member_scan(
+    analyzer: &dyn IAnalyzer,
+    candidate: &CodeUnit,
+) -> bool {
+    if !(candidate.is_function() || candidate.is_field()) {
+        return false;
+    }
+    let Some(rust) = crate::analyzer::usages::rust_graph::resolve_rust_analyzer(analyzer) else {
+        return false;
+    };
+    rust.parent_of(candidate).is_some()
 }
 
 fn analyze_rust_candidates_with_usage_graph(
@@ -907,6 +929,9 @@ fn query_graph_usages(
 }
 
 fn graph_strategy_for(candidate: &CodeUnit) -> Option<Box<dyn UsageAnalyzer>> {
+    if RustExportUsageGraphStrategy::can_handle(candidate) {
+        return Some(Box::new(RustExportUsageGraphStrategy::new()));
+    }
     if JsTsExportUsageGraphStrategy::can_handle(candidate) {
         return Some(Box::new(JsTsExportUsageGraphStrategy::new()));
     }

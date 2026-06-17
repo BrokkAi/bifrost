@@ -31,6 +31,10 @@ The visible result is that Rust dead-code reports still identify unused private 
 - [x] (2026-06-17T09:22:00Z) Ran `cargo fmt` and `cargo test --test python_js_ts_dead_code_smells`; all 10 tests passed.
 - [x] (2026-06-17T09:24:00Z) Re-ran `cargo test --test rust_dead_code_smells`; all 9 tests passed after the shared inbound-count refactor.
 - [x] (2026-06-17T09:27:00Z) Re-ran `cargo clippy --all-targets --all-features -- -D warnings` and `git diff --check`; both completed cleanly.
+- [x] (2026-06-17T10:16:00Z) Committed the Rust/Python bulk scoring slice as `88b56dc`.
+- [x] (2026-06-17T10:25:00Z) Ran guided review against refreshed `origin/master`; reviewers found Rust member-call undercounting and a fixed graph callsite cap mismatch.
+- [x] (2026-06-17T10:35:00Z) Fixed guided-review findings by routing Rust member candidates through the existing per-symbol Rust strategy and clamping the report usage cap to the inverted graph callsite cap.
+- [x] (2026-06-17T10:42:00Z) Re-ran `cargo test --test rust_dead_code_smells`, `cargo test --test python_js_ts_dead_code_smells`, `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`; all passed.
 
 ## Surprises & Discoveries
 
@@ -45,6 +49,9 @@ The visible result is that Rust dead-code reports still identify unused private 
 
 - Observation: Python already exposes `build_python_usage_edges(...)`, so Python can move to the same one-pass inbound scoring shape without new resolver substrate work.
   Evidence: `src/analyzer/usages/python_graph.rs` resolves the Python analyzer, builds the Python workspace graph once, and returns `UsageEdges`.
+
+- Observation: Rust's inverted graph intentionally does not resolve instance-method dispatch (`recv.method()`), while the existing Rust per-symbol strategy has member-target handling.
+  Evidence: `src/analyzer/usages/rust_graph/inverted.rs` documents the recall gap, and `src/analyzer/usages/rust_graph/extractor.rs` contains `scan_files_for_member_target`.
 
 ## Decision Log
 
@@ -66,6 +73,14 @@ The visible result is that Rust dead-code reports still identify unused private 
 
 - Decision: Implement Python as the next bulk scoring slice and leave JS/TS on the legacy per-symbol path for now.
   Rationale: Python's whole-workspace graph uses dotted FQN identity, while JS/TS needs a separate design for file-scoped identity before same-name exports can be scored safely.
+  Date/Author: 2026-06-17 / Codex
+
+- Decision: Keep Rust member candidates on the existing per-symbol Rust strategy until the inverted graph supports receiver/member inference.
+  Rationale: Routing methods and fields through the bulk graph can undercount `recv.method()` calls and create false dead-code findings.
+  Date/Author: 2026-06-17 / Codex
+
+- Decision: Clamp `max_usages_per_symbol` to the inverted graph's fixed callsite cap and display the effective cap when clamped.
+  Rationale: The shared inverted edge builder truncates at `MAX_CALLSITES`; reporting a higher accepted cap would be misleading unless the builder grows a configurable limit.
   Date/Author: 2026-06-17 / Codex
 
 ## Outcomes & Retrospective
@@ -134,27 +149,30 @@ Key implementation artifacts will be recorded here after code changes and test r
 Rust focused test evidence:
 
     cargo test --test rust_dead_code_smells
-    running 9 tests
+    running 11 tests
+    test rust_dead_code_smell_clamps_usage_cap_to_graph_callsite_limit ... ok
+    test rust_dead_code_smell_does_not_undercount_instance_method_usage ... ok
     test rust_dead_code_smell_honors_usage_candidate_file_cap ... ok
     test rust_dead_code_smell_honors_usage_cap ... ok
     test rust_dead_code_smell_skips_truncated_usage_candidates ... ok
-    test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+    test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 
 Legacy Python/JS/TS focused test evidence:
 
     cargo test --test python_js_ts_dead_code_smells
-    running 10 tests
+    running 11 tests
+    test python_dead_code_smell_clamps_usage_cap_to_graph_callsite_limit ... ok
     test python_dead_code_smell_honors_usage_candidate_file_cap ... ok
     test python_dead_code_smell_honors_usage_cap ... ok
     test python_dead_code_smell_skips_truncated_usage_candidates ... ok
     test ts_dead_code_smell_reexport_counts_as_usage ... ok
-    test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+    test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 
 Rust formatting and lint evidence:
 
     cargo fmt
     cargo clippy --all-targets --all-features -- -D warnings
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 6.25s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.21s
 
 Whitespace evidence:
 

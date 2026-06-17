@@ -316,6 +316,39 @@ def second():
 }
 
 #[test]
+fn python_dead_code_smell_clamps_usage_cap_to_graph_callsite_limit() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+def helper():
+    return 1
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let helper = python_definition(&analyzer, "service.helper");
+
+    let result = report_dead_code_and_unused_abstraction_smells(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec!["service.py".to_string()],
+            fq_names: vec![helper.fq_name()],
+            max_usages_per_symbol: 2000,
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        result
+            .report
+            .contains("Usage cap per symbol: 1000 (clamped from 2000 by graph call-site cap)"),
+        "{}",
+        result.report
+    );
+}
+
+#[test]
 fn js_dead_code_smell_reports_unused_export() {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file(
