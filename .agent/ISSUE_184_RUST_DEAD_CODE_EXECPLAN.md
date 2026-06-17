@@ -35,6 +35,9 @@ The visible result is that Rust dead-code reports still identify unused private 
 - [x] (2026-06-17T10:25:00Z) Ran guided review against refreshed `origin/master`; reviewers found Rust member-call undercounting and a fixed graph callsite cap mismatch.
 - [x] (2026-06-17T10:35:00Z) Fixed guided-review findings by routing Rust member candidates through the existing per-symbol Rust strategy and clamping the report usage cap to the inverted graph callsite cap.
 - [x] (2026-06-17T10:42:00Z) Re-ran `cargo test --test rust_dead_code_smells`, `cargo test --test python_js_ts_dead_code_smells`, `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`; all passed.
+- [x] (2026-06-17T11:20:00Z) Implemented JS/TS file-scoped bulk dead-code scoring with reusable scoped usage node identity and scoped edge aggregation.
+- [x] (2026-06-17T11:20:00Z) Added JS/TS tests for graph-derived evidence, duplicate export names, duplicate owner members, unseedable locals, and ambiguous star re-export aliases.
+- [x] (2026-06-17T11:35:00Z) Ran `cargo fmt`, `cargo test --test python_js_ts_dead_code_smells`, `cargo test --test rust_dead_code_smells`, `cargo test --test usages_js_ts_graph_test`, `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`; all passed.
 
 ## Surprises & Discoveries
 
@@ -52,6 +55,9 @@ The visible result is that Rust dead-code reports still identify unused private 
 
 - Observation: Rust's inverted graph intentionally does not resolve instance-method dispatch (`recv.method()`), while the existing Rust per-symbol strategy has member-target handling.
   Evidence: `src/analyzer/usages/rust_graph/inverted.rs` documents the recall gap, and `src/analyzer/usages/rust_graph/extractor.rs` contains `scan_files_for_member_target`.
+
+- Observation: JS/TS `CodeUnit::fq_name()` values are often bare export names, so the whole-workspace graph must key by file plus fqn to avoid cross-counting duplicate exports.
+  Evidence: tests can define `a.ts` and `b.ts` with separate `helper` exports whose `fq_name()` values are both `helper`.
 
 ## Decision Log
 
@@ -83,17 +89,29 @@ The visible result is that Rust dead-code reports still identify unused private 
   Rationale: The shared inverted edge builder truncates at `MAX_CALLSITES`; reporting a higher accepted cap would be misleading unless the builder grows a configurable limit.
   Date/Author: 2026-06-17 / Codex
 
+- Decision: Add a reusable `UsageNodeKey { file, fqn }` scoped identity seam parallel to existing string-keyed `UsageEdges`, and use it first for JS/TS only.
+  Rationale: JS/TS needs file-scoped identity now, but migrating Rust/Python/other language graph builders would widen this slice unnecessarily.
+  Date/Author: 2026-06-17 / Codex
+
+- Decision: Skip JS/TS candidates with ambiguous export aliases instead of overcounting or falling back.
+  Rationale: Dead-code reporting is heuristic; ambiguous alias evidence can create either false positives or false negatives, so the report should surface it as inconclusive.
+  Date/Author: 2026-06-17 / Codex
+
 ## Outcomes & Retrospective
 
 2026-06-17: The Rust dead-code report now uses one inverted Rust usage graph build per report call and derives zero-inbound/one-inbound findings from graph edge weights. Rust bulk analysis now honors `max_usage_candidate_files` by skipping inconclusive oversized Rust workspaces and honors `max_usages_per_symbol` by skipping candidates whose inbound count exceeds the requested usage cap. Focused tests and Rust linting passed. Gradle checks were requested by the general project guidance but are not available in this Rust worktree because there is no `./gradlew`.
 
 2026-06-17: The Python dead-code report now also uses one inverted Python usage graph build per report call and derives zero-inbound/one-inbound findings from graph edge weights. JavaScript and TypeScript intentionally remain on the legacy per-symbol path until file-scoped identity is designed. Python focused tests now cover graph-derived one-call evidence plus graph truncation, file-cap skipping, and usage-cap skipping.
 
+2026-06-17: The JavaScript/TypeScript dead-code report now uses a file-scoped inverted graph path for exported candidates. The scoped identity seam is reusable for future languages, while existing string-keyed graph builders remain unchanged. Ambiguous JS/TS export aliases are skipped as inconclusive.
+
 ## Context and Orientation
 
 The report entry point is `src/code_quality/dead_code_smells.rs`, function `report_dead_code_and_unused_abstraction_smells`. It resolves input files, selects candidate declarations, and currently calls `analyze_candidate` once per candidate. `analyze_candidate` uses per-symbol usage analysis and is still appropriate for the existing Python, JavaScript, and TypeScript behavior in this slice.
 
-For Rust, the scalable whole-program path is `crate::analyzer::usages::rust_graph::build_rust_usage_edges`. It returns `UsageEdges`, a crate-internal structure with an `edges` map keyed by `(caller_fqn, callee_fqn)` and a `truncated` map keyed by callee FQN for symbols whose call sites exceeded the enumeration guardrail. A caller is the enclosing function or class-like declaration containing a reference. A callee is the declaration being referenced. An inbound count for a candidate is the sum of edge weights where the edge callee equals the candidate's fully qualified name.
+For Rust and Python, the scalable whole-program paths return `UsageEdges`, a crate-internal structure with an `edges` map keyed by `(caller_fqn, callee_fqn)` and a `truncated` map keyed by callee FQN for symbols whose call sites exceeded the enumeration guardrail. A caller is the enclosing function or class-like declaration containing a reference. A callee is the declaration being referenced. An inbound count for a candidate is the sum of edge weights where the edge callee equals the candidate's fully qualified name.
+
+For JS/TS, bare FQN identity is insufficient because unrelated files can export the same local name. The scoped path uses `UsageNodeKey { file, fqn }` and `ScopedUsageEdges` so dead-code scoring can distinguish `a.ts::helper` from `b.ts::helper`. Ambiguous export aliases, star re-exports, and unseedable local symbols are skipped as inconclusive rather than forced into a potentially wrong key.
 
 Rust visibility information already exists on `RustAnalyzer` as `is_rust_public_like_declaration`. Public-like means the declaration syntax has a Rust `pub...` visibility modifier. The dead-code report must reuse this analyzer helper rather than parsing visibility text again.
 
@@ -105,7 +123,7 @@ Second, build findings from inbound counts. Zero-inbound and one-inbound candida
 
 Third, update `tests/rust_dead_code_smells.rs`. Existing private helper, one-call wrapper, recursion, explicit FQN targeting, and threshold behavior should still pass after expected wording changes. Add a public `pub fn` test that asserts conservative public-surface wording. Cover `truncated_symbols` behavior with an integration test that creates more than the Rust usage-graph call-site limit and asserts the candidate is skipped as inconclusive.
 
-The Python follow-up slice now uses Python's inverted usage graph for the same one-pass inbound scoring shape. Deferred follow-up slices remain tracked here but are not implemented in this branch. JS/TS needs special care because node identity is file-scoped for that ecosystem, so inbound scoring must include path identity where same-name symbols appear in different files. Go, Java, C#, C++, PHP, and Scala parity should only be pursued after the Rust and Python slices confirm product value and graph semantics. If broad graph cost still dominates after bulk dead-code scoring, later work can profile resolver/cache micro-optimizations.
+The Python follow-up slice now uses Python's inverted usage graph for the same one-pass inbound scoring shape. The JS/TS follow-up slice now uses file-scoped identity so same-name exports in different files do not cross-count. Deferred follow-up slices remain tracked here but are not implemented in this branch. Go, Java, C#, C++, PHP, and Scala parity should only be pursued after the Rust, Python, and JS/TS slices confirm product value and graph semantics. If broad graph cost still dominates after bulk dead-code scoring, later work can profile resolver/cache micro-optimizations.
 
 ## Concrete Steps
 
@@ -136,7 +154,7 @@ Then run final checks:
 
 The new Rust tests should demonstrate the behavior change. A private unused helper should still appear in the report with zero total usages. A one-call wrapper should still appear with total usage count `1`. A public unused function should appear with conservative wording that includes "unreferenced in workspace" and mentions public surface risk rather than saying it is definitely dead. Python, JavaScript, and TypeScript dead-code tests should continue to pass unchanged.
 
-The implementation is accepted when the focused tests pass, formatting is clean, clippy reports no warnings, and Gradle tidy/fix/analyze complete successfully or any skipped final command is documented with the reason.
+The implementation is accepted when the focused tests pass, JS/TS graph strategy tests pass, formatting is clean, clippy reports no warnings, and Gradle tidy/fix/analyze complete successfully or any skipped final command is documented with the reason.
 
 ## Idempotence and Recovery
 
@@ -160,19 +178,32 @@ Rust focused test evidence:
 Legacy Python/JS/TS focused test evidence:
 
     cargo test --test python_js_ts_dead_code_smells
-    running 11 tests
+    running 14 tests
+    test ts_dead_code_smell_does_not_cross_count_duplicate_export_names ... ok
+    test ts_dead_code_smell_does_not_cross_count_duplicate_owner_members ... ok
+    test ts_dead_code_smell_skips_ambiguous_star_reexport_alias ... ok
     test python_dead_code_smell_clamps_usage_cap_to_graph_callsite_limit ... ok
     test python_dead_code_smell_honors_usage_candidate_file_cap ... ok
     test python_dead_code_smell_honors_usage_cap ... ok
     test python_dead_code_smell_skips_truncated_usage_candidates ... ok
     test ts_dead_code_smell_reexport_counts_as_usage ... ok
-    test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+    test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+JS/TS usage graph regression evidence:
+
+    cargo test --test usages_js_ts_graph_test
+    running 35 tests
+    test ts_duplicate_owner_names_do_not_cross_match_members ... ok
+    test ts_local_barrel_reexport_is_followed ... ok
+    test ts_static_member_on_namespace_import_resolves_member_usage ... ok
+    test usage_finder_routes_jsts_targets_to_graph_strategy ... ok
+    test result: ok. 33 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out
 
 Rust formatting and lint evidence:
 
     cargo fmt
     cargo clippy --all-targets --all-features -- -D warnings
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.21s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 6.39s
 
 Whitespace evidence:
 
@@ -194,6 +225,8 @@ At the end of this work, `src/code_quality/dead_code_smells.rs` should contain a
         skipped: &mut Vec<String>,
     ) -> Vec<DeadCodeFinding>
 
-The helper may use a different exact name if the surrounding code reads better, but it must resolve `RustAnalyzer`, call `build_rust_usage_edges` once, and produce `DeadCodeFinding` rows from inbound edge counts. It must not call `RustExportUsageGraphStrategy::find_usages` per Rust candidate.
+The helper may use a different exact name if the surrounding code reads better, but it must resolve `RustAnalyzer`, call `build_rust_usage_edges` once, and produce `DeadCodeFinding` rows from inbound edge counts. It must not call `RustExportUsageGraphStrategy::find_usages` per non-member Rust candidate.
 
 The Rust analyzer visibility helper `RustAnalyzer::is_rust_public_like_declaration` may be widened only as much as needed for crate-internal code-quality use.
+
+The JS/TS scoped helper should build one scoped usage graph through `build_jsts_scoped_usage_edges`, score only candidates with resolved `UsageNodeKey` identity, and keep ambiguous or unseedable candidates in skipped/inconclusive evidence.

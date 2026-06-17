@@ -86,6 +86,28 @@ pub(crate) struct UsageEdges {
     pub(crate) truncated: BTreeMap<String, usize>,
 }
 
+/// File-scoped declaration identity for languages where a bare fqn/export name is
+/// not globally unique.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct UsageNodeKey {
+    pub(crate) file: ProjectFile,
+    pub(crate) fqn: String,
+}
+
+impl UsageNodeKey {
+    pub(crate) fn new(file: ProjectFile, fqn: String) -> Self {
+        Self { file, fqn }
+    }
+}
+
+/// Aggregated result of an inverted edge build whose endpoints are file-scoped.
+pub(crate) struct ScopedUsageEdges {
+    /// `(caller key, callee key) -> weight` (distinct `(file, line, caller)` sites).
+    pub(crate) edges: BTreeMap<(UsageNodeKey, UsageNodeKey), usize>,
+    /// Callees past the call-site cap: `key -> total call sites`.
+    pub(crate) truncated: BTreeMap<UsageNodeKey, usize>,
+}
+
 /// One file's contribution, merged by [`merge_and_cap`].
 #[derive(Default)]
 pub(crate) struct PerFileEdges {
@@ -211,6 +233,108 @@ impl<'a> EdgeCollector<'a> {
     }
 }
 
+#[derive(Default)]
+pub(crate) struct ScopedPerFileEdges {
+    edge_lines: BTreeMap<(UsageNodeKey, UsageNodeKey), HashSet<usize>>,
+    callsites: BTreeMap<UsageNodeKey, HashSet<usize>>,
+}
+
+pub(crate) struct ScopedFileDeclarations {
+    enclosers: Vec<(usize, usize, UsageNodeKey)>,
+    definitions: HashMap<UsageNodeKey, Vec<(usize, usize)>>,
+}
+
+pub(crate) fn build_scoped_file_declarations(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+) -> ScopedFileDeclarations {
+    let mut enclosers = Vec::new();
+    let mut definitions: HashMap<UsageNodeKey, Vec<(usize, usize)>> = HashMap::default();
+    for unit in analyzer.declarations(file) {
+        let key = UsageNodeKey::new(unit.source().clone(), unit.fq_name());
+        for unit_range in analyzer.ranges(unit) {
+            let span = (unit_range.start_byte, unit_range.end_byte);
+            enclosers.push((span.0, span.1, key.clone()));
+            definitions.entry(key.clone()).or_default().push(span);
+        }
+    }
+    ScopedFileDeclarations {
+        enclosers,
+        definitions,
+    }
+}
+
+pub(crate) struct ScopedEdgeCollector<'a> {
+    line_starts: &'a [usize],
+    nodes: &'a HashSet<UsageNodeKey>,
+    declarations: ScopedFileDeclarations,
+    out: ScopedPerFileEdges,
+}
+
+impl<'a> ScopedEdgeCollector<'a> {
+    pub(crate) fn new(
+        line_starts: &'a [usize],
+        nodes: &'a HashSet<UsageNodeKey>,
+        declarations: ScopedFileDeclarations,
+    ) -> Self {
+        Self {
+            line_starts,
+            nodes,
+            declarations,
+            out: ScopedPerFileEdges::default(),
+        }
+    }
+
+    fn enclosing(&self, start: usize, end: usize) -> Option<&UsageNodeKey> {
+        self.declarations
+            .enclosers
+            .iter()
+            .filter(|(unit_start, unit_end, _)| *unit_start <= start && end <= *unit_end)
+            .min_by_key(|(unit_start, unit_end, _)| unit_end - unit_start)
+            .map(|(_, _, key)| key)
+    }
+
+    pub(crate) fn record(&mut self, callee: UsageNodeKey, start: usize, end: usize) {
+        if !self.nodes.contains(&callee) {
+            return;
+        }
+        let caller = match self.enclosing(start, end) {
+            Some(caller) => caller.clone(),
+            None => return,
+        };
+        if caller == callee {
+            return;
+        }
+        self.out
+            .callsites
+            .entry(callee.clone())
+            .or_default()
+            .insert(start);
+
+        if self
+            .declarations
+            .definitions
+            .get(&callee)
+            .is_some_and(|spans| spans.iter().any(|(s, e)| *s < end && start < *e))
+        {
+            return;
+        }
+        if !self.nodes.contains(&caller) {
+            return;
+        }
+        let line = find_line_index_for_offset(self.line_starts, start);
+        self.out
+            .edge_lines
+            .entry((caller, callee))
+            .or_default()
+            .insert(line);
+    }
+
+    pub(crate) fn finish(self) -> ScopedPerFileEdges {
+        self.out
+    }
+}
+
 /// Drive a whole-workspace inverted edge build over `files` in parallel.
 ///
 /// This owns everything language-agnostic — the parallel fan-out, the per-file
@@ -253,6 +377,35 @@ where
     merge_and_cap(per_file)
 }
 
+pub(crate) fn build_scoped_edges<'a, KeepFn, LinesFn, ScanFn>(
+    analyzer: &dyn IAnalyzer,
+    files: &[ProjectFile],
+    nodes: &'a HashSet<UsageNodeKey>,
+    keep_file: KeepFn,
+    line_starts_of: LinesFn,
+    scan: ScanFn,
+) -> ScopedUsageEdges
+where
+    KeepFn: Fn(&ProjectFile) -> bool + Sync,
+    LinesFn: Fn(&ProjectFile) -> Option<&'a [usize]> + Sync,
+    ScanFn: Fn(&ProjectFile, &mut ScopedEdgeCollector<'a>) + Sync,
+{
+    let per_file: Vec<ScopedPerFileEdges> = files
+        .par_iter()
+        .filter_map(|file| {
+            if !keep_file(file) {
+                return None;
+            }
+            let line_starts = line_starts_of(file)?;
+            let declarations = build_scoped_file_declarations(analyzer, file);
+            let mut collector = ScopedEdgeCollector::new(line_starts, nodes, declarations);
+            scan(file, &mut collector);
+            Some(collector.finish())
+        })
+        .collect();
+    merge_scoped_and_cap(per_file)
+}
+
 /// Sum per-file results and drop callees past [`MAX_CALLSITES`] into `truncated`.
 pub(crate) fn merge_and_cap(per_file: Vec<PerFileEdges>) -> UsageEdges {
     // Each file's `edge_lines` already holds the distinct lines for that file, so
@@ -280,6 +433,30 @@ pub(crate) fn merge_and_cap(per_file: Vec<PerFileEdges>) -> UsageEdges {
         .collect();
 
     UsageEdges { edges, truncated }
+}
+
+pub(crate) fn merge_scoped_and_cap(per_file: Vec<ScopedPerFileEdges>) -> ScopedUsageEdges {
+    let mut edge_weights: BTreeMap<(UsageNodeKey, UsageNodeKey), usize> = BTreeMap::new();
+    let mut callsites: BTreeMap<UsageNodeKey, usize> = BTreeMap::new();
+    for file in per_file {
+        for (key, lines) in file.edge_lines {
+            *edge_weights.entry(key).or_insert(0) += lines.len();
+        }
+        for (callee, sites) in file.callsites {
+            *callsites.entry(callee).or_insert(0) += sites.len();
+        }
+    }
+
+    let truncated: BTreeMap<UsageNodeKey, usize> = callsites
+        .into_iter()
+        .filter(|(_, total)| *total > MAX_CALLSITES)
+        .collect();
+    let edges: BTreeMap<(UsageNodeKey, UsageNodeKey), usize> = edge_weights
+        .into_iter()
+        .filter(|((_, callee), _)| !truncated.contains_key(callee))
+        .collect();
+
+    ScopedUsageEdges { edges, truncated }
 }
 
 #[cfg(test)]

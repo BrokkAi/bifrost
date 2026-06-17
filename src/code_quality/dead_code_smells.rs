@@ -6,6 +6,8 @@
 use super::{ReportLines, append_ambiguous_path_notes, resolve_project_files, sanitize_table_cell};
 use crate::analyzer::common::language_for_target;
 use crate::analyzer::usages::ImportGraphCandidateProvider;
+use crate::analyzer::usages::inverted_edges::UsageNodeKey;
+use crate::analyzer::usages::js_ts_graph::JsTsScopedNodeStatus;
 use crate::analyzer::usages::{
     CandidateFileProvider, FallbackCandidateProvider, FuzzyResult, JsTsExportUsageGraphStrategy,
     RustExportUsageGraphStrategy, TextSearchCandidateProvider, UsageAnalyzer, UsageHit,
@@ -115,6 +117,7 @@ pub fn report_dead_code_and_unused_abstraction_smells(
     let mut findings: Vec<DeadCodeFinding> = Vec::new();
     let mut rust_candidates: Vec<CodeUnit> = Vec::new();
     let mut python_candidates: Vec<CodeUnit> = Vec::new();
+    let mut jsts_candidates: Vec<CodeUnit> = Vec::new();
 
     for candidate in &candidate_selection.candidates {
         match code_unit_language(candidate) {
@@ -126,6 +129,10 @@ pub fn report_dead_code_and_unused_abstraction_smells(
             }
             Language::Python => {
                 python_candidates.push(candidate.clone());
+                continue;
+            }
+            Language::JavaScript | Language::TypeScript => {
+                jsts_candidates.push(candidate.clone());
                 continue;
             }
             _ => {}
@@ -156,6 +163,17 @@ pub fn report_dead_code_and_unused_abstraction_smells(
         analyze_python_candidates_with_usage_graph(
             analyzer,
             &python_candidates,
+            usage_candidate_file_cap,
+            usage_cap,
+            &mut skipped,
+        )
+        .into_iter()
+        .filter(|finding| finding.score >= threshold),
+    );
+    findings.extend(
+        analyze_jsts_candidates_with_scoped_usage_graph(
+            analyzer,
+            &jsts_candidates,
             usage_candidate_file_cap,
             usage_cap,
             &mut skipped,
@@ -684,6 +702,123 @@ fn analyze_python_candidates_with_usage_graph(
         .collect()
 }
 
+fn analyze_jsts_candidates_with_scoped_usage_graph(
+    analyzer: &dyn IAnalyzer,
+    candidates: &[CodeUnit],
+    usage_candidate_file_cap: usize,
+    usage_cap: usize,
+    skipped: &mut Vec<String>,
+) -> Vec<DeadCodeFinding> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let jsts_file_count = [Language::JavaScript, Language::TypeScript]
+        .into_iter()
+        .map(|language| {
+            analyzer
+                .project()
+                .analyzable_files(language)
+                .map_or(0, |files| files.len())
+        })
+        .sum::<usize>();
+    if jsts_file_count > usage_candidate_file_cap {
+        for candidate in candidates {
+            skipped.push(format!(
+                "`{}`: JS/TS usage graph candidate files exceeded cap {usage_candidate_file_cap} ({jsts_file_count} JS/TS files); evidence is inconclusive",
+                candidate.fq_name()
+            ));
+        }
+        return Vec::new();
+    }
+
+    let mut nodes: HashSet<UsageNodeKey> = analyzer
+        .all_declarations()
+        .filter(|unit| {
+            matches!(
+                code_unit_language(unit),
+                Language::JavaScript | Language::TypeScript
+            ) && !unit.is_synthetic()
+                && (unit.is_function() || unit.is_class() || unit.is_field())
+        })
+        .map(scoped_key_for)
+        .collect();
+    nodes.extend(candidates.iter().map(scoped_key_for));
+
+    let Some(result) = crate::analyzer::usages::js_ts_graph::build_jsts_scoped_usage_edges(
+        analyzer,
+        &nodes,
+        |_| true,
+    ) else {
+        for candidate in candidates {
+            skipped.push(format!(
+                "`{}`: JS/TS usage graph could not be built; evidence is inconclusive",
+                candidate.fq_name()
+            ));
+        }
+        return Vec::new();
+    };
+
+    let declarations_by_key = scoped_declarations_by_key_for_languages(
+        analyzer,
+        &[Language::JavaScript, Language::TypeScript],
+    );
+    let mut incoming: BTreeMap<UsageNodeKey, ScopedGraphIncomingUsage> = BTreeMap::new();
+    for ((caller, callee), weight) in result.edges.edges {
+        let usage = incoming.entry(callee).or_default();
+        usage.total += weight;
+        usage.callers.entry(caller).or_insert(weight);
+    }
+
+    candidates
+        .iter()
+        .filter_map(|candidate| {
+            let candidate_key = scoped_key_for(candidate);
+            match result.node_status.get(&candidate_key) {
+                Some(JsTsScopedNodeStatus::Resolved) => {}
+                Some(JsTsScopedNodeStatus::Ambiguous) => {
+                    skipped.push(format!(
+                        "`{}`: JS/TS export identity was ambiguous; evidence is inconclusive",
+                        candidate.fq_name()
+                    ));
+                    return None;
+                }
+                Some(JsTsScopedNodeStatus::Unseedable) | None => {
+                    skipped.push(format!(
+                        "`{}`: JS/TS export seed could not be resolved; evidence is inconclusive",
+                        candidate.fq_name()
+                    ));
+                    return None;
+                }
+            }
+            if let Some(total_callsites) = result.edges.truncated.get(&candidate_key) {
+                skipped.push(format!(
+                    "`{}`: too many workspace inbound call sites ({total_callsites}, limit {}); evidence is inconclusive",
+                    candidate.fq_name(),
+                    crate::analyzer::usages::inverted_edges::MAX_CALLSITES
+                ));
+                return None;
+            }
+            let usage = incoming.get(&candidate_key).cloned().unwrap_or_default();
+            if usage.total > usage_cap {
+                skipped.push(format!(
+                    "`{}`: too many workspace inbound call sites ({}, limit {usage_cap}); evidence is inconclusive",
+                    candidate.fq_name(),
+                    usage.total
+                ));
+                return None;
+            }
+            scoped_graph_finding_for_language(
+                analyzer,
+                code_unit_language(candidate),
+                &declarations_by_key,
+                candidate,
+                usage,
+            )
+        })
+        .collect()
+}
+
 fn rust_graph_finding(
     analyzer: &dyn IAnalyzer,
     rust: &RustAnalyzer,
@@ -780,6 +915,64 @@ fn graph_finding_for_language(
     })
 }
 
+#[derive(Clone, Debug, Default)]
+struct ScopedGraphIncomingUsage {
+    total: usize,
+    callers: BTreeMap<UsageNodeKey, usize>,
+}
+
+fn scoped_graph_finding_for_language(
+    analyzer: &dyn IAnalyzer,
+    language: Language,
+    declarations_by_key: &BTreeMap<UsageNodeKey, Vec<CodeUnit>>,
+    candidate: &CodeUnit,
+    usage: ScopedGraphIncomingUsage,
+) -> Option<DeadCodeFinding> {
+    if usage.total > 1 {
+        return None;
+    }
+
+    let range = analyzer
+        .ranges_of(candidate)
+        .into_iter()
+        .filter(|range| !range.is_empty())
+        .max_by_key(span_lines)?;
+    let declaration_lines = span_lines(&range);
+    let score = graph_score(usage.total, declaration_lines);
+    let confidence = if usage.total == 0 { 0.90 } else { 0.70 };
+    let evidence = scoped_graph_inbound_evidence(&usage);
+    let label = language_label(language);
+    let rationale = if usage.total == 0 {
+        format!(
+            "symbol has no workspace inbound usage evidence in {label} tree-sitter analysis and may be generated residue"
+        )
+    } else {
+        format!(
+            "symbol has only one workspace inbound caller in {label} tree-sitter analysis and may be a low-value abstraction"
+        )
+    };
+
+    Some(DeadCodeFinding {
+        language,
+        score,
+        confidence,
+        kind: candidate.kind().display_lowercase().to_string(),
+        symbol: candidate.fq_name(),
+        file: candidate.source().clone(),
+        start_line: range.start_line + 1,
+        end_line: range.end_line + 1,
+        total_usage_count: usage.total,
+        external_usage_count: scoped_external_usage_count(
+            analyzer,
+            declarations_by_key,
+            candidate,
+            &usage,
+        ),
+        evidence,
+        rationale,
+    })
+}
+
 fn graph_score(total_usage_count: usize, declaration_lines: usize) -> i32 {
     if total_usage_count == 0 {
         30 + (declaration_lines / 4).min(20) as i32
@@ -821,6 +1014,24 @@ fn graph_inbound_evidence(usage: &GraphIncomingUsage) -> String {
     }
 }
 
+fn scoped_graph_inbound_evidence(usage: &ScopedGraphIncomingUsage) -> String {
+    if usage.total == 0 {
+        return "no non-self usages found".to_string();
+    }
+    if let Some((caller, weight)) = usage.callers.iter().next() {
+        if *weight == 1 {
+            format!("one workspace inbound edge from {}", caller.fqn)
+        } else {
+            format!(
+                "one workspace inbound caller: {} ({weight} references)",
+                caller.fqn
+            )
+        }
+    } else {
+        "one workspace inbound edge".to_string()
+    }
+}
+
 fn rust_graph_rationale(total_usage_count: usize, is_public: bool) -> String {
     match (total_usage_count, is_public) {
         (0, true) => {
@@ -836,6 +1047,53 @@ fn rust_graph_rationale(total_usage_count: usize, is_public: bool) -> String {
             "symbol has only one workspace inbound caller in Rust tree-sitter analysis and may be a low-value abstraction".to_string()
         }
     }
+}
+
+fn scoped_declarations_by_key_for_languages(
+    analyzer: &dyn IAnalyzer,
+    languages: &[Language],
+) -> BTreeMap<UsageNodeKey, Vec<CodeUnit>> {
+    let mut declarations: BTreeMap<UsageNodeKey, Vec<CodeUnit>> = BTreeMap::new();
+    for declaration in analyzer
+        .all_declarations()
+        .filter(|unit| languages.contains(&code_unit_language(unit)))
+    {
+        declarations
+            .entry(scoped_key_for(declaration))
+            .or_default()
+            .push(declaration.clone());
+    }
+    declarations
+}
+
+fn scoped_external_usage_count(
+    analyzer: &dyn IAnalyzer,
+    declarations_by_key: &BTreeMap<UsageNodeKey, Vec<CodeUnit>>,
+    candidate: &CodeUnit,
+    usage: &ScopedGraphIncomingUsage,
+) -> usize {
+    usage
+        .callers
+        .iter()
+        .filter(|(caller, _)| {
+            let Some(caller) = declarations_by_key
+                .get(caller)
+                .and_then(|declarations| declarations.first())
+            else {
+                return true;
+            };
+            let defining_owner = analyzer
+                .parent_of(candidate)
+                .unwrap_or_else(|| candidate.clone());
+            let caller_owner = analyzer.parent_of(caller).unwrap_or_else(|| caller.clone());
+            caller_owner != defining_owner
+        })
+        .map(|(_, weight)| *weight)
+        .sum()
+}
+
+fn scoped_key_for(unit: &CodeUnit) -> UsageNodeKey {
+    UsageNodeKey::new(unit.source().clone(), unit.fq_name())
 }
 
 fn rust_declarations_by_fqn(analyzer: &dyn IAnalyzer) -> BTreeMap<String, Vec<CodeUnit>> {

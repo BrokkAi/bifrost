@@ -25,11 +25,16 @@ fn js_definition(analyzer: &JavascriptAnalyzer, predicate: impl Fn(&CodeUnit) ->
 }
 
 fn ts_definition(analyzer: &TypescriptAnalyzer, predicate: impl Fn(&CodeUnit) -> bool) -> CodeUnit {
-    analyzer
-        .get_all_declarations()
-        .into_iter()
-        .find(predicate)
-        .expect("missing TS definition")
+    let declarations = analyzer.get_all_declarations();
+    declarations.into_iter().find(predicate).unwrap_or_else(|| {
+        let available = analyzer
+            .get_all_declarations()
+            .into_iter()
+            .map(|unit| format!("{}:{}:{:?}", unit.source(), unit.fq_name(), unit.kind()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        panic!("missing TS definition; available: {available}")
+    })
 }
 
 #[test]
@@ -423,7 +428,9 @@ export function run(): number {
 
     assert!(result.report.contains("adapter"), "{}", result.report);
     assert!(
-        result.report.contains("only usage: consumer.ts"),
+        result
+            .report
+            .contains("one workspace inbound edge from run"),
         "{}",
         result.report
     );
@@ -479,6 +486,183 @@ export function run(): number {
 }
 
 #[test]
+fn ts_dead_code_smell_does_not_cross_count_duplicate_export_names() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("a.ts", "export function helper(): number { return 1; }\n")
+        .file("b.ts", "export function helper(): number { return 2; }\n")
+        .file(
+            "consumer.ts",
+            r#"
+import { helper } from "./b";
+
+export function run(): number {
+  return helper();
+}
+"#,
+        )
+        .build();
+    let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
+    let a_file = project.file("a.ts");
+    let helper = ts_definition(&analyzer, |cu| {
+        cu.is_function() && cu.identifier() == "helper" && cu.source() == &a_file
+    });
+
+    let result = report_dead_code_and_unused_abstraction_smells(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec!["a.ts".to_string()],
+            fq_names: vec![helper.fq_name()],
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        result.report.contains("no non-self usages found"),
+        "{}",
+        result.report
+    );
+    assert!(!result.report.contains("| 1 | 1 |"), "{}", result.report);
+}
+
+#[test]
+fn ts_dead_code_smell_does_not_cross_count_duplicate_owner_members() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "a.ts",
+            r#"
+export class Foo {
+  static make(): number {
+    return 1;
+  }
+}
+"#,
+        )
+        .file(
+            "b.ts",
+            r#"
+export class Foo {
+  static make(): number {
+    return 2;
+  }
+}
+"#,
+        )
+        .file(
+            "consumer.ts",
+            r#"
+import { Foo } from "./b";
+
+export function run(): number {
+  return Foo.make();
+}
+"#,
+        )
+        .build();
+    let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
+    let a_file = project.file("a.ts");
+    let make = ts_definition(&analyzer, |cu| {
+        cu.is_function() && cu.fq_name() == "Foo.make$static" && cu.source() == &a_file
+    });
+
+    let result = report_dead_code_and_unused_abstraction_smells(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec!["a.ts".to_string()],
+            fq_names: vec![make.fq_name()],
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        result.report.contains("no non-self usages found"),
+        "{}",
+        result.report
+    );
+    assert!(!result.report.contains("| 1 | 1 |"), "{}", result.report);
+
+    let b_file = project.file("b.ts");
+    let b_make = ts_definition(&analyzer, |cu| {
+        cu.is_function() && cu.fq_name() == "Foo.make$static" && cu.source() == &b_file
+    });
+    let result = report_dead_code_and_unused_abstraction_smells(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec!["b.ts".to_string()],
+            fq_names: vec![b_make.fq_name()],
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        result
+            .report
+            .contains("one workspace inbound edge from run"),
+        "{}",
+        result.report
+    );
+    assert!(result.report.contains("| 1 | 1 |"), "{}", result.report);
+}
+
+#[test]
+fn ts_dead_code_smell_skips_ambiguous_star_reexport_alias() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("a.ts", "export function helper(): number { return 1; }\n")
+        .file("b.ts", "export function helper(): number { return 2; }\n")
+        .file(
+            "barrel.ts",
+            r#"
+export * from "./a";
+export * from "./b";
+"#,
+        )
+        .file(
+            "consumer.ts",
+            r#"
+import { helper } from "./barrel";
+
+export function run(): number {
+  return helper();
+}
+"#,
+        )
+        .build();
+    let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
+    let a_file = project.file("a.ts");
+    let helper = ts_definition(&analyzer, |cu| {
+        cu.is_function() && cu.identifier() == "helper" && cu.source() == &a_file
+    });
+
+    let result = report_dead_code_and_unused_abstraction_smells(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec![
+                "a.ts".to_string(),
+                "b.ts".to_string(),
+                "barrel.ts".to_string(),
+                "consumer.ts".to_string(),
+            ],
+            fq_names: vec![helper.fq_name()],
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        result
+            .report
+            .contains("JS/TS export identity was ambiguous"),
+        "{}",
+        result.report
+    );
+    assert!(
+        result
+            .report
+            .contains("No dead code or unused abstraction smells met minScore 8."),
+        "{}",
+        result.report
+    );
+}
+
+#[test]
 fn js_dead_code_smell_skips_unseedable_local_symbol() {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file(
@@ -510,8 +694,9 @@ export function run() {
     );
 
     assert!(
-        result.report.contains("usage analysis was ambiguous")
-            || result.report.contains("no export seed resolved"),
+        result
+            .report
+            .contains("JS/TS export seed could not be resolved"),
         "{}",
         result.report
     );
