@@ -1,20 +1,13 @@
 use super::extractor::scan_file;
-use super::inverted::{self, ParsedPhpFile};
+use super::inverted;
 use super::resolver::{PhpHierarchyIndex, TargetKind, TargetSpec, resolve_php_analyzer};
 use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::usages::parsed_tree::parse_kept_tree_sitter_files;
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, PhpAnalyzer, ProjectFile};
-use crate::hash::{HashMap, HashSet};
+use crate::hash::HashSet;
 use std::collections::BTreeSet;
-
-pub(super) struct PhpEdgeGraph<'a> {
-    pub(super) php: &'a PhpAnalyzer,
-    pub(super) files: Vec<ProjectFile>,
-    pub(super) parsed: HashMap<ProjectFile, ParsedPhpFile>,
-}
 
 pub(crate) struct PhpQueryResolver<'a> {
     php: &'a PhpAnalyzer,
@@ -70,14 +63,12 @@ impl<'a> PhpQueryResolver<'a> {
 }
 
 pub(crate) struct PhpEdgeResolver<'a> {
-    graph: PhpEdgeGraph<'a>,
+    php: &'a PhpAnalyzer,
+    files: Vec<ProjectFile>,
 }
 
 impl<'a> PhpEdgeResolver<'a> {
-    pub(crate) fn new<F>(analyzer: &'a dyn IAnalyzer, keep_file: &F) -> Option<Self>
-    where
-        F: Fn(&ProjectFile) -> bool + Sync,
-    {
+    pub(crate) fn new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
         let php = resolve_php_analyzer(analyzer)?;
         let files: Vec<ProjectFile> = analyzer
             .project()
@@ -85,13 +76,7 @@ impl<'a> PhpEdgeResolver<'a> {
             .ok()?
             .into_iter()
             .collect();
-
-        let language = tree_sitter_php::LANGUAGE_PHP.into();
-        let parsed = parse_kept_tree_sitter_files(&files, keep_file, &language);
-
-        Some(Self {
-            graph: PhpEdgeGraph { php, files, parsed },
-        })
+        Some(Self { php, files })
     }
 
     pub(crate) fn build_edges<F>(
@@ -103,6 +88,6 @@ impl<'a> PhpEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        inverted::build_php_edges(analyzer, &self.graph, nodes, keep_file)
+        inverted::build_php_edges(analyzer, self.php, &self.files, nodes, keep_file)
     }
 }

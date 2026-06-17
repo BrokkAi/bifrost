@@ -22,7 +22,9 @@ use super::extractor::{
 };
 use super::resolver::resolve_receiver_type;
 use crate::analyzer::PythonAnalyzer;
-use crate::analyzer::usages::inverted_edges::{EdgeCollector, UsageEdges, build_edges};
+use crate::analyzer::usages::inverted_edges::{
+    EdgeCollector, UsageEdges, build_edges, collect_file_edges,
+};
 use crate::analyzer::usages::local_inference::LocalBindingsSnapshot;
 use crate::analyzer::usages::model::ImportKind;
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
@@ -41,68 +43,65 @@ where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     let files: Vec<ProjectFile> = graph.parsed_files().cloned().collect();
-    build_edges(
-        analyzer,
-        &files,
-        nodes,
-        keep_file,
-        |file| {
-            graph
-                .parsed_file(file)
-                .map(|parsed| parsed.line_starts.as_slice())
-        },
-        |file, collector| {
-            let Some(parsed) = graph.parsed_file(file) else {
-                return;
-            };
-            let source = parsed.source.as_str();
+    build_edges(&files, keep_file, |file| {
+        // Python keeps its trees in the project graph (resolution needs them), so
+        // this borrows rather than parsing on demand — capping its memory is #185.
+        let parsed = graph.parsed_file(file)?;
+        Some(collect_file_edges(
+            analyzer,
+            file,
+            nodes,
+            &parsed.line_starts,
+            |collector| {
+                let source = parsed.source.as_str();
 
-            // Per-file resolution context from the import binder. A namespace
-            // binding's module_specifier is either the full fqn (for
-            // `from m import f`) or the module prefix (for `import m as u`); the
-            // node-membership check downstream disambiguates which applies.
-            let binder = py.import_binder_of(file);
-            let mut named: HashMap<String, String> = HashMap::default();
-            let mut namespace: HashMap<String, String> = HashMap::default();
-            for (local, binding) in &binder.bindings {
-                match binding.kind {
-                    ImportKind::Named => {
-                        if let Some(imported) = &binding.imported_name {
-                            named.insert(
-                                local.clone(),
-                                format!("{}.{}", binding.module_specifier, imported),
-                            );
+                // Per-file resolution context from the import binder. A namespace
+                // binding's module_specifier is either the full fqn (for
+                // `from m import f`) or the module prefix (for `import m as u`); the
+                // node-membership check downstream disambiguates which applies.
+                let binder = py.import_binder_of(file);
+                let mut named: HashMap<String, String> = HashMap::default();
+                let mut namespace: HashMap<String, String> = HashMap::default();
+                for (local, binding) in &binder.bindings {
+                    match binding.kind {
+                        ImportKind::Named => {
+                            if let Some(imported) = &binding.imported_name {
+                                named.insert(
+                                    local.clone(),
+                                    format!("{}.{}", binding.module_specifier, imported),
+                                );
+                            }
                         }
+                        ImportKind::Namespace => {
+                            namespace.insert(local.clone(), binding.module_specifier.clone());
+                        }
+                        ImportKind::Default | ImportKind::CommonJsRequire | ImportKind::Glob => {}
                     }
-                    ImportKind::Namespace => {
-                        namespace.insert(local.clone(), binding.module_specifier.clone());
-                    }
-                    ImportKind::Default | ImportKind::CommonJsRequire | ImportKind::Glob => {}
                 }
-            }
-            let same_file: HashMap<String, String> = analyzer
-                .declarations(file)
-                .map(|unit| (unit.identifier().to_string(), unit.fq_name()))
-                .collect();
+                let same_file: HashMap<String, String> = analyzer
+                    .declarations(file)
+                    .map(|unit| (unit.identifier().to_string(), unit.fq_name()))
+                    .collect();
 
-            // Per-function receiver-type facts (typed params + `x = Foo()`),
-            // computed by the same routine the forward scan uses, so a typed
-            // `recv.method` resolves to the receiver's class fqn.
-            let scope_facts = collect_scope_facts(analyzer, file, &[], "", true);
+                // Per-function receiver-type facts (typed params + `x = Foo()`),
+                // computed by the same routine the forward scan uses, so a typed
+                // `recv.method` resolves to the receiver's class fqn.
+                let scope_facts = collect_scope_facts(analyzer, file, &[], "", true);
 
-            let mut ctx = PyScan {
-                analyzer,
-                file,
-                source,
-                named,
-                namespace,
-                same_file,
-                scope_facts: &scope_facts,
-                collector,
-            };
-            scan_tree(parsed.tree.root_node(), &mut ctx);
-        },
-    )
+                let mut ctx = PyScan {
+                    analyzer,
+                    file,
+                    source,
+                    named,
+                    namespace,
+                    same_file,
+                    scope_facts: &scope_facts,
+                    collector,
+                };
+                scan_tree(parsed.tree.root_node(), &mut ctx);
+            },
+        ))
+    })
 }
 
 struct PyScan<'a, 'b> {

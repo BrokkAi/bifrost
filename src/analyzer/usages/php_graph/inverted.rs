@@ -32,59 +32,52 @@
 use super::resolver::{
     FileContext, node_text, resolve_php_constant, resolve_php_function, resolve_php_type,
 };
-use super::shared::PhpEdgeGraph;
 use crate::analyzer::usages::inverted_edges::{
-    ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, first_precise,
+    ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, collect_file_edges, first_precise,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::analyzer::usages::parsed_tree::ParsedTreeFile;
-use crate::analyzer::{IAnalyzer, ProjectFile, parse_php_use_aliases_from_source};
+use crate::analyzer::usages::parsed_tree::parse_tree_sitter_file;
+use crate::analyzer::{IAnalyzer, PhpAnalyzer, ProjectFile, parse_php_use_aliases_from_source};
 use crate::hash::HashSet;
 use tree_sitter::Node;
-
-/// A PHP file parsed once for the inverted scan: source, tree, and line starts.
-pub(super) type ParsedPhpFile = ParsedTreeFile;
 
 /// Build the whole PHP `caller -> callee` edge set in a single inverted pass over
 /// the resolver-owned file set. `nodes`/`keep_file` mirror the Go builder.
 pub(super) fn build_php_edges<F>(
     analyzer: &dyn IAnalyzer,
-    graph: &PhpEdgeGraph,
+    php: &PhpAnalyzer,
+    files: &[ProjectFile],
     nodes: &HashSet<String>,
     keep_file: F,
 ) -> UsageEdges
 where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
-    build_edges(
-        analyzer,
-        &graph.files,
-        nodes,
-        keep_file,
-        |file| {
-            graph
-                .parsed
-                .get(file)
-                .map(|parsed| parsed.line_starts.as_slice())
-        },
-        |file, collector| {
-            let Some(parsed) = graph.parsed.get(file) else {
-                return;
-            };
-            let ctx = FileContext {
-                namespace: graph.php.namespace_of_file(file),
-                aliases: parse_php_use_aliases_from_source(&parsed.source),
-            };
-            let mut scan = PhpScan {
-                ctx,
-                source: parsed.source.as_str(),
-                class_ranges: ClassRangeIndex::build(analyzer, file),
-                collector,
-            };
-            let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
-            walk(parsed.tree.root_node(), &mut scan, &mut bindings);
-        },
-    )
+    let language = tree_sitter_php::LANGUAGE_PHP.into();
+    build_edges(files, keep_file, |file| {
+        // Parse here and drop the tree when this closure returns, capping live trees.
+        let parsed = parse_tree_sitter_file(file, &language)?;
+        Some(collect_file_edges(
+            analyzer,
+            file,
+            nodes,
+            &parsed.line_starts,
+            |collector| {
+                let ctx = FileContext {
+                    namespace: php.namespace_of_file(file),
+                    aliases: parse_php_use_aliases_from_source(&parsed.source),
+                };
+                let mut scan = PhpScan {
+                    ctx,
+                    source: parsed.source.as_str(),
+                    class_ranges: ClassRangeIndex::build(analyzer, file),
+                    collector,
+                };
+                let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
+                walk(parsed.tree.root_node(), &mut scan, &mut bindings);
+            },
+        ))
+    })
 }
 
 struct PhpScan<'a, 'b> {

@@ -24,7 +24,7 @@ use super::extractor::{
 use super::resolver::JsTsProjectGraph;
 use crate::analyzer::usages::inverted_edges::{
     EdgeCollector, ScopedEdgeCollector, ScopedUsageEdges, UsageEdges, UsageNodeKey, build_edges,
-    build_scoped_edges,
+    build_scoped_edges, collect_file_edges,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::{ExportEntry, ImportKind};
@@ -45,62 +45,58 @@ where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     let files: Vec<ProjectFile> = graph.parsed.keys().cloned().collect();
-    build_edges(
-        analyzer,
-        &files,
-        nodes,
-        keep_file,
-        |file| {
-            graph
-                .parsed
-                .get(file)
-                .map(|parsed| parsed.line_starts.as_slice())
-        },
-        |file, collector| {
-            let Some(parsed) = graph.parsed.get(file) else {
-                return;
-            };
-            let source = parsed.source.as_str();
+    build_edges(&files, keep_file, |file| {
+        // JS/TS keeps its trees in the project graph (resolution needs them), so this
+        // borrows rather than parsing on demand — capping its memory is #185.
+        let parsed = graph.parsed.get(file)?;
+        Some(collect_file_edges(
+            analyzer,
+            file,
+            nodes,
+            &parsed.line_starts,
+            |collector| {
+                let source = parsed.source.as_str();
 
-            // Per-file resolution context: which bare names resolve to which
-            // exported name, and which locals are namespace imports.
-            let binder = compute_import_binder(source, &parsed.tree);
-            let mut named_imports: HashMap<String, String> = HashMap::default();
-            let mut namespace_locals: HashSet<String> = HashSet::default();
-            for (local, binding) in &binder.bindings {
-                match binding.kind {
-                    ImportKind::Named => {
-                        named_imports.insert(
-                            local.clone(),
-                            binding
-                                .imported_name
-                                .clone()
-                                .unwrap_or_else(|| local.clone()),
-                        );
+                // Per-file resolution context: which bare names resolve to which
+                // exported name, and which locals are namespace imports.
+                let binder = compute_import_binder(source, &parsed.tree);
+                let mut named_imports: HashMap<String, String> = HashMap::default();
+                let mut namespace_locals: HashSet<String> = HashSet::default();
+                for (local, binding) in &binder.bindings {
+                    match binding.kind {
+                        ImportKind::Named => {
+                            named_imports.insert(
+                                local.clone(),
+                                binding
+                                    .imported_name
+                                    .clone()
+                                    .unwrap_or_else(|| local.clone()),
+                            );
+                        }
+                        ImportKind::Namespace | ImportKind::CommonJsRequire | ImportKind::Glob => {
+                            namespace_locals.insert(local.clone());
+                        }
+                        // Default imports need the target module's default-export name.
+                        ImportKind::Default => {}
                     }
-                    ImportKind::Namespace | ImportKind::CommonJsRequire | ImportKind::Glob => {
-                        namespace_locals.insert(local.clone());
-                    }
-                    // Default imports need the target module's default-export name.
-                    ImportKind::Default => {}
                 }
-            }
-            let same_file: HashSet<String> = analyzer
-                .declarations(file)
-                .map(|unit| unit.identifier().to_string())
-                .collect();
+                let same_file: HashSet<String> = analyzer
+                    .declarations(file)
+                    .map(|unit| unit.identifier().to_string())
+                    .collect();
 
-            let mut ctx = TsScan {
-                source,
-                named_imports,
-                namespace_locals,
-                same_file,
-                collector,
-            };
-            let mut locals = LocalInferenceEngine::new(LocalInferenceConfig::default());
-            scan_node(parsed.tree.root_node(), &mut ctx, &mut locals);
-        },
-    )
+                let mut ctx = TsScan {
+                    source,
+                    named_imports,
+                    namespace_locals,
+                    same_file,
+                    collector,
+                };
+                let mut locals = LocalInferenceEngine::new(LocalInferenceConfig::default());
+                scan_node(parsed.tree.root_node(), &mut ctx, &mut locals);
+            },
+        ))
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

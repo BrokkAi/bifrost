@@ -1,20 +1,14 @@
 use super::extractor::{ScanState, scan_file};
-use super::inverted::{self, ParsedJavaFile};
+use super::inverted;
 use super::jvm_scala::scan_scala_files_for_java_type;
 use super::resolver::{TargetSpec, resolve_java_analyzer};
 use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::usages::parsed_tree::parse_kept_tree_sitter_files;
 use crate::analyzer::{CodeUnit, IAnalyzer, JavaAnalyzer, Language, ProjectFile};
-use crate::hash::{HashMap, HashSet};
+use crate::hash::HashSet;
 use std::collections::BTreeSet;
-
-pub(super) struct JavaEdgeGraph {
-    pub(super) files: Vec<ProjectFile>,
-    pub(super) parsed: HashMap<ProjectFile, ParsedJavaFile>,
-}
 
 pub(crate) struct JavaQueryResolver<'a> {
     java: &'a JavaAnalyzer,
@@ -97,14 +91,11 @@ impl<'a> JavaQueryResolver<'a> {
 
 pub(crate) struct JavaEdgeResolver<'a> {
     java: &'a JavaAnalyzer,
-    graph: JavaEdgeGraph,
+    files: Vec<ProjectFile>,
 }
 
 impl<'a> JavaEdgeResolver<'a> {
-    pub(crate) fn new<F>(analyzer: &'a dyn IAnalyzer, keep_file: &F) -> Option<Self>
-    where
-        F: Fn(&ProjectFile) -> bool + Sync,
-    {
+    pub(crate) fn new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
         let java = resolve_java_analyzer(analyzer)?;
         let files: Vec<ProjectFile> = analyzer
             .project()
@@ -112,13 +103,7 @@ impl<'a> JavaEdgeResolver<'a> {
             .ok()?
             .into_iter()
             .collect();
-        let language = tree_sitter_java::LANGUAGE.into();
-        let parsed = parse_kept_tree_sitter_files(&files, keep_file, &language);
-
-        Some(Self {
-            java,
-            graph: JavaEdgeGraph { files, parsed },
-        })
+        Some(Self { java, files })
     }
 
     pub(crate) fn build_edges<F>(
@@ -130,6 +115,6 @@ impl<'a> JavaEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        inverted::build_java_edges(analyzer, self.java, &self.graph, nodes, keep_file)
+        inverted::build_java_edges(analyzer, self.java, &self.files, nodes, keep_file)
     }
 }

@@ -28,18 +28,15 @@ use super::resolver::{
 };
 use super::shared::CppEdgeGraph;
 use crate::analyzer::usages::inverted_edges::{
-    ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, first_precise,
+    ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, collect_file_edges, first_precise,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::analyzer::usages::parsed_tree::ParsedTreeFile;
+use crate::analyzer::usages::parsed_tree::parse_tree_sitter_file;
 use crate::analyzer::{
     CodeUnit, IAnalyzer, ProjectFile, cpp_node_text as node_text, normalize_cpp_whitespace,
 };
 use crate::hash::HashSet;
 use tree_sitter::Node;
-
-/// A C++ file parsed once for the inverted scan: source, tree, and line starts.
-pub(super) type ParsedCppFile = ParsedTreeFile;
 
 /// Build the whole C++ `caller -> callee` edge set in a single inverted pass over
 /// the resolver-owned file set. `nodes`/`keep_file` mirror the Go builder.
@@ -52,32 +49,28 @@ pub(super) fn build_cpp_edges<F>(
 where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
-    build_edges(
-        analyzer,
-        &graph.files,
-        nodes,
-        keep_file,
-        |file| {
-            graph
-                .parsed
-                .get(file)
-                .map(|parsed| parsed.line_starts.as_slice())
-        },
-        |file, collector| {
-            let Some(parsed) = graph.parsed.get(file) else {
-                return;
-            };
-            let mut ctx = CppScan {
-                visibility: &graph.visibility,
-                file,
-                source: parsed.source.as_str(),
-                class_ranges: ClassRangeIndex::build(analyzer, file),
-                collector,
-            };
-            let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
-            walk(parsed.tree.root_node(), &mut ctx, &mut bindings);
-        },
-    )
+    let language = tree_sitter_cpp::LANGUAGE.into();
+    build_edges(&graph.files, keep_file, |file| {
+        // Parse here and drop the tree when this closure returns, capping live trees.
+        let parsed = parse_tree_sitter_file(file, &language)?;
+        Some(collect_file_edges(
+            analyzer,
+            file,
+            nodes,
+            &parsed.line_starts,
+            |collector| {
+                let mut ctx = CppScan {
+                    visibility: &graph.visibility,
+                    file,
+                    source: parsed.source.as_str(),
+                    class_ranges: ClassRangeIndex::build(analyzer, file),
+                    collector,
+                };
+                let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
+                walk(parsed.tree.root_node(), &mut ctx, &mut bindings);
+            },
+        ))
+    })
 }
 
 struct CppScan<'a, 'b> {

@@ -1,19 +1,17 @@
 use super::extractor::{ScanState, scan_file};
-use super::inverted::{self, ParsedCppFile};
+use super::inverted;
 use super::resolver::{TargetSpec, VisibilityIndex, collect_include_closure, resolve_cpp_analyzer};
 use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::usages::parsed_tree::parse_kept_tree_sitter_files;
 use crate::analyzer::{CodeUnit, CppAnalyzer, IAnalyzer, Language, ProjectFile};
-use crate::hash::{HashMap, HashSet};
+use crate::hash::HashSet;
 use std::collections::BTreeSet;
 
 pub(super) struct CppEdgeGraph {
     pub(super) files: Vec<ProjectFile>,
     pub(super) visibility: VisibilityIndex,
-    pub(super) parsed: HashMap<ProjectFile, ParsedCppFile>,
 }
 
 pub(crate) struct CppQueryResolver<'a> {
@@ -118,15 +116,8 @@ impl CppEdgeResolver {
         };
         let visibility = VisibilityIndex::build(cpp, analyzer, &roots);
 
-        let language = tree_sitter_cpp::LANGUAGE.into();
-        let parsed = parse_kept_tree_sitter_files(&files, keep_file, &language);
-
         Some(Self {
-            graph: CppEdgeGraph {
-                files,
-                visibility,
-                parsed,
-            },
+            graph: CppEdgeGraph { files, visibility },
         })
     }
 

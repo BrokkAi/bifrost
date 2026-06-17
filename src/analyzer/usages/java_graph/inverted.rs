@@ -19,55 +19,48 @@
 //! receiver shapes the forward Java scan proves.
 
 use super::resolver::{is_ignored_type_context, node_text};
-use super::shared::JavaEdgeGraph;
 use crate::analyzer::usages::inverted_edges::{
-    ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, first_precise,
+    ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, collect_file_edges, first_precise,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::analyzer::usages::parsed_tree::ParsedTreeFile;
+use crate::analyzer::usages::parsed_tree::parse_tree_sitter_file;
 use crate::analyzer::{IAnalyzer, JavaAnalyzer, ProjectFile};
 use crate::hash::HashSet;
 use tree_sitter::Node;
 
-/// A Java file parsed once for the inverted scan: source, tree, and line starts.
-pub(super) type ParsedJavaFile = ParsedTreeFile;
-
 pub(super) fn build_java_edges<F>(
     analyzer: &dyn IAnalyzer,
     java: &JavaAnalyzer,
-    graph: &JavaEdgeGraph,
+    files: &[ProjectFile],
     nodes: &HashSet<String>,
     keep_file: F,
 ) -> UsageEdges
 where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
-    build_edges(
-        analyzer,
-        &graph.files,
-        nodes,
-        keep_file,
-        |file| {
-            graph
-                .parsed
-                .get(file)
-                .map(|parsed| parsed.line_starts.as_slice())
-        },
-        |file, collector| {
-            let Some(parsed) = graph.parsed.get(file) else {
-                return;
-            };
-            let mut ctx = JavaScan {
-                java,
-                file,
-                source: parsed.source.as_str(),
-                class_ranges: ClassRangeIndex::build(analyzer, file),
-                collector,
-            };
-            let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
-            walk(parsed.tree.root_node(), &mut ctx, &mut bindings);
-        },
-    )
+    let language = tree_sitter_java::LANGUAGE.into();
+    build_edges(files, keep_file, |file| {
+        // Parse the file here and drop its tree when this closure returns, so only a
+        // handful of trees are live at once instead of the whole workspace.
+        let parsed = parse_tree_sitter_file(file, &language)?;
+        Some(collect_file_edges(
+            analyzer,
+            file,
+            nodes,
+            &parsed.line_starts,
+            |collector| {
+                let mut ctx = JavaScan {
+                    java,
+                    file,
+                    source: parsed.source.as_str(),
+                    class_ranges: ClassRangeIndex::build(analyzer, file),
+                    collector,
+                };
+                let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
+                walk(parsed.tree.root_node(), &mut ctx, &mut bindings);
+            },
+        ))
+    })
 }
 
 struct JavaScan<'a, 'b> {
