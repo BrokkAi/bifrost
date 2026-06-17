@@ -5,12 +5,10 @@ use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
+use crate::analyzer::usages::parsed_tree::parse_kept_tree_sitter_files;
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, PhpAnalyzer, ProjectFile};
-use crate::hash::{HashMap, HashSet, map_with_capacity};
-use crate::text_utils::compute_line_starts;
-use rayon::prelude::*;
+use crate::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
-use tree_sitter::Parser;
 
 pub(super) struct PhpEdgeGraph<'a> {
     pub(super) php: &'a PhpAnalyzer,
@@ -88,15 +86,8 @@ impl<'a> PhpEdgeResolver<'a> {
             .into_iter()
             .collect();
 
-        let parsed_files: Vec<(ProjectFile, ParsedPhpFile)> = files
-            .par_iter()
-            .filter(|file| keep_file(file))
-            .filter_map(parse_php_file)
-            .collect();
-        let mut parsed: HashMap<ProjectFile, ParsedPhpFile> = map_with_capacity(parsed_files.len());
-        for (file, parsed_file) in parsed_files {
-            parsed.insert(file, parsed_file);
-        }
+        let language = tree_sitter_php::LANGUAGE_PHP.into();
+        let parsed = parse_kept_tree_sitter_files(&files, keep_file, &language);
 
         Some(Self {
             graph: PhpEdgeGraph { php, files, parsed },
@@ -114,25 +105,4 @@ impl<'a> PhpEdgeResolver<'a> {
     {
         inverted::build_php_edges(analyzer, &self.graph, nodes, keep_file)
     }
-}
-
-fn parse_php_file(file: &ProjectFile) -> Option<(ProjectFile, ParsedPhpFile)> {
-    let source = file.read_to_string().ok()?;
-    if source.is_empty() {
-        return None;
-    }
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
-        .ok()?;
-    let tree = parser.parse(source.as_str(), None)?;
-    let line_starts = compute_line_starts(&source);
-    Some((
-        file.clone(),
-        ParsedPhpFile {
-            source,
-            tree,
-            line_starts,
-        },
-    ))
 }

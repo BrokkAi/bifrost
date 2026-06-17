@@ -31,18 +31,15 @@ use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, first_precise,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
+use crate::analyzer::usages::parsed_tree::ParsedTreeFile;
 use crate::analyzer::{
     CodeUnit, IAnalyzer, ProjectFile, cpp_node_text as node_text, normalize_cpp_whitespace,
 };
 use crate::hash::HashSet;
-use tree_sitter::{Node, Tree};
+use tree_sitter::Node;
 
 /// A C++ file parsed once for the inverted scan: source, tree, and line starts.
-pub(super) struct ParsedCppFile {
-    pub(super) source: String,
-    pub(super) tree: Tree,
-    pub(super) line_starts: Vec<usize>,
-}
+pub(super) type ParsedCppFile = ParsedTreeFile;
 
 /// Build the whole C++ `caller -> callee` edge set in a single inverted pass over
 /// the workspace. Returns `None` when there are no C++ files. `nodes`/`keep_file`

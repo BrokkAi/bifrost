@@ -6,12 +6,10 @@ use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
+use crate::analyzer::usages::parsed_tree::parse_kept_tree_sitter_files;
 use crate::analyzer::{CodeUnit, IAnalyzer, JavaAnalyzer, Language, ProjectFile};
-use crate::hash::{HashMap, HashSet, map_with_capacity};
-use crate::text_utils::compute_line_starts;
-use rayon::prelude::*;
+use crate::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
-use tree_sitter::Parser;
 
 pub(super) struct JavaEdgeGraph {
     pub(super) files: Vec<ProjectFile>,
@@ -114,16 +112,8 @@ impl<'a> JavaEdgeResolver<'a> {
             .ok()?
             .into_iter()
             .collect();
-        let parsed_files: Vec<(ProjectFile, ParsedJavaFile)> = files
-            .par_iter()
-            .filter(|file| keep_file(file))
-            .filter_map(parse_java_file)
-            .collect();
-        let mut parsed: HashMap<ProjectFile, ParsedJavaFile> =
-            map_with_capacity(parsed_files.len());
-        for (file, parsed_file) in parsed_files {
-            parsed.insert(file, parsed_file);
-        }
+        let language = tree_sitter_java::LANGUAGE.into();
+        let parsed = parse_kept_tree_sitter_files(&files, keep_file, &language);
 
         Some(Self {
             java,
@@ -142,25 +132,4 @@ impl<'a> JavaEdgeResolver<'a> {
     {
         inverted::build_java_edges(analyzer, self.java, &self.graph, nodes, keep_file)
     }
-}
-
-fn parse_java_file(file: &ProjectFile) -> Option<(ProjectFile, ParsedJavaFile)> {
-    let source = file.read_to_string().ok()?;
-    if source.is_empty() {
-        return None;
-    }
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_java::LANGUAGE.into())
-        .ok()?;
-    let tree = parser.parse(source.as_str(), None)?;
-    let line_starts = compute_line_starts(&source);
-    Some((
-        file.clone(),
-        ParsedJavaFile {
-            source,
-            tree,
-            line_starts,
-        },
-    ))
 }

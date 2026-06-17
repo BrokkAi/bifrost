@@ -26,16 +26,13 @@ use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, first_precise,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
+use crate::analyzer::usages::parsed_tree::ParsedTreeFile;
 use crate::analyzer::{CSharpAnalyzer, IAnalyzer, ProjectFile};
 use crate::hash::HashSet;
-use tree_sitter::{Node, Tree};
+use tree_sitter::Node;
 
 /// A C# file parsed once for the inverted scan: source, tree, and line starts.
-pub(super) struct ParsedCSharpFile {
-    pub(super) source: String,
-    pub(super) tree: Tree,
-    pub(super) line_starts: Vec<usize>,
-}
+pub(super) type ParsedCSharpFile = ParsedTreeFile;
 
 pub(super) fn build_csharp_edges<F>(
     analyzer: &dyn IAnalyzer,

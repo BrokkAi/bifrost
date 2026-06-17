@@ -37,16 +37,13 @@ use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, first_precise,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
+use crate::analyzer::usages::parsed_tree::ParsedTreeFile;
 use crate::analyzer::{IAnalyzer, ProjectFile, parse_php_use_aliases_from_source};
 use crate::hash::HashSet;
-use tree_sitter::{Node, Tree};
+use tree_sitter::Node;
 
 /// A PHP file parsed once for the inverted scan: source, tree, and line starts.
-pub(super) struct ParsedPhpFile {
-    pub(super) source: String,
-    pub(super) tree: Tree,
-    pub(super) line_starts: Vec<usize>,
-}
+pub(super) type ParsedPhpFile = ParsedTreeFile;
 
 /// Build the whole PHP `caller -> callee` edge set in a single inverted pass over
 /// the workspace. Returns `None` when there are no PHP files. `nodes`/`keep_file`

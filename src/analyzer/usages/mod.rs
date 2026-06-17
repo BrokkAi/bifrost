@@ -27,6 +27,7 @@ pub(crate) mod js_ts_graph;
 mod local_inference;
 mod model;
 mod outcome;
+mod parsed_tree;
 pub(crate) mod php_graph;
 pub(crate) mod python_graph;
 mod regex_analyzer;
