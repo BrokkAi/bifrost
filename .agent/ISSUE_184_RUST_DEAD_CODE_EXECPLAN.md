@@ -1,4 +1,4 @@
-# Issue 184 Rust Dead-Code Bulk Inbound Analysis
+# Issue 184 Dead-Code Bulk Inbound Analysis
 
 This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
 
@@ -6,9 +6,9 @@ This plan follows `.agent/PLANS.md` in this repository. It is self-contained so 
 
 ## Purpose / Big Picture
 
-The `report_dead_code_and_unused_abstraction_smells` tool is used by SlopCop as a broad, heuristic report over a workspace. On large Rust repositories, the old implementation performed one usage query for each candidate symbol; each Rust query rebuilt scan-graph state, making the tool too slow for broad scans. After this change, Rust dead-code scoring will build the Rust whole-program caller-to-callee graph once, count inbound references for each candidate, and report zero-inbound or one-inbound symbols with wording that makes clear this is workspace evidence, not proof of dead code.
+The `report_dead_code_and_unused_abstraction_smells` tool is used by SlopCop as a broad, heuristic report over a workspace. The original issue focused on Rust, where the old implementation performed one usage query for each candidate symbol and rebuilt scan-graph state for every candidate. This branch generalized the fix across the analyzer languages that have safe whole-program inverted graph semantics: supported candidates are scored from one bulk caller-to-callee graph per language, and unsafe shapes stay on precise or inconclusive paths.
 
-The visible result is that Rust dead-code reports still identify unused private helpers and one-call wrappers, but they do so through one inverted graph pass. Public Rust APIs with no workspace inbound references are reported conservatively as possibly untested or externally consumed public surface.
+The visible result is that dead-code reports still identify unused private helpers and one-call wrappers, but they do so through graph-derived workspace inbound counts where safe. Public/API-like declarations with no workspace inbound references are reported conservatively as possibly untested or externally consumed public surface, not as definite dead code.
 
 ## Progress
 
@@ -25,7 +25,7 @@ The visible result is that Rust dead-code reports still identify unused private 
 - [x] (2026-06-17T08:49:55Z) Re-ran `cargo test --test rust_dead_code_smells`; all 9 tests passed, including cap-regression tests.
 - [x] (2026-06-17T08:49:55Z) Re-ran `cargo test --test python_js_ts_dead_code_smells`; all 7 tests passed.
 - [x] (2026-06-17T08:49:55Z) Re-ran `cargo fmt` and `cargo clippy --all-targets --all-features -- -D warnings`; both completed cleanly.
-- [x] (2026-06-17T09:15:00Z) Started the deferred Python dead-code bulk graph scoring slice; JS/TS remains deferred because its candidate identity needs file-scoped handling.
+- [x] (2026-06-17T09:15:00Z) Started the Python dead-code bulk graph scoring slice; JS/TS identity work remained separate at that point because it needed file-scoped handling.
 - [x] (2026-06-17T09:22:00Z) Implemented Python bulk inbound scoring in `src/code_quality/dead_code_smells.rs` using one `build_python_usage_edges(...)` call per report.
 - [x] (2026-06-17T09:22:00Z) Updated Python dead-code tests for graph-derived one-call evidence, graph call-site truncation, file-cap skipping, and usage-cap skipping.
 - [x] (2026-06-17T09:22:00Z) Ran `cargo fmt` and `cargo test --test python_js_ts_dead_code_smells`; all 10 tests passed.
@@ -56,7 +56,7 @@ The visible result is that Rust dead-code reports still identify unused private 
 - [x] (2026-06-17T14:45:00Z) Ran a second guided review on the Scala review-fix diff and fixed the remaining performance finding by caching normalized Scala import exposure once per report.
 - [x] (2026-06-17T14:45:00Z) Re-ran `cargo test --test scala_dead_code_smells -- --nocapture`; all 16 tests passed with the cached Scala bulk eligibility context.
 - [x] (2026-06-17T15:05:00Z) Committed the Scala review-fix checkpoint as `0cce553` before starting the Go slice.
-- [x] (2026-06-17T15:10:00Z) Started the Go dead-code bulk graph scoring slice; Go functions and types will use the shared FQN scorer, while Go fields stay on the precise path.
+- [x] (2026-06-17T15:10:00Z) Started the Go dead-code bulk graph scoring slice; Go functions and types use the shared FQN scorer, while Go fields stay on the precise path.
 - [x] (2026-06-17T15:25:00Z) Implemented the initial Go report routing, Go public-surface wording, and `tests/go_dead_code_smells.rs`; first focused run passed 8 of 9 tests and exposed a test expectation mismatch for Go top-level external-usage ownership.
 - [x] (2026-06-17T15:30:00Z) Re-ran `cargo test --test go_dead_code_smells -- --nocapture`; all 9 Go dead-code tests passed.
 - [x] (2026-06-17T15:35:00Z) Ran `cargo test --test usages_go_graph_test`, `cargo test --test rust_dead_code_smells`, and `cargo test --test python_js_ts_dead_code_smells`; all passed.
@@ -68,7 +68,7 @@ The visible result is that Rust dead-code reports still identify unused private 
 - [x] (2026-06-17T16:40:00Z) Re-ran `cargo test --test usages_go_graph_test`; all 29 tests passed after adding explicit module-field caller attribution for top-level initializers.
 - [x] (2026-06-17T16:50:00Z) Re-ran `cargo test --test rust_dead_code_smells`, `cargo test --test python_js_ts_dead_code_smells`, `cargo test --test java_dead_code_smells`, and `cargo test --test scala_dead_code_smells`; all passed after Go review fixes.
 - [x] (2026-06-17T16:55:00Z) Re-ran `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`; all completed cleanly after removing one clippy `useless_conversion`.
-- [x] (2026-06-17T17:05:00Z) Started the C# dead-code bulk graph scoring slice; C# classes and non-overloaded methods will use `build_csharp_usage_edges(...)`, while fields, constructors, overloads, static-using-sensitive methods, and runtime/test entry points stay precise or are skipped.
+- [x] (2026-06-17T17:05:00Z) Started the C# dead-code bulk graph scoring slice; C# classes and non-overloaded methods use `build_csharp_usage_edges(...)`, while fields, constructors, overloads, static-using-sensitive methods, and runtime/test entry points stay precise or are skipped.
 - [x] (2026-06-17T17:25:00Z) Implemented C# bulk routing, conservative C# API wording, entry-point exclusion, and `tests/csharp_dead_code_smells.rs`; `cargo test --test csharp_dead_code_smells -- --nocapture` passed with 12 tests.
 - [x] (2026-06-17T17:30:00Z) Ran `cargo test --test usages_csharp_graph_test`; all 25 C# usage graph tests passed.
 - [x] (2026-06-17T17:40:00Z) Re-ran `cargo test --test rust_dead_code_smells`, `cargo test --test python_js_ts_dead_code_smells`, `cargo test --test java_dead_code_smells`, `cargo test --test scala_dead_code_smells`, and `cargo test --test go_dead_code_smells`; all passed after the C# slice.
@@ -77,7 +77,7 @@ The visible result is that Rust dead-code reports still identify unused private 
 - [x] (2026-06-17T18:20:00Z) Implemented C# guided-review fixes and re-ran `cargo test --test csharp_dead_code_smells`; all 16 tests passed, including new regressions for alias usings, whitespace static usings, qualified test attributes, non-static `Main`, and public classes with private members.
 - [x] (2026-06-17T18:30:00Z) Re-ran `cargo test --test usages_csharp_graph_test`, all existing dead-code smell suites, `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`; all completed cleanly after C# review fixes.
 - [x] (2026-06-17T18:35:00Z) Committed the completed C# checkpoint as `2371852` before starting the next language slice.
-- [ ] (2026-06-17T18:40:00Z) Started the C++ dead-code bulk graph scoring slice; C++ classes and non-overloaded free functions will use `build_cpp_usage_edges(...)`, while methods, constructors, fields, overloaded functions, and runtime entry points stay precise or excluded.
+- [x] (2026-06-17T18:40:00Z) Started the C++ dead-code bulk graph scoring slice; C++ classes and non-overloaded free functions use `build_cpp_usage_edges(...)`, while methods, constructors, fields, overloaded functions, and runtime entry points stay precise or excluded.
 - [x] (2026-06-17T19:00:00Z) Implemented initial C++ bulk routing and `tests/cpp_dead_code_smells.rs`; first focused test run exposed that registering `CppUsageGraphStrategy` for precise fallback would undercount unsupported method receiver forms, so unsafe C++ candidates now keep the existing text-search precise path.
 - [x] (2026-06-17T19:05:00Z) Re-ran `cargo test --test cpp_dead_code_smells -- --nocapture`; all 12 C++ dead-code tests passed.
 - [x] (2026-06-17T19:10:00Z) Ran `cargo test --test usages_cpp_graph_test` and re-ran Rust, Python/JS/TS, Java, Scala, Go, and C# dead-code smell suites; all passed after the C++ slice.
@@ -86,10 +86,13 @@ The visible result is that Rust dead-code reports still identify unused private 
 - [x] (2026-06-17T19:45:00Z) Implemented C++ guided-review fixes by moving bulk eligibility into `cpp_graph` beside `TargetSpec`, treating namespace/module-owned functions as free-function bulk candidates, narrowing entry-point exclusion to global `::main`, and adding focused regressions.
 - [x] (2026-06-17T19:50:00Z) Re-ran `cargo test --test cpp_dead_code_smells -- --nocapture`, `cargo test --test usages_cpp_graph_test`, and all existing dead-code smell suites; all passed after C++ review fixes.
 - [x] (2026-06-17T19:55:00Z) Re-ran `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`; all completed cleanly after C++ review fixes.
-- [ ] (2026-06-17T20:05:00Z) Started the PHP dead-code bulk graph scoring slice; PHP classes/types and namespace-level functions will use `build_php_usage_edges(...)`, while constructors, methods, properties, and constants stay precise.
+- [x] (2026-06-17T20:05:00Z) Started the PHP dead-code bulk graph scoring slice; PHP classes/types and namespace-level functions use `build_php_usage_edges(...)`, while constructors, methods, properties, and constants stay precise.
 - [x] (2026-06-17T20:20:00Z) Implemented PHP bulk eligibility beside `PhpUsageGraphStrategy`, wired PHP report routing, and added `tests/php_dead_code_smells.rs`; `cargo test --test php_dead_code_smells -- --nocapture` passed with 10 tests.
 - [x] (2026-06-17T20:25:00Z) Ran `cargo test --test usages_php_graph_test` and re-ran Rust, Python/JS/TS, Java, Scala, Go, C#, and C++ dead-code smell suites; all passed after the PHP slice.
 - [x] (2026-06-17T20:30:00Z) Ran `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`; all completed cleanly after the PHP slice.
+- [x] (2026-06-17T21:10:00Z) Opened draft PR #195 for visibility, rebased the branch onto current `origin/master`, resolved graph-module split conflicts, and force-pushed the clean rebased branch.
+- [x] (2026-06-17T21:15:00Z) Verified PR #195 reports `MERGEABLE` / `CLEAN` after rebase conflict resolution.
+- [x] (2026-06-17T21:20:00Z) Started the completion/accounting slice by reconciling this ExecPlan with the actual implementation state. All supported analyzer languages in `Language` are now covered by bulk dead-code scoring where safe; remaining work is optional profiling or targeted graph-semantic parity follow-up, not a missing language slice.
 
 ## Surprises & Discoveries
 
@@ -170,8 +173,8 @@ The visible result is that Rust dead-code reports still identify unused private 
 
 ## Decision Log
 
-- Decision: Keep this issue slice Rust-only for implementation, while tracking other language targets in this plan as follow-up slices.
-  Rationale: Issue 184's current hot path is Rust dead-code reporting; Python and JS/TS tests should remain unchanged so this branch does not widen into a cross-language migration.
+- Decision: Start issue #184 with the Rust implementation and track additional language slices explicitly before widening.
+  Rationale: Issue 184's original hot path was Rust dead-code reporting. The branch later widened deliberately through checkpointed, reviewed language slices after the Rust substrate proved out.
   Date/Author: 2026-06-17 / Codex
 
 - Decision: Use whole-program inbound graph evidence directly for Rust instead of running recall-safe per-symbol confirmation queries.
@@ -186,8 +189,8 @@ The visible result is that Rust dead-code reports still identify unused private 
   Rationale: There should be one Rust analyzer capability resolution path for Rust usage-graph consumers so MultiAnalyzer handling cannot drift.
   Date/Author: 2026-06-17 / Codex
 
-- Decision: Implement Python as the next bulk scoring slice and leave JS/TS on the legacy per-symbol path for now.
-  Rationale: Python's whole-workspace graph uses dotted FQN identity, while JS/TS needs a separate design for file-scoped identity before same-name exports can be scored safely.
+- Decision: Implement Python before JS/TS, and defer JS/TS until file-scoped identity is available.
+  Rationale: Python's whole-workspace graph uses dotted FQN identity, while JS/TS needed a separate `UsageNodeKey { file, fqn }` design before same-name exports could be scored safely. JS/TS was implemented later with that scoped identity seam.
   Date/Author: 2026-06-17 / Codex
 
 - Decision: Keep Rust member candidates on the existing per-symbol Rust strategy until the inverted graph supports receiver/member inference.
@@ -258,7 +261,7 @@ The visible result is that Rust dead-code reports still identify unused private 
 
 2026-06-17: The Rust dead-code report now uses one inverted Rust usage graph build per report call and derives zero-inbound/one-inbound findings from graph edge weights. Rust bulk analysis now honors `max_usage_candidate_files` by skipping inconclusive oversized Rust workspaces and honors `max_usages_per_symbol` by skipping candidates whose inbound count exceeds the requested usage cap. Focused tests and Rust linting passed. Gradle checks were requested by the general project guidance but are not available in this Rust worktree because there is no `./gradlew`.
 
-2026-06-17: The Python dead-code report now also uses one inverted Python usage graph build per report call and derives zero-inbound/one-inbound findings from graph edge weights. JavaScript and TypeScript intentionally remain on the legacy per-symbol path until file-scoped identity is designed. Python focused tests now cover graph-derived one-call evidence plus graph truncation, file-cap skipping, and usage-cap skipping.
+2026-06-17: The Python dead-code report now also uses one inverted Python usage graph build per report call and derives zero-inbound/one-inbound findings from graph edge weights. Python focused tests now cover graph-derived one-call evidence plus graph truncation, file-cap skipping, and usage-cap skipping. JS/TS was implemented later after adding file-scoped identity.
 
 2026-06-17: The JavaScript/TypeScript dead-code report now uses a file-scoped inverted graph path for exported candidates. The scoped identity seam is reusable for future languages, while existing string-keyed graph builders remain unchanged. Ambiguous JS/TS export aliases are skipped as inconclusive.
 
@@ -270,21 +273,29 @@ The visible result is that Rust dead-code reports still identify unused private 
 
 2026-06-17: A second guided review found the candidate-aware import guard was still too expensive when repeated for every method candidate. The Scala slice now builds one `ScalaDeadCodeBulkContext` per report and reuses it for all Scala candidate eligibility checks.
 
-2026-06-17: The Go slice is now in progress. The intended implementation reuses the shared string-keyed FQN scorer for Go functions and types/classes through one `build_go_usage_edges(...)` pass per report, with exported Go symbols reported using conservative public-surface wording and Go fields kept precise.
+2026-06-17: The Go slice reused the shared string-keyed FQN scorer for Go functions and types/classes through one `build_go_usage_edges(...)` pass per report, with exported Go symbols reported using conservative public-surface wording and Go fields kept precise.
 
 2026-06-17: The Go dead-code report now bulk-scores Go functions and types/classes with one inverted Go usage graph pass per report. Go fields remain precise, exported Go findings use lower confidence and public-surface wording, and focused Go tests cover zero-inbound, one-inbound, cap handling, exported policy, and field fallback behavior.
 
 2026-06-17: Guided review tightened the Go slice. Go runtime/test entry points are excluded from dead-code candidates, package-level initializer references can now be attributed to module field callers in the inverted graph, and public-surface finding construction/test fixture setup were deduplicated.
 
-2026-06-17: The C# slice is now in progress. The intended implementation mirrors Java's conservative FQN bulk scorer shape: one `build_csharp_usage_edges(...)` pass for safe candidates, precise fallback for unsafe members, and conservative public/API-like wording for non-private declarations.
+2026-06-17: The C# slice mirrors Java's conservative FQN bulk scorer shape: one `build_csharp_usage_edges(...)` pass for safe candidates, precise fallback for unsafe members, and conservative public/API-like wording for non-private declarations.
 
 2026-06-17: The C# dead-code report now bulk-scores safe C# classes and non-overloaded methods with one inverted C# usage graph pass per report. Fields, constructors, overloaded methods, and static-using-sensitive methods stay on the precise path or are skipped as inconclusive, while `Main` and attributed test methods are excluded from candidate selection.
 
+2026-06-17: The C++ dead-code report now bulk-scores class/type declarations and non-overloaded free functions with one inverted C++ usage graph pass per report. Constructors, methods, fields, overloaded functions, and unsupported receiver-sensitive forms stay conservative. C++ precise fallback is intentionally not registered for the dead-code report because the graph can return successful zero-hit evidence for receiver forms that are unsafe for this heuristic; unsupported C++ precise cases are reported as inconclusive instead of silently disappearing.
+
+2026-06-17: The PHP dead-code report now bulk-scores namespace-level functions and class/type declarations with one inverted PHP usage graph pass per report. Methods, constructors, properties, constants, magic methods, and dynamic dispatch-sensitive forms stay precise or conservative. PHP precise fallback is registered so candidates that are unsafe for bulk scoring do not disappear.
+
+2026-06-17: PR #195 was opened as a draft for visibility, rebased onto current `origin/master`, and pushed after resolving Java/Scala/C++ graph-module split conflicts. GitHub reports the PR as `MERGEABLE` and `CLEAN` at head `f571a9f`.
+
+2026-06-17: All concrete language targets represented in `Language` are now covered by the issue #184 dead-code bulk path where graph semantics are safe: Rust, Python, JS/TS, Java, Scala, Go, C#, C++, and PHP. The remaining meaningful follow-up is not a missing language slice; it is either guided review/CI hardening, product-value validation on larger workspaces, or targeted graph parity/profiling work if broad graph cost or skipped unsafe shapes still dominate.
+
 ## Context and Orientation
 
-The report entry point is `src/code_quality/dead_code_smells.rs`, function `report_dead_code_and_unused_abstraction_smells`. It resolves input files, selects candidate declarations, and currently calls `analyze_candidate` once per candidate. `analyze_candidate` uses per-symbol usage analysis and is still appropriate for the existing Python, JavaScript, and TypeScript behavior in this slice.
+The report entry point is `src/code_quality/dead_code_smells.rs`, function `report_dead_code_and_unused_abstraction_smells`. It resolves input files, selects candidate declarations, partitions them by language and eligibility, bulk-scores safe candidates with one whole-program inverted graph per language, and sends unsafe shapes to the conservative per-symbol path or explicit inconclusive evidence.
 
-For Rust and Python, the scalable whole-program paths return `UsageEdges`, a crate-internal structure with an `edges` map keyed by `(caller_fqn, callee_fqn)` and a `truncated` map keyed by callee FQN for symbols whose call sites exceeded the enumeration guardrail. A caller is the enclosing function or class-like declaration containing a reference. A callee is the declaration being referenced. An inbound count for a candidate is the sum of edge weights where the edge callee equals the candidate's fully qualified name.
+For Rust, Python, Java, Scala, Go, C#, C++, and PHP, the scalable whole-program paths return `UsageEdges`, a crate-internal structure with an `edges` map keyed by `(caller_fqn, callee_fqn)` and a `truncated` map keyed by callee FQN for symbols whose call sites exceeded the enumeration guardrail. A caller is the enclosing function or class-like declaration containing a reference. A callee is the declaration being referenced. An inbound count for a candidate is the sum of edge weights where the edge callee equals the candidate's fully qualified name.
 
 For JS/TS, bare FQN identity is insufficient because unrelated files can export the same local name. The scoped path uses `UsageNodeKey { file, fqn }` and `ScopedUsageEdges` so dead-code scoring can distinguish `a.ts::helper` from `b.ts::helper`. Ambiguous export aliases, star re-exports, and unseedable local symbols are skipped as inconclusive rather than forced into a potentially wrong key.
 
@@ -292,48 +303,50 @@ Rust visibility information already exists on `RustAnalyzer` as `is_rust_public_
 
 ## Plan of Work
 
-First, add the Rust bulk path to `src/code_quality/dead_code_smells.rs`. The report function should partition the selected candidates: Rust candidates go through one new helper, and unsupported bulk languages keep the existing `analyze_candidate` loop. The helper should resolve the concrete `RustAnalyzer`, build a Rust node set from all Rust function and class declarations plus all Rust smell candidates, call `build_rust_usage_edges` once with an all-files `keep_file` predicate, and compute inbound counts for each candidate from the resulting edges.
+The language migration work is complete for the current analyzer language set. The report now uses bulk graph scoring for safe candidates in Rust, Python, JS/TS, Java, Scala, Go, C#, C++, and PHP, with language-specific conservative guards for members, fields, constructors, overloads, import-sensitive references, entry points, public/API-like declarations, ambiguous JS/TS export identity, and dynamic dispatch-sensitive forms.
 
-Second, build findings from inbound counts. Zero-inbound and one-inbound candidates produce findings; higher inbound counts produce no finding. Candidates present in `UsageEdges.truncated` are skipped with a clear inconclusive-evidence note and never flagged. Private Rust candidates can keep the existing strong dead-code and one-call-abstraction wording. Public Rust candidates must use lower score and confidence, and must say they are unreferenced or lightly referenced in the workspace and may be externally consumed or untested public surface.
+The next work should not add another language unless `Language` gains a new analyzer. Prefer one of these follow-up slices:
 
-Third, update `tests/rust_dead_code_smells.rs`. Existing private helper, one-call wrapper, recursion, explicit FQN targeting, and threshold behavior should still pass after expected wording changes. Add a public `pub fn` test that asserts conservative public-surface wording. Cover `truncated_symbols` behavior with an integration test that creates more than the Rust usage-graph call-site limit and asserts the candidate is skipped as inconclusive.
-
-The Python follow-up slice now uses Python's inverted usage graph for the same one-pass inbound scoring shape. The JS/TS follow-up slice now uses file-scoped identity so same-name exports in different files do not cross-count. The Java follow-up slice uses Java's existing package-qualified FQN graph for safe candidates and keeps overlap-sensitive candidates precise. The Scala follow-up slice uses Scala's existing FQN graph only for safe candidates and keeps richer member/import semantics precise. The Go follow-up slice uses Go's existing package-qualified FQN graph for functions and types/classes while leaving fields precise. The current C# follow-up slice uses C#'s existing package-qualified FQN graph for safe classes and methods while leaving fields, constructors, overloads, static-using-sensitive methods, and externally invoked entry points conservative. Deferred follow-up slices remain tracked here but are not implemented in this branch. C++ and PHP parity should only be pursued after the Rust, Python, JS/TS, Java, Scala, Go, and C# slices confirm product value and graph semantics. If broad graph cost still dominates after bulk dead-code scoring, later work can profile resolver/cache micro-optimizations.
+1. Run guided review and CI-driven hardening on PR #195.
+2. Validate product value on large real workspaces and compare report latency/quality before and after the bulk path.
+3. Profile broad graph cost if latency still dominates, then consider resolver/cache micro-optimizations with evidence.
+4. Add targeted graph parity slices for currently conservative unsafe shapes only when product value justifies widening recall, such as Go fields, Java static imports/fields, Scala import-sensitive members, C# using-member forms, C++ receiver-sensitive methods/fields, or PHP dynamic/member forms.
 
 ## Concrete Steps
 
 All commands are run from `/Users/dave/.codex/worktrees/89d9/bifrost`.
 
-The branch sync step has already been run:
+Branch sync and PR conflict resolution were completed:
 
     git fetch
     git rebase
 
-Expected result observed:
-
-    Current branch 184-optimize-rust-dead-code-usage-graph-resolution-on-large-workspaces is up to date.
-
-After implementation, run focused tests first:
+Focused test commands used during the final validation cycle:
 
     cargo test --test rust_dead_code_smells
     cargo test --test python_js_ts_dead_code_smells
+    cargo test --test java_dead_code_smells
+    cargo test --test scala_dead_code_smells
+    cargo test --test go_dead_code_smells
+    cargo test --test csharp_dead_code_smells
+    cargo test --test cpp_dead_code_smells
+    cargo test --test php_dead_code_smells
 
-Then run final checks:
+Final checks:
 
     cargo fmt
     cargo clippy --all-targets --all-features -- -D warnings
-    ./gradlew fix tidy
-    ./gradlew analyze
+    git diff --check
 
 ## Validation and Acceptance
 
-The new Rust tests should demonstrate the behavior change. A private unused helper should still appear in the report with zero total usages. A one-call wrapper should still appear with total usage count `1`. A public unused function should appear with conservative wording that includes "unreferenced in workspace" and mentions public surface risk rather than saying it is definitely dead. Python, JavaScript, and TypeScript dead-code tests should continue to pass unchanged.
+The implementation is accepted when each migrated language has focused dead-code coverage for zero-inbound findings, one-inbound findings, cap handling, public/API-like wording where applicable, and conservative fallback/skipped behavior for unsafe shapes. The relevant usage-graph regression suite for each graph-backed language should pass where one exists.
 
-The implementation is accepted when the focused tests pass, JS/TS graph strategy tests pass, formatting is clean, clippy reports no warnings, and Gradle tidy/fix/analyze complete successfully or any skipped final command is documented with the reason.
+The current branch has passed the focused dead-code suites for Rust, Python/JS/TS, Java, Scala, Go, C#, C++, and PHP; relevant JS/TS, Java, Scala, Go, C#, C++, and PHP usage graph suites; `cargo fmt`; `cargo clippy --all-targets --all-features -- -D warnings`; and `git diff --check`. Gradle commands remain unavailable in this Rust worktree because there is no `./gradlew`.
 
 ## Idempotence and Recovery
 
-The implementation is additive and can be retried safely. If tests fail after the Rust fast path is added, inspect the report text emitted by the failing assertions and update the wording or expectations only when the behavior still matches the heuristic contract. Do not reset the worktree or discard unrelated user changes. If `./gradlew fix tidy` rewrites formatting, inspect the diff before continuing.
+The implementation is additive and can be retried safely. If tests fail after a bulk graph change, inspect the report text emitted by the failing assertions and update the wording or expectations only when the behavior still matches the heuristic contract. Do not reset the worktree or discard unrelated user changes.
 
 ## Artifacts and Notes
 
@@ -636,16 +649,6 @@ Final hygiene validation:
 
 ## Interfaces and Dependencies
 
-At the end of this work, `src/code_quality/dead_code_smells.rs` should contain a crate-internal Rust bulk helper with behavior equivalent to:
+`src/code_quality/dead_code_smells.rs` now owns the report partitioning and language-specific bulk scoring helpers. The FQN-keyed languages use the shared `analyze_fqn_candidates_with_usage_graph(...)` helper with language-specific eligibility and finding builders. JS/TS uses `build_jsts_scoped_usage_edges(...)` and `UsageNodeKey { file, fqn }` so same-name exports do not cross-count. Unsafe or ambiguous candidates are routed to precise analysis where reliable or reported as inconclusive evidence.
 
-    fn analyze_rust_candidates_with_usage_graph(
-        analyzer: &dyn IAnalyzer,
-        candidates: &[CodeUnit],
-        skipped: &mut Vec<String>,
-    ) -> Vec<DeadCodeFinding>
-
-The helper may use a different exact name if the surrounding code reads better, but it must resolve `RustAnalyzer`, call `build_rust_usage_edges` once, and produce `DeadCodeFinding` rows from inbound edge counts. It must not call `RustExportUsageGraphStrategy::find_usages` per non-member Rust candidate.
-
-The Rust analyzer visibility helper `RustAnalyzer::is_rust_public_like_declaration` may be widened only as much as needed for crate-internal code-quality use.
-
-The JS/TS scoped helper should build one scoped usage graph through `build_jsts_scoped_usage_edges`, score only candidates with resolved `UsageNodeKey` identity, and keep ambiguous or unseedable candidates in skipped/inconclusive evidence.
+Rust public-surface classification reuses `RustAnalyzer::is_rust_public_like_declaration`. Other languages use language-specific conservative public/API-like checks documented in their slice decisions and tests.
