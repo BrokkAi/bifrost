@@ -3,11 +3,11 @@ name: Publish wheels
 on:
   push:
     tags:
-      - 'py-v*'
+      - 'v*.*.*'
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to build and publish (e.g. py-v0.2.1). Must already exist.'
+        description: 'Tag to build and publish (e.g. v0.6.4). Must already exist.'
         required: true
         type: string
 
@@ -24,18 +24,26 @@ jobs:
         with:
           ref: ${{ inputs.tag || github.ref }}
 
-      - name: Verify pyproject.toml version matches tag
+      - name: Verify version is in sync (tag == Cargo.toml, pyproject inherits)
         shell: bash
         env:
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
-          tag_version="${TAG#py-v}"
-          pkg_version=$(grep -m1 '^version' pyproject.toml | sed -E 's/version *= *"([^"]+)"/\1/')
-          if [ "$tag_version" != "$pkg_version" ]; then
-            echo "Tag version $tag_version != pyproject.toml $pkg_version" >&2
+          tag_version="${TAG#v}"
+          # Cargo.toml is the single source of truth; the wheel inherits it via
+          # maturin's dynamic version.
+          crate_version=$(grep -m1 '^version' Cargo.toml | sed -E 's/version *= *"([^"]+)"/\1/')
+          if [ "$tag_version" != "$crate_version" ]; then
+            echo "Tag version $tag_version != Cargo.toml $crate_version" >&2
             exit 1
           fi
-          echo "Version $pkg_version matches tag $TAG"
+          # Guard the single-source invariant: pyproject must NOT hardcode a
+          # version (it would silently override Cargo.toml and re-introduce drift).
+          if grep -qE '^version *=' pyproject.toml; then
+            echo "pyproject.toml declares a hardcoded version; it must use dynamic = [\"version\"]" >&2
+            exit 1
+          fi
+          echo "Version $crate_version matches tag $TAG (pyproject inherits via maturin)"
 
   build:
     name: build (${{ matrix.target }})
@@ -123,6 +131,30 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+
+      - name: Verify built artifacts carry the tagged version
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          # Last line of defence: confirm every wheel/sdist about to hit PyPI
+          # actually carries the tagged version, whatever maturin resolved.
+          expected="${TAG#v}"
+          shopt -s nullglob
+          artifacts=(dist/*.whl dist/*.tar.gz)
+          if [ ${#artifacts[@]} -eq 0 ]; then
+            echo "No artifacts found in dist/" >&2
+            exit 1
+          fi
+          bad=0
+          for f in "${artifacts[@]}"; do
+            case "$(basename "$f")" in
+              *-"${expected}"-*|*-"${expected}".tar.gz) ;;
+              *) echo "Artifact $(basename "$f") does not carry version $expected" >&2; bad=1 ;;
+            esac
+          done
+          [ "$bad" -eq 0 ] || exit 1
+          echo "All ${#artifacts[@]} artifacts carry version $expected"
 
       - name: Publish to PyPI (trusted publishing)
         uses: pypa/gh-action-pypi-publish@release/v1

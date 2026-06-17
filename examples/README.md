@@ -67,8 +67,9 @@ this checkout works too, but then it imports the *local* source tree, not the wh
   (`https://pypi.org/pypi/brokk-bifrost-searchtools/json`): macOS x86_64 + arm64,
   manylinux x86_64 + aarch64, Windows amd64, plus the sdist.
 - `validate_published_wheel.sh` prints `PASS` on your machine.
-- Tag `py-v<version>` matches `pyproject.toml` (the workflow's `verify-version`
-  job enforces this).
+- Tag `v<version>` matches `Cargo.toml` (the single source of truth; the wheel
+  inherits it via maturin's dynamic version, and the workflow's `verify-version`
+  job enforces tag == `Cargo.toml`).
 - Re-running the publish workflow for an already-published version is **expected
   to fail** at the upload step — PyPI refuses to overwrite existing files. Bump
   the version to publish again.
