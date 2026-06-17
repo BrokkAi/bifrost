@@ -1,6 +1,9 @@
 [project]
 name = "brokk-bifrost-searchtools"
-version = "0.2.1"
+# Version is intentionally NOT hardcoded here: maturin reads it from
+# Cargo.toml (the single source of truth) because of `dynamic` below. This
+# makes it impossible for the wheel and the crate to drift out of sync.
+dynamic = ["version"]
 description = "Fast, structured code search and analysis for Python, backed by a native Rust (Tree-sitter) extension"
 readme = "bifrost_searchtools/README.md"
 requires-python = ">=3.12"
