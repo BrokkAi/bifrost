@@ -25,6 +25,30 @@ where
     Some(resolver.build_edges(analyzer, nodes, keep_file))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PhpDeadCodeBulkEligibility {
+    BulkSafe,
+    NeedsPrecise,
+}
+
+pub(crate) fn dead_code_bulk_eligibility(
+    analyzer: &dyn IAnalyzer,
+    target: &CodeUnit,
+) -> PhpDeadCodeBulkEligibility {
+    let Some(php) = resolve_php_analyzer(analyzer) else {
+        return PhpDeadCodeBulkEligibility::NeedsPrecise;
+    };
+    let Some(spec) = TargetSpec::from_target(php, target) else {
+        return PhpDeadCodeBulkEligibility::NeedsPrecise;
+    };
+    match spec.kind {
+        TargetKind::Type | TargetKind::Function => PhpDeadCodeBulkEligibility::BulkSafe,
+        TargetKind::Constructor | TargetKind::Method | TargetKind::Field | TargetKind::Constant => {
+            PhpDeadCodeBulkEligibility::NeedsPrecise
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct PhpUsageGraphStrategy {
     _private: (),

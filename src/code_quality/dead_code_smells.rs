@@ -126,6 +126,7 @@ pub fn report_dead_code_and_unused_abstraction_smells(
     let mut go_candidates: Vec<CodeUnit> = Vec::new();
     let mut csharp_candidates: Vec<CodeUnit> = Vec::new();
     let mut cpp_candidates: Vec<CodeUnit> = Vec::new();
+    let mut php_candidates: Vec<CodeUnit> = Vec::new();
     let mut java_overloaded_fqns: Option<HashSet<String>> = None;
     let mut java_static_imports_present: Option<bool> = None;
     let mut csharp_overloaded_fqns: Option<HashSet<String>> = None;
@@ -177,6 +178,10 @@ pub fn report_dead_code_and_unused_abstraction_smells(
                 ) =>
             {
                 cpp_candidates.push(candidate.clone());
+                continue;
+            }
+            Language::Php if !php_candidate_needs_precise_scan(analyzer, candidate) => {
+                php_candidates.push(candidate.clone());
                 continue;
             }
             Language::Java
@@ -300,6 +305,17 @@ pub fn report_dead_code_and_unused_abstraction_smells(
         analyze_cpp_candidates_with_usage_graph(
             analyzer,
             &cpp_candidates,
+            usage_candidate_file_cap,
+            usage_cap,
+            &mut skipped,
+        )
+        .into_iter()
+        .filter(|finding| finding.score >= threshold),
+    );
+    findings.extend(
+        analyze_php_candidates_with_usage_graph(
+            analyzer,
+            &php_candidates,
             usage_candidate_file_cap,
             usage_cap,
             &mut skipped,
@@ -542,6 +558,7 @@ fn is_dead_code_candidate(code_unit: &CodeUnit) -> bool {
             | Language::Go
             | Language::CSharp
             | Language::Cpp
+            | Language::Php
     ) && (code_unit.is_function() || code_unit.is_class() || code_unit.is_field())
 }
 
@@ -934,6 +951,30 @@ fn analyze_cpp_candidates_with_usage_graph(
             crate::analyzer::usages::cpp_graph::build_cpp_usage_edges(analyzer, nodes, |_| true)
         },
         cpp_graph_finding,
+    )
+}
+
+fn analyze_php_candidates_with_usage_graph(
+    analyzer: &dyn IAnalyzer,
+    candidates: &[CodeUnit],
+    usage_candidate_file_cap: usize,
+    usage_cap: usize,
+    skipped: &mut Vec<String>,
+) -> Vec<DeadCodeFinding> {
+    analyze_fqn_candidates_with_usage_graph(
+        FqnBulkGraphRequest {
+            analyzer,
+            language: Language::Php,
+            candidates,
+            usage_candidate_file_cap,
+            usage_cap,
+            skipped,
+        },
+        |unit| unit.is_function() || unit.is_class(),
+        |nodes| {
+            crate::analyzer::usages::php_graph::build_php_usage_edges(analyzer, nodes, |_| true)
+        },
+        php_graph_finding,
     )
 }
 
@@ -1339,6 +1380,23 @@ fn cpp_graph_finding(
     )
 }
 
+fn php_graph_finding(
+    analyzer: &dyn IAnalyzer,
+    declarations_by_fqn: &BTreeMap<String, Vec<CodeUnit>>,
+    candidate: &CodeUnit,
+    usage: GraphIncomingUsage,
+) -> Option<DeadCodeFinding> {
+    public_surface_graph_finding(
+        analyzer,
+        Language::Php,
+        declarations_by_fqn,
+        candidate,
+        usage,
+        true,
+        "public",
+    )
+}
+
 fn public_surface_graph_finding(
     analyzer: &dyn IAnalyzer,
     language: Language,
@@ -1713,6 +1771,13 @@ fn cpp_candidate_needs_precise_scan(
     )
 }
 
+fn php_candidate_needs_precise_scan(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bool {
+    matches!(
+        crate::analyzer::usages::php_graph::dead_code_bulk_eligibility(analyzer, candidate),
+        crate::analyzer::usages::php_graph::PhpDeadCodeBulkEligibility::NeedsPrecise
+    )
+}
+
 fn scala_bulk_file_count_exceeds_cap(
     analyzer: &dyn IAnalyzer,
     usage_candidate_file_cap: usize,
@@ -2044,6 +2109,7 @@ fn language_label(language: Language) -> &'static str {
         Language::Go => "Go",
         Language::CSharp => "C#",
         Language::Cpp => "C++",
+        Language::Php => "PHP",
         _ => "graph-backed",
     }
 }

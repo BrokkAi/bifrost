@@ -86,6 +86,10 @@ The visible result is that Rust dead-code reports still identify unused private 
 - [x] (2026-06-17T19:45:00Z) Implemented C++ guided-review fixes by moving bulk eligibility into `cpp_graph` beside `TargetSpec`, treating namespace/module-owned functions as free-function bulk candidates, narrowing entry-point exclusion to global `::main`, and adding focused regressions.
 - [x] (2026-06-17T19:50:00Z) Re-ran `cargo test --test cpp_dead_code_smells -- --nocapture`, `cargo test --test usages_cpp_graph_test`, and all existing dead-code smell suites; all passed after C++ review fixes.
 - [x] (2026-06-17T19:55:00Z) Re-ran `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`; all completed cleanly after C++ review fixes.
+- [ ] (2026-06-17T20:05:00Z) Started the PHP dead-code bulk graph scoring slice; PHP classes/types and namespace-level functions will use `build_php_usage_edges(...)`, while constructors, methods, properties, and constants stay precise.
+- [x] (2026-06-17T20:20:00Z) Implemented PHP bulk eligibility beside `PhpUsageGraphStrategy`, wired PHP report routing, and added `tests/php_dead_code_smells.rs`; `cargo test --test php_dead_code_smells -- --nocapture` passed with 10 tests.
+- [x] (2026-06-17T20:25:00Z) Ran `cargo test --test usages_php_graph_test` and re-ran Rust, Python/JS/TS, Java, Scala, Go, C#, and C++ dead-code smell suites; all passed after the PHP slice.
+- [x] (2026-06-17T20:30:00Z) Ran `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`; all completed cleanly after the PHP slice.
 
 ## Surprises & Discoveries
 
@@ -160,6 +164,9 @@ The visible result is that Rust dead-code reports still identify unused private 
 
 - Observation: C++ namespace declarations are represented as module owners, so namespace-owned functions need to be treated as free functions for dead-code bulk eligibility.
   Evidence: guided review identified that `analyzer.parent_of(candidate).is_none()` misses `namespace detail { void helper(); }` even though the inverted graph supports namespace-qualified free functions.
+
+- Observation: PHP has a whole-workspace inverted edge builder that resolves namespace/use-aware type references, namespace-level function calls, constants, constructors, and typed receiver member calls, but dynamic function/class/member forms are intentionally ignored.
+  Evidence: `src/analyzer/usages/php_graph/inverted.rs` documents PHP graph semantics, and `tests/usages_php_graph_test.rs` covers ignored dynamic class/function/member forms.
 
 ## Decision Log
 
@@ -241,6 +248,10 @@ The visible result is that Rust dead-code reports still identify unused private 
 
 - Decision: Keep C++ dead-code bulk eligibility in `cpp_graph` beside `TargetSpec`, not in `dead_code_smells.rs`.
   Rationale: The graph resolver owns C++ target-shape classification, including module-owned namespace functions and constructors; the report layer should consume that classification to avoid drift.
+  Date/Author: 2026-06-17 / Codex
+
+- Decision: Add PHP bulk dead-code scoring only for class/type declarations and namespace-level functions.
+  Rationale: PHP FQNs are namespace-qualified for these shapes and the graph handles direct type/function references. Methods, constructors, properties, constants, magic methods, and dynamic dispatch-sensitive forms stay precise to avoid graph undercount false positives.
   Date/Author: 2026-06-17 / Codex
 
 ## Outcomes & Retrospective
@@ -516,11 +527,37 @@ C++ usage graph regression evidence:
     test cpp_graph_review_fails_on_mixed_proven_and_unproven_member_matches ... ok
     test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 
+PHP focused test evidence:
+
+    cargo test --test php_dead_code_smells -- --nocapture
+    running 10 tests
+    test php_dead_code_smell_reports_unused_function_with_public_wording ... ok
+    test php_dead_code_smell_reports_one_call_function ... ok
+    test php_type_usage_from_another_file_prevents_finding ... ok
+    test php_symbol_with_two_distinct_inbound_callers_is_not_flagged ... ok
+    test php_dead_code_smell_honors_usage_candidate_file_cap ... ok
+    test php_dead_code_smell_honors_usage_cap ... ok
+    test php_public_class_uses_conservative_wording_and_score ... ok
+    test php_constructor_candidate_stays_on_precise_path ... ok
+    test php_method_candidate_stays_on_precise_path ... ok
+    test php_property_candidate_stays_on_precise_path ... ok
+    test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+PHP usage graph regression evidence:
+
+    cargo test --test usages_php_graph_test
+    running 26 tests
+    test usage_finder_routes_php_targets_through_graph_strategy ... ok
+    test php_graph_finds_global_and_namespace_qualified_function_calls ... ok
+    test php_graph_ignores_dynamic_class_function_and_member_forms ... ok
+    test php_graph_ignores_magic_methods_and_properties_as_dynamic_dispatch ... ok
+    test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
 Rust formatting and lint evidence:
 
     cargo fmt
     cargo clippy --all-targets --all-features -- -D warnings
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.02s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.19s
 
 Whitespace evidence:
 
