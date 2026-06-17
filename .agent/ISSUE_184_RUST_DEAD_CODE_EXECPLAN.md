@@ -76,6 +76,16 @@ The visible result is that Rust dead-code reports still identify unused private 
 - [x] (2026-06-17T18:10:00Z) Ran guided review on the C# slice; reviewers found alias using directives, brittle static-using detection, over-broad `Main` exclusion, full-body public-surface classification, and duplicated/weak C# test-attribute detection.
 - [x] (2026-06-17T18:20:00Z) Implemented C# guided-review fixes and re-ran `cargo test --test csharp_dead_code_smells`; all 16 tests passed, including new regressions for alias usings, whitespace static usings, qualified test attributes, non-static `Main`, and public classes with private members.
 - [x] (2026-06-17T18:30:00Z) Re-ran `cargo test --test usages_csharp_graph_test`, all existing dead-code smell suites, `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`; all completed cleanly after C# review fixes.
+- [x] (2026-06-17T18:35:00Z) Committed the completed C# checkpoint as `2371852` before starting the next language slice.
+- [ ] (2026-06-17T18:40:00Z) Started the C++ dead-code bulk graph scoring slice; C++ classes and non-overloaded free functions will use `build_cpp_usage_edges(...)`, while methods, constructors, fields, overloaded functions, and runtime entry points stay precise or excluded.
+- [x] (2026-06-17T19:00:00Z) Implemented initial C++ bulk routing and `tests/cpp_dead_code_smells.rs`; first focused test run exposed that registering `CppUsageGraphStrategy` for precise fallback would undercount unsupported method receiver forms, so unsafe C++ candidates now keep the existing text-search precise path.
+- [x] (2026-06-17T19:05:00Z) Re-ran `cargo test --test cpp_dead_code_smells -- --nocapture`; all 12 C++ dead-code tests passed.
+- [x] (2026-06-17T19:10:00Z) Ran `cargo test --test usages_cpp_graph_test` and re-ran Rust, Python/JS/TS, Java, Scala, Go, and C# dead-code smell suites; all passed after the C++ slice.
+- [x] (2026-06-17T19:15:00Z) Ran `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`; all completed cleanly after the C++ slice.
+- [x] (2026-06-17T19:35:00Z) Ran guided review on the C++ slice; reviewers found duplicated C++ target-shape classification, namespace-owned free functions missing the bulk path, and an over-broad `main` exclusion.
+- [x] (2026-06-17T19:45:00Z) Implemented C++ guided-review fixes by moving bulk eligibility into `cpp_graph` beside `TargetSpec`, treating namespace/module-owned functions as free-function bulk candidates, narrowing entry-point exclusion to global `::main`, and adding focused regressions.
+- [x] (2026-06-17T19:50:00Z) Re-ran `cargo test --test cpp_dead_code_smells -- --nocapture`, `cargo test --test usages_cpp_graph_test`, and all existing dead-code smell suites; all passed after C++ review fixes.
+- [x] (2026-06-17T19:55:00Z) Re-ran `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`; all completed cleanly after C++ review fixes.
 
 ## Surprises & Discoveries
 
@@ -145,6 +155,12 @@ The visible result is that Rust dead-code reports still identify unused private 
 - Observation: The C# inverted graph intentionally fails closed for static using and alias using member forms.
   Evidence: guided review pointed to `tests/usages_csharp_graph_test.rs` coverage for deferred using member forms, so C# bulk dead-code eligibility now keeps methods precise whenever a C# workspace contains alias or static using directives.
 
+- Observation: C++ has a whole-workspace inverted edge builder that resolves include-aware type references, free function calls, scoped static/member calls, typed receivers, aliases, and constructors, but unknown receivers remain a recall gap.
+  Evidence: `src/analyzer/usages/cpp_graph/inverted.rs` documents the inverted C++ graph semantics, and `tests/usages_cpp_graph_test.rs` includes fallback tests for unproven receiver/member matches.
+
+- Observation: C++ namespace declarations are represented as module owners, so namespace-owned functions need to be treated as free functions for dead-code bulk eligibility.
+  Evidence: guided review identified that `analyzer.parent_of(candidate).is_none()` misses `namespace detail { void helper(); }` even though the inverted graph supports namespace-qualified free functions.
+
 ## Decision Log
 
 - Decision: Keep this issue slice Rust-only for implementation, while tracking other language targets in this plan as follow-up slices.
@@ -213,6 +229,18 @@ The visible result is that Rust dead-code reports still identify unused private 
 
 - Decision: Treat C# alias using directives as the same bulk-dead-code ambiguity class as static using directives, and detect both with whitespace-tolerant directive regexes.
   Rationale: Alias receivers and static-imported bare member calls are deferred by the C# usage graph; falling back to precise analysis avoids false graph-derived dead-code evidence.
+  Date/Author: 2026-06-17 / Codex
+
+- Decision: Add C++ bulk dead-code scoring only for class/type declarations and non-overloaded free functions.
+  Rationale: C++ FQNs are namespace-qualified enough for those shapes, while constructors, methods, fields, and overloads need precise analysis because arity, receiver inference, and field access semantics can otherwise create false zero-inbound graph evidence.
+  Date/Author: 2026-06-17 / Codex
+
+- Decision: Do not register `CppUsageGraphStrategy` in `graph_strategy_for(...)` for the dead-code precise fallback path in this slice.
+  Rationale: The C++ graph strategy can return a successful zero-hit result for receiver forms that the bulk slice intentionally treats as unsafe; leaving those candidates on the existing text-search path preserves the conservative fallback behavior.
+  Date/Author: 2026-06-17 / Codex
+
+- Decision: Keep C++ dead-code bulk eligibility in `cpp_graph` beside `TargetSpec`, not in `dead_code_smells.rs`.
+  Rationale: The graph resolver owns C++ target-shape classification, including module-owned namespace functions and constructors; the report layer should consume that classification to avoid drift.
   Date/Author: 2026-06-17 / Codex
 
 ## Outcomes & Retrospective
@@ -457,11 +485,42 @@ C# usage graph regression evidence:
     test csharp_graph_fails_closed_for_deferred_using_member_forms ... ok
     test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 
+C++ focused test evidence:
+
+    cargo test --test cpp_dead_code_smells -- --nocapture
+    running 15 tests
+    test cpp_dead_code_smell_reports_unused_static_helper ... ok
+    test cpp_dead_code_smell_reports_one_call_free_function ... ok
+    test cpp_dead_code_smell_bulk_scores_namespaced_free_function ... ok
+    test cpp_type_usage_from_another_file_prevents_finding ... ok
+    test cpp_symbol_with_two_distinct_inbound_callers_is_not_flagged ... ok
+    test cpp_dead_code_smell_honors_usage_candidate_file_cap ... ok
+    test cpp_dead_code_smell_honors_usage_cap ... ok
+    test cpp_public_function_and_class_use_conservative_wording_and_score ... ok
+    test cpp_constructor_candidate_stays_on_precise_path ... ok
+    test cpp_member_method_candidate_stays_on_precise_path ... ok
+    test cpp_overloaded_free_functions_stay_on_precise_path ... ok
+    test cpp_field_candidate_stays_on_precise_path ... ok
+    test cpp_main_is_not_dead_code_candidate ... ok
+    test cpp_namespaced_main_is_still_dead_code_candidate ... ok
+    test cpp_member_main_is_still_dead_code_candidate ... ok
+    test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+C++ usage graph regression evidence:
+
+    cargo test --test usages_cpp_graph_test
+    running 26 tests
+    test usage_finder_routes_cpp_targets_through_graph_strategy ... ok
+    test cpp_graph_v2_keeps_free_function_overloads_and_headers_narrow ... ok
+    test cpp_graph_v3_preserves_declaration_filtering_and_fallback_boundaries ... ok
+    test cpp_graph_review_fails_on_mixed_proven_and_unproven_member_matches ... ok
+    test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
 Rust formatting and lint evidence:
 
     cargo fmt
     cargo clippy --all-targets --all-features -- -D warnings
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.94s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.02s
 
 Whitespace evidence:
 

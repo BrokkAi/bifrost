@@ -125,10 +125,12 @@ pub fn report_dead_code_and_unused_abstraction_smells(
     let mut scala_candidates: Vec<CodeUnit> = Vec::new();
     let mut go_candidates: Vec<CodeUnit> = Vec::new();
     let mut csharp_candidates: Vec<CodeUnit> = Vec::new();
+    let mut cpp_candidates: Vec<CodeUnit> = Vec::new();
     let mut java_overloaded_fqns: Option<HashSet<String>> = None;
     let mut java_static_imports_present: Option<bool> = None;
     let mut csharp_overloaded_fqns: Option<HashSet<String>> = None;
     let mut csharp_unsafe_using_member_forms_present: Option<bool> = None;
+    let mut cpp_overloaded_fqns: Option<HashSet<String>> = None;
     let mut scala_files_present: Option<bool> = None;
     let mut scala_overloaded_fqns: Option<HashSet<String>> = None;
     let mut scala_file_count: Option<usize> = None;
@@ -165,6 +167,16 @@ pub fn report_dead_code_and_unused_abstraction_smells(
                 ) =>
             {
                 csharp_candidates.push(candidate.clone());
+                continue;
+            }
+            Language::Cpp
+                if !cpp_candidate_needs_precise_scan(
+                    analyzer,
+                    candidate,
+                    &mut cpp_overloaded_fqns,
+                ) =>
+            {
+                cpp_candidates.push(candidate.clone());
                 continue;
             }
             Language::Java
@@ -277,6 +289,17 @@ pub fn report_dead_code_and_unused_abstraction_smells(
         analyze_csharp_candidates_with_usage_graph(
             analyzer,
             &csharp_candidates,
+            usage_candidate_file_cap,
+            usage_cap,
+            &mut skipped,
+        )
+        .into_iter()
+        .filter(|finding| finding.score >= threshold),
+    );
+    findings.extend(
+        analyze_cpp_candidates_with_usage_graph(
+            analyzer,
+            &cpp_candidates,
             usage_candidate_file_cap,
             usage_cap,
             &mut skipped,
@@ -438,6 +461,11 @@ fn dead_code_candidates(
                 {
                     continue;
                 }
+                if code_unit_language(&definition) == Language::Cpp
+                    && cpp_implicit_entry_point(analyzer, &definition)
+                {
+                    continue;
+                }
                 matched_any = true;
                 if seen.insert(definition.clone()) {
                     candidates.push(definition);
@@ -457,6 +485,11 @@ fn dead_code_candidates(
                 }
                 if code_unit_language(&declaration) == Language::CSharp
                     && csharp_implicit_entry_point(analyzer, &declaration)
+                {
+                    continue;
+                }
+                if code_unit_language(&declaration) == Language::Cpp
+                    && cpp_implicit_entry_point(analyzer, &declaration)
                 {
                     continue;
                 }
@@ -508,6 +541,7 @@ fn is_dead_code_candidate(code_unit: &CodeUnit) -> bool {
             | Language::Scala
             | Language::Go
             | Language::CSharp
+            | Language::Cpp
     ) && (code_unit.is_function() || code_unit.is_class() || code_unit.is_field())
 }
 
@@ -876,6 +910,30 @@ fn analyze_csharp_candidates_with_usage_graph(
             })
         },
         csharp_graph_finding,
+    )
+}
+
+fn analyze_cpp_candidates_with_usage_graph(
+    analyzer: &dyn IAnalyzer,
+    candidates: &[CodeUnit],
+    usage_candidate_file_cap: usize,
+    usage_cap: usize,
+    skipped: &mut Vec<String>,
+) -> Vec<DeadCodeFinding> {
+    analyze_fqn_candidates_with_usage_graph(
+        FqnBulkGraphRequest {
+            analyzer,
+            language: Language::Cpp,
+            candidates,
+            usage_candidate_file_cap,
+            usage_cap,
+            skipped,
+        },
+        |unit| unit.is_function() || unit.is_class() || unit.is_field(),
+        |nodes| {
+            crate::analyzer::usages::cpp_graph::build_cpp_usage_edges(analyzer, nodes, |_| true)
+        },
+        cpp_graph_finding,
     )
 }
 
@@ -1264,6 +1322,23 @@ fn csharp_graph_finding(
     )
 }
 
+fn cpp_graph_finding(
+    analyzer: &dyn IAnalyzer,
+    declarations_by_fqn: &BTreeMap<String, Vec<CodeUnit>>,
+    candidate: &CodeUnit,
+    usage: GraphIncomingUsage,
+) -> Option<DeadCodeFinding> {
+    public_surface_graph_finding(
+        analyzer,
+        Language::Cpp,
+        declarations_by_fqn,
+        candidate,
+        usage,
+        cpp_public_like_declaration(analyzer, candidate),
+        "public",
+    )
+}
+
 fn public_surface_graph_finding(
     analyzer: &dyn IAnalyzer,
     language: Language,
@@ -1619,6 +1694,25 @@ fn csharp_candidate_needs_precise_scan(
         && (overloads.contains(candidate.fq_name().as_str()) || has_unsafe_using_member_forms)
 }
 
+fn cpp_candidate_needs_precise_scan(
+    analyzer: &dyn IAnalyzer,
+    candidate: &CodeUnit,
+    overloaded_fqns: &mut Option<HashSet<String>>,
+) -> bool {
+    let empty_overloads = HashSet::default();
+    let overloads = if candidate.is_function() {
+        overloaded_fqns.get_or_insert_with(|| overloaded_function_fqns(analyzer, Language::Cpp))
+    } else {
+        &empty_overloads
+    };
+    matches!(
+        crate::analyzer::usages::cpp_graph::dead_code_bulk_eligibility(
+            analyzer, candidate, overloads,
+        ),
+        crate::analyzer::usages::cpp_graph::CppDeadCodeBulkEligibility::NeedsPrecise
+    )
+}
+
 fn scala_bulk_file_count_exceeds_cap(
     analyzer: &dyn IAnalyzer,
     usage_candidate_file_cap: usize,
@@ -1703,6 +1797,15 @@ fn csharp_public_like_declaration(analyzer: &dyn IAnalyzer, candidate: &CodeUnit
     !contains_java_visibility_modifier(header, "private")
 }
 
+fn cpp_public_like_declaration(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bool {
+    if candidate.is_class() {
+        return true;
+    }
+    let source = analyzer.get_source(candidate, true).unwrap_or_default();
+    let header = declaration_header(&source);
+    !contains_java_visibility_modifier(header, "static")
+}
+
 fn go_exported_declaration(candidate: &CodeUnit) -> bool {
     candidate
         .identifier()
@@ -1755,6 +1858,10 @@ fn csharp_constructor_candidate(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) 
         && analyzer
             .parent_of(candidate)
             .is_some_and(|parent| candidate.identifier() == parent.identifier())
+}
+
+fn cpp_implicit_entry_point(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bool {
+    crate::analyzer::usages::cpp_graph::is_cpp_global_main(analyzer, candidate)
 }
 
 fn csharp_implicit_entry_point(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bool {
@@ -1936,6 +2043,7 @@ fn language_label(language: Language) -> &'static str {
         Language::Scala => "Scala",
         Language::Go => "Go",
         Language::CSharp => "C#",
+        Language::Cpp => "C++",
         _ => "graph-backed",
     }
 }
