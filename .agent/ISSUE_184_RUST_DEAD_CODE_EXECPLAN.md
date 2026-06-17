@@ -46,6 +46,10 @@ The visible result is that Rust dead-code reports still identify unused private 
 - [x] (2026-06-17T13:10:00Z) Ran guided review on the Java slice and fixed findings: Java fields and static-import-sensitive methods now stay precise, Java overload/static-import metadata is lazy, Java public API findings use conservative wording, and Python/Java share the FQN bulk scorer.
 - [x] (2026-06-17T13:10:00Z) Re-ran `cargo test --test java_dead_code_smells`; all 11 tests passed.
 - [x] (2026-06-17T13:20:00Z) Re-ran `cargo test --test usages_java_graph_test`, `cargo test --test rust_dead_code_smells`, `cargo test --test python_js_ts_dead_code_smells`, `cargo fmt`, and `cargo clippy --all-targets --all-features -- -D warnings`; all passed.
+- [x] (2026-06-17T14:00:00Z) Started the Scala dead-code bulk graph scoring slice with conservative guards for fields, constructors, overloads, import-sensitive members, and public/API-like declarations.
+- [x] (2026-06-17T13:23:00Z) Added Scala bulk eligibility and report partitioning, then ran `cargo test --test usage_graph_scala_test --no-run`; compilation succeeded.
+- [x] (2026-06-17T13:35:00Z) Added `tests/scala_dead_code_smells.rs` and ran `cargo test --test scala_dead_code_smells -- --nocapture`; all 13 tests passed.
+- [x] (2026-06-17T13:45:00Z) Ran Scala slice regressions: `cargo test --test usage_graph_scala_test`, `cargo test --test rust_dead_code_smells`, `cargo test --test python_js_ts_dead_code_smells`, `cargo test --test java_dead_code_smells`, `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`; all passed.
 
 ## Surprises & Discoveries
 
@@ -75,6 +79,18 @@ The visible result is that Rust dead-code reports still identify unused private 
 
 - Observation: Java's inverted graph still misses bare identifier field reads and static-imported method calls that the precise Java strategy handles.
   Evidence: guided review identified false-positive scenarios for `return cached;` and `import static com.example.Target.run; run();`; regression tests now assert those candidates use precise `only usage:` evidence.
+
+- Observation: Scala's precise usage scanner handles fields, constructors, direct member imports, wildcard ambiguity, and arity checks that the inverted Scala graph does not fully model.
+  Evidence: `scala_graph::extractor` uses `TargetSpec`, `Visibility`, `direct_member_names`, `ambiguous_direct_member_names`, and `member_call_arity_matches`, while `scala_graph::inverted` records type references and method calls from receiver/enclosing-class inference only.
+
+- Observation: Scala can reuse the shared string-keyed FQN bulk scorer without a new scoped identity seam in this slice, but only after routing unsafe member shapes to the precise scanner.
+  Evidence: `cargo test --test usage_graph_scala_test --no-run` compiled after adding `scala_graph::dead_code_bulk_eligibility(...)` and the `Language::Scala` report partition.
+
+- Observation: The Scala inverted usage graph counts unique caller-to-callee inbound edges, not repeated textual calls from the same caller.
+  Evidence: the Scala cap and multi-inbound tests use two distinct callers; repeated calls inside one method produce one inbound edge.
+
+- Observation: Scala field reads are not reliable enough for zero-usage dead-code reporting in this slice, even on the precise path.
+  Evidence: the existing precise scanner can treat a same-owner `val` as locally shadowed; the report now skips empty Scala field evidence as inconclusive rather than emitting a zero-inbound finding.
 
 ## Decision Log
 
@@ -122,6 +138,10 @@ The visible result is that Rust dead-code reports still identify unused private 
   Rationale: The precise Java scanner handles bare identifier field reads and static imports; using bulk graph evidence for those shapes can create false zero-inbound dead-code findings.
   Date/Author: 2026-06-17 / Codex
 
+- Decision: Add Scala bulk dead-code scoring only for Scala candidates whose current inverted graph evidence is safe: type declarations and non-overloaded methods without import-sensitive member exposure.
+  Rationale: Scala's precise scanner covers richer member and import semantics than the inverted graph. The broad report should skip to precise analysis for fields, constructors, overloads, and direct-member-import/wildcard-ambiguity-sensitive cases.
+  Date/Author: 2026-06-17 / Codex
+
 ## Outcomes & Retrospective
 
 2026-06-17: The Rust dead-code report now uses one inverted Rust usage graph build per report call and derives zero-inbound/one-inbound findings from graph edge weights. Rust bulk analysis now honors `max_usage_candidate_files` by skipping inconclusive oversized Rust workspaces and honors `max_usages_per_symbol` by skipping candidates whose inbound count exceeds the requested usage cap. Focused tests and Rust linting passed. Gradle checks were requested by the general project guidance but are not available in this Rust worktree because there is no `./gradlew`.
@@ -131,6 +151,8 @@ The visible result is that Rust dead-code reports still identify unused private 
 2026-06-17: The JavaScript/TypeScript dead-code report now uses a file-scoped inverted graph path for exported candidates. The scoped identity seam is reusable for future languages, while existing string-keyed graph builders remain unchanged. Ambiguous JS/TS export aliases are skipped as inconclusive.
 
 2026-06-17: The Java dead-code report now uses one inverted Java usage graph build per report call for safe Java candidates. Constructors, overloaded Java methods, and Java class candidates in mixed Java/Scala workspaces remain on the precise per-symbol path. Focused Java tests cover graph-derived findings and the guarded precise-path cases.
+
+2026-06-17: The Scala dead-code report now uses one inverted Scala usage graph build per report call for safe Scala candidates. Scala classes/objects and non-overloaded methods without import-sensitive exposure can be scored from inbound graph counts. Fields, constructors, overloaded methods, and direct/wildcard-import-sensitive methods stay conservative or precise; empty Scala field evidence is skipped as inconclusive instead of reported as dead code. Public-like Scala findings use lower score/confidence and workspace/public-surface wording.
 
 ## Context and Orientation
 
@@ -150,7 +172,7 @@ Second, build findings from inbound counts. Zero-inbound and one-inbound candida
 
 Third, update `tests/rust_dead_code_smells.rs`. Existing private helper, one-call wrapper, recursion, explicit FQN targeting, and threshold behavior should still pass after expected wording changes. Add a public `pub fn` test that asserts conservative public-surface wording. Cover `truncated_symbols` behavior with an integration test that creates more than the Rust usage-graph call-site limit and asserts the candidate is skipped as inconclusive.
 
-The Python follow-up slice now uses Python's inverted usage graph for the same one-pass inbound scoring shape. The JS/TS follow-up slice now uses file-scoped identity so same-name exports in different files do not cross-count. The Java follow-up slice uses Java's existing package-qualified FQN graph for safe candidates and keeps overlap-sensitive candidates precise. Deferred follow-up slices remain tracked here but are not implemented in this branch. Go, C#, C++, PHP, and Scala parity should only be pursued after the Rust, Python, JS/TS, and Java slices confirm product value and graph semantics. If broad graph cost still dominates after bulk dead-code scoring, later work can profile resolver/cache micro-optimizations.
+The Python follow-up slice now uses Python's inverted usage graph for the same one-pass inbound scoring shape. The JS/TS follow-up slice now uses file-scoped identity so same-name exports in different files do not cross-count. The Java follow-up slice uses Java's existing package-qualified FQN graph for safe candidates and keeps overlap-sensitive candidates precise. The Scala follow-up slice uses Scala's existing FQN graph only for safe candidates and keeps richer member/import semantics precise. Deferred follow-up slices remain tracked here but are not implemented in this branch. Go, C#, C++, and PHP parity should only be pursued after the Rust, Python, JS/TS, Java, and Scala slices confirm product value and graph semantics. If broad graph cost still dominates after bulk dead-code scoring, later work can profile resolver/cache micro-optimizations.
 
 ## Concrete Steps
 
@@ -253,11 +275,42 @@ Java usage graph regression evidence:
     test scala_target_usage_lookup_does_not_scan_java_source ... ok
     test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 
+Scala focused test evidence:
+
+    cargo test --test scala_dead_code_smells -- --nocapture
+    running 13 tests
+    test scala_dead_code_smell_reports_unused_private_method ... ok
+    test scala_dead_code_smell_reports_one_call_method ... ok
+    test scala_type_usage_prevents_false_dead_code_finding ... ok
+    test scala_dead_code_smell_does_not_flag_symbol_with_multiple_inbound_edges ... ok
+    test scala_dead_code_smell_honors_usage_candidate_file_cap ... ok
+    test scala_dead_code_smell_honors_usage_cap ... ok
+    test scala_field_candidate_stays_on_precise_path_for_bare_identifier_reads ... ok
+    test scala_constructor_candidate_stays_on_precise_path ... ok
+    test scala_overloaded_methods_stay_on_precise_path ... ok
+    test scala_direct_member_import_candidate_stays_on_precise_path ... ok
+    test scala_wildcard_import_candidate_stays_on_precise_path ... ok
+    test scala_public_api_uses_conservative_wording_and_score ... ok
+    test scala_private_method_keeps_strong_wording ... ok
+    test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+Scala usage graph regression evidence:
+
+    cargo test --test usage_graph_scala_test
+    running 6 tests
+    test resolves_instance_object_and_unqualified_calls ... ok
+    test type_references_edge_to_the_type_node ... ok
+    test receiver_typing_is_type_based_not_name_based ... ok
+    test self_recursion_produces_no_edge_and_unused_has_no_incoming ... ok
+    test every_edge_endpoint_is_a_node ... ok
+    test scala3_indented_this_and_block_scoping ... ok
+    test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
 Rust formatting and lint evidence:
 
     cargo fmt
     cargo clippy --all-targets --all-features -- -D warnings
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.62s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.41s
 
 Whitespace evidence:
 

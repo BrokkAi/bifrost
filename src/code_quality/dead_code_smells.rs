@@ -10,8 +10,8 @@ use crate::analyzer::usages::inverted_edges::{UsageEdges, UsageNodeKey};
 use crate::analyzer::usages::js_ts_graph::JsTsScopedNodeStatus;
 use crate::analyzer::usages::{
     CandidateFileProvider, FallbackCandidateProvider, FuzzyResult, JavaUsageGraphStrategy,
-    JsTsExportUsageGraphStrategy, RustExportUsageGraphStrategy, TextSearchCandidateProvider,
-    UsageAnalyzer, UsageHit,
+    JsTsExportUsageGraphStrategy, RustExportUsageGraphStrategy, ScalaUsageGraphStrategy,
+    TextSearchCandidateProvider, UsageAnalyzer, UsageHit,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range, RustAnalyzer};
 use crate::hash::HashSet;
@@ -120,9 +120,12 @@ pub fn report_dead_code_and_unused_abstraction_smells(
     let mut python_candidates: Vec<CodeUnit> = Vec::new();
     let mut jsts_candidates: Vec<CodeUnit> = Vec::new();
     let mut java_candidates: Vec<CodeUnit> = Vec::new();
+    let mut scala_candidates: Vec<CodeUnit> = Vec::new();
     let mut java_overloaded_fqns: Option<HashSet<String>> = None;
     let mut java_static_imports_present: Option<bool> = None;
     let mut scala_files_present: Option<bool> = None;
+    let mut scala_overloaded_fqns: Option<HashSet<String>> = None;
+    let mut scala_import_sensitive_member_names: Option<HashSet<String>> = None;
 
     for candidate in &candidate_selection.candidates {
         match code_unit_language(candidate) {
@@ -150,6 +153,17 @@ pub fn report_dead_code_and_unused_abstraction_smells(
                 ) =>
             {
                 java_candidates.push(candidate.clone());
+                continue;
+            }
+            Language::Scala
+                if !scala_candidate_needs_precise_scan(
+                    analyzer,
+                    candidate,
+                    &mut scala_overloaded_fqns,
+                    &mut scala_import_sensitive_member_names,
+                ) =>
+            {
+                scala_candidates.push(candidate.clone());
                 continue;
             }
             _ => {}
@@ -202,6 +216,17 @@ pub fn report_dead_code_and_unused_abstraction_smells(
         analyze_java_candidates_with_usage_graph(
             analyzer,
             &java_candidates,
+            usage_candidate_file_cap,
+            usage_cap,
+            &mut skipped,
+        )
+        .into_iter()
+        .filter(|finding| finding.score >= threshold),
+    );
+    findings.extend(
+        analyze_scala_candidates_with_usage_graph(
+            analyzer,
+            &scala_candidates,
             usage_candidate_file_cap,
             usage_cap,
             &mut skipped,
@@ -403,10 +428,13 @@ fn dead_code_candidates(
 }
 
 fn is_dead_code_candidate(code_unit: &CodeUnit) -> bool {
-    if code_unit.is_synthetic() || code_unit.is_anonymous() {
+    if code_unit.is_anonymous() {
         return false;
     }
     let language = code_unit_language(code_unit);
+    if code_unit.is_synthetic() && language != Language::Scala {
+        return false;
+    }
     matches!(
         language,
         Language::Rust
@@ -414,6 +442,7 @@ fn is_dead_code_candidate(code_unit: &CodeUnit) -> bool {
             | Language::JavaScript
             | Language::TypeScript
             | Language::Java
+            | Language::Scala
     ) && (code_unit.is_function() || code_unit.is_class() || code_unit.is_field())
 }
 
@@ -474,6 +503,13 @@ fn analyze_candidate(
         .into_iter()
         .filter(|hit| hit.enclosing != *candidate)
         .collect();
+    if language == Language::Scala && candidate.is_field() && non_self_hits.is_empty() {
+        skipped.push(format!(
+            "`{}`: Scala field usage evidence was inconclusive; precise field reads are not reported as dead code in this bulk slice",
+            candidate.fq_name()
+        ));
+        return None;
+    }
     if non_self_hits.len() > 1 {
         return None;
     }
@@ -703,6 +739,30 @@ fn analyze_java_candidates_with_usage_graph(
             crate::analyzer::usages::java_graph::build_java_usage_edges(analyzer, nodes, |_| true)
         },
         java_graph_finding,
+    )
+}
+
+fn analyze_scala_candidates_with_usage_graph(
+    analyzer: &dyn IAnalyzer,
+    candidates: &[CodeUnit],
+    usage_candidate_file_cap: usize,
+    usage_cap: usize,
+    skipped: &mut Vec<String>,
+) -> Vec<DeadCodeFinding> {
+    analyze_fqn_candidates_with_usage_graph(
+        FqnBulkGraphRequest {
+            analyzer,
+            language: Language::Scala,
+            candidates,
+            usage_candidate_file_cap,
+            usage_cap,
+            skipped,
+        },
+        |unit| unit.is_function() || unit.is_class(),
+        |nodes| {
+            crate::analyzer::usages::scala_graph::build_scala_usage_edges(analyzer, nodes, |_| true)
+        },
+        scala_graph_finding,
     )
 }
 
@@ -1066,6 +1126,49 @@ fn java_graph_finding(
     })
 }
 
+fn scala_graph_finding(
+    analyzer: &dyn IAnalyzer,
+    declarations_by_fqn: &BTreeMap<String, Vec<CodeUnit>>,
+    candidate: &CodeUnit,
+    usage: GraphIncomingUsage,
+) -> Option<DeadCodeFinding> {
+    if usage.total > 1 {
+        return None;
+    }
+
+    let range = analyzer
+        .ranges_of(candidate)
+        .into_iter()
+        .filter(|range| !range.is_empty())
+        .max_by_key(span_lines)?;
+    let declaration_lines = span_lines(&range);
+    let is_public = scala_public_like_declaration(analyzer, candidate);
+    let score = jvm_public_graph_score(usage.total, declaration_lines, is_public);
+    let confidence = jvm_public_graph_confidence(usage.total, is_public);
+    let evidence = graph_inbound_evidence(&usage);
+    let rationale = scala_graph_rationale(usage.total, is_public);
+
+    Some(DeadCodeFinding {
+        language: Language::Scala,
+        score,
+        confidence,
+        kind: candidate.kind().display_lowercase().to_string(),
+        symbol: candidate.fq_name(),
+        file: candidate.source().clone(),
+        start_line: range.start_line + 1,
+        end_line: range.end_line + 1,
+        total_usage_count: usage.total,
+        external_usage_count: external_usage_count(
+            analyzer,
+            declarations_by_fqn,
+            candidate,
+            &usage,
+        ),
+        evidence,
+        rationale,
+    })
+}
+
 #[derive(Clone, Debug, Default)]
 struct ScopedGraphIncomingUsage {
     total: usize,
@@ -1142,6 +1245,14 @@ fn rust_graph_score(total_usage_count: usize, declaration_lines: usize, is_publi
 }
 
 fn java_graph_score(total_usage_count: usize, declaration_lines: usize, is_public: bool) -> i32 {
+    jvm_public_graph_score(total_usage_count, declaration_lines, is_public)
+}
+
+fn jvm_public_graph_score(
+    total_usage_count: usize,
+    declaration_lines: usize,
+    is_public: bool,
+) -> i32 {
     match (total_usage_count, is_public) {
         (0, true) => 10 + (declaration_lines / 8).min(8) as i32,
         (0, false) => graph_score(total_usage_count, declaration_lines),
@@ -1160,6 +1271,10 @@ fn rust_graph_confidence(total_usage_count: usize, is_public: bool) -> f64 {
 }
 
 fn java_graph_confidence(total_usage_count: usize, is_public: bool) -> f64 {
+    jvm_public_graph_confidence(total_usage_count, is_public)
+}
+
+fn jvm_public_graph_confidence(total_usage_count: usize, is_public: bool) -> f64 {
     match (total_usage_count, is_public) {
         (0, true) => 0.55,
         (0, false) => 0.90,
@@ -1231,6 +1346,23 @@ fn java_graph_rationale(total_usage_count: usize, is_public: bool) -> String {
         }
         (_, false) => {
             "symbol has only one workspace inbound caller in Java tree-sitter analysis and may be a low-value abstraction".to_string()
+        }
+    }
+}
+
+fn scala_graph_rationale(total_usage_count: usize, is_public: bool) -> String {
+    match (total_usage_count, is_public) {
+        (0, true) => {
+            "public Scala symbol is unreferenced in workspace; it may be untested public surface or consumed externally".to_string()
+        }
+        (0, false) => {
+            "symbol has no workspace inbound usage evidence in Scala tree-sitter analysis and may be generated residue".to_string()
+        }
+        (_, true) => {
+            "public Scala symbol has only one workspace inbound reference; it may be lightly tested public surface or consumed externally".to_string()
+        }
+        (_, false) => {
+            "symbol has only one workspace inbound caller in Scala tree-sitter analysis and may be a low-value abstraction".to_string()
         }
     }
 }
@@ -1312,17 +1444,129 @@ fn java_candidate_needs_precise_scan(
     )
 }
 
+fn scala_candidate_needs_precise_scan(
+    analyzer: &dyn IAnalyzer,
+    candidate: &CodeUnit,
+    overloaded_fqns: &mut Option<HashSet<String>>,
+    import_sensitive_member_names: &mut Option<HashSet<String>>,
+) -> bool {
+    let empty_set = HashSet::default();
+    let overloads = if candidate.is_function() {
+        overloaded_fqns.get_or_insert_with(|| overloaded_function_fqns(analyzer, Language::Scala))
+    } else {
+        &empty_set
+    };
+    let import_sensitive_names = if candidate.is_function() {
+        import_sensitive_member_names
+            .get_or_insert_with(|| scala_import_sensitive_member_names(analyzer))
+    } else {
+        &empty_set
+    };
+
+    (candidate.is_function()
+        && scala_source_has_multiple_defs_for_identifier(candidate, candidate.identifier()))
+        || matches!(
+            crate::analyzer::usages::scala_graph::dead_code_bulk_eligibility(
+                analyzer,
+                candidate,
+                overloads,
+                import_sensitive_names,
+            ),
+            crate::analyzer::usages::scala_graph::ScalaDeadCodeBulkEligibility::NeedsPrecise
+        )
+}
+
 fn java_overloaded_function_fqns(analyzer: &dyn IAnalyzer) -> HashSet<String> {
+    overloaded_function_fqns(analyzer, Language::Java)
+}
+
+fn overloaded_function_fqns(analyzer: &dyn IAnalyzer, language: Language) -> HashSet<String> {
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     for declaration in analyzer.all_declarations().filter(|unit| {
-        code_unit_language(unit) == Language::Java && !unit.is_synthetic() && unit.is_function()
+        code_unit_language(unit) == language && !unit.is_synthetic() && unit.is_function()
     }) {
-        *counts.entry(declaration.fq_name()).or_default() += 1;
+        let fqn = declaration.fq_name();
+        let definition_count = analyzer
+            .get_definitions(&fqn)
+            .into_iter()
+            .filter(|definition| code_unit_language(definition) == language)
+            .count();
+        *counts.entry(fqn).or_default() += definition_count.max(1);
     }
     counts
         .into_iter()
         .filter_map(|(fqn, count)| (count > 1).then_some(fqn))
         .collect()
+}
+
+fn scala_import_sensitive_member_names(analyzer: &dyn IAnalyzer) -> HashSet<String> {
+    let mut names = HashSet::default();
+    let Ok(files) = analyzer.project().analyzable_files(Language::Scala) else {
+        return names;
+    };
+
+    let all_method_names: HashSet<String> = analyzer
+        .all_declarations()
+        .filter(|unit| {
+            code_unit_language(unit) == Language::Scala
+                && !unit.is_synthetic()
+                && unit.is_function()
+        })
+        .map(|unit| unit.identifier().to_string())
+        .collect();
+
+    for file in files {
+        let Ok(source) = file.read_to_string() else {
+            continue;
+        };
+        for import in scala_import_lines(&source) {
+            if import.contains("._") || import.contains(".{") {
+                names.extend(all_method_names.iter().cloned());
+                continue;
+            }
+            if let Some(name) = import.rsplit('.').next().and_then(scala_imported_name) {
+                names.insert(name.to_string());
+            }
+        }
+    }
+
+    names
+}
+
+fn scala_source_has_multiple_defs_for_identifier(candidate: &CodeUnit, identifier: &str) -> bool {
+    let Ok(source) = candidate.source().read_to_string() else {
+        return false;
+    };
+    source
+        .match_indices("def ")
+        .filter(|(index, _)| {
+            let after_def = source[*index + 4..].trim_start();
+            after_def.starts_with(identifier)
+                && after_def[identifier.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        })
+        .take(2)
+        .count()
+        > 1
+}
+
+fn scala_import_lines(source: &str) -> impl Iterator<Item = String> + '_ {
+    source.lines().filter_map(|line| {
+        let trimmed = line.trim();
+        trimmed
+            .strip_prefix("import ")
+            .map(|import| import.trim().to_string())
+    })
+}
+
+fn scala_imported_name(segment: &str) -> Option<&str> {
+    let name = segment.trim();
+    if name.is_empty() || name == "_" {
+        return None;
+    }
+    Some(name.split("=>").last().unwrap_or(name).trim())
 }
 
 fn has_analyzable_files(analyzer: &dyn IAnalyzer, language: Language) -> bool {
@@ -1348,6 +1592,11 @@ fn java_public_like_declaration(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) 
     analyzer
         .get_source(candidate, true)
         .is_some_and(|source| contains_java_visibility_modifier(&source, "public"))
+}
+
+fn scala_public_like_declaration(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bool {
+    let source = analyzer.get_source(candidate, true).unwrap_or_default();
+    !contains_java_visibility_modifier(&source, "private")
 }
 
 fn contains_java_visibility_modifier(source: &str, modifier: &str) -> bool {
@@ -1456,6 +1705,9 @@ fn graph_strategy_for(candidate: &CodeUnit) -> Option<Box<dyn UsageAnalyzer>> {
     if JavaUsageGraphStrategy::can_handle(candidate) {
         return Some(Box::new(JavaUsageGraphStrategy::new()));
     }
+    if ScalaUsageGraphStrategy::can_handle(candidate) {
+        return Some(Box::new(ScalaUsageGraphStrategy::new()));
+    }
     None
 }
 
@@ -1470,6 +1722,7 @@ fn language_label(language: Language) -> &'static str {
         Language::JavaScript => "JavaScript",
         Language::TypeScript => "TypeScript",
         Language::Java => "Java",
+        Language::Scala => "Scala",
         _ => "graph-backed",
     }
 }

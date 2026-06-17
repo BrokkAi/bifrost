@@ -9,6 +9,9 @@ use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
+use crate::analyzer::usages::scala_graph::resolver::{
+    TargetKind, TargetSpec, resolve_scala_analyzer,
+};
 use crate::analyzer::usages::scala_graph::shared::{ScalaEdgeResolver, ScalaQueryResolver};
 use crate::analyzer::usages::traits::UsageAnalyzer;
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
@@ -24,6 +27,38 @@ where
 {
     let resolver = ScalaEdgeResolver::new(analyzer, &keep_file)?;
     Some(resolver.build_edges(analyzer, nodes, keep_file))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScalaDeadCodeBulkEligibility {
+    BulkSafe,
+    NeedsPrecise,
+}
+
+pub(crate) fn dead_code_bulk_eligibility(
+    analyzer: &dyn IAnalyzer,
+    target: &CodeUnit,
+    overloaded_fqns: &HashSet<String>,
+    import_sensitive_member_names: &HashSet<String>,
+) -> ScalaDeadCodeBulkEligibility {
+    let Some(scala) = resolve_scala_analyzer(analyzer) else {
+        return ScalaDeadCodeBulkEligibility::NeedsPrecise;
+    };
+    let Some(spec) = TargetSpec::from_target(scala, target) else {
+        return ScalaDeadCodeBulkEligibility::NeedsPrecise;
+    };
+
+    match spec.kind {
+        TargetKind::Type => ScalaDeadCodeBulkEligibility::BulkSafe,
+        TargetKind::Method if overloaded_fqns.contains(target.fq_name().as_str()) => {
+            ScalaDeadCodeBulkEligibility::NeedsPrecise
+        }
+        TargetKind::Method if import_sensitive_member_names.contains(&spec.member_name) => {
+            ScalaDeadCodeBulkEligibility::NeedsPrecise
+        }
+        TargetKind::Method => ScalaDeadCodeBulkEligibility::BulkSafe,
+        TargetKind::Constructor | TargetKind::Field => ScalaDeadCodeBulkEligibility::NeedsPrecise,
+    }
 }
 
 #[derive(Default)]
