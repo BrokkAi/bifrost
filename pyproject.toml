@@ -1,5 +1,5 @@
 [project]
-name = "bifrost-searchtools"
+name = "brokk-bifrost-searchtools"
 version = "0.2.1"
 description = "Python searchtools client backed by a native bifrost Rust extension"
 requires-python = ">=3.12"
