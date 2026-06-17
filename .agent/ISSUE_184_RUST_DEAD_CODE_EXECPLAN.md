@@ -68,6 +68,14 @@ The visible result is that Rust dead-code reports still identify unused private 
 - [x] (2026-06-17T16:40:00Z) Re-ran `cargo test --test usages_go_graph_test`; all 29 tests passed after adding explicit module-field caller attribution for top-level initializers.
 - [x] (2026-06-17T16:50:00Z) Re-ran `cargo test --test rust_dead_code_smells`, `cargo test --test python_js_ts_dead_code_smells`, `cargo test --test java_dead_code_smells`, and `cargo test --test scala_dead_code_smells`; all passed after Go review fixes.
 - [x] (2026-06-17T16:55:00Z) Re-ran `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`; all completed cleanly after removing one clippy `useless_conversion`.
+- [x] (2026-06-17T17:05:00Z) Started the C# dead-code bulk graph scoring slice; C# classes and non-overloaded methods will use `build_csharp_usage_edges(...)`, while fields, constructors, overloads, static-using-sensitive methods, and runtime/test entry points stay precise or are skipped.
+- [x] (2026-06-17T17:25:00Z) Implemented C# bulk routing, conservative C# API wording, entry-point exclusion, and `tests/csharp_dead_code_smells.rs`; `cargo test --test csharp_dead_code_smells -- --nocapture` passed with 12 tests.
+- [x] (2026-06-17T17:30:00Z) Ran `cargo test --test usages_csharp_graph_test`; all 25 C# usage graph tests passed.
+- [x] (2026-06-17T17:40:00Z) Re-ran `cargo test --test rust_dead_code_smells`, `cargo test --test python_js_ts_dead_code_smells`, `cargo test --test java_dead_code_smells`, `cargo test --test scala_dead_code_smells`, and `cargo test --test go_dead_code_smells`; all passed after the C# slice.
+- [x] (2026-06-17T17:45:00Z) Re-ran `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`; all completed cleanly.
+- [x] (2026-06-17T18:10:00Z) Ran guided review on the C# slice; reviewers found alias using directives, brittle static-using detection, over-broad `Main` exclusion, full-body public-surface classification, and duplicated/weak C# test-attribute detection.
+- [x] (2026-06-17T18:20:00Z) Implemented C# guided-review fixes and re-ran `cargo test --test csharp_dead_code_smells`; all 16 tests passed, including new regressions for alias usings, whitespace static usings, qualified test attributes, non-static `Main`, and public classes with private members.
+- [x] (2026-06-17T18:30:00Z) Re-ran `cargo test --test usages_csharp_graph_test`, all existing dead-code smell suites, `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`; all completed cleanly after C# review fixes.
 
 ## Surprises & Discoveries
 
@@ -131,6 +139,12 @@ The visible result is that Rust dead-code reports still identify unused private 
 - Observation: Go has runtime and test entry points that are externally invoked without workspace inbound edges.
   Evidence: guided review identified `main`, `init`, and `_test.go` `TestXxx`/`BenchmarkXxx`/`ExampleXxx` functions as false-positive candidates if they flow through zero-inbound graph scoring.
 
+- Observation: C# has a whole-workspace inverted edge builder that resolves type references, typed member calls, static member calls, and same-class bare member calls.
+  Evidence: `src/analyzer/usages/csharp_graph.rs` exports `build_csharp_usage_edges(...)`, and `src/analyzer/usages/csharp_graph/inverted.rs` documents the C# caller-to-callee graph semantics.
+
+- Observation: The C# inverted graph intentionally fails closed for static using and alias using member forms.
+  Evidence: guided review pointed to `tests/usages_csharp_graph_test.rs` coverage for deferred using member forms, so C# bulk dead-code eligibility now keeps methods precise whenever a C# workspace contains alias or static using directives.
+
 ## Decision Log
 
 - Decision: Keep this issue slice Rust-only for implementation, while tracking other language targets in this plan as follow-up slices.
@@ -193,6 +207,14 @@ The visible result is that Rust dead-code reports still identify unused private 
   Rationale: These functions are invoked by the Go toolchain/runtime, so zero workspace inbound edges are not meaningful dead-code evidence.
   Date/Author: 2026-06-17 / Codex
 
+- Decision: Add C# bulk dead-code scoring only for class/type declarations and non-overloaded methods when no `using static` ambiguity guard applies.
+  Rationale: C# FQNs are namespace/type-qualified and the graph handles type/member references, but constructors, overloads, fields, static-imported members, `Main`, and test entry methods need precise handling or exclusion to avoid false zero-inbound findings.
+  Date/Author: 2026-06-17 / Codex
+
+- Decision: Treat C# alias using directives as the same bulk-dead-code ambiguity class as static using directives, and detect both with whitespace-tolerant directive regexes.
+  Rationale: Alias receivers and static-imported bare member calls are deferred by the C# usage graph; falling back to precise analysis avoids false graph-derived dead-code evidence.
+  Date/Author: 2026-06-17 / Codex
+
 ## Outcomes & Retrospective
 
 2026-06-17: The Rust dead-code report now uses one inverted Rust usage graph build per report call and derives zero-inbound/one-inbound findings from graph edge weights. Rust bulk analysis now honors `max_usage_candidate_files` by skipping inconclusive oversized Rust workspaces and honors `max_usages_per_symbol` by skipping candidates whose inbound count exceeds the requested usage cap. Focused tests and Rust linting passed. Gradle checks were requested by the general project guidance but are not available in this Rust worktree because there is no `./gradlew`.
@@ -215,6 +237,10 @@ The visible result is that Rust dead-code reports still identify unused private 
 
 2026-06-17: Guided review tightened the Go slice. Go runtime/test entry points are excluded from dead-code candidates, package-level initializer references can now be attributed to module field callers in the inverted graph, and public-surface finding construction/test fixture setup were deduplicated.
 
+2026-06-17: The C# slice is now in progress. The intended implementation mirrors Java's conservative FQN bulk scorer shape: one `build_csharp_usage_edges(...)` pass for safe candidates, precise fallback for unsafe members, and conservative public/API-like wording for non-private declarations.
+
+2026-06-17: The C# dead-code report now bulk-scores safe C# classes and non-overloaded methods with one inverted C# usage graph pass per report. Fields, constructors, overloaded methods, and static-using-sensitive methods stay on the precise path or are skipped as inconclusive, while `Main` and attributed test methods are excluded from candidate selection.
+
 ## Context and Orientation
 
 The report entry point is `src/code_quality/dead_code_smells.rs`, function `report_dead_code_and_unused_abstraction_smells`. It resolves input files, selects candidate declarations, and currently calls `analyze_candidate` once per candidate. `analyze_candidate` uses per-symbol usage analysis and is still appropriate for the existing Python, JavaScript, and TypeScript behavior in this slice.
@@ -233,7 +259,7 @@ Second, build findings from inbound counts. Zero-inbound and one-inbound candida
 
 Third, update `tests/rust_dead_code_smells.rs`. Existing private helper, one-call wrapper, recursion, explicit FQN targeting, and threshold behavior should still pass after expected wording changes. Add a public `pub fn` test that asserts conservative public-surface wording. Cover `truncated_symbols` behavior with an integration test that creates more than the Rust usage-graph call-site limit and asserts the candidate is skipped as inconclusive.
 
-The Python follow-up slice now uses Python's inverted usage graph for the same one-pass inbound scoring shape. The JS/TS follow-up slice now uses file-scoped identity so same-name exports in different files do not cross-count. The Java follow-up slice uses Java's existing package-qualified FQN graph for safe candidates and keeps overlap-sensitive candidates precise. The Scala follow-up slice uses Scala's existing FQN graph only for safe candidates and keeps richer member/import semantics precise. The current Go follow-up slice uses Go's existing package-qualified FQN graph for functions and types/classes while leaving fields precise. Deferred follow-up slices remain tracked here but are not implemented in this branch. C#, C++, and PHP parity should only be pursued after the Rust, Python, JS/TS, Java, Scala, and Go slices confirm product value and graph semantics. If broad graph cost still dominates after bulk dead-code scoring, later work can profile resolver/cache micro-optimizations.
+The Python follow-up slice now uses Python's inverted usage graph for the same one-pass inbound scoring shape. The JS/TS follow-up slice now uses file-scoped identity so same-name exports in different files do not cross-count. The Java follow-up slice uses Java's existing package-qualified FQN graph for safe candidates and keeps overlap-sensitive candidates precise. The Scala follow-up slice uses Scala's existing FQN graph only for safe candidates and keeps richer member/import semantics precise. The Go follow-up slice uses Go's existing package-qualified FQN graph for functions and types/classes while leaving fields precise. The current C# follow-up slice uses C#'s existing package-qualified FQN graph for safe classes and methods while leaving fields, constructors, overloads, static-using-sensitive methods, and externally invoked entry points conservative. Deferred follow-up slices remain tracked here but are not implemented in this branch. C++ and PHP parity should only be pursued after the Rust, Python, JS/TS, Java, Scala, Go, and C# slices confirm product value and graph semantics. If broad graph cost still dominates after bulk dead-code scoring, later work can profile resolver/cache micro-optimizations.
 
 ## Concrete Steps
 
@@ -398,11 +424,44 @@ Go usage graph regression evidence:
     test go_graph_strategy_enforces_max_usages_limit ... ok
     test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 
+C# focused test evidence:
+
+    cargo test --test csharp_dead_code_smells
+    running 16 tests
+    test csharp_dead_code_smell_reports_unused_private_method ... ok
+    test csharp_dead_code_smell_reports_one_call_method ... ok
+    test csharp_type_usage_from_another_file_prevents_finding ... ok
+    test csharp_symbol_with_two_distinct_inbound_callers_is_not_flagged ... ok
+    test csharp_dead_code_smell_honors_usage_candidate_file_cap ... ok
+    test csharp_dead_code_smell_honors_usage_cap ... ok
+    test csharp_public_api_uses_conservative_wording_and_score ... ok
+    test csharp_public_class_with_private_member_uses_conservative_wording ... ok
+    test csharp_constructor_candidate_stays_on_precise_path ... ok
+    test csharp_overloaded_methods_stay_on_precise_path ... ok
+    test csharp_field_candidate_stays_on_precise_path ... ok
+    test csharp_static_using_method_stays_on_precise_path ... ok
+    test csharp_static_using_with_whitespace_stays_on_precise_path ... ok
+    test csharp_alias_using_method_stays_on_precise_path ... ok
+    test csharp_main_and_test_methods_are_not_dead_code_candidates ... ok
+    test csharp_non_static_main_is_still_dead_code_candidate ... ok
+    test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+C# usage graph regression evidence:
+
+    cargo test --test usages_csharp_graph_test
+    running 25 tests
+    test usage_finder_routes_csharp_targets_through_graph_strategy ... ok
+    test csharp_graph_covers_non_class_type_targets ... ok
+    test csharp_graph_finds_static_and_instance_member_references ... ok
+    test csharp_graph_keeps_constructor_and_method_overloads_narrow ... ok
+    test csharp_graph_fails_closed_for_deferred_using_member_forms ... ok
+    test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
 Rust formatting and lint evidence:
 
     cargo fmt
     cargo clippy --all-targets --all-features -- -D warnings
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.57s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.94s
 
 Whitespace evidence:
 

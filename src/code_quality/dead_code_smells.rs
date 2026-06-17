@@ -9,9 +9,10 @@ use crate::analyzer::usages::ImportGraphCandidateProvider;
 use crate::analyzer::usages::inverted_edges::{UsageEdges, UsageNodeKey};
 use crate::analyzer::usages::js_ts_graph::JsTsScopedNodeStatus;
 use crate::analyzer::usages::{
-    CandidateFileProvider, FallbackCandidateProvider, FuzzyResult, GoUsageGraphStrategy,
-    JavaUsageGraphStrategy, JsTsExportUsageGraphStrategy, RustExportUsageGraphStrategy,
-    ScalaUsageGraphStrategy, TextSearchCandidateProvider, UsageAnalyzer, UsageHit,
+    CSharpUsageGraphStrategy, CandidateFileProvider, FallbackCandidateProvider, FuzzyResult,
+    GoUsageGraphStrategy, JavaUsageGraphStrategy, JsTsExportUsageGraphStrategy,
+    RustExportUsageGraphStrategy, ScalaUsageGraphStrategy, TextSearchCandidateProvider,
+    UsageAnalyzer, UsageHit,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range, RustAnalyzer};
 use crate::hash::HashSet;
@@ -19,6 +20,7 @@ use crate::path_utils::{AmbiguousPathInput, rel_path_string};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::LazyLock;
 
 const DEFAULT_MIN_SCORE: i32 = 8;
 const DEFAULT_MAX_FINDINGS: usize = 40;
@@ -122,8 +124,11 @@ pub fn report_dead_code_and_unused_abstraction_smells(
     let mut java_candidates: Vec<CodeUnit> = Vec::new();
     let mut scala_candidates: Vec<CodeUnit> = Vec::new();
     let mut go_candidates: Vec<CodeUnit> = Vec::new();
+    let mut csharp_candidates: Vec<CodeUnit> = Vec::new();
     let mut java_overloaded_fqns: Option<HashSet<String>> = None;
     let mut java_static_imports_present: Option<bool> = None;
+    let mut csharp_overloaded_fqns: Option<HashSet<String>> = None;
+    let mut csharp_unsafe_using_member_forms_present: Option<bool> = None;
     let mut scala_files_present: Option<bool> = None;
     let mut scala_overloaded_fqns: Option<HashSet<String>> = None;
     let mut scala_file_count: Option<usize> = None;
@@ -149,6 +154,17 @@ pub fn report_dead_code_and_unused_abstraction_smells(
             }
             Language::Go if !candidate.is_field() && !go_implicit_entry_point(candidate) => {
                 go_candidates.push(candidate.clone());
+                continue;
+            }
+            Language::CSharp
+                if !csharp_candidate_needs_precise_scan(
+                    analyzer,
+                    candidate,
+                    &mut csharp_overloaded_fqns,
+                    &mut csharp_unsafe_using_member_forms_present,
+                ) =>
+            {
+                csharp_candidates.push(candidate.clone());
                 continue;
             }
             Language::Java
@@ -250,6 +266,17 @@ pub fn report_dead_code_and_unused_abstraction_smells(
         analyze_go_candidates_with_usage_graph(
             analyzer,
             &go_candidates,
+            usage_candidate_file_cap,
+            usage_cap,
+            &mut skipped,
+        )
+        .into_iter()
+        .filter(|finding| finding.score >= threshold),
+    );
+    findings.extend(
+        analyze_csharp_candidates_with_usage_graph(
+            analyzer,
+            &csharp_candidates,
             usage_candidate_file_cap,
             usage_cap,
             &mut skipped,
@@ -406,6 +433,11 @@ fn dead_code_candidates(
                 if !is_dead_code_candidate(&definition) {
                     continue;
                 }
+                if code_unit_language(&definition) == Language::CSharp
+                    && csharp_implicit_entry_point(analyzer, &definition)
+                {
+                    continue;
+                }
                 matched_any = true;
                 if seen.insert(definition.clone()) {
                     candidates.push(definition);
@@ -421,6 +453,11 @@ fn dead_code_candidates(
         for file in files {
             for declaration in analyzer.get_declarations(file) {
                 if !is_dead_code_candidate(&declaration) {
+                    continue;
+                }
+                if code_unit_language(&declaration) == Language::CSharp
+                    && csharp_implicit_entry_point(analyzer, &declaration)
+                {
                     continue;
                 }
                 if seen.insert(declaration.clone()) {
@@ -470,6 +507,7 @@ fn is_dead_code_candidate(code_unit: &CodeUnit) -> bool {
             | Language::Java
             | Language::Scala
             | Language::Go
+            | Language::CSharp
     ) && (code_unit.is_function() || code_unit.is_class() || code_unit.is_field())
 }
 
@@ -812,6 +850,32 @@ fn analyze_go_candidates_with_usage_graph(
         |unit| unit.is_function() || unit.is_class() || go_module_level_field(unit),
         |nodes| crate::analyzer::usages::go_graph::build_go_usage_edges(analyzer, nodes, |_| true),
         go_graph_finding,
+    )
+}
+
+fn analyze_csharp_candidates_with_usage_graph(
+    analyzer: &dyn IAnalyzer,
+    candidates: &[CodeUnit],
+    usage_candidate_file_cap: usize,
+    usage_cap: usize,
+    skipped: &mut Vec<String>,
+) -> Vec<DeadCodeFinding> {
+    analyze_fqn_candidates_with_usage_graph(
+        FqnBulkGraphRequest {
+            analyzer,
+            language: Language::CSharp,
+            candidates,
+            usage_candidate_file_cap,
+            usage_cap,
+            skipped,
+        },
+        |unit| unit.is_function() || unit.is_class(),
+        |nodes| {
+            crate::analyzer::usages::csharp_graph::build_csharp_usage_edges(analyzer, nodes, |_| {
+                true
+            })
+        },
+        csharp_graph_finding,
     )
 }
 
@@ -1183,6 +1247,23 @@ fn go_graph_finding(
     )
 }
 
+fn csharp_graph_finding(
+    analyzer: &dyn IAnalyzer,
+    declarations_by_fqn: &BTreeMap<String, Vec<CodeUnit>>,
+    candidate: &CodeUnit,
+    usage: GraphIncomingUsage,
+) -> Option<DeadCodeFinding> {
+    public_surface_graph_finding(
+        analyzer,
+        Language::CSharp,
+        declarations_by_fqn,
+        candidate,
+        usage,
+        csharp_public_like_declaration(analyzer, candidate),
+        "public",
+    )
+}
+
 fn public_surface_graph_finding(
     analyzer: &dyn IAnalyzer,
     language: Language,
@@ -1514,6 +1595,30 @@ fn scala_candidate_needs_precise_scan(
     )
 }
 
+fn csharp_candidate_needs_precise_scan(
+    analyzer: &dyn IAnalyzer,
+    candidate: &CodeUnit,
+    overloaded_fqns: &mut Option<HashSet<String>>,
+    unsafe_using_member_forms_present: &mut Option<bool>,
+) -> bool {
+    if candidate.is_field() || csharp_constructor_candidate(analyzer, candidate) {
+        return true;
+    }
+
+    let empty_overloads = HashSet::default();
+    let overloads = if candidate.is_function() {
+        overloaded_fqns.get_or_insert_with(|| overloaded_function_fqns(analyzer, Language::CSharp))
+    } else {
+        &empty_overloads
+    };
+    let has_unsafe_using_member_forms = candidate.is_function()
+        && *unsafe_using_member_forms_present
+            .get_or_insert_with(|| csharp_unsafe_using_member_forms_present(analyzer));
+
+    candidate.is_function()
+        && (overloads.contains(candidate.fq_name().as_str()) || has_unsafe_using_member_forms)
+}
+
 fn scala_bulk_file_count_exceeds_cap(
     analyzer: &dyn IAnalyzer,
     usage_candidate_file_cap: usize,
@@ -1569,6 +1674,18 @@ fn java_static_imports_present(analyzer: &dyn IAnalyzer) -> bool {
         })
 }
 
+fn csharp_unsafe_using_member_forms_present(analyzer: &dyn IAnalyzer) -> bool {
+    analyzer
+        .project()
+        .analyzable_files(Language::CSharp)
+        .is_ok_and(|files| {
+            files.into_iter().any(|file| {
+                file.read_to_string()
+                    .is_ok_and(|source| csharp_source_has_unsafe_using_member_form(&source))
+            })
+        })
+}
+
 fn java_public_like_declaration(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bool {
     analyzer
         .get_source(candidate, true)
@@ -1578,6 +1695,12 @@ fn java_public_like_declaration(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) 
 fn scala_public_like_declaration(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bool {
     let source = analyzer.get_source(candidate, true).unwrap_or_default();
     !contains_java_visibility_modifier(&source, "private")
+}
+
+fn csharp_public_like_declaration(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bool {
+    let source = analyzer.get_source(candidate, true).unwrap_or_default();
+    let header = declaration_header(&source);
+    !contains_java_visibility_modifier(header, "private")
 }
 
 fn go_exported_declaration(candidate: &CodeUnit) -> bool {
@@ -1625,6 +1748,60 @@ fn go_test_name_matches_prefix(name: &str, prefix: &str) -> bool {
 
 fn go_module_level_field(unit: &CodeUnit) -> bool {
     unit.is_field() && unit.short_name().starts_with("_module_.")
+}
+
+fn csharp_constructor_candidate(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bool {
+    candidate.is_function()
+        && analyzer
+            .parent_of(candidate)
+            .is_some_and(|parent| candidate.identifier() == parent.identifier())
+}
+
+fn csharp_implicit_entry_point(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bool {
+    if !candidate.is_function() {
+        return false;
+    }
+    csharp_main_entry_point(analyzer, candidate) || csharp_test_entry_point(analyzer, candidate)
+}
+
+fn csharp_test_entry_point(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bool {
+    let source = analyzer.get_source(candidate, true).unwrap_or_default();
+    csharp_source_has_test_attribute(&source)
+}
+
+fn csharp_main_entry_point(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bool {
+    if candidate.identifier() != "Main" {
+        return false;
+    }
+    let source = analyzer.get_source(candidate, true).unwrap_or_default();
+    let header = declaration_header(&source);
+    contains_java_visibility_modifier(header, "static")
+}
+
+fn csharp_source_has_unsafe_using_member_form(source: &str) -> bool {
+    static STATIC_USING_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"(?m)^\s*(?:global\s+)?using\s+static\b")
+            .expect("valid csharp static using regex")
+    });
+    static ALIAS_USING_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"(?m)^\s*(?:global\s+)?using\s+[A-Za-z_][A-Za-z0-9_]*\s*=")
+            .expect("valid csharp alias using regex")
+    });
+    STATIC_USING_RE.is_match(source) || ALIAS_USING_RE.is_match(source)
+}
+
+fn csharp_source_has_test_attribute(source: &str) -> bool {
+    static TEST_ATTR_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+            r"\[(?:[A-Za-z_][A-Za-z0-9_.]*\.)?(?:Test|Fact|Theory|TestMethod)(?:Attribute)?(?:\s*\(|\s*\])",
+        )
+        .expect("valid csharp test regex")
+    });
+    TEST_ATTR_RE.is_match(source)
+}
+
+fn declaration_header(source: &str) -> &str {
+    source.split('{').next().unwrap_or(source)
 }
 
 fn contains_java_visibility_modifier(source: &str, modifier: &str) -> bool {
@@ -1739,6 +1916,9 @@ fn graph_strategy_for(candidate: &CodeUnit) -> Option<Box<dyn UsageAnalyzer>> {
     if GoUsageGraphStrategy::can_handle(candidate) {
         return Some(Box::new(GoUsageGraphStrategy::new()));
     }
+    if CSharpUsageGraphStrategy::can_handle(candidate) {
+        return Some(Box::new(CSharpUsageGraphStrategy::new()));
+    }
     None
 }
 
@@ -1755,6 +1935,7 @@ fn language_label(language: Language) -> &'static str {
         Language::Java => "Java",
         Language::Scala => "Scala",
         Language::Go => "Go",
+        Language::CSharp => "C#",
         _ => "graph-backed",
     }
 }
