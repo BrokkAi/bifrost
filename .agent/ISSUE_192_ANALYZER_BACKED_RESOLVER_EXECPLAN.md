@@ -33,7 +33,13 @@ The observable outcome is that existing `scan_usages` and `usage_graph` response
 - [x] (2026-06-17T08:05Z) Ran and passed `cargo test --test usages_cpp_graph_test`.
 - [x] (2026-06-17T08:05Z) Ran and passed `cargo test --test usage_graph_test --test usage_graph_cpp_test`.
 - [x] (2026-06-17T08:05Z) Ran and passed `cargo clippy --all-targets --all-features -- -D warnings` after the C++ slice.
-- [ ] Migrate PHP analyzer-backed usage internals to mode-specific resolver/cache ownership.
+- [x] (2026-06-17T08:44Z) Migrated PHP analyzer-backed usage internals to mode-specific resolver/cache ownership.
+- [x] (2026-06-17T08:44Z) Added PHP `usage_graph` regression tests for path-filtered callers and skipping unrelated malformed out-of-scope callers.
+- [x] (2026-06-17T08:44Z) Ran and passed `cargo fmt` after the PHP slice.
+- [x] (2026-06-17T08:44Z) Ran and passed `cargo test --test usage_graph_php_test`.
+- [x] (2026-06-17T08:44Z) Ran and passed `cargo test --test usages_php_graph_test`.
+- [x] (2026-06-17T08:44Z) Ran and passed `cargo test --test usage_graph_test --test usage_graph_php_test`.
+- [x] (2026-06-17T08:44Z) Ran and passed `cargo clippy --all-targets --all-features -- -D warnings` after the PHP slice.
 - [ ] Migrate Scala analyzer-backed usage internals to mode-specific resolver/cache ownership.
 
 ## Surprises & Discoveries
@@ -46,6 +52,9 @@ The observable outcome is that existing `scan_usages` and `usage_graph` response
 
 - Observation: C++ edge scans already filtered caller files before parsing ASTs; the migration preserved that behavior by moving setup into `CppEdgeResolver`.
   Evidence: `cargo test --test usage_graph_cpp_test` passed new `path_filter_only_emits_matching_cpp_callers` and `scoped_usage_graph_skips_unrelated_invalid_cpp_callers` tests.
+
+- Observation: PHP edge scans already filtered caller files before parsing ASTs; the migration preserved that behavior by moving setup into `PhpEdgeResolver`.
+  Evidence: `cargo test --test usage_graph_php_test` passed new `path_filter_only_emits_matching_php_callers` and `scoped_usage_graph_skips_unrelated_invalid_php_callers` tests.
 
 ## Decision Log
 
@@ -70,6 +79,8 @@ The observable outcome is that existing `scan_usages` and `usage_graph` response
 Java and C# have been brought forward onto the post-#189 codebase as internal resolver/cache ownership refactors, and their focused graph/forward usage suites plus clippy pass. The public tool schema remains owned by #189. C++, PHP, and Scala remain to be migrated under #192.
 
 The C++ slice now also uses internal mode-specific resolver/cache ownership. `CppQueryResolver` owns forward query setup, and `CppEdgeResolver` owns edge-side file discovery, filtered parsing, include-closure visibility construction, and delegation to the inverted C++ edge walker. PHP and Scala remain to be migrated under #192.
+
+The PHP slice now also uses internal mode-specific resolver/cache ownership. `PhpQueryResolver` owns forward query setup, including optional `PhpHierarchyIndex` construction for method and field targets. `PhpEdgeResolver` owns edge-side file discovery and filtered parsing before delegating to the inverted PHP edge walker. Scala remains the final analyzer-backed migration under #192.
 
 ## Context and Orientation
 
@@ -188,6 +199,21 @@ C++ validation evidence:
     cargo clippy --all-targets --all-features -- -D warnings
     Finished `dev` profile
 
+PHP validation evidence:
+
+    cargo test --test usage_graph_php_test
+    test result: ok. 8 passed; 0 failed
+
+    cargo test --test usages_php_graph_test
+    test result: ok. 26 passed; 0 failed
+
+    cargo test --test usage_graph_test --test usage_graph_php_test
+    test result: ok. 8 passed; 0 failed
+    test result: ok. 7 passed; 0 failed
+
+    cargo clippy --all-targets --all-features -- -D warnings
+    Finished `dev` profile
+
 ## Interfaces and Dependencies
 
 Java now exposes internal resolver types in `src/analyzer/usages/java_graph/shared.rs`:
@@ -211,7 +237,14 @@ C++ now exposes internal resolver types in `src/analyzer/usages/cpp_graph/shared
 
 `CppQueryResolver::find_usages` owns forward query setup. `CppEdgeResolver::build_edges` owns edge-side parsed-file and visibility-index setup before delegating to the inverted C++ edge builder.
 
-Future PHP and Scala work should use the same principle, but should not force exact type names or data shapes when a language's analyzer requires different internal state. The invariant is that public `scan_usages` and `usage_graph` behavior remains stable while duplicate per-consumer parser/analyzer setup is consolidated behind internal, mode-specific resolver entrypoints.
+PHP now exposes internal resolver types in `src/analyzer/usages/php_graph/shared.rs`:
+
+    pub(crate) struct PhpQueryResolver<'a>
+    pub(crate) struct PhpEdgeResolver<'a>
+
+`PhpQueryResolver::find_usages` owns forward query setup. `PhpEdgeResolver::build_edges` owns edge-side parsed-file setup before delegating to the inverted PHP edge builder.
+
+Future Scala work should use the same principle, but should not force exact type names or data shapes when the language's analyzer requires different internal state. The invariant is that public `scan_usages` and `usage_graph` behavior remains stable while duplicate per-consumer parser/analyzer setup is consolidated behind internal, mode-specific resolver entrypoints.
 
 ## Revision Notes
 
@@ -220,3 +253,5 @@ Future PHP and Scala work should use the same principle, but should not force ex
 2026-06-17: Updated progress, outcomes, and artifacts after running formatting, focused Java/C# tests, combined usage graph regression tests, and clippy successfully.
 
 2026-06-17: Completed the C++ shared resolver/cache ownership slice, added edge-scope regression tests, and recorded validation evidence. PHP and Scala remain.
+
+2026-06-17: Completed the PHP shared resolver/cache ownership slice, added edge-scope regression tests, and recorded validation evidence. Scala remains.
