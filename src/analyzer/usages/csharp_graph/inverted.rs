@@ -20,76 +20,46 @@
 use super::extractor::{is_declaration_name, member_access_name, member_access_receiver};
 use super::resolver::{
     first_type_child, is_type_reference_node, node_text, normalize_type_text, reference_type_text,
-    resolve_csharp_analyzer,
 };
+use super::shared::CSharpEdgeGraph;
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, first_precise,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::analyzer::{CSharpAnalyzer, IAnalyzer, Language, ProjectFile};
-use crate::hash::{HashMap, HashSet};
-use crate::text_utils::compute_line_starts;
-use rayon::prelude::*;
-use tree_sitter::{Node, Parser, Tree};
+use crate::analyzer::{CSharpAnalyzer, IAnalyzer, ProjectFile};
+use crate::hash::HashSet;
+use tree_sitter::{Node, Tree};
 
 /// A C# file parsed once for the inverted scan: source, tree, and line starts.
-struct ParsedFile {
-    source: String,
-    tree: Tree,
-    line_starts: Vec<usize>,
+pub(super) struct ParsedCSharpFile {
+    pub(super) source: String,
+    pub(super) tree: Tree,
+    pub(super) line_starts: Vec<usize>,
 }
 
-/// Build the whole C# `caller -> callee` edge set in a single inverted pass over
-/// the workspace. Returns `None` when there are no C# files. `nodes`/`keep_file`
-/// mirror the Go builder.
-pub(crate) fn build_csharp_usage_edges<F>(
+pub(super) fn build_csharp_edges<F>(
     analyzer: &dyn IAnalyzer,
+    csharp: &CSharpAnalyzer,
+    graph: &CSharpEdgeGraph,
     nodes: &HashSet<String>,
     keep_file: F,
-) -> Option<UsageEdges>
+) -> UsageEdges
 where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
-    let csharp = resolve_csharp_analyzer(analyzer)?;
-    let files: Vec<ProjectFile> = analyzer
-        .project()
-        .analyzable_files(Language::CSharp)
-        .ok()?
-        .into_iter()
-        .collect();
-    let parsed: HashMap<ProjectFile, ParsedFile> = files
-        .par_iter()
-        .filter(|file| keep_file(file))
-        .filter_map(|file| {
-            let source = file.read_to_string().ok()?;
-            if source.is_empty() {
-                return None;
-            }
-            let mut parser = Parser::new();
-            parser
-                .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
-                .ok()?;
-            let tree = parser.parse(source.as_str(), None)?;
-            let line_starts = compute_line_starts(&source);
-            Some((
-                file.clone(),
-                ParsedFile {
-                    source,
-                    tree,
-                    line_starts,
-                },
-            ))
-        })
-        .collect();
-
-    Some(build_edges(
+    build_edges(
         analyzer,
-        &files,
+        &graph.files,
         nodes,
         keep_file,
-        |file| parsed.get(file).map(|parsed| parsed.line_starts.as_slice()),
+        |file| {
+            graph
+                .parsed
+                .get(file)
+                .map(|parsed| parsed.line_starts.as_slice())
+        },
         |file, collector| {
-            let Some(parsed) = parsed.get(file) else {
+            let Some(parsed) = graph.parsed.get(file) else {
                 return;
             };
             let mut ctx = CsScan {
@@ -102,7 +72,7 @@ where
             let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
             walk(parsed.tree.root_node(), &mut ctx, &mut bindings);
         },
-    ))
+    )
 }
 
 struct CsScan<'a, 'b> {
