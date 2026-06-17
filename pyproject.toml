@@ -1,9 +1,39 @@
 [project]
 name = "brokk-bifrost-searchtools"
 version = "0.2.1"
-description = "Python searchtools client backed by a native bifrost Rust extension"
+description = "Fast, structured code search and analysis for Python, backed by a native Rust (Tree-sitter) extension"
+readme = "bifrost_searchtools/README.md"
 requires-python = ">=3.12"
+license = "LGPL-3.0-or-later"
+license-files = ["LICENSE.md"]
+authors = [{ name = "Brokk" }]
+keywords = [
+    "code-analysis",
+    "tree-sitter",
+    "code-search",
+    "semantic-search",
+    "static-analysis",
+    "symbols",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Software Development :: Quality Assurance",
+]
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/BrokkAi/bifrost"
+Repository = "https://github.com/BrokkAi/bifrost"
+Issues = "https://github.com/BrokkAi/bifrost/issues"
 
 [build-system]
 requires = ["maturin>=1.7,<2.0"]

@@ -169,7 +169,7 @@ Rank related files from one or more seed files:
 
 ## Python Client
 
-The Python distribution is `bifrost-searchtools`. Import it as `bifrost_searchtools`.
+The Python distribution is `brokk-bifrost-searchtools`. Import it as `bifrost_searchtools`.
 
 Example:
 
