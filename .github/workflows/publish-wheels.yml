@@ -52,9 +52,11 @@ jobs:
             runner: ubuntu-24.04-arm
             kind: linux
           - target: x86_64-apple-darwin
-            # macos-latest is arm64; use the Intel runner so the x86_64 wheel
-            # builds natively rather than relying on cross-compilation.
-            runner: macos-13
+            # macos-latest is arm64; build the x86_64 wheel natively on the last
+            # Intel image. macos-13 was retired (Dec 2025); macos-15-intel is the
+            # final native x86_64 macOS runner, available until ~Aug 2027. After
+            # that, cross-compile this target from an arm64 runner instead.
+            runner: macos-15-intel
             kind: macos
           - target: aarch64-apple-darwin
             runner: macos-latest
