@@ -26,7 +26,13 @@ The observable outcome is that existing `scan_usages` and `usage_graph` response
 - [x] (2026-06-17T07:52Z) Ran and passed `cargo test --test usages_csharp_graph_test`.
 - [x] (2026-06-17T07:52Z) Ran and passed `cargo test --test usage_graph_test --test usage_graph_java_test --test usage_graph_csharp_test`.
 - [x] (2026-06-17T07:52Z) Ran and passed `cargo clippy --all-targets --all-features -- -D warnings`.
-- [ ] Migrate C++ analyzer-backed usage internals to mode-specific resolver/cache ownership.
+- [x] (2026-06-17T08:05Z) Migrated C++ analyzer-backed usage internals to mode-specific resolver/cache ownership.
+- [x] (2026-06-17T08:05Z) Added C++ `usage_graph` regression tests for path-filtered callers and skipping unrelated malformed out-of-scope callers.
+- [x] (2026-06-17T08:05Z) Ran and passed `cargo fmt` after the C++ slice.
+- [x] (2026-06-17T08:05Z) Ran and passed `cargo test --test usage_graph_cpp_test`.
+- [x] (2026-06-17T08:05Z) Ran and passed `cargo test --test usages_cpp_graph_test`.
+- [x] (2026-06-17T08:05Z) Ran and passed `cargo test --test usage_graph_test --test usage_graph_cpp_test`.
+- [x] (2026-06-17T08:05Z) Ran and passed `cargo clippy --all-targets --all-features -- -D warnings` after the C++ slice.
 - [ ] Migrate PHP analyzer-backed usage internals to mode-specific resolver/cache ownership.
 - [ ] Migrate Scala analyzer-backed usage internals to mode-specific resolver/cache ownership.
 
@@ -37,6 +43,9 @@ The observable outcome is that existing `scan_usages` and `usage_graph` response
 
 - Observation: The #192 branch starts from a newer master than the exact #189 merge commit.
   Evidence: `git log --oneline --decorate -5` showed `5ec9cd7` at `origin/master`, with `27268d5 refactor(usages): drop ProjectUsageGraph, add per-language reference identity (#189)` in its history.
+
+- Observation: C++ edge scans already filtered caller files before parsing ASTs; the migration preserved that behavior by moving setup into `CppEdgeResolver`.
+  Evidence: `cargo test --test usage_graph_cpp_test` passed new `path_filter_only_emits_matching_cpp_callers` and `scoped_usage_graph_skips_unrelated_invalid_cpp_callers` tests.
 
 ## Decision Log
 
@@ -59,6 +68,8 @@ The observable outcome is that existing `scan_usages` and `usage_graph` response
 ## Outcomes & Retrospective
 
 Java and C# have been brought forward onto the post-#189 codebase as internal resolver/cache ownership refactors, and their focused graph/forward usage suites plus clippy pass. The public tool schema remains owned by #189. C++, PHP, and Scala remain to be migrated under #192.
+
+The C++ slice now also uses internal mode-specific resolver/cache ownership. `CppQueryResolver` owns forward query setup, and `CppEdgeResolver` owns edge-side file discovery, filtered parsing, include-closure visibility construction, and delegation to the inverted C++ edge walker. PHP and Scala remain to be migrated under #192.
 
 ## Context and Orientation
 
@@ -162,6 +173,21 @@ Validation evidence:
     cargo clippy --all-targets --all-features -- -D warnings
     Finished `dev` profile
 
+C++ validation evidence:
+
+    cargo test --test usage_graph_cpp_test
+    test result: ok. 8 passed; 0 failed
+
+    cargo test --test usages_cpp_graph_test
+    test result: ok. 26 passed; 0 failed
+
+    cargo test --test usage_graph_test --test usage_graph_cpp_test
+    test result: ok. 8 passed; 0 failed
+    test result: ok. 7 passed; 0 failed
+
+    cargo clippy --all-targets --all-features -- -D warnings
+    Finished `dev` profile
+
 ## Interfaces and Dependencies
 
 Java now exposes internal resolver types in `src/analyzer/usages/java_graph/shared.rs`:
@@ -178,10 +204,19 @@ C# now exposes internal resolver types in `src/analyzer/usages/csharp_graph/shar
 
 `CSharpQueryResolver::find_usages` owns forward query setup. `CSharpEdgeResolver::build_edges` owns edge-side parsed-file setup before delegating to the inverted C# edge builder.
 
-Future C++, PHP, and Scala work should use the same principle, but should not force exact type names or data shapes when a language's analyzer requires different internal state. The invariant is that public `scan_usages` and `usage_graph` behavior remains stable while duplicate per-consumer parser/analyzer setup is consolidated behind internal, mode-specific resolver entrypoints.
+C++ now exposes internal resolver types in `src/analyzer/usages/cpp_graph/shared.rs`:
+
+    pub(crate) struct CppQueryResolver<'a>
+    pub(crate) struct CppEdgeResolver
+
+`CppQueryResolver::find_usages` owns forward query setup. `CppEdgeResolver::build_edges` owns edge-side parsed-file and visibility-index setup before delegating to the inverted C++ edge builder.
+
+Future PHP and Scala work should use the same principle, but should not force exact type names or data shapes when a language's analyzer requires different internal state. The invariant is that public `scan_usages` and `usage_graph` behavior remains stable while duplicate per-consumer parser/analyzer setup is consolidated behind internal, mode-specific resolver entrypoints.
 
 ## Revision Notes
 
 2026-06-17: Created this plan after #189 merged and after replaying only the Java and C# analyzer-backed resolver work onto current `origin/master`. The older #185 plan edits were intentionally dropped because #189 superseded the project-graph language direction.
 
 2026-06-17: Updated progress, outcomes, and artifacts after running formatting, focused Java/C# tests, combined usage graph regression tests, and clippy successfully.
+
+2026-06-17: Completed the C++ shared resolver/cache ownership slice, added edge-scope regression tests, and recorded validation evidence. PHP and Scala remain.
