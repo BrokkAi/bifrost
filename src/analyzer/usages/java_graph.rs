@@ -3,19 +3,28 @@ mod hits;
 mod inverted;
 mod jvm_scala;
 mod resolver;
+mod shared;
 
-pub(crate) use inverted::build_java_usage_edges;
-
-use crate::analyzer::usages::common::{language_for_file, language_for_target};
-use crate::analyzer::usages::java_graph::extractor::{ScanState, scan_file};
-use crate::analyzer::usages::java_graph::jvm_scala::scan_scala_files_for_java_type;
-use crate::analyzer::usages::java_graph::resolver::{TargetSpec, resolve_java_analyzer};
-use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
+use crate::analyzer::usages::common::language_for_target;
+use crate::analyzer::usages::inverted_edges::UsageEdges;
+use crate::analyzer::usages::java_graph::shared::{JavaEdgeResolver, JavaQueryResolver};
+use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::UsageAnalyzer;
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::HashSet;
-use std::collections::BTreeSet;
+
+pub(crate) fn build_java_usage_edges<F>(
+    analyzer: &dyn IAnalyzer,
+    nodes: &HashSet<String>,
+    keep_file: F,
+) -> Option<UsageEdges>
+where
+    F: Fn(&ProjectFile) -> bool + Sync,
+{
+    let resolver = JavaEdgeResolver::new(analyzer, &keep_file)?;
+    Some(resolver.build_edges(analyzer, nodes, keep_file))
+}
 
 #[derive(Default)]
 pub struct JavaUsageGraphStrategy {
@@ -51,7 +60,7 @@ impl JavaUsageGraphStrategy {
             );
         }
 
-        let Some(java) = resolve_java_analyzer(analyzer) else {
+        let Some(resolver) = JavaQueryResolver::new(analyzer) else {
             return GraphUsageOutcome::fallback_safe(
                 target.fq_name(),
                 GraphFailureReason::MissingAnalyzerCapability(
@@ -61,71 +70,7 @@ impl JavaUsageGraphStrategy {
             );
         };
 
-        let Some(spec) = TargetSpec::from_target(java, target) else {
-            return GraphUsageOutcome::fallback_safe(
-                target.fq_name(),
-                GraphFailureReason::UnsupportedTargetShape("target shape is unsupported"),
-                "JavaUsageGraphStrategy",
-            );
-        };
-
-        let files: HashSet<ProjectFile> = candidate_files
-            .iter()
-            .filter(|file| language_for_file(file) == Language::Java)
-            .cloned()
-            .chain(std::iter::once(target.source().clone()))
-            .collect();
-
-        let mut hits: BTreeSet<UsageHit> = BTreeSet::new();
-        let mut saw_unproven_match = false;
-        let mut raw_match_count = 0usize;
-        let mut limit_exceeded = false;
-        let mut state = ScanState {
-            max_usages,
-            hits: &mut hits,
-            saw_unproven_match: &mut saw_unproven_match,
-            raw_match_count: &mut raw_match_count,
-            limit_exceeded: &mut limit_exceeded,
-        };
-        for file in files {
-            scan_file(java, analyzer, &file, &spec, &mut state);
-            if *state.limit_exceeded {
-                break;
-            }
-        }
-        scan_scala_files_for_java_type(analyzer, candidate_files, &spec, &mut state);
-
-        if hits.is_empty() && saw_unproven_match {
-            return GraphUsageOutcome::fallback_safe(
-                target.fq_name(),
-                GraphFailureReason::UnsafeInference("no proven structured hits"),
-                "JavaUsageGraphStrategy",
-            );
-        }
-
-        if hits.is_empty() && raw_match_count > 0 {
-            return GraphUsageOutcome::Resolved(FuzzyResult::success(
-                target.clone(),
-                BTreeSet::new(),
-            ));
-        }
-
-        if hits.is_empty() {
-            return GraphUsageOutcome::Resolved(FuzzyResult::success(
-                target.clone(),
-                BTreeSet::new(),
-            ));
-        }
-
-        if limit_exceeded || hits.len() > max_usages {
-            return GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites {
-                short_name: target.short_name().to_string(),
-                total_callsites: hits.len(),
-                limit: max_usages,
-            });
-        }
-
-        GraphUsageOutcome::Resolved(FuzzyResult::success(target.clone(), hits))
+        resolver.find_usages(analyzer, target, candidate_files, max_usages)
     }
 }
 
