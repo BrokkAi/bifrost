@@ -61,7 +61,7 @@ pub use project::{
     TestProject,
 };
 pub use python::PythonAnalyzer;
-pub use rust::RustAnalyzer;
+pub use rust::{RustAnalyzer, RustReferenceContext};
 pub use scala::ScalaAnalyzer;
 pub use source_content::SourceContent;
 pub use tree_sitter_analyzer::{LanguageAdapter, TreeSitterAnalyzer};

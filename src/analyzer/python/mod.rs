@@ -5,6 +5,7 @@ mod declarations;
 mod hierarchy;
 mod imports;
 mod tests;
+mod usage_index;
 
 use crate::analyzer::clone_detection::{CloneCandidateProfile, detect_structural_clone_smells};
 use crate::analyzer::common::language_for_file as file_language;
@@ -36,6 +37,7 @@ use declarations::{
 };
 use imports::{PythonImportDetails, parse_python_import_details, resolve_python_relative_module};
 use tests::detect_python_test_assertion_smells;
+use usage_index::PythonUsageIndex;
 
 #[derive(Clone)]
 pub struct PythonAnalyzer {
@@ -47,6 +49,7 @@ pub struct PythonAnalyzer {
     direct_descendants: Cache<CodeUnit, Arc<HashSet<CodeUnit>>>,
     module_code_units: Arc<HashMap<String, CodeUnit>>,
     reverse_import_index: Arc<OnceLock<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
+    usage_index: Arc<OnceLock<PythonUsageIndex>>,
 }
 
 impl PythonAnalyzer {
@@ -85,6 +88,7 @@ impl PythonAnalyzer {
             direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec),
             direct_descendants: build_weighted_cache(memo_budget / 8, weight_code_unit_set_by_unit),
             reverse_import_index: Arc::new(OnceLock::new()),
+            usage_index: Arc::new(OnceLock::new()),
         }
     }
 
@@ -474,6 +478,7 @@ impl IAnalyzer for PythonAnalyzer {
                 weight_code_unit_set_by_unit,
             ),
             reverse_import_index: Arc::new(OnceLock::new()),
+            usage_index: Arc::new(OnceLock::new()),
         }
     }
 
@@ -491,6 +496,7 @@ impl IAnalyzer for PythonAnalyzer {
                 weight_code_unit_set_by_unit,
             ),
             reverse_import_index: Arc::new(OnceLock::new()),
+            usage_index: Arc::new(OnceLock::new()),
         }
     }
 

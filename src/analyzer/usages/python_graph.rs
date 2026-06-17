@@ -110,11 +110,7 @@ impl PythonExportUsageGraphStrategy {
 
         let mut seeds = BTreeSet::new();
         for seed_name in seed_names {
-            seeds.extend(
-                graph
-                    .usage_graph
-                    .seeds_for_target(target.source(), &seed_name),
-            );
+            seeds.extend(py.usage_seeds(target.source(), &seed_name));
         }
         if seeds.is_empty() {
             return GraphUsageOutcome::fallback_safe(
@@ -126,7 +122,7 @@ impl PythonExportUsageGraphStrategy {
 
         let scan_files = graph.scan_files(candidate_files, target.source());
 
-        let hits = scan_files_for_seeds(analyzer, &graph, &scan_files, target, &seeds);
+        let hits = scan_files_for_seeds(analyzer, py, &graph, &scan_files, target, &seeds);
         let hits: BTreeSet<UsageHit> = hits
             .into_iter()
             .filter(|hit| &hit.enclosing != target)

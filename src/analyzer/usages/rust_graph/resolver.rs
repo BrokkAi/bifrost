@@ -1,4 +1,3 @@
-use crate::analyzer::usages::rust_graph::extractor::RustProjectGraph;
 use crate::analyzer::{
     AnalyzerDelegate, CodeUnit, IAnalyzer, Language, MultiAnalyzer, ProjectFile, RustAnalyzer,
 };
@@ -50,7 +49,6 @@ pub(super) fn is_graph_visible_member_target(rust: &RustAnalyzer, target: &CodeU
 
 pub(super) fn infer_graph_seeds(
     analyzer: &RustAnalyzer,
-    graph: &RustProjectGraph,
     target: &CodeUnit,
 ) -> BTreeSet<(ProjectFile, String)> {
     let mut seeds = BTreeSet::new();
@@ -58,9 +56,7 @@ pub(super) fn infer_graph_seeds(
         .parent_of(target)
         .is_some_and(|parent| parent.is_module());
     for seed_name in infer_export_names(analyzer, target) {
-        let resolved = graph
-            .usage_graph
-            .seeds_for_target(target.source(), &seed_name);
+        let resolved = analyzer.usage_seeds(target.source(), &seed_name);
         if resolved.is_empty() && nested_module_target {
             seeds.insert((target.source().clone(), seed_name));
         } else {

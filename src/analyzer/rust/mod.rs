@@ -4,6 +4,7 @@ mod declarations;
 mod graph_support;
 mod imports;
 mod tests;
+mod usage_index;
 
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::{
@@ -19,9 +20,12 @@ use tree_sitter::Parser;
 
 use super::js_ts::build_weighted_cache;
 use adapter::RustAdapter;
-use cache::{weight_code_unit_set, weight_project_file_set};
+use cache::{weight_code_unit_set, weight_project_file_set, weight_reference_context};
 use declarations::collect_rust_type_identifiers;
 use tests::detect_rust_test_assertion_smells;
+
+pub use graph_support::RustReferenceContext;
+use usage_index::RustUsageIndex;
 
 #[derive(Clone)]
 pub struct RustAnalyzer {
@@ -29,7 +33,9 @@ pub struct RustAnalyzer {
     memo_budget: u64,
     imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
+    reference_contexts: Cache<ProjectFile, Arc<RustReferenceContext>>,
     reverse_import_index: Arc<OnceLock<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
+    usage_index: Arc<OnceLock<RustUsageIndex>>,
 }
 
 impl RustAnalyzer {
@@ -44,7 +50,9 @@ impl RustAnalyzer {
             memo_budget,
             imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
+            reference_contexts: build_weighted_cache(memo_budget / 8, weight_reference_context),
             reverse_import_index: Arc::new(OnceLock::new()),
+            usage_index: Arc::new(OnceLock::new()),
         }
     }
 
@@ -64,7 +72,9 @@ impl RustAnalyzer {
             memo_budget,
             imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
+            reference_contexts: build_weighted_cache(memo_budget / 8, weight_reference_context),
             reverse_import_index: Arc::new(OnceLock::new()),
+            usage_index: Arc::new(OnceLock::new()),
         }
     }
 
@@ -169,7 +179,12 @@ impl IAnalyzer for RustAnalyzer {
             memo_budget: self.memo_budget,
             imported_code_units: build_weighted_cache(self.memo_budget / 4, weight_code_unit_set),
             referencing_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
+            reference_contexts: build_weighted_cache(
+                self.memo_budget / 8,
+                weight_reference_context,
+            ),
             reverse_import_index: Arc::new(OnceLock::new()),
+            usage_index: Arc::new(OnceLock::new()),
         }
     }
 
@@ -179,7 +194,12 @@ impl IAnalyzer for RustAnalyzer {
             memo_budget: self.memo_budget,
             imported_code_units: build_weighted_cache(self.memo_budget / 4, weight_code_unit_set),
             referencing_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
+            reference_contexts: build_weighted_cache(
+                self.memo_budget / 8,
+                weight_reference_context,
+            ),
             reverse_import_index: Arc::new(OnceLock::new()),
+            usage_index: Arc::new(OnceLock::new()),
         }
     }
 

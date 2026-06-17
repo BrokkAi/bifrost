@@ -13,7 +13,7 @@
 mod common;
 
 use brokk_bifrost::SearchToolsService;
-use common::usage_graph::{assert_every_edge_endpoint_is_a_node, find_edge};
+use common::usage_graph::{assert_every_edge_endpoint_is_a_node, find_edge, has_edge};
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -35,6 +35,31 @@ fn usage_graph_in(fixture: &str, arguments: &str) -> Value {
 
 fn usage_graph(arguments: &str) -> Value {
     usage_graph_in("usage-graph-python", arguments)
+}
+
+#[test]
+fn receiver_typing_is_function_scoped_not_class_body() {
+    // Regression for the inverted receiver-typing scope: a function-scoped
+    // receiver accessed at function level resolves, but the same name accessed at
+    // the body level of a nested class must not (matching the per-symbol scan).
+    let value = usage_graph_in("usage-graph-python-nested-class", "{}");
+    assert!(
+        has_edge(&value, "m.outer", "m.Foo.method"),
+        "function-level recv.method() should resolve to outer -> Foo.method; edges: {:#}",
+        value["edges"]
+    );
+    let edges_to_method = value["edges"]
+        .as_array()
+        .expect("edges array")
+        .iter()
+        .filter(|edge| edge["to"].as_str() == Some("m.Foo.method"))
+        .count();
+    assert_eq!(
+        edges_to_method, 1,
+        "only the function-level call should resolve; the class-body access must \
+         not add an edge. edges: {:#}",
+        value["edges"]
+    );
 }
 
 fn fqns(value: &Value) -> Vec<String> {

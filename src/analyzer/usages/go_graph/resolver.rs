@@ -1,9 +1,9 @@
 use crate::analyzer::go::packages::{canonical_go_package_name, read_go_module_path};
 use crate::analyzer::usages::common::language_for_file;
-use crate::analyzer::usages::graph_core::{ImportEdgeKind, ProjectUsageGraph};
 use crate::analyzer::usages::model::{
     ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind,
 };
+use crate::analyzer::usages::{ImportEdge, ImportEdgeKind};
 use crate::analyzer::{
     AnalyzerDelegate, CodeUnit, GoAnalyzer, IAnalyzer, ImportAnalysisProvider, Language,
     MultiAnalyzer, ProjectFile,
@@ -12,6 +12,7 @@ use crate::hash::{HashMap, HashSet};
 use rayon::prelude::*;
 use regex::Regex;
 use std::collections::BTreeSet;
+use std::collections::VecDeque;
 use std::sync::{Arc, LazyLock};
 use tree_sitter::{Node, Parser, Tree};
 
@@ -51,7 +52,13 @@ pub(crate) type ParsedFileCache = HashMap<ProjectFile, Arc<ParsedFile>>;
 
 pub(crate) struct GoProjectGraph {
     pub(super) parsed: HashMap<ProjectFile, Arc<ParsedFile>>,
-    usage_graph: ProjectUsageGraph,
+    /// Go-owned re-export + importer index, built from the analyzer's
+    /// exports/binders + Go's own module resolution (`resolve_go_module`), so the
+    /// forward scan resolves seeds + importer edges without a cross-file graph.
+    exports_by_file: HashMap<ProjectFile, ExportIndex>,
+    reexport_edges: HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>>,
+    star_reexports: HashMap<ProjectFile, Vec<ProjectFile>>,
+    importer_reverse: HashMap<ProjectFile, Vec<ImportEdge>>,
     /// Retained so the inverted whole-workspace edge builder can resolve a file's
     /// imports to package names without rescanning every parsed file.
     dir_index: ParentDirIndex,
@@ -152,6 +159,199 @@ impl GoProjectGraph {
             .collect();
         files
     }
+
+    /// Export seeds for `target_short` in `target_file`, following re-export
+    /// chains. Go has no re-export aliasing, so the chain walk is a no-op and this
+    /// is the file's own matching local exports — but it mirrors the graph it
+    /// replaces so behavior is identical.
+    pub(super) fn seeds_for_target(
+        &self,
+        target_file: &ProjectFile,
+        target_short: &str,
+    ) -> BTreeSet<(ProjectFile, String)> {
+        let mut seeds: BTreeSet<(ProjectFile, String)> = BTreeSet::new();
+        if let Some(exports) = self.exports_by_file.get(target_file) {
+            for (exported_name, entry) in &exports.exports_by_name {
+                let local = match entry {
+                    ExportEntry::Local { local_name } => Some(local_name.as_str()),
+                    ExportEntry::Default { local_name } => local_name.as_deref(),
+                    ExportEntry::ReexportedNamed { .. } => None,
+                };
+                if let Some(local_name) = local
+                    && local_name == target_short
+                {
+                    seeds.insert((target_file.clone(), exported_name.clone()));
+                }
+            }
+        }
+        let mut frontier: VecDeque<(ProjectFile, String)> = seeds.iter().cloned().collect();
+        while let Some(seed) = frontier.pop_front() {
+            if let Some(reexports) = self.reexport_edges.get(&seed) {
+                for next in reexports {
+                    if seeds.insert(next.clone()) {
+                        frontier.push_back(next.clone());
+                    }
+                }
+            }
+            if let Some(star_files) = self.star_reexports.get(&seed.0) {
+                for star_file in star_files {
+                    let next = (star_file.clone(), seed.1.clone());
+                    if seeds.insert(next.clone()) {
+                        frontier.push_back(next);
+                    }
+                }
+            }
+        }
+        seeds
+    }
+
+    /// The import edges in `importer` that bind one of the `seeds`.
+    pub(super) fn matching_edges_for_importer(
+        &self,
+        importer: &ProjectFile,
+        seeds: &BTreeSet<(ProjectFile, String)>,
+    ) -> Vec<ImportEdge> {
+        let mut matches = Vec::new();
+        for (target_file, _) in seeds {
+            let Some(edges) = self.importer_reverse.get(target_file) else {
+                continue;
+            };
+            matches.extend(
+                edges
+                    .iter()
+                    .filter(|edge| &edge.importer == importer && edge_matches_seed(edge, seeds))
+                    .cloned(),
+            );
+        }
+        matches
+    }
+}
+
+fn edge_matches_seed(edge: &ImportEdge, seeds: &BTreeSet<(ProjectFile, String)>) -> bool {
+    match &edge.kind {
+        ImportEdgeKind::Named(name) => seeds.contains(&(edge.target_file.clone(), name.clone())),
+        ImportEdgeKind::Default => {
+            seeds.contains(&(edge.target_file.clone(), "default".to_string()))
+        }
+        ImportEdgeKind::Namespace => seeds.iter().any(|(file, _)| file == &edge.target_file),
+        ImportEdgeKind::CommonJsRequire(export_name) => {
+            seeds.contains(&(edge.target_file.clone(), export_name.clone()))
+        }
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn build_reexport_edges(
+    exports_by_file: &HashMap<ProjectFile, ExportIndex>,
+    binders_by_file: &HashMap<ProjectFile, ImportBinder>,
+    resolve: &impl Fn(&str) -> Vec<ProjectFile>,
+) -> (
+    HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>>,
+    HashMap<ProjectFile, Vec<ProjectFile>>,
+) {
+    let mut reexport_edges: HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>> =
+        HashMap::default();
+    let mut star_reexports: HashMap<ProjectFile, Vec<ProjectFile>> = HashMap::default();
+    for (file, exports) in exports_by_file {
+        for (exported_name, entry) in &exports.exports_by_name {
+            match entry {
+                ExportEntry::Local { local_name } => {
+                    let Some(binder) = binders_by_file.get(file) else {
+                        continue;
+                    };
+                    let Some(binding) = binder.bindings.get(local_name) else {
+                        continue;
+                    };
+                    let Some(imported_name) = binding.imported_name.as_ref() else {
+                        continue;
+                    };
+                    for resolved_file in resolve(&binding.module_specifier) {
+                        reexport_edges
+                            .entry((resolved_file, imported_name.clone()))
+                            .or_default()
+                            .push((file.clone(), exported_name.clone()));
+                    }
+                }
+                ExportEntry::Default { .. } => {}
+                ExportEntry::ReexportedNamed {
+                    module_specifier,
+                    imported_name,
+                } => {
+                    for resolved_file in resolve(module_specifier) {
+                        reexport_edges
+                            .entry((resolved_file, imported_name.clone()))
+                            .or_default()
+                            .push((file.clone(), exported_name.clone()));
+                    }
+                }
+            }
+        }
+        for star in &exports.reexport_stars {
+            for resolved_file in resolve(&star.module_specifier) {
+                star_reexports
+                    .entry(resolved_file)
+                    .or_default()
+                    .push(file.clone());
+            }
+        }
+    }
+    (reexport_edges, star_reexports)
+}
+
+fn build_importer_reverse_go(
+    files: &[ProjectFile],
+    binders_by_file: &HashMap<ProjectFile, ImportBinder>,
+    exports_by_file: &HashMap<ProjectFile, ExportIndex>,
+    resolve: &impl Fn(&str) -> Vec<ProjectFile>,
+) -> HashMap<ProjectFile, Vec<ImportEdge>> {
+    let mut reverse: HashMap<ProjectFile, Vec<ImportEdge>> = HashMap::default();
+    for file in files {
+        let Some(binder) = binders_by_file.get(file) else {
+            continue;
+        };
+        for (local_name, binding) in &binder.bindings {
+            for target_file in resolve(&binding.module_specifier) {
+                // A dot-import (`import . "pkg"`) binds every export of the target
+                // as a named edge, mirroring the graph it replaces.
+                if matches!(binding.kind, ImportKind::Glob) {
+                    let Some(exports) = exports_by_file.get(&target_file) else {
+                        continue;
+                    };
+                    for export_name in exports.exports_by_name.keys() {
+                        reverse
+                            .entry(target_file.clone())
+                            .or_default()
+                            .push(ImportEdge {
+                                importer: file.clone(),
+                                local_name: export_name.clone(),
+                                target_file: target_file.clone(),
+                                kind: ImportEdgeKind::Named(export_name.clone()),
+                            });
+                    }
+                    continue;
+                }
+                let kind = match (binding.kind, binding.imported_name.as_deref()) {
+                    (ImportKind::Namespace, _) => ImportEdgeKind::Namespace,
+                    (ImportKind::Named, Some(name)) => ImportEdgeKind::Named(name.to_string()),
+                    (ImportKind::Named, None) => ImportEdgeKind::Named(local_name.clone()),
+                    // Go binders only emit Namespace/Glob.
+                    (ImportKind::Default, _)
+                    | (ImportKind::CommonJsRequire, _)
+                    | (ImportKind::Glob, _) => continue,
+                };
+                reverse
+                    .entry(target_file.clone())
+                    .or_default()
+                    .push(ImportEdge {
+                        importer: file.clone(),
+                        local_name: local_name.clone(),
+                        target_file,
+                        kind,
+                    });
+            }
+        }
+    }
+    reverse
 }
 
 /// Read and tree-sitter parse a single Go file. Returns `None` if the file
@@ -227,16 +427,18 @@ pub(super) fn build_go_graph(
         );
     }
 
-    let usage_graph = ProjectUsageGraph::build(
-        files,
-        exports_by_file,
-        &binders_by_file,
-        |_importer, module| resolve_go_module(module, &dir_index, module_path.as_deref()),
-    );
+    let resolve = |module: &str| resolve_go_module(module, &dir_index, module_path.as_deref());
+    let (reexport_edges, star_reexports) =
+        build_reexport_edges(&exports_by_file, &binders_by_file, &resolve);
+    let importer_reverse =
+        build_importer_reverse_go(&files, &binders_by_file, &exports_by_file, &resolve);
 
     GoProjectGraph {
         parsed,
-        usage_graph,
+        exports_by_file,
+        reexport_edges,
+        star_reexports,
+        importer_reverse,
         dir_index,
         module_path,
     }
@@ -427,15 +629,13 @@ impl TargetSpec {
         let identifier = target.identifier().to_string();
         let owner = owner_name(target);
         let top_level_seeds = if owner.is_none() || is_module_field(target) {
-            let seeds = graph
-                .usage_graph
-                .seeds_for_target(target.source(), &identifier);
+            let seeds = graph.seeds_for_target(target.source(), &identifier);
             (!seeds.is_empty()).then_some(seeds)
         } else {
             None
         };
         let owner_seeds = owner.as_ref().and_then(|owner| {
-            let mut seeds = graph.usage_graph.seeds_for_target(target.source(), owner);
+            let mut seeds = graph.seeds_for_target(target.source(), owner);
             if seeds.is_empty() && analyzer.parent_of(target).is_some() {
                 seeds.insert((target.source().clone(), owner.clone()));
             }
@@ -495,7 +695,7 @@ impl ScanBindings {
         let mut direct_names = HashSet::default();
         let mut namespace_names = HashSet::default();
         if let Some(seeds) = &spec.top_level_seeds {
-            for edge in graph.usage_graph.matching_edges_for_importer(file, seeds) {
+            for edge in graph.matching_edges_for_importer(file, seeds) {
                 match edge.kind {
                     ImportEdgeKind::Namespace | ImportEdgeKind::CommonJsRequire(_) => {
                         namespace_names.insert(edge.local_name);
@@ -513,7 +713,7 @@ impl ScanBindings {
         let mut owner_direct_names = HashSet::default();
         let mut owner_namespace_names = HashSet::default();
         if let Some(seeds) = &spec.owner_seeds {
-            for edge in graph.usage_graph.matching_edges_for_importer(file, seeds) {
+            for edge in graph.matching_edges_for_importer(file, seeds) {
                 match edge.kind {
                     ImportEdgeKind::Namespace | ImportEdgeKind::CommonJsRequire(_) => {
                         owner_namespace_names.insert(edge.local_name);
