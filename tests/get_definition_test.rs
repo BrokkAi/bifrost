@@ -120,6 +120,39 @@ pub fn run() {
 }
 
 #[test]
+fn rust_unimported_bare_name_does_not_guess_workspace_identifier() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+mod util;
+
+pub fn run() {
+    helper();
+}
+"#,
+        )
+        .file("util.rs", "pub fn helper() {}\n")
+        .build();
+
+    let line = "    helper();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"lib.rs","line":5,"column":{}}}]}}"#,
+            column_of(line, "helper")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"].as_array().unwrap().len(),
+        0,
+        "{value}"
+    );
+}
+
+#[test]
 fn rust_include_tests_false_filters_candidate_definitions() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(
@@ -152,11 +185,7 @@ pub fn run() {
         ),
     );
 
-    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
-    assert_eq!(
-        value["results"][0]["definitions"][0]["path"], "tests/helper.rs",
-        "{value}"
-    );
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
 }
 
 #[test]
@@ -241,6 +270,33 @@ function run() {
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(result["definitions"][0]["path"], "util.js", "{value}");
+}
+
+#[test]
+fn javascript_unknown_receiver_member_does_not_guess_same_file_function() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "app.ts",
+            r#"
+export function method() {}
+
+export function run(obj: any) {
+  obj.method();
+}
+"#,
+        )
+        .build();
+
+    let line = "  obj.method();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.ts","line":5,"column":{}}}]}}"#,
+            column_of(line, "method")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
 }
 
 #[test]

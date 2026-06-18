@@ -38,6 +38,7 @@ use crate::analyzer::{
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tree_sitter::{Node, Parser, Tree};
 
@@ -113,7 +114,8 @@ pub(crate) fn resolve_definition_batch(
 
 struct DefinitionBatchContext {
     support: DefinitionSupport,
-    sources: HashMap<ProjectFile, Result<String, String>>,
+    sources: HashMap<ProjectFile, Result<Arc<String>, String>>,
+    trees: HashMap<(ProjectFile, Language), Option<Tree>>,
     cpp_visibility: HashMap<ProjectFile, Arc<CppVisibilityIndex>>,
     scala_project_types: Option<Arc<ScalaProjectTypes>>,
 }
@@ -123,18 +125,27 @@ impl DefinitionBatchContext {
         Self {
             support: DefinitionSupport::build(analyzer, include_tests),
             sources: HashMap::default(),
+            trees: HashMap::default(),
             cpp_visibility: HashMap::default(),
             scala_project_types: None,
         }
     }
 
-    fn source(&mut self, file: &ProjectFile) -> Result<String, String> {
+    fn source(&mut self, file: &ProjectFile) -> Result<Arc<String>, String> {
         self.sources
             .entry(file.clone())
             .or_insert_with(|| {
                 file.read_to_string()
+                    .map(Arc::new)
                     .map_err(|err| format!("failed to read `{}`: {err}", rel_path_string(file)))
             })
+            .clone()
+    }
+
+    fn tree(&mut self, file: &ProjectFile, language: Language, source: &str) -> Option<Tree> {
+        self.trees
+            .entry((file.clone(), language))
+            .or_insert_with(|| parse_tree_for_language(language, source))
             .clone()
     }
 
@@ -163,7 +174,6 @@ impl DefinitionBatchContext {
 
 struct DefinitionSupport {
     by_fqn: HashMap<String, Vec<CodeUnit>>,
-    by_identifier: HashMap<String, Vec<CodeUnit>>,
     by_file_identifier: HashMap<(ProjectFile, String), Vec<CodeUnit>>,
     packages: HashSet<String>,
     normalized_fqns: HashSet<String>,
@@ -172,7 +182,6 @@ struct DefinitionSupport {
 impl DefinitionSupport {
     fn build(analyzer: &dyn IAnalyzer, include_tests: bool) -> Self {
         let mut by_fqn: HashMap<String, Vec<CodeUnit>> = HashMap::default();
-        let mut by_identifier: HashMap<String, Vec<CodeUnit>> = HashMap::default();
         let mut by_file_identifier: HashMap<(ProjectFile, String), Vec<CodeUnit>> =
             HashMap::default();
         let mut packages = HashSet::default();
@@ -185,10 +194,6 @@ impl DefinitionSupport {
             packages.insert(unit.package_name().to_string());
             normalized_fqns.insert(fqn.replace("$.", ".").trim_end_matches('$').to_string());
             by_fqn.entry(fqn).or_default().push(unit.clone());
-            by_identifier
-                .entry(unit.identifier().to_string())
-                .or_default()
-                .push(unit.clone());
             by_file_identifier
                 .entry((unit.source().clone(), unit.identifier().to_string()))
                 .or_default()
@@ -200,12 +205,8 @@ impl DefinitionSupport {
         for units in by_file_identifier.values_mut() {
             sort_units(units);
         }
-        for units in by_identifier.values_mut() {
-            sort_units(units);
-        }
         Self {
             by_fqn,
-            by_identifier,
             by_file_identifier,
             packages,
             normalized_fqns,
@@ -216,28 +217,11 @@ impl DefinitionSupport {
         self.by_fqn.get(fqn).cloned().unwrap_or_default()
     }
 
-    fn fqn_or_identifier(&self, file: &ProjectFile, fqn: &str) -> Vec<CodeUnit> {
-        let exact = self.fqn(fqn);
-        if !exact.is_empty() {
-            return exact;
-        }
-        let ident = fqn.rsplit('.').next().unwrap_or(fqn);
-        let in_file = self.file_identifier(file, ident);
-        if !in_file.is_empty() {
-            return in_file;
-        }
-        self.by_identifier.get(ident).cloned().unwrap_or_default()
-    }
-
     fn file_identifier(&self, file: &ProjectFile, ident: &str) -> Vec<CodeUnit> {
         self.by_file_identifier
             .get(&(file.clone(), ident.to_string()))
             .cloned()
             .unwrap_or_default()
-    }
-
-    fn identifier(&self, ident: &str) -> Vec<CodeUnit> {
-        self.by_identifier.get(ident).cloned().unwrap_or_default()
     }
 
     fn fqn_exists(&self, fqn: &str) -> bool {
@@ -326,14 +310,22 @@ fn resolve_one(
         }
     };
 
+    let tree = context.tree(&request.file, language, &source);
     let resolved = match language {
-        Language::Rust => resolve_rust(analyzer, &context.support, &request.file, &site.text),
+        Language::Rust => resolve_rust(
+            analyzer,
+            &context.support,
+            &request.file,
+            &source,
+            &site.text,
+        ),
         Language::JavaScript | Language::TypeScript => resolve_js_ts(
             analyzer,
             &context.support,
             &request.file,
             language,
             &source,
+            tree.as_ref(),
             &site.text,
         ),
         Language::Go => resolve_go(
@@ -343,16 +335,54 @@ fn resolve_one(
             &source,
             &site.text,
         ),
-        Language::Java => resolve_java(analyzer, &context.support, &request.file, &source, &site),
-        Language::Php => resolve_php(analyzer, &context.support, &request.file, &source, &site),
-        Language::Python => {
-            resolve_python(analyzer, &context.support, &request.file, &source, &site)
-        }
-        Language::CSharp => {
-            resolve_csharp(analyzer, &context.support, &request.file, &source, &site)
-        }
-        Language::Cpp => resolve_cpp(analyzer, context, &request.file, &source, &site),
-        Language::Scala => resolve_scala(analyzer, context, &request.file, &source, &site),
+        Language::Java => resolve_java(
+            analyzer,
+            &context.support,
+            &request.file,
+            &source,
+            tree.as_ref(),
+            &site,
+        ),
+        Language::Php => resolve_php(
+            analyzer,
+            &context.support,
+            &request.file,
+            &source,
+            tree.as_ref(),
+            &site,
+        ),
+        Language::Python => resolve_python(
+            analyzer,
+            &context.support,
+            &request.file,
+            &source,
+            tree.as_ref(),
+            &site,
+        ),
+        Language::CSharp => resolve_csharp(
+            analyzer,
+            &context.support,
+            &request.file,
+            &source,
+            tree.as_ref(),
+            &site,
+        ),
+        Language::Cpp => resolve_cpp(
+            analyzer,
+            context,
+            &request.file,
+            &source,
+            tree.as_ref(),
+            &site,
+        ),
+        Language::Scala => resolve_scala(
+            analyzer,
+            context,
+            &request.file,
+            &source,
+            tree.as_ref(),
+            &site,
+        ),
         Language::None => unreachable!("unsupported language handled before source extraction"),
     };
 
@@ -570,6 +600,7 @@ fn resolve_rust(
     analyzer: &dyn IAnalyzer,
     support: &DefinitionSupport,
     file: &ProjectFile,
+    source: &str,
     reference: &str,
 ) -> DefinitionLookupOutcome {
     let Some(rust) = crate::analyzer::usages::rust_graph::resolve_rust_analyzer(analyzer) else {
@@ -581,28 +612,22 @@ fn resolve_rust(
         let resolved = refs
             .resolve_scoped(path, name)
             .map(|fqn| support.fqn(&fqn))
-            .unwrap_or_else(|| {
-                rust_import_fallback(file, path)
-                    .map(|prefix| support.fqn_or_identifier(file, &format!("{prefix}.{name}")))
-                    .unwrap_or_default()
-            });
+            .unwrap_or_default();
         (resolved, true)
     } else {
-        (
-            refs.resolve_bare(reference)
-                .map(|fqn| support.fqn(fqn))
-                .unwrap_or_else(|| {
-                    let imported = rust_import_fallback(file, reference)
-                        .map(|fqn| support.fqn_or_identifier(file, &fqn))
-                        .unwrap_or_default();
-                    if imported.is_empty() {
-                        support.file_identifier(file, reference)
-                    } else {
-                        imported
-                    }
-                }),
-            false,
-        )
+        let mut resolved = refs
+            .resolve_bare(reference)
+            .map(|fqn| support.fqn(fqn))
+            .unwrap_or_default();
+        if resolved.is_empty() {
+            let imported = rust_import_candidates(rust, support, file, source, reference);
+            resolved = if imported.is_empty() {
+                support.file_identifier(file, reference)
+            } else {
+                imported
+            };
+        }
+        (resolved, false)
     };
     if !candidates.is_empty() {
         return candidates_outcome(candidates);
@@ -618,39 +643,123 @@ fn resolve_rust(
             format!("`{reference}` did not resolve through its Rust module path"),
         );
     }
-    let mut searched = support.identifier(reference.rsplit([':', '.']).next().unwrap_or(reference));
-    sort_units(&mut searched);
-    if !searched.is_empty() {
-        return candidates_outcome(searched);
-    }
     no_definition(
         "no_indexed_definition",
         format!("`{reference}` did not resolve to an indexed Rust definition"),
     )
 }
 
-fn rust_import_fallback(file: &ProjectFile, local: &str) -> Option<String> {
-    let source = file.read_to_string().ok()?;
-    for line in source.lines() {
-        let trimmed = line.trim();
-        let Some(path) = trimmed
-            .strip_prefix("use ")
-            .and_then(|rest| rest.strip_suffix(';'))
-            .map(str::trim)
-        else {
+fn rust_import_candidates(
+    rust: &crate::analyzer::RustAnalyzer,
+    support: &DefinitionSupport,
+    file: &ProjectFile,
+    source: &str,
+    reference: &str,
+) -> Vec<CodeUnit> {
+    let statement_candidates =
+        rust_import_statement_candidates(rust, support, file, source, reference);
+    if !statement_candidates.is_empty() {
+        return statement_candidates;
+    }
+
+    let binder = rust.import_binder_of(file);
+    let Some(binding) = binder.bindings.get(reference) else {
+        return Vec::new();
+    };
+    match binding.kind {
+        ImportKind::Named => {
+            let imported = binding.imported_name.as_deref().unwrap_or(reference);
+            let package = rust.resolve_module_package(file, &binding.module_specifier);
+            let mut candidates = package
+                .as_ref()
+                .map(|package| support.fqn(&format!("{package}.{imported}")))
+                .unwrap_or_default();
+            if candidates.is_empty() {
+                let files = rust.resolve_module_files(file, &binding.module_specifier);
+                candidates = support.file_identifier_in_files(&files, imported);
+            }
+            candidates
+        }
+        ImportKind::Namespace => {
+            let Some((module_specifier, imported)) = binding.module_specifier.rsplit_once("::")
+            else {
+                return Vec::new();
+            };
+            let files = rust.resolve_module_files(file, module_specifier);
+            support.file_identifier_in_files(&files, imported)
+        }
+        ImportKind::Default | ImportKind::CommonJsRequire | ImportKind::Glob => Vec::new(),
+    }
+}
+
+fn rust_import_statement_candidates(
+    rust: &crate::analyzer::RustAnalyzer,
+    support: &DefinitionSupport,
+    file: &ProjectFile,
+    source: &str,
+    reference: &str,
+) -> Vec<CodeUnit> {
+    for raw in source.lines() {
+        let mut path = raw.trim();
+        path = path.strip_prefix("pub ").unwrap_or(path).trim();
+        let Some(rest) = path.strip_prefix("use ") else {
             continue;
         };
-        let path = path.strip_prefix("crate::").unwrap_or(path);
-        let path = path.strip_prefix("self::").unwrap_or(path);
-        if path.contains('{') {
+        path = rest.trim_end_matches(';').trim();
+        if path.contains('{') || path.ends_with("::*") {
             continue;
         }
-        let dotted = path.replace("::", ".");
-        if dotted.rsplit('.').next() == Some(local) {
-            return Some(dotted);
+        let (path_without_alias, local_name) = match path.rsplit_once(" as ") {
+            Some((target, alias)) => (target.trim(), alias.trim()),
+            None => {
+                let local = path.rsplit("::").next().unwrap_or(path);
+                (path, local)
+            }
+        };
+        if local_name != reference {
+            continue;
+        }
+        let Some((module_specifier, imported_name)) = path_without_alias.rsplit_once("::") else {
+            continue;
+        };
+        let mut files = rust.resolve_module_files(file, module_specifier);
+        files.extend(rust_module_files_from_path(file, module_specifier));
+        let candidates = support.file_identifier_in_files(&files, imported_name);
+        if !candidates.is_empty() {
+            return candidates;
         }
     }
-    None
+    Vec::new()
+}
+
+fn rust_module_files_from_path(file: &ProjectFile, module_specifier: &str) -> Vec<ProjectFile> {
+    let Some(relative_module) = rust_relative_module_path(file, module_specifier) else {
+        return Vec::new();
+    };
+    let mut files = Vec::new();
+    for rel_path in [
+        relative_module.with_extension("rs"),
+        relative_module.join("mod.rs"),
+    ] {
+        let candidate = ProjectFile::new(file.root().to_path_buf(), rel_path);
+        if candidate.exists() {
+            files.push(candidate);
+        }
+    }
+    files
+}
+
+fn rust_relative_module_path(file: &ProjectFile, module_specifier: &str) -> Option<PathBuf> {
+    let module = module_specifier
+        .strip_prefix("crate::")
+        .or_else(|| module_specifier.strip_prefix("self::"))
+        .map(PathBuf::from)
+        .or_else(|| {
+            module_specifier
+                .strip_prefix("super::")
+                .map(|rest| file.parent().parent().unwrap_or(Path::new("")).join(rest))
+        })?;
+    Some(module.to_string_lossy().replace("::", "/").into())
 }
 
 fn rust_reference_looks_external(reference: &str) -> bool {
@@ -660,18 +769,32 @@ fn rust_reference_looks_external(reference: &str) -> bool {
         .is_some_and(|root| !matches!(root, "crate" | "self" | "super") && root != reference)
 }
 
+fn parse_tree_for_language(language: Language, source: &str) -> Option<Tree> {
+    match language {
+        Language::JavaScript | Language::TypeScript => parse_js_ts_tree(source, language),
+        Language::Cpp => parse_cpp_tree(source),
+        Language::Scala => parse_scala_tree(source),
+        Language::Java => parse_java_tree(source),
+        Language::Php => parse_php_tree(source),
+        Language::CSharp => parse_csharp_tree(source),
+        Language::Python => parse_python_tree(source),
+        Language::Rust | Language::Go | Language::None => None,
+    }
+}
+
 fn resolve_js_ts(
     analyzer: &dyn IAnalyzer,
     support: &DefinitionSupport,
     file: &ProjectFile,
     language: Language,
     source: &str,
+    tree: Option<&Tree>,
     reference: &str,
 ) -> DefinitionLookupOutcome {
-    let Some(tree) = parse_js_ts_tree(source, language) else {
+    let Some(tree) = tree else {
         return no_definition("jsts_parse_failed", "JS/TS source could not be parsed");
     };
-    let imports = compute_jsts_import_binder(source, &tree);
+    let imports = compute_jsts_import_binder(source, tree);
     let aliases = AliasResolver::new(analyzer.project().root().to_path_buf());
 
     if let Some((qualifier, name)) = reference.split_once('.') {
@@ -690,10 +813,6 @@ fn resolve_js_ts(
                 support,
                 Some(&aliases),
             );
-        }
-        let candidates = support.file_identifier(file, name);
-        if !candidates.is_empty() {
-            return candidates_outcome(candidates);
         }
         return no_definition(
             "no_indexed_definition",
@@ -888,12 +1007,13 @@ fn resolve_cpp(
     context: &mut DefinitionBatchContext,
     file: &ProjectFile,
     source: &str,
+    tree: Option<&Tree>,
     site: &ResolvedReferenceSite,
 ) -> DefinitionLookupOutcome {
     let Some(cpp) = resolve_cpp_analyzer(analyzer) else {
         return no_definition("cpp_analyzer_unavailable", "C++ analyzer is unavailable");
     };
-    let Some(tree) = parse_cpp_tree(source) else {
+    let Some(tree) = tree else {
         return no_definition("cpp_parse_failed", "C++ source could not be parsed");
     };
     let visibility = context.cpp_visibility(cpp, analyzer, file);
@@ -1539,6 +1659,7 @@ fn resolve_scala(
     context: &mut DefinitionBatchContext,
     file: &ProjectFile,
     source: &str,
+    tree: Option<&Tree>,
     site: &ResolvedReferenceSite,
 ) -> DefinitionLookupOutcome {
     let Some(scala) = resolve_scala_analyzer(analyzer) else {
@@ -1547,7 +1668,7 @@ fn resolve_scala(
             "Scala analyzer is unavailable",
         );
     };
-    let Some(tree) = parse_scala_tree(source) else {
+    let Some(tree) = tree else {
         return no_definition("scala_parse_failed", "Scala source could not be parsed");
     };
     let types = context.scala_project_types(scala);
@@ -1945,32 +2066,35 @@ fn scala_seed_active_path(
     cutoff_start: usize,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
-    if node.start_byte() >= cutoff_start {
-        return;
-    }
-    let enters_scope = SCALA_SCOPE_NODES.contains(&node.kind());
-    if enters_scope && !(node.start_byte() <= cutoff_start && cutoff_start < node.end_byte()) {
-        return;
-    }
-    if enters_scope {
-        bindings.enter_scope();
-    }
-    match node.kind() {
-        "function_definition" => {
-            scala_seed_parameters(resolver, source, node, cutoff_start, bindings)
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        if node.start_byte() >= cutoff_start {
+            continue;
         }
-        "val_definition" | "var_definition" if node.start_byte() < cutoff_start => {
-            scala_seed_value_definition(resolver, source, node, cutoff_start, bindings)
+        let enters_scope = SCALA_SCOPE_NODES.contains(&node.kind());
+        if enters_scope && !(node.start_byte() <= cutoff_start && cutoff_start < node.end_byte()) {
+            continue;
         }
-        _ => {}
-    }
+        if enters_scope {
+            bindings.enter_scope();
+        }
+        match node.kind() {
+            "function_definition" => {
+                scala_seed_parameters(resolver, source, node, cutoff_start, bindings)
+            }
+            "val_definition" | "var_definition" if node.start_byte() < cutoff_start => {
+                scala_seed_value_definition(resolver, source, node, cutoff_start, bindings)
+            }
+            _ => {}
+        }
 
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.start_byte() >= cutoff_start {
-            break;
-        }
-        scala_seed_active_path(resolver, source, child, cutoff_start, bindings);
+        let mut cursor = node.walk();
+        let mut children: Vec<_> = node
+            .named_children(&mut cursor)
+            .take_while(|child| child.start_byte() < cutoff_start)
+            .collect();
+        children.reverse();
+        stack.extend(children);
     }
 }
 
@@ -2143,12 +2267,13 @@ fn resolve_java(
     support: &DefinitionSupport,
     file: &ProjectFile,
     source: &str,
+    tree: Option<&Tree>,
     site: &ResolvedReferenceSite,
 ) -> DefinitionLookupOutcome {
     let Some(java) = crate::analyzer::usages::java_graph::resolve_java_analyzer(analyzer) else {
         return no_definition("java_analyzer_unavailable", "Java analyzer is unavailable");
     };
-    let Some(tree) = parse_java_tree(source) else {
+    let Some(tree) = tree else {
         return no_definition("java_parse_failed", "Java source could not be parsed");
     };
 
@@ -2185,19 +2310,21 @@ fn resolve_java(
                 )
             }),
         "method_invocation" => {
-            resolve_java_method_invocation(analyzer, support, file, source, node)
+            resolve_java_method_invocation(analyzer, support, file, source, root, node)
         }
-        "field_access" => resolve_java_field_access(analyzer, support, file, source, node),
+        "field_access" => resolve_java_field_access(analyzer, support, file, source, root, node),
         "identifier" => {
             if let Some(parent) = node.parent() {
                 match parent.kind() {
                     "method_invocation" => {
                         return resolve_java_method_invocation(
-                            analyzer, support, file, source, parent,
+                            analyzer, support, file, source, root, parent,
                         );
                     }
                     "field_access" => {
-                        return resolve_java_field_access(analyzer, support, file, source, parent);
+                        return resolve_java_field_access(
+                            analyzer, support, file, source, root, parent,
+                        );
                     }
                     _ => {}
                 }
@@ -2224,23 +2351,27 @@ fn parse_java_tree(source: &str) -> Option<Tree> {
 }
 
 fn smallest_named_node_covering<'tree>(
-    node: Node<'tree>,
+    mut node: Node<'tree>,
     start: usize,
     end: usize,
 ) -> Option<Node<'tree>> {
     if node.end_byte() < end || node.start_byte() > start {
         return None;
     }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.start_byte() <= start
-            && child.end_byte() >= end
-            && let Some(found) = smallest_named_node_covering(child, start, end)
-        {
-            return Some(found);
+    loop {
+        let mut cursor = node.walk();
+        let mut containing_child = None;
+        for child in node.named_children(&mut cursor) {
+            if child.start_byte() <= start && child.end_byte() >= end {
+                containing_child = Some(child);
+                break;
+            }
+        }
+        match containing_child {
+            Some(child) => node = child,
+            None => return Some(node),
         }
     }
-    Some(node)
 }
 
 fn is_java_declaration_or_import_name(node: Node<'_>) -> bool {
@@ -2296,6 +2427,7 @@ fn resolve_java_method_invocation(
     support: &DefinitionSupport,
     file: &ProjectFile,
     source: &str,
+    root: Node<'_>,
     node: Node<'_>,
 ) -> DefinitionLookupOutcome {
     let Some(name_node) = node.child_by_field_name("name") else {
@@ -2307,7 +2439,7 @@ fn resolve_java_method_invocation(
     }
 
     if let Some(object) = node.child_by_field_name("object") {
-        if let Some(owner) = java_receiver_type(analyzer, file, source, object) {
+        if let Some(owner) = java_receiver_type(analyzer, file, source, root, object) {
             return java_member_candidates(support, &owner.fq_name(), name);
         }
         return no_definition(
@@ -2339,6 +2471,7 @@ fn resolve_java_field_access(
     support: &DefinitionSupport,
     file: &ProjectFile,
     source: &str,
+    root: Node<'_>,
     node: Node<'_>,
 ) -> DefinitionLookupOutcome {
     let Some(field_node) = node.child_by_field_name("field") else {
@@ -2348,7 +2481,7 @@ fn resolve_java_field_access(
     let Some(object) = node.child_by_field_name("object") else {
         return no_definition("no_field_receiver", "Java field access has no receiver");
     };
-    if let Some(owner) = java_receiver_type(analyzer, file, source, object) {
+    if let Some(owner) = java_receiver_type(analyzer, file, source, root, object) {
         return java_member_candidates(support, &owner.fq_name(), field);
     }
     no_definition(
@@ -2390,10 +2523,11 @@ fn java_receiver_type(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     source: &str,
+    root: Node<'_>,
     object: Node<'_>,
 ) -> Option<CodeUnit> {
     let java = crate::analyzer::usages::java_graph::resolve_java_analyzer(analyzer)?;
-    java_receiver_type_for_java(java, file, source, object).or_else(|| {
+    java_receiver_type_for_java(java, file, source, root, object).or_else(|| {
         matches!(object.kind(), "this" | "super")
             .then(|| {
                 ClassRangeIndex::build(analyzer, file)
@@ -2408,6 +2542,7 @@ fn java_receiver_type_for_java(
     java: &JavaAnalyzer,
     file: &ProjectFile,
     source: &str,
+    root: Node<'_>,
     object: Node<'_>,
 ) -> Option<CodeUnit> {
     match object.kind() {
@@ -2417,7 +2552,7 @@ fn java_receiver_type_for_java(
         }
         "identifier" => {
             let name = java_node_text(object, source);
-            java_type_of_identifier_before(java, file, source, name, object.start_byte())
+            java_type_of_identifier_before(java, file, source, root, name, object.start_byte())
         }
         _ => None,
     }
@@ -2427,20 +2562,12 @@ fn java_type_of_identifier_before(
     java: &JavaAnalyzer,
     file: &ProjectFile,
     source: &str,
+    root: Node<'_>,
     name: &str,
     before_byte: usize,
 ) -> Option<CodeUnit> {
-    let tree = parse_java_tree(source)?;
     let mut found = None;
-    collect_java_typed_binding_before(
-        java,
-        file,
-        source,
-        tree.root_node(),
-        name,
-        before_byte,
-        &mut found,
-    );
+    collect_java_typed_binding_before(java, file, source, root, name, before_byte, &mut found);
     found
 }
 
@@ -2453,43 +2580,50 @@ fn collect_java_typed_binding_before(
     before_byte: usize,
     found: &mut Option<CodeUnit>,
 ) {
-    if node.start_byte() >= before_byte {
-        return;
-    }
-    match node.kind() {
-        "local_variable_declaration" | "field_declaration" => {
-            if let Some(resolved) = node
-                .child_by_field_name("type")
-                .and_then(|type_node| java_type_from_node(java, file, source, type_node))
-            {
-                let mut cursor = node.walk();
-                for child in node.named_children(&mut cursor) {
-                    if child.kind() == "variable_declarator"
-                        && let Some(name_node) = child.child_by_field_name("name")
-                        && name_node.start_byte() < before_byte
-                        && java_node_text(name_node, source) == name
-                    {
-                        *found = Some(resolved.clone());
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        if node.start_byte() >= before_byte {
+            continue;
+        }
+        match node.kind() {
+            "local_variable_declaration" | "field_declaration" => {
+                if let Some(resolved) = node
+                    .child_by_field_name("type")
+                    .and_then(|type_node| java_type_from_node(java, file, source, type_node))
+                {
+                    let mut cursor = node.walk();
+                    for child in node.named_children(&mut cursor) {
+                        if child.kind() == "variable_declarator"
+                            && let Some(name_node) = child.child_by_field_name("name")
+                            && name_node.start_byte() < before_byte
+                            && java_node_text(name_node, source) == name
+                        {
+                            *found = Some(resolved.clone());
+                        }
                     }
                 }
             }
+            "formal_parameter" => {
+                if let Some(name_node) = node.child_by_field_name("name")
+                    && name_node.start_byte() < before_byte
+                    && java_node_text(name_node, source) == name
+                    && let Some(resolved) = node
+                        .child_by_field_name("type")
+                        .and_then(|type_node| java_type_from_node(java, file, source, type_node))
+                {
+                    *found = Some(resolved);
+                }
+            }
+            _ => {}
         }
-        "formal_parameter" => {
-            if let Some(name_node) = node.child_by_field_name("name")
-                && name_node.start_byte() < before_byte
-                && java_node_text(name_node, source) == name
-                && let Some(resolved) = node
-                    .child_by_field_name("type")
-                    .and_then(|type_node| java_type_from_node(java, file, source, type_node))
-            {
-                *found = Some(resolved);
+        let mut cursor = node.walk();
+        let mut children: Vec<_> = node.named_children(&mut cursor).collect();
+        children.reverse();
+        for child in children {
+            if child.start_byte() < before_byte {
+                stack.push(child);
             }
         }
-        _ => {}
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_java_typed_binding_before(java, file, source, child, name, before_byte, found);
     }
 }
 
@@ -2641,12 +2775,13 @@ fn resolve_php(
     support: &DefinitionSupport,
     file: &ProjectFile,
     source: &str,
+    tree: Option<&Tree>,
     site: &ResolvedReferenceSite,
 ) -> DefinitionLookupOutcome {
     let Some(php) = crate::analyzer::usages::php_graph::resolve_php_analyzer(analyzer) else {
         return no_definition("php_analyzer_unavailable", "PHP analyzer is unavailable");
     };
-    let Some(tree) = parse_php_tree(source) else {
+    let Some(tree) = tree else {
         return no_definition("php_parse_failed", "PHP source could not be parsed");
     };
     let root = tree.root_node();
@@ -2722,12 +2857,13 @@ fn resolve_csharp(
     support: &DefinitionSupport,
     file: &ProjectFile,
     source: &str,
+    tree: Option<&Tree>,
     site: &ResolvedReferenceSite,
 ) -> DefinitionLookupOutcome {
     let Some(csharp) = resolve_csharp_analyzer(analyzer) else {
         return no_definition("csharp_analyzer_unavailable", "C# analyzer is unavailable");
     };
-    let Some(tree) = parse_csharp_tree(source) else {
+    let Some(tree) = tree else {
         return no_definition("csharp_parse_failed", "C# source could not be parsed");
     };
     let Some(node) =
@@ -3148,6 +3284,7 @@ fn resolve_python(
     support: &DefinitionSupport,
     file: &ProjectFile,
     source: &str,
+    tree: Option<&Tree>,
     site: &ResolvedReferenceSite,
 ) -> DefinitionLookupOutcome {
     let Some(py) = resolve_python_analyzer(analyzer) else {
@@ -3156,7 +3293,7 @@ fn resolve_python(
             "Python analyzer is unavailable",
         );
     };
-    let Some(tree) = parse_python_tree(source) else {
+    let Some(tree) = tree else {
         return no_definition("python_parse_failed", "Python source could not be parsed");
     };
     let Some(node) =
@@ -3800,47 +3937,51 @@ fn php_parent_fqn(
 }
 
 fn php_declared_parent_type(
-    node: Node<'_>,
+    mut node: Node<'_>,
     source: &str,
     ctx: &FileContext,
     start: usize,
     end: usize,
 ) -> Option<String> {
-    if node.start_byte() <= start
-        && node.end_byte() >= end
-        && matches!(
-            node.kind(),
-            "class_declaration" | "interface_declaration" | "trait_declaration"
-        )
-    {
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            if matches!(child.kind(), "base_clause" | "class_interface_clause") {
-                let mut clause_cursor = child.walk();
-                for clause_child in child.named_children(&mut clause_cursor) {
-                    if matches!(
-                        clause_child.kind(),
-                        "name" | "qualified_name" | "namespace_name"
-                    ) {
-                        return resolve_php_type(
-                            &php_qualified_candidate_text(clause_child, source),
-                            ctx,
-                        );
+    loop {
+        if node.start_byte() <= start
+            && node.end_byte() >= end
+            && matches!(
+                node.kind(),
+                "class_declaration" | "interface_declaration" | "trait_declaration"
+            )
+        {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if matches!(child.kind(), "base_clause" | "class_interface_clause") {
+                    let mut clause_cursor = child.walk();
+                    for clause_child in child.named_children(&mut clause_cursor) {
+                        if matches!(
+                            clause_child.kind(),
+                            "name" | "qualified_name" | "namespace_name"
+                        ) {
+                            return resolve_php_type(
+                                &php_qualified_candidate_text(clause_child, source),
+                                ctx,
+                            );
+                        }
                     }
                 }
             }
         }
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.start_byte() <= start
-            && child.end_byte() >= end
-            && let Some(parent) = php_declared_parent_type(child, source, ctx, start, end)
-        {
-            return Some(parent);
+        let mut cursor = node.walk();
+        let mut next = None;
+        for child in node.named_children(&mut cursor) {
+            if child.start_byte() <= start && child.end_byte() >= end {
+                next = Some(child);
+                break;
+            }
+        }
+        match next {
+            Some(child) => node = child,
+            None => return None,
         }
     }
-    None
 }
 
 fn php_instance_receiver_fqn(
