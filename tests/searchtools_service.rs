@@ -285,8 +285,58 @@ func (c *Client) Build() error {
     let result = &value["results"][0];
     assert_eq!("resolved", result["status"], "{value}");
     assert_eq!(
-        "example.com/app.Helper.UpdatePackageMetadata",
-        result["definition"]["fqn"],
+        "example.com/app.Helper.UpdatePackageMetadata", result["definition"]["fqn"],
+        "{value}"
+    );
+}
+
+#[test]
+fn get_definition_by_reference_resolves_scala_constructor_field_from_symbol_context() {
+    let temp = TempDir::new().unwrap();
+    fs::create_dir_all(temp.path().join("app")).unwrap();
+    fs::write(
+        temp.path().join("app").join("StreamContext.scala"),
+        r#"package app
+class Registry
+class FlowShape
+class GraphStage[T]
+
+private[app] class StreamContext(
+  rootConfig: String,
+  val registry: Registry
+)
+"#,
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("app").join("TimeGrouped.scala"),
+        r#"package app
+
+private[app] class TimeGrouped(
+  context: StreamContext,
+  host: String
+) extends GraphStage[FlowShape] {
+  val value =
+    context.registry,
+}
+"#,
+    )
+    .unwrap();
+
+    let service =
+        SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "get_definition_by_reference",
+            r#"{"references":[{"symbol":"app.TimeGrouped","context":"    context.registry,","target":"registry"}]}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    let result = &value["results"][0];
+    assert_eq!("resolved", result["status"], "{value}");
+    assert_eq!(
+        "app.StreamContext.registry", result["definition"]["fqn"],
         "{value}"
     );
 }

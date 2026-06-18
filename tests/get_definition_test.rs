@@ -2060,7 +2060,10 @@ fn scala_object_receiver_method_resolves_to_definition() {
 
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(result["definition"]["fqn"], "app.DataSources$.of", "{value}");
+    assert_eq!(
+        result["definition"]["fqn"], "app.DataSources$.of",
+        "{value}"
+    );
 }
 
 #[test]

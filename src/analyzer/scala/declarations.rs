@@ -470,7 +470,10 @@ fn scala_field_signature(node: Node<'_>, source: &str, name: &str) -> String {
 }
 
 fn scala_class_parameter_field_signature(node: Node<'_>, source: &str, name: &str) -> String {
-    let keyword = if scala_node_text(node, source).trim_start().starts_with("var ") {
+    let keyword = if scala_node_text(node, source)
+        .trim_start()
+        .starts_with("var ")
+    {
         "var"
     } else {
         "val"

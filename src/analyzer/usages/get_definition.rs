@@ -2091,13 +2091,68 @@ fn scala_receiver_type_fqn(
             }
             let bindings = scala_bindings_before(resolver, source, root, cutoff_start);
             first_precise(&bindings, name).or_else(|| {
-                (!bindings.is_shadowed(name))
-                    .then(|| resolver.resolve(name))
-                    .flatten()
+                scala_enclosing_class_parameter_type(
+                    analyzer, file, receiver, name, resolver, source,
+                )
+                .or_else(|| {
+                    (!bindings.is_shadowed(name))
+                        .then(|| resolver.resolve(name))
+                        .flatten()
+                })
             })
         }
         _ => None,
     }
+}
+
+fn scala_enclosing_class_parameter_type(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    node: Node<'_>,
+    name: &str,
+    resolver: &ScalaNameResolver,
+    source: &str,
+) -> Option<String> {
+    let current_class = ClassRangeIndex::build(analyzer, file)
+        .enclosing(node.start_byte())
+        .map(str::to_string);
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "class_definition" {
+            let parameters = parent.child_by_field_name("class_parameters")?;
+            let mut cursor = parameters.walk();
+            for parameter in parameters.named_children(&mut cursor) {
+                if parameter.kind() != "class_parameter" {
+                    continue;
+                }
+                let Some(param_name) = parameter.child_by_field_name("name") else {
+                    continue;
+                };
+                if scala_node_text(param_name, source).trim() != name {
+                    continue;
+                }
+                return parameter.child_by_field_name("type").and_then(|type_node| {
+                    let type_text = scala_node_text(type_node, source);
+                    resolver.resolve(type_text).or_else(|| {
+                        scala_same_package_type_fqn(current_class.as_deref()?, type_text)
+                    })
+                });
+            }
+            return None;
+        }
+        current = parent.parent();
+    }
+    None
+}
+
+fn scala_same_package_type_fqn(current_class_fqn: &str, type_text: &str) -> Option<String> {
+    let simple = scala_simple_name(type_text);
+    if simple.is_empty() || simple.contains('.') {
+        return None;
+    }
+    current_class_fqn
+        .rsplit_once('.')
+        .map(|(package, _)| format!("{package}.{simple}"))
 }
 
 fn scala_fqn_outcome(
@@ -2234,7 +2289,10 @@ fn scala_seed_parameter(
     let resolved = parameter
         .child_by_field_name("type")
         .filter(|type_node| type_node.end_byte() <= cutoff_start)
-        .and_then(|type_node| resolver.resolve(scala_node_text(type_node, source)));
+        .and_then(|type_node| {
+            let type_text = scala_node_text(type_node, source);
+            resolver.resolve(type_text)
+        });
     scala_seed_typed(binding_name, resolved, bindings);
 }
 
