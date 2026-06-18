@@ -1,10 +1,11 @@
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::{
     CSharpAnalyzer, CloneSmell, CloneSmellWeights, CodeUnit, CommentDensityStats, CppAnalyzer,
-    DeclarationInfo, ExceptionHandlingSmell, ExceptionSmellWeights, GoAnalyzer, IAnalyzer,
-    ImportAnalysisProvider, ImportInfo, JavaAnalyzer, JavascriptAnalyzer, Language, PhpAnalyzer,
-    Project, ProjectFile, PythonAnalyzer, Range, RustAnalyzer, ScalaAnalyzer,
-    TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider, TypescriptAnalyzer,
+    DeclarationInfo, DefinitionLookupIndex, ExceptionHandlingSmell, ExceptionSmellWeights,
+    GoAnalyzer, IAnalyzer, ImportAnalysisProvider, ImportInfo, JavaAnalyzer, JavascriptAnalyzer,
+    Language, PhpAnalyzer, Project, ProjectFile, PythonAnalyzer, Range, RustAnalyzer,
+    ScalaAnalyzer, TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider,
+    TypescriptAnalyzer,
 };
 use crate::hash::HashSet;
 use rayon::prelude::*;
@@ -134,11 +135,20 @@ impl AnalyzerDelegate {
 #[derive(Clone, Default)]
 pub struct MultiAnalyzer {
     delegates: BTreeMap<Language, AnalyzerDelegate>,
+    definition_lookup_index: DefinitionLookupIndex,
 }
 
 impl MultiAnalyzer {
     pub fn new(delegates: BTreeMap<Language, AnalyzerDelegate>) -> Self {
-        Self { delegates }
+        let definition_lookup_index = DefinitionLookupIndex::from_declarations(
+            delegates
+                .values()
+                .flat_map(|delegate| delegate.analyzer().all_declarations()),
+        );
+        Self {
+            delegates,
+            definition_lookup_index,
+        }
     }
 
     pub fn with_java(java: JavaAnalyzer) -> Self {
@@ -309,6 +319,10 @@ impl IAnalyzer for MultiAnalyzer {
                 .values()
                 .flat_map(move |delegate| delegate.analyzer().definitions(fq_name)),
         )
+    }
+
+    fn definition_lookup_index(&self) -> &DefinitionLookupIndex {
+        &self.definition_lookup_index
     }
 
     fn direct_children<'a>(

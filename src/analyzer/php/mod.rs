@@ -119,6 +119,10 @@ impl IAnalyzer for PhpAnalyzer {
         self.inner.definitions(fq_name)
     }
 
+    fn definition_lookup_index(&self) -> &crate::analyzer::DefinitionLookupIndex {
+        self.inner.definition_lookup_index()
+    }
+
     fn direct_children<'a>(
         &'a self,
         code_unit: &CodeUnit,

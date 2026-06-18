@@ -1,8 +1,8 @@
 use crate::analyzer::cognitive_complexity;
 use crate::analyzer::persistence::{self, AnalyzerStorage};
 use crate::analyzer::{
-    AnalyzerConfig, CodeBaseMetrics, CodeUnit, DeclarationInfo, ImportInfo, Language, Project,
-    ProjectFile, Range,
+    AnalyzerConfig, CodeBaseMetrics, CodeUnit, DeclarationInfo, DefinitionLookupIndex, ImportInfo,
+    Language, Project, ProjectFile, Range,
 };
 use crate::hash::{HashMap, HashSet, map_with_capacity, set_with_capacity};
 use crate::profiling;
@@ -138,6 +138,7 @@ pub(crate) struct FileState {
 struct AnalyzerState {
     files: HashMap<ProjectFile, FileState>,
     definitions: HashMap<String, Vec<CodeUnit>>,
+    definition_lookup_index: DefinitionLookupIndex,
     // Child lists are canonicalized once while building immutable analyzer
     // state. `direct_children` intentionally exposes this deduped, source-
     // ordered contract; callers only reorder when they need a presentation-
@@ -695,6 +696,7 @@ where
         // these maps avoids repeated growth while building large workspaces.
         let capacities = Self::index_capacities(&files);
         let mut definitions = map_with_capacity::<String, Vec<CodeUnit>>(capacities.definitions);
+        let mut definition_lookup_index = DefinitionLookupIndex::default();
         let mut children = map_with_capacity::<CodeUnit, Vec<CodeUnit>>(capacities.children);
         let mut module_children =
             map_with_capacity::<String, Vec<CodeUnit>>(capacities.module_children);
@@ -708,6 +710,7 @@ where
 
         for state in files.values() {
             for declaration in &state.declarations {
+                definition_lookup_index.insert(declaration);
                 definitions
                     .entry(adapter.normalize_full_name(&declaration.fq_name()))
                     .or_default()
@@ -768,6 +771,7 @@ where
             });
             matches.dedup();
         }
+        definition_lookup_index.sort_entries();
 
         for matches in classes_by_package.values_mut() {
             matches.sort_by_cached_key(|code_unit| {
@@ -781,6 +785,7 @@ where
         AnalyzerState {
             files,
             definitions,
+            definition_lookup_index,
             children,
             module_children,
             ranges,
@@ -1134,6 +1139,10 @@ where
                 })
                 .flatten(),
         )
+    }
+
+    fn definition_lookup_index(&self) -> &DefinitionLookupIndex {
+        &self.state.definition_lookup_index
     }
 
     fn direct_children<'a>(

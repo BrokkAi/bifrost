@@ -32,9 +32,10 @@ use crate::analyzer::usages::scala_graph::{
     scala_node_text,
 };
 use crate::analyzer::{
-    AliasResolver, CSharpAnalyzer, CodeUnit, IAnalyzer, ImportAnalysisProvider, JavaAnalyzer,
-    Language, PhpAnalyzer, ProjectFile, PythonAnalyzer, Range, ScalaAnalyzer, cpp_node_text,
-    parse_php_use_aliases_from_source, quoted_include_paths, resolve_include_targets,
+    AliasResolver, CSharpAnalyzer, CodeUnit, DefinitionLookupIndex, IAnalyzer,
+    ImportAnalysisProvider, JavaAnalyzer, Language, PhpAnalyzer, ProjectFile, PythonAnalyzer,
+    Range, ScalaAnalyzer, cpp_node_text, parse_php_use_aliases_from_source, quoted_include_paths,
+    resolve_include_targets,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
@@ -111,8 +112,8 @@ pub(crate) fn resolve_definition_batch(
         .collect()
 }
 
-struct DefinitionBatchContext {
-    support: DefinitionSupport,
+struct DefinitionBatchContext<'a> {
+    support: &'a DefinitionLookupIndex,
     sources: HashMap<ProjectFile, Result<Arc<String>, String>>,
     trees: HashMap<(ProjectFile, Language), Option<Tree>>,
     cpp_visibility: HashMap<ProjectFile, Arc<CppVisibilityIndex>>,
@@ -120,10 +121,10 @@ struct DefinitionBatchContext {
     go_graph: Option<Option<Arc<GoProjectGraph>>>,
 }
 
-impl DefinitionBatchContext {
-    fn new(analyzer: &dyn IAnalyzer) -> Self {
+impl<'a> DefinitionBatchContext<'a> {
+    fn new(analyzer: &'a dyn IAnalyzer) -> Self {
         Self {
-            support: DefinitionSupport::build(analyzer),
+            support: analyzer.definition_lookup_index(),
             sources: HashMap::default(),
             trees: HashMap::default(),
             cpp_visibility: HashMap::default(),
@@ -196,96 +197,9 @@ impl DefinitionBatchContext {
     }
 }
 
-struct DefinitionSupport {
-    by_fqn: HashMap<String, Vec<CodeUnit>>,
-    by_file_identifier: HashMap<(ProjectFile, String), Vec<CodeUnit>>,
-    packages: HashSet<String>,
-    normalized_fqns: HashSet<String>,
-}
-
-impl DefinitionSupport {
-    fn build(analyzer: &dyn IAnalyzer) -> Self {
-        let mut by_fqn: HashMap<String, Vec<CodeUnit>> = HashMap::default();
-        let mut by_file_identifier: HashMap<(ProjectFile, String), Vec<CodeUnit>> =
-            HashMap::default();
-        let mut packages = HashSet::default();
-        let mut normalized_fqns = HashSet::default();
-        for unit in analyzer.all_declarations() {
-            let fqn = unit.fq_name();
-            packages.insert(unit.package_name().to_string());
-            normalized_fqns.insert(fqn.replace("$.", ".").trim_end_matches('$').to_string());
-            by_fqn.entry(fqn).or_default().push(unit.clone());
-            by_file_identifier
-                .entry((unit.source().clone(), unit.identifier().to_string()))
-                .or_default()
-                .push(unit.clone());
-        }
-        for units in by_fqn.values_mut() {
-            sort_units(units);
-        }
-        for units in by_file_identifier.values_mut() {
-            sort_units(units);
-        }
-        Self {
-            by_fqn,
-            by_file_identifier,
-            packages,
-            normalized_fqns,
-        }
-    }
-
-    fn fqn(&self, fqn: &str) -> Vec<CodeUnit> {
-        self.by_fqn.get(fqn).cloned().unwrap_or_default()
-    }
-
-    fn file_identifier(&self, file: &ProjectFile, ident: &str) -> Vec<CodeUnit> {
-        self.by_file_identifier
-            .get(&(file.clone(), ident.to_string()))
-            .cloned()
-            .unwrap_or_default()
-    }
-
-    fn fqn_exists(&self, fqn: &str) -> bool {
-        self.by_fqn.contains_key(fqn)
-    }
-
-    fn normalized_fqn_exists(&self, fqn: &str) -> bool {
-        self.normalized_fqns.contains(fqn)
-    }
-
-    fn package_exists(&self, package: &str) -> bool {
-        self.packages.contains(package)
-    }
-
-    fn fqn_prefix_exists(&self, prefix: &str) -> bool {
-        let prefix = format!("{prefix}.");
-        self.by_fqn.keys().any(|fqn| fqn.starts_with(&prefix))
-    }
-
-    fn file_identifier_in_files(&self, files: &[ProjectFile], ident: &str) -> Vec<CodeUnit> {
-        let mut out = Vec::new();
-        for file in files {
-            out.extend(self.file_identifier(file, ident));
-        }
-        sort_units(&mut out);
-        out.dedup();
-        out
-    }
-
-    fn fqn_candidates(&self, fqns: impl IntoIterator<Item = String>) -> Vec<CodeUnit> {
-        let mut out = Vec::new();
-        for fqn in fqns {
-            out.extend(self.fqn(&fqn));
-        }
-        sort_units(&mut out);
-        out.dedup();
-        out
-    }
-}
-
 fn resolve_one(
     analyzer: &dyn IAnalyzer,
-    context: &mut DefinitionBatchContext,
+    context: &mut DefinitionBatchContext<'_>,
     request: DefinitionLookupRequest,
 ) -> DefinitionLookupOutcome {
     let language = language_for_file(&request.file);
@@ -323,14 +237,14 @@ fn resolve_one(
     let resolved = match language {
         Language::Rust => resolve_rust(
             analyzer,
-            &context.support,
+            context.support,
             &request.file,
             &source,
             &site.text,
         ),
         Language::JavaScript | Language::TypeScript => resolve_js_ts(
             analyzer,
-            &context.support,
+            context.support,
             &request.file,
             language,
             &source,
@@ -342,7 +256,7 @@ fn resolve_one(
             let go_graph = go.and_then(|go| context.go_graph(go, analyzer));
             resolve_go(
                 analyzer,
-                &context.support,
+                context.support,
                 &request.file,
                 &source,
                 &site,
@@ -351,7 +265,7 @@ fn resolve_one(
         }
         Language::Java => resolve_java(
             analyzer,
-            &context.support,
+            context.support,
             &request.file,
             &source,
             tree.as_ref(),
@@ -359,7 +273,7 @@ fn resolve_one(
         ),
         Language::Php => resolve_php(
             analyzer,
-            &context.support,
+            context.support,
             &request.file,
             &source,
             tree.as_ref(),
@@ -367,7 +281,7 @@ fn resolve_one(
         ),
         Language::Python => resolve_python(
             analyzer,
-            &context.support,
+            context.support,
             &request.file,
             &source,
             tree.as_ref(),
@@ -375,7 +289,7 @@ fn resolve_one(
         ),
         Language::CSharp => resolve_csharp(
             analyzer,
-            &context.support,
+            context.support,
             &request.file,
             &source,
             tree.as_ref(),
@@ -607,7 +521,7 @@ fn is_ident_byte(byte: u8) -> bool {
 
 fn resolve_rust(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionSupport,
+    support: &DefinitionLookupIndex,
     file: &ProjectFile,
     source: &str,
     reference: &str,
@@ -660,7 +574,7 @@ fn resolve_rust(
 
 fn rust_import_candidates(
     rust: &crate::analyzer::RustAnalyzer,
-    support: &DefinitionSupport,
+    support: &DefinitionLookupIndex,
     file: &ProjectFile,
     source: &str,
     reference: &str,
@@ -703,7 +617,7 @@ fn rust_import_candidates(
 
 fn rust_import_statement_candidates(
     rust: &crate::analyzer::RustAnalyzer,
-    support: &DefinitionSupport,
+    support: &DefinitionLookupIndex,
     file: &ProjectFile,
     source: &str,
     reference: &str,
@@ -793,7 +707,7 @@ fn parse_tree_for_language(language: Language, source: &str) -> Option<Tree> {
 
 fn resolve_js_ts(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionSupport,
+    support: &DefinitionLookupIndex,
     file: &ProjectFile,
     language: Language,
     source: &str,
@@ -865,7 +779,7 @@ fn resolve_js_ts_module_binding(
     module: &str,
     exported_name: &str,
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionSupport,
+    support: &DefinitionLookupIndex,
     aliases: Option<&AliasResolver>,
 ) -> DefinitionLookupOutcome {
     let files = crate::analyzer::resolve_js_ts_module_specifier(file, module, language, aliases);
@@ -919,7 +833,7 @@ fn parse_js_ts_tree(source: &str, language: Language) -> Option<Tree> {
 
 fn resolve_go(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionSupport,
+    support: &DefinitionLookupIndex,
     file: &ProjectFile,
     source: &str,
     site: &ResolvedReferenceSite,
@@ -1031,13 +945,13 @@ fn go_import_paths(
     imports
 }
 
-fn go_import_path_is_workspace(support: &DefinitionSupport, import_path: &str) -> bool {
+fn go_import_path_is_workspace(support: &DefinitionLookupIndex, import_path: &str) -> bool {
     support.fqn_prefix_exists(import_path)
 }
 
 fn resolve_cpp(
     analyzer: &dyn IAnalyzer,
-    context: &mut DefinitionBatchContext,
+    context: &mut DefinitionBatchContext<'_>,
     file: &ProjectFile,
     source: &str,
     tree: Option<&Tree>,
@@ -1050,7 +964,7 @@ fn resolve_cpp(
         return no_definition("cpp_parse_failed", "C++ source could not be parsed");
     };
     let visibility = context.cpp_visibility(cpp, analyzer, file);
-    let support = &context.support;
+    let support = context.support;
     let root = tree.root_node();
     let Some(node) = smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)
     else {
@@ -1193,7 +1107,7 @@ fn cpp_is_type_declaration_name(node: Node<'_>) -> bool {
 
 fn resolve_cpp_type(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionSupport,
+    support: &DefinitionLookupIndex,
     file: &ProjectFile,
     visibility: &CppVisibilityIndex,
     source: &str,
@@ -1236,7 +1150,7 @@ fn resolve_cpp_type(
 
 fn resolve_cpp_call(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionSupport,
+    support: &DefinitionLookupIndex,
     file: &ProjectFile,
     visibility: &CppVisibilityIndex,
     source: &str,
@@ -1331,7 +1245,7 @@ fn resolve_cpp_call(
 
 fn resolve_cpp_field(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionSupport,
+    support: &DefinitionLookupIndex,
     file: &ProjectFile,
     visibility: &CppVisibilityIndex,
     source: &str,
@@ -1363,7 +1277,7 @@ fn resolve_cpp_field(
 fn cpp_visible_name_candidates(
     visibility: &CppVisibilityIndex,
     file: &ProjectFile,
-    support: &DefinitionSupport,
+    support: &DefinitionLookupIndex,
     raw_name: &str,
     kind: Option<CppTargetKind>,
     lexical_namespace: Option<&str>,
@@ -1418,7 +1332,7 @@ fn cpp_unit_is_type_alias(unit: &CodeUnit) -> bool {
 }
 
 fn cpp_member_candidates(
-    support: &DefinitionSupport,
+    support: &DefinitionLookupIndex,
     owners: Vec<CodeUnit>,
     member: &str,
 ) -> Vec<CodeUnit> {
@@ -1689,7 +1603,7 @@ fn cpp_lexical_namespace(node: Node<'_>, source: &str) -> Option<String> {
 
 fn resolve_scala(
     analyzer: &dyn IAnalyzer,
-    context: &mut DefinitionBatchContext,
+    context: &mut DefinitionBatchContext<'_>,
     file: &ProjectFile,
     source: &str,
     tree: Option<&Tree>,
@@ -1705,7 +1619,7 @@ fn resolve_scala(
         return no_definition("scala_parse_failed", "Scala source could not be parsed");
     };
     let types = context.scala_project_types(scala);
-    let support = &context.support;
+    let support = context.support;
     let resolver = ScalaNameResolver::for_file(scala, file, types.as_ref());
     let root = tree.root_node();
     let Some(node) = smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)
@@ -1764,7 +1678,7 @@ fn resolve_scala(
             if let Some(fqn) = resolver.resolve(text) {
                 return scala_fqn_outcome(support, &fqn, text);
             }
-            if scala_import_boundary_for_name(scala, &context.support, file, text) {
+            if scala_import_boundary_for_name(scala, context.support, file, text) {
                 return boundary(format!(
                     "`{text}` appears to cross a Scala import boundary not indexed in this workspace"
                 ));
@@ -1866,7 +1780,7 @@ fn scala_is_type_position(node: Node<'_>) -> bool {
 struct ScalaLookupCtx<'a> {
     scala: &'a ScalaAnalyzer,
     analyzer: &'a dyn IAnalyzer,
-    support: &'a DefinitionSupport,
+    support: &'a DefinitionLookupIndex,
     file: &'a ProjectFile,
     source: &'a str,
 }
@@ -1974,7 +1888,7 @@ fn resolve_scala_call(
 
 fn resolve_scala_field(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionSupport,
+    support: &DefinitionLookupIndex,
     file: &ProjectFile,
     source: &str,
     resolver: &ScalaNameResolver,
@@ -2043,7 +1957,7 @@ fn scala_receiver_type_fqn(
 }
 
 fn scala_fqn_outcome(
-    support: &DefinitionSupport,
+    support: &DefinitionLookupIndex,
     fqn: &str,
     reference: &str,
 ) -> DefinitionLookupOutcome {
@@ -2251,7 +2165,7 @@ fn scala_seed_typed(
 
 fn scala_import_boundary_for_name(
     scala: &ScalaAnalyzer,
-    support: &DefinitionSupport,
+    support: &DefinitionLookupIndex,
     file: &ProjectFile,
     name: &str,
 ) -> bool {
@@ -2279,12 +2193,12 @@ fn scala_import_boundary_for_name(
     false
 }
 
-fn supportless_scala_import_target_missing(support: &DefinitionSupport, path: &str) -> bool {
+fn supportless_scala_import_target_missing(support: &DefinitionLookupIndex, path: &str) -> bool {
     let normalized = path.replace("$.", ".").trim_end_matches('$').to_string();
     !support.fqn_exists(&normalized) && !support.normalized_fqn_exists(&normalized)
 }
 
-fn scala_workspace_package_exists(support: &DefinitionSupport, package: &str) -> bool {
+fn scala_workspace_package_exists(support: &DefinitionLookupIndex, package: &str) -> bool {
     support.package_exists(package)
 }
 
@@ -2297,7 +2211,7 @@ fn scala_simple_name(name: &str) -> &str {
 
 fn resolve_java(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionSupport,
+    support: &DefinitionLookupIndex,
     file: &ProjectFile,
     source: &str,
     tree: Option<&Tree>,
@@ -2431,7 +2345,7 @@ fn is_java_declaration_or_import_name(node: Node<'_>) -> bool {
 
 fn resolve_java_type_reference(
     java: &JavaAnalyzer,
-    support: &DefinitionSupport,
+    support: &DefinitionLookupIndex,
     file: &ProjectFile,
     source: &str,
     node: Node<'_>,
@@ -2457,7 +2371,7 @@ fn resolve_java_type_reference(
 
 fn resolve_java_method_invocation(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionSupport,
+    support: &DefinitionLookupIndex,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -2501,7 +2415,7 @@ fn resolve_java_method_invocation(
 
 fn resolve_java_field_access(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionSupport,
+    support: &DefinitionLookupIndex,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -2526,7 +2440,7 @@ fn resolve_java_field_access(
 fn resolve_java_bare_identifier(
     analyzer: &dyn IAnalyzer,
     java: &JavaAnalyzer,
-    support: &DefinitionSupport,
+    support: &DefinitionLookupIndex,
     file: &ProjectFile,
     source: &str,
     node: Node<'_>,
@@ -2673,7 +2587,7 @@ fn java_type_from_node(
 }
 
 fn java_member_candidates(
-    support: &DefinitionSupport,
+    support: &DefinitionLookupIndex,
     owner_fqn: &str,
     member: &str,
 ) -> DefinitionLookupOutcome {
@@ -2690,7 +2604,7 @@ fn java_member_candidates(
 
 fn java_static_import_candidates(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionSupport,
+    support: &DefinitionLookupIndex,
     file: &ProjectFile,
     member: &str,
 ) -> DefinitionLookupOutcome {
@@ -2738,7 +2652,7 @@ fn java_static_import_candidates(
 
 fn java_import_boundary_for_type(
     java: &JavaAnalyzer,
-    support: &DefinitionSupport,
+    support: &DefinitionLookupIndex,
     file: &ProjectFile,
     name: &str,
 ) -> bool {
@@ -2779,11 +2693,11 @@ fn java_static_import_path(import: &str) -> Option<&str> {
         .map(str::trim)
 }
 
-fn java_workspace_fqn_exists(support: &DefinitionSupport, fqn: &str) -> bool {
+fn java_workspace_fqn_exists(support: &DefinitionLookupIndex, fqn: &str) -> bool {
     support.fqn_exists(fqn)
 }
 
-fn java_workspace_package_exists(support: &DefinitionSupport, package: &str) -> bool {
+fn java_workspace_package_exists(support: &DefinitionLookupIndex, package: &str) -> bool {
     support.package_exists(package) || support.fqn_prefix_exists(package)
 }
 
@@ -2805,7 +2719,7 @@ fn normalize_java_type_text(raw: &str) -> &str {
 
 fn resolve_php(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionSupport,
+    support: &DefinitionLookupIndex,
     file: &ProjectFile,
     source: &str,
     tree: Option<&Tree>,
@@ -2887,7 +2801,7 @@ fn resolve_php(
 
 fn resolve_csharp(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionSupport,
+    support: &DefinitionLookupIndex,
     file: &ProjectFile,
     source: &str,
     tree: Option<&Tree>,
@@ -3058,7 +2972,7 @@ fn csharp_is_unqualified_invocation_target(node: Node<'_>) -> bool {
 
 fn csharp_type_outcome(
     csharp: &CSharpAnalyzer,
-    support: &DefinitionSupport,
+    support: &DefinitionLookupIndex,
     file: &ProjectFile,
     reference: &str,
 ) -> DefinitionLookupOutcome {
@@ -3082,7 +2996,7 @@ fn csharp_type_outcome(
 
 fn csharp_member_outcome(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionSupport,
+    support: &DefinitionLookupIndex,
     owners: Vec<CodeUnit>,
     member: &str,
 ) -> DefinitionLookupOutcome {
@@ -3117,7 +3031,7 @@ fn csharp_member_outcome(
 fn csharp_receiver_type_units(
     analyzer: &dyn IAnalyzer,
     csharp: &CSharpAnalyzer,
-    support: &DefinitionSupport,
+    support: &DefinitionLookupIndex,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -3179,7 +3093,7 @@ fn csharp_enclosing_class(
 
 fn csharp_import_boundary_for_type(
     csharp: &CSharpAnalyzer,
-    support: &DefinitionSupport,
+    support: &DefinitionLookupIndex,
     file: &ProjectFile,
     reference: &str,
 ) -> bool {
@@ -3196,13 +3110,13 @@ fn csharp_import_boundary_for_type(
         })
 }
 
-fn csharp_workspace_namespace_exists(support: &DefinitionSupport, namespace: &str) -> bool {
+fn csharp_workspace_namespace_exists(support: &DefinitionLookupIndex, namespace: &str) -> bool {
     support.package_exists(namespace)
 }
 
 fn csharp_alias_using_boundary_for_type(
     csharp: &CSharpAnalyzer,
-    support: &DefinitionSupport,
+    support: &DefinitionLookupIndex,
     file: &ProjectFile,
     reference: &str,
 ) -> bool {
@@ -3225,7 +3139,7 @@ fn csharp_alias_using_boundary_for_type(
 
 fn csharp_static_using_boundary_for_member(
     csharp: &CSharpAnalyzer,
-    support: &DefinitionSupport,
+    support: &DefinitionLookupIndex,
     file: &ProjectFile,
 ) -> bool {
     csharp.import_statements(file).iter().any(|raw| {
@@ -3239,7 +3153,7 @@ fn csharp_static_using_boundary_for_member(
     })
 }
 
-fn csharp_workspace_type_exists(support: &DefinitionSupport, reference: &str) -> bool {
+fn csharp_workspace_type_exists(support: &DefinitionLookupIndex, reference: &str) -> bool {
     support.fqn_exists(reference) || support.normalized_fqn_exists(reference)
 }
 
@@ -3314,7 +3228,7 @@ fn csharp_seed_active_path(
 
 fn resolve_python(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionSupport,
+    support: &DefinitionLookupIndex,
     file: &ProjectFile,
     source: &str,
     tree: Option<&Tree>,
@@ -3452,7 +3366,7 @@ impl PythonDefinitionContext {
     fn build(
         py: &PythonAnalyzer,
         analyzer: &dyn IAnalyzer,
-        _support: &DefinitionSupport,
+        _support: &DefinitionLookupIndex,
         file: &ProjectFile,
         _source: &str,
     ) -> Self {
@@ -3539,7 +3453,7 @@ fn python_reference_node(node: Node<'_>) -> Option<PythonReferenceNode<'_>> {
 }
 
 fn python_fqn_outcome(
-    support: &DefinitionSupport,
+    support: &DefinitionLookupIndex,
     fqn: &str,
     raw: &str,
 ) -> DefinitionLookupOutcome {
@@ -3560,7 +3474,7 @@ fn python_fqn_outcome(
 
 fn python_member_outcome(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionSupport,
+    support: &DefinitionLookupIndex,
     receiver_type: CodeUnit,
     member: &str,
 ) -> DefinitionLookupOutcome {
@@ -3587,14 +3501,14 @@ fn python_member_outcome(
     }
 }
 
-fn python_crosses_unindexed_boundary(support: &DefinitionSupport, fqn: &str) -> bool {
+fn python_crosses_unindexed_boundary(support: &DefinitionLookupIndex, fqn: &str) -> bool {
     let Some((module, _)) = fqn.rsplit_once('.') else {
         return !python_workspace_module_exists(support, "");
     };
     !python_workspace_module_exists(support, module)
 }
 
-fn python_workspace_module_exists(support: &DefinitionSupport, module: &str) -> bool {
+fn python_workspace_module_exists(support: &DefinitionLookupIndex, module: &str) -> bool {
     support.package_exists(module) || support.fqn_exists(module)
 }
 
@@ -3864,7 +3778,7 @@ fn php_qualified_reference_node(mut node: Node<'_>) -> Node<'_> {
 }
 
 fn php_fqn_outcome(
-    support: &DefinitionSupport,
+    support: &DefinitionLookupIndex,
     fqn: Option<String>,
     raw: &str,
 ) -> DefinitionLookupOutcome {
@@ -3890,7 +3804,7 @@ fn php_fqn_outcome(
 }
 
 fn php_member_outcome(
-    support: &DefinitionSupport,
+    support: &DefinitionLookupIndex,
     owner: Option<String>,
     member: &str,
 ) -> DefinitionLookupOutcome {
@@ -3916,20 +3830,20 @@ fn php_member_outcome(
     )
 }
 
-fn php_crosses_unindexed_boundary(support: &DefinitionSupport, fqn: &str) -> bool {
+fn php_crosses_unindexed_boundary(support: &DefinitionLookupIndex, fqn: &str) -> bool {
     let Some((namespace, _)) = fqn.rsplit_once('.') else {
         return !php_workspace_exact_namespace_exists(support, "");
     };
     !php_workspace_exact_namespace_exists(support, namespace)
 }
 
-fn php_workspace_exact_namespace_exists(support: &DefinitionSupport, namespace: &str) -> bool {
+fn php_workspace_exact_namespace_exists(support: &DefinitionLookupIndex, namespace: &str) -> bool {
     support.package_exists(namespace)
 }
 
 fn php_static_scope_fqn(
     php: &PhpAnalyzer,
-    support: &DefinitionSupport,
+    support: &DefinitionLookupIndex,
     scope: Node<'_>,
     source: &str,
     ctx: &FileContext,
@@ -3947,7 +3861,7 @@ fn php_static_scope_fqn(
 
 fn php_parent_fqn(
     php: &PhpAnalyzer,
-    support: &DefinitionSupport,
+    support: &DefinitionLookupIndex,
     enclosing_fqn: &str,
 ) -> Option<String> {
     let child = support.fqn(enclosing_fqn).into_iter().next()?;

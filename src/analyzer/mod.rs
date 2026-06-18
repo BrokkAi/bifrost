@@ -7,6 +7,7 @@ pub(crate) mod common;
 mod config;
 mod cpp;
 mod csharp;
+mod definition_lookup_index;
 mod go;
 mod i_analyzer;
 mod java;
@@ -39,6 +40,7 @@ pub(crate) use cpp::{
     resolve_include_targets,
 };
 pub use csharp::CSharpAnalyzer;
+pub use definition_lookup_index::DefinitionLookupIndex;
 pub use go::GoAnalyzer;
 pub use i_analyzer::IAnalyzer;
 pub use java::JavaAnalyzer;

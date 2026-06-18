@@ -2,13 +2,15 @@ use crate::analyzer::common::display_identifier_for_target;
 use crate::analyzer::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, FuzzyResult, UsageFinder};
 use crate::analyzer::{
     CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType, CommentDensityStats,
-    DeclarationInfo, ExceptionHandlingSmell, ExceptionSmellWeights, ImportAnalysisProvider,
-    Language, ParseError, Project, ProjectFile, Range, TestAssertionSmell, TestAssertionWeights,
-    TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider, metrics_from_declarations,
+    DeclarationInfo, DefinitionLookupIndex, ExceptionHandlingSmell, ExceptionSmellWeights,
+    ImportAnalysisProvider, Language, ParseError, Project, ProjectFile, Range, TestAssertionSmell,
+    TestAssertionWeights, TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider,
+    metrics_from_declarations,
 };
 use std::any::Any;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::OnceLock;
 
 pub trait IAnalyzer: Send + Sync + Any {
     fn top_level_declarations<'a>(
@@ -37,6 +39,10 @@ pub trait IAnalyzer: Send + Sync + Any {
     }
     fn definitions<'a>(&'a self, _fq_name: &'a str) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
         Box::new(std::iter::empty())
+    }
+    fn definition_lookup_index(&self) -> &DefinitionLookupIndex {
+        static EMPTY: OnceLock<DefinitionLookupIndex> = OnceLock::new();
+        EMPTY.get_or_init(DefinitionLookupIndex::default)
     }
     fn direct_children<'a>(
         &'a self,
