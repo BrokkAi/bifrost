@@ -25,16 +25,12 @@ use super::resolver::{package_name_of, scala_display_name, scala_normalized_fq_n
 use super::shared::ScalaEdgeGraph;
 use super::syntax::{node_text, scala_import_path};
 use crate::analyzer::usages::inverted_edges::{
-    ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, first_precise,
+    ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, first_precise, parse_and_collect,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::analyzer::usages::parsed_tree::ParsedTreeFile;
 use crate::analyzer::{IAnalyzer, ImportAnalysisProvider, ProjectFile, ScalaAnalyzer};
 use crate::hash::{HashMap, HashSet};
 use tree_sitter::Node;
-
-/// A Scala file parsed once for the inverted scan: source, tree, and line starts.
-pub(super) type ParsedScalaFile = ParsedTreeFile;
 
 /// Every class/object/trait/enum the project declares, indexed for the per-file
 /// name->fqn rebuild. Built once and shared across all files' scans.
@@ -140,21 +136,9 @@ pub(super) fn build_scala_edges<F>(
 where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
-    build_edges(
-        analyzer,
-        &graph.files,
-        nodes,
-        keep_file,
-        |file| {
-            graph
-                .parsed
-                .get(file)
-                .map(|parsed| parsed.line_starts.as_slice())
-        },
-        |file, collector| {
-            let Some(parsed) = graph.parsed.get(file) else {
-                return;
-            };
+    let language = tree_sitter_scala::LANGUAGE.into();
+    build_edges(&graph.files, keep_file, |file| {
+        parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
             let resolver = NameResolver::for_file(graph.scala, file, &graph.types);
             let mut ctx = ScalaScan {
                 source: parsed.source.as_str(),
@@ -164,8 +148,8 @@ where
             };
             let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
             walk(parsed.tree.root_node(), &mut ctx, &mut bindings);
-        },
-    )
+        })
+    })
 }
 
 struct ScalaScan<'a, 'b> {

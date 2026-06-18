@@ -23,7 +23,9 @@ use super::extractor::{
     selector_parts, type_ref_from_node, var_spec_names,
 };
 use super::resolver::{GoProjectGraph, TypeRef, node_text};
-use crate::analyzer::usages::inverted_edges::{EdgeCollector, UsageEdges, build_edges};
+use crate::analyzer::usages::inverted_edges::{
+    EdgeCollector, UsageEdges, build_edges, collect_file_edges,
+};
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::{GoAnalyzer, IAnalyzer, ProjectFile};
 use crate::hash::{HashMap, HashSet};
@@ -46,35 +48,28 @@ where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     let files: Vec<ProjectFile> = graph.parsed_files().cloned().collect();
-    build_edges(
-        analyzer,
-        &files,
-        nodes,
-        keep_file,
-        |file| {
-            graph
-                .parsed_file(file)
-                .map(|parsed| parsed.line_starts.as_slice())
-        },
-        |file, collector| {
-            let Some(parsed) = graph.parsed_file(file) else {
-                return;
-            };
-            let Some(file_pkg) = graph.package_name_of(file) else {
-                return;
-            };
-            let (alias_packages, dot_packages) = graph.namespace_packages(go, file);
-            let mut ctx = FileScan {
-                source: parsed.source.as_str(),
-                file_pkg,
-                alias_packages,
-                dot_packages,
-                collector,
-            };
-            let mut locals = LocalInferenceEngine::new(LocalInferenceConfig::default());
-            scan_node(parsed.tree.root_node(), &mut ctx, &mut locals);
-        },
-    )
+    build_edges(&files, keep_file, |file| {
+        let parsed = graph.parsed_file(file)?;
+        let file_pkg = graph.package_name_of(file)?;
+        Some(collect_file_edges(
+            analyzer,
+            file,
+            nodes,
+            &parsed.line_starts,
+            |collector| {
+                let (alias_packages, dot_packages) = graph.namespace_packages(go, file);
+                let mut ctx = FileScan {
+                    source: parsed.source.as_str(),
+                    file_pkg,
+                    alias_packages,
+                    dot_packages,
+                    collector,
+                };
+                let mut locals = LocalInferenceEngine::new(LocalInferenceConfig::default());
+                scan_node(parsed.tree.root_node(), &mut ctx, &mut locals);
+            },
+        ))
+    })
 }
 
 struct FileScan<'a, 'b> {

@@ -22,7 +22,7 @@ pub(crate) fn build_php_usage_edges<F>(
 where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
-    let resolver = PhpEdgeResolver::new(analyzer, &keep_file)?;
+    let resolver = PhpEdgeResolver::new(analyzer)?;
     Some(resolver.build_edges(analyzer, nodes, keep_file))
 }
 

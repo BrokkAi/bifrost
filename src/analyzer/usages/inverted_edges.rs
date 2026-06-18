@@ -21,12 +21,14 @@
 //! [`super::go_graph`] for the reference shape.
 
 use crate::analyzer::usages::local_inference::LocalInferenceEngine;
+use crate::analyzer::usages::parsed_tree::{ParsedTreeFile, parse_tree_sitter_file};
 use crate::analyzer::{IAnalyzer, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::find_line_index_for_offset;
 use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::hash::Hash;
+use tree_sitter::Language as TreeSitterLanguage;
 
 /// Per-file index of class-like declaration spans, for attributing an
 /// unqualified / `this` / `self` reference to its enclosing class. Sources the
@@ -348,44 +350,38 @@ impl<'a> ScopedEdgeCollector<'a> {
     }
 }
 
-/// Drive a whole-workspace inverted edge build over `files` in parallel.
+/// Drive a whole-workspace inverted edge build over `files` in parallel, where each
+/// language closure produces one file's [`PerFileEdges`] (or `None` to skip it).
 ///
-/// This owns everything language-agnostic — the parallel fan-out, the per-file
-/// enclosing index, the [`EdgeCollector`] lifecycle, and the final merge/cap — so
-/// a language implements only two small things:
+/// This owns the language-agnostic parts — the parallel fan-out and the final
+/// merge/cap — and leaves each language a single `scan(file) -> Option<PerFileEdges>`
+/// closure. The closure obtains the file's source/tree/line starts (the local-parse
+/// languages parse it on demand via [`super::parsed_tree::parse_tree_sitter_file`];
+/// the graph-based languages borrow it from their project graph), then builds its
+/// edges with [`collect_file_edges`]. Because nothing is borrowed across the walk,
+/// a closure that parses on demand can drop its tree before returning — so at most a
+/// handful of trees (≈ the rayon worker count) are live at once instead of the whole
+/// workspace.
 ///
-/// - `line_starts_of(file) -> Option<&[usize]>`: hand back the file's cached line
-///   starts (every language already parses with these), or `None` to skip the file.
-/// - `scan(file, &mut collector)`: walk the file's AST and, for each reference,
-///   resolve the callee fqn and call [`EdgeCollector::record`].
-///
-/// `keep_file` drops out-of-scope caller files (tests / path filter). See the Go
-/// implementation in [`super::go_graph`] for the canonical `scan` shape.
-pub(crate) fn build_edges<'a, KeepFn, LinesFn, ScanFn>(
-    analyzer: &dyn IAnalyzer,
+/// `keep_file` drops out-of-scope caller files (tests / path filter) before the
+/// closure runs. See the Go implementation in [`super::go_graph`] for the canonical
+/// `scan` shape.
+#[allow(clippy::redundant_closure)] // the closure borrows `scan`; see the note below
+pub(crate) fn build_edges<KeepFn, ScanFn>(
     files: &[ProjectFile],
-    nodes: &'a HashSet<String>,
     keep_file: KeepFn,
-    line_starts_of: LinesFn,
     scan: ScanFn,
 ) -> UsageEdges
 where
     KeepFn: Fn(&ProjectFile) -> bool + Sync,
-    LinesFn: Fn(&ProjectFile) -> Option<&'a [usize]> + Sync,
-    ScanFn: Fn(&ProjectFile, &mut EdgeCollector<'a>) + Sync,
+    ScanFn: Fn(&ProjectFile) -> Option<PerFileEdges> + Sync,
 {
     let per_file: Vec<PerFileEdges> = files
         .par_iter()
-        .filter_map(|file| {
-            if !keep_file(file) {
-                return None;
-            }
-            let line_starts = line_starts_of(file)?;
-            let declarations = build_file_declarations(analyzer, file);
-            let mut collector = EdgeCollector::new(line_starts, nodes, declarations);
-            scan(file, &mut collector);
-            Some(collector.finish())
-        })
+        .filter(|file| keep_file(file))
+        // Borrow `scan` rather than move it: it's `Sync` but not necessarily `Send`,
+        // and rayon shares one mapper across worker threads.
+        .filter_map(|file| scan(file))
         .collect();
     merge_and_cap(per_file)
 }
@@ -417,6 +413,54 @@ where
         })
         .collect();
     merge_scoped_and_cap(per_file)
+}
+
+/// Build one file's edges: construct its declaration index and an [`EdgeCollector`],
+/// run the language `walk` against the collector, and return the owned result. The
+/// collector's borrow of `line_starts` is scoped to this call, so the caller is free
+/// to drop the parsed tree / source / line starts as soon as this returns.
+pub(crate) fn collect_file_edges<W>(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    nodes: &HashSet<String>,
+    line_starts: &[usize],
+    walk: W,
+) -> PerFileEdges
+where
+    W: FnOnce(&mut EdgeCollector),
+{
+    let declarations = build_file_declarations(analyzer, file);
+    let mut collector = EdgeCollector::new(line_starts, nodes, declarations);
+    walk(&mut collector);
+    collector.finish()
+}
+
+/// Parse `file` on demand, build its edges via [`collect_file_edges`], and drop the
+/// tree / source / line starts when this returns — bounding live trees to ≈ the rayon
+/// worker count. Returns `None` to skip an unreadable or empty file. The `scan`
+/// closure receives the parsed file and the collector and owns the language AST walk.
+/// Centralizing the parse, the skip-on-failure, and the tree-lifetime scoping here
+/// keeps the six local-parse adapters from each repeating them, and gives a single
+/// home for any later parse-failure handling, tracing, or memory instrumentation.
+/// See the Java builder for the shape.
+pub(crate) fn parse_and_collect<S>(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    nodes: &HashSet<String>,
+    language: &TreeSitterLanguage,
+    scan: S,
+) -> Option<PerFileEdges>
+where
+    S: FnOnce(&ParsedTreeFile, &mut EdgeCollector),
+{
+    let parsed = parse_tree_sitter_file(file, language)?;
+    Some(collect_file_edges(
+        analyzer,
+        file,
+        nodes,
+        &parsed.line_starts,
+        |collector| scan(&parsed, collector),
+    ))
 }
 
 /// Sum per-file results and drop callees past [`MAX_CALLSITES`] into `truncated`.

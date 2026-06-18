@@ -1,20 +1,18 @@
 use super::extractor::scan_file;
-use super::inverted::{self, ParsedScalaFile, ProjectTypes};
+use super::inverted::{self, ProjectTypes};
 use super::resolver::{TargetSpec, resolve_scala_analyzer};
 use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::usages::parsed_tree::parse_kept_tree_sitter_files;
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, ScalaAnalyzer};
-use crate::hash::{HashMap, HashSet};
+use crate::hash::HashSet;
 use std::collections::BTreeSet;
 
 pub(super) struct ScalaEdgeGraph<'a> {
     pub(super) scala: &'a ScalaAnalyzer,
     pub(super) files: Vec<ProjectFile>,
     pub(super) types: ProjectTypes,
-    pub(super) parsed: HashMap<ProjectFile, ParsedScalaFile>,
 }
 
 pub(crate) struct ScalaQueryResolver<'a> {
@@ -83,10 +81,7 @@ pub(crate) struct ScalaEdgeResolver<'a> {
 }
 
 impl<'a> ScalaEdgeResolver<'a> {
-    pub(crate) fn new<F>(analyzer: &'a dyn IAnalyzer, keep_file: &F) -> Option<Self>
-    where
-        F: Fn(&ProjectFile) -> bool + Sync,
-    {
+    pub(crate) fn new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
         let scala = resolve_scala_analyzer(analyzer)?;
         let files: Vec<ProjectFile> = analyzer
             .project()
@@ -95,15 +90,12 @@ impl<'a> ScalaEdgeResolver<'a> {
             .into_iter()
             .collect();
         let types = ProjectTypes::build(scala);
-        let language = tree_sitter_scala::LANGUAGE.into();
-        let parsed = parse_kept_tree_sitter_files(&files, keep_file, &language);
 
         Some(Self {
             graph: ScalaEdgeGraph {
                 scala,
                 files,
                 types,
-                parsed,
             },
         })
     }

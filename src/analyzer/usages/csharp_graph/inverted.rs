@@ -21,44 +21,27 @@ use super::extractor::{is_declaration_name, member_access_name, member_access_re
 use super::resolver::{
     first_type_child, is_type_reference_node, node_text, normalize_type_text, reference_type_text,
 };
-use super::shared::CSharpEdgeGraph;
 use crate::analyzer::usages::inverted_edges::{
-    ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, first_precise,
+    ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, first_precise, parse_and_collect,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::analyzer::usages::parsed_tree::ParsedTreeFile;
 use crate::analyzer::{CSharpAnalyzer, IAnalyzer, ProjectFile};
 use crate::hash::HashSet;
 use tree_sitter::Node;
 
-/// A C# file parsed once for the inverted scan: source, tree, and line starts.
-pub(super) type ParsedCSharpFile = ParsedTreeFile;
-
 pub(super) fn build_csharp_edges<F>(
     analyzer: &dyn IAnalyzer,
     csharp: &CSharpAnalyzer,
-    graph: &CSharpEdgeGraph,
+    files: &[ProjectFile],
     nodes: &HashSet<String>,
     keep_file: F,
 ) -> UsageEdges
 where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
-    build_edges(
-        analyzer,
-        &graph.files,
-        nodes,
-        keep_file,
-        |file| {
-            graph
-                .parsed
-                .get(file)
-                .map(|parsed| parsed.line_starts.as_slice())
-        },
-        |file, collector| {
-            let Some(parsed) = graph.parsed.get(file) else {
-                return;
-            };
+    let language = tree_sitter_c_sharp::LANGUAGE.into();
+    build_edges(files, keep_file, |file| {
+        parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
             let mut ctx = CsScan {
                 csharp,
                 file,
@@ -68,8 +51,8 @@ where
             };
             let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
             walk(parsed.tree.root_node(), &mut ctx, &mut bindings);
-        },
-    )
+        })
+    })
 }
 
 struct CsScan<'a, 'b> {

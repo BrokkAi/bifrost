@@ -25,7 +25,7 @@ pub(crate) fn build_java_usage_edges<F>(
 where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
-    let resolver = JavaEdgeResolver::new(analyzer, &keep_file)?;
+    let resolver = JavaEdgeResolver::new(analyzer)?;
     Some(resolver.build_edges(analyzer, nodes, keep_file))
 }
 

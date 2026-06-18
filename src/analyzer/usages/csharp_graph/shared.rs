@@ -1,19 +1,13 @@
 use super::extractor::{ScanState, scan_file};
-use super::inverted::{self, ParsedCSharpFile};
+use super::inverted;
 use super::resolver::{TargetKind, TargetSpec, resolve_csharp_analyzer};
 use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::usages::parsed_tree::parse_kept_tree_sitter_files;
 use crate::analyzer::{CSharpAnalyzer, CodeUnit, IAnalyzer, Language, ProjectFile};
-use crate::hash::{HashMap, HashSet};
+use crate::hash::HashSet;
 use std::collections::BTreeSet;
-
-pub(super) struct CSharpEdgeGraph {
-    pub(super) files: Vec<ProjectFile>,
-    pub(super) parsed: HashMap<ProjectFile, ParsedCSharpFile>,
-}
 
 pub(crate) struct CSharpQueryResolver<'a> {
     csharp: &'a CSharpAnalyzer,
@@ -86,14 +80,11 @@ impl<'a> CSharpQueryResolver<'a> {
 
 pub(crate) struct CSharpEdgeResolver<'a> {
     csharp: &'a CSharpAnalyzer,
-    graph: CSharpEdgeGraph,
+    files: Vec<ProjectFile>,
 }
 
 impl<'a> CSharpEdgeResolver<'a> {
-    pub(crate) fn new<F>(analyzer: &'a dyn IAnalyzer, keep_file: &F) -> Option<Self>
-    where
-        F: Fn(&ProjectFile) -> bool + Sync,
-    {
+    pub(crate) fn new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
         let csharp = resolve_csharp_analyzer(analyzer)?;
         let files: Vec<ProjectFile> = analyzer
             .project()
@@ -101,13 +92,7 @@ impl<'a> CSharpEdgeResolver<'a> {
             .ok()?
             .into_iter()
             .collect();
-        let language = tree_sitter_c_sharp::LANGUAGE.into();
-        let parsed = parse_kept_tree_sitter_files(&files, keep_file, &language);
-
-        Some(Self {
-            csharp,
-            graph: CSharpEdgeGraph { files, parsed },
-        })
+        Some(Self { csharp, files })
     }
 
     pub(crate) fn build_edges<F>(
@@ -119,6 +104,6 @@ impl<'a> CSharpEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        inverted::build_csharp_edges(analyzer, self.csharp, &self.graph, nodes, keep_file)
+        inverted::build_csharp_edges(analyzer, self.csharp, &self.files, nodes, keep_file)
     }
 }
