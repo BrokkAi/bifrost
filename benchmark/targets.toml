@@ -209,7 +209,7 @@ summary_targets = ["src/RouteCollector.php"]
 seed_file_paths = ["src/RouteCollector.php"]
 usage_symbols = ["FastRoute.RouteCollector.addRoute"]
 definition_queries = [
-  { path = "src/RouteCollector.php", line = 40, column = 39, symbol = "addRoute", expected_status = "unsupported_language" },
+  { path = "src/RouteCollector.php", line = 74, column = 16, symbol = "addRoute", expected_status = "resolved", expected_fqn = "FastRoute.RouteCollector.addRoute" },
 ]
 
 [[repos]]

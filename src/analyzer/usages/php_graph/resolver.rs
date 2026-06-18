@@ -67,7 +67,9 @@ impl TargetSpec {
     }
 }
 
-pub(super) fn resolve_php_analyzer(analyzer: &dyn IAnalyzer) -> Option<&PhpAnalyzer> {
+pub(in crate::analyzer::usages) fn resolve_php_analyzer(
+    analyzer: &dyn IAnalyzer,
+) -> Option<&PhpAnalyzer> {
     if let Some(php) = (analyzer as &dyn std::any::Any).downcast_ref::<PhpAnalyzer>() {
         return Some(php);
     }
@@ -79,9 +81,9 @@ pub(super) fn resolve_php_analyzer(analyzer: &dyn IAnalyzer) -> Option<&PhpAnaly
     }
 }
 
-pub(super) struct FileContext {
-    pub(super) namespace: String,
-    pub(super) aliases: PhpUseAliases,
+pub(in crate::analyzer::usages) struct FileContext {
+    pub(in crate::analyzer::usages) namespace: String,
+    pub(in crate::analyzer::usages) aliases: PhpUseAliases,
 }
 
 #[derive(Default)]
@@ -238,7 +240,10 @@ fn enclosing_owner_at(
         .map(|enclosing_owner| enclosing_owner.fq_name())
 }
 
-pub(super) fn qualified_candidate_text(node: Node<'_>, source: &str) -> String {
+pub(in crate::analyzer::usages) fn qualified_candidate_text(
+    node: Node<'_>,
+    source: &str,
+) -> String {
     let mut candidate = node;
     let mut parent = node.parent();
     while let Some(ancestor) = parent {
@@ -252,7 +257,10 @@ pub(super) fn qualified_candidate_text(node: Node<'_>, source: &str) -> String {
     node_text(candidate, source).trim().to_string()
 }
 
-pub(super) fn resolve_php_type(raw: &str, ctx: &FileContext) -> Option<String> {
+pub(in crate::analyzer::usages) fn resolve_php_type(
+    raw: &str,
+    ctx: &FileContext,
+) -> Option<String> {
     let first = raw.split('|').next().unwrap_or(raw).trim();
     if first.is_empty() || matches!(first, "self" | "static" | "parent") {
         return None;
@@ -279,7 +287,10 @@ pub(super) fn resolve_php_type(raw: &str, ctx: &FileContext) -> Option<String> {
     Some(join_namespace(&ctx.namespace, &normalized))
 }
 
-pub(super) fn resolve_php_function(raw: &str, ctx: &FileContext) -> Option<String> {
+pub(in crate::analyzer::usages) fn resolve_php_function(
+    raw: &str,
+    ctx: &FileContext,
+) -> Option<String> {
     if raw.starts_with('\\') {
         return Some(php_namespace_to_fq(raw));
     }
@@ -290,7 +301,10 @@ pub(super) fn resolve_php_function(raw: &str, ctx: &FileContext) -> Option<Strin
     Some(join_namespace(&ctx.namespace, &normalized))
 }
 
-pub(super) fn resolve_php_constant(raw: &str, ctx: &FileContext) -> Option<String> {
+pub(in crate::analyzer::usages) fn resolve_php_constant(
+    raw: &str,
+    ctx: &FileContext,
+) -> Option<String> {
     if raw.starts_with('\\') {
         return Some(module_constant_fq(&php_namespace_to_fq(raw)));
     }
@@ -372,6 +386,6 @@ fn semantic_parent(node: Node<'_>) -> Option<Node<'_>> {
     None
 }
 
-pub(super) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+pub(in crate::analyzer::usages) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     source.get(node.start_byte()..node.end_byte()).unwrap_or("")
 }

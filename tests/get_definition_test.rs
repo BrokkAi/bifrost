@@ -442,6 +442,239 @@ public class UseLocal {
 }
 
 #[test]
+fn php_imported_type_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "src/Service.php",
+            "<?php\nnamespace App;\nclass Service {}\n",
+        )
+        .file(
+            "src/Controller.php",
+            "<?php\nnamespace App;\nuse App\\Service;\nclass Controller {\n    public function handle(Service $service): void {}\n}\n",
+        )
+        .build();
+
+    let line = "    public function handle(Service $service): void {}";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/Controller.php","line":5,"column":{}}}]}}"#,
+            column_of(line, "Service")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "App.Service", "{value}");
+    assert_eq!(
+        result["definitions"][0]["path"], "src/Service.php",
+        "{value}"
+    );
+}
+
+#[test]
+fn php_function_alias_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "src/helpers.php",
+            "<?php\nnamespace App;\nfunction render_view(): void {}\n",
+        )
+        .file(
+            "src/Controller.php",
+            "<?php\nnamespace App;\nuse function App\\render_view;\nclass Controller {\n    public function handle(): void {\n        render_view();\n    }\n}\n",
+        )
+        .build();
+
+    let line = "        render_view();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/Controller.php","line":6,"column":{}}}]}}"#,
+            column_of(line, "render_view")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "App.render_view",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["path"], "src/helpers.php",
+        "{value}"
+    );
+}
+
+#[test]
+fn php_typed_receiver_method_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "src/Service.php",
+            "<?php\nnamespace App;\nclass Service {\n    public function run(): void {}\n}\n",
+        )
+        .file(
+            "src/Controller.php",
+            "<?php\nnamespace App;\nclass Controller {\n    public function handle(Service $service): void {\n        $service->run();\n    }\n}\n",
+        )
+        .build();
+
+    let line = "        $service->run();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/Controller.php","line":5,"column":{}}}]}}"#,
+            column_of(line, "run")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "App.Service.run",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["path"], "src/Service.php",
+        "{value}"
+    );
+}
+
+#[test]
+fn php_fully_qualified_type_resolves_from_final_segment() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "src/Service.php",
+            "<?php\nnamespace App;\nclass Service {}\n",
+        )
+        .file(
+            "src/Controller.php",
+            "<?php\nnamespace App;\nclass Controller {\n    public function handle(\\App\\Service $service): void {}\n}\n",
+        )
+        .build();
+
+    let line = "    public function handle(\\App\\Service $service): void {}";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/Controller.php","line":4,"column":{}}}]}}"#,
+            column_of(line, "Service")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "App.Service", "{value}");
+}
+
+#[test]
+fn php_parent_static_call_resolves_to_parent_definition() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "src/BaseController.php",
+            "<?php\nnamespace App;\nclass BaseController {\n    public function run(): void {}\n}\n",
+        )
+        .file(
+            "src/ChildController.php",
+            "<?php\nnamespace App;\nclass ChildController extends BaseController {\n    public function run(): void {}\n    public function call(): void {\n        parent::run();\n    }\n}\n",
+        )
+        .build();
+
+    let line = "        parent::run();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/ChildController.php","line":6,"column":{}}}]}}"#,
+            column_of(line, "run")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "App.BaseController.run",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["path"], "src/BaseController.php",
+        "{value}"
+    );
+}
+
+#[test]
+fn php_prefix_only_external_import_reports_boundary() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "src/Controller/Controller.php",
+            "<?php\nnamespace Vendor\\Package\\Controller;\nclass Controller {}\n",
+        )
+        .file(
+            "src/App.php",
+            "<?php\nnamespace App;\nuse Vendor\\Package\\Service;\nclass App {\n    public function handle(Service $service): void {}\n}\n",
+        )
+        .build();
+
+    let line = "    public function handle(Service $service): void {}";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/App.php","line":5,"column":{}}}]}}"#,
+            column_of(line, "Service")
+        ),
+    );
+
+    assert_eq!(
+        value["results"][0]["status"], "unresolvable_import_boundary",
+        "{value}"
+    );
+}
+
+#[test]
+fn php_external_type_reports_boundary() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "src/Controller.php",
+            "<?php\nnamespace App;\nuse Vendor\\Package\\Service;\nclass Controller {\n    public function handle(Service $service): void {}\n}\n",
+        )
+        .build();
+
+    let line = "    public function handle(Service $service): void {}";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/Controller.php","line":5,"column":{}}}]}}"#,
+            column_of(line, "Service")
+        ),
+    );
+
+    assert_eq!(
+        value["results"][0]["status"], "unresolvable_import_boundary",
+        "{value}"
+    );
+}
+
+#[test]
+fn php_local_value_returns_no_definition() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "src/Controller.php",
+            "<?php\nnamespace App;\nclass Controller {\n    public function handle(): void {\n        $value = 1;\n        $value++;\n    }\n}\n",
+        )
+        .build();
+
+    let line = "        $value++;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/Controller.php","line":5,"column":{}}}]}}"#,
+            column_of(line, "value")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
 fn valid_local_value_returns_no_definition() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file(

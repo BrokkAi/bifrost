@@ -44,6 +44,11 @@ This work adds a `get_definition` searchtools/MCP tool for that on-demand lookup
 - [x] (2026-06-18T20:05Z) Ran a guided-review-style multi-agent review over the Java slice. Review findings were fixed by adding typed local/field/parameter receiver inference, `this`/`super` member resolution, and workspace-wildcard import classification that returns `no_definition` instead of an external-boundary diagnostic.
 - [x] (2026-06-18T20:08Z) Added Java regression tests for typed receiver methods, `this` field access, and workspace wildcard missing-type behavior.
 - [x] (2026-06-18T20:12Z) Re-ran `cargo test --test get_definition_test`, `cargo test --test bifrost_benchmark_run`, `cargo run --bin bifrost_benchmark -- validate --manifest benchmark/targets.toml`, `cargo run --bin bifrost_benchmark -- run --manifest benchmark/targets.toml --repo google-gson --max-files 80`, `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`; all passed.
+- [x] (2026-06-18T20:38Z) Added PHP `get_definition` support for namespaced type references, function aliases, constants, static member references, `$this` member references, typed local/parameter receiver calls, and external namespace boundary diagnostics.
+- [x] (2026-06-18T20:38Z) Updated the FastRoute benchmark probe from `unsupported_language` to a resolved `FastRoute.RouteCollector.addRoute` `$this->addRoute(...)` reference and recorded the manual observation plus typed-property follow-up.
+- [x] (2026-06-18T20:44Z) Ran the requested guided review checkpoint over the uncommitted PHP slice with parallel reviewer agents. Review findings were fixed by reusing PHP qualified-name candidate text, resolving `parent::member` through a proven declared parent instead of the current class, narrowing PHP helper visibility to `crate::analyzer::usages`, and requiring exact indexed namespaces before downgrading missing PHP definitions from `unresolvable_import_boundary` to `no_definition`.
+- [x] (2026-06-18T20:50Z) Added PHP regression tests for fully qualified type lookups from the final segment, `parent::run()` selecting the parent definition, prefix-only external imports reporting `unresolvable_import_boundary`, imported types, function aliases, typed receivers, external imports, and local values.
+- [x] (2026-06-18T20:54Z) Re-ran `cargo test --test get_definition_test`, `cargo test --test bifrost_benchmark_run`, `cargo run --bin bifrost_benchmark -- validate --manifest benchmark/targets.toml`, `cargo run --bin bifrost_benchmark -- run --manifest benchmark/targets.toml --repo fastroute-php --max-files 80`, `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`; all passed.
 
 ## Surprises & Discoveries
 
@@ -83,6 +88,18 @@ This work adds a `get_definition` searchtools/MCP tool for that on-demand lookup
 - Observation: Java wildcard imports should only report `unresolvable_import_boundary` when the imported package is absent from the indexed workspace.
   Evidence: guided review found `import pkg.*; MissingType` was over-classified as an external boundary even when package `pkg` exists locally; `java_workspace_wildcard_missing_type_returns_no_definition` now locks this down as `no_definition`.
 
+- Observation: PHP line/column lookup on a fully qualified name can land on the terminal `name` node rather than the wrapping `qualified_name`.
+  Evidence: guided review reproduced `\App\Service` returning `unsupported_php_reference_shape` before the fix; `php_fully_qualified_type_resolves_from_final_segment` now covers this path and `get_definition` reuses the existing PHP `qualified_candidate_text` behavior.
+
+- Observation: PHP `parent::member` must not be treated like `self::member`.
+  Evidence: guided review found a false positive where `parent::run()` could resolve to the child override. The resolver now inspects the enclosing class declaration's parent type and `php_parent_static_call_resolves_to_parent_definition` locks the expected parent target.
+
+- Observation: PHP namespace-boundary classification needs exact indexed namespaces, not descendant-prefix matches.
+  Evidence: guided review found that an indexed `Vendor.Package.Controller` namespace could mask a missing imported `Vendor.Package.Service`; `php_prefix_only_external_import_reports_boundary` now keeps that as `unresolvable_import_boundary`.
+
+- Observation: FastRoute's original `$this->dataGenerator->addRoute(...)` line needs typed-property receiver inference that the PHP slice does not yet implement.
+  Evidence: manual direct calls showed the same-class `$this->addRoute(...)` probe resolves accurately while property-promotion receiver chains remain `no_definition`; the benchmark observation documents this as follow-up rather than using it as the smoke query.
+
 ## Decision Log
 
 - Decision: Treat unresolved dependency/library/module boundaries as a first-class terminal state, separate from `no_definition`.
@@ -103,6 +120,10 @@ This work adds a `get_definition` searchtools/MCP tool for that on-demand lookup
 
 - Decision: Land Java as the next full-language-support slice after the initial Rust/JS/TS/Go implementation.
   Rationale: Java has mature analyzer import/type-resolution APIs and a benchmark target that can assert a real resolved workspace FQN immediately.
+  Date/Author: 2026-06-18 / Codex
+
+- Decision: Land PHP after Java with conservative support for the same reference forms already handled by the PHP inverted usage graph.
+  Rationale: PHP already had reusable namespace/use-alias resolution and local receiver inference primitives. The on-demand path can now return accurate metadata for common workspace PHP references while explicitly documenting unsupported property receiver chains as a follow-up gap.
   Date/Author: 2026-06-18 / Codex
 
 ## Outcomes & Retrospective
