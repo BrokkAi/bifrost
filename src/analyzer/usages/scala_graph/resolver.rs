@@ -1,7 +1,6 @@
 use crate::analyzer::usages::scala_graph::syntax::{parenthesized_arity, scala_import_path};
 use crate::analyzer::{
-    AnalyzerDelegate, CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language,
-    MultiAnalyzer, ProjectFile, ScalaAnalyzer,
+    CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, ProjectFile, ScalaAnalyzer,
 };
 use crate::hash::HashSet;
 
@@ -72,20 +71,6 @@ impl TargetSpec {
             member_name,
             arity,
         })
-    }
-}
-
-pub(in crate::analyzer::usages) fn resolve_scala_analyzer(
-    analyzer: &dyn IAnalyzer,
-) -> Option<&ScalaAnalyzer> {
-    if let Some(scala) = (analyzer as &dyn std::any::Any).downcast_ref::<ScalaAnalyzer>() {
-        return Some(scala);
-    }
-
-    let multi = (analyzer as &dyn std::any::Any).downcast_ref::<MultiAnalyzer>()?;
-    match multi.delegates().get(&Language::Scala) {
-        Some(AnalyzerDelegate::Scala(scala)) => Some(scala),
-        _ => None,
     }
 }
 

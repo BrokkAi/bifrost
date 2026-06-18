@@ -1,22 +1,6 @@
 use crate::analyzer::usages::graph_core::{ImportEdge, ImportEdgeKind};
-use crate::analyzer::{
-    AnalyzerDelegate, CodeUnit, IAnalyzer, Language, MultiAnalyzer, ProjectFile, PythonAnalyzer,
-};
+use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, PythonAnalyzer};
 use std::collections::BTreeSet;
-
-pub(in crate::analyzer::usages) fn resolve_python_analyzer(
-    analyzer: &dyn IAnalyzer,
-) -> Option<&PythonAnalyzer> {
-    if let Some(py) = (analyzer as &dyn std::any::Any).downcast_ref::<PythonAnalyzer>() {
-        return Some(py);
-    }
-
-    let multi = (analyzer as &dyn std::any::Any).downcast_ref::<MultiAnalyzer>()?;
-    match multi.delegates().get(&Language::Python) {
-        Some(AnalyzerDelegate::Python(py)) => Some(py),
-        _ => None,
-    }
-}
 
 pub(super) fn infer_export_names(analyzer: &PythonAnalyzer, target: &CodeUnit) -> BTreeSet<String> {
     if (target.is_function() || target.is_field())

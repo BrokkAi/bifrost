@@ -11,14 +11,17 @@ use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::scala_graph::resolver::{TargetKind, TargetSpec};
 use crate::analyzer::usages::scala_graph::shared::{ScalaEdgeResolver, ScalaQueryResolver};
-use crate::analyzer::usages::traits::UsageAnalyzer;
-use crate::analyzer::{CodeUnit, IAnalyzer, ImportAnalysisProvider, Language, ProjectFile};
+use crate::analyzer::usages::traits::{UsageAnalyzer, UsageEdgeResolver, UsageQueryResolver};
+use crate::analyzer::{
+    CodeUnit, IAnalyzer, ImportAnalysisProvider, Language, ProjectFile, ScalaAnalyzer,
+    resolve_analyzer,
+};
 use crate::hash::HashSet;
 
 pub(in crate::analyzer::usages) use inverted::{
     NameResolver as ScalaNameResolver, ProjectTypes as ScalaProjectTypes,
 };
-pub(in crate::analyzer::usages) use resolver::{resolve_scala_analyzer, scala_normalized_fq_name};
+pub(in crate::analyzer::usages) use resolver::scala_normalized_fq_name;
 pub(in crate::analyzer::usages) use syntax::{node_text as scala_node_text, scala_import_path};
 
 pub(crate) fn build_scala_usage_edges<F>(
@@ -29,7 +32,7 @@ pub(crate) fn build_scala_usage_edges<F>(
 where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
-    let resolver = ScalaEdgeResolver::new(analyzer)?;
+    let resolver = ScalaEdgeResolver::try_new(analyzer)?;
     Some(resolver.build_edges(analyzer, nodes, keep_file))
 }
 
@@ -47,7 +50,7 @@ pub(crate) struct ScalaDeadCodeBulkContext {
 
 impl ScalaDeadCodeBulkContext {
     pub(crate) fn from_analyzer(analyzer: &dyn IAnalyzer) -> Option<Self> {
-        let scala = resolve_scala_analyzer(analyzer)?;
+        let scala = resolve_analyzer::<ScalaAnalyzer>(analyzer)?;
         let mut context = Self::default();
         for file in scala.get_analyzed_files() {
             for import in scala.import_info_of(&file) {
@@ -80,7 +83,7 @@ pub(crate) fn dead_code_bulk_eligibility(
     overloaded_fqns: &HashSet<String>,
     context: &ScalaDeadCodeBulkContext,
 ) -> ScalaDeadCodeBulkEligibility {
-    let Some(scala) = resolve_scala_analyzer(analyzer) else {
+    let Some(scala) = resolve_analyzer::<ScalaAnalyzer>(analyzer) else {
         return ScalaDeadCodeBulkEligibility::NeedsPrecise;
     };
     let Some(spec) = TargetSpec::from_target(scala, target) else {
@@ -138,7 +141,7 @@ impl ScalaUsageGraphStrategy {
             );
         }
 
-        let Some(resolver) = ScalaQueryResolver::new(analyzer) else {
+        let Some(resolver) = ScalaQueryResolver::try_new(analyzer) else {
             return GraphUsageOutcome::fallback_safe(
                 target.fq_name(),
                 GraphFailureReason::MissingAnalyzerCapability(
@@ -148,7 +151,7 @@ impl ScalaUsageGraphStrategy {
             );
         };
 
-        resolver.find_usages(analyzer, target, candidate_files, max_usages)
+        resolver.find_usages(analyzer, overloads, candidate_files, max_usages)
     }
 }
 

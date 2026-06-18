@@ -1,11 +1,14 @@
 use super::extractor::scan_file;
 use super::inverted::{self, ProjectTypes};
-use super::resolver::{TargetSpec, resolve_scala_analyzer};
+use super::resolver::TargetSpec;
 use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, ScalaAnalyzer};
+use crate::analyzer::usages::traits::{UsageEdgeResolver, UsageQueryResolver};
+use crate::analyzer::{
+    CodeUnit, IAnalyzer, Language, ProjectFile, ScalaAnalyzer, resolve_analyzer,
+};
 use crate::hash::HashSet;
 use std::collections::BTreeSet;
 
@@ -19,20 +22,23 @@ pub(crate) struct ScalaQueryResolver<'a> {
     scala: &'a ScalaAnalyzer,
 }
 
-impl<'a> ScalaQueryResolver<'a> {
-    pub(crate) fn new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
+impl<'a> UsageQueryResolver<'a> for ScalaQueryResolver<'a> {
+    fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
         Some(Self {
-            scala: resolve_scala_analyzer(analyzer)?,
+            scala: resolve_analyzer::<ScalaAnalyzer>(analyzer)?,
         })
     }
 
-    pub(crate) fn find_usages(
+    fn find_usages(
         &self,
         analyzer: &dyn IAnalyzer,
-        target: &CodeUnit,
+        overloads: &[CodeUnit],
         candidate_files: &HashSet<ProjectFile>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
+        let Some(target) = overloads.first() else {
+            return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
+        };
         let Some(spec) = TargetSpec::from_target(self.scala, target) else {
             return GraphUsageOutcome::fallback_safe(
                 target.fq_name(),
@@ -80,9 +86,9 @@ pub(crate) struct ScalaEdgeResolver<'a> {
     graph: ScalaEdgeGraph<'a>,
 }
 
-impl<'a> ScalaEdgeResolver<'a> {
-    pub(crate) fn new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
-        let scala = resolve_scala_analyzer(analyzer)?;
+impl<'a> UsageEdgeResolver<'a> for ScalaEdgeResolver<'a> {
+    fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
+        let scala = resolve_analyzer::<ScalaAnalyzer>(analyzer)?;
         let files: Vec<ProjectFile> = analyzer
             .project()
             .analyzable_files(Language::Scala)
@@ -100,7 +106,7 @@ impl<'a> ScalaEdgeResolver<'a> {
         })
     }
 
-    pub(crate) fn build_edges<F>(
+    fn build_edges<F>(
         &self,
         analyzer: &dyn IAnalyzer,
         nodes: &HashSet<String>,

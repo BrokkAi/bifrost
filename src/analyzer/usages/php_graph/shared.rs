@@ -1,11 +1,12 @@
 use super::extractor::scan_file;
 use super::inverted;
-use super::resolver::{PhpHierarchyIndex, TargetKind, TargetSpec, resolve_php_analyzer};
+use super::resolver::{PhpHierarchyIndex, TargetKind, TargetSpec};
 use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, PhpAnalyzer, ProjectFile};
+use crate::analyzer::usages::traits::{UsageEdgeResolver, UsageQueryResolver};
+use crate::analyzer::{CodeUnit, IAnalyzer, Language, PhpAnalyzer, ProjectFile, resolve_analyzer};
 use crate::hash::HashSet;
 use std::collections::BTreeSet;
 
@@ -13,20 +14,23 @@ pub(crate) struct PhpQueryResolver<'a> {
     php: &'a PhpAnalyzer,
 }
 
-impl<'a> PhpQueryResolver<'a> {
-    pub(crate) fn new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
+impl<'a> UsageQueryResolver<'a> for PhpQueryResolver<'a> {
+    fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
         Some(Self {
-            php: resolve_php_analyzer(analyzer)?,
+            php: resolve_analyzer::<PhpAnalyzer>(analyzer)?,
         })
     }
 
-    pub(crate) fn find_usages(
+    fn find_usages(
         &self,
         analyzer: &dyn IAnalyzer,
-        target: &CodeUnit,
+        overloads: &[CodeUnit],
         candidate_files: &HashSet<ProjectFile>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
+        let Some(target) = overloads.first() else {
+            return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
+        };
         let Some(spec) = TargetSpec::from_target(self.php, target) else {
             return GraphUsageOutcome::fallback_safe(
                 target.fq_name(),
@@ -67,9 +71,9 @@ pub(crate) struct PhpEdgeResolver<'a> {
     files: Vec<ProjectFile>,
 }
 
-impl<'a> PhpEdgeResolver<'a> {
-    pub(crate) fn new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
-        let php = resolve_php_analyzer(analyzer)?;
+impl<'a> UsageEdgeResolver<'a> for PhpEdgeResolver<'a> {
+    fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
+        let php = resolve_analyzer::<PhpAnalyzer>(analyzer)?;
         let files: Vec<ProjectFile> = analyzer
             .project()
             .analyzable_files(Language::Php)
@@ -79,7 +83,7 @@ impl<'a> PhpEdgeResolver<'a> {
         Some(Self { php, files })
     }
 
-    pub(crate) fn build_edges<F>(
+    fn build_edges<F>(
         &self,
         analyzer: &dyn IAnalyzer,
         nodes: &HashSet<String>,

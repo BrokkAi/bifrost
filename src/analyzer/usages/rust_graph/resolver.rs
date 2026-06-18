@@ -1,19 +1,5 @@
-use crate::analyzer::{
-    AnalyzerDelegate, CodeUnit, IAnalyzer, Language, MultiAnalyzer, ProjectFile, RustAnalyzer,
-};
+use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, RustAnalyzer};
 use std::collections::BTreeSet;
-
-pub(crate) fn resolve_rust_analyzer(analyzer: &dyn IAnalyzer) -> Option<&RustAnalyzer> {
-    if let Some(rust) = (analyzer as &dyn std::any::Any).downcast_ref::<RustAnalyzer>() {
-        return Some(rust);
-    }
-
-    let multi = (analyzer as &dyn std::any::Any).downcast_ref::<MultiAnalyzer>()?;
-    match multi.delegates().get(&Language::Rust) {
-        Some(AnalyzerDelegate::Rust(rust)) => Some(rust),
-        _ => None,
-    }
-}
 
 pub(super) fn supports_same_file_local_scan(analyzer: &RustAnalyzer, target: &CodeUnit) -> bool {
     target.is_function() && analyzer.parent_of(target).is_none()

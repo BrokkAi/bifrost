@@ -1,7 +1,7 @@
 use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::{
-    AnalyzerDelegate, CodeUnit, IAnalyzer, Language, MultiAnalyzer, PhpAnalyzer, PhpUseAliases,
-    ProjectFile, Range, parse_php_use_aliases_from_source, php_namespace_to_fq,
+    CodeUnit, IAnalyzer, Language, PhpAnalyzer, PhpUseAliases, ProjectFile, Range,
+    parse_php_use_aliases_from_source, php_namespace_to_fq,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::find_line_index_for_offset;
@@ -64,20 +64,6 @@ impl TargetSpec {
             target_fq_name: target.fq_name(),
             member_name: target.identifier().to_string(),
         })
-    }
-}
-
-pub(in crate::analyzer::usages) fn resolve_php_analyzer(
-    analyzer: &dyn IAnalyzer,
-) -> Option<&PhpAnalyzer> {
-    if let Some(php) = (analyzer as &dyn std::any::Any).downcast_ref::<PhpAnalyzer>() {
-        return Some(php);
-    }
-
-    let multi = (analyzer as &dyn std::any::Any).downcast_ref::<MultiAnalyzer>()?;
-    match multi.delegates().get(&Language::Php) {
-        Some(AnalyzerDelegate::Php(php)) => Some(php),
-        _ => None,
     }
 }
 

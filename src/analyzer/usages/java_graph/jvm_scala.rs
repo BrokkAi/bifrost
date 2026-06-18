@@ -7,8 +7,8 @@ use crate::analyzer::usages::scala_graph::syntax::{
     scala_import_path, stable_type_qualifier,
 };
 use crate::analyzer::{
-    AnalyzerDelegate, CodeUnit, IAnalyzer, ImportAnalysisProvider, Language, MultiAnalyzer,
-    ProjectFile, Range, ScalaAnalyzer,
+    CodeUnit, IAnalyzer, ImportAnalysisProvider, Language, ProjectFile, Range, ScalaAnalyzer,
+    resolve_analyzer,
 };
 use crate::hash::HashSet;
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset, snippet_around_line};
@@ -24,7 +24,7 @@ pub(super) fn scan_scala_files_for_java_type(
     if *state.limit_exceeded || spec.kind != TargetKind::Type {
         return;
     }
-    let Some(scala) = resolve_scala_analyzer(analyzer) else {
+    let Some(scala) = resolve_analyzer::<ScalaAnalyzer>(analyzer) else {
         return;
     };
 
@@ -36,18 +36,6 @@ pub(super) fn scan_scala_files_for_java_type(
         if *state.limit_exceeded {
             break;
         }
-    }
-}
-
-fn resolve_scala_analyzer(analyzer: &dyn IAnalyzer) -> Option<&ScalaAnalyzer> {
-    if let Some(scala) = (analyzer as &dyn std::any::Any).downcast_ref::<ScalaAnalyzer>() {
-        return Some(scala);
-    }
-
-    let multi = (analyzer as &dyn std::any::Any).downcast_ref::<MultiAnalyzer>()?;
-    match multi.delegates().get(&Language::Scala) {
-        Some(AnalyzerDelegate::Scala(scala)) => Some(scala),
-        _ => None,
     }
 }
 

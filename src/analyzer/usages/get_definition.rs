@@ -2,17 +2,15 @@ use crate::analyzer::common::language_for_file;
 use crate::analyzer::usages::cpp_graph::{
     CppTargetKind, CppVisibilityIndex, cpp_first_type_child, cpp_is_declaration_name,
     cpp_is_declarator_node, cpp_name_for, extract_variable_name, normalize_cpp_type_text,
-    resolve_cpp_analyzer,
 };
 use crate::analyzer::usages::csharp_graph::{
     csharp_first_type_child, csharp_is_declaration_name, csharp_is_type_reference_node,
     csharp_node_text, csharp_reference_type_text, member_access_name as csharp_member_access_name,
-    member_access_receiver as csharp_member_access_receiver, resolve_csharp_analyzer,
-    seed_csharp_bindings_before,
+    member_access_receiver as csharp_member_access_receiver, seed_csharp_bindings_before,
 };
 use crate::analyzer::usages::go_graph::{
     GoProjectGraph, build_workspace_go_graph, default_go_import_local_name, extract_go_import_path,
-    preparse_go_files, resolve_go_analyzer, resolve_go_reference,
+    preparse_go_files, resolve_go_reference,
 };
 use crate::analyzer::usages::inverted_edges::{ClassRangeIndex, first_precise};
 use crate::analyzer::usages::js_ts_graph::compute_jsts_import_binder;
@@ -25,16 +23,16 @@ use crate::analyzer::usages::php_graph::{
 use crate::analyzer::usages::python_graph::{
     collect_assigned_identifiers, collect_scope_facts, enclosing_scope_facts,
     is_declaration_identifier as python_is_declaration_identifier, python_slice,
-    resolve_python_analyzer, resolve_receiver_type as resolve_python_receiver_type,
+    resolve_receiver_type as resolve_python_receiver_type,
 };
 use crate::analyzer::usages::scala_graph::{
-    ScalaNameResolver, ScalaProjectTypes, resolve_scala_analyzer, scala_import_path,
-    scala_node_text,
+    ScalaNameResolver, ScalaProjectTypes, scala_import_path, scala_node_text,
 };
 use crate::analyzer::{
-    AliasResolver, CSharpAnalyzer, CodeUnit, IAnalyzer, ImportAnalysisProvider, JavaAnalyzer,
-    Language, PhpAnalyzer, ProjectFile, PythonAnalyzer, Range, ScalaAnalyzer, cpp_node_text,
-    parse_php_use_aliases_from_source, quoted_include_paths, resolve_include_targets,
+    AliasResolver, CSharpAnalyzer, CodeUnit, CppAnalyzer, GoAnalyzer, IAnalyzer,
+    ImportAnalysisProvider, JavaAnalyzer, Language, PhpAnalyzer, ProjectFile, PythonAnalyzer,
+    Range, RustAnalyzer, ScalaAnalyzer, cpp_node_text, parse_php_use_aliases_from_source,
+    quoted_include_paths, resolve_analyzer, resolve_include_targets,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
@@ -355,7 +353,7 @@ fn resolve_one(
             &site.text,
         ),
         Language::Go => {
-            let go = resolve_go_analyzer(analyzer);
+            let go = resolve_analyzer::<GoAnalyzer>(analyzer);
             let go_graph = go.and_then(|go| context.go_graph(go, analyzer));
             resolve_go(
                 analyzer,
@@ -655,7 +653,7 @@ fn resolve_rust(
     source: &str,
     reference: &str,
 ) -> DefinitionLookupOutcome {
-    let Some(rust) = crate::analyzer::usages::rust_graph::resolve_rust_analyzer(analyzer) else {
+    let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) else {
         return no_definition("rust_analyzer_unavailable", "Rust analyzer is unavailable");
     };
     let refs = rust.reference_context_of(file);
@@ -968,7 +966,7 @@ fn resolve_go(
     site: &ResolvedReferenceSite,
     graph: Option<&GoProjectGraph>,
 ) -> DefinitionLookupOutcome {
-    let Some(go) = resolve_go_analyzer(analyzer) else {
+    let Some(go) = resolve_analyzer::<GoAnalyzer>(analyzer) else {
         return no_definition("go_analyzer_unavailable", "Go analyzer is unavailable");
     };
     let reference = site.text.as_str();
@@ -1086,7 +1084,7 @@ fn resolve_cpp(
     tree: Option<&Tree>,
     site: &ResolvedReferenceSite,
 ) -> DefinitionLookupOutcome {
-    let Some(cpp) = resolve_cpp_analyzer(analyzer) else {
+    let Some(cpp) = resolve_analyzer::<CppAnalyzer>(analyzer) else {
         return no_definition("cpp_analyzer_unavailable", "C++ analyzer is unavailable");
     };
     let Some(tree) = tree else {
@@ -1738,7 +1736,7 @@ fn resolve_scala(
     tree: Option<&Tree>,
     site: &ResolvedReferenceSite,
 ) -> DefinitionLookupOutcome {
-    let Some(scala) = resolve_scala_analyzer(analyzer) else {
+    let Some(scala) = resolve_analyzer::<ScalaAnalyzer>(analyzer) else {
         return no_definition(
             "scala_analyzer_unavailable",
             "Scala analyzer is unavailable",
@@ -2346,7 +2344,7 @@ fn resolve_java(
     tree: Option<&Tree>,
     site: &ResolvedReferenceSite,
 ) -> DefinitionLookupOutcome {
-    let Some(java) = crate::analyzer::usages::java_graph::resolve_java_analyzer(analyzer) else {
+    let Some(java) = resolve_analyzer::<JavaAnalyzer>(analyzer) else {
         return no_definition("java_analyzer_unavailable", "Java analyzer is unavailable");
     };
     let Some(tree) = tree else {
@@ -2602,7 +2600,7 @@ fn java_receiver_type(
     root: Node<'_>,
     object: Node<'_>,
 ) -> Option<CodeUnit> {
-    let java = crate::analyzer::usages::java_graph::resolve_java_analyzer(analyzer)?;
+    let java = resolve_analyzer::<JavaAnalyzer>(analyzer)?;
     java_receiver_type_for_java(java, file, source, root, object).or_else(|| {
         matches!(object.kind(), "this" | "super")
             .then(|| {
@@ -2854,7 +2852,7 @@ fn resolve_php(
     tree: Option<&Tree>,
     site: &ResolvedReferenceSite,
 ) -> DefinitionLookupOutcome {
-    let Some(php) = crate::analyzer::usages::php_graph::resolve_php_analyzer(analyzer) else {
+    let Some(php) = resolve_analyzer::<PhpAnalyzer>(analyzer) else {
         return no_definition("php_analyzer_unavailable", "PHP analyzer is unavailable");
     };
     let Some(tree) = tree else {
@@ -2936,7 +2934,7 @@ fn resolve_csharp(
     tree: Option<&Tree>,
     site: &ResolvedReferenceSite,
 ) -> DefinitionLookupOutcome {
-    let Some(csharp) = resolve_csharp_analyzer(analyzer) else {
+    let Some(csharp) = resolve_analyzer::<CSharpAnalyzer>(analyzer) else {
         return no_definition("csharp_analyzer_unavailable", "C# analyzer is unavailable");
     };
     let Some(tree) = tree else {
@@ -3363,7 +3361,7 @@ fn resolve_python(
     tree: Option<&Tree>,
     site: &ResolvedReferenceSite,
 ) -> DefinitionLookupOutcome {
-    let Some(py) = resolve_python_analyzer(analyzer) else {
+    let Some(py) = resolve_analyzer::<PythonAnalyzer>(analyzer) else {
         return no_definition(
             "python_analyzer_unavailable",
             "Python analyzer is unavailable",

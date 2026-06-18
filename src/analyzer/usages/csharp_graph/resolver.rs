@@ -1,7 +1,5 @@
 use crate::analyzer::usages::local_inference::{LocalInferenceEngine, SymbolResolution};
-use crate::analyzer::{
-    AnalyzerDelegate, CSharpAnalyzer, CodeUnit, IAnalyzer, Language, MultiAnalyzer, ProjectFile,
-};
+use crate::analyzer::{CSharpAnalyzer, CodeUnit, IAnalyzer, ProjectFile};
 use tree_sitter::Node;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -49,20 +47,6 @@ impl TargetSpec {
             method_arity: (kind == TargetKind::Method || kind == TargetKind::Constructor)
                 .then(|| signature_arity(target.signature())),
         })
-    }
-}
-
-pub(in crate::analyzer::usages) fn resolve_csharp_analyzer(
-    analyzer: &dyn IAnalyzer,
-) -> Option<&CSharpAnalyzer> {
-    if let Some(csharp) = (analyzer as &dyn std::any::Any).downcast_ref::<CSharpAnalyzer>() {
-        return Some(csharp);
-    }
-
-    let multi = (analyzer as &dyn std::any::Any).downcast_ref::<MultiAnalyzer>()?;
-    match multi.delegates().get(&Language::CSharp) {
-        Some(AnalyzerDelegate::CSharp(csharp)) => Some(csharp),
-        _ => None,
     }
 }
 

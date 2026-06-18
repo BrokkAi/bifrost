@@ -1,8 +1,7 @@
 use crate::analyzer::usages::cpp_graph::extractor::ScanCtx;
 use crate::analyzer::{
-    AnalyzerDelegate, CodeUnit, CodeUnitType, CppAnalyzer, IAnalyzer, Language, MultiAnalyzer,
-    ProjectFile, cpp_node_text as node_text, normalize_cpp_whitespace, quoted_include_paths,
-    resolve_include_targets,
+    CodeUnit, CodeUnitType, CppAnalyzer, IAnalyzer, ProjectFile, cpp_node_text as node_text,
+    normalize_cpp_whitespace, quoted_include_paths, resolve_include_targets,
 };
 use crate::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
@@ -444,19 +443,6 @@ pub(super) fn collect_visible_declarations(
                 out,
             );
         }
-    }
-}
-
-pub(in crate::analyzer::usages) fn resolve_cpp_analyzer(
-    analyzer: &dyn IAnalyzer,
-) -> Option<&CppAnalyzer> {
-    if let Some(cpp) = (analyzer as &dyn std::any::Any).downcast_ref::<CppAnalyzer>() {
-        return Some(cpp);
-    }
-    let multi = (analyzer as &dyn std::any::Any).downcast_ref::<MultiAnalyzer>()?;
-    match multi.delegates().get(&Language::Cpp) {
-        Some(AnalyzerDelegate::Cpp(cpp)) => Some(cpp),
-        _ => None,
     }
 }
 
