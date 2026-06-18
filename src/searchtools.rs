@@ -137,7 +137,7 @@ pub struct GetDefinitionByReferenceParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DefinitionContextReferenceQuery {
-    pub path: String,
+    pub symbol: String,
     pub context: String,
     pub target: String,
 }
@@ -258,8 +258,8 @@ pub struct DefinitionLookupResult {
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reference: Option<DefinitionReferenceSite>,
-    #[serde(default)]
-    pub definitions: Vec<DefinitionCandidate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub definition: Option<DefinitionCandidate>,
     #[serde(default)]
     pub diagnostics: Vec<DefinitionDiagnostic>,
 }
@@ -279,14 +279,14 @@ pub struct GetDefinitionByReferenceResult {
 pub struct DefinitionByReferenceLookupResult {
     pub query: DefinitionContextReferenceQuery,
     pub status: String,
-    #[serde(default)]
-    pub definitions: Vec<DefinitionCandidate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub definition: Option<DefinitionCandidate>,
     #[serde(default)]
     pub diagnostics: Vec<DefinitionDiagnostic>,
 }
 
 type DefinitionCandidateKey = (String, String, usize, usize, String, Option<String>, String);
-type DefinitionOutcomeKey = (String, Vec<DefinitionCandidateKey>);
+type DefinitionOutcomeKey = (String, Option<DefinitionCandidateKey>);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DefinitionCandidate {
@@ -768,7 +768,7 @@ pub fn get_definition_by_location(
                     query,
                     status: "not_found".to_string(),
                     reference: None,
-                    definitions: Vec::new(),
+                    definition: None,
                     diagnostics: vec![DefinitionDiagnostic {
                         kind: "ambiguous_path".to_string(),
                         message: format!(
@@ -784,7 +784,7 @@ pub fn get_definition_by_location(
                     query,
                     status: "not_found".to_string(),
                     reference: None,
-                    definitions: Vec::new(),
+                    definition: None,
                     diagnostics: vec![DefinitionDiagnostic {
                         kind: "path_not_found".to_string(),
                         message: format!("`{path}` does not resolve to a workspace file"),
@@ -816,38 +816,10 @@ pub fn get_definition_by_reference(
 ) -> GetDefinitionByReferenceResult {
     let _scope = profiling::scope("searchtools::get_definition_by_reference");
 
-    let resolver = WorkspaceFileResolver::new(analyzer.project());
     let mut results = Vec::with_capacity(params.references.len());
 
     for query in params.references {
-        let result = match resolver.resolve_literal(&query.path) {
-            ResolvedFileInput::File(file) => {
-                resolve_definition_context_query(analyzer, file, query)
-            }
-            ResolvedFileInput::Ambiguous(item) => DefinitionByReferenceLookupResult {
-                query,
-                status: "not_found".to_string(),
-                definitions: Vec::new(),
-                diagnostics: vec![DefinitionDiagnostic {
-                    kind: "ambiguous_path".to_string(),
-                    message: format!(
-                        "`{}` is ambiguous; matches: {}",
-                        item.input,
-                        item.matches.join(", ")
-                    ),
-                }],
-            },
-            ResolvedFileInput::NotFound(path) => DefinitionByReferenceLookupResult {
-                query,
-                status: "not_found".to_string(),
-                definitions: Vec::new(),
-                diagnostics: vec![DefinitionDiagnostic {
-                    kind: "path_not_found".to_string(),
-                    message: format!("`{path}` does not resolve to a workspace file"),
-                }],
-            },
-        };
-        results.push(result);
+        results.push(resolve_definition_context_query(analyzer, query));
     }
 
     GetDefinitionByReferenceResult { results }
@@ -855,9 +827,19 @@ pub fn get_definition_by_reference(
 
 fn resolve_definition_context_query(
     analyzer: &dyn IAnalyzer,
-    file: ProjectFile,
     query: DefinitionContextReferenceQuery,
 ) -> DefinitionByReferenceLookupResult {
+    let units = match resolve_definition_context_symbol(analyzer, &query.symbol) {
+        Ok(units) => units,
+        Err(diagnostics) => {
+            return DefinitionByReferenceLookupResult {
+                query,
+                status: "not_found".to_string(),
+                definition: None,
+                diagnostics,
+            };
+        }
+    };
     if query.context.is_empty() {
         return invalid_context_lookup(query, "empty_context", "context must not be empty");
     }
@@ -865,34 +847,41 @@ fn resolve_definition_context_query(
         return invalid_context_lookup(query, "empty_target", "target must not be empty");
     }
 
-    let source = match file.read_to_string() {
-        Ok(source) => source,
-        Err(err) => {
-            return DefinitionByReferenceLookupResult {
-                query,
-                status: "not_found".to_string(),
-                definitions: Vec::new(),
-                diagnostics: vec![DefinitionDiagnostic {
-                    kind: "read_failed".to_string(),
-                    message: format!("failed to read source file: {err}"),
-                }],
-            };
-        }
-    };
-
     let mut requests = Vec::new();
-    for (context_start, context) in source.match_indices(&query.context) {
-        for (target_offset, _) in context.match_indices(&query.target) {
-            let start_byte = context_start + target_offset;
-            requests.push(
-                crate::analyzer::usages::get_definition::DefinitionLookupRequest {
-                    file: file.clone(),
-                    line: None,
-                    column: None,
-                    start_byte: Some(start_byte),
-                    end_byte: Some(start_byte + query.target.len()),
-                },
-            );
+    for unit in units {
+        let Some(range) = primary_range(analyzer, &unit) else {
+            continue;
+        };
+        let source = match unit.source().read_to_string() {
+            Ok(source) => source,
+            Err(err) => {
+                return DefinitionByReferenceLookupResult {
+                    query,
+                    status: "not_found".to_string(),
+                    definition: None,
+                    diagnostics: vec![DefinitionDiagnostic {
+                        kind: "read_failed".to_string(),
+                        message: format!("failed to read source file: {err}"),
+                    }],
+                };
+            }
+        };
+        let Some(symbol_source) = source.get(range.start_byte..range.end_byte) else {
+            continue;
+        };
+        for (context_offset, context) in symbol_source.match_indices(&query.context) {
+            for (target_offset, _) in context.match_indices(&query.target) {
+                let start_byte = range.start_byte + context_offset + target_offset;
+                requests.push(
+                    crate::analyzer::usages::get_definition::DefinitionLookupRequest {
+                        file: unit.source().clone(),
+                        line: None,
+                        column: None,
+                        start_byte: Some(start_byte),
+                        end_byte: Some(start_byte + query.target.len()),
+                    },
+                );
+            }
         }
     }
 
@@ -909,6 +898,35 @@ fn resolve_definition_context_query(
     collapse_context_outcomes(analyzer, query, outcomes)
 }
 
+fn resolve_definition_context_symbol(
+    analyzer: &dyn IAnalyzer,
+    symbol: &str,
+) -> Result<Vec<CodeUnit>, Vec<DefinitionDiagnostic>> {
+    if symbol.trim().is_empty() {
+        return Err(vec![DefinitionDiagnostic {
+            kind: "empty_symbol".to_string(),
+            message: "symbol must not be empty".to_string(),
+        }]);
+    }
+
+    let exact = resolve_codeunit_exact(analyzer, symbol);
+    if !exact.is_empty() {
+        return Ok(exact);
+    }
+
+    match resolve_codeunit_fuzzy(analyzer, symbol) {
+        CodeUnitResolution::Resolved(units) => Ok(units),
+        CodeUnitResolution::Ambiguous(matches) => Err(vec![DefinitionDiagnostic {
+            kind: "ambiguous_symbol".to_string(),
+            message: format!("`{symbol}` is ambiguous; matches: {}", matches.join(", ")),
+        }]),
+        CodeUnitResolution::NotFound => Err(vec![DefinitionDiagnostic {
+            kind: "symbol_not_found".to_string(),
+            message: format!("`{symbol}` does not resolve to a workspace symbol"),
+        }]),
+    }
+}
+
 fn invalid_context_lookup(
     query: DefinitionContextReferenceQuery,
     kind: &str,
@@ -917,7 +935,7 @@ fn invalid_context_lookup(
     DefinitionByReferenceLookupResult {
         query,
         status: "invalid_location".to_string(),
-        definitions: Vec::new(),
+        definition: None,
         diagnostics: vec![DefinitionDiagnostic {
             kind: kind.to_string(),
             message: message.to_string(),
@@ -941,24 +959,10 @@ fn collapse_context_outcomes(
         return render_definition_reference_lookup(analyzer, query, first.clone());
     }
 
-    let mut definitions = Vec::new();
-    for outcome in &outcomes {
-        for unit in &outcome.candidates {
-            let Some(candidate) = definition_candidate(analyzer, unit) else {
-                continue;
-            };
-            if !definitions.iter().any(|existing| {
-                definition_candidate_key(existing) == definition_candidate_key(&candidate)
-            }) {
-                definitions.push(candidate);
-            }
-        }
-    }
-
     DefinitionByReferenceLookupResult {
         query,
         status: "ambiguous".to_string(),
-        definitions,
+        definition: None,
         diagnostics: vec![DefinitionDiagnostic {
             kind: "ambiguous_reference_target".to_string(),
             message: "target appears multiple times in context and resolves to different semantic outcomes"
@@ -975,11 +979,10 @@ fn render_definition_reference_lookup(
     DefinitionByReferenceLookupResult {
         query,
         status: outcome.status.as_str().to_string(),
-        definitions: outcome
-            .candidates
-            .into_iter()
-            .filter_map(|unit| definition_candidate(analyzer, &unit))
-            .collect(),
+        definition: outcome
+            .definition
+            .as_ref()
+            .and_then(|unit| definition_candidate(analyzer, unit)),
         diagnostics: outcome
             .diagnostics
             .into_iter()
@@ -995,14 +998,12 @@ fn semantic_outcome_key(
     analyzer: &dyn IAnalyzer,
     outcome: &crate::analyzer::usages::get_definition::DefinitionLookupOutcome,
 ) -> DefinitionOutcomeKey {
-    let mut definitions: Vec<_> = outcome
-        .candidates
-        .iter()
-        .filter_map(|unit| definition_candidate(analyzer, unit))
-        .map(|candidate| definition_candidate_key(&candidate))
-        .collect();
-    definitions.sort();
-    (outcome.status.as_str().to_string(), definitions)
+    let definition = outcome
+        .definition
+        .as_ref()
+        .and_then(|unit| definition_candidate(analyzer, unit))
+        .map(|candidate| definition_candidate_key(&candidate));
+    (outcome.status.as_str().to_string(), definition)
 }
 
 fn definition_candidate_key(candidate: &DefinitionCandidate) -> DefinitionCandidateKey {
@@ -1029,11 +1030,10 @@ fn render_definition_lookup(
             path: site.path,
             target: site.text,
         }),
-        definitions: outcome
-            .candidates
-            .into_iter()
-            .filter_map(|unit| definition_candidate(analyzer, &unit))
-            .collect(),
+        definition: outcome
+            .definition
+            .as_ref()
+            .and_then(|unit| definition_candidate(analyzer, unit)),
         diagnostics: outcome
             .diagnostics
             .into_iter()

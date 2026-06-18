@@ -711,7 +711,7 @@ definition_queries = [
         failing["failure_message"]
             .as_str()
             .unwrap_or_default()
-            .contains("did not include expected fqn `wrong.helper`"),
+            .contains("expected fqn `wrong.helper` but got `helper`"),
         "report: {report}"
     );
 }

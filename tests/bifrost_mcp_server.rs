@@ -684,7 +684,7 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
         "get_definition_by_reference",
         json!({
             "references": [{
-                "path": "A.java",
+                "symbol": "A",
                 "context": "class A",
                 "target": "A"
             }]

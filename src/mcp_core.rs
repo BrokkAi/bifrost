@@ -172,9 +172,9 @@ fn get_definition_by_reference_descriptor() -> Value {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "path": {
+                            "symbol": {
                                 "type": "string",
-                                "description": "Project-relative source file path containing the reference."
+                                "description": "Fully qualified workspace symbol whose source contains the reference context."
                             },
                             "context": {
                                 "type": "string",
@@ -185,7 +185,7 @@ fn get_definition_by_reference_descriptor() -> Value {
                                 "description": "Exact reference text to resolve inside the context."
                             }
                         },
-                        "required": ["path", "context", "target"]
+                        "required": ["symbol", "context", "target"]
                     }
                 }
             },

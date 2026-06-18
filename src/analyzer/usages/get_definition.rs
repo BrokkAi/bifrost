@@ -57,7 +57,7 @@ pub(crate) struct DefinitionLookupRequest {
 pub(crate) struct DefinitionLookupOutcome {
     pub(crate) status: DefinitionLookupStatus,
     pub(crate) reference: Option<ResolvedReferenceSite>,
-    pub(crate) candidates: Vec<CodeUnit>,
+    pub(crate) definition: Option<CodeUnit>,
     pub(crate) diagnostics: Vec<DefinitionLookupDiagnostic>,
 }
 
@@ -321,13 +321,6 @@ fn finish_lookup_outcome(
     mut outcome: DefinitionLookupOutcome,
     site: ResolvedReferenceSite,
 ) -> DefinitionLookupOutcome {
-    if !outcome.candidates.is_empty() {
-        outcome.status = if outcome.candidates.len() == 1 {
-            DefinitionLookupStatus::Resolved
-        } else {
-            DefinitionLookupStatus::Ambiguous
-        };
-    }
     outcome.reference = Some(site);
     outcome
 }
@@ -2396,9 +2389,7 @@ fn resolve_java_method_invocation(
     }
 
     let static_import = java_static_import_candidates(analyzer, support, file, name);
-    if !static_import.candidates.is_empty()
-        || static_import.status == DefinitionLookupStatus::UnresolvableImportBoundary
-    {
+    if static_import.status != DefinitionLookupStatus::NoDefinition {
         return static_import;
     }
 
@@ -2450,9 +2441,7 @@ fn resolve_java_bare_identifier(
         return candidates_outcome(vec![unit]);
     }
     let static_import = java_static_import_candidates(analyzer, support, file, name);
-    if !static_import.candidates.is_empty()
-        || static_import.status == DefinitionLookupStatus::UnresolvableImportBoundary
-    {
+    if static_import.status != DefinitionLookupStatus::NoDefinition {
         return static_import;
     }
     if java_import_boundary_for_type(java, support, file, name) {
@@ -4169,18 +4158,43 @@ fn php_is_non_reference_context(node: Node<'_>) -> bool {
     false
 }
 
-fn candidates_outcome(candidates: Vec<CodeUnit>) -> DefinitionLookupOutcome {
-    let status = if candidates.len() == 1 {
+fn candidates_outcome(mut candidates: Vec<CodeUnit>) -> DefinitionLookupOutcome {
+    sort_units(&mut candidates);
+    candidates.dedup();
+    let mut semantic_keys = HashSet::default();
+    for candidate in &candidates {
+        semantic_keys.insert(definition_semantic_key(candidate));
+    }
+    let status = if semantic_keys.len() == 1 {
         DefinitionLookupStatus::Resolved
     } else {
         DefinitionLookupStatus::Ambiguous
     };
+    let diagnostics = if semantic_keys.len() > 1 {
+        vec![DefinitionLookupDiagnostic {
+            kind: "ambiguous_definition".to_string(),
+            message: "reference resolved to multiple workspace definitions".to_string(),
+        }]
+    } else {
+        Vec::new()
+    };
     DefinitionLookupOutcome {
         status,
         reference: None,
-        candidates,
-        diagnostics: Vec::new(),
+        definition: candidates
+            .into_iter()
+            .next()
+            .filter(|_| status == DefinitionLookupStatus::Resolved),
+        diagnostics,
     }
+}
+
+fn definition_semantic_key(unit: &CodeUnit) -> (String, Option<String>, String) {
+    (
+        unit.fq_name(),
+        unit.signature().map(str::to_string),
+        format!("{:?}", unit.kind()),
+    )
 }
 
 fn boundary(message: String) -> DefinitionLookupOutcome {
@@ -4203,7 +4217,7 @@ fn diagnostic_outcome(
     DefinitionLookupOutcome {
         status,
         reference: None,
-        candidates: Vec::new(),
+        definition: None,
         diagnostics: vec![DefinitionLookupDiagnostic {
             kind: kind.into(),
             message: message.into(),

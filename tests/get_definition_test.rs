@@ -67,8 +67,8 @@ pub fn format_value() {}
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(result["reference"]["target"], "format_value", "{value}");
-    assert_eq!(result["definitions"][0]["fqn"], "format_value", "{value}");
-    assert_eq!(result["definitions"][0]["path"], "util.rs", "{value}");
+    assert_eq!(result["definition"]["fqn"], "format_value", "{value}");
+    assert_eq!(result["definition"]["path"], "util.rs", "{value}");
 }
 
 #[test]
@@ -92,7 +92,7 @@ pub fn run() {
         project.root(),
         &json!({
             "references": [{
-                "path": "lib.rs",
+                "symbol": "run",
                 "context": "let value = helper();",
                 "target": "helper"
             }]
@@ -106,7 +106,7 @@ pub fn run() {
         result.as_object().unwrap().get("reference").is_none(),
         "{value}"
     );
-    assert_eq!(result["definitions"][0]["path"], "util.rs", "{value}");
+    assert_eq!(result["definition"]["path"], "util.rs", "{value}");
 }
 
 #[test]
@@ -130,7 +130,7 @@ pub fn run() {
         project.root(),
         &json!({
             "references": [{
-                "path": "lib.rs",
+                "symbol": "run",
                 "context": "helper(); helper();",
                 "target": "helper"
             }]
@@ -140,12 +140,7 @@ pub fn run() {
 
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(
-        result["definitions"].as_array().unwrap().len(),
-        1,
-        "{value}"
-    );
-    assert_eq!(result["definitions"][0]["path"], "util.rs", "{value}");
+    assert_eq!(result["definition"]["path"], "util.rs", "{value}");
 }
 
 #[test]
@@ -170,7 +165,7 @@ pub fn run() {
         project.root(),
         &json!({
             "references": [{
-                "path": "lib.rs",
+                "symbol": "run",
                 "context": "crate::util::helper(); helper();",
                 "target": "helper"
             }]
@@ -180,11 +175,7 @@ pub fn run() {
 
     let result = &value["results"][0];
     assert_eq!(result["status"], "ambiguous", "{value}");
-    assert_eq!(
-        result["definitions"].as_array().unwrap().len(),
-        2,
-        "{value}"
-    );
+    assert!(result["definition"].is_null(), "{value}");
     assert_eq!(
         result["diagnostics"][0]["kind"], "ambiguous_reference_target",
         "{value}"
@@ -220,7 +211,7 @@ pub fn run() {
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(result["reference"]["target"], "helper", "{value}");
-    assert_eq!(result["definitions"][0]["path"], "util.rs", "{value}");
+    assert_eq!(result["definition"]["path"], "util.rs", "{value}");
 }
 
 #[test]
@@ -247,11 +238,7 @@ pub fn run() {
 
     let result = &value["results"][0];
     assert_eq!(result["status"], "unresolvable_import_boundary", "{value}");
-    assert_eq!(
-        result["definitions"].as_array().unwrap().len(),
-        0,
-        "{value}"
-    );
+    assert!(result["definition"].is_null(), "{value}");
 }
 
 #[test]
@@ -280,11 +267,7 @@ pub fn run() {
     );
 
     assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
-    assert_eq!(
-        value["results"][0]["definitions"].as_array().unwrap().len(),
-        0,
-        "{value}"
-    );
+    assert!(value["results"][0]["definition"].is_null(), "{value}");
 }
 
 #[test]
@@ -313,11 +296,7 @@ pub fn run() {
     );
 
     assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
-    assert_eq!(
-        value["results"][0]["definitions"].as_array().unwrap().len(),
-        0,
-        "{value}"
-    );
+    assert!(value["results"][0]["definition"].is_null(), "{value}");
 }
 
 #[test]
@@ -347,7 +326,7 @@ pub fn run() {
 
     assert_eq!(value["results"][0]["status"], "resolved", "{value}");
     assert_eq!(
-        value["results"][0]["definitions"][0]["path"], "tests/helper.rs",
+        value["results"][0]["definition"]["path"], "tests/helper.rs",
         "{value}"
     );
 }
@@ -399,8 +378,8 @@ export function run() {
 
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(result["definitions"][0]["fqn"], "helper", "{value}");
-    assert_eq!(result["definitions"][0]["path"], "util.ts", "{value}");
+    assert_eq!(result["definition"]["fqn"], "helper", "{value}");
+    assert_eq!(result["definition"]["path"], "util.ts", "{value}");
 }
 
 #[test]
@@ -434,8 +413,8 @@ export function run() {
 
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(result["definitions"][0]["fqn"], "helper", "{value}");
-    assert_eq!(result["definitions"][0]["path"], "src/util.ts", "{value}");
+    assert_eq!(result["definition"]["fqn"], "helper", "{value}");
+    assert_eq!(result["definition"]["path"], "src/util.ts", "{value}");
 }
 
 #[test]
@@ -468,7 +447,7 @@ function run() {
 
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(result["definitions"][0]["path"], "util.js", "{value}");
+    assert_eq!(result["definition"]["path"], "util.js", "{value}");
 }
 
 #[test]
@@ -566,10 +545,10 @@ func Helper() {}
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(
-        result["definitions"][0]["fqn"], "example.com/app/sub.Helper",
+        result["definition"]["fqn"], "example.com/app/sub.Helper",
         "{value}"
     );
-    assert_eq!(result["definitions"][0]["path"], "sub/sub.go", "{value}");
+    assert_eq!(result["definition"]["path"], "sub/sub.go", "{value}");
 }
 
 #[test]
@@ -610,10 +589,10 @@ func Helper() {}
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(
-        result["definitions"][0]["fqn"], "example.com/app/sub.Helper",
+        result["definition"]["fqn"], "example.com/app/sub.Helper",
         "{value}"
     );
-    assert_eq!(result["definitions"][0]["path"], "sub/sub.go", "{value}");
+    assert_eq!(result["definition"]["path"], "sub/sub.go", "{value}");
 }
 
 #[test]
@@ -652,11 +631,7 @@ func Helper() {}
     );
 
     assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
-    assert_eq!(
-        value["results"][0]["definitions"].as_array().unwrap().len(),
-        0,
-        "{value}"
-    );
+    assert!(value["results"][0]["definition"].is_null(), "{value}");
 }
 
 #[test]
@@ -687,11 +662,7 @@ func Run() {
     );
 
     assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
-    assert_eq!(
-        value["results"][0]["definitions"].as_array().unwrap().len(),
-        0,
-        "{value}"
-    );
+    assert!(value["results"][0]["definition"].is_null(), "{value}");
 }
 
 #[test]
@@ -723,11 +694,8 @@ public class UseTarget {
 
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(result["definitions"][0]["fqn"], "pkg.Target", "{value}");
-    assert_eq!(
-        result["definitions"][0]["path"], "pkg/Target.java",
-        "{value}"
-    );
+    assert_eq!(result["definition"]["fqn"], "pkg.Target", "{value}");
+    assert_eq!(result["definition"]["path"], "pkg/Target.java", "{value}");
 }
 
 #[test]
@@ -764,11 +732,8 @@ public class UseTarget {
 
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(result["definitions"][0]["fqn"], "pkg.Target.run", "{value}");
-    assert_eq!(
-        result["definitions"][0]["path"], "pkg/Target.java",
-        "{value}"
-    );
+    assert_eq!(result["definition"]["fqn"], "pkg.Target.run", "{value}");
+    assert_eq!(result["definition"]["path"], "pkg/Target.java", "{value}");
 }
 
 #[test]
@@ -805,11 +770,8 @@ public class UseTarget {
 
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(result["definitions"][0]["fqn"], "pkg.Target.run", "{value}");
-    assert_eq!(
-        result["definitions"][0]["path"], "pkg/Target.java",
-        "{value}"
-    );
+    assert_eq!(result["definition"]["fqn"], "pkg.Target.run", "{value}");
+    assert_eq!(result["definition"]["path"], "pkg/Target.java", "{value}");
 }
 
 #[test]
@@ -842,14 +804,8 @@ public class Holder {
 
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(
-        result["definitions"][0]["fqn"], "app.Holder.value",
-        "{value}"
-    );
-    assert_eq!(
-        result["definitions"][0]["path"], "app/Holder.java",
-        "{value}"
-    );
+    assert_eq!(result["definition"]["fqn"], "app.Holder.value", "{value}");
+    assert_eq!(result["definition"]["path"], "app/Holder.java", "{value}");
 }
 
 #[test]
@@ -968,11 +924,8 @@ fn php_imported_type_resolves_to_definition() {
 
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(result["definitions"][0]["fqn"], "App.Service", "{value}");
-    assert_eq!(
-        result["definitions"][0]["path"], "src/Service.php",
-        "{value}"
-    );
+    assert_eq!(result["definition"]["fqn"], "App.Service", "{value}");
+    assert_eq!(result["definition"]["path"], "src/Service.php", "{value}");
 }
 
 #[test]
@@ -999,14 +952,8 @@ fn php_function_alias_resolves_to_definition() {
 
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(
-        result["definitions"][0]["fqn"], "App.render_view",
-        "{value}"
-    );
-    assert_eq!(
-        result["definitions"][0]["path"], "src/helpers.php",
-        "{value}"
-    );
+    assert_eq!(result["definition"]["fqn"], "App.render_view", "{value}");
+    assert_eq!(result["definition"]["path"], "src/helpers.php", "{value}");
 }
 
 #[test]
@@ -1033,14 +980,8 @@ fn php_typed_receiver_method_resolves_to_definition() {
 
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(
-        result["definitions"][0]["fqn"], "App.Service.run",
-        "{value}"
-    );
-    assert_eq!(
-        result["definitions"][0]["path"], "src/Service.php",
-        "{value}"
-    );
+    assert_eq!(result["definition"]["fqn"], "App.Service.run", "{value}");
+    assert_eq!(result["definition"]["path"], "src/Service.php", "{value}");
 }
 
 #[test]
@@ -1067,7 +1008,7 @@ fn php_fully_qualified_type_resolves_from_final_segment() {
 
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(result["definitions"][0]["fqn"], "App.Service", "{value}");
+    assert_eq!(result["definition"]["fqn"], "App.Service", "{value}");
 }
 
 #[test]
@@ -1095,11 +1036,11 @@ fn php_parent_static_call_resolves_to_parent_definition() {
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(
-        result["definitions"][0]["fqn"], "App.BaseController.run",
+        result["definition"]["fqn"], "App.BaseController.run",
         "{value}"
     );
     assert_eq!(
-        result["definitions"][0]["path"], "src/BaseController.php",
+        result["definition"]["path"], "src/BaseController.php",
         "{value}"
     );
 }
@@ -1198,11 +1139,8 @@ fn python_from_import_resolves_to_definition() {
 
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(
-        result["definitions"][0]["fqn"], "pkg.util.helper",
-        "{value}"
-    );
-    assert_eq!(result["definitions"][0]["path"], "pkg/util.py", "{value}");
+    assert_eq!(result["definition"]["fqn"], "pkg.util.helper", "{value}");
+    assert_eq!(result["definition"]["path"], "pkg/util.py", "{value}");
 }
 
 #[test]
@@ -1226,11 +1164,8 @@ fn python_namespace_import_resolves_to_definition() {
 
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(
-        result["definitions"][0]["fqn"], "pkg.util.helper",
-        "{value}"
-    );
-    assert_eq!(result["definitions"][0]["path"], "pkg/util.py", "{value}");
+    assert_eq!(result["definition"]["fqn"], "pkg.util.helper", "{value}");
+    assert_eq!(result["definition"]["path"], "pkg/util.py", "{value}");
 }
 
 #[test]
@@ -1254,8 +1189,8 @@ fn python_attribute_object_resolves_to_namespace_not_member() {
 
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(result["definitions"][0]["fqn"], "pkg.util", "{value}");
-    assert_eq!(result["definitions"][0]["path"], "pkg/util.py", "{value}");
+    assert_eq!(result["definition"]["fqn"], "pkg.util", "{value}");
+    assert_eq!(result["definition"]["path"], "pkg/util.py", "{value}");
 }
 
 #[test]
@@ -1279,11 +1214,8 @@ fn python_plain_dotted_import_resolves_to_definition() {
 
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(
-        result["definitions"][0]["fqn"], "pkg.util.helper",
-        "{value}"
-    );
-    assert_eq!(result["definitions"][0]["path"], "pkg/util.py", "{value}");
+    assert_eq!(result["definition"]["fqn"], "pkg.util.helper", "{value}");
+    assert_eq!(result["definition"]["path"], "pkg/util.py", "{value}");
 }
 
 #[test]
@@ -1311,10 +1243,10 @@ fn python_typed_receiver_method_resolves_to_definition() {
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(
-        result["definitions"][0]["fqn"], "service.Service.run",
+        result["definition"]["fqn"], "service.Service.run",
         "{value}"
     );
-    assert_eq!(result["definitions"][0]["path"], "service.py", "{value}");
+    assert_eq!(result["definition"]["path"], "service.py", "{value}");
 }
 
 #[test]
@@ -1341,11 +1273,8 @@ fn python_typed_receiver_inherited_method_resolves_to_base_definition() {
 
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(
-        result["definitions"][0]["fqn"], "service.Base.run",
-        "{value}"
-    );
-    assert_eq!(result["definitions"][0]["path"], "service.py", "{value}");
+    assert_eq!(result["definition"]["fqn"], "service.Base.run", "{value}");
+    assert_eq!(result["definition"]["path"], "service.py", "{value}");
 }
 
 #[test]
@@ -1439,11 +1368,8 @@ fn csharp_using_type_resolves_to_definition() {
 
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(result["definitions"][0]["fqn"], "Lib.Service", "{value}");
-    assert_eq!(
-        result["definitions"][0]["path"], "Lib/Service.cs",
-        "{value}"
-    );
+    assert_eq!(result["definition"]["fqn"], "Lib.Service", "{value}");
+    assert_eq!(result["definition"]["path"], "Lib/Service.cs", "{value}");
 }
 
 #[test]
@@ -1470,14 +1396,8 @@ fn csharp_typed_receiver_method_resolves_to_definition() {
 
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(
-        result["definitions"][0]["fqn"], "Lib.Service.Run",
-        "{value}"
-    );
-    assert_eq!(
-        result["definitions"][0]["path"], "Lib/Service.cs",
-        "{value}"
-    );
+    assert_eq!(result["definition"]["fqn"], "Lib.Service.Run", "{value}");
+    assert_eq!(result["definition"]["path"], "Lib/Service.cs", "{value}");
 }
 
 #[test]
@@ -1500,10 +1420,7 @@ fn csharp_this_method_resolves_to_definition() {
 
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(
-        result["definitions"][0]["fqn"], "App.Controller.Run",
-        "{value}"
-    );
+    assert_eq!(result["definition"]["fqn"], "App.Controller.Run", "{value}");
 }
 
 #[test]
@@ -1614,11 +1531,7 @@ fn csharp_ambiguous_using_type_returns_ambiguous() {
     );
 
     assert_eq!(value["results"][0]["status"], "ambiguous", "{value}");
-    assert_eq!(
-        value["results"][0]["definitions"].as_array().unwrap().len(),
-        2,
-        "{value}"
-    );
+    assert!(value["results"][0]["definition"].is_null(), "{value}");
 }
 
 #[test]
@@ -1687,8 +1600,8 @@ fn cpp_included_type_resolves_to_definition() {
 
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(result["definitions"][0]["fqn"], "ns.Service", "{value}");
-    assert_eq!(result["definitions"][0]["path"], "target.h", "{value}");
+    assert_eq!(result["definition"]["fqn"], "ns.Service", "{value}");
+    assert_eq!(result["definition"]["path"], "target.h", "{value}");
 }
 
 #[test]
@@ -1718,8 +1631,8 @@ fn cpp_typed_receiver_method_resolves_to_definition() {
     );
 
     let result = &value["results"][0];
-    assert_eq!(result["status"], "ambiguous", "{value}");
-    assert_eq!(result["definitions"][0]["fqn"], "ns.Service.run", "{value}");
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definition"]["fqn"], "ns.Service.run", "{value}");
 }
 
 #[test]
@@ -1743,10 +1656,7 @@ fn cpp_relative_namespace_call_resolves_to_definition() {
 
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(
-        result["definitions"][0]["fqn"], "ns::detail.helper",
-        "{value}"
-    );
+    assert_eq!(result["definition"]["fqn"], "ns::detail.helper", "{value}");
 }
 
 #[test]
@@ -1880,7 +1790,7 @@ fn cpp_auto_new_receiver_method_resolves_to_definition() {
 
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(result["definitions"][0]["fqn"], "ns.Service.run", "{value}");
+    assert_eq!(result["definition"]["fqn"], "ns.Service.run", "{value}");
 }
 
 #[test]
@@ -1922,7 +1832,7 @@ fn scala_same_package_type_resolves_to_definition() {
 
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(result["definitions"][0]["fqn"], "app.Service", "{value}");
+    assert_eq!(result["definition"]["fqn"], "app.Service", "{value}");
 }
 
 #[test]
@@ -1949,10 +1859,7 @@ fn scala_object_apply_call_resolves_to_definition() {
 
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(
-        result["definitions"][0]["fqn"], "app.Factory$.apply",
-        "{value}"
-    );
+    assert_eq!(result["definition"]["fqn"], "app.Factory$.apply", "{value}");
 }
 
 #[test]
@@ -1979,10 +1886,7 @@ fn scala_object_apply_call_resolves_from_constructor_like_reference() {
 
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(
-        result["definitions"][0]["fqn"], "app.Factory$.apply",
-        "{value}"
-    );
+    assert_eq!(result["definition"]["fqn"], "app.Factory$.apply", "{value}");
 }
 
 #[test]
@@ -2010,7 +1914,7 @@ fn scala_unqualified_member_call_beats_same_named_object_apply() {
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(
-        result["definitions"][0]["fqn"], "app.Controller.Factory",
+        result["definition"]["fqn"], "app.Controller.Factory",
         "{value}"
     );
 }
@@ -2039,10 +1943,7 @@ fn scala_typed_receiver_method_resolves_to_definition() {
 
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(
-        result["definitions"][0]["fqn"], "app.Service.run",
-        "{value}"
-    );
+    assert_eq!(result["definition"]["fqn"], "app.Service.run", "{value}");
 }
 
 #[test]

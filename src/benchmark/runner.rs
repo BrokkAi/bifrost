@@ -467,20 +467,18 @@ fn assert_scenario_result(
                 }
 
                 if let Some(expected_fqn) = query.expected_fqn.as_deref() {
-                    let definitions = result["definitions"].as_array().ok_or_else(|| {
+                    let definition = result["definition"].as_object().ok_or_else(|| {
                         format!(
-                            "get_definition result {index} missing definitions array for `{}`",
+                            "get_definition result {index} missing definition object for `{}`",
                             target.name
                         )
                     })?;
-                    let found = definitions
-                        .iter()
-                        .filter_map(|definition| definition["fqn"].as_str())
-                        .any(|fqn| fqn == expected_fqn);
-                    if !found {
+                    let actual_fqn = definition.get("fqn").and_then(|value| value.as_str());
+                    if actual_fqn != Some(expected_fqn) {
                         return Err(format!(
-                            "get_definition result {index} for `{}` did not include expected fqn `{expected_fqn}`",
-                            target.name
+                            "get_definition result {index} for `{}` expected fqn `{expected_fqn}` but got `{}`",
+                            target.name,
+                            actual_fqn.unwrap_or("<missing>")
                         ));
                     }
                 }
