@@ -1045,7 +1045,10 @@ fn unquote(text: &str) -> String {
 // ImportBinder extraction
 // ===================================================================================
 
-pub(super) fn compute_import_binder(source: &str, tree: &Tree) -> ImportBinder {
+pub(in crate::analyzer::usages) fn compute_import_binder(
+    source: &str,
+    tree: &Tree,
+) -> ImportBinder {
     let mut binder = ImportBinder::empty();
     let root = tree.root_node();
 

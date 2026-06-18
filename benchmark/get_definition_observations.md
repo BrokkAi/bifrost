@@ -4,6 +4,8 @@ Manual inspection date: 2026-06-18
 
 The checked-in benchmark manifest now exercises `get_definition` for every target language. Smoke runs used `cargo run --bin bifrost_benchmark -- run --manifest benchmark/targets.toml --repo <name> --max-files 80` against pinned cached checkouts. Supported-language FQNs were also inspected with direct `target/debug/bifrost --tool get_definition` calls against the subset workspaces.
 
+The C++ and Scala manifest entries intentionally repeat the inspected same-file query three times. Those duplicate rows are not additional semantic claims; they exercise the public batch API's per-file and per-language cache behavior in the daily benchmark suite.
+
 | Repo | Language | Query | Expected | Observed | Manual verdict | False positives | False negatives / follow-up |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | google-gson | Java | `gson/src/main/java/com/google/gson/Gson.java:319:14` `TypeAdapter` | `resolved`, `com.google.gson.TypeAdapter` | `resolved`, `com.google.gson.TypeAdapter` at `gson/src/main/java/com/google/gson/TypeAdapter.java:121..322` | Accurate imported/same-package Java type reference resolution. | None observed for this probe. | Overloaded same-owner method calls such as `toJson(...)` can return `ambiguous` until overload filtering is added. |

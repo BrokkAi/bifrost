@@ -10,7 +10,11 @@ use crate::analyzer::usages::csharp_graph::{
     member_access_receiver as csharp_member_access_receiver, resolve_csharp_analyzer,
     seed_csharp_bindings_before,
 };
+use crate::analyzer::usages::go_graph::{
+    default_go_import_local_name, extract_go_import_path, resolve_go_analyzer,
+};
 use crate::analyzer::usages::inverted_edges::{ClassRangeIndex, first_precise};
+use crate::analyzer::usages::js_ts_graph::compute_jsts_import_binder;
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::ImportKind;
 use crate::analyzer::usages::php_graph::{
@@ -34,8 +38,7 @@ use crate::analyzer::{
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
-use regex::Regex;
-use std::sync::LazyLock;
+use std::sync::Arc;
 use tree_sitter::{Node, Parser, Tree};
 
 #[derive(Debug, Clone)]
@@ -101,27 +104,87 @@ pub(crate) fn resolve_definition_batch(
     requests: Vec<DefinitionLookupRequest>,
     include_tests: bool,
 ) -> Vec<DefinitionLookupOutcome> {
-    let support = DefinitionSupport::build(analyzer);
+    let mut context = DefinitionBatchContext::new(analyzer, include_tests);
     requests
         .into_iter()
-        .map(|request| resolve_one(analyzer, &support, request, include_tests))
+        .map(|request| resolve_one(analyzer, &mut context, request, include_tests))
         .collect()
+}
+
+struct DefinitionBatchContext {
+    support: DefinitionSupport,
+    sources: HashMap<ProjectFile, Result<String, String>>,
+    cpp_visibility: HashMap<ProjectFile, Arc<CppVisibilityIndex>>,
+    scala_project_types: Option<Arc<ScalaProjectTypes>>,
+}
+
+impl DefinitionBatchContext {
+    fn new(analyzer: &dyn IAnalyzer, include_tests: bool) -> Self {
+        Self {
+            support: DefinitionSupport::build(analyzer, include_tests),
+            sources: HashMap::default(),
+            cpp_visibility: HashMap::default(),
+            scala_project_types: None,
+        }
+    }
+
+    fn source(&mut self, file: &ProjectFile) -> Result<String, String> {
+        self.sources
+            .entry(file.clone())
+            .or_insert_with(|| {
+                file.read_to_string()
+                    .map_err(|err| format!("failed to read `{}`: {err}", rel_path_string(file)))
+            })
+            .clone()
+    }
+
+    fn cpp_visibility(
+        &mut self,
+        cpp: &crate::analyzer::CppAnalyzer,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+    ) -> Arc<CppVisibilityIndex> {
+        self.cpp_visibility
+            .entry(file.clone())
+            .or_insert_with(|| {
+                let mut roots = HashSet::default();
+                roots.insert(file.clone());
+                Arc::new(CppVisibilityIndex::build(cpp, analyzer, &roots))
+            })
+            .clone()
+    }
+
+    fn scala_project_types(&mut self, scala: &ScalaAnalyzer) -> Arc<ScalaProjectTypes> {
+        self.scala_project_types
+            .get_or_insert_with(|| Arc::new(ScalaProjectTypes::build(scala)))
+            .clone()
+    }
 }
 
 struct DefinitionSupport {
     by_fqn: HashMap<String, Vec<CodeUnit>>,
     by_identifier: HashMap<String, Vec<CodeUnit>>,
     by_file_identifier: HashMap<(ProjectFile, String), Vec<CodeUnit>>,
+    packages: HashSet<String>,
+    normalized_fqns: HashSet<String>,
 }
 
 impl DefinitionSupport {
-    fn build(analyzer: &dyn IAnalyzer) -> Self {
+    fn build(analyzer: &dyn IAnalyzer, include_tests: bool) -> Self {
         let mut by_fqn: HashMap<String, Vec<CodeUnit>> = HashMap::default();
         let mut by_identifier: HashMap<String, Vec<CodeUnit>> = HashMap::default();
         let mut by_file_identifier: HashMap<(ProjectFile, String), Vec<CodeUnit>> =
             HashMap::default();
+        let mut packages = HashSet::default();
+        let mut normalized_fqns = HashSet::default();
         for unit in analyzer.all_declarations() {
-            by_fqn.entry(unit.fq_name()).or_default().push(unit.clone());
+            if !include_tests && analyzer.contains_tests(unit.source()) {
+                continue;
+            }
+            let fqn = unit.fq_name();
+            packages.insert(unit.package_name().to_string());
+            normalized_fqns.insert(fqn.replace("$.", ".").trim_end_matches('$').to_string());
+            by_fqn.entry(fqn).or_default().push(unit.clone());
             by_identifier
                 .entry(unit.identifier().to_string())
                 .or_default()
@@ -144,6 +207,8 @@ impl DefinitionSupport {
             by_fqn,
             by_identifier,
             by_file_identifier,
+            packages,
+            normalized_fqns,
         }
     }
 
@@ -171,6 +236,27 @@ impl DefinitionSupport {
             .unwrap_or_default()
     }
 
+    fn identifier(&self, ident: &str) -> Vec<CodeUnit> {
+        self.by_identifier.get(ident).cloned().unwrap_or_default()
+    }
+
+    fn fqn_exists(&self, fqn: &str) -> bool {
+        self.by_fqn.contains_key(fqn)
+    }
+
+    fn normalized_fqn_exists(&self, fqn: &str) -> bool {
+        self.normalized_fqns.contains(fqn)
+    }
+
+    fn package_exists(&self, package: &str) -> bool {
+        self.packages.contains(package)
+    }
+
+    fn fqn_prefix_exists(&self, prefix: &str) -> bool {
+        let prefix = format!("{prefix}.");
+        self.by_fqn.keys().any(|fqn| fqn.starts_with(&prefix))
+    }
+
     fn file_identifier_in_files(&self, files: &[ProjectFile], ident: &str) -> Vec<CodeUnit> {
         let mut out = Vec::new();
         for file in files {
@@ -194,7 +280,7 @@ impl DefinitionSupport {
 
 fn resolve_one(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionSupport,
+    context: &mut DefinitionBatchContext,
     request: DefinitionLookupRequest,
     include_tests: bool,
 ) -> DefinitionLookupOutcome {
@@ -209,13 +295,22 @@ fn resolve_one(
         );
     }
 
-    let source = match request.file.read_to_string() {
+    let language = language_for_file(&request.file);
+    if language == Language::None {
+        return diagnostic_outcome(
+            DefinitionLookupStatus::UnsupportedLanguage,
+            "unsupported_language",
+            format!("{language:?} get_definition is not implemented yet"),
+        );
+    }
+
+    let source = match context.source(&request.file) {
         Ok(source) => source,
-        Err(err) => {
+        Err(message) => {
             return diagnostic_outcome(
                 DefinitionLookupStatus::NotFound,
                 "file_read_failed",
-                format!("failed to read `{}`: {err}", rel_path_string(&request.file)),
+                message,
             );
         }
     };
@@ -231,30 +326,34 @@ fn resolve_one(
         }
     };
 
-    let language = language_for_file(&request.file);
     let resolved = match language {
-        Language::Rust => resolve_rust(analyzer, support, &request.file, &site.text),
-        Language::JavaScript | Language::TypeScript => {
-            resolve_js_ts(analyzer, support, &request.file, language, &site.text)
+        Language::Rust => resolve_rust(analyzer, &context.support, &request.file, &site.text),
+        Language::JavaScript | Language::TypeScript => resolve_js_ts(
+            analyzer,
+            &context.support,
+            &request.file,
+            language,
+            &source,
+            &site.text,
+        ),
+        Language::Go => resolve_go(
+            analyzer,
+            &context.support,
+            &request.file,
+            &source,
+            &site.text,
+        ),
+        Language::Java => resolve_java(analyzer, &context.support, &request.file, &source, &site),
+        Language::Php => resolve_php(analyzer, &context.support, &request.file, &source, &site),
+        Language::Python => {
+            resolve_python(analyzer, &context.support, &request.file, &source, &site)
         }
-        Language::Go => resolve_go(analyzer, support, &request.file, &site.text),
-        Language::Java => resolve_java(analyzer, support, &request.file, &source, &site),
-        Language::Php => resolve_php(analyzer, support, &request.file, &source, &site),
-        Language::Python => resolve_python(analyzer, support, &request.file, &source, &site),
-        Language::CSharp => resolve_csharp(analyzer, support, &request.file, &source, &site),
-        Language::Cpp => resolve_cpp(analyzer, support, &request.file, &source, &site),
-        Language::Scala => resolve_scala(analyzer, support, &request.file, &source, &site),
-        Language::None => {
-            return DefinitionLookupOutcome {
-                status: DefinitionLookupStatus::UnsupportedLanguage,
-                reference: Some(site),
-                candidates: Vec::new(),
-                diagnostics: vec![DefinitionLookupDiagnostic {
-                    kind: "unsupported_language".to_string(),
-                    message: format!("{language:?} get_definition is not implemented yet"),
-                }],
-            };
+        Language::CSharp => {
+            resolve_csharp(analyzer, &context.support, &request.file, &source, &site)
         }
+        Language::Cpp => resolve_cpp(analyzer, context, &request.file, &source, &site),
+        Language::Scala => resolve_scala(analyzer, context, &request.file, &source, &site),
+        Language::None => unreachable!("unsupported language handled before source extraction"),
     };
 
     finish_with_symbol_filter(resolved, site, request.symbol)
@@ -319,13 +418,31 @@ fn resolve_reference_site(
                     source.len()
                 ));
             }
-            (start, end)
+            if !source.is_char_boundary(start) || !source.is_char_boundary(end) {
+                return Err(format!(
+                    "byte range [{start}, {end}) does not align to UTF-8 character boundaries"
+                ));
+            }
+            let token = token_bounds_at(source, start)
+                .ok_or_else(|| format!("no reference token at byte {start}"))?;
+            if end > token.1 {
+                return Err(
+                    "byte range must identify a single reference token; use start_byte inside the token for qualified expressions"
+                        .to_string(),
+                );
+            }
+            token
         }
         (Some(start), None, _, _) => {
             if start >= source.len() {
                 return Err(format!(
                     "start_byte {start} is outside {} byte file",
                     source.len()
+                ));
+            }
+            if !source.is_char_boundary(start) {
+                return Err(format!(
+                    "start_byte {start} does not align to a UTF-8 character boundary"
                 ));
             }
             token_bounds_at(source, start)
@@ -357,6 +474,9 @@ fn resolve_reference_site(
     let (start, end) = expand_reference_expression(source, selection_start, selection_end);
     if start >= end {
         return Err("reference selection is empty".to_string());
+    }
+    if !source.is_char_boundary(start) || !source.is_char_boundary(end) {
+        return Err("reference selection does not align to UTF-8 character boundaries".to_string());
     }
     let text = source[start..end].trim().to_string();
     if text.is_empty() {
@@ -456,27 +576,33 @@ fn resolve_rust(
         return no_definition("rust_analyzer_unavailable", "Rust analyzer is unavailable");
     };
     let refs = rust.reference_context_of(file);
-    let candidates = if let Some((path, name)) = reference.rsplit_once("::") {
-        refs.resolve_scoped(path, name)
+    let (candidates, scoped_lookup_failed) = if let Some((path, name)) = reference.rsplit_once("::")
+    {
+        let resolved = refs
+            .resolve_scoped(path, name)
             .map(|fqn| support.fqn(&fqn))
             .unwrap_or_else(|| {
                 rust_import_fallback(file, path)
                     .map(|prefix| support.fqn_or_identifier(file, &format!("{prefix}.{name}")))
                     .unwrap_or_default()
-            })
+            });
+        (resolved, true)
     } else {
-        refs.resolve_bare(reference)
-            .map(|fqn| support.fqn(fqn))
-            .unwrap_or_else(|| {
-                let imported = rust_import_fallback(file, reference)
-                    .map(|fqn| support.fqn_or_identifier(file, &fqn))
-                    .unwrap_or_default();
-                if imported.is_empty() {
-                    support.file_identifier(file, reference)
-                } else {
-                    imported
-                }
-            })
+        (
+            refs.resolve_bare(reference)
+                .map(|fqn| support.fqn(fqn))
+                .unwrap_or_else(|| {
+                    let imported = rust_import_fallback(file, reference)
+                        .map(|fqn| support.fqn_or_identifier(file, &fqn))
+                        .unwrap_or_default();
+                    if imported.is_empty() {
+                        support.file_identifier(file, reference)
+                    } else {
+                        imported
+                    }
+                }),
+            false,
+        )
     };
     if !candidates.is_empty() {
         return candidates_outcome(candidates);
@@ -486,13 +612,13 @@ fn resolve_rust(
             "`{reference}` appears to cross a Rust crate/module boundary not indexed in this workspace"
         ));
     }
-    let mut searched: Vec<CodeUnit> = analyzer
-        .search_definitions(
-            reference.rsplit([':', '.']).next().unwrap_or(reference),
-            true,
-        )
-        .into_iter()
-        .collect();
+    if scoped_lookup_failed {
+        return no_definition(
+            "no_indexed_definition",
+            format!("`{reference}` did not resolve through its Rust module path"),
+        );
+    }
+    let mut searched = support.identifier(reference.rsplit([':', '.']).next().unwrap_or(reference));
     sort_units(&mut searched);
     if !searched.is_empty() {
         return candidates_outcome(searched);
@@ -539,27 +665,26 @@ fn resolve_js_ts(
     support: &DefinitionSupport,
     file: &ProjectFile,
     language: Language,
+    source: &str,
     reference: &str,
 ) -> DefinitionLookupOutcome {
-    let source = match file.read_to_string() {
-        Ok(source) => source,
-        Err(err) => {
-            return diagnostic_outcome(
-                DefinitionLookupStatus::NotFound,
-                "file_read_failed",
-                format!("failed to read `{}`: {err}", rel_path_string(file)),
-            );
-        }
+    let Some(tree) = parse_js_ts_tree(source, language) else {
+        return no_definition("jsts_parse_failed", "JS/TS source could not be parsed");
     };
-    let imports = parse_js_ts_imports(&source);
+    let imports = compute_jsts_import_binder(source, &tree);
     let aliases = AliasResolver::new(analyzer.project().root().to_path_buf());
 
     if let Some((qualifier, name)) = reference.split_once('.') {
-        if let Some(binding) = imports.namespace.get(qualifier) {
+        if let Some(binding) = imports.bindings.get(qualifier)
+            && matches!(
+                binding.kind,
+                ImportKind::Namespace | ImportKind::CommonJsRequire
+            )
+        {
             return resolve_js_ts_module_binding(
                 file,
                 language,
-                binding,
+                &binding.module_specifier,
                 name,
                 analyzer,
                 support,
@@ -576,27 +701,23 @@ fn resolve_js_ts(
         );
     }
 
-    if let Some(named) = imports.named.get(reference) {
-        return resolve_js_ts_module_binding(
-            file,
-            language,
-            &named.module,
-            &named.imported,
-            analyzer,
-            support,
-            Some(&aliases),
-        );
-    }
-    if let Some(default_module) = imports.default.get(reference) {
-        return resolve_js_ts_module_binding(
-            file,
-            language,
-            default_module,
-            "default",
-            analyzer,
-            support,
-            Some(&aliases),
-        );
+    if let Some(binding) = imports.bindings.get(reference) {
+        let exported_name = match binding.kind {
+            ImportKind::Named => binding.imported_name.as_deref().unwrap_or(reference),
+            ImportKind::Default => "default",
+            ImportKind::Namespace | ImportKind::CommonJsRequire | ImportKind::Glob => reference,
+        };
+        if matches!(binding.kind, ImportKind::Named | ImportKind::Default) {
+            return resolve_js_ts_module_binding(
+                file,
+                language,
+                &binding.module_specifier,
+                exported_name,
+                analyzer,
+                support,
+                Some(&aliases),
+            );
+        }
     }
 
     let same_file = support.file_identifier(file, reference);
@@ -660,122 +781,36 @@ fn is_bare_js_ts_specifier(module: &str) -> bool {
         && !module.starts_with("@/")
 }
 
-#[derive(Default)]
-struct JsTsImports {
-    named: HashMap<String, JsTsNamedImport>,
-    namespace: HashMap<String, String>,
-    default: HashMap<String, String>,
-}
-
-struct JsTsNamedImport {
-    module: String,
-    imported: String,
-}
-
-fn parse_js_ts_imports(source: &str) -> JsTsImports {
-    static FROM_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"(?m)^\s*import\s+(.+?)\s+from\s+['"]([^'"]+)['"]"#).unwrap()
-    });
-    static REQUIRE_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(
-            r#"(?m)^\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\(['"]([^'"]+)['"]\)"#,
-        )
-        .unwrap()
-    });
-
-    let mut imports = JsTsImports::default();
-    for captures in FROM_RE.captures_iter(source) {
-        let clause = captures.get(1).map(|m| m.as_str().trim()).unwrap_or("");
-        let module = captures
-            .get(2)
-            .map(|m| m.as_str())
-            .unwrap_or("")
-            .to_string();
-        parse_js_ts_import_clause(clause, &module, &mut imports);
-    }
-    for captures in REQUIRE_RE.captures_iter(source) {
-        let local = captures
-            .get(1)
-            .map(|m| m.as_str())
-            .unwrap_or("")
-            .to_string();
-        let module = captures
-            .get(2)
-            .map(|m| m.as_str())
-            .unwrap_or("")
-            .to_string();
-        if !local.is_empty() && !module.is_empty() {
-            imports.namespace.insert(local, module);
-        }
-    }
-    imports
-}
-
-fn parse_js_ts_import_clause(clause: &str, module: &str, imports: &mut JsTsImports) {
-    let mut rest = clause.trim();
-    if let Some(namespace) = rest.strip_prefix("* as ") {
-        let local = namespace.trim();
-        if is_identifier(local) {
-            imports
-                .namespace
-                .insert(local.to_string(), module.to_string());
-        }
-        return;
-    }
-
-    if let Some(open) = rest.find('{') {
-        let default_part = rest[..open].trim().trim_end_matches(',').trim();
-        if is_identifier(default_part) {
-            imports
-                .default
-                .insert(default_part.to_string(), module.to_string());
-        }
-        if let Some(close) = rest[open + 1..].find('}') {
-            let names = &rest[open + 1..open + 1 + close];
-            for part in names.split(',') {
-                let part = part.trim();
-                if part.is_empty() {
-                    continue;
-                }
-                let (imported, local) = part
-                    .split_once(" as ")
-                    .map(|(imported, local)| (imported.trim(), local.trim()))
-                    .unwrap_or((part, part));
-                if is_identifier(imported) && is_identifier(local) {
-                    imports.named.insert(
-                        local.to_string(),
-                        JsTsNamedImport {
-                            module: module.to_string(),
-                            imported: imported.to_string(),
-                        },
-                    );
-                }
-            }
-        }
-        return;
-    }
-
-    rest = rest.trim_end_matches(',');
-    if is_identifier(rest) {
-        imports.default.insert(rest.to_string(), module.to_string());
-    }
+fn parse_js_ts_tree(source: &str, language: Language) -> Option<Tree> {
+    let mut parser = Parser::new();
+    let tree_sitter_language = match language {
+        Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
+        Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        _ => return None,
+    };
+    parser.set_language(&tree_sitter_language).ok()?;
+    parser.parse(source, None)
 }
 
 fn resolve_go(
     analyzer: &dyn IAnalyzer,
     support: &DefinitionSupport,
     file: &ProjectFile,
+    source: &str,
     reference: &str,
 ) -> DefinitionLookupOutcome {
-    let package = go_package_name(file);
+    let Some(go) = resolve_go_analyzer(analyzer) else {
+        return no_definition("go_analyzer_unavailable", "Go analyzer is unavailable");
+    };
+    let package = go_package_name(file, source);
     if let Some((qualifier, name)) = reference.split_once('.') {
-        let imports = parse_go_imports(file);
+        let imports = go_imports(go, file);
         if let Some(import_path) = imports.get(qualifier) {
             let candidates = support.fqn(&format!("{import_path}.{name}"));
             if !candidates.is_empty() {
                 return candidates_outcome(candidates);
             }
-            if !go_import_path_is_workspace(analyzer, import_path) {
+            if !go_import_path_is_workspace(support, import_path) {
                 return boundary(format!(
                     "`{import_path}` is outside this partial Go workspace analysis"
                 ));
@@ -785,10 +820,7 @@ fn resolve_go(
                 format!("`{name}` is not indexed in Go package `{import_path}`"),
             );
         }
-        let candidates = support.fqn_candidates([
-            format!("{package}.{qualifier}.{name}"),
-            format!("{package}.{name}"),
-        ]);
+        let candidates = support.fqn_candidates([format!("{package}.{qualifier}.{name}")]);
         if !candidates.is_empty() {
             return candidates_outcome(candidates);
         }
@@ -812,8 +844,7 @@ fn resolve_go(
     )
 }
 
-fn go_package_name(file: &ProjectFile) -> String {
-    let source = file.read_to_string().unwrap_or_default();
+fn go_package_name(file: &ProjectFile, source: &str) -> String {
     let declared = source
         .lines()
         .find_map(|line| line.trim().strip_prefix("package "))
@@ -822,67 +853,39 @@ fn go_package_name(file: &ProjectFile) -> String {
     crate::analyzer::go::packages::canonical_go_package_name(file, declared)
 }
 
-fn parse_go_imports(file: &ProjectFile) -> HashMap<String, String> {
-    let source = file.read_to_string().unwrap_or_default();
+fn go_imports(go: &crate::analyzer::GoAnalyzer, file: &ProjectFile) -> HashMap<String, String> {
     let mut imports = HashMap::default();
-    let lines: Vec<&str> = source.lines().collect();
-    let mut index = 0;
-    while index < lines.len() {
-        let trimmed = lines[index].trim();
-        if let Some(rest) = trimmed.strip_prefix("import ") {
-            let rest = rest.trim();
-            if rest == "(" {
-                index += 1;
-                while index < lines.len() && lines[index].trim() != ")" {
-                    parse_go_import_line(lines[index].trim(), &mut imports);
-                    index += 1;
-                }
-            } else {
-                parse_go_import_line(rest, &mut imports);
-            }
+    for import in go.import_info_of(file) {
+        if import.alias.as_deref() == Some("_") {
+            continue;
         }
-        index += 1;
+        let Some(import_path) = extract_go_import_path(&import.raw_snippet) else {
+            continue;
+        };
+        let local = import
+            .alias
+            .as_deref()
+            .filter(|alias| *alias != ".")
+            .map(default_go_import_local_name)
+            .or_else(|| {
+                import
+                    .identifier
+                    .as_deref()
+                    .map(default_go_import_local_name)
+            })
+            .unwrap_or_else(|| default_go_import_local_name(&import_path));
+        imports.insert(local, import_path);
     }
     imports
 }
 
-fn parse_go_import_line(line: &str, imports: &mut HashMap<String, String>) {
-    let line = line.split("//").next().unwrap_or("").trim();
-    if line.is_empty() {
-        return;
-    }
-    let Some(first_quote) = line.find('"') else {
-        return;
-    };
-    let Some(second_quote) = line[first_quote + 1..].find('"') else {
-        return;
-    };
-    let import_path = &line[first_quote + 1..first_quote + 1 + second_quote];
-    let alias = line[..first_quote].trim();
-    if alias == "_" {
-        return;
-    }
-    let local = if alias.is_empty() {
-        import_path
-            .rsplit('/')
-            .next()
-            .unwrap_or(import_path)
-            .replace('-', "_")
-    } else {
-        alias.to_string()
-    };
-    imports.insert(local, import_path.to_string());
-}
-
-fn go_import_path_is_workspace(analyzer: &dyn IAnalyzer, import_path: &str) -> bool {
-    analyzer
-        .all_declarations()
-        .any(|unit| unit.fq_name().starts_with(&format!("{import_path}.")))
+fn go_import_path_is_workspace(support: &DefinitionSupport, import_path: &str) -> bool {
+    support.fqn_prefix_exists(import_path)
 }
 
 fn resolve_cpp(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionSupport,
+    context: &mut DefinitionBatchContext,
     file: &ProjectFile,
     source: &str,
     site: &ResolvedReferenceSite,
@@ -893,9 +896,8 @@ fn resolve_cpp(
     let Some(tree) = parse_cpp_tree(source) else {
         return no_definition("cpp_parse_failed", "C++ source could not be parsed");
     };
-    let mut roots = HashSet::default();
-    roots.insert(file.clone());
-    let visibility = CppVisibilityIndex::build(cpp, analyzer, &roots);
+    let visibility = context.cpp_visibility(cpp, analyzer, file);
+    let support = &context.support;
     let root = tree.root_node();
     let Some(node) = smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)
     else {
@@ -915,14 +917,33 @@ fn resolve_cpp(
                     format!("`{}` is not a C++ reference site", site.text),
                 );
             }
-            resolve_cpp_type(analyzer, support, file, &visibility, source, type_node)
+            resolve_cpp_type(
+                analyzer,
+                support,
+                file,
+                visibility.as_ref(),
+                source,
+                type_node,
+            )
         }
-        Some(CppReferenceNode::Call(call)) => {
-            resolve_cpp_call(analyzer, support, file, &visibility, source, root, call)
-        }
-        Some(CppReferenceNode::Field(field)) => {
-            resolve_cpp_field(analyzer, support, file, &visibility, source, root, field)
-        }
+        Some(CppReferenceNode::Call(call)) => resolve_cpp_call(
+            analyzer,
+            support,
+            file,
+            visibility.as_ref(),
+            source,
+            root,
+            call,
+        ),
+        Some(CppReferenceNode::Field(field)) => resolve_cpp_field(
+            analyzer,
+            support,
+            file,
+            visibility.as_ref(),
+            source,
+            root,
+            field,
+        ),
         Some(CppReferenceNode::Identifier(identifier)) => {
             if cpp_is_declaration_name(node) {
                 return no_definition(
@@ -1515,7 +1536,7 @@ fn cpp_lexical_namespace(node: Node<'_>, source: &str) -> Option<String> {
 
 fn resolve_scala(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionSupport,
+    context: &mut DefinitionBatchContext,
     file: &ProjectFile,
     source: &str,
     site: &ResolvedReferenceSite,
@@ -1529,8 +1550,9 @@ fn resolve_scala(
     let Some(tree) = parse_scala_tree(source) else {
         return no_definition("scala_parse_failed", "Scala source could not be parsed");
     };
-    let types = ScalaProjectTypes::build(scala);
-    let resolver = ScalaNameResolver::for_file(scala, file, &types);
+    let types = context.scala_project_types(scala);
+    let support = &context.support;
+    let resolver = ScalaNameResolver::for_file(scala, file, types.as_ref());
     let root = tree.root_node();
     let Some(node) = smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)
     else {
@@ -1588,7 +1610,7 @@ fn resolve_scala(
             if let Some(fqn) = resolver.resolve(text) {
                 return scala_fqn_outcome(support, &fqn, text);
             }
-            if scala_import_boundary_for_name(scala, analyzer, file, text) {
+            if scala_import_boundary_for_name(scala, &context.support, file, text) {
                 return boundary(format!(
                     "`{text}` appears to cross a Scala import boundary not indexed in this workspace"
                 ));
@@ -1717,7 +1739,7 @@ fn resolve_scala_type(
     if let Some(fqn) = resolver.resolve(text) {
         return scala_fqn_outcome(ctx.support, &fqn, text);
     }
-    if scala_import_boundary_for_name(ctx.scala, ctx.analyzer, ctx.file, scala_simple_name(text)) {
+    if scala_import_boundary_for_name(ctx.scala, ctx.support, ctx.file, scala_simple_name(text)) {
         return boundary(format!(
             "`{text}` appears to cross a Scala import boundary not indexed in this workspace"
         ));
@@ -1776,7 +1798,7 @@ fn resolve_scala_call(
                 }
                 return scala_fqn_outcome(ctx.support, &owner_fqn, name);
             }
-            if scala_import_boundary_for_name(ctx.scala, ctx.analyzer, ctx.file, name) {
+            if scala_import_boundary_for_name(ctx.scala, ctx.support, ctx.file, name) {
                 return boundary(format!(
                     "`{name}` appears to cross a Scala import boundary not indexed in this workspace"
                 ));
@@ -2072,7 +2094,7 @@ fn scala_seed_typed(
 
 fn scala_import_boundary_for_name(
     scala: &ScalaAnalyzer,
-    analyzer: &dyn IAnalyzer,
+    support: &DefinitionSupport,
     file: &ProjectFile,
     name: &str,
 ) -> bool {
@@ -2083,7 +2105,7 @@ fn scala_import_boundary_for_name(
         };
         if import.is_wildcard {
             if simple.chars().next().is_some_and(char::is_uppercase)
-                && !scala_workspace_package_exists(analyzer, &path)
+                && !scala_workspace_package_exists(support, &path)
             {
                 return true;
             }
@@ -2093,25 +2115,20 @@ fn scala_import_boundary_for_name(
             .identifier
             .as_deref()
             .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(path.as_str()));
-        if local_name == simple && supportless_scala_import_target_missing(analyzer, &path) {
+        if local_name == simple && supportless_scala_import_target_missing(support, &path) {
             return true;
         }
     }
     false
 }
 
-fn supportless_scala_import_target_missing(analyzer: &dyn IAnalyzer, path: &str) -> bool {
+fn supportless_scala_import_target_missing(support: &DefinitionSupport, path: &str) -> bool {
     let normalized = path.replace("$.", ".").trim_end_matches('$').to_string();
-    !analyzer.all_declarations().any(|unit| {
-        unit.fq_name() == normalized
-            || unit.fq_name().replace("$.", ".").trim_end_matches('$') == normalized
-    })
+    !support.fqn_exists(&normalized) && !support.normalized_fqn_exists(&normalized)
 }
 
-fn scala_workspace_package_exists(analyzer: &dyn IAnalyzer, package: &str) -> bool {
-    analyzer
-        .all_declarations()
-        .any(|unit| unit.package_name() == package)
+fn scala_workspace_package_exists(support: &DefinitionSupport, package: &str) -> bool {
+    support.package_exists(package)
 }
 
 fn scala_simple_name(name: &str) -> &str {
@@ -2156,11 +2173,11 @@ fn resolve_java(
 
     match node.kind() {
         "type_identifier" | "scoped_type_identifier" | "generic_type" => {
-            resolve_java_type_reference(java, file, source, node)
+            resolve_java_type_reference(java, support, file, source, node)
         }
         "object_creation_expression" => node
             .child_by_field_name("type")
-            .map(|type_node| resolve_java_type_reference(java, file, source, type_node))
+            .map(|type_node| resolve_java_type_reference(java, support, file, source, type_node))
             .unwrap_or_else(|| {
                 no_definition(
                     "no_indexed_definition",
@@ -2250,6 +2267,7 @@ fn is_java_declaration_or_import_name(node: Node<'_>) -> bool {
 
 fn resolve_java_type_reference(
     java: &JavaAnalyzer,
+    support: &DefinitionSupport,
     file: &ProjectFile,
     source: &str,
     node: Node<'_>,
@@ -2262,7 +2280,7 @@ fn resolve_java_type_reference(
     if let Some(unit) = java.resolve_type_name_in_file(file, normalized) {
         return candidates_outcome(vec![unit]);
     }
-    if java_import_boundary_for_type(java, file, normalized) {
+    if java_import_boundary_for_type(java, support, file, normalized) {
         return boundary(format!(
             "`{normalized}` appears to cross a Java import boundary not indexed in this workspace"
         ));
@@ -2357,7 +2375,7 @@ fn resolve_java_bare_identifier(
     {
         return static_import;
     }
-    if java_import_boundary_for_type(java, file, name) {
+    if java_import_boundary_for_type(java, support, file, name) {
         return boundary(format!(
             "`{name}` appears to cross a Java import boundary not indexed in this workspace"
         ));
@@ -2517,7 +2535,7 @@ fn java_static_import_candidates(
         };
         if let Some(owner) = path.strip_suffix(".*") {
             let owner_candidates = support.fqn(&format!("{owner}.{member}"));
-            if owner_candidates.is_empty() && !java_workspace_fqn_exists(analyzer, owner) {
+            if owner_candidates.is_empty() && !java_workspace_fqn_exists(support, owner) {
                 saw_external = true;
             }
             candidates.extend(owner_candidates);
@@ -2530,7 +2548,7 @@ fn java_static_import_candidates(
             continue;
         }
         let imported = support.fqn(path);
-        if imported.is_empty() && !java_workspace_fqn_exists(analyzer, owner) {
+        if imported.is_empty() && !java_workspace_fqn_exists(support, owner) {
             saw_external = true;
         }
         candidates.extend(imported);
@@ -2551,7 +2569,12 @@ fn java_static_import_candidates(
     )
 }
 
-fn java_import_boundary_for_type(java: &JavaAnalyzer, file: &ProjectFile, name: &str) -> bool {
+fn java_import_boundary_for_type(
+    java: &JavaAnalyzer,
+    support: &DefinitionSupport,
+    file: &ProjectFile,
+    name: &str,
+) -> bool {
     for import in java.import_statements(file) {
         let trimmed = import.trim();
         if trimmed.starts_with("import static ") {
@@ -2565,7 +2588,7 @@ fn java_import_boundary_for_type(java: &JavaAnalyzer, file: &ProjectFile, name: 
             continue;
         };
         if let Some(package) = path.strip_suffix(".*") {
-            if !package.is_empty() && !java_workspace_package_exists(java, package) {
+            if !package.is_empty() && !java_workspace_package_exists(support, package) {
                 return true;
             }
             continue;
@@ -2575,7 +2598,7 @@ fn java_import_boundary_for_type(java: &JavaAnalyzer, file: &ProjectFile, name: 
                 .rsplit_once('.')
                 .map(|(package, _)| package)
                 .unwrap_or("");
-            return !java_workspace_package_exists(java, package);
+            return !java_workspace_package_exists(support, package);
         }
     }
     false
@@ -2589,14 +2612,12 @@ fn java_static_import_path(import: &str) -> Option<&str> {
         .map(str::trim)
 }
 
-fn java_workspace_fqn_exists(analyzer: &dyn IAnalyzer, fqn: &str) -> bool {
-    analyzer.definitions(fqn).next().is_some()
+fn java_workspace_fqn_exists(support: &DefinitionSupport, fqn: &str) -> bool {
+    support.fqn_exists(fqn)
 }
 
-fn java_workspace_package_exists(java: &JavaAnalyzer, package: &str) -> bool {
-    java.all_declarations().any(|unit| {
-        unit.package_name() == package || unit.fq_name().starts_with(&format!("{package}."))
-    })
+fn java_workspace_package_exists(support: &DefinitionSupport, package: &str) -> bool {
+    support.package_exists(package) || support.fqn_prefix_exists(package)
 }
 
 fn java_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
@@ -2663,27 +2684,27 @@ fn resolve_php(
     match php_reference_node(node) {
         Some(PhpReferenceNode::Type(type_node)) => {
             let raw = php_qualified_candidate_text(type_node, source);
-            php_fqn_outcome(php, support, resolve_php_type(&raw, &ctx), &raw)
+            php_fqn_outcome(support, resolve_php_type(&raw, &ctx), &raw)
         }
         Some(PhpReferenceNode::Function(name_node)) => {
             let raw = php_qualified_candidate_text(name_node, source);
-            php_fqn_outcome(php, support, resolve_php_function(&raw, &ctx), &raw)
+            php_fqn_outcome(support, resolve_php_function(&raw, &ctx), &raw)
         }
         Some(PhpReferenceNode::Constant(name_node)) => {
             let raw = php_qualified_candidate_text(name_node, source);
-            php_fqn_outcome(php, support, resolve_php_constant(&raw, &ctx), &raw)
+            php_fqn_outcome(support, resolve_php_constant(&raw, &ctx), &raw)
         }
         Some(PhpReferenceNode::StaticMember { scope, name }) => {
             let member = php_node_text(name, source).trim_start_matches('$');
             let owner = php_static_scope_fqn(php, support, scope, source, &ctx, &class_ranges);
-            php_member_outcome(php, support, owner, member)
+            php_member_outcome(support, owner, member)
         }
         Some(PhpReferenceNode::InstanceMember { object, name }) => {
             let member = php_node_text(name, source).trim_start_matches('$');
             let bindings =
                 php_bindings_before(php, file, source, root, site.range.start_byte, &ctx);
             let owner = php_instance_receiver_fqn(object, source, &class_ranges, &bindings);
-            php_member_outcome(php, support, owner, member)
+            php_member_outcome(support, owner, member)
         }
         None => no_definition(
             "unsupported_php_reference_shape",
@@ -2768,7 +2789,7 @@ fn resolve_csharp(
                 .collect();
             let outcome = csharp_member_outcome(analyzer, support, owners, member);
             if outcome.status == DefinitionLookupStatus::NoDefinition
-                && csharp_static_using_boundary_for_member(csharp, file)
+                && csharp_static_using_boundary_for_member(csharp, support, file)
             {
                 return boundary(format!(
                     "`{member}` appears to cross a C# static using boundary not indexed in this workspace"
@@ -2879,7 +2900,7 @@ fn csharp_type_outcome(
     if !candidates.is_empty() {
         return candidates_outcome(candidates);
     }
-    if csharp_import_boundary_for_type(csharp, file, reference) {
+    if csharp_import_boundary_for_type(csharp, support, file, reference) {
         return boundary(format!(
             "`{reference}` appears to cross a C# using boundary not indexed in this workspace"
         ));
@@ -2989,10 +3010,11 @@ fn csharp_enclosing_class(
 
 fn csharp_import_boundary_for_type(
     csharp: &CSharpAnalyzer,
+    support: &DefinitionSupport,
     file: &ProjectFile,
     reference: &str,
 ) -> bool {
-    if csharp_alias_using_boundary_for_type(csharp, file, reference) {
+    if csharp_alias_using_boundary_for_type(csharp, support, file, reference) {
         return true;
     }
     let simple = reference.rsplit('.').next().unwrap_or(reference);
@@ -3000,19 +3022,18 @@ fn csharp_import_boundary_for_type(
         .using_namespaces_of(file)
         .into_iter()
         .any(|namespace| {
-            !csharp_workspace_namespace_exists(csharp, &namespace)
+            !csharp_workspace_namespace_exists(support, &namespace)
                 && (reference == simple || reference.starts_with(&format!("{namespace}.")))
         })
 }
 
-fn csharp_workspace_namespace_exists(csharp: &CSharpAnalyzer, namespace: &str) -> bool {
-    csharp
-        .all_declarations()
-        .any(|unit| unit.package_name() == namespace)
+fn csharp_workspace_namespace_exists(support: &DefinitionSupport, namespace: &str) -> bool {
+    support.package_exists(namespace)
 }
 
 fn csharp_alias_using_boundary_for_type(
     csharp: &CSharpAnalyzer,
+    support: &DefinitionSupport,
     file: &ProjectFile,
     reference: &str,
 ) -> bool {
@@ -3026,14 +3047,18 @@ fn csharp_alias_using_boundary_for_type(
         let Some((alias, target)) = trimmed.split_once('=') else {
             continue;
         };
-        if alias.trim() == reference && !csharp_workspace_type_exists(csharp, target.trim()) {
+        if alias.trim() == reference && !csharp_workspace_type_exists(support, target.trim()) {
             return true;
         }
     }
     false
 }
 
-fn csharp_static_using_boundary_for_member(csharp: &CSharpAnalyzer, file: &ProjectFile) -> bool {
+fn csharp_static_using_boundary_for_member(
+    csharp: &CSharpAnalyzer,
+    support: &DefinitionSupport,
+    file: &ProjectFile,
+) -> bool {
     csharp.import_statements(file).iter().any(|raw| {
         raw.trim()
             .trim_start_matches("global ")
@@ -3041,15 +3066,12 @@ fn csharp_static_using_boundary_for_member(csharp: &CSharpAnalyzer, file: &Proje
             .trim_end_matches(';')
             .trim()
             .strip_prefix("static ")
-            .is_some_and(|target| !csharp_workspace_type_exists(csharp, target.trim()))
+            .is_some_and(|target| !csharp_workspace_type_exists(support, target.trim()))
     })
 }
 
-fn csharp_workspace_type_exists(csharp: &CSharpAnalyzer, reference: &str) -> bool {
-    csharp.all_declarations().any(|unit| {
-        unit.is_class()
-            && (unit.fq_name() == reference || unit.fq_name().replace('$', ".") == reference)
-    })
+fn csharp_workspace_type_exists(support: &DefinitionSupport, reference: &str) -> bool {
+    support.fqn_exists(reference) || support.normalized_fqn_exists(reference)
 }
 
 const CSHARP_SCOPE_NODES: &[&str] = &[
@@ -3172,7 +3194,6 @@ fn resolve_python(
             );
             if !object_shadowed && let Some(module) = ctx.namespace_module_for_object(object_text) {
                 return python_fqn_outcome(
-                    py,
                     support,
                     &format!("{module}.{attribute_text}"),
                     site.text.as_str(),
@@ -3215,7 +3236,7 @@ fn resolve_python(
                 );
             }
             if let Some(fqn) = ctx.named.get(text).or_else(|| ctx.namespace.get(text)) {
-                return python_fqn_outcome(py, support, fqn, text);
+                return python_fqn_outcome(support, fqn, text);
             }
             if let Some(candidates) = ctx.same_file.get(text)
                 && !candidates.is_empty()
@@ -3348,7 +3369,6 @@ fn python_reference_node(node: Node<'_>) -> Option<PythonReferenceNode<'_>> {
 }
 
 fn python_fqn_outcome(
-    py: &PythonAnalyzer,
     support: &DefinitionSupport,
     fqn: &str,
     raw: &str,
@@ -3357,7 +3377,7 @@ fn python_fqn_outcome(
     if !candidates.is_empty() {
         return candidates_outcome(candidates);
     }
-    if python_crosses_unindexed_boundary(py, fqn) {
+    if python_crosses_unindexed_boundary(support, fqn) {
         return boundary(format!(
             "`{raw}` resolves to `{fqn}`, which is outside this partial Python workspace analysis"
         ));
@@ -3397,16 +3417,15 @@ fn python_member_outcome(
     }
 }
 
-fn python_crosses_unindexed_boundary(py: &PythonAnalyzer, fqn: &str) -> bool {
+fn python_crosses_unindexed_boundary(support: &DefinitionSupport, fqn: &str) -> bool {
     let Some((module, _)) = fqn.rsplit_once('.') else {
-        return !python_workspace_module_exists(py, "");
+        return !python_workspace_module_exists(support, "");
     };
-    !python_workspace_module_exists(py, module)
+    !python_workspace_module_exists(support, module)
 }
 
-fn python_workspace_module_exists(py: &PythonAnalyzer, module: &str) -> bool {
-    py.all_declarations()
-        .any(|unit| unit.package_name() == module || unit.fq_name() == module)
+fn python_workspace_module_exists(support: &DefinitionSupport, module: &str) -> bool {
+    support.package_exists(module) || support.fqn_exists(module)
 }
 
 fn python_receiver_type_unit(
@@ -3675,7 +3694,6 @@ fn php_qualified_reference_node(mut node: Node<'_>) -> Node<'_> {
 }
 
 fn php_fqn_outcome(
-    php: &PhpAnalyzer,
     support: &DefinitionSupport,
     fqn: Option<String>,
     raw: &str,
@@ -3690,7 +3708,7 @@ fn php_fqn_outcome(
     if !candidates.is_empty() {
         return candidates_outcome(candidates);
     }
-    if php_crosses_unindexed_boundary(php, &fqn) {
+    if php_crosses_unindexed_boundary(support, &fqn) {
         return boundary(format!(
             "`{raw}` resolves to `{fqn}`, which is outside this partial PHP workspace analysis"
         ));
@@ -3702,7 +3720,6 @@ fn php_fqn_outcome(
 }
 
 fn php_member_outcome(
-    php: &PhpAnalyzer,
     support: &DefinitionSupport,
     owner: Option<String>,
     member: &str,
@@ -3718,7 +3735,7 @@ fn php_member_outcome(
     if !candidates.is_empty() {
         return candidates_outcome(candidates);
     }
-    if php_crosses_unindexed_boundary(php, &owner) {
+    if php_crosses_unindexed_boundary(support, &owner) {
         return boundary(format!(
             "`{member}` appears to cross a PHP boundary at `{owner}` not indexed in this workspace"
         ));
@@ -3729,16 +3746,15 @@ fn php_member_outcome(
     )
 }
 
-fn php_crosses_unindexed_boundary(php: &PhpAnalyzer, fqn: &str) -> bool {
+fn php_crosses_unindexed_boundary(support: &DefinitionSupport, fqn: &str) -> bool {
     let Some((namespace, _)) = fqn.rsplit_once('.') else {
-        return !php_workspace_exact_namespace_exists(php, "");
+        return !php_workspace_exact_namespace_exists(support, "");
     };
-    !php_workspace_exact_namespace_exists(php, namespace)
+    !php_workspace_exact_namespace_exists(support, namespace)
 }
 
-fn php_workspace_exact_namespace_exists(php: &PhpAnalyzer, namespace: &str) -> bool {
-    php.all_declarations()
-        .any(|unit| unit.package_name() == namespace)
+fn php_workspace_exact_namespace_exists(support: &DefinitionSupport, namespace: &str) -> bool {
+    support.package_exists(namespace)
 }
 
 fn php_static_scope_fqn(
@@ -4105,15 +4121,6 @@ fn diagnostic_outcome(
             message: message.into(),
         }],
     }
-}
-
-fn is_identifier(text: &str) -> bool {
-    let mut chars = text.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    (first == '_' || first == '$' || first.is_ascii_alphabetic())
-        && chars.all(|ch| ch == '_' || ch == '$' || ch.is_ascii_alphanumeric())
 }
 
 fn sort_units(units: &mut [CodeUnit]) {

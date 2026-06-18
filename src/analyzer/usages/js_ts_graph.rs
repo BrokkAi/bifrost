@@ -49,6 +49,7 @@ use std::collections::BTreeSet;
 
 use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::inverted_edges::UsageNodeKey;
+pub(in crate::analyzer::usages) use extractor::compute_import_binder as compute_jsts_import_binder;
 pub(crate) use inverted::{JsTsScopedNodeStatus, JsTsScopedUsageEdges};
 
 /// Build the whole JS/TS `caller -> callee` edge set in a single inverted pass per

@@ -87,6 +87,99 @@ pub fn run() {
 }
 
 #[test]
+fn rust_unresolved_scoped_path_does_not_guess_by_leaf_name() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+mod util;
+
+pub fn run() {
+    crate::missing::helper();
+}
+"#,
+        )
+        .file("util.rs", "pub fn helper() {}\n")
+        .build();
+
+    let line = "    crate::missing::helper();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"lib.rs","line":5,"column":{}}}]}}"#,
+            column_of(line, "helper")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"].as_array().unwrap().len(),
+        0,
+        "{value}"
+    );
+}
+
+#[test]
+fn rust_include_tests_false_filters_candidate_definitions() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+pub fn run() {
+    helper();
+}
+"#,
+        )
+        .file("tests/helper.rs", "#[test]\npub fn helper() {}\n")
+        .build();
+
+    let line = "    helper();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"lib.rs","line":3,"column":{}}}]}}"#,
+            column_of(line, "helper")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"lib.rs","line":3,"column":{}}}],"include_tests":true}}"#,
+            column_of(line, "helper")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["path"], "tests/helper.rs",
+        "{value}"
+    );
+}
+
+#[test]
+fn invalid_utf8_byte_range_returns_diagnostic_instead_of_panicking() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("lib.rs", "pub fn helper() { let café = 1; }\n")
+        .build();
+
+    let source = std::fs::read_to_string(project.root().join("lib.rs")).expect("source");
+    let start = source.find('é').expect("non-ascii byte");
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"lib.rs","start_byte":{},"end_byte":{}}}]}}"#,
+            start + 1,
+            start + 2
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "invalid_location", "{value}");
+}
+
+#[test]
 fn typescript_named_import_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file("util.ts", "export function helper() {}\n")
@@ -115,6 +208,39 @@ export function run() {
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(result["definitions"][0]["fqn"], "helper", "{value}");
     assert_eq!(result["definitions"][0]["path"], "util.ts", "{value}");
+}
+
+#[test]
+fn javascript_destructured_commonjs_require_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "util.js",
+            "function helper() {}\nexports.helper = helper;\n",
+        )
+        .file(
+            "app.js",
+            r#"
+const { helper } = require("./util");
+
+function run() {
+  helper();
+}
+"#,
+        )
+        .build();
+
+    let line = "  helper();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.js","line":5,"column":{}}}]}}"#,
+            column_of(line, "helper")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "util.js", "{value}");
 }
 
 #[test]
@@ -189,6 +315,41 @@ func Helper() {}
         "{value}"
     );
     assert_eq!(result["definitions"][0]["path"], "sub/sub.go", "{value}");
+}
+
+#[test]
+fn go_unresolved_selector_does_not_fall_back_to_package_leaf() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n")
+        .file(
+            "main.go",
+            r#"
+package main
+
+func Helper() {}
+
+func Run() {
+    other.Helper()
+}
+"#,
+        )
+        .build();
+
+    let line = "    other.Helper()";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"main.go","line":7,"column":{}}}]}}"#,
+            column_of(line, "Helper")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"].as_array().unwrap().len(),
+        0,
+        "{value}"
+    );
 }
 
 #[test]
@@ -1728,4 +1889,5 @@ fn unsupported_language_returns_structured_status() {
         value["results"][0]["status"], "unsupported_language",
         "{value}"
     );
+    assert!(value["results"][0]["reference"].is_null(), "{value}");
 }

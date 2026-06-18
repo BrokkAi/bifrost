@@ -8,7 +8,9 @@ use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::go_graph::extractor::scan_files_for_target;
 use crate::analyzer::usages::go_graph::resolver::{
     GoProjectGraph, TargetSpec, build_go_graph, build_workspace_go_graph, preparse_go_files,
-    resolve_go_analyzer,
+};
+pub(in crate::analyzer::usages) use crate::analyzer::usages::go_graph::resolver::{
+    default_go_import_local_name, extract_go_import_path, resolve_go_analyzer,
 };
 use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::model::FuzzyResult;
