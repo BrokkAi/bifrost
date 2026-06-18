@@ -214,15 +214,17 @@ fn suffix_search_pattern(query_path: &[String]) -> String {
         return String::new();
     }
 
-    let delimiter = r"(?:\.|::|/|\\|\+)";
+    let delimiter = r"(?:\.|::|/|\\|\+|\$)";
     let mut pattern = String::from("(?:^|");
     pattern.push_str(delimiter);
     pattern.push(')');
     for segment in prefix {
         pattern.push_str(&regex::escape(segment));
+        pattern.push_str(r"\$?");
         pattern.push_str(delimiter);
     }
     pattern.push_str(&regex::escape(last));
+    pattern.push_str(r"\$?");
     pattern.push('$');
     pattern
 }

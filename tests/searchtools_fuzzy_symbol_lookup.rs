@@ -180,6 +180,37 @@ object InstanceChoiceControl {
 }
 
 #[test]
+fn indexed_suffix_lookup_preserves_scala_dollar_full_match_precedence() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "src/pkg/Foo/Bar.scala",
+            r#"package pkg.Foo
+class Bar
+"#,
+        )
+        .file(
+            "src/pkg/DollarAlias.scala",
+            r#"package pkg
+class Foo$Bar
+"#,
+        )
+        .build();
+    let analyzer = ScalaAnalyzer::from_project(project.project().clone());
+
+    let locations = get_symbol_locations(
+        &analyzer,
+        SymbolLookupParams {
+            symbols: vec!["Foo.Bar".to_string()],
+        },
+    );
+
+    assert!(locations.not_found.is_empty(), "{locations:#?}");
+    assert_eq!(1, locations.locations.len(), "{locations:#?}");
+    assert_eq!("pkg.Foo$Bar", locations.locations[0].symbol);
+    assert_eq!("src/pkg/DollarAlias.scala", locations.locations[0].path);
+}
+
+#[test]
 fn get_symbol_sources_returns_flat_top_level_symbols_for_file_paths() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(
