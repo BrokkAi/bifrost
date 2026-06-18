@@ -55,6 +55,15 @@ fn resolve_codeunit_fuzzy_with(
         return resolved;
     }
 
+    if let Some(resolved) = suffix_resolution_from_index(analyzer, trimmed, include) {
+        return resolved;
+    }
+    if stripped != trimmed
+        && let Some(resolved) = suffix_resolution_from_index(analyzer, &stripped, include)
+    {
+        return resolved;
+    }
+
     let declarations = analyzer.get_all_declarations();
     let mut full_matches = BTreeMap::new();
     let mut suffix_matches = BTreeMap::new();
@@ -63,12 +72,16 @@ fn resolve_codeunit_fuzzy_with(
     } else {
         vec![trimmed, stripped.as_str()]
     };
+    let mut query_paths_by_language: BTreeMap<Language, BTreeSet<Vec<String>>> = BTreeMap::new();
 
     for candidate in &declarations {
-        let query_paths: BTreeSet<Vec<String>> = query_inputs
-            .iter()
-            .flat_map(|query| query_symbol_interpretations(code_unit_language(candidate), query))
-            .collect();
+        let language = code_unit_language(candidate);
+        let query_paths = query_paths_by_language.entry(language).or_insert_with(|| {
+            query_inputs
+                .iter()
+                .flat_map(|query| query_symbol_interpretations(language, query))
+                .collect()
+        });
         if query_paths.is_empty() {
             continue;
         }
@@ -76,7 +89,7 @@ fn resolve_codeunit_fuzzy_with(
             analyzer,
             candidate,
             include,
-            &query_paths,
+            query_paths,
             &mut full_matches,
             &mut suffix_matches,
         );
@@ -86,7 +99,7 @@ fn resolve_codeunit_fuzzy_with(
                     analyzer,
                     &member,
                     include,
-                    &query_paths,
+                    query_paths,
                     &mut full_matches,
                     &mut suffix_matches,
                 );
@@ -141,6 +154,79 @@ fn matching_definitions(
         .filter(|code_unit| include(code_unit))
         .cloned()
         .collect()
+}
+
+fn suffix_resolution_from_index(
+    analyzer: &dyn IAnalyzer,
+    symbol: &str,
+    include: impl Copy + Fn(&CodeUnit) -> bool,
+) -> Option<CodeUnitResolution> {
+    let mut full_matches = BTreeMap::new();
+    let mut suffix_matches = BTreeMap::new();
+    for language in analyzer.languages() {
+        let query_paths = query_symbol_interpretations(language, symbol);
+        if query_paths.iter().all(|path| path.len() < 2) {
+            continue;
+        }
+
+        for query_path in &query_paths {
+            let pattern = suffix_search_pattern(query_path);
+            if pattern.is_empty() {
+                continue;
+            }
+            for candidate in analyzer.search_definitions(&pattern, false) {
+                if code_unit_language(&candidate) != language || !include(&candidate) {
+                    continue;
+                }
+                collect_fuzzy_matches(
+                    analyzer,
+                    &candidate,
+                    include,
+                    &query_paths,
+                    &mut full_matches,
+                    &mut suffix_matches,
+                );
+            }
+        }
+    }
+
+    if !full_matches.is_empty() {
+        return unique_resolution_from_matches(analyzer, full_matches, include);
+    }
+    unique_resolution_from_matches(analyzer, suffix_matches, include)
+}
+
+fn unique_resolution_from_matches(
+    analyzer: &dyn IAnalyzer,
+    matches: BTreeMap<String, CodeUnit>,
+    include: impl Copy + Fn(&CodeUnit) -> bool,
+) -> Option<CodeUnitResolution> {
+    (matches.len() == 1)
+        .then(|| resolution_from_matches(analyzer, matches, include))
+        .flatten()
+}
+
+fn suffix_search_pattern(query_path: &[String]) -> String {
+    let Some((last, prefix)) = query_path.split_last() else {
+        return String::new();
+    };
+    if prefix.is_empty() {
+        return String::new();
+    }
+
+    let delimiter = r"(?:\.|::|/|\\|\+|\$)";
+    let mut pattern = String::from("(?:^|");
+    pattern.push_str(delimiter);
+    pattern.push(')');
+    for segment in prefix {
+        pattern.push_str(&regex::escape(segment));
+        pattern.push_str(r"\$?");
+        pattern.push_str(delimiter);
+    }
+    pattern.push_str(&regex::escape(last));
+    pattern.push_str(r"\$?");
+    pattern.push('$');
+    pattern
 }
 
 fn collect_fuzzy_matches(
