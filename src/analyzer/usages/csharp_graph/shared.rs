@@ -1,11 +1,14 @@
 use super::extractor::{ScanState, scan_file};
 use super::inverted;
-use super::resolver::{TargetKind, TargetSpec, resolve_csharp_analyzer};
+use super::resolver::{TargetKind, TargetSpec};
 use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::{CSharpAnalyzer, CodeUnit, IAnalyzer, Language, ProjectFile};
+use crate::analyzer::usages::traits::{UsageEdgeResolver, UsageQueryResolver};
+use crate::analyzer::{
+    CSharpAnalyzer, CodeUnit, IAnalyzer, Language, ProjectFile, resolve_analyzer,
+};
 use crate::hash::HashSet;
 use std::collections::BTreeSet;
 
@@ -13,20 +16,23 @@ pub(crate) struct CSharpQueryResolver<'a> {
     csharp: &'a CSharpAnalyzer,
 }
 
-impl<'a> CSharpQueryResolver<'a> {
-    pub(crate) fn new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
+impl<'a> UsageQueryResolver<'a> for CSharpQueryResolver<'a> {
+    fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
         Some(Self {
-            csharp: resolve_csharp_analyzer(analyzer)?,
+            csharp: resolve_analyzer::<CSharpAnalyzer>(analyzer)?,
         })
     }
 
-    pub(crate) fn find_usages(
+    fn find_usages(
         &self,
         analyzer: &dyn IAnalyzer,
-        target: &CodeUnit,
+        overloads: &[CodeUnit],
         candidate_files: &HashSet<ProjectFile>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
+        let Some(target) = overloads.first() else {
+            return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
+        };
         let Some(spec) = TargetSpec::from_target(analyzer, target) else {
             return GraphUsageOutcome::fallback_safe(
                 target.fq_name(),
@@ -83,9 +89,9 @@ pub(crate) struct CSharpEdgeResolver<'a> {
     files: Vec<ProjectFile>,
 }
 
-impl<'a> CSharpEdgeResolver<'a> {
-    pub(crate) fn new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
-        let csharp = resolve_csharp_analyzer(analyzer)?;
+impl<'a> UsageEdgeResolver<'a> for CSharpEdgeResolver<'a> {
+    fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
+        let csharp = resolve_analyzer::<CSharpAnalyzer>(analyzer)?;
         let files: Vec<ProjectFile> = analyzer
             .project()
             .analyzable_files(Language::CSharp)
@@ -95,7 +101,7 @@ impl<'a> CSharpEdgeResolver<'a> {
         Some(Self { csharp, files })
     }
 
-    pub(crate) fn build_edges<F>(
+    fn build_edges<F>(
         &self,
         analyzer: &dyn IAnalyzer,
         nodes: &HashSet<String>,

@@ -10,7 +10,7 @@ pub(in crate::analyzer::usages) use extractor::{
 pub(in crate::analyzer::usages) use resolver::{
     first_type_child as csharp_first_type_child,
     is_type_reference_node as csharp_is_type_reference_node, node_text as csharp_node_text,
-    reference_type_text as csharp_reference_type_text, resolve_csharp_analyzer,
+    reference_type_text as csharp_reference_type_text,
     seed_bindings_before as seed_csharp_bindings_before,
 };
 
@@ -19,7 +19,7 @@ use crate::analyzer::usages::csharp_graph::shared::{CSharpEdgeResolver, CSharpQu
 use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::usages::traits::UsageAnalyzer;
+use crate::analyzer::usages::traits::{UsageAnalyzer, UsageEdgeResolver, UsageQueryResolver};
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::HashSet;
 
@@ -31,7 +31,7 @@ pub(crate) fn build_csharp_usage_edges<F>(
 where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
-    let resolver = CSharpEdgeResolver::new(analyzer)?;
+    let resolver = CSharpEdgeResolver::try_new(analyzer)?;
     Some(resolver.build_edges(analyzer, nodes, keep_file))
 }
 
@@ -69,7 +69,7 @@ impl CSharpUsageGraphStrategy {
             );
         }
 
-        let Some(resolver) = CSharpQueryResolver::new(analyzer) else {
+        let Some(resolver) = CSharpQueryResolver::try_new(analyzer) else {
             return GraphUsageOutcome::fallback_safe(
                 target.fq_name(),
                 GraphFailureReason::MissingAnalyzerCapability(
@@ -79,7 +79,7 @@ impl CSharpUsageGraphStrategy {
             );
         };
 
-        resolver.find_usages(analyzer, target, candidate_files, max_usages)
+        resolver.find_usages(analyzer, overloads, candidate_files, max_usages)
     }
 }
 

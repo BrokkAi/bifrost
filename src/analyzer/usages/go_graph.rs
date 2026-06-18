@@ -4,22 +4,24 @@ mod inverted;
 mod reference;
 mod resolver;
 
-use crate::analyzer::GoAnalyzer;
 use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::go_graph::extractor::scan_files_for_target;
 pub(in crate::analyzer::usages) use crate::analyzer::usages::go_graph::resolver::{
-    GoProjectGraph, build_workspace_go_graph, default_go_import_local_name, extract_go_import_path,
-    preparse_go_files, resolve_go_analyzer,
+    GoProjectGraph, build_workspace_go_graph, preparse_go_files,
 };
 use crate::analyzer::usages::go_graph::resolver::{TargetSpec, build_go_graph};
 use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::usages::traits::UsageAnalyzer;
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
+use crate::analyzer::usages::traits::{UsageAnalyzer, UsageEdgeResolver, UsageQueryResolver};
+use crate::analyzer::{CodeUnit, GoAnalyzer, IAnalyzer, Language, ProjectFile, resolve_analyzer};
 use crate::hash::HashSet;
 pub(in crate::analyzer::usages) use reference::resolve_go_reference;
 use std::collections::BTreeSet;
+
+pub(in crate::analyzer::usages) use resolver::{
+    default_go_import_local_name, extract_go_import_path,
+};
 
 /// Build the whole Go `caller -> callee` edge set in a single inverted pass over
 /// the workspace (see [`inverted`]). Returns `None` when the analyzer exposes no
@@ -34,21 +36,76 @@ pub(crate) fn build_go_usage_edges<F>(
 where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
-    let go = resolve_go_analyzer(analyzer)?;
-    let files: Vec<ProjectFile> = analyzer
-        .project()
-        .analyzable_files(Language::Go)
-        .ok()?
-        .into_iter()
-        .collect();
-    if files.is_empty() {
-        return None;
+    let resolver = GoEdgeResolver::try_new(analyzer)?;
+    Some(resolver.build_edges(analyzer, nodes, keep_file))
+}
+
+pub(crate) struct GoQueryResolver<'a> {
+    go: &'a GoAnalyzer,
+}
+
+impl<'a> UsageQueryResolver<'a> for GoQueryResolver<'a> {
+    fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
+        Some(Self {
+            go: resolve_analyzer::<GoAnalyzer>(analyzer)?,
+        })
     }
-    let cache = preparse_go_files(&files);
-    let graph = build_workspace_go_graph(go, &files, Some(&cache))?;
-    Some(inverted::build_go_edges(
-        analyzer, go, &graph, nodes, keep_file,
-    ))
+
+    fn find_usages(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        overloads: &[CodeUnit],
+        candidate_files: &HashSet<ProjectFile>,
+        max_usages: usize,
+    ) -> GraphUsageOutcome {
+        let Some(target) = overloads.first() else {
+            return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
+        };
+        let graph = build_go_graph(self.go, candidate_files, target.source(), None);
+        resolve_with_graph(
+            analyzer,
+            self.go,
+            &graph,
+            overloads,
+            candidate_files,
+            max_usages,
+        )
+    }
+}
+
+pub(crate) struct GoEdgeResolver<'a> {
+    go: &'a GoAnalyzer,
+    graph: GoProjectGraph,
+}
+
+impl<'a> UsageEdgeResolver<'a> for GoEdgeResolver<'a> {
+    fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
+        let go = resolve_analyzer::<GoAnalyzer>(analyzer)?;
+        let files: Vec<ProjectFile> = analyzer
+            .project()
+            .analyzable_files(Language::Go)
+            .ok()?
+            .into_iter()
+            .collect();
+        if files.is_empty() {
+            return None;
+        }
+        let cache = preparse_go_files(&files);
+        let graph = build_workspace_go_graph(go, &files, Some(&cache))?;
+        Some(Self { go, graph })
+    }
+
+    fn build_edges<F>(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        nodes: &HashSet<String>,
+        keep_file: F,
+    ) -> UsageEdges
+    where
+        F: Fn(&ProjectFile) -> bool + Sync,
+    {
+        inverted::build_go_edges(analyzer, self.go, &self.graph, nodes, keep_file)
+    }
 }
 
 #[derive(Default)]
@@ -85,7 +142,7 @@ impl GoUsageGraphStrategy {
             );
         }
 
-        let Some(go) = resolve_go_analyzer(analyzer) else {
+        let Some(resolver) = GoQueryResolver::try_new(analyzer) else {
             return GraphUsageOutcome::fallback_safe(
                 target.fq_name(),
                 GraphFailureReason::MissingAnalyzerCapability(
@@ -95,8 +152,7 @@ impl GoUsageGraphStrategy {
             );
         };
 
-        let graph = build_go_graph(go, candidate_files, target.source(), None);
-        resolve_with_graph(analyzer, go, &graph, overloads, candidate_files, max_usages)
+        resolver.find_usages(analyzer, overloads, candidate_files, max_usages)
     }
 }
 

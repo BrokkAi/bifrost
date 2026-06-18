@@ -10,7 +10,7 @@ use crate::analyzer::usages::cpp_graph::shared::{CppEdgeResolver, CppQueryResolv
 use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::usages::traits::UsageAnalyzer;
+use crate::analyzer::usages::traits::{UsageAnalyzer, UsageEdgeResolver, UsageQueryResolver};
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::HashSet;
 
@@ -18,7 +18,7 @@ pub(in crate::analyzer::usages) use resolver::{
     TargetKind as CppTargetKind, VisibilityIndex as CppVisibilityIndex, cpp_name_for,
     extract_variable_name, first_type_child as cpp_first_type_child,
     is_declaration_name as cpp_is_declaration_name, is_declarator_node as cpp_is_declarator_node,
-    normalize_type_text as normalize_cpp_type_text, resolve_cpp_analyzer,
+    normalize_type_text as normalize_cpp_type_text,
 };
 
 pub(crate) fn build_cpp_usage_edges<F>(
@@ -29,7 +29,7 @@ pub(crate) fn build_cpp_usage_edges<F>(
 where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
-    let resolver = CppEdgeResolver::new(analyzer, &keep_file)?;
+    let resolver = CppEdgeResolver::try_new(analyzer)?;
     Some(resolver.build_edges(analyzer, nodes, keep_file))
 }
 
@@ -113,7 +113,7 @@ impl CppUsageGraphStrategy {
             );
         }
 
-        let Some(resolver) = CppQueryResolver::new(analyzer) else {
+        let Some(resolver) = CppQueryResolver::try_new(analyzer) else {
             return GraphUsageOutcome::fallback_safe(
                 target.fq_name(),
                 GraphFailureReason::MissingAnalyzerCapability(
@@ -123,7 +123,7 @@ impl CppUsageGraphStrategy {
             );
         };
 
-        resolver.find_usages(analyzer, target, candidate_files, max_usages)
+        resolver.find_usages(analyzer, overloads, candidate_files, max_usages)
     }
 }
 

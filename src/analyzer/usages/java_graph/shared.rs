@@ -1,12 +1,13 @@
 use super::extractor::{ScanState, scan_file};
 use super::inverted;
 use super::jvm_scala::scan_scala_files_for_java_type;
-use super::resolver::{TargetSpec, resolve_java_analyzer};
+use super::resolver::TargetSpec;
 use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::{CodeUnit, IAnalyzer, JavaAnalyzer, Language, ProjectFile};
+use crate::analyzer::usages::traits::{UsageEdgeResolver, UsageQueryResolver};
+use crate::analyzer::{CodeUnit, IAnalyzer, JavaAnalyzer, Language, ProjectFile, resolve_analyzer};
 use crate::hash::HashSet;
 use std::collections::BTreeSet;
 
@@ -14,20 +15,23 @@ pub(crate) struct JavaQueryResolver<'a> {
     java: &'a JavaAnalyzer,
 }
 
-impl<'a> JavaQueryResolver<'a> {
-    pub(crate) fn new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
+impl<'a> UsageQueryResolver<'a> for JavaQueryResolver<'a> {
+    fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
         Some(Self {
-            java: resolve_java_analyzer(analyzer)?,
+            java: resolve_analyzer::<JavaAnalyzer>(analyzer)?,
         })
     }
 
-    pub(crate) fn find_usages(
+    fn find_usages(
         &self,
         analyzer: &dyn IAnalyzer,
-        target: &CodeUnit,
+        overloads: &[CodeUnit],
         candidate_files: &HashSet<ProjectFile>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
+        let Some(target) = overloads.first() else {
+            return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
+        };
         let Some(spec) = TargetSpec::from_target(self.java, target) else {
             return GraphUsageOutcome::fallback_safe(
                 target.fq_name(),
@@ -94,9 +98,9 @@ pub(crate) struct JavaEdgeResolver<'a> {
     files: Vec<ProjectFile>,
 }
 
-impl<'a> JavaEdgeResolver<'a> {
-    pub(crate) fn new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
-        let java = resolve_java_analyzer(analyzer)?;
+impl<'a> UsageEdgeResolver<'a> for JavaEdgeResolver<'a> {
+    fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
+        let java = resolve_analyzer::<JavaAnalyzer>(analyzer)?;
         let files: Vec<ProjectFile> = analyzer
             .project()
             .analyzable_files(Language::Java)
@@ -106,7 +110,7 @@ impl<'a> JavaEdgeResolver<'a> {
         Some(Self { java, files })
     }
 
-    pub(crate) fn build_edges<F>(
+    fn build_edges<F>(
         &self,
         analyzer: &dyn IAnalyzer,
         nodes: &HashSet<String>,

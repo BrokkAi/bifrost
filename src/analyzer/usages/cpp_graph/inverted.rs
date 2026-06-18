@@ -26,7 +26,6 @@ use super::resolver::{
     VisibilityIndex, extract_variable_name, first_type_child, is_declaration_name,
     is_declarator_node, normalize_type_text,
 };
-use super::shared::CppEdgeGraph;
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, first_precise, parse_and_collect,
 };
@@ -41,7 +40,8 @@ use tree_sitter::Node;
 /// the resolver-owned file set. `nodes`/`keep_file` mirror the Go builder.
 pub(super) fn build_cpp_edges<F>(
     analyzer: &dyn IAnalyzer,
-    graph: &CppEdgeGraph,
+    files: &[ProjectFile],
+    visibility: &VisibilityIndex,
     nodes: &HashSet<String>,
     keep_file: F,
 ) -> UsageEdges
@@ -49,10 +49,10 @@ where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     let language = tree_sitter_cpp::LANGUAGE.into();
-    build_edges(&graph.files, keep_file, |file| {
+    build_edges(files, keep_file, |file| {
         parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
             let mut ctx = CppScan {
-                visibility: &graph.visibility,
+                visibility,
                 file,
                 source: parsed.source.as_str(),
                 class_ranges: ClassRangeIndex::build(analyzer, file),

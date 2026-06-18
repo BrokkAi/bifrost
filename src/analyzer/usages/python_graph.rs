@@ -9,8 +9,10 @@ use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::python_graph::extractor::{build_python_graph, scan_files_for_seeds};
 use crate::analyzer::usages::python_graph::resolver::infer_export_names;
-use crate::analyzer::usages::traits::UsageAnalyzer;
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
+use crate::analyzer::usages::traits::{UsageAnalyzer, UsageEdgeResolver, UsageQueryResolver};
+use crate::analyzer::{
+    CodeUnit, IAnalyzer, Language, ProjectFile, PythonAnalyzer, resolve_analyzer,
+};
 use crate::hash::HashSet;
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -20,7 +22,7 @@ pub(in crate::analyzer::usages) use extractor::{
     collect_assigned_identifiers, collect_scope_facts, enclosing_scope_facts,
     is_declaration_identifier, slice as python_slice,
 };
-pub(in crate::analyzer::usages) use resolver::{resolve_python_analyzer, resolve_receiver_type};
+pub(in crate::analyzer::usages) use resolver::resolve_receiver_type;
 
 /// Build the whole Python `caller -> callee` edge set in a single inverted pass
 /// over the workspace (see [`inverted`]). Returns `None` when there are no Python
@@ -33,11 +35,8 @@ pub(crate) fn build_python_usage_edges<F>(
 where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
-    let py = resolve_python_analyzer(analyzer)?;
-    let graph = build_python_workspace_graph(analyzer)?;
-    Some(inverted::build_python_edges(
-        analyzer, py, &graph, nodes, keep_file,
-    ))
+    let resolver = PythonEdgeResolver::try_new(analyzer)?;
+    Some(resolver.build_edges(analyzer, nodes, keep_file))
 }
 
 /// Build the Python project graph once over the whole workspace so a bulk caller
@@ -45,10 +44,10 @@ where
 /// rebuilding it (re-parsing the candidate closure) for each symbol. Module
 /// resolution is index-backed, so the one-time full build stays linear. `None`
 /// when there are no Python files.
-pub(crate) fn build_python_workspace_graph(
+fn build_python_workspace_graph(
+    py: &PythonAnalyzer,
     analyzer: &dyn IAnalyzer,
 ) -> Option<Arc<PythonProjectGraph>> {
-    let py = resolve_python_analyzer(analyzer)?;
     let files: HashSet<ProjectFile> = analyzer
         .project()
         .analyzable_files(Language::Python)
@@ -59,47 +58,28 @@ pub(crate) fn build_python_workspace_graph(
     Some(Arc::new(build_python_graph(py, &files, &target)))
 }
 
-#[derive(Default)]
-pub struct PythonExportUsageGraphStrategy;
+pub(crate) struct PythonQueryResolver<'a> {
+    py: &'a PythonAnalyzer,
+}
 
-impl PythonExportUsageGraphStrategy {
-    pub fn new() -> Self {
-        Self
+impl<'a> UsageQueryResolver<'a> for PythonQueryResolver<'a> {
+    fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
+        Some(Self {
+            py: resolve_analyzer::<PythonAnalyzer>(analyzer)?,
+        })
     }
 
-    pub fn can_handle(target: &CodeUnit) -> bool {
-        language_for_target(target) == Language::Python
-    }
-
-    pub(crate) fn find_graph_usages(
+    fn find_usages(
         &self,
         analyzer: &dyn IAnalyzer,
         overloads: &[CodeUnit],
         candidate_files: &HashSet<ProjectFile>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
-        if overloads.is_empty() {
+        let Some(target) = overloads.first() else {
             return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
-        }
-
-        let target = &overloads[0];
-        if language_for_target(target) != Language::Python {
-            return GraphUsageOutcome::fallback_safe(
-                target.fq_name(),
-                GraphFailureReason::UnsupportedTargetLanguage("target is not Python"),
-                "PythonExportUsageGraphStrategy",
-            );
-        }
-
-        let Some(py) = resolve_python_analyzer(analyzer) else {
-            return GraphUsageOutcome::fallback_safe(
-                target.fq_name(),
-                GraphFailureReason::MissingAnalyzerCapability(
-                    "analyzer does not expose PythonAnalyzer",
-                ),
-                "PythonExportUsageGraphStrategy",
-            );
         };
+        let py = self.py;
 
         let graph = build_python_graph(py, candidate_files, target.source());
         let seed_names = infer_export_names(py, target);
@@ -140,6 +120,77 @@ impl PythonExportUsageGraphStrategy {
         }
 
         GraphUsageOutcome::Resolved(FuzzyResult::success(target.clone(), hits))
+    }
+}
+
+pub(crate) struct PythonEdgeResolver<'a> {
+    py: &'a PythonAnalyzer,
+    graph: Arc<PythonProjectGraph>,
+}
+
+impl<'a> UsageEdgeResolver<'a> for PythonEdgeResolver<'a> {
+    fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
+        let py = resolve_analyzer::<PythonAnalyzer>(analyzer)?;
+        let graph = build_python_workspace_graph(py, analyzer)?;
+        Some(Self { py, graph })
+    }
+
+    fn build_edges<F>(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        nodes: &HashSet<String>,
+        keep_file: F,
+    ) -> UsageEdges
+    where
+        F: Fn(&ProjectFile) -> bool + Sync,
+    {
+        inverted::build_python_edges(analyzer, self.py, &self.graph, nodes, keep_file)
+    }
+}
+
+#[derive(Default)]
+pub struct PythonExportUsageGraphStrategy;
+
+impl PythonExportUsageGraphStrategy {
+    pub fn new() -> Self {
+        Self
+    }
+
+    pub fn can_handle(target: &CodeUnit) -> bool {
+        language_for_target(target) == Language::Python
+    }
+
+    pub(crate) fn find_graph_usages(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        overloads: &[CodeUnit],
+        candidate_files: &HashSet<ProjectFile>,
+        max_usages: usize,
+    ) -> GraphUsageOutcome {
+        if overloads.is_empty() {
+            return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
+        }
+
+        let target = &overloads[0];
+        if language_for_target(target) != Language::Python {
+            return GraphUsageOutcome::fallback_safe(
+                target.fq_name(),
+                GraphFailureReason::UnsupportedTargetLanguage("target is not Python"),
+                "PythonExportUsageGraphStrategy",
+            );
+        }
+
+        let Some(resolver) = PythonQueryResolver::try_new(analyzer) else {
+            return GraphUsageOutcome::fallback_safe(
+                target.fq_name(),
+                GraphFailureReason::MissingAnalyzerCapability(
+                    "analyzer does not expose PythonAnalyzer",
+                ),
+                "PythonExportUsageGraphStrategy",
+            );
+        };
+
+        resolver.find_usages(analyzer, overloads, candidate_files, max_usages)
     }
 }
 

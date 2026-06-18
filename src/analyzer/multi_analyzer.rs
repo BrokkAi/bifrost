@@ -9,7 +9,21 @@ use crate::analyzer::{
 };
 use crate::hash::HashSet;
 use rayon::prelude::*;
+use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
+
+/// Resolve a concrete analyzer of type `T` out of a `&dyn IAnalyzer`, whether it is
+/// that analyzer directly or a [`MultiAnalyzer`] holding it as a per-language delegate.
+pub(crate) fn resolve_analyzer<T: Any>(analyzer: &dyn IAnalyzer) -> Option<&T> {
+    if let Some(direct) = (analyzer as &dyn Any).downcast_ref::<T>() {
+        return Some(direct);
+    }
+    let multi = (analyzer as &dyn Any).downcast_ref::<MultiAnalyzer>()?;
+    multi
+        .delegates()
+        .values()
+        .find_map(|delegate| (delegate.analyzer() as &dyn Any).downcast_ref::<T>())
+}
 
 #[derive(Clone)]
 pub enum AnalyzerDelegate {

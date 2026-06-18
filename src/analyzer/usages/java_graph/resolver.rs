@@ -1,9 +1,7 @@
 use crate::analyzer::usages::java_graph::extractor::ScanCtx;
 use crate::analyzer::usages::java_graph::hits::enclosing_context;
 use crate::analyzer::usages::local_inference::LocalInferenceEngine;
-use crate::analyzer::{
-    AnalyzerDelegate, CodeUnit, IAnalyzer, JavaAnalyzer, Language, MultiAnalyzer, ProjectFile,
-};
+use crate::analyzer::{CodeUnit, IAnalyzer, JavaAnalyzer, ProjectFile};
 use crate::hash::HashSet;
 use tree_sitter::Node;
 
@@ -56,20 +54,6 @@ impl TargetSpec {
                 .then(|| signature_arity(target.signature())),
             owner,
         })
-    }
-}
-
-pub(in crate::analyzer::usages) fn resolve_java_analyzer(
-    analyzer: &dyn IAnalyzer,
-) -> Option<&JavaAnalyzer> {
-    if let Some(java) = (analyzer as &dyn std::any::Any).downcast_ref::<JavaAnalyzer>() {
-        return Some(java);
-    }
-
-    let multi = (analyzer as &dyn std::any::Any).downcast_ref::<MultiAnalyzer>()?;
-    match multi.delegates().get(&Language::Java) {
-        Some(AnalyzerDelegate::Java(java)) => Some(java),
-        _ => None,
     }
 }
 

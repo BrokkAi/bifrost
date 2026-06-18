@@ -722,7 +722,8 @@ fn rust_candidate_needs_precise_member_scan(
     if !(candidate.is_function() || candidate.is_field()) {
         return false;
     }
-    let Some(rust) = crate::analyzer::usages::rust_graph::resolve_rust_analyzer(analyzer) else {
+    let Some(rust) = crate::analyzer::resolve_analyzer::<crate::analyzer::RustAnalyzer>(analyzer)
+    else {
         return false;
     };
     rust.parent_of(candidate).is_some()
@@ -739,7 +740,8 @@ fn analyze_rust_candidates_with_usage_graph(
         return Vec::new();
     }
 
-    let Some(rust) = crate::analyzer::usages::rust_graph::resolve_rust_analyzer(analyzer) else {
+    let Some(rust) = crate::analyzer::resolve_analyzer::<crate::analyzer::RustAnalyzer>(analyzer)
+    else {
         for candidate in candidates {
             skipped.push(format!(
                 "`{}`: Rust analyzer capability was unavailable; evidence is inconclusive",

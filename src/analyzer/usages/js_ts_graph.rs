@@ -42,7 +42,7 @@ use crate::analyzer::usages::js_ts_graph::resolver::{
 };
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::usages::traits::UsageAnalyzer;
+use crate::analyzer::usages::traits::{UsageAnalyzer, UsageEdgeResolver, UsageQueryResolver};
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::HashSet;
 use std::collections::BTreeSet;
@@ -62,35 +62,124 @@ pub(crate) fn build_jsts_usage_edges<F>(
     keep_file: F,
 ) -> Option<UsageEdges>
 where
-    F: Fn(&ProjectFile) -> bool + Sync + Copy,
+    F: Fn(&ProjectFile) -> bool + Sync,
 {
-    let mut edges: std::collections::BTreeMap<(String, String), usize> =
-        std::collections::BTreeMap::new();
-    let mut truncated: std::collections::BTreeMap<String, usize> =
-        std::collections::BTreeMap::new();
-    let mut any = false;
+    let resolver = JsTsEdgeResolver::try_new(analyzer)?;
+    Some(resolver.build_edges(analyzer, nodes, keep_file))
+}
 
-    for language in [Language::TypeScript, Language::JavaScript] {
-        let has_files = analyzer
-            .project()
-            .analyzable_files(language)
-            .map(|set| set.into_iter().next().is_some())
-            .unwrap_or(false);
-        if !has_files {
-            continue;
-        }
-        any = true;
-        let graph = build_js_ts_graph(analyzer, language);
-        let result = inverted::build_jsts_edges(analyzer, &graph, nodes, keep_file);
-        for (key, weight) in result.edges {
-            *edges.entry(key).or_insert(0) += weight;
-        }
-        for (callee, total) in result.truncated {
-            *truncated.entry(callee).or_insert(0) += total;
-        }
+/// JS/TS resolves usages off the project file set rather than a single concrete
+/// analyzer — it spans the TypeScript and JavaScript analyzers — so these resolvers
+/// hold no borrowed analyzer in this form.
+pub(crate) struct JsTsQueryResolver;
+
+impl<'a> UsageQueryResolver<'a> for JsTsQueryResolver {
+    fn try_new(_analyzer: &'a dyn IAnalyzer) -> Option<Self> {
+        Some(Self)
     }
 
-    any.then_some(UsageEdges { edges, truncated })
+    fn find_usages(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        overloads: &[CodeUnit],
+        candidate_files: &HashSet<ProjectFile>,
+        max_usages: usize,
+    ) -> GraphUsageOutcome {
+        let Some(target) = overloads.first() else {
+            return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
+        };
+        let language = target_language(target);
+        if language == Language::None {
+            return GraphUsageOutcome::fallback_safe(
+                target.fq_name(),
+                GraphFailureReason::UnsupportedTargetLanguage("target is not JS/TS"),
+                "JsTsExportUsageGraphStrategy",
+            );
+        }
+
+        let graph = build_js_ts_graph(analyzer, language);
+        let seeds = graph.seeds_for_target(target.source(), top_level_identifier(target));
+        if seeds.is_empty() {
+            return GraphUsageOutcome::fallback_safe(
+                target.fq_name(),
+                GraphFailureReason::NoGraphSeed("no export seed resolved"),
+                "JsTsExportUsageGraphStrategy",
+            );
+        }
+
+        let importers = graph.importers_of_seeds(&seeds);
+        let scan_files: HashSet<ProjectFile> =
+            candidate_files.iter().cloned().chain(importers).collect();
+
+        let hits = scan_files_for_seeds(analyzer, &graph, &scan_files, target, &seeds, language);
+        let hits: BTreeSet<UsageHit> = hits
+            .into_iter()
+            .filter(|hit| &hit.enclosing != target)
+            .collect();
+
+        if hits.len() > max_usages {
+            return GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites {
+                short_name: target.short_name().to_string(),
+                total_callsites: hits.len(),
+                limit: max_usages,
+            });
+        }
+
+        GraphUsageOutcome::Resolved(FuzzyResult::success(target.clone(), hits))
+    }
+}
+
+pub(crate) struct JsTsEdgeResolver;
+
+impl<'a> UsageEdgeResolver<'a> for JsTsEdgeResolver {
+    fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
+        let has_jsts = [Language::TypeScript, Language::JavaScript]
+            .iter()
+            .any(|language| {
+                analyzer
+                    .project()
+                    .analyzable_files(*language)
+                    .map(|set| set.into_iter().next().is_some())
+                    .unwrap_or(false)
+            });
+        has_jsts.then_some(Self)
+    }
+
+    fn build_edges<F>(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        nodes: &HashSet<String>,
+        keep_file: F,
+    ) -> UsageEdges
+    where
+        F: Fn(&ProjectFile) -> bool + Sync,
+    {
+        let mut edges: std::collections::BTreeMap<(String, String), usize> =
+            std::collections::BTreeMap::new();
+        let mut truncated: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+
+        for language in [Language::TypeScript, Language::JavaScript] {
+            let has_files = analyzer
+                .project()
+                .analyzable_files(language)
+                .map(|set| set.into_iter().next().is_some())
+                .unwrap_or(false);
+            if !has_files {
+                continue;
+            }
+            let graph = build_js_ts_graph(analyzer, language);
+            let result = inverted::build_jsts_edges(analyzer, &graph, nodes, &keep_file);
+            for (key, weight) in result.edges {
+                *edges.entry(key).or_insert(0) += weight;
+            }
+            for (callee, total) in result.truncated {
+                *truncated.entry(callee).or_insert(0) += total;
+            }
+        }
+
+        UsageEdges { edges, truncated }
+    }
 }
 
 /// Build the whole JS/TS `caller -> callee` edge set using file-scoped node
@@ -177,49 +266,17 @@ impl JsTsExportUsageGraphStrategy {
         candidate_files: &HashSet<ProjectFile>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
-        if overloads.is_empty() {
-            return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
-        }
-
-        let target = &overloads[0];
-        let language = target_language(target);
-        if language == Language::None {
+        let Some(resolver) = JsTsQueryResolver::try_new(analyzer) else {
+            let fq_name = overloads.first().map(CodeUnit::fq_name).unwrap_or_default();
             return GraphUsageOutcome::fallback_safe(
-                target.fq_name(),
-                GraphFailureReason::UnsupportedTargetLanguage("target is not JS/TS"),
+                fq_name,
+                GraphFailureReason::MissingAnalyzerCapability(
+                    "analyzer does not expose a JS/TS analyzer",
+                ),
                 "JsTsExportUsageGraphStrategy",
             );
-        }
-
-        let graph = build_js_ts_graph(analyzer, language);
-        let seeds = graph.seeds_for_target(target.source(), top_level_identifier(target));
-        if seeds.is_empty() {
-            return GraphUsageOutcome::fallback_safe(
-                target.fq_name(),
-                GraphFailureReason::NoGraphSeed("no export seed resolved"),
-                "JsTsExportUsageGraphStrategy",
-            );
-        }
-
-        let importers = graph.importers_of_seeds(&seeds);
-        let scan_files: HashSet<ProjectFile> =
-            candidate_files.iter().cloned().chain(importers).collect();
-
-        let hits = scan_files_for_seeds(analyzer, &graph, &scan_files, target, &seeds, language);
-        let hits: BTreeSet<UsageHit> = hits
-            .into_iter()
-            .filter(|hit| &hit.enclosing != target)
-            .collect();
-
-        if hits.len() > max_usages {
-            return GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites {
-                short_name: target.short_name().to_string(),
-                total_callsites: hits.len(),
-                limit: max_usages,
-            });
-        }
-
-        GraphUsageOutcome::Resolved(FuzzyResult::success(target.clone(), hits))
+        };
+        resolver.find_usages(analyzer, overloads, candidate_files, max_usages)
     }
 }
 
