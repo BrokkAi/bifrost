@@ -257,5 +257,5 @@ summary_targets = ["Dapper/SqlMapper.cs"]
 seed_file_paths = ["Dapper/SqlMapper.cs"]
 usage_symbols = ["Dapper.SqlMapper$CacheInfo"]
 definition_queries = [
-  { path = "Dapper/SqlMapper.cs", line = 1862, column = 28, symbol = "CacheInfo", expected_status = "unsupported_language" },
+  { path = "Dapper/SqlMapper.cs", line = 1862, column = 28, symbol = "CacheInfo", expected_status = "resolved", expected_fqn = "Dapper.SqlMapper$CacheInfo" },
 ]

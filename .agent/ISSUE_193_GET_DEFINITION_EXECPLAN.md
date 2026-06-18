@@ -54,6 +54,11 @@ This work adds a `get_definition` searchtools/MCP tool for that on-demand lookup
 - [x] (2026-06-18T21:27Z) Ran the requested guided review checkpoint over the uncommitted Python slice with parallel reviewer agents. Review findings were fixed by preserving the original focus token range for AST classification, preventing object-side attribute clicks from resolving to the member, resolving plain dotted imports such as `import pkg.util`, disabling broad workspace fallback for typed receiver annotations, and checking ancestor methods for typed receiver calls.
 - [x] (2026-06-18T21:34Z) Added Python regression tests for object-side namespace lookups, plain dotted imports, inherited receiver methods, unimported receiver annotations, named imports, namespace imports, typed receivers, external imports, and local values.
 - [x] (2026-06-18T21:38Z) Re-ran `cargo test --test get_definition_test`, `cargo test --test bifrost_benchmark_run`, `cargo run --bin bifrost_benchmark -- validate --manifest benchmark/targets.toml`, `cargo run --bin bifrost_benchmark -- run --manifest benchmark/targets.toml --repo click-py --max-files 80`, `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`; all passed.
+- [x] (2026-06-18T09:05Z) Added C# `get_definition` support for visible type references, typed receiver methods, `this`/`base` members, same-owner unqualified member calls, ambiguous visible type candidates, local-shadow `no_definition`, and alias/static/namespace using boundary diagnostics.
+- [x] (2026-06-18T09:05Z) Updated the Dapper benchmark probe from `unsupported_language` to a resolved `Dapper.SqlMapper$CacheInfo` nested type reference and documented the manual result in `benchmark/get_definition_observations.md`.
+- [x] (2026-06-18T09:05Z) Ran the requested guided review checkpoint over the uncommitted C# slice with parallel reviewer agents. Review findings were fixed by adding scoped local-binding inference for on-demand lookup, preventing delegate parameters and local functions from resolving as class methods, reporting alias/static external usings as `unresolvable_import_boundary`, and preserving ambiguous visible type candidates instead of collapsing them to `no_definition`.
+- [x] (2026-06-18T09:05Z) Added C# regression tests for imported types, typed receivers, `this` members, external namespace/alias/static usings, ambiguous type imports, delegate/local-function shadows, and local values.
+- [x] (2026-06-18T09:05Z) Re-ran `cargo test --test get_definition_test`, `cargo run --bin bifrost_benchmark -- validate --manifest benchmark/targets.toml`, `cargo run --bin bifrost_benchmark -- run --manifest benchmark/targets.toml --repo dapper-csharp --max-files 80`, `cargo test --test bifrost_benchmark_run`, `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`; all passed.
 
 ## Surprises & Discoveries
 
@@ -117,6 +122,18 @@ This work adds a `get_definition` searchtools/MCP tool for that on-demand lookup
 - Observation: Click's `Command.main` is not a good benchmark smoke target for a unique resolved FQN because overload declarations and the implementation all share the same FQN.
   Evidence: direct `get_definition` against `self.main` returned `ambiguous` with three `click.core.Command.main` candidates; the benchmark uses `_complete_visible_commands` instead and documents overload disambiguation as follow-up.
 
+- Observation: Dapper's `CacheInfo` benchmark reference resolves across partial class files.
+  Evidence: the checked-in benchmark probe at `Dapper/SqlMapper.cs:1862:28` returns `Dapper.SqlMapper$CacheInfo` with the definition in `Dapper/SqlMapper.CacheInfo.cs:10..18`.
+
+- Observation: C# unqualified invocation lookup must account for local value and local-function shadows before falling back to the enclosing class.
+  Evidence: guided review found that delegate parameters and local functions named `Run` could otherwise make `Run()` falsely resolve to `App.Run`; `csharp_delegate_parameter_shadow_returns_no_definition` and `csharp_local_function_shadow_returns_no_definition` now cover those cases.
+
+- Observation: `CSharpAnalyzer::resolve_visible_type` intentionally hides ambiguous visible type candidates, which is not sufficient for `get_definition`.
+  Evidence: guided review found `using A; using B; Service service;` would return `no_definition`; `get_definition` now uses `visible_type_candidates` and `csharp_ambiguous_using_type_returns_ambiguous` locks down the `ambiguous` status.
+
+- Observation: C# alias and static usings need explicit boundary handling.
+  Evidence: guided review found `using Svc = External.Service;` and `using static External.Helpers;` could fall through to `no_definition`; the resolver now reports `unresolvable_import_boundary` for those external import forms.
+
 ## Decision Log
 
 - Decision: Treat unresolved dependency/library/module boundaries as a first-class terminal state, separate from `no_definition`.
@@ -145,6 +162,10 @@ This work adds a `get_definition` searchtools/MCP tool for that on-demand lookup
 
 - Decision: Land Python after PHP with conservative support for import-bound, same-file, and typed-receiver reference forms.
   Rationale: Python's analyzer already exposes import binders, module declarations, scope facts, and hierarchy providers. The on-demand path can reuse those pieces for common editor lookups while keeping unresolved packages and local shadowing distinct from indexed definitions.
+  Date/Author: 2026-06-18 / Codex
+
+- Decision: Land C# after Python with conservative support for analyzer-visible types and the member forms already supported by the C# usage graph.
+  Rationale: C# has mature indexed declarations, visible-type resolution, local binding inference, and type hierarchy support. The on-demand path can now resolve common workspace C# references while keeping overload/signature-sensitive member disambiguation as a documented follow-up.
   Date/Author: 2026-06-18 / Codex
 
 ## Outcomes & Retrospective

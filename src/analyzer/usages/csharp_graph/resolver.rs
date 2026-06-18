@@ -52,7 +52,9 @@ impl TargetSpec {
     }
 }
 
-pub(super) fn resolve_csharp_analyzer(analyzer: &dyn IAnalyzer) -> Option<&CSharpAnalyzer> {
+pub(in crate::analyzer::usages) fn resolve_csharp_analyzer(
+    analyzer: &dyn IAnalyzer,
+) -> Option<&CSharpAnalyzer> {
     if let Some(csharp) = (analyzer as &dyn std::any::Any).downcast_ref::<CSharpAnalyzer>() {
         return Some(csharp);
     }
@@ -79,7 +81,7 @@ fn signature_arity(signature: Option<&str>) -> usize {
     count_top_level_comma_separated(inner)
 }
 
-pub(super) fn seed_bindings_before(
+pub(in crate::analyzer::usages) fn seed_bindings_before(
     node: Node<'_>,
     cutoff_start: usize,
     csharp: &CSharpAnalyzer,
@@ -243,7 +245,7 @@ pub(super) fn normalize_type_text(reference: &str) -> String {
         .to_string()
 }
 
-pub(super) fn reference_type_text(node: Node<'_>, source: &str) -> String {
+pub(in crate::analyzer::usages) fn reference_type_text(node: Node<'_>, source: &str) -> String {
     let mut current = node;
     while let Some(parent) = current.parent() {
         if matches!(
@@ -258,7 +260,7 @@ pub(super) fn reference_type_text(node: Node<'_>, source: &str) -> String {
     normalize_type_text(node_text(current, source))
 }
 
-pub(super) fn binding_scope_node(mut node: Node<'_>) -> Node<'_> {
+pub(in crate::analyzer::usages) fn binding_scope_node(mut node: Node<'_>) -> Node<'_> {
     while let Some(parent) = node.parent() {
         if matches!(
             parent.kind(),
@@ -290,7 +292,7 @@ pub(super) fn receiver_targets_owner(
     }
 }
 
-pub(super) fn is_type_reference_node(mut node: Node<'_>) -> bool {
+pub(in crate::analyzer::usages) fn is_type_reference_node(mut node: Node<'_>) -> bool {
     while let Some(parent) = node.parent() {
         if parent
             .child_by_field_name("type")
@@ -403,7 +405,7 @@ fn count_top_level_comma_separated(text: &str) -> usize {
     count
 }
 
-pub(super) fn first_type_child(node: Node<'_>) -> Option<Node<'_>> {
+pub(in crate::analyzer::usages) fn first_type_child(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor).find(|child| {
         matches!(
@@ -428,7 +430,7 @@ pub(super) fn same_node(left: Node<'_>, right: Node<'_>) -> bool {
     left.start_byte() == right.start_byte() && left.end_byte() == right.end_byte()
 }
 
-pub(super) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+pub(in crate::analyzer::usages) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     source
         .get(node.start_byte()..node.end_byte())
         .unwrap_or_default()

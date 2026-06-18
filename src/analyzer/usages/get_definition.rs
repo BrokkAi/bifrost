@@ -1,4 +1,10 @@
 use crate::analyzer::common::language_for_file;
+use crate::analyzer::usages::csharp_graph::{
+    csharp_first_type_child, csharp_is_declaration_name, csharp_is_type_reference_node,
+    csharp_node_text, csharp_reference_type_text, member_access_name as csharp_member_access_name,
+    member_access_receiver as csharp_member_access_receiver, resolve_csharp_analyzer,
+    seed_csharp_bindings_before,
+};
 use crate::analyzer::usages::inverted_edges::{ClassRangeIndex, first_precise};
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::ImportKind;
@@ -12,8 +18,8 @@ use crate::analyzer::usages::python_graph::{
     resolve_python_analyzer, resolve_receiver_type as resolve_python_receiver_type,
 };
 use crate::analyzer::{
-    AliasResolver, CodeUnit, IAnalyzer, JavaAnalyzer, Language, PhpAnalyzer, ProjectFile,
-    PythonAnalyzer, Range, parse_php_use_aliases_from_source,
+    AliasResolver, CSharpAnalyzer, CodeUnit, IAnalyzer, JavaAnalyzer, Language, PhpAnalyzer,
+    ProjectFile, PythonAnalyzer, Range, parse_php_use_aliases_from_source,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
@@ -225,7 +231,8 @@ fn resolve_one(
         Language::Java => resolve_java(analyzer, support, &request.file, &source, &site),
         Language::Php => resolve_php(analyzer, support, &request.file, &source, &site),
         Language::Python => resolve_python(analyzer, support, &request.file, &source, &site),
-        Language::Cpp | Language::Scala | Language::CSharp | Language::None => {
+        Language::CSharp => resolve_csharp(analyzer, support, &request.file, &source, &site),
+        Language::Cpp | Language::Scala | Language::None => {
             return DefinitionLookupOutcome {
                 status: DefinitionLookupStatus::UnsupportedLanguage,
                 reference: Some(site),
@@ -1428,6 +1435,431 @@ fn resolve_php(
                 node.kind()
             ),
         ),
+    }
+}
+
+fn resolve_csharp(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionSupport,
+    file: &ProjectFile,
+    source: &str,
+    site: &ResolvedReferenceSite,
+) -> DefinitionLookupOutcome {
+    let Some(csharp) = resolve_csharp_analyzer(analyzer) else {
+        return no_definition("csharp_analyzer_unavailable", "C# analyzer is unavailable");
+    };
+    let Some(tree) = parse_csharp_tree(source) else {
+        return no_definition("csharp_parse_failed", "C# source could not be parsed");
+    };
+    let Some(node) =
+        smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)
+    else {
+        return no_definition(
+            "no_indexed_definition",
+            format!(
+                "`{}` did not resolve to an indexed C# definition",
+                site.text
+            ),
+        );
+    };
+    if csharp_is_declaration_name(node) {
+        return no_definition(
+            "declaration_or_import_site",
+            format!("`{}` is not a C# reference site", site.text),
+        );
+    }
+
+    match csharp_reference_node(node) {
+        Some(CSharpReferenceNode::Type(type_node)) => {
+            let reference = csharp_reference_type_text(type_node, source);
+            csharp_type_outcome(csharp, support, file, &reference)
+        }
+        Some(CSharpReferenceNode::Member { receiver, name }) => {
+            let member = csharp_node_text(name, source);
+            if member.is_empty() {
+                return no_definition("no_member_name", "C# member reference is blank");
+            }
+            let owners = csharp_receiver_type_units(
+                analyzer,
+                csharp,
+                support,
+                file,
+                source,
+                tree.root_node(),
+                receiver,
+            );
+            csharp_member_outcome(analyzer, support, owners, member)
+        }
+        Some(CSharpReferenceNode::UnqualifiedMember(name)) => {
+            let member = csharp_node_text(name, source);
+            let bindings = csharp_bindings_before_scoped(
+                csharp,
+                file,
+                source,
+                tree.root_node(),
+                name.start_byte(),
+            );
+            if bindings.is_shadowed(member) {
+                return no_definition(
+                    "local_variable_reference",
+                    format!("`{member}` is a local C# value or local function"),
+                );
+            }
+            let owners = csharp_enclosing_class(analyzer, file, name.start_byte())
+                .into_iter()
+                .collect();
+            let outcome = csharp_member_outcome(analyzer, support, owners, member);
+            if outcome.status == DefinitionLookupStatus::NoDefinition
+                && csharp_static_using_boundary_for_member(csharp, file)
+            {
+                return boundary(format!(
+                    "`{member}` appears to cross a C# static using boundary not indexed in this workspace"
+                ));
+            }
+            outcome
+        }
+        Some(CSharpReferenceNode::Identifier(identifier)) => {
+            let text = csharp_node_text(identifier, source);
+            if text.is_empty() {
+                return no_definition("no_reference_text", "C# identifier is blank");
+            }
+            if csharp_is_type_reference_node(identifier) {
+                let reference = csharp_reference_type_text(identifier, source);
+                return csharp_type_outcome(csharp, support, file, &reference);
+            }
+            no_definition(
+                "no_indexed_definition",
+                format!("`{text}` did not resolve to an indexed C# definition"),
+            )
+        }
+        None => no_definition(
+            "unsupported_csharp_reference_shape",
+            format!(
+                "`{}` is a C# `{}` reference shape that get_definition does not resolve yet",
+                site.text,
+                node.kind()
+            ),
+        ),
+    }
+}
+
+fn parse_csharp_tree(source: &str) -> Option<Tree> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
+        .ok()?;
+    parser.parse(source, None)
+}
+
+enum CSharpReferenceNode<'tree> {
+    Type(Node<'tree>),
+    Member {
+        receiver: Node<'tree>,
+        name: Node<'tree>,
+    },
+    UnqualifiedMember(Node<'tree>),
+    Identifier(Node<'tree>),
+}
+
+fn csharp_reference_node(node: Node<'_>) -> Option<CSharpReferenceNode<'_>> {
+    let original = node;
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "member_access_expression"
+            && (csharp_member_access_name(parent) == Some(current)
+                || csharp_member_access_name(parent) == Some(original))
+        {
+            current = parent;
+        } else {
+            break;
+        }
+    }
+
+    match current.kind() {
+        "member_access_expression" => Some(CSharpReferenceNode::Member {
+            receiver: csharp_member_access_receiver(current)?,
+            name: csharp_member_access_name(current)?,
+        }),
+        "object_creation_expression" => current
+            .child_by_field_name("type")
+            .or_else(|| csharp_first_type_child(current))
+            .map(CSharpReferenceNode::Type),
+        "identifier" | "type" => {
+            if csharp_is_unqualified_invocation_target(current) {
+                return Some(CSharpReferenceNode::UnqualifiedMember(current));
+            }
+            if csharp_is_type_reference_node(current) {
+                Some(CSharpReferenceNode::Type(current))
+            } else {
+                Some(CSharpReferenceNode::Identifier(current))
+            }
+        }
+        "qualified_name" | "generic_name" | "nullable_type" | "array_type" => {
+            Some(CSharpReferenceNode::Type(current))
+        }
+        _ => None,
+    }
+}
+
+fn csharp_is_unqualified_invocation_target(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        parent.kind() == "invocation_expression"
+            && parent.child_by_field_name("function") == Some(node)
+    })
+}
+
+fn csharp_type_outcome(
+    csharp: &CSharpAnalyzer,
+    support: &DefinitionSupport,
+    file: &ProjectFile,
+    reference: &str,
+) -> DefinitionLookupOutcome {
+    let mut candidates = csharp_visible_type_candidates(csharp, file, reference);
+    if candidates.is_empty() {
+        candidates = support.fqn(reference);
+    }
+    if !candidates.is_empty() {
+        return candidates_outcome(candidates);
+    }
+    if csharp_import_boundary_for_type(csharp, file, reference) {
+        return boundary(format!(
+            "`{reference}` appears to cross a C# using boundary not indexed in this workspace"
+        ));
+    }
+    no_definition(
+        "no_indexed_definition",
+        format!("`{reference}` did not resolve to an indexed C# type"),
+    )
+}
+
+fn csharp_member_outcome(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionSupport,
+    owners: Vec<CodeUnit>,
+    member: &str,
+) -> DefinitionLookupOutcome {
+    if owners.is_empty() {
+        return no_definition(
+            "unsupported_csharp_receiver",
+            format!("receiver for C# member `{member}` is not resolved"),
+        );
+    };
+
+    let mut candidates = Vec::new();
+    for owner in &owners {
+        candidates.extend(support.fqn(&format!("{}.{}", owner.fq_name(), member)));
+        if let Some(provider) = analyzer.type_hierarchy_provider() {
+            for ancestor in provider.get_ancestors(owner) {
+                candidates.extend(support.fqn(&format!("{}.{}", ancestor.fq_name(), member)));
+            }
+        }
+    }
+    sort_units(&mut candidates);
+    candidates.dedup();
+    if candidates.is_empty() {
+        no_definition(
+            "no_indexed_definition",
+            format!("C# member `{member}` is not indexed as a definition"),
+        )
+    } else {
+        candidates_outcome(candidates)
+    }
+}
+
+fn csharp_receiver_type_units(
+    analyzer: &dyn IAnalyzer,
+    csharp: &CSharpAnalyzer,
+    support: &DefinitionSupport,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    receiver: Node<'_>,
+) -> Vec<CodeUnit> {
+    match receiver.kind() {
+        "identifier" => {
+            let name = csharp_node_text(receiver, source);
+            let bindings =
+                csharp_bindings_before_scoped(csharp, file, source, root, receiver.start_byte());
+            if let Some(fqn) = first_precise(&bindings, name) {
+                return support.fqn(&fqn);
+            }
+            if bindings.is_shadowed(name) {
+                Vec::new()
+            } else {
+                csharp_visible_type_candidates(csharp, file, name)
+            }
+        }
+        "this" => csharp_enclosing_class(analyzer, file, receiver.start_byte())
+            .into_iter()
+            .collect(),
+        "base" => csharp_enclosing_class(analyzer, file, receiver.start_byte())
+            .and_then(|owner| {
+                analyzer
+                    .type_hierarchy_provider()
+                    .and_then(|provider| provider.get_ancestors(&owner).into_iter().next())
+            })
+            .into_iter()
+            .collect(),
+        "qualified_name" | "generic_name" => {
+            csharp_visible_type_candidates(csharp, file, csharp_node_text(receiver, source))
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn csharp_visible_type_candidates(
+    csharp: &CSharpAnalyzer,
+    file: &ProjectFile,
+    name: &str,
+) -> Vec<CodeUnit> {
+    let mut candidates = csharp.visible_type_candidates(file, name);
+    sort_units(&mut candidates);
+    candidates.dedup();
+    candidates
+}
+
+fn csharp_enclosing_class(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    byte: usize,
+) -> Option<CodeUnit> {
+    let fqn = ClassRangeIndex::build(analyzer, file)
+        .enclosing(byte)?
+        .to_string();
+    analyzer.definitions(&fqn).next().cloned()
+}
+
+fn csharp_import_boundary_for_type(
+    csharp: &CSharpAnalyzer,
+    file: &ProjectFile,
+    reference: &str,
+) -> bool {
+    if csharp_alias_using_boundary_for_type(csharp, file, reference) {
+        return true;
+    }
+    let simple = reference.rsplit('.').next().unwrap_or(reference);
+    csharp
+        .using_namespaces_of(file)
+        .into_iter()
+        .any(|namespace| {
+            !csharp_workspace_namespace_exists(csharp, &namespace)
+                && (reference == simple || reference.starts_with(&format!("{namespace}.")))
+        })
+}
+
+fn csharp_workspace_namespace_exists(csharp: &CSharpAnalyzer, namespace: &str) -> bool {
+    csharp
+        .all_declarations()
+        .any(|unit| unit.package_name() == namespace)
+}
+
+fn csharp_alias_using_boundary_for_type(
+    csharp: &CSharpAnalyzer,
+    file: &ProjectFile,
+    reference: &str,
+) -> bool {
+    for raw in csharp.import_statements(file) {
+        let trimmed = raw
+            .trim()
+            .trim_start_matches("global ")
+            .trim_start_matches("using ")
+            .trim_end_matches(';')
+            .trim();
+        let Some((alias, target)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if alias.trim() == reference && !csharp_workspace_type_exists(csharp, target.trim()) {
+            return true;
+        }
+    }
+    false
+}
+
+fn csharp_static_using_boundary_for_member(csharp: &CSharpAnalyzer, file: &ProjectFile) -> bool {
+    csharp.import_statements(file).iter().any(|raw| {
+        raw.trim()
+            .trim_start_matches("global ")
+            .trim_start_matches("using ")
+            .trim_end_matches(';')
+            .trim()
+            .strip_prefix("static ")
+            .is_some_and(|target| !csharp_workspace_type_exists(csharp, target.trim()))
+    })
+}
+
+fn csharp_workspace_type_exists(csharp: &CSharpAnalyzer, reference: &str) -> bool {
+    csharp.all_declarations().any(|unit| {
+        unit.is_class()
+            && (unit.fq_name() == reference || unit.fq_name().replace('$', ".") == reference)
+    })
+}
+
+const CSHARP_SCOPE_NODES: &[&str] = &[
+    "method_declaration",
+    "constructor_declaration",
+    "destructor_declaration",
+    "operator_declaration",
+    "accessor_declaration",
+    "local_function_statement",
+    "lambda_expression",
+    "block",
+    "for_statement",
+    "for_each_statement",
+    "using_statement",
+    "catch_clause",
+];
+
+fn csharp_bindings_before_scoped(
+    csharp: &CSharpAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    cutoff_start: usize,
+) -> LocalInferenceEngine<String> {
+    let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
+    csharp_seed_active_path(root, cutoff_start, csharp, file, source, &mut bindings);
+    bindings
+}
+
+fn csharp_seed_active_path(
+    node: Node<'_>,
+    cutoff_start: usize,
+    csharp: &CSharpAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    bindings: &mut LocalInferenceEngine<String>,
+) {
+    if node.start_byte() >= cutoff_start {
+        return;
+    }
+
+    if node.kind() == "local_function_statement"
+        && let Some(name) = node.child_by_field_name("name")
+        && name.start_byte() < cutoff_start
+    {
+        bindings.declare_shadow(csharp_node_text(name, source));
+    }
+
+    let enters_scope = CSHARP_SCOPE_NODES.contains(&node.kind());
+    if enters_scope && !(node.start_byte() <= cutoff_start && cutoff_start < node.end_byte()) {
+        return;
+    }
+    if enters_scope {
+        bindings.enter_scope();
+    }
+
+    if matches!(node.kind(), "parameter" | "variable_declaration")
+        && node.end_byte() <= cutoff_start
+    {
+        seed_csharp_bindings_before(node, cutoff_start, csharp, file, source, bindings);
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.start_byte() >= cutoff_start {
+            break;
+        }
+        csharp_seed_active_path(child, cutoff_start, csharp, file, source, bindings);
     }
 }
 

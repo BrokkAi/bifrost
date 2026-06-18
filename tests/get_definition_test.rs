@@ -913,6 +913,260 @@ fn python_local_value_returns_no_definition() {
 }
 
 #[test]
+fn csharp_using_type_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Lib/Service.cs",
+            "namespace Lib { public class Service {} }\n",
+        )
+        .file(
+            "App/Controller.cs",
+            "using Lib;\nnamespace App { public class Controller { private Service service; } }\n",
+        )
+        .build();
+
+    let line = "namespace App { public class Controller { private Service service; } }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"App/Controller.cs","line":2,"column":{}}}]}}"#,
+            column_of(line, "Service")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "Lib.Service", "{value}");
+    assert_eq!(
+        result["definitions"][0]["path"], "Lib/Service.cs",
+        "{value}"
+    );
+}
+
+#[test]
+fn csharp_typed_receiver_method_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Lib/Service.cs",
+            "namespace Lib { public class Service { public void Run() {} } }\n",
+        )
+        .file(
+            "App/Controller.cs",
+            "using Lib;\nnamespace App { public class Controller { public void Handle(Service service) { service.Run(); } } }\n",
+        )
+        .build();
+
+    let line = "namespace App { public class Controller { public void Handle(Service service) { service.Run(); } } }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"App/Controller.cs","line":2,"column":{}}}]}}"#,
+            column_of(line, "Run")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Lib.Service.Run",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["path"], "Lib/Service.cs",
+        "{value}"
+    );
+}
+
+#[test]
+fn csharp_this_method_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "App/Controller.cs",
+            "namespace App { public class Controller { public void Run() {} public void Handle() { this.Run(); } } }\n",
+        )
+        .build();
+
+    let line = "namespace App { public class Controller { public void Run() {} public void Handle() { this.Run(); } } }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"App/Controller.cs","line":1,"column":{}}}]}}"#,
+            column_of(line, "Run();")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "App.Controller.Run",
+        "{value}"
+    );
+}
+
+#[test]
+fn csharp_external_using_reports_boundary() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "App/Controller.cs",
+            "using External;\nnamespace App { public class Controller { private Service service; } }\n",
+        )
+        .build();
+
+    let line = "namespace App { public class Controller { private Service service; } }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"App/Controller.cs","line":2,"column":{}}}]}}"#,
+            column_of(line, "Service")
+        ),
+    );
+
+    assert_eq!(
+        value["results"][0]["status"], "unresolvable_import_boundary",
+        "{value}"
+    );
+}
+
+#[test]
+fn csharp_local_value_returns_no_definition() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "App.cs",
+            "class App { void Run() { var value = 1; value++; } }\n",
+        )
+        .build();
+
+    let line = "class App { void Run() { var value = 1; value++; } }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"App.cs","line":1,"column":{}}}]}}"#,
+            column_of(line, "value++")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn csharp_delegate_parameter_shadow_returns_no_definition() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "App.cs",
+            "using System;\nclass App { void Run() {} void Handle(Action Run) { Run(); } }\n",
+        )
+        .build();
+
+    let line = "class App { void Run() {} void Handle(Action Run) { Run(); } }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"App.cs","line":2,"column":{}}}]}}"#,
+            column_of(line, "Run();")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn csharp_local_function_shadow_returns_no_definition() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "App.cs",
+            "class App { void Run() {} void Handle() { void Run() {} Run(); } }\n",
+        )
+        .build();
+
+    let line = "class App { void Run() {} void Handle() { void Run() {} Run(); } }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"App.cs","line":1,"column":{}}}]}}"#,
+            column_of(line, "Run();")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn csharp_ambiguous_using_type_returns_ambiguous() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("A/Service.cs", "namespace A { public class Service {} }\n")
+        .file("B/Service.cs", "namespace B { public class Service {} }\n")
+        .file(
+            "App.cs",
+            "using A;\nusing B;\nclass App { private Service service; }\n",
+        )
+        .build();
+
+    let line = "class App { private Service service; }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"App.cs","line":3,"column":{}}}]}}"#,
+            column_of(line, "Service")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "ambiguous", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"].as_array().unwrap().len(),
+        2,
+        "{value}"
+    );
+}
+
+#[test]
+fn csharp_alias_external_using_reports_boundary() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "App.cs",
+            "using Svc = External.Service;\nclass App { private Svc service; }\n",
+        )
+        .build();
+
+    let line = "class App { private Svc service; }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"App.cs","line":2,"column":{}}}]}}"#,
+            column_of(line, "Svc")
+        ),
+    );
+
+    assert_eq!(
+        value["results"][0]["status"], "unresolvable_import_boundary",
+        "{value}"
+    );
+}
+
+#[test]
+fn csharp_static_external_using_reports_boundary() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "App.cs",
+            "using static External.Helpers;\nclass App { void Handle() { Help(); } }\n",
+        )
+        .build();
+
+    let line = "class App { void Handle() { Help(); } }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"App.cs","line":2,"column":{}}}]}}"#,
+            column_of(line, "Help")
+        ),
+    );
+
+    assert_eq!(
+        value["results"][0]["status"], "unresolvable_import_boundary",
+        "{value}"
+    );
+}
+
+#[test]
 fn valid_local_value_returns_no_definition() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file(
@@ -940,13 +1194,13 @@ export function run() {
 
 #[test]
 fn unsupported_language_returns_structured_status() {
-    let project = InlineTestProject::with_language(Language::CSharp)
-        .file("App.cs", "class App { void Run() { Helper(); } }\n")
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("App.scala", "object App { def run(): Unit = helper() }\n")
         .build();
 
     let value = lookup(
         project.root(),
-        r#"{"references":[{"path":"App.cs","line":1,"column":26}]}"#,
+        r#"{"references":[{"path":"App.scala","line":1,"column":32}]}"#,
     );
 
     assert_eq!(
