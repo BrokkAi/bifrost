@@ -357,18 +357,27 @@ class SearchToolsClient:
     def _call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         runtime = self._ensure_started()
         try:
-            payload = runtime.native.call_tool_json(name, json.dumps(arguments))
+            payload = runtime.native.call_tool_payload_json(
+                name,
+                json.dumps(arguments),
+                self._render_line_numbers,
+            )
         except Exception as exc:
             raise SearchToolsError(str(exc)) from exc
 
         try:
-            structured = json.loads(payload)
+            decoded = json.loads(payload)
         except json.JSONDecodeError as exc:
             raise SearchToolsError(
                 f"Native searchtools call returned invalid JSON: {exc}"
             ) from exc
-        if not isinstance(structured, dict):
+        if not isinstance(decoded, dict):
             raise SearchToolsError("Native searchtools call did not return a JSON object")
+        structured = decoded.get("structured")
+        if not isinstance(structured, dict):
+            raise SearchToolsError(
+                "Native searchtools payload returned a non-object structured result"
+            )
         return structured
 
     def _call_tool_payload(self, name: str, arguments: dict[str, Any]) -> _ToolPayload:
