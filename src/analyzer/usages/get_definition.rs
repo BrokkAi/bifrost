@@ -11,7 +11,8 @@ use crate::analyzer::usages::csharp_graph::{
     seed_csharp_bindings_before,
 };
 use crate::analyzer::usages::go_graph::{
-    default_go_import_local_name, extract_go_import_path, resolve_go_analyzer,
+    GoProjectGraph, build_workspace_go_graph, default_go_import_local_name, extract_go_import_path,
+    preparse_go_files, resolve_go_analyzer, resolve_go_reference,
 };
 use crate::analyzer::usages::inverted_edges::{ClassRangeIndex, first_precise};
 use crate::analyzer::usages::js_ts_graph::compute_jsts_import_binder;
@@ -90,8 +91,8 @@ pub(crate) struct ResolvedReferenceSite {
     pub(crate) path: String,
     pub(crate) text: String,
     pub(crate) range: Range,
-    focus_start_byte: usize,
-    focus_end_byte: usize,
+    pub(crate) focus_start_byte: usize,
+    pub(crate) focus_end_byte: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -118,6 +119,7 @@ struct DefinitionBatchContext {
     trees: HashMap<(ProjectFile, Language), Option<Tree>>,
     cpp_visibility: HashMap<ProjectFile, Arc<CppVisibilityIndex>>,
     scala_project_types: Option<Arc<ScalaProjectTypes>>,
+    go_graph: Option<Option<Arc<GoProjectGraph>>>,
 }
 
 impl DefinitionBatchContext {
@@ -128,6 +130,7 @@ impl DefinitionBatchContext {
             trees: HashMap::default(),
             cpp_visibility: HashMap::default(),
             scala_project_types: None,
+            go_graph: None,
         }
     }
 
@@ -169,6 +172,29 @@ impl DefinitionBatchContext {
         self.scala_project_types
             .get_or_insert_with(|| Arc::new(ScalaProjectTypes::build(scala)))
             .clone()
+    }
+
+    fn go_graph(
+        &mut self,
+        go: &crate::analyzer::GoAnalyzer,
+        analyzer: &dyn IAnalyzer,
+    ) -> Option<Arc<GoProjectGraph>> {
+        if self.go_graph.is_none() {
+            let graph = analyzer
+                .project()
+                .analyzable_files(Language::Go)
+                .ok()
+                .and_then(|files| {
+                    let files: Vec<ProjectFile> = files.into_iter().collect();
+                    if files.is_empty() {
+                        return None;
+                    }
+                    let cache = preparse_go_files(&files);
+                    build_workspace_go_graph(go, &files, Some(&cache)).map(Arc::new)
+                });
+            self.go_graph = Some(graph);
+        }
+        self.go_graph.as_ref().and_then(Clone::clone)
     }
 }
 
@@ -328,13 +354,18 @@ fn resolve_one(
             tree.as_ref(),
             &site.text,
         ),
-        Language::Go => resolve_go(
-            analyzer,
-            &context.support,
-            &request.file,
-            &source,
-            &site.text,
-        ),
+        Language::Go => {
+            let go = resolve_go_analyzer(analyzer);
+            let go_graph = go.and_then(|go| context.go_graph(go, analyzer));
+            resolve_go(
+                analyzer,
+                &context.support,
+                &request.file,
+                &source,
+                &site,
+                go_graph.as_deref(),
+            )
+        }
         Language::Java => resolve_java(
             analyzer,
             &context.support,
@@ -491,9 +522,8 @@ fn resolve_reference_site(
             if column == 0 {
                 return Err("column must be 1-based".to_string());
             }
-            let point = byte_offset_for_character_column(
-                source, line_start, line_end, line, column,
-            )?;
+            let point =
+                byte_offset_for_character_column(source, line_start, line_end, line, column)?;
             token_bounds_at(source, point.min(source.len().saturating_sub(1)))
                 .ok_or_else(|| format!("no reference token at line {line}, column {column}"))?
         }
@@ -916,9 +946,7 @@ fn resolve_js_ts_module_binding(
 }
 
 fn is_bare_js_ts_specifier(module: &str) -> bool {
-    !module.starts_with("./")
-        && !module.starts_with("../")
-        && !module.starts_with('/')
+    !module.starts_with("./") && !module.starts_with("../") && !module.starts_with('/')
 }
 
 fn parse_js_ts_tree(source: &str, language: Language) -> Option<Tree> {
@@ -937,14 +965,39 @@ fn resolve_go(
     support: &DefinitionSupport,
     file: &ProjectFile,
     source: &str,
-    reference: &str,
+    site: &ResolvedReferenceSite,
+    graph: Option<&GoProjectGraph>,
 ) -> DefinitionLookupOutcome {
     let Some(go) = resolve_go_analyzer(analyzer) else {
         return no_definition("go_analyzer_unavailable", "Go analyzer is unavailable");
     };
+    let reference = site.text.as_str();
+    if let Some(resolution) =
+        graph.and_then(|graph| resolve_go_reference(graph, go, file, source, site))
+    {
+        let candidates = support.fqn_candidates(resolution.fqn_candidates);
+        if !candidates.is_empty() {
+            return candidates_outcome(candidates);
+        }
+        if resolution.shadowed {
+            return no_definition(
+                "no_indexed_definition",
+                format!("`{reference}` is shadowed by a local Go binding"),
+            );
+        }
+        if let Some((_, name)) = reference.split_once('.')
+            && let Some(package) = resolution.resolved_import_packages.first()
+        {
+            return no_definition(
+                "no_indexed_definition",
+                format!("`{name}` is not indexed in Go package `{package}`"),
+            );
+        }
+    }
+
     let package = go_package_name(file, source);
     if let Some((qualifier, name)) = reference.split_once('.') {
-        let imports = go_imports(go, file);
+        let imports = go_import_paths(go, file);
         if let Some(import_path) = imports.get(qualifier) {
             let candidates = support.fqn(&format!("{import_path}.{name}"));
             if !candidates.is_empty() {
@@ -993,10 +1046,13 @@ fn go_package_name(file: &ProjectFile, source: &str) -> String {
     crate::analyzer::go::packages::canonical_go_package_name(file, declared)
 }
 
-fn go_imports(go: &crate::analyzer::GoAnalyzer, file: &ProjectFile) -> HashMap<String, String> {
+fn go_import_paths(
+    go: &crate::analyzer::GoAnalyzer,
+    file: &ProjectFile,
+) -> HashMap<String, String> {
     let mut imports = HashMap::default();
     for import in go.import_info_of(file) {
-        if import.alias.as_deref() == Some("_") {
+        if matches!(import.alias.as_deref(), Some("_") | Some(".")) {
             continue;
         }
         let Some(import_path) = extract_go_import_path(&import.raw_snippet) else {
@@ -1005,7 +1061,6 @@ fn go_imports(go: &crate::analyzer::GoAnalyzer, file: &ProjectFile) -> HashMap<S
         let local = import
             .alias
             .as_deref()
-            .filter(|alias| *alias != ".")
             .map(default_go_import_local_name)
             .or_else(|| {
                 import

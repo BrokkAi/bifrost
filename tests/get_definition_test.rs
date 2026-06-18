@@ -448,6 +448,93 @@ func Helper() {}
 }
 
 #[test]
+fn go_dot_import_resolves_unqualified_definition() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n")
+        .file(
+            "main.go",
+            r#"
+package main
+
+import . "example.com/app/sub"
+
+func Run() {
+    Helper()
+}
+"#,
+        )
+        .file(
+            "sub/sub.go",
+            r#"
+package sub
+
+func Helper() {}
+"#,
+        )
+        .build();
+
+    let line = "    Helper()";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"main.go","line":7,"column":{}}}]}}"#,
+            column_of(line, "Helper")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "example.com/app/sub.Helper",
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["path"], "sub/sub.go", "{value}");
+}
+
+#[test]
+fn go_local_binding_shadows_dot_imported_definition() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n")
+        .file(
+            "main.go",
+            r#"
+package main
+
+import . "example.com/app/sub"
+
+func Run(Helper func()) {
+    Helper()
+}
+"#,
+        )
+        .file(
+            "sub/sub.go",
+            r#"
+package sub
+
+func Helper() {}
+"#,
+        )
+        .build();
+
+    let line = "    Helper()";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"main.go","line":7,"column":{}}}]}}"#,
+            column_of(line, "Helper")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"].as_array().unwrap().len(),
+        0,
+        "{value}"
+    );
+}
+
+#[test]
 fn go_unresolved_selector_does_not_fall_back_to_package_leaf() {
     let project = InlineTestProject::with_language(Language::Go)
         .file("go.mod", "module example.com/app\n")

@@ -1,23 +1,24 @@
 mod extractor;
 mod hits;
 mod inverted;
+mod reference;
 mod resolver;
 
 use crate::analyzer::GoAnalyzer;
 use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::go_graph::extractor::scan_files_for_target;
-use crate::analyzer::usages::go_graph::resolver::{
-    GoProjectGraph, TargetSpec, build_go_graph, build_workspace_go_graph, preparse_go_files,
-};
 pub(in crate::analyzer::usages) use crate::analyzer::usages::go_graph::resolver::{
-    default_go_import_local_name, extract_go_import_path, resolve_go_analyzer,
+    GoProjectGraph, build_workspace_go_graph, default_go_import_local_name, extract_go_import_path,
+    preparse_go_files, resolve_go_analyzer,
 };
+use crate::analyzer::usages::go_graph::resolver::{TargetSpec, build_go_graph};
 use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::UsageAnalyzer;
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::HashSet;
+pub(in crate::analyzer::usages) use reference::resolve_go_reference;
 use std::collections::BTreeSet;
 
 /// Build the whole Go `caller -> callee` edge set in a single inverted pass over
