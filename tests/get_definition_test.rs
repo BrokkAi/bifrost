@@ -17,6 +17,13 @@ fn column_of(line: &str, needle: &str) -> usize {
     line.find(needle).expect("needle in line") + 1
 }
 
+fn character_column_of(line: &str, needle: &str) -> usize {
+    line[..line.find(needle).expect("needle in line")]
+        .chars()
+        .count()
+        + 1
+}
+
 #[test]
 fn rust_named_import_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::Rust)
@@ -52,6 +59,38 @@ pub fn format_value() {}
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(result["reference"]["text"], "format_value", "{value}");
     assert_eq!(result["definitions"][0]["fqn"], "format_value", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "util.rs", "{value}");
+}
+
+#[test]
+fn line_column_uses_character_columns_not_byte_offsets() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+mod util;
+use crate::util::helper;
+
+pub fn run() {
+    let café = helper();
+}
+"#,
+        )
+        .file("util.rs", "pub fn helper() {}\n")
+        .build();
+
+    let line = "    let café = helper();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"lib.rs","line":6,"column":{}}}]}}"#,
+            character_column_of(line, "helper")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["reference"]["text"], "helper", "{value}");
     assert_eq!(result["definitions"][0]["path"], "util.rs", "{value}");
 }
 

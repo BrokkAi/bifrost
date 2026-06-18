@@ -491,10 +491,9 @@ fn resolve_reference_site(
             if column == 0 {
                 return Err("column must be 1-based".to_string());
             }
-            let point = line_start.saturating_add(column - 1);
-            if point > line_end {
-                return Err(format!("column {column} is outside line {line}"));
-            }
+            let point = byte_offset_for_character_column(
+                source, line_start, line_end, line, column,
+            )?;
             token_bounds_at(source, point.min(source.len().saturating_sub(1)))
                 .ok_or_else(|| format!("no reference token at line {line}, column {column}"))?
         }
@@ -526,6 +525,29 @@ fn resolve_reference_site(
         focus_start_byte: selection_start,
         focus_end_byte: selection_end,
     })
+}
+
+fn byte_offset_for_character_column(
+    source: &str,
+    line_start: usize,
+    line_end: usize,
+    line_number: usize,
+    column: usize,
+) -> Result<usize, String> {
+    let line = source
+        .get(line_start..line_end)
+        .ok_or_else(|| format!("line {line_number} is outside valid UTF-8 boundaries"))?;
+    let character_offset = column - 1;
+    if character_offset == 0 {
+        return Ok(line_start);
+    }
+    if let Some((byte_offset, _)) = line.char_indices().nth(character_offset) {
+        return Ok(line_start + byte_offset);
+    }
+    if character_offset == line.chars().count() {
+        return Ok(line_end);
+    }
+    Err(format!("column {column} is outside line {line_number}"))
 }
 
 fn token_bounds_at(source: &str, byte: usize) -> Option<(usize, usize)> {
