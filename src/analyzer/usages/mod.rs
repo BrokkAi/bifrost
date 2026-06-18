@@ -19,6 +19,7 @@ mod common;
 pub(crate) mod cpp_graph;
 pub(crate) mod csharp_graph;
 mod finder;
+pub(crate) mod get_definition;
 pub(crate) mod go_graph;
 mod graph_core;
 pub(crate) mod inverted_edges;

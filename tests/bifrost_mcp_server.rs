@@ -166,6 +166,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "get_symbol_sources",
             "get_summaries",
             "scan_usages",
+            "get_definition",
             "usage_graph",
             "refresh",
             "activate_workspace",
@@ -202,6 +203,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "get_symbol_sources",
             "get_summaries",
             "scan_usages",
+            "get_definition",
             "usage_graph",
             "semantic_search",
             "refresh",
@@ -667,6 +669,7 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
         "get_symbol_sources",
         "get_summaries",
         "scan_usages",
+        "get_definition",
         "usage_graph",
     ];
     #[cfg(feature = "nlp")]
@@ -685,6 +688,7 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
             "get_symbol_sources",
             "get_summaries",
             "scan_usages",
+            "get_definition",
             "usage_graph",
         ],
     );

@@ -160,6 +160,7 @@ mod tests {
             "get_symbol_sources",
             "get_summaries",
             "scan_usages",
+            "get_definition",
             "usage_graph",
         ]
         .into_iter()

@@ -85,6 +85,58 @@ pub(crate) fn symbol_tool_descriptors() -> Vec<Value> {
             }),
         ),
         tool_descriptor(
+            "get_definition",
+            "Resolve source reference sites back to workspace definition metadata. Use when you know a file and source location and need usage-to-definition navigation without building the whole usage_graph. Results distinguish resolved definitions from no_definition, unresolvable_import_boundary, ambiguous, unsupported_language, invalid_location, and not_found states.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "references": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": {
+                                    "type": "string",
+                                    "description": "Project-relative source file path containing the reference."
+                                },
+                                "line": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                    "description": "1-based line containing the reference. Use with column when byte offsets are not available."
+                                },
+                                "column": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                    "description": "1-based column containing the reference token."
+                                },
+                                "start_byte": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "description": "0-based byte offset at or inside the reference token."
+                                },
+                                "end_byte": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "description": "Optional exclusive byte end offset for a selected reference range."
+                                },
+                                "symbol": {
+                                    "type": "string",
+                                    "description": "Optional disambiguating symbol name. The location remains the primary lookup input."
+                                }
+                            },
+                            "required": ["path"]
+                        }
+                    },
+                    "include_tests": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Allow reference lookups inside detected test files."
+                    }
+                },
+                "required": ["references"]
+            }),
+        ),
+        tool_descriptor(
             "usage_graph",
             "Return the whole-workspace caller->callee reference graph in one call: classes and functions as nodes, resolved references as weighted edges. Use to build a code map or rank symbols by importance (e.g. PageRank) instead of issuing one scan_usages call per symbol. Edges reuse scan_usages resolution; symbols whose call sites exceed the enumeration guardrail are listed under truncated_symbols with their inbound edges omitted.",
             json!({
