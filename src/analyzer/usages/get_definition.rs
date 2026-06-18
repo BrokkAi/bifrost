@@ -2069,6 +2069,12 @@ fn resolve_scala_field(
         if !candidates.is_empty() {
             return candidates_outcome(candidates);
         }
+        return no_definition(
+            "unsupported_scala_receiver",
+            format!(
+                "receiver for Scala member `{member}` resolved to `{owner}`, but `{owner}.{member}` was not indexed"
+            ),
+        );
     }
     no_definition(
         "unsupported_scala_receiver",
@@ -2139,7 +2145,7 @@ fn scala_enclosing_class_parameter_type(
                 }
                 return parameter.child_by_field_name("type").and_then(|type_node| {
                     let type_text = scala_node_text(type_node, source);
-                    resolver.resolve(type_text).or_else(|| {
+                    scala_resolve_type_annotation(resolver, type_text).or_else(|| {
                         current_class
                             .as_deref()
                             .and_then(|class_fqn| scala_same_package_type_fqn(class_fqn, type_text))
@@ -2174,6 +2180,21 @@ fn scala_package_type_fqn(package: &str, type_text: &str) -> Option<String> {
     } else {
         Some(format!("{package}.{simple}"))
     }
+}
+
+fn scala_resolve_type_annotation(resolver: &ScalaNameResolver, type_text: &str) -> Option<String> {
+    let trimmed = type_text.trim();
+    if let Some(base_type) = trimmed.strip_suffix(".type") {
+        return resolver.resolve(base_type).map(|fqn| {
+            if fqn.ends_with('$') {
+                fqn
+            } else {
+                format!("{fqn}$")
+            }
+        });
+    }
+    let fqn = resolver.resolve(type_text)?;
+    Some(fqn.trim_end_matches('$').to_string())
 }
 
 fn scala_fqn_outcome(
@@ -2312,7 +2333,7 @@ fn scala_seed_parameter(
         .filter(|type_node| type_node.end_byte() <= cutoff_start)
         .and_then(|type_node| {
             let type_text = scala_node_text(type_node, source);
-            resolver.resolve(type_text)
+            scala_resolve_type_annotation(resolver, type_text)
         });
     scala_seed_typed(binding_name, resolved, bindings);
 }
@@ -2327,7 +2348,9 @@ fn scala_seed_value_definition(
     let resolved = node
         .child_by_field_name("type")
         .filter(|type_node| type_node.end_byte() <= cutoff_start)
-        .and_then(|type_node| resolver.resolve(scala_node_text(type_node, source)))
+        .and_then(|type_node| {
+            scala_resolve_type_annotation(resolver, scala_node_text(type_node, source))
+        })
         .or_else(|| {
             node.child_by_field_name("value")
                 .filter(|value| value.end_byte() <= cutoff_start)

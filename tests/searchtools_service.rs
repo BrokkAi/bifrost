@@ -296,12 +296,12 @@ fn get_definition_by_reference_resolves_scala_constructor_field_from_symbol_cont
     fs::create_dir_all(temp.path().join("app")).unwrap();
     fs::write(
         temp.path().join("app").join("StreamContext.scala"),
-        r#"package app
+        r#"package com.netflix.atlas.eval.stream
 class Registry
 class FlowShape
 class GraphStage[T]
 
-private[app] class StreamContext(
+private[stream] class StreamContext(
   rootConfig: String,
   val registry: Registry
 )
@@ -310,13 +310,13 @@ private[app] class StreamContext(
     .unwrap();
     fs::write(
         temp.path().join("app").join("TimeGrouped.scala"),
-        r#"package app
+        r#"package com.netflix.atlas.eval.stream
 
 object AggrDatapoint {
   def AggregatorSettings(input: Int, intermediate: Int, registry: Registry, host: String): Int = 0
 }
 
-private[app] class TimeGrouped(
+private[stream] class TimeGrouped(
   context: StreamContext,
   host: String
 ) extends GraphStage[FlowShape] {
@@ -338,7 +338,7 @@ private[app] class TimeGrouped(
     let payload = service
         .call_tool_json(
             "get_definition_by_reference",
-            r#"{"references":[{"symbol":"app.TimeGrouped","context":"    context.registry,","target":"registry"}]}"#,
+            r#"{"references":[{"symbol":"com.netflix.atlas.eval.stream.TimeGrouped","context":"    context.registry,","target":"registry"}]}"#,
         )
         .unwrap();
     let value: Value = serde_json::from_str(&payload).unwrap();
@@ -346,7 +346,7 @@ private[app] class TimeGrouped(
     let result = &value["results"][0];
     assert_eq!("resolved", result["status"], "{value}");
     assert_eq!(
-        "app.StreamContext.registry", result["definition"]["fqn"],
+        "com.netflix.atlas.eval.stream.StreamContext.registry", result["definition"]["fqn"],
         "{value}"
     );
 }
