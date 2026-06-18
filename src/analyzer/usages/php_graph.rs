@@ -6,8 +6,8 @@ mod shared;
 
 pub(in crate::analyzer::usages) use resolver::{
     FileContext, node_text as php_node_text,
-    qualified_candidate_text as php_qualified_candidate_text, resolve_php_analyzer,
-    resolve_php_constant, resolve_php_function, resolve_php_type,
+    qualified_candidate_text as php_qualified_candidate_text, resolve_php_constant,
+    resolve_php_function, resolve_php_type,
 };
 
 use crate::analyzer::usages::common::language_for_target;
@@ -16,8 +16,8 @@ use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::php_graph::resolver::{TargetKind, TargetSpec};
 use crate::analyzer::usages::php_graph::shared::{PhpEdgeResolver, PhpQueryResolver};
-use crate::analyzer::usages::traits::UsageAnalyzer;
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
+use crate::analyzer::usages::traits::{UsageAnalyzer, UsageEdgeResolver, UsageQueryResolver};
+use crate::analyzer::{CodeUnit, IAnalyzer, Language, PhpAnalyzer, ProjectFile, resolve_analyzer};
 use crate::hash::HashSet;
 
 pub(crate) fn build_php_usage_edges<F>(
@@ -28,7 +28,7 @@ pub(crate) fn build_php_usage_edges<F>(
 where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
-    let resolver = PhpEdgeResolver::new(analyzer)?;
+    let resolver = PhpEdgeResolver::try_new(analyzer)?;
     Some(resolver.build_edges(analyzer, nodes, keep_file))
 }
 
@@ -42,7 +42,7 @@ pub(crate) fn dead_code_bulk_eligibility(
     analyzer: &dyn IAnalyzer,
     target: &CodeUnit,
 ) -> PhpDeadCodeBulkEligibility {
-    let Some(php) = resolve_php_analyzer(analyzer) else {
+    let Some(php) = resolve_analyzer::<PhpAnalyzer>(analyzer) else {
         return PhpDeadCodeBulkEligibility::NeedsPrecise;
     };
     let Some(spec) = TargetSpec::from_target(php, target) else {
@@ -90,7 +90,7 @@ impl PhpUsageGraphStrategy {
             );
         }
 
-        let Some(resolver) = PhpQueryResolver::new(analyzer) else {
+        let Some(resolver) = PhpQueryResolver::try_new(analyzer) else {
             return GraphUsageOutcome::fallback_safe(
                 target.fq_name(),
                 GraphFailureReason::MissingAnalyzerCapability(
@@ -100,7 +100,7 @@ impl PhpUsageGraphStrategy {
             );
         };
 
-        resolver.find_usages(analyzer, target, candidate_files, max_usages)
+        resolver.find_usages(analyzer, overloads, candidate_files, max_usages)
     }
 }
 

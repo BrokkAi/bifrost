@@ -51,6 +51,7 @@ pub use model::{
     ParseErrorKind, ProjectFile, Range, TestAssertionSmell, TestAssertionWeights,
     metrics_from_declarations,
 };
+pub(crate) use multi_analyzer::resolve_analyzer;
 pub use multi_analyzer::{AnalyzerDelegate, MultiAnalyzer};
 pub use php::{
     PhpAnalyzer, PhpUseAliases, parse_php_use_aliases, parse_php_use_aliases_by_kind,

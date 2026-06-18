@@ -5,8 +5,7 @@ use crate::analyzer::usages::model::{
 };
 use crate::analyzer::usages::{ImportEdge, ImportEdgeKind};
 use crate::analyzer::{
-    AnalyzerDelegate, CodeUnit, GoAnalyzer, IAnalyzer, ImportAnalysisProvider, Language,
-    MultiAnalyzer, ProjectFile,
+    CodeUnit, GoAnalyzer, IAnalyzer, ImportAnalysisProvider, Language, ProjectFile,
 };
 use crate::hash::{HashMap, HashSet};
 use rayon::prelude::*;
@@ -15,20 +14,6 @@ use std::collections::BTreeSet;
 use std::collections::VecDeque;
 use std::sync::{Arc, LazyLock};
 use tree_sitter::{Node, Parser, Tree};
-
-pub(in crate::analyzer::usages) fn resolve_go_analyzer(
-    analyzer: &dyn IAnalyzer,
-) -> Option<&GoAnalyzer> {
-    if let Some(go) = (analyzer as &dyn std::any::Any).downcast_ref::<GoAnalyzer>() {
-        return Some(go);
-    }
-
-    let multi = (analyzer as &dyn std::any::Any).downcast_ref::<MultiAnalyzer>()?;
-    match multi.delegates().get(&Language::Go) {
-        Some(AnalyzerDelegate::Go(go)) => Some(go),
-        _ => None,
-    }
-}
 
 pub(crate) struct ParsedFile {
     pub(super) source: Arc<String>,

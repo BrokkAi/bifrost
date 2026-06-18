@@ -7,13 +7,12 @@ mod shared;
 
 use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::inverted_edges::UsageEdges;
-pub(in crate::analyzer::usages) use crate::analyzer::usages::java_graph::resolver::resolve_java_analyzer;
 use crate::analyzer::usages::java_graph::resolver::{TargetKind, TargetSpec};
 use crate::analyzer::usages::java_graph::shared::{JavaEdgeResolver, JavaQueryResolver};
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::usages::traits::UsageAnalyzer;
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
+use crate::analyzer::usages::traits::{UsageAnalyzer, UsageEdgeResolver, UsageQueryResolver};
+use crate::analyzer::{CodeUnit, IAnalyzer, JavaAnalyzer, Language, ProjectFile, resolve_analyzer};
 use crate::hash::HashSet;
 
 pub(crate) fn build_java_usage_edges<F>(
@@ -24,7 +23,7 @@ pub(crate) fn build_java_usage_edges<F>(
 where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
-    let resolver = JavaEdgeResolver::new(analyzer)?;
+    let resolver = JavaEdgeResolver::try_new(analyzer)?;
     Some(resolver.build_edges(analyzer, nodes, keep_file))
 }
 
@@ -41,7 +40,7 @@ pub(crate) fn dead_code_bulk_eligibility(
     static_imports_present: bool,
     scala_files_present: bool,
 ) -> JavaDeadCodeBulkEligibility {
-    let Some(java) = resolve_java_analyzer(analyzer) else {
+    let Some(java) = resolve_analyzer::<JavaAnalyzer>(analyzer) else {
         return JavaDeadCodeBulkEligibility::NeedsPrecise;
     };
     let Some(spec) = TargetSpec::from_target(java, target) else {
@@ -93,7 +92,7 @@ impl JavaUsageGraphStrategy {
             );
         }
 
-        let Some(resolver) = JavaQueryResolver::new(analyzer) else {
+        let Some(resolver) = JavaQueryResolver::try_new(analyzer) else {
             return GraphUsageOutcome::fallback_safe(
                 target.fq_name(),
                 GraphFailureReason::MissingAnalyzerCapability(
@@ -103,7 +102,7 @@ impl JavaUsageGraphStrategy {
             );
         };
 
-        resolver.find_usages(analyzer, target, candidate_files, max_usages)
+        resolver.find_usages(analyzer, overloads, candidate_files, max_usages)
     }
 }
 
