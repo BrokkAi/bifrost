@@ -279,6 +279,41 @@ export function run() {
 }
 
 #[test]
+fn typescript_path_alias_import_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "tsconfig.json",
+            r#"{ "compilerOptions": { "baseUrl": ".", "paths": { "~/*": ["src/*"] } } }"#,
+        )
+        .file("src/util.ts", "export function helper() {}\n")
+        .file(
+            "app.ts",
+            r#"
+import { helper } from "~/util";
+
+export function run() {
+  helper();
+}
+"#,
+        )
+        .build();
+
+    let line = "  helper();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.ts","line":5,"column":{}}}]}}"#,
+            column_of(line, "helper")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "helper", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "src/util.ts", "{value}");
+}
+
+#[test]
 fn javascript_destructured_commonjs_require_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file(

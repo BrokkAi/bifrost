@@ -881,13 +881,13 @@ fn resolve_js_ts_module_binding(
     support: &DefinitionSupport,
     aliases: Option<&AliasResolver>,
 ) -> DefinitionLookupOutcome {
-    if is_bare_js_ts_specifier(module) {
-        return boundary(format!(
-            "`{module}` is a package import outside this partial workspace analysis"
-        ));
-    }
     let files = crate::analyzer::resolve_js_ts_module_specifier(file, module, language, aliases);
     if files.is_empty() {
+        if is_bare_js_ts_specifier(module) {
+            return boundary(format!(
+                "`{module}` is a package import outside this partial workspace analysis"
+            ));
+        }
         return boundary(format!(
             "`{module}` could not be resolved to a workspace JS/TS file"
         ));
@@ -919,7 +919,6 @@ fn is_bare_js_ts_specifier(module: &str) -> bool {
     !module.starts_with("./")
         && !module.starts_with("../")
         && !module.starts_with('/')
-        && !module.starts_with("@/")
 }
 
 fn parse_js_ts_tree(source: &str, language: Language) -> Option<Tree> {
