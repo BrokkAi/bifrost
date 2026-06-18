@@ -17,6 +17,7 @@ The current `get_definition` tool requires callers to identify a reference by li
 - [x] (2026-06-18) Updated service dispatch, tests, and benchmark callers to the new tool names; benchmark scenario labels remain `get_definition` for report continuity while the invoked tool is `get_definition_by_location`.
 - [x] (2026-06-18) Ran formatting, focused tests, clippy, and `git diff --check`; all passed.
 - [x] (2026-06-18) Commit the completed feature.
+- [x] (2026-06-18) Removed the leftover `include_tests` parameter from both definition APIs so exact reference lookup always resolves against the full analyzed workspace.
 
 ## Surprises & Discoveries
 
@@ -38,10 +39,13 @@ The current `get_definition` tool requires callers to identify a reference by li
 - Decision: Report semantically different candidate target matches as `ambiguous`, not `invalid_location`.
   Rationale: The text locator found valid references; the problem is multiple valid semantic answers, so `ambiguous` is the clearer terminal state.
   Date/Author: 2026-06-18 / Codex.
+- Decision: Remove `include_tests` from definition lookup.
+  Rationale: Unlike broad discovery tools, exact definition lookup starts from a concrete reference site and should resolve what that reference means rather than applying a test filtering policy.
+  Date/Author: 2026-06-18 / Codex.
 
 ## Outcomes & Retrospective
 
-The API split is implemented and validated. Direct service callers can use `get_definition_by_location` for exact line/column or byte-offset lookups and `get_definition_by_reference` for exact copied context plus target text. MCP now exposes only one of those tools per server process: normal line-number mode exposes location lookup, and `--no-line-numbers` exposes reference lookup. The public location-mode `reference` echo is reduced to `{ path, target }`, and reference mode omits `reference` entirely.
+The API split is implemented and validated. Direct service callers can use `get_definition_by_location` for exact line/column or byte-offset lookups and `get_definition_by_reference` for exact copied context plus target text. MCP now exposes only one of those tools per server process: normal line-number mode exposes location lookup, and `--no-line-numbers` exposes reference lookup. The public location-mode `reference` echo is reduced to `{ path, target }`, reference mode omits `reference` entirely, and neither definition API exposes `include_tests`.
 
 Validation completed from `/home/jonathan/Projects/bifrost`:
 
@@ -66,7 +70,7 @@ In this plan, a "location" lookup means the caller identifies a reference using 
 
 First, rename the existing public entrypoint to `get_definition_by_location` while keeping its input shape. Change its serialized `reference` from detailed byte/line fields to `{ path, target }`, where `target` is the normalized source text the resolver selected.
 
-Second, add `get_definition_by_reference` in `src/searchtools.rs`. Define a request type with `references: Vec<{ path, context, target }>` and `include_tests`. For each query, resolve the file path, load source text from the project file, find all exact context matches, find all exact target matches within each context, create byte-offset `DefinitionLookupRequest` values for those candidates, and run them through `resolve_definition_batch`. Collapse candidate outcomes when they are semantically equivalent by comparing status plus definition candidate identity. If valid candidates produce different definition sets or statuses, return an `ambiguous` result with diagnostics. If no context or target can be found, return `invalid_location` with diagnostics.
+Second, add `get_definition_by_reference` in `src/searchtools.rs`. Define a request type with `references: Vec<{ path, context, target }>` and no test-filtering option. For each query, resolve the file path, load source text from the project file, find all exact context matches, find all exact target matches within each context, create byte-offset `DefinitionLookupRequest` values for those candidates, and run them through `resolve_definition_batch`. Collapse candidate outcomes when they are semantically equivalent by comparing status plus definition candidate identity. If valid candidates produce different definition sets or statuses, return an `ambiguous` result with diagnostics. If no context or target can be found, return `invalid_location` with diagnostics.
 
 Third, update service dispatch and descriptors. The service should accept both `get_definition_by_location` and `get_definition_by_reference`. The MCP registry should build the symbol toolset with either the location descriptor or the reference descriptor depending on `McpRenderOptions.render_line_numbers`; `true` selects location and `false` selects reference. The MCP server should reject the unlisted variant because allowed tool names come from the selected descriptor list.
 

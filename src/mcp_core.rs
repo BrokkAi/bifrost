@@ -153,11 +153,6 @@ fn get_definition_by_location_descriptor() -> Value {
                         },
                         "required": ["path"]
                     }
-                },
-                "include_tests": {
-                    "type": "boolean",
-                    "default": false,
-                    "description": "Allow reference lookups inside detected test files."
                 }
             },
             "required": ["references"]
@@ -192,11 +187,6 @@ fn get_definition_by_reference_descriptor() -> Value {
                         },
                         "required": ["path", "context", "target"]
                     }
-                },
-                "include_tests": {
-                    "type": "boolean",
-                    "default": false,
-                    "description": "Allow reference lookups inside detected test files."
                 }
             },
             "required": ["references"]

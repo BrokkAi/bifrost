@@ -237,6 +237,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
         ];
         expected
     });
+    assert_tool_schema_omits_property(tools, "get_definition_by_location", "include_tests");
 
     let ping = round_trip(
         &mut stdin,
@@ -1022,6 +1023,13 @@ fn bifrost_searchtools_server_can_hide_line_numbers_in_text_preview() {
     );
     assert!(names.contains(&"get_definition_by_reference"), "{names:?}");
     assert!(!names.contains(&"get_definition_by_location"), "{names:?}");
+    assert_tool_schema_omits_property(
+        list_tools["result"]["tools"]
+            .as_array()
+            .expect("tools array"),
+        "get_definition_by_reference",
+        "include_tests",
+    );
 
     let unavailable_location_tool = round_trip(
         &mut stdin,
@@ -1588,6 +1596,18 @@ fn tool_names(tools: &[Value]) -> Vec<&str> {
         .iter()
         .map(|tool| tool["name"].as_str().expect("tool name"))
         .collect()
+}
+
+fn assert_tool_schema_omits_property(tools: &[Value], tool_name: &str, property_name: &str) {
+    let tool = tools
+        .iter()
+        .find(|tool| tool["name"] == tool_name)
+        .unwrap_or_else(|| panic!("missing tool descriptor for {tool_name}"));
+    let schema = serde_json::to_string(&tool["inputSchema"]).expect("schema serializes");
+    assert!(
+        !schema.contains(property_name),
+        "{tool_name} schema unexpectedly contains {property_name}: {schema}"
+    );
 }
 
 fn assert_unknown_tool(root: &std::path::Path, mode: &str, tool_name: &str, arguments: Value) {

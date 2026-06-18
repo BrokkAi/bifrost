@@ -321,39 +321,35 @@ pub fn run() {
 }
 
 #[test]
-fn rust_include_tests_false_filters_candidate_definitions() {
+fn rust_reference_inside_test_file_resolves_without_include_tests_flag() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(
-            "lib.rs",
-            r#"
+            "tests/helper.rs",
+            r##"
+fn helper() {}
+
+#[test]
 pub fn run() {
     helper();
 }
-"#,
+"##,
         )
-        .file("tests/helper.rs", "#[test]\npub fn helper() {}\n")
         .build();
 
     let line = "    helper();";
     let value = lookup(
         project.root(),
         &format!(
-            r#"{{"references":[{{"path":"lib.rs","line":3,"column":{}}}]}}"#,
+            r#"{{"references":[{{"path":"tests/helper.rs","line":6,"column":{}}}]}}"#,
             column_of(line, "helper")
         ),
     );
 
-    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
-
-    let value = lookup(
-        project.root(),
-        &format!(
-            r#"{{"references":[{{"path":"lib.rs","line":3,"column":{}}}],"include_tests":true}}"#,
-            column_of(line, "helper")
-        ),
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["path"], "tests/helper.rs",
+        "{value}"
     );
-
-    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
 }
 
 #[test]

@@ -115,8 +115,6 @@ pub struct UsageGraphParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetDefinitionParams {
     pub references: Vec<DefinitionReferenceQuery>,
-    #[serde(default)]
-    pub include_tests: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,8 +133,6 @@ pub struct DefinitionReferenceQuery {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetDefinitionByReferenceParams {
     pub references: Vec<DefinitionContextReferenceQuery>,
-    #[serde(default)]
-    pub include_tests: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -802,11 +798,8 @@ pub fn get_definition_by_location(
         .iter()
         .map(|(_, _, request)| request.clone())
         .collect();
-    let outcomes = crate::analyzer::usages::get_definition::resolve_definition_batch(
-        analyzer,
-        requests,
-        params.include_tests,
-    );
+    let outcomes =
+        crate::analyzer::usages::get_definition::resolve_definition_batch(analyzer, requests);
 
     for ((index, query, _), outcome) in pending.into_iter().zip(outcomes) {
         results[index] = Some(render_definition_lookup(analyzer, query, outcome));
@@ -829,7 +822,7 @@ pub fn get_definition_by_reference(
     for query in params.references {
         let result = match resolver.resolve_literal(&query.path) {
             ResolvedFileInput::File(file) => {
-                resolve_definition_context_query(analyzer, file, query, params.include_tests)
+                resolve_definition_context_query(analyzer, file, query)
             }
             ResolvedFileInput::Ambiguous(item) => DefinitionByReferenceLookupResult {
                 query,
@@ -864,7 +857,6 @@ fn resolve_definition_context_query(
     analyzer: &dyn IAnalyzer,
     file: ProjectFile,
     query: DefinitionContextReferenceQuery,
-    include_tests: bool,
 ) -> DefinitionByReferenceLookupResult {
     if query.context.is_empty() {
         return invalid_context_lookup(query, "empty_context", "context must not be empty");
@@ -912,11 +904,8 @@ fn resolve_definition_context_query(
         );
     }
 
-    let outcomes = crate::analyzer::usages::get_definition::resolve_definition_batch(
-        analyzer,
-        requests,
-        include_tests,
-    );
+    let outcomes =
+        crate::analyzer::usages::get_definition::resolve_definition_batch(analyzer, requests);
     collapse_context_outcomes(analyzer, query, outcomes)
 }
 

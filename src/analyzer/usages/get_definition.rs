@@ -103,12 +103,11 @@ pub(crate) struct DefinitionLookupDiagnostic {
 pub(crate) fn resolve_definition_batch(
     analyzer: &dyn IAnalyzer,
     requests: Vec<DefinitionLookupRequest>,
-    include_tests: bool,
 ) -> Vec<DefinitionLookupOutcome> {
-    let mut context = DefinitionBatchContext::new(analyzer, include_tests);
+    let mut context = DefinitionBatchContext::new(analyzer);
     requests
         .into_iter()
-        .map(|request| resolve_one(analyzer, &mut context, request, include_tests))
+        .map(|request| resolve_one(analyzer, &mut context, request))
         .collect()
 }
 
@@ -122,9 +121,9 @@ struct DefinitionBatchContext {
 }
 
 impl DefinitionBatchContext {
-    fn new(analyzer: &dyn IAnalyzer, include_tests: bool) -> Self {
+    fn new(analyzer: &dyn IAnalyzer) -> Self {
         Self {
-            support: DefinitionSupport::build(analyzer, include_tests),
+            support: DefinitionSupport::build(analyzer),
             sources: HashMap::default(),
             trees: HashMap::default(),
             cpp_visibility: HashMap::default(),
@@ -205,16 +204,13 @@ struct DefinitionSupport {
 }
 
 impl DefinitionSupport {
-    fn build(analyzer: &dyn IAnalyzer, include_tests: bool) -> Self {
+    fn build(analyzer: &dyn IAnalyzer) -> Self {
         let mut by_fqn: HashMap<String, Vec<CodeUnit>> = HashMap::default();
         let mut by_file_identifier: HashMap<(ProjectFile, String), Vec<CodeUnit>> =
             HashMap::default();
         let mut packages = HashSet::default();
         let mut normalized_fqns = HashSet::default();
         for unit in analyzer.all_declarations() {
-            if !include_tests && analyzer.contains_tests(unit.source()) {
-                continue;
-            }
             let fqn = unit.fq_name();
             packages.insert(unit.package_name().to_string());
             normalized_fqns.insert(fqn.replace("$.", ".").trim_end_matches('$').to_string());
@@ -291,19 +287,7 @@ fn resolve_one(
     analyzer: &dyn IAnalyzer,
     context: &mut DefinitionBatchContext,
     request: DefinitionLookupRequest,
-    include_tests: bool,
 ) -> DefinitionLookupOutcome {
-    if !include_tests && analyzer.contains_tests(&request.file) {
-        return diagnostic_outcome(
-            DefinitionLookupStatus::NotFound,
-            "excluded_test_file",
-            format!(
-                "`{}` is a test file and include_tests is false",
-                rel_path_string(&request.file)
-            ),
-        );
-    }
-
     let language = language_for_file(&request.file);
     if language == Language::None {
         return diagnostic_outcome(
