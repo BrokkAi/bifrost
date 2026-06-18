@@ -14,6 +14,8 @@ from typing import Any, overload
 
 from .models import (
     FileSummariesResult,
+    DefinitionByReferenceLookupResult,
+    DefinitionLookupResult,
     MostRelevantFilesResult,
     SemanticSearchResult,
     SemanticSearchStatus,
@@ -175,6 +177,47 @@ class SearchToolsClient:
             render_line_numbers=self._render_line_numbers,
             rendered_text=payload.rendered_text,
         )
+
+    def get_definition_by_location(
+        self,
+        path: str,
+        *,
+        line: int | None = None,
+        column: int | None = None,
+        start_byte: int | None = None,
+        end_byte: int | None = None,
+    ) -> DefinitionLookupResult:
+        reference: dict[str, Any] = {"path": path}
+        if line is not None:
+            reference["line"] = line
+        if column is not None:
+            reference["column"] = column
+        if start_byte is not None:
+            reference["start_byte"] = start_byte
+        if end_byte is not None:
+            reference["end_byte"] = end_byte
+        result = self._call_tool(
+            "get_definition_by_location",
+            {"references": [reference]},
+        )
+        return DefinitionLookupResult.from_dict(result["results"][0])
+
+    def get_definition_by_reference(
+        self,
+        symbol: str,
+        *,
+        context: str,
+        target: str,
+    ) -> DefinitionByReferenceLookupResult:
+        result = self._call_tool(
+            "get_definition_by_reference",
+            {
+                "references": [
+                    {"symbol": symbol, "context": context, "target": target}
+                ]
+            },
+        )
+        return DefinitionByReferenceLookupResult.from_dict(result["results"][0])
 
     def get_summaries(self, targets: list[str]) -> FileSummariesResult:
         payload = self._call_tool_payload("get_summaries", {"targets": targets})

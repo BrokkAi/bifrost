@@ -275,6 +275,127 @@ class AmbiguousSymbol:
 
 
 @dataclass(frozen=True)
+class DefinitionDiagnostic:
+    kind: str
+    message: str
+
+    @classmethod
+    def from_dict(cls, data: dict) -> DefinitionDiagnostic:
+        return cls(kind=data["kind"], message=data["message"])
+
+    def render_text(self) -> str:
+        return f"{self.kind}: {self.message}"
+
+
+@dataclass(frozen=True)
+class DefinitionCandidate:
+    fqn: str
+    path: str
+    start_line: int
+    end_line: int
+    kind: str
+    signature: str | None
+    language: str
+
+    @classmethod
+    def from_dict(cls, data: dict) -> DefinitionCandidate:
+        return cls(
+            fqn=data["fqn"],
+            path=data["path"],
+            start_line=int(data["start_line"]),
+            end_line=int(data["end_line"]),
+            kind=data["kind"],
+            signature=data.get("signature"),
+            language=data["language"],
+        )
+
+    def render_text(self) -> str:
+        location = f"{self.path}:{self.start_line}..{self.end_line}"
+        signature = f" {self.signature}" if self.signature else ""
+        return f"{self.fqn} ({self.kind}, {self.language}) at {location}{signature}"
+
+
+@dataclass(frozen=True)
+class DefinitionReferenceSite:
+    path: str
+    target: str
+
+    @classmethod
+    def from_dict(cls, data: dict) -> DefinitionReferenceSite:
+        return cls(path=data["path"], target=data["target"])
+
+
+@dataclass(frozen=True)
+class DefinitionLookupResult:
+    query: dict
+    status: str
+    reference: DefinitionReferenceSite | None
+    definition: DefinitionCandidate | None
+    diagnostics: list[DefinitionDiagnostic]
+
+    @classmethod
+    def from_dict(cls, data: dict) -> DefinitionLookupResult:
+        return cls(
+            query=dict(data["query"]),
+            status=data["status"],
+            reference=(
+                DefinitionReferenceSite.from_dict(data["reference"])
+                if data.get("reference") is not None
+                else None
+            ),
+            definition=(
+                DefinitionCandidate.from_dict(data["definition"])
+                if data.get("definition") is not None
+                else None
+            ),
+            diagnostics=[
+                DefinitionDiagnostic.from_dict(item)
+                for item in data.get("diagnostics", [])
+            ],
+        )
+
+    def render_text(self) -> str:
+        lines = [f"status: {self.status}"]
+        if self.reference is not None:
+            lines.append(f"reference: {self.reference.path} -> {self.reference.target}")
+        if self.definition is not None:
+            lines.append(self.definition.render_text())
+        lines.extend(diagnostic.render_text() for diagnostic in self.diagnostics)
+        return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class DefinitionByReferenceLookupResult:
+    query: dict
+    status: str
+    definition: DefinitionCandidate | None
+    diagnostics: list[DefinitionDiagnostic]
+
+    @classmethod
+    def from_dict(cls, data: dict) -> DefinitionByReferenceLookupResult:
+        return cls(
+            query=dict(data["query"]),
+            status=data["status"],
+            definition=(
+                DefinitionCandidate.from_dict(data["definition"])
+                if data.get("definition") is not None
+                else None
+            ),
+            diagnostics=[
+                DefinitionDiagnostic.from_dict(item)
+                for item in data.get("diagnostics", [])
+            ],
+        )
+
+    def render_text(self) -> str:
+        lines = [f"status: {self.status}"]
+        if self.definition is not None:
+            lines.append(self.definition.render_text())
+        lines.extend(diagnostic.render_text() for diagnostic in self.diagnostics)
+        return "\n".join(lines)
+
+
+@dataclass(frozen=True)
 class SummaryElement:
     path: str
     symbol: str

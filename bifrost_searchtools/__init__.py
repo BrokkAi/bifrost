@@ -1,6 +1,11 @@
 from .client import SearchToolsClient, SearchToolsError, SymbolKindFilter
 from .models import (
     AmbiguousSymbol,
+    DefinitionByReferenceLookupResult,
+    DefinitionCandidate,
+    DefinitionDiagnostic,
+    DefinitionLookupResult,
+    DefinitionReferenceSite,
     FileSummariesResult,
     MostRelevantFilesResult,
     SemanticSearchResult,
@@ -27,6 +32,11 @@ from .models import (
 __all__ = [
     "FileSummariesResult",
     "AmbiguousSymbol",
+    "DefinitionByReferenceLookupResult",
+    "DefinitionCandidate",
+    "DefinitionDiagnostic",
+    "DefinitionLookupResult",
+    "DefinitionReferenceSite",
     "MostRelevantFilesResult",
     "SemanticSearchResult",
     "SemanticSearchStatus",
