@@ -675,6 +675,244 @@ fn php_local_value_returns_no_definition() {
 }
 
 #[test]
+fn python_from_import_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("pkg/util.py", "def helper():\n    pass\n")
+        .file(
+            "app.py",
+            "from pkg.util import helper\n\ndef run():\n    helper()\n",
+        )
+        .build();
+
+    let line = "    helper()";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.py","line":4,"column":{}}}]}}"#,
+            column_of(line, "helper")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "pkg.util.helper",
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["path"], "pkg/util.py", "{value}");
+}
+
+#[test]
+fn python_namespace_import_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("pkg/util.py", "def helper():\n    pass\n")
+        .file(
+            "app.py",
+            "import pkg.util as util\n\ndef run():\n    util.helper()\n",
+        )
+        .build();
+
+    let line = "    util.helper()";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.py","line":4,"column":{}}}]}}"#,
+            column_of(line, "helper")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "pkg.util.helper",
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["path"], "pkg/util.py", "{value}");
+}
+
+#[test]
+fn python_attribute_object_resolves_to_namespace_not_member() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("pkg/util.py", "def helper():\n    pass\n")
+        .file(
+            "app.py",
+            "import pkg.util as util\n\ndef run():\n    util.helper()\n",
+        )
+        .build();
+
+    let line = "    util.helper()";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.py","line":4,"column":{}}}]}}"#,
+            column_of(line, "util")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "pkg.util", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "pkg/util.py", "{value}");
+}
+
+#[test]
+fn python_plain_dotted_import_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("pkg/util.py", "def helper():\n    pass\n")
+        .file(
+            "app.py",
+            "import pkg.util\n\ndef run():\n    pkg.util.helper()\n",
+        )
+        .build();
+
+    let line = "    pkg.util.helper()";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.py","line":4,"column":{}}}]}}"#,
+            column_of(line, "helper")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "pkg.util.helper",
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["path"], "pkg/util.py", "{value}");
+}
+
+#[test]
+fn python_typed_receiver_method_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            "class Service:\n    def run(self):\n        pass\n",
+        )
+        .file(
+            "app.py",
+            "from service import Service\n\ndef handle(service: Service):\n    service.run()\n",
+        )
+        .build();
+
+    let line = "    service.run()";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.py","line":4,"column":{}}}]}}"#,
+            column_of(line, "run")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "service.Service.run",
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["path"], "service.py", "{value}");
+}
+
+#[test]
+fn python_typed_receiver_inherited_method_resolves_to_base_definition() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            "class Base:\n    def run(self):\n        pass\n\nclass Child(Base):\n    pass\n",
+        )
+        .file(
+            "app.py",
+            "from service import Child\n\ndef handle(service: Child):\n    service.run()\n",
+        )
+        .build();
+
+    let line = "    service.run()";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.py","line":4,"column":{}}}]}}"#,
+            column_of(line, "run")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "service.Base.run",
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["path"], "service.py", "{value}");
+}
+
+#[test]
+fn python_unimported_receiver_annotation_returns_no_definition() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "other.py",
+            "class Service:\n    def run(self):\n        pass\n",
+        )
+        .file(
+            "app.py",
+            "def handle(service: Service):\n    service.run()\n",
+        )
+        .build();
+
+    let line = "    service.run()";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.py","line":2,"column":{}}}]}}"#,
+            column_of(line, "run")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn python_external_import_reports_boundary() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "app.py",
+            "import requests\n\ndef run():\n    requests.get()\n",
+        )
+        .build();
+
+    let line = "    requests.get()";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.py","line":4,"column":{}}}]}}"#,
+            column_of(line, "get")
+        ),
+    );
+
+    assert_eq!(
+        value["results"][0]["status"], "unresolvable_import_boundary",
+        "{value}"
+    );
+}
+
+#[test]
+fn python_local_value_returns_no_definition() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("app.py", "def run():\n    value = 1\n    value\n")
+        .build();
+
+    let line = "    value";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.py","line":3,"column":{}}}]}}"#,
+            column_of(line, "value")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
 fn valid_local_value_returns_no_definition() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file(
@@ -702,13 +940,13 @@ export function run() {
 
 #[test]
 fn unsupported_language_returns_structured_status() {
-    let project = InlineTestProject::with_language(Language::Python)
-        .file("app.py", "def run():\n    helper()\n")
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("App.cs", "class App { void Run() { Helper(); } }\n")
         .build();
 
     let value = lookup(
         project.root(),
-        r#"{"references":[{"path":"app.py","line":2,"column":5}]}"#,
+        r#"{"references":[{"path":"App.cs","line":1,"column":26}]}"#,
     );
 
     assert_eq!(

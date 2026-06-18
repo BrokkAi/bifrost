@@ -163,7 +163,7 @@ summary_targets = ["src/click/core.py"]
 seed_file_paths = ["src/click/core.py"]
 usage_symbols = ["click.core.Command.main"]
 definition_queries = [
-  { path = "src/click/core.py", line = 1373, column = 9, symbol = "main", expected_status = "unsupported_language" },
+  { path = "src/click/core.py", line = 1366, column = 42, symbol = "_complete_visible_commands", expected_status = "resolved", expected_fqn = "click.core._complete_visible_commands" },
 ]
 
 [[repos]]

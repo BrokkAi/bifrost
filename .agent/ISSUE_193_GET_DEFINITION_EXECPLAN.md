@@ -49,6 +49,11 @@ This work adds a `get_definition` searchtools/MCP tool for that on-demand lookup
 - [x] (2026-06-18T20:44Z) Ran the requested guided review checkpoint over the uncommitted PHP slice with parallel reviewer agents. Review findings were fixed by reusing PHP qualified-name candidate text, resolving `parent::member` through a proven declared parent instead of the current class, narrowing PHP helper visibility to `crate::analyzer::usages`, and requiring exact indexed namespaces before downgrading missing PHP definitions from `unresolvable_import_boundary` to `no_definition`.
 - [x] (2026-06-18T20:50Z) Added PHP regression tests for fully qualified type lookups from the final segment, `parent::run()` selecting the parent definition, prefix-only external imports reporting `unresolvable_import_boundary`, imported types, function aliases, typed receivers, external imports, and local values.
 - [x] (2026-06-18T20:54Z) Re-ran `cargo test --test get_definition_test`, `cargo test --test bifrost_benchmark_run`, `cargo run --bin bifrost_benchmark -- validate --manifest benchmark/targets.toml`, `cargo run --bin bifrost_benchmark -- run --manifest benchmark/targets.toml --repo fastroute-php --max-files 80`, `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`; all passed.
+- [x] (2026-06-18T21:18Z) Added Python `get_definition` support for same-file references, named imports, namespace imports, plain dotted imports, typed parameter receivers, inherited receiver methods, `self`/`cls` receivers, local-shadow `no_definition`, and external package boundary diagnostics.
+- [x] (2026-06-18T21:18Z) Updated the Click benchmark probe from `unsupported_language` to a resolved same-file `_complete_visible_commands` reference and documented the `Command.main` overload ambiguity as follow-up.
+- [x] (2026-06-18T21:27Z) Ran the requested guided review checkpoint over the uncommitted Python slice with parallel reviewer agents. Review findings were fixed by preserving the original focus token range for AST classification, preventing object-side attribute clicks from resolving to the member, resolving plain dotted imports such as `import pkg.util`, disabling broad workspace fallback for typed receiver annotations, and checking ancestor methods for typed receiver calls.
+- [x] (2026-06-18T21:34Z) Added Python regression tests for object-side namespace lookups, plain dotted imports, inherited receiver methods, unimported receiver annotations, named imports, namespace imports, typed receivers, external imports, and local values.
+- [x] (2026-06-18T21:38Z) Re-ran `cargo test --test get_definition_test`, `cargo test --test bifrost_benchmark_run`, `cargo run --bin bifrost_benchmark -- validate --manifest benchmark/targets.toml`, `cargo run --bin bifrost_benchmark -- run --manifest benchmark/targets.toml --repo click-py --max-files 80`, `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`; all passed.
 
 ## Surprises & Discoveries
 
@@ -100,6 +105,18 @@ This work adds a `get_definition` searchtools/MCP tool for that on-demand lookup
 - Observation: FastRoute's original `$this->dataGenerator->addRoute(...)` line needs typed-property receiver inference that the PHP slice does not yet implement.
   Evidence: manual direct calls showed the same-class `$this->addRoute(...)` probe resolves accurately while property-promotion receiver chains remain `no_definition`; the benchmark observation documents this as follow-up rather than using it as the smoke query.
 
+- Observation: Python location fidelity needs both the normalized reference range and the original focus token range.
+  Evidence: guided review found that clicking `util` in `util.helper()` would otherwise classify the full attribute and jump to `helper`; `ResolvedReferenceSite` now keeps internal focus bytes and `python_attribute_object_resolves_to_namespace_not_member` covers object-side lookup.
+
+- Observation: Python receiver annotations must not fall back to arbitrary same-named classes elsewhere in the workspace.
+  Evidence: guided review flagged the inverted graph's explicit avoidance of broad workspace fallback; `python_unimported_receiver_annotation_returns_no_definition` now prevents unimported `Service` annotations from resolving to unrelated workspace classes.
+
+- Observation: Python typed receiver methods need ancestor lookup for inherited members.
+  Evidence: guided review found `Child` receiver calls to `Base.run` would miss inherited definitions; `python_typed_receiver_inherited_method_resolves_to_base_definition` now covers the hierarchy path.
+
+- Observation: Click's `Command.main` is not a good benchmark smoke target for a unique resolved FQN because overload declarations and the implementation all share the same FQN.
+  Evidence: direct `get_definition` against `self.main` returned `ambiguous` with three `click.core.Command.main` candidates; the benchmark uses `_complete_visible_commands` instead and documents overload disambiguation as follow-up.
+
 ## Decision Log
 
 - Decision: Treat unresolved dependency/library/module boundaries as a first-class terminal state, separate from `no_definition`.
@@ -124,6 +141,10 @@ This work adds a `get_definition` searchtools/MCP tool for that on-demand lookup
 
 - Decision: Land PHP after Java with conservative support for the same reference forms already handled by the PHP inverted usage graph.
   Rationale: PHP already had reusable namespace/use-alias resolution and local receiver inference primitives. The on-demand path can now return accurate metadata for common workspace PHP references while explicitly documenting unsupported property receiver chains as a follow-up gap.
+  Date/Author: 2026-06-18 / Codex
+
+- Decision: Land Python after PHP with conservative support for import-bound, same-file, and typed-receiver reference forms.
+  Rationale: Python's analyzer already exposes import binders, module declarations, scope facts, and hierarchy providers. The on-demand path can reuse those pieces for common editor lookups while keeping unresolved packages and local shadowing distinct from indexed definitions.
   Date/Author: 2026-06-18 / Codex
 
 ## Outcomes & Retrospective

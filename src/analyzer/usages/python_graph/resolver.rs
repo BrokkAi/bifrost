@@ -4,7 +4,9 @@ use crate::analyzer::{
 };
 use std::collections::BTreeSet;
 
-pub(super) fn resolve_python_analyzer(analyzer: &dyn IAnalyzer) -> Option<&PythonAnalyzer> {
+pub(in crate::analyzer::usages) fn resolve_python_analyzer(
+    analyzer: &dyn IAnalyzer,
+) -> Option<&PythonAnalyzer> {
     if let Some(py) = (analyzer as &dyn std::any::Any).downcast_ref::<PythonAnalyzer>() {
         return Some(py);
     }
@@ -83,7 +85,7 @@ pub(super) fn target_owner_code_unit(
         .find(|code_unit| code_unit.source() == target.source() && code_unit.is_class())
 }
 
-pub(super) fn resolve_receiver_type(
+pub(in crate::analyzer::usages) fn resolve_receiver_type(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     raw_type: &str,

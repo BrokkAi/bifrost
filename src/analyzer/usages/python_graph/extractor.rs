@@ -277,7 +277,7 @@ pub(super) struct ScanCtx<'a> {
 /// The per-function receiver-type facts enclosing `node`, if any. Shared by the
 /// forward scan ([`ScanCtx`]) and the inverted builder (`PyScan`) so the two
 /// paths resolve a receiver's scope through one place.
-pub(super) fn enclosing_scope_facts<'a>(
+pub(in crate::analyzer::usages) fn enclosing_scope_facts<'a>(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     scope_facts: &'a HashMap<CodeUnit, LocalBindingsSnapshot<String>>,
@@ -421,11 +421,11 @@ fn handle_attribute_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
-pub(super) fn slice<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+pub(in crate::analyzer::usages) fn slice<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     source.get(node.start_byte()..node.end_byte()).unwrap_or("")
 }
 
-pub(super) fn is_declaration_identifier(node: Node<'_>) -> bool {
+pub(in crate::analyzer::usages) fn is_declaration_identifier(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
@@ -484,7 +484,7 @@ fn collect_top_level_conflicts(root: Node<'_>, source: &str) -> HashSet<String> 
     conflicts
 }
 
-pub(super) fn collect_assigned_identifiers(
+pub(in crate::analyzer::usages) fn collect_assigned_identifiers(
     node: Node<'_>,
     source: &str,
     out: &mut HashSet<String>,
@@ -506,7 +506,7 @@ pub(super) fn collect_assigned_identifiers(
     }
 }
 
-pub(super) fn collect_scope_facts(
+pub(in crate::analyzer::usages) fn collect_scope_facts(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     edges: &[ImportEdge],
