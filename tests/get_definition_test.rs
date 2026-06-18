@@ -1399,6 +1399,295 @@ fn cpp_unqualified_typo_with_angle_include_returns_no_definition() {
 }
 
 #[test]
+fn scala_same_package_type_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Service.scala", "package app\nclass Service\n")
+        .file(
+            "app/Controller.scala",
+            "package app\nclass Controller { val service: Service = new Service }\n",
+        )
+        .build();
+
+    let line = "class Controller { val service: Service = new Service }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Controller.scala","line":2,"column":{}}}]}}"#,
+            column_of(line, "Service")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "app.Service", "{value}");
+}
+
+#[test]
+fn scala_object_apply_call_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Factory.scala",
+            "package app\nclass Service\nobject Factory { def apply(): Service = new Service }\n",
+        )
+        .file(
+            "app/Controller.scala",
+            "package app\nclass Controller { val service = Factory() }\n",
+        )
+        .build();
+
+    let line = "class Controller { val service = Factory() }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Controller.scala","line":2,"column":{}}}]}}"#,
+            column_of(line, "Factory")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Factory$.apply",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_object_apply_call_accepts_source_symbol_filter() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Factory.scala",
+            "package app\nclass Service\nobject Factory { def apply(): Service = new Service }\n",
+        )
+        .file(
+            "app/Controller.scala",
+            "package app\nclass Controller { val service = Factory() }\n",
+        )
+        .build();
+
+    let line = "class Controller { val service = Factory() }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Controller.scala","line":2,"column":{},"symbol":"Factory"}}]}}"#,
+            column_of(line, "Factory")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Factory$.apply",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_object_apply_call_rejects_mismatched_symbol_filter() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Factory.scala",
+            "package app\nclass Service\nobject Factory { def apply(): Service = new Service }\n",
+        )
+        .file(
+            "app/Controller.scala",
+            "package app\nclass Controller { val service = Factory() }\n",
+        )
+        .build();
+
+    let line = "class Controller { val service = Factory() }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Controller.scala","line":2,"column":{},"symbol":"Other"}}]}}"#,
+            column_of(line, "Factory")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "symbol_filter_mismatch",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_unqualified_member_call_beats_same_named_object_apply() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Factory.scala",
+            "package app\nclass Service\nobject Factory { def apply(): Service = new Service }\n",
+        )
+        .file(
+            "app/Controller.scala",
+            "package app\nclass Controller { def Factory(): Int = 1; def run(): Int = Factory() }\n",
+        )
+        .build();
+
+    let line = "class Controller { def Factory(): Int = 1; def run(): Int = Factory() }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Controller.scala","line":2,"column":{}}}]}}"#,
+            column_of(line, "Factory() }")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Controller.Factory",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_typed_receiver_method_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Service.scala",
+            "package app\nclass Service { def run(): Int = 1 }\n",
+        )
+        .file(
+            "app/Controller.scala",
+            "package app\nclass Controller { def handle(service: Service): Int = service.run() }\n",
+        )
+        .build();
+
+    let line = "class Controller { def handle(service: Service): Int = service.run() }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Controller.scala","line":2,"column":{}}}]}}"#,
+            column_of(line, "run")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Service.run",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_external_import_reports_boundary() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Controller.scala",
+            "package app\nimport external.Service\nclass Controller { val service: Service = ??? }\n",
+        )
+        .build();
+
+    let line = "class Controller { val service: Service = ??? }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Controller.scala","line":3,"column":{}}}]}}"#,
+            column_of(line, "Service")
+        ),
+    );
+
+    assert_eq!(
+        value["results"][0]["status"], "unresolvable_import_boundary",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_external_constructor_call_reports_boundary() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Controller.scala",
+            "package app\nimport external.Service\nclass Controller { val service = Service() }\n",
+        )
+        .build();
+
+    let line = "class Controller { val service = Service() }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Controller.scala","line":3,"column":{}}}]}}"#,
+            column_of(line, "Service")
+        ),
+    );
+
+    assert_eq!(
+        value["results"][0]["status"], "unresolvable_import_boundary",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_external_imported_function_call_reports_boundary() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Controller.scala",
+            "package app\nimport external.Helpers.make\nclass Controller { val service = make() }\n",
+        )
+        .build();
+
+    let line = "class Controller { val service = make() }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Controller.scala","line":3,"column":{}}}]}}"#,
+            column_of(line, "make")
+        ),
+    );
+
+    assert_eq!(
+        value["results"][0]["status"], "unresolvable_import_boundary",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_local_value_returns_no_definition() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "App.scala",
+            "object App { def run(): Int = { val value = 1; value } }\n",
+        )
+        .build();
+
+    let line = "object App { def run(): Int = { val value = 1; value } }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"App.scala","line":1,"column":{}}}]}}"#,
+            column_of(line, "value }")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn scala_uppercase_local_value_shadows_workspace_type() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Service.scala", "package app\nclass Service\n")
+        .file(
+            "app/App.scala",
+            "package app\nobject App { def run(): Int = { val Service = 1; Service } }\n",
+        )
+        .build();
+
+    let line = "object App { def run(): Int = { val Service = 1; Service } }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/App.scala","line":2,"column":{}}}]}}"#,
+            column_of(line, "Service }")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
 fn valid_local_value_returns_no_definition() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file(
@@ -1426,13 +1715,13 @@ export function run() {
 
 #[test]
 fn unsupported_language_returns_structured_status() {
-    let project = InlineTestProject::with_language(Language::Scala)
-        .file("App.scala", "object App { def run(): Unit = helper() }\n")
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("notes.txt", "helper\n")
         .build();
 
     let value = lookup(
         project.root(),
-        r#"{"references":[{"path":"App.scala","line":1,"column":32}]}"#,
+        r#"{"references":[{"path":"notes.txt","line":1,"column":1}]}"#,
     );
 
     assert_eq!(

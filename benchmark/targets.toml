@@ -233,7 +233,7 @@ summary_targets = ["shared/src/main/scala/scala/xml/Elem.scala"]
 seed_file_paths = ["shared/src/main/scala/scala/xml/Elem.scala"]
 usage_symbols = ["scala.xml.Elem"]
 definition_queries = [
-  { path = "shared/src/main/scala/scala/xml/Elem.scala", line = 107, column = 13, symbol = "Elem", expected_status = "unsupported_language" },
+  { path = "shared/src/main/scala/scala/xml/Elem.scala", line = 107, column = 13, symbol = "Elem", expected_status = "resolved", expected_fqn = "scala.xml.Elem$.apply" },
 ]
 
 [[repos]]

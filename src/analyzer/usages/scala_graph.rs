@@ -9,14 +9,17 @@ use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::usages::scala_graph::resolver::{
-    TargetKind, TargetSpec, resolve_scala_analyzer, scala_normalized_fq_name,
-};
+use crate::analyzer::usages::scala_graph::resolver::{TargetKind, TargetSpec};
 use crate::analyzer::usages::scala_graph::shared::{ScalaEdgeResolver, ScalaQueryResolver};
-use crate::analyzer::usages::scala_graph::syntax::scala_import_path;
 use crate::analyzer::usages::traits::UsageAnalyzer;
 use crate::analyzer::{CodeUnit, IAnalyzer, ImportAnalysisProvider, Language, ProjectFile};
 use crate::hash::HashSet;
+
+pub(in crate::analyzer::usages) use inverted::{
+    NameResolver as ScalaNameResolver, ProjectTypes as ScalaProjectTypes,
+};
+pub(in crate::analyzer::usages) use resolver::{resolve_scala_analyzer, scala_normalized_fq_name};
+pub(in crate::analyzer::usages) use syntax::{node_text as scala_node_text, scala_import_path};
 
 pub(crate) fn build_scala_usage_edges<F>(
     analyzer: &dyn IAnalyzer,

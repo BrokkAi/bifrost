@@ -22,10 +22,14 @@ use crate::analyzer::usages::python_graph::{
     is_declaration_identifier as python_is_declaration_identifier, python_slice,
     resolve_python_analyzer, resolve_receiver_type as resolve_python_receiver_type,
 };
+use crate::analyzer::usages::scala_graph::{
+    ScalaNameResolver, ScalaProjectTypes, resolve_scala_analyzer, scala_import_path,
+    scala_node_text,
+};
 use crate::analyzer::{
-    AliasResolver, CSharpAnalyzer, CodeUnit, IAnalyzer, JavaAnalyzer, Language, PhpAnalyzer,
-    ProjectFile, PythonAnalyzer, Range, cpp_node_text, parse_php_use_aliases_from_source,
-    quoted_include_paths, resolve_include_targets,
+    AliasResolver, CSharpAnalyzer, CodeUnit, IAnalyzer, ImportAnalysisProvider, JavaAnalyzer,
+    Language, PhpAnalyzer, ProjectFile, PythonAnalyzer, Range, ScalaAnalyzer, cpp_node_text,
+    parse_php_use_aliases_from_source, quoted_include_paths, resolve_include_targets,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
@@ -239,7 +243,8 @@ fn resolve_one(
         Language::Python => resolve_python(analyzer, support, &request.file, &source, &site),
         Language::CSharp => resolve_csharp(analyzer, support, &request.file, &source, &site),
         Language::Cpp => resolve_cpp(analyzer, support, &request.file, &source, &site),
-        Language::Scala | Language::None => {
+        Language::Scala => resolve_scala(analyzer, support, &request.file, &source, &site),
+        Language::None => {
             return DefinitionLookupOutcome {
                 status: DefinitionLookupStatus::UnsupportedLanguage,
                 reference: Some(site),
@@ -261,22 +266,27 @@ fn finish_with_symbol_filter(
     symbol: Option<String>,
 ) -> DefinitionLookupOutcome {
     if let Some(symbol) = symbol.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        let before = outcome.candidates.len();
-        outcome.candidates.retain(|candidate| {
-            candidate.fq_name() == symbol
-                || candidate.identifier() == symbol
-                || candidate.short_name() == symbol
-                || candidate.fq_name().ends_with(&format!(".{symbol}"))
-        });
-        if before > 0 && outcome.candidates.is_empty() {
-            outcome.status = DefinitionLookupStatus::NoDefinition;
-            outcome.diagnostics.push(DefinitionLookupDiagnostic {
-                kind: "symbol_filter_mismatch".to_string(),
-                message: format!(
-                    "resolved reference `{}` did not match symbol disambiguator `{symbol}`",
-                    site.text
-                ),
+        if site.text == symbol {
+            // The symbol can name the queried source token rather than the target
+            // definition, e.g. Scala `Elem(...)` resolving to `Elem$.apply`.
+        } else {
+            let before = outcome.candidates.len();
+            outcome.candidates.retain(|candidate| {
+                candidate.fq_name() == symbol
+                    || candidate.identifier() == symbol
+                    || candidate.short_name() == symbol
+                    || candidate.fq_name().ends_with(&format!(".{symbol}"))
             });
+            if before > 0 && outcome.candidates.is_empty() {
+                outcome.status = DefinitionLookupStatus::NoDefinition;
+                outcome.diagnostics.push(DefinitionLookupDiagnostic {
+                    kind: "symbol_filter_mismatch".to_string(),
+                    message: format!(
+                        "resolved reference `{}` did not match symbol disambiguator `{symbol}`",
+                        site.text
+                    ),
+                });
+            }
         }
     }
 
@@ -1501,6 +1511,614 @@ fn cpp_lexical_namespace(node: Node<'_>, source: &str) -> Option<String> {
     }
     names.reverse();
     (!names.is_empty()).then(|| names.join("::"))
+}
+
+fn resolve_scala(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionSupport,
+    file: &ProjectFile,
+    source: &str,
+    site: &ResolvedReferenceSite,
+) -> DefinitionLookupOutcome {
+    let Some(scala) = resolve_scala_analyzer(analyzer) else {
+        return no_definition(
+            "scala_analyzer_unavailable",
+            "Scala analyzer is unavailable",
+        );
+    };
+    let Some(tree) = parse_scala_tree(source) else {
+        return no_definition("scala_parse_failed", "Scala source could not be parsed");
+    };
+    let types = ScalaProjectTypes::build(scala);
+    let resolver = ScalaNameResolver::for_file(scala, file, &types);
+    let root = tree.root_node();
+    let Some(node) = smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)
+    else {
+        return no_definition(
+            "no_indexed_definition",
+            format!(
+                "`{}` did not resolve to an indexed Scala definition",
+                site.text
+            ),
+        );
+    };
+    if scala_is_declaration_name(node) {
+        return no_definition(
+            "declaration_or_import_site",
+            format!("`{}` is not a Scala reference site", site.text),
+        );
+    }
+
+    match scala_reference_node(node) {
+        Some(ScalaReferenceNode::Type(type_node)) => {
+            let ctx = ScalaLookupCtx {
+                scala,
+                analyzer,
+                support,
+                file,
+                source,
+            };
+            resolve_scala_type(ctx, &resolver, root, type_node)
+        }
+        Some(ScalaReferenceNode::Call(call)) => {
+            let ctx = ScalaLookupCtx {
+                scala,
+                analyzer,
+                support,
+                file,
+                source,
+            };
+            resolve_scala_call(ctx, &resolver, root, call)
+        }
+        Some(ScalaReferenceNode::Field(field)) => {
+            resolve_scala_field(analyzer, support, file, source, &resolver, root, field)
+        }
+        Some(ScalaReferenceNode::Identifier(identifier)) => {
+            let text = scala_node_text(identifier, source).trim();
+            if text.is_empty() {
+                return no_definition("no_reference_text", "Scala identifier is blank");
+            }
+            let bindings = scala_bindings_before(&resolver, source, root, identifier.start_byte());
+            if bindings.is_shadowed(text) {
+                return no_definition(
+                    "local_variable_reference",
+                    format!("`{text}` is a local Scala value"),
+                );
+            }
+            if let Some(fqn) = resolver.resolve(text) {
+                return scala_fqn_outcome(support, &fqn, text);
+            }
+            if scala_import_boundary_for_name(scala, analyzer, file, text) {
+                return boundary(format!(
+                    "`{text}` appears to cross a Scala import boundary not indexed in this workspace"
+                ));
+            }
+            no_definition(
+                "no_indexed_definition",
+                format!("`{text}` did not resolve to an indexed Scala definition"),
+            )
+        }
+        None => no_definition(
+            "unsupported_scala_reference_shape",
+            format!(
+                "`{}` is a Scala `{}` reference shape that get_definition does not resolve yet",
+                site.text,
+                node.kind()
+            ),
+        ),
+    }
+}
+
+fn parse_scala_tree(source: &str) -> Option<Tree> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_scala::LANGUAGE.into())
+        .ok()?;
+    parser.parse(source, None)
+}
+
+enum ScalaReferenceNode<'tree> {
+    Type(Node<'tree>),
+    Call(Node<'tree>),
+    Field(Node<'tree>),
+    Identifier(Node<'tree>),
+}
+
+fn scala_reference_node(node: Node<'_>) -> Option<ScalaReferenceNode<'_>> {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "field_expression"
+            && parent.child_by_field_name("field") == Some(current)
+        {
+            current = parent;
+            continue;
+        }
+        if parent.kind() == "call_expression"
+            && parent.child_by_field_name("function") == Some(current)
+        {
+            current = parent;
+            continue;
+        }
+        break;
+    }
+
+    match current.kind() {
+        "call_expression" => Some(ScalaReferenceNode::Call(current)),
+        "field_expression" => Some(ScalaReferenceNode::Field(current)),
+        "type_identifier" | "stable_type_identifier" | "generic_type" => {
+            Some(ScalaReferenceNode::Type(current))
+        }
+        "identifier" | "operator_identifier" => Some(ScalaReferenceNode::Identifier(current)),
+        _ => None,
+    }
+}
+
+fn scala_is_declaration_name(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    parent.child_by_field_name("name") == Some(node)
+        && matches!(
+            parent.kind(),
+            "class_definition"
+                | "object_definition"
+                | "trait_definition"
+                | "enum_definition"
+                | "function_definition"
+                | "parameter"
+                | "val_definition"
+                | "var_definition"
+        )
+}
+
+fn scala_is_type_position(node: Node<'_>) -> bool {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.child_by_field_name("type") == Some(current) {
+            return true;
+        }
+        if matches!(parent.kind(), "generic_type" | "stable_type_identifier") {
+            current = parent;
+            continue;
+        }
+        return false;
+    }
+    false
+}
+
+#[derive(Clone, Copy)]
+struct ScalaLookupCtx<'a> {
+    scala: &'a ScalaAnalyzer,
+    analyzer: &'a dyn IAnalyzer,
+    support: &'a DefinitionSupport,
+    file: &'a ProjectFile,
+    source: &'a str,
+}
+
+fn resolve_scala_type(
+    ctx: ScalaLookupCtx<'_>,
+    resolver: &ScalaNameResolver,
+    root: Node<'_>,
+    node: Node<'_>,
+) -> DefinitionLookupOutcome {
+    let text = scala_node_text(node, ctx.source).trim();
+    if text.is_empty() {
+        return no_definition("no_reference_text", "Scala type reference is blank");
+    }
+    if !scala_is_type_position(node) {
+        let bindings = scala_bindings_before(resolver, ctx.source, root, node.start_byte());
+        if bindings.is_shadowed(text) {
+            return no_definition(
+                "local_variable_reference",
+                format!("`{text}` is a local Scala value"),
+            );
+        }
+    }
+    if let Some(fqn) = resolver.resolve(text) {
+        return scala_fqn_outcome(ctx.support, &fqn, text);
+    }
+    if scala_import_boundary_for_name(ctx.scala, ctx.analyzer, ctx.file, scala_simple_name(text)) {
+        return boundary(format!(
+            "`{text}` appears to cross a Scala import boundary not indexed in this workspace"
+        ));
+    }
+    no_definition(
+        "no_indexed_definition",
+        format!("`{text}` did not resolve to an indexed Scala type"),
+    )
+}
+
+fn resolve_scala_call(
+    ctx: ScalaLookupCtx<'_>,
+    resolver: &ScalaNameResolver,
+    root: Node<'_>,
+    call: Node<'_>,
+) -> DefinitionLookupOutcome {
+    let Some(function) = call.child_by_field_name("function") else {
+        return no_definition("no_function_name", "Scala call expression has no function");
+    };
+    match function.kind() {
+        "field_expression" => resolve_scala_field(
+            ctx.analyzer,
+            ctx.support,
+            ctx.file,
+            ctx.source,
+            resolver,
+            root,
+            function,
+        ),
+        "identifier" | "type_identifier" => {
+            let name = scala_node_text(function, ctx.source).trim();
+            if name.is_empty() {
+                return no_definition("no_function_name", "Scala call name is blank");
+            }
+            let bindings = scala_bindings_before(resolver, ctx.source, root, function.start_byte());
+            if bindings.is_shadowed(name) {
+                return no_definition(
+                    "local_variable_reference",
+                    format!("`{name}` is a local Scala value"),
+                );
+            }
+            if function.kind() == "identifier"
+                && let Some(owner) =
+                    scala_enclosing_class(ctx.analyzer, ctx.file, function.start_byte())
+                && owner.identifier() != name
+            {
+                let candidates = ctx.support.fqn(&format!("{}.{}", owner.fq_name(), name));
+                if !candidates.is_empty() {
+                    return candidates_outcome(candidates);
+                }
+            }
+            if let Some(owner_fqn) = resolver.resolve(name) {
+                let apply_candidates = ctx.support.fqn(&format!("{owner_fqn}.apply"));
+                if !apply_candidates.is_empty() {
+                    return candidates_outcome(apply_candidates);
+                }
+                return scala_fqn_outcome(ctx.support, &owner_fqn, name);
+            }
+            if scala_import_boundary_for_name(ctx.scala, ctx.analyzer, ctx.file, name) {
+                return boundary(format!(
+                    "`{name}` appears to cross a Scala import boundary not indexed in this workspace"
+                ));
+            }
+            no_definition(
+                "no_indexed_definition",
+                format!("`{name}` did not resolve to an indexed Scala callable"),
+            )
+        }
+        _ => no_definition(
+            "unsupported_scala_reference_shape",
+            format!(
+                "Scala `{}` call targets are not resolved by get_definition yet",
+                function.kind()
+            ),
+        ),
+    }
+}
+
+fn resolve_scala_field(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionSupport,
+    file: &ProjectFile,
+    source: &str,
+    resolver: &ScalaNameResolver,
+    root: Node<'_>,
+    field: Node<'_>,
+) -> DefinitionLookupOutcome {
+    let Some(field_node) = field.child_by_field_name("field") else {
+        return no_definition(
+            "no_member_name",
+            "Scala field expression has no member name",
+        );
+    };
+    let member = scala_node_text(field_node, source).trim();
+    let Some(receiver) = field.child_by_field_name("value") else {
+        return no_definition(
+            "no_member_receiver",
+            "Scala field expression has no receiver",
+        );
+    };
+    if let Some(owner) = scala_receiver_type_fqn(
+        analyzer,
+        file,
+        source,
+        resolver,
+        root,
+        receiver,
+        field.start_byte(),
+    ) {
+        let candidates = support.fqn(&format!("{owner}.{member}"));
+        if !candidates.is_empty() {
+            return candidates_outcome(candidates);
+        }
+    }
+    no_definition(
+        "unsupported_scala_receiver",
+        format!("receiver for Scala member `{member}` is not resolved"),
+    )
+}
+
+fn scala_receiver_type_fqn(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    resolver: &ScalaNameResolver,
+    root: Node<'_>,
+    receiver: Node<'_>,
+    cutoff_start: usize,
+) -> Option<String> {
+    match receiver.kind() {
+        "identifier" => {
+            let name = scala_node_text(receiver, source).trim();
+            if name == "this" {
+                return ClassRangeIndex::build(analyzer, file)
+                    .enclosing(receiver.start_byte())
+                    .map(str::to_string);
+            }
+            let bindings = scala_bindings_before(resolver, source, root, cutoff_start);
+            first_precise(&bindings, name).or_else(|| {
+                (!bindings.is_shadowed(name))
+                    .then(|| resolver.resolve(name))
+                    .flatten()
+            })
+        }
+        _ => None,
+    }
+}
+
+fn scala_fqn_outcome(
+    support: &DefinitionSupport,
+    fqn: &str,
+    reference: &str,
+) -> DefinitionLookupOutcome {
+    let candidates = support.fqn(fqn);
+    if candidates.is_empty() {
+        no_definition(
+            "no_indexed_definition",
+            format!("`{reference}` resolved to `{fqn}`, but no indexed definition was found"),
+        )
+    } else {
+        candidates_outcome(candidates)
+    }
+}
+
+fn scala_enclosing_class(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    byte: usize,
+) -> Option<CodeUnit> {
+    let fqn = ClassRangeIndex::build(analyzer, file)
+        .enclosing(byte)?
+        .to_string();
+    analyzer.definitions(&fqn).next().cloned()
+}
+
+const SCALA_SCOPE_NODES: &[&str] = &[
+    "class_definition",
+    "object_definition",
+    "trait_definition",
+    "enum_definition",
+    "function_definition",
+    "block",
+    "indented_block",
+    "case_clause",
+    "lambda_expression",
+];
+
+fn scala_bindings_before(
+    resolver: &ScalaNameResolver,
+    source: &str,
+    root: Node<'_>,
+    cutoff_start: usize,
+) -> LocalInferenceEngine<String> {
+    let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
+    scala_seed_active_path(resolver, source, root, cutoff_start, &mut bindings);
+    bindings
+}
+
+fn scala_seed_active_path(
+    resolver: &ScalaNameResolver,
+    source: &str,
+    node: Node<'_>,
+    cutoff_start: usize,
+    bindings: &mut LocalInferenceEngine<String>,
+) {
+    if node.start_byte() >= cutoff_start {
+        return;
+    }
+    let enters_scope = SCALA_SCOPE_NODES.contains(&node.kind());
+    if enters_scope && !(node.start_byte() <= cutoff_start && cutoff_start < node.end_byte()) {
+        return;
+    }
+    if enters_scope {
+        bindings.enter_scope();
+    }
+    match node.kind() {
+        "function_definition" => {
+            scala_seed_parameters(resolver, source, node, cutoff_start, bindings)
+        }
+        "val_definition" | "var_definition" if node.start_byte() < cutoff_start => {
+            scala_seed_value_definition(resolver, source, node, cutoff_start, bindings)
+        }
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.start_byte() >= cutoff_start {
+            break;
+        }
+        scala_seed_active_path(resolver, source, child, cutoff_start, bindings);
+    }
+}
+
+fn scala_seed_parameters(
+    resolver: &ScalaNameResolver,
+    source: &str,
+    node: Node<'_>,
+    cutoff_start: usize,
+    bindings: &mut LocalInferenceEngine<String>,
+) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() != "parameters" || child.start_byte() >= cutoff_start {
+            continue;
+        }
+        let mut inner = child.walk();
+        for parameter in child.named_children(&mut inner) {
+            if parameter.kind() == "parameter" && parameter.start_byte() < cutoff_start {
+                scala_seed_parameter(resolver, source, parameter, cutoff_start, bindings);
+            }
+        }
+    }
+}
+
+fn scala_seed_parameter(
+    resolver: &ScalaNameResolver,
+    source: &str,
+    parameter: Node<'_>,
+    cutoff_start: usize,
+    bindings: &mut LocalInferenceEngine<String>,
+) {
+    let Some(name) = parameter.child_by_field_name("name") else {
+        return;
+    };
+    if name.start_byte() >= cutoff_start {
+        return;
+    }
+    let binding_name = scala_node_text(name, source).trim();
+    if binding_name.is_empty() {
+        return;
+    }
+    let resolved = parameter
+        .child_by_field_name("type")
+        .filter(|type_node| type_node.end_byte() <= cutoff_start)
+        .and_then(|type_node| resolver.resolve(scala_node_text(type_node, source)));
+    scala_seed_typed(binding_name, resolved, bindings);
+}
+
+fn scala_seed_value_definition(
+    resolver: &ScalaNameResolver,
+    source: &str,
+    node: Node<'_>,
+    cutoff_start: usize,
+    bindings: &mut LocalInferenceEngine<String>,
+) {
+    let resolved = node
+        .child_by_field_name("type")
+        .filter(|type_node| type_node.end_byte() <= cutoff_start)
+        .and_then(|type_node| resolver.resolve(scala_node_text(type_node, source)))
+        .or_else(|| {
+            node.child_by_field_name("value")
+                .filter(|value| value.end_byte() <= cutoff_start)
+                .and_then(|value| scala_constructed_type(value, resolver, source))
+        });
+    let Some(pattern) = node.child_by_field_name("pattern") else {
+        return;
+    };
+    if pattern.start_byte() >= cutoff_start {
+        return;
+    }
+    for name in scala_pattern_names(pattern, source) {
+        scala_seed_typed(name, resolved.clone(), bindings);
+    }
+}
+
+fn scala_constructed_type(
+    node: Node<'_>,
+    resolver: &ScalaNameResolver,
+    source: &str,
+) -> Option<String> {
+    if node.kind() != "instance_expression" {
+        return None;
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| child.kind() == "type_identifier" || child.kind() == "generic_type")
+        .and_then(|type_node| resolver.resolve(scala_node_text(type_node, source)))
+}
+
+fn scala_pattern_names<'a>(node: Node<'_>, source: &'a str) -> Vec<&'a str> {
+    match node.kind() {
+        "identifier" | "operator_identifier" => {
+            let name = scala_node_text(node, source).trim();
+            if name.is_empty() {
+                Vec::new()
+            } else {
+                vec![name]
+            }
+        }
+        _ => {
+            let mut names = Vec::new();
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                names.extend(scala_pattern_names(child, source));
+            }
+            names
+        }
+    }
+}
+
+fn scala_seed_typed(
+    name: &str,
+    resolved: Option<String>,
+    bindings: &mut LocalInferenceEngine<String>,
+) {
+    match resolved {
+        Some(fqn) => bindings.seed_symbol(name.to_string(), fqn),
+        None => bindings.declare_shadow(name.to_string()),
+    }
+}
+
+fn scala_import_boundary_for_name(
+    scala: &ScalaAnalyzer,
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    name: &str,
+) -> bool {
+    let simple = scala_simple_name(name);
+    for import in scala.import_info_of(file) {
+        let Some(path) = scala_import_path(import) else {
+            continue;
+        };
+        if import.is_wildcard {
+            if simple.chars().next().is_some_and(char::is_uppercase)
+                && !scala_workspace_package_exists(analyzer, &path)
+            {
+                return true;
+            }
+            continue;
+        }
+        let local_name = import
+            .identifier
+            .as_deref()
+            .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(path.as_str()));
+        if local_name == simple && supportless_scala_import_target_missing(analyzer, &path) {
+            return true;
+        }
+    }
+    false
+}
+
+fn supportless_scala_import_target_missing(analyzer: &dyn IAnalyzer, path: &str) -> bool {
+    let normalized = path.replace("$.", ".").trim_end_matches('$').to_string();
+    !analyzer.all_declarations().any(|unit| {
+        unit.fq_name() == normalized
+            || unit.fq_name().replace("$.", ".").trim_end_matches('$') == normalized
+    })
+}
+
+fn scala_workspace_package_exists(analyzer: &dyn IAnalyzer, package: &str) -> bool {
+    analyzer
+        .all_declarations()
+        .any(|unit| unit.package_name() == package)
+}
+
+fn scala_simple_name(name: &str) -> &str {
+    name.split(['[', '(', '{', '.', ' ', '<'])
+        .next()
+        .unwrap_or(name)
+        .trim()
 }
 
 fn resolve_java(

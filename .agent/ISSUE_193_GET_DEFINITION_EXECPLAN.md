@@ -64,6 +64,11 @@ This work adds a `get_definition` searchtools/MCP tool for that on-demand lookup
 - [x] (2026-06-18T09:20Z) Ran the requested guided review checkpoint over the uncommitted C++ slice with parallel reviewer agents. Review findings were fixed by preventing declaration sites from resolving as references, restricting type fallback to classes/type aliases, requiring lexical-namespace proof for relative qualified calls, adding `auto new` receiver inference, and avoiding broad boundary diagnostics for unqualified typos in files with angle includes.
 - [x] (2026-06-18T09:20Z) Added C++ regression tests for include-visible types, typed receiver calls, relative namespace calls, declaration-site clicks, same-named function/type confusion, wrong-namespace qualified calls, `auto new` receivers, unresolved external includes, unqualified typos with angle includes, and local values.
 - [x] (2026-06-18T09:20Z) Re-ran `cargo test --test get_definition_test`, `cargo run --bin bifrost_benchmark -- validate --manifest benchmark/targets.toml`, `cargo run --bin bifrost_benchmark -- run --manifest benchmark/targets.toml --repo fmt-cpp --max-files 80`, `cargo test --test bifrost_benchmark_run`, `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`; all passed.
+- [x] (2026-06-18T09:31Z) Added Scala `get_definition` support for same-package type references, companion-object `apply` calls, typed receiver methods, local-value `no_definition`, and direct external import-boundary diagnostics.
+- [x] (2026-06-18T09:31Z) Updated the scala-xml benchmark probe from `unsupported_language` to a resolved `scala.xml.Elem$.apply` companion-object call at `shared/src/main/scala/scala/xml/Elem.scala:107:13`, and documented the manual result in `benchmark/get_definition_observations.md`.
+- [x] (2026-06-18T09:31Z) Ran the requested guided review checkpoint over the uncommitted Scala slice with parallel reviewer agents. Review findings were fixed by preferring enclosing members over same-name visible objects for ordinary unqualified calls, preserving companion `apply` lookup for owner self-name constructor-style calls, classifying external constructor/function calls as `unresolvable_import_boundary`, honoring uppercase local term shadowing, and adding source-token symbol-filter coverage.
+- [x] (2026-06-18T09:31Z) Added Scala regression tests for same-package types, companion `apply`, source-token symbol filtering and mismatch diagnostics, member-vs-object precedence, typed receivers, external constructor/function/type boundaries, uppercase local shadowing, and local values.
+- [x] (2026-06-18T09:31Z) Re-ran `cargo test --test get_definition_test`, `cargo test --test bifrost_benchmark_run`, `cargo run --bin bifrost_benchmark -- validate --manifest benchmark/targets.toml`, `cargo run --bin bifrost_benchmark -- run --manifest benchmark/targets.toml --repo scala-xml --max-files 80`, `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`; all passed.
 
 ## Surprises & Discoveries
 
@@ -154,6 +159,12 @@ This work adds a `get_definition` searchtools/MCP tool for that on-demand lookup
 - Observation: C++ out-of-line method lookups may legitimately return declaration and definition candidates with the same FQN.
   Evidence: `cpp_typed_receiver_method_resolves_to_definition` returns `ambiguous` for `ns.Service.run` when both `target.h` and `target.cpp` contain indexed candidates; this is documented as a follow-up for body/signature preference rather than hidden.
 
+- Observation: Scala owner self-name calls inside a class can look like ordinary unqualified method calls but should still be allowed to resolve through a same-package companion object's `apply`.
+  Evidence: the scala-xml benchmark call `Elem(...)` inside `class Elem` initially resolved to a constructor-like `scala.xml.Elem.Elem` candidate after the member-precedence review fix. The resolver now skips owner self-name member precedence so the benchmark returns `scala.xml.Elem$.apply` while a distinct same-name method such as `Controller.Factory()` still wins over `object Factory.apply`.
+
+- Observation: Scala source-token symbol filtering is needed for companion `apply` targets.
+  Evidence: the benchmark query carries `symbol = "Elem"` while the target definition FQN is `scala.xml.Elem$.apply`. Focused tests now preserve the resolved candidate when the source token matches the requested symbol and still report `symbol_filter_mismatch` for unrelated symbols.
+
 ## Decision Log
 
 - Decision: Treat unresolved dependency/library/module boundaries as a first-class terminal state, separate from `no_definition`.
@@ -190,6 +201,10 @@ This work adds a `get_definition` searchtools/MCP tool for that on-demand lookup
 
 - Decision: Land C++ after C# with include-visibility and lexical-namespace safeguards.
   Rationale: The C++ usage graph already has include-closure visibility and local receiver inference primitives. The on-demand path can reuse those semantics for common workspace C++ references while staying conservative about declaration sites, unrelated namespace suffixes, unqualified typos, and declaration/definition ambiguity.
+  Date/Author: 2026-06-18 / Codex
+
+- Decision: Land Scala after C++ with conservative support for analyzer-visible package/type, companion `apply`, and typed receiver forms.
+  Rationale: Scala has enough indexed declarations, import analysis, and graph-local inference to cover useful benchmark and workspace lookups, but overloaded methods, inherited receiver members, and signature-sensitive disambiguation should remain documented follow-up work rather than being guessed in the on-demand path.
   Date/Author: 2026-06-18 / Codex
 
 ## Outcomes & Retrospective
