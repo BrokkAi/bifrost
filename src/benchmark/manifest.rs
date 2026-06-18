@@ -168,16 +168,19 @@ pub enum BenchmarkScenario {
     MostRelevantFiles,
     #[serde(rename = "scan_usages")]
     ScanUsages,
+    #[serde(rename = "get_definition")]
+    GetDefinition,
 }
 
 impl BenchmarkScenario {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::WorkspaceBuild,
         Self::SearchSymbols,
         Self::GetSymbolLocations,
         Self::GetSummaries,
         Self::MostRelevantFiles,
         Self::ScanUsages,
+        Self::GetDefinition,
     ];
 
     pub fn label(self) -> &'static str {
@@ -188,6 +191,7 @@ impl BenchmarkScenario {
             Self::GetSummaries => "get_summaries",
             Self::MostRelevantFiles => "most_relevant_files",
             Self::ScanUsages => "scan_usages",
+            Self::GetDefinition => "get_definition",
         }
     }
 }
@@ -323,6 +327,26 @@ pub struct BenchmarkRepoTarget {
     pub seed_file_paths: Vec<String>,
     #[serde(default)]
     pub usage_symbols: Vec<String>,
+    #[serde(default)]
+    pub definition_queries: Vec<DefinitionQueryTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DefinitionQueryTarget {
+    pub path: String,
+    #[serde(default)]
+    pub line: Option<usize>,
+    #[serde(default)]
+    pub column: Option<usize>,
+    #[serde(default)]
+    pub start_byte: Option<usize>,
+    #[serde(default)]
+    pub end_byte: Option<usize>,
+    #[serde(default)]
+    pub symbol: Option<String>,
+    pub expected_status: String,
+    #[serde(default)]
+    pub expected_fqn: Option<String>,
 }
 
 impl BenchmarkRepoTarget {
@@ -422,6 +446,60 @@ impl BenchmarkRepoTarget {
                 "repo `{name}` enables `scan_usages` but does not define usage_symbols"
             ));
         }
+
+        if scenarios.contains(&BenchmarkScenario::GetDefinition) {
+            if self.definition_queries.is_empty() {
+                errors.push(format!(
+                    "repo `{name}` enables `get_definition` but does not define definition_queries"
+                ));
+            }
+            for (index, query) in self.definition_queries.iter().enumerate() {
+                query.validate(name, index, errors);
+            }
+        }
+    }
+}
+
+impl DefinitionQueryTarget {
+    fn validate(&self, repo_name: &str, index: usize, errors: &mut Vec<String>) {
+        let label = format!("repo `{repo_name}` definition_queries[{index}]");
+        if self.path.trim().is_empty() {
+            errors.push(format!("{label} must define a non-empty path"));
+        }
+
+        let has_byte_location = self.start_byte.is_some();
+        let has_line_location = self.line.is_some() && self.column.is_some();
+        if !has_byte_location && !has_line_location {
+            errors.push(format!(
+                "{label} must define either start_byte or both line and column"
+            ));
+        }
+        if self.end_byte.is_some() && self.start_byte.is_none() {
+            errors.push(format!("{label} defines end_byte without start_byte"));
+        }
+        if matches!((self.start_byte, self.end_byte), (Some(start), Some(end)) if start >= end) {
+            errors.push(format!("{label} has an empty or inverted byte range"));
+        }
+        if self.line == Some(0) {
+            errors.push(format!("{label} line must be 1-based"));
+        }
+        if self.column == Some(0) {
+            errors.push(format!("{label} column must be 1-based"));
+        }
+
+        if !is_definition_status(&self.expected_status) {
+            errors.push(format!(
+                "{label} has unsupported expected_status `{}`",
+                self.expected_status
+            ));
+        }
+        if self
+            .expected_fqn
+            .as_ref()
+            .is_some_and(|expected| expected.trim().is_empty())
+        {
+            errors.push(format!("{label} has a blank expected_fqn"));
+        }
     }
 }
 
@@ -466,6 +544,19 @@ fn normalize_extension(extension: &str) -> String {
 
 fn has_non_blank_values(values: &[String]) -> bool {
     values.iter().any(|value| !value.trim().is_empty())
+}
+
+fn is_definition_status(status: &str) -> bool {
+    matches!(
+        status,
+        "resolved"
+            | "no_definition"
+            | "unresolvable_import_boundary"
+            | "ambiguous"
+            | "unsupported_language"
+            | "invalid_location"
+            | "not_found"
+    )
 }
 
 fn manifest_language_from_analyzer(language: Language) -> Option<ManifestLanguage> {

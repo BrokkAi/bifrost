@@ -75,7 +75,9 @@ impl TargetSpec {
     }
 }
 
-pub(super) fn resolve_scala_analyzer(analyzer: &dyn IAnalyzer) -> Option<&ScalaAnalyzer> {
+pub(in crate::analyzer::usages) fn resolve_scala_analyzer(
+    analyzer: &dyn IAnalyzer,
+) -> Option<&ScalaAnalyzer> {
     if let Some(scala) = (analyzer as &dyn std::any::Any).downcast_ref::<ScalaAnalyzer>() {
         return Some(scala);
     }
@@ -263,18 +265,21 @@ fn signature_arity(signature: &str) -> Option<usize> {
     parenthesized_arity(&signature[open..])
 }
 
-pub(super) fn package_name_of(scala: &ScalaAnalyzer, file: &ProjectFile) -> Option<String> {
+pub(in crate::analyzer::usages) fn package_name_of(
+    scala: &ScalaAnalyzer,
+    file: &ProjectFile,
+) -> Option<String> {
     scala
         .declarations(file)
         .next()
         .map(|unit| unit.package_name().to_string())
 }
 
-pub(super) fn scala_normalized_fq_name(fq_name: &str) -> String {
+pub(in crate::analyzer::usages) fn scala_normalized_fq_name(fq_name: &str) -> String {
     fq_name.replace("$.", ".").trim_end_matches('$').to_string()
 }
 
-pub(super) fn scala_display_name(unit: &CodeUnit) -> String {
+pub(in crate::analyzer::usages) fn scala_display_name(unit: &CodeUnit) -> String {
     unit.short_name()
         .rsplit('.')
         .next()

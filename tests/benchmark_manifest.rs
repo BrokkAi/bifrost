@@ -37,6 +37,20 @@ fn checked_in_targets_manifest_loads_and_validates() {
         covered_scenarios,
         BenchmarkScenario::ALL.into_iter().collect()
     );
+
+    for repo in &manifest.repos {
+        assert!(
+            repo.scenario_set()
+                .contains(&BenchmarkScenario::GetDefinition),
+            "{} must enable get_definition coverage",
+            repo.name
+        );
+        assert!(
+            !repo.definition_queries.is_empty(),
+            "{} must define at least one get_definition query",
+            repo.name
+        );
+    }
 }
 
 #[test]
@@ -92,6 +106,13 @@ scenarios = ["workspace_build", "search_symbols", "get_symbol_locations", "get_s
             .messages()
             .iter()
             .any(|message| message.contains("scan_usages")),
+        "{validation}"
+    );
+    assert!(
+        validation
+            .messages()
+            .iter()
+            .any(|message| message.contains("get_definition")),
         "{validation}"
     );
 }

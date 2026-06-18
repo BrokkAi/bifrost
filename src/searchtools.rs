@@ -112,6 +112,28 @@ pub struct UsageGraphParams {
     pub paths: Option<Vec<String>>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetDefinitionParams {
+    pub references: Vec<DefinitionReferenceQuery>,
+    #[serde(default)]
+    pub include_tests: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DefinitionReferenceQuery {
+    pub path: String,
+    #[serde(default)]
+    pub line: Option<usize>,
+    #[serde(default)]
+    pub column: Option<usize>,
+    #[serde(default)]
+    pub start_byte: Option<usize>,
+    #[serde(default)]
+    pub end_byte: Option<usize>,
+    #[serde(default)]
+    pub symbol: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RefreshResult {
     pub languages: Vec<String>,
@@ -215,6 +237,51 @@ pub struct SymbolLocation {
     pub loc: usize,
     pub start_line: usize,
     pub end_line: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GetDefinitionResult {
+    pub results: Vec<DefinitionLookupResult>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DefinitionLookupResult {
+    pub query: DefinitionReferenceQuery,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference: Option<DefinitionReferenceSite>,
+    #[serde(default)]
+    pub definitions: Vec<DefinitionCandidate>,
+    #[serde(default)]
+    pub diagnostics: Vec<DefinitionDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DefinitionReferenceSite {
+    pub path: String,
+    pub text: String,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub start_line: usize,
+    pub end_line: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DefinitionCandidate {
+    pub fqn: String,
+    pub path: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    pub language: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DefinitionDiagnostic {
+    pub kind: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -647,6 +714,127 @@ pub fn get_symbol_locations(
         locations,
         not_found,
     }
+}
+
+pub fn get_definition(
+    analyzer: &dyn IAnalyzer,
+    params: GetDefinitionParams,
+) -> GetDefinitionResult {
+    let _scope = profiling::scope("searchtools::get_definition");
+
+    let resolver = WorkspaceFileResolver::new(analyzer.project());
+    let mut pending = Vec::new();
+    let mut results: Vec<Option<DefinitionLookupResult>> = vec![None; params.references.len()];
+
+    for (index, query) in params.references.into_iter().enumerate() {
+        match resolver.resolve_literal(&query.path) {
+            ResolvedFileInput::File(file) => {
+                pending.push((
+                    index,
+                    query.clone(),
+                    crate::analyzer::usages::get_definition::DefinitionLookupRequest {
+                        file,
+                        line: query.line,
+                        column: query.column,
+                        start_byte: query.start_byte,
+                        end_byte: query.end_byte,
+                        symbol: query.symbol.clone(),
+                    },
+                ));
+            }
+            ResolvedFileInput::Ambiguous(item) => {
+                results[index] = Some(DefinitionLookupResult {
+                    query,
+                    status: "not_found".to_string(),
+                    reference: None,
+                    definitions: Vec::new(),
+                    diagnostics: vec![DefinitionDiagnostic {
+                        kind: "ambiguous_path".to_string(),
+                        message: format!(
+                            "`{}` is ambiguous; matches: {}",
+                            item.input,
+                            item.matches.join(", ")
+                        ),
+                    }],
+                });
+            }
+            ResolvedFileInput::NotFound(path) => {
+                results[index] = Some(DefinitionLookupResult {
+                    query,
+                    status: "not_found".to_string(),
+                    reference: None,
+                    definitions: Vec::new(),
+                    diagnostics: vec![DefinitionDiagnostic {
+                        kind: "path_not_found".to_string(),
+                        message: format!("`{path}` does not resolve to a workspace file"),
+                    }],
+                });
+            }
+        }
+    }
+
+    let requests: Vec<_> = pending
+        .iter()
+        .map(|(_, _, request)| request.clone())
+        .collect();
+    let outcomes = crate::analyzer::usages::get_definition::resolve_definition_batch(
+        analyzer,
+        requests,
+        params.include_tests,
+    );
+
+    for ((index, query, _), outcome) in pending.into_iter().zip(outcomes) {
+        results[index] = Some(render_definition_lookup(analyzer, query, outcome));
+    }
+
+    GetDefinitionResult {
+        results: results.into_iter().flatten().collect(),
+    }
+}
+
+fn render_definition_lookup(
+    analyzer: &dyn IAnalyzer,
+    query: DefinitionReferenceQuery,
+    outcome: crate::analyzer::usages::get_definition::DefinitionLookupOutcome,
+) -> DefinitionLookupResult {
+    DefinitionLookupResult {
+        query,
+        status: outcome.status.as_str().to_string(),
+        reference: outcome.reference.map(|site| DefinitionReferenceSite {
+            path: site.path,
+            text: site.text,
+            start_byte: site.range.start_byte,
+            end_byte: site.range.end_byte,
+            start_line: site.range.start_line,
+            end_line: site.range.end_line,
+        }),
+        definitions: outcome
+            .candidates
+            .into_iter()
+            .filter_map(|unit| definition_candidate(analyzer, &unit))
+            .collect(),
+        diagnostics: outcome
+            .diagnostics
+            .into_iter()
+            .map(|diagnostic| DefinitionDiagnostic {
+                kind: diagnostic.kind,
+                message: diagnostic.message,
+            })
+            .collect(),
+    }
+}
+
+fn definition_candidate(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<DefinitionCandidate> {
+    let range = primary_range(analyzer, unit)?;
+    Some(DefinitionCandidate {
+        fqn: unit.fq_name(),
+        path: rel_path_string(unit.source()),
+        start_line: range.start_line,
+        end_line: range.end_line,
+        kind: code_unit_kind_name(unit.kind()).to_string(),
+        signature: unit.signature().map(str::to_string),
+        language: language_name(language_for_target(unit)),
+    })
 }
 
 pub fn get_symbol_ancestors(

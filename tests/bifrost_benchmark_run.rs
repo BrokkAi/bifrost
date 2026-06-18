@@ -31,6 +31,7 @@ required_scenarios = [
   "get_summaries",
   "most_relevant_files",
   "scan_usages",
+  "get_definition",
 ]
 
 [[repos]]
@@ -46,12 +47,16 @@ scenarios = [
   "get_summaries",
   "most_relevant_files",
   "scan_usages",
+  "get_definition",
 ]
 search_patterns = ["method2"]
 location_symbols = ["A.method2"]
 summary_targets = ["A.java"]
 seed_file_paths = ["A.java"]
 usage_symbols = ["E.iMethod"]
+definition_queries = [
+  {{ path = "A.java", line = 8, column = 19, symbol = "method2", expected_status = "no_definition" }},
+]
 "#,
             toml_basic_string(&repo_root.display().to_string()),
             head_commit(&repo_root)
@@ -84,7 +89,7 @@ usage_symbols = ["E.iMethod"]
     let scenarios = report["repos"][0]["scenarios"]
         .as_array()
         .expect("scenario array");
-    assert_eq!(scenarios.len(), 6, "report: {report}");
+    assert_eq!(scenarios.len(), 7, "report: {report}");
     for scenario in scenarios {
         assert_eq!(scenario["success"], true, "report: {report}");
     }
@@ -99,6 +104,7 @@ usage_symbols = ["E.iMethod"]
     assert!(names.contains(&"get_summaries"), "report: {report}");
     assert!(names.contains(&"most_relevant_files"), "report: {report}");
     assert!(names.contains(&"scan_usages"), "report: {report}");
+    assert!(names.contains(&"get_definition"), "report: {report}");
 }
 
 #[test]
@@ -126,6 +132,7 @@ required_scenarios = [
   "get_symbol_locations",
   "get_summaries",
   "scan_usages",
+  "get_definition",
 ]
 
 [[repos]]
@@ -140,12 +147,16 @@ scenarios = [
   "get_symbol_locations",
   "get_summaries",
   "scan_usages",
+  "get_definition",
 ]
 search_patterns = ["method2"]
 location_symbols = ["A.method2"]
-summary_targets = ["A.java", "B.java"]
+summary_targets = ["A.java"]
 seed_file_paths = ["B.java"]
 usage_symbols = ["A.method2"]
+definition_queries = [
+  {{ path = "E.java", line = 10, column = 17, symbol = "iMethod", expected_status = "no_definition" }},
+]
 "#,
             toml_basic_string(&repo_root.display().to_string()),
             head_commit(&repo_root)
@@ -158,7 +169,7 @@ usage_symbols = ["A.method2"]
         .arg("--manifest")
         .arg(&manifest_path)
         .arg("--max-files")
-        .arg("2")
+        .arg("3")
         .env(
             "BIFROST_BENCHMARK_BIFROST_BIN",
             env!("CARGO_BIN_EXE_bifrost"),
@@ -177,9 +188,9 @@ usage_symbols = ["A.method2"]
     let report: Value =
         serde_json::from_str(&fs::read_to_string(report_path).expect("read report"))
             .expect("parse report");
-    assert_eq!(report["max_files"], 2, "report: {report}");
+    assert_eq!(report["max_files"], 3, "report: {report}");
     assert_eq!(
-        report["repos"][0]["subset_max_files"], 2,
+        report["repos"][0]["subset_max_files"], 3,
         "report: {report}"
     );
     assert_ne!(
@@ -190,7 +201,7 @@ usage_symbols = ["A.method2"]
     let scenarios = report["repos"][0]["scenarios"]
         .as_array()
         .expect("scenario array");
-    assert_eq!(scenarios.len(), 5, "report: {report}");
+    assert_eq!(scenarios.len(), 6, "report: {report}");
     for scenario in scenarios {
         assert_eq!(scenario["success"], true, "report: {report}");
     }
@@ -290,6 +301,7 @@ required_scenarios = [
   "get_summaries",
   "most_relevant_files",
   "scan_usages",
+  "get_definition",
 ]
 
 [[repos]]
@@ -305,12 +317,16 @@ scenarios = [
   "get_summaries",
   "most_relevant_files",
   "scan_usages",
+  "get_definition",
 ]
 search_patterns = ["method2"]
 location_symbols = ["A.method2"]
 summary_targets = ["A.java"]
 seed_file_paths = ["A.java"]
 usage_symbols = ["A.method2"]
+definition_queries = [
+  {{ path = "A.java", line = 8, column = 19, symbol = "method2", expected_status = "no_definition" }},
+]
 "#,
             toml_basic_string(&repo_root.display().to_string()),
             head_commit(&repo_root)
@@ -375,6 +391,7 @@ required_scenarios = [
   "workspace_build",
   "get_symbol_locations",
   "scan_usages",
+  "get_definition",
 ]
 
 [[repos]]
@@ -387,9 +404,13 @@ scenarios = [
   "workspace_build",
   "get_symbol_locations",
   "scan_usages",
+  "get_definition",
 ]
 location_symbols = ["does.not.Exist"]
 usage_symbols = ["E.iMethod"]
+definition_queries = [
+  {{ path = "A.java", line = 8, column = 19, symbol = "method2", expected_status = "no_definition" }},
+]
 "#,
             toml_basic_string(&repo_root.display().to_string()),
             head_commit(&repo_root)
@@ -422,7 +443,7 @@ usage_symbols = ["E.iMethod"]
     let scenarios = report["repos"][0]["scenarios"]
         .as_array()
         .expect("scenario array");
-    assert_eq!(scenarios.len(), 3, "report: {report}");
+    assert_eq!(scenarios.len(), 4, "report: {report}");
 
     let failing = scenarios
         .iter()
@@ -442,6 +463,257 @@ usage_symbols = ["E.iMethod"]
         .find(|scenario| scenario["name"] == "scan_usages")
         .expect("scan_usages scenario");
     assert_eq!(surviving["success"], true, "report: {report}");
+
+    let later_definition = scenarios
+        .iter()
+        .find(|scenario| scenario["name"] == "get_definition")
+        .expect("get_definition scenario");
+    assert_eq!(later_definition["success"], true, "report: {report}");
+}
+
+#[test]
+fn run_subcommand_accepts_get_definition_expected_fqn_for_supported_language() {
+    let temp = TempDir::new().expect("temp dir");
+    let repo_root = temp.path().join("fixture-rust");
+    fs::create_dir_all(&repo_root).expect("repo root");
+    fs::write(
+        repo_root.join("lib.rs"),
+        "pub fn helper() {}\n\npub fn run() {\n    helper();\n}\n",
+    )
+    .expect("write rust fixture");
+    init_git_repo(&repo_root);
+
+    let manifest_dir = temp.path().join("manifest");
+    fs::create_dir_all(&manifest_dir).expect("manifest dir");
+    let manifest_path = manifest_dir.join("benchmark.toml");
+    fs::write(
+        &manifest_path,
+        format!(
+            r#"
+warmup_iterations = 1
+measured_iterations = 1
+output_dir = "out"
+repo_cache_dir = "cache"
+required_languages = ["rust"]
+required_scenarios = [
+  "get_definition",
+]
+
+[[repos]]
+name = "fixture-rust"
+url = "{}"
+commit = "{}"
+languages = ["rust"]
+extensions = ["rs"]
+scenarios = [
+  "get_definition",
+]
+definition_queries = [
+  {{ path = "lib.rs", line = 4, column = 5, symbol = "helper", expected_status = "resolved", expected_fqn = "helper" }},
+]
+"#,
+            toml_basic_string(&repo_root.display().to_string()),
+            head_commit(&repo_root)
+        ),
+    )
+    .expect("write manifest");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bifrost_benchmark"))
+        .arg("run")
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .env(
+            "BIFROST_BENCHMARK_BIFROST_BIN",
+            env!("CARGO_BIN_EXE_bifrost"),
+        )
+        .output()
+        .expect("run bifrost_benchmark");
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let report_path = single_json_file(&manifest_dir.join("out"));
+    let report: Value =
+        serde_json::from_str(&fs::read_to_string(report_path).expect("read report"))
+            .expect("parse report");
+    let scenario = &report["repos"][0]["scenarios"][0];
+    assert_eq!(scenario["name"], "get_definition", "report: {report}");
+    assert_eq!(scenario["success"], true, "report: {report}");
+}
+
+#[test]
+fn run_subcommand_fails_get_definition_on_expected_status_mismatch() {
+    let temp = TempDir::new().expect("temp dir");
+    let repo_root = temp.path().join("fixture-repo");
+    copy_dir_recursively(&fixture_root(), &repo_root).expect("copy fixture repo");
+    init_git_repo(&repo_root);
+
+    let manifest_dir = temp.path().join("manifest");
+    fs::create_dir_all(&manifest_dir).expect("manifest dir");
+    let manifest_path = manifest_dir.join("benchmark.toml");
+    fs::write(
+        &manifest_path,
+        format!(
+            r#"
+warmup_iterations = 1
+measured_iterations = 1
+output_dir = "out"
+repo_cache_dir = "cache"
+required_languages = ["java"]
+required_scenarios = [
+  "get_definition",
+  "search_symbols",
+]
+
+[[repos]]
+name = "fixture-java"
+url = "{}"
+commit = "{}"
+languages = ["java"]
+extensions = ["java"]
+scenarios = [
+  "get_definition",
+  "search_symbols",
+]
+definition_queries = [
+  {{ path = "A.java", line = 8, column = 19, symbol = "method2", expected_status = "resolved", expected_fqn = "A.method2" }},
+]
+search_patterns = ["method2"]
+"#,
+            toml_basic_string(&repo_root.display().to_string()),
+            head_commit(&repo_root)
+        ),
+    )
+    .expect("write manifest");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bifrost_benchmark"))
+        .arg("run")
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .env(
+            "BIFROST_BENCHMARK_BIFROST_BIN",
+            env!("CARGO_BIN_EXE_bifrost"),
+        )
+        .output()
+        .expect("run bifrost_benchmark");
+
+    assert!(
+        !output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let report_path = single_json_file(&manifest_dir.join("out"));
+    let report: Value =
+        serde_json::from_str(&fs::read_to_string(report_path).expect("read report"))
+            .expect("parse report");
+    let scenarios = report["repos"][0]["scenarios"]
+        .as_array()
+        .expect("scenario array");
+    let failing = scenarios
+        .iter()
+        .find(|scenario| scenario["name"] == "get_definition")
+        .expect("get_definition scenario");
+    assert_eq!(failing["success"], false, "report: {report}");
+    assert!(
+        failing["failure_message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("expected status `resolved` but got `no_definition`"),
+        "report: {report}"
+    );
+
+    let surviving = scenarios
+        .iter()
+        .find(|scenario| scenario["name"] == "search_symbols")
+        .expect("search_symbols scenario");
+    assert_eq!(surviving["success"], true, "report: {report}");
+}
+
+#[test]
+fn run_subcommand_fails_get_definition_on_expected_fqn_mismatch() {
+    let temp = TempDir::new().expect("temp dir");
+    let repo_root = temp.path().join("fixture-rust");
+    fs::create_dir_all(&repo_root).expect("repo root");
+    fs::write(
+        repo_root.join("lib.rs"),
+        "pub fn helper() {}\n\npub fn run() {\n    helper();\n}\n",
+    )
+    .expect("write rust fixture");
+    init_git_repo(&repo_root);
+
+    let manifest_dir = temp.path().join("manifest");
+    fs::create_dir_all(&manifest_dir).expect("manifest dir");
+    let manifest_path = manifest_dir.join("benchmark.toml");
+    fs::write(
+        &manifest_path,
+        format!(
+            r#"
+warmup_iterations = 1
+measured_iterations = 1
+output_dir = "out"
+repo_cache_dir = "cache"
+required_languages = ["rust"]
+required_scenarios = [
+  "get_definition",
+]
+
+[[repos]]
+name = "fixture-rust"
+url = "{}"
+commit = "{}"
+languages = ["rust"]
+extensions = ["rs"]
+scenarios = [
+  "get_definition",
+]
+definition_queries = [
+  {{ path = "lib.rs", line = 4, column = 5, symbol = "helper", expected_status = "resolved", expected_fqn = "wrong.helper" }},
+]
+"#,
+            toml_basic_string(&repo_root.display().to_string()),
+            head_commit(&repo_root)
+        ),
+    )
+    .expect("write manifest");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bifrost_benchmark"))
+        .arg("run")
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .env(
+            "BIFROST_BENCHMARK_BIFROST_BIN",
+            env!("CARGO_BIN_EXE_bifrost"),
+        )
+        .output()
+        .expect("run bifrost_benchmark");
+
+    assert!(
+        !output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let report_path = single_json_file(&manifest_dir.join("out"));
+    let report: Value =
+        serde_json::from_str(&fs::read_to_string(report_path).expect("read report"))
+            .expect("parse report");
+    let failing = &report["repos"][0]["scenarios"][0];
+    assert_eq!(failing["name"], "get_definition", "report: {report}");
+    assert_eq!(failing["success"], false, "report: {report}");
+    assert!(
+        failing["failure_message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("did not include expected fqn `wrong.helper`"),
+        "report: {report}"
+    );
 }
 
 fn fixture_root() -> PathBuf {

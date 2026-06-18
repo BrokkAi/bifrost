@@ -18,6 +18,14 @@ Current probe-input fields are:
 - `summary_targets` for `get_summaries`
 - `seed_file_paths` for `most_relevant_files`
 - `usage_symbols` for `scan_usages`
+- `definition_queries` for `get_definition`
+
+`definition_queries` entries are source-location probes. Each entry defines a
+project-relative `path`, either `line` plus `column` or a byte range, optional
+`symbol`, required `expected_status`, and optional `expected_fqn`. The benchmark
+fails the `get_definition` scenario when the returned status differs or when an
+expected FQN is not present in the returned definitions. Unsupported languages
+should assert `unsupported_language` until first-class support is added.
 
 Milestone 1 validation fails when any of these drift:
 
@@ -39,6 +47,7 @@ The important checked-in files in this directory are:
 
 - `targets.toml`: pinned corpus, per-repo probes, and default local paths
 - `README.md`: operator documentation for the harness and the planned daily workflow
+- `get_definition_observations.md`: manually inspected definition-lookup probe results and follow-up notes
 - `baselines/`: blessed compare targets and promotion notes for the scheduled workflow
 
 ## Local Use

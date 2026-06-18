@@ -59,7 +59,9 @@ impl TargetSpec {
     }
 }
 
-pub(super) fn resolve_java_analyzer(analyzer: &dyn IAnalyzer) -> Option<&JavaAnalyzer> {
+pub(in crate::analyzer::usages) fn resolve_java_analyzer(
+    analyzer: &dyn IAnalyzer,
+) -> Option<&JavaAnalyzer> {
     if let Some(java) = (analyzer as &dyn std::any::Any).downcast_ref::<JavaAnalyzer>() {
         return Some(java);
     }

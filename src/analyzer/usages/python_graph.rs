@@ -8,9 +8,7 @@ use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::python_graph::extractor::{build_python_graph, scan_files_for_seeds};
-use crate::analyzer::usages::python_graph::resolver::{
-    infer_export_names, resolve_python_analyzer,
-};
+use crate::analyzer::usages::python_graph::resolver::infer_export_names;
 use crate::analyzer::usages::traits::UsageAnalyzer;
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::HashSet;
@@ -18,6 +16,11 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 pub(crate) use extractor::PythonProjectGraph;
+pub(in crate::analyzer::usages) use extractor::{
+    collect_assigned_identifiers, collect_scope_facts, enclosing_scope_facts,
+    is_declaration_identifier, slice as python_slice,
+};
+pub(in crate::analyzer::usages) use resolver::{resolve_python_analyzer, resolve_receiver_type};
 
 /// Build the whole Python `caller -> callee` edge set in a single inverted pass
 /// over the workspace (see [`inverted`]). Returns `None` when there are no Python

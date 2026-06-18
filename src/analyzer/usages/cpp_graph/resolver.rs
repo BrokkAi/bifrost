@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use tree_sitter::{Node, Parser};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum TargetKind {
+pub(in crate::analyzer::usages) enum TargetKind {
     Type,
     Constructor,
     FreeFunction,
@@ -101,7 +101,7 @@ impl TargetSpec {
     }
 }
 
-pub(super) struct VisibilityIndex {
+pub(in crate::analyzer::usages) struct VisibilityIndex {
     pub(super) visible_by_file: HashMap<ProjectFile, HashSet<CodeUnit>>,
     aliases_by_file: HashMap<ProjectFile, Vec<CppAlias>>,
 }
@@ -112,7 +112,7 @@ struct CppAlias {
 }
 
 impl VisibilityIndex {
-    pub(super) fn build(
+    pub(in crate::analyzer::usages) fn build(
         cpp: &CppAnalyzer,
         analyzer: &dyn IAnalyzer,
         roots: &HashSet<ProjectFile>,
@@ -154,7 +154,21 @@ impl VisibilityIndex {
                 .is_some_and(|visible| visible.iter().any(|unit| same_visible_symbol(unit, target)))
     }
 
-    pub(super) fn resolve_type(&self, file: &ProjectFile, raw_name: &str) -> Option<CodeUnit> {
+    pub(in crate::analyzer::usages) fn visible_units<'a>(
+        &'a self,
+        file: &ProjectFile,
+    ) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
+        match self.visible_by_file.get(file) {
+            Some(visible) => Box::new(visible.iter()),
+            None => Box::new(std::iter::empty()),
+        }
+    }
+
+    pub(in crate::analyzer::usages) fn resolve_type(
+        &self,
+        file: &ProjectFile,
+        raw_name: &str,
+    ) -> Option<CodeUnit> {
         let normalized = normalize_reference_name(raw_name)?;
         self.visible_by_file
             .get(file)?
@@ -234,7 +248,7 @@ impl VisibilityIndex {
         files
     }
 
-    pub(super) fn resolve_named(
+    pub(in crate::analyzer::usages) fn resolve_named(
         &self,
         file: &ProjectFile,
         raw_name: &str,
@@ -433,7 +447,9 @@ pub(super) fn collect_visible_declarations(
     }
 }
 
-pub(super) fn resolve_cpp_analyzer(analyzer: &dyn IAnalyzer) -> Option<&CppAnalyzer> {
+pub(in crate::analyzer::usages) fn resolve_cpp_analyzer(
+    analyzer: &dyn IAnalyzer,
+) -> Option<&CppAnalyzer> {
     if let Some(cpp) = (analyzer as &dyn std::any::Any).downcast_ref::<CppAnalyzer>() {
         return Some(cpp);
     }
@@ -695,7 +711,10 @@ pub(super) fn split_top_level_commas(value: &str) -> impl Iterator<Item = &str> 
     .filter(|item| !item.is_empty())
 }
 
-pub(super) fn extract_variable_name(node: Node<'_>, source: &str) -> Option<String> {
+pub(in crate::analyzer::usages) fn extract_variable_name(
+    node: Node<'_>,
+    source: &str,
+) -> Option<String> {
     match node.kind() {
         "identifier" | "field_identifier" => {
             let name = node_text(node, source).trim();
@@ -709,7 +728,7 @@ pub(super) fn extract_variable_name(node: Node<'_>, source: &str) -> Option<Stri
     }
 }
 
-pub(super) fn is_declarator_node(node: Node<'_>) -> bool {
+pub(in crate::analyzer::usages) fn is_declarator_node(node: Node<'_>) -> bool {
     matches!(
         node.kind(),
         "identifier"
@@ -722,7 +741,7 @@ pub(super) fn is_declarator_node(node: Node<'_>) -> bool {
     )
 }
 
-pub(super) fn first_type_child(node: Node<'_>) -> Option<Node<'_>> {
+pub(in crate::analyzer::usages) fn first_type_child(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor).find(|child| {
         matches!(
@@ -735,7 +754,7 @@ pub(super) fn first_type_child(node: Node<'_>) -> Option<Node<'_>> {
     })
 }
 
-pub(super) fn is_declaration_name(node: Node<'_>) -> bool {
+pub(in crate::analyzer::usages) fn is_declaration_name(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
@@ -768,7 +787,7 @@ pub(super) fn function_terminal_node(node: Node<'_>) -> Node<'_> {
         .unwrap_or(node)
 }
 
-pub(super) fn normalize_type_text(value: &str) -> String {
+pub(in crate::analyzer::usages) fn normalize_type_text(value: &str) -> String {
     normalize_cpp_whitespace(value)
         .trim_start_matches("const ")
         .trim_end_matches('*')
@@ -801,7 +820,7 @@ pub(super) fn normalize_cpp_reference_text(value: &str) -> String {
         .to_string()
 }
 
-pub(super) fn cpp_name_for(unit: &CodeUnit) -> String {
+pub(in crate::analyzer::usages) fn cpp_name_for(unit: &CodeUnit) -> String {
     let short = unit.short_name().replace(['.', '$'], "::");
     if unit.package_name().is_empty() {
         short

@@ -4,6 +4,16 @@ mod inverted;
 mod resolver;
 mod shared;
 
+pub(in crate::analyzer::usages) use extractor::{
+    is_declaration_name as csharp_is_declaration_name, member_access_name, member_access_receiver,
+};
+pub(in crate::analyzer::usages) use resolver::{
+    first_type_child as csharp_first_type_child,
+    is_type_reference_node as csharp_is_type_reference_node, node_text as csharp_node_text,
+    reference_type_text as csharp_reference_type_text, resolve_csharp_analyzer,
+    seed_bindings_before as seed_csharp_bindings_before,
+};
+
 use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::csharp_graph::shared::{CSharpEdgeResolver, CSharpQueryResolver};
 use crate::analyzer::usages::inverted_edges::UsageEdges;

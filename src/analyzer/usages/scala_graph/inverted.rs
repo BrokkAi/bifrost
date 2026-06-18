@@ -34,7 +34,7 @@ use tree_sitter::Node;
 
 /// Every class/object/trait/enum the project declares, indexed for the per-file
 /// name->fqn rebuild. Built once and shared across all files' scans.
-pub(super) struct ProjectTypes {
+pub(in crate::analyzer::usages) struct ProjectTypes {
     /// `(package, source_name) -> fqn` — a type reachable by simple name from a
     /// file in the same package (or via a wildcard import of that package).
     by_package: HashMap<(String, String), String>,
@@ -44,7 +44,7 @@ pub(super) struct ProjectTypes {
 }
 
 impl ProjectTypes {
-    pub(super) fn build(scala: &ScalaAnalyzer) -> Self {
+    pub(in crate::analyzer::usages) fn build(scala: &ScalaAnalyzer) -> Self {
         let mut by_package = HashMap::default();
         let mut by_normalized_fqn = HashMap::default();
         for unit in scala.all_declarations().filter(|unit| unit.is_class()) {
@@ -64,12 +64,16 @@ impl ProjectTypes {
 
 /// Per-file map from a source-visible type/object name to the analyzer's fqn,
 /// mirroring the forward scanner's [`Visibility`](super::resolver).
-struct NameResolver {
+pub(in crate::analyzer::usages) struct NameResolver {
     names: HashMap<String, String>,
 }
 
 impl NameResolver {
-    fn for_file(scala: &ScalaAnalyzer, file: &ProjectFile, types: &ProjectTypes) -> Self {
+    pub(in crate::analyzer::usages) fn for_file(
+        scala: &ScalaAnalyzer,
+        file: &ProjectFile,
+        types: &ProjectTypes,
+    ) -> Self {
         let mut names = HashMap::default();
 
         // Types in the file's own package are reachable by simple name.
@@ -109,7 +113,7 @@ impl NameResolver {
     }
 
     /// Resolve a type/object source name (stripping generics) to its fqn.
-    fn resolve(&self, raw: &str) -> Option<String> {
+    pub(in crate::analyzer::usages) fn resolve(&self, raw: &str) -> Option<String> {
         let simple = simple_type_name(raw)?;
         self.names.get(simple).cloned()
     }

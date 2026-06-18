@@ -16,7 +16,9 @@ use std::collections::VecDeque;
 use std::sync::{Arc, LazyLock};
 use tree_sitter::{Node, Parser, Tree};
 
-pub(super) fn resolve_go_analyzer(analyzer: &dyn IAnalyzer) -> Option<&GoAnalyzer> {
+pub(in crate::analyzer::usages) fn resolve_go_analyzer(
+    analyzer: &dyn IAnalyzer,
+) -> Option<&GoAnalyzer> {
     if let Some(go) = (analyzer as &dyn std::any::Any).downcast_ref::<GoAnalyzer>() {
         return Some(go);
     }
@@ -775,7 +777,7 @@ fn same_go_package(graph: &GoProjectGraph, left: &ProjectFile, right: &ProjectFi
     left_parsed.package_name == right_parsed.package_name
 }
 
-fn extract_go_import_path(raw_import: &str) -> Option<String> {
+pub(in crate::analyzer::usages) fn extract_go_import_path(raw_import: &str) -> Option<String> {
     let trimmed = raw_import.trim();
     trimmed
         .split_whitespace()
@@ -789,7 +791,9 @@ fn extract_go_import_path(raw_import: &str) -> Option<String> {
         .filter(|path| !path.is_empty())
 }
 
-fn default_go_import_local_name(import_path_or_identifier: &str) -> String {
+pub(in crate::analyzer::usages) fn default_go_import_local_name(
+    import_path_or_identifier: &str,
+) -> String {
     let tail = import_path_or_identifier
         .rsplit('/')
         .next()
