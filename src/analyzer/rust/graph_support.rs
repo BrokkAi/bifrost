@@ -20,6 +20,8 @@ use super::imports::{resolve_rust_module_path, split_rust_import_module_and_name
 /// file; see the execplan's "Identity model".)
 #[derive(Debug, Default)]
 pub struct RustReferenceContext {
+    /// Dotted module/package name for the file this context resolves from.
+    package: String,
     /// local name -> fqn for `use path::Item;` / `use path::func;` named bindings.
     pub(super) named: HashMap<String, String>,
     /// local alias -> package for `use crate::util;` namespace bindings.
@@ -46,11 +48,29 @@ impl RustReferenceContext {
         if let Some(package) = self.namespace.get(path) {
             return Some(format!("{package}.{name}"));
         }
+        if is_rooted_rust_module_path(path)
+            && let Some(package) = resolve_rust_module_path(&self.package, path)
+        {
+            return Some(if package.is_empty() {
+                name.to_string()
+            } else {
+                format!("{package}.{name}")
+            });
+        }
         self.named
             .get(path)
             .or_else(|| self.same_file.get(path))
             .map(|type_fqn| format!("{type_fqn}.{name}"))
     }
+}
+
+fn is_rooted_rust_module_path(path: &str) -> bool {
+    path == "crate"
+        || path == "self"
+        || path == "super"
+        || path.starts_with("crate::")
+        || path.starts_with("self::")
+        || path.starts_with("super::")
 }
 
 impl RustAnalyzer {
@@ -249,6 +269,7 @@ impl RustAnalyzer {
             .map(|unit| (unit.identifier().to_string(), unit.fq_name()))
             .collect();
         RustReferenceContext {
+            package: rust_package_name(file),
             named,
             namespace,
             same_file,

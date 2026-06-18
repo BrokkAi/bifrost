@@ -217,6 +217,37 @@ fn get_summaries_large_file_glob_stays_full_fidelity_on_service_path() {
 }
 
 #[test]
+fn get_definition_by_reference_resolves_rust_crate_scoped_item() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(
+        src.join("lib.rs"),
+        r#"pub fn helper() {}
+
+pub fn caller() {
+    crate::helper();
+}
+"#,
+    )
+    .unwrap();
+
+    let service =
+        SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "get_definition_by_reference",
+            r#"{"references":[{"symbol":"caller","context":"    crate::helper();","target":"helper"}]}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    let result = &value["results"][0];
+    assert_eq!("resolved", result["status"], "{value}");
+    assert_eq!("helper", result["definition"]["fqn"], "{value}");
+}
+
+#[test]
 fn python_boundary_returns_canonical_rendered_text_payload() {
     let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
     let payload = service
