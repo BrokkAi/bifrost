@@ -81,6 +81,7 @@ pub(crate) fn first_precise<T: Clone + Eq + Hash>(
 pub(crate) const MAX_CALLSITES: usize = crate::analyzer::usages::DEFAULT_MAX_USAGES;
 
 /// Aggregated result of an inverted edge build.
+#[derive(Default)]
 pub(crate) struct UsageEdges {
     /// `(caller fqn, callee fqn) -> weight` (distinct `(file, line, caller)` sites).
     pub(crate) edges: BTreeMap<(String, String), usize>,
@@ -103,6 +104,7 @@ impl UsageNodeKey {
 }
 
 /// Aggregated result of an inverted edge build whose endpoints are file-scoped.
+#[derive(Default)]
 pub(crate) struct ScopedUsageEdges {
     /// `(caller key, callee key) -> weight` (distinct `(file, line, caller)` sites).
     pub(crate) edges: BTreeMap<(UsageNodeKey, UsageNodeKey), usize>,
@@ -386,33 +388,42 @@ where
     merge_and_cap(per_file)
 }
 
-pub(crate) fn build_scoped_edges<'a, KeepFn, LinesFn, ScanFn>(
-    analyzer: &dyn IAnalyzer,
+#[allow(clippy::redundant_closure)] // the closure borrows `scan` (Sync, not necessarily Send)
+pub(crate) fn build_scoped_edges<KeepFn, ScanFn>(
     files: &[ProjectFile],
-    nodes: &'a HashSet<UsageNodeKey>,
     keep_file: KeepFn,
-    line_starts_of: LinesFn,
     scan: ScanFn,
 ) -> ScopedUsageEdges
 where
     KeepFn: Fn(&ProjectFile) -> bool + Sync,
-    LinesFn: Fn(&ProjectFile) -> Option<&'a [usize]> + Sync,
-    ScanFn: Fn(&ProjectFile, &mut ScopedEdgeCollector<'a>) + Sync,
+    ScanFn: Fn(&ProjectFile) -> Option<ScopedPerFileEdges> + Sync,
 {
     let per_file: Vec<ScopedPerFileEdges> = files
         .par_iter()
-        .filter_map(|file| {
-            if !keep_file(file) {
-                return None;
-            }
-            let line_starts = line_starts_of(file)?;
-            let declarations = build_scoped_file_declarations(analyzer, file);
-            let mut collector = ScopedEdgeCollector::new(line_starts, nodes, declarations);
-            scan(file, &mut collector);
-            Some(collector.finish())
-        })
+        .filter(|file| keep_file(file))
+        .filter_map(|file| scan(file))
         .collect();
     merge_scoped_and_cap(per_file)
+}
+
+/// Scoped counterpart to [`collect_file_edges`]: build one file's declaration index and a
+/// [`ScopedEdgeCollector`], run the language `walk`, and return the owned per-file edges.
+/// The collector's borrows of `line_starts`/`nodes` are scoped to this call, so the caller
+/// can drop the parsed tree as soon as it returns.
+pub(crate) fn collect_scoped_file_edges<'a, W>(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    nodes: &'a HashSet<UsageNodeKey>,
+    line_starts: &'a [usize],
+    walk: W,
+) -> ScopedPerFileEdges
+where
+    W: FnOnce(&mut ScopedEdgeCollector<'a>),
+{
+    let declarations = build_scoped_file_declarations(analyzer, file);
+    let mut collector = ScopedEdgeCollector::new(line_starts, nodes, declarations);
+    walk(&mut collector);
+    collector.finish()
 }
 
 /// Build one file's edges: construct its declaration index and an [`EdgeCollector`],

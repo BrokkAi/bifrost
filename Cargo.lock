@@ -195,6 +195,7 @@ dependencies = [
  "jaq-core",
  "jaq-json",
  "jaq-std",
+ "libc",
  "lsp-server",
  "lsp-types",
  "moka",

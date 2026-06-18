@@ -5,7 +5,7 @@ use crate::analyzer::js_ts::imports::{
 use crate::analyzer::usages::graph_core::{ImportEdge, ImportEdgeKind};
 use crate::analyzer::usages::js_ts_graph::hits::record_hit;
 use crate::analyzer::usages::js_ts_graph::resolver::{
-    JsTsProjectGraph, is_static_member, member_name, top_level_identifier,
+    JsTsUsageIndex, is_static_member, member_name, top_level_identifier, tree_sitter_language_for,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::{
@@ -16,14 +16,14 @@ use crate::hash::{HashMap, HashSet};
 use crate::text_utils::compute_line_starts;
 use rayon::prelude::*;
 use std::collections::BTreeSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use tree_sitter::{Node, Parser, Tree};
 
 const TARGET_BINDING: &str = "__target__";
 
 pub(super) fn scan_files_for_seeds(
     analyzer: &dyn IAnalyzer,
-    graph: &JsTsProjectGraph,
+    index: &JsTsUsageIndex,
     files: &HashSet<ProjectFile>,
     target: &CodeUnit,
     seeds: &BTreeSet<(ProjectFile, String)>,
@@ -36,45 +36,33 @@ pub(super) fn scan_files_for_seeds(
         .parent_of(target)
         .map(|owner| owner.source().clone());
 
-    let parser_language = match language {
-        Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
-        Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-        _ => return BTreeSet::new(),
+    let Some(parser_language) = tree_sitter_language_for(language) else {
+        return BTreeSet::new();
     };
 
     let files_vec: Vec<&ProjectFile> = files.iter().collect();
 
     files_vec.par_iter().for_each(|file| {
-        // Reuse the build-phase parse when available; only fall back to a fresh parse
-        // for ad-hoc candidates that weren't part of the project graph (e.g. a text
-        // search candidate outside the analyzer's analyzable set).
-        let owned_source: Option<Arc<String>>;
-        let owned_tree: Option<Tree>;
-        let (source_str, tree_ref) = if let Some(parsed) = graph.parsed.get(*file) {
-            (parsed.source.as_str(), &parsed.tree)
-        } else {
-            let Ok(source) = file.read_to_string() else {
-                return;
-            };
-            if source.is_empty() {
-                return;
-            }
-            let mut parser = Parser::new();
-            if parser.set_language(&parser_language).is_err() {
-                return;
-            }
-            let Some(tree) = parser.parse(source.as_str(), None) else {
-                return;
-            };
-            owned_source = Some(Arc::new(source));
-            owned_tree = Some(tree);
-            (
-                owned_source.as_deref().unwrap().as_str(),
-                owned_tree.as_ref().unwrap(),
-            )
+        // The resolution maps are analyzer-cached, but the syntax trees are not — parse
+        // each scan file here and drop it when this closure returns, so a repeated query
+        // re-parses only its candidate closure, never the whole workspace.
+        let Ok(source) = file.read_to_string() else {
+            return;
         };
+        if source.is_empty() {
+            return;
+        }
+        let mut parser = Parser::new();
+        if parser.set_language(&parser_language).is_err() {
+            return;
+        }
+        let Some(tree) = parser.parse(source.as_str(), None) else {
+            return;
+        };
+        let source_str = source.as_str();
+        let tree_ref = &tree;
 
-        let edges = graph.matching_edges_for_importer(file, seeds);
+        let edges = index.matching_edges_for_importer(file, seeds);
 
         let mut local_hits: BTreeSet<UsageHit> = BTreeSet::new();
         let line_starts = compute_line_starts(source_str);

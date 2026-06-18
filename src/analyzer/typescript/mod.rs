@@ -28,6 +28,7 @@ use crate::analyzer::js_ts::imports::{
 };
 use crate::analyzer::js_ts::model::{module_code_unit, node_text, trim_statement};
 use crate::analyzer::js_ts::tests::detect_js_ts_test_assertion_smells;
+use crate::analyzer::usages::js_ts_graph::{JsTsUsageIndex, build_jsts_usage_index};
 #[derive(Debug, Clone, Default)]
 pub struct TypescriptAdapter;
 
@@ -143,6 +144,9 @@ pub struct TypescriptAnalyzer {
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     relevant_imports: Cache<CodeUnit, Arc<HashSet<String>>>,
     reverse_import_index: Arc<OnceLock<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
+    /// Analyzer-cached JS/TS usage-resolution maps, built once per analyzer and reused
+    /// across `scan_usages`/`usage_graph` queries. Reset on `update`/`update_all`.
+    jsts_usage_index: Arc<OnceLock<JsTsUsageIndex>>,
     /// Shared tsconfig path-alias resolver (parsed configs cached) so the import/reference
     /// graph resolves `@/`-style aliases the same way the scan_usages graph does.
     alias_resolver: Arc<AliasResolver>,
@@ -163,8 +167,16 @@ impl TypescriptAnalyzer {
             referencing_files: build_weighted_cache(memo_budget / 6, weight_project_file_set),
             relevant_imports: build_weighted_cache(memo_budget / 6, weight_string_set),
             reverse_import_index: Arc::new(OnceLock::new()),
+            jsts_usage_index: Arc::new(OnceLock::new()),
             alias_resolver,
         }
+    }
+
+    /// Lazily-built, analyzer-cached JS/TS usage-resolution maps for this analyzer's
+    /// language. Built once and reused until `update`/`update_all` resets the cell.
+    pub(crate) fn jsts_usage_index(&self) -> &JsTsUsageIndex {
+        self.jsts_usage_index
+            .get_or_init(|| build_jsts_usage_index(self, Language::TypeScript))
     }
 
     pub fn new_with_config_and_storage(
@@ -186,6 +198,7 @@ impl TypescriptAnalyzer {
             referencing_files: build_weighted_cache(memo_budget / 6, weight_project_file_set),
             relevant_imports: build_weighted_cache(memo_budget / 6, weight_string_set),
             reverse_import_index: Arc::new(OnceLock::new()),
+            jsts_usage_index: Arc::new(OnceLock::new()),
             alias_resolver,
         }
     }
@@ -428,6 +441,7 @@ impl IAnalyzer for TypescriptAnalyzer {
             referencing_files: build_weighted_cache(self.memo_budget / 6, weight_project_file_set),
             relevant_imports: build_weighted_cache(self.memo_budget / 6, weight_string_set),
             reverse_import_index: Arc::new(OnceLock::new()),
+            jsts_usage_index: Arc::new(OnceLock::new()),
             alias_resolver,
         }
     }
@@ -441,6 +455,7 @@ impl IAnalyzer for TypescriptAnalyzer {
             referencing_files: build_weighted_cache(self.memo_budget / 6, weight_project_file_set),
             relevant_imports: build_weighted_cache(self.memo_budget / 6, weight_string_set),
             reverse_import_index: Arc::new(OnceLock::new()),
+            jsts_usage_index: Arc::new(OnceLock::new()),
             alias_resolver,
         }
     }

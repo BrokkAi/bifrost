@@ -18,6 +18,7 @@ use crate::analyzer::js_ts::imports::{
 use crate::analyzer::js_ts::model::{module_code_unit, node_text, trim_statement};
 use crate::analyzer::js_ts::tests::detect_js_ts_test_assertion_smells;
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
+use crate::analyzer::usages::js_ts_graph::{JsTsUsageIndex, build_jsts_usage_index};
 use crate::analyzer::{
     AliasResolver, AnalyzerConfig, CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo,
     Language, LanguageAdapter, Project, ProjectFile, TestAssertionSmell, TestAssertionWeights,
@@ -144,6 +145,9 @@ struct JsMemoCaches {
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     relevant_imports: Cache<CodeUnit, Arc<HashSet<String>>>,
     reverse_import_index: OnceLock<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
+    /// Analyzer-cached JS/TS usage-resolution maps, built once and reused across queries.
+    /// Reset (with the rest of this bucket) on `update`/`update_all`.
+    jsts_usage_index: OnceLock<JsTsUsageIndex>,
 }
 
 impl JsMemoCaches {
@@ -153,6 +157,7 @@ impl JsMemoCaches {
             referencing_files: build_weighted_cache(budget_bytes / 6, weight_project_file_set),
             relevant_imports: build_weighted_cache(budget_bytes / 6, weight_string_set),
             reverse_import_index: OnceLock::new(),
+            jsts_usage_index: OnceLock::new(),
         }
     }
 }
@@ -160,6 +165,14 @@ impl JsMemoCaches {
 impl JavascriptAnalyzer {
     pub fn new(project: Arc<dyn Project>) -> Self {
         Self::new_with_config(project, AnalyzerConfig::default())
+    }
+
+    /// Lazily-built, analyzer-cached JS/TS usage-resolution maps for this analyzer's
+    /// language. Built once and reused until `update`/`update_all` rebuilds the cache bucket.
+    pub(crate) fn jsts_usage_index(&self) -> &JsTsUsageIndex {
+        self.memo_caches
+            .jsts_usage_index
+            .get_or_init(|| build_jsts_usage_index(self, Language::JavaScript))
     }
 
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {

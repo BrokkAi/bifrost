@@ -1,7 +1,7 @@
 //! Shared import-edge types for the per-language usage indices.
 //!
 //! Each language's usage index (`RustUsageIndex`, `PythonUsageIndex`,
-//! `GoProjectGraph`, `JsTsProjectGraph`) builds these edges from its own module
+//! `GoProjectGraph`, `JsTsUsageIndex`) builds these edges from its own module
 //! resolution, so `scan_usages` and `usage_graph` resolve references through one
 //! index per language.
 

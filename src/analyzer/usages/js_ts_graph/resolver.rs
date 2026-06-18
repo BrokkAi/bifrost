@@ -10,27 +10,15 @@ use crate::analyzer::{
 use crate::hash::{HashMap, HashSet, map_with_capacity, set_with_capacity};
 use rayon::prelude::*;
 use std::collections::{BTreeSet, VecDeque};
-use std::sync::Arc;
-use tree_sitter::{Parser, Tree};
+use tree_sitter::Parser;
 
-/// Cached parse for one source file. `source` is held alongside the `Tree` so AST byte
-/// ranges remain valid for the lifetime of the graph (and so the scan phase can reuse
-/// the parse result without re-reading the file).
-pub(super) struct ParsedFile {
-    pub(super) source: Arc<String>,
-    pub(super) tree: Tree,
-    /// Byte offsets of each line start, computed once at parse time so the
-    /// inverted edge scan can attribute references to lines without recomputing.
-    pub(super) line_starts: Vec<usize>,
-}
-
-pub(crate) struct JsTsProjectGraph {
-    /// Parsed source + tree per file. Reused by the scan phase to avoid double parsing.
-    pub(super) parsed: HashMap<ProjectFile, ParsedFile>,
-    /// JS/TS-owned re-export + importer index, built from the per-file
-    /// export/import indices + analyzer-level module resolution
-    /// (`resolve_js_ts_module_specifier` + tsconfig aliases), so the forward scan
-    /// resolves seeds + importer edges without a cross-file graph.
+/// JS/TS resolution maps for one language: a re-export + importer index built from the
+/// per-file export/import indices plus analyzer-level module resolution
+/// (`resolve_js_ts_module_specifier` + tsconfig aliases), so the forward scan resolves
+/// seeds + importer edges without a cross-file graph. Plain data (no syntax trees), so it
+/// can be cached on the analyzer and reused across queries.
+#[derive(Default, Clone)]
+pub(crate) struct JsTsUsageIndex {
     pub(super) exports_by_file: HashMap<ProjectFile, ExportIndex>,
     pub(super) reexport_edges: HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>>,
     pub(super) direct_reexport_edges: HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>>,
@@ -39,25 +27,20 @@ pub(crate) struct JsTsProjectGraph {
     pub(super) importer_reverse: HashMap<ProjectFile, Vec<ImportEdge>>,
 }
 
-pub(super) fn build_js_ts_graph(analyzer: &dyn IAnalyzer, language: Language) -> JsTsProjectGraph {
+/// Build the cacheable [`JsTsUsageIndex`] for one language: parse every file once to
+/// derive its export/import indices, then build the re-export + importer maps — dropping
+/// the syntax trees as soon as the per-file indices are computed (the maps are the only
+/// thing the analyzer caches; the scan phase re-parses its candidate files on demand).
+pub(crate) fn build_jsts_usage_index(
+    analyzer: &dyn IAnalyzer,
+    language: Language,
+) -> JsTsUsageIndex {
     let files = collect_jsts_files(analyzer, language);
-    let parser_language = match language {
-        Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
-        Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-        _ => {
-            return JsTsProjectGraph {
-                parsed: HashMap::default(),
-                exports_by_file: HashMap::default(),
-                reexport_edges: HashMap::default(),
-                direct_reexport_edges: HashMap::default(),
-                star_reexports: HashMap::default(),
-                direct_star_reexports: HashMap::default(),
-                importer_reverse: HashMap::default(),
-            };
-        }
+    let Some(parser_language) = tree_sitter_language_for(language) else {
+        return JsTsUsageIndex::default();
     };
 
-    let parsed_files: Vec<(ProjectFile, ParsedFile, ExportIndex, ImportBinder)> = files
+    let per_file: Vec<(ProjectFile, ExportIndex, ImportBinder)> = files
         .par_iter()
         .filter_map(|file| {
             let source = file.read_to_string().ok()?;
@@ -66,28 +49,14 @@ pub(super) fn build_js_ts_graph(analyzer: &dyn IAnalyzer, language: Language) ->
             let tree = parser.parse(source.as_str(), None)?;
             let exports = compute_export_index(&source, &tree);
             let binder = compute_import_binder(&source, &tree);
-            let line_starts = crate::text_utils::compute_line_starts(&source);
-            Some((
-                file.clone(),
-                ParsedFile {
-                    source: Arc::new(source),
-                    tree,
-                    line_starts,
-                },
-                exports,
-                binder,
-            ))
+            // `tree`/`source` drop here — only the per-file indices outlive the parse.
+            Some((file.clone(), exports, binder))
         })
         .collect();
 
-    let mut parsed: HashMap<ProjectFile, ParsedFile> = map_with_capacity(parsed_files.len());
-    let mut exports_by_file: HashMap<ProjectFile, ExportIndex> =
-        map_with_capacity(parsed_files.len());
-    let mut binders_by_file: HashMap<ProjectFile, ImportBinder> =
-        map_with_capacity(parsed_files.len());
-
-    for (file, parsed_file, exports, binder) in parsed_files {
-        parsed.insert(file.clone(), parsed_file);
+    let mut exports_by_file: HashMap<ProjectFile, ExportIndex> = map_with_capacity(per_file.len());
+    let mut binders_by_file: HashMap<ProjectFile, ImportBinder> = map_with_capacity(per_file.len());
+    for (file, exports, binder) in per_file {
         exports_by_file.insert(file.clone(), exports);
         binders_by_file.insert(file, binder);
     }
@@ -101,8 +70,7 @@ pub(super) fn build_js_ts_graph(analyzer: &dyn IAnalyzer, language: Language) ->
     let importer_reverse =
         build_importer_reverse(&files, &binders_by_file, &exports_by_file, &resolve);
 
-    JsTsProjectGraph {
-        parsed,
+    JsTsUsageIndex {
         exports_by_file,
         reexport_edges,
         direct_reexport_edges,
@@ -112,7 +80,7 @@ pub(super) fn build_js_ts_graph(analyzer: &dyn IAnalyzer, language: Language) ->
     }
 }
 
-impl JsTsProjectGraph {
+impl JsTsUsageIndex {
     /// Export seeds for `target_short` in `target_file`, following named and star
     /// re-export chains across files.
     pub(super) fn seeds_for_target(
@@ -162,7 +130,7 @@ impl JsTsProjectGraph {
         &self,
         seeds: &BTreeSet<(ProjectFile, String)>,
     ) -> HashSet<ProjectFile> {
-        let mut out: HashSet<ProjectFile> = set_with_capacity(self.parsed.len().min(64));
+        let mut out: HashSet<ProjectFile> = set_with_capacity(self.importer_reverse.len().min(64));
         for (target_file, _) in seeds {
             if let Some(edges) = self.importer_reverse.get(target_file) {
                 for edge in edges {
@@ -374,7 +342,7 @@ fn build_importer_reverse(
     reverse
 }
 
-fn collect_jsts_files(analyzer: &dyn IAnalyzer, language: Language) -> Vec<ProjectFile> {
+pub(super) fn collect_jsts_files(analyzer: &dyn IAnalyzer, language: Language) -> Vec<ProjectFile> {
     let mut result: Vec<ProjectFile> = analyzer
         .project()
         .analyzable_files(language)
@@ -383,6 +351,15 @@ fn collect_jsts_files(analyzer: &dyn IAnalyzer, language: Language) -> Vec<Proje
     result.sort();
     result.dedup();
     result
+}
+
+/// The tree-sitter grammar for a JS/TS language, or `None` for anything else.
+pub(super) fn tree_sitter_language_for(language: Language) -> Option<tree_sitter::Language> {
+    match language {
+        Language::JavaScript => Some(tree_sitter_javascript::LANGUAGE.into()),
+        Language::TypeScript => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+        _ => None,
+    }
 }
 
 pub(super) fn target_language(target: &CodeUnit) -> Language {

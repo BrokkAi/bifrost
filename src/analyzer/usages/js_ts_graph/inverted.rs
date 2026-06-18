@@ -21,40 +21,45 @@ use super::extractor::{
     compute_import_binder, is_declaration_identifier, is_object_in_member_expression,
     is_property_key_in_member, rightmost_jsx_identifier, slice,
 };
-use super::resolver::JsTsProjectGraph;
+use super::resolver::{JsTsUsageIndex, collect_jsts_files, tree_sitter_language_for};
 use crate::analyzer::usages::inverted_edges::{
     EdgeCollector, ScopedEdgeCollector, ScopedUsageEdges, UsageEdges, UsageNodeKey, build_edges,
-    build_scoped_edges, collect_file_edges,
+    build_scoped_edges, collect_scoped_file_edges, parse_and_collect,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::{ExportEntry, ImportKind};
+use crate::analyzer::usages::parsed_tree::parse_tree_sitter_file;
 use crate::analyzer::{IAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::Node;
 
-/// Build every JS/TS `caller -> callee` edge in one pass over the project graph,
-/// using the shared [`build_edges`] driver for all the language-agnostic accounting.
+/// Build every JS/TS `caller -> callee` edge in one parse-on-demand pass over the
+/// workspace files, using the shared [`build_edges`] driver for all the
+/// language-agnostic accounting.
 pub(super) fn build_jsts_edges<F>(
     analyzer: &dyn IAnalyzer,
-    graph: &JsTsProjectGraph,
+    language: Language,
     nodes: &HashSet<String>,
     keep_file: F,
 ) -> UsageEdges
 where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
-    let files: Vec<ProjectFile> = graph.parsed.keys().cloned().collect();
+    let Some(parser_language) = tree_sitter_language_for(language) else {
+        return UsageEdges::default();
+    };
+    let files = collect_jsts_files(analyzer, language);
     build_edges(&files, keep_file, |file| {
-        // JS/TS keeps its trees in the project graph (resolution needs them), so this
-        // borrows rather than parsing on demand — capping its memory is #185.
-        let parsed = graph.parsed.get(file)?;
-        Some(collect_file_edges(
+        // The non-scoped scan needs only the file's own tree (binder + declarations),
+        // no cross-file resolution index. parse_and_collect drops the tree when this
+        // closure returns, capping live trees to the worker count.
+        parse_and_collect(
             analyzer,
             file,
             nodes,
-            &parsed.line_starts,
-            |collector| {
+            &parser_language,
+            |parsed, collector| {
                 let source = parsed.source.as_str();
 
                 // Per-file resolution context: which bare names resolve to which
@@ -95,7 +100,7 @@ where
                 let mut locals = LocalInferenceEngine::new(LocalInferenceConfig::default());
                 scan_node(parsed.tree.root_node(), &mut ctx, &mut locals);
             },
-        ))
+        )
     })
 }
 
@@ -113,7 +118,7 @@ pub(crate) struct JsTsScopedUsageEdges {
 
 pub(super) fn build_jsts_scoped_edges<F>(
     analyzer: &dyn IAnalyzer,
-    graph: &JsTsProjectGraph,
+    index: &JsTsUsageIndex,
     language: Language,
     nodes: &HashSet<UsageNodeKey>,
     keep_file: F,
@@ -121,40 +126,40 @@ pub(super) fn build_jsts_scoped_edges<F>(
 where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
-    let files: Vec<ProjectFile> = graph.parsed.keys().cloned().collect();
+    let Some(parser_language) = tree_sitter_language_for(language) else {
+        return JsTsScopedUsageEdges {
+            edges: ScopedUsageEdges::default(),
+            node_status: BTreeMap::new(),
+        };
+    };
+    let files = collect_jsts_files(analyzer, language);
     let declarations = scoped_declarations_by_file_and_name(analyzer, language);
-    let node_status = scoped_node_status(graph, nodes, &declarations);
-    let edges = build_scoped_edges(
-        analyzer,
-        &files,
-        nodes,
-        keep_file,
-        |file| {
-            graph
-                .parsed
-                .get(file)
-                .map(|parsed| parsed.line_starts.as_slice())
-        },
-        |file, collector| {
-            let Some(parsed) = graph.parsed.get(file) else {
-                return;
-            };
-            let source = parsed.source.as_str();
-            let imports = scoped_import_bindings(graph, file, &declarations);
-            let same_file = scoped_same_file_declarations(analyzer, file, language);
-
-            let mut ctx = ScopedTsScan {
-                source,
-                graph,
-                declarations: &declarations,
-                imports,
-                same_file,
-                collector,
-            };
-            let mut locals = LocalInferenceEngine::new(LocalInferenceConfig::default());
-            scan_scoped_node(parsed.tree.root_node(), &mut ctx, &mut locals);
-        },
-    );
+    let node_status = scoped_node_status(index, nodes, &declarations);
+    let edges = build_scoped_edges(&files, keep_file, |file| {
+        // Parse on demand and drop the tree when this closure returns; cross-file
+        // resolution comes from the analyzer-cached `index`, not retained trees.
+        let parsed = parse_tree_sitter_file(file, &parser_language)?;
+        let imports = scoped_import_bindings(index, file, &declarations);
+        let same_file = scoped_same_file_declarations(analyzer, file, language);
+        Some(collect_scoped_file_edges(
+            analyzer,
+            file,
+            nodes,
+            &parsed.line_starts,
+            |collector| {
+                let mut ctx = ScopedTsScan {
+                    source: parsed.source.as_str(),
+                    index,
+                    declarations: &declarations,
+                    imports,
+                    same_file,
+                    collector,
+                };
+                let mut locals = LocalInferenceEngine::new(LocalInferenceConfig::default());
+                scan_scoped_node(parsed.tree.root_node(), &mut ctx, &mut locals);
+            },
+        ))
+    });
     JsTsScopedUsageEdges { edges, node_status }
 }
 
@@ -166,7 +171,7 @@ struct ScopedImportBindings {
 
 struct ScopedTsScan<'a, 'b> {
     source: &'a str,
-    graph: &'a JsTsProjectGraph,
+    index: &'a JsTsUsageIndex,
     declarations: &'a HashMap<(ProjectFile, String), BTreeSet<UsageNodeKey>>,
     imports: ScopedImportBindings,
     same_file: HashMap<String, UsageNodeKey>,
@@ -187,7 +192,7 @@ impl<'a> ScopedTsScan<'a, '_> {
     fn namespace_member_callee(&self, namespace: &str, member: &str) -> Option<UsageNodeKey> {
         let target_file = self.imports.namespace.get(namespace)?;
         single_key(canonical_export_keys(
-            self.graph,
+            self.index,
             self.declarations,
             target_file,
             member,
@@ -253,17 +258,17 @@ fn scoped_same_file_declarations(
 }
 
 fn scoped_import_bindings(
-    graph: &JsTsProjectGraph,
+    index: &JsTsUsageIndex,
     file: &ProjectFile,
     declarations: &HashMap<(ProjectFile, String), BTreeSet<UsageNodeKey>>,
 ) -> ScopedImportBindings {
     let mut grouped_named: HashMap<String, BTreeSet<UsageNodeKey>> = HashMap::default();
     let mut grouped_namespace: HashMap<String, BTreeSet<ProjectFile>> = HashMap::default();
-    for edges in graph.importer_reverse.values() {
+    for edges in index.importer_reverse.values() {
         for edge in edges.iter().filter(|edge| &edge.importer == file) {
             match &edge.kind {
                 crate::analyzer::usages::ImportEdgeKind::Named(name) => {
-                    let keys = canonical_export_keys(graph, declarations, &edge.target_file, name);
+                    let keys = canonical_export_keys(index, declarations, &edge.target_file, name);
                     grouped_named
                         .entry(edge.local_name.clone())
                         .or_default()
@@ -271,7 +276,7 @@ fn scoped_import_bindings(
                 }
                 crate::analyzer::usages::ImportEdgeKind::Default => {
                     let keys =
-                        canonical_export_keys(graph, declarations, &edge.target_file, "default");
+                        canonical_export_keys(index, declarations, &edge.target_file, "default");
                     grouped_named
                         .entry(edge.local_name.clone())
                         .or_default()
@@ -300,7 +305,7 @@ fn scoped_import_bindings(
 }
 
 fn scoped_node_status(
-    graph: &JsTsProjectGraph,
+    index: &JsTsUsageIndex,
     nodes: &HashSet<UsageNodeKey>,
     declarations: &HashMap<(ProjectFile, String), BTreeSet<UsageNodeKey>>,
 ) -> BTreeMap<UsageNodeKey, JsTsScopedNodeStatus> {
@@ -308,10 +313,10 @@ fn scoped_node_status(
         .iter()
         .map(|node| {
             let top = top_level_name(&node.fqn);
-            let keys = canonical_export_keys(graph, declarations, &node.file, &top);
+            let keys = canonical_export_keys(index, declarations, &node.file, &top);
             let status = if keys.is_empty() {
                 JsTsScopedNodeStatus::Unseedable
-            } else if ambiguous_alias_for_node(graph, declarations, node, &top) {
+            } else if ambiguous_alias_for_node(index, declarations, node, &top) {
                 JsTsScopedNodeStatus::Ambiguous
             } else if keys
                 .iter()
@@ -327,23 +332,23 @@ fn scoped_node_status(
 }
 
 fn ambiguous_alias_for_node(
-    graph: &JsTsProjectGraph,
+    index: &JsTsUsageIndex,
     declarations: &HashMap<(ProjectFile, String), BTreeSet<UsageNodeKey>>,
     node: &UsageNodeKey,
     export_name: &str,
 ) -> bool {
     let direct_key = (node.file.clone(), export_name.to_string());
-    if let Some(aliases) = graph.reexport_edges.get(&direct_key) {
+    if let Some(aliases) = index.reexport_edges.get(&direct_key) {
         for (alias_file, alias_name) in aliases {
-            let keys = canonical_export_keys(graph, declarations, alias_file, alias_name);
+            let keys = canonical_export_keys(index, declarations, alias_file, alias_name);
             if keys.len() > 1 {
                 return true;
             }
         }
     }
-    if let Some(star_files) = graph.star_reexports.get(&node.file) {
+    if let Some(star_files) = index.star_reexports.get(&node.file) {
         for star_file in star_files {
-            let keys = canonical_export_keys(graph, declarations, star_file, export_name);
+            let keys = canonical_export_keys(index, declarations, star_file, export_name);
             if keys.len() > 1 {
                 return true;
             }
@@ -353,16 +358,16 @@ fn ambiguous_alias_for_node(
 }
 
 fn canonical_export_keys(
-    graph: &JsTsProjectGraph,
+    index: &JsTsUsageIndex,
     declarations: &HashMap<(ProjectFile, String), BTreeSet<UsageNodeKey>>,
     file: &ProjectFile,
     export_name: &str,
 ) -> BTreeSet<UsageNodeKey> {
-    canonical_export_keys_inner(graph, declarations, file, export_name, &mut BTreeSet::new())
+    canonical_export_keys_inner(index, declarations, file, export_name, &mut BTreeSet::new())
 }
 
 fn canonical_export_keys_inner(
-    graph: &JsTsProjectGraph,
+    index: &JsTsUsageIndex,
     declarations: &HashMap<(ProjectFile, String), BTreeSet<UsageNodeKey>>,
     file: &ProjectFile,
     export_name: &str,
@@ -373,7 +378,7 @@ fn canonical_export_keys_inner(
         return BTreeSet::new();
     }
 
-    if let Some(exports) = graph.exports_by_file.get(file)
+    if let Some(exports) = index.exports_by_file.get(file)
         && let Some(entry) = exports.exports_by_name.get(export_name)
     {
         match entry {
@@ -395,10 +400,10 @@ fn canonical_export_keys_inner(
     }
 
     let mut out = BTreeSet::new();
-    if let Some(targets) = graph.direct_reexport_edges.get(&current) {
+    if let Some(targets) = index.direct_reexport_edges.get(&current) {
         for (target_file, target_name) in targets {
             out.extend(canonical_export_keys_inner(
-                graph,
+                index,
                 declarations,
                 target_file,
                 target_name,
@@ -407,11 +412,11 @@ fn canonical_export_keys_inner(
         }
     }
     if out.is_empty()
-        && let Some(target_files) = graph.direct_star_reexports.get(file)
+        && let Some(target_files) = index.direct_star_reexports.get(file)
     {
         for target_file in target_files {
             out.extend(canonical_export_keys_inner(
-                graph,
+                index,
                 declarations,
                 target_file,
                 export_name,
