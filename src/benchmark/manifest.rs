@@ -342,8 +342,6 @@ pub struct DefinitionQueryTarget {
     pub start_byte: Option<usize>,
     #[serde(default)]
     pub end_byte: Option<usize>,
-    #[serde(default)]
-    pub symbol: Option<String>,
     pub expected_status: String,
     #[serde(default)]
     pub expected_fqn: Option<String>,

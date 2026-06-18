@@ -50,7 +50,6 @@ pub(crate) struct DefinitionLookupRequest {
     pub(crate) column: Option<usize>,
     pub(crate) start_byte: Option<usize>,
     pub(crate) end_byte: Option<usize>,
-    pub(crate) symbol: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -417,39 +416,13 @@ fn resolve_one(
         Language::None => unreachable!("unsupported language handled before source extraction"),
     };
 
-    finish_with_symbol_filter(resolved, site, request.symbol)
+    finish_lookup_outcome(resolved, site)
 }
 
-fn finish_with_symbol_filter(
+fn finish_lookup_outcome(
     mut outcome: DefinitionLookupOutcome,
     site: ResolvedReferenceSite,
-    symbol: Option<String>,
 ) -> DefinitionLookupOutcome {
-    if let Some(symbol) = symbol.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        if site.text == symbol {
-            // The symbol can name the queried source token rather than the target
-            // definition, e.g. Scala `Elem(...)` resolving to `Elem$.apply`.
-        } else {
-            let before = outcome.candidates.len();
-            outcome.candidates.retain(|candidate| {
-                candidate.fq_name() == symbol
-                    || candidate.identifier() == symbol
-                    || candidate.short_name() == symbol
-                    || candidate.fq_name().ends_with(&format!(".{symbol}"))
-            });
-            if before > 0 && outcome.candidates.is_empty() {
-                outcome.status = DefinitionLookupStatus::NoDefinition;
-                outcome.diagnostics.push(DefinitionLookupDiagnostic {
-                    kind: "symbol_filter_mismatch".to_string(),
-                    message: format!(
-                        "resolved reference `{}` did not match symbol disambiguator `{symbol}`",
-                        site.text
-                    ),
-                });
-            }
-        }
-    }
-
     if !outcome.candidates.is_empty() {
         outcome.status = if outcome.candidates.len() == 1 {
             DefinitionLookupStatus::Resolved

@@ -291,8 +291,7 @@ fn tool_arguments(target: &BenchmarkRepoTarget, scenario: BenchmarkScenario) -> 
                     "line": query.line,
                     "column": query.column,
                     "start_byte": query.start_byte,
-                    "end_byte": query.end_byte,
-                    "symbol": query.symbol
+                    "end_byte": query.end_byte
                 })
             }).collect::<Vec<_>>(),
             "include_tests": true

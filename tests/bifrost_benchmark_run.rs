@@ -55,7 +55,7 @@ summary_targets = ["A.java"]
 seed_file_paths = ["A.java"]
 usage_symbols = ["E.iMethod"]
 definition_queries = [
-  {{ path = "A.java", line = 8, column = 19, symbol = "method2", expected_status = "no_definition" }},
+  {{ path = "A.java", line = 8, column = 19, expected_status = "no_definition" }},
 ]
 "#,
             toml_basic_string(&repo_root.display().to_string()),
@@ -155,7 +155,7 @@ summary_targets = ["A.java"]
 seed_file_paths = ["B.java"]
 usage_symbols = ["A.method2"]
 definition_queries = [
-  {{ path = "E.java", line = 10, column = 17, symbol = "iMethod", expected_status = "no_definition" }},
+  {{ path = "E.java", line = 10, column = 17, expected_status = "no_definition" }},
 ]
 "#,
             toml_basic_string(&repo_root.display().to_string()),
@@ -325,7 +325,7 @@ summary_targets = ["A.java"]
 seed_file_paths = ["A.java"]
 usage_symbols = ["A.method2"]
 definition_queries = [
-  {{ path = "A.java", line = 8, column = 19, symbol = "method2", expected_status = "no_definition" }},
+  {{ path = "A.java", line = 8, column = 19, expected_status = "no_definition" }},
 ]
 "#,
             toml_basic_string(&repo_root.display().to_string()),
@@ -409,7 +409,7 @@ scenarios = [
 location_symbols = ["does.not.Exist"]
 usage_symbols = ["E.iMethod"]
 definition_queries = [
-  {{ path = "A.java", line = 8, column = 19, symbol = "method2", expected_status = "no_definition" }},
+  {{ path = "A.java", line = 8, column = 19, expected_status = "no_definition" }},
 ]
 "#,
             toml_basic_string(&repo_root.display().to_string()),
@@ -509,7 +509,7 @@ scenarios = [
   "get_definition",
 ]
 definition_queries = [
-  {{ path = "lib.rs", line = 4, column = 5, symbol = "helper", expected_status = "resolved", expected_fqn = "helper" }},
+  {{ path = "lib.rs", line = 4, column = 5, expected_status = "resolved", expected_fqn = "helper" }},
 ]
 "#,
             toml_basic_string(&repo_root.display().to_string()),
@@ -580,7 +580,7 @@ scenarios = [
   "search_symbols",
 ]
 definition_queries = [
-  {{ path = "A.java", line = 8, column = 19, symbol = "method2", expected_status = "resolved", expected_fqn = "A.method2" }},
+  {{ path = "A.java", line = 8, column = 19, expected_status = "resolved", expected_fqn = "A.method2" }},
 ]
 search_patterns = ["method2"]
 "#,
@@ -673,7 +673,7 @@ scenarios = [
   "get_definition",
 ]
 definition_queries = [
-  {{ path = "lib.rs", line = 4, column = 5, symbol = "helper", expected_status = "resolved", expected_fqn = "wrong.helper" }},
+  {{ path = "lib.rs", line = 4, column = 5, expected_status = "resolved", expected_fqn = "wrong.helper" }},
 ]
 "#,
             toml_basic_string(&repo_root.display().to_string()),

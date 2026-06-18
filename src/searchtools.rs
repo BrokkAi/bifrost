@@ -130,8 +130,6 @@ pub struct DefinitionReferenceQuery {
     pub start_byte: Option<usize>,
     #[serde(default)]
     pub end_byte: Option<usize>,
-    #[serde(default)]
-    pub symbol: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -738,7 +736,6 @@ pub fn get_definition(
                         column: query.column,
                         start_byte: query.start_byte,
                         end_byte: query.end_byte,
-                        symbol: query.symbol.clone(),
                     },
                 ));
             }

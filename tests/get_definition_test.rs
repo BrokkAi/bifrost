@@ -1831,7 +1831,7 @@ fn scala_object_apply_call_resolves_to_definition() {
 }
 
 #[test]
-fn scala_object_apply_call_accepts_source_symbol_filter() {
+fn scala_object_apply_call_resolves_from_constructor_like_reference() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(
             "app/Factory.scala",
@@ -1847,7 +1847,7 @@ fn scala_object_apply_call_accepts_source_symbol_filter() {
     let value = lookup(
         project.root(),
         &format!(
-            r#"{{"references":[{{"path":"app/Controller.scala","line":2,"column":{},"symbol":"Factory"}}]}}"#,
+            r#"{{"references":[{{"path":"app/Controller.scala","line":2,"column":{}}}]}}"#,
             column_of(line, "Factory")
         ),
     );
@@ -1856,36 +1856,6 @@ fn scala_object_apply_call_accepts_source_symbol_filter() {
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(
         result["definitions"][0]["fqn"], "app.Factory$.apply",
-        "{value}"
-    );
-}
-
-#[test]
-fn scala_object_apply_call_rejects_mismatched_symbol_filter() {
-    let project = InlineTestProject::with_language(Language::Scala)
-        .file(
-            "app/Factory.scala",
-            "package app\nclass Service\nobject Factory { def apply(): Service = new Service }\n",
-        )
-        .file(
-            "app/Controller.scala",
-            "package app\nclass Controller { val service = Factory() }\n",
-        )
-        .build();
-
-    let line = "class Controller { val service = Factory() }";
-    let value = lookup(
-        project.root(),
-        &format!(
-            r#"{{"references":[{{"path":"app/Controller.scala","line":2,"column":{},"symbol":"Other"}}]}}"#,
-            column_of(line, "Factory")
-        ),
-    );
-
-    let result = &value["results"][0];
-    assert_eq!(result["status"], "no_definition", "{value}");
-    assert_eq!(
-        result["diagnostics"][0]["kind"], "symbol_filter_mismatch",
         "{value}"
     );
 }
