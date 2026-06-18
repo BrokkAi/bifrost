@@ -26,7 +26,8 @@ use crate::analyzer::usages::python_graph::{
     resolve_receiver_type as resolve_python_receiver_type,
 };
 use crate::analyzer::usages::scala_graph::{
-    ScalaNameResolver, ScalaProjectTypes, scala_import_path, scala_node_text,
+    ScalaNameResolver, ScalaProjectTypes, package_name_of as scala_package_name_of,
+    scala_import_path, scala_node_text,
 };
 use crate::analyzer::{
     AliasResolver, CSharpAnalyzer, CodeUnit, CppAnalyzer, DefinitionLookupIndex, GoAnalyzer,
@@ -1804,9 +1805,9 @@ fn resolve_scala(
             };
             resolve_scala_call(ctx, &resolver, root, call)
         }
-        Some(ScalaReferenceNode::Field(field)) => {
-            resolve_scala_field(analyzer, support, file, source, &resolver, root, field)
-        }
+        Some(ScalaReferenceNode::Field(field)) => resolve_scala_field(
+            scala, analyzer, support, file, source, &resolver, root, field,
+        ),
         Some(ScalaReferenceNode::Identifier(identifier)) => {
             let text = scala_node_text(identifier, source).trim();
             if text.is_empty() {
@@ -1973,6 +1974,7 @@ fn resolve_scala_call(
     };
     match function.kind() {
         "field_expression" => resolve_scala_field(
+            ctx.scala,
             ctx.analyzer,
             ctx.support,
             ctx.file,
@@ -2031,6 +2033,7 @@ fn resolve_scala_call(
 }
 
 fn resolve_scala_field(
+    scala: &ScalaAnalyzer,
     analyzer: &dyn IAnalyzer,
     support: &DefinitionLookupIndex,
     file: &ProjectFile,
@@ -2053,6 +2056,7 @@ fn resolve_scala_field(
         );
     };
     if let Some(owner) = scala_receiver_type_fqn(
+        scala,
         analyzer,
         file,
         source,
@@ -2073,6 +2077,7 @@ fn resolve_scala_field(
 }
 
 fn scala_receiver_type_fqn(
+    scala: &ScalaAnalyzer,
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     source: &str,
@@ -2092,7 +2097,7 @@ fn scala_receiver_type_fqn(
             let bindings = scala_bindings_before(resolver, source, root, cutoff_start);
             first_precise(&bindings, name).or_else(|| {
                 scala_enclosing_class_parameter_type(
-                    analyzer, file, receiver, name, resolver, source,
+                    scala, analyzer, file, receiver, name, resolver, source,
                 )
                 .or_else(|| {
                     (!bindings.is_shadowed(name))
@@ -2106,6 +2111,7 @@ fn scala_receiver_type_fqn(
 }
 
 fn scala_enclosing_class_parameter_type(
+    scala: &ScalaAnalyzer,
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     node: Node<'_>,
@@ -2134,7 +2140,13 @@ fn scala_enclosing_class_parameter_type(
                 return parameter.child_by_field_name("type").and_then(|type_node| {
                     let type_text = scala_node_text(type_node, source);
                     resolver.resolve(type_text).or_else(|| {
-                        scala_same_package_type_fqn(current_class.as_deref()?, type_text)
+                        current_class
+                            .as_deref()
+                            .and_then(|class_fqn| scala_same_package_type_fqn(class_fqn, type_text))
+                            .or_else(|| {
+                                scala_package_name_of(scala, file)
+                                    .and_then(|package| scala_package_type_fqn(&package, type_text))
+                            })
                     })
                 });
             }
@@ -2146,13 +2158,22 @@ fn scala_enclosing_class_parameter_type(
 }
 
 fn scala_same_package_type_fqn(current_class_fqn: &str, type_text: &str) -> Option<String> {
+    let package = current_class_fqn
+        .rsplit_once('.')
+        .map(|(package, _)| package)?;
+    scala_package_type_fqn(package, type_text)
+}
+
+fn scala_package_type_fqn(package: &str, type_text: &str) -> Option<String> {
     let simple = scala_simple_name(type_text);
     if simple.is_empty() || simple.contains('.') {
         return None;
     }
-    current_class_fqn
-        .rsplit_once('.')
-        .map(|(package, _)| format!("{package}.{simple}"))
+    if package.is_empty() {
+        Some(simple.to_string())
+    } else {
+        Some(format!("{package}.{simple}"))
+    }
 }
 
 fn scala_fqn_outcome(

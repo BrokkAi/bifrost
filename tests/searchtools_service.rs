@@ -312,12 +312,22 @@ private[app] class StreamContext(
         temp.path().join("app").join("TimeGrouped.scala"),
         r#"package app
 
+object AggrDatapoint {
+  def AggregatorSettings(input: Int, intermediate: Int, registry: Registry, host: String): Int = 0
+}
+
 private[app] class TimeGrouped(
   context: StreamContext,
   host: String
 ) extends GraphStage[FlowShape] {
-  val value =
+  private val maxInputDatapointsPerExpression = 1
+  private val maxIntermediateDatapointsPerExpression = 2
+  private val aggrSettings = AggrDatapoint.AggregatorSettings(
+    maxInputDatapointsPerExpression,
+    maxIntermediateDatapointsPerExpression,
     context.registry,
+    host
+  )
 }
 "#,
     )
