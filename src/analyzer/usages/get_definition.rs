@@ -2128,7 +2128,7 @@ fn scala_enclosing_class_parameter_type(
             let parameters = parent.child_by_field_name("class_parameters")?;
             let mut cursor = parameters.walk();
             for parameter in parameters.named_children(&mut cursor) {
-                if parameter.kind() != "class_parameter" {
+                if !matches!(parameter.kind(), "parameter" | "class_parameter") {
                     continue;
                 }
                 let Some(param_name) = parameter.child_by_field_name("name") else {
