@@ -14,6 +14,13 @@ use crate::analyzer::usages::traits::UsageAnalyzer;
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::HashSet;
 
+pub(in crate::analyzer::usages) use resolver::{
+    TargetKind as CppTargetKind, VisibilityIndex as CppVisibilityIndex, cpp_name_for,
+    extract_variable_name, first_type_child as cpp_first_type_child,
+    is_declaration_name as cpp_is_declaration_name, is_declarator_node as cpp_is_declarator_node,
+    normalize_type_text as normalize_cpp_type_text, resolve_cpp_analyzer,
+};
+
 pub(crate) fn build_cpp_usage_edges<F>(
     analyzer: &dyn IAnalyzer,
     nodes: &HashSet<String>,

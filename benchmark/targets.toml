@@ -91,7 +91,7 @@ location_symbols = ["vformat"]
 summary_targets = ["include/fmt/base.h"]
 seed_file_paths = ["include/fmt/base.h"]
 definition_queries = [
-  { path = "include/fmt/base.h", line = 2395, column = 15, symbol = "vformat_to", expected_status = "unsupported_language" },
+  { path = "include/fmt/base.h", line = 2798, column = 11, symbol = "vformat_to", expected_status = "resolved", expected_fqn = "detail.vformat_to" },
 ]
 
 [[repos]]

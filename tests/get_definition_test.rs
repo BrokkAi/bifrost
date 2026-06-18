@@ -1167,6 +1167,238 @@ fn csharp_static_external_using_reports_boundary() {
 }
 
 #[test]
+fn cpp_included_type_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("target.h", "namespace ns { class Service {}; }\n")
+        .file("app.cpp", "#include \"target.h\"\nns::Service service;\n")
+        .build();
+
+    let line = "ns::Service service;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.cpp","line":2,"column":{}}}]}}"#,
+            column_of(line, "Service")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "ns.Service", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "target.h", "{value}");
+}
+
+#[test]
+fn cpp_typed_receiver_method_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "target.h",
+            "namespace ns { class Service { public: void run(); }; }\n",
+        )
+        .file(
+            "target.cpp",
+            "#include \"target.h\"\nnamespace ns { void Service::run() {} }\n",
+        )
+        .file(
+            "app.cpp",
+            "#include \"target.h\"\nvoid handle(ns::Service service) { service.run(); }\n",
+        )
+        .build();
+
+    let line = "void handle(ns::Service service) { service.run(); }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.cpp","line":2,"column":{}}}]}}"#,
+            column_of(line, "run")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "ambiguous", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "ns.Service.run", "{value}");
+}
+
+#[test]
+fn cpp_relative_namespace_call_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "app.cpp",
+            "namespace ns { namespace detail { void helper() {} } void run() { detail::helper(); } }\n",
+        )
+        .build();
+
+    let line =
+        "namespace ns { namespace detail { void helper() {} } void run() { detail::helper(); } }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.cpp","line":1,"column":{}}}]}}"#,
+            column_of(line, "helper();")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "ns::detail.helper",
+        "{value}"
+    );
+}
+
+#[test]
+fn cpp_external_include_reports_boundary() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "app.cpp",
+            "#include <external/service.h>\nService service;\n",
+        )
+        .build();
+
+    let line = "Service service;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.cpp","line":2,"column":{}}}]}}"#,
+            column_of(line, "Service")
+        ),
+    );
+
+    assert_eq!(
+        value["results"][0]["status"], "unresolvable_import_boundary",
+        "{value}"
+    );
+}
+
+#[test]
+fn cpp_local_value_returns_no_definition() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("app.cpp", "void run() { int value = 1; value++; }\n")
+        .build();
+
+    let line = "void run() { int value = 1; value++; }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.cpp","line":1,"column":{}}}]}}"#,
+            column_of(line, "value++")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn cpp_out_of_line_definition_name_is_not_reference() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "target.cpp",
+            "namespace ns { class Service { public: void run(); }; void Service::run() {} }\n",
+        )
+        .build();
+
+    let line = "namespace ns { class Service { public: void run(); }; void Service::run() {} }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"target.cpp","line":1,"column":{}}}]}}"#,
+            column_of(line, "run() {}")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn cpp_type_reference_does_not_resolve_to_same_named_function() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("api.h", "namespace ns { void Service(); }\n")
+        .file("app.cpp", "#include \"api.h\"\nns::Service service;\n")
+        .build();
+
+    let line = "ns::Service service;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.cpp","line":2,"column":{}}}]}}"#,
+            column_of(line, "Service")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn cpp_qualified_call_does_not_cross_unrelated_namespace() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "api.h",
+            "namespace ns { namespace detail { void helper() {} } }\n",
+        )
+        .file(
+            "app.cpp",
+            "#include \"api.h\"\nvoid run() { detail::helper(); }\n",
+        )
+        .build();
+
+    let line = "void run() { detail::helper(); }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.cpp","line":2,"column":{}}}]}}"#,
+            column_of(line, "helper")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn cpp_auto_new_receiver_method_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "target.h",
+            "namespace ns { class Service { public: void run() {} }; }\n",
+        )
+        .file(
+            "app.cpp",
+            "#include \"target.h\"\nvoid handle() { auto service = new ns::Service(); service->run(); }\n",
+        )
+        .build();
+
+    let line = "void handle() { auto service = new ns::Service(); service->run(); }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.cpp","line":2,"column":{}}}]}}"#,
+            column_of(line, "run")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "ns.Service.run", "{value}");
+}
+
+#[test]
+fn cpp_unqualified_typo_with_angle_include_returns_no_definition() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("app.cpp", "#include <vector>\nvoid run() { typo(); }\n")
+        .build();
+
+    let line = "void run() { typo(); }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.cpp","line":2,"column":{}}}]}}"#,
+            column_of(line, "typo")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
 fn valid_local_value_returns_no_definition() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file(

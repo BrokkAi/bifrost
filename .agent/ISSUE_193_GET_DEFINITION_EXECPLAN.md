@@ -59,6 +59,11 @@ This work adds a `get_definition` searchtools/MCP tool for that on-demand lookup
 - [x] (2026-06-18T09:05Z) Ran the requested guided review checkpoint over the uncommitted C# slice with parallel reviewer agents. Review findings were fixed by adding scoped local-binding inference for on-demand lookup, preventing delegate parameters and local functions from resolving as class methods, reporting alias/static external usings as `unresolvable_import_boundary`, and preserving ambiguous visible type candidates instead of collapsing them to `no_definition`.
 - [x] (2026-06-18T09:05Z) Added C# regression tests for imported types, typed receivers, `this` members, external namespace/alias/static usings, ambiguous type imports, delegate/local-function shadows, and local values.
 - [x] (2026-06-18T09:05Z) Re-ran `cargo test --test get_definition_test`, `cargo run --bin bifrost_benchmark -- validate --manifest benchmark/targets.toml`, `cargo run --bin bifrost_benchmark -- run --manifest benchmark/targets.toml --repo dapper-csharp --max-files 80`, `cargo test --test bifrost_benchmark_run`, `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`; all passed.
+- [x] (2026-06-18T09:20Z) Added C++ `get_definition` support for include-visible type references, relative namespace-qualified free function calls, typed receiver methods, `this` receivers, `auto x = new Type()` receiver inference, local-value `no_definition`, and conservative unresolved include-boundary diagnostics.
+- [x] (2026-06-18T09:20Z) Updated the fmt benchmark probe from `unsupported_language` to a resolved `detail.vformat_to` call reference at `include/fmt/base.h:2798:11`, and documented the manual result in `benchmark/get_definition_observations.md`.
+- [x] (2026-06-18T09:20Z) Ran the requested guided review checkpoint over the uncommitted C++ slice with parallel reviewer agents. Review findings were fixed by preventing declaration sites from resolving as references, restricting type fallback to classes/type aliases, requiring lexical-namespace proof for relative qualified calls, adding `auto new` receiver inference, and avoiding broad boundary diagnostics for unqualified typos in files with angle includes.
+- [x] (2026-06-18T09:20Z) Added C++ regression tests for include-visible types, typed receiver calls, relative namespace calls, declaration-site clicks, same-named function/type confusion, wrong-namespace qualified calls, `auto new` receivers, unresolved external includes, unqualified typos with angle includes, and local values.
+- [x] (2026-06-18T09:20Z) Re-ran `cargo test --test get_definition_test`, `cargo run --bin bifrost_benchmark -- validate --manifest benchmark/targets.toml`, `cargo run --bin bifrost_benchmark -- run --manifest benchmark/targets.toml --repo fmt-cpp --max-files 80`, `cargo test --test bifrost_benchmark_run`, `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`; all passed.
 
 ## Surprises & Discoveries
 
@@ -134,6 +139,21 @@ This work adds a `get_definition` searchtools/MCP tool for that on-demand lookup
 - Observation: C# alias and static usings need explicit boundary handling.
   Evidence: guided review found `using Svc = External.Service;` and `using static External.Helpers;` could fall through to `no_definition`; the resolver now reports `unresolvable_import_boundary` for those external import forms.
 
+- Observation: fmt's benchmark C++ probe resolves a call through an included implementation file.
+  Evidence: `include/fmt/base.h:2798:11` on `detail::vformat_to(...)` returns `detail.vformat_to` at `include/fmt/format-inl.h:1467..1474`, and the `fmt-cpp --max-files 80` benchmark run passes with the expected FQN.
+
+- Observation: C++ declaration-site filtering must inspect both the original focused node and the promoted reference shape.
+  Evidence: guided review found out-of-line definitions such as `void Service::run() {}` could otherwise promote to `Service::run` and resolve as a reference; `cpp_out_of_line_definition_name_is_not_reference` now locks this down.
+
+- Observation: C++ relative qualified lookup cannot use a raw suffix match.
+  Evidence: guided review found global-scope `detail::helper()` could falsely resolve to `ns::detail::helper`; `cpp_qualified_call_does_not_cross_unrelated_namespace` now requires lexical namespace context for that relative match.
+
+- Observation: C++ unresolved include-boundary diagnostics should not be based solely on the presence of an angle include for every unresolved name.
+  Evidence: guided review found `#include <vector>` plus `typo();` would be over-classified as `unresolvable_import_boundary`; `cpp_unqualified_typo_with_angle_include_returns_no_definition` keeps ordinary local misses as `no_definition`.
+
+- Observation: C++ out-of-line method lookups may legitimately return declaration and definition candidates with the same FQN.
+  Evidence: `cpp_typed_receiver_method_resolves_to_definition` returns `ambiguous` for `ns.Service.run` when both `target.h` and `target.cpp` contain indexed candidates; this is documented as a follow-up for body/signature preference rather than hidden.
+
 ## Decision Log
 
 - Decision: Treat unresolved dependency/library/module boundaries as a first-class terminal state, separate from `no_definition`.
@@ -166,6 +186,10 @@ This work adds a `get_definition` searchtools/MCP tool for that on-demand lookup
 
 - Decision: Land C# after Python with conservative support for analyzer-visible types and the member forms already supported by the C# usage graph.
   Rationale: C# has mature indexed declarations, visible-type resolution, local binding inference, and type hierarchy support. The on-demand path can now resolve common workspace C# references while keeping overload/signature-sensitive member disambiguation as a documented follow-up.
+  Date/Author: 2026-06-18 / Codex
+
+- Decision: Land C++ after C# with include-visibility and lexical-namespace safeguards.
+  Rationale: The C++ usage graph already has include-closure visibility and local receiver inference primitives. The on-demand path can reuse those semantics for common workspace C++ references while staying conservative about declaration sites, unrelated namespace suffixes, unqualified typos, and declaration/definition ambiguity.
   Date/Author: 2026-06-18 / Codex
 
 ## Outcomes & Retrospective

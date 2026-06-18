@@ -1,4 +1,9 @@
 use crate::analyzer::common::language_for_file;
+use crate::analyzer::usages::cpp_graph::{
+    CppTargetKind, CppVisibilityIndex, cpp_first_type_child, cpp_is_declaration_name,
+    cpp_is_declarator_node, cpp_name_for, extract_variable_name, normalize_cpp_type_text,
+    resolve_cpp_analyzer,
+};
 use crate::analyzer::usages::csharp_graph::{
     csharp_first_type_child, csharp_is_declaration_name, csharp_is_type_reference_node,
     csharp_node_text, csharp_reference_type_text, member_access_name as csharp_member_access_name,
@@ -19,7 +24,8 @@ use crate::analyzer::usages::python_graph::{
 };
 use crate::analyzer::{
     AliasResolver, CSharpAnalyzer, CodeUnit, IAnalyzer, JavaAnalyzer, Language, PhpAnalyzer,
-    ProjectFile, PythonAnalyzer, Range, parse_php_use_aliases_from_source,
+    ProjectFile, PythonAnalyzer, Range, cpp_node_text, parse_php_use_aliases_from_source,
+    quoted_include_paths, resolve_include_targets,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
@@ -232,7 +238,8 @@ fn resolve_one(
         Language::Php => resolve_php(analyzer, support, &request.file, &source, &site),
         Language::Python => resolve_python(analyzer, support, &request.file, &source, &site),
         Language::CSharp => resolve_csharp(analyzer, support, &request.file, &source, &site),
-        Language::Cpp | Language::Scala | Language::None => {
+        Language::Cpp => resolve_cpp(analyzer, support, &request.file, &source, &site),
+        Language::Scala | Language::None => {
             return DefinitionLookupOutcome {
                 status: DefinitionLookupStatus::UnsupportedLanguage,
                 reference: Some(site),
@@ -861,6 +868,639 @@ fn go_import_path_is_workspace(analyzer: &dyn IAnalyzer, import_path: &str) -> b
     analyzer
         .all_declarations()
         .any(|unit| unit.fq_name().starts_with(&format!("{import_path}.")))
+}
+
+fn resolve_cpp(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionSupport,
+    file: &ProjectFile,
+    source: &str,
+    site: &ResolvedReferenceSite,
+) -> DefinitionLookupOutcome {
+    let Some(cpp) = resolve_cpp_analyzer(analyzer) else {
+        return no_definition("cpp_analyzer_unavailable", "C++ analyzer is unavailable");
+    };
+    let Some(tree) = parse_cpp_tree(source) else {
+        return no_definition("cpp_parse_failed", "C++ source could not be parsed");
+    };
+    let mut roots = HashSet::default();
+    roots.insert(file.clone());
+    let visibility = CppVisibilityIndex::build(cpp, analyzer, &roots);
+    let root = tree.root_node();
+    let Some(node) = smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)
+    else {
+        return no_definition(
+            "no_indexed_definition",
+            format!(
+                "`{}` did not resolve to an indexed C++ definition",
+                site.text
+            ),
+        );
+    };
+    match cpp_reference_node(node) {
+        Some(CppReferenceNode::Type(type_node)) => {
+            if cpp_is_type_declaration_name(node) {
+                return no_definition(
+                    "declaration_or_import_site",
+                    format!("`{}` is not a C++ reference site", site.text),
+                );
+            }
+            resolve_cpp_type(analyzer, support, file, &visibility, source, type_node)
+        }
+        Some(CppReferenceNode::Call(call)) => {
+            resolve_cpp_call(analyzer, support, file, &visibility, source, root, call)
+        }
+        Some(CppReferenceNode::Field(field)) => {
+            resolve_cpp_field(analyzer, support, file, &visibility, source, root, field)
+        }
+        Some(CppReferenceNode::Identifier(identifier)) => {
+            if cpp_is_declaration_name(node) {
+                return no_definition(
+                    "declaration_or_import_site",
+                    format!("`{}` is not a C++ reference site", site.text),
+                );
+            }
+            let text = cpp_node_text(identifier, source);
+            if text.is_empty() {
+                return no_definition("no_reference_text", "C++ identifier is blank");
+            }
+            no_definition(
+                "no_indexed_definition",
+                format!("`{text}` did not resolve to an indexed C++ definition"),
+            )
+        }
+        None => no_definition(
+            "unsupported_cpp_reference_shape",
+            format!(
+                "`{}` is a C++ `{}` reference shape that get_definition does not resolve yet",
+                site.text,
+                node.kind()
+            ),
+        ),
+    }
+}
+
+fn parse_cpp_tree(source: &str) -> Option<Tree> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_cpp::LANGUAGE.into())
+        .ok()?;
+    parser.parse(source, None)
+}
+
+enum CppReferenceNode<'tree> {
+    Type(Node<'tree>),
+    Call(Node<'tree>),
+    Field(Node<'tree>),
+    Identifier(Node<'tree>),
+}
+
+fn cpp_reference_node(node: Node<'_>) -> Option<CppReferenceNode<'_>> {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "qualified_identifier"
+            && (parent.child_by_field_name("name") == Some(current)
+                || parent.child_by_field_name("scope") == Some(current))
+        {
+            current = parent;
+            continue;
+        }
+        if parent.kind() == "field_expression"
+            && parent.child_by_field_name("field") == Some(current)
+        {
+            current = parent;
+            continue;
+        }
+        if parent.kind() == "call_expression"
+            && parent.child_by_field_name("function") == Some(current)
+        {
+            current = parent;
+            continue;
+        }
+        break;
+    }
+
+    match current.kind() {
+        "call_expression" => Some(CppReferenceNode::Call(current)),
+        "field_expression" => Some(CppReferenceNode::Field(current)),
+        "type_identifier" | "qualified_identifier" | "template_type" | "scoped_type_identifier" => {
+            Some(CppReferenceNode::Type(current))
+        }
+        "identifier" | "field_identifier" => Some(CppReferenceNode::Identifier(current)),
+        _ => None,
+    }
+}
+
+fn cpp_is_type_declaration_name(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    parent.child_by_field_name("name") == Some(node)
+        && matches!(
+            parent.kind(),
+            "class_specifier"
+                | "struct_specifier"
+                | "union_specifier"
+                | "enum_specifier"
+                | "alias_declaration"
+                | "type_definition"
+        )
+}
+
+fn resolve_cpp_type(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionSupport,
+    file: &ProjectFile,
+    visibility: &CppVisibilityIndex,
+    source: &str,
+    node: Node<'_>,
+) -> DefinitionLookupOutcome {
+    let text = normalize_cpp_type_text(cpp_node_text(node, source));
+    if text.is_empty() {
+        return no_definition("no_reference_text", "C++ type reference is blank");
+    }
+    if let Some(unit) = visibility.resolve_type(file, &text) {
+        let candidates = support.fqn(&unit.fq_name());
+        return if candidates.is_empty() {
+            candidates_outcome(vec![unit])
+        } else {
+            candidates_outcome(candidates)
+        };
+    }
+    let namespace = cpp_lexical_namespace(node, source);
+    let candidates = cpp_visible_name_candidates(
+        visibility,
+        file,
+        support,
+        &text,
+        Some(CppTargetKind::Type),
+        namespace.as_deref(),
+    );
+    if !candidates.is_empty() {
+        return candidates_outcome(candidates);
+    }
+    if cpp_unresolved_include_boundary(analyzer, file, &text) {
+        return boundary(format!(
+            "`{text}` appears to cross a C++ include boundary not indexed in this workspace"
+        ));
+    }
+    no_definition(
+        "no_indexed_definition",
+        format!("`{text}` did not resolve to an indexed C++ type"),
+    )
+}
+
+fn resolve_cpp_call(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionSupport,
+    file: &ProjectFile,
+    visibility: &CppVisibilityIndex,
+    source: &str,
+    root: Node<'_>,
+    call: Node<'_>,
+) -> DefinitionLookupOutcome {
+    let Some(function) = call.child_by_field_name("function") else {
+        return no_definition("no_function_name", "C++ call expression has no function");
+    };
+    match function.kind() {
+        "field_expression" => {
+            resolve_cpp_field(analyzer, support, file, visibility, source, root, function)
+        }
+        "qualified_identifier" => {
+            let text = cpp_node_text(function, source);
+            let mut candidates = cpp_visible_name_candidates(
+                visibility,
+                file,
+                support,
+                text,
+                Some(CppTargetKind::FreeFunction),
+                cpp_lexical_namespace(function, source).as_deref(),
+            );
+            if !candidates.is_empty() {
+                return candidates_outcome(candidates);
+            }
+            if let Some(scope) = function.child_by_field_name("scope")
+                && let Some(name) = function.child_by_field_name("name")
+            {
+                let member = cpp_node_text(name, source);
+                if let Some(owner) = visibility.resolve_type(file, cpp_node_text(scope, source)) {
+                    candidates = cpp_member_candidates(support, vec![owner], member);
+                    if !candidates.is_empty() {
+                        return candidates_outcome(candidates);
+                    }
+                }
+            }
+            if cpp_unresolved_include_boundary(analyzer, file, text) {
+                return boundary(format!(
+                    "`{text}` appears to cross a C++ include boundary not indexed in this workspace"
+                ));
+            }
+            no_definition(
+                "no_indexed_definition",
+                format!("`{text}` did not resolve to an indexed C++ callable"),
+            )
+        }
+        "identifier" => {
+            let name = cpp_node_text(function, source);
+            if name.is_empty() {
+                return no_definition("no_function_name", "C++ call name is blank");
+            }
+            let bindings =
+                cpp_bindings_before(visibility, file, source, root, function.start_byte());
+            if bindings.is_shadowed(name) {
+                return no_definition(
+                    "local_variable_reference",
+                    format!("`{name}` is a local C++ value"),
+                );
+            }
+            let candidates = cpp_visible_name_candidates(
+                visibility,
+                file,
+                support,
+                name,
+                Some(CppTargetKind::FreeFunction),
+                None,
+            );
+            if !candidates.is_empty() {
+                return candidates_outcome(candidates);
+            }
+            if let Some(owner) = cpp_enclosing_class(analyzer, file, function.start_byte()) {
+                let member_candidates = cpp_member_candidates(support, vec![owner], name);
+                if !member_candidates.is_empty() {
+                    return candidates_outcome(member_candidates);
+                }
+            }
+            no_definition(
+                "no_indexed_definition",
+                format!("`{name}` did not resolve to an indexed C++ callable"),
+            )
+        }
+        _ => no_definition(
+            "unsupported_cpp_reference_shape",
+            format!(
+                "C++ `{}` call targets are not resolved by get_definition yet",
+                function.kind()
+            ),
+        ),
+    }
+}
+
+fn resolve_cpp_field(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionSupport,
+    file: &ProjectFile,
+    visibility: &CppVisibilityIndex,
+    source: &str,
+    root: Node<'_>,
+    field: Node<'_>,
+) -> DefinitionLookupOutcome {
+    let Some(name_node) = field.child_by_field_name("field") else {
+        return no_definition("no_member_name", "C++ field expression has no member name");
+    };
+    let member = cpp_node_text(name_node, source);
+    let Some(receiver) = field
+        .child_by_field_name("argument")
+        .or_else(|| field.named_child(0))
+    else {
+        return no_definition("no_member_receiver", "C++ field expression has no receiver");
+    };
+    let owners = cpp_receiver_type_units(analyzer, visibility, file, source, root, receiver);
+    let candidates = cpp_member_candidates(support, owners, member);
+    if candidates.is_empty() {
+        no_definition(
+            "unsupported_cpp_receiver",
+            format!("receiver for C++ member `{member}` is not resolved"),
+        )
+    } else {
+        candidates_outcome(candidates)
+    }
+}
+
+fn cpp_visible_name_candidates(
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    support: &DefinitionSupport,
+    raw_name: &str,
+    kind: Option<CppTargetKind>,
+    lexical_namespace: Option<&str>,
+) -> Vec<CodeUnit> {
+    let normalized = raw_name.trim().trim_start_matches("::");
+    let namespace_relative = lexical_namespace
+        .filter(|namespace| !namespace.is_empty() && normalized.contains("::"))
+        .map(|namespace| format!("{namespace}::{normalized}"));
+    let mut candidates = Vec::new();
+    for unit in visibility.visible_units(file) {
+        if let Some(kind) = kind
+            && !cpp_unit_matches_kind(unit, kind)
+        {
+            continue;
+        }
+        let cpp_name = cpp_name_for(unit);
+        if cpp_name == normalized
+            || namespace_relative
+                .as_deref()
+                .is_some_and(|relative| cpp_name == relative)
+            || (!normalized.contains("::") && unit.identifier() == normalized)
+        {
+            let indexed = support.fqn(&unit.fq_name());
+            if indexed.is_empty() {
+                candidates.push(unit.clone());
+            } else {
+                candidates.extend(indexed);
+            }
+        }
+    }
+    sort_units(&mut candidates);
+    candidates.dedup();
+    candidates
+}
+
+fn cpp_unit_matches_kind(unit: &CodeUnit, kind: CppTargetKind) -> bool {
+    match kind {
+        CppTargetKind::FreeFunction => unit.is_function(),
+        CppTargetKind::Type => unit.is_class() || cpp_unit_is_type_alias(unit),
+        CppTargetKind::Constructor
+        | CppTargetKind::Method
+        | CppTargetKind::GlobalField
+        | CppTargetKind::MemberField => true,
+    }
+}
+
+fn cpp_unit_is_type_alias(unit: &CodeUnit) -> bool {
+    unit.is_field()
+        && unit.signature().is_some_and(|signature| {
+            signature.starts_with("typedef ") || signature.starts_with("using ")
+        })
+}
+
+fn cpp_member_candidates(
+    support: &DefinitionSupport,
+    owners: Vec<CodeUnit>,
+    member: &str,
+) -> Vec<CodeUnit> {
+    let mut candidates = Vec::new();
+    for owner in owners {
+        candidates.extend(support.fqn(&format!("{}.{}", owner.fq_name(), member)));
+    }
+    sort_units(&mut candidates);
+    candidates.dedup();
+    candidates
+}
+
+fn cpp_receiver_type_units(
+    analyzer: &dyn IAnalyzer,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    receiver: Node<'_>,
+) -> Vec<CodeUnit> {
+    match receiver.kind() {
+        "identifier" => {
+            let name = cpp_node_text(receiver, source);
+            let bindings =
+                cpp_bindings_before(visibility, file, source, root, receiver.start_byte());
+            if let Some(unit) = first_precise(&bindings, name) {
+                return vec![unit];
+            }
+            if bindings.is_shadowed(name) {
+                Vec::new()
+            } else {
+                visibility.resolve_type(file, name).into_iter().collect()
+            }
+        }
+        "this" => cpp_enclosing_class(analyzer, file, receiver.start_byte())
+            .into_iter()
+            .collect(),
+        "parenthesized_expression" | "pointer_expression" => receiver
+            .child_by_field_name("argument")
+            .or_else(|| receiver.named_child(0))
+            .map(|inner| cpp_receiver_type_units(analyzer, visibility, file, source, root, inner))
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+fn cpp_enclosing_class(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    byte: usize,
+) -> Option<CodeUnit> {
+    let fqn = ClassRangeIndex::build(analyzer, file)
+        .enclosing(byte)?
+        .to_string();
+    analyzer.definitions(&fqn).next().cloned()
+}
+
+const CPP_SCOPE_NODES: &[&str] = &[
+    "compound_statement",
+    "function_definition",
+    "lambda_expression",
+    "for_statement",
+    "while_statement",
+    "if_statement",
+];
+
+fn cpp_bindings_before(
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    cutoff_start: usize,
+) -> LocalInferenceEngine<CodeUnit> {
+    let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
+    cpp_seed_active_path(visibility, file, source, root, cutoff_start, &mut bindings);
+    bindings
+}
+
+fn cpp_seed_active_path(
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    cutoff_start: usize,
+    bindings: &mut LocalInferenceEngine<CodeUnit>,
+) {
+    if node.start_byte() >= cutoff_start {
+        return;
+    }
+    let enters_scope = CPP_SCOPE_NODES.contains(&node.kind());
+    if enters_scope && !(node.start_byte() <= cutoff_start && cutoff_start < node.end_byte()) {
+        return;
+    }
+    if enters_scope {
+        bindings.enter_scope();
+    }
+    match node.kind() {
+        "parameter_declaration" | "optional_parameter_declaration"
+            if node.end_byte() <= cutoff_start =>
+        {
+            cpp_seed_typed_binding(visibility, file, source, node, bindings)
+        }
+        "declaration" | "field_declaration" if node.start_byte() < cutoff_start => {
+            cpp_seed_variable_declaration(visibility, file, source, node, cutoff_start, bindings)
+        }
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.start_byte() >= cutoff_start {
+            break;
+        }
+        cpp_seed_active_path(visibility, file, source, child, cutoff_start, bindings);
+    }
+}
+
+fn cpp_seed_typed_binding(
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    bindings: &mut LocalInferenceEngine<CodeUnit>,
+) {
+    let Some(declarator) = node.child_by_field_name("declarator") else {
+        return;
+    };
+    let Some(name) = extract_variable_name(declarator, source) else {
+        return;
+    };
+    let type_text = node
+        .child_by_field_name("type")
+        .or_else(|| cpp_first_type_child(node))
+        .map(|type_node| normalize_cpp_type_text(cpp_node_text(type_node, source)));
+    cpp_seed_binding(
+        visibility,
+        file,
+        source,
+        &name,
+        type_text.as_deref(),
+        None,
+        bindings,
+    );
+}
+
+fn cpp_seed_variable_declaration(
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    cutoff_start: usize,
+    bindings: &mut LocalInferenceEngine<CodeUnit>,
+) {
+    let type_text = node
+        .child_by_field_name("type")
+        .or_else(|| cpp_first_type_child(node))
+        .map(|type_node| normalize_cpp_type_text(cpp_node_text(type_node, source)));
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        let declarator = if child.kind() == "init_declarator" {
+            child.child_by_field_name("declarator")
+        } else if cpp_is_declarator_node(child) {
+            Some(child)
+        } else {
+            None
+        };
+        let Some(declarator) = declarator else {
+            continue;
+        };
+        if declarator.start_byte() >= cutoff_start {
+            continue;
+        }
+        if declarator.kind() == "function_declarator" {
+            continue;
+        }
+        if let Some(name) = extract_variable_name(declarator, source) {
+            let value = child
+                .child_by_field_name("value")
+                .filter(|value| value.end_byte() <= cutoff_start);
+            cpp_seed_binding(
+                visibility,
+                file,
+                source,
+                &name,
+                type_text.as_deref(),
+                value,
+                bindings,
+            );
+        }
+    }
+}
+
+fn cpp_seed_binding(
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+    name: &str,
+    type_text: Option<&str>,
+    value: Option<Node<'_>>,
+    bindings: &mut LocalInferenceEngine<CodeUnit>,
+) {
+    if name.is_empty() {
+        return;
+    }
+    let resolved = type_text
+        .filter(|text| *text != "auto")
+        .and_then(|text| visibility.resolve_type(file, text))
+        .or_else(|| {
+            value.and_then(|value| cpp_infer_type_from_value(visibility, file, source, value))
+        });
+    match resolved {
+        Some(unit) => bindings.seed_symbol(name.to_string(), unit),
+        None => bindings.declare_shadow(name.to_string()),
+    }
+}
+
+fn cpp_infer_type_from_value(
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+) -> Option<CodeUnit> {
+    match node.kind() {
+        "new_expression" => {
+            let text = cpp_node_text(node, source).trim();
+            let rest = text.strip_prefix("new ").unwrap_or(text);
+            visibility.resolve_type(file, rest.split(['(', '{']).next().unwrap_or(rest))
+        }
+        "call_expression" => node
+            .child_by_field_name("function")
+            .and_then(|function| visibility.resolve_type(file, cpp_node_text(function, source))),
+        _ => None,
+    }
+}
+
+fn cpp_unresolved_include_boundary(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    reference: &str,
+) -> bool {
+    if !reference.contains("::") && !reference.chars().next().is_some_and(char::is_uppercase) {
+        return false;
+    }
+    analyzer.import_statements(file).iter().any(|import| {
+        if import.contains('<') && import.contains('>') {
+            return true;
+        }
+        quoted_include_paths(std::slice::from_ref(import))
+            .iter()
+            .any(|include| resolve_include_targets(analyzer.project(), file, include).is_empty())
+    })
+}
+
+fn cpp_lexical_namespace(node: Node<'_>, source: &str) -> Option<String> {
+    let mut names = Vec::new();
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "namespace_definition"
+            && let Some(name) = parent.child_by_field_name("name")
+        {
+            names.push(cpp_node_text(name, source).trim().to_string());
+        }
+        current = parent.parent();
+    }
+    names.reverse();
+    (!names.is_empty()).then(|| names.join("::"))
 }
 
 fn resolve_java(
