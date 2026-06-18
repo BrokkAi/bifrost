@@ -1947,6 +1947,123 @@ fn scala_typed_receiver_method_resolves_to_definition() {
 }
 
 #[test]
+fn scala_constructor_parameter_field_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Context.scala",
+            "package app\nclass Registry\nclass Context(val registry: Registry)\n",
+        )
+        .file(
+            "app/Grouped.scala",
+            "package app\nclass Grouped(context: Context) { val value = context.registry }\n",
+        )
+        .build();
+
+    let line = "class Grouped(context: Context) { val value = context.registry }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Grouped.scala","line":2,"column":{}}}]}}"#,
+            column_of(line, "registry")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definition"]["fqn"], "app.Context.registry",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_modified_case_class_parameter_field_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Context.scala",
+            "package app\nclass Registry\nfinal case class Context(registry: Registry)\n",
+        )
+        .file(
+            "app/Grouped.scala",
+            "package app\nclass Grouped(context: Context) { val value = context.registry }\n",
+        )
+        .build();
+
+    let line = "class Grouped(context: Context) { val value = context.registry }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Grouped.scala","line":2,"column":{}}}]}}"#,
+            column_of(line, "registry")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definition"]["fqn"], "app.Context.registry",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_multiline_private_constructor_parameter_field_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/StreamContext.scala",
+            "package app\nclass Registry\nprivate[app] class StreamContext(\n  val registry: Registry\n)\n",
+        )
+        .file(
+            "app/TimeGrouped.scala",
+            "package app\nprivate[app] class TimeGrouped(\n  context: StreamContext,\n  host: String\n) {\n  val value = context.registry\n}\n",
+        )
+        .build();
+
+    let line = "  val value = context.registry";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/TimeGrouped.scala","line":6,"column":{}}}]}}"#,
+            column_of(line, "registry")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definition"]["fqn"], "app.StreamContext.registry",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_object_receiver_method_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/DataSources.scala",
+            "package app\nclass DataSource\nobject DataSources { def of(source: DataSource): Int = 1 }\n",
+        )
+        .file(
+            "app/Controller.scala",
+            "package app\nclass Controller { val value = DataSources.of(new DataSource) }\n",
+        )
+        .build();
+
+    let line = "class Controller { val value = DataSources.of(new DataSource) }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Controller.scala","line":2,"column":{}}}]}}"#,
+            column_of(line, "of")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definition"]["fqn"], "app.DataSources$.of", "{value}");
+}
+
+#[test]
 fn scala_external_import_reports_boundary() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(

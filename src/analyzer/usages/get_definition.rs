@@ -2082,7 +2082,7 @@ fn scala_receiver_type_fqn(
     cutoff_start: usize,
 ) -> Option<String> {
     match receiver.kind() {
-        "identifier" => {
+        "identifier" | "type_identifier" => {
             let name = scala_node_text(receiver, source).trim();
             if name == "this" {
                 return ClassRangeIndex::build(analyzer, file)
@@ -2170,7 +2170,7 @@ fn scala_seed_active_path(
             bindings.enter_scope();
         }
         match node.kind() {
-            "function_definition" => {
+            "class_definition" | "function_definition" => {
                 scala_seed_parameters(resolver, source, node, cutoff_start, bindings)
             }
             "val_definition" | "var_definition" if node.start_byte() < cutoff_start => {
@@ -2198,12 +2198,16 @@ fn scala_seed_parameters(
 ) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        if child.kind() != "parameters" || child.start_byte() >= cutoff_start {
+        if !matches!(child.kind(), "parameters" | "class_parameters")
+            || child.start_byte() >= cutoff_start
+        {
             continue;
         }
         let mut inner = child.walk();
         for parameter in child.named_children(&mut inner) {
-            if parameter.kind() == "parameter" && parameter.start_byte() < cutoff_start {
+            if matches!(parameter.kind(), "parameter" | "class_parameter")
+                && parameter.start_byte() < cutoff_start
+            {
                 scala_seed_parameter(resolver, source, parameter, cutoff_start, bindings);
             }
         }

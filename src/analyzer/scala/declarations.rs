@@ -180,6 +180,7 @@ impl<'a> ScalaVisitor<'a> {
                 constructor,
                 scala_primary_constructor_signature(node, self.source),
             );
+            self.visit_class_parameter_fields(node, package_name, &code_unit);
         }
 
         if let Some(body) = node.child_by_field_name("body") {
@@ -188,6 +189,55 @@ impl<'a> ScalaVisitor<'a> {
                 package_name: package_name.to_string(),
                 parent: code_unit,
             });
+        }
+    }
+
+    fn visit_class_parameter_fields(
+        &mut self,
+        node: Node<'_>,
+        package_name: &str,
+        parent: &CodeUnit,
+    ) {
+        let Some(parameters) = node.child_by_field_name("class_parameters") else {
+            return;
+        };
+        let is_case_class = scala_is_case_class_definition(node, self.source);
+        let mut cursor = parameters.walk();
+        for parameter in parameters.named_children(&mut cursor) {
+            if parameter.kind() != "class_parameter" {
+                continue;
+            }
+            let parameter_text = scala_node_text(parameter, self.source).trim_start();
+            if !is_case_class
+                && !parameter_text.starts_with("val ")
+                && !parameter_text.starts_with("var ")
+            {
+                continue;
+            }
+            let Some(name_node) = parameter.child_by_field_name("name") else {
+                continue;
+            };
+            let name = scala_node_text(name_node, self.source).trim();
+            if name.is_empty() {
+                continue;
+            }
+            let code_unit = CodeUnit::new(
+                self.file.clone(),
+                CodeUnitType::Field,
+                package_name.to_string(),
+                format!("{}.{}", parent.short_name(), name),
+            );
+            self.parsed.add_code_unit(
+                code_unit.clone(),
+                parameter,
+                self.source,
+                Some(parent.clone()),
+                None,
+            );
+            self.parsed.add_signature(
+                code_unit,
+                scala_class_parameter_field_signature(parameter, self.source, name),
+            );
         }
     }
 
@@ -419,6 +469,23 @@ fn scala_field_signature(node: Node<'_>, source: &str, name: &str) -> String {
     )
 }
 
+fn scala_class_parameter_field_signature(node: Node<'_>, source: &str, name: &str) -> String {
+    let keyword = if scala_node_text(node, source).trim_start().starts_with("var ") {
+        "var"
+    } else {
+        "val"
+    };
+    let type_text = node
+        .child_by_field_name("type")
+        .map(|child| format!(": {}", scala_node_text(child, source).trim()))
+        .unwrap_or_default();
+    let default_value = node
+        .child_by_field_name("default_value")
+        .map(|child| format!(" = {}", scala_node_text(child, source).trim()))
+        .unwrap_or_default();
+    format!("{keyword} {name}{type_text}{default_value}")
+}
+
 fn scala_modifier_prefix(node: Node<'_>, source: &str) -> String {
     let mut modifiers = Vec::new();
     let mut cursor = node.walk();
@@ -485,6 +552,12 @@ fn scala_literal_initializer(
     } else {
         None
     }
+}
+
+fn scala_is_case_class_definition(node: Node<'_>, source: &str) -> bool {
+    let text = scala_node_text(node, source);
+    let header = text.split(['(', '{']).next().unwrap_or(text);
+    header.split_whitespace().any(|token| token == "case")
 }
 
 pub(super) fn last_segment(name: &str) -> &str {
