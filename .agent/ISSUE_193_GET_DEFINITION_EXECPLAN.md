@@ -38,6 +38,12 @@ This work adds a `get_definition` searchtools/MCP tool for that on-demand lookup
 - [x] (2026-06-18T19:26Z) Smoke-ran `get_definition` coverage through `bifrost_benchmark run --repo <name> --max-files 80` for all ten benchmark repos; all scenario entries passed after tightening supported-language FQN assertions.
 - [x] (2026-06-18T19:33Z) Ran a guided-review-style multi-agent review over the benchmark-slice diff. Review findings were fixed by adding per-repo manifest coverage assertions, pinning definition-query files in subset mode, adding successful and failing FQN assertion tests, and moving JS/Rust benchmark probes from declarations to real references.
 - [x] (2026-06-18T19:34Z) Re-ran `cargo test --test benchmark_manifest`, `cargo test --test bifrost_benchmark_run`, `cargo run --bin bifrost_benchmark -- validate --manifest benchmark/targets.toml`, and focused `express-js` / `serde-json-rs` smoke runs after review fixes; all passed.
+- [x] (2026-06-18T19:52Z) Added Java `get_definition` support for resolvable type references, static imports, same-owner bare method calls, and explicit Java import-boundary diagnostics.
+- [x] (2026-06-18T19:52Z) Added focused Java tests covering imported type resolution, static import resolution, external import boundaries, and local-value `no_definition`.
+- [x] (2026-06-18T19:52Z) Updated the Java benchmark probe from `unsupported_language` to a resolved `com.google.gson.TypeAdapter` reference and smoke-ran `google-gson --max-files 80`; the `get_definition` scenario passed.
+- [x] (2026-06-18T20:05Z) Ran a guided-review-style multi-agent review over the Java slice. Review findings were fixed by adding typed local/field/parameter receiver inference, `this`/`super` member resolution, and workspace-wildcard import classification that returns `no_definition` instead of an external-boundary diagnostic.
+- [x] (2026-06-18T20:08Z) Added Java regression tests for typed receiver methods, `this` field access, and workspace wildcard missing-type behavior.
+- [x] (2026-06-18T20:12Z) Re-ran `cargo test --test get_definition_test`, `cargo test --test bifrost_benchmark_run`, `cargo run --bin bifrost_benchmark -- validate --manifest benchmark/targets.toml`, `cargo run --bin bifrost_benchmark -- run --manifest benchmark/targets.toml --repo google-gson --max-files 80`, `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, and `git diff --check`; all passed.
 
 ## Surprises & Discoveries
 
@@ -68,6 +74,15 @@ This work adds a `get_definition` searchtools/MCP tool for that on-demand lookup
 - Observation: The benchmark smoke probes are stronger when supported-language entries target real reference sites, not declaration sites.
   Evidence: guided review flagged the initial Express `app` and Rust `to_value` declaration probes; the checked-in manifest now uses Express `tryRender` at a call site and Rust `Value::Number` at a match arm reference.
 
+- Observation: Java comment references should not be used as benchmark `get_definition` probes.
+  Evidence: the original Gson `fromJson` row pointed at a Javadoc example and returned `no_definition` with a `block_comment` diagnostic once Java support was enabled. The benchmark now uses the production `TypeAdapter` type reference in `Gson.getAdapter`.
+
+- Observation: Java member resolution needs local type inference for simple named receivers to avoid under-reporting valid workspace member references.
+  Evidence: guided review found that `target.run()` and `target.field` would return `no_definition` unless the receiver itself was a type literal; `java_typed_receiver_method_resolves_to_definition` now covers a parameter-typed receiver.
+
+- Observation: Java wildcard imports should only report `unresolvable_import_boundary` when the imported package is absent from the indexed workspace.
+  Evidence: guided review found `import pkg.*; MissingType` was over-classified as an external boundary even when package `pkg` exists locally; `java_workspace_wildcard_missing_type_returns_no_definition` now locks this down as `no_definition`.
+
 ## Decision Log
 
 - Decision: Treat unresolved dependency/library/module boundaries as a first-class terminal state, separate from `no_definition`.
@@ -84,6 +99,10 @@ This work adds a `get_definition` searchtools/MCP tool for that on-demand lookup
 
 - Decision: Make `get_definition` a required benchmark scenario but keep unsupported-language probes as `unsupported_language` assertions.
   Rationale: This catches regressions in the tool's public status contract across every benchmark target language without pretending unimplemented language resolvers are accurate.
+  Date/Author: 2026-06-18 / Codex
+
+- Decision: Land Java as the next full-language-support slice after the initial Rust/JS/TS/Go implementation.
+  Rationale: Java has mature analyzer import/type-resolution APIs and a benchmark target that can assert a real resolved workspace FQN immediately.
   Date/Author: 2026-06-18 / Codex
 
 ## Outcomes & Retrospective

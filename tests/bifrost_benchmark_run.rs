@@ -55,7 +55,7 @@ summary_targets = ["A.java"]
 seed_file_paths = ["A.java"]
 usage_symbols = ["E.iMethod"]
 definition_queries = [
-  {{ path = "A.java", line = 8, column = 19, symbol = "method2", expected_status = "unsupported_language" }},
+  {{ path = "A.java", line = 8, column = 19, symbol = "method2", expected_status = "no_definition" }},
 ]
 "#,
             toml_basic_string(&repo_root.display().to_string()),
@@ -155,7 +155,7 @@ summary_targets = ["A.java"]
 seed_file_paths = ["B.java"]
 usage_symbols = ["A.method2"]
 definition_queries = [
-  {{ path = "E.java", line = 10, column = 17, symbol = "iMethod", expected_status = "unsupported_language" }},
+  {{ path = "E.java", line = 10, column = 17, symbol = "iMethod", expected_status = "no_definition" }},
 ]
 "#,
             toml_basic_string(&repo_root.display().to_string()),
@@ -325,7 +325,7 @@ summary_targets = ["A.java"]
 seed_file_paths = ["A.java"]
 usage_symbols = ["A.method2"]
 definition_queries = [
-  {{ path = "A.java", line = 8, column = 19, symbol = "method2", expected_status = "unsupported_language" }},
+  {{ path = "A.java", line = 8, column = 19, symbol = "method2", expected_status = "no_definition" }},
 ]
 "#,
             toml_basic_string(&repo_root.display().to_string()),
@@ -409,7 +409,7 @@ scenarios = [
 location_symbols = ["does.not.Exist"]
 usage_symbols = ["E.iMethod"]
 definition_queries = [
-  {{ path = "A.java", line = 8, column = 19, symbol = "method2", expected_status = "unsupported_language" }},
+  {{ path = "A.java", line = 8, column = 19, symbol = "method2", expected_status = "no_definition" }},
 ]
 "#,
             toml_basic_string(&repo_root.display().to_string()),
@@ -624,7 +624,7 @@ search_patterns = ["method2"]
         failing["failure_message"]
             .as_str()
             .unwrap_or_default()
-            .contains("expected status `resolved` but got `unsupported_language`"),
+            .contains("expected status `resolved` but got `no_definition`"),
         "report: {report}"
     );
 

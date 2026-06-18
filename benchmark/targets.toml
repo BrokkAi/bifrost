@@ -45,7 +45,7 @@ summary_targets = ["gson/src/main/java/com/google/gson/Gson.java"]
 seed_file_paths = ["gson/src/main/java/com/google/gson/Gson.java"]
 usage_symbols = ["Gson.fromJson"]
 definition_queries = [
-  { path = "gson/src/main/java/com/google/gson/Gson.java", line = 65, column = 23, symbol = "fromJson", expected_status = "unsupported_language" },
+  { path = "gson/src/main/java/com/google/gson/Gson.java", line = 319, column = 14, symbol = "TypeAdapter", expected_status = "resolved", expected_fqn = "com.google.gson.TypeAdapter" },
 ]
 
 [[repos]]
