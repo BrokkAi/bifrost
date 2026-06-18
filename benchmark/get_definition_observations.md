@@ -1,0 +1,18 @@
+# get_definition Benchmark Observations
+
+Manual inspection date: 2026-06-18
+
+The checked-in benchmark manifest now exercises `get_definition` for every target language. Smoke runs used `cargo run --bin bifrost_benchmark -- run --manifest benchmark/targets.toml --repo <name> --max-files 80` against pinned cached checkouts. Supported-language FQNs were also inspected with direct `target/debug/bifrost --tool get_definition` calls against the subset workspaces.
+
+| Repo | Language | Query | Expected | Observed | Manual verdict | False positives | False negatives / follow-up |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| google-gson | Java | `gson/src/main/java/com/google/gson/Gson.java:65:23` `fromJson` | `unsupported_language` | `unsupported_language` | Correct for current scope; Java on-demand lookup is intentionally not implemented. | None observed. | Add Java support later and convert this to a resolved workspace definition probe. |
+| gin-go | Go | `gin.go:238:12` `New` | `resolved`, `github.com/gin-gonic/gin.New` | `resolved`, `github.com/gin-gonic/gin.New` at `gin.go:202..233` | Accurate same-package function resolution. This also guards against the known short-name/canonical-FQN drift around `gin.New`. | None observed. | None for this probe. |
+| fmt-cpp | C++ | `include/fmt/base.h:2395:15` `vformat_to` | `unsupported_language` | `unsupported_language` | Correct for current scope; C++ on-demand lookup is intentionally not implemented. | None observed. | Add C++ support later and convert this to a resolved workspace definition probe. |
+| express-js | JavaScript | `lib/application.js:574:3` `tryRender` | `resolved`, `tryRender` | `resolved`, `tryRender` at `lib/application.js:625..631` | Accurate same-file function reference resolution. | None observed for this probe. | Method/property references such as `app.listen` currently return `no_definition`; add CommonJS/property-assignment binding later. |
+| ky-ts | TypeScript | `source/core/Ky.ts:151:18` `Ky` | `resolved`, `Ky` | `resolved`, `Ky` at `source/core/Ky.ts:142..1042` | Accurate same-file class reference resolution. | None observed. | None for this probe. |
+| click-py | Python | `src/click/core.py:1373:9` `main` | `unsupported_language` | `unsupported_language` | Correct for current scope; Python on-demand lookup is intentionally not implemented. | None observed. | Add Python support later and convert this to a resolved workspace definition probe. |
+| serde-json-rs | Rust | `src/value/mod.rs:535:20` `Value::Number` | `resolved`, `value.Value.Number` | `resolved`, `value.Value.Number` at `src/value/mod.rs:142` | Accurate enum-variant reference resolution. | None observed. | None for this probe. |
+| fastroute-php | PHP | `src/RouteCollector.php:40:39` `addRoute` | `unsupported_language` | `unsupported_language` | Correct for current scope; PHP on-demand lookup is intentionally not implemented. | None observed. | Add PHP support later and convert this to a resolved workspace definition probe. |
+| scala-xml | Scala | `shared/src/main/scala/scala/xml/Elem.scala:107:13` `Elem` | `unsupported_language` | `unsupported_language` | Correct for current scope; Scala on-demand lookup is intentionally not implemented. | None observed. | Add Scala support later and convert this to a resolved workspace definition probe. |
+| dapper-csharp | C# | `Dapper/SqlMapper.cs:1862:28` `CacheInfo` | `unsupported_language` | `unsupported_language` | Correct for current scope; C# on-demand lookup is intentionally not implemented. | None observed. | Add C# support later and convert this to a resolved workspace definition probe. |

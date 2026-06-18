@@ -34,6 +34,7 @@ fn repo_target(source_root: &Path, commit: &str) -> BenchmarkRepoTarget {
         summary_targets: Vec::new(),
         seed_file_paths: Vec::new(),
         usage_symbols: Vec::new(),
+        definition_queries: Vec::new(),
     }
 }
 

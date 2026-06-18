@@ -21,6 +21,7 @@ required_scenarios = [
   "get_summaries",
   "most_relevant_files",
   "scan_usages",
+  "get_definition",
 ]
 
 [[repos]]
@@ -36,12 +37,16 @@ scenarios = [
   "get_summaries",
   "most_relevant_files",
   "scan_usages",
+  "get_definition",
 ]
 search_patterns = ["Gson"]
 location_symbols = ["Gson.fromJson"]
 summary_targets = ["gson/src/main/java/com/google/gson/Gson.java"]
 seed_file_paths = ["gson/src/main/java/com/google/gson/Gson.java"]
 usage_symbols = ["Gson.fromJson"]
+definition_queries = [
+  { path = "gson/src/main/java/com/google/gson/Gson.java", line = 65, column = 23, symbol = "fromJson", expected_status = "unsupported_language" },
+]
 
 [[repos]]
 name = "gin-go"
@@ -56,12 +61,16 @@ scenarios = [
   "get_summaries",
   "most_relevant_files",
   "scan_usages",
+  "get_definition",
 ]
 search_patterns = ["Engine"]
 location_symbols = ["gin.New"]
 summary_targets = ["gin.go"]
 seed_file_paths = ["gin.go"]
 usage_symbols = ["gin.New"]
+definition_queries = [
+  { path = "gin.go", line = 238, column = 12, symbol = "New", expected_status = "resolved", expected_fqn = "github.com/gin-gonic/gin.New" },
+]
 
 [[repos]]
 name = "fmt-cpp"
@@ -75,11 +84,15 @@ scenarios = [
   "get_symbol_locations",
   "get_summaries",
   "most_relevant_files",
+  "get_definition",
 ]
 search_patterns = ["format"]
 location_symbols = ["vformat"]
 summary_targets = ["include/fmt/base.h"]
 seed_file_paths = ["include/fmt/base.h"]
+definition_queries = [
+  { path = "include/fmt/base.h", line = 2395, column = 15, symbol = "vformat_to", expected_status = "unsupported_language" },
+]
 
 [[repos]]
 name = "express-js"
@@ -94,12 +107,16 @@ scenarios = [
   "get_summaries",
   "most_relevant_files",
   "scan_usages",
+  "get_definition",
 ]
 search_patterns = ["listen"]
 location_symbols = ["request.js.accepts"]
 summary_targets = ["lib/application.js"]
 seed_file_paths = ["lib/application.js"]
 usage_symbols = ["request.js.accepts"]
+definition_queries = [
+  { path = "lib/application.js", line = 574, column = 3, symbol = "tryRender", expected_status = "resolved", expected_fqn = "tryRender" },
+]
 
 [[repos]]
 name = "ky-ts"
@@ -114,12 +131,16 @@ scenarios = [
   "get_summaries",
   "most_relevant_files",
   "scan_usages",
+  "get_definition",
 ]
 search_patterns = ["Ky"]
 location_symbols = ["Ky.create$static"]
 summary_targets = ["source/core/Ky.ts"]
 seed_file_paths = ["source/core/Ky.ts"]
 usage_symbols = ["Ky"]
+definition_queries = [
+  { path = "source/core/Ky.ts", line = 151, column = 18, symbol = "Ky", expected_status = "resolved", expected_fqn = "Ky" },
+]
 
 [[repos]]
 name = "click-py"
@@ -134,12 +155,16 @@ scenarios = [
   "get_summaries",
   "most_relevant_files",
   "scan_usages",
+  "get_definition",
 ]
 search_patterns = ["Command"]
 location_symbols = ["click.core.Command.main"]
 summary_targets = ["src/click/core.py"]
 seed_file_paths = ["src/click/core.py"]
 usage_symbols = ["click.core.Command.main"]
+definition_queries = [
+  { path = "src/click/core.py", line = 1373, column = 9, symbol = "main", expected_status = "unsupported_language" },
+]
 
 [[repos]]
 name = "serde-json-rs"
@@ -153,11 +178,15 @@ scenarios = [
   "get_symbol_locations",
   "get_summaries",
   "most_relevant_files",
+  "get_definition",
 ]
 search_patterns = ["Value"]
 location_symbols = ["value.to_value"]
 summary_targets = ["src/value/mod.rs"]
 seed_file_paths = ["src/value/mod.rs"]
+definition_queries = [
+  { path = "src/value/mod.rs", line = 535, column = 20, symbol = "Number", expected_status = "resolved", expected_fqn = "value.Value.Number" },
+]
 
 [[repos]]
 name = "fastroute-php"
@@ -172,12 +201,16 @@ scenarios = [
   "get_summaries",
   "most_relevant_files",
   "scan_usages",
+  "get_definition",
 ]
 search_patterns = ["RouteCollector"]
 location_symbols = ["FastRoute.RouteCollector.addRoute"]
 summary_targets = ["src/RouteCollector.php"]
 seed_file_paths = ["src/RouteCollector.php"]
 usage_symbols = ["FastRoute.RouteCollector.addRoute"]
+definition_queries = [
+  { path = "src/RouteCollector.php", line = 40, column = 39, symbol = "addRoute", expected_status = "unsupported_language" },
+]
 
 [[repos]]
 name = "scala-xml"
@@ -192,12 +225,16 @@ scenarios = [
   "get_summaries",
   "most_relevant_files",
   "scan_usages",
+  "get_definition",
 ]
 search_patterns = ["Elem"]
 location_symbols = ["scala.xml.Elem.copy"]
 summary_targets = ["shared/src/main/scala/scala/xml/Elem.scala"]
 seed_file_paths = ["shared/src/main/scala/scala/xml/Elem.scala"]
 usage_symbols = ["scala.xml.Elem"]
+definition_queries = [
+  { path = "shared/src/main/scala/scala/xml/Elem.scala", line = 107, column = 13, symbol = "Elem", expected_status = "unsupported_language" },
+]
 
 [[repos]]
 name = "dapper-csharp"
@@ -212,9 +249,13 @@ scenarios = [
   "get_summaries",
   "most_relevant_files",
   "scan_usages",
+  "get_definition",
 ]
 search_patterns = ["SqlMapper"]
 location_symbols = ["Dapper.SqlMapper$CacheInfo"]
 summary_targets = ["Dapper/SqlMapper.cs"]
 seed_file_paths = ["Dapper/SqlMapper.cs"]
 usage_symbols = ["Dapper.SqlMapper$CacheInfo"]
+definition_queries = [
+  { path = "Dapper/SqlMapper.cs", line = 1862, column = 28, symbol = "CacheInfo", expected_status = "unsupported_language" },
+]

@@ -284,6 +284,19 @@ fn tool_arguments(target: &BenchmarkRepoTarget, scenario: BenchmarkScenario) -> 
             "symbols": target.usage_symbols,
             "include_tests": true
         }),
+        BenchmarkScenario::GetDefinition => json!({
+            "references": target.definition_queries.iter().map(|query| {
+                json!({
+                    "path": query.path,
+                    "line": query.line,
+                    "column": query.column,
+                    "start_byte": query.start_byte,
+                    "end_byte": query.end_byte,
+                    "symbol": query.symbol
+                })
+            }).collect::<Vec<_>>(),
+            "include_tests": true
+        }),
     }
 }
 
@@ -417,6 +430,62 @@ fn assert_scenario_result(
                     "scan_usages found no call sites for `{}`",
                     target.name
                 ));
+            }
+            Ok(())
+        }
+        BenchmarkScenario::GetDefinition => {
+            let results = structured["results"].as_array().ok_or_else(|| {
+                format!(
+                    "get_definition result missing results array for `{}`",
+                    target.name
+                )
+            })?;
+            if results.len() != target.definition_queries.len() {
+                return Err(format!(
+                    "get_definition returned {} result(s) for {} query/queries in `{}`",
+                    results.len(),
+                    target.definition_queries.len(),
+                    target.name
+                ));
+            }
+
+            for (index, (query, result)) in target
+                .definition_queries
+                .iter()
+                .zip(results.iter())
+                .enumerate()
+            {
+                let actual_status = result["status"].as_str().ok_or_else(|| {
+                    format!(
+                        "get_definition result {index} missing status for `{}`",
+                        target.name
+                    )
+                })?;
+                if actual_status != query.expected_status {
+                    return Err(format!(
+                        "get_definition result {index} for `{}` expected status `{}` but got `{actual_status}`",
+                        target.name, query.expected_status
+                    ));
+                }
+
+                if let Some(expected_fqn) = query.expected_fqn.as_deref() {
+                    let definitions = result["definitions"].as_array().ok_or_else(|| {
+                        format!(
+                            "get_definition result {index} missing definitions array for `{}`",
+                            target.name
+                        )
+                    })?;
+                    let found = definitions
+                        .iter()
+                        .filter_map(|definition| definition["fqn"].as_str())
+                        .any(|fqn| fqn == expected_fqn);
+                    if !found {
+                        return Err(format!(
+                            "get_definition result {index} for `{}` did not include expected fqn `{expected_fqn}`",
+                            target.name
+                        ));
+                    }
+                }
             }
             Ok(())
         }

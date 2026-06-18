@@ -30,6 +30,14 @@ This work adds a `get_definition` searchtools/MCP tool for that on-demand lookup
 - [x] (2026-06-17T22:48Z) Ran `git diff --check`; it completed cleanly.
 - [x] (2026-06-18T18:10Z) Recorded pre-benchmark-slice worktree status: `## 193-add-on-demand-get_definition-for-usage-references...origin/193-add-on-demand-get_definition-for-usage-references` with the initial `get_definition` implementation still uncommitted.
 - [x] (2026-06-18T18:12Z) Re-ran focused validation for the existing tool slice before checkpointing: `cargo test --test get_definition_test`, `cargo test --test searchtools_service`, and `cargo test --test bifrost_mcp_server` all passed.
+- [x] (2026-06-18T18:15Z) Checkpoint-committed the existing tool implementation as `accc688 Add on-demand get_definition tool`.
+- [x] (2026-06-18T18:16Z) Ran `git fetch` and `git rebase`; Git reported the current branch is up to date.
+- [x] (2026-06-18T19:26Z) Added `get_definition` as a first-class benchmark scenario with per-query expected status and optional expected FQN assertions.
+- [x] (2026-06-18T19:26Z) Added one checked-in `get_definition` benchmark query for each target repo/language and documented manually inspected results in `benchmark/get_definition_observations.md`.
+- [x] (2026-06-18T19:26Z) Ran `cargo test --test benchmark_manifest`, `cargo test --test bifrost_benchmark_run`, and `cargo run --bin bifrost_benchmark -- validate --manifest benchmark/targets.toml`; all passed.
+- [x] (2026-06-18T19:26Z) Smoke-ran `get_definition` coverage through `bifrost_benchmark run --repo <name> --max-files 80` for all ten benchmark repos; all scenario entries passed after tightening supported-language FQN assertions.
+- [x] (2026-06-18T19:33Z) Ran a guided-review-style multi-agent review over the benchmark-slice diff. Review findings were fixed by adding per-repo manifest coverage assertions, pinning definition-query files in subset mode, adding successful and failing FQN assertion tests, and moving JS/Rust benchmark probes from declarations to real references.
+- [x] (2026-06-18T19:34Z) Re-ran `cargo test --test benchmark_manifest`, `cargo test --test bifrost_benchmark_run`, `cargo run --bin bifrost_benchmark -- validate --manifest benchmark/targets.toml`, and focused `express-js` / `serde-json-rs` smoke runs after review fixes; all passed.
 
 ## Surprises & Discoveries
 
@@ -48,6 +56,18 @@ This work adds a `get_definition` searchtools/MCP tool for that on-demand lookup
 - Observation: The inline Rust analyzer indexes a helper in `util.rs` as `format_value`, not `util.format_value`.
   Evidence: `cargo test --test get_definition_test` returned definition metadata with `fqn: "format_value"` and `path: "util.rs"` for the named-import lookup.
 
+- Observation: The benchmark compare path already treats added candidate scenarios as `NewCandidate`, so the blessed Ubuntu baseline does not need to be updated in this slice.
+  Evidence: `BenchmarkCompareReport::from_reports` indexes baseline and candidate scenario keys separately and reports `(None, Some(candidate))` as `ScenarioCompareOutcome::NewCandidate` with `is_regression: false`.
+
+- Observation: Express property-assigned methods such as `app.listen` are not resolved by the current JavaScript `get_definition` implementation.
+  Evidence: a direct call against the pinned Express subset for `lib/application.js:598` returned `no_definition` for `app.listen`; the final benchmark smoke probe uses the real `tryRender` call at `lib/application.js:574`, which resolves to the same-file function declaration.
+
+- Observation: Benchmark subset mode must pin `definition_queries.path`, not just `summary_targets` and `seed_file_paths`.
+  Evidence: guided review noted that future definition probes outside existing summary/seed files could otherwise become `not_found` only in `--max-files` runs; `src/benchmark/subset_workspace.rs` now includes definition-query paths and the subset test uses a separate `E.java` query file.
+
+- Observation: The benchmark smoke probes are stronger when supported-language entries target real reference sites, not declaration sites.
+  Evidence: guided review flagged the initial Express `app` and Rust `to_value` declaration probes; the checked-in manifest now uses Express `tryRender` at a call site and Rust `Value::Number` at a match arm reference.
+
 ## Decision Log
 
 - Decision: Treat unresolved dependency/library/module boundaries as a first-class terminal state, separate from `no_definition`.
@@ -61,6 +81,10 @@ This work adds a `get_definition` searchtools/MCP tool for that on-demand lookup
 - Decision: Support Rust, JavaScript/TypeScript, and Go first; return `unsupported_language` for Java, C#, C++, PHP, Scala, Python, and unknown files in this issue.
   Rationale: Issue #193 names Rust, JS/TS, and Go as the initial languages with reusable inverted resolver paths. The analyzer-backed languages should wait until their adapters settle instead of forcing a broad generic resolved-reference event model.
   Date/Author: 2026-06-17 / Codex
+
+- Decision: Make `get_definition` a required benchmark scenario but keep unsupported-language probes as `unsupported_language` assertions.
+  Rationale: This catches regressions in the tool's public status contract across every benchmark target language without pretending unimplemented language resolvers are accurate.
+  Date/Author: 2026-06-18 / Codex
 
 ## Outcomes & Retrospective
 
