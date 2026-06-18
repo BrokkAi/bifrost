@@ -161,6 +161,7 @@ fn suffix_resolution_from_index(
     symbol: &str,
     include: impl Copy + Fn(&CodeUnit) -> bool,
 ) -> Option<CodeUnitResolution> {
+    let mut full_matches = BTreeMap::new();
     let mut suffix_matches = BTreeMap::new();
     for language in analyzer.languages() {
         let query_paths = query_symbol_interpretations(language, symbol);
@@ -168,8 +169,8 @@ fn suffix_resolution_from_index(
             continue;
         }
 
-        for query_path in query_paths {
-            let pattern = suffix_search_pattern(&query_path);
+        for query_path in &query_paths {
+            let pattern = suffix_search_pattern(query_path);
             if pattern.is_empty() {
                 continue;
             }
@@ -177,17 +178,32 @@ fn suffix_resolution_from_index(
                 if code_unit_language(&candidate) != language || !include(&candidate) {
                     continue;
                 }
-                if codeunit_lookup_aliases(&candidate)
-                    .iter()
-                    .any(|candidate_path| path_ends_with(candidate_path, &query_path))
-                {
-                    insert_match(&mut suffix_matches, &candidate);
-                }
+                collect_fuzzy_matches(
+                    analyzer,
+                    &candidate,
+                    include,
+                    &query_paths,
+                    &mut full_matches,
+                    &mut suffix_matches,
+                );
             }
         }
     }
 
-    resolution_from_matches(analyzer, suffix_matches, include)
+    if !full_matches.is_empty() {
+        return unique_resolution_from_matches(analyzer, full_matches, include);
+    }
+    unique_resolution_from_matches(analyzer, suffix_matches, include)
+}
+
+fn unique_resolution_from_matches(
+    analyzer: &dyn IAnalyzer,
+    matches: BTreeMap<String, CodeUnit>,
+    include: impl Copy + Fn(&CodeUnit) -> bool,
+) -> Option<CodeUnitResolution> {
+    (matches.len() == 1)
+        .then(|| resolution_from_matches(analyzer, matches, include))
+        .flatten()
 }
 
 fn suffix_search_pattern(query_path: &[String]) -> String {

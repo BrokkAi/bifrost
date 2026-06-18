@@ -20,6 +20,12 @@ fn canonical_project() -> common::BuiltInlineTestProject {
         .file("a/list/list.go", "package list\nfunc Run() string { return \"a\" }\n")
         .file("b/list/list.go", "package list\nfunc Run() string { return \"b\" }\n")
         .file(
+            "a/srv/server.go",
+            "package srv\ntype Server struct{}\nfunc (s *Server) New() string { return \"method\" }\n",
+        )
+        .file("Server/pkg.go", "package Server\nfunc New() string { return \"package\" }\n")
+        .file("gin/gin.go", "package gin\ntype Engine struct{}\nfunc New() *Engine { return &Engine{} }\n")
+        .file(
             "a/list/list_test.go",
             "package list\nimport \"testing\"\nfunc TestListRun(t *testing.T) {}\n",
         )
@@ -156,6 +162,43 @@ fn get_symbol_locations_uses_canonical_suffix_without_losing_ambiguity() {
         "ambiguous bare suffix must not collapse to one location: {bare:#?}"
     );
     assert!(bare.locations.is_empty(), "{bare:#?}");
+}
+
+#[test]
+fn get_symbol_locations_resolves_unique_short_go_suffix() {
+    let project = canonical_project();
+    let analyzer = GoAnalyzer::from_project(project.project().clone());
+
+    let result = get_symbol_locations(
+        &analyzer,
+        SymbolLookupParams {
+            symbols: vec!["gin.New".to_string()],
+        },
+    );
+
+    assert!(result.not_found.is_empty(), "{result:#?}");
+    assert_eq!(1, result.locations.len(), "{result:#?}");
+    assert_eq!("example.com/repo/gin.New", result.locations[0].symbol);
+}
+
+#[test]
+fn get_symbol_locations_prefers_full_match_over_suffix_sibling() {
+    let project = canonical_project();
+    let analyzer = GoAnalyzer::from_project(project.project().clone());
+
+    let result = get_symbol_locations(
+        &analyzer,
+        SymbolLookupParams {
+            symbols: vec!["Server.New".to_string()],
+        },
+    );
+
+    assert!(result.not_found.is_empty(), "{result:#?}");
+    assert_eq!(1, result.locations.len(), "{result:#?}");
+    assert_eq!(
+        "example.com/repo/a/srv.Server.New",
+        result.locations[0].symbol
+    );
 }
 
 #[test]
