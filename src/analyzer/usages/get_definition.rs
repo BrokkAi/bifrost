@@ -2663,6 +2663,15 @@ fn scala_enclosing_class_parameter_type(
                 if scala_node_text(param_name, source).trim() != name {
                     continue;
                 }
+                if scala_active_path_declares_name_after(
+                    parent,
+                    source,
+                    name,
+                    parameter.end_byte(),
+                    node.start_byte(),
+                ) {
+                    return None;
+                }
                 return parameter.child_by_field_name("type").and_then(|type_node| {
                     let type_text = scala_node_text(type_node, source);
                     scala_resolve_type_annotation(resolver, type_text).or_else(|| {
@@ -2681,6 +2690,75 @@ fn scala_enclosing_class_parameter_type(
         current = parent.parent();
     }
     None
+}
+
+fn scala_active_path_declares_name_after(
+    node: Node<'_>,
+    source: &str,
+    name: &str,
+    lower_bound: usize,
+    target_byte: usize,
+) -> bool {
+    if target_byte < node.start_byte() || node.end_byte() <= target_byte {
+        return false;
+    }
+
+    let mut containing_child = None;
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.start_byte() <= target_byte && target_byte < child.end_byte() {
+            containing_child = Some(child);
+        }
+        if child.start_byte() >= target_byte || child.end_byte() <= lower_bound {
+            continue;
+        }
+        if scala_node_declares_name_before(child, source, name, lower_bound, target_byte) {
+            return true;
+        }
+    }
+
+    containing_child.is_some_and(|child| {
+        scala_active_path_declares_name_after(child, source, name, lower_bound, target_byte)
+    })
+}
+
+fn scala_node_declares_name_before(
+    node: Node<'_>,
+    source: &str,
+    name: &str,
+    lower_bound: usize,
+    target_byte: usize,
+) -> bool {
+    match node.kind() {
+        "parameter" | "class_parameter" => {
+            node.child_by_field_name("name").is_some_and(|name_node| {
+                lower_bound <= name_node.start_byte()
+                    && name_node.start_byte() < target_byte
+                    && scala_node_text(name_node, source).trim() == name
+            })
+        }
+        "parameters" | "class_parameters" => {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor).any(|child| {
+                scala_node_declares_name_before(child, source, name, lower_bound, target_byte)
+            })
+        }
+        "val_definition" | "var_definition" => {
+            if node.start_byte() >= target_byte {
+                return false;
+            }
+            node.child_by_field_name("pattern").is_some_and(|pattern| {
+                lower_bound <= pattern.start_byte()
+                    && scala_pattern_names(pattern, source).contains(&name)
+            })
+        }
+        "function_definition" => node.child_by_field_name("name").is_some_and(|name_node| {
+            lower_bound <= name_node.start_byte()
+                && name_node.start_byte() < target_byte
+                && scala_node_text(name_node, source).trim() == name
+        }),
+        _ => false,
+    }
 }
 
 fn scala_same_package_type_fqn(current_class_fqn: &str, type_text: &str) -> Option<String> {

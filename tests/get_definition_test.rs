@@ -2920,6 +2920,31 @@ fn scala_constructor_parameter_field_resolves_to_definition() {
 }
 
 #[test]
+fn scala_local_receiver_shadows_constructor_parameter_fallback() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Context.scala",
+            "package app\nclass Registry\nclass Context(val registry: Registry)\n",
+        )
+        .file(
+            "app/Grouped.scala",
+            "package app\nclass Grouped(context: Context) { def run(): Any = { val context = null; context.registry } }\n",
+        )
+        .build();
+
+    let line = "class Grouped(context: Context) { def run(): Any = { val context = null; context.registry } }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Grouped.scala","line":2,"column":{}}}]}}"#,
+            column_of(line, "registry")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
 fn scala_modified_case_class_parameter_field_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(
