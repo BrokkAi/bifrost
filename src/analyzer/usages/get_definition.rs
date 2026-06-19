@@ -2906,23 +2906,40 @@ fn java_member_candidates(
     member: &str,
 ) -> DefinitionLookupOutcome {
     let mut candidates = support.fqn(&format!("{owner_fqn}.{member}"));
+    sort_units(&mut candidates);
+    candidates.dedup();
+    if !candidates.is_empty() {
+        return candidates_outcome(candidates);
+    }
+
     if let Some(owner) = analyzer.definitions(owner_fqn).next().cloned()
         && let Some(provider) = analyzer.type_hierarchy_provider()
     {
-        for ancestor in provider.get_ancestors(&owner) {
-            candidates.extend(support.fqn(&format!("{}.{}", ancestor.fq_name(), member)));
+        let mut seen = HashSet::default();
+        let mut level = provider.get_direct_ancestors(&owner);
+        seen.insert(owner);
+        while !level.is_empty() {
+            let mut level_candidates = Vec::new();
+            let mut next_level = Vec::new();
+            for ancestor in level {
+                if !seen.insert(ancestor.clone()) {
+                    continue;
+                }
+                level_candidates.extend(support.fqn(&format!("{}.{}", ancestor.fq_name(), member)));
+                next_level.extend(provider.get_direct_ancestors(&ancestor));
+            }
+            sort_units(&mut level_candidates);
+            level_candidates.dedup();
+            if !level_candidates.is_empty() {
+                return candidates_outcome(level_candidates);
+            }
+            level = next_level;
         }
     }
-    sort_units(&mut candidates);
-    candidates.dedup();
-    if candidates.is_empty() {
-        no_definition(
-            "no_indexed_definition",
-            format!("`{owner_fqn}.{member}` is not indexed as a Java definition"),
-        )
-    } else {
-        candidates_outcome(candidates)
-    }
+    no_definition(
+        "no_indexed_definition",
+        format!("`{owner_fqn}.{member}` is not indexed as a Java definition"),
+    )
 }
 
 fn java_static_import_candidates(

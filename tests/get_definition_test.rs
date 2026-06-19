@@ -858,6 +858,48 @@ public class UseUtil {
 }
 
 #[test]
+fn java_static_method_receiver_prefers_nearest_declaring_type() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "pkg/BaseUtil.java",
+            "package pkg; public class BaseUtil { public static String label() { return \"base\"; } }\n",
+        )
+        .file(
+            "pkg/StrUtil.java",
+            "package pkg; public class StrUtil extends BaseUtil { public static String label() { return \"child\"; } }\n",
+        )
+        .file(
+            "app/UseUtil.java",
+            r#"
+package app;
+
+import pkg.StrUtil;
+
+public class UseUtil {
+    public String call() {
+        return StrUtil.label();
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        return StrUtil.label();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/UseUtil.java","line":8,"column":{}}}]}}"#,
+            column_of(line, "label")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definition"]["fqn"], "pkg.StrUtil.label", "{value}");
+    assert_eq!(result["definition"]["path"], "pkg/StrUtil.java", "{value}");
+}
+
+#[test]
 fn java_this_field_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(
