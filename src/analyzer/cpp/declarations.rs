@@ -44,6 +44,10 @@ fn class_like_name(node: Node<'_>, source: &str) -> Option<String> {
         best = Some(token.to_string());
     }
     if let Some(parent) = node.parent()
+        && matches!(
+            parent.kind(),
+            "declaration" | "field_declaration" | "function_definition"
+        )
         && let Some(recovered) = exported_class_name_from_text(node_text(parent, source))
         && best.as_deref() != Some(recovered.as_str())
     {
@@ -57,15 +61,40 @@ fn class_like_name(node: Node<'_>, source: &str) -> Option<String> {
 }
 
 fn exported_class_name_from_text(text: &str) -> Option<String> {
-    let captures =
-        Regex::new(r"\b(?:class|struct|union)\s+[A-Z_][A-Z0-9_]*\s+([A-Za-z_]\w*)\s*(?:[:{])")
-            .expect("valid exported C++ class regex")
-            .captures(text)?;
-    let name = captures.get(1)?.as_str();
-    if matches!(name, "final" | "public" | "private" | "protected") {
-        return None;
-    }
+    let header = text.split(['{', ':']).next().unwrap_or(text);
+    let identifiers: Vec<_> = Regex::new(r"[A-Za-z_]\w*")
+        .expect("valid C++ identifier regex")
+        .find_iter(header)
+        .map(|m| m.as_str())
+        .collect();
+    let class_keyword_index = identifiers
+        .iter()
+        .position(|token| matches!(*token, "class" | "struct" | "union"))?;
+    let candidates: Vec<_> = identifiers[class_keyword_index + 1..]
+        .iter()
+        .copied()
+        .filter(|token| !cpp_class_header_modifier(token))
+        .collect();
+    let name = candidates
+        .iter()
+        .copied()
+        .filter(|token| !cpp_export_macro_token(token))
+        .next_back()
+        .or_else(|| candidates.last().copied())?;
     Some(name.to_string())
+}
+
+fn cpp_class_header_modifier(token: &str) -> bool {
+    matches!(
+        token,
+        "final" | "public" | "private" | "protected" | "virtual"
+    )
+}
+
+fn cpp_export_macro_token(token: &str) -> bool {
+    token
+        .chars()
+        .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
 }
 
 fn recover_exported_class_declaration<'tree>(

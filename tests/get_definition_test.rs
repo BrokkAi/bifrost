@@ -1941,6 +1941,58 @@ fn cpp_workspace_angle_include_missing_type_returns_no_definition() {
 }
 
 #[test]
+fn cpp_export_macro_class_recovery_handles_header_variants() {
+    let cases = [
+        (
+            "final class",
+            "#define API\nnamespace ns { class API Service final { public: void run(); }; }\n",
+        ),
+        (
+            "single macro with base",
+            "#define API_EXPORT\nnamespace ns { class Base {}; class API_EXPORT Service : public Base { public: void run(); }; }\n",
+        ),
+        (
+            "multiple macros",
+            "#define DLL_PUBLIC\n#define API\nnamespace ns { class DLL_PUBLIC API Service { public: void run(); }; }\n",
+        ),
+        (
+            "struct macro",
+            "#define API\nnamespace ns { struct API Service { void run(); }; }\n",
+        ),
+    ];
+
+    for (name, header) in cases {
+        let project = InlineTestProject::with_language(Language::Cpp)
+            .file("include/target.h", header)
+            .file(
+                "target.cpp",
+                "#include \"include/target.h\"\nnamespace ns { void Service::run() {} }\n",
+            )
+            .file(
+                "src/app.cpp",
+                "#include <target.h>\nusing namespace ns;\nvoid handle(Service& service) { service.run(); }\n",
+            )
+            .build();
+
+        let line = "void handle(Service& service) { service.run(); }";
+        let value = lookup(
+            project.root(),
+            &format!(
+                r#"{{"references":[{{"path":"src/app.cpp","line":3,"column":{}}}]}}"#,
+                column_of(line, "run")
+            ),
+        );
+
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{name}: {value}");
+        assert_eq!(
+            result["definition"]["fqn"], "ns.Service.run",
+            "{name}: {value}"
+        );
+    }
+}
+
+#[test]
 fn cpp_relative_namespace_call_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(
