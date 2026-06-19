@@ -271,36 +271,6 @@ pub(super) fn resolve_rust_import_fq_name(
 
     let crate_package = rust_crate_root_package(source_file);
     resolve_rust_module_path_with_crate(package, &crate_package, path)
-        .or_else(|| resolve_root_relative_rust_import_path(package, &crate_package, path))
-}
-
-fn resolve_root_relative_rust_import_path(
-    package: &str,
-    crate_package: &str,
-    path: &str,
-) -> Option<String> {
-    if !package.is_empty() {
-        return None;
-    }
-    let segments: Vec<_> = path
-        .split("::")
-        .filter(|segment| !segment.is_empty())
-        .collect();
-    if !matches!(segments.first(), Some(&"self" | &"super")) {
-        return None;
-    }
-    let tail = segments
-        .iter()
-        .skip_while(|segment| matches!(**segment, "self" | "super"))
-        .copied();
-    Some(
-        crate_package
-            .split('.')
-            .filter(|segment| !segment.is_empty())
-            .chain(tail)
-            .collect::<Vec<_>>()
-            .join("."),
-    )
 }
 
 pub(super) fn rust_crate_root_package(file: &ProjectFile) -> String {
