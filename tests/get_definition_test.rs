@@ -212,6 +212,194 @@ fn run(ctx: BridgeContext) -> anyhow::Result<()> {
 }
 
 #[test]
+fn rust_struct_field_access_resolves_from_option_expect_locals() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .file("src/lib.rs", "pub mod pricing;\npub mod route;\npub use route::RouteCheapnessEstimate;\n")
+        .file("src/route.rs", "pub struct RouteCheapnessEstimate {\n    pub input_price_per_mtok_micros: Option<u64>,\n}\n")
+        .file(
+            "src/pricing.rs",
+            r#"
+use crate::{RouteCheapnessEstimate};
+
+pub fn pricing() -> Option<RouteCheapnessEstimate> {
+    todo!()
+}
+
+fn run() {
+    let fast = pricing().expect("priced model");
+    let _ = fast.input_price_per_mtok_micros;
+}
+"#,
+        )
+        .build();
+
+    let line = "    let _ = fast.input_price_per_mtok_micros;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/pricing.rs","line":10,"column":{}}}]}}"#,
+            column_of(line, "input_price_per_mtok_micros")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "route.RouteCheapnessEstimate.input_price_per_mtok_micros",
+        "{value}"
+    );
+}
+
+#[test]
+fn rust_struct_field_access_resolves_from_macro_token_trees() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+macro_rules! object {
+    ($($tt:tt)*) => {};
+}
+
+pub struct LlmModel {
+    pub name: String,
+}
+
+pub struct ModelFit {
+    pub model: LlmModel,
+}
+
+fn fit_to_json(fit: &ModelFit) {
+    object!({
+        "name": fit.model.name,
+        "ollama_name": helper(&fit.model.name),
+    });
+}
+"#,
+        )
+        .build();
+
+    let line = r#"        "ollama_name": helper(&fit.model.name),"#;
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"lib.rs","line":17,"column":{}}}]}}"#,
+            column_of(line, "model")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "ModelFit.model", "{value}");
+}
+
+#[test]
+fn rust_struct_field_access_resolves_imported_parameter_types() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .file(
+            "src/lib.rs",
+            r#"
+pub mod display;
+pub mod fit;
+pub mod models;
+"#,
+        )
+        .file(
+            "src/fit.rs",
+            r#"
+use crate::models::LlmModel;
+
+pub struct ModelFit {
+    pub model: LlmModel,
+}
+"#,
+        )
+        .file(
+            "src/models.rs",
+            r#"
+pub struct LlmModel {
+    pub name: String,
+}
+"#,
+        )
+        .file(
+            "src/display.rs",
+            r#"
+use crate::fit::ModelFit;
+
+fn fit_to_json(fit: &ModelFit) {
+    let _ = &fit.model.name;
+}
+"#,
+        )
+        .build();
+
+    let line = "    let _ = &fit.model.name;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/display.rs","line":5,"column":{}}}]}}"#,
+            column_of(line, "model")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "fit.ModelFit.model",
+        "{value}"
+    );
+}
+
+#[test]
+fn rust_struct_field_access_resolves_borrowed_self_field() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+pub struct Provider {
+    model: String,
+}
+
+pub struct Other {
+    model: String,
+}
+
+impl Provider {
+    fn model(&self) -> String {
+        String::new()
+    }
+
+    fn run(&self) {
+        let _ = Arc::clone(&self.model);
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        let _ = Arc::clone(&self.model);";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"lib.rs","line":16,"column":{}}}]}}"#,
+            column_of(line, "model")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "Provider.model", "{value}");
+}
+
+#[test]
 fn go_selector_chain_resolves_promoted_embedded_fields_and_range_elements() {
     let project = InlineTestProject::with_language(Language::Go)
         .file("go.mod", "module example.com/app\n\ngo 1.22\n")
