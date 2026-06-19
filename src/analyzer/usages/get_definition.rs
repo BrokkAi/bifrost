@@ -5760,10 +5760,11 @@ fn cpp_resolve_owner_type_in_lexical_namespace(
     node: Node<'_>,
     owner: &str,
 ) -> Option<CodeUnit> {
-    visibility.resolve_type(file, owner).or_else(|| {
-        let namespace = cpp_lexical_namespace(node, source)?;
-        visibility.resolve_type(file, &format!("{namespace}::{owner}"))
-    })
+    cpp_lexical_namespace(node, source)
+        .into_iter()
+        .flat_map(|namespace| cpp_namespace_relative_names(&namespace, owner))
+        .find_map(|name| visibility.resolve_type(file, &name))
+        .or_else(|| visibility.resolve_type(file, owner))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5954,6 +5955,7 @@ fn cpp_seed_typed_binding(
         visibility,
         file,
         source,
+        cpp_lexical_namespace(node, source).as_deref(),
         &name,
         type_text.as_deref(),
         cpp_declarator_pointer_depth(declarator),
@@ -5994,6 +5996,7 @@ fn cpp_seed_for_range_binding(
         visibility,
         file,
         source,
+        cpp_lexical_namespace(node, source).as_deref(),
         &name,
         type_text.as_deref(),
         cpp_declarator_pointer_depth(declarator),
@@ -6050,6 +6053,7 @@ fn cpp_seed_variable_declaration(
                 visibility,
                 file,
                 source,
+                cpp_lexical_namespace(node, source).as_deref(),
                 &name,
                 type_text.as_deref(),
                 cpp_declarator_pointer_depth(declarator),
@@ -6227,6 +6231,7 @@ fn cpp_seed_binding(
     visibility: &CppVisibilityIndex,
     file: &ProjectFile,
     source: &str,
+    lexical_namespace: Option<&str>,
     name: &str,
     type_text: Option<&str>,
     declarator_depth: i32,
@@ -6238,7 +6243,9 @@ fn cpp_seed_binding(
     }
     let resolved = type_text
         .filter(|text| *text != "auto")
-        .and_then(|text| cpp_resolve_type_unit(analyzer, visibility, file, text))
+        .and_then(|text| {
+            cpp_resolve_type_unit_in_namespace(analyzer, visibility, file, text, lexical_namespace)
+        })
         .map(|unit| CppType {
             unit,
             indirection: 0,
@@ -6267,6 +6274,29 @@ fn cpp_resolve_type_unit(
     file: &ProjectFile,
     type_text: &str,
 ) -> Option<CodeUnit> {
+    cpp_resolve_type_unit_in_namespace(analyzer, visibility, file, type_text, None)
+}
+
+fn cpp_resolve_type_unit_in_namespace(
+    analyzer: &dyn IAnalyzer,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    type_text: &str,
+    lexical_namespace: Option<&str>,
+) -> Option<CodeUnit> {
+    let name = normalize_cpp_type_text(type_text);
+    if name.contains("::")
+        && !type_text.trim_start().starts_with("::")
+        && let Some(unit) = lexical_namespace
+            .into_iter()
+            .flat_map(|namespace| cpp_namespace_relative_names(namespace, &name))
+            .find_map(|candidate| {
+                let mut seen = HashSet::default();
+                cpp_resolve_type_unit_inner(analyzer, visibility, file, &candidate, &mut seen)
+            })
+    {
+        return Some(unit);
+    }
     let mut seen = HashSet::default();
     cpp_resolve_type_unit_inner(analyzer, visibility, file, type_text, &mut seen)
 }
@@ -6317,11 +6347,21 @@ fn cpp_resolve_type_unit_inner(
 
 fn cpp_type_unit_matches_name(unit: &CodeUnit, name: &str) -> bool {
     if name.contains("::") {
-        let cpp_name = cpp_name_for(unit);
-        cpp_name == name || cpp_name.ends_with(&format!("::{name}"))
+        cpp_name_for(unit) == name
     } else {
         unit.identifier() == name
     }
+}
+
+fn cpp_namespace_relative_names(namespace: &str, name: &str) -> Vec<String> {
+    let parts = namespace
+        .split("::")
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    (1..=parts.len())
+        .rev()
+        .map(|len| format!("{}::{name}", parts[..len].join("::")))
+        .collect()
 }
 
 fn cpp_choose_canonical_type(

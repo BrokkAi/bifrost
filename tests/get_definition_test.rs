@@ -5875,6 +5875,61 @@ void Parser::run() {
 }
 
 #[test]
+fn cpp_out_of_line_method_prefers_lexical_namespace_owner() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "global.h",
+            r#"
+class Parser {
+public:
+    bool wrong();
+};
+"#,
+        )
+        .file(
+            "parser.h",
+            r#"
+namespace ns {
+class Parser {
+public:
+    bool right();
+    bool run();
+};
+}
+"#,
+        )
+        .file(
+            "parser.cpp",
+            r#"
+#include "global.h"
+#include "parser.h"
+namespace ns {
+bool Parser::run() {
+    return this->right();
+}
+}
+"#,
+        )
+        .build();
+
+    let line = "    return this->right();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"parser.cpp","line":6,"column":{}}}]}}"#,
+            column_of(line, "right")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "ns.Parser.right",
+        "{value}"
+    );
+}
+
+#[test]
 fn cpp_this_receiver_resolves_in_out_of_line_method_body() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(
@@ -5979,6 +6034,49 @@ bool Visitor::run(const ast::TernaryOperator* tern) {
         result["definitions"][0]["fqn"], "ns::ast.TernaryOperator.condition",
         "{value}"
     );
+}
+
+#[test]
+fn cpp_relative_qualified_type_does_not_match_unrelated_suffix_namespace() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "target.h",
+            r#"
+namespace foo {
+namespace bar {
+class T {
+public:
+    bool wrong() const;
+};
+}
+}
+"#,
+        )
+        .file(
+            "visitor.cpp",
+            r#"
+#include "target.h"
+namespace ns {
+namespace codegen {
+bool run(const bar::T* value) {
+    return value->wrong();
+}
+}
+}
+"#,
+        )
+        .build();
+
+    let line = "    return value->wrong();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"visitor.cpp","line":6,"column":{}}}]}}"#,
+            column_of(line, "wrong")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
 }
 
 #[test]
