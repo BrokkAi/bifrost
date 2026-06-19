@@ -1720,11 +1720,9 @@ fn cpp_typed_receiver_method_resolves_to_definition() {
 
 #[test]
 fn cpp_workspace_angle_include_receiver_method_resolves_to_definition() {
+    let header = "#define API\nnamespace ns { class API Service { public: void run(); }; }\n";
     let project = InlineTestProject::with_language(Language::Cpp)
-        .file(
-            "include/target.h",
-            "namespace ns { class Service { public: void run(); }; }\n",
-        )
+        .file("include/target.h", header)
         .file(
             "target.cpp",
             "#include \"include/target.h\"\nnamespace ns { void Service::run() {} }\n",

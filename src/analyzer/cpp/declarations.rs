@@ -26,6 +26,81 @@ enum CppWork<'tree> {
     Node(CppNodeWork<'tree>),
 }
 
+fn class_like_name(node: Node<'_>, source: &str) -> Option<String> {
+    let text = node_text(node, source);
+    let header = text.split(['{', ':']).next().unwrap_or(text).trim();
+    let mut best = None;
+    for token in Regex::new(r"[A-Za-z_]\w*")
+        .expect("valid C++ identifier regex")
+        .find_iter(header)
+        .map(|m| m.as_str())
+    {
+        if matches!(
+            token,
+            "class" | "struct" | "union" | "enum" | "final" | "public" | "private" | "protected"
+        ) {
+            continue;
+        }
+        best = Some(token.to_string());
+    }
+    if let Some(parent) = node.parent()
+        && let Some(recovered) = exported_class_name_from_text(node_text(parent, source))
+        && best.as_deref() != Some(recovered.as_str())
+    {
+        return Some(recovered);
+    }
+    best.or_else(|| {
+        node.child_by_field_name("name")
+            .map(|name_node| normalize_cpp_whitespace(node_text(name_node, source)))
+            .filter(|name| !name.is_empty())
+    })
+}
+
+fn exported_class_name_from_text(text: &str) -> Option<String> {
+    let captures =
+        Regex::new(r"\b(?:class|struct|union)\s+[A-Z_][A-Z0-9_]*\s+([A-Za-z_]\w*)\s*(?:[:{])")
+            .expect("valid exported C++ class regex")
+            .captures(text)?;
+    let name = captures.get(1)?.as_str();
+    if matches!(name, "final" | "public" | "private" | "protected") {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+fn recover_exported_class_declaration<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<(Node<'tree>, String)> {
+    let class_node = first_class_like_child(node)?;
+    let name = exported_class_name_from_text(node_text(node, source))?;
+    Some((class_node, name))
+}
+
+fn recover_exported_class_function_definition(node: Node<'_>, source: &str) -> Option<String> {
+    if node.kind() != "function_definition" {
+        return None;
+    }
+    let type_node = node.child_by_field_name("type")?;
+    if !matches!(
+        type_node.kind(),
+        "class_specifier" | "struct_specifier" | "union_specifier"
+    ) {
+        return None;
+    }
+    exported_class_name_from_text(node_text(node, source))
+}
+
+fn first_class_like_child(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).find(|child| {
+        matches!(
+            child.kind(),
+            "class_specifier" | "struct_specifier" | "union_specifier"
+        )
+    })
+}
+
 fn push_cpp_child_work<'tree>(
     node: Node<'tree>,
     scope: ScopeInfo,
@@ -122,6 +197,12 @@ impl<'a> CppVisitor<'a> {
             }
             "preproc_def" | "preproc_function_def" => self.visit_macro(node),
             "preproc_include" => self.visit_include(node),
+            "labeled_statement" if scope.class_unit.is_some() => {
+                stack.push(CppWork::Container(CppContainer {
+                    node,
+                    scope: scope.clone(),
+                }))
+            }
             "preproc_if" | "preproc_ifdef" | "preproc_ifndef" | "preproc_else" | "preproc_elif" => {
                 stack.push(CppWork::Container(CppContainer {
                     node,
@@ -187,14 +268,19 @@ impl<'a> CppVisitor<'a> {
         scope: &ScopeInfo,
         stack: &mut Vec<CppWork<'tree>>,
     ) {
-        let Some(name_node) = node.child_by_field_name("name") else {
+        let Some(name) = class_like_name(node, self.source) else {
             return;
         };
-        let name = normalize_cpp_whitespace(node_text(name_node, self.source));
-        if name.is_empty() {
-            return;
-        }
+        self.visit_named_class_like(node, name, scope, stack);
+    }
 
+    fn visit_named_class_like<'tree>(
+        &mut self,
+        node: Node<'tree>,
+        name: String,
+        scope: &ScopeInfo,
+        stack: &mut Vec<CppWork<'tree>>,
+    ) {
         let short_name = if let Some(parent) = &scope.class_unit {
             format!("{}${name}", parent.short_name())
         } else {
@@ -331,6 +417,19 @@ impl<'a> CppVisitor<'a> {
     }
 
     fn visit_function_definition(&mut self, node: Node<'_>, scope: &ScopeInfo) {
+        if let Some(name) = recover_exported_class_function_definition(node, self.source) {
+            let mut stack = Vec::new();
+            self.visit_named_class_like(node, name, scope, &mut stack);
+            while let Some(work) = stack.pop() {
+                match work {
+                    CppWork::Container(container) => {
+                        push_cpp_child_work(container.node, container.scope, &mut stack);
+                    }
+                    CppWork::Node(work) => self.visit_node(work.node, &work.scope, &mut stack),
+                }
+            }
+            return;
+        }
         let Some(declarator) = node.child_by_field_name("declarator") else {
             return;
         };
@@ -366,6 +465,10 @@ impl<'a> CppVisitor<'a> {
         in_class_body: bool,
         stack: &mut Vec<CppWork<'tree>>,
     ) {
+        if let Some((class_node, name)) = recover_exported_class_declaration(node, self.source) {
+            self.visit_named_class_like(class_node, name, scope, stack);
+        }
+
         let mut handled_function = false;
         let mut handled_declarator = false;
         let mut cursor = node.walk();
