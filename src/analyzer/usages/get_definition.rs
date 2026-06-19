@@ -667,7 +667,7 @@ fn rust_use_statements_from_source(source: &str) -> Vec<String> {
     let mut collecting = false;
     for line in source.lines() {
         let trimmed = line.trim();
-        if !collecting && !(trimmed.starts_with("use ") || trimmed.starts_with("pub use ")) {
+        if !collecting && !trimmed.starts_with("use ") && !trimmed.starts_with("pub use ") {
             continue;
         }
         if collecting {
@@ -834,6 +834,7 @@ fn resolve_js_ts(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_js_ts_module_binding(
     file: &ProjectFile,
     language: Language,
@@ -4105,6 +4106,7 @@ fn java_type_of_identifier_before(
     found
 }
 
+#[allow(clippy::too_many_arguments)]
 fn java_lambda_parameter_type_before(
     analyzer: &dyn IAnalyzer,
     java: &JavaAnalyzer,
@@ -5059,14 +5061,12 @@ fn csharp_reference_node(node: Node<'_>) -> Option<CSharpReferenceNode<'_>> {
     let original = node;
     let mut current = node;
     while let Some(parent) = current.parent() {
-        if matches!(parent.kind(), "generic_name" | "qualified_name")
+        if (matches!(parent.kind(), "generic_name" | "qualified_name")
             && parent.start_byte() <= current.start_byte()
-            && parent.end_byte() >= current.end_byte()
-        {
-            current = parent;
-        } else if parent.kind() == "member_access_expression"
-            && (csharp_member_access_name(parent) == Some(current)
-                || csharp_member_access_name(parent) == Some(original))
+            && parent.end_byte() >= current.end_byte())
+            || (parent.kind() == "member_access_expression"
+                && (csharp_member_access_name(parent) == Some(current)
+                    || csharp_member_access_name(parent) == Some(original)))
         {
             current = parent;
         } else {
