@@ -147,6 +147,103 @@ pub fn run() {
 }
 
 #[test]
+fn go_selector_chain_resolves_promoted_embedded_fields_and_range_elements() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file(
+            "types/types.go",
+            r#"
+package types
+
+type Category struct {
+    ID string
+}
+
+type ScanResult struct {
+    Category Category
+}
+"#,
+        )
+        .file(
+            "tui/model.go",
+            r#"
+package tui
+
+import "example.com/app/types"
+
+type dataState struct {
+    results []*types.ScanResult
+}
+
+type selectionState struct {
+    selected map[string]bool
+}
+
+type Model struct {
+    dataState
+    selectionState
+}
+
+func (m *Model) Handle() {
+    for _, r := range m.results {
+        if m.selected[r.Category.ID] {
+            _ = r
+        }
+    }
+    r := m.results[0]
+    _ = r.Category.ID
+}
+"#,
+        )
+        .build();
+
+    let selected_line = "        if m.selected[r.Category.ID] {";
+    let selected = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"tui/model.go","line":21,"column":{}}}]}}"#,
+            column_of(selected_line, "selected")
+        ),
+    );
+    assert_eq!(selected["results"][0]["status"], "resolved", "{selected}");
+    assert_eq!(
+        selected["results"][0]["definitions"][0]["fqn"],
+        "example.com/app/tui.selectionState.selected",
+        "{selected}"
+    );
+
+    let id = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"tui/model.go","line":21,"column":{}}}]}}"#,
+            column_of(selected_line, "ID")
+        ),
+    );
+    assert_eq!(id["results"][0]["status"], "resolved", "{id}");
+    assert_eq!(
+        id["results"][0]["definitions"][0]["fqn"], "example.com/app/types.Category.ID",
+        "{id}"
+    );
+
+    let indexed_line = "    _ = r.Category.ID";
+    let indexed_id = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"tui/model.go","line":26,"column":{}}}]}}"#,
+            column_of(indexed_line, "ID")
+        ),
+    );
+    assert_eq!(
+        indexed_id["results"][0]["status"], "resolved",
+        "{indexed_id}"
+    );
+    assert_eq!(
+        indexed_id["results"][0]["definitions"][0]["fqn"], "example.com/app/types.Category.ID",
+        "{indexed_id}"
+    );
+}
+
+#[test]
 fn rust_reference_context_collapses_repeated_targets_with_same_definition() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(

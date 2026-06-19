@@ -47,6 +47,23 @@ impl DefinitionLookupIndex {
         self.by_fqn.get(fqn).cloned().unwrap_or_default()
     }
 
+    pub(crate) fn fqn_direct_children(&self, fqn: &str) -> Vec<CodeUnit> {
+        let prefix = format!("{fqn}.");
+        let mut out = Vec::new();
+        for (child_fqn, units) in &self.by_fqn {
+            let Some(rest) = child_fqn.strip_prefix(&prefix) else {
+                continue;
+            };
+            if rest.contains('.') {
+                continue;
+            }
+            out.extend(units.iter().cloned());
+        }
+        sort_units(&mut out);
+        out.dedup();
+        out
+    }
+
     pub(crate) fn file_identifier(&self, file: &ProjectFile, ident: &str) -> Vec<CodeUnit> {
         self.by_file_identifier
             .get(&(file.clone(), ident.to_string()))

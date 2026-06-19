@@ -2842,7 +2842,7 @@ fn resolve_go_local_selector_chain(
     )?;
     let mut deepest_workspace_field = None;
     for (index, member) in segments[1..].iter().enumerate() {
-        let candidates = support.fqn(&format!("{owner_fqn}.{member}"));
+        let candidates = go_indexed_field_candidates(analyzer, support, &owner_fqn, member);
         if !candidates.is_empty() {
             deepest_workspace_field = Some(candidates.clone());
         }
@@ -3130,6 +3130,9 @@ fn go_value_type_text(
         "call_expression" => go_call_expression_return_type_text(
             analyzer, support, file, source, root, value_node, byte,
         ),
+        "index_expression" => {
+            go_index_expression_type_text(analyzer, support, file, source, root, value_node, byte)
+        }
         "identifier" => {
             go_identifier_value_type_fqn(analyzer, support, file, source, root, value_node, byte)
                 .and_then(|fqn| go_type_text_from_fqn(&fqn).map(str::to_string))
@@ -3269,6 +3272,9 @@ fn go_expression_type_text(
         "selector_expression" => go_selector_expression_type_text(
             analyzer, support, file, source, root, expression, byte,
         ),
+        "index_expression" => {
+            go_index_expression_type_text(analyzer, support, file, source, root, expression, byte)
+        }
         _ => {
             go_type_text_from_composite_value(go_node_text(expression, source)).map(str::to_string)
         }
@@ -3298,6 +3304,27 @@ fn go_selector_expression_type_text(
     )?;
     go_indexed_field_type(analyzer, support, &qualifier_type, field)
         .map(|(_, type_text)| type_text.trim().to_string())
+}
+
+fn go_index_expression_type_text(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    expression: Node<'_>,
+    byte: usize,
+) -> Option<String> {
+    if expression.kind() != "index_expression" {
+        return None;
+    }
+    let collection = expression.child_by_field_name("operand").or_else(|| {
+        let mut cursor = expression.walk();
+        expression.named_children(&mut cursor).next()
+    })?;
+    let iterable_type =
+        go_expression_type_text(analyzer, support, file, source, root, collection, byte)?;
+    go_iterable_element_type_text(&iterable_type).map(str::to_string)
 }
 
 fn go_call_expression_return_type_text(
@@ -3495,20 +3522,128 @@ fn go_indexed_field_type(
     owner_fqn: &str,
     field: &str,
 ) -> Option<(ProjectFile, String)> {
+    let mut visited = HashSet::default();
+    go_indexed_field_type_inner(analyzer, support, owner_fqn, field, &mut visited)
+}
+
+fn go_indexed_field_type_inner(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    owner_fqn: &str,
+    field: &str,
+    visited: &mut HashSet<String>,
+) -> Option<(ProjectFile, String)> {
+    if !visited.insert(owner_fqn.to_string()) {
+        return None;
+    }
+    if let Some(field_type) = go_direct_field_type(analyzer, support, owner_fqn, field) {
+        return Some(field_type);
+    }
+    for embedded in go_embedded_field_types(analyzer, support, owner_fqn) {
+        if let Some(field_type) =
+            go_indexed_field_type_inner(analyzer, support, &embedded, field, visited)
+        {
+            return Some(field_type);
+        }
+    }
+    None
+}
+
+fn go_direct_field_type(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    owner_fqn: &str,
+    field: &str,
+) -> Option<(ProjectFile, String)> {
     let field_unit = support
         .fqn(&format!("{owner_fqn}.{field}"))
         .into_iter()
         .next()?;
+    go_field_unit_type_text(analyzer, &field_unit, field)
+        .map(|type_text| (field_unit.source().clone(), type_text))
+}
+
+fn go_indexed_field_candidates(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    owner_fqn: &str,
+    field: &str,
+) -> Vec<CodeUnit> {
+    let mut visited = HashSet::default();
+    let mut candidates =
+        go_indexed_field_candidates_inner(analyzer, support, owner_fqn, field, &mut visited);
+    sort_units(&mut candidates);
+    candidates.dedup();
+    candidates
+}
+
+fn go_indexed_field_candidates_inner(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    owner_fqn: &str,
+    field: &str,
+    visited: &mut HashSet<String>,
+) -> Vec<CodeUnit> {
+    if !visited.insert(owner_fqn.to_string()) {
+        return Vec::new();
+    }
+    let direct = support.fqn(&format!("{owner_fqn}.{field}"));
+    if !direct.is_empty() {
+        return direct;
+    }
+    let mut out = Vec::new();
+    for embedded in go_embedded_field_types(analyzer, support, owner_fqn) {
+        out.extend(go_indexed_field_candidates_inner(
+            analyzer, support, &embedded, field, visited,
+        ));
+    }
+    out
+}
+
+fn go_embedded_field_types(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    owner_fqn: &str,
+) -> Vec<String> {
+    support
+        .fqn_direct_children(owner_fqn)
+        .into_iter()
+        .filter_map(|field| {
+            let field_name = field.identifier().to_string();
+            let type_text = go_field_unit_type_text(analyzer, &field, &field_name)?;
+            let simple = go_simple_type_name(&type_text)?;
+            (simple == field_name).then(|| {
+                go_resolve_go_field_type_fqn(
+                    analyzer,
+                    support,
+                    owner_fqn,
+                    field.source(),
+                    &type_text,
+                )
+            })?
+        })
+        .collect()
+}
+
+fn go_field_unit_type_text(
+    analyzer: &dyn IAnalyzer,
+    field_unit: &CodeUnit,
+    field: &str,
+) -> Option<String> {
     let signature = field_unit
         .signature()
         .map(str::to_string)
-        .or_else(|| analyzer.signatures(&field_unit).iter().next().cloned())?;
-    let type_text = signature
-        .trim()
+        .or_else(|| analyzer.signatures(field_unit).iter().next().cloned())?;
+    let trimmed = signature.trim();
+    if let Some(type_text) = trimmed
         .strip_prefix(field)
         .map(str::trim)
-        .filter(|value| !value.is_empty())?;
-    Some((field_unit.source().clone(), type_text.to_string()))
+        .filter(|value| !value.is_empty())
+    {
+        return Some(type_text.to_string());
+    }
+    let simple = go_simple_type_name(trimmed)?;
+    (simple == field).then(|| trimmed.to_string())
 }
 
 fn go_resolve_go_field_type_fqn(

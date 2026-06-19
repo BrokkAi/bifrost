@@ -363,6 +363,36 @@ fn visit_go_struct_fields(
                     .filter(|name| name.kind() == "field_identifier")
                     .collect()
             };
+            if field_names.is_empty() {
+                if let Some((field_name, type_node)) = go_embedded_struct_field(field, source) {
+                    let code_unit = CodeUnit::new(
+                        file.clone(),
+                        CodeUnitType::Field,
+                        package_name.to_string(),
+                        format!("{}.{}", parent.short_name(), field_name),
+                    );
+                    if record_ranges {
+                        parsed.add_code_unit(
+                            code_unit.clone(),
+                            type_node,
+                            source,
+                            Some(parent.clone()),
+                            Some(parent.clone()),
+                        );
+                    } else {
+                        parsed.add_synthetic_code_unit(
+                            code_unit.clone(),
+                            Some(parent.clone()),
+                            Some(parent.clone()),
+                        );
+                    }
+                    parsed.add_signature(
+                        code_unit,
+                        go_node_text(type_node, source).trim().to_string(),
+                    );
+                }
+                continue;
+            }
             for (index, name) in field_names.into_iter().enumerate() {
                 let field_name = go_node_text(name, source).trim();
                 if field_name.is_empty() {
@@ -427,6 +457,25 @@ fn visit_go_struct_fields(
             }
         }
     }
+}
+
+fn go_embedded_struct_field<'tree>(
+    field: Node<'tree>,
+    source: &str,
+) -> Option<(String, Node<'tree>)> {
+    let mut cursor = field.walk();
+    for child in field.named_children(&mut cursor) {
+        if matches!(
+            child.kind(),
+            "raw_string_literal" | "interpreted_string_literal"
+        ) {
+            continue;
+        }
+        if let Some(name) = extract_go_type_name(child, source) {
+            return Some((name, child));
+        }
+    }
+    None
 }
 
 fn visit_go_interface_methods(
