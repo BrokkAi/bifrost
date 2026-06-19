@@ -217,7 +217,7 @@ impl<'a> CppVisitor<'a> {
             "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier" => {
                 self.visit_class_like(node, scope, stack)
             }
-            "function_definition" => self.visit_function_definition(node, scope),
+            "function_definition" => self.visit_function_definition(node, scope, stack),
             "declaration" => self.visit_declaration(node, scope, false, stack),
             "field_declaration" => self.visit_declaration(node, scope, true, stack),
             "type_definition" | "alias_declaration" => {
@@ -277,17 +277,17 @@ impl<'a> CppVisitor<'a> {
                 .add_code_unit(module.clone(), node, self.source, None, None);
         }
 
-        if let Some(body) = cpp_body_node(node) {
-            stack.push(CppWork::Container(CppContainer {
-                node: body,
-                scope: ScopeInfo {
-                    package_name: full_name,
-                    module: Some(module),
-                    class_unit: scope.class_unit.clone(),
-                    template_signature: scope.template_signature.clone(),
-                },
-            }));
-        }
+        let namespace_scope = ScopeInfo {
+            package_name: full_name,
+            module: Some(module),
+            class_unit: scope.class_unit.clone(),
+            template_signature: scope.template_signature.clone(),
+        };
+        let container = cpp_body_node(node).unwrap_or(node);
+        stack.push(CppWork::Container(CppContainer {
+            node: container,
+            scope: namespace_scope,
+        }));
     }
 
     fn visit_class_like<'tree>(
@@ -444,7 +444,12 @@ impl<'a> CppVisitor<'a> {
         }
     }
 
-    fn visit_function_definition(&mut self, node: Node<'_>, scope: &ScopeInfo) {
+    fn visit_function_definition<'tree>(
+        &mut self,
+        node: Node<'tree>,
+        scope: &ScopeInfo,
+        stack: &mut Vec<CppWork<'tree>>,
+    ) {
         if let Some(name) = recover_exported_class_function_definition(node, self.source) {
             let mut stack = Vec::new();
             self.visit_named_class_like(node, name, scope, &mut stack);
@@ -459,12 +464,15 @@ impl<'a> CppVisitor<'a> {
             return;
         }
         let Some(declarator) = node.child_by_field_name("declarator") else {
+            self.visit_malformed_function_definition_container(node, scope, stack);
             return;
         };
         let Some(function_declarator) = extract_function_declarator(declarator) else {
+            self.visit_malformed_function_definition_container(node, scope, stack);
             return;
         };
         let Some(function) = extract_function_info(function_declarator, self.source, scope) else {
+            self.visit_malformed_function_definition_container(node, scope, stack);
             return;
         };
         let code_unit = function.code_unit(self.file.clone());
@@ -484,6 +492,24 @@ impl<'a> CppVisitor<'a> {
         } else if let Some(module) = &scope.module {
             self.parsed.add_child(module.clone(), code_unit);
         }
+    }
+
+    fn visit_malformed_function_definition_container<'tree>(
+        &mut self,
+        node: Node<'tree>,
+        scope: &ScopeInfo,
+        stack: &mut Vec<CppWork<'tree>>,
+    ) {
+        let Some(body) = cpp_body_node(node) else {
+            return;
+        };
+        if !cpp_contains_namespace_definition(body) {
+            return;
+        }
+        stack.push(CppWork::Container(CppContainer {
+            node: body,
+            scope: scope.clone(),
+        }));
     }
 
     fn visit_declaration<'tree>(
@@ -1513,4 +1539,13 @@ fn cpp_body_node(node: Node<'_>) -> Option<Node<'_>> {
             )
         })
     })
+}
+
+fn cpp_contains_namespace_definition(node: Node<'_>) -> bool {
+    if node.kind() == "namespace_definition" {
+        return true;
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(cpp_contains_namespace_definition)
 }

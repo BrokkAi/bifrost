@@ -5067,6 +5067,161 @@ void Parser::run() {
 }
 
 #[test]
+fn cpp_member_field_receiver_resolves_in_out_of_line_method_body() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "parser.h",
+            r#"
+namespace ns {
+class Logger {
+public:
+    bool atErrorLimit() const;
+};
+class Parser {
+    Logger& log_;
+    void run();
+};
+}
+"#,
+        )
+        .file(
+            "parser.cpp",
+            r#"
+#include "parser.h"
+namespace ns {
+void Parser::run() {
+    if (log_.atErrorLimit()) {}
+}
+}
+"#,
+        )
+        .build();
+
+    let line = "    if (log_.atErrorLimit()) {}";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"parser.cpp","line":5,"column":{}}}]}}"#,
+            column_of(line, "atErrorLimit")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "ns.Logger.atErrorLimit",
+        "{value}"
+    );
+}
+
+#[test]
+fn cpp_this_receiver_resolves_in_out_of_line_method_body() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "visitor.h",
+            r#"
+namespace ns {
+class Visitor {
+public:
+    bool traverse();
+    bool run();
+};
+}
+"#,
+        )
+        .file(
+            "visitor.cpp",
+            r#"
+#include "visitor.h"
+namespace ns {
+bool Visitor::run() {
+    return this->traverse();
+}
+}
+"#,
+        )
+        .build();
+
+    let line = "    return this->traverse();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"visitor.cpp","line":5,"column":{}}}]}}"#,
+            column_of(line, "traverse")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "ns.Visitor.traverse",
+        "{value}"
+    );
+}
+
+#[test]
+fn cpp_relative_qualified_parameter_type_resolves_arrow_member() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "ast.h",
+            r#"
+namespace ns {
+namespace ast {
+class TernaryOperator {
+public:
+    bool condition() const;
+};
+}
+}
+"#,
+        )
+        .file(
+            "visitor.h",
+            r#"
+#include "ast.h"
+namespace ns {
+namespace codegen {
+class Visitor {
+public:
+    bool run(const ast::TernaryOperator* tern);
+};
+}
+}
+"#,
+        )
+        .file(
+            "visitor.cpp",
+            r#"
+#include "visitor.h"
+namespace ns {
+namespace codegen {
+bool Visitor::run(const ast::TernaryOperator* tern) {
+    return tern->condition();
+}
+}
+}
+"#,
+        )
+        .build();
+
+    let line = "    return tern->condition();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"visitor.cpp","line":6,"column":{}}}]}}"#,
+            column_of(line, "condition")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "ns::ast.TernaryOperator.condition",
+        "{value}"
+    );
+}
+
+#[test]
 fn cpp_bare_member_field_resolves_from_base_class() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(

@@ -4298,9 +4298,14 @@ fn resolve_cpp(
                     format!("`{text}` is a local C++ value"),
                 );
             }
-            if let Some(owner) =
-                cpp_enclosing_class(ctx.analyzer, ctx.file, ctx.source, identifier.start_byte())
-            {
+            if let Some(owner) = cpp_enclosing_class(
+                ctx.analyzer,
+                ctx.visibility,
+                ctx.file,
+                ctx.source,
+                ctx.root,
+                identifier.start_byte(),
+            ) {
                 let member_candidates = cpp_member_candidates(ctx, vec![owner], text, None, None)
                     .into_iter()
                     .filter(|unit| unit.is_field())
@@ -4603,9 +4608,14 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                 );
                 return candidates_outcome(candidates);
             }
-            if let Some(owner) =
-                cpp_enclosing_class(ctx.analyzer, ctx.file, ctx.source, function.start_byte())
-            {
+            if let Some(owner) = cpp_enclosing_class(
+                ctx.analyzer,
+                ctx.visibility,
+                ctx.file,
+                ctx.source,
+                ctx.root,
+                function.start_byte(),
+            ) {
                 let member_candidates = cpp_member_candidates(
                     ctx,
                     vec![owner],
@@ -5273,13 +5283,30 @@ fn cpp_receiver_type_units(
             }
             if bindings.is_shadowed(name) {
                 Vec::new()
+            } else if let Some(cpp_type) = cpp_enclosing_member_field_type(
+                analyzer, support, visibility, file, source, root, receiver, name,
+            ) {
+                vec![cpp_receiver_unit_for_access(
+                    analyzer,
+                    visibility,
+                    file,
+                    cpp_type,
+                    unwrap_template_alias,
+                )]
             } else {
                 visibility.resolve_type(file, name).into_iter().collect()
             }
         }
-        "this" => cpp_enclosing_class(analyzer, file, source, receiver.start_byte())
-            .into_iter()
-            .collect(),
+        "this" => cpp_enclosing_class(
+            analyzer,
+            visibility,
+            file,
+            source,
+            root,
+            receiver.start_byte(),
+        )
+        .into_iter()
+        .collect(),
         "field_expression" => {
             cpp_field_expression_type(analyzer, support, visibility, file, source, root, receiver)
                 .map(|cpp_type| cpp_type.unit)
@@ -5363,12 +5390,17 @@ fn cpp_field_expression_uses_arrow(field: Node<'_>, source: &str) -> bool {
 
 fn cpp_enclosing_class(
     analyzer: &dyn IAnalyzer,
+    visibility: &CppVisibilityIndex,
     file: &ProjectFile,
     source: &str,
+    root: Node<'_>,
     byte: usize,
 ) -> Option<CodeUnit> {
     if let Some(fqn) = ClassRangeIndex::build(analyzer, file).enclosing(byte) {
         return analyzer.definitions(fqn).next().cloned();
+    }
+    if let Some(owner) = cpp_out_of_line_function_owner(visibility, file, source, root, byte) {
+        return Some(owner);
     }
 
     let line_starts = compute_line_starts(source);
@@ -5386,6 +5418,78 @@ fn cpp_enclosing_class(
         .definitions(owner_fqn)
         .find(|unit| unit.is_class())
         .cloned()
+}
+
+fn cpp_out_of_line_function_owner(
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    byte: usize,
+) -> Option<CodeUnit> {
+    let mut node = smallest_named_node_covering(root, byte, byte)?;
+    loop {
+        if node.kind() == "function_definition" {
+            let declarator = node.child_by_field_name("declarator")?;
+            let qualified = cpp_declarator_qualified_name(declarator, source)?;
+            let (owner, _) = qualified.rsplit_once("::")?;
+            return cpp_resolve_owner_type_in_lexical_namespace(
+                visibility, file, source, node, owner,
+            );
+        }
+        node = node.parent()?;
+    }
+}
+
+fn cpp_declarator_qualified_name(node: Node<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "qualified_identifier" | "scoped_identifier" => {
+            let text = cpp_node_text(node, source).trim().to_string();
+            text.contains("::").then_some(text)
+        }
+        _ => node
+            .child_by_field_name("declarator")
+            .and_then(|inner| cpp_declarator_qualified_name(inner, source)),
+    }
+}
+
+fn cpp_resolve_owner_type_in_lexical_namespace(
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    owner: &str,
+) -> Option<CodeUnit> {
+    visibility.resolve_type(file, owner).or_else(|| {
+        let namespace = cpp_lexical_namespace(node, source)?;
+        visibility.resolve_type(file, &format!("{namespace}::{owner}"))
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cpp_enclosing_member_field_type(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    node: Node<'_>,
+    name: &str,
+) -> Option<CppType> {
+    let owner = cpp_enclosing_class(analyzer, visibility, file, source, root, node.start_byte())?;
+    let ctx = CppLookupCtx {
+        analyzer,
+        support,
+        file,
+        visibility,
+        source,
+        root,
+    };
+    cpp_member_candidates(ctx, vec![owner], name, None, None)
+        .into_iter()
+        .filter(|unit| unit.is_field())
+        .find_map(|unit| cpp_field_declared_type(analyzer, visibility, file, &unit))
 }
 
 const CPP_SCOPE_NODES: &[&str] = &[
@@ -5864,7 +5968,8 @@ fn cpp_resolve_type_unit_inner(
 
 fn cpp_type_unit_matches_name(unit: &CodeUnit, name: &str) -> bool {
     if name.contains("::") {
-        cpp_name_for(unit) == name
+        let cpp_name = cpp_name_for(unit);
+        cpp_name == name || cpp_name.ends_with(&format!("::{name}"))
     } else {
         unit.identifier() == name
     }

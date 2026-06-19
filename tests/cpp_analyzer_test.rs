@@ -745,6 +745,43 @@ class AdaptiveIntBuilderBase {
 }
 
 #[test]
+fn cpp_declarations_survive_namespace_macro_statements() {
+    let source = r#"
+#ifndef VERSIONED_H
+#define VERSIONED_H
+namespace openvdb {
+OPENVDB_USE_VERSION_NAMESPACE
+namespace OPENVDB_VERSION_NAME {
+namespace ax {
+class Logger {
+public:
+    bool atErrorLimit() const;
+};
+}
+}
+}
+#endif
+"#;
+    let project = inline_cpp_project(&[("versioned.h", source)]);
+    let analyzer = CppAnalyzer::from_project(project.clone());
+    let file = ProjectFile::new(project.root().to_path_buf(), "versioned.h");
+    let declarations = analyzer.get_declarations(&file);
+
+    assert!(
+        declarations
+            .iter()
+            .any(|cu| cu.is_class() && cu.identifier() == "Logger"),
+        "{declarations:#?}"
+    );
+    assert!(
+        declarations
+            .iter()
+            .any(|cu| cu.is_function() && base_function_name(cu) == "atErrorLimit"),
+        "{declarations:#?}"
+    );
+}
+
+#[test]
 fn test_constructor_destructor_scoped_definition_and_decl_vs_def_behavior() {
     let analyzer = fixture_analyzer();
     let ctor_dtor = ProjectFile::new(analyzer.project().root().to_path_buf(), "ctor_dtor.h");

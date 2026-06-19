@@ -923,7 +923,9 @@ where
         }
 
         let all_children: Vec<_> = crate::analyzer::IAnalyzer::direct_children(self, code_unit)
-            .filter(|child| !child.is_synthetic())
+            .filter(|child| {
+                !child.is_synthetic() || !crate::analyzer::IAnalyzer::ranges(self, child).is_empty()
+            })
             .collect();
         let field_children: Vec<_> = all_children
             .iter()
