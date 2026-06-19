@@ -639,6 +639,46 @@ export function run(value: Widget) {
 }
 
 #[test]
+fn typescript_reference_context_resolves_type_alias_union_member() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "app.ts",
+            r#"
+export type ClientOptionsWithUrl = {
+  accelerateUrl: string
+}
+
+export type ClientOptionsWithAdapter = {
+  adapter: unknown
+}
+
+export type ClientOptions = ClientOptionsWithUrl | ClientOptionsWithAdapter
+"#,
+        )
+        .build();
+
+    let value = lookup_reference(
+        project.root(),
+        &json!({
+            "references": [{
+                "symbol": "ClientOptions",
+                "context": "export type ClientOptions = ClientOptionsWithUrl | ClientOptionsWithAdapter",
+                "target": "ClientOptionsWithUrl"
+            }]
+        })
+        .to_string(),
+    );
+
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"],
+        "app.ts.ClientOptionsWithUrl",
+        "{value}"
+    );
+    assert_eq!(value["results"][0]["definitions"][0]["start_line"], 2, "{value}");
+}
+
+#[test]
 fn typescript_path_alias_import_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file(

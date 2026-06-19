@@ -898,9 +898,10 @@ fn visit_js_variable_statement(
         };
         let code_unit = CodeUnit::new(file.clone(), kind, "", short_name);
         let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
+        let range_node = if exported { node } else { definition };
         parsed.add_code_unit(
             code_unit.clone(),
-            definition,
+            range_node,
             source,
             parent.cloned(),
             Some(top_level),
