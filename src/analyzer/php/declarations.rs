@@ -91,13 +91,15 @@ impl<'a> PhpVisitor<'a> {
     ) {
         match node.kind() {
             "namespace_definition" => self.visit_namespace(node, scope, stack),
-            "class_declaration" | "interface_declaration" | "trait_declaration" => {
-                self.visit_type_declaration(node, scope, stack)
-            }
+            "class_declaration"
+            | "interface_declaration"
+            | "trait_declaration"
+            | "enum_declaration" => self.visit_type_declaration(node, scope, stack),
             "function_definition" => self.visit_function(node, scope),
             "method_declaration" => self.visit_method(node, scope),
             "property_declaration" => self.visit_property_declaration(node, scope),
             "const_declaration" => self.visit_const_declaration(node, scope),
+            "enum_case" => self.visit_enum_case(node, scope),
             "declaration_list" | "compound_statement" => {
                 stack.push(PhpWork::Container(PhpContainer {
                     node,
@@ -211,6 +213,7 @@ impl<'a> PhpVisitor<'a> {
 
     fn visit_method(&mut self, node: Node<'_>, scope: &PhpScope) {
         self.visit_function(node, scope);
+        self.visit_promoted_parameters(node, scope);
     }
 
     fn visit_property_declaration(&mut self, node: Node<'_>, scope: &PhpScope) {
@@ -308,6 +311,81 @@ impl<'a> PhpVisitor<'a> {
             } else {
                 format!("{prefix}{name};")
             };
+            self.parsed.add_signature(code_unit, signature);
+        }
+    }
+
+    fn visit_enum_case(&mut self, node: Node<'_>, scope: &PhpScope) {
+        let Some(parent) = &scope.class_unit else {
+            return;
+        };
+        let Some(name_node) = node.child_by_field_name("name") else {
+            return;
+        };
+        let name = php_node_text(name_node, self.source).trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        let code_unit = CodeUnit::new(
+            self.file.clone(),
+            CodeUnitType::Field,
+            scope.package_name.clone(),
+            format!("{}.{}", parent.short_name(), name),
+        );
+        self.parsed.add_code_unit(
+            code_unit.clone(),
+            node,
+            self.source,
+            Some(parent.clone()),
+            None,
+        );
+        self.parsed
+            .set_primary_range(&code_unit, php_declaration_range(node, self.source));
+        self.parsed.add_signature(
+            code_unit,
+            normalize_php_snippet(&php_node_text(node, self.source)),
+        );
+    }
+
+    fn visit_promoted_parameters(&mut self, node: Node<'_>, scope: &PhpScope) {
+        let Some(parent) = &scope.class_unit else {
+            return;
+        };
+        let Some(parameters) = node.child_by_field_name("parameters") else {
+            return;
+        };
+        let mut cursor = parameters.walk();
+        for parameter in parameters.named_children(&mut cursor) {
+            if parameter.kind() != "property_promotion_parameter" {
+                continue;
+            }
+            let Some(name_node) = parameter.child_by_field_name("name") else {
+                continue;
+            };
+            let raw_name = php_node_text(name_node, self.source).trim().to_string();
+            if raw_name.is_empty() {
+                continue;
+            }
+            let stripped_name = raw_name.trim_start_matches('$');
+            let code_unit = CodeUnit::new(
+                self.file.clone(),
+                CodeUnitType::Field,
+                scope.package_name.clone(),
+                format!("{}.{}", parent.short_name(), stripped_name),
+            );
+            self.parsed.add_code_unit(
+                code_unit.clone(),
+                parameter,
+                self.source,
+                Some(parent.clone()),
+                None,
+            );
+            self.parsed
+                .set_primary_range(&code_unit, php_declaration_range(parameter, self.source));
+            let signature = format!(
+                "{};",
+                normalize_php_snippet(&php_node_text(parameter, self.source)).trim_end_matches(',')
+            );
             self.parsed.add_signature(code_unit, signature);
         }
     }

@@ -3638,6 +3638,117 @@ fn php_self_class_constant_resolves_to_definition() {
 }
 
 #[test]
+fn php_enum_cases_resolve_as_static_members() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "app/Permissions/Permission.php",
+            r#"
+<?php
+
+namespace App\Permissions;
+
+enum Permission: string
+{
+    case PageUpdate = 'page-update';
+    case PageView = 'page-view';
+}
+"#,
+        )
+        .file(
+            "app/Uploads/AttachmentController.php",
+            r#"
+<?php
+
+namespace App\Uploads;
+
+use App\Permissions\Permission;
+
+class AttachmentController
+{
+    public function update(): void
+    {
+        $this->check(Permission::PageView);
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        $this->check(Permission::PageView);";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Uploads/AttachmentController.php","line":12,"column":{}}}]}}"#,
+            column_of(line, "PageView")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "App.Permissions.Permission.PageView",
+        "{value}"
+    );
+}
+
+#[test]
+fn php_promoted_constructor_properties_resolve_as_instance_members() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "app/Queries/PageQueries.php",
+            r#"
+<?php
+
+namespace App\Queries;
+
+class PageQueries
+{
+}
+"#,
+        )
+        .file(
+            "app/Uploads/AttachmentController.php",
+            r#"
+<?php
+
+namespace App\Uploads;
+
+use App\Queries\PageQueries;
+
+class AttachmentController
+{
+    public function __construct(
+        protected PageQueries $pageQueries,
+    ) {
+    }
+
+    public function attachLink(): void
+    {
+        $page = $this->pageQueries;
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        $page = $this->pageQueries;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Uploads/AttachmentController.php","line":17,"column":{}}}]}}"#,
+            column_of(line, "pageQueries")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "App.Uploads.AttachmentController.pageQueries",
+        "{value}"
+    );
+}
+
+#[test]
 fn php_prefix_only_external_import_reports_boundary() {
     let project = InlineTestProject::with_language(Language::Php)
         .file(

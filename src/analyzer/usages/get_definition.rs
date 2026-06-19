@@ -10295,6 +10295,8 @@ fn php_is_declaration_name(node: Node<'_>) -> bool {
                 | "trait_declaration"
                 | "function_definition"
                 | "method_declaration"
+                | "enum_declaration"
+                | "enum_case"
                 | "const_element"
                 | "property_element"
                 | "simple_parameter"
