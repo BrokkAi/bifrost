@@ -15,10 +15,11 @@ use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::HashSet;
 
 pub(in crate::analyzer::usages) use resolver::{
-    TargetKind as CppTargetKind, VisibilityIndex as CppVisibilityIndex, cpp_name_for,
-    extract_variable_name, first_type_child as cpp_first_type_child,
-    is_declaration_name as cpp_is_declaration_name, is_declarator_node as cpp_is_declarator_node,
-    normalize_type_text as normalize_cpp_type_text,
+    TargetKind as CppTargetKind, VisibilityIndex as CppVisibilityIndex,
+    call_arity as cpp_call_arity, cpp_name_for, extract_variable_name,
+    first_type_child as cpp_first_type_child, is_declaration_name as cpp_is_declaration_name,
+    is_declarator_node as cpp_is_declarator_node, normalize_type_text as normalize_cpp_type_text,
+    signature_arity as cpp_signature_arity,
 };
 
 pub(crate) fn build_cpp_usage_edges<F>(

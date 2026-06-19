@@ -447,7 +447,7 @@ pub(super) fn collect_visible_declarations(
     }
 }
 
-pub(super) fn signature_arity(signature: Option<&str>) -> usize {
+pub(in crate::analyzer::usages) fn signature_arity(signature: Option<&str>) -> usize {
     let Some(signature) = signature else {
         return 0;
     };
@@ -466,7 +466,7 @@ pub(super) fn signature_arity(signature: Option<&str>) -> usize {
     split_top_level_commas(inner).count()
 }
 
-pub(super) fn call_arity(node: Node<'_>) -> usize {
+pub(in crate::analyzer::usages) fn call_arity(node: Node<'_>) -> usize {
     node.child_by_field_name("arguments")
         .or_else(|| node.child_by_field_name("parameters"))
         .or_else(|| node.child_by_field_name("value"))

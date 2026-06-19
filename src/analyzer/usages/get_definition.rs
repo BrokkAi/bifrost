@@ -1,7 +1,8 @@
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::usages::cpp_graph::{
-    CppTargetKind, CppVisibilityIndex, cpp_first_type_child, cpp_is_declaration_name,
-    cpp_is_declarator_node, cpp_name_for, extract_variable_name, normalize_cpp_type_text,
+    CppTargetKind, CppVisibilityIndex, cpp_call_arity, cpp_first_type_child,
+    cpp_is_declaration_name, cpp_is_declarator_node, cpp_name_for, cpp_signature_arity,
+    extract_variable_name, normalize_cpp_type_text,
 };
 use crate::analyzer::usages::csharp_graph::{
     csharp_first_type_child, csharp_is_declaration_name, csharp_is_type_reference_node,
@@ -1155,6 +1156,7 @@ fn resolve_cpp(
             source,
             root,
             field,
+            None,
         ),
         Some(CppReferenceNode::Identifier(identifier)) => {
             if cpp_is_declaration_name(node) {
@@ -1306,9 +1308,16 @@ fn resolve_cpp_call(
         return no_definition("no_function_name", "C++ call expression has no function");
     };
     match function.kind() {
-        "field_expression" => {
-            resolve_cpp_field(analyzer, support, file, visibility, source, root, function)
-        }
+        "field_expression" => resolve_cpp_field(
+            analyzer,
+            support,
+            file,
+            visibility,
+            source,
+            root,
+            function,
+            Some(cpp_call_arity(call)),
+        ),
         "qualified_identifier" => {
             let text = cpp_node_text(function, source);
             let mut candidates = cpp_visible_name_candidates(
@@ -1320,6 +1329,7 @@ fn resolve_cpp_call(
                 cpp_lexical_namespace(function, source).as_deref(),
             );
             if !candidates.is_empty() {
+                candidates = cpp_filter_candidates_by_arity(candidates, Some(cpp_call_arity(call)));
                 return candidates_outcome(candidates);
             }
             if let Some(scope) = function.child_by_field_name("scope")
@@ -1327,7 +1337,12 @@ fn resolve_cpp_call(
             {
                 let member = cpp_node_text(name, source);
                 if let Some(owner) = visibility.resolve_type(file, cpp_node_text(scope, source)) {
-                    candidates = cpp_member_candidates(support, vec![owner], member);
+                    candidates = cpp_member_candidates(
+                        support,
+                        vec![owner],
+                        member,
+                        Some(cpp_call_arity(call)),
+                    );
                     if !candidates.is_empty() {
                         return candidates_outcome(candidates);
                     }
@@ -1356,7 +1371,7 @@ fn resolve_cpp_call(
                     format!("`{name}` is a local C++ value"),
                 );
             }
-            let candidates = cpp_visible_name_candidates(
+            let mut candidates = cpp_visible_name_candidates(
                 visibility,
                 file,
                 support,
@@ -1365,10 +1380,12 @@ fn resolve_cpp_call(
                 None,
             );
             if !candidates.is_empty() {
+                candidates = cpp_filter_candidates_by_arity(candidates, Some(cpp_call_arity(call)));
                 return candidates_outcome(candidates);
             }
             if let Some(owner) = cpp_enclosing_class(analyzer, file, function.start_byte()) {
-                let member_candidates = cpp_member_candidates(support, vec![owner], name);
+                let member_candidates =
+                    cpp_member_candidates(support, vec![owner], name, Some(cpp_call_arity(call)));
                 if !member_candidates.is_empty() {
                     return candidates_outcome(member_candidates);
                 }
@@ -1396,6 +1413,7 @@ fn resolve_cpp_field(
     source: &str,
     root: Node<'_>,
     field: Node<'_>,
+    arity: Option<usize>,
 ) -> DefinitionLookupOutcome {
     let Some(name_node) = field.child_by_field_name("field") else {
         return no_definition("no_member_name", "C++ field expression has no member name");
@@ -1408,7 +1426,7 @@ fn resolve_cpp_field(
         return no_definition("no_member_receiver", "C++ field expression has no receiver");
     };
     let owners = cpp_receiver_type_units(analyzer, visibility, file, source, root, receiver);
-    let candidates = cpp_member_candidates(support, owners, member);
+    let candidates = cpp_member_candidates(support, owners, member, arity);
     if candidates.is_empty() {
         no_definition(
             "unsupported_cpp_receiver",
@@ -1480,14 +1498,40 @@ fn cpp_member_candidates(
     support: &DefinitionLookupIndex,
     owners: Vec<CodeUnit>,
     member: &str,
+    arity: Option<usize>,
 ) -> Vec<CodeUnit> {
     let mut candidates = Vec::new();
     for owner in owners {
         candidates.extend(support.fqn(&format!("{}.{}", owner.fq_name(), member)));
     }
+    candidates = cpp_filter_candidates_by_arity(candidates, arity);
     sort_units(&mut candidates);
     candidates.dedup();
     candidates
+}
+
+fn cpp_filter_candidates_by_arity(
+    candidates: Vec<CodeUnit>,
+    arity: Option<usize>,
+) -> Vec<CodeUnit> {
+    let Some(expected) = arity else {
+        return candidates;
+    };
+    let filtered: Vec<_> = candidates
+        .iter()
+        .filter(|unit| {
+            unit.is_function()
+                && unit
+                    .signature()
+                    .is_some_and(|signature| cpp_signature_arity(Some(signature)) == expected)
+        })
+        .cloned()
+        .collect();
+    if filtered.is_empty() {
+        candidates
+    } else {
+        filtered
+    }
 }
 
 fn cpp_receiver_type_units(

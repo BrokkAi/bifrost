@@ -1761,6 +1761,37 @@ fn cpp_typed_receiver_method_resolves_to_definition() {
 }
 
 #[test]
+fn cpp_typed_receiver_method_filters_overloads_by_call_arity() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "target.h",
+            "namespace ns { class DataReader {}; class Net { public: int load_model(); int load_model(const DataReader& dr); }; }\n",
+        )
+        .file(
+            "app.cpp",
+            "#include \"target.h\"\nvoid handle(ns::Net& net, const ns::DataReader& dr) { net.load_model(dr); }\n",
+        )
+        .build();
+
+    let line = "void handle(ns::Net& net, const ns::DataReader& dr) { net.load_model(dr); }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.cpp","line":2,"column":{}}}]}}"#,
+            column_of(line, "load_model")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definition"]["fqn"], "ns.Net.load_model", "{value}");
+    assert_eq!(
+        result["definition"]["signature"], "(DataReader &)",
+        "{value}"
+    );
+}
+
+#[test]
 fn cpp_workspace_angle_include_receiver_method_resolves_to_definition() {
     let header = "#define API\nnamespace ns { class API Service { public: void run(); }; }\n";
     let project = InlineTestProject::with_language(Language::Cpp)
