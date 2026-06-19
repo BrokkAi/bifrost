@@ -775,6 +775,44 @@ public class UseTarget {
 }
 
 #[test]
+fn java_static_method_receiver_resolves_imported_type_to_definition() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "pkg/Util.java",
+            "package pkg; public class Util { public static String format(String value) { return value; } }\n",
+        )
+        .file(
+            "app/UseUtil.java",
+            r#"
+package app;
+
+import pkg.Util;
+
+public class UseUtil {
+    public String call(String value) {
+        return Util.format(value);
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        return Util.format(value);";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/UseUtil.java","line":8,"column":{}}}]}}"#,
+            column_of(line, "format")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definition"]["fqn"], "pkg.Util.format", "{value}");
+    assert_eq!(result["definition"]["path"], "pkg/Util.java", "{value}");
+}
+
+#[test]
 fn java_this_field_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(

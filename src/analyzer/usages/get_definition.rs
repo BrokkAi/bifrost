@@ -2746,6 +2746,11 @@ fn java_receiver_type_for_java(
         "identifier" => {
             let name = java_node_text(object, source);
             java_type_of_identifier_before(java, file, source, root, name, object.start_byte())
+                .or_else(|| {
+                    (!java_identifier_binding_before(source, root, name, object.start_byte()))
+                        .then(|| java.resolve_type_name_in_file(file, name))
+                        .flatten()
+                })
         }
         _ => None,
     }
@@ -2762,6 +2767,68 @@ fn java_type_of_identifier_before(
     let mut found = None;
     collect_java_typed_binding_before(java, file, source, root, name, before_byte, &mut found);
     found
+}
+
+fn java_identifier_binding_before(
+    source: &str,
+    root: Node<'_>,
+    name: &str,
+    before_byte: usize,
+) -> bool {
+    let mut found = false;
+    collect_java_identifier_binding_before(source, root, name, before_byte, &mut found);
+    found
+}
+
+fn collect_java_identifier_binding_before(
+    source: &str,
+    node: Node<'_>,
+    name: &str,
+    before_byte: usize,
+    found: &mut bool,
+) {
+    if *found {
+        return;
+    }
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        if node.start_byte() >= before_byte {
+            continue;
+        }
+        match node.kind() {
+            "local_variable_declaration" | "field_declaration" => {
+                let mut cursor = node.walk();
+                for child in node.named_children(&mut cursor) {
+                    if child.kind() == "variable_declarator"
+                        && let Some(name_node) = child.child_by_field_name("name")
+                        && name_node.start_byte() < before_byte
+                        && java_node_text(name_node, source) == name
+                    {
+                        *found = true;
+                        return;
+                    }
+                }
+            }
+            "formal_parameter" => {
+                if let Some(name_node) = node.child_by_field_name("name")
+                    && name_node.start_byte() < before_byte
+                    && java_node_text(name_node, source) == name
+                {
+                    *found = true;
+                    return;
+                }
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        let mut children: Vec<_> = node.named_children(&mut cursor).collect();
+        children.reverse();
+        for child in children {
+            if child.start_byte() < before_byte {
+                stack.push(child);
+            }
+        }
+    }
 }
 
 fn collect_java_typed_binding_before(
