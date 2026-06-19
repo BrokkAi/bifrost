@@ -1710,6 +1710,50 @@ public class UseUtil {
 }
 
 #[test]
+fn java_method_reference_resolves_to_receiver_type_member() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "app/GuardianState.java",
+            "package app; public class GuardianState { public boolean isFailed() { return false; } }\n",
+        )
+        .file(
+            "app/UseGuardian.java",
+            r#"
+package app;
+
+import java.util.stream.Stream;
+
+public class UseGuardian {
+    public long count(Stream<GuardianState> states) {
+        return states.filter(GuardianState::isFailed).count();
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        return states.filter(GuardianState::isFailed).count();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/UseGuardian.java","line":8,"column":{}}}]}}"#,
+            column_of(line, "isFailed")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.GuardianState.isFailed",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["path"], "app/GuardianState.java",
+        "{value}"
+    );
+}
+
+#[test]
 fn java_static_method_receiver_resolves_inherited_member_to_definition() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(

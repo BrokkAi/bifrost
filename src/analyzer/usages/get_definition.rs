@@ -3876,6 +3876,9 @@ fn resolve_java(
         "method_invocation" => {
             resolve_java_method_invocation(analyzer, support, file, source, root, node)
         }
+        "method_reference" => {
+            resolve_java_method_reference(analyzer, java, support, file, source, root, node)
+        }
         "field_access" => resolve_java_field_access(analyzer, support, file, source, root, node),
         "identifier" => {
             if let Some(parent) = node.parent() {
@@ -3888,6 +3891,11 @@ fn resolve_java(
                     "field_access" => {
                         return resolve_java_field_access(
                             analyzer, support, file, source, root, parent,
+                        );
+                    }
+                    "method_reference" => {
+                        return resolve_java_method_reference(
+                            analyzer, java, support, file, source, root, parent,
                         );
                     }
                     _ => {}
@@ -4031,6 +4039,78 @@ fn resolve_java_method_invocation(
         "no_indexed_definition",
         format!("`{name}` did not resolve to an indexed Java method"),
     )
+}
+
+fn resolve_java_method_reference(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    node: Node<'_>,
+) -> DefinitionLookupOutcome {
+    let text = java_node_text(node, source);
+    let Some(separator) = text.find("::") else {
+        return no_definition(
+            "malformed_java_method_reference",
+            "Java method reference has no `::` separator",
+        );
+    };
+    let receiver_text = text[..separator].trim();
+    let member = java_method_reference_member_name(text[separator + 2..].trim());
+    if receiver_text.is_empty() || member.is_empty() {
+        return no_definition(
+            "malformed_java_method_reference",
+            "Java method reference has a blank receiver or member",
+        );
+    }
+    if member == "new" {
+        return resolve_java_type_reference(analyzer, java, support, file, source, node);
+    }
+
+    let separator_byte = node.start_byte() + separator;
+    let receiver_node = java_method_reference_receiver_node(node, separator_byte);
+    let owner = receiver_node
+        .and_then(|receiver| java_receiver_type(analyzer, file, source, root, receiver))
+        .or_else(|| {
+            java_type_text_with_context(
+                analyzer,
+                java,
+                file,
+                normalize_java_type_text(receiver_text),
+                node.start_byte(),
+            )
+        });
+    if let Some(owner) = owner {
+        return java_member_candidates(analyzer, support, &owner.fq_name(), member);
+    }
+
+    no_definition(
+        "unsupported_java_receiver",
+        format!("receiver for Java method reference `{member}` is not resolved"),
+    )
+}
+
+fn java_method_reference_receiver_node(node: Node<'_>, separator_byte: usize) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .filter(|child| child.end_byte() <= separator_byte)
+        .last()
+}
+
+fn java_method_reference_member_name(mut text: &str) -> &str {
+    if let Some(rest) = text.strip_prefix('<')
+        && let Some((_, after_type_args)) = rest.split_once('>')
+    {
+        text = after_type_args.trim_start();
+    }
+    let end = text
+        .char_indices()
+        .find(|(_, ch)| *ch != '_' && !ch.is_ascii_alphanumeric())
+        .map(|(idx, _)| idx)
+        .unwrap_or(text.len());
+    &text[..end]
 }
 
 fn resolve_java_field_access(
