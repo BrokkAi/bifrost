@@ -1961,7 +1961,16 @@ fn cpp_seed_variable_declaration(
         if declarator.start_byte() >= cutoff_start {
             continue;
         }
-        if declarator.kind() == "function_declarator" {
+        if declarator.kind() == "function_declarator"
+            && !cpp_constructor_style_local_declaration(
+                visibility,
+                file,
+                source,
+                declarator,
+                type_text.as_deref(),
+                bindings,
+            )
+        {
             continue;
         }
         if let Some(name) = extract_variable_name(declarator, source) {
@@ -1979,6 +1988,108 @@ fn cpp_seed_variable_declaration(
             );
         }
     }
+}
+
+fn cpp_constructor_style_local_declaration(
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+    declarator: Node<'_>,
+    type_text: Option<&str>,
+    bindings: &LocalInferenceEngine<CodeUnit>,
+) -> bool {
+    let Some(parameters) = declarator.child_by_field_name("parameters") else {
+        return false;
+    };
+    if parameters.named_child_count() == 0 {
+        return false;
+    }
+    if extract_variable_name(declarator, source).is_none() {
+        return false;
+    }
+    if !type_text
+        .and_then(|text| visibility.resolve_type(file, text))
+        .is_some_and(|unit| unit.is_class())
+    {
+        return false;
+    }
+    cpp_constructor_arguments_look_like_expressions(visibility, file, source, parameters, bindings)
+}
+
+fn cpp_constructor_arguments_look_like_expressions(
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+    parameters: Node<'_>,
+    bindings: &LocalInferenceEngine<CodeUnit>,
+) -> bool {
+    let text = cpp_node_text(parameters, source);
+    let inner = text.trim().trim_start_matches('(').trim_end_matches(')');
+    cpp_split_top_level_commas(inner).any(|argument| {
+        let argument = argument.trim();
+        !argument.is_empty()
+            && !cpp_argument_looks_like_parameter_declaration(visibility, file, argument, bindings)
+    })
+}
+
+fn cpp_argument_looks_like_parameter_declaration(
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    argument: &str,
+    bindings: &LocalInferenceEngine<CodeUnit>,
+) -> bool {
+    let without_default = argument.split('=').next().unwrap_or(argument).trim();
+    if without_default.is_empty() {
+        return false;
+    }
+    if is_cpp_local_symbol_expression(without_default, bindings) {
+        return false;
+    }
+    if cpp_builtin_type_text(without_default) {
+        return true;
+    }
+    visibility
+        .resolve_type(file, &cpp_parameter_type_text(without_default))
+        .is_some()
+}
+
+fn is_cpp_local_symbol_expression(
+    argument: &str,
+    bindings: &LocalInferenceEngine<CodeUnit>,
+) -> bool {
+    argument
+        .chars()
+        .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+        && !bindings.resolve_symbol(argument).is_unknown()
+}
+
+fn cpp_builtin_type_text(text: &str) -> bool {
+    let normalized = cpp_parameter_type_text(text);
+    let tokens: Vec<_> = normalized.split_whitespace().collect();
+    !tokens.is_empty()
+        && tokens.iter().all(|token| {
+            matches!(
+                *token,
+                "auto"
+                    | "bool"
+                    | "char"
+                    | "char8_t"
+                    | "char16_t"
+                    | "char32_t"
+                    | "const"
+                    | "double"
+                    | "float"
+                    | "int"
+                    | "long"
+                    | "short"
+                    | "signed"
+                    | "size_t"
+                    | "unsigned"
+                    | "void"
+                    | "volatile"
+                    | "wchar_t"
+            )
+        })
 }
 
 fn cpp_seed_binding(

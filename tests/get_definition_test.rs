@@ -1823,6 +1823,73 @@ fn cpp_typed_receiver_method_filters_overloads_by_argument_type() {
 }
 
 #[test]
+fn cpp_chained_struct_field_receiver_resolves_member_field() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("bstr.h", "struct bstr { int len; };\n")
+        .file(
+            "app.c",
+            "#include \"bstr.h\"\nstruct tmp_buffers { struct bstr write_console_buf; };\nint read_len(struct tmp_buffers *buffers) { return buffers->write_console_buf.len; }\n",
+        )
+        .build();
+
+    let line =
+        "int read_len(struct tmp_buffers *buffers) { return buffers->write_console_buf.len; }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.c","line":3,"column":{}}}]}}"#,
+            line.rfind("len").expect("field in line") + 1
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definition"]["fqn"], "bstr.len", "{value}");
+}
+
+#[test]
+fn cpp_local_function_declaration_does_not_seed_receiver_binding() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "app.cpp",
+            "class Widget { public: void run(); };\nWidget make(int);\nvoid handle() { make.run(); }\n",
+        )
+        .build();
+
+    let line = "void handle() { make.run(); }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.cpp","line":3,"column":{}}}]}}"#,
+            column_of(line, "run")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn cpp_local_function_declaration_with_builtin_pointer_does_not_seed_receiver_binding() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "app.cpp",
+            "class Widget { public: void run(); };\nWidget make(const unsigned char* mem);\nvoid handle() { make.run(); }\n",
+        )
+        .build();
+
+    let line = "void handle() { make.run(); }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.cpp","line":3,"column":{}}}]}}"#,
+            column_of(line, "run")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
 fn cpp_workspace_angle_include_receiver_method_resolves_to_definition() {
     let header = "#define API\nnamespace ns { class API Service { public: void run(); }; }\n";
     let project = InlineTestProject::with_language(Language::Cpp)

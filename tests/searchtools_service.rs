@@ -291,6 +291,117 @@ func (c *Client) Build() error {
 }
 
 #[test]
+fn get_definition_by_reference_resolves_cpp_overload_by_argument_type() {
+    let temp = TempDir::new().unwrap();
+    fs::write(
+        temp.path().join("target.h"),
+        r#"namespace ncnn {
+class DataReader {};
+class DataReaderFromMemory : public DataReader {};
+class Net {
+public:
+    int load_model(const char* path);
+    int load_model(const DataReader& dr);
+};
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("app.cpp"),
+        r#"#include "target.h"
+using namespace ncnn;
+
+class DataReaderFromMemoryCopy : public DataReaderFromMemory {};
+
+void PYBIND11_MODULE(Net& net, DataReaderFromMemoryCopy& dr) {
+    net.load_model(dr);
+}
+"#,
+    )
+    .unwrap();
+
+    let service =
+        SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "get_definition_by_reference",
+            r#"{"references":[{"symbol":"PYBIND11_MODULE","context":"    net.load_model(dr);","target":"load_model"}]}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    let result = &value["results"][0];
+    assert_eq!("resolved", result["status"], "{value}");
+    assert_eq!(
+        "ncnn.Net.load_model", result["definition"]["fqn"],
+        "{value}"
+    );
+    assert_eq!(
+        "(DataReader &)", result["definition"]["signature"],
+        "{value}"
+    );
+}
+
+#[test]
+fn get_definition_by_reference_resolves_cpp_constructor_style_local_argument() {
+    let temp = TempDir::new().unwrap();
+    fs::write(
+        temp.path().join("target.h"),
+        r#"namespace ncnn {
+class DataReader {};
+class DataReaderFromMemory : public DataReader {};
+class Net {
+public:
+    int load_model(const char* path);
+    int load_model(const DataReader& dr);
+};
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("app.cpp"),
+        r#"#include "target.h"
+using namespace ncnn;
+
+class DataReaderFromMemoryCopy : public DataReaderFromMemory {
+public:
+    explicit DataReaderFromMemoryCopy(const unsigned char*& mem);
+};
+
+void PYBIND11_MODULE(Net& net, const char* mem) {
+    const unsigned char* _mem = (const unsigned char*)mem;
+    DataReaderFromMemoryCopy dr(_mem);
+    net.load_model(dr);
+}
+"#,
+    )
+    .unwrap();
+
+    let service =
+        SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "get_definition_by_reference",
+            r#"{"references":[{"symbol":"PYBIND11_MODULE","context":"    net.load_model(dr);","target":"load_model"}]}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    let result = &value["results"][0];
+    assert_eq!("resolved", result["status"], "{value}");
+    assert_eq!(
+        "ncnn.Net.load_model", result["definition"]["fqn"],
+        "{value}"
+    );
+    assert_eq!(
+        "(DataReader &)", result["definition"]["signature"],
+        "{value}"
+    );
+}
+
+#[test]
 fn get_definition_by_reference_resolves_scala_constructor_field_from_symbol_context() {
     let temp = TempDir::new().unwrap();
     fs::create_dir_all(temp.path().join("app")).unwrap();
