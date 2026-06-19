@@ -130,6 +130,8 @@ fn test_resolve_imports_semantic_cases() {
     let imported = nested.imported_code_units_of(&user_file);
     assert!(imported.iter().any(|cu| cu.identifier() == "TargetStruct"));
 
+    // `super` at a crate root is invalid Rust ("too many leading `super` keywords"),
+    // so a root-file `use super::X` must not resolve to anything.
     let super_root = RustAnalyzer::from_project(rust_project(&[
         ("src/lib.rs", "pub struct ExternalStruct;"),
         (
@@ -143,9 +145,32 @@ fn test_resolve_imports_semantic_cases() {
     let main_file = ProjectFile::new(super_root.project().root().to_path_buf(), "src/main.rs");
     let imported = super_root.imported_code_units_of(&main_file);
     assert!(
-        imported
+        !imported
             .iter()
-            .any(|cu| cu.identifier() == "ExternalStruct")
+            .any(|cu| cu.identifier() == "ExternalStruct"),
+        "`use super::X` at a crate root is invalid and must not resolve"
+    );
+
+    // A legitimate (non-root) `super::` import does resolve: from `pkg::nested`,
+    // `super` is `pkg`, so `super::service::Service` reaches `pkg::service`.
+    let super_relative = RustAnalyzer::from_project(rust_project(&[
+        ("src/pkg/service.rs", "pub struct Service;"),
+        (
+            "src/pkg/nested/mod.rs",
+            r#"
+            use super::service::Service;
+            fn run() { let _s = Service; }
+            "#,
+        ),
+    ]));
+    let nested_file = ProjectFile::new(
+        super_relative.project().root().to_path_buf(),
+        "src/pkg/nested/mod.rs",
+    );
+    let imported = super_relative.imported_code_units_of(&nested_file);
+    assert!(
+        imported.iter().any(|cu| cu.identifier() == "Service"),
+        "`use super::service::Service` from pkg::nested should resolve to pkg::service::Service"
     );
 }
 
