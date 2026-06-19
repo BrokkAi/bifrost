@@ -4788,45 +4788,12 @@ fn go_indexed_field_type(
     owner_fqn: &str,
     field: &str,
 ) -> Option<(ProjectFile, String)> {
-    let mut visited = HashSet::default();
-    go_indexed_field_type_inner(analyzer, support, owner_fqn, field, &mut visited)
-}
-
-fn go_indexed_field_type_inner(
-    analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
-    owner_fqn: &str,
-    field: &str,
-    visited: &mut HashSet<String>,
-) -> Option<(ProjectFile, String)> {
-    if !visited.insert(owner_fqn.to_string()) {
-        return None;
-    }
-    if let Some(field_type) = go_direct_field_type(analyzer, support, owner_fqn, field) {
-        return Some(field_type);
-    }
-    for embedded in go_embedded_field_types(analyzer, support, owner_fqn) {
-        if let Some(field_type) =
-            go_indexed_field_type_inner(analyzer, support, &embedded, field, visited)
-        {
-            return Some(field_type);
-        }
-    }
-    None
-}
-
-fn go_direct_field_type(
-    analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
-    owner_fqn: &str,
-    field: &str,
-) -> Option<(ProjectFile, String)> {
-    let field_unit = support
-        .fqn(&format!("{owner_fqn}.{field}"))
-        .into_iter()
-        .next()?;
-    go_field_unit_type_text(analyzer, &field_unit, field)
-        .map(|type_text| (field_unit.source().clone(), type_text))
+    let mut candidates = go_indexed_field_candidates(analyzer, support, owner_fqn, field);
+    (candidates.len() == 1).then(|| {
+        let field_unit = candidates.remove(0);
+        go_field_unit_type_text(analyzer, &field_unit, field)
+            .map(|type_text| (field_unit.source().clone(), type_text))
+    })?
 }
 
 fn go_indexed_field_candidates(
@@ -4835,35 +4802,65 @@ fn go_indexed_field_candidates(
     owner_fqn: &str,
     field: &str,
 ) -> Vec<CodeUnit> {
-    let mut visited = HashSet::default();
-    let mut candidates =
-        go_indexed_field_candidates_inner(analyzer, support, owner_fqn, field, &mut visited);
-    sort_units(&mut candidates);
-    candidates.dedup();
-    candidates
+    let mut path = HashSet::default();
+    go_indexed_field_candidates_at_nearest_depth(analyzer, support, owner_fqn, field, &mut path)
+        .map(|(_, mut candidates)| {
+            sort_units(&mut candidates);
+            candidates.dedup();
+            candidates
+        })
+        .unwrap_or_default()
 }
 
-fn go_indexed_field_candidates_inner(
+fn go_indexed_field_candidates_at_nearest_depth(
     analyzer: &dyn IAnalyzer,
     support: &DefinitionLookupIndex,
     owner_fqn: &str,
     field: &str,
-    visited: &mut HashSet<String>,
-) -> Vec<CodeUnit> {
-    if !visited.insert(owner_fqn.to_string()) {
-        return Vec::new();
+    path: &mut HashSet<String>,
+) -> Option<(usize, Vec<CodeUnit>)> {
+    if !path.insert(owner_fqn.to_string()) {
+        return None;
     }
+    let result = go_indexed_field_candidates_at_nearest_depth_inner(
+        analyzer, support, owner_fqn, field, path,
+    );
+    path.remove(owner_fqn);
+    result
+}
+
+fn go_indexed_field_candidates_at_nearest_depth_inner(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    owner_fqn: &str,
+    field: &str,
+    path: &mut HashSet<String>,
+) -> Option<(usize, Vec<CodeUnit>)> {
     let direct = support.fqn(&format!("{owner_fqn}.{field}"));
     if !direct.is_empty() {
-        return direct;
+        return Some((0, direct));
     }
-    let mut out = Vec::new();
+
+    let mut best_depth = usize::MAX;
+    let mut best_candidates = Vec::new();
     for embedded in go_embedded_field_types(analyzer, support, owner_fqn) {
-        out.extend(go_indexed_field_candidates_inner(
-            analyzer, support, &embedded, field, visited,
-        ));
+        let Some((depth, candidates)) =
+            go_indexed_field_candidates_at_nearest_depth(analyzer, support, &embedded, field, path)
+        else {
+            continue;
+        };
+        let promoted_depth = depth + 1;
+        match promoted_depth.cmp(&best_depth) {
+            std::cmp::Ordering::Less => {
+                best_depth = promoted_depth;
+                best_candidates = candidates;
+            }
+            std::cmp::Ordering::Equal => best_candidates.extend(candidates),
+            std::cmp::Ordering::Greater => {}
+        }
     }
-    out
+
+    (best_depth != usize::MAX).then_some((best_depth, best_candidates))
 }
 
 fn go_embedded_field_types(

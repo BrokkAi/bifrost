@@ -2761,6 +2761,52 @@ func (br *Buf) Reset() {
 }
 
 #[test]
+fn go_duplicate_promoted_fields_are_ambiguous() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n")
+        .file(
+            "main.go",
+            r#"
+package main
+
+type Left struct {
+    ID string
+}
+
+type Right struct {
+    ID string
+}
+
+type Model struct {
+    Left
+    Right
+}
+
+func run(model Model) {
+    _ = model.ID
+}
+"#,
+        )
+        .build();
+
+    let line = "    _ = model.ID";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"main.go","line":18,"column":{}}}]}}"#,
+            column_of(line, "ID")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "ambiguous", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "ambiguous_definition",
+        "{value}"
+    );
+}
+
+#[test]
 fn go_local_alias_to_receiver_field_resolves_field_definition() {
     let project = InlineTestProject::with_language(Language::Go)
         .file("go.mod", "module example.com/app\n")
