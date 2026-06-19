@@ -1061,6 +1061,11 @@ fn ts_local_receiver_owner_candidates(
     aliases: &AliasResolver,
     receiver: &str,
 ) -> Vec<CodeUnit> {
+    if receiver == "this"
+        && let Some(owner) = jsts_enclosing_class(analyzer, file, site.focus_start_byte)
+    {
+        return vec![owner];
+    }
     let Some(scope) = jsts_enclosing_function_scope(tree.root_node(), site.focus_start_byte) else {
         return Vec::new();
     };
@@ -1083,6 +1088,17 @@ fn ts_local_receiver_owner_candidates(
     sort_units(&mut candidates);
     candidates.dedup();
     candidates
+}
+
+fn jsts_enclosing_class(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    byte: usize,
+) -> Option<CodeUnit> {
+    let fqn = ClassRangeIndex::build(analyzer, file)
+        .enclosing(byte)?
+        .to_string();
+    analyzer.definitions(&fqn).next().cloned()
 }
 
 fn jsts_enclosing_function_scope(root: Node<'_>, byte: usize) -> Option<Node<'_>> {

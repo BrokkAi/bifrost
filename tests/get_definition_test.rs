@@ -1057,6 +1057,77 @@ export function run(obj: any) {
 }
 
 #[test]
+fn typescript_this_member_resolves_to_enclosing_class_method() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "context.ts",
+            r#"
+export class Context {
+  private loadResource(url: string): string {
+    return url
+  }
+
+  constructor() {
+    const loader = (url: string) => this.loadResource(url)
+  }
+}
+"#,
+        )
+        .build();
+
+    let line = "    const loader = (url: string) => this.loadResource(url)";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"context.ts","line":8,"column":{}}}]}}"#,
+            column_of(line, "loadResource")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Context.loadResource",
+        "{value}"
+    );
+}
+
+#[test]
+fn typescript_this_member_resolves_to_enclosing_class_method_body() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "context.ts",
+            r#"
+export class Context {
+  private validatePath(path: string): void {}
+
+  async loadResource(path: string): Promise<string> {
+    this.validatePath(path)
+    return path
+  }
+}
+"#,
+        )
+        .build();
+
+    let line = "    this.validatePath(path)";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"context.ts","line":6,"column":{}}}]}}"#,
+            column_of(line, "validatePath")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Context.validatePath",
+        "{value}"
+    );
+}
+
+#[test]
 fn typescript_package_import_reports_boundary() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file(
