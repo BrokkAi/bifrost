@@ -33,6 +33,12 @@ fn class_like_name(node: Node<'_>, source: &str) -> Option<String> {
             parent.kind(),
             "declaration" | "field_declaration" | "function_definition"
         )
+        && node
+            .child_by_field_name("name")
+            .map(|name_node| {
+                cpp_export_macro_token(&normalize_cpp_whitespace(node_text(name_node, source)))
+            })
+            .unwrap_or(false)
         && let Some(recovered) = exported_class_name_from_node(parent, source)
         && best.as_deref() != Some(recovered.as_str())
     {
@@ -159,6 +165,16 @@ fn recover_exported_class_declaration<'tree>(
     source: &str,
 ) -> Option<(Node<'tree>, String)> {
     let class_node = first_class_like_child(node)?;
+    if has_direct_cpp_declarator(node)
+        && class_node
+            .child_by_field_name("name")
+            .map(|name_node| {
+                !cpp_export_macro_token(&normalize_cpp_whitespace(node_text(name_node, source)))
+            })
+            .unwrap_or(false)
+    {
+        return None;
+    }
     let name = exported_class_name_from_node(class_node, source)?;
     Some((class_node, name))
 }
@@ -565,14 +581,13 @@ impl<'a> CppVisitor<'a> {
         let mut handled_declarator = false;
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
-            if in_class_body
-                && matches!(
-                    child.kind(),
-                    "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier"
-                )
-                && !has_direct_cpp_declarator(node)
-            {
-                self.visit_class_like(child, scope, stack);
+            if matches!(
+                child.kind(),
+                "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier"
+            ) {
+                if in_class_body && !has_direct_cpp_declarator(node) {
+                    self.visit_class_like(child, scope, stack);
+                }
                 continue;
             }
             if let Some(kind) = classify_declarator(child) {
