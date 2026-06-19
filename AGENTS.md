@@ -26,6 +26,13 @@ Before pushing Rust changes, run the same core checks that CI enforces locally w
 
 At minimum, run `cargo fmt` and `cargo clippy --all-targets --all-features -- -D warnings`. If clippy fails, fix that locally before pushing rather than waiting for the CI matrix to report it back.
 
+# Design philosophy
+
+We build for correctness and generality. Adding narrow "fallbacks" is a smell. Always follow problems
+to their source and fix the root cause, even when that increases the blast radius.
+
+Backwards compatibility is not yet a concern. Clean up APIs instead when our requirements change.
+
 # Implementation details
 
 - Prefer stack-safe iterative traversal over recursive Rust calls for analyzer tree/graph walks, especially during
