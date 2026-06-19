@@ -3062,6 +3062,49 @@ fn cpp_same_file_global_value_resolves_to_definition() {
 }
 
 #[test]
+fn cpp_static_const_struct_value_resolves_in_initializer() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "app.c",
+            r#"
+typedef struct AVClass AVClass;
+typedef struct StreamOps StreamOps;
+
+struct AVClass {
+    const char *class_name;
+};
+
+struct StreamOps {
+    const AVClass *priv_class;
+};
+
+static const AVClass curl_avio_class = {
+    .class_name = "stream",
+};
+
+static const StreamOps stream_ops = {
+    .priv_class = &curl_avio_class,
+};
+"#,
+        )
+        .build();
+
+    let line = "    .priv_class = &curl_avio_class,";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.c","line":18,"column":{}}}]}}"#,
+            column_of(line, "curl_avio_class")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "app.c", "{value}");
+    assert_eq!(result["definitions"][0]["start_line"], 13, "{value}");
+}
+
+#[test]
 fn cpp_out_of_line_definition_name_is_not_reference() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(

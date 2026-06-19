@@ -1432,6 +1432,17 @@ fn resolve_cpp(
             if !candidates.is_empty() {
                 return candidates_outcome(candidates);
             }
+            let candidates = cpp_visible_name_candidates(
+                ctx.visibility,
+                ctx.file,
+                ctx.support,
+                text,
+                Some(CppTargetKind::GlobalField),
+                cpp_lexical_namespace(identifier, ctx.source).as_deref(),
+            );
+            if !candidates.is_empty() {
+                return candidates_outcome(candidates);
+            }
             no_definition(
                 "no_indexed_definition",
                 format!("`{text}` did not resolve to an indexed C++ definition"),
@@ -2222,11 +2233,13 @@ fn cpp_local_bindings_before(
     visibility: &CppVisibilityIndex,
     file: &ProjectFile,
     source: &str,
-    root: Node<'_>,
+    _root: Node<'_>,
     node: Node<'_>,
     cutoff_start: usize,
 ) -> LocalInferenceEngine<CodeUnit> {
-    let local_root = cpp_enclosing_local_scope(node).unwrap_or(root);
+    let Some(local_root) = cpp_enclosing_local_scope(node) else {
+        return LocalInferenceEngine::new(LocalInferenceConfig::default());
+    };
     cpp_bindings_before(visibility, file, source, local_root, cutoff_start)
 }
 
