@@ -330,7 +330,7 @@ class DefinitionLookupResult:
     query: dict
     status: str
     reference: DefinitionReferenceSite | None
-    definition: DefinitionCandidate | None
+    definitions: list[DefinitionCandidate]
     diagnostics: list[DefinitionDiagnostic]
 
     @classmethod
@@ -343,11 +343,10 @@ class DefinitionLookupResult:
                 if data.get("reference") is not None
                 else None
             ),
-            definition=(
-                DefinitionCandidate.from_dict(data["definition"])
-                if data.get("definition") is not None
-                else None
-            ),
+            definitions=[
+                DefinitionCandidate.from_dict(item)
+                for item in data.get("definitions", [])
+            ],
             diagnostics=[
                 DefinitionDiagnostic.from_dict(item)
                 for item in data.get("diagnostics", [])
@@ -358,8 +357,7 @@ class DefinitionLookupResult:
         lines = [f"status: {self.status}"]
         if self.reference is not None:
             lines.append(f"reference: {self.reference.path} -> {self.reference.target}")
-        if self.definition is not None:
-            lines.append(self.definition.render_text())
+        lines.extend(definition.render_text() for definition in self.definitions)
         lines.extend(diagnostic.render_text() for diagnostic in self.diagnostics)
         return "\n".join(lines)
 
@@ -368,7 +366,7 @@ class DefinitionLookupResult:
 class DefinitionByReferenceLookupResult:
     query: dict
     status: str
-    definition: DefinitionCandidate | None
+    definitions: list[DefinitionCandidate]
     diagnostics: list[DefinitionDiagnostic]
 
     @classmethod
@@ -376,11 +374,10 @@ class DefinitionByReferenceLookupResult:
         return cls(
             query=dict(data["query"]),
             status=data["status"],
-            definition=(
-                DefinitionCandidate.from_dict(data["definition"])
-                if data.get("definition") is not None
-                else None
-            ),
+            definitions=[
+                DefinitionCandidate.from_dict(item)
+                for item in data.get("definitions", [])
+            ],
             diagnostics=[
                 DefinitionDiagnostic.from_dict(item)
                 for item in data.get("diagnostics", [])
@@ -389,8 +386,7 @@ class DefinitionByReferenceLookupResult:
 
     def render_text(self) -> str:
         lines = [f"status: {self.status}"]
-        if self.definition is not None:
-            lines.append(self.definition.render_text())
+        lines.extend(definition.render_text() for definition in self.definitions)
         lines.extend(diagnostic.render_text() for diagnostic in self.diagnostics)
         return "\n".join(lines)
 
