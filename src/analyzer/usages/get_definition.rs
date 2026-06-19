@@ -2922,7 +2922,7 @@ fn cpp_unit_matches_kind(
     kind: CppTargetKind,
 ) -> bool {
     match kind {
-        CppTargetKind::FreeFunction => unit.is_function(),
+        CppTargetKind::FreeFunction => unit.is_function() && !cpp_parent_is_class(support, unit),
         CppTargetKind::Type => unit.is_class() || cpp_unit_is_type_alias(unit),
         CppTargetKind::GlobalField => {
             unit.is_field() && cpp_is_unqualified_field(analyzer, support, unit)
@@ -2930,6 +2930,17 @@ fn cpp_unit_matches_kind(
         CppTargetKind::MemberField => unit.is_field(),
         CppTargetKind::Constructor | CppTargetKind::Method => true,
     }
+}
+
+fn cpp_parent_is_class(support: &DefinitionLookupIndex, unit: &CodeUnit) -> bool {
+    let fqn = unit.fq_name();
+    let Some((parent_fqn, _)) = fqn.rsplit_once('.') else {
+        return false;
+    };
+    support
+        .fqn(parent_fqn)
+        .into_iter()
+        .any(|parent| parent.is_class())
 }
 
 fn cpp_is_unqualified_field(
@@ -2969,9 +2980,10 @@ fn cpp_member_candidates(
     arity: Option<usize>,
     arg_types: Option<&[Option<CppType>]>,
 ) -> Vec<CodeUnit> {
-    let mut candidates = Vec::new();
-    for owner in owners {
-        candidates.extend(ctx.support.fqn(&format!("{}.{}", owner.fq_name(), member)));
+    let mut candidates = cpp_direct_member_candidates(ctx.support, &owners, member);
+    if candidates.is_empty() {
+        let mut seen = HashSet::default();
+        candidates = cpp_inherited_member_candidates(ctx, &owners, member, &mut seen);
     }
     candidates = cpp_filter_candidates_by_call(
         candidates,
@@ -2984,6 +2996,47 @@ fn cpp_member_candidates(
     sort_units(&mut candidates);
     candidates.dedup();
     candidates
+}
+
+fn cpp_direct_member_candidates(
+    support: &DefinitionLookupIndex,
+    owners: &[CodeUnit],
+    member: &str,
+) -> Vec<CodeUnit> {
+    let mut candidates = Vec::new();
+    for owner in owners {
+        candidates.extend(support.fqn(&format!("{}.{}", owner.fq_name(), member)));
+    }
+    sort_units(&mut candidates);
+    candidates.dedup();
+    candidates
+}
+
+fn cpp_inherited_member_candidates(
+    ctx: CppLookupCtx<'_, '_>,
+    owners: &[CodeUnit],
+    member: &str,
+    seen: &mut HashSet<String>,
+) -> Vec<CodeUnit> {
+    let mut bases = Vec::new();
+    for owner in owners {
+        for base in cpp_direct_base_types(ctx.analyzer, ctx.visibility, ctx.file, owner) {
+            if seen.insert(base.fq_name()) {
+                bases.push(base);
+            }
+        }
+    }
+    if bases.is_empty() {
+        return Vec::new();
+    }
+    let direct = cpp_direct_member_candidates(ctx.support, &bases, member);
+    if !direct.is_empty() {
+        return direct;
+    }
+    let mut inherited = cpp_inherited_member_candidates(ctx, &bases, member, seen);
+    sort_units(&mut inherited);
+    inherited.dedup();
+    inherited
 }
 
 fn cpp_filter_candidates_by_call(

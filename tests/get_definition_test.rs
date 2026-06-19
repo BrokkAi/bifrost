@@ -3897,6 +3897,75 @@ void Parser::run() {
 }
 
 #[test]
+fn cpp_bare_member_field_resolves_from_base_class() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "app.cpp",
+            r#"
+class Base {
+protected:
+    int fp_;
+};
+class Parser : public Base {
+    void run() {
+        if (!fp_) {}
+    }
+};
+"#,
+        )
+        .build();
+
+    let line = "        if (!fp_) {}";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.cpp","line":8,"column":{}}}]}}"#,
+            column_of(line, "fp_")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "Base.fp_", "{value}");
+}
+
+#[test]
+fn cpp_bare_member_call_prefers_current_class_override() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "app.cpp",
+            r#"
+class Base {
+public:
+    virtual void close(bool send = true) = 0;
+};
+class Parser : public Base {
+public:
+    void close(bool send = true) override;
+    void run() {
+        close(false);
+    }
+};
+void Parser::close(bool send) {}
+"#,
+        )
+        .build();
+
+    let line = "        close(false);";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.cpp","line":10,"column":{}}}]}}"#,
+            column_of(line, "close")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "Parser.close", "{value}");
+}
+
+#[test]
 fn cpp_bare_identifier_does_not_resolve_unrelated_member_field() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(
