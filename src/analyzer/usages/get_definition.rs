@@ -7652,7 +7652,7 @@ fn resolve_java_method_invocation(
 
     if let Some(object) = node.child_by_field_name("object") {
         if let Some(owner) = java_receiver_type(analyzer, file, source, root, object) {
-            return java_member_candidates(analyzer, support, &owner.fq_name(), name);
+            return java_member_candidates(analyzer, support, &owner.fq_name(), name, true);
         }
         return no_definition(
             "unsupported_java_receiver",
@@ -7667,7 +7667,7 @@ fn resolve_java_method_invocation(
 
     let class_ranges = ClassRangeIndex::build(analyzer, file);
     if let Some(owner_fqn) = class_ranges.enclosing(name_node.start_byte()) {
-        return java_member_candidates(analyzer, support, owner_fqn, name);
+        return java_member_candidates(analyzer, support, owner_fqn, name, true);
     }
 
     no_definition(
@@ -7718,7 +7718,7 @@ fn resolve_java_method_reference(
             )
         });
     if let Some(owner) = owner {
-        return java_member_candidates(analyzer, support, &owner.fq_name(), member);
+        return java_member_candidates(analyzer, support, &owner.fq_name(), member, true);
     }
 
     no_definition(
@@ -7764,7 +7764,7 @@ fn resolve_java_field_access(
         return no_definition("no_field_receiver", "Java field access has no receiver");
     };
     if let Some(owner) = java_receiver_type(analyzer, file, source, root, object) {
-        return java_member_candidates(analyzer, support, &owner.fq_name(), field);
+        return java_member_candidates(analyzer, support, &owner.fq_name(), field, false);
     }
     no_definition(
         "unsupported_java_receiver",
@@ -8505,6 +8505,7 @@ fn java_member_candidates(
     support: &DefinitionLookupIndex,
     owner_fqn: &str,
     member: &str,
+    allow_generated_accessors: bool,
 ) -> DefinitionLookupOutcome {
     let mut candidates = support.fqn(&format!("{owner_fqn}.{member}"));
     sort_units(&mut candidates);
@@ -8513,7 +8514,16 @@ fn java_member_candidates(
         return candidates_outcome(candidates);
     }
 
-    if let Some(owner) = analyzer.definitions(owner_fqn).next().cloned()
+    let owner = analyzer.definitions(owner_fqn).next().cloned();
+    if allow_generated_accessors && let Some(owner) = owner.as_ref() {
+        let generated_accessor_candidates =
+            java_lombok_accessor_field_candidates(analyzer, support, owner, member);
+        if !generated_accessor_candidates.is_empty() {
+            return candidates_outcome(generated_accessor_candidates);
+        }
+    }
+
+    if let Some(owner) = owner
         && let Some(provider) = analyzer.type_hierarchy_provider()
     {
         let mut seen = HashSet::default();
@@ -8541,6 +8551,176 @@ fn java_member_candidates(
         "no_indexed_definition",
         format!("`{owner_fqn}.{member}` is not indexed as a Java definition"),
     )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JavaAccessorKind {
+    Getter,
+    Setter,
+}
+
+fn java_lombok_accessor_field_candidates(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    owner: &CodeUnit,
+    member: &str,
+) -> Vec<CodeUnit> {
+    let Some((kind, field_name)) = java_accessor_property_name(member) else {
+        return Vec::new();
+    };
+    let mut fields: Vec<_> = support
+        .fqn(&format!("{}.{}", owner.fq_name(), field_name))
+        .into_iter()
+        .filter(CodeUnit::is_field)
+        .collect();
+    sort_units(&mut fields);
+    fields.dedup();
+    if fields.is_empty() {
+        return Vec::new();
+    }
+
+    let owner_has_accessor_annotation = analyzer
+        .get_source(owner, false)
+        .is_some_and(|source| java_class_source_has_lombok_accessor_annotation(&source, kind));
+    if owner_has_accessor_annotation {
+        return fields;
+    }
+
+    fields
+        .into_iter()
+        .filter(|field| {
+            analyzer.get_source(field, false).is_some_and(|source| {
+                java_field_source_has_lombok_accessor_annotation(&source, kind)
+            })
+        })
+        .collect()
+}
+
+fn java_accessor_property_name(member: &str) -> Option<(JavaAccessorKind, String)> {
+    let (kind, suffix) = if let Some(suffix) = member.strip_prefix("get") {
+        (JavaAccessorKind::Getter, suffix)
+    } else if let Some(suffix) = member.strip_prefix("is") {
+        (JavaAccessorKind::Getter, suffix)
+    } else if let Some(suffix) = member.strip_prefix("set") {
+        (JavaAccessorKind::Setter, suffix)
+    } else {
+        return None;
+    };
+    if suffix.is_empty()
+        || !suffix
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_uppercase())
+    {
+        return None;
+    }
+    Some((kind, java_bean_decapitalize(suffix)))
+}
+
+fn java_bean_decapitalize(name: &str) -> String {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    if first.is_ascii_uppercase()
+        && chars
+            .clone()
+            .next()
+            .is_some_and(|second| second.is_ascii_uppercase())
+    {
+        return name.to_string();
+    }
+    let mut out = String::with_capacity(name.len());
+    out.push(first.to_ascii_lowercase());
+    out.extend(chars);
+    out
+}
+
+fn java_class_source_has_lombok_accessor_annotation(source: &str, kind: JavaAccessorKind) -> bool {
+    java_source_declaration_has_lombok_accessor_annotation(
+        source,
+        &[
+            "class_declaration",
+            "record_declaration",
+            "enum_declaration",
+            "interface_declaration",
+        ],
+        kind,
+    )
+}
+
+fn java_field_source_has_lombok_accessor_annotation(source: &str, kind: JavaAccessorKind) -> bool {
+    if java_source_declaration_has_lombok_accessor_annotation(source, &["field_declaration"], kind)
+    {
+        return true;
+    }
+    let wrapped = format!("class __BifrostLombokAccessor {{\n{source}\n}}");
+    java_source_declaration_has_lombok_accessor_annotation(&wrapped, &["field_declaration"], kind)
+}
+
+fn java_source_declaration_has_lombok_accessor_annotation(
+    source: &str,
+    declaration_kinds: &[&str],
+    kind: JavaAccessorKind,
+) -> bool {
+    let Some(tree) = parse_java_tree(source) else {
+        return false;
+    };
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if declaration_kinds.contains(&node.kind())
+            && java_modifiers_have_lombok_accessor_annotation(node, source, kind)
+        {
+            return true;
+        }
+        let mut cursor = node.walk();
+        let mut children: Vec<_> = node.named_children(&mut cursor).collect();
+        children.reverse();
+        stack.extend(children);
+    }
+    false
+}
+
+fn java_modifiers_have_lombok_accessor_annotation(
+    declaration: Node<'_>,
+    source: &str,
+    kind: JavaAccessorKind,
+) -> bool {
+    let Some(modifiers) = java_named_child_by_kind(declaration, "modifiers") else {
+        return false;
+    };
+    let mut cursor = modifiers.walk();
+    modifiers
+        .named_children(&mut cursor)
+        .filter(|child| matches!(child.kind(), "annotation" | "marker_annotation"))
+        .filter_map(|annotation| java_annotation_short_name(annotation, source))
+        .any(|name| java_lombok_annotation_generates_accessor(&name, kind))
+}
+
+fn java_named_child_by_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| child.kind() == kind)
+}
+
+fn java_annotation_short_name(annotation: Node<'_>, source: &str) -> Option<String> {
+    let raw = if let Some(name_node) = annotation.child_by_field_name("name") {
+        java_node_text(name_node, source)
+    } else {
+        java_node_text(annotation, source)
+    };
+    let trimmed = raw.trim().trim_start_matches('@');
+    let short = trimmed.rsplit('.').next().unwrap_or(trimmed).trim();
+    (!short.is_empty()).then(|| short.to_string())
+}
+
+fn java_lombok_annotation_generates_accessor(name: &str, kind: JavaAccessorKind) -> bool {
+    match name {
+        "Data" | "Value" => kind == JavaAccessorKind::Getter,
+        "Getter" => kind == JavaAccessorKind::Getter,
+        "Setter" => kind == JavaAccessorKind::Setter,
+        _ => false,
+    }
 }
 
 fn java_static_import_candidates(

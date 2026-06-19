@@ -2884,6 +2884,135 @@ public class UseTarget {
 }
 
 #[test]
+fn java_lombok_data_getter_resolves_to_backing_field() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "app/Person.java",
+            r#"
+package app;
+
+import lombok.Data;
+
+@Data
+public class Person {
+    private final String name;
+}
+"#,
+        )
+        .file(
+            "app/UsePerson.java",
+            r#"
+package app;
+
+public class UsePerson {
+    String run(Person person) {
+        return person.getName();
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        return person.getName();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/UsePerson.java","line":6,"column":{}}}]}}"#,
+            column_of(line, "getName")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Person.name",
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["kind"], "field", "{value}");
+}
+
+#[test]
+fn java_missing_getter_without_lombok_does_not_guess_field() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "app/Person.java",
+            r#"
+package app;
+
+public class Person {
+    private final String name;
+}
+"#,
+        )
+        .file(
+            "app/UsePerson.java",
+            r#"
+package app;
+
+public class UsePerson {
+    String run(Person person) {
+        return person.getName();
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        return person.getName();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/UsePerson.java","line":6,"column":{}}}]}}"#,
+            column_of(line, "getName")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn java_lombok_accessor_name_field_access_does_not_resolve_backing_field() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "app/Person.java",
+            r#"
+package app;
+
+import lombok.Data;
+
+@Data
+public class Person {
+    private final String name;
+}
+"#,
+        )
+        .file(
+            "app/UsePerson.java",
+            r#"
+package app;
+
+public class UsePerson {
+    Object run(Person person) {
+        return person.getName;
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        return person.getName;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/UsePerson.java","line":6,"column":{}}}]}}"#,
+            column_of(line, "getName")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
 fn java_lambda_parameter_field_resolves_from_collection_chain() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(
