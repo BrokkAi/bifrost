@@ -1171,6 +1171,96 @@ fn php_parent_static_call_resolves_to_parent_definition() {
 }
 
 #[test]
+fn php_parent_constructor_resolves_to_nearest_inherited_definition() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "src/GrandBase.php",
+            "<?php\nnamespace App;\nclass GrandBase {\n    public function __construct() {}\n}\n",
+        )
+        .file(
+            "src/BaseController.php",
+            "<?php\nnamespace App;\nclass BaseController extends GrandBase {}\n",
+        )
+        .file(
+            "src/ChildController.php",
+            "<?php\nnamespace App;\nclass ChildController extends BaseController {\n    public function call(): void {\n        parent::__construct();\n    }\n}\n",
+        )
+        .build();
+
+    let line = "        parent::__construct();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/ChildController.php","line":5,"column":{}}}]}}"#,
+            column_of(line, "__construct")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definition"]["fqn"], "App.GrandBase.__construct",
+        "{value}"
+    );
+}
+
+#[test]
+fn php_inherited_member_resolves_parent_with_multiline_extends() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "src/BaseController.php",
+            "<?php\nnamespace App;\nclass BaseController {\n    public function run(): void {}\n}\n",
+        )
+        .file(
+            "src/ChildController.php",
+            "<?php\nnamespace App;\nclass ChildController extends\n    BaseController {\n    public function call(): void {\n        parent::run();\n    }\n}\n",
+        )
+        .build();
+
+    let line = "        parent::run();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/ChildController.php","line":6,"column":{}}}]}}"#,
+            column_of(line, "run")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definition"]["fqn"], "App.BaseController.run",
+        "{value}"
+    );
+}
+
+#[test]
+fn php_self_class_constant_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "src/SchemaTool.php",
+            "<?php\nnamespace App;\nclass SchemaTool {\n    private const KNOWN_COLUMN_OPTIONS = [];\n    public function gather(): void {\n        $options = self::KNOWN_COLUMN_OPTIONS;\n    }\n}\n",
+        )
+        .build();
+
+    let line = "        $options = self::KNOWN_COLUMN_OPTIONS;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/SchemaTool.php","line":6,"column":{}}}]}}"#,
+            column_of(line, "KNOWN_COLUMN_OPTIONS")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definition"]["fqn"], "App.SchemaTool.KNOWN_COLUMN_OPTIONS",
+        "{value}"
+    );
+}
+
+#[test]
 fn php_prefix_only_external_import_reports_boundary() {
     let project = InlineTestProject::with_language(Language::Php)
         .file(

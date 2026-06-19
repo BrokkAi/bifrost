@@ -3611,14 +3611,14 @@ fn resolve_php(
         Some(PhpReferenceNode::StaticMember { scope, name }) => {
             let member = php_node_text(name, source).trim_start_matches('$');
             let owner = php_static_scope_fqn(php, support, scope, source, &ctx, &class_ranges);
-            php_member_outcome(support, owner, member)
+            php_member_outcome(php, analyzer, support, owner, member)
         }
         Some(PhpReferenceNode::InstanceMember { object, name }) => {
             let member = php_node_text(name, source).trim_start_matches('$');
             let bindings =
                 php_bindings_before(php, file, source, root, site.range.start_byte, &ctx);
             let owner = php_instance_receiver_fqn(object, source, &class_ranges, &bindings);
-            php_member_outcome(support, owner, member)
+            php_member_outcome(php, analyzer, support, owner, member)
         }
         None => no_definition(
             "unsupported_php_reference_shape",
@@ -4636,6 +4636,8 @@ fn php_fqn_outcome(
 }
 
 fn php_member_outcome(
+    php: &PhpAnalyzer,
+    analyzer: &dyn IAnalyzer,
     support: &DefinitionLookupIndex,
     owner: Option<String>,
     member: &str,
@@ -4651,6 +4653,10 @@ fn php_member_outcome(
     if !candidates.is_empty() {
         return candidates_outcome(candidates);
     }
+    let inherited = php_inherited_member_candidates(php, analyzer, support, &owner, member);
+    if !inherited.is_empty() {
+        return candidates_outcome(inherited);
+    }
     if php_crosses_unindexed_boundary(support, &owner) {
         return boundary(format!(
             "`{member}` appears to cross a PHP boundary at `{owner}` not indexed in this workspace"
@@ -4660,6 +4666,48 @@ fn php_member_outcome(
         "no_indexed_definition",
         format!("`{fqn}` is not indexed as a PHP definition"),
     )
+}
+
+fn php_inherited_member_candidates(
+    php: &PhpAnalyzer,
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    owner_fqn: &str,
+    member: &str,
+) -> Vec<CodeUnit> {
+    let mut seen = HashSet::default();
+    let mut level = php_direct_parent_fqns(php, analyzer, support, owner_fqn);
+    seen.insert(owner_fqn.to_string());
+    while !level.is_empty() {
+        let mut level_candidates = Vec::new();
+        let mut next_level = Vec::new();
+        for ancestor in level {
+            if !seen.insert(ancestor.clone()) {
+                continue;
+            }
+            level_candidates.extend(support.fqn(&format!("{ancestor}.{member}")));
+            next_level.extend(php_direct_parent_fqns(php, analyzer, support, &ancestor));
+        }
+        sort_units(&mut level_candidates);
+        level_candidates.dedup();
+        if !level_candidates.is_empty() {
+            return level_candidates;
+        }
+        level = next_level;
+    }
+    Vec::new()
+}
+
+fn php_direct_parent_fqns(
+    php: &PhpAnalyzer,
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    owner_fqn: &str,
+) -> Vec<String> {
+    php_parent_fqn(php, support, owner_fqn)
+        .into_iter()
+        .filter(|parent| analyzer.definitions(parent).next().is_some())
+        .collect()
 }
 
 fn php_crosses_unindexed_boundary(support: &DefinitionLookupIndex, fqn: &str) -> bool {
