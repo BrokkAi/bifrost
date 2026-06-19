@@ -249,7 +249,7 @@ fn resolve_one(
             language,
             &source,
             tree.as_ref(),
-            &site.text,
+            &site,
         ),
         Language::Go => {
             let go = resolve_analyzer::<GoAnalyzer>(analyzer);
@@ -705,11 +705,13 @@ fn resolve_js_ts(
     language: Language,
     source: &str,
     tree: Option<&Tree>,
-    reference: &str,
+    site: &ResolvedReferenceSite,
 ) -> DefinitionLookupOutcome {
     let Some(tree) = tree else {
         return no_definition("jsts_parse_failed", "JS/TS source could not be parsed");
     };
+    let reference = site.text.as_str();
+    let value_position = jsts_reference_is_value_position(tree, site);
     let imports = compute_jsts_import_binder(source, tree);
     let aliases = AliasResolver::new(analyzer.project().root().to_path_buf());
 
@@ -728,6 +730,7 @@ fn resolve_js_ts(
                 analyzer,
                 support,
                 Some(&aliases),
+                value_position,
             );
         }
         return no_definition(
@@ -751,11 +754,17 @@ fn resolve_js_ts(
                 analyzer,
                 support,
                 Some(&aliases),
+                value_position,
             );
         }
     }
 
-    let same_file = support.file_identifier(file, reference);
+    let mut same_file = support.file_identifier(file, reference);
+    if value_position {
+        same_file = jsts_value_space_candidates(analyzer, same_file);
+    } else {
+        same_file = jsts_type_space_candidates(analyzer, same_file);
+    }
     if !same_file.is_empty() {
         return candidates_outcome(same_file);
     }
@@ -774,6 +783,7 @@ fn resolve_js_ts_module_binding(
     analyzer: &dyn IAnalyzer,
     support: &DefinitionLookupIndex,
     aliases: Option<&AliasResolver>,
+    value_position: bool,
 ) -> DefinitionLookupOutcome {
     let files = crate::analyzer::resolve_js_ts_module_specifier(file, module, language, aliases);
     if files.is_empty() {
@@ -788,6 +798,11 @@ fn resolve_js_ts_module_binding(
     }
 
     let mut candidates = support.file_identifier_in_files(&files, exported_name);
+    if value_position {
+        candidates = jsts_value_space_candidates(analyzer, candidates);
+    } else {
+        candidates = jsts_type_space_candidates(analyzer, candidates);
+    }
     if candidates.is_empty() && exported_name == "default" {
         for file in &files {
             candidates.extend(
@@ -799,6 +814,11 @@ fn resolve_js_ts_module_binding(
         }
         sort_units(&mut candidates);
         candidates.dedup();
+        if value_position {
+            candidates = jsts_value_space_candidates(analyzer, candidates);
+        } else {
+            candidates = jsts_type_space_candidates(analyzer, candidates);
+        }
     }
     if candidates.is_empty() {
         return no_definition(
@@ -807,6 +827,110 @@ fn resolve_js_ts_module_binding(
         );
     }
     candidates_outcome(candidates)
+}
+
+fn jsts_reference_is_value_position(tree: &Tree, site: &ResolvedReferenceSite) -> bool {
+    let Some(node) = smallest_named_node_covering(
+        tree.root_node(),
+        site.focus_start_byte,
+        site.focus_end_byte,
+    ) else {
+        return true;
+    };
+    !jsts_reference_is_type_position(node)
+}
+
+fn jsts_reference_is_type_position(mut node: Node<'_>) -> bool {
+    loop {
+        match node.kind() {
+            "type_identifier"
+            | "predefined_type"
+            | "type_annotation"
+            | "type_arguments"
+            | "type_parameters"
+            | "generic_type"
+            | "union_type"
+            | "intersection_type"
+            | "interface_declaration"
+            | "type_alias_declaration"
+            | "extends_type_clause"
+            | "implements_clause"
+            | "constraint" => return true,
+            "call_expression"
+            | "arguments"
+            | "member_expression"
+            | "subscript_expression"
+            | "binary_expression"
+            | "unary_expression"
+            | "return_statement"
+            | "expression_statement"
+            | "variable_declarator"
+            | "assignment_expression" => return false,
+            _ => {}
+        }
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        node = parent;
+    }
+}
+
+fn jsts_value_space_candidates(
+    analyzer: &dyn IAnalyzer,
+    candidates: Vec<CodeUnit>,
+) -> Vec<CodeUnit> {
+    let value_candidates: Vec<_> = candidates
+        .iter()
+        .filter(|candidate| !jsts_unit_is_type_only(analyzer, candidate))
+        .cloned()
+        .collect();
+    if value_candidates.is_empty() {
+        candidates
+    } else {
+        value_candidates
+    }
+}
+
+fn jsts_type_space_candidates(
+    analyzer: &dyn IAnalyzer,
+    candidates: Vec<CodeUnit>,
+) -> Vec<CodeUnit> {
+    let type_candidates: Vec<_> = candidates
+        .iter()
+        .filter(|candidate| jsts_unit_is_type_only(analyzer, candidate))
+        .cloned()
+        .collect();
+    if type_candidates.is_empty() {
+        candidates
+    } else {
+        type_candidates
+    }
+}
+
+fn jsts_unit_is_type_only(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> bool {
+    if analyzer
+        .type_alias_provider()
+        .is_some_and(|provider| provider.is_type_alias(unit))
+    {
+        return true;
+    }
+    unit.signature().is_some_and(jsts_signature_is_type_only)
+        || analyzer
+            .signatures(unit)
+            .iter()
+            .any(|signature| jsts_signature_is_type_only(signature))
+}
+
+fn jsts_signature_is_type_only(signature: &str) -> bool {
+    let signature = signature.trim_start();
+    signature.starts_with("interface ")
+        || signature.starts_with("export interface ")
+        || signature.starts_with("declare interface ")
+        || signature.starts_with("export declare interface ")
+        || signature.starts_with("type ")
+        || signature.starts_with("export type ")
+        || signature.starts_with("declare type ")
+        || signature.starts_with("export declare type ")
 }
 
 fn is_bare_js_ts_specifier(module: &str) -> bool {

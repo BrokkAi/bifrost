@@ -526,6 +526,74 @@ export function run() {
 }
 
 #[test]
+fn typescript_value_reference_prefers_const_over_same_named_interface() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "app.ts",
+            r#"
+export interface Widget {
+  value: string;
+}
+export const Widget = makeWidget();
+
+export function run() {
+  consume(Widget);
+}
+"#,
+        )
+        .build();
+
+    let line = "  consume(Widget);";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.ts","line":8,"column":{}}}]}}"#,
+            column_of(line, "Widget")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"].as_array().unwrap().len(), 1, "{value}");
+    assert_eq!(result["definitions"][0]["kind"], "field", "{value}");
+    assert_eq!(result["definitions"][0]["start_line"], 5, "{value}");
+}
+
+#[test]
+fn typescript_type_reference_prefers_interface_over_same_named_const() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "app.ts",
+            r#"
+export interface Widget {
+  value: string;
+}
+export const Widget = makeWidget();
+
+export function run(value: Widget) {
+  return value;
+}
+"#,
+        )
+        .build();
+
+    let line = "export function run(value: Widget) {";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.ts","line":7,"column":{}}}]}}"#,
+            column_of(line, "Widget")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"].as_array().unwrap().len(), 1, "{value}");
+    assert_eq!(result["definitions"][0]["kind"], "class", "{value}");
+    assert_eq!(result["definitions"][0]["start_line"], 2, "{value}");
+}
+
+#[test]
 fn typescript_path_alias_import_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file(
