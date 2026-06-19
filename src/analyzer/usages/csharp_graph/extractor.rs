@@ -247,6 +247,8 @@ pub(in crate::analyzer::usages) fn is_declaration_name(node: Node<'_>) -> bool {
         "class_declaration"
             | "interface_declaration"
             | "struct_declaration"
+            | "enum_declaration"
+            | "enum_member_declaration"
             | "record_declaration"
             | "record_struct_declaration"
             | "method_declaration"

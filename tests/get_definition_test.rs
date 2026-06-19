@@ -3010,6 +3010,144 @@ fn csharp_typed_receiver_method_resolves_to_definition() {
 }
 
 #[test]
+fn csharp_visible_enum_member_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Lib/Modes.cs",
+            "namespace Lib { public enum Mode { Read, Write } }\n",
+        )
+        .file(
+            "App/Controller.cs",
+            "using Lib;\nnamespace App { public class Controller { public void Handle() { var mode = Mode.Read; } } }\n",
+        )
+        .build();
+
+    let line = "namespace App { public class Controller { public void Handle() { var mode = Mode.Read; } } }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"App/Controller.cs","line":2,"column":{}}}]}}"#,
+            column_of(line, "Read")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "Lib.Mode.Read", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "Lib/Modes.cs", "{value}");
+}
+
+#[test]
+fn csharp_visible_enum_receiver_type_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Lib/Modes.cs",
+            "namespace Lib { public enum Mode { Read, Write } }\n",
+        )
+        .file(
+            "App/Controller.cs",
+            "using Lib;\nnamespace App { public class Controller { public void Handle() { var mode = Mode.Read; } } }\n",
+        )
+        .build();
+
+    let line = "namespace App { public class Controller { public void Handle() { var mode = Mode.Read; } } }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"App/Controller.cs","line":2,"column":{}}}]}}"#,
+            column_of(line, "Mode")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "Lib.Mode", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "Lib/Modes.cs", "{value}");
+}
+
+#[test]
+fn csharp_enum_declaration_name_returns_no_definition() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Lib/Modes.cs",
+            "namespace Lib { public enum Mode { Read, Write } }\n",
+        )
+        .build();
+
+    let line = "namespace Lib { public enum Mode { Read, Write } }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"Lib/Modes.cs","line":1,"column":{}}},{{"path":"Lib/Modes.cs","line":1,"column":{}}}]}}"#,
+            column_of(line, "Mode"),
+            column_of(line, "Read")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    assert_eq!(value["results"][1]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn csharp_same_namespace_static_property_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "App/App.cs",
+            "namespace App { public partial class App { public static ResourceDictionary ResourceDictionary { get; private set; } } public class ResourceDictionary {} }\n",
+        )
+        .file(
+            "App/Bootstrapper.cs",
+            "namespace App { public class Bootstrapper { public void Start() { var value = App.ResourceDictionary; } } }\n",
+        )
+        .build();
+
+    let line = "namespace App { public class Bootstrapper { public void Start() { var value = App.ResourceDictionary; } } }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"App/Bootstrapper.cs","line":1,"column":{}}}]}}"#,
+            column_of(line, "ResourceDictionary")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "App.App.ResourceDictionary",
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["path"], "App/App.cs", "{value}");
+}
+
+#[test]
+fn csharp_same_namespace_static_receiver_type_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "App/App.cs",
+            "namespace App { public partial class App { public static ResourceDictionary ResourceDictionary { get; private set; } } public class ResourceDictionary {} }\n",
+        )
+        .file(
+            "App/Bootstrapper.cs",
+            "namespace App { public class Bootstrapper { public void Start() { var value = App.ResourceDictionary; } } }\n",
+        )
+        .build();
+
+    let line = "namespace App { public class Bootstrapper { public void Start() { var value = App.ResourceDictionary; } } }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"App/Bootstrapper.cs","line":1,"column":{}}}]}}"#,
+            column_of(line, "App.ResourceDictionary")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "App.App", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "App/App.cs", "{value}");
+}
+
+#[test]
 fn csharp_instance_member_receiver_resolves_from_enclosing_property_type() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(

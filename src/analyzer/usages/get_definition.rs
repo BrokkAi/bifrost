@@ -7084,6 +7084,19 @@ fn resolve_csharp(
                 let reference = csharp_reference_type_text(identifier, source);
                 return csharp_type_outcome(csharp, support, file, &reference);
             }
+            let bindings = csharp_bindings_before_scoped(
+                csharp,
+                file,
+                source,
+                tree.root_node(),
+                identifier.start_byte(),
+            );
+            if !bindings.is_shadowed(text) {
+                let outcome = csharp_type_outcome(csharp, support, file, text);
+                if outcome.status != DefinitionLookupStatus::NoDefinition {
+                    return outcome;
+                }
+            }
             no_definition(
                 "no_indexed_definition",
                 format!("`{text}` did not resolve to an indexed C# definition"),

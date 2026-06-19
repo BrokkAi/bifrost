@@ -88,12 +88,14 @@ impl<'a> CSharpVisitor<'a> {
             "class_declaration"
             | "interface_declaration"
             | "struct_declaration"
+            | "enum_declaration"
             | "record_declaration"
             | "record_struct_declaration" => self.visit_type_declaration(node, scope, stack),
             "method_declaration" => self.visit_method(node, scope),
             "constructor_declaration" => self.visit_constructor(node, scope),
             "property_declaration" => self.visit_property(node, scope),
             "field_declaration" => self.visit_field_declaration(node, scope),
+            "enum_member_declaration" => self.visit_enum_member(node, scope),
             "using_directive" => self.visit_using_directive(node),
             _ => {}
         }
@@ -332,6 +334,36 @@ impl<'a> CSharpVisitor<'a> {
             );
         }
     }
+
+    fn visit_enum_member(&mut self, node: Node<'_>, scope: &CSharpScope) {
+        let Some(parent) = &scope.class_unit else {
+            return;
+        };
+        let Some(name_node) = node.child_by_field_name("name") else {
+            return;
+        };
+        let name = cs_node_text(name_node, self.source).trim();
+        if name.is_empty() {
+            return;
+        }
+        let code_unit = CodeUnit::new(
+            self.file.clone(),
+            CodeUnitType::Field,
+            scope.package_name.clone(),
+            format!("{}.{}", parent.short_name(), name),
+        );
+        self.parsed.add_code_unit(
+            code_unit.clone(),
+            node,
+            self.source,
+            Some(parent.clone()),
+            None,
+        );
+        self.parsed.add_signature(
+            code_unit,
+            normalize_cs_whitespace(cs_node_text(node, self.source)),
+        );
+    }
 }
 
 fn collect_csharp_type_identifiers(
@@ -382,6 +414,7 @@ fn is_csharp_type_position_node(mut node: Node<'_>) -> bool {
             "class_declaration"
                 | "interface_declaration"
                 | "struct_declaration"
+                | "enum_declaration"
                 | "record_declaration"
                 | "record_struct_declaration"
         ) && !parent
