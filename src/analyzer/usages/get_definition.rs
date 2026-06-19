@@ -536,7 +536,7 @@ fn resolve_rust(
             .map(|fqn| support.fqn(fqn))
             .unwrap_or_default();
         if resolved.is_empty() {
-            let imported = rust_import_candidates(rust, support, file, source, reference);
+            let imported = rust_import_candidates(analyzer, rust, support, file, source, reference);
             resolved = if imported.is_empty() {
                 support.file_identifier(file, reference)
             } else {
@@ -566,6 +566,7 @@ fn resolve_rust(
 }
 
 fn rust_import_candidates(
+    analyzer: &dyn IAnalyzer,
     rust: &crate::analyzer::RustAnalyzer,
     support: &DefinitionLookupIndex,
     file: &ProjectFile,
@@ -573,7 +574,7 @@ fn rust_import_candidates(
     reference: &str,
 ) -> Vec<CodeUnit> {
     let statement_candidates =
-        rust_import_statement_candidates(rust, support, file, source, reference);
+        rust_import_statement_candidates(analyzer, rust, support, file, source, reference);
     if !statement_candidates.is_empty() {
         return statement_candidates;
     }
@@ -609,13 +610,21 @@ fn rust_import_candidates(
 }
 
 fn rust_import_statement_candidates(
+    analyzer: &dyn IAnalyzer,
     rust: &crate::analyzer::RustAnalyzer,
     support: &DefinitionLookupIndex,
     file: &ProjectFile,
     source: &str,
     reference: &str,
 ) -> Vec<CodeUnit> {
-    for raw in source.lines() {
+    let import_statements = analyzer.import_statements(file);
+    let flattened_imports: Vec<String> = import_statements
+        .iter()
+        .map(String::as_str)
+        .chain(rust_use_statements_from_source(source).iter().map(String::as_str))
+        .flat_map(crate::analyzer::rust::flatten_rust_use)
+        .collect();
+    for raw in flattened_imports {
         let mut path = raw.trim();
         path = path.strip_prefix("pub ").unwrap_or(path).trim();
         let Some(rest) = path.strip_prefix("use ") else {
@@ -648,6 +657,30 @@ fn rust_import_statement_candidates(
     Vec::new()
 }
 
+fn rust_use_statements_from_source(source: &str) -> Vec<String> {
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let mut collecting = false;
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if !collecting
+            && !(trimmed.starts_with("use ") || trimmed.starts_with("pub use "))
+        {
+            continue;
+        }
+        if collecting {
+            current.push(' ');
+        }
+        current.push_str(trimmed);
+        collecting = true;
+        if trimmed.ends_with(';') {
+            statements.push(std::mem::take(&mut current));
+            collecting = false;
+        }
+    }
+    statements
+}
+
 fn rust_module_files_from_path(file: &ProjectFile, module_specifier: &str) -> Vec<ProjectFile> {
     let Some(relative_module) = rust_relative_module_path(file, module_specifier) else {
         return Vec::new();
@@ -656,6 +689,8 @@ fn rust_module_files_from_path(file: &ProjectFile, module_specifier: &str) -> Ve
     for rel_path in [
         relative_module.with_extension("rs"),
         relative_module.join("mod.rs"),
+        PathBuf::from("src").join(&relative_module).with_extension("rs"),
+        PathBuf::from("src").join(&relative_module).join("mod.rs"),
     ] {
         let candidate = ProjectFile::new(file.root().to_path_buf(), rel_path);
         if candidate.exists() {
@@ -674,8 +709,28 @@ fn rust_relative_module_path(file: &ProjectFile, module_specifier: &str) -> Opti
             module_specifier
                 .strip_prefix("super::")
                 .map(|rest| file.parent().parent().unwrap_or(Path::new("")).join(rest))
+        })
+        .or_else(|| {
+            let (crate_name, rest) = module_specifier.split_once("::")?;
+            (Some(crate_name) == rust_current_crate_name(file).as_deref()).then(|| rest.into())
         })?;
     Some(module.to_string_lossy().replace("::", "/").into())
+}
+
+fn rust_current_crate_name(file: &ProjectFile) -> Option<String> {
+    let manifest = file.root().join("Cargo.toml");
+    let source = std::fs::read_to_string(manifest).ok()?;
+    source.lines().find_map(|line| {
+        let trimmed = line.trim();
+        let value = trimmed.strip_prefix("name")?.trim_start();
+        let value = value.strip_prefix('=')?.trim();
+        value
+            .trim_matches('"')
+            .split('"')
+            .next()
+            .filter(|name| !name.is_empty())
+            .map(|name| name.replace('-', "_"))
+    })
 }
 
 fn rust_reference_looks_external(reference: &str) -> bool {

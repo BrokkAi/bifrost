@@ -72,6 +72,40 @@ pub fn format_value() {}
 }
 
 #[test]
+fn rust_grouped_crate_import_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("Cargo.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+        .file("src/lib.rs", "pub mod env;\n")
+        .file("src/env.rs", "pub fn env_init() {}\n")
+        .file(
+            "src/bin/app.rs",
+            r#"
+use app::{
+    env::{env_init},
+};
+
+fn main() {
+    env_init();
+}
+"#,
+        )
+        .build();
+
+    let line = "    env_init();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/bin/app.rs","line":7,"column":{}}}]}}"#,
+            column_of(line, "env_init")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "src/env.rs", "{value}");
+}
+
+#[test]
 fn rust_reference_context_resolves_target_definition() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(

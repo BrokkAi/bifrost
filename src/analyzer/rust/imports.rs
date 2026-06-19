@@ -70,7 +70,7 @@ impl ImportAnalysisProvider for RustAnalyzer {
     }
 }
 
-pub(super) fn flatten_rust_use(raw: &str) -> Vec<String> {
+pub(crate) fn flatten_rust_use(raw: &str) -> Vec<String> {
     let trimmed = raw.trim().trim_end_matches(';').trim();
     let (prefix, body) = if let Some(body) = trimmed.strip_prefix("pub use ") {
         ("pub use ", body)
