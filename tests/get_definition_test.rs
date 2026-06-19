@@ -3,9 +3,13 @@ mod common;
 use brokk_bifrost::{Language, SearchToolsService};
 use common::InlineTestProject;
 use serde_json::{Value, json};
+use std::sync::{LazyLock, Mutex};
+
+static LOOKUP_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 fn lookup(root: &std::path::Path, args: &str) -> Value {
-    let service = SearchToolsService::new_without_semantic_index(root.to_path_buf())
+    let _guard = LOOKUP_LOCK.lock().expect("lookup lock poisoned");
+    let service = SearchToolsService::new_manual_without_semantic_index(root.to_path_buf())
         .expect("failed to build searchtools service");
     let payload = service
         .call_tool_json("get_definition_by_location", args)
@@ -14,7 +18,8 @@ fn lookup(root: &std::path::Path, args: &str) -> Value {
 }
 
 fn lookup_reference(root: &std::path::Path, args: &str) -> Value {
-    let service = SearchToolsService::new_without_semantic_index(root.to_path_buf())
+    let _guard = LOOKUP_LOCK.lock().expect("lookup lock poisoned");
+    let service = SearchToolsService::new_manual_without_semantic_index(root.to_path_buf())
         .expect("failed to build searchtools service");
     let payload = service
         .call_tool_json("get_definition_by_reference", args)
