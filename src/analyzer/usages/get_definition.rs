@@ -1247,7 +1247,7 @@ fn go_binding_type_fqn(
     byte: usize,
 ) -> Option<String> {
     go_receiver_binding_type_fqn(support, file, source, root, name, byte)
-        .or_else(|| go_local_binding_type_fqn(support, file, source, name, byte))
+        .or_else(|| go_local_binding_type_fqn(support, file, source, root, name, byte))
 }
 
 fn go_receiver_binding_type_fqn(
@@ -1270,46 +1270,142 @@ fn go_receiver_binding_type_fqn(
     }
 }
 
+/// The type a local `name` is bound to, resolved by walking the parsed AST
+/// outward from `byte`. Each enclosing scope is searched for the nearest
+/// preceding `:=` or `var` declaration of `name`; the innermost match wins, so
+/// shadowing is respected. An `if`/`for` initializer is a named child of the
+/// statement node we walk through, so those bindings are covered too.
 fn go_local_binding_type_fqn(
     support: &DefinitionLookupIndex,
     file: &ProjectFile,
     source: &str,
+    root: Node<'_>,
     name: &str,
     byte: usize,
 ) -> Option<String> {
-    let prefix = source.get(..byte)?;
-    for raw_line in prefix.lines().rev() {
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with("//") {
+    let mut scope = smallest_named_node_covering(root, byte, byte)?;
+    loop {
+        if let Some(binding) = go_nearest_binding_in_scope(scope, source, name, byte) {
+            let resolved = match binding {
+                GoLocalBinding::Type(type_node) => {
+                    go_resolve_type_fqn(support, file, source, type_node)
+                }
+                GoLocalBinding::Value(value_node) => go_type_text_from_composite_value(
+                    go_node_text(value_node, source),
+                )
+                .and_then(|type_text| go_resolve_type_text_fqn(support, file, source, type_text)),
+            };
+            if resolved.is_some() {
+                return resolved;
+            }
+        }
+        scope = scope.parent()?;
+    }
+}
+
+/// How a local binding names its type: an explicit `var x T` annotation, or the
+/// value expression of an inferred `x := value` binding to derive it from.
+enum GoLocalBinding<'tree> {
+    Type(Node<'tree>),
+    Value(Node<'tree>),
+}
+
+fn go_nearest_binding_in_scope<'tree>(
+    scope: Node<'tree>,
+    source: &str,
+    name: &str,
+    byte: usize,
+) -> Option<GoLocalBinding<'tree>> {
+    let mut cursor = scope.walk();
+    let mut nearest: Option<(usize, GoLocalBinding<'tree>)> = None;
+    for child in scope.named_children(&mut cursor) {
+        if child.end_byte() > byte {
             continue;
         }
-        if let Some(type_text) = go_type_from_short_var_declaration(line, name) {
-            if let Some(fqn) = go_resolve_type_text_fqn(support, file, source, type_text) {
-                return Some(fqn);
-            }
+        let binding = match child.kind() {
+            "short_var_declaration" => go_short_var_binding(child, source, name),
+            "var_declaration" => go_var_declaration_binding(child, source, name),
+            _ => None,
+        };
+        if let Some(binding) = binding
+            && nearest
+                .as_ref()
+                .is_none_or(|(start, _)| child.start_byte() > *start)
+        {
+            nearest = Some((child.start_byte(), binding));
         }
-        if let Some(type_text) = go_type_from_var_declaration(line, name) {
-            if let Some(fqn) = go_resolve_type_text_fqn(support, file, source, type_text) {
-                return Some(fqn);
-            }
+    }
+    nearest.map(|(_, binding)| binding)
+}
+
+fn go_short_var_binding<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    name: &str,
+) -> Option<GoLocalBinding<'tree>> {
+    let left = node.child_by_field_name("left")?;
+    let index = go_expression_list_index(left, source, name)?;
+    let right = node.child_by_field_name("right")?;
+    go_expression_list_item(right, index).map(GoLocalBinding::Value)
+}
+
+fn go_var_declaration_binding<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    name: &str,
+) -> Option<GoLocalBinding<'tree>> {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        // `var x T` holds a `var_spec` directly; `var ( ... )` wraps each spec.
+        let found = if child.kind() == "var_spec" {
+            go_var_spec_binding(child, source, name)
+        } else {
+            let mut inner = child.walk();
+            child
+                .named_children(&mut inner)
+                .filter(|spec| spec.kind() == "var_spec")
+                .find_map(|spec| go_var_spec_binding(spec, source, name))
+        };
+        if found.is_some() {
+            return found;
         }
     }
     None
 }
 
-fn go_type_from_short_var_declaration<'a>(line: &'a str, name: &str) -> Option<&'a str> {
-    let (lhs, rhs) = line.split_once(":=")?;
-    let mut lhs_names = lhs.split(',').map(str::trim);
-    if lhs_names.next()? != name || lhs_names.next().is_some() {
-        return None;
+fn go_var_spec_binding<'tree>(
+    spec: Node<'tree>,
+    source: &str,
+    name: &str,
+) -> Option<GoLocalBinding<'tree>> {
+    let index = go_named_identifier_index(spec, source, name)?;
+    if let Some(type_node) = spec.child_by_field_name("type") {
+        return Some(GoLocalBinding::Type(type_node));
     }
-    go_type_text_from_composite_value(rhs.trim())
+    let value_list = spec.child_by_field_name("value")?;
+    go_expression_list_item(value_list, index).map(GoLocalBinding::Value)
 }
 
-fn go_type_from_var_declaration<'a>(line: &'a str, name: &str) -> Option<&'a str> {
-    let rest = line.strip_prefix("var ")?.trim();
-    let mut parts = rest.split_whitespace();
-    (parts.next()? == name).then(|| parts.next()).flatten()
+fn go_named_identifier_index(spec: Node<'_>, source: &str, name: &str) -> Option<usize> {
+    let mut cursor = spec.walk();
+    spec.named_children(&mut cursor)
+        .filter(|child| child.kind() == "identifier")
+        .position(|child| go_node_text(child, source).trim() == name)
+}
+
+fn go_expression_list_index(list: Node<'_>, source: &str, name: &str) -> Option<usize> {
+    let mut cursor = list.walk();
+    list.named_children(&mut cursor)
+        .position(|child| go_node_text(child, source).trim() == name)
+}
+
+fn go_expression_list_item<'tree>(list: Node<'tree>, index: usize) -> Option<Node<'tree>> {
+    if list.kind() == "expression_list" {
+        let mut cursor = list.walk();
+        list.named_children(&mut cursor).nth(index)
+    } else {
+        (index == 0).then_some(list)
+    }
 }
 
 fn go_type_text_from_composite_value(value: &str) -> Option<&str> {
