@@ -2217,6 +2217,36 @@ fn csharp_typed_receiver_method_resolves_to_definition() {
 }
 
 #[test]
+fn csharp_extension_method_resolves_from_visible_namespace() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Dapper/SqlMapper.cs",
+            "namespace Dapper { public static class SqlMapper { public static T QueryFirst<T>(this IDbConnection cnn, string sql, object? param = null) => default!; public static dynamic QueryFirst(this IDbConnection cnn, string sql) => default!; } }\n",
+        )
+        .file(
+            "App/Repo.cs",
+            "using Dapper;\nusing System.Data;\nnamespace App { class Repo { public int Load(IDbConnection connection) { return connection.QueryFirst<int>(\"select 1\"); } } }\n",
+        )
+        .build();
+
+    let line = "namespace App { class Repo { public int Load(IDbConnection connection) { return connection.QueryFirst<int>(\"select 1\"); } } }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"App/Repo.cs","line":3,"column":{}}}]}}"#,
+            column_of(line, "QueryFirst")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Dapper.SqlMapper.QueryFirst",
+        "{value}"
+    );
+}
+
+#[test]
 fn csharp_typed_receiver_method_filters_overloads_by_call_arity() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(

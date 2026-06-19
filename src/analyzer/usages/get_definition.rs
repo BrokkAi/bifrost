@@ -4172,7 +4172,7 @@ fn resolve_csharp(
             csharp_type_outcome(csharp, support, file, &reference)
         }
         Some(CSharpReferenceNode::Member { receiver, name }) => {
-            let member = csharp_node_text(name, source);
+            let member = csharp_member_name_text(name, source);
             if member.is_empty() {
                 return no_definition("no_member_name", "C# member reference is blank");
             }
@@ -4186,10 +4186,18 @@ fn resolve_csharp(
                 receiver,
             );
             let arity = csharp_invocation_arity(name, source);
-            csharp_member_outcome(analyzer, support, owners, member, arity)
+            let outcome = csharp_member_outcome(analyzer, support, owners, member, arity);
+            if outcome.status == DefinitionLookupStatus::NoDefinition {
+                let extensions =
+                    csharp_extension_method_candidates(csharp, analyzer, file, member, arity);
+                if !extensions.is_empty() {
+                    return candidates_outcome(extensions);
+                }
+            }
+            outcome
         }
         Some(CSharpReferenceNode::UnqualifiedMember(name)) => {
-            let member = csharp_node_text(name, source);
+            let member = csharp_member_name_text(name, source);
             let bindings = csharp_bindings_before_scoped(
                 csharp,
                 file,
@@ -4264,7 +4272,12 @@ fn csharp_reference_node(node: Node<'_>) -> Option<CSharpReferenceNode<'_>> {
     let original = node;
     let mut current = node;
     while let Some(parent) = current.parent() {
-        if parent.kind() == "member_access_expression"
+        if matches!(parent.kind(), "generic_name" | "qualified_name")
+            && parent.start_byte() <= current.start_byte()
+            && parent.end_byte() >= current.end_byte()
+        {
+            current = parent;
+        } else if parent.kind() == "member_access_expression"
             && (csharp_member_access_name(parent) == Some(current)
                 || csharp_member_access_name(parent) == Some(original))
         {
@@ -4322,6 +4335,14 @@ fn csharp_invocation_arity(node: Node<'_>, source: &str) -> Option<usize> {
         break;
     }
     None
+}
+
+fn csharp_member_name_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    csharp_node_text(node, source)
+        .split('<')
+        .next()
+        .unwrap_or_default()
+        .trim()
 }
 
 fn csharp_type_outcome(
@@ -4422,6 +4443,67 @@ fn csharp_filter_candidates_by_arity(
     } else {
         filtered
     }
+}
+
+fn csharp_extension_method_candidates(
+    csharp: &CSharpAnalyzer,
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    member: &str,
+    arity: Option<usize>,
+) -> Vec<CodeUnit> {
+    let mut namespaces = csharp.using_namespaces_of(file);
+    let file_namespace = csharp.namespace_of_file(file);
+    if !file_namespace.is_empty() {
+        namespaces.push(file_namespace);
+    }
+    namespaces.sort();
+    namespaces.dedup();
+
+    let mut candidates: Vec<_> = csharp
+        .get_all_declarations()
+        .into_iter()
+        .filter(|unit| unit.is_function() && unit.identifier() == member)
+        .filter(|unit| csharp_extension_declaring_type_is_visible(csharp, &namespaces, unit))
+        .filter(|unit| csharp_is_extension_method(analyzer, unit))
+        .collect();
+    sort_units(&mut candidates);
+    candidates.dedup();
+
+    if let Some(call_arity) = arity {
+        let expected = call_arity + 1;
+        let exact: Vec<_> = candidates
+            .iter()
+            .filter(|unit| csharp_signature_arity(unit.signature()) == expected)
+            .cloned()
+            .collect();
+        if !exact.is_empty() {
+            return exact;
+        }
+    }
+
+    candidates
+}
+
+fn csharp_extension_declaring_type_is_visible(
+    analyzer: &dyn IAnalyzer,
+    namespaces: &[String],
+    unit: &CodeUnit,
+) -> bool {
+    analyzer.parent_of(unit).is_some_and(|owner| {
+        namespaces
+            .iter()
+            .any(|namespace| owner.package_name() == namespace)
+    })
+}
+
+fn csharp_is_extension_method(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> bool {
+    analyzer.signatures_of(unit).iter().any(|signature| {
+        signature
+            .split_once('(')
+            .map(|(_, parameters)| parameters.trim_start().starts_with("this "))
+            .unwrap_or(false)
+    })
 }
 
 fn csharp_receiver_type_units(
