@@ -1114,6 +1114,118 @@ func use(v *bool) {}
 }
 
 #[test]
+fn go_receiver_struct_field_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "buf.go",
+            r#"
+package app
+
+type Buf struct {
+    buffer []byte
+}
+
+func (br *Buf) Reset() {
+    if br.buffer == nil {
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "    if br.buffer == nil {";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"buf.go","line":9,"column":{}}}]}}"#,
+            column_of(line, "br.buffer")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "app.Buf.buffer", "{value}");
+}
+
+#[test]
+fn go_receiver_field_chain_resolves_deepest_workspace_field() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "buf.go",
+            r#"
+package app
+
+import "sync"
+
+type Buf struct {
+    rw sync.RWMutex
+}
+
+func (br *Buf) Lock() {
+    br.rw.Lock()
+}
+"#,
+        )
+        .build();
+
+    let line = "    br.rw.Lock()";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"buf.go","line":11,"column":{}}}]}}"#,
+            column_of(line, "br.rw.Lock")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "app.Buf.rw", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "partial_selector_chain",
+        "{value}"
+    );
+}
+
+#[test]
+fn go_receiver_field_chain_missing_terminal_reports_partial_field() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "buf.go",
+            r#"
+package app
+
+import "sync"
+
+type Buf struct {
+    rw sync.RWMutex
+}
+
+func (br *Buf) Lock() {
+    br.rw.Missing()
+}
+"#,
+        )
+        .build();
+
+    let line = "    br.rw.Missing()";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"buf.go","line":11,"column":{}}}]}}"#,
+            column_of(line, "br.rw.Missing")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "app.Buf.rw", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "partial_selector_chain",
+        "{value}"
+    );
+}
+
+#[test]
 fn go_local_binding_shadows_dot_imported_definition() {
     let project = InlineTestProject::with_language(Language::Go)
         .file("go.mod", "module example.com/app\n")

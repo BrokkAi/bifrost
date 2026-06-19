@@ -1200,12 +1200,42 @@ fn resolve_go_shadowed_selector_chain(
         segments[0],
         site.focus_start_byte,
     )?;
-    for field in &segments[1..segments.len() - 1] {
-        owner_fqn = go_indexed_field_type_fqn(analyzer, support, &owner_fqn, field)?;
+    let mut deepest_workspace_field = None;
+    for (index, member) in segments[1..].iter().enumerate() {
+        let candidates = support.fqn(&format!("{owner_fqn}.{member}"));
+        if !candidates.is_empty() {
+            deepest_workspace_field = Some(candidates.clone());
+        }
+        if index == segments.len() - 2 {
+            return if candidates.is_empty() {
+                deepest_workspace_field
+                    .map(|candidates| go_partial_selector_chain_outcome(candidates, member))
+            } else {
+                Some(candidates_outcome(candidates))
+            };
+        }
+        let Some(next_owner) = go_indexed_field_type_fqn(analyzer, support, &owner_fqn, member)
+        else {
+            return deepest_workspace_field
+                .map(|candidates| go_partial_selector_chain_outcome(candidates, member));
+        };
+        owner_fqn = next_owner;
     }
-    let member = segments.last()?;
-    let candidates = support.fqn(&format!("{owner_fqn}.{member}"));
-    (!candidates.is_empty()).then(|| candidates_outcome(candidates))
+    None
+}
+
+fn go_partial_selector_chain_outcome(
+    candidates: Vec<CodeUnit>,
+    missing_member: &str,
+) -> DefinitionLookupOutcome {
+    let mut outcome = candidates_outcome(candidates);
+    outcome.diagnostics.push(DefinitionLookupDiagnostic {
+        kind: "partial_selector_chain".to_string(),
+        message: format!(
+            "resolved the deepest indexed Go workspace field before `{missing_member}`"
+        ),
+    });
+    outcome
 }
 
 fn go_binding_type_fqn(
