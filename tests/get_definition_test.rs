@@ -805,6 +805,54 @@ func Helper() {}
 }
 
 #[test]
+fn go_receiver_field_chain_resolves_qualified_field_type() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n")
+        .file(
+            "store/store.go",
+            r#"
+package store
+
+type Client struct{}
+
+func (c Client) Ping() {}
+"#,
+        )
+        .file(
+            "main.go",
+            r#"
+package main
+
+import "example.com/app/store"
+
+type Env struct { Client store.Client }
+type Server struct { Env Env }
+
+func (s Server) Run() {
+    s.Env.Client.Ping()
+}
+"#,
+        )
+        .build();
+
+    let line = "    s.Env.Client.Ping()";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"main.go","line":10,"column":{}}}]}}"#,
+            column_of(line, "Ping")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "example.com/app/store.Client.Ping",
+        "{value}"
+    );
+}
+
+#[test]
 fn go_local_binding_shadows_dot_imported_definition() {
     let project = InlineTestProject::with_language(Language::Go)
         .file("go.mod", "module example.com/app\n")

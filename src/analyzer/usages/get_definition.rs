@@ -1077,7 +1077,27 @@ fn go_indexed_field_type_fqn(
         .map(str::trim)
         .filter(|value| !value.is_empty())?;
     let package = owner_fqn.rsplit_once('.').map(|(package, _)| package)?;
+    if let Some(fqn) =
+        go_resolve_qualified_type_from_file(analyzer, support, field_unit.source(), type_text)
+    {
+        return Some(fqn);
+    }
     go_resolve_type_name_in_package(support, package, type_text)
+}
+
+fn go_resolve_qualified_type_from_file(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    type_text: &str,
+) -> Option<String> {
+    let (Some(qualifier), name) = go_type_name_parts(type_text)? else {
+        return None;
+    };
+    let go = resolve_analyzer::<GoAnalyzer>(analyzer)?;
+    let import_path = go_import_paths(go, file).remove(qualifier)?;
+    let fqn = format!("{import_path}.{name}");
+    support.fqn_exists(&fqn).then_some(fqn)
 }
 
 fn go_resolve_type_fqn(
@@ -1104,20 +1124,25 @@ fn go_resolve_type_name_in_package(
 }
 
 fn go_simple_type_name(type_text: &str) -> Option<&str> {
+    go_type_name_parts(type_text).map(|(_, name)| name)
+}
+
+fn go_type_name_parts(type_text: &str) -> Option<(Option<&str>, &str)> {
     let trimmed = type_text
         .trim()
         .trim_start_matches('*')
         .trim_start_matches("[]")
         .trim();
-    let name = trimmed
+    let raw = trimmed
         .split(['[', '{', ' ', '\t', '\n', '\r'])
         .next()
-        .unwrap_or(trimmed)
+        .unwrap_or(trimmed);
+    let (qualifier, name) = raw
         .rsplit_once('.')
-        .map(|(_, name)| name)
-        .unwrap_or(trimmed)
-        .trim();
-    (!name.is_empty()).then_some(name)
+        .map(|(qualifier, name)| (Some(qualifier.trim()), name))
+        .unwrap_or((None, raw));
+    let name = name.trim();
+    (!name.is_empty()).then_some((qualifier.filter(|value| !value.is_empty()), name))
 }
 
 fn go_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
