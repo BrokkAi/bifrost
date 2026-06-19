@@ -350,6 +350,64 @@ pub fn run() {
 }
 
 #[test]
+fn rust_root_super_path_does_not_resolve_to_crate_root_item() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+pub fn helper() {}
+
+pub fn run() {
+    super::helper();
+}
+"#,
+        )
+        .build();
+
+    let line = "    super::helper();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"lib.rs","line":5,"column":{}}}]}}"#,
+            column_of(line, "helper")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    assert!(value["results"][0]["definitions"][0].is_null(), "{value}");
+}
+
+#[test]
+fn rust_too_many_super_segments_do_not_resolve_to_crate_root_item() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+pub fn helper() {}
+
+pub mod child {
+    pub fn run() {
+        super::super::helper();
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        super::super::helper();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"lib.rs","line":6,"column":{}}}]}}"#,
+            column_of(line, "helper")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    assert!(value["results"][0]["definitions"][0].is_null(), "{value}");
+}
+
+#[test]
 fn rust_unimported_bare_name_does_not_guess_workspace_identifier() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(

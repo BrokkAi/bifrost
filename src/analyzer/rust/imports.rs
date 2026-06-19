@@ -213,36 +213,32 @@ pub(super) fn resolve_rust_module_path_with_crate(
         return None;
     }
 
-    let resolved = if segments[0] == "crate" {
-        crate_package
+    let resolved = match segments[0] {
+        "crate" => crate_package
             .split('.')
             .filter(|segment| !segment.is_empty())
             .chain(segments[1..].iter().copied())
             .collect::<Vec<_>>()
-            .join(".")
-    } else if segments[0] == "super" {
-        let mut package_parts: Vec<_> = package
-            .split('.')
-            .filter(|segment| !segment.is_empty())
-            .collect();
-        if package_parts.is_empty() {
-            return None;
+            .join("."),
+        "self" | "super" => {
+            let mut package_parts: Vec<_> = package
+                .split('.')
+                .filter(|segment| !segment.is_empty())
+                .collect();
+            let mut index = 0usize;
+            while matches!(segments.get(index), Some(&"self" | &"super")) {
+                if segments[index] == "super" {
+                    package_parts.pop()?;
+                }
+                index += 1;
+            }
+            package_parts
+                .into_iter()
+                .chain(segments[index..].iter().copied())
+                .collect::<Vec<_>>()
+                .join(".")
         }
-        package_parts.pop();
-        package_parts
-            .into_iter()
-            .chain(segments[1..].iter().copied())
-            .collect::<Vec<_>>()
-            .join(".")
-    } else if segments[0] == "self" {
-        package
-            .split('.')
-            .filter(|segment| !segment.is_empty())
-            .chain(segments[1..].iter().copied())
-            .collect::<Vec<_>>()
-            .join(".")
-    } else {
-        segments.join(".")
+        _ => segments.join("."),
     };
 
     Some(resolved)
