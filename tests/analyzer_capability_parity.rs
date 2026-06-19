@@ -63,7 +63,7 @@ fn direct_analyzers_match_brokk_capability_matrix() {
     assert!(rust.type_hierarchy_provider().is_none());
     assert!(cpp.type_hierarchy_provider().is_none());
     assert!(csharp.type_hierarchy_provider().is_some());
-    assert!(php.type_hierarchy_provider().is_none());
+    assert!(php.type_hierarchy_provider().is_some());
     assert!(scala.type_hierarchy_provider().is_none());
 }
 

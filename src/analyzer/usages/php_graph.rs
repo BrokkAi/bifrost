@@ -4,10 +4,11 @@ mod inverted;
 mod resolver;
 mod shared;
 
+pub(in crate::analyzer::usages) use crate::analyzer::{
+    PhpFileContext as FileContext, resolve_php_constant, resolve_php_function, resolve_php_type,
+};
 pub(in crate::analyzer::usages) use resolver::{
-    FileContext, node_text as php_node_text,
-    qualified_candidate_text as php_qualified_candidate_text, resolve_php_constant,
-    resolve_php_function, resolve_php_type,
+    node_text as php_node_text, qualified_candidate_text as php_qualified_candidate_text,
 };
 
 use crate::analyzer::usages::common::language_for_target;

@@ -47,3 +47,24 @@ pub(crate) fn weight_code_unit_set(_key: &ProjectFile, value: &Arc<HashSet<CodeU
         + size_of::<HashSet<CodeUnit>>();
     size.min(u32::MAX as usize) as u32
 }
+
+pub(crate) fn weight_code_unit_vec_by_unit(_key: &CodeUnit, value: &Arc<Vec<CodeUnit>>) -> u32 {
+    weight_bytes(size_of::<Vec<CodeUnit>>() + value.iter().map(estimate_code_unit).sum::<usize>())
+}
+
+pub(crate) fn weight_code_unit_set_by_unit(_key: &CodeUnit, value: &Arc<HashSet<CodeUnit>>) -> u32 {
+    weight_bytes(
+        size_of::<HashSet<CodeUnit>>() + value.iter().map(estimate_code_unit).sum::<usize>(),
+    )
+}
+
+fn estimate_code_unit(code_unit: &CodeUnit) -> usize {
+    size_of::<CodeUnit>()
+        + code_unit.fq_name().len()
+        + code_unit.signature().map_or(0, str::len)
+        + code_unit.source().rel_path().to_string_lossy().len()
+}
+
+fn weight_bytes(bytes: usize) -> u32 {
+    bytes.clamp(1, u32::MAX as usize) as u32
+}

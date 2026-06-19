@@ -9,6 +9,11 @@ pub struct PhpUseAliases {
     pub const_aliases: HashMap<String, String>,
 }
 
+pub(crate) struct PhpFileContext {
+    pub(crate) namespace: String,
+    pub(crate) aliases: PhpUseAliases,
+}
+
 impl PhpUseAliases {
     pub(super) fn extend(&mut self, other: Self) {
         self.type_aliases.extend(other.type_aliases);
@@ -131,4 +136,82 @@ pub fn php_namespace_to_fq(name: &str) -> String {
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join(".")
+}
+
+pub(crate) fn resolve_php_type(raw: &str, ctx: &PhpFileContext) -> Option<String> {
+    let first = raw.split('|').next().unwrap_or(raw).trim();
+    if first.is_empty() || matches!(first, "self" | "static" | "parent") {
+        return None;
+    }
+    if first.starts_with('\\') {
+        return Some(php_namespace_to_fq(first));
+    }
+    let normalized = php_namespace_to_fq(first);
+    let local = normalized.split('.').next().unwrap_or(normalized.as_str());
+    if let Some(imported) = ctx.aliases.type_aliases.get(local) {
+        if normalized == local {
+            return Some(imported.clone());
+        }
+        let suffix = normalized
+            .strip_prefix(local)
+            .unwrap_or("")
+            .trim_start_matches('.');
+        return Some(if suffix.is_empty() {
+            imported.clone()
+        } else {
+            format!("{imported}.{suffix}")
+        });
+    }
+    Some(join_namespace(&ctx.namespace, &normalized))
+}
+
+pub(crate) fn resolve_php_function(raw: &str, ctx: &PhpFileContext) -> Option<String> {
+    if raw.starts_with('\\') {
+        return Some(php_namespace_to_fq(raw));
+    }
+    let normalized = php_namespace_to_fq(raw);
+    if let Some(imported) = ctx.aliases.function_aliases.get(&normalized) {
+        return Some(imported.clone());
+    }
+    Some(join_namespace(&ctx.namespace, &normalized))
+}
+
+pub(crate) fn resolve_php_constant(raw: &str, ctx: &PhpFileContext) -> Option<String> {
+    if raw.starts_with('\\') {
+        return Some(module_constant_fq(&php_namespace_to_fq(raw)));
+    }
+    let normalized = php_namespace_to_fq(raw);
+    if let Some(imported) = ctx.aliases.const_aliases.get(&normalized) {
+        return Some(module_constant_fq(imported));
+    }
+    Some(join_namespace(
+        &ctx.namespace,
+        &format!("_module_.{normalized}"),
+    ))
+}
+
+fn module_constant_fq(fq_name: &str) -> String {
+    if fq_name.contains("._module_.") {
+        return fq_name.to_string();
+    }
+    let public = public_php_fq_name(fq_name);
+    if let Some((namespace, name)) = public.rsplit_once('.') {
+        format!("{namespace}._module_.{name}")
+    } else {
+        format!("_module_.{public}")
+    }
+}
+
+fn public_php_fq_name(fq_name: &str) -> String {
+    fq_name.replace("._module_.", ".")
+}
+
+fn join_namespace(namespace: &str, name: &str) -> String {
+    if namespace.is_empty() {
+        name.to_string()
+    } else if name.is_empty() {
+        namespace.to_string()
+    } else {
+        format!("{namespace}.{name}")
+    }
 }

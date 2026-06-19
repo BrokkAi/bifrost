@@ -1,12 +1,10 @@
 use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::{
-    CodeUnit, IAnalyzer, Language, PhpAnalyzer, PhpUseAliases, ProjectFile, Range,
-    parse_php_use_aliases_from_source, php_namespace_to_fq,
+    CodeUnit, IAnalyzer, Language, PhpAnalyzer, PhpFileContext, ProjectFile, Range,
+    TypeHierarchyProvider, resolve_php_type,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::find_line_index_for_offset;
-use regex::Regex;
-use std::sync::LazyLock;
 use tree_sitter::Node;
 
 pub(super) enum TargetKind {
@@ -67,11 +65,6 @@ impl TargetSpec {
     }
 }
 
-pub(in crate::analyzer::usages) struct FileContext {
-    pub(in crate::analyzer::usages) namespace: String,
-    pub(in crate::analyzer::usages) aliases: PhpUseAliases,
-}
-
 #[derive(Default)]
 pub(super) struct PhpHierarchyIndex {
     ancestors: HashMap<String, HashSet<String>>,
@@ -85,40 +78,22 @@ impl PhpHierarchyIndex {
             if language_for_file(file) != Language::Php {
                 continue;
             }
-            let Ok(source) = file.read_to_string() else {
-                continue;
-            };
-            let ctx = FileContext {
-                namespace: php.namespace_of_file(file),
-                aliases: parse_php_use_aliases_from_source(&source),
-            };
-            hierarchy.extend_file(&source, &ctx);
+            for code_unit in php.declarations(file).filter(|unit| unit.is_class()) {
+                let type_name = code_unit.fq_name();
+                if php.is_interface(code_unit) {
+                    hierarchy.interfaces.insert(type_name.clone());
+                }
+                let ancestors = php
+                    .get_direct_ancestors(code_unit)
+                    .into_iter()
+                    .map(|ancestor| ancestor.fq_name())
+                    .collect::<HashSet<_>>();
+                if !ancestors.is_empty() {
+                    hierarchy.ancestors.insert(type_name, ancestors);
+                }
+            }
         }
         hierarchy
-    }
-
-    fn extend_file(&mut self, source: &str, ctx: &FileContext) {
-        for captures in TYPE_DECLARATION_RE.captures_iter(source) {
-            let Some(kind) = captures.name("kind") else {
-                continue;
-            };
-            let Some(name) = captures.name("name") else {
-                continue;
-            };
-            let Some(type_name) = resolve_php_type(name.as_str(), ctx) else {
-                continue;
-            };
-            if kind.as_str() == "interface" {
-                self.interfaces.insert(type_name.clone());
-            }
-            let parents = self.ancestors.entry(type_name).or_default();
-            if let Some(extends) = captures.name("extends") {
-                parents.extend(resolve_type_list(extends.as_str(), ctx));
-            }
-            if let Some(implements) = captures.name("implements") {
-                parents.extend(resolve_type_list(implements.as_str(), ctx));
-            }
-        }
     }
 
     fn is_subtype(&self, receiver_fq_name: &str, owner: &str) -> bool {
@@ -143,19 +118,6 @@ impl PhpHierarchyIndex {
     }
 }
 
-static TYPE_DECLARATION_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"\b(?P<kind>class|interface|trait)\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?:\s+extends\s+(?P<extends>[^ {]+(?:\s*,\s*[^ {]+)*))?(?:\s+implements\s+(?P<implements>[^ {]+(?:\s*,\s*[^ {]+)*))?",
-    )
-    .expect("valid PHP type declaration regex")
-});
-
-fn resolve_type_list(raw: &str, ctx: &FileContext) -> Vec<String> {
-    raw.split(',')
-        .filter_map(|name| resolve_php_type(name.trim(), ctx))
-        .collect()
-}
-
 pub(super) fn receiver_type_matches(
     receiver_fq_name: &str,
     owner: &str,
@@ -176,7 +138,7 @@ pub(super) fn static_receiver_matches(
     line_starts: &[usize],
     receiver: &str,
     owner: &str,
-    ctx: &FileContext,
+    ctx: &PhpFileContext,
     hierarchy: &PhpHierarchyIndex,
 ) -> bool {
     match receiver {
@@ -188,10 +150,6 @@ pub(super) fn static_receiver_matches(
         _ => resolve_php_type(receiver, ctx)
             .is_some_and(|fq| receiver_type_matches(&fq, owner, hierarchy)),
     }
-}
-
-fn public_php_fq_name(fq_name: &str) -> String {
-    fq_name.replace("._module_.", ".")
 }
 
 pub(super) fn receiver_is_enclosing_subtype(
@@ -241,89 +199,6 @@ pub(in crate::analyzer::usages) fn qualified_candidate_text(
         }
     }
     node_text(candidate, source).trim().to_string()
-}
-
-pub(in crate::analyzer::usages) fn resolve_php_type(
-    raw: &str,
-    ctx: &FileContext,
-) -> Option<String> {
-    let first = raw.split('|').next().unwrap_or(raw).trim();
-    if first.is_empty() || matches!(first, "self" | "static" | "parent") {
-        return None;
-    }
-    if first.starts_with('\\') {
-        return Some(php_namespace_to_fq(first));
-    }
-    let normalized = php_namespace_to_fq(first);
-    let local = normalized.split('.').next().unwrap_or(normalized.as_str());
-    if let Some(imported) = ctx.aliases.type_aliases.get(local) {
-        if normalized == local {
-            return Some(imported.clone());
-        }
-        let suffix = normalized
-            .strip_prefix(local)
-            .unwrap_or("")
-            .trim_start_matches('.');
-        return Some(if suffix.is_empty() {
-            imported.clone()
-        } else {
-            format!("{imported}.{suffix}")
-        });
-    }
-    Some(join_namespace(&ctx.namespace, &normalized))
-}
-
-pub(in crate::analyzer::usages) fn resolve_php_function(
-    raw: &str,
-    ctx: &FileContext,
-) -> Option<String> {
-    if raw.starts_with('\\') {
-        return Some(php_namespace_to_fq(raw));
-    }
-    let normalized = php_namespace_to_fq(raw);
-    if let Some(imported) = ctx.aliases.function_aliases.get(&normalized) {
-        return Some(imported.clone());
-    }
-    Some(join_namespace(&ctx.namespace, &normalized))
-}
-
-pub(in crate::analyzer::usages) fn resolve_php_constant(
-    raw: &str,
-    ctx: &FileContext,
-) -> Option<String> {
-    if raw.starts_with('\\') {
-        return Some(module_constant_fq(&php_namespace_to_fq(raw)));
-    }
-    let normalized = php_namespace_to_fq(raw);
-    if let Some(imported) = ctx.aliases.const_aliases.get(&normalized) {
-        return Some(module_constant_fq(imported));
-    }
-    Some(join_namespace(
-        &ctx.namespace,
-        &format!("_module_.{normalized}"),
-    ))
-}
-
-fn module_constant_fq(fq_name: &str) -> String {
-    if fq_name.contains("._module_.") {
-        return fq_name.to_string();
-    }
-    let public = public_php_fq_name(fq_name);
-    if let Some((namespace, name)) = public.rsplit_once('.') {
-        format!("{namespace}._module_.{name}")
-    } else {
-        format!("_module_.{public}")
-    }
-}
-
-fn join_namespace(namespace: &str, name: &str) -> String {
-    if namespace.is_empty() {
-        name.to_string()
-    } else if name.is_empty() {
-        namespace.to_string()
-    } else {
-        format!("{namespace}.{name}")
-    }
 }
 
 pub(super) fn is_object_creation_type_name(node: Node<'_>) -> bool {
