@@ -1016,6 +1016,62 @@ func (s Server) Run() {
 }
 
 #[test]
+fn go_local_pointer_struct_field_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n")
+        .file(
+            "main.go",
+            r#"
+package main
+
+type PublishOptions struct {
+    Fix bool
+}
+
+func NewCmdPublish() {
+    opts := &PublishOptions{}
+    use(&opts.Fix)
+    if opts.Fix {
+    }
+}
+
+func use(v *bool) {}
+"#,
+        )
+        .build();
+
+    let pointer_line = "    use(&opts.Fix)";
+    let pointer_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"main.go","line":10,"column":{}}}]}}"#,
+            column_of(pointer_line, "Fix")
+        ),
+    );
+    let pointer_result = &pointer_value["results"][0];
+    assert_eq!(pointer_result["status"], "resolved", "{pointer_value}");
+    assert_eq!(
+        pointer_result["definitions"][0]["fqn"], "example.com/app.PublishOptions.Fix",
+        "{pointer_value}"
+    );
+
+    let field_line = "    if opts.Fix {";
+    let field_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"main.go","line":11,"column":{}}}]}}"#,
+            column_of(field_line, "Fix")
+        ),
+    );
+    let field_result = &field_value["results"][0];
+    assert_eq!(field_result["status"], "resolved", "{field_value}");
+    assert_eq!(
+        field_result["definitions"][0]["fqn"], "example.com/app.PublishOptions.Fix",
+        "{field_value}"
+    );
+}
+
+#[test]
 fn go_local_binding_shadows_dot_imported_definition() {
     let project = InlineTestProject::with_language(Language::Go)
         .file("go.mod", "module example.com/app\n")

@@ -1185,14 +1185,14 @@ fn resolve_go_shadowed_selector_chain(
     reference: &str,
 ) -> Option<DefinitionLookupOutcome> {
     let segments: Vec<_> = reference.split('.').collect();
-    if segments.len() < 3 {
+    if segments.len() < 2 {
         return None;
     }
 
     let mut parser = Parser::new();
     parser.set_language(&tree_sitter_go::LANGUAGE.into()).ok()?;
     let tree = parser.parse(source, None)?;
-    let mut owner_fqn = go_receiver_binding_type_fqn(
+    let mut owner_fqn = go_binding_type_fqn(
         support,
         file,
         source,
@@ -1206,6 +1206,18 @@ fn resolve_go_shadowed_selector_chain(
     let member = segments.last()?;
     let candidates = support.fqn(&format!("{owner_fqn}.{member}"));
     (!candidates.is_empty()).then(|| candidates_outcome(candidates))
+}
+
+fn go_binding_type_fqn(
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    name: &str,
+    byte: usize,
+) -> Option<String> {
+    go_receiver_binding_type_fqn(support, file, source, root, name, byte)
+        .or_else(|| go_local_binding_type_fqn(support, file, source, name, byte))
 }
 
 fn go_receiver_binding_type_fqn(
@@ -1226,6 +1238,71 @@ fn go_receiver_binding_type_fqn(
         }
         current = current.parent()?;
     }
+}
+
+fn go_local_binding_type_fqn(
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    name: &str,
+    byte: usize,
+) -> Option<String> {
+    let prefix = source.get(..byte)?;
+    for raw_line in prefix.lines().rev() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with("//") {
+            continue;
+        }
+        if let Some(type_text) = go_type_from_short_var_declaration(line, name) {
+            if let Some(fqn) = go_resolve_type_text_fqn(support, file, source, type_text) {
+                return Some(fqn);
+            }
+        }
+        if let Some(type_text) = go_type_from_var_declaration(line, name) {
+            if let Some(fqn) = go_resolve_type_text_fqn(support, file, source, type_text) {
+                return Some(fqn);
+            }
+        }
+    }
+    None
+}
+
+fn go_type_from_short_var_declaration<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+    let (lhs, rhs) = line.split_once(":=")?;
+    let mut lhs_names = lhs.split(',').map(str::trim);
+    if lhs_names.next()? != name || lhs_names.next().is_some() {
+        return None;
+    }
+    go_type_text_from_composite_value(rhs.trim())
+}
+
+fn go_type_from_var_declaration<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+    let rest = line.strip_prefix("var ")?.trim();
+    let mut parts = rest.split_whitespace();
+    (parts.next()? == name).then(|| parts.next()).flatten()
+}
+
+fn go_type_text_from_composite_value(value: &str) -> Option<&str> {
+    let trimmed = value
+        .trim_start_matches('&')
+        .trim_start_matches('*')
+        .trim_start();
+    let end = trimmed.find(['{', '(']).unwrap_or(trimmed.len());
+    let type_text = trimmed[..end].trim();
+    (!type_text.is_empty()).then_some(type_text)
+}
+
+fn go_resolve_type_text_fqn(
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    type_text: &str,
+) -> Option<String> {
+    let (qualifier, name) = go_type_name_parts(type_text)?;
+    if qualifier.is_some() {
+        return None;
+    }
+    go_resolve_type_name_in_package(support, &go_package_name(file, source), name)
 }
 
 fn go_parameter_type_for_name<'tree>(
