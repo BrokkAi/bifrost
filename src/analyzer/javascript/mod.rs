@@ -904,20 +904,78 @@ fn visit_js_variable_statement(
             range_node,
             source,
             parent.cloned(),
-            Some(top_level),
+            Some(top_level.clone()),
         );
         if is_function {
             parsed.add_signature(
-                code_unit,
+                code_unit.clone(),
                 js_variable_function_signature(definition, child, source, name, exported),
             );
         } else {
             parsed.add_signature(
-                code_unit,
+                code_unit.clone(),
                 js_variable_signature(definition, child, source, exported),
             );
         }
+        if !is_function
+            && let Some(value) = value
+            && value.kind() == "object"
+        {
+            visit_js_object_literal_properties(file, source, value, &code_unit, &top_level, parsed);
+        }
     }
+}
+
+fn visit_js_object_literal_properties(
+    file: &ProjectFile,
+    source: &str,
+    object: Node<'_>,
+    parent: &CodeUnit,
+    top_level: &CodeUnit,
+    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+) {
+    for index in 0..object.named_child_count() {
+        let Some(child) = object.named_child(index) else {
+            continue;
+        };
+        let Some(name) = js_object_literal_property_name(child, source) else {
+            continue;
+        };
+        let code_unit = CodeUnit::new(
+            file.clone(),
+            crate::analyzer::CodeUnitType::Field,
+            "",
+            format!("{}.{}", parent.short_name(), name),
+        );
+        parsed.add_code_unit(
+            code_unit.clone(),
+            child,
+            source,
+            Some(parent.clone()),
+            Some(top_level.clone()),
+        );
+        parsed.add_signature(code_unit, trim_statement(node_text(child, source)));
+    }
+}
+
+fn js_object_literal_property_name(node: Node<'_>, source: &str) -> Option<String> {
+    let key = match node.kind() {
+        "pair" => node
+            .child_by_field_name("key")
+            .or_else(|| node.named_child(0))?,
+        "shorthand_property_identifier" => node,
+        "method_definition" => node.child_by_field_name("name")?,
+        _ => return None,
+    };
+    if key.kind() == "computed_property_name" {
+        return None;
+    }
+    let name = node_text(key, source)
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .to_string();
+    (!name.is_empty()).then_some(name)
 }
 
 fn one_line(text: &str) -> String {

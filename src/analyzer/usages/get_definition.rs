@@ -792,6 +792,38 @@ fn resolve_js_ts(
                 value_position,
             );
         }
+        let receiver_candidates = if let Some(binding) = imports.bindings.get(qualifier)
+            && matches!(binding.kind, ImportKind::Named | ImportKind::Default)
+        {
+            let exported_name = match binding.kind {
+                ImportKind::Named => binding.imported_name.as_deref().unwrap_or(qualifier),
+                ImportKind::Default => "default",
+                _ => qualifier,
+            };
+            resolve_js_ts_module_binding_candidates(
+                analyzer,
+                support,
+                language,
+                file,
+                &binding.module_specifier,
+                exported_name,
+                Some(&aliases),
+                value_position,
+            )
+        } else {
+            let mut same_file = support.file_identifier(file, qualifier);
+            if value_position {
+                same_file = jsts_value_space_candidates(analyzer, same_file);
+            } else {
+                same_file = jsts_type_space_candidates(analyzer, same_file);
+            }
+            same_file
+        };
+        let member_candidates =
+            jsts_member_candidates(analyzer, support, receiver_candidates, name, value_position);
+        if !member_candidates.is_empty() {
+            return candidates_outcome(member_candidates);
+        }
         return no_definition(
             "no_indexed_definition",
             format!("`{reference}` did not resolve to an indexed JS/TS definition"),
@@ -857,6 +889,41 @@ fn resolve_js_ts_module_binding(
         ));
     }
 
+    let candidates = resolve_js_ts_module_binding_candidates(
+        analyzer,
+        support,
+        language,
+        file,
+        module,
+        exported_name,
+        aliases,
+        value_position,
+    );
+    if candidates.is_empty() {
+        return no_definition(
+            "no_indexed_definition",
+            format!("`{exported_name}` is not indexed in `{module}`"),
+        );
+    }
+    candidates_outcome(candidates)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_js_ts_module_binding_candidates(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    language: Language,
+    file: &ProjectFile,
+    module: &str,
+    exported_name: &str,
+    aliases: Option<&AliasResolver>,
+    value_position: bool,
+) -> Vec<CodeUnit> {
+    let files = crate::analyzer::resolve_js_ts_module_specifier(file, module, language, aliases);
+    if files.is_empty() {
+        return Vec::new();
+    }
+
     let mut candidates = jsts_module_export_candidates(
         analyzer,
         support,
@@ -887,13 +954,7 @@ fn resolve_js_ts_module_binding(
             candidates = jsts_type_space_candidates(analyzer, candidates);
         }
     }
-    if candidates.is_empty() {
-        return no_definition(
-            "no_indexed_definition",
-            format!("`{exported_name}` is not indexed in `{module}`"),
-        );
-    }
-    candidates_outcome(candidates)
+    candidates
 }
 
 fn jsts_module_export_candidates(
@@ -915,6 +976,24 @@ fn jsts_module_export_candidates(
         candidates.extend(file_candidates);
     }
 
+    if value_position {
+        jsts_value_space_candidates(analyzer, candidates)
+    } else {
+        jsts_type_space_candidates(analyzer, candidates)
+    }
+}
+
+fn jsts_member_candidates(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    receiver_candidates: Vec<CodeUnit>,
+    member: &str,
+    value_position: bool,
+) -> Vec<CodeUnit> {
+    let mut candidates = Vec::new();
+    for receiver in receiver_candidates {
+        candidates.extend(support.fqn(&format!("{}.{}", receiver.fq_name(), member)));
+    }
     if value_position {
         jsts_value_space_candidates(analyzer, candidates)
     } else {

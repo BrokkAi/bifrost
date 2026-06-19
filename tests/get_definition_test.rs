@@ -758,6 +758,59 @@ export function render(avatar: string) {
 }
 
 #[test]
+fn typescript_imported_object_literal_property_resolves_through_star_barrel() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "tsconfig.json",
+            r#"{ "compilerOptions": { "baseUrl": ".", "paths": { "@renderer/*": ["src/renderer/*"] } } }"#,
+        )
+        .file(
+            "src/renderer/primitives/index.ts",
+            "export * from \"./classNames\";\n",
+        )
+        .file(
+            "src/renderer/primitives/classNames.ts",
+            r#"
+export const providerListClasses = {
+  itemEnabledDot: 'dot',
+  itemLabel: 'label'
+} as const
+"#,
+        )
+        .file(
+            "src/renderer/components/ProviderListItem.tsx",
+            r#"
+import { providerListClasses } from "@renderer/primitives";
+
+export function render() {
+  return providerListClasses.itemEnabledDot;
+}
+"#,
+        )
+        .build();
+
+    let line = "  return providerListClasses.itemEnabledDot;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/renderer/components/ProviderListItem.tsx","line":5,"column":{}}}]}}"#,
+            column_of(line, "itemEnabledDot")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "classNames.ts.providerListClasses.itemEnabledDot",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["path"], "src/renderer/primitives/classNames.ts",
+        "{value}"
+    );
+}
+
+#[test]
 fn javascript_destructured_commonjs_require_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file(
@@ -788,6 +841,41 @@ function run() {
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(result["definitions"][0]["path"], "util.js", "{value}");
+}
+
+#[test]
+fn javascript_same_file_object_literal_property_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "app.js",
+            r#"
+const classes = {
+  enabled: 'dot'
+};
+
+function render() {
+  return classes.enabled;
+}
+"#,
+        )
+        .build();
+
+    let line = "  return classes.enabled;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.js","line":7,"column":{}}}]}}"#,
+            column_of(line, "enabled")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.js.classes.enabled",
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["start_line"], 3, "{value}");
 }
 
 #[test]

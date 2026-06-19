@@ -925,20 +925,320 @@ fn visit_ts_value(
             range_node,
             source,
             parent.cloned(),
-            Some(top_level),
+            Some(top_level.clone()),
         );
         if is_function {
             parsed.add_signature(
-                code_unit,
+                code_unit.clone(),
                 ts_variable_function_signature(definition, child, source, exported),
             );
         } else {
             parsed.add_signature(
-                code_unit,
+                code_unit.clone(),
                 ts_variable_signature(definition, child, source, exported),
             );
         }
+        if !is_function
+            && let Some(value) = value
+            && let Some(object) = ts_indexable_object_literal_value(child, value, source)
+        {
+            visit_ts_object_literal_properties(
+                file, source, object, &code_unit, &top_level, parsed,
+            );
+        }
     }
+}
+
+fn ts_indexable_object_literal_value<'tree>(
+    declarator: Node<'tree>,
+    value: Node<'tree>,
+    source: &str,
+) -> Option<Node<'tree>> {
+    ts_object_literal_value(value).or_else(|| {
+        (value.kind() == "call_expression")
+            .then(|| ts_shape_preserving_call_object_argument(declarator, value, source))
+            .flatten()
+    })
+}
+
+fn ts_object_literal_value(node: Node<'_>) -> Option<Node<'_>> {
+    match node.kind() {
+        "object" => Some(node),
+        "as_expression" | "satisfies_expression" | "type_assertion" => {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .find_map(ts_object_literal_value)
+        }
+        _ => None,
+    }
+}
+
+fn ts_shape_preserving_call_object_argument<'tree>(
+    anchor: Node<'tree>,
+    call: Node<'tree>,
+    source: &str,
+) -> Option<Node<'tree>> {
+    let arguments = call.child_by_field_name("arguments")?;
+    let mut cursor = arguments.walk();
+    arguments
+        .named_children(&mut cursor)
+        .enumerate()
+        .find_map(|(index, argument)| {
+            let object = ts_object_literal_value(argument)?;
+            ts_call_preserves_object_argument_shape(anchor, call, source, index).then_some(object)
+        })
+}
+
+fn ts_call_preserves_object_argument_shape(
+    anchor: Node<'_>,
+    call: Node<'_>,
+    source: &str,
+    argument_index: usize,
+) -> bool {
+    if argument_index == 0 && ts_call_is_z_object(call, source) {
+        return true;
+    }
+    let Some(callee_name) = ts_call_identifier_name(call, source) else {
+        return false;
+    };
+    ts_source_function_preserves_parameter_shape(anchor, source, &callee_name, argument_index)
+}
+
+fn ts_call_is_z_object(call: Node<'_>, source: &str) -> bool {
+    let Some(function) = call.child_by_field_name("function") else {
+        return false;
+    };
+    if function.kind() != "member_expression" {
+        return false;
+    }
+    let Some(object) = function.child_by_field_name("object") else {
+        return false;
+    };
+    let Some(property) = function.child_by_field_name("property") else {
+        return false;
+    };
+    node_text(object, source).trim() == "z" && node_text(property, source).trim() == "object"
+}
+
+fn ts_call_identifier_name(call: Node<'_>, source: &str) -> Option<String> {
+    let function = call.child_by_field_name("function")?;
+    matches!(function.kind(), "identifier" | "property_identifier")
+        .then(|| node_text(function, source).trim().to_string())
+        .filter(|name| !name.is_empty())
+}
+
+fn ts_source_function_preserves_parameter_shape(
+    anchor: Node<'_>,
+    source: &str,
+    function_name: &str,
+    parameter_index: usize,
+) -> bool {
+    let root = ts_root_node(anchor);
+    let mut functions = Vec::new();
+    ts_collect_function_nodes(root, source, function_name, &mut functions);
+    functions.into_iter().any(|function| {
+        ts_function_node_preserves_parameter_shape(function, source, parameter_index)
+    })
+}
+
+fn ts_root_node(mut node: Node<'_>) -> Node<'_> {
+    while let Some(parent) = node.parent() {
+        node = parent;
+    }
+    node
+}
+
+fn ts_collect_function_nodes<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    function_name: &str,
+    out: &mut Vec<Node<'tree>>,
+) {
+    if node.kind() == "function_declaration"
+        && node
+            .child_by_field_name("name")
+            .is_some_and(|name| node_text(name, source).trim() == function_name)
+    {
+        out.push(node);
+        return;
+    }
+    if node.kind() == "variable_declarator"
+        && node
+            .child_by_field_name("name")
+            .is_some_and(|name| node_text(name, source).trim() == function_name)
+        && let Some(value) = node.child_by_field_name("value")
+        && matches!(value.kind(), "arrow_function" | "function_expression")
+    {
+        out.push(value);
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        ts_collect_function_nodes(child, source, function_name, out);
+    }
+}
+
+fn ts_function_node_preserves_parameter_shape(
+    function: Node<'_>,
+    source: &str,
+    parameter_index: usize,
+) -> bool {
+    let Some(parameter_name) = ts_function_parameter_name(function, source, parameter_index) else {
+        return false;
+    };
+    if function.kind() == "arrow_function"
+        && let Some(body) = function.child_by_field_name("body")
+        && ts_expression_preserves_parameter_shape(body, source, &parameter_name)
+    {
+        return true;
+    }
+    ts_function_returns_parameter_shape(function, function.id(), source, &parameter_name)
+}
+
+fn ts_function_parameter_name(
+    function: Node<'_>,
+    source: &str,
+    parameter_index: usize,
+) -> Option<String> {
+    let parameters = function.child_by_field_name("parameters")?;
+    let mut cursor = parameters.walk();
+    parameters
+        .named_children(&mut cursor)
+        .filter_map(ts_parameter_name_node)
+        .nth(parameter_index)
+        .map(|name| node_text(name, source).trim().to_string())
+        .filter(|name| !name.is_empty())
+}
+
+fn ts_parameter_name_node(parameter: Node<'_>) -> Option<Node<'_>> {
+    match parameter.kind() {
+        "identifier" | "shorthand_property_identifier_pattern" => Some(parameter),
+        "required_parameter" | "optional_parameter" => parameter
+            .child_by_field_name("pattern")
+            .or_else(|| parameter.child_by_field_name("name")),
+        _ => None,
+    }
+}
+
+fn ts_function_returns_parameter_shape(
+    node: Node<'_>,
+    root_id: usize,
+    source: &str,
+    parameter_name: &str,
+) -> bool {
+    if node.id() != root_id
+        && matches!(
+            node.kind(),
+            "function_declaration"
+                | "function_expression"
+                | "arrow_function"
+                | "method_definition"
+                | "class_declaration"
+                | "abstract_class_declaration"
+                | "interface_declaration"
+        )
+    {
+        return false;
+    }
+    if node.kind() == "return_statement" {
+        let mut cursor = node.walk();
+        return node
+            .named_children(&mut cursor)
+            .next()
+            .is_some_and(|expression| {
+                ts_expression_preserves_parameter_shape(expression, source, parameter_name)
+            });
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| ts_function_returns_parameter_shape(child, root_id, source, parameter_name))
+}
+
+fn ts_expression_preserves_parameter_shape(
+    expression: Node<'_>,
+    source: &str,
+    parameter_name: &str,
+) -> bool {
+    let Some(expression) = ts_object_shape_expression(expression) else {
+        return false;
+    };
+    if matches!(expression.kind(), "identifier" | "property_identifier")
+        && node_text(expression, source).trim() == parameter_name
+    {
+        return true;
+    }
+    if expression.kind() != "object" {
+        return false;
+    }
+    let mut cursor = expression.walk();
+    expression.named_children(&mut cursor).any(|child| {
+        child.kind() == "spread_element"
+            && child
+                .named_child(0)
+                .and_then(ts_object_shape_expression)
+                .is_some_and(|spread| node_text(spread, source).trim() == parameter_name)
+    })
+}
+
+fn ts_object_shape_expression(node: Node<'_>) -> Option<Node<'_>> {
+    match node.kind() {
+        "as_expression" | "satisfies_expression" | "type_assertion" => {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .find_map(ts_object_shape_expression)
+        }
+        _ => Some(node),
+    }
+}
+fn visit_ts_object_literal_properties(
+    file: &ProjectFile,
+    source: &str,
+    object: Node<'_>,
+    parent: &CodeUnit,
+    top_level: &CodeUnit,
+    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+) {
+    for index in 0..object.named_child_count() {
+        let Some(child) = object.named_child(index) else {
+            continue;
+        };
+        let Some(name) = ts_object_literal_property_name(child, source) else {
+            continue;
+        };
+        let code_unit = CodeUnit::new(
+            file.clone(),
+            crate::analyzer::CodeUnitType::Field,
+            "",
+            format!("{}.{}", parent.short_name(), name),
+        );
+        parsed.add_code_unit(
+            code_unit.clone(),
+            child,
+            source,
+            Some(parent.clone()),
+            Some(top_level.clone()),
+        );
+        parsed.add_signature(code_unit, trim_statement(node_text(child, source)));
+    }
+}
+
+fn ts_object_literal_property_name(node: Node<'_>, source: &str) -> Option<String> {
+    let key = match node.kind() {
+        "pair" => node
+            .child_by_field_name("key")
+            .or_else(|| node.named_child(0))?,
+        "shorthand_property_identifier" => node,
+        "method_definition" => node.child_by_field_name("name")?,
+        _ => return None,
+    };
+    if key.kind() == "computed_property_name" {
+        return None;
+    }
+    let name = trim_statement(node_text(key, source))
+        .trim_matches('"')
+        .trim_matches('\'')
+        .to_string();
+    (!name.is_empty()).then_some(name)
 }
 
 fn visit_ts_method(

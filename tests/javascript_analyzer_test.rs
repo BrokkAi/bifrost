@@ -594,7 +594,7 @@ fn test_build_related_identifiers_module_cu_and_field_signatures() {
             .trim()
     );
     assert_eq!(
-        "const inlineObj",
+        "const inlineObj\n  a: 1\n  b: 2",
         skeletons
             .get(&definition(&analyzer, "fields.js.inlineObj"))
             .unwrap()

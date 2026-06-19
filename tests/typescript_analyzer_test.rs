@@ -151,7 +151,10 @@ fn test_vars_ts_skeletons_and_arrow_function_classification() {
         "let currentUser: string = \"Alice\"",
         skeletons.get(&current_user).unwrap()
     );
-    assert_eq!("const config", skeletons.get(&config).unwrap());
+    assert_eq!(
+        "const config\n  host: \"localhost\"\n  port: 8080",
+        skeletons.get(&config).unwrap()
+    );
     assert_eq!(
         "const anArrowFunc = (msg: string): void => { ... }",
         skeletons.get(&arrow).unwrap()
@@ -450,7 +453,7 @@ fn test_complex_field_initializer_and_multi_assignment_signatures() {
             .trim()
     );
     assert_eq!(
-        "const inlineObj",
+        "const inlineObj\n  a: 1\n  b: 2",
         skeletons
             .get(&definition(&analyzer, "fields.ts.inlineObj"))
             .unwrap()
@@ -555,6 +558,37 @@ fn test_static_instance_member_overlap() {
         color_units
             .iter()
             .any(|code_unit| code_unit.fq_name() == "Color.count$static")
+    );
+}
+
+#[test]
+fn test_call_argument_object_literal_does_not_index_variable_member_definitions() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    let file = write_file(
+        root,
+        "tool.ts",
+        r#"
+            export function log(definition: { handler(): void }): void {}
+
+            export const listTools = log({
+              handler(): void {},
+            });
+        "#,
+    );
+    let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+    let declarations = analyzer.get_declarations(&file);
+
+    assert!(
+        declarations
+            .iter()
+            .all(|unit| unit.fq_name() != "tool.ts.listTools.handler")
+    );
+    assert!(
+        !analyzer
+            .get_skeleton(&definition(&analyzer, "tool.ts.listTools"))
+            .unwrap()
+            .contains("handler")
     );
 }
 
