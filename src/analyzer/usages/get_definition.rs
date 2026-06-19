@@ -1341,6 +1341,24 @@ fn resolve_cpp(
             if text.is_empty() {
                 return no_definition("no_reference_text", "C++ identifier is blank");
             }
+            let bindings = cpp_local_bindings_before(
+                ctx.visibility,
+                ctx.file,
+                ctx.source,
+                ctx.root,
+                identifier,
+                identifier.start_byte(),
+            );
+            if bindings.is_shadowed(text) {
+                return no_definition(
+                    "local_variable_reference",
+                    format!("`{text}` is a local C++ value"),
+                );
+            }
+            let candidates = ctx.support.file_identifier(ctx.file, text);
+            if !candidates.is_empty() {
+                return candidates_outcome(candidates);
+            }
             no_definition(
                 "no_indexed_definition",
                 format!("`{text}` did not resolve to an indexed C++ definition"),
@@ -2124,6 +2142,32 @@ fn cpp_bindings_before(
     let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
     cpp_seed_active_path(visibility, file, source, root, cutoff_start, &mut bindings);
     bindings
+}
+
+fn cpp_local_bindings_before(
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    node: Node<'_>,
+    cutoff_start: usize,
+) -> LocalInferenceEngine<CodeUnit> {
+    let local_root = cpp_enclosing_local_scope(node).unwrap_or(root);
+    cpp_bindings_before(visibility, file, source, local_root, cutoff_start)
+}
+
+fn cpp_enclosing_local_scope(mut node: Node<'_>) -> Option<Node<'_>> {
+    let mut fallback = None;
+    while let Some(parent) = node.parent() {
+        if matches!(parent.kind(), "function_definition" | "lambda_expression") {
+            return Some(parent);
+        }
+        if fallback.is_none() && parent.kind() == "compound_statement" {
+            fallback = Some(parent);
+        }
+        node = parent;
+    }
+    fallback
 }
 
 fn cpp_seed_active_path(

@@ -2752,6 +2752,30 @@ fn cpp_local_value_returns_no_definition() {
 }
 
 #[test]
+fn cpp_same_file_global_value_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "app.c",
+            "static const int global_value = 1;\nint run() { return global_value; }\n",
+        )
+        .build();
+
+    let line = "int run() { return global_value; }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.c","line":2,"column":{}}}]}}"#,
+            column_of(line, "global_value")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "app.c", "{value}");
+    assert_eq!(result["definitions"][0]["start_line"], 1, "{value}");
+}
+
+#[test]
 fn cpp_out_of_line_definition_name_is_not_reference() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(
