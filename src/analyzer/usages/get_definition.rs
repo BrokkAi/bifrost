@@ -246,7 +246,8 @@ fn resolve_one(
             context.support,
             &request.file,
             &source,
-            &site.text,
+            tree.as_ref(),
+            &site,
         ),
         Language::JavaScript | Language::TypeScript => resolve_js_ts(
             analyzer,
@@ -523,11 +524,19 @@ fn resolve_rust(
     support: &DefinitionLookupIndex,
     file: &ProjectFile,
     source: &str,
-    reference: &str,
+    tree: Option<&Tree>,
+    site: &ResolvedReferenceSite,
 ) -> DefinitionLookupOutcome {
     let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) else {
         return no_definition("rust_analyzer_unavailable", "Rust analyzer is unavailable");
     };
+    let reference = site.text.as_str();
+    if reference.contains('.')
+        && let Some(tree) = tree
+        && let Some(outcome) = resolve_rust_field(analyzer, support, file, source, tree, site)
+    {
+        return outcome;
+    }
     let refs = rust.reference_context_of(file);
     let (candidates, scoped_lookup_failed) = if let Some((path, name)) = reference.rsplit_once("::")
     {
@@ -569,6 +578,477 @@ fn resolve_rust(
         "no_indexed_definition",
         format!("`{reference}` did not resolve to an indexed Rust definition"),
     )
+}
+
+fn resolve_rust_field(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+    site: &ResolvedReferenceSite,
+) -> Option<DefinitionLookupOutcome> {
+    let node =
+        smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)?;
+    let field_expression = rust_enclosing_field_expression(node)?;
+    let field = field_expression.child_by_field_name("field")?;
+    let member = rust_node_text(field, source).trim();
+    let receiver = field_expression.child_by_field_name("value")?;
+    let owner = rust_expression_type_fqn(
+        analyzer,
+        support,
+        file,
+        source,
+        tree.root_node(),
+        receiver,
+        field_expression.start_byte(),
+    )?;
+    let candidates = support.fqn(&format!("{owner}.{member}"));
+    if candidates.is_empty() {
+        Some(no_definition(
+            "no_indexed_definition",
+            format!("`{owner}.{member}` is not indexed as a Rust definition"),
+        ))
+    } else {
+        Some(candidates_outcome(candidates))
+    }
+}
+
+fn rust_enclosing_field_expression(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        if node.kind() == "field_expression" {
+            return Some(node);
+        }
+        node = node.parent()?;
+    }
+}
+
+fn rust_expression_type_fqn(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    expression: Node<'_>,
+    before_byte: usize,
+) -> Option<String> {
+    match expression.kind() {
+        "self" => rust_enclosing_impl_type_fqn(support, file, source, expression),
+        "identifier" => rust_binding_type_fqn(
+            analyzer,
+            support,
+            file,
+            source,
+            root,
+            rust_node_text(expression, source).trim(),
+            before_byte,
+        ),
+        "field_expression" => {
+            let receiver = expression.child_by_field_name("value")?;
+            let field = expression.child_by_field_name("field")?;
+            let owner = rust_expression_type_fqn(
+                analyzer,
+                support,
+                file,
+                source,
+                root,
+                receiver,
+                before_byte,
+            )?;
+            let member = rust_node_text(field, source).trim();
+            rust_field_type_fqn(analyzer, support, file, source, &owner, member)
+        }
+        "call_expression" => rust_value_type_fqn(analyzer, support, file, source, root, expression),
+        "try_expression" | "await_expression" | "parenthesized_expression" => {
+            let mut cursor = expression.walk();
+            expression.named_children(&mut cursor).find_map(|child| {
+                rust_expression_type_fqn(analyzer, support, file, source, root, child, before_byte)
+            })
+        }
+        _ => None,
+    }
+}
+
+fn rust_binding_type_fqn(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    name: &str,
+    before_byte: usize,
+) -> Option<String> {
+    let mut found = None;
+    rust_collect_binding_type_fqn(
+        analyzer,
+        support,
+        file,
+        source,
+        root,
+        root,
+        name,
+        before_byte,
+        &mut found,
+    );
+    found.or_else(|| {
+        rust_binding_type_from_source_text(analyzer, support, file, source, name, before_byte)
+    })
+}
+
+fn rust_binding_type_from_source_text(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    name: &str,
+    before_byte: usize,
+) -> Option<String> {
+    let before = source.get(..before_byte)?;
+    for line in before.lines().rev() {
+        let trimmed = line.trim().trim_end_matches(';').trim();
+        let Some(rest) = trimmed.strip_prefix("let ") else {
+            continue;
+        };
+        let rest = rest.strip_prefix("mut ").unwrap_or(rest).trim();
+        if let Some(after_name) = rest.strip_prefix(name) {
+            let after_name = after_name.trim();
+            if let Some(type_text) = after_name.strip_prefix(':').and_then(|rest| {
+                rest.split_once('=')
+                    .map(|(ty, _)| ty.trim())
+                    .or(Some(rest.trim()))
+            }) {
+                return rust_resolve_type_node_fqn(support, file, type_text);
+            }
+            if let Some(value) = after_name.strip_prefix('=').map(str::trim) {
+                return rust_call_text_name(value).and_then(|call| {
+                    let candidates = rust_named_candidates(support, file, call);
+                    rust_callable_return_type(analyzer, candidates)
+                        .and_then(|type_text| rust_resolve_type_node_fqn(support, file, &type_text))
+                });
+            }
+        }
+    }
+    None
+}
+
+fn rust_collect_binding_type_fqn(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    node: Node<'_>,
+    name: &str,
+    before_byte: usize,
+    found: &mut Option<String>,
+) {
+    if node.start_byte() >= before_byte {
+        return;
+    }
+    match node.kind() {
+        "parameter" => {
+            if let Some((binding, type_node)) = rust_typed_binding(node, source)
+                && binding == name
+                && let Some(fqn) =
+                    rust_resolve_type_node_fqn(support, file, rust_node_text(type_node, source))
+            {
+                *found = Some(fqn);
+            }
+        }
+        "let_declaration" => {
+            if let Some(binding) = node
+                .child_by_field_name("pattern")
+                .and_then(|pattern| rust_simple_identifier_text(pattern, source))
+                && binding == name
+            {
+                if let Some(type_node) = node.child_by_field_name("type")
+                    && let Some(fqn) =
+                        rust_resolve_type_node_fqn(support, file, rust_node_text(type_node, source))
+                {
+                    *found = Some(fqn);
+                } else if let Some(value) = node.child_by_field_name("value")
+                    && let Some(fqn) =
+                        rust_value_type_fqn(analyzer, support, file, source, root, value)
+                {
+                    *found = Some(fqn);
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.start_byte() >= before_byte {
+            break;
+        }
+        rust_collect_binding_type_fqn(
+            analyzer,
+            support,
+            file,
+            source,
+            root,
+            child,
+            name,
+            before_byte,
+            found,
+        );
+    }
+}
+
+fn rust_typed_binding<'tree>(node: Node<'tree>, source: &str) -> Option<(String, Node<'tree>)> {
+    let pattern = node.child_by_field_name("pattern")?;
+    let name = rust_simple_identifier_text(pattern, source)?;
+    let type_node = node.child_by_field_name("type")?;
+    Some((name, type_node))
+}
+
+fn rust_value_type_fqn(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    value: Node<'_>,
+) -> Option<String> {
+    match value.kind() {
+        "try_expression" | "await_expression" | "parenthesized_expression" => {
+            let mut cursor = value.walk();
+            value
+                .named_children(&mut cursor)
+                .find_map(|child| rust_value_type_fqn(analyzer, support, file, source, root, child))
+        }
+        "call_expression" => {
+            let function = value.child_by_field_name("function")?;
+            if function.kind() == "field_expression"
+                && let Some(method) = function.child_by_field_name("field")
+                && let Some(receiver) = function.child_by_field_name("value")
+            {
+                let method_name = rust_node_text(method, source).trim();
+                if method_name == "unwrap_or_default" {
+                    return rust_expression_type_fqn(
+                        analyzer,
+                        support,
+                        file,
+                        source,
+                        root,
+                        receiver,
+                        value.start_byte(),
+                    );
+                }
+                let owner = rust_expression_type_fqn(
+                    analyzer,
+                    support,
+                    file,
+                    source,
+                    root,
+                    receiver,
+                    value.start_byte(),
+                )?;
+                return rust_callable_return_type(
+                    analyzer,
+                    support.fqn(&format!("{owner}.{method_name}")),
+                )
+                .and_then(|type_text| rust_resolve_type_node_fqn(support, file, &type_text));
+            }
+            let name = rust_callable_name(function, source)?;
+            let candidates = rust_named_candidates(support, file, &name);
+            rust_callable_return_type(analyzer, candidates)
+                .and_then(|type_text| rust_resolve_type_node_fqn(support, file, &type_text))
+        }
+        "struct_expression" => value.child_by_field_name("name").and_then(|name| {
+            rust_resolve_type_node_fqn(support, file, rust_node_text(name, source))
+        }),
+        _ => rust_call_text_name(rust_node_text(value, source)).and_then(|name| {
+            let candidates = support.file_identifier(file, name);
+            rust_callable_return_type(analyzer, candidates)
+                .and_then(|type_text| rust_resolve_type_node_fqn(support, file, &type_text))
+        }),
+    }
+}
+
+fn rust_callable_return_type(
+    analyzer: &dyn IAnalyzer,
+    candidates: Vec<CodeUnit>,
+) -> Option<String> {
+    candidates.into_iter().find_map(|candidate| {
+        let signature = analyzer
+            .signatures(&candidate)
+            .iter()
+            .next()
+            .cloned()
+            .or_else(|| candidate.signature().map(str::to_string))?;
+        rust_function_return_type_text(&signature).map(str::to_string)
+    })
+}
+
+fn rust_function_return_type_text(signature: &str) -> Option<&str> {
+    let return_type = signature.split_once("->")?.1.trim();
+    let return_type = return_type
+        .split('{')
+        .next()
+        .unwrap_or(return_type)
+        .trim()
+        .trim_end_matches(';')
+        .trim();
+    rust_unwrap_result_type(return_type).or(Some(return_type))
+}
+
+fn rust_unwrap_result_type(type_text: &str) -> Option<&str> {
+    let generic = type_text
+        .strip_prefix("Result<")
+        .or_else(|| type_text.strip_prefix("anyhow::Result<"))?;
+    let mut depth = 0usize;
+    for (index, ch) in generic.char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' if depth == 0 => return Some(generic[..index].trim()),
+            '>' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => return Some(generic[..index].trim()),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn rust_field_type_fqn(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    _source: &str,
+    owner_fqn: &str,
+    member: &str,
+) -> Option<String> {
+    let field = support
+        .fqn(&format!("{owner_fqn}.{member}"))
+        .into_iter()
+        .next()?;
+    let signature = field
+        .signature()
+        .map(str::to_string)
+        .or_else(|| analyzer.signatures(&field).iter().next().cloned())?;
+    let type_text = signature.split_once(':')?.1.trim();
+    rust_resolve_type_node_fqn(support, file, type_text)
+        .or_else(|| rust_resolve_type_node_fqn(support, field.source(), type_text))
+}
+
+fn rust_resolve_type_node_fqn(
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    type_text: &str,
+) -> Option<String> {
+    let name = rust_simple_type_name(type_text)?;
+    support
+        .file_identifier(file, name)
+        .into_iter()
+        .find(|unit| unit.is_class())
+        .map(|unit| unit.fq_name().to_string())
+        .or_else(|| {
+            support
+                .fqn(name)
+                .into_iter()
+                .find(|unit| unit.is_class())
+                .map(|unit| unit.fq_name().to_string())
+        })
+        .or_else(|| {
+            let mut candidates: Vec<_> = support
+                .identifier(name)
+                .into_iter()
+                .filter(|unit| unit.is_class())
+                .collect();
+            candidates.dedup();
+            (candidates.len() == 1).then(|| candidates.remove(0).fq_name().to_string())
+        })
+        .or_else(|| {
+            support
+                .fqn_direct_children("")
+                .into_iter()
+                .find(|unit| unit.is_class() && unit.identifier() == name)
+                .map(|unit| unit.fq_name().to_string())
+        })
+}
+
+fn rust_enclosing_impl_type_fqn(
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+) -> Option<String> {
+    let mut current = node.parent()?;
+    loop {
+        if current.kind() == "impl_item"
+            && let Some(type_node) = current.child_by_field_name("type")
+        {
+            return rust_resolve_type_node_fqn(support, file, rust_node_text(type_node, source));
+        }
+        current = current.parent()?;
+    }
+}
+
+fn rust_named_candidates(
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    name: &str,
+) -> Vec<CodeUnit> {
+    let mut candidates = support.file_identifier(file, name);
+    candidates.extend(support.fqn(name));
+    sort_units(&mut candidates);
+    candidates.dedup();
+    candidates
+}
+
+fn rust_simple_type_name(type_text: &str) -> Option<&str> {
+    let trimmed = type_text
+        .trim()
+        .trim_start_matches('&')
+        .trim_start_matches("mut ")
+        .trim_start_matches('&')
+        .trim_start_matches("mut ")
+        .trim();
+    let raw = trimmed
+        .rsplit("::")
+        .next()
+        .unwrap_or(trimmed)
+        .split(['<', '>', ',', ' ', '\t', '\n', '\r'])
+        .next()
+        .unwrap_or(trimmed)
+        .trim();
+    (!raw.is_empty()).then_some(raw)
+}
+
+fn rust_callable_name(node: Node<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "identifier" => Some(rust_node_text(node, source).trim().to_string()),
+        "scoped_identifier" => node
+            .child_by_field_name("name")
+            .map(|name| rust_node_text(name, source).trim().to_string()),
+        _ => None,
+    }
+}
+
+fn rust_call_text_name(value: &str) -> Option<&str> {
+    let head = value
+        .trim()
+        .trim_end_matches('?')
+        .trim()
+        .split_once('(')?
+        .0
+        .trim();
+    let name = head.rsplit("::").next().unwrap_or(head).trim();
+    (!name.is_empty()).then_some(name)
+}
+
+fn rust_simple_identifier_text(node: Node<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "identifier" => Some(rust_node_text(node, source).trim().to_string()),
+        _ => None,
+    }
+}
+
+fn rust_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    source
+        .get(node.start_byte()..node.end_byte())
+        .unwrap_or_default()
 }
 
 fn rust_import_candidates(
@@ -759,8 +1239,17 @@ fn parse_tree_for_language(file: &ProjectFile, language: Language, source: &str)
         Language::Php => parse_php_tree(source),
         Language::CSharp => parse_csharp_tree(source),
         Language::Python => parse_python_tree(source),
-        Language::Rust | Language::Go | Language::None => None,
+        Language::Rust => parse_rust_tree(source),
+        Language::Go | Language::None => None,
     }
+}
+
+fn parse_rust_tree(source: &str) -> Option<Tree> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .ok()?;
+    parser.parse(source, None)
 }
 
 fn resolve_js_ts(

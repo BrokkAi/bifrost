@@ -147,6 +147,71 @@ pub fn run() {
 }
 
 #[test]
+fn rust_struct_field_access_resolves_from_parameters_and_result_locals() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+struct BridgeContext {
+    settings: SettingsStore,
+}
+
+struct SettingsStore {
+    path: String,
+}
+
+struct RolloutRewrite {
+    session_meta_count: usize,
+}
+
+fn build() -> anyhow::Result<RolloutRewrite> {
+    todo!()
+}
+
+fn run(ctx: BridgeContext) -> anyhow::Result<()> {
+    let rewrite = build()?;
+    let _ = ctx.settings.path;
+    let _ = rewrite.session_meta_count;
+    Ok(())
+}
+"#,
+        )
+        .build();
+
+    let settings_line = "    let _ = ctx.settings.path;";
+    let settings = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"lib.rs","line":20,"column":{}}}]}}"#,
+            column_of(settings_line, "settings")
+        ),
+    );
+    assert_eq!(settings["results"][0]["status"], "resolved", "{settings}");
+    assert_eq!(
+        settings["results"][0]["definitions"][0]["fqn"], "BridgeContext.settings",
+        "{settings}"
+    );
+
+    let session_line = "    let _ = rewrite.session_meta_count;";
+    let session_meta_count = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"lib.rs","line":21,"column":{}}}]}}"#,
+            column_of(session_line, "session_meta_count")
+        ),
+    );
+    assert_eq!(
+        session_meta_count["results"][0]["status"], "resolved",
+        "{session_meta_count}"
+    );
+    assert_eq!(
+        session_meta_count["results"][0]["definitions"][0]["fqn"],
+        "RolloutRewrite.session_meta_count",
+        "{session_meta_count}"
+    );
+}
+
+#[test]
 fn go_selector_chain_resolves_promoted_embedded_fields_and_range_elements() {
     let project = InlineTestProject::with_language(Language::Go)
         .file("go.mod", "module example.com/app\n\ngo 1.22\n")
