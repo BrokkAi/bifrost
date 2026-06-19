@@ -1922,7 +1922,7 @@ fn resolve_go(
         }
         if resolution.shadowed {
             if let Some(outcome) =
-                resolve_go_shadowed_selector_chain(analyzer, support, file, source, site, reference)
+                resolve_go_local_selector_chain(analyzer, support, file, source, site, reference)
             {
                 return outcome;
             }
@@ -1976,6 +1976,11 @@ fn resolve_go(
                 "no_indexed_definition",
                 format!("`{name}` is not indexed in Go package `{import_path}`"),
             );
+        }
+        if let Some(outcome) =
+            resolve_go_local_selector_chain(analyzer, support, file, source, site, reference)
+        {
+            return outcome;
         }
         let candidates = support.fqn_candidates([format!("{package}.{qualifier}.{name}")]);
         if !candidates.is_empty() {
@@ -2072,7 +2077,7 @@ fn go_external_dot_import_path(
     })
 }
 
-fn resolve_go_shadowed_selector_chain(
+fn resolve_go_local_selector_chain(
     analyzer: &dyn IAnalyzer,
     support: &DefinitionLookupIndex,
     file: &ProjectFile,
@@ -2089,6 +2094,7 @@ fn resolve_go_shadowed_selector_chain(
     parser.set_language(&tree_sitter_go::LANGUAGE.into()).ok()?;
     let tree = parser.parse(source, None)?;
     let mut owner_fqn = go_binding_type_fqn(
+        analyzer,
         support,
         file,
         source,
@@ -2135,6 +2141,7 @@ fn go_partial_selector_chain_outcome(
 }
 
 fn go_binding_type_fqn(
+    analyzer: &dyn IAnalyzer,
     support: &DefinitionLookupIndex,
     file: &ProjectFile,
     source: &str,
@@ -2143,7 +2150,7 @@ fn go_binding_type_fqn(
     byte: usize,
 ) -> Option<String> {
     go_receiver_binding_type_fqn(support, file, source, root, name, byte)
-        .or_else(|| go_local_binding_type_fqn(support, file, source, root, name, byte))
+        .or_else(|| go_local_binding_type_fqn(analyzer, support, file, source, root, name, byte))
 }
 
 fn go_receiver_binding_type_fqn(
@@ -2172,6 +2179,7 @@ fn go_receiver_binding_type_fqn(
 /// shadowing is respected. An `if`/`for` initializer is a named child of the
 /// statement node we walk through, so those bindings are covered too.
 fn go_local_binding_type_fqn(
+    analyzer: &dyn IAnalyzer,
     support: &DefinitionLookupIndex,
     file: &ProjectFile,
     source: &str,
@@ -2186,10 +2194,12 @@ fn go_local_binding_type_fqn(
                 GoLocalBinding::Type(type_node) => {
                     go_resolve_type_fqn(support, file, source, type_node)
                 }
-                GoLocalBinding::Value(value_node) => go_type_text_from_composite_value(
-                    go_node_text(value_node, source),
-                )
-                .and_then(|type_text| go_resolve_type_text_fqn(support, file, source, type_text)),
+                GoLocalBinding::Value(value_node) => {
+                    go_value_type_fqn(analyzer, support, file, source, root, value_node, byte)
+                }
+                GoLocalBinding::RangeElement(range_node) => go_range_binding_type_fqn(
+                    analyzer, support, file, source, root, range_node, byte,
+                ),
             };
             if resolved.is_some() {
                 return resolved;
@@ -2204,6 +2214,7 @@ fn go_local_binding_type_fqn(
 enum GoLocalBinding<'tree> {
     Type(Node<'tree>),
     Value(Node<'tree>),
+    RangeElement(Node<'tree>),
 }
 
 fn go_nearest_binding_in_scope<'tree>(
@@ -2219,8 +2230,10 @@ fn go_nearest_binding_in_scope<'tree>(
             continue;
         }
         let binding = match child.kind() {
+            "parameter_list" => go_parameter_list_binding(child, source, name),
             "short_var_declaration" => go_short_var_binding(child, source, name),
             "var_declaration" => go_var_declaration_binding(child, source, name),
+            "range_clause" => go_range_binding(child, source, name),
             _ => None,
         };
         if let Some(binding) = binding
@@ -2232,6 +2245,34 @@ fn go_nearest_binding_in_scope<'tree>(
         }
     }
     nearest.map(|(_, binding)| binding)
+}
+
+fn go_parameter_list_binding<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    name: &str,
+) -> Option<GoLocalBinding<'tree>> {
+    let mut cursor = node.walk();
+    for parameter in node.named_children(&mut cursor) {
+        if parameter.kind() != "parameter_declaration" {
+            continue;
+        }
+        let Some(type_node) = go_parameter_type_for_name(parameter, source, name) else {
+            continue;
+        };
+        return Some(GoLocalBinding::Type(type_node));
+    }
+    None
+}
+
+fn go_range_binding<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    name: &str,
+) -> Option<GoLocalBinding<'tree>> {
+    let left = node.child_by_field_name("left")?;
+    let index = go_expression_list_index(left, source, name)?;
+    (index == 1).then_some(GoLocalBinding::RangeElement(node))
 }
 
 fn go_short_var_binding<'tree>(
@@ -2304,6 +2345,16 @@ fn go_expression_list_item<'tree>(list: Node<'tree>, index: usize) -> Option<Nod
     }
 }
 
+fn go_first_named_child(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).next()
+}
+
+fn go_last_named_child(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).last()
+}
+
 fn go_type_text_from_composite_value(value: &str) -> Option<&str> {
     let trimmed = value
         .trim_start_matches('&')
@@ -2312,6 +2363,332 @@ fn go_type_text_from_composite_value(value: &str) -> Option<&str> {
     let end = trimmed.find(['{', '(']).unwrap_or(trimmed.len());
     let type_text = trimmed[..end].trim();
     (!type_text.is_empty()).then_some(type_text)
+}
+
+fn go_value_type_fqn(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    value_node: Node<'_>,
+    byte: usize,
+) -> Option<String> {
+    go_value_type_text(analyzer, support, file, source, root, value_node, byte)
+        .and_then(|type_text| go_resolve_type_text_fqn(support, file, source, &type_text))
+}
+
+fn go_value_type_text(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    value_node: Node<'_>,
+    byte: usize,
+) -> Option<String> {
+    match value_node.kind() {
+        "selector_expression" => go_selector_expression_type_text(
+            analyzer, support, file, source, root, value_node, byte,
+        ),
+        "call_expression" => go_call_expression_return_type_text(
+            analyzer, support, file, source, root, value_node, byte,
+        ),
+        "identifier" => {
+            go_identifier_value_type_fqn(analyzer, support, file, source, root, value_node, byte)
+                .and_then(|fqn| go_type_text_from_fqn(&fqn).map(str::to_string))
+        }
+        _ => {
+            go_type_text_from_composite_value(go_node_text(value_node, source)).map(str::to_string)
+        }
+    }
+}
+
+fn go_identifier_value_type_fqn(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    value_node: Node<'_>,
+    byte: usize,
+) -> Option<String> {
+    matches!(value_node.kind(), "identifier").then_some(())?;
+    let identifier = go_node_text(value_node, source).trim();
+    go_binding_type_fqn(
+        analyzer,
+        support,
+        file,
+        source,
+        root,
+        identifier,
+        byte.min(value_node.start_byte()),
+    )
+}
+
+fn go_selector_value_type_fqn(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    value_node: Node<'_>,
+    byte: usize,
+) -> Option<String> {
+    if value_node.kind() != "selector_expression" {
+        return None;
+    }
+    let qualifier_node = go_first_named_child(value_node)?;
+    let field_node = go_last_named_child(value_node)?;
+    let field = go_node_text(field_node, source).trim();
+    let qualifier_type = go_expression_type_fqn(
+        analyzer,
+        support,
+        file,
+        source,
+        root,
+        qualifier_node,
+        byte.min(value_node.start_byte()),
+    )?;
+    let (field_file, type_text) = go_indexed_field_type(analyzer, support, &qualifier_type, field)?;
+    go_resolve_go_field_type_fqn(analyzer, support, &qualifier_type, &field_file, &type_text)
+}
+
+fn go_expression_type_fqn(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    expression: Node<'_>,
+    byte: usize,
+) -> Option<String> {
+    match expression.kind() {
+        "identifier" => go_binding_type_fqn(
+            analyzer,
+            support,
+            file,
+            source,
+            root,
+            go_node_text(expression, source).trim(),
+            byte,
+        ),
+        "selector_expression" => {
+            go_selector_value_type_fqn(analyzer, support, file, source, root, expression, byte)
+        }
+        "parenthesized_expression" | "unary_expression" => {
+            let mut cursor = expression.walk();
+            expression.named_children(&mut cursor).find_map(|child| {
+                go_expression_type_fqn(analyzer, support, file, source, root, child, byte)
+            })
+        }
+        _ => None,
+    }
+}
+
+fn go_range_binding_type_fqn(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    range_node: Node<'_>,
+    byte: usize,
+) -> Option<String> {
+    let right = range_node
+        .child_by_field_name("right")
+        .or_else(|| go_last_named_child(range_node))?;
+    let iterable_type =
+        go_expression_type_text(analyzer, support, file, source, root, right, byte)?;
+    let element_type = go_iterable_element_type_text(&iterable_type)?;
+    go_resolve_type_text_fqn(support, file, source, element_type)
+}
+
+fn go_expression_type_text(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    expression: Node<'_>,
+    byte: usize,
+) -> Option<String> {
+    match expression.kind() {
+        "identifier" => {
+            let binding =
+                go_nearest_visible_binding(root, source, go_node_text(expression, source), byte)?;
+            match binding {
+                GoLocalBinding::Type(type_node) => {
+                    Some(go_node_text(type_node, source).to_string())
+                }
+                GoLocalBinding::Value(value_node) => {
+                    go_value_type_text(analyzer, support, file, source, root, value_node, byte)
+                }
+                GoLocalBinding::RangeElement(range_node) => go_range_binding_type_fqn(
+                    analyzer, support, file, source, root, range_node, byte,
+                )
+                .and_then(|fqn| go_type_text_from_fqn(&fqn).map(str::to_string)),
+            }
+        }
+        "selector_expression" => go_selector_expression_type_text(
+            analyzer, support, file, source, root, expression, byte,
+        ),
+        _ => {
+            go_type_text_from_composite_value(go_node_text(expression, source)).map(str::to_string)
+        }
+    }
+}
+
+fn go_selector_expression_type_text(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    expression: Node<'_>,
+    byte: usize,
+) -> Option<String> {
+    let qualifier_node = go_first_named_child(expression)?;
+    let field_node = go_last_named_child(expression)?;
+    let field = go_node_text(field_node, source).trim();
+    let qualifier_type = go_expression_type_fqn(
+        analyzer,
+        support,
+        file,
+        source,
+        root,
+        qualifier_node,
+        byte.min(expression.start_byte()),
+    )?;
+    go_indexed_field_type(analyzer, support, &qualifier_type, field)
+        .map(|(_, type_text)| type_text.trim().to_string())
+}
+
+fn go_call_expression_return_type_text(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    expression: Node<'_>,
+    byte: usize,
+) -> Option<String> {
+    if expression.kind() != "call_expression" {
+        return None;
+    }
+    let function = expression
+        .child_by_field_name("function")
+        .or_else(|| go_first_named_child(expression))?;
+    match function.kind() {
+        "selector_expression" => {
+            let qualifier_node = go_first_named_child(function)?;
+            let method_node = go_last_named_child(function)?;
+            let owner_fqn = go_expression_type_fqn(
+                analyzer,
+                support,
+                file,
+                source,
+                root,
+                qualifier_node,
+                byte.min(expression.start_byte()),
+            )?;
+            let method = go_node_text(method_node, source).trim();
+            go_callable_return_type_text(analyzer, support.fqn(&format!("{owner_fqn}.{method}")))
+        }
+        "identifier" => {
+            let package = go_package_name(file, source);
+            let name = go_node_text(function, source).trim();
+            go_callable_return_type_text(
+                analyzer,
+                go_package_member_candidates(support, &package, name),
+            )
+        }
+        _ => None,
+    }
+}
+
+fn go_callable_return_type_text(
+    analyzer: &dyn IAnalyzer,
+    candidates: Vec<CodeUnit>,
+) -> Option<String> {
+    candidates.into_iter().find_map(|candidate| {
+        for signature in analyzer.signatures(&candidate) {
+            if let Some(return_type) = go_function_return_type_text(signature) {
+                return Some(return_type.to_string());
+            }
+        }
+        candidate
+            .signature()
+            .and_then(go_function_return_type_text)
+            .map(str::to_string)
+    })
+}
+
+fn go_function_return_type_text(signature: &str) -> Option<&str> {
+    let header = signature.split('{').next().unwrap_or(signature).trim();
+    let rest = header.strip_prefix("func")?.trim_start();
+    let rest = if rest.starts_with('(') {
+        let receiver_end = go_matching_close_paren(rest, 0)?;
+        rest.get(receiver_end + 1..)?.trim_start()
+    } else {
+        rest
+    };
+    let params_start = rest.find('(')?;
+    let params_end = go_matching_close_paren(rest, params_start)?;
+    let return_type = rest.get(params_end + 1..)?.trim();
+    (!return_type.is_empty()).then_some(return_type)
+}
+
+fn go_matching_close_paren(text: &str, open_byte: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, ch) in text
+        .char_indices()
+        .skip_while(|(index, _)| *index < open_byte)
+    {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn go_nearest_visible_binding<'tree>(
+    root: Node<'tree>,
+    source: &str,
+    name: &str,
+    byte: usize,
+) -> Option<GoLocalBinding<'tree>> {
+    let mut scope = smallest_named_node_covering(root, byte, byte)?;
+    loop {
+        if let Some(binding) = go_nearest_binding_in_scope(scope, source, name.trim(), byte) {
+            return Some(binding);
+        }
+        scope = scope.parent()?;
+    }
+}
+
+fn go_iterable_element_type_text(type_text: &str) -> Option<&str> {
+    let trimmed = type_text.trim();
+    trimmed
+        .strip_prefix("[]")
+        .or_else(|| {
+            trimmed.strip_prefix("map[").and_then(|rest| {
+                let close = rest.find(']')?;
+                Some(rest[close + 1..].trim())
+            })
+        })
+        .filter(|value| !value.is_empty())
+}
+
+fn go_type_text_from_fqn(fqn: &str) -> Option<&str> {
+    fqn.rsplit_once('.').map(|(_, name)| name)
 }
 
 fn go_resolve_type_text_fqn(
@@ -2332,25 +2709,37 @@ fn go_parameter_type_for_name<'tree>(
     source: &str,
     name: &str,
 ) -> Option<Node<'tree>> {
+    if parameter_list.kind() == "parameter_declaration" {
+        return go_parameter_declaration_type_for_name(parameter_list, source, name);
+    }
     let mut cursor = parameter_list.walk();
     for parameter in parameter_list.named_children(&mut cursor) {
         if parameter.kind() != "parameter_declaration" {
             continue;
         }
-        let mut names = Vec::new();
-        let mut type_node = None;
-        let mut inner = parameter.walk();
-        for child in parameter.named_children(&mut inner) {
-            match child.kind() {
-                "identifier" => names.push(go_node_text(child, source)),
-                _ => type_node = Some(child),
-            }
-        }
-        if names.contains(&name) {
+        let type_node = go_parameter_declaration_type_for_name(parameter, source, name);
+        if type_node.is_some() {
             return type_node;
         }
     }
     None
+}
+
+fn go_parameter_declaration_type_for_name<'tree>(
+    parameter: Node<'tree>,
+    source: &str,
+    name: &str,
+) -> Option<Node<'tree>> {
+    let mut names = Vec::new();
+    let mut type_node = None;
+    let mut inner = parameter.walk();
+    for child in parameter.named_children(&mut inner) {
+        match child.kind() {
+            "identifier" => names.push(go_node_text(child, source)),
+            _ => type_node = Some(child),
+        }
+    }
+    names.contains(&name).then_some(type_node).flatten()
 }
 
 fn go_indexed_field_type_fqn(
@@ -2359,6 +2748,16 @@ fn go_indexed_field_type_fqn(
     owner_fqn: &str,
     field: &str,
 ) -> Option<String> {
+    let (field_file, type_text) = go_indexed_field_type(analyzer, support, owner_fqn, field)?;
+    go_resolve_go_field_type_fqn(analyzer, support, owner_fqn, &field_file, &type_text)
+}
+
+fn go_indexed_field_type(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    owner_fqn: &str,
+    field: &str,
+) -> Option<(ProjectFile, String)> {
     let field_unit = support
         .fqn(&format!("{owner_fqn}.{field}"))
         .into_iter()
@@ -2372,12 +2771,21 @@ fn go_indexed_field_type_fqn(
         .strip_prefix(field)
         .map(str::trim)
         .filter(|value| !value.is_empty())?;
-    let package = owner_fqn.rsplit_once('.').map(|(package, _)| package)?;
-    if let Some(fqn) =
-        go_resolve_qualified_type_from_file(analyzer, support, field_unit.source(), type_text)
+    Some((field_unit.source().clone(), type_text.to_string()))
+}
+
+fn go_resolve_go_field_type_fqn(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    owner_fqn: &str,
+    field_file: &ProjectFile,
+    type_text: &str,
+) -> Option<String> {
+    if let Some(fqn) = go_resolve_qualified_type_from_file(analyzer, support, field_file, type_text)
     {
         return Some(fqn);
     }
+    let package = owner_fqn.rsplit_once('.').map(|(package, _)| package)?;
     go_resolve_type_name_in_package(support, package, type_text)
 }
 

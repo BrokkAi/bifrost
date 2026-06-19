@@ -1429,6 +1429,135 @@ func (br *Buf) Reset() {
 }
 
 #[test]
+fn go_local_alias_to_receiver_field_resolves_field_definition() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n")
+        .file(
+            "resolver.go",
+            r#"
+package resolver
+
+type status struct {
+    disabledGroups []string
+}
+
+type BlockingResolver struct {
+    status *status
+}
+
+func (r *BlockingResolver) setDisabledGroups(groups []string) {
+    s := r.status
+    s.disabledGroups = groups
+}
+"#,
+        )
+        .build();
+
+    let line = "    s.disabledGroups = groups";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"resolver.go","line":14,"column":{}}}]}}"#,
+            column_of(line, "disabledGroups")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "example.com/app.status.disabledGroups",
+        "{value}"
+    );
+}
+
+#[test]
+fn go_range_element_struct_field_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n")
+        .file(
+            "resolver.go",
+            r#"
+package resolver
+
+type scheduledGroup struct {
+    group string
+}
+
+func disable(groups []scheduledGroup) {
+    for _, sg := range groups {
+        if sg.group == "" {
+        }
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        if sg.group == \"\" {";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"resolver.go","line":10,"column":{}}}]}}"#,
+            column_of(line, "group")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "example.com/app.scheduledGroup.group",
+        "{value}"
+    );
+}
+
+#[test]
+fn go_range_element_from_method_return_resolves_field_definition() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n")
+        .file(
+            "resolver.go",
+            r#"
+package resolver
+
+type scheduledGroup struct {
+    group string
+}
+
+type Resolver struct{}
+
+func (r *Resolver) collectGroups() []scheduledGroup {
+    return nil
+}
+
+func (r *Resolver) disable() {
+    groups := r.collectGroups()
+    for _, sg := range groups {
+        if sg.group == "" {
+        }
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        if sg.group == \"\" {";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"resolver.go","line":17,"column":{}}}]}}"#,
+            column_of(line, "group")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "example.com/app.scheduledGroup.group",
+        "{value}"
+    );
+}
+
+#[test]
 fn go_receiver_field_chain_resolves_deepest_workspace_field() {
     let project = InlineTestProject::with_language(Language::Go)
         .file(
