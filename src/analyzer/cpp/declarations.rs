@@ -83,6 +83,25 @@ fn exported_class_name_from_text(text: &str) -> Option<String> {
     Some(name.to_string())
 }
 
+fn class_keyword_byte_index(text: &str) -> Option<usize> {
+    Regex::new(r"[A-Za-z_]\w*")
+        .expect("valid C++ identifier regex")
+        .find_iter(text)
+        .find(|token| matches!(token.as_str(), "class" | "struct" | "union"))
+        .map(|token| token.start())
+}
+
+fn paren_depth_at(text: &str, byte_index: usize) -> usize {
+    text.get(..byte_index)
+        .unwrap_or("")
+        .chars()
+        .fold(0usize, |depth, ch| match ch {
+            '(' => depth + 1,
+            ')' => depth.saturating_sub(1),
+            _ => depth,
+        })
+}
+
 fn cpp_class_header_modifier(token: &str) -> bool {
     matches!(
         token,
@@ -111,10 +130,20 @@ fn recover_exported_class_function_definition(node: Node<'_>, source: &str) -> O
     }
     let text = node_text(node, source);
     let header = text.split('{').next().unwrap_or(text).trim();
-    if header.contains('(') {
+    let class_index = class_keyword_byte_index(header)?;
+    if paren_depth_at(header, class_index) != 0 {
         return None;
     }
-    exported_class_name_from_text(text)
+    let name = exported_class_name_from_text(header)?;
+    let name_end = Regex::new(&format!(r"\b{}\b", regex::escape(&name)))
+        .expect("valid recovered class name regex")
+        .find_iter(header)
+        .last()
+        .map(|matched| matched.end())?;
+    if header[name_end..].contains('(') {
+        return None;
+    }
+    Some(name)
 }
 
 fn first_class_like_child(node: Node<'_>) -> Option<Node<'_>> {

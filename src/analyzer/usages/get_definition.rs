@@ -5349,16 +5349,7 @@ fn resolve_cpp(
             if text.is_empty() {
                 return no_definition("no_reference_text", "C++ identifier is blank");
             }
-            let bindings = cpp_local_bindings_before(
-                ctx.analyzer,
-                ctx.support,
-                ctx.visibility,
-                ctx.file,
-                ctx.source,
-                ctx.root,
-                identifier,
-                identifier.start_byte(),
-            );
+            let bindings = cpp_local_bindings_before(ctx, identifier, identifier.start_byte());
             if bindings.is_shadowed(text) {
                 return no_definition(
                     "local_variable_reference",
@@ -5640,15 +5631,7 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
             if name.is_empty() {
                 return no_definition("no_function_name", "C++ call name is blank");
             }
-            let bindings = cpp_bindings_before(
-                ctx.analyzer,
-                ctx.support,
-                ctx.visibility,
-                ctx.file,
-                ctx.source,
-                ctx.root,
-                function.start_byte(),
-            );
+            let bindings = cpp_bindings_before(ctx, ctx.root, function.start_byte());
             if bindings.is_shadowed(name) {
                 return no_definition(
                     "local_variable_reference",
@@ -6212,15 +6195,15 @@ fn cpp_expression_type(
     match node.kind() {
         "identifier" => {
             let name = cpp_node_text(node, source);
-            let bindings = cpp_bindings_before(
+            let ctx = CppLookupCtx {
                 analyzer,
                 support,
-                visibility,
                 file,
+                visibility,
                 source,
                 root,
-                node.start_byte(),
-            );
+            };
+            let bindings = cpp_bindings_before(ctx, root, node.start_byte());
             first_precise(&bindings, name)
         }
         "field_expression" => {
@@ -6320,32 +6303,19 @@ fn cpp_field_declared_type(
 }
 
 fn cpp_receiver_type_units(
-    analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
-    visibility: &CppVisibilityIndex,
-    file: &ProjectFile,
-    source: &str,
-    root: Node<'_>,
+    ctx: CppLookupCtx<'_, '_>,
     receiver: Node<'_>,
     unwrap_template_alias: bool,
 ) -> Vec<CodeUnit> {
     match receiver.kind() {
         "identifier" => {
-            let name = cpp_node_text(receiver, source);
-            let bindings = cpp_bindings_before(
-                analyzer,
-                support,
-                visibility,
-                file,
-                source,
-                root,
-                receiver.start_byte(),
-            );
+            let name = cpp_node_text(receiver, ctx.source);
+            let bindings = cpp_bindings_before(ctx, ctx.root, receiver.start_byte());
             if let Some(cpp_type) = first_precise(&bindings, name) {
                 return vec![cpp_receiver_unit_for_access(
-                    analyzer,
-                    visibility,
-                    file,
+                    ctx.analyzer,
+                    ctx.visibility,
+                    ctx.file,
                     cpp_type,
                     unwrap_template_alias,
                 )];
@@ -6353,50 +6323,55 @@ fn cpp_receiver_type_units(
             if bindings.is_shadowed(name) {
                 Vec::new()
             } else if let Some(cpp_type) = cpp_enclosing_member_field_type(
-                analyzer, support, visibility, file, source, root, receiver, name,
+                ctx.analyzer,
+                ctx.support,
+                ctx.visibility,
+                ctx.file,
+                ctx.source,
+                ctx.root,
+                receiver,
+                name,
             ) {
                 vec![cpp_receiver_unit_for_access(
-                    analyzer,
-                    visibility,
-                    file,
+                    ctx.analyzer,
+                    ctx.visibility,
+                    ctx.file,
                     cpp_type,
                     unwrap_template_alias,
                 )]
             } else {
-                visibility.resolve_type(file, name).into_iter().collect()
+                ctx.visibility
+                    .resolve_type(ctx.file, name)
+                    .into_iter()
+                    .collect()
             }
         }
         "this" => cpp_enclosing_class(
-            analyzer,
-            visibility,
-            file,
-            source,
-            root,
+            ctx.analyzer,
+            ctx.visibility,
+            ctx.file,
+            ctx.source,
+            ctx.root,
             receiver.start_byte(),
         )
         .into_iter()
         .collect(),
-        "field_expression" => {
-            cpp_field_expression_type(analyzer, support, visibility, file, source, root, receiver)
-                .map(|cpp_type| cpp_type.unit)
-                .into_iter()
-                .collect()
-        }
+        "field_expression" => cpp_field_expression_type(
+            ctx.analyzer,
+            ctx.support,
+            ctx.visibility,
+            ctx.file,
+            ctx.source,
+            ctx.root,
+            receiver,
+        )
+        .map(|cpp_type| cpp_type.unit)
+        .into_iter()
+        .collect(),
         "parenthesized_expression" | "pointer_expression" => receiver
             .child_by_field_name("argument")
             .or_else(|| receiver.named_child(0))
-            .map(|inner| {
-                cpp_receiver_type_units(
-                    analyzer,
-                    support,
-                    visibility,
-                    file,
-                    source,
-                    root,
-                    inner,
-                    unwrap_template_alias,
-                )
-            })
+            .map(|inner| cpp_receiver_type_units(ctx, inner, unwrap_template_alias))
             .unwrap_or_default(),
         _ => Vec::new(),
     }
@@ -6413,13 +6388,16 @@ fn cpp_field_receiver_type_units(
     field: Node<'_>,
     receiver: Node<'_>,
 ) -> Vec<CodeUnit> {
-    cpp_receiver_type_units(
+    let ctx = CppLookupCtx {
         analyzer,
         support,
-        visibility,
         file,
+        visibility,
         source,
         root,
+    };
+    cpp_receiver_type_units(
+        ctx,
         receiver,
         cpp_field_expression_uses_arrow(field, source),
     )
@@ -6573,50 +6551,24 @@ const CPP_SCOPE_NODES: &[&str] = &[
 ];
 
 fn cpp_bindings_before(
-    analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
-    visibility: &CppVisibilityIndex,
-    file: &ProjectFile,
-    source: &str,
+    ctx: CppLookupCtx<'_, '_>,
     root: Node<'_>,
     cutoff_start: usize,
 ) -> LocalInferenceEngine<CppType> {
     let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
-    cpp_seed_active_path(
-        analyzer,
-        support,
-        visibility,
-        file,
-        source,
-        root,
-        cutoff_start,
-        &mut bindings,
-    );
+    cpp_seed_active_path(ctx, root, cutoff_start, &mut bindings);
     bindings
 }
 
 fn cpp_local_bindings_before(
-    analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
-    visibility: &CppVisibilityIndex,
-    file: &ProjectFile,
-    source: &str,
-    _root: Node<'_>,
+    ctx: CppLookupCtx<'_, '_>,
     node: Node<'_>,
     cutoff_start: usize,
 ) -> LocalInferenceEngine<CppType> {
     let Some(local_root) = cpp_enclosing_local_scope(node) else {
         return LocalInferenceEngine::new(LocalInferenceConfig::default());
     };
-    cpp_bindings_before(
-        analyzer,
-        support,
-        visibility,
-        file,
-        source,
-        local_root,
-        cutoff_start,
-    )
+    cpp_bindings_before(ctx, local_root, cutoff_start)
 }
 
 fn cpp_enclosing_local_scope(mut node: Node<'_>) -> Option<Node<'_>> {
@@ -6634,11 +6586,7 @@ fn cpp_enclosing_local_scope(mut node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn cpp_seed_active_path(
-    analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
-    visibility: &CppVisibilityIndex,
-    file: &ProjectFile,
-    source: &str,
+    ctx: CppLookupCtx<'_, '_>,
     node: Node<'_>,
     cutoff_start: usize,
     bindings: &mut LocalInferenceEngine<CppType>,
@@ -6657,27 +6605,30 @@ fn cpp_seed_active_path(
         "parameter_declaration" | "optional_parameter_declaration"
             if node.end_byte() <= cutoff_start =>
         {
-            cpp_seed_typed_binding(analyzer, support, visibility, file, source, node, bindings)
-        }
-        "for_range_loop" if node.start_byte() < cutoff_start => cpp_seed_for_range_binding(
-            analyzer,
-            support,
-            visibility,
-            file,
-            source,
-            node,
-            cutoff_start,
-            bindings,
-        ),
-        "declaration" | "field_declaration" if node.start_byte() < cutoff_start => {
-            cpp_seed_variable_declaration(
-                analyzer,
-                support,
-                visibility,
-                file,
-                source,
+            cpp_seed_typed_binding(
+                ctx.analyzer,
+                ctx.support,
+                ctx.visibility,
+                ctx.file,
+                ctx.source,
                 node,
-                cutoff_start,
+                bindings,
+            )
+        }
+        "for_range_loop" if node.start_byte() < cutoff_start => {
+            cpp_seed_for_range_binding(ctx, node, cutoff_start, bindings)
+        }
+        "declaration" | "field_declaration" if node.start_byte() < cutoff_start => {
+            cpp_seed_variable_declaration(ctx, node, cutoff_start, bindings)
+        }
+        "expression_statement" if node.end_byte() <= cutoff_start => {
+            cpp_seed_recovered_statement_declaration(
+                ctx.analyzer,
+                ctx.support,
+                ctx.visibility,
+                ctx.file,
+                ctx.source,
+                node,
                 bindings,
             )
         }
@@ -6689,16 +6640,7 @@ fn cpp_seed_active_path(
         if child.start_byte() >= cutoff_start {
             break;
         }
-        cpp_seed_active_path(
-            analyzer,
-            support,
-            visibility,
-            file,
-            source,
-            child,
-            cutoff_start,
-            bindings,
-        );
+        cpp_seed_active_path(ctx, child, cutoff_start, bindings);
     }
 }
 
@@ -6717,7 +6659,9 @@ fn cpp_seed_typed_binding(
     let Some(name) = extract_variable_name(declarator, source) else {
         return;
     };
-    let type_text = cpp_declaration_type_text(node, source);
+    let type_text =
+        cpp_declaration_type_text_for_declarator(visibility, file, node, declarator, source)
+            .or_else(|| cpp_declaration_type_text(visibility, file, node, source));
     cpp_seed_binding(
         analyzer,
         support,
@@ -6734,11 +6678,7 @@ fn cpp_seed_typed_binding(
 }
 
 fn cpp_seed_for_range_binding(
-    analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
-    visibility: &CppVisibilityIndex,
-    file: &ProjectFile,
-    source: &str,
+    ctx: CppLookupCtx<'_, '_>,
     node: Node<'_>,
     cutoff_start: usize,
     bindings: &mut LocalInferenceEngine<CppType>,
@@ -6752,20 +6692,20 @@ fn cpp_seed_for_range_binding(
     let Some(declarator) = node.child_by_field_name("declarator") else {
         return;
     };
-    let Some(name) = extract_variable_name(declarator, source) else {
+    let Some(name) = extract_variable_name(declarator, ctx.source) else {
         return;
     };
     let type_text = node
         .child_by_field_name("type")
         .or_else(|| cpp_first_type_child(node))
-        .map(|type_node| cpp_normalize_declared_type_text(cpp_node_text(type_node, source)));
+        .map(|type_node| cpp_normalize_declared_type_text(cpp_node_text(type_node, ctx.source)));
     cpp_seed_binding(
-        analyzer,
-        support,
-        visibility,
-        file,
-        source,
-        cpp_lexical_namespace(node, source).as_deref(),
+        ctx.analyzer,
+        ctx.support,
+        ctx.visibility,
+        ctx.file,
+        ctx.source,
+        cpp_lexical_namespace(node, ctx.source).as_deref(),
         &name,
         type_text.as_deref(),
         cpp_declarator_pointer_depth(declarator),
@@ -6775,16 +6715,13 @@ fn cpp_seed_for_range_binding(
 }
 
 fn cpp_seed_variable_declaration(
-    analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
-    visibility: &CppVisibilityIndex,
-    file: &ProjectFile,
-    source: &str,
+    ctx: CppLookupCtx<'_, '_>,
     node: Node<'_>,
     cutoff_start: usize,
     bindings: &mut LocalInferenceEngine<CppType>,
 ) {
-    let type_text = cpp_declaration_type_text(node, source);
+    let declaration_type_text =
+        cpp_declaration_type_text(ctx.visibility, ctx.file, node, ctx.source);
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         let declarator = if child.kind() == "init_declarator" {
@@ -6800,11 +6737,19 @@ fn cpp_seed_variable_declaration(
         if declarator.start_byte() >= cutoff_start {
             continue;
         }
+        let type_text = cpp_declaration_type_text_for_declarator(
+            ctx.visibility,
+            ctx.file,
+            node,
+            declarator,
+            ctx.source,
+        )
+        .or_else(|| declaration_type_text.clone());
         if declarator.kind() == "function_declarator"
             && !cpp_constructor_style_local_declaration(
-                visibility,
-                file,
-                source,
+                ctx.visibility,
+                ctx.file,
+                ctx.source,
                 declarator,
                 type_text.as_deref(),
                 bindings,
@@ -6812,17 +6757,17 @@ fn cpp_seed_variable_declaration(
         {
             continue;
         }
-        if let Some(name) = extract_variable_name(declarator, source) {
+        if let Some(name) = extract_variable_name(declarator, ctx.source) {
             let value = child
                 .child_by_field_name("value")
                 .filter(|value| value.end_byte() <= cutoff_start);
             cpp_seed_binding(
-                analyzer,
-                support,
-                visibility,
-                file,
-                source,
-                cpp_lexical_namespace(node, source).as_deref(),
+                ctx.analyzer,
+                ctx.support,
+                ctx.visibility,
+                ctx.file,
+                ctx.source,
+                cpp_lexical_namespace(node, ctx.source).as_deref(),
                 &name,
                 type_text.as_deref(),
                 cpp_declarator_pointer_depth(declarator),
@@ -6831,17 +6776,218 @@ fn cpp_seed_variable_declaration(
             );
         }
     }
+    if node.end_byte() <= cutoff_start {
+        cpp_seed_recovered_statement_declaration(
+            ctx.analyzer,
+            ctx.support,
+            ctx.visibility,
+            ctx.file,
+            ctx.source,
+            node,
+            bindings,
+        );
+    }
 }
 
-fn cpp_declaration_type_text(node: Node<'_>, source: &str) -> Option<String> {
+fn cpp_seed_recovered_statement_declaration(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    bindings: &mut LocalInferenceEngine<CppType>,
+) {
+    for (name, type_text, pointer_depth) in
+        cpp_recover_macro_decorated_statement_declarations(visibility, file, node, source)
+    {
+        cpp_seed_binding(
+            analyzer,
+            support,
+            visibility,
+            file,
+            source,
+            cpp_lexical_namespace(node, source).as_deref(),
+            &name,
+            Some(&type_text),
+            pointer_depth,
+            None,
+            bindings,
+        );
+    }
+}
+
+fn cpp_recover_macro_decorated_statement_declarations(
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    node: Node<'_>,
+    source: &str,
+) -> Vec<(String, String, i32)> {
+    let statement = cpp_node_text(node, source)
+        .trim()
+        .trim_end_matches(';')
+        .trim();
+    if statement.is_empty()
+        || statement.contains(['=', '{', '}'])
+        || statement.starts_with("return ")
+    {
+        return Vec::new();
+    }
+    let declarators: Vec<_> = cpp_split_top_level_commas(statement).collect();
+    let Some(first) = declarators.first().map(|part| part.trim()) else {
+        return Vec::new();
+    };
+    let Some((first_name, first_start, first_end)) = cpp_last_identifier_span(first) else {
+        return Vec::new();
+    };
+    if !first[first_end..]
+        .trim()
+        .chars()
+        .all(|ch| matches!(ch, '*' | '&'))
+    {
+        return Vec::new();
+    }
+    let prefix = first[..first_start].trim();
+    if prefix.is_empty() {
+        return Vec::new();
+    }
+    let shared_prefix = prefix.trim_end_matches(['*', '&', ' ', '\t', '\n', '\r']);
+    let first_declarator_prefix = prefix[shared_prefix.len()..].trim();
+    if first_declarator_prefix
+        .chars()
+        .any(|ch| !matches!(ch, '*' | '&' | ' ' | '\t' | '\n' | '\r'))
+    {
+        return Vec::new();
+    }
+    let normalized = cpp_normalize_declared_type_text(shared_prefix);
+    let Some(type_text) = cpp_resolvable_declared_type_suffix(visibility, file, &normalized) else {
+        return Vec::new();
+    };
+    let mut recovered = vec![(
+        first_name.to_string(),
+        type_text.clone(),
+        cpp_type_text_pointer_depth(first_declarator_prefix),
+    )];
+
+    for declarator in declarators.iter().skip(1).map(|part| part.trim()) {
+        let Some((name, start, end)) = cpp_last_identifier_span(declarator) else {
+            continue;
+        };
+        if !declarator[end..]
+            .trim()
+            .chars()
+            .all(|ch| matches!(ch, '*' | '&'))
+        {
+            continue;
+        }
+        let declarator_prefix = declarator[..start].trim();
+        if declarator_prefix
+            .chars()
+            .any(|ch| !matches!(ch, '*' | '&' | ' ' | '\t' | '\n' | '\r'))
+        {
+            continue;
+        }
+        recovered.push((
+            name.to_string(),
+            type_text.clone(),
+            cpp_type_text_pointer_depth(declarator_prefix),
+        ));
+    }
+
+    recovered
+}
+
+fn cpp_last_identifier_span(text: &str) -> Option<(&str, usize, usize)> {
+    let (end_start, end_ch) = text
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| ch.is_ascii_alphanumeric() || *ch == '_')?;
+    let end = end_start + end_ch.len_utf8();
+    let start = text[..end]
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| !(ch.is_ascii_alphanumeric() || *ch == '_'))
+        .map(|(index, ch)| index + ch.len_utf8())
+        .unwrap_or(0);
+    let ident = &text[start..end];
+    ident
+        .chars()
+        .next()
+        .filter(|ch| ch.is_ascii_alphabetic() || *ch == '_')?;
+    Some((ident, start, end))
+}
+
+fn cpp_declaration_type_text(
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    node: Node<'_>,
+    source: &str,
+) -> Option<String> {
     cpp_declaration_prefix_before_first_declarator(node, source)
         .or_else(|| {
             node.child_by_field_name("type")
                 .or_else(|| cpp_first_type_child(node))
                 .map(|type_node| cpp_node_text(type_node, source).to_string())
         })
-        .map(|text| cpp_normalize_declared_type_text(&text))
+        .map(|text| cpp_normalize_declared_type_for_visibility(visibility, file, &text))
         .filter(|text| !text.is_empty())
+}
+
+fn cpp_declaration_type_text_for_declarator(
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    declaration: Node<'_>,
+    declarator: Node<'_>,
+    source: &str,
+) -> Option<String> {
+    let name = cpp_declarator_name_node(declarator)?;
+    let prefix = source
+        .get(declaration.start_byte()..name.start_byte())?
+        .trim();
+    if prefix.contains(',') {
+        return cpp_declaration_type_text(visibility, file, declaration, source);
+    }
+    (!prefix.is_empty())
+        .then(|| cpp_normalize_declared_type_for_visibility(visibility, file, prefix))
+        .filter(|text| !text.is_empty())
+}
+
+fn cpp_declarator_name_node(node: Node<'_>) -> Option<Node<'_>> {
+    match node.kind() {
+        "identifier" | "field_identifier" => Some(node),
+        _ => node
+            .child_by_field_name("declarator")
+            .or_else(|| node.child_by_field_name("name"))
+            .or_else(|| node.named_child(node.named_child_count().saturating_sub(1)))
+            .and_then(cpp_declarator_name_node),
+    }
+}
+
+fn cpp_normalize_declared_type_for_visibility(
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    text: &str,
+) -> String {
+    let normalized = cpp_normalize_declared_type_text(text);
+    cpp_resolvable_declared_type_suffix(visibility, file, &normalized).unwrap_or(normalized)
+}
+
+fn cpp_resolvable_declared_type_suffix(
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    text: &str,
+) -> Option<String> {
+    if visibility.resolve_type(file, text).is_some() {
+        return Some(text.to_string());
+    }
+    let tokens: Vec<_> = text.split_whitespace().collect();
+    for index in 1..tokens.len() {
+        let suffix = tokens[index..].join(" ");
+        if visibility.resolve_type(file, &suffix).is_some() {
+            return Some(suffix);
+        }
+    }
+    None
 }
 
 fn cpp_declaration_prefix_before_first_declarator(node: Node<'_>, source: &str) -> Option<String> {

@@ -6021,6 +6021,65 @@ void run() {
 }
 
 #[test]
+fn cpp_elaborated_return_type_function_is_not_recovered_as_class() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "app.cpp",
+            r#"
+class RawData {};
+class RawData make() {
+    return RawData{};
+}
+void consume(make *ptr) {}
+"#,
+        )
+        .build();
+
+    let line = "void consume(make *ptr) {}";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.cpp","line":6,"column":{}}}]}}"#,
+            column_of(line, "make")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn cpp_multi_declarator_local_declaration_reuses_shared_type() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "app.cpp",
+            r#"
+struct RawData {
+    void use();
+};
+void run() {
+    RawData first, second;
+    second.use();
+}
+"#,
+        )
+        .build();
+
+    let line = "    second.use();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.cpp","line":7,"column":{}}}]}}"#,
+            column_of(line, "use")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "RawData.use", "{value}");
+}
+
+#[test]
 fn cpp_export_macro_class_body_seeds_local_receiver_type() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(
@@ -6061,6 +6120,186 @@ void run() {
     assert_eq!(value["results"][1]["status"], "resolved", "{value}");
     assert_eq!(
         value["results"][1]["definitions"][0]["fqn"], "DeepImage.level",
+        "{value}"
+    );
+}
+
+#[test]
+fn cpp_macro_decorated_local_type_seeds_receiver_binding() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "app.cpp",
+            r#"
+#define API
+
+struct RawData {
+    void use();
+};
+
+void run() {
+    API RawData raw;
+    raw.use();
+}
+"#,
+        )
+        .build();
+
+    let line = "    raw.use();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.cpp","line":10,"column":{}}}]}}"#,
+            column_of(line, "use")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "RawData.use",
+        "{value}"
+    );
+}
+
+#[test]
+fn cpp_function_like_macro_decorated_local_type_seeds_receiver_binding() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "app.cpp",
+            r#"
+#define API_ATTR(x)
+
+struct RawData {
+    void use();
+};
+
+void run() {
+    API_ATTR(foo) RawData raw;
+    raw.use();
+}
+"#,
+        )
+        .build();
+
+    let line = "    raw.use();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.cpp","line":10,"column":{}}}]}}"#,
+            column_of(line, "use")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "RawData.use",
+        "{value}"
+    );
+}
+
+#[test]
+fn cpp_macro_decorated_multi_declarator_reuses_shared_type() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "app.cpp",
+            r#"
+#define API
+
+struct RawData {
+    void use();
+};
+
+void run() {
+    API RawData first, second;
+    second.use();
+}
+"#,
+        )
+        .build();
+
+    let line = "    second.use();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.cpp","line":10,"column":{}}}]}}"#,
+            column_of(line, "use")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "RawData.use",
+        "{value}"
+    );
+}
+
+#[test]
+fn cpp_macro_decorated_multi_declarator_keeps_pointer_depth_per_declarator() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "app.cpp",
+            r#"
+#define API
+
+struct RawData {
+    void use();
+};
+
+void run() {
+    API RawData *first, second;
+    second.use();
+}
+"#,
+        )
+        .build();
+
+    let line = "    second.use();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.cpp","line":10,"column":{}}}]}}"#,
+            column_of(line, "use")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "RawData.use",
+        "{value}"
+    );
+}
+
+#[test]
+fn cpp_macro_decorated_multi_declarator_preserves_pointer_depth_on_later_pointer() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "app.cpp",
+            r#"
+#define API
+
+struct RawData {
+    void use();
+};
+
+void run() {
+    API RawData first, *second;
+    second->use();
+}
+"#,
+        )
+        .build();
+
+    let line = "    second->use();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.cpp","line":10,"column":{}}}]}}"#,
+            column_of(line, "use")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "RawData.use",
         "{value}"
     );
 }
@@ -6164,22 +6403,31 @@ fn cpp_export_macro_class_recovery_handles_header_variants() {
         (
             "final class",
             "#define API\nnamespace ns { class API Service final { public: void run(); }; }\n",
+            "ns.Service.run",
         ),
         (
             "single macro with base",
             "#define API_EXPORT\nnamespace ns { class Base {}; class API_EXPORT Service : public Base { public: void run(); }; }\n",
+            "ns.Service.run",
         ),
         (
             "multiple macros",
             "#define DLL_PUBLIC\n#define API\nnamespace ns { class DLL_PUBLIC API Service { public: void run(); }; }\n",
+            "ns.Service.run",
         ),
         (
             "struct macro",
             "#define API\nnamespace ns { struct API Service { void run(); }; }\n",
+            "ns.Service.run",
+        ),
+        (
+            "function-like namespace macro",
+            "#define NS_ENTER(name) namespace name {\n#define NS_EXIT }\n#define API\nNS_ENTER(ns)\nclass API Service { public: void run(); };\nNS_EXIT\n",
+            "Service.run",
         ),
     ];
 
-    for (name, header) in cases {
+    for (name, header, expected_fqn) in cases {
         let project = InlineTestProject::with_language(Language::Cpp)
             .file("include/target.h", header)
             .file(
@@ -6204,7 +6452,7 @@ fn cpp_export_macro_class_recovery_handles_header_variants() {
         let result = &value["results"][0];
         assert_eq!(result["status"], "resolved", "{name}: {value}");
         assert_eq!(
-            result["definitions"][0]["fqn"], "ns.Service.run",
+            result["definitions"][0]["fqn"], expected_fqn,
             "{name}: {value}"
         );
     }
