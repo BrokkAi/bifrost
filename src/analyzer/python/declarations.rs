@@ -19,6 +19,7 @@ pub(super) struct Scope {
     kind: ScopeKind,
     path: String,
     code_unit: Option<CodeUnit>,
+    method_receiver: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -226,6 +227,7 @@ impl<'a> PythonVisitor<'a> {
                 kind: ScopeKind::Class,
                 path: short_name,
                 code_unit: Some(code_unit),
+                method_receiver: None,
             });
         }
         if let Some(body) = node.child_by_field_name("body") {
@@ -302,6 +304,11 @@ impl<'a> PythonVisitor<'a> {
                 kind: ScopeKind::Function,
                 path: short_name,
                 code_unit: scope_code_unit,
+                method_receiver: scope
+                    .last()
+                    .is_some_and(|parent| parent.kind == ScopeKind::Class)
+                    .then(|| python_instance_method_receiver_name(node, self.source))
+                    .flatten(),
             });
             if let Some(body) = node.child_by_field_name("body") {
                 stack.push(PythonWork::Container(PythonContainer {
@@ -318,6 +325,7 @@ impl<'a> PythonVisitor<'a> {
             kind: ScopeKind::Function,
             path: short_name,
             code_unit: None,
+            method_receiver: None,
         });
         if let Some(body) = node.child_by_field_name("body") {
             stack.push(PythonWork::Container(PythonContainer {
@@ -383,17 +391,25 @@ impl<'a> PythonVisitor<'a> {
     }
 
     fn visit_instance_attribute_assignment(&mut self, left: Node<'_>, scope: &[Scope]) {
+        let Some(function) = scope
+            .last()
+            .filter(|scope| scope.kind == ScopeKind::Function)
+        else {
+            return;
+        };
+        let Some(receiver) = function.method_receiver.as_deref() else {
+            return;
+        };
         let Some(parent) = scope
-            .iter()
-            .rev()
-            .find(|scope| scope.kind == ScopeKind::Class)
+            .get(scope.len().saturating_sub(2))
+            .filter(|scope| scope.kind == ScopeKind::Class)
         else {
             return;
         };
         let Some(parent_cu) = parent.code_unit.clone() else {
             return;
         };
-        for (name, node) in collect_self_assigned_attributes(left, self.source) {
+        for (name, node) in collect_self_assigned_attributes(left, self.source, receiver) {
             let code_unit = CodeUnit::new(
                 self.file.clone(),
                 CodeUnitType::Field,
@@ -658,32 +674,101 @@ fn collect_assigned_names(node: Node<'_>, source: &str) -> Vec<String> {
 fn collect_self_assigned_attributes<'tree>(
     node: Node<'tree>,
     source: &str,
+    receiver_name: &str,
 ) -> Vec<(String, Node<'tree>)> {
     let mut attributes = Vec::new();
-    walk_named_tree_preorder(node, true, |node| {
-        if node.kind() != "attribute" {
-            return WalkControl::Continue;
-        }
-        let Some(object) = node.child_by_field_name("object") else {
-            return WalkControl::Continue;
-        };
-        if object.kind() != "identifier" {
-            return WalkControl::Continue;
-        }
-        let receiver = py_node_text(object, source).trim();
-        if receiver != "self" && receiver != "cls" {
-            return WalkControl::Continue;
-        }
-        let Some(attribute) = node.child_by_field_name("attribute") else {
-            return WalkControl::SkipChildren;
-        };
-        let name = py_node_text(attribute, source).trim();
-        if !name.is_empty() {
-            attributes.push((name.to_string(), attribute));
-        }
-        WalkControl::SkipChildren
-    });
+    collect_direct_self_assigned_attributes(node, source, receiver_name, &mut attributes);
     attributes
+}
+
+fn collect_direct_self_assigned_attributes<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    receiver_name: &str,
+    attributes: &mut Vec<(String, Node<'tree>)>,
+) {
+    match node.kind() {
+        "attribute" => {
+            let Some(object) = node.child_by_field_name("object") else {
+                return;
+            };
+            if object.kind() != "identifier" || py_node_text(object, source).trim() != receiver_name
+            {
+                return;
+            }
+            let Some(attribute) = node.child_by_field_name("attribute") else {
+                return;
+            };
+            let name = py_node_text(attribute, source).trim();
+            if !name.is_empty() {
+                attributes.push((name.to_string(), attribute));
+            }
+        }
+        "pattern_list" | "tuple" | "list" | "parenthesized_expression" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect_direct_self_assigned_attributes(child, source, receiver_name, attributes);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn python_instance_method_receiver_name(node: Node<'_>, source: &str) -> Option<String> {
+    if python_function_has_decorator(node, source, "staticmethod")
+        || python_function_has_decorator(node, source, "classmethod")
+    {
+        return None;
+    }
+    python_first_parameter_name(node, source)
+}
+
+fn python_function_has_decorator(node: Node<'_>, source: &str, decorator_name: &str) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if parent.kind() != "decorated_definition" {
+        return false;
+    }
+    source
+        .get(parent.start_byte()..node.start_byte())
+        .is_some_and(|decorators| {
+            decorators
+                .lines()
+                .map(str::trim)
+                .filter(|line| line.starts_with('@'))
+                .any(|line| {
+                    line.trim_start_matches('@').split(['(', ' ', '\t']).next()
+                        == Some(decorator_name)
+                })
+        })
+}
+
+fn python_first_parameter_name(node: Node<'_>, source: &str) -> Option<String> {
+    let parameters = node.child_by_field_name("parameters")?;
+    let mut cursor = parameters.walk();
+    parameters
+        .named_children(&mut cursor)
+        .find_map(|child| python_parameter_name(child, source))
+}
+
+fn python_parameter_name(node: Node<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "identifier" => Some(py_node_text(node, source).trim().to_string()),
+        "typed_parameter"
+        | "default_parameter"
+        | "list_splat_pattern"
+        | "dictionary_splat_pattern" => node
+            .child_by_field_name("name")
+            .or_else(|| {
+                let mut cursor = node.walk();
+                node.named_children(&mut cursor)
+                    .find(|child| child.kind() == "identifier")
+            })
+            .and_then(|name| python_parameter_name(name, source)),
+        _ => None,
+    }
+    .filter(|name| !name.is_empty())
 }
 
 pub(super) fn collect_python_identifiers(

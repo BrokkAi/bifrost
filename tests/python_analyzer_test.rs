@@ -1,10 +1,12 @@
 mod common;
 
 use brokk_bifrost::{
-    CodeUnit, IAnalyzer, ImportAnalysisProvider, ProjectFile, PythonAnalyzer, TypeHierarchyProvider,
+    CodeUnit, IAnalyzer, ImportAnalysisProvider, Language, ProjectFile, PythonAnalyzer,
+    TestProject, TypeHierarchyProvider,
 };
-use common::{assert_code_eq, normalize_nonempty_lines, py_fixture_project};
+use common::{assert_code_eq, normalize_nonempty_lines, py_fixture_project, write_file};
 use std::collections::BTreeSet;
+use tempfile::tempdir;
 
 fn fixture_analyzer() -> PythonAnalyzer {
     PythonAnalyzer::from_project(py_fixture_project())
@@ -98,6 +100,38 @@ fn test_python_top_level_variables() {
     let top_level = analyzer.get_top_level_declarations(&vars_py);
     assert!(top_level.contains(&top_value));
     assert!(top_level.contains(&export_like));
+}
+
+#[test]
+fn test_chained_self_attribute_assignment_does_not_index_receiver_prefix() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    let file = write_file(
+        root,
+        "main.py",
+        r#"
+class Service:
+    def configure(self, pair):
+        self.config.value = 1
+        self.direct, other = pair
+
+    def read(self):
+        return self.config
+"#,
+    );
+    let analyzer = PythonAnalyzer::from_project(TestProject::new(root, Language::Python));
+    let declarations = analyzer.get_declarations(&file);
+
+    assert!(
+        declarations
+            .iter()
+            .all(|unit| unit.fq_name() != "main.Service.config")
+    );
+    assert!(
+        declarations
+            .iter()
+            .any(|unit| unit.fq_name() == "main.Service.direct")
+    );
 }
 
 #[test]

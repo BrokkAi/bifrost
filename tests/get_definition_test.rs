@@ -650,6 +650,65 @@ def imported_static():
 }
 
 #[test]
+fn python_nested_function_self_assignment_does_not_create_outer_field() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "main.py",
+            r#"
+class Service:
+    def configure(self):
+        def inner():
+            self.shadow = 1
+
+    def read(self):
+        return self.shadow
+"#,
+        )
+        .build();
+
+    let line = "        return self.shadow";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"main.py","line":8,"column":{}}}]}}"#,
+            column_of(line, "shadow")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn python_nested_class_self_assignment_does_not_create_outer_field() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "main.py",
+            r#"
+class Service:
+    def configure(self):
+        class Inner:
+            def run(self):
+                self.shadow = 1
+
+    def read(self):
+        return self.shadow
+"#,
+        )
+        .build();
+
+    let line = "        return self.shadow";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"main.py","line":9,"column":{}}}]}}"#,
+            column_of(line, "shadow")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
 fn rust_reference_context_collapses_repeated_targets_with_same_definition() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(
@@ -7385,6 +7444,70 @@ fn scala_uppercase_local_value_shadows_workspace_type() {
             r#"{{"references":[{{"path":"app/App.scala","line":2,"column":{}}}]}}"#,
             column_of(line, "Service }")
         ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn python_staticmethod_first_parameter_does_not_create_instance_field() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "main.py",
+            r#"
+class Service:
+    @staticmethod
+    def configure(obj):
+        obj.shadow = 1
+
+    def run(self):
+        return self.shadow
+"#,
+        )
+        .build();
+
+    let value = lookup_reference(
+        project.root(),
+        &json!({
+            "references": [{
+                "symbol": "Service.run",
+                "context": "return self.shadow",
+                "target": "shadow"
+            }]
+        })
+        .to_string(),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn python_classmethod_first_parameter_does_not_create_instance_field() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "main.py",
+            r#"
+class Service:
+    @classmethod
+    def configure(cls):
+        cls.shadow = 1
+
+    def run(self):
+        return self.shadow
+"#,
+        )
+        .build();
+
+    let value = lookup_reference(
+        project.root(),
+        &json!({
+            "references": [{
+                "symbol": "Service.run",
+                "context": "return self.shadow",
+                "target": "shadow"
+            }]
+        })
+        .to_string(),
     );
 
     assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
