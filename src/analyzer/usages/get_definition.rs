@@ -981,6 +981,10 @@ fn resolve_go(
         if let Some((_, name)) = reference.split_once('.')
             && let Some(package) = resolution.resolved_import_packages.first()
         {
+            let candidates = go_package_member_candidates(support, package, name);
+            if !candidates.is_empty() {
+                return candidates_outcome(candidates);
+            }
             if !go_import_path_is_workspace(support, package) {
                 return boundary(format!(
                     "`{package}` is outside this partial Go workspace analysis"
@@ -1006,7 +1010,7 @@ fn resolve_go(
     if let Some((qualifier, name)) = reference.split_once('.') {
         let imports = go_import_paths(go, file);
         if let Some(import_path) = imports.get(qualifier) {
-            let candidates = support.fqn(&format!("{import_path}.{name}"));
+            let candidates = go_package_member_candidates(support, import_path, name);
             if !candidates.is_empty() {
                 return candidates_outcome(candidates);
             }
@@ -1030,7 +1034,7 @@ fn resolve_go(
         );
     }
 
-    let candidates = support.fqn(&format!("{package}.{reference}"));
+    let candidates = go_package_member_candidates(support, &package, reference);
     if !candidates.is_empty() {
         return candidates_outcome(candidates);
     }
@@ -1088,6 +1092,18 @@ fn go_import_paths(
 
 fn go_import_path_is_workspace(support: &DefinitionLookupIndex, import_path: &str) -> bool {
     support.fqn_prefix_exists(import_path)
+}
+
+fn go_package_member_candidates(
+    support: &DefinitionLookupIndex,
+    package: &str,
+    name: &str,
+) -> Vec<CodeUnit> {
+    let mut candidates = support.fqn(&format!("{package}.{name}"));
+    candidates.extend(support.fqn(&format!("{package}._module_.{name}")));
+    sort_units(&mut candidates);
+    candidates.dedup();
+    candidates
 }
 
 fn go_external_dot_import_path(

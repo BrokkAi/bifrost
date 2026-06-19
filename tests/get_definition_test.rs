@@ -763,6 +763,54 @@ func Helper() {}
 }
 
 #[test]
+fn go_import_selector_resolves_package_var_definition() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n")
+        .file(
+            "main.go",
+            r#"
+package main
+
+import "errors"
+import "example.com/app/store"
+
+func Run(err error) bool {
+    return errors.Is(err, store.ErrDuplicate)
+}
+"#,
+        )
+        .file(
+            "store/errors.go",
+            r#"
+package store
+
+import "errors"
+
+var ErrDuplicate = errors.New("duplicate")
+"#,
+        )
+        .build();
+
+    let line = "    return errors.Is(err, store.ErrDuplicate)";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"main.go","line":8,"column":{}}}]}}"#,
+            column_of(line, "ErrDuplicate")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"],
+        "example.com/app/store._module_.ErrDuplicate",
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["path"], "store/errors.go", "{value}");
+}
+
+#[test]
 fn go_external_import_selector_reports_boundary() {
     let project = InlineTestProject::with_language(Language::Go)
         .file("go.mod", "module example.com/app\n")
