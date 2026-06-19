@@ -13,7 +13,7 @@ use lsp_types::notification::{
 use lsp_types::request::{
     Completion, DocumentDiagnosticRequest, DocumentHighlightRequest, DocumentSymbolRequest,
     FoldingRangeRequest, GotoDefinition, HoverRequest, References, Request as LspRequestTrait,
-    WorkspaceSymbolRequest,
+    TypeHierarchyPrepare, TypeHierarchySubtypes, TypeHierarchySupertypes, WorkspaceSymbolRequest,
 };
 use lsp_types::{
     DidChangeTextDocumentParams, DidChangeWatchedFilesParams, DidCloseTextDocumentParams,
@@ -29,7 +29,7 @@ use crate::lsp::conversion::uri_to_path;
 use crate::lsp::handlers::util::project_file_for_uri as resolve_project_file;
 use crate::lsp::handlers::{
     completion, definition, diagnostic, document_highlight, document_symbol, folding_range, hover,
-    references, workspace_symbol,
+    references, type_hierarchy, workspace_symbol,
 };
 
 /// Run the LSP server over stdio. `fallback_root` is used when the client does
@@ -45,8 +45,7 @@ pub(crate) fn run_with_connection(
     io_threads: IoThreads,
     fallback_root: PathBuf,
 ) -> Result<(), String> {
-    let server_capabilities = serde_json::to_value(server_capabilities())
-        .map_err(|err| format!("Failed to serialize LSP server capabilities: {err}"))?;
+    let server_capabilities = server_capabilities_json()?;
 
     let init_params_value = connection
         .initialize(server_capabilities)
@@ -66,6 +65,20 @@ pub(crate) fn run_with_connection(
         .join()
         .map_err(|err| format!("LSP IO threads failed: {err}"))?;
     result
+}
+
+fn server_capabilities_json() -> Result<serde_json::Value, String> {
+    let mut capabilities = serde_json::to_value(server_capabilities())
+        .map_err(|err| format!("Failed to serialize LSP server capabilities: {err}"))?;
+    if let Some(object) = capabilities.as_object_mut() {
+        // lsp-types 0.97 has the type-hierarchy request/response types but no
+        // ServerCapabilities field for this standard 3.17+ capability.
+        object.insert(
+            "typeHierarchyProvider".to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
+    Ok(capabilities)
 }
 
 fn main_loop(connection: &Connection, state: &mut ServerState) -> Result<(), String> {
@@ -157,6 +170,31 @@ fn handle_request(
         DocumentDiagnosticRequest::METHOD => {
             decode_and_run::<DocumentDiagnosticRequest, _>(req, |params| {
                 Ok(diagnostic::handle(
+                    &state.workspace,
+                    state.project(),
+                    &params,
+                ))
+            })
+        }
+        TypeHierarchyPrepare::METHOD => decode_and_run::<TypeHierarchyPrepare, _>(req, |params| {
+            Ok(type_hierarchy::prepare(
+                &state.workspace,
+                state.project(),
+                &params,
+            ))
+        }),
+        TypeHierarchySupertypes::METHOD => {
+            decode_and_run::<TypeHierarchySupertypes, _>(req, |params| {
+                Ok(type_hierarchy::supertypes(
+                    &state.workspace,
+                    state.project(),
+                    &params,
+                ))
+            })
+        }
+        TypeHierarchySubtypes::METHOD => {
+            decode_and_run::<TypeHierarchySubtypes, _>(req, |params| {
+                Ok(type_hierarchy::subtypes(
                     &state.workspace,
                     state.project(),
                     &params,

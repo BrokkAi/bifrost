@@ -6,5 +6,6 @@ pub mod document_symbol;
 pub mod folding_range;
 pub mod hover;
 pub mod references;
+pub mod type_hierarchy;
 pub(crate) mod util;
 pub mod workspace_symbol;

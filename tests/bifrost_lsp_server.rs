@@ -69,6 +69,10 @@ fn bifrost_lsp_server_handles_initialize_and_shutdown() {
         initialize["result"]["capabilities"]["textDocumentSync"].is_object(),
         "textDocumentSync should be advertised: {initialize}"
     );
+    assert_eq!(
+        initialize["result"]["capabilities"]["typeHierarchyProvider"], true,
+        "typeHierarchyProvider should be advertised: {initialize}"
+    );
 
     write_message(
         &mut stdin,
@@ -1944,6 +1948,191 @@ fn start_lsp_server(
         json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
     );
     (child, stdin, reader, stderr)
+}
+
+#[test]
+fn bifrost_lsp_server_type_hierarchy_java_round_trips_item_data() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("Hierarchy.java");
+    fs::write(
+        &file_path,
+        "class Base {}\nclass Child extends Base {\n    void method() {}\n}\n",
+    )
+    .expect("write Java hierarchy fixture");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+
+    let child_item =
+        prepare_type_hierarchy(&mut stdin, &mut reader, &mut stderr, 10, &file_uri, 1, 6);
+    assert_eq!(child_item["name"], "Child", "prepared child: {child_item}");
+
+    let supertypes = type_hierarchy_relation(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        11,
+        "typeHierarchy/supertypes",
+        child_item,
+    );
+    assert_eq!(
+        supertypes.len(),
+        1,
+        "expected one supertype: {supertypes:#?}"
+    );
+    assert_eq!(supertypes[0]["name"], "Base", "supertype should be Base");
+
+    let base_item = supertypes[0].clone();
+    let subtypes = type_hierarchy_relation(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        12,
+        "typeHierarchy/subtypes",
+        base_item,
+    );
+    let subtype_names: Vec<_> = subtypes
+        .iter()
+        .filter_map(|item| item["name"].as_str())
+        .collect();
+    assert_eq!(subtype_names, vec!["Child"], "subtypes: {subtypes:#?}");
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_type_hierarchy_python_uses_same_handler() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("hierarchy.py");
+    fs::write(
+        &file_path,
+        "class Base:\n    pass\n\nclass Child(Base):\n    def method(self):\n        pass\n",
+    )
+    .expect("write Python hierarchy fixture");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let child_item =
+        prepare_type_hierarchy(&mut stdin, &mut reader, &mut stderr, 20, &file_uri, 3, 6);
+
+    let supertypes = type_hierarchy_relation(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        21,
+        "typeHierarchy/supertypes",
+        child_item,
+    );
+    let supertype_names: Vec<_> = supertypes
+        .iter()
+        .filter_map(|item| item["name"].as_str())
+        .collect();
+    assert_eq!(supertype_names, vec!["Base"], "supertypes: {supertypes:#?}");
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_type_hierarchy_returns_null_without_provider() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("lib.rs");
+    fs::write(&file_path, "struct Base;\n").expect("write Rust fixture");
+    fs::write(root.join("Supported.java"), "class Supported {}\n").expect("write Java fixture");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 30,
+            "method": "textDocument/prepareTypeHierarchy",
+            "params": {
+                "textDocument": {"uri": file_uri},
+                "position": {"line": 0, "character": 7}
+            }
+        }),
+    );
+    let response = read_response_for_id(&mut reader, &mut stderr, 30);
+    assert!(
+        response["result"].is_null(),
+        "expected null prepare result without provider, got {response}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+fn prepare_type_hierarchy(
+    stdin: &mut impl Write,
+    reader: &mut impl BufRead,
+    stderr: &mut impl Read,
+    id: u64,
+    uri: &str,
+    line: u64,
+    character: u64,
+) -> Value {
+    write_message(
+        stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "textDocument/prepareTypeHierarchy",
+            "params": {
+                "textDocument": {"uri": uri},
+                "position": {"line": line, "character": character}
+            }
+        }),
+    );
+    let response = read_response_for_id(reader, stderr, id);
+    let items = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected prepare array, got {response}"));
+    assert_eq!(items.len(), 1, "expected one prepared item: {items:#?}");
+    items[0].clone()
+}
+
+fn type_hierarchy_relation(
+    stdin: &mut impl Write,
+    reader: &mut impl BufRead,
+    stderr: &mut impl Read,
+    id: u64,
+    method: &str,
+    item: Value,
+) -> Vec<Value> {
+    write_message(
+        stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": {"item": item}
+        }),
+    );
+    let response = read_response_for_id(reader, stderr, id);
+    response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected {method} array, got {response}"))
+        .clone()
+}
+
+fn shutdown_lsp(
+    mut child: std::process::Child,
+    mut stdin: std::process::ChildStdin,
+    mut reader: BufReader<std::process::ChildStdout>,
+    mut stderr: std::process::ChildStderr,
+) {
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 99, "method": "shutdown"}),
+    );
+    let _ = read_response_for_id(&mut reader, &mut stderr, 99);
+    write_message(&mut stdin, json!({"jsonrpc": "2.0", "method": "exit"}));
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
 }
 
 #[test]

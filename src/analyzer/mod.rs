@@ -32,7 +32,7 @@ pub use capabilities::{
     CapabilityProvider, ImportAnalysisProvider, TestDetectionProvider, TypeAliasProvider,
     TypeHierarchyProvider,
 };
-pub(crate) use capabilities::{build_reverse_import_index, direct_descendants_via_ancestors};
+pub(crate) use capabilities::{build_direct_descendant_index, build_reverse_import_index};
 pub use config::AnalyzerConfig;
 pub use cpp::CppAnalyzer;
 pub(crate) use cpp::{

@@ -1,5 +1,5 @@
 use super::*;
-use crate::analyzer::direct_descendants_via_ancestors;
+use crate::analyzer::build_direct_descendant_index;
 use std::sync::Arc;
 
 impl TypeHierarchyProvider for PythonAnalyzer {
@@ -24,7 +24,12 @@ impl TypeHierarchyProvider for PythonAnalyzer {
             return (*cached).clone();
         }
 
-        let descendants = direct_descendants_via_ancestors(self, self, code_unit);
+        let descendants = self
+            .direct_descendant_index
+            .get_or_init(|| build_direct_descendant_index(self, self))
+            .get(&code_unit.fq_name())
+            .map(|descendants| descendants.as_ref().clone())
+            .unwrap_or_default();
         self.direct_descendants
             .insert(code_unit.clone(), Arc::new(descendants.clone()));
         descendants

@@ -81,6 +81,10 @@ pub trait TypeHierarchyProvider: CapabilityProvider {
     fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit>;
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit>;
 
+    fn supports_type_hierarchy(&self, _code_unit: &CodeUnit) -> bool {
+        true
+    }
+
     fn get_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         traverse_hierarchy(code_unit, |next| self.get_direct_ancestors(next))
     }
@@ -111,26 +115,30 @@ pub trait TypeHierarchyProvider: CapabilityProvider {
     }
 }
 
-pub(crate) fn direct_descendants_via_ancestors<A, P>(
+pub(crate) fn build_direct_descendant_index<A, P>(
     analyzer: &A,
     provider: &P,
-    code_unit: &CodeUnit,
-) -> HashSet<CodeUnit>
+) -> HashMap<String, Arc<HashSet<CodeUnit>>>
 where
     A: IAnalyzer,
     P: TypeHierarchyProvider + ?Sized,
 {
-    analyzer
+    let mut reverse: HashMap<String, HashSet<CodeUnit>> = HashMap::default();
+    for candidate in analyzer
         .all_declarations()
         .filter(|candidate| candidate.is_class())
-        .filter(|candidate| *candidate != code_unit)
-        .filter(|candidate| {
-            provider
-                .get_direct_ancestors(candidate)
-                .into_iter()
-                .any(|ancestor| ancestor.fq_name() == code_unit.fq_name())
-        })
-        .cloned()
+    {
+        for ancestor in provider.get_direct_ancestors(candidate) {
+            reverse
+                .entry(ancestor.fq_name())
+                .or_default()
+                .insert(candidate.clone());
+        }
+    }
+
+    reverse
+        .into_iter()
+        .map(|(ancestor, descendants)| (ancestor, Arc::new(descendants)))
         .collect()
 }
 
