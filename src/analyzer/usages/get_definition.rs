@@ -787,10 +787,21 @@ fn rust_expression_type_fqn(
             rust_field_type_fqn(analyzer, support, file, source, &owner, member)
         }
         "call_expression" => rust_value_type_fqn(analyzer, support, file, source, root, expression),
-        "try_expression"
-        | "await_expression"
-        | "parenthesized_expression"
-        | "reference_expression" => {
+        "try_expression" => {
+            let mut cursor = expression.walk();
+            expression.named_children(&mut cursor).find_map(|child| {
+                rust_unwrapped_expression_type_fqn(
+                    analyzer,
+                    support,
+                    file,
+                    source,
+                    root,
+                    child,
+                    before_byte,
+                )
+            })
+        }
+        "await_expression" | "parenthesized_expression" | "reference_expression" => {
             let mut cursor = expression.walk();
             expression.named_children(&mut cursor).find_map(|child| {
                 rust_expression_type_fqn(analyzer, support, file, source, root, child, before_byte)
@@ -824,6 +835,30 @@ fn rust_binding_type_fqn(
     found.or_else(|| {
         rust_binding_type_from_source_text(analyzer, support, file, source, name, before_byte)
     })
+}
+
+fn rust_binding_type_text(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    name: &str,
+    before_byte: usize,
+) -> Option<String> {
+    let mut found = None;
+    rust_collect_binding_type_text(
+        analyzer,
+        support,
+        file,
+        source,
+        root,
+        root,
+        name,
+        before_byte,
+        &mut found,
+    );
+    found
 }
 
 fn rust_binding_type_from_source_text(
@@ -861,6 +896,66 @@ fn rust_binding_type_from_source_text(
         }
     }
     None
+}
+
+fn rust_collect_binding_type_text(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    node: Node<'_>,
+    name: &str,
+    before_byte: usize,
+    found: &mut Option<String>,
+) {
+    if node.start_byte() >= before_byte {
+        return;
+    }
+    match node.kind() {
+        "parameter" => {
+            if let Some((binding, type_node)) = rust_typed_binding(node, source)
+                && binding == name
+            {
+                *found = Some(rust_node_text(type_node, source).trim().to_string());
+            }
+        }
+        "let_declaration" => {
+            if let Some(binding) = node
+                .child_by_field_name("pattern")
+                .and_then(|pattern| rust_simple_identifier_text(pattern, source))
+                && binding == name
+            {
+                if let Some(type_node) = node.child_by_field_name("type") {
+                    *found = Some(rust_node_text(type_node, source).trim().to_string());
+                } else if let Some(value) = node.child_by_field_name("value")
+                    && let Some(type_text) =
+                        rust_value_type_text(analyzer, support, file, source, root, value)
+                {
+                    *found = Some(type_text);
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.start_byte() >= before_byte {
+            break;
+        }
+        rust_collect_binding_type_text(
+            analyzer,
+            support,
+            file,
+            source,
+            root,
+            child,
+            name,
+            before_byte,
+            found,
+        );
+    }
 }
 
 fn rust_collect_binding_type_fqn(
@@ -951,15 +1046,120 @@ fn rust_value_type_fqn(
     root: Node<'_>,
     value: Node<'_>,
 ) -> Option<String> {
+    let type_text = rust_value_type_text(analyzer, support, file, source, root, value)?;
+    rust_resolve_type_node_fqn(analyzer, support, file, &type_text)
+}
+
+fn rust_unwrapped_expression_type_fqn(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    expression: Node<'_>,
+    before_byte: usize,
+) -> Option<String> {
+    let type_text = rust_expression_type_text(
+        analyzer,
+        support,
+        file,
+        source,
+        root,
+        expression,
+        before_byte,
+    )?;
+    let inner = rust_unwrap_container_type(&type_text)?;
+    rust_resolve_type_node_fqn(analyzer, support, file, inner)
+}
+
+fn rust_expression_type_text(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    expression: Node<'_>,
+    before_byte: usize,
+) -> Option<String> {
+    match expression.kind() {
+        "identifier" => rust_binding_type_text(
+            analyzer,
+            support,
+            file,
+            source,
+            root,
+            rust_node_text(expression, source).trim(),
+            before_byte,
+        ),
+        "field_expression" => {
+            let receiver = expression.child_by_field_name("value")?;
+            let field = expression.child_by_field_name("field")?;
+            let owner = rust_expression_type_fqn(
+                analyzer,
+                support,
+                file,
+                source,
+                root,
+                receiver,
+                before_byte,
+            )?;
+            let member = rust_node_text(field, source).trim();
+            rust_field_type_text(analyzer, support, &owner, member)
+        }
+        "call_expression" => {
+            rust_value_type_text(analyzer, support, file, source, root, expression)
+        }
+        "try_expression" => {
+            let mut cursor = expression.walk();
+            expression.named_children(&mut cursor).find_map(|child| {
+                let type_text = rust_expression_type_text(
+                    analyzer,
+                    support,
+                    file,
+                    source,
+                    root,
+                    child,
+                    before_byte,
+                )?;
+                rust_unwrap_container_type(&type_text).map(str::to_string)
+            })
+        }
+        "await_expression" | "parenthesized_expression" | "reference_expression" => {
+            let mut cursor = expression.walk();
+            expression.named_children(&mut cursor).find_map(|child| {
+                rust_expression_type_text(analyzer, support, file, source, root, child, before_byte)
+            })
+        }
+        "struct_expression" => expression
+            .child_by_field_name("name")
+            .map(|name| rust_node_text(name, source).trim().to_string()),
+        _ => rust_call_text_name(rust_node_text(expression, source)).and_then(|name| {
+            rust_callable_return_type(analyzer, support.file_identifier(file, name))
+        }),
+    }
+}
+
+fn rust_value_type_text(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    value: Node<'_>,
+) -> Option<String> {
     match value.kind() {
-        "try_expression"
-        | "await_expression"
-        | "parenthesized_expression"
-        | "reference_expression" => {
+        "try_expression" => {
             let mut cursor = value.walk();
-            value
-                .named_children(&mut cursor)
-                .find_map(|child| rust_value_type_fqn(analyzer, support, file, source, root, child))
+            value.named_children(&mut cursor).find_map(|child| {
+                let type_text = rust_value_type_text(analyzer, support, file, source, root, child)?;
+                rust_unwrap_container_type(&type_text).map(str::to_string)
+            })
+        }
+        "await_expression" | "parenthesized_expression" | "reference_expression" => {
+            let mut cursor = value.walk();
+            value.named_children(&mut cursor).find_map(|child| {
+                rust_value_type_text(analyzer, support, file, source, root, child)
+            })
         }
         "call_expression" => {
             let function = value.child_by_field_name("function")?;
@@ -968,8 +1168,8 @@ fn rust_value_type_fqn(
                 && let Some(receiver) = function.child_by_field_name("value")
             {
                 let method_name = rust_node_text(method, source).trim();
-                if method_name == "unwrap_or_default" {
-                    return rust_expression_type_fqn(
+                if matches!(method_name, "expect" | "unwrap" | "unwrap_or_default") {
+                    let type_text = rust_expression_type_text(
                         analyzer,
                         support,
                         file,
@@ -977,18 +1177,8 @@ fn rust_value_type_fqn(
                         root,
                         receiver,
                         value.start_byte(),
-                    );
-                }
-                if matches!(method_name, "expect" | "unwrap") {
-                    return rust_expression_type_fqn(
-                        analyzer,
-                        support,
-                        file,
-                        source,
-                        root,
-                        receiver,
-                        value.start_byte(),
-                    );
+                    )?;
+                    return rust_unwrap_container_type(&type_text).map(str::to_string);
                 }
                 let owner = rust_expression_type_fqn(
                     analyzer,
@@ -1002,25 +1192,16 @@ fn rust_value_type_fqn(
                 return rust_callable_return_type(
                     analyzer,
                     support.fqn(&format!("{owner}.{method_name}")),
-                )
-                .and_then(|type_text| {
-                    rust_resolve_type_node_fqn(analyzer, support, file, &type_text)
-                });
+                );
             }
             let name = rust_callable_name(function, source)?;
-            let candidates = rust_named_candidates(support, file, &name);
-            rust_callable_return_type(analyzer, candidates).and_then(|type_text| {
-                rust_resolve_type_node_fqn(analyzer, support, file, &type_text)
-            })
+            rust_callable_return_type(analyzer, rust_named_candidates(support, file, &name))
         }
-        "struct_expression" => value.child_by_field_name("name").and_then(|name| {
-            rust_resolve_type_node_fqn(analyzer, support, file, rust_node_text(name, source))
-        }),
+        "struct_expression" => value
+            .child_by_field_name("name")
+            .map(|name| rust_node_text(name, source).trim().to_string()),
         _ => rust_call_text_name(rust_node_text(value, source)).and_then(|name| {
-            let candidates = support.file_identifier(file, name);
-            rust_callable_return_type(analyzer, candidates).and_then(|type_text| {
-                rust_resolve_type_node_fqn(analyzer, support, file, &type_text)
-            })
+            rust_callable_return_type(analyzer, support.file_identifier(file, name))
         }),
     }
 }
@@ -1049,7 +1230,7 @@ fn rust_function_return_type_text(signature: &str) -> Option<&str> {
         .trim()
         .trim_end_matches(';')
         .trim();
-    rust_unwrap_container_type(return_type).or(Some(return_type))
+    Some(return_type)
 }
 
 fn rust_unwrap_container_type(type_text: &str) -> Option<&str> {
@@ -1091,6 +1272,25 @@ fn rust_field_type_fqn(
     let type_text = signature.split_once(':')?.1.trim();
     rust_resolve_type_node_fqn(analyzer, support, file, type_text)
         .or_else(|| rust_resolve_type_node_fqn(analyzer, support, field.source(), type_text))
+}
+
+fn rust_field_type_text(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    owner_fqn: &str,
+    member: &str,
+) -> Option<String> {
+    let field = support
+        .fqn(&format!("{owner_fqn}.{member}"))
+        .into_iter()
+        .next()?;
+    let signature = field
+        .signature()
+        .map(str::to_string)
+        .or_else(|| analyzer.signatures(&field).iter().next().cloned())?;
+    signature
+        .split_once(':')
+        .map(|(_, type_text)| type_text.trim().to_string())
 }
 
 fn rust_resolve_type_node_fqn(

@@ -772,6 +772,44 @@ pub fn test_crate_macros() {
 }
 
 #[test]
+fn rust_struct_field_access_does_not_unwrap_option_without_syntax() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .file("src/lib.rs", "pub mod pricing;\npub mod route;\npub use route::RouteCheapnessEstimate;\n")
+        .file("src/route.rs", "pub struct RouteCheapnessEstimate {\n    pub input_price_per_mtok_micros: Option<u64>,\n}\n")
+        .file(
+            "src/pricing.rs",
+            r#"
+use crate::{RouteCheapnessEstimate};
+
+pub fn pricing() -> Option<RouteCheapnessEstimate> {
+    todo!()
+}
+
+fn run() {
+    let maybe = pricing();
+    let _ = maybe.input_price_per_mtok_micros;
+}
+"#,
+        )
+        .build();
+
+    let line = "    let _ = maybe.input_price_per_mtok_micros;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/pricing.rs","line":10,"column":{}}}]}}"#,
+            column_of(line, "input_price_per_mtok_micros")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
 fn rust_crate_scoped_macro_resolves_inside_inline_module() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(
