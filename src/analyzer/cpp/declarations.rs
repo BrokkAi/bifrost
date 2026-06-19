@@ -27,28 +27,13 @@ enum CppWork<'tree> {
 }
 
 fn class_like_name(node: Node<'_>, source: &str) -> Option<String> {
-    let text = node_text(node, source);
-    let header = text.split(['{', ':']).next().unwrap_or(text).trim();
-    let mut best = None;
-    for token in Regex::new(r"[A-Za-z_]\w*")
-        .expect("valid C++ identifier regex")
-        .find_iter(header)
-        .map(|m| m.as_str())
-    {
-        if matches!(
-            token,
-            "class" | "struct" | "union" | "enum" | "final" | "public" | "private" | "protected"
-        ) {
-            continue;
-        }
-        best = Some(token.to_string());
-    }
+    let best = class_like_name_from_children(node, source);
     if let Some(parent) = node.parent()
         && matches!(
             parent.kind(),
             "declaration" | "field_declaration" | "function_definition"
         )
-        && let Some(recovered) = exported_class_name_from_text(node_text(parent, source))
+        && let Some(recovered) = exported_class_name_from_node(parent, source)
         && best.as_deref() != Some(recovered.as_str())
     {
         return Some(recovered);
@@ -56,38 +41,111 @@ fn class_like_name(node: Node<'_>, source: &str) -> Option<String> {
     best.or_else(|| {
         node.child_by_field_name("name")
             .map(|name_node| normalize_cpp_whitespace(node_text(name_node, source)))
-            .filter(|name| !name.is_empty())
+            .filter(|name| !name.is_empty() && !cpp_export_macro_token(name))
     })
 }
 
-fn exported_class_name_from_text(text: &str) -> Option<String> {
-    let header = text.split(['{', ':']).next().unwrap_or(text);
-    let identifiers: Vec<_> = Regex::new(r"[A-Za-z_]\w*")
-        .expect("valid C++ identifier regex")
-        .find_iter(header)
-        .map(|m| m.as_str())
-        .collect();
-    let class_keyword_index = identifiers
-        .iter()
-        .position(|token| matches!(*token, "class" | "struct" | "union"))?;
-    let candidates: Vec<_> = identifiers[class_keyword_index + 1..]
-        .iter()
-        .copied()
-        .filter(|token| !cpp_class_header_modifier(token))
-        .collect();
-    let name = candidates
-        .iter()
-        .copied()
-        .rfind(|token| !cpp_export_macro_token(token))
-        .or_else(|| candidates.last().copied())?;
-    Some(name.to_string())
+fn class_like_name_from_children(node: Node<'_>, source: &str) -> Option<String> {
+    let mut grammar_name = None;
+    if let Some(name_node) = node.child_by_field_name("name") {
+        let name = normalize_cpp_whitespace(node_text(name_node, source));
+        if name.is_empty() {
+            return None;
+        }
+        if !cpp_export_macro_token(&name) {
+            return Some(name);
+        }
+        grammar_name = Some(name);
+    }
+
+    let mut best = None;
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if matches!(
+            child.kind(),
+            "field_declaration_list" | "base_class_clause" | "declaration_list" | "enumerator_list"
+        ) {
+            break;
+        }
+        if !matches!(child.kind(), "type_identifier" | "identifier") {
+            continue;
+        }
+        let name = normalize_cpp_whitespace(node_text(child, source));
+        if !name.is_empty() && !cpp_export_macro_token(&name) {
+            best = Some(name);
+        }
+    }
+    best.or(grammar_name)
 }
 
-fn cpp_class_header_modifier(token: &str) -> bool {
-    matches!(
-        token,
-        "final" | "public" | "private" | "protected" | "virtual"
-    )
+fn exported_class_name_from_node(node: Node<'_>, source: &str) -> Option<String> {
+    if node.kind() == "declaration"
+        && node
+            .child_by_field_name("type")
+            .or_else(|| first_class_like_child(node))
+            .is_some_and(|type_node| {
+                matches!(
+                    type_node.kind(),
+                    "class_specifier" | "struct_specifier" | "union_specifier"
+                )
+            })
+        && let Some(name) = node
+            .child_by_field_name("declarator")
+            .and_then(|declarator| declarator_name_from_node(declarator, source))
+        && !cpp_export_macro_token(&name)
+    {
+        return Some(name);
+    }
+
+    if node.kind() == "function_definition"
+        && node.child_by_field_name("type").is_some_and(|type_node| {
+            matches!(
+                type_node.kind(),
+                "class_specifier" | "struct_specifier" | "union_specifier"
+            )
+        })
+        && let Some(name) = node
+            .child_by_field_name("declarator")
+            .and_then(|declarator| direct_identifier_name(declarator, source))
+        && !cpp_export_macro_token(&name)
+    {
+        return Some(name);
+    }
+
+    let class_node = if matches!(
+        node.kind(),
+        "class_specifier" | "struct_specifier" | "union_specifier"
+    ) {
+        node
+    } else {
+        first_class_like_child(node)?
+    };
+    class_like_name_from_children(class_node, source)
+}
+
+fn direct_identifier_name(node: Node<'_>, source: &str) -> Option<String> {
+    if !matches!(
+        node.kind(),
+        "identifier" | "field_identifier" | "type_identifier"
+    ) {
+        return None;
+    }
+    let name = normalize_cpp_whitespace(node_text(node, source));
+    (!name.is_empty()).then_some(name)
+}
+
+fn declarator_name_from_node(node: Node<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "identifier" | "field_identifier" | "type_identifier" => {
+            let name = normalize_cpp_whitespace(node_text(node, source));
+            (!name.is_empty()).then_some(name)
+        }
+        _ => {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .find_map(|child| declarator_name_from_node(child, source))
+        }
+    }
 }
 
 fn cpp_export_macro_token(token: &str) -> bool {
@@ -101,11 +159,14 @@ fn recover_exported_class_declaration<'tree>(
     source: &str,
 ) -> Option<(Node<'tree>, String)> {
     let class_node = first_class_like_child(node)?;
-    let name = exported_class_name_from_text(node_text(node, source))?;
+    let name = exported_class_name_from_node(class_node, source)?;
     Some((class_node, name))
 }
 
-fn recover_exported_class_function_definition(node: Node<'_>, source: &str) -> Option<String> {
+fn recover_exported_class_function_definition<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<(Node<'tree>, String)> {
     if node.kind() != "function_definition" {
         return None;
     }
@@ -116,7 +177,8 @@ fn recover_exported_class_function_definition(node: Node<'_>, source: &str) -> O
     ) {
         return None;
     }
-    exported_class_name_from_text(node_text(node, source))
+    let name = exported_class_name_from_node(node, source)?;
+    Some((type_node, name))
 }
 
 fn first_class_like_child(node: Node<'_>) -> Option<Node<'_>> {
@@ -445,9 +507,11 @@ impl<'a> CppVisitor<'a> {
     }
 
     fn visit_function_definition(&mut self, node: Node<'_>, scope: &ScopeInfo) {
-        if let Some(name) = recover_exported_class_function_definition(node, self.source) {
+        if let Some((class_node, name)) =
+            recover_exported_class_function_definition(node, self.source)
+        {
             let mut stack = Vec::new();
-            self.visit_named_class_like(node, name, scope, &mut stack);
+            self.visit_named_class_like(class_node, name, scope, &mut stack);
             while let Some(work) = stack.pop() {
                 match work {
                     CppWork::Container(container) => {
@@ -506,6 +570,7 @@ impl<'a> CppVisitor<'a> {
                     child.kind(),
                     "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier"
                 )
+                && !has_direct_cpp_declarator(node)
             {
                 self.visit_class_like(child, scope, stack);
                 continue;
@@ -965,6 +1030,24 @@ fn classify_declarator(node: Node<'_>) -> Option<DeclaratorKind<'_>> {
             .or_else(|| last_named_child(node))
             .and_then(classify_declarator),
     }
+}
+
+fn has_direct_cpp_declarator(node: Node<'_>) -> bool {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).any(|child| {
+        matches!(
+            child.kind(),
+            "init_declarator"
+                | "identifier"
+                | "field_identifier"
+                | "pointer_declarator"
+                | "reference_declarator"
+                | "array_declarator"
+                | "function_declarator"
+                | "parenthesized_declarator"
+                | "attributed_declarator"
+        )
+    })
 }
 
 fn is_function_pointer_like_inner_declarator(node: Node<'_>) -> bool {
