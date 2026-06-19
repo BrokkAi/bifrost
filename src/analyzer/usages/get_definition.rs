@@ -621,7 +621,11 @@ fn rust_import_statement_candidates(
     let flattened_imports: Vec<String> = import_statements
         .iter()
         .map(String::as_str)
-        .chain(rust_use_statements_from_source(source).iter().map(String::as_str))
+        .chain(
+            rust_use_statements_from_source(source)
+                .iter()
+                .map(String::as_str),
+        )
         .flat_map(crate::analyzer::rust::flatten_rust_use)
         .collect();
     for raw in flattened_imports {
@@ -663,9 +667,7 @@ fn rust_use_statements_from_source(source: &str) -> Vec<String> {
     let mut collecting = false;
     for line in source.lines() {
         let trimmed = line.trim();
-        if !collecting
-            && !(trimmed.starts_with("use ") || trimmed.starts_with("pub use "))
-        {
+        if !collecting && !(trimmed.starts_with("use ") || trimmed.starts_with("pub use ")) {
             continue;
         }
         if collecting {
@@ -689,7 +691,9 @@ fn rust_module_files_from_path(file: &ProjectFile, module_specifier: &str) -> Ve
     for rel_path in [
         relative_module.with_extension("rs"),
         relative_module.join("mod.rs"),
-        PathBuf::from("src").join(&relative_module).with_extension("rs"),
+        PathBuf::from("src")
+            .join(&relative_module)
+            .with_extension("rs"),
         PathBuf::from("src").join(&relative_module).join("mod.rs"),
     ] {
         let candidate = ProjectFile::new(file.root().to_path_buf(), rel_path);
@@ -885,11 +889,9 @@ fn resolve_js_ts_module_binding(
 }
 
 fn jsts_reference_is_value_position(tree: &Tree, site: &ResolvedReferenceSite) -> bool {
-    let Some(node) = smallest_named_node_covering(
-        tree.root_node(),
-        site.focus_start_byte,
-        site.focus_end_byte,
-    ) else {
+    let Some(node) =
+        smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)
+    else {
         return true;
     };
     !jsts_reference_is_type_position(node)
@@ -3055,8 +3057,19 @@ fn scala_resolve_type_annotation(resolver: &ScalaNameResolver, type_text: &str) 
             }
         });
     }
-    let fqn = resolver.resolve(type_text)?;
+    let fqn = resolver
+        .resolve(type_text)
+        .or_else(|| scala_type_base_text(trimmed).and_then(|base| resolver.resolve(base)))?;
     Some(fqn.trim_end_matches('$').to_string())
+}
+
+fn scala_type_base_text(type_text: &str) -> Option<&str> {
+    let base = type_text
+        .split(['[', '<'])
+        .next()
+        .unwrap_or(type_text)
+        .trim();
+    (!base.is_empty() && base != type_text.trim()).then_some(base)
 }
 
 fn scala_fqn_outcome(
@@ -3217,6 +3230,10 @@ fn scala_seed_value_definition(
             node.child_by_field_name("value")
                 .filter(|value| value.end_byte() <= cutoff_start)
                 .and_then(|value| scala_constructed_type(value, resolver, source))
+                .or_else(|| {
+                    scala_constructor_type_text(scala_node_text(node, source))
+                        .and_then(|type_text| scala_resolve_type_annotation(resolver, type_text))
+                })
         });
     let Some(pattern) = node.child_by_field_name("pattern") else {
         return;
@@ -3234,13 +3251,58 @@ fn scala_constructed_type(
     resolver: &ScalaNameResolver,
     source: &str,
 ) -> Option<String> {
-    if node.kind() != "instance_expression" {
+    if node.kind() == "call_expression"
+        && let Some(function) = node
+            .child_by_field_name("function")
+            .or_else(|| node.named_child(0))
+    {
+        return scala_constructed_type(function, resolver, source);
+    }
+    if !matches!(
+        node.kind(),
+        "instance_expression" | "generic_type" | "type_identifier" | "identifier"
+    ) {
         return None;
     }
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .find(|child| child.kind() == "type_identifier" || child.kind() == "generic_type")
-        .and_then(|type_node| resolver.resolve(scala_node_text(type_node, source)))
+        .or_else(|| {
+            matches!(
+                node.kind(),
+                "type_identifier" | "generic_type" | "identifier"
+            )
+            .then_some(node)
+        })
+        .and_then(|type_node| {
+            scala_resolve_type_annotation(resolver, scala_node_text(type_node, source))
+        })
+}
+
+fn scala_constructor_type_text(value_text: &str) -> Option<&str> {
+    let trimmed = value_text.trim_start();
+    let value = if let Some(after_keyword) = trimmed
+        .strip_prefix("val ")
+        .or_else(|| trimmed.strip_prefix("var "))
+    {
+        after_keyword.split_once('=')?.1.trim_start()
+    } else {
+        trimmed
+    };
+    let value = value.strip_prefix("new ").unwrap_or(value).trim_start();
+    let end = value
+        .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '.'))
+        .unwrap_or(value.len());
+    if end == 0 {
+        return None;
+    }
+    let type_text = &value[..end];
+    let simple_name = type_text.rsplit('.').next().unwrap_or(type_text);
+    simple_name
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_uppercase())
+        .then_some(type_text)
 }
 
 fn scala_pattern_names<'a>(node: Node<'_>, source: &'a str) -> Vec<&'a str> {
@@ -4978,10 +5040,7 @@ enum PhpReferenceNode<'tree> {
     },
 }
 
-fn php_reference_node<'tree>(
-    node: Node<'tree>,
-    source: &str,
-) -> Option<PhpReferenceNode<'tree>> {
+fn php_reference_node<'tree>(node: Node<'tree>, source: &str) -> Option<PhpReferenceNode<'tree>> {
     let node = php_qualified_reference_node(node);
     match node.kind() {
         "object_creation_expression" => php_object_creation_type(node).map(PhpReferenceNode::Type),
@@ -5022,7 +5081,9 @@ fn php_reference_node<'tree>(
                     let object = parent.child_by_field_name("object")?;
                     Some(PhpReferenceNode::InstanceMember { object, name: node })
                 }
-                _ if php_is_instanceof_type_name(node, source) => Some(PhpReferenceNode::Type(node)),
+                _ if php_is_instanceof_type_name(node, source) => {
+                    Some(PhpReferenceNode::Type(node))
+                }
                 _ if php_is_bare_constant_reference(node) => Some(PhpReferenceNode::Constant(node)),
                 _ => None,
             }
