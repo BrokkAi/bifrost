@@ -343,6 +343,7 @@ impl<'a> PythonVisitor<'a> {
         let Some(left) = assignment.child_by_field_name("left") else {
             return;
         };
+        self.visit_instance_attribute_assignment(left, scope);
         let names = collect_assigned_names(left, self.source);
         for name in names {
             let short_name = if let Some(parent) = scope.last() {
@@ -378,6 +379,39 @@ impl<'a> PythonVisitor<'a> {
             {
                 self.parsed.add_child(parent_cu.clone(), code_unit);
             }
+        }
+    }
+
+    fn visit_instance_attribute_assignment(&mut self, left: Node<'_>, scope: &[Scope]) {
+        let Some(parent) = scope
+            .iter()
+            .rev()
+            .find(|scope| scope.kind == ScopeKind::Class)
+        else {
+            return;
+        };
+        let Some(parent_cu) = parent.code_unit.clone() else {
+            return;
+        };
+        for (name, node) in collect_self_assigned_attributes(left, self.source) {
+            let code_unit = CodeUnit::new(
+                self.file.clone(),
+                CodeUnitType::Field,
+                self.package_name.to_string(),
+                format!("{}.{}", parent.path, name),
+            );
+            self.parsed.replace_code_unit(
+                code_unit.clone(),
+                node,
+                self.source,
+                Some(parent_cu.clone()),
+                Some(parent_cu.clone()),
+            );
+            self.parsed.add_signature(
+                code_unit.clone(),
+                py_node_text(left, self.source).trim().to_string(),
+            );
+            self.parsed.add_child(parent_cu.clone(), code_unit);
         }
     }
 
@@ -619,6 +653,37 @@ fn collect_assigned_names(node: Node<'_>, source: &str) -> Vec<String> {
         WalkControl::Continue
     });
     names
+}
+
+fn collect_self_assigned_attributes<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Vec<(String, Node<'tree>)> {
+    let mut attributes = Vec::new();
+    walk_named_tree_preorder(node, true, |node| {
+        if node.kind() != "attribute" {
+            return WalkControl::Continue;
+        }
+        let Some(object) = node.child_by_field_name("object") else {
+            return WalkControl::Continue;
+        };
+        if object.kind() != "identifier" {
+            return WalkControl::Continue;
+        }
+        let receiver = py_node_text(object, source).trim();
+        if receiver != "self" && receiver != "cls" {
+            return WalkControl::Continue;
+        }
+        let Some(attribute) = node.child_by_field_name("attribute") else {
+            return WalkControl::SkipChildren;
+        };
+        let name = py_node_text(attribute, source).trim();
+        if !name.is_empty() {
+            attributes.push((name.to_string(), attribute));
+        }
+        WalkControl::SkipChildren
+    });
+    attributes
 }
 
 pub(super) fn collect_python_identifiers(

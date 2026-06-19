@@ -8543,6 +8543,11 @@ fn resolve_python(
                     site.text.as_str(),
                 );
             }
+            if !object_shadowed
+                && let Some(receiver_type) = ctx.receiver_type_for_object(support, object_text)
+            {
+                return python_member_outcome(analyzer, support, receiver_type, attribute_text);
+            }
             if let Some(receiver_type) =
                 python_receiver_type_unit(analyzer, py, file, source, tree.root_node(), object)
             {
@@ -8674,6 +8679,21 @@ impl PythonDefinitionContext {
             .values()
             .find(|module| module.as_str() == object)
             .map(String::as_str)
+    }
+
+    fn receiver_type_for_object(
+        &self,
+        support: &DefinitionLookupIndex,
+        object: &str,
+    ) -> Option<CodeUnit> {
+        if let Some(fqn) = self.named.get(object) {
+            return support.fqn(fqn).into_iter().find(|unit| unit.is_class());
+        }
+        self.same_file
+            .get(object)?
+            .iter()
+            .find(|unit| unit.is_class())
+            .cloned()
     }
 }
 

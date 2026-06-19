@@ -244,6 +244,103 @@ func (m *Model) Handle() {
 }
 
 #[test]
+fn python_class_and_instance_attributes_resolve_to_definitions() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "util.py",
+            r#"
+class ModelParser:
+    @staticmethod
+    def from_model(path):
+        return ModelParser()
+"#,
+        )
+        .file(
+            "main.py",
+            r#"
+from util import ModelParser
+
+class DataType:
+    FLOAT = object()
+
+class Service:
+    def __init__(self, memory):
+        self.memory = memory
+
+    def run(self):
+        return self.memory
+
+def class_attr():
+    return DataType.FLOAT
+
+def imported_static():
+    return ModelParser.from_model("model.xml")
+"#,
+        )
+        .build();
+
+    let class_attr = lookup_reference(
+        project.root(),
+        &json!({
+            "references": [{
+                "symbol": "class_attr",
+                "context": "return DataType.FLOAT",
+                "target": "FLOAT"
+            }]
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        class_attr["results"][0]["status"], "resolved",
+        "{class_attr}"
+    );
+    assert_eq!(
+        class_attr["results"][0]["definitions"][0]["fqn"], "main.DataType.FLOAT",
+        "{class_attr}"
+    );
+
+    let instance_attr = lookup_reference(
+        project.root(),
+        &json!({
+            "references": [{
+                "symbol": "Service.run",
+                "context": "return self.memory",
+                "target": "memory"
+            }]
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        instance_attr["results"][0]["status"], "resolved",
+        "{instance_attr}"
+    );
+    assert_eq!(
+        instance_attr["results"][0]["definitions"][0]["fqn"], "main.Service.memory",
+        "{instance_attr}"
+    );
+
+    let imported_static = lookup_reference(
+        project.root(),
+        &json!({
+            "references": [{
+                "symbol": "imported_static",
+                "context": "return ModelParser.from_model(\"model.xml\")",
+                "target": "from_model"
+            }]
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        imported_static["results"][0]["status"], "resolved",
+        "{imported_static}"
+    );
+    assert_eq!(
+        imported_static["results"][0]["definitions"][0]["fqn"], "util.ModelParser.from_model",
+        "{imported_static}"
+    );
+}
+
+#[test]
 fn rust_reference_context_collapses_repeated_targets_with_same_definition() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(
