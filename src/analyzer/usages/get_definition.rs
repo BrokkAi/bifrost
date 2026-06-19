@@ -1309,7 +1309,8 @@ fn resolve_cpp_call(
         return no_definition("no_function_name", "C++ call expression has no function");
     };
     let call_arity = cpp_call_arity(call);
-    let call_arg_types = cpp_call_argument_types(visibility, file, source, root, call);
+    let call_arg_types =
+        cpp_call_argument_types(analyzer, support, visibility, file, source, root, call);
     match function.kind() {
         "field_expression" => resolve_cpp_field(
             analyzer,
@@ -1456,7 +1457,8 @@ fn resolve_cpp_field(
     else {
         return no_definition("no_member_receiver", "C++ field expression has no receiver");
     };
-    let owners = cpp_receiver_type_units(analyzer, visibility, file, source, root, receiver);
+    let owners =
+        cpp_receiver_type_units(analyzer, support, visibility, file, source, root, receiver);
     let candidates = cpp_member_candidates(
         analyzer, support, owners, member, arity, arg_types, visibility, file,
     );
@@ -1762,6 +1764,8 @@ fn cpp_base_type_text(base: &str) -> String {
 }
 
 fn cpp_call_argument_types(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
     visibility: &CppVisibilityIndex,
     file: &ProjectFile,
     source: &str,
@@ -1775,12 +1779,14 @@ fn cpp_call_argument_types(
     let mut cursor = args.walk();
     Some(
         args.named_children(&mut cursor)
-            .map(|arg| cpp_expression_type(visibility, file, source, root, arg))
+            .map(|arg| cpp_expression_type(analyzer, support, visibility, file, source, root, arg))
             .collect(),
     )
 }
 
 fn cpp_expression_type(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
     visibility: &CppVisibilityIndex,
     file: &ProjectFile,
     source: &str,
@@ -1793,16 +1799,73 @@ fn cpp_expression_type(
             let bindings = cpp_bindings_before(visibility, file, source, root, node.start_byte());
             first_precise(&bindings, name)
         }
+        "field_expression" => {
+            cpp_field_expression_type(analyzer, support, visibility, file, source, root, node)
+        }
         "parenthesized_expression" | "pointer_expression" => node
             .child_by_field_name("argument")
             .or_else(|| node.named_child(0))
-            .and_then(|inner| cpp_expression_type(visibility, file, source, root, inner)),
+            .and_then(|inner| {
+                cpp_expression_type(analyzer, support, visibility, file, source, root, inner)
+            }),
         _ => None,
     }
 }
 
+fn cpp_field_expression_type(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    field: Node<'_>,
+) -> Option<CodeUnit> {
+    let member = field
+        .child_by_field_name("field")
+        .map(|field| cpp_node_text(field, source))?;
+    let receiver = field
+        .child_by_field_name("argument")
+        .or_else(|| field.named_child(0))?;
+    let owners =
+        cpp_receiver_type_units(analyzer, support, visibility, file, source, root, receiver);
+    let candidates = cpp_member_candidates(
+        analyzer, support, owners, member, None, None, visibility, file,
+    );
+    candidates
+        .into_iter()
+        .filter(|unit| unit.is_field())
+        .find_map(|unit| cpp_field_declared_type(analyzer, visibility, file, &unit))
+}
+
+fn cpp_field_declared_type(
+    analyzer: &dyn IAnalyzer,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    field: &CodeUnit,
+) -> Option<CodeUnit> {
+    let declaration_text = field
+        .signature()
+        .map(str::to_string)
+        .or_else(|| analyzer.get_source(field, false))?;
+    let declaration = declaration_text
+        .split('=')
+        .next()
+        .unwrap_or(&declaration_text)
+        .trim()
+        .trim_end_matches(';')
+        .trim();
+    let name_at = declaration.rfind(field.identifier())?;
+    let type_text = declaration[..name_at].trim();
+    if type_text.is_empty() {
+        return None;
+    }
+    visibility.resolve_type(file, type_text)
+}
+
 fn cpp_receiver_type_units(
     analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
     visibility: &CppVisibilityIndex,
     file: &ProjectFile,
     source: &str,
@@ -1826,10 +1889,17 @@ fn cpp_receiver_type_units(
         "this" => cpp_enclosing_class(analyzer, file, receiver.start_byte())
             .into_iter()
             .collect(),
+        "field_expression" => {
+            cpp_field_expression_type(analyzer, support, visibility, file, source, root, receiver)
+                .into_iter()
+                .collect()
+        }
         "parenthesized_expression" | "pointer_expression" => receiver
             .child_by_field_name("argument")
             .or_else(|| receiver.named_child(0))
-            .map(|inner| cpp_receiver_type_units(analyzer, visibility, file, source, root, inner))
+            .map(|inner| {
+                cpp_receiver_type_units(analyzer, support, visibility, file, source, root, inner)
+            })
             .unwrap_or_default(),
         _ => Vec::new(),
     }

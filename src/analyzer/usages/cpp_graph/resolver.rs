@@ -739,6 +739,9 @@ pub(in crate::analyzer::usages) fn first_type_child(node: Node<'_>) -> Option<No
                 | "primitive_type"
                 | "qualified_identifier"
                 | "scoped_type_identifier"
+                | "struct_specifier"
+                | "union_specifier"
+                | "enum_specifier"
         )
     })
 }
@@ -777,12 +780,24 @@ pub(super) fn function_terminal_node(node: Node<'_>) -> Node<'_> {
 }
 
 pub(in crate::analyzer::usages) fn normalize_type_text(value: &str) -> String {
-    normalize_cpp_whitespace(value)
-        .trim_start_matches("const ")
-        .trim_end_matches('*')
-        .trim_end_matches('&')
+    strip_tag_type_prefix(
+        normalize_cpp_whitespace(value)
+            .trim_start_matches("const ")
+            .trim_end_matches('*')
+            .trim_end_matches('&')
+            .trim(),
+    )
+    .to_string()
+}
+
+fn strip_tag_type_prefix(value: &str) -> &str {
+    let value = value.trim_start_matches("const ");
+    value
+        .strip_prefix("struct ")
+        .or_else(|| value.strip_prefix("class "))
+        .or_else(|| value.strip_prefix("enum "))
+        .unwrap_or(value)
         .trim()
-        .to_string()
 }
 
 pub(super) fn normalize_reference_name(value: &str) -> Option<String> {
@@ -801,12 +816,13 @@ pub(super) fn normalize_cpp_reference_text(value: &str) -> String {
     if let Some(index) = text.find('<') {
         text.truncate(index);
     }
-    text.trim()
+    let normalized = text
+        .trim()
         .trim_start_matches("const ")
         .trim_end_matches('*')
         .trim_end_matches('&')
-        .trim_matches(':')
-        .to_string()
+        .trim_matches(':');
+    strip_tag_type_prefix(normalized).to_string()
 }
 
 pub(in crate::analyzer::usages) fn cpp_name_for(unit: &CodeUnit) -> String {
