@@ -212,6 +212,312 @@ fn run(ctx: BridgeContext) -> anyhow::Result<()> {
 }
 
 #[test]
+fn rust_struct_field_access_ignores_shadowing_binding_after_inner_scope() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+struct Outer {
+    name: String,
+}
+
+struct Inner {
+    name: String,
+}
+
+fn run(value: Outer) {
+    {
+        let value: Inner = todo!();
+        let _ = value.name;
+    }
+    let _ = value.name;
+}
+"#,
+        )
+        .build();
+
+    let line = "    let _ = value.name;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"lib.rs","line":15,"column":{}}}]}}"#,
+            column_of(line, "name")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "Outer.name",
+        "{value}"
+    );
+}
+
+#[test]
+fn rust_unimported_inline_module_type_does_not_guess_same_file_identifier() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+mod hidden {
+    pub struct Hidden {
+        pub name: String,
+    }
+}
+
+fn run(value: Hidden) {
+    let _ = value.name;
+}
+"#,
+        )
+        .build();
+
+    let line = "    let _ = value.name;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"lib.rs","line":9,"column":{}}}]}}"#,
+            column_of(line, "name")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn rust_function_local_use_does_not_leak_to_sibling_function_type_lookup() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .file(
+            "src/lib.rs",
+            r#"
+mod hidden {
+    pub struct Hidden {
+        pub name: String,
+    }
+}
+
+fn other() {
+    use crate::hidden::Hidden;
+}
+
+fn run(value: Hidden) {
+    let _ = value.name;
+}
+"#,
+        )
+        .build();
+
+    let line = "    let _ = value.name;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/lib.rs","line":13,"column":{}}}]}}"#,
+            column_of(line, "name")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn rust_parent_module_use_does_not_leak_into_inline_child_module() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .file(
+            "src/lib.rs",
+            r#"
+mod hidden {
+    pub struct Hidden {
+        pub name: String,
+    }
+}
+
+use crate::hidden::Hidden;
+
+mod child {
+    fn run(value: Hidden) {
+        let _ = value.name;
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        let _ = value.name;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/lib.rs","line":12,"column":{}}}]}}"#,
+            column_of(line, "name")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn rust_function_local_use_does_not_leak_through_resolve_bare_for_crate_root_type() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .file(
+            "src/lib.rs",
+            r#"
+pub struct Actual {
+    pub name: String,
+}
+
+fn other() {
+    use crate::Actual as Hidden;
+}
+
+fn run(value: Hidden) {
+    let _ = value.name;
+}
+"#,
+        )
+        .build();
+
+    let line = "    let _ = value.name;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/lib.rs","line":11,"column":{}}}]}}"#,
+            column_of(line, "name")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn rust_inline_module_local_type_resolves_inside_same_module_scope() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .file(
+            "src/lib.rs",
+            r#"
+mod child {
+    struct Local {
+        name: String,
+    }
+
+    fn run(value: Local) {
+        let _ = value.name;
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        let _ = value.name;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/lib.rs","line":8,"column":{}}}]}}"#,
+            column_of(line, "name")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "child.Local.name",
+        "{value}"
+    );
+}
+
+#[test]
+fn rust_inline_module_local_type_resolves_before_later_declaration() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .file(
+            "src/lib.rs",
+            r#"
+mod child {
+    fn run(value: Local) {
+        let _ = value.name;
+    }
+
+    struct Local {
+        name: String,
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        let _ = value.name;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/lib.rs","line":4,"column":{}}}]}}"#,
+            column_of(line, "name")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "child.Local.name",
+        "{value}"
+    );
+}
+
+#[test]
+fn rust_later_module_use_resolves_earlier_same_module_reference() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .file(
+            "src/lib.rs",
+            r#"
+mod hidden {
+    pub struct Hidden {
+        pub name: String,
+    }
+}
+
+fn run(value: Hidden) {
+    let _ = value.name;
+}
+
+use crate::hidden::Hidden;
+"#,
+        )
+        .build();
+
+    let line = "    let _ = value.name;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/lib.rs","line":9,"column":{}}}]}}"#,
+            column_of(line, "name")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "hidden.Hidden.name",
+        "{value}"
+    );
+}
+
+#[test]
 fn rust_struct_field_access_resolves_from_option_expect_locals() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(
@@ -1077,6 +1383,45 @@ pub fn run() {
 
     assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
     assert!(value["results"][0]["definitions"][0].is_null(), "{value}");
+}
+
+#[test]
+fn rust_unimported_parameter_type_does_not_guess_workspace_identifier() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .file(
+            "src/lib.rs",
+            r#"
+mod hidden;
+
+pub fn run(value: Hidden) {
+    let _ = value.name;
+}
+"#,
+        )
+        .file(
+            "src/hidden.rs",
+            r#"
+pub struct Hidden {
+    pub name: String,
+}
+"#,
+        )
+        .build();
+
+    let line = "    let _ = value.name;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/lib.rs","line":5,"column":{}}}]}}"#,
+            column_of(line, "name")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
 }
 
 #[test]

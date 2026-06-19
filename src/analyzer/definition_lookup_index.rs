@@ -71,18 +71,6 @@ impl DefinitionLookupIndex {
             .unwrap_or_default()
     }
 
-    pub(crate) fn identifier(&self, ident: &str) -> Vec<CodeUnit> {
-        let mut out = Vec::new();
-        for ((_, candidate), units) in &self.by_file_identifier {
-            if candidate == ident {
-                out.extend(units.iter().cloned());
-            }
-        }
-        sort_units(&mut out);
-        out.dedup();
-        out
-    }
-
     pub(crate) fn fqn_exists(&self, fqn: &str) -> bool {
         self.by_fqn.contains_key(fqn)
     }

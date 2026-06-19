@@ -18,7 +18,7 @@ use crate::analyzer::usages::go_graph::{
 use crate::analyzer::usages::inverted_edges::{ClassRangeIndex, first_precise};
 use crate::analyzer::usages::js_ts_graph::{cached_jsts_index, compute_jsts_import_binder};
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::analyzer::usages::model::{ImportBinder, ImportKind};
+use crate::analyzer::usages::model::{ExportEntry, ImportBinder, ImportKind};
 use crate::analyzer::usages::php_graph::{
     FileContext, php_node_text, php_qualified_candidate_text, resolve_php_constant,
     resolve_php_function, resolve_php_type,
@@ -551,7 +551,15 @@ fn resolve_rust(
             .map(|fqn| support.fqn(fqn))
             .unwrap_or_default();
         if resolved.is_empty() {
-            let imported = rust_import_candidates(analyzer, rust, support, file, source, reference);
+            let imported = rust_import_candidates(
+                analyzer,
+                rust,
+                support,
+                file,
+                source,
+                reference,
+                Some(site.range.start_byte),
+            );
             resolved = if imported.is_empty() {
                 support.file_identifier(file, reference)
             } else {
@@ -1270,8 +1278,8 @@ fn rust_field_type_fqn(
         .map(str::to_string)
         .or_else(|| analyzer.signatures(&field).iter().next().cloned())?;
     let type_text = signature.split_once(':')?.1.trim();
-    rust_resolve_type_node_fqn(analyzer, support, file, type_text)
-        .or_else(|| rust_resolve_type_node_fqn(analyzer, support, field.source(), type_text))
+    rust_resolve_type_node_fqn(analyzer, support, file, type_text, None)
+        .or_else(|| rust_resolve_type_node_fqn(analyzer, support, field.source(), type_text, None))
 }
 
 fn rust_field_type_text(
@@ -1298,57 +1306,161 @@ fn rust_resolve_type_node_fqn(
     support: &DefinitionLookupIndex,
     file: &ProjectFile,
     type_text: &str,
+    reference_byte: Option<usize>,
 ) -> Option<String> {
     let name = rust_simple_type_name(type_text)?;
     if let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) {
         let refs = rust.reference_context_of(file);
-        if let Some((path, scoped_name)) = rust_type_path_and_name(type_text) {
-            if let Some(resolved) = refs.resolve_scoped(path, scoped_name)
-                && support
-                    .fqn(&resolved)
-                    .into_iter()
-                    .any(|unit| unit.is_class())
-            {
-                return Some(resolved);
-            }
+        if let Some((path, scoped_name)) = rust_type_path_and_name(type_text)
+            && let Some(resolved) = refs.resolve_scoped(path, scoped_name)
+            && support
+                .fqn(&resolved)
+                .into_iter()
+                .any(|unit| unit.is_class())
+        {
+            return Some(resolved);
         }
-        if let Some(resolved) = refs.resolve_bare(name)
+        if let Some(reference_byte) = reference_byte {
+            if let Some(local) =
+                rust_local_type_fqn_visible_at(analyzer, support, file, name, reference_byte)
+            {
+                return Some(local);
+            }
+        } else if let Some(resolved) = refs.resolve_bare(name)
             && support
                 .fqn(resolved)
                 .into_iter()
                 .any(|unit| unit.is_class())
+            && rust_type_fqn_visible_from_file(file, resolved)
         {
             return Some(resolved.to_string());
         }
+        if let Some(imported) =
+            rust_import_type_fqn(analyzer, rust, support, file, name, reference_byte)
+        {
+            return Some(imported);
+        }
     }
     support
-        .file_identifier(file, name)
+        .fqn(name)
         .into_iter()
         .find(|unit| unit.is_class())
         .map(|unit| unit.fq_name().to_string())
-        .or_else(|| {
-            support
-                .fqn(name)
-                .into_iter()
-                .find(|unit| unit.is_class())
-                .map(|unit| unit.fq_name().to_string())
+}
+
+fn rust_import_type_fqn(
+    analyzer: &dyn IAnalyzer,
+    rust: &RustAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    name: &str,
+    reference_byte: Option<usize>,
+) -> Option<String> {
+    let source = file.read_to_string().ok()?;
+    let mut candidates: Vec<_> =
+        rust_import_candidates(analyzer, rust, support, file, &source, name, reference_byte)
+            .into_iter()
+            .filter(|unit| unit.is_class())
+            .collect();
+    sort_units(&mut candidates);
+    candidates.dedup();
+    (candidates.len() == 1).then(|| candidates.remove(0).fq_name())
+}
+
+fn rust_type_fqn_visible_from_file(file: &ProjectFile, fqn: &str) -> bool {
+    rust_fqn_package(fqn) == rust_local_package_name(file)
+}
+
+fn rust_local_type_fqn_visible_at(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    name: &str,
+    reference_byte: usize,
+) -> Option<String> {
+    let source = file.read_to_string().ok()?;
+    let tree = parse_rust_tree(&source)?;
+    let reference_mod = rust_enclosing_mod_item_range_at(tree.root_node(), reference_byte);
+    let mut candidates: Vec<_> = support
+        .file_identifier(file, name)
+        .into_iter()
+        .filter(|unit| unit.is_class())
+        .filter(|unit| {
+            analyzer.ranges(unit).iter().any(|range| {
+                rust_definition_scope_visible_at(tree.root_node(), range.start_byte, reference_byte)
+                    && rust_enclosing_mod_item_range_at(tree.root_node(), range.start_byte)
+                        == reference_mod
+            })
         })
-        .or_else(|| {
-            let mut candidates: Vec<_> = support
-                .identifier(name)
-                .into_iter()
-                .filter(|unit| unit.is_class())
-                .collect();
-            candidates.dedup();
-            (candidates.len() == 1).then(|| candidates.remove(0).fq_name().to_string())
-        })
-        .or_else(|| {
-            support
-                .fqn_direct_children("")
-                .into_iter()
-                .find(|unit| unit.is_class() && unit.identifier() == name)
-                .map(|unit| unit.fq_name().to_string())
-        })
+        .collect();
+    sort_units(&mut candidates);
+    candidates.dedup();
+    (candidates.len() == 1).then(|| candidates.remove(0).fq_name())
+}
+
+fn rust_definition_scope_visible_at(
+    root: Node<'_>,
+    definition_byte: usize,
+    reference_byte: usize,
+) -> bool {
+    let Some(definition_node) =
+        smallest_named_node_covering(root, definition_byte, definition_byte)
+    else {
+        return false;
+    };
+    rust_enclosing_visibility_scope_range(definition_node)
+        .is_none_or(|(start, end)| start <= reference_byte && reference_byte < end)
+}
+
+fn rust_enclosing_visibility_scope_range(node: Node<'_>) -> Option<(usize, usize)> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if rust_use_lexical_scope_kind(parent.kind()) {
+            return Some((parent.start_byte(), parent.end_byte()));
+        }
+        current = parent.parent();
+    }
+    None
+}
+
+fn rust_fqn_package(fqn: &str) -> &str {
+    fqn.rsplit_once('.')
+        .map(|(package, _)| package)
+        .unwrap_or("")
+}
+
+fn rust_local_package_name(file: &ProjectFile) -> String {
+    let rel = file.rel_path();
+    let mut components: Vec<_> = rel
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().to_string())
+        .collect();
+
+    if components.first().map(|component| component.as_str()) == Some("src") {
+        components.remove(0);
+    }
+    if components.is_empty() {
+        return String::new();
+    }
+
+    let file_name = components.pop().unwrap_or_default();
+    let stem = std::path::Path::new(&file_name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default();
+
+    if stem == "lib" || stem == "main" || stem == "mod" {
+        components.join(".")
+    } else if rel.starts_with("src") {
+        components
+            .into_iter()
+            .chain(std::iter::once(stem.to_string()))
+            .filter(|component| !component.is_empty())
+            .collect::<Vec<_>>()
+            .join(".")
+    } else {
+        components.join(".")
+    }
 }
 
 fn rust_type_path_and_name(type_text: &str) -> Option<(&str, &str)> {
@@ -1388,6 +1500,7 @@ fn rust_enclosing_impl_type_fqn(
                 support,
                 file,
                 rust_node_text(type_node, source),
+                Some(type_node.start_byte()),
             );
         }
         current = current.parent()?;
@@ -1467,11 +1580,22 @@ fn rust_import_candidates(
     file: &ProjectFile,
     source: &str,
     reference: &str,
+    reference_byte: Option<usize>,
 ) -> Vec<CodeUnit> {
-    let statement_candidates =
-        rust_import_statement_candidates(analyzer, rust, support, file, source, reference);
+    let statement_candidates = rust_import_statement_candidates(
+        analyzer,
+        rust,
+        support,
+        file,
+        source,
+        reference,
+        reference_byte,
+    );
     if !statement_candidates.is_empty() {
         return statement_candidates;
+    }
+    if reference_byte.is_some() {
+        return Vec::new();
     }
 
     let binder = rust.import_binder_of(file);
@@ -1487,7 +1611,11 @@ fn rust_import_candidates(
                 .map(|package| support.fqn(&format!("{package}.{imported}")))
                 .unwrap_or_default();
             if candidates.is_empty() {
-                let files = rust.resolve_module_files(file, &binding.module_specifier);
+                let files = rust_resolved_module_files(rust, file, &binding.module_specifier);
+                candidates = rust_export_candidates(rust, support, &files, imported);
+            }
+            if candidates.is_empty() {
+                let files = rust_resolved_module_files(rust, file, &binding.module_specifier);
                 candidates = support.file_identifier_in_files(&files, imported);
             }
             candidates
@@ -1497,8 +1625,12 @@ fn rust_import_candidates(
             else {
                 return Vec::new();
             };
-            let files = rust.resolve_module_files(file, module_specifier);
-            support.file_identifier_in_files(&files, imported)
+            let files = rust_resolved_module_files(rust, file, module_specifier);
+            let mut candidates = rust_export_candidates(rust, support, &files, imported);
+            if candidates.is_empty() {
+                candidates = support.file_identifier_in_files(&files, imported);
+            }
+            candidates
         }
         ImportKind::Default | ImportKind::CommonJsRequire | ImportKind::Glob => Vec::new(),
     }
@@ -1511,16 +1643,17 @@ fn rust_import_statement_candidates(
     file: &ProjectFile,
     source: &str,
     reference: &str,
+    reference_byte: Option<usize>,
 ) -> Vec<CodeUnit> {
     let import_statements = analyzer.import_statements(file);
-    let flattened_imports: Vec<String> = import_statements
-        .iter()
-        .map(String::as_str)
-        .chain(
-            rust_use_statements_from_source(source)
-                .iter()
-                .map(String::as_str),
-        )
+    let visible_source_imports = rust_visible_use_statements_from_source(source, reference_byte);
+    let import_texts: Vec<&str> = if reference_byte.is_some() {
+        visible_source_imports.iter().map(String::as_str).collect()
+    } else {
+        import_statements.iter().map(String::as_str).collect()
+    };
+    let flattened_imports: Vec<String> = import_texts
+        .into_iter()
         .flat_map(crate::analyzer::rust::flatten_rust_use)
         .collect();
     for raw in flattened_imports {
@@ -1546,9 +1679,11 @@ fn rust_import_statement_candidates(
         let Some((module_specifier, imported_name)) = path_without_alias.rsplit_once("::") else {
             continue;
         };
-        let mut files = rust.resolve_module_files(file, module_specifier);
-        files.extend(rust_module_files_from_path(file, module_specifier));
-        let candidates = support.file_identifier_in_files(&files, imported_name);
+        let files = rust_resolved_module_files(rust, file, module_specifier);
+        let mut candidates = rust_export_candidates(rust, support, &files, imported_name);
+        if candidates.is_empty() {
+            candidates = support.file_identifier_in_files(&files, imported_name);
+        }
         if !candidates.is_empty() {
             return candidates;
         }
@@ -1556,26 +1691,192 @@ fn rust_import_statement_candidates(
     Vec::new()
 }
 
-fn rust_use_statements_from_source(source: &str) -> Vec<String> {
-    let mut statements = Vec::new();
-    let mut current = String::new();
-    let mut collecting = false;
-    for line in source.lines() {
-        let trimmed = line.trim();
-        if !collecting && !trimmed.starts_with("use ") && !trimmed.starts_with("pub use ") {
-            continue;
-        }
-        if collecting {
-            current.push(' ');
-        }
-        current.push_str(trimmed);
-        collecting = true;
-        if trimmed.ends_with(';') {
-            statements.push(std::mem::take(&mut current));
-            collecting = false;
+fn rust_resolved_module_files(
+    rust: &crate::analyzer::RustAnalyzer,
+    file: &ProjectFile,
+    module_specifier: &str,
+) -> Vec<ProjectFile> {
+    let mut files = rust.resolve_module_files(file, module_specifier);
+    files.extend(rust_module_files_from_path(file, module_specifier));
+    files.sort();
+    files.dedup();
+    files
+}
+
+fn rust_export_candidates(
+    rust: &crate::analyzer::RustAnalyzer,
+    support: &DefinitionLookupIndex,
+    module_files: &[ProjectFile],
+    export_name: &str,
+) -> Vec<CodeUnit> {
+    let mut visited = HashSet::default();
+    let mut candidates = Vec::new();
+    for module_file in module_files {
+        candidates.extend(rust_export_candidates_in_file(
+            rust,
+            support,
+            module_file,
+            export_name,
+            &mut visited,
+        ));
+    }
+    sort_units(&mut candidates);
+    candidates.dedup();
+    candidates
+}
+
+fn rust_export_candidates_in_file(
+    rust: &crate::analyzer::RustAnalyzer,
+    support: &DefinitionLookupIndex,
+    module_file: &ProjectFile,
+    export_name: &str,
+    visited: &mut HashSet<(ProjectFile, String)>,
+) -> Vec<CodeUnit> {
+    if !visited.insert((module_file.clone(), export_name.to_string())) {
+        return Vec::new();
+    }
+
+    let index = rust.export_index_of(module_file);
+    let mut candidates = Vec::new();
+    if let Some(entry) = index.exports_by_name.get(export_name) {
+        match entry {
+            ExportEntry::Local { local_name } => {
+                candidates.extend(support.file_identifier(module_file, local_name));
+            }
+            ExportEntry::ReexportedNamed {
+                module_specifier,
+                imported_name,
+            } => {
+                let files = rust_resolved_module_files(rust, module_file, module_specifier);
+                for file in files {
+                    candidates.extend(rust_export_candidates_in_file(
+                        rust,
+                        support,
+                        &file,
+                        imported_name,
+                        visited,
+                    ));
+                }
+            }
+            ExportEntry::Default { .. } => {}
         }
     }
+
+    for star in &index.reexport_stars {
+        let files = rust_resolved_module_files(rust, module_file, &star.module_specifier);
+        for file in files {
+            candidates.extend(rust_export_candidates_in_file(
+                rust,
+                support,
+                &file,
+                export_name,
+                visited,
+            ));
+        }
+    }
+
+    sort_units(&mut candidates);
+    candidates.dedup();
+    candidates
+}
+
+fn rust_visible_use_statements_from_source(
+    source: &str,
+    reference_byte: Option<usize>,
+) -> Vec<String> {
+    let Some(tree) = parse_rust_tree(source) else {
+        return Vec::new();
+    };
+    let mut statements = Vec::new();
+    rust_collect_visible_use_statements(tree.root_node(), source, reference_byte, &mut statements);
     statements
+}
+
+fn rust_collect_visible_use_statements(
+    node: Node<'_>,
+    source: &str,
+    reference_byte: Option<usize>,
+    out: &mut Vec<String>,
+) {
+    if node.kind() == "use_declaration" {
+        if rust_use_statement_visible_at(node, reference_byte) {
+            out.push(rust_node_text(node, source).trim().to_string());
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        rust_collect_visible_use_statements(child, source, reference_byte, out);
+    }
+}
+
+fn rust_use_statement_visible_at(node: Node<'_>, reference_byte: Option<usize>) -> bool {
+    if let Some(byte) = reference_byte
+        && rust_enclosing_mod_item_range(node)
+            != rust_enclosing_mod_item_range_at(rust_root_node(node), byte)
+    {
+        return false;
+    }
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if rust_use_lexical_scope_kind(parent.kind()) {
+            let Some(byte) = reference_byte else {
+                return false;
+            };
+            if !(parent.start_byte() <= byte && byte < parent.end_byte()) {
+                return false;
+            }
+        }
+        current = parent.parent();
+    }
+    true
+}
+
+fn rust_root_node(mut node: Node<'_>) -> Node<'_> {
+    while let Some(parent) = node.parent() {
+        node = parent;
+    }
+    node
+}
+
+fn rust_enclosing_mod_item_range(node: Node<'_>) -> Option<(usize, usize)> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "mod_item" {
+            return Some((parent.start_byte(), parent.end_byte()));
+        }
+        current = parent.parent();
+    }
+    None
+}
+
+fn rust_enclosing_mod_item_range_at(node: Node<'_>, byte: usize) -> Option<(usize, usize)> {
+    let mut candidate = None;
+    let mut current = node;
+    loop {
+        let mut cursor = current.walk();
+        let mut next = None;
+        for child in current.named_children(&mut cursor) {
+            if child.start_byte() <= byte && byte < child.end_byte() {
+                if child.kind() == "mod_item" {
+                    candidate = Some((child.start_byte(), child.end_byte()));
+                }
+                next = Some(child);
+                break;
+            }
+        }
+        let Some(child) = next else {
+            return candidate;
+        };
+        current = child;
+    }
+}
+
+fn rust_use_lexical_scope_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "block" | "function_item" | "impl_item" | "trait_item" | "mod_item"
+    )
 }
 
 fn rust_module_files_from_path(file: &ProjectFile, module_specifier: &str) -> Vec<ProjectFile> {
