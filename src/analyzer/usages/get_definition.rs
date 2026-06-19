@@ -3894,7 +3894,7 @@ fn resolve_php(
         aliases: parse_php_use_aliases_from_source(source),
     };
     let class_ranges = ClassRangeIndex::build(analyzer, file);
-    match php_reference_node(node) {
+    match php_reference_node(node, source) {
         Some(PhpReferenceNode::Type(type_node)) => {
             let raw = php_qualified_candidate_text(type_node, source);
             php_fqn_outcome(support, resolve_php_type(&raw, &ctx), &raw)
@@ -4907,7 +4907,10 @@ enum PhpReferenceNode<'tree> {
     },
 }
 
-fn php_reference_node(node: Node<'_>) -> Option<PhpReferenceNode<'_>> {
+fn php_reference_node<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<PhpReferenceNode<'tree>> {
     let node = php_qualified_reference_node(node);
     match node.kind() {
         "object_creation_expression" => php_object_creation_type(node).map(PhpReferenceNode::Type),
@@ -4928,7 +4931,9 @@ fn php_reference_node(node: Node<'_>) -> Option<PhpReferenceNode<'_>> {
         "name" | "qualified_name" => {
             let parent = node.parent()?;
             match parent.kind() {
-                "object_creation_expression" | "named_type" => Some(PhpReferenceNode::Type(node)),
+                "object_creation_expression" | "named_type" | "instanceof_expression" => {
+                    Some(PhpReferenceNode::Type(node))
+                }
                 "function_call_expression"
                     if parent.child_by_field_name("function") == Some(node) =>
                 {
@@ -4946,15 +4951,37 @@ fn php_reference_node(node: Node<'_>) -> Option<PhpReferenceNode<'_>> {
                     let object = parent.child_by_field_name("object")?;
                     Some(PhpReferenceNode::InstanceMember { object, name: node })
                 }
+                _ if php_is_instanceof_type_name(node, source) => Some(PhpReferenceNode::Type(node)),
                 _ if php_is_bare_constant_reference(node) => Some(PhpReferenceNode::Constant(node)),
                 _ => None,
             }
         }
         _ => {
             let parent = node.parent()?;
-            php_reference_node(parent)
+            php_reference_node(parent, source)
         }
     }
+}
+
+fn php_is_instanceof_type_name(mut node: Node<'_>, source: &str) -> bool {
+    while let Some(parent) = node.parent() {
+        if parent.kind() == "instanceof_expression" {
+            return true;
+        }
+        let parent_text = php_node_text(parent, source);
+        if let Some(index) = parent_text.find(" instanceof ") {
+            let operator_end = parent.start_byte() + index + " instanceof ".len();
+            return node.start_byte() >= operator_end;
+        }
+        if matches!(
+            parent.kind(),
+            "statement" | "expression_statement" | "compound_statement"
+        ) {
+            return false;
+        }
+        node = parent;
+    }
+    false
 }
 
 fn php_static_member_parts(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {

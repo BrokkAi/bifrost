@@ -1409,6 +1409,42 @@ fn php_imported_type_resolves_to_definition() {
 }
 
 #[test]
+fn php_instanceof_imported_type_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "src/Mapping/Accessors/ReadonlyAccessor.php",
+            "<?php\nnamespace App\\Mapping\\Accessors;\nclass ReadonlyAccessor {}\n",
+        )
+        .file(
+            "src/UnitOfWork.php",
+            "<?php\nnamespace App;\nuse App\\Mapping\\Accessors\\ReadonlyAccessor;\nclass UnitOfWork {\n    public function reset(mixed $accessor): void {\n        if (! $accessor instanceof ReadonlyAccessor) {}\n    }\n}\n",
+        )
+        .build();
+
+    let line = "        if (! $accessor instanceof ReadonlyAccessor) {}";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/UnitOfWork.php","line":6,"column":{}}}]}}"#,
+            line.find("ReadonlyAccessor").expect("ReadonlyAccessor") + 1
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"],
+        "App.Mapping.Accessors.ReadonlyAccessor",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["path"],
+        "src/Mapping/Accessors/ReadonlyAccessor.php",
+        "{value}"
+    );
+}
+
+#[test]
 fn php_function_alias_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::Php)
         .file(
