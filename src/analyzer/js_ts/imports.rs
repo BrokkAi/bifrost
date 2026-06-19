@@ -366,7 +366,7 @@ pub(crate) fn resolve_js_ts_module_specifier(
         };
         for base in aliases.candidate_bases(source_file, module_specifier) {
             let mut candidates = Vec::new();
-            collect_candidate_paths(source_file.root(), &base, exts, &mut candidates);
+            collect_candidate_paths(source_file.root(), &base, language, exts, &mut candidates);
             if !candidates.is_empty() {
                 candidates.sort();
                 candidates.dedup();
@@ -377,7 +377,7 @@ pub(crate) fn resolve_js_ts_module_specifier(
     }
     let base = source_file.parent().join(module_specifier);
     let mut candidates = Vec::new();
-    collect_candidate_paths(source_file.root(), &base, exts, &mut candidates);
+    collect_candidate_paths(source_file.root(), &base, language, exts, &mut candidates);
     candidates.sort();
     candidates.dedup();
     candidates
@@ -405,6 +405,7 @@ fn extract_import_module_path(raw_import: &str) -> Option<String> {
 fn collect_candidate_paths(
     root: &Path,
     module_path: &Path,
+    language: Language,
     extensions: &[&str],
     out: &mut Vec<ProjectFile>,
 ) {
@@ -419,6 +420,20 @@ fn collect_candidate_paths(
         }
         return;
     }
+    if let Some(source_extensions) =
+        ts_source_extensions_for_runtime_specifier(module_path, language)
+    {
+        for source_extension in source_extensions {
+            let source_path = module_path.with_extension(source_extension);
+            let file = ProjectFile::new(root.to_path_buf(), source_path);
+            if file.exists() {
+                out.push(file);
+            }
+        }
+        if !out.is_empty() {
+            return;
+        }
+    }
     for extension in extensions {
         let with_ext = PathBuf::from(format!("{}.{}", module_path.to_string_lossy(), extension));
         let direct = ProjectFile::new(root.to_path_buf(), with_ext);
@@ -430,6 +445,22 @@ fn collect_candidate_paths(
         if index_file.exists() {
             out.push(index_file);
         }
+    }
+}
+
+fn ts_source_extensions_for_runtime_specifier(
+    module_path: &Path,
+    language: Language,
+) -> Option<&'static [&'static str]> {
+    if language != Language::TypeScript {
+        return None;
+    }
+    match module_path.extension().and_then(|ext| ext.to_str()) {
+        Some("js") => Some(&["ts", "tsx"]),
+        Some("jsx") => Some(&["tsx", "ts"]),
+        Some("mjs") => Some(&["mts", "ts"]),
+        Some("cjs") => Some(&["cts", "ts"]),
+        _ => None,
     }
 }
 

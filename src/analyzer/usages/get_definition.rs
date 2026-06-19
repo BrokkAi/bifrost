@@ -825,8 +825,11 @@ fn resolve_js_ts(
             }
             same_file
         };
-        let member_candidates =
-            jsts_member_candidates(analyzer, support, receiver_candidates, name, value_position);
+        let member_candidates = if language == Language::TypeScript {
+            ts_member_candidates(analyzer, support, receiver_candidates, name, value_position)
+        } else {
+            jsts_member_candidates(analyzer, support, receiver_candidates, name, value_position)
+        };
         if !member_candidates.is_empty() {
             return candidates_outcome(member_candidates);
         }
@@ -838,6 +841,18 @@ fn resolve_js_ts(
                 jsts_member_candidates(analyzer, support, inferred_receivers, name, value_position);
             if !inferred_member_candidates.is_empty() {
                 return candidates_outcome(inferred_member_candidates);
+            }
+            if let Some(receiver_type) = ts_global_object_receiver_type(qualifier) {
+                let global_receivers = support
+                    .fqn(receiver_type)
+                    .into_iter()
+                    .filter(|unit| jsts_unit_is_type_only(analyzer, unit))
+                    .collect();
+                let global_member_candidates =
+                    ts_member_candidates(analyzer, support, global_receivers, name, value_position);
+                if !global_member_candidates.is_empty() {
+                    return candidates_outcome(global_member_candidates);
+                }
             }
         }
         return no_definition(
@@ -880,6 +895,13 @@ fn resolve_js_ts(
         "no_indexed_definition",
         format!("`{reference}` did not resolve to an indexed JS/TS definition"),
     )
+}
+
+fn ts_global_object_receiver_type(receiver: &str) -> Option<&'static str> {
+    match receiver {
+        "window" => Some("Window"),
+        _ => None,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1049,6 +1071,292 @@ fn jsts_member_candidates(
     }
 }
 
+fn ts_member_candidates(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    receiver_candidates: Vec<CodeUnit>,
+    member: &str,
+    value_position: bool,
+) -> Vec<CodeUnit> {
+    let mut candidates = Vec::new();
+    for receiver in receiver_candidates {
+        let mut members = support.fqn(&format!("{}.{}", receiver.fq_name(), member));
+        if value_position {
+            members = jsts_value_space_candidates(analyzer, members);
+        } else {
+            members = jsts_type_space_candidates(analyzer, members);
+        }
+
+        let has_synthetic = members.iter().any(CodeUnit::is_synthetic);
+        if has_synthetic
+            && !jsts_unit_is_type_only(analyzer, &receiver)
+            && !ts_synthetic_member_is_supported_by_receiver_initializer(
+                analyzer, support, &receiver, member,
+            )
+        {
+            candidates.extend(members.into_iter().filter(|member| !member.is_synthetic()));
+        } else {
+            candidates.extend(members);
+        }
+    }
+    candidates
+}
+
+fn ts_synthetic_member_is_supported_by_receiver_initializer(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    receiver: &CodeUnit,
+    member: &str,
+) -> bool {
+    let Ok(source) = receiver.source().read_to_string() else {
+        return false;
+    };
+    let Some(tree) = parse_js_ts_tree(receiver.source(), &source, Language::TypeScript) else {
+        return false;
+    };
+    let imports = compute_jsts_import_binder(&source, &tree);
+    let aliases = AliasResolver::new(analyzer.project().root().to_path_buf());
+
+    let mut saw_receiver_node = false;
+    for node in ts_nodes_for_code_unit(analyzer, receiver, tree.root_node()) {
+        let Some(declarator) = ts_variable_declarator_for_unit_node(node, receiver, &source) else {
+            continue;
+        };
+        saw_receiver_node = true;
+        let Some(value) = declarator.child_by_field_name("value") else {
+            continue;
+        };
+        let Some(call) =
+            ts_unwrap_expression(value, &source).filter(|value| value.kind() == "call_expression")
+        else {
+            return true;
+        };
+        let Some(argument_index) =
+            ts_call_direct_object_argument_index_with_member(call, &source, member)
+        else {
+            continue;
+        };
+        if ts_call_preserves_argument_shape(
+            analyzer,
+            support,
+            receiver.source(),
+            &source,
+            &imports,
+            &aliases,
+            call,
+            argument_index,
+        ) {
+            return true;
+        }
+    }
+    let _ = saw_receiver_node;
+    false
+}
+
+fn ts_variable_declarator_for_unit_node<'tree>(
+    node: Node<'tree>,
+    unit: &CodeUnit,
+    source: &str,
+) -> Option<Node<'tree>> {
+    if node.kind() == "variable_declarator"
+        && node
+            .child_by_field_name("name")
+            .is_some_and(|name| node_text_matches(name, source, unit.identifier()))
+    {
+        return Some(node);
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).find_map(|child| {
+        (child.kind() == "variable_declarator"
+            && child
+                .child_by_field_name("name")
+                .is_some_and(|name| node_text_matches(name, source, unit.identifier())))
+        .then_some(child)
+        .or_else(|| ts_variable_declarator_for_unit_node(child, unit, source))
+    })
+}
+
+fn ts_call_direct_object_argument_index_with_member(
+    call: Node<'_>,
+    source: &str,
+    member: &str,
+) -> Option<usize> {
+    let arguments = call.child_by_field_name("arguments")?;
+    let mut cursor = arguments.walk();
+    arguments
+        .named_children(&mut cursor)
+        .enumerate()
+        .find_map(|(index, argument)| {
+            let object = ts_direct_object_literal_value(argument, source)?;
+            ts_object_literal_has_member(object, source, member).then_some(index)
+        })
+}
+
+fn ts_direct_object_literal_value<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+    let node = ts_unwrap_expression(node, source)?;
+    (node.kind() == "object").then_some(node)
+}
+
+fn ts_unwrap_expression<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+    match node.kind() {
+        "as_expression"
+        | "satisfies_expression"
+        | "type_assertion"
+        | "parenthesized_expression" => {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .find(|child| {
+                    child.kind() != "type_annotation"
+                        && child.kind() != "type_identifier"
+                        && child.kind() != "predefined_type"
+                })
+                .and_then(|child| ts_unwrap_expression(child, source))
+        }
+        _ => Some(node),
+    }
+}
+
+fn ts_object_literal_has_member(object: Node<'_>, source: &str, member: &str) -> bool {
+    let mut cursor = object.walk();
+    object
+        .named_children(&mut cursor)
+        .filter_map(|child| {
+            crate::analyzer::typescript::ts_object_literal_property_name(child, source)
+        })
+        .any(|name| name == member)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ts_call_preserves_argument_shape(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    imports: &ImportBinder,
+    aliases: &AliasResolver,
+    call: Node<'_>,
+    argument_index: usize,
+) -> bool {
+    let Some(function) = call.child_by_field_name("function") else {
+        return false;
+    };
+    ts_call_expression_callees(
+        analyzer, support, file, source, imports, aliases, function, 0,
+    )
+    .into_iter()
+    .any(|callee| ts_function_preserves_parameter_shape(analyzer, &callee, argument_index))
+}
+
+fn ts_function_preserves_parameter_shape(
+    analyzer: &dyn IAnalyzer,
+    callee: &CodeUnit,
+    parameter_index: usize,
+) -> bool {
+    let Ok(source) = callee.source().read_to_string() else {
+        return false;
+    };
+    let Some(tree) = parse_js_ts_tree(callee.source(), &source, Language::TypeScript) else {
+        return false;
+    };
+    ts_nodes_for_code_unit(analyzer, callee, tree.root_node())
+        .into_iter()
+        .any(|node| ts_function_node_preserves_parameter_shape(node, &source, parameter_index))
+}
+
+fn ts_function_node_preserves_parameter_shape(
+    function: Node<'_>,
+    source: &str,
+    parameter_index: usize,
+) -> bool {
+    let Some(parameter_name) = ts_function_parameter_name(function, source, parameter_index) else {
+        return false;
+    };
+    if function.kind() == "arrow_function"
+        && let Some(body) = function.child_by_field_name("body")
+        && ts_expression_preserves_parameter_shape(body, source, &parameter_name)
+    {
+        return true;
+    }
+    ts_function_returns_parameter_shape(function, function.id(), source, &parameter_name)
+}
+
+fn ts_function_parameter_name(
+    function: Node<'_>,
+    source: &str,
+    parameter_index: usize,
+) -> Option<String> {
+    let parameters = function.child_by_field_name("parameters")?;
+    let mut cursor = parameters.walk();
+    parameters
+        .named_children(&mut cursor)
+        .filter_map(ts_parameter_name_node)
+        .nth(parameter_index)
+        .and_then(|name| source.get(name.start_byte()..name.end_byte()))
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+}
+
+fn ts_function_returns_parameter_shape(
+    node: Node<'_>,
+    root_id: usize,
+    source: &str,
+    parameter_name: &str,
+) -> bool {
+    if node.id() != root_id
+        && matches!(
+            node.kind(),
+            "function_declaration"
+                | "function_expression"
+                | "arrow_function"
+                | "method_definition"
+                | "class_declaration"
+                | "abstract_class_declaration"
+                | "interface_declaration"
+        )
+    {
+        return false;
+    }
+    if node.kind() == "return_statement" {
+        let mut cursor = node.walk();
+        return node
+            .named_children(&mut cursor)
+            .next()
+            .is_some_and(|expression| {
+                ts_expression_preserves_parameter_shape(expression, source, parameter_name)
+            });
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| ts_function_returns_parameter_shape(child, root_id, source, parameter_name))
+}
+
+fn ts_expression_preserves_parameter_shape(
+    expression: Node<'_>,
+    source: &str,
+    parameter_name: &str,
+) -> bool {
+    let Some(expression) = ts_unwrap_expression(expression, source) else {
+        return false;
+    };
+    if matches!(expression.kind(), "identifier" | "property_identifier")
+        && node_text_matches(expression, source, parameter_name)
+    {
+        return true;
+    }
+    if expression.kind() != "object" {
+        return false;
+    }
+    let mut cursor = expression.walk();
+    expression.named_children(&mut cursor).any(|child| {
+        child.kind() == "spread_element"
+            && child
+                .named_child(0)
+                .and_then(|spread| ts_unwrap_expression(spread, source))
+                .is_some_and(|spread| node_text_matches(spread, source, parameter_name))
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn ts_local_receiver_owner_candidates(
     analyzer: &dyn IAnalyzer,
@@ -1061,29 +1369,50 @@ fn ts_local_receiver_owner_candidates(
     aliases: &AliasResolver,
     receiver: &str,
 ) -> Vec<CodeUnit> {
+    ts_receiver_owner_candidates_at_byte(
+        analyzer,
+        support,
+        file,
+        source,
+        tree.root_node(),
+        imports,
+        aliases,
+        receiver,
+        site.focus_start_byte,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ts_receiver_owner_candidates_at_byte(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    imports: &ImportBinder,
+    aliases: &AliasResolver,
+    receiver: &str,
+    byte: usize,
+) -> Vec<CodeUnit> {
     if receiver == "this"
-        && let Some(owner) = jsts_enclosing_class(analyzer, file, site.focus_start_byte)
+        && let Some(owner) = jsts_enclosing_class(analyzer, file, byte)
     {
         return vec![owner];
     }
-    let Some(scope) = jsts_enclosing_function_scope(tree.root_node(), site.focus_start_byte) else {
+    let Some(scope) = jsts_enclosing_function_scope(root, byte) else {
         return Vec::new();
     };
 
     let mut candidates = ts_receiver_owners_from_parameters(
         analyzer, support, file, source, imports, aliases, scope, receiver,
     );
+    if candidates.is_empty() {
+        candidates.extend(ts_receiver_owners_from_contextual_callback(
+            analyzer, support, file, source, imports, aliases, scope, receiver,
+        ));
+    }
     candidates.extend(ts_receiver_owners_from_local_bindings(
-        analyzer,
-        support,
-        file,
-        source,
-        imports,
-        aliases,
-        scope,
-        receiver,
-        site.focus_start_byte,
-        0,
+        analyzer, support, file, source, imports, aliases, scope, receiver, byte, 0,
     ));
     sort_units(&mut candidates);
     candidates.dedup();
@@ -1183,6 +1512,218 @@ fn ts_receiver_owners_from_parameters(
         }
     }
     owners
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ts_receiver_owners_from_contextual_callback(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    imports: &ImportBinder,
+    aliases: &AliasResolver,
+    scope: Node<'_>,
+    receiver: &str,
+) -> Vec<CodeUnit> {
+    let Some(callback_parameter_index) = ts_callback_parameter_index(scope, source, receiver)
+    else {
+        return Vec::new();
+    };
+    let Some((call, argument_index)) = ts_callback_argument_context(scope) else {
+        return Vec::new();
+    };
+    let Some(function) = call.child_by_field_name("function") else {
+        return Vec::new();
+    };
+    let callees = ts_call_expression_callees(
+        analyzer, support, file, source, imports, aliases, function, 0,
+    );
+
+    let mut owners = Vec::new();
+    for callee in callees {
+        owners.extend(ts_callback_parameter_owners_from_callee(
+            analyzer,
+            support,
+            &callee,
+            argument_index,
+            callback_parameter_index,
+            0,
+        ));
+    }
+    owners
+}
+
+fn ts_callback_parameter_index(scope: Node<'_>, source: &str, receiver: &str) -> Option<usize> {
+    let parameters = scope
+        .child_by_field_name("parameters")
+        .or_else(|| scope.child_by_field_name("parameter"))?;
+    if parameters.kind() == "identifier" {
+        return node_text_matches(parameters, source, receiver).then_some(0);
+    }
+    let mut cursor = parameters.walk();
+    parameters
+        .named_children(&mut cursor)
+        .filter_map(|parameter| ts_parameter_name_node(parameter))
+        .position(|name| node_text_matches(name, source, receiver))
+}
+
+fn ts_parameter_name_node(parameter: Node<'_>) -> Option<Node<'_>> {
+    match parameter.kind() {
+        "identifier" | "shorthand_property_identifier_pattern" => Some(parameter),
+        "required_parameter" | "optional_parameter" => parameter
+            .child_by_field_name("pattern")
+            .or_else(|| parameter.child_by_field_name("name")),
+        _ => None,
+    }
+}
+
+fn ts_callback_argument_context(scope: Node<'_>) -> Option<(Node<'_>, usize)> {
+    let mut current = scope;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "arguments" {
+            let mut cursor = parent.walk();
+            let argument_index = parent
+                .named_children(&mut cursor)
+                .position(|child| child.id() == current.id())?;
+            let call = parent
+                .parent()
+                .filter(|node| node.kind() == "call_expression")?;
+            return Some((call, argument_index));
+        }
+        current = parent;
+    }
+    None
+}
+
+fn ts_callback_parameter_owners_from_callee(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    callee: &CodeUnit,
+    argument_index: usize,
+    callback_parameter_index: usize,
+    depth: usize,
+) -> Vec<CodeUnit> {
+    if depth > 8 {
+        return Vec::new();
+    }
+    let Ok(source) = callee.source().read_to_string() else {
+        return Vec::new();
+    };
+    let Some(tree) = parse_js_ts_tree(callee.source(), &source, Language::TypeScript) else {
+        return Vec::new();
+    };
+    let imports = compute_jsts_import_binder(&source, &tree);
+    let aliases = AliasResolver::new(analyzer.project().root().to_path_buf());
+    let mut owners = Vec::new();
+    for node in ts_nodes_for_code_unit(analyzer, callee, tree.root_node()) {
+        let Some(callback_type) = ts_function_parameter_type_text(node, &source, argument_index)
+        else {
+            continue;
+        };
+        let Some(parameter_type) =
+            ts_callback_parameter_type_text(&callback_type, callback_parameter_index)
+        else {
+            continue;
+        };
+        owners.extend(ts_resolve_type_text_to_property_owners(
+            analyzer,
+            support,
+            callee.source(),
+            &source,
+            &imports,
+            &aliases,
+            &parameter_type,
+            depth + 1,
+        ));
+    }
+    owners
+}
+
+fn ts_function_parameter_type_text(
+    function: Node<'_>,
+    source: &str,
+    parameter_index: usize,
+) -> Option<String> {
+    let parameters = function.child_by_field_name("parameters")?;
+    let mut cursor = parameters.walk();
+    parameters
+        .named_children(&mut cursor)
+        .filter(|parameter| {
+            matches!(
+                parameter.kind(),
+                "required_parameter" | "optional_parameter"
+            )
+        })
+        .nth(parameter_index)
+        .and_then(|parameter| parameter.child_by_field_name("type"))
+        .map(|type_node| ts_type_annotation_text(type_node, source))
+}
+
+fn ts_callback_parameter_type_text(callback_type: &str, parameter_index: usize) -> Option<String> {
+    let callback_type = callback_type.trim();
+    let open = callback_type.find('(')?;
+    let close = ts_matching_close_delimiter(callback_type, open, '(', ')')?;
+    let parameters = callback_type.get(open + 1..close)?;
+    let parameter = ts_split_top_level_commas(parameters)
+        .into_iter()
+        .nth(parameter_index)?;
+    let (_, type_text) = parameter.split_once(':')?;
+    Some(ts_clean_type_text(type_text))
+}
+
+fn ts_matching_close_delimiter(
+    text: &str,
+    open_byte: usize,
+    open_char: char,
+    close_char: char,
+) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, ch) in text
+        .char_indices()
+        .skip_while(|(index, _)| *index < open_byte)
+    {
+        if ch == open_char {
+            depth += 1;
+        } else if ch == close_char {
+            depth = depth.checked_sub(1)?;
+            if depth == 0 {
+                return Some(index);
+            }
+        }
+    }
+    None
+}
+
+fn ts_split_top_level_commas(text: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut paren_depth = 0usize;
+    let mut angle_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    for (index, ch) in text.char_indices() {
+        match ch {
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '<' => angle_depth += 1,
+            '>' => angle_depth = angle_depth.saturating_sub(1),
+            '{' => brace_depth += 1,
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            ',' if paren_depth == 0
+                && angle_depth == 0
+                && brace_depth == 0
+                && bracket_depth == 0 =>
+            {
+                parts.push(text[start..index].trim());
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(text[start..].trim());
+    parts
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1318,14 +1859,39 @@ fn ts_expression_property_owners(
     match expression.kind() {
         "call_expression" => expression
             .child_by_field_name("function")
-            .and_then(|function| ts_call_reference_name(function, source))
-            .map(|name| {
-                let callees = ts_identifier_candidates(
-                    analyzer, support, file, source, imports, aliases, &name, true,
+            .map(|function| {
+                let callees = ts_call_expression_callees(
+                    analyzer,
+                    support,
+                    file,
+                    source,
+                    imports,
+                    aliases,
+                    function,
+                    depth + 1,
                 );
                 ts_expand_property_owners(analyzer, support, callees, depth + 1)
             })
             .unwrap_or_default(),
+        "await_expression" => {
+            let mut cursor = expression.walk();
+            expression
+                .named_children(&mut cursor)
+                .next()
+                .map(|child| {
+                    ts_expression_property_owners(
+                        analyzer,
+                        support,
+                        file,
+                        source,
+                        imports,
+                        aliases,
+                        child,
+                        depth + 1,
+                    )
+                })
+                .unwrap_or_default()
+        }
         "as_expression" | "satisfies_expression" | "type_assertion" => expression
             .child_by_field_name("type")
             .or_else(|| ts_assertion_type_child(expression))
@@ -1362,6 +1928,130 @@ fn ts_expression_property_owners(
             }),
         _ => Vec::new(),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ts_call_expression_callees(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    imports: &ImportBinder,
+    aliases: &AliasResolver,
+    function: Node<'_>,
+    depth: usize,
+) -> Vec<CodeUnit> {
+    if depth > 8 {
+        return Vec::new();
+    }
+    if function.kind() == "member_expression" {
+        let Some(object) = function.child_by_field_name("object") else {
+            return Vec::new();
+        };
+        let Some(property) = function
+            .child_by_field_name("property")
+            .and_then(|property| ts_call_reference_name(property, source))
+        else {
+            return Vec::new();
+        };
+        if let Some(namespace) = source
+            .get(object.start_byte()..object.end_byte())
+            .map(str::trim)
+            .filter(|namespace| !namespace.is_empty())
+            && let Some(binding) = imports.bindings.get(namespace)
+            && matches!(
+                binding.kind,
+                ImportKind::Namespace | ImportKind::CommonJsRequire
+            )
+        {
+            return resolve_js_ts_module_binding_candidates(
+                analyzer,
+                support,
+                Language::TypeScript,
+                file,
+                &binding.module_specifier,
+                &property,
+                Some(aliases),
+                true,
+            );
+        }
+        let receiver_owners = ts_expression_receiver_owners(
+            analyzer,
+            support,
+            file,
+            source,
+            imports,
+            aliases,
+            object,
+            depth + 1,
+        );
+        let callees = jsts_member_candidates(analyzer, support, receiver_owners, &property, true);
+        if !callees.is_empty() {
+            return callees;
+        }
+    }
+
+    ts_call_reference_name(function, source)
+        .map(|name| {
+            ts_identifier_candidates(
+                analyzer, support, file, source, imports, aliases, &name, true,
+            )
+        })
+        .unwrap_or_default()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ts_expression_receiver_owners(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    imports: &ImportBinder,
+    aliases: &AliasResolver,
+    expression: Node<'_>,
+    depth: usize,
+) -> Vec<CodeUnit> {
+    if depth > 8 {
+        return Vec::new();
+    }
+    match expression.kind() {
+        "identifier" | "property_identifier" | "this" => {
+            let Some(receiver) = source
+                .get(expression.start_byte()..expression.end_byte())
+                .map(str::trim)
+            else {
+                return Vec::new();
+            };
+            ts_receiver_owner_candidates_at_byte(
+                analyzer,
+                support,
+                file,
+                source,
+                root_node(expression),
+                imports,
+                aliases,
+                receiver,
+                expression.start_byte(),
+            )
+        }
+        _ => ts_expression_property_owners(
+            analyzer,
+            support,
+            file,
+            source,
+            imports,
+            aliases,
+            expression,
+            depth + 1,
+        ),
+    }
+}
+
+fn root_node(mut node: Node<'_>) -> Node<'_> {
+    while let Some(parent) = node.parent() {
+        node = parent;
+    }
+    node
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1433,6 +2123,19 @@ fn ts_resolve_type_text_to_property_owners(
     }
 
     if let Some(inner) = ts_generic_type_argument(&type_text, "ReturnType") {
+        return ts_resolve_type_text_to_property_owners(
+            analyzer,
+            support,
+            file,
+            source,
+            imports,
+            aliases,
+            inner,
+            depth + 1,
+        );
+    }
+
+    if let Some(inner) = ts_generic_type_argument(&type_text, "Promise") {
         return ts_resolve_type_text_to_property_owners(
             analyzer,
             support,
@@ -1564,6 +2267,18 @@ fn ts_function_return_property_owners(
     let aliases = AliasResolver::new(analyzer.project().root().to_path_buf());
     let mut owners = Vec::new();
     for node in ts_nodes_for_code_unit(analyzer, function, tree.root_node()) {
+        if let Some(type_text) = ts_function_return_type_text(node, &source) {
+            owners.extend(ts_resolve_type_text_to_property_owners(
+                analyzer,
+                support,
+                function.source(),
+                &source,
+                &imports,
+                &aliases,
+                &type_text,
+                depth + 1,
+            ));
+        }
         ts_collect_return_property_owners(
             analyzer,
             support,
@@ -1580,6 +2295,13 @@ fn ts_function_return_property_owners(
     sort_units(&mut owners);
     owners.dedup();
     owners
+}
+
+fn ts_function_return_type_text(function: Node<'_>, source: &str) -> Option<String> {
+    function
+        .child_by_field_name("return_type")
+        .map(|type_node| ts_type_annotation_text(type_node, source))
+        .filter(|text| !text.is_empty())
 }
 
 fn ts_nodes_for_code_unit<'tree>(

@@ -716,6 +716,37 @@ export function run() {
 }
 
 #[test]
+fn typescript_js_extension_import_resolves_to_ts_source() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("util.ts", "export function helper() {}\n")
+        .file(
+            "app.ts",
+            r#"
+import { helper } from "./util.js";
+
+export function run() {
+  helper();
+}
+"#,
+        )
+        .build();
+
+    let line = "  helper();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.ts","line":5,"column":{}}}]}}"#,
+            column_of(line, "helper")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "helper", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "util.ts", "{value}");
+}
+
+#[test]
 fn typescript_path_alias_import_resolves_through_star_barrel() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file(
@@ -911,6 +942,319 @@ export function isVisionModel() {
         result["definitions"][0]["fqn"], "getBuildConfig.visionModels",
         "{value}"
     );
+}
+
+#[test]
+fn typescript_contextual_callback_parameter_members_resolve() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "utils.ts",
+            r#"
+export class Response {
+  setPage(): void {}
+}
+
+export class Context {
+  newPage(): Page { return new Page() }
+}
+
+export class Page {
+  pptrPage = ''
+}
+
+export function withContext(cb: (response: Response, context: Context) => void): void {}
+"#,
+        )
+        .file(
+            "app.ts",
+            r#"
+import { withContext } from './utils.js'
+
+export function run() {
+  withContext((response, context) => {
+    context.newPage()
+    response.setPage()
+  })
+}
+"#,
+        )
+        .build();
+
+    let context_line = "    context.newPage()";
+    let context_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.ts","line":6,"column":{}}}]}}"#,
+            column_of(context_line, "newPage")
+        ),
+    );
+
+    let context_result = &context_value["results"][0];
+    assert_eq!(context_result["status"], "resolved", "{context_value}");
+    assert_eq!(
+        context_result["definitions"][0]["fqn"], "Context.newPage",
+        "{context_value}"
+    );
+
+    let response_line = "    response.setPage()";
+    let response_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.ts","line":7,"column":{}}}]}}"#,
+            column_of(response_line, "setPage")
+        ),
+    );
+
+    let response_result = &response_value["results"][0];
+    assert_eq!(response_result["status"], "resolved", "{response_value}");
+    assert_eq!(
+        response_result["definitions"][0]["fqn"], "Response.setPage",
+        "{response_value}"
+    );
+}
+
+#[test]
+fn typescript_member_call_contextual_callback_parameter_members_resolve() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "utils.ts",
+            r#"
+export class Context {
+  newPage(): Page { return new Page() }
+}
+
+export class Page {}
+
+export function withContext(cb: (context: Context) => void): void {}
+"#,
+        )
+        .file(
+            "app.ts",
+            r#"
+import * as utils from './utils.js'
+
+export function run() {
+  utils.withContext(context => {
+    context.newPage()
+  })
+}
+"#,
+        )
+        .build();
+
+    let line = "    context.newPage()";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.ts","line":6,"column":{}}}]}}"#,
+            column_of(line, "newPage")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Context.newPage",
+        "{value}"
+    );
+}
+
+#[test]
+fn typescript_awaited_member_call_initialized_local_resolves_to_return_type_member() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "utils.ts",
+            r#"
+export class Context {
+  newPage(): Promise<Page> { return Promise.resolve(new Page()) }
+}
+
+export class Page {
+  pptrPage = ''
+}
+
+export function withContext(cb: (context: Context) => Promise<void>): void {}
+"#,
+        )
+        .file(
+            "app.ts",
+            r#"
+import { withContext } from './utils.js'
+
+export function run() {
+  withContext(async context => {
+    const page = await context.newPage()
+    page.pptrPage
+  })
+}
+"#,
+        )
+        .build();
+
+    let line = "    page.pptrPage";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.ts","line":7,"column":{}}}]}}"#,
+            column_of(line, "pptrPage")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "Page.pptrPage", "{value}");
+}
+
+#[test]
+fn typescript_call_initialized_exported_object_member_resolves_to_argument_property() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "tool.ts",
+            r#"
+export function defineTool<T>(definition: T): T {
+  return {
+    ...definition,
+    pageScoped: true,
+  } as T
+}
+
+export const listTools = defineTool({
+  handler(): void {},
+})
+"#,
+        )
+        .file(
+            "app.ts",
+            r#"
+import { listTools } from './tool.js'
+
+export function run() {
+  listTools.handler()
+}
+"#,
+        )
+        .build();
+
+    let line = "  listTools.handler()";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.ts","line":5,"column":{}}}]}}"#,
+            column_of(line, "handler")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "tool.ts.listTools.handler",
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["start_line"], 10, "{value}");
+}
+
+#[test]
+fn typescript_call_argument_object_member_requires_shape_preserving_callee() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "tool.ts",
+            r#"
+export function log(definition: { handler(): void }): void {}
+
+export const listTools = log({
+  handler(): void {},
+})
+"#,
+        )
+        .file(
+            "app.ts",
+            r#"
+import { listTools } from './tool.js'
+
+export function run() {
+  listTools.handler()
+}
+"#,
+        )
+        .build();
+
+    let line = "  listTools.handler()";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.ts","line":5,"column":{}}}]}}"#,
+            column_of(line, "handler")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn typescript_window_member_resolves_to_ambient_window_interface_property() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "app.ts",
+            r#"
+export {}
+
+declare global {
+  interface Window {
+    __dtmcp?: {
+      toolGroups?: string[]
+    }
+  }
+}
+
+export function run() {
+  if (window.__dtmcp) {}
+}
+"#,
+        )
+        .build();
+
+    let line = "  if (window.__dtmcp) {}";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.ts","line":13,"column":{}}}]}}"#,
+            column_of(line, "__dtmcp")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "Window.__dtmcp", "{value}");
+    assert_eq!(result["definitions"][0]["start_line"], 6, "{value}");
+}
+
+#[test]
+fn typescript_window_member_ignores_non_ambient_local_window_class() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "app.ts",
+            r#"
+class Window {
+  other(): void {}
+}
+
+export function run() {
+  window.other()
+}
+"#,
+        )
+        .build();
+
+    let line = "  window.other()";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.ts","line":7,"column":{}}}]}}"#,
+            column_of(line, "other")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
 }
 
 #[test]

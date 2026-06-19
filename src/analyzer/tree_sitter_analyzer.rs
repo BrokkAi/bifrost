@@ -922,8 +922,9 @@ where
             }
         }
 
-        let all_children: Vec<_> =
-            crate::analyzer::IAnalyzer::direct_children(self, code_unit).collect();
+        let all_children: Vec<_> = crate::analyzer::IAnalyzer::direct_children(self, code_unit)
+            .filter(|child| !child.is_synthetic())
+            .collect();
         let field_children: Vec<_> = all_children
             .iter()
             .copied()
