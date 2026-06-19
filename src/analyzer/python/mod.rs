@@ -47,6 +47,7 @@ pub struct PythonAnalyzer {
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
     direct_descendants: Cache<CodeUnit, Arc<HashSet<CodeUnit>>>,
+    direct_descendant_index: Arc<OnceLock<HashMap<String, Arc<HashSet<CodeUnit>>>>>,
     module_code_units: Arc<HashMap<String, CodeUnit>>,
     reverse_import_index: Arc<OnceLock<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     usage_index: Arc<OnceLock<PythonUsageIndex>>,
@@ -87,6 +88,7 @@ impl PythonAnalyzer {
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
             direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec),
             direct_descendants: build_weighted_cache(memo_budget / 8, weight_code_unit_set_by_unit),
+            direct_descendant_index: Arc::new(OnceLock::new()),
             reverse_import_index: Arc::new(OnceLock::new()),
             usage_index: Arc::new(OnceLock::new()),
         }
@@ -481,6 +483,7 @@ impl IAnalyzer for PythonAnalyzer {
                 self.memo_budget / 8,
                 weight_code_unit_set_by_unit,
             ),
+            direct_descendant_index: Arc::new(OnceLock::new()),
             reverse_import_index: Arc::new(OnceLock::new()),
             usage_index: Arc::new(OnceLock::new()),
         }
@@ -499,6 +502,7 @@ impl IAnalyzer for PythonAnalyzer {
                 self.memo_budget / 8,
                 weight_code_unit_set_by_unit,
             ),
+            direct_descendant_index: Arc::new(OnceLock::new()),
             reverse_import_index: Arc::new(OnceLock::new()),
             usage_index: Arc::new(OnceLock::new()),
         }

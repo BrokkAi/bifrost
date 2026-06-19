@@ -11,6 +11,7 @@ pub(super) struct JavaMemoCaches {
     pub(super) relevant_imports: Cache<CodeUnit, Arc<HashSet<String>>>,
     pub(super) direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
     pub(super) direct_descendants: Cache<CodeUnit, Arc<HashSet<CodeUnit>>>,
+    pub(super) direct_descendant_index: OnceLock<HashMap<String, Arc<HashSet<CodeUnit>>>>,
     pub(super) reverse_import_index: OnceLock<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
 }
 
@@ -23,6 +24,7 @@ impl JavaMemoCaches {
             relevant_imports: Self::build_cache(budget_bytes / 8, weight_string_set),
             direct_ancestors: Self::build_cache(budget_bytes / 8, weight_code_unit_vec),
             direct_descendants: Self::build_cache(budget_bytes / 8, weight_code_unit_set),
+            direct_descendant_index: OnceLock::new(),
             reverse_import_index: OnceLock::new(),
         }
     }

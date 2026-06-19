@@ -1,4 +1,6 @@
-use lsp_types::{DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, SymbolKind};
+use lsp_types::{
+    DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, Range as LspRange, SymbolKind,
+};
 
 use crate::analyzer::common::display_identifier_for_target;
 use crate::analyzer::{
@@ -36,28 +38,23 @@ fn build_symbol(
     line_starts: &[usize],
     parent_kind: Option<SymbolKind>,
 ) -> DocumentSymbol {
-    let range = primary_range(analyzer, code_unit, content);
-    let lsp_range = byte_range_to_lsp_range(content, line_starts, &range);
-    let selection_range =
-        identifier_selection_range(code_unit, content, line_starts, &range).unwrap_or(lsp_range);
-
-    let kind = classify_symbol_kind(code_unit, parent_kind);
+    let parts = lsp_symbol_parts(analyzer, code_unit, content, line_starts, parent_kind);
 
     let children: Vec<DocumentSymbol> = analyzer
         .direct_children(code_unit)
         .filter(|child| !child.is_anonymous())
-        .map(|child| build_symbol(analyzer, child, content, line_starts, Some(kind)))
+        .map(|child| build_symbol(analyzer, child, content, line_starts, Some(parts.kind)))
         .collect();
 
     #[allow(deprecated)] // `deprecated` field is present on lsp-types DocumentSymbol.
     DocumentSymbol {
-        name: display_identifier_for_target(code_unit),
-        detail: code_unit.signature().map(str::to_string),
-        kind,
+        name: parts.name,
+        detail: parts.detail,
+        kind: parts.kind,
         tags: None,
         deprecated: None,
-        range: lsp_range,
-        selection_range,
+        range: parts.range,
+        selection_range: parts.selection_range,
         children: if children.is_empty() {
             None
         } else {
@@ -66,7 +63,40 @@ fn build_symbol(
     }
 }
 
-fn primary_range(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit, content: &str) -> ByteRange {
+pub(super) struct LspSymbolParts {
+    pub(super) name: String,
+    pub(super) detail: Option<String>,
+    pub(super) kind: SymbolKind,
+    pub(super) range: LspRange,
+    pub(super) selection_range: LspRange,
+}
+
+pub(super) fn lsp_symbol_parts(
+    analyzer: &dyn IAnalyzer,
+    code_unit: &CodeUnit,
+    content: &str,
+    line_starts: &[usize],
+    parent_kind: Option<SymbolKind>,
+) -> LspSymbolParts {
+    let range = primary_range(analyzer, code_unit, content);
+    let lsp_range = byte_range_to_lsp_range(content, line_starts, &range);
+    let selection_range =
+        identifier_selection_range(code_unit, content, line_starts, &range).unwrap_or(lsp_range);
+
+    LspSymbolParts {
+        name: display_identifier_for_target(code_unit),
+        detail: code_unit.signature().map(str::to_string),
+        kind: classify_symbol_kind(code_unit, parent_kind),
+        range: lsp_range,
+        selection_range,
+    }
+}
+
+pub(super) fn primary_range(
+    analyzer: &dyn IAnalyzer,
+    code_unit: &CodeUnit,
+    content: &str,
+) -> ByteRange {
     // Prefer the analyzer's recorded range; fall back to the whole file if the
     // analyzer has no range info (synthetic units, modules, etc.).
     analyzer
@@ -90,7 +120,10 @@ fn primary_range(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit, content: &str) 
 /// already-classified kind of the enclosing symbol so we can promote fields
 /// of an enum to `EnumMember` and methods named after their enclosing type to
 /// `Constructor`.
-fn classify_symbol_kind(code_unit: &CodeUnit, parent_kind: Option<SymbolKind>) -> SymbolKind {
+pub(super) fn classify_symbol_kind(
+    code_unit: &CodeUnit,
+    parent_kind: Option<SymbolKind>,
+) -> SymbolKind {
     match code_unit.kind() {
         CodeUnitType::Class => classify_class_like(code_unit.signature()),
         CodeUnitType::Function => {
