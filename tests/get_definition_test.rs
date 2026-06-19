@@ -1754,6 +1754,148 @@ func (s Server) Run() {
 }
 
 #[test]
+fn go_package_qualified_parameter_field_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n")
+        .file(
+            "request/nginx.go",
+            r#"
+package request
+
+type NginxRewriteReq struct {
+    WebsiteID uint
+    Name string
+}
+"#,
+        )
+        .file(
+            "main.go",
+            r#"
+package main
+
+import "example.com/app/request"
+
+func GetRewriteConfig(req request.NginxRewriteReq) {
+    if req.Name == "current" {
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "    if req.Name == \"current\" {";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"main.go","line":7,"column":{}}}]}}"#,
+            column_of(line, "Name")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "example.com/app/request.NginxRewriteReq.Name",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["path"], "request/nginx.go",
+        "{value}"
+    );
+}
+
+#[test]
+fn go_imported_local_receiver_field_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n")
+        .file(
+            "store/store.go",
+            r#"
+package store
+
+type Client struct {
+    Name string
+}
+"#,
+        )
+        .file(
+            "main.go",
+            r#"
+package main
+
+import "example.com/app/store"
+
+func Run() {
+    var typed store.Client
+    _ = typed.Name
+
+    inferred := store.Client{}
+    _ = inferred.Name
+}
+"#,
+        )
+        .build();
+
+    for (line_no, line) in [(8, "    _ = typed.Name"), (11, "    _ = inferred.Name")] {
+        let value = lookup(
+            project.root(),
+            &format!(
+                r#"{{"references":[{{"path":"main.go","line":{line_no},"column":{}}}]}}"#,
+                column_of(line, "Name")
+            ),
+        );
+
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(
+            result["definitions"][0]["fqn"], "example.com/app/store.Client.Name",
+            "{value}"
+        );
+        assert_eq!(
+            result["definitions"][0]["path"], "store/store.go",
+            "{value}"
+        );
+    }
+}
+
+#[test]
+fn go_unresolved_inner_local_receiver_does_not_fall_back_to_outer_binding() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n")
+        .file(
+            "main.go",
+            r#"
+package main
+
+type Client struct {
+    Name string
+}
+
+func Run() {
+    client := Client{}
+    {
+        client := missing()
+        _ = client.Name
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        _ = client.Name";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"main.go","line":12,"column":{}}}]}}"#,
+            column_of(line, "Name")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+}
+
+#[test]
 fn go_local_pointer_struct_field_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::Go)
         .file("go.mod", "module example.com/app\n")

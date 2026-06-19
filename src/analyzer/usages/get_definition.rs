@@ -2887,11 +2887,12 @@ fn go_binding_type_fqn(
     name: &str,
     byte: usize,
 ) -> Option<String> {
-    go_receiver_binding_type_fqn(support, file, source, root, name, byte)
+    go_receiver_binding_type_fqn(analyzer, support, file, source, root, name, byte)
         .or_else(|| go_local_binding_type_fqn(analyzer, support, file, source, root, name, byte))
 }
 
 fn go_receiver_binding_type_fqn(
+    analyzer: &dyn IAnalyzer,
     support: &DefinitionLookupIndex,
     file: &ProjectFile,
     source: &str,
@@ -2905,7 +2906,7 @@ fn go_receiver_binding_type_fqn(
             && let Some(receiver) = current.child_by_field_name("receiver")
             && let Some(type_node) = go_parameter_type_for_name(receiver, source, name)
         {
-            return go_resolve_type_fqn(support, file, source, type_node);
+            return go_resolve_type_fqn(analyzer, support, file, source, type_node);
         }
         current = current.parent()?;
     }
@@ -2928,9 +2929,9 @@ fn go_local_binding_type_fqn(
     let mut scope = smallest_named_node_covering(root, byte, byte)?;
     loop {
         if let Some(binding) = go_nearest_binding_in_scope(scope, source, name, byte) {
-            let resolved = match binding {
+            return match binding {
                 GoLocalBinding::Type(type_node) => {
-                    go_resolve_type_fqn(support, file, source, type_node)
+                    go_resolve_type_fqn(analyzer, support, file, source, type_node)
                 }
                 GoLocalBinding::Value(value_node) => {
                     go_value_type_fqn(analyzer, support, file, source, root, value_node, byte)
@@ -2939,9 +2940,6 @@ fn go_local_binding_type_fqn(
                     analyzer, support, file, source, root, range_node, byte,
                 ),
             };
-            if resolved.is_some() {
-                return resolved;
-            }
         }
         scope = scope.parent()?;
     }
@@ -3113,7 +3111,7 @@ fn go_value_type_fqn(
     byte: usize,
 ) -> Option<String> {
     go_value_type_text(analyzer, support, file, source, root, value_node, byte)
-        .and_then(|type_text| go_resolve_type_text_fqn(support, file, source, &type_text))
+        .and_then(|type_text| go_resolve_type_text_fqn(analyzer, support, file, source, &type_text))
 }
 
 fn go_value_type_text(
@@ -3239,7 +3237,7 @@ fn go_range_binding_type_fqn(
     let iterable_type =
         go_expression_type_text(analyzer, support, file, source, root, right, byte)?;
     let element_type = go_iterable_element_type_text(&iterable_type)?;
-    go_resolve_type_text_fqn(support, file, source, element_type)
+    go_resolve_type_text_fqn(analyzer, support, file, source, element_type)
 }
 
 fn go_expression_type_text(
@@ -3430,6 +3428,7 @@ fn go_type_text_from_fqn(fqn: &str) -> Option<&str> {
 }
 
 fn go_resolve_type_text_fqn(
+    analyzer: &dyn IAnalyzer,
     support: &DefinitionLookupIndex,
     file: &ProjectFile,
     source: &str,
@@ -3437,7 +3436,7 @@ fn go_resolve_type_text_fqn(
 ) -> Option<String> {
     let (qualifier, name) = go_type_name_parts(type_text)?;
     if qualifier.is_some() {
-        return None;
+        return go_resolve_qualified_type_from_file(analyzer, support, file, type_text);
     }
     go_resolve_type_name_in_package(support, &go_package_name(file, source), name)
 }
@@ -3543,16 +3542,16 @@ fn go_resolve_qualified_type_from_file(
 }
 
 fn go_resolve_type_fqn(
+    analyzer: &dyn IAnalyzer,
     support: &DefinitionLookupIndex,
     file: &ProjectFile,
     source: &str,
     type_node: Node<'_>,
 ) -> Option<String> {
-    go_resolve_type_name_in_package(
-        support,
-        &go_package_name(file, source),
-        go_node_text(type_node, source),
-    )
+    let type_text = go_node_text(type_node, source);
+    go_resolve_qualified_type_from_file(analyzer, support, file, type_text).or_else(|| {
+        go_resolve_type_name_in_package(support, &go_package_name(file, source), type_text)
+    })
 }
 
 fn go_resolve_type_name_in_package(
