@@ -2,7 +2,7 @@ use crate::analyzer::common::language_for_file;
 use crate::analyzer::usages::cpp_graph::{
     CppTargetKind, CppVisibilityIndex, cpp_call_arity, cpp_first_type_child,
     cpp_is_declaration_name, cpp_is_declarator_node, cpp_name_for, cpp_signature_arity,
-    extract_variable_name, normalize_cpp_type_text,
+    cpp_split_top_level_commas, extract_variable_name, normalize_cpp_type_text,
 };
 use crate::analyzer::usages::csharp_graph::{
     csharp_first_type_child, csharp_is_declaration_name, csharp_is_type_reference_node,
@@ -1157,6 +1157,7 @@ fn resolve_cpp(
             root,
             field,
             None,
+            None,
         ),
         Some(CppReferenceNode::Identifier(identifier)) => {
             if cpp_is_declaration_name(node) {
@@ -1307,6 +1308,8 @@ fn resolve_cpp_call(
     let Some(function) = call.child_by_field_name("function") else {
         return no_definition("no_function_name", "C++ call expression has no function");
     };
+    let call_arity = cpp_call_arity(call);
+    let call_arg_types = cpp_call_argument_types(visibility, file, source, root, call);
     match function.kind() {
         "field_expression" => resolve_cpp_field(
             analyzer,
@@ -1316,7 +1319,8 @@ fn resolve_cpp_call(
             source,
             root,
             function,
-            Some(cpp_call_arity(call)),
+            Some(call_arity),
+            call_arg_types.as_deref(),
         ),
         "qualified_identifier" => {
             let text = cpp_node_text(function, source);
@@ -1329,7 +1333,14 @@ fn resolve_cpp_call(
                 cpp_lexical_namespace(function, source).as_deref(),
             );
             if !candidates.is_empty() {
-                candidates = cpp_filter_candidates_by_arity(candidates, Some(cpp_call_arity(call)));
+                candidates = cpp_filter_candidates_by_call(
+                    candidates,
+                    Some(call_arity),
+                    call_arg_types.as_deref(),
+                    analyzer,
+                    visibility,
+                    file,
+                );
                 return candidates_outcome(candidates);
             }
             if let Some(scope) = function.child_by_field_name("scope")
@@ -1338,10 +1349,14 @@ fn resolve_cpp_call(
                 let member = cpp_node_text(name, source);
                 if let Some(owner) = visibility.resolve_type(file, cpp_node_text(scope, source)) {
                     candidates = cpp_member_candidates(
+                        analyzer,
                         support,
                         vec![owner],
                         member,
-                        Some(cpp_call_arity(call)),
+                        Some(call_arity),
+                        call_arg_types.as_deref(),
+                        visibility,
+                        file,
                     );
                     if !candidates.is_empty() {
                         return candidates_outcome(candidates);
@@ -1380,12 +1395,27 @@ fn resolve_cpp_call(
                 None,
             );
             if !candidates.is_empty() {
-                candidates = cpp_filter_candidates_by_arity(candidates, Some(cpp_call_arity(call)));
+                candidates = cpp_filter_candidates_by_call(
+                    candidates,
+                    Some(call_arity),
+                    call_arg_types.as_deref(),
+                    analyzer,
+                    visibility,
+                    file,
+                );
                 return candidates_outcome(candidates);
             }
             if let Some(owner) = cpp_enclosing_class(analyzer, file, function.start_byte()) {
-                let member_candidates =
-                    cpp_member_candidates(support, vec![owner], name, Some(cpp_call_arity(call)));
+                let member_candidates = cpp_member_candidates(
+                    analyzer,
+                    support,
+                    vec![owner],
+                    name,
+                    Some(call_arity),
+                    call_arg_types.as_deref(),
+                    visibility,
+                    file,
+                );
                 if !member_candidates.is_empty() {
                     return candidates_outcome(member_candidates);
                 }
@@ -1414,6 +1444,7 @@ fn resolve_cpp_field(
     root: Node<'_>,
     field: Node<'_>,
     arity: Option<usize>,
+    arg_types: Option<&[Option<CodeUnit>]>,
 ) -> DefinitionLookupOutcome {
     let Some(name_node) = field.child_by_field_name("field") else {
         return no_definition("no_member_name", "C++ field expression has no member name");
@@ -1426,7 +1457,9 @@ fn resolve_cpp_field(
         return no_definition("no_member_receiver", "C++ field expression has no receiver");
     };
     let owners = cpp_receiver_type_units(analyzer, visibility, file, source, root, receiver);
-    let candidates = cpp_member_candidates(support, owners, member, arity);
+    let candidates = cpp_member_candidates(
+        analyzer, support, owners, member, arity, arg_types, visibility, file,
+    );
     if candidates.is_empty() {
         no_definition(
             "unsupported_cpp_receiver",
@@ -1495,19 +1528,81 @@ fn cpp_unit_is_type_alias(unit: &CodeUnit) -> bool {
 }
 
 fn cpp_member_candidates(
+    analyzer: &dyn IAnalyzer,
     support: &DefinitionLookupIndex,
     owners: Vec<CodeUnit>,
     member: &str,
     arity: Option<usize>,
+    arg_types: Option<&[Option<CodeUnit>]>,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
 ) -> Vec<CodeUnit> {
     let mut candidates = Vec::new();
     for owner in owners {
         candidates.extend(support.fqn(&format!("{}.{}", owner.fq_name(), member)));
     }
-    candidates = cpp_filter_candidates_by_arity(candidates, arity);
+    candidates =
+        cpp_filter_candidates_by_call(candidates, arity, arg_types, analyzer, visibility, file);
     sort_units(&mut candidates);
     candidates.dedup();
     candidates
+}
+
+fn cpp_filter_candidates_by_call(
+    candidates: Vec<CodeUnit>,
+    arity: Option<usize>,
+    arg_types: Option<&[Option<CodeUnit>]>,
+    analyzer: &dyn IAnalyzer,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+) -> Vec<CodeUnit> {
+    let arity_filtered = cpp_filter_candidates_by_arity(candidates, arity);
+    let Some(arg_types) = arg_types else {
+        return arity_filtered;
+    };
+    if arg_types.iter().any(Option::is_none) {
+        return arity_filtered;
+    }
+    if arity_filtered.iter().any(|unit| {
+        unit.signature().is_some_and(|signature| {
+            cpp_signature_has_workspace_pointer_param(signature, visibility, file)
+        })
+    }) {
+        return arity_filtered;
+    }
+    let filtered: Vec<_> = arity_filtered
+        .iter()
+        .filter(|unit| cpp_candidate_params_match_args(unit, arg_types, analyzer, visibility, file))
+        .cloned()
+        .collect();
+    if filtered.is_empty() {
+        arity_filtered
+    } else {
+        filtered
+    }
+}
+
+fn cpp_signature_has_workspace_pointer_param(
+    signature: &str,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+) -> bool {
+    let inner = signature
+        .find('(')
+        .and_then(|open| {
+            signature[open + 1..]
+                .find(')')
+                .map(|close| &signature[open + 1..open + 1 + close])
+        })
+        .unwrap_or(signature)
+        .trim();
+    cpp_split_top_level_commas(inner).any(|parameter| {
+        let text = parameter.split('=').next().unwrap_or(parameter);
+        text.contains('*')
+            && visibility
+                .resolve_type(file, &cpp_parameter_type_text(text))
+                .is_some()
+    })
 }
 
 fn cpp_filter_candidates_by_arity(
@@ -1531,6 +1626,178 @@ fn cpp_filter_candidates_by_arity(
         candidates
     } else {
         filtered
+    }
+}
+
+fn cpp_candidate_params_match_args(
+    candidate: &CodeUnit,
+    arg_types: &[Option<CodeUnit>],
+    analyzer: &dyn IAnalyzer,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+) -> bool {
+    let Some(param_types) = candidate.signature().and_then(cpp_signature_param_types) else {
+        return false;
+    };
+    param_types.len() == arg_types.len()
+        && param_types
+            .iter()
+            .zip(arg_types.iter())
+            .all(|(param_type, arg_type)| {
+                let Some(arg_type) = arg_type else {
+                    return false;
+                };
+                let Some(param_unit) = visibility.resolve_type(file, param_type) else {
+                    return false;
+                };
+                cpp_type_assignable_to(
+                    analyzer,
+                    visibility,
+                    file,
+                    arg_type,
+                    &param_unit,
+                    &mut HashSet::default(),
+                )
+            })
+}
+
+fn cpp_signature_param_types(signature: &str) -> Option<Vec<String>> {
+    let inner = signature
+        .find('(')
+        .and_then(|open| {
+            signature[open + 1..]
+                .find(')')
+                .map(|close| &signature[open + 1..open + 1 + close])
+        })
+        .unwrap_or(signature)
+        .trim();
+    if inner.is_empty() || inner == "void" {
+        return Some(Vec::new());
+    }
+    Some(
+        cpp_split_top_level_commas(inner)
+            .map(cpp_parameter_type_text)
+            .collect(),
+    )
+}
+
+fn cpp_parameter_type_text(parameter: &str) -> String {
+    let mut text = parameter
+        .split('=')
+        .next()
+        .unwrap_or(parameter)
+        .trim()
+        .trim_end_matches(';')
+        .trim();
+    if let Some((before, last)) = text.rsplit_once(char::is_whitespace)
+        && cpp_parameter_name_token(last)
+    {
+        text = before.trim();
+    }
+    normalize_cpp_type_text(text)
+}
+
+fn cpp_parameter_name_token(token: &str) -> bool {
+    let token = token.trim_start_matches('*').trim_start_matches('&').trim();
+    token
+        .chars()
+        .next()
+        .is_some_and(|ch| ch == '_' || ch.is_ascii_lowercase())
+        && token
+            .chars()
+            .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn cpp_type_assignable_to(
+    analyzer: &dyn IAnalyzer,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    arg_type: &CodeUnit,
+    param_type: &CodeUnit,
+    seen: &mut HashSet<String>,
+) -> bool {
+    if arg_type.fq_name() == param_type.fq_name() {
+        return true;
+    }
+    if !seen.insert(arg_type.fq_name()) {
+        return false;
+    }
+    cpp_direct_base_types(analyzer, visibility, file, arg_type)
+        .into_iter()
+        .any(|base| {
+            base.fq_name() == param_type.fq_name()
+                || cpp_type_assignable_to(analyzer, visibility, file, &base, param_type, seen)
+        })
+}
+
+fn cpp_direct_base_types(
+    analyzer: &dyn IAnalyzer,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    unit: &CodeUnit,
+) -> Vec<CodeUnit> {
+    let signature = unit
+        .signature()
+        .map(str::to_string)
+        .or_else(|| analyzer.get_source(unit, false));
+    let Some(signature) = signature else {
+        return Vec::new();
+    };
+    let Some((_, bases)) = signature.split_once(':') else {
+        return Vec::new();
+    };
+    let bases = bases.split('{').next().unwrap_or(bases);
+    cpp_split_top_level_commas(bases)
+        .filter_map(|base| visibility.resolve_type(file, &cpp_base_type_text(base)))
+        .collect()
+}
+
+fn cpp_base_type_text(base: &str) -> String {
+    let filtered = base
+        .split_whitespace()
+        .filter(|token| !matches!(*token, "public" | "private" | "protected" | "virtual"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    normalize_cpp_type_text(&filtered)
+}
+
+fn cpp_call_argument_types(
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    call: Node<'_>,
+) -> Option<Vec<Option<CodeUnit>>> {
+    let args = call
+        .child_by_field_name("arguments")
+        .or_else(|| call.child_by_field_name("parameters"))
+        .or_else(|| call.child_by_field_name("value"))?;
+    let mut cursor = args.walk();
+    Some(
+        args.named_children(&mut cursor)
+            .map(|arg| cpp_expression_type(visibility, file, source, root, arg))
+            .collect(),
+    )
+}
+
+fn cpp_expression_type(
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    node: Node<'_>,
+) -> Option<CodeUnit> {
+    match node.kind() {
+        "identifier" => {
+            let name = cpp_node_text(node, source);
+            let bindings = cpp_bindings_before(visibility, file, source, root, node.start_byte());
+            first_precise(&bindings, name)
+        }
+        "parenthesized_expression" | "pointer_expression" => node
+            .child_by_field_name("argument")
+            .or_else(|| node.named_child(0))
+            .and_then(|inner| cpp_expression_type(visibility, file, source, root, inner)),
+        _ => None,
     }
 }
 

@@ -641,7 +641,9 @@ fn first_named_child_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Nod
         .find(|child| child.kind() == kind)
 }
 
-pub(super) fn split_top_level_commas(value: &str) -> impl Iterator<Item = &str> {
+pub(in crate::analyzer::usages) fn split_top_level_commas(
+    value: &str,
+) -> impl Iterator<Item = &str> {
     struct TopLevelCommaSplit<'a> {
         value: &'a str,
         start: usize,
