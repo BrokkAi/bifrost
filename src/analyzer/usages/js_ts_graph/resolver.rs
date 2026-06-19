@@ -81,6 +81,67 @@ pub(crate) fn build_jsts_usage_index(
 }
 
 impl JsTsUsageIndex {
+    /// Resolve `exported_name` as exported by `module_files` to concrete local
+    /// declarations, following named re-export chains and `export *` barrels.
+    pub(in crate::analyzer::usages) fn local_bindings_for_exported_name(
+        &self,
+        module_files: &[ProjectFile],
+        exported_name: &str,
+    ) -> BTreeSet<(ProjectFile, String)> {
+        let mut resolved = BTreeSet::new();
+        let mut visited = HashSet::default();
+        let mut frontier: VecDeque<(ProjectFile, String)> = module_files
+            .iter()
+            .cloned()
+            .map(|file| (file, exported_name.to_string()))
+            .collect();
+
+        while let Some((file, name)) = frontier.pop_front() {
+            if !visited.insert((file.clone(), name.clone())) {
+                continue;
+            }
+
+            if let Some(targets) = self
+                .direct_reexport_edges
+                .get(&(file.clone(), name.clone()))
+            {
+                for target in targets {
+                    frontier.push_back(target.clone());
+                }
+                continue;
+            }
+
+            if let Some(exports) = self.exports_by_file.get(&file)
+                && let Some(entry) = exports.exports_by_name.get(&name)
+            {
+                match entry {
+                    ExportEntry::Local { local_name } => {
+                        resolved.insert((file, local_name.clone()));
+                    }
+                    ExportEntry::Default { local_name } => {
+                        resolved.insert((
+                            file,
+                            local_name.clone().unwrap_or_else(|| "default".to_string()),
+                        ));
+                    }
+                    ExportEntry::ReexportedNamed { .. } => {}
+                }
+                continue;
+            }
+
+            // Per ES module semantics, `export * from` does not forward default.
+            if name != "default"
+                && let Some(target_files) = self.direct_star_reexports.get(&file)
+            {
+                for target_file in target_files {
+                    frontier.push_back((target_file.clone(), name.clone()));
+                }
+            }
+        }
+
+        resolved
+    }
+
     /// Export seeds for `target_short` in `target_file`, following named and star
     /// re-export chains across files.
     pub(super) fn seeds_for_target(

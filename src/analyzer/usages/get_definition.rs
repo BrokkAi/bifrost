@@ -15,7 +15,7 @@ use crate::analyzer::usages::go_graph::{
     preparse_go_files, resolve_go_reference,
 };
 use crate::analyzer::usages::inverted_edges::{ClassRangeIndex, first_precise};
-use crate::analyzer::usages::js_ts_graph::compute_jsts_import_binder;
+use crate::analyzer::usages::js_ts_graph::{cached_jsts_index, compute_jsts_import_binder};
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::ImportKind;
 use crate::analyzer::usages::php_graph::{
@@ -857,7 +857,14 @@ fn resolve_js_ts_module_binding(
         ));
     }
 
-    let mut candidates = support.file_identifier_in_files(&files, exported_name);
+    let mut candidates = jsts_module_export_candidates(
+        analyzer,
+        support,
+        language,
+        &files,
+        exported_name,
+        value_position,
+    );
     if value_position {
         candidates = jsts_value_space_candidates(analyzer, candidates);
     } else {
@@ -887,6 +894,32 @@ fn resolve_js_ts_module_binding(
         );
     }
     candidates_outcome(candidates)
+}
+
+fn jsts_module_export_candidates(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    language: Language,
+    files: &[ProjectFile],
+    exported_name: &str,
+    value_position: bool,
+) -> Vec<CodeUnit> {
+    let Some(index) = cached_jsts_index(analyzer, language) else {
+        return Vec::new();
+    };
+
+    let bindings = index.local_bindings_for_exported_name(files, exported_name);
+    let mut candidates = Vec::new();
+    for (file, local_name) in bindings {
+        let file_candidates = support.file_identifier_in_files(&[file], &local_name);
+        candidates.extend(file_candidates);
+    }
+
+    if value_position {
+        jsts_value_space_candidates(analyzer, candidates)
+    } else {
+        jsts_type_space_candidates(analyzer, candidates)
+    }
 }
 
 fn jsts_reference_is_value_position(tree: &Tree, site: &ResolvedReferenceSite) -> bool {

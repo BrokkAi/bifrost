@@ -76,7 +76,10 @@ where
 /// Borrow the analyzer-cached [`JsTsUsageIndex`] for `language` off the concrete TS/JS
 /// analyzer behind `analyzer`, building it on first use. `None` when the analyzer does
 /// not expose the matching JS/TS analyzer.
-fn cached_jsts_index(analyzer: &dyn IAnalyzer, language: Language) -> Option<&JsTsUsageIndex> {
+pub(in crate::analyzer::usages) fn cached_jsts_index(
+    analyzer: &dyn IAnalyzer,
+    language: Language,
+) -> Option<&JsTsUsageIndex> {
     match language {
         Language::TypeScript => {
             Some(resolve_analyzer::<TypescriptAnalyzer>(analyzer)?.jsts_usage_index())

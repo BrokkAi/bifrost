@@ -716,6 +716,48 @@ export function run() {
 }
 
 #[test]
+fn typescript_path_alias_import_resolves_through_star_barrel() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "tsconfig.json",
+            r#"{ "compilerOptions": { "baseUrl": ".", "paths": { "@renderer/*": ["src/renderer/*"] } } }"#,
+        )
+        .file("src/renderer/utils/index.ts", "export * from \"./naming\";\n")
+        .file(
+            "src/renderer/utils/naming.ts",
+            "export function isEmoji(value: string): boolean { return value.length > 0; }\n",
+        )
+        .file(
+            "src/renderer/components/UserPopup.tsx",
+            r#"
+import { isEmoji } from "@renderer/utils";
+
+export function render(avatar: string) {
+  return isEmoji(avatar);
+}
+"#,
+        )
+        .build();
+
+    let line = "  return isEmoji(avatar);";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/renderer/components/UserPopup.tsx","line":5,"column":{}}}]}}"#,
+            column_of(line, "isEmoji")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "isEmoji", "{value}");
+    assert_eq!(
+        result["definitions"][0]["path"], "src/renderer/utils/naming.ts",
+        "{value}"
+    );
+}
+
+#[test]
 fn javascript_destructured_commonjs_require_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file(
