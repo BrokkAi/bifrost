@@ -1051,7 +1051,7 @@ fn go_parameter_type_for_name<'tree>(
                 _ => type_node = Some(child),
             }
         }
-        if names.iter().any(|candidate| *candidate == name) {
+        if names.contains(&name) {
             return type_node;
         }
     }
@@ -1071,7 +1071,7 @@ fn go_indexed_field_type_fqn(
     let signature = field_unit
         .signature()
         .map(str::to_string)
-        .or_else(|| analyzer.signatures(&field_unit).into_iter().next().cloned())?;
+        .or_else(|| analyzer.signatures(&field_unit).iter().next().cloned())?;
     let type_text = signature
         .trim()
         .strip_prefix(field)
@@ -1155,6 +1155,14 @@ fn resolve_cpp(
             ),
         );
     };
+    let ctx = CppLookupCtx {
+        analyzer,
+        support,
+        file,
+        visibility: visibility.as_ref(),
+        source,
+        root,
+    };
     match cpp_reference_node(node) {
         Some(CppReferenceNode::Type(type_node)) => {
             if cpp_is_type_declaration_name(node) {
@@ -1167,31 +1175,13 @@ fn resolve_cpp(
                 analyzer,
                 support,
                 file,
-                visibility.as_ref(),
-                source,
+                ctx.visibility,
+                ctx.source,
                 type_node,
             )
         }
-        Some(CppReferenceNode::Call(call)) => resolve_cpp_call(
-            analyzer,
-            support,
-            file,
-            visibility.as_ref(),
-            source,
-            root,
-            call,
-        ),
-        Some(CppReferenceNode::Field(field)) => resolve_cpp_field(
-            analyzer,
-            support,
-            file,
-            visibility.as_ref(),
-            source,
-            root,
-            field,
-            None,
-            None,
-        ),
+        Some(CppReferenceNode::Call(call)) => resolve_cpp_call(ctx, call),
+        Some(CppReferenceNode::Field(field)) => resolve_cpp_field(ctx, field, None, None),
         Some(CppReferenceNode::Identifier(identifier)) => {
             if cpp_is_declaration_name(node) {
                 return no_definition(
@@ -1199,7 +1189,7 @@ fn resolve_cpp(
                     format!("`{}` is not a C++ reference site", site.text),
                 );
             }
-            let text = cpp_node_text(identifier, source);
+            let text = cpp_node_text(identifier, ctx.source);
             if text.is_empty() {
                 return no_definition("no_reference_text", "C++ identifier is blank");
             }
@@ -1232,6 +1222,16 @@ enum CppReferenceNode<'tree> {
     Call(Node<'tree>),
     Field(Node<'tree>),
     Identifier(Node<'tree>),
+}
+
+#[derive(Clone, Copy)]
+struct CppLookupCtx<'a, 'tree> {
+    analyzer: &'a dyn IAnalyzer,
+    support: &'a DefinitionLookupIndex,
+    file: &'a ProjectFile,
+    visibility: &'a CppVisibilityIndex,
+    source: &'a str,
+    root: Node<'tree>,
 }
 
 fn cpp_reference_node(node: Node<'_>) -> Option<CppReferenceNode<'_>> {
@@ -1329,75 +1329,66 @@ fn resolve_cpp_type(
     )
 }
 
-fn resolve_cpp_call(
-    analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
-    file: &ProjectFile,
-    visibility: &CppVisibilityIndex,
-    source: &str,
-    root: Node<'_>,
-    call: Node<'_>,
-) -> DefinitionLookupOutcome {
+fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLookupOutcome {
     let Some(function) = call.child_by_field_name("function") else {
         return no_definition("no_function_name", "C++ call expression has no function");
     };
     let call_arity = cpp_call_arity(call);
-    let call_arg_types =
-        cpp_call_argument_types(analyzer, support, visibility, file, source, root, call);
+    let call_arg_types = cpp_call_argument_types(
+        ctx.analyzer,
+        ctx.support,
+        ctx.visibility,
+        ctx.file,
+        ctx.source,
+        ctx.root,
+        call,
+    );
     match function.kind() {
-        "field_expression" => resolve_cpp_field(
-            analyzer,
-            support,
-            file,
-            visibility,
-            source,
-            root,
-            function,
-            Some(call_arity),
-            call_arg_types.as_deref(),
-        ),
+        "field_expression" => {
+            resolve_cpp_field(ctx, function, Some(call_arity), call_arg_types.as_deref())
+        }
         "qualified_identifier" => {
-            let text = cpp_node_text(function, source);
+            let text = cpp_node_text(function, ctx.source);
             let mut candidates = cpp_visible_name_candidates(
-                visibility,
-                file,
-                support,
+                ctx.visibility,
+                ctx.file,
+                ctx.support,
                 text,
                 Some(CppTargetKind::FreeFunction),
-                cpp_lexical_namespace(function, source).as_deref(),
+                cpp_lexical_namespace(function, ctx.source).as_deref(),
             );
             if !candidates.is_empty() {
                 candidates = cpp_filter_candidates_by_call(
                     candidates,
                     Some(call_arity),
                     call_arg_types.as_deref(),
-                    analyzer,
-                    visibility,
-                    file,
+                    ctx.analyzer,
+                    ctx.visibility,
+                    ctx.file,
                 );
                 return candidates_outcome(candidates);
             }
             if let Some(scope) = function.child_by_field_name("scope")
                 && let Some(name) = function.child_by_field_name("name")
             {
-                let member = cpp_node_text(name, source);
-                if let Some(owner) = visibility.resolve_type(file, cpp_node_text(scope, source)) {
+                let member = cpp_node_text(name, ctx.source);
+                if let Some(owner) = ctx
+                    .visibility
+                    .resolve_type(ctx.file, cpp_node_text(scope, ctx.source))
+                {
                     candidates = cpp_member_candidates(
-                        analyzer,
-                        support,
+                        ctx,
                         vec![owner],
                         member,
                         Some(call_arity),
                         call_arg_types.as_deref(),
-                        visibility,
-                        file,
                     );
                     if !candidates.is_empty() {
                         return candidates_outcome(candidates);
                     }
                 }
             }
-            if cpp_unresolved_include_boundary(analyzer, file, text) {
+            if cpp_unresolved_include_boundary(ctx.analyzer, ctx.file, text) {
                 return boundary(format!(
                     "`{text}` appears to cross a C++ include boundary not indexed in this workspace"
                 ));
@@ -1408,12 +1399,17 @@ fn resolve_cpp_call(
             )
         }
         "identifier" => {
-            let name = cpp_node_text(function, source);
+            let name = cpp_node_text(function, ctx.source);
             if name.is_empty() {
                 return no_definition("no_function_name", "C++ call name is blank");
             }
-            let bindings =
-                cpp_bindings_before(visibility, file, source, root, function.start_byte());
+            let bindings = cpp_bindings_before(
+                ctx.visibility,
+                ctx.file,
+                ctx.source,
+                ctx.root,
+                function.start_byte(),
+            );
             if bindings.is_shadowed(name) {
                 return no_definition(
                     "local_variable_reference",
@@ -1421,9 +1417,9 @@ fn resolve_cpp_call(
                 );
             }
             let mut candidates = cpp_visible_name_candidates(
-                visibility,
-                file,
-                support,
+                ctx.visibility,
+                ctx.file,
+                ctx.support,
                 name,
                 Some(CppTargetKind::FreeFunction),
                 None,
@@ -1433,22 +1429,20 @@ fn resolve_cpp_call(
                     candidates,
                     Some(call_arity),
                     call_arg_types.as_deref(),
-                    analyzer,
-                    visibility,
-                    file,
+                    ctx.analyzer,
+                    ctx.visibility,
+                    ctx.file,
                 );
                 return candidates_outcome(candidates);
             }
-            if let Some(owner) = cpp_enclosing_class(analyzer, file, function.start_byte()) {
+            if let Some(owner) = cpp_enclosing_class(ctx.analyzer, ctx.file, function.start_byte())
+            {
                 let member_candidates = cpp_member_candidates(
-                    analyzer,
-                    support,
+                    ctx,
                     vec![owner],
                     name,
                     Some(call_arity),
                     call_arg_types.as_deref(),
-                    visibility,
-                    file,
                 );
                 if !member_candidates.is_empty() {
                     return candidates_outcome(member_candidates);
@@ -1470,12 +1464,7 @@ fn resolve_cpp_call(
 }
 
 fn resolve_cpp_field(
-    analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
-    file: &ProjectFile,
-    visibility: &CppVisibilityIndex,
-    source: &str,
-    root: Node<'_>,
+    ctx: CppLookupCtx<'_, '_>,
     field: Node<'_>,
     arity: Option<usize>,
     arg_types: Option<&[Option<CodeUnit>]>,
@@ -1483,18 +1472,23 @@ fn resolve_cpp_field(
     let Some(name_node) = field.child_by_field_name("field") else {
         return no_definition("no_member_name", "C++ field expression has no member name");
     };
-    let member = cpp_node_text(name_node, source);
+    let member = cpp_node_text(name_node, ctx.source);
     let Some(receiver) = field
         .child_by_field_name("argument")
         .or_else(|| field.named_child(0))
     else {
         return no_definition("no_member_receiver", "C++ field expression has no receiver");
     };
-    let owners =
-        cpp_receiver_type_units(analyzer, support, visibility, file, source, root, receiver);
-    let candidates = cpp_member_candidates(
-        analyzer, support, owners, member, arity, arg_types, visibility, file,
+    let owners = cpp_receiver_type_units(
+        ctx.analyzer,
+        ctx.support,
+        ctx.visibility,
+        ctx.file,
+        ctx.source,
+        ctx.root,
+        receiver,
     );
+    let candidates = cpp_member_candidates(ctx, owners, member, arity, arg_types);
     if candidates.is_empty() {
         no_definition(
             "unsupported_cpp_receiver",
@@ -1563,21 +1557,24 @@ fn cpp_unit_is_type_alias(unit: &CodeUnit) -> bool {
 }
 
 fn cpp_member_candidates(
-    analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    ctx: CppLookupCtx<'_, '_>,
     owners: Vec<CodeUnit>,
     member: &str,
     arity: Option<usize>,
     arg_types: Option<&[Option<CodeUnit>]>,
-    visibility: &CppVisibilityIndex,
-    file: &ProjectFile,
 ) -> Vec<CodeUnit> {
     let mut candidates = Vec::new();
     for owner in owners {
-        candidates.extend(support.fqn(&format!("{}.{}", owner.fq_name(), member)));
+        candidates.extend(ctx.support.fqn(&format!("{}.{}", owner.fq_name(), member)));
     }
-    candidates =
-        cpp_filter_candidates_by_call(candidates, arity, arg_types, analyzer, visibility, file);
+    candidates = cpp_filter_candidates_by_call(
+        candidates,
+        arity,
+        arg_types,
+        ctx.analyzer,
+        ctx.visibility,
+        ctx.file,
+    );
     sort_units(&mut candidates);
     candidates.dedup();
     candidates
@@ -1863,7 +1860,18 @@ fn cpp_field_expression_type(
     let owners =
         cpp_receiver_type_units(analyzer, support, visibility, file, source, root, receiver);
     let candidates = cpp_member_candidates(
-        analyzer, support, owners, member, None, None, visibility, file,
+        CppLookupCtx {
+            analyzer,
+            support,
+            file,
+            visibility,
+            source,
+            root,
+        },
+        owners,
+        member,
+        None,
+        None,
     );
     candidates
         .into_iter()
@@ -2331,7 +2339,16 @@ fn resolve_scala(
             resolve_scala_call(ctx, &resolver, root, call)
         }
         Some(ScalaReferenceNode::Field(field)) => resolve_scala_field(
-            scala, analyzer, support, file, source, &resolver, root, field,
+            ScalaLookupCtx {
+                scala,
+                analyzer,
+                support,
+                file,
+                source,
+            },
+            &resolver,
+            root,
+            field,
         ),
         Some(ScalaReferenceNode::Identifier(identifier)) => {
             let text = scala_node_text(identifier, source).trim();
@@ -2498,16 +2515,7 @@ fn resolve_scala_call(
         return no_definition("no_function_name", "Scala call expression has no function");
     };
     match function.kind() {
-        "field_expression" => resolve_scala_field(
-            ctx.scala,
-            ctx.analyzer,
-            ctx.support,
-            ctx.file,
-            ctx.source,
-            resolver,
-            root,
-            function,
-        ),
+        "field_expression" => resolve_scala_field(ctx, resolver, root, function),
         "identifier" | "type_identifier" => {
             let name = scala_node_text(function, ctx.source).trim();
             if name.is_empty() {
@@ -2558,11 +2566,7 @@ fn resolve_scala_call(
 }
 
 fn resolve_scala_field(
-    scala: &ScalaAnalyzer,
-    analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
-    file: &ProjectFile,
-    source: &str,
+    ctx: ScalaLookupCtx<'_>,
     resolver: &ScalaNameResolver,
     root: Node<'_>,
     field: Node<'_>,
@@ -2573,24 +2577,16 @@ fn resolve_scala_field(
             "Scala field expression has no member name",
         );
     };
-    let member = scala_node_text(field_node, source).trim();
+    let member = scala_node_text(field_node, ctx.source).trim();
     let Some(receiver) = field.child_by_field_name("value") else {
         return no_definition(
             "no_member_receiver",
             "Scala field expression has no receiver",
         );
     };
-    if let Some(owner) = scala_receiver_type_fqn(
-        scala,
-        analyzer,
-        file,
-        source,
-        resolver,
-        root,
-        receiver,
-        field.start_byte(),
-    ) {
-        let candidates = support.fqn(&format!("{owner}.{member}"));
+    if let Some(owner) = scala_receiver_type_fqn(ctx, resolver, root, receiver, field.start_byte())
+    {
+        let candidates = ctx.support.fqn(&format!("{owner}.{member}"));
         if !candidates.is_empty() {
             return candidates_outcome(candidates);
         }
@@ -2608,10 +2604,7 @@ fn resolve_scala_field(
 }
 
 fn scala_receiver_type_fqn(
-    scala: &ScalaAnalyzer,
-    analyzer: &dyn IAnalyzer,
-    file: &ProjectFile,
-    source: &str,
+    ctx: ScalaLookupCtx<'_>,
     resolver: &ScalaNameResolver,
     root: Node<'_>,
     receiver: Node<'_>,
@@ -2619,16 +2612,22 @@ fn scala_receiver_type_fqn(
 ) -> Option<String> {
     match receiver.kind() {
         "identifier" | "type_identifier" => {
-            let name = scala_node_text(receiver, source).trim();
+            let name = scala_node_text(receiver, ctx.source).trim();
             if name == "this" {
-                return ClassRangeIndex::build(analyzer, file)
+                return ClassRangeIndex::build(ctx.analyzer, ctx.file)
                     .enclosing(receiver.start_byte())
                     .map(str::to_string);
             }
-            let bindings = scala_bindings_before(resolver, source, root, cutoff_start);
+            let bindings = scala_bindings_before(resolver, ctx.source, root, cutoff_start);
             first_precise(&bindings, name).or_else(|| {
                 scala_enclosing_class_parameter_type(
-                    scala, analyzer, file, receiver, name, resolver, source,
+                    ctx.scala,
+                    ctx.analyzer,
+                    ctx.file,
+                    receiver,
+                    name,
+                    resolver,
+                    ctx.source,
                 )
                 .or_else(|| {
                     (!bindings.is_shadowed(name))

@@ -78,8 +78,7 @@ fn exported_class_name_from_text(text: &str) -> Option<String> {
     let name = candidates
         .iter()
         .copied()
-        .filter(|token| !cpp_export_macro_token(token))
-        .next_back()
+        .rfind(|token| !cpp_export_macro_token(token))
         .or_else(|| candidates.last().copied())?;
     Some(name.to_string())
 }
