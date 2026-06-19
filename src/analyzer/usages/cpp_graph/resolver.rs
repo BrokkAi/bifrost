@@ -819,9 +819,9 @@ pub(super) fn normalize_cpp_reference_text(value: &str) -> String {
     let normalized = text
         .trim()
         .trim_start_matches("const ")
-        .trim_end_matches('*')
-        .trim_end_matches('&')
-        .trim_matches(':');
+        .trim_end_matches(|ch: char| ch == '*' || ch == '&' || ch.is_whitespace())
+        .trim_matches(':')
+        .trim();
     strip_tag_type_prefix(normalized).to_string()
 }
 

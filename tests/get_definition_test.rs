@@ -3073,6 +3073,80 @@ fn cpp_typed_receiver_method_wrong_argument_type_returns_overload_definitions() 
 }
 
 #[test]
+fn cpp_typed_receiver_method_filters_pointer_overload_by_argument_indirection() {
+    // A pointer argument must select the `Widget*` overload over the `Widget`
+    // value overload. This is the case the old workspace-pointer escape hatch
+    // bailed on (returning both); indirection-aware matching resolves it.
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "target.h",
+            "namespace ns { class Widget {}; class Sink { public: int accept(Widget w); int accept(Widget* w); }; }\n",
+        )
+        .file(
+            "app.cpp",
+            "#include \"target.h\"\nusing namespace ns;\nvoid bind(Sink& sink, Widget* wp) { sink.accept(wp); }\n",
+        )
+        .build();
+
+    let line = "void bind(Sink& sink, Widget* wp) { sink.accept(wp); }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.cpp","line":3,"column":{}}}]}}"#,
+            column_of(line, "accept")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"].as_array().unwrap().len(),
+        1,
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["fqn"], "ns.Sink.accept", "{value}");
+    assert_eq!(
+        result["definitions"][0]["signature"], "(Widget *)",
+        "{value}"
+    );
+}
+
+#[test]
+fn cpp_typed_receiver_method_filters_value_overload_by_argument_indirection() {
+    // The mirror of the pointer case: a value argument must select the `Widget`
+    // overload over the `Widget*` overload.
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "target.h",
+            "namespace ns { class Widget {}; class Sink { public: int accept(Widget w); int accept(Widget* w); }; }\n",
+        )
+        .file(
+            "app.cpp",
+            "#include \"target.h\"\nusing namespace ns;\nvoid bind(Sink& sink, Widget w) { sink.accept(w); }\n",
+        )
+        .build();
+
+    let line = "void bind(Sink& sink, Widget w) { sink.accept(w); }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.cpp","line":3,"column":{}}}]}}"#,
+            column_of(line, "accept")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"].as_array().unwrap().len(),
+        1,
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["fqn"], "ns.Sink.accept", "{value}");
+    assert_eq!(result["definitions"][0]["signature"], "(Widget)", "{value}");
+}
+
+#[test]
 fn cpp_chained_struct_field_receiver_resolves_member_field() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file("bstr.h", "struct bstr { int len; };\n")

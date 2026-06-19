@@ -1949,7 +1949,7 @@ fn resolve_cpp_field(
     ctx: CppLookupCtx<'_, '_>,
     field: Node<'_>,
     arity: Option<usize>,
-    arg_types: Option<&[Option<CodeUnit>]>,
+    arg_types: Option<&[Option<CppType>]>,
 ) -> DefinitionLookupOutcome {
     let Some(name_node) = field.child_by_field_name("field") else {
         return no_definition("no_member_name", "C++ field expression has no member name");
@@ -2073,7 +2073,7 @@ fn cpp_member_candidates(
     owners: Vec<CodeUnit>,
     member: &str,
     arity: Option<usize>,
-    arg_types: Option<&[Option<CodeUnit>]>,
+    arg_types: Option<&[Option<CppType>]>,
 ) -> Vec<CodeUnit> {
     let mut candidates = Vec::new();
     for owner in owners {
@@ -2095,7 +2095,7 @@ fn cpp_member_candidates(
 fn cpp_filter_candidates_by_call(
     candidates: Vec<CodeUnit>,
     arity: Option<usize>,
-    arg_types: Option<&[Option<CodeUnit>]>,
+    arg_types: Option<&[Option<CppType>]>,
     analyzer: &dyn IAnalyzer,
     visibility: &CppVisibilityIndex,
     file: &ProjectFile,
@@ -2105,13 +2105,6 @@ fn cpp_filter_candidates_by_call(
         return arity_filtered;
     };
     if arg_types.iter().any(Option::is_none) {
-        return arity_filtered;
-    }
-    if arity_filtered.iter().any(|unit| {
-        unit.signature().is_some_and(|signature| {
-            cpp_signature_has_workspace_pointer_param(signature, visibility, file)
-        })
-    }) {
         return arity_filtered;
     }
     let filtered: Vec<_> = arity_filtered
@@ -2124,29 +2117,6 @@ fn cpp_filter_candidates_by_call(
     } else {
         filtered
     }
-}
-
-fn cpp_signature_has_workspace_pointer_param(
-    signature: &str,
-    visibility: &CppVisibilityIndex,
-    file: &ProjectFile,
-) -> bool {
-    let inner = signature
-        .find('(')
-        .and_then(|open| {
-            signature[open + 1..]
-                .find(')')
-                .map(|close| &signature[open + 1..open + 1 + close])
-        })
-        .unwrap_or(signature)
-        .trim();
-    cpp_split_top_level_commas(inner).any(|parameter| {
-        let text = parameter.split('=').next().unwrap_or(parameter);
-        text.contains('*')
-            && visibility
-                .resolve_type(file, &cpp_parameter_type_text(text))
-                .is_some()
-    })
 }
 
 fn cpp_filter_candidates_by_arity(
@@ -2175,7 +2145,7 @@ fn cpp_filter_candidates_by_arity(
 
 fn cpp_candidate_params_match_args(
     candidate: &CodeUnit,
-    arg_types: &[Option<CodeUnit>],
+    arg_types: &[Option<CppType>],
     analyzer: &dyn IAnalyzer,
     visibility: &CppVisibilityIndex,
     file: &ProjectFile,
@@ -2191,6 +2161,9 @@ fn cpp_candidate_params_match_args(
                 let Some(arg_type) = arg_type else {
                     return false;
                 };
+                if cpp_type_text_pointer_depth(param_type) != arg_type.indirection {
+                    return false;
+                }
                 let Some(param_unit) = visibility.resolve_type(file, param_type) else {
                     return false;
                 };
@@ -2198,7 +2171,7 @@ fn cpp_candidate_params_match_args(
                     analyzer,
                     visibility,
                     file,
-                    arg_type,
+                    &arg_type.unit,
                     &param_unit,
                     &mut HashSet::default(),
                 )
@@ -2233,12 +2206,20 @@ fn cpp_parameter_type_text(parameter: &str) -> String {
         .trim()
         .trim_end_matches(';')
         .trim();
+    // Pointer depth must be read from the raw text: the type normalizer
+    // (`normalize_cpp_type_text`) deliberately strips `*`/`&` to get the bare type
+    // name, so we capture the depth first and re-append it after normalizing.
+    let pointer_depth = cpp_type_text_pointer_depth(text);
     if let Some((before, last)) = text.rsplit_once(char::is_whitespace)
         && cpp_parameter_name_token(last)
     {
         text = before.trim();
     }
-    normalize_cpp_type_text(text)
+    format!(
+        "{}{}",
+        normalize_cpp_type_text(text),
+        "*".repeat(pointer_depth as usize)
+    )
 }
 
 fn cpp_parameter_name_token(token: &str) -> bool {
@@ -2305,6 +2286,59 @@ fn cpp_base_type_text(base: &str) -> String {
     normalize_cpp_type_text(&filtered)
 }
 
+/// A C++ value type paired with its pointer indirection depth: 0 for a value or
+/// reference, 1 for `T*`, 2 for `T**`, and so on. References bind from values, so
+/// they contribute depth 0; only `*` levels must agree between an argument and a
+/// parameter for overload matching.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct CppType {
+    unit: CodeUnit,
+    indirection: i32,
+}
+
+/// Top-level pointer depth declared by `text` (the number of `*` outside any
+/// template/array/parameter brackets). `&` is ignored: a reference parameter
+/// binds from a value argument.
+fn cpp_type_text_pointer_depth(text: &str) -> i32 {
+    let mut depth = 0i32;
+    let mut bracket = 0i32;
+    for ch in text.chars() {
+        match ch {
+            '<' | '(' | '[' => bracket += 1,
+            '>' | ')' | ']' => bracket -= 1,
+            '*' if bracket <= 0 => depth += 1,
+            _ => {}
+        }
+    }
+    depth
+}
+
+/// Pointer depth contributed by a declarator: one per `pointer_declarator`
+/// wrapping the name. `reference_declarator` contributes nothing.
+fn cpp_declarator_pointer_depth(declarator: Node<'_>) -> i32 {
+    let mut depth = 0;
+    let mut current = declarator;
+    loop {
+        if current.kind() == "pointer_declarator" {
+            depth += 1;
+        }
+        match current.child_by_field_name("declarator") {
+            Some(inner) => current = inner,
+            None => return depth,
+        }
+    }
+}
+
+/// Indirection change of a `pointer_expression`: `&x` adds a pointer level, `*x`
+/// removes one. `None` for any other unary operator sharing this node kind.
+fn cpp_pointer_expression_delta(node: Node<'_>) -> Option<i32> {
+    match node.child_by_field_name("operator")?.kind() {
+        "&" => Some(1),
+        "*" => Some(-1),
+        _ => None,
+    }
+}
+
 fn cpp_call_argument_types(
     analyzer: &dyn IAnalyzer,
     support: &DefinitionLookupIndex,
@@ -2313,7 +2347,7 @@ fn cpp_call_argument_types(
     source: &str,
     root: Node<'_>,
     call: Node<'_>,
-) -> Option<Vec<Option<CodeUnit>>> {
+) -> Option<Vec<Option<CppType>>> {
     let args = call
         .child_by_field_name("arguments")
         .or_else(|| call.child_by_field_name("parameters"))
@@ -2334,7 +2368,7 @@ fn cpp_expression_type(
     source: &str,
     root: Node<'_>,
     node: Node<'_>,
-) -> Option<CodeUnit> {
+) -> Option<CppType> {
     match node.kind() {
         "identifier" => {
             let name = cpp_node_text(node, source);
@@ -2344,12 +2378,25 @@ fn cpp_expression_type(
         "field_expression" => {
             cpp_field_expression_type(analyzer, support, visibility, file, source, root, node)
         }
-        "parenthesized_expression" | "pointer_expression" => node
+        "new_expression" | "call_expression" => {
+            cpp_infer_type_from_value(visibility, file, source, node)
+        }
+        "parenthesized_expression" => node
             .child_by_field_name("argument")
             .or_else(|| node.named_child(0))
             .and_then(|inner| {
                 cpp_expression_type(analyzer, support, visibility, file, source, root, inner)
             }),
+        "pointer_expression" => {
+            let delta = cpp_pointer_expression_delta(node)?;
+            let inner = node
+                .child_by_field_name("argument")
+                .or_else(|| node.named_child(0))?;
+            let mut inner_type =
+                cpp_expression_type(analyzer, support, visibility, file, source, root, inner)?;
+            inner_type.indirection += delta;
+            Some(inner_type)
+        }
         _ => None,
     }
 }
@@ -2362,7 +2409,7 @@ fn cpp_field_expression_type(
     source: &str,
     root: Node<'_>,
     field: Node<'_>,
-) -> Option<CodeUnit> {
+) -> Option<CppType> {
     let member = field
         .child_by_field_name("field")
         .map(|field| cpp_node_text(field, source))?;
@@ -2396,7 +2443,7 @@ fn cpp_field_declared_type(
     visibility: &CppVisibilityIndex,
     file: &ProjectFile,
     field: &CodeUnit,
-) -> Option<CodeUnit> {
+) -> Option<CppType> {
     let declaration_text = field
         .signature()
         .map(str::to_string)
@@ -2413,7 +2460,10 @@ fn cpp_field_declared_type(
     if type_text.is_empty() {
         return None;
     }
-    visibility.resolve_type(file, type_text)
+    let indirection = cpp_type_text_pointer_depth(type_text);
+    visibility
+        .resolve_type(file, type_text)
+        .map(|unit| CppType { unit, indirection })
 }
 
 fn cpp_receiver_type_units(
@@ -2430,8 +2480,8 @@ fn cpp_receiver_type_units(
             let name = cpp_node_text(receiver, source);
             let bindings =
                 cpp_bindings_before(visibility, file, source, root, receiver.start_byte());
-            if let Some(unit) = first_precise(&bindings, name) {
-                return vec![unit];
+            if let Some(cpp_type) = first_precise(&bindings, name) {
+                return vec![cpp_type.unit];
             }
             if bindings.is_shadowed(name) {
                 Vec::new()
@@ -2444,6 +2494,7 @@ fn cpp_receiver_type_units(
             .collect(),
         "field_expression" => {
             cpp_field_expression_type(analyzer, support, visibility, file, source, root, receiver)
+                .map(|cpp_type| cpp_type.unit)
                 .into_iter()
                 .collect()
         }
@@ -2501,7 +2552,7 @@ fn cpp_bindings_before(
     source: &str,
     root: Node<'_>,
     cutoff_start: usize,
-) -> LocalInferenceEngine<CodeUnit> {
+) -> LocalInferenceEngine<CppType> {
     let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
     cpp_seed_active_path(visibility, file, source, root, cutoff_start, &mut bindings);
     bindings
@@ -2514,7 +2565,7 @@ fn cpp_local_bindings_before(
     _root: Node<'_>,
     node: Node<'_>,
     cutoff_start: usize,
-) -> LocalInferenceEngine<CodeUnit> {
+) -> LocalInferenceEngine<CppType> {
     let Some(local_root) = cpp_enclosing_local_scope(node) else {
         return LocalInferenceEngine::new(LocalInferenceConfig::default());
     };
@@ -2541,7 +2592,7 @@ fn cpp_seed_active_path(
     source: &str,
     node: Node<'_>,
     cutoff_start: usize,
-    bindings: &mut LocalInferenceEngine<CodeUnit>,
+    bindings: &mut LocalInferenceEngine<CppType>,
 ) {
     if node.start_byte() >= cutoff_start {
         return;
@@ -2582,7 +2633,7 @@ fn cpp_seed_typed_binding(
     file: &ProjectFile,
     source: &str,
     node: Node<'_>,
-    bindings: &mut LocalInferenceEngine<CodeUnit>,
+    bindings: &mut LocalInferenceEngine<CppType>,
 ) {
     let Some(declarator) = node.child_by_field_name("declarator") else {
         return;
@@ -2600,6 +2651,7 @@ fn cpp_seed_typed_binding(
         source,
         &name,
         type_text.as_deref(),
+        cpp_declarator_pointer_depth(declarator),
         None,
         bindings,
     );
@@ -2611,7 +2663,7 @@ fn cpp_seed_for_range_binding(
     source: &str,
     node: Node<'_>,
     cutoff_start: usize,
-    bindings: &mut LocalInferenceEngine<CodeUnit>,
+    bindings: &mut LocalInferenceEngine<CppType>,
 ) {
     if node
         .child_by_field_name("body")
@@ -2635,6 +2687,7 @@ fn cpp_seed_for_range_binding(
         source,
         &name,
         type_text.as_deref(),
+        cpp_declarator_pointer_depth(declarator),
         None,
         bindings,
     );
@@ -2646,7 +2699,7 @@ fn cpp_seed_variable_declaration(
     source: &str,
     node: Node<'_>,
     cutoff_start: usize,
-    bindings: &mut LocalInferenceEngine<CodeUnit>,
+    bindings: &mut LocalInferenceEngine<CppType>,
 ) {
     let type_text = node
         .child_by_field_name("type")
@@ -2689,6 +2742,7 @@ fn cpp_seed_variable_declaration(
                 source,
                 &name,
                 type_text.as_deref(),
+                cpp_declarator_pointer_depth(declarator),
                 value,
                 bindings,
             );
@@ -2702,7 +2756,7 @@ fn cpp_constructor_style_local_declaration(
     source: &str,
     declarator: Node<'_>,
     type_text: Option<&str>,
-    bindings: &LocalInferenceEngine<CodeUnit>,
+    bindings: &LocalInferenceEngine<CppType>,
 ) -> bool {
     let Some(parameters) = declarator.child_by_field_name("parameters") else {
         return false;
@@ -2727,7 +2781,7 @@ fn cpp_constructor_arguments_look_like_expressions(
     file: &ProjectFile,
     source: &str,
     parameters: Node<'_>,
-    bindings: &LocalInferenceEngine<CodeUnit>,
+    bindings: &LocalInferenceEngine<CppType>,
 ) -> bool {
     let text = cpp_node_text(parameters, source);
     let inner = text.trim().trim_start_matches('(').trim_end_matches(')');
@@ -2742,7 +2796,7 @@ fn cpp_argument_looks_like_parameter_declaration(
     visibility: &CppVisibilityIndex,
     file: &ProjectFile,
     argument: &str,
-    bindings: &LocalInferenceEngine<CodeUnit>,
+    bindings: &LocalInferenceEngine<CppType>,
 ) -> bool {
     let without_default = argument.split('=').next().unwrap_or(argument).trim();
     if without_default.is_empty() {
@@ -2761,7 +2815,7 @@ fn cpp_argument_looks_like_parameter_declaration(
 
 fn is_cpp_local_symbol_expression(
     argument: &str,
-    bindings: &LocalInferenceEngine<CodeUnit>,
+    bindings: &LocalInferenceEngine<CppType>,
 ) -> bool {
     argument
         .chars()
@@ -2770,7 +2824,10 @@ fn is_cpp_local_symbol_expression(
 }
 
 fn cpp_builtin_type_text(text: &str) -> bool {
+    // Builtin-ness is a property of the base type, independent of pointer depth,
+    // so drop the trailing `*` markers that `cpp_parameter_type_text` appends.
     let normalized = cpp_parameter_type_text(text);
+    let normalized = normalized.trim_end_matches('*');
     let tokens: Vec<_> = normalized.split_whitespace().collect();
     !tokens.is_empty()
         && tokens.iter().all(|token| {
@@ -2798,14 +2855,16 @@ fn cpp_builtin_type_text(text: &str) -> bool {
         })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cpp_seed_binding(
     visibility: &CppVisibilityIndex,
     file: &ProjectFile,
     source: &str,
     name: &str,
     type_text: Option<&str>,
+    declarator_depth: i32,
     value: Option<Node<'_>>,
-    bindings: &mut LocalInferenceEngine<CodeUnit>,
+    bindings: &mut LocalInferenceEngine<CppType>,
 ) {
     if name.is_empty() {
         return;
@@ -2813,11 +2872,20 @@ fn cpp_seed_binding(
     let resolved = type_text
         .filter(|text| *text != "auto")
         .and_then(|text| visibility.resolve_type(file, text))
+        .map(|unit| CppType {
+            unit,
+            indirection: 0,
+        })
         .or_else(|| {
             value.and_then(|value| cpp_infer_type_from_value(visibility, file, source, value))
         });
     match resolved {
-        Some(unit) => bindings.seed_symbol(name.to_string(), unit),
+        Some(mut cpp_type) => {
+            // The declarator (`T* p`, `T** pp`) adds to whatever the type spelling
+            // or inferred value contributed.
+            cpp_type.indirection += declarator_depth;
+            bindings.seed_symbol(name.to_string(), cpp_type);
+        }
         None => bindings.declare_shadow(name.to_string()),
     }
 }
@@ -2827,16 +2895,26 @@ fn cpp_infer_type_from_value(
     file: &ProjectFile,
     source: &str,
     node: Node<'_>,
-) -> Option<CodeUnit> {
+) -> Option<CppType> {
     match node.kind() {
         "new_expression" => {
             let text = cpp_node_text(node, source).trim();
             let rest = text.strip_prefix("new ").unwrap_or(text);
-            visibility.resolve_type(file, rest.split(['(', '{']).next().unwrap_or(rest))
+            visibility
+                .resolve_type(file, rest.split(['(', '{']).next().unwrap_or(rest))
+                // `new T` yields a `T*`.
+                .map(|unit| CppType {
+                    unit,
+                    indirection: 1,
+                })
         }
         "call_expression" => node
             .child_by_field_name("function")
-            .and_then(|function| visibility.resolve_type(file, cpp_node_text(function, source))),
+            .and_then(|function| visibility.resolve_type(file, cpp_node_text(function, source)))
+            .map(|unit| CppType {
+                unit,
+                indirection: 0,
+            }),
         _ => None,
     }
 }
@@ -4408,59 +4486,50 @@ fn collect_java_type_text_binding_before(
     before_byte: usize,
     found: &mut Option<String>,
 ) {
-    if found.is_some() || node.start_byte() >= before_byte {
-        return;
-    }
-    match node.kind() {
-        "local_variable_declaration" | "field_declaration" => {
-            if let Some(type_node) = node.child_by_field_name("type") {
-                let type_text = normalize_java_type_text(java_node_text(type_node, source));
-                let mut cursor = node.walk();
-                for child in node.named_children(&mut cursor) {
-                    if child.kind() == "variable_declarator"
-                        && let Some(name_node) = child.child_by_field_name("name")
-                        && name_node.start_byte() < before_byte
-                        && java_node_text(name_node, source) == name
-                    {
-                        *found = Some(type_text.to_string());
-                        return;
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        if node.start_byte() >= before_byte {
+            continue;
+        }
+        match node.kind() {
+            "local_variable_declaration" | "field_declaration" => {
+                if let Some(type_node) = node.child_by_field_name("type") {
+                    let type_text = normalize_java_type_text(java_node_text(type_node, source));
+                    let mut cursor = node.walk();
+                    for child in node.named_children(&mut cursor) {
+                        if child.kind() == "variable_declarator"
+                            && let Some(name_node) = child.child_by_field_name("name")
+                            && name_node.start_byte() < before_byte
+                            && java_node_text(name_node, source) == name
+                        {
+                            *found = Some(type_text.to_string());
+                        }
                     }
                 }
             }
+            "formal_parameter" => {
+                if let Some(name_node) = node.child_by_field_name("name")
+                    && name_node.start_byte() < before_byte
+                    && java_node_text(name_node, source) == name
+                    && let Some(type_node) = node.child_by_field_name("type")
+                {
+                    *found = Some(
+                        normalize_java_type_text(java_node_text(type_node, source)).to_string(),
+                    );
+                }
+            }
+            _ => {}
         }
-        "formal_parameter" => {
-            if let Some(name_node) = node.child_by_field_name("name")
-                && name_node.start_byte() < before_byte
-                && java_node_text(name_node, source) == name
-                && let Some(type_node) = node.child_by_field_name("type")
-            {
-                *found =
-                    Some(normalize_java_type_text(java_node_text(type_node, source)).to_string());
-                return;
+        let mut cursor = node.walk();
+        let mut children: Vec<_> = node.named_children(&mut cursor).collect();
+        children.reverse();
+        for child in children {
+            if child.start_byte() < before_byte {
+                stack.push(child);
             }
         }
-        _ => {}
     }
-    let mut cursor = node.walk();
-    let mut children: Vec<_> = node.named_children(&mut cursor).collect();
-    children.reverse();
-    for child in children {
-        if child.start_byte() < before_byte {
-            collect_java_type_text_binding_before(
-                java,
-                file,
-                source,
-                child,
-                name,
-                before_byte,
-                found,
-            );
-        }
-    }
-    if found.is_some() {
-        return;
-    }
-    if java.resolve_type_name_in_file(file, name).is_some() {
+    if found.is_none() && java.resolve_type_name_in_file(file, name).is_some() {
         *found = Some(name.to_string());
     }
 }
@@ -4887,7 +4956,7 @@ fn resolve_php(
         aliases: parse_php_use_aliases_from_source(source),
     };
     let class_ranges = ClassRangeIndex::build(analyzer, file);
-    match php_reference_node(node, source) {
+    match php_reference_node(node) {
         Some(PhpReferenceNode::Type(type_node)) => {
             let raw = php_qualified_candidate_text(type_node, source);
             php_fqn_outcome(support, resolve_php_type(&raw, &ctx), &raw)
@@ -5980,7 +6049,7 @@ enum PhpReferenceNode<'tree> {
     },
 }
 
-fn php_reference_node<'tree>(node: Node<'tree>, source: &str) -> Option<PhpReferenceNode<'tree>> {
+fn php_reference_node<'tree>(node: Node<'tree>) -> Option<PhpReferenceNode<'tree>> {
     let node = php_qualified_reference_node(node);
     match node.kind() {
         "object_creation_expression" => php_object_creation_type(node).map(PhpReferenceNode::Type),
@@ -6001,9 +6070,7 @@ fn php_reference_node<'tree>(node: Node<'tree>, source: &str) -> Option<PhpRefer
         "name" | "qualified_name" => {
             let parent = node.parent()?;
             match parent.kind() {
-                "object_creation_expression" | "named_type" | "instanceof_expression" => {
-                    Some(PhpReferenceNode::Type(node))
-                }
+                "object_creation_expression" | "named_type" => Some(PhpReferenceNode::Type(node)),
                 "function_call_expression"
                     if parent.child_by_field_name("function") == Some(node) =>
                 {
@@ -6021,39 +6088,32 @@ fn php_reference_node<'tree>(node: Node<'tree>, source: &str) -> Option<PhpRefer
                     let object = parent.child_by_field_name("object")?;
                     Some(PhpReferenceNode::InstanceMember { object, name: node })
                 }
-                _ if php_is_instanceof_type_name(node, source) => {
-                    Some(PhpReferenceNode::Type(node))
-                }
+                _ if php_is_instanceof_type_name(node) => Some(PhpReferenceNode::Type(node)),
                 _ if php_is_bare_constant_reference(node) => Some(PhpReferenceNode::Constant(node)),
                 _ => None,
             }
         }
         _ => {
             let parent = node.parent()?;
-            php_reference_node(parent, source)
+            php_reference_node(parent)
         }
     }
 }
 
-fn php_is_instanceof_type_name(mut node: Node<'_>, source: &str) -> bool {
-    while let Some(parent) = node.parent() {
-        if parent.kind() == "instanceof_expression" {
-            return true;
-        }
-        let parent_text = php_node_text(parent, source);
-        if let Some(index) = parent_text.find(" instanceof ") {
-            let operator_end = parent.start_byte() + index + " instanceof ".len();
-            return node.start_byte() >= operator_end;
-        }
-        if matches!(
-            parent.kind(),
-            "statement" | "expression_statement" | "compound_statement"
-        ) {
-            return false;
-        }
-        node = parent;
-    }
-    false
+/// True when `node` is the type operand of a PHP `instanceof`. The grammar models
+/// `$x instanceof Foo` as a `binary_expression` whose `operator` child is the
+/// `instanceof` token and whose `right` field is the class name.
+fn php_is_instanceof_type_name(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    parent.kind() == "binary_expression"
+        && parent
+            .child_by_field_name("operator")
+            .is_some_and(|operator| operator.kind() == "instanceof")
+        && parent.child_by_field_name("right").is_some_and(|right| {
+            right.start_byte() <= node.start_byte() && node.end_byte() <= right.end_byte()
+        })
 }
 
 fn php_static_member_parts(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
