@@ -1531,6 +1531,16 @@ fn resolve_js_ts(
         if !member_candidates.is_empty() {
             return candidates_outcome(member_candidates);
         }
+        let exact_same_file = jsts_exact_same_file_dotted_candidates(
+            analyzer,
+            support,
+            file,
+            reference,
+            value_position,
+        );
+        if !exact_same_file.is_empty() {
+            return candidates_outcome(exact_same_file);
+        }
         if language == Language::TypeScript {
             let inferred_receivers = ts_local_receiver_owner_candidates(
                 analyzer, support, file, source, tree, site, &imports, &aliases, qualifier,
@@ -1552,6 +1562,11 @@ fn resolve_js_ts(
                     return candidates_outcome(global_member_candidates);
                 }
             }
+        }
+        let exact_project =
+            jsts_exact_dotted_candidates(analyzer, support, file, reference, value_position);
+        if !exact_project.is_empty() {
+            return candidates_outcome(exact_project);
         }
         return no_definition(
             "no_indexed_definition",
@@ -1691,6 +1706,59 @@ fn resolve_js_ts_module_binding_candidates(
         }
     }
     candidates
+}
+
+fn jsts_exact_same_file_dotted_candidates(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    reference: &str,
+    value_position: bool,
+) -> Vec<CodeUnit> {
+    let mut candidates: Vec<_> = support
+        .fqn(reference)
+        .into_iter()
+        .filter(|unit| unit.source() == file)
+        .collect();
+    if value_position {
+        candidates = jsts_value_space_candidates(analyzer, candidates);
+    } else {
+        candidates = jsts_type_space_candidates(analyzer, candidates);
+    }
+    candidates
+}
+
+fn jsts_exact_dotted_candidates(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    reference: &str,
+    value_position: bool,
+) -> Vec<CodeUnit> {
+    let mut candidates = support.fqn(reference);
+    if let Some(top_level) = jsts_top_level_path_component(file) {
+        let preferred: Vec<_> = candidates
+            .iter()
+            .filter(|unit| jsts_top_level_path_component(unit.source()) == Some(top_level))
+            .cloned()
+            .collect();
+        if !preferred.is_empty() {
+            candidates = preferred;
+        }
+    }
+    if value_position {
+        candidates = jsts_value_space_candidates(analyzer, candidates);
+    } else {
+        candidates = jsts_type_space_candidates(analyzer, candidates);
+    }
+    candidates
+}
+
+fn jsts_top_level_path_component(file: &ProjectFile) -> Option<&str> {
+    file.rel_path()
+        .components()
+        .next()
+        .and_then(|component| component.as_os_str().to_str())
 }
 
 fn jsts_module_export_candidates(

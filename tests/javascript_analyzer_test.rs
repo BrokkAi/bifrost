@@ -601,3 +601,31 @@ fn test_build_related_identifiers_module_cu_and_field_signatures() {
             .trim()
     );
 }
+
+#[test]
+fn test_commonjs_module_exports_assignment_is_not_indexed_as_member_definition() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    let file = write_file(
+        root,
+        "common.js",
+        r#"
+            module.exports = {
+              run() {}
+            };
+        "#,
+    );
+    let analyzer = JavascriptAnalyzer::from_project(TestProject::new(root, Language::JavaScript));
+    let declarations = analyzer.get_declarations(&file);
+
+    assert!(
+        declarations
+            .iter()
+            .all(|unit| unit.fq_name() != "common.js.module.exports")
+    );
+    assert!(
+        declarations
+            .iter()
+            .all(|unit| unit.fq_name() != "common.js.module.exports.run")
+    );
+}

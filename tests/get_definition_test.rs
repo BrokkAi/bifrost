@@ -1829,6 +1829,149 @@ function render() {
 }
 
 #[test]
+fn javascript_member_assignment_function_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "app.js",
+            r#"
+const utils = {};
+utils.typeConverter = function (value) {
+  return value;
+};
+
+function render() {
+  return utils.typeConverter(1);
+}
+"#,
+        )
+        .build();
+
+    let line = "  return utils.typeConverter(1);";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.js","line":8,"column":{}}}]}}"#,
+            column_of(line, "typeConverter")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "utils.typeConverter",
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["kind"], "function", "{value}");
+    assert_eq!(result["definitions"][0]["start_line"], 3, "{value}");
+}
+
+#[test]
+fn javascript_member_assignment_object_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "app.js",
+            r#"
+const alasql = {};
+alasql.options = {
+  csvStringToNumber: true
+};
+
+function render() {
+  return alasql.options.csvStringToNumber;
+}
+"#,
+        )
+        .build();
+
+    let line = "  return alasql.options.csvStringToNumber;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.js","line":8,"column":{}}}]}}"#,
+            column_of(line, "options")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "alasql.options", "{value}");
+    assert_eq!(result["definitions"][0]["kind"], "field", "{value}");
+    assert_eq!(result["definitions"][0]["start_line"], 3, "{value}");
+}
+
+#[test]
+fn javascript_cross_file_member_assignment_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "defs.js",
+            r#"
+const alasql = {};
+alasql.options = {
+  csvStringToNumber: true
+};
+"#,
+        )
+        .file(
+            "use.js",
+            r#"
+function render() {
+  return alasql.options.csvStringToNumber;
+}
+"#,
+        )
+        .build();
+
+    let line = "  return alasql.options.csvStringToNumber;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"use.js","line":3,"column":{}}}]}}"#,
+            column_of(line, "options")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "alasql.options", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "defs.js", "{value}");
+    assert_eq!(result["definitions"][0]["start_line"], 3, "{value}");
+}
+
+#[test]
+fn javascript_local_member_assignment_resolves_later_member_use() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "app.js",
+            r#"
+function compile(query) {
+  query.windowaggrs = [];
+  if (query.windowaggrs && query.windowaggrs.length > 0) {
+    return query.windowaggrs;
+  }
+}
+"#,
+        )
+        .build();
+
+    let line = "  if (query.windowaggrs && query.windowaggrs.length > 0) {";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.js","line":4,"column":{}}}]}}"#,
+            column_of(line, "windowaggrs")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "query.windowaggrs",
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["start_line"], 3, "{value}");
+}
+
+#[test]
 fn javascript_member_expression_receiver_focus_resolves_receiver_definition() {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file(

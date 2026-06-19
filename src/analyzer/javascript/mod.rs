@@ -121,6 +121,8 @@ impl LanguageAdapter for JavascriptAdapter {
             }
         }
 
+        visit_js_assignment_declarations(file, source, root, &mut parsed);
+
         if module_has_imports {
             parsed.add_code_unit(module, root, source, None, None);
         }
@@ -976,6 +978,118 @@ fn js_object_literal_property_name(node: Node<'_>, source: &str) -> Option<Strin
         .trim_matches('\'')
         .to_string();
     (!name.is_empty()).then_some(name)
+}
+
+fn visit_js_assignment_declarations(
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+) {
+    walk_named_tree_preorder(root, true, |node| {
+        if node.kind() == "assignment_expression" {
+            visit_js_assignment_expression(file, source, node, parsed);
+        }
+        WalkControl::Continue
+    });
+}
+
+fn visit_js_assignment_expression(
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+) {
+    let Some(left) = node.child_by_field_name("left") else {
+        return;
+    };
+    let Some(name) = js_member_assignment_name(left, source) else {
+        return;
+    };
+    let value = node.child_by_field_name("right");
+    let is_function =
+        value.is_some_and(|value| matches!(value.kind(), "arrow_function" | "function_expression"));
+    let kind = if is_function {
+        crate::analyzer::CodeUnitType::Function
+    } else {
+        crate::analyzer::CodeUnitType::Field
+    };
+    let code_unit = CodeUnit::new(file.clone(), kind, "", name);
+    parsed.add_code_unit(
+        code_unit.clone(),
+        node,
+        source,
+        None,
+        Some(code_unit.clone()),
+    );
+    parsed.add_signature(
+        code_unit.clone(),
+        js_assignment_signature(node, left, value, source),
+    );
+    if !is_function
+        && let Some(value) = value
+        && value.kind() == "object"
+    {
+        visit_js_object_literal_properties(file, source, value, &code_unit, &code_unit, parsed);
+    }
+}
+
+fn js_member_assignment_name(node: Node<'_>, source: &str) -> Option<String> {
+    if node.kind() != "member_expression" {
+        return None;
+    }
+    if js_is_commonjs_export_assignment_target(node, source) {
+        return None;
+    }
+    let object = node.child_by_field_name("object")?;
+    let property = node.child_by_field_name("property")?;
+    if property.kind() == "computed_property_name" {
+        return None;
+    }
+    let object_name = match object.kind() {
+        "identifier" | "property_identifier" => node_text(object, source).trim().to_string(),
+        "member_expression" => js_member_assignment_name(object, source)?,
+        _ => return None,
+    };
+    let property_name = node_text(property, source)
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'');
+    if object_name.is_empty() || property_name.is_empty() {
+        return None;
+    }
+    Some(format!("{object_name}.{property_name}"))
+}
+
+fn js_is_commonjs_export_assignment_target(node: Node<'_>, source: &str) -> bool {
+    let text = node_text(node, source).trim();
+    text == "exports"
+        || text.starts_with("exports.")
+        || text == "module.exports"
+        || text.starts_with("module.exports.")
+}
+
+fn js_assignment_signature(
+    assignment: Node<'_>,
+    left: Node<'_>,
+    value: Option<Node<'_>>,
+    source: &str,
+) -> String {
+    let left_text = trim_statement(node_text(left, source));
+    let Some(value) = value else {
+        return trim_statement(node_text(assignment, source));
+    };
+    if matches!(value.kind(), "arrow_function" | "function_expression") {
+        let params = value
+            .child_by_field_name("parameters")
+            .map(|parameters| trim_statement(node_text(parameters, source)))
+            .unwrap_or_else(|| "()".to_string());
+        return format!("{left_text} = function{params} ...");
+    }
+    if is_simple_js_initializer(value) {
+        return format!("{left_text} = {}", trim_statement(node_text(value, source)));
+    }
+    format!("{left_text} = ...")
 }
 
 fn one_line(text: &str) -> String {
