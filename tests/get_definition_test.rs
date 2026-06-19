@@ -5265,6 +5265,48 @@ fn cpp_chained_struct_field_receiver_resolves_member_field() {
 }
 
 #[test]
+fn cpp_typedef_struct_value_parameter_resolves_member_field() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "include/lib/raw.h",
+            r#"
+#ifndef LIB_RAW_H
+#define LIB_RAW_H
+#ifdef __cplusplus
+extern "C" {
+#endif
+typedef struct RawData { unsigned char * data; unsigned long size; } RawData;
+#ifdef __cplusplus
+}
+#endif
+#endif
+"#,
+        )
+        .file(
+            "apps/shared/raw_reader.h",
+            "#include \"lib/raw.h\"\nint read_len(const RawData raw);\n",
+        )
+        .file(
+            "apps/shared/app.c",
+            "#include \"raw_reader.h\"\nint read_len(const RawData raw) { return raw.size; }\n",
+        )
+        .build();
+
+    let line = "int read_len(const RawData raw) { return raw.size; }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"apps/shared/app.c","line":2,"column":{}}}]}}"#,
+            column_of(line, "size")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "RawData.size", "{value}");
+}
+
+#[test]
 fn cpp_local_function_declaration_does_not_seed_receiver_binding() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(

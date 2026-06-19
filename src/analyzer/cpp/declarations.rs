@@ -214,6 +214,19 @@ impl<'a> CppVisitor<'a> {
                 }
             }
             "namespace_definition" => self.visit_namespace(node, scope, stack),
+            "linkage_specification" => {
+                if let Some(body) = cpp_body_node(node) {
+                    stack.push(CppWork::Container(CppContainer {
+                        node: body,
+                        scope: scope.clone(),
+                    }));
+                } else {
+                    stack.push(CppWork::Container(CppContainer {
+                        node,
+                        scope: scope.clone(),
+                    }));
+                }
+            }
             "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier" => {
                 self.visit_class_like(node, scope, stack)
             }
@@ -223,6 +236,10 @@ impl<'a> CppVisitor<'a> {
             "type_definition" | "alias_declaration" => {
                 self.visit_type_declaration(node, scope, stack)
             }
+            "ERROR" => stack.push(CppWork::Container(CppContainer {
+                node,
+                scope: scope.clone(),
+            })),
             "preproc_def" | "preproc_function_def" => self.visit_macro(node),
             "preproc_include" => self.visit_include(node),
             "labeled_statement" if scope.class_unit.is_some() => {

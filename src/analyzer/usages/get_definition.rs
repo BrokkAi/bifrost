@@ -5945,10 +5945,7 @@ fn cpp_seed_typed_binding(
     let Some(name) = extract_variable_name(declarator, source) else {
         return;
     };
-    let type_text = node
-        .child_by_field_name("type")
-        .or_else(|| cpp_first_type_child(node))
-        .map(|type_node| normalize_cpp_type_text(cpp_node_text(type_node, source)));
+    let type_text = cpp_declaration_type_text(node, source);
     cpp_seed_binding(
         analyzer,
         support,
@@ -5988,7 +5985,7 @@ fn cpp_seed_for_range_binding(
     let type_text = node
         .child_by_field_name("type")
         .or_else(|| cpp_first_type_child(node))
-        .map(|type_node| normalize_cpp_type_text(cpp_node_text(type_node, source)));
+        .map(|type_node| cpp_normalize_declared_type_text(cpp_node_text(type_node, source)));
     cpp_seed_binding(
         analyzer,
         support,
@@ -6013,10 +6010,7 @@ fn cpp_seed_variable_declaration(
     cutoff_start: usize,
     bindings: &mut LocalInferenceEngine<CppType>,
 ) {
-    let type_text = node
-        .child_by_field_name("type")
-        .or_else(|| cpp_first_type_child(node))
-        .map(|type_node| normalize_cpp_type_text(cpp_node_text(type_node, source)));
+    let type_text = cpp_declaration_type_text(node, source);
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         let declarator = if child.kind() == "init_declarator" {
@@ -6061,6 +6055,64 @@ fn cpp_seed_variable_declaration(
                 bindings,
             );
         }
+    }
+}
+
+fn cpp_declaration_type_text(node: Node<'_>, source: &str) -> Option<String> {
+    cpp_declaration_prefix_before_first_declarator(node, source)
+        .or_else(|| {
+            node.child_by_field_name("type")
+                .or_else(|| cpp_first_type_child(node))
+                .map(|type_node| cpp_node_text(type_node, source).to_string())
+        })
+        .map(|text| cpp_normalize_declared_type_text(&text))
+        .filter(|text| !text.is_empty())
+}
+
+fn cpp_declaration_prefix_before_first_declarator(
+    node: Node<'_>,
+    source: &str,
+) -> Option<String> {
+    let mut cursor = node.walk();
+    let first_declarator = node.named_children(&mut cursor).find_map(|child| {
+        if child.kind() == "init_declarator" {
+            child.child_by_field_name("declarator")
+        } else if cpp_is_declarator_node(child) {
+            Some(child)
+        } else {
+            None
+        }
+    })?;
+    source
+        .get(node.start_byte()..first_declarator.start_byte())
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+}
+
+fn cpp_normalize_declared_type_text(text: &str) -> String {
+    const DECLARATION_SPECIFIERS: [&str; 10] = [
+        "const ",
+        "volatile ",
+        "static ",
+        "extern ",
+        "mutable ",
+        "constexpr ",
+        "constinit ",
+        "inline ",
+        "register ",
+        "thread_local ",
+    ];
+
+    let mut normalized = normalize_cpp_type_text(text);
+    loop {
+        let Some(stripped) = DECLARATION_SPECIFIERS
+            .iter()
+            .find_map(|specifier| normalized.strip_prefix(specifier))
+        else {
+            return normalized;
+        };
+        normalized = normalize_cpp_type_text(stripped);
     }
 }
 
