@@ -4190,6 +4190,80 @@ void run() {
 }
 
 #[test]
+fn cpp_alias_pointer_receiver_resolves_underlying_type_member() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "app.cpp",
+            r#"
+template <class T> class shared_ptr {
+public:
+    T* operator->();
+};
+class InterfaceElement {
+public:
+    void getActiveOutputs();
+};
+class NodeDef : public InterfaceElement {};
+using NodeDefPtr = shared_ptr<NodeDef>;
+void run(NodeDefPtr nodeDef) {
+    nodeDef->getActiveOutputs();
+}
+"#,
+        )
+        .build();
+
+    let line = "    nodeDef->getActiveOutputs();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.cpp","line":13,"column":{}}}]}}"#,
+            column_of(line, "getActiveOutputs")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "InterfaceElement.getActiveOutputs",
+        "{value}"
+    );
+}
+
+#[test]
+fn cpp_template_alias_dot_receiver_does_not_unwrap_to_first_argument() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "app.cpp",
+            r#"
+template <class T> class vector {
+public:
+    int size();
+};
+class Node {
+public:
+    void visit();
+};
+using NodeVector = vector<Node>;
+void run(NodeVector nodes) {
+    nodes.visit();
+}
+"#,
+        )
+        .build();
+
+    let line = "    nodes.visit();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.cpp","line":12,"column":{}}}]}}"#,
+            column_of(line, "visit")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
 fn cpp_unqualified_typo_with_angle_include_returns_no_definition() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file("app.cpp", "#include <vector>\nvoid run() { typo(); }\n")

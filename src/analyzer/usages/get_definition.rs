@@ -2878,13 +2878,14 @@ fn resolve_cpp_field(
     else {
         return no_definition("no_member_receiver", "C++ field expression has no receiver");
     };
-    let owners = cpp_receiver_type_units(
+    let owners = cpp_field_receiver_type_units(
         ctx.analyzer,
         ctx.support,
         ctx.visibility,
         ctx.file,
         ctx.source,
         ctx.root,
+        field,
         receiver,
     );
     let candidates = cpp_member_candidates(ctx, owners, member, arity, arg_types);
@@ -2946,7 +2947,7 @@ fn cpp_unit_matches_kind(
 ) -> bool {
     match kind {
         CppTargetKind::FreeFunction => unit.is_function() && !cpp_parent_is_class(support, unit),
-        CppTargetKind::Type => unit.is_class() || cpp_unit_is_type_alias(unit),
+        CppTargetKind::Type => unit.is_class() || cpp_unit_is_type_alias(analyzer, unit),
         CppTargetKind::GlobalField => {
             unit.is_field() && cpp_is_unqualified_field(analyzer, support, unit)
         }
@@ -2999,11 +3000,20 @@ fn cpp_is_unqualified_field(
     })
 }
 
-fn cpp_unit_is_type_alias(unit: &CodeUnit) -> bool {
-    unit.is_field()
-        && unit.signature().is_some_and(|signature| {
-            signature.starts_with("typedef ") || signature.starts_with("using ")
-        })
+fn cpp_unit_is_type_alias(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> bool {
+    analyzer
+        .type_alias_provider()
+        .is_some_and(|provider| provider.is_type_alias(unit))
+        || unit.signature().is_some_and(cpp_signature_is_type_alias)
+}
+
+fn cpp_signature_is_type_alias(signature: &str) -> bool {
+    let signature = signature.trim_start();
+    signature.starts_with("typedef ")
+        || signature.starts_with("using ") && signature.contains('=')
+        || signature.starts_with("template ")
+            && signature.contains(" using ")
+            && signature.contains('=')
 }
 
 fn cpp_member_candidates(
@@ -3274,6 +3284,7 @@ fn cpp_base_type_text(base: &str) -> String {
 struct CppType {
     unit: CodeUnit,
     indirection: i32,
+    alias_unit: Option<CodeUnit>,
 }
 
 /// Top-level pointer depth declared by `text` (the number of `*` outside any
@@ -3404,8 +3415,9 @@ fn cpp_field_expression_type(
     let receiver = field
         .child_by_field_name("argument")
         .or_else(|| field.named_child(0))?;
-    let owners =
-        cpp_receiver_type_units(analyzer, support, visibility, file, source, root, receiver);
+    let owners = cpp_field_receiver_type_units(
+        analyzer, support, visibility, file, source, root, field, receiver,
+    );
     let candidates = cpp_member_candidates(
         CppLookupCtx {
             analyzer,
@@ -3451,7 +3463,11 @@ fn cpp_field_declared_type(
     let indirection = cpp_type_text_pointer_depth(type_text);
     visibility
         .resolve_type(file, type_text)
-        .map(|unit| CppType { unit, indirection })
+        .map(|unit| CppType {
+            unit,
+            indirection,
+            alias_unit: None,
+        })
 }
 
 fn cpp_receiver_type_units(
@@ -3462,6 +3478,7 @@ fn cpp_receiver_type_units(
     source: &str,
     root: Node<'_>,
     receiver: Node<'_>,
+    unwrap_template_alias: bool,
 ) -> Vec<CodeUnit> {
     match receiver.kind() {
         "identifier" => {
@@ -3476,7 +3493,13 @@ fn cpp_receiver_type_units(
                 receiver.start_byte(),
             );
             if let Some(cpp_type) = first_precise(&bindings, name) {
-                return vec![cpp_type.unit];
+                return vec![cpp_receiver_unit_for_access(
+                    analyzer,
+                    visibility,
+                    file,
+                    cpp_type,
+                    unwrap_template_alias,
+                )];
             }
             if bindings.is_shadowed(name) {
                 Vec::new()
@@ -3497,11 +3520,75 @@ fn cpp_receiver_type_units(
             .child_by_field_name("argument")
             .or_else(|| receiver.named_child(0))
             .map(|inner| {
-                cpp_receiver_type_units(analyzer, support, visibility, file, source, root, inner)
+                cpp_receiver_type_units(
+                    analyzer,
+                    support,
+                    visibility,
+                    file,
+                    source,
+                    root,
+                    inner,
+                    unwrap_template_alias,
+                )
             })
             .unwrap_or_default(),
         _ => Vec::new(),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cpp_field_receiver_type_units(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    field: Node<'_>,
+    receiver: Node<'_>,
+) -> Vec<CodeUnit> {
+    cpp_receiver_type_units(
+        analyzer,
+        support,
+        visibility,
+        file,
+        source,
+        root,
+        receiver,
+        cpp_field_expression_uses_arrow(field, source),
+    )
+}
+
+fn cpp_receiver_unit_for_access(
+    analyzer: &dyn IAnalyzer,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    cpp_type: CppType,
+    unwrap_template_alias: bool,
+) -> CodeUnit {
+    if unwrap_template_alias
+        && let Some(alias) = cpp_type.alias_unit.as_ref()
+        && let Some(target) =
+            cpp_alias_template_first_argument_target_unit(analyzer, visibility, file, alias)
+    {
+        return target;
+    }
+    cpp_type.unit
+}
+
+fn cpp_field_expression_uses_arrow(field: Node<'_>, source: &str) -> bool {
+    let Some(receiver) = field
+        .child_by_field_name("argument")
+        .or_else(|| field.named_child(0))
+    else {
+        return false;
+    };
+    let Some(name) = field.child_by_field_name("field") else {
+        return false;
+    };
+    source
+        .get(receiver.end_byte()..name.start_byte())
+        .is_some_and(|between| between.contains("->"))
 }
 
 fn cpp_enclosing_class(
@@ -3928,10 +4015,12 @@ fn cpp_seed_binding(
     }
     let resolved = type_text
         .filter(|text| *text != "auto")
-        .and_then(|text| visibility.resolve_type(file, text))
+        .and_then(|text| cpp_resolve_type_unit(analyzer, visibility, file, text))
         .map(|unit| CppType {
             unit,
             indirection: 0,
+            alias_unit: type_text
+                .and_then(|text| cpp_resolve_type_alias_unit(analyzer, visibility, file, text)),
         })
         .or_else(|| {
             value.and_then(|value| {
@@ -3947,6 +4036,158 @@ fn cpp_seed_binding(
         }
         None => bindings.declare_shadow(name.to_string()),
     }
+}
+
+fn cpp_resolve_type_unit(
+    analyzer: &dyn IAnalyzer,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    type_text: &str,
+) -> Option<CodeUnit> {
+    let mut seen = HashSet::default();
+    cpp_resolve_type_unit_inner(analyzer, visibility, file, type_text, &mut seen)
+}
+
+fn cpp_resolve_type_alias_unit(
+    analyzer: &dyn IAnalyzer,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    type_text: &str,
+) -> Option<CodeUnit> {
+    let name = normalize_cpp_type_text(type_text);
+    visibility.visible_units(file).find_map(|unit| {
+        (cpp_unit_is_type_alias(analyzer, unit) && cpp_type_unit_matches_name(unit, &name))
+            .then(|| unit.clone())
+    })
+}
+
+fn cpp_resolve_type_unit_inner(
+    analyzer: &dyn IAnalyzer,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    type_text: &str,
+    seen: &mut HashSet<String>,
+) -> Option<CodeUnit> {
+    let name = normalize_cpp_type_text(type_text);
+    if !seen.insert(name.clone()) {
+        return None;
+    }
+    let mut targets = visibility
+        .visible_units(file)
+        .filter(|unit| {
+            (unit.is_class() || cpp_unit_is_type_alias(analyzer, unit))
+                && cpp_type_unit_matches_name(unit, &name)
+        })
+        .filter_map(|unit| {
+            cpp_alias_target_unit(analyzer, visibility, file, unit, seen)
+                .or_else(|| (!cpp_unit_is_type_alias(analyzer, unit)).then(|| unit.clone()))
+        })
+        .collect::<Vec<_>>();
+    if targets.is_empty()
+        && let Some(unit) = visibility.resolve_type(file, type_text)
+    {
+        targets
+            .push(cpp_alias_target_unit(analyzer, visibility, file, &unit, seen).unwrap_or(unit));
+    }
+    cpp_choose_canonical_type(analyzer, targets)
+}
+
+fn cpp_type_unit_matches_name(unit: &CodeUnit, name: &str) -> bool {
+    if name.contains("::") {
+        cpp_name_for(unit) == name
+    } else {
+        unit.identifier() == name
+    }
+}
+
+fn cpp_choose_canonical_type(
+    analyzer: &dyn IAnalyzer,
+    mut candidates: Vec<CodeUnit>,
+) -> Option<CodeUnit> {
+    sort_units(&mut candidates);
+    candidates.dedup();
+    let first = candidates.first()?.clone();
+    let cpp_name = cpp_name_for(&first);
+    if !candidates
+        .iter()
+        .all(|candidate| cpp_name_for(candidate) == cpp_name)
+    {
+        return (candidates.len() == 1).then_some(first);
+    }
+    candidates
+        .iter()
+        .find(|candidate| cpp_type_has_definition_body(analyzer, candidate))
+        .cloned()
+        .or(Some(first))
+}
+
+fn cpp_type_has_definition_body(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> bool {
+    unit.signature()
+        .is_some_and(|signature| signature.contains('{') || signature.contains(':'))
+        || analyzer
+            .signatures(unit)
+            .iter()
+            .any(|signature| signature.contains('{') || signature.contains(':'))
+        || analyzer
+            .get_source(unit, false)
+            .is_some_and(|source| source.contains('{') || source.contains(':'))
+}
+
+fn cpp_alias_target_unit(
+    analyzer: &dyn IAnalyzer,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    unit: &CodeUnit,
+    seen: &mut HashSet<String>,
+) -> Option<CodeUnit> {
+    if !cpp_unit_is_type_alias(analyzer, unit) {
+        return None;
+    }
+    cpp_alias_target_texts(analyzer, unit)
+        .find_map(|rhs| cpp_resolve_type_unit_inner(analyzer, visibility, file, &rhs, seen))
+}
+
+fn cpp_alias_template_first_argument_target_unit(
+    analyzer: &dyn IAnalyzer,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    unit: &CodeUnit,
+) -> Option<CodeUnit> {
+    let mut seen = HashSet::default();
+    cpp_alias_target_texts(analyzer, unit).find_map(|rhs| {
+        let target = cpp_template_first_argument(&rhs)?;
+        cpp_resolve_type_unit_inner(analyzer, visibility, file, target, &mut seen)
+    })
+}
+
+fn cpp_alias_target_texts<'a>(
+    analyzer: &'a dyn IAnalyzer,
+    unit: &'a CodeUnit,
+) -> impl Iterator<Item = String> + 'a {
+    unit.signature()
+        .map(str::to_string)
+        .into_iter()
+        .chain(analyzer.signatures(unit).iter().cloned())
+        .chain(analyzer.get_source(unit, false))
+        .filter_map(|signature| cpp_alias_target_text(&signature))
+}
+
+fn cpp_alias_target_text(signature: &str) -> Option<String> {
+    let signature = signature.trim();
+    let rhs = if let Some((_, rhs)) = signature.split_once('=') {
+        rhs
+    } else if let Some(rest) = signature.strip_prefix("typedef ") {
+        rest.rsplit_once(char::is_whitespace)?.0
+    } else {
+        return None;
+    };
+    Some(rhs.trim().trim_end_matches(';').trim().to_string())
+}
+
+fn cpp_template_first_argument(type_text: &str) -> Option<&str> {
+    let open = type_text.find('<')?;
+    let close = type_text.rfind('>')?;
+    (close > open).then_some(type_text[open + 1..close].split(',').next()?.trim())
 }
 
 fn cpp_infer_type_from_value(
@@ -3967,6 +4208,7 @@ fn cpp_infer_type_from_value(
                 .map(|unit| CppType {
                     unit,
                     indirection: 1,
+                    alias_unit: None,
                 })
         }
         "call_expression" => {
@@ -3978,6 +4220,7 @@ fn cpp_infer_type_from_value(
                     .map(|unit| CppType {
                         unit,
                         indirection: 0,
+                        alias_unit: None,
                     })
             })
         }
@@ -4055,7 +4298,11 @@ fn cpp_function_return_type(
     let type_text = normalize_cpp_type_text(type_text);
     visibility
         .resolve_type(file, &type_text)
-        .map(|unit| CppType { unit, indirection })
+        .map(|unit| CppType {
+            unit,
+            indirection,
+            alias_unit: cpp_resolve_type_alias_unit(analyzer, visibility, file, &type_text),
+        })
 }
 
 fn cpp_unresolved_include_boundary(

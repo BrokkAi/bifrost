@@ -11,7 +11,7 @@ use crate::analyzer::js_ts::build_weighted_cache;
 use crate::analyzer::{
     AnalyzerConfig, CloneSmell, CloneSmellWeights, CodeUnit, CodeUnitType, IAnalyzer,
     ImportAnalysisProvider, ImportInfo, Language, Project, ProjectFile, TestAssertionSmell,
-    TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer,
+    TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider,
 };
 use crate::hash::HashSet;
 use moka::sync::Cache;
@@ -274,6 +274,10 @@ impl IAnalyzer for CppAnalyzer {
         Some(self)
     }
 
+    fn type_alias_provider(&self) -> Option<&dyn TypeAliasProvider> {
+        Some(self)
+    }
+
     fn contains_tests(&self, file: &ProjectFile) -> bool {
         self.inner.contains_tests(file)
     }
@@ -337,5 +341,11 @@ impl IAnalyzer for CppAnalyzer {
 
     fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {
         Some(self)
+    }
+}
+
+impl TypeAliasProvider for CppAnalyzer {
+    fn is_type_alias(&self, code_unit: &CodeUnit) -> bool {
+        self.inner.is_type_alias(code_unit)
     }
 }
