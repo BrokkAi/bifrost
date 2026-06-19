@@ -481,14 +481,12 @@ namespace Demo
                 activated = client.activate_workspace(other)
                 active = client.get_active_workspace()
 
-        self.assertEqual(
-            os.path.realpath(str(other)),
-            os.path.realpath(activated.workspace_path),
-        )
-        self.assertEqual(
-            os.path.realpath(activated.workspace_path),
-            os.path.realpath(active.workspace_path),
-        )
+            # Rust canonicalizes the root (on Windows that adds a \\?\ prefix),
+            # so compare by filesystem identity rather than string equality.
+            self.assertTrue(os.path.samefile(activated.workspace_path, other))
+            self.assertTrue(
+                os.path.samefile(active.workspace_path, activated.workspace_path)
+            )
 
     def test_get_file_contents_reads_fixture_file(self) -> None:
         with SearchToolsClient(root=self.fixture_root) as client:
