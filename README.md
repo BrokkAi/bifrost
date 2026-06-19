@@ -194,15 +194,23 @@ Pass `render_line_numbers=False` to `SearchToolsClient(...)` to omit line number
 
 `SearchToolsClient.refresh()` forces a full rebuild of the code index. Query methods already apply watcher-detected file changes automatically, so most callers should treat `refresh()` as an escape hatch for recovery or explicit full rescans rather than a step to run before every request.
 
-The client exposes:
+The client exposes a typed method per tool, each returning a dataclass from
+`bifrost_searchtools.models` (rather than a raw dict):
 
-- `refresh()`
-- `search_symbols(...)`
-- `get_symbol_locations(...)`
-- `get_symbol_sources(...)`
-- `get_summaries(...)`
-- `list_symbols(...)`
-- `most_relevant_files(...)`
+- workspace: `refresh()`, `update_paths(...)`, `activate_workspace(...)`, `get_active_workspace()`
+- symbols: `search_symbols(...)`, `get_symbol_locations(...)`, `get_symbol_ancestors(...)`, `get_symbol_sources(...)`, `get_summaries(...)`, `list_symbols(...)`, `contains_tests(...)`, `scan_usages(...)`, `usage_graph(...)`, `most_relevant_files(...)`
+- definitions: `get_definition_by_location(...)`, `get_definition_by_reference(...)`
+- semantic: `semantic_search(...)`, `semantic_search_status()`
+- files: `get_file_contents(...)`, `find_filenames(...)`, `search_file_contents(...)`, `find_files_containing(...)`, `list_files(...)`
+- git: `get_git_log(...)`, `get_commit_diff(...)`, `search_git_commit_messages(...)`
+- structured data: `jq(...)`, `xml_skim(...)`, `xml_select(...)`
+- code quality (slopcop): `compute_cyclomatic_complexity(...)`, `compute_cognitive_complexity(...)`, `report_comment_density_for_code_unit(...)`, `report_comment_density_for_files(...)`, `report_exception_handling_smells(...)`, `report_test_assertion_smells(...)`, `report_structural_clone_smells(...)`, `report_long_method_and_god_object_smells(...)`, `report_dead_code_and_unused_abstraction_smells(...)`, `report_secret_like_code(...)`, `analyze_git_hotspots(...)`
+
+The git tools return their own rendered text (a `GitTextResult` carrying `.text`);
+the slopcop tools return a `CodeQualityReport` carrying `.report`. The remaining
+tools return structured dataclasses. The many per-rule tuning knobs on the
+slopcop smell reports are accepted through an `options` dict whose keys map 1:1 to
+the underlying Rust tool arguments.
 
 `get_summaries(...)` remains directory-aware for MCP callers: directory targets surface a `compact_symbols` inventory alongside ordinary summaries when mixed with file or class targets. The direct Rust `brokk_bifrost::searchtools::get_summaries(...)` API and the Python `searchtools` client are narrower and report directory targets in `not_found` instead of embedding directory inventory in `SummaryResult`.
 

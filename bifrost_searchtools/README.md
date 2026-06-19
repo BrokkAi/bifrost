@@ -76,9 +76,37 @@ exposes:
 | `semantic_search_status()` | Report whether the semantic index is ready. |
 | `refresh()` | Force a full re-index (recovery escape hatch). |
 | `update_paths(paths)` | Incrementally re-analyze specific paths (with `manual=True`). |
+| `activate_workspace(path)` / `get_active_workspace()` | Switch / read the active workspace root. |
+| `get_file_contents(file_paths)` | Read whole files by path. |
+| `find_filenames(patterns, *, limit=None)` | Find files by path glob. |
+| `search_file_contents(patterns, *, file_path=None, context_lines=None, case_insensitive=False)` | Grep contents with context. |
+| `find_files_containing(patterns, *, limit=None, case_insensitive=False)` | Find files whose contents match. |
+| `list_files(directory_path="", *, max_entries=None)` | List files under a directory. |
+| `get_git_log(*, file_path=None, limit=None)` | Recent commits (optionally for one path). |
+| `get_commit_diff(revision, *, max_files=None, lines_per_file=None)` | Unified diff for a commit. |
+| `search_git_commit_messages(pattern, *, limit=None)` | Regex search over commit messages. |
+| `jq(file_path, filter_expr, *, max_files=None, matches_per_file=None)` | Run a jq filter over JSON files. |
+| `xml_skim(file_path, *, max_files=None)` | Summarize XML element structure. |
+| `xml_select(file_path, xpath, *, output=XmlSelectOutput.TEXT, attr_name=None, max_files=None)` | Evaluate an XPath over XML files. |
+| `compute_cyclomatic_complexity(file_paths, *, threshold=None)` | Per-function cyclomatic complexity. |
+| `compute_cognitive_complexity(file_paths, *, threshold=None)` | Per-function cognitive complexity. |
+| `report_comment_density_for_code_unit(fq_name, *, max_lines=None)` | Comment density for one symbol. |
+| `report_comment_density_for_files(file_paths, *, max_top_level_rows=None, max_files=None)` | Comment density per file. |
+| `report_exception_handling_smells(file_paths, *, min_score=None, max_findings=None, options=None)` | Suspicious exception handlers. |
+| `report_test_assertion_smells(file_paths, *, min_score=None, max_findings=None, options=None)` | Low-value test assertions. |
+| `report_structural_clone_smells(file_paths, *, min_score=None, max_findings=None, options=None)` | Structural code clones. |
+| `report_long_method_and_god_object_smells(file_paths, *, max_findings=None, max_files=None, options=None)` | Oversized functions / god objects. |
+| `report_dead_code_and_unused_abstraction_smells(*, file_paths=None, fq_names=None, min_score=None, max_findings=None, options=None)` | Likely dead code (Rust). |
+| `report_secret_like_code(*, max_findings=None, max_commits=None, include_history_only=False, include_low_confidence=False)` | Secret-looking strings in files / history. |
+| `analyze_git_hotspots(*, since_days=None, since_iso=None, until_iso=None, max_commits=None, max_files=None)` | Churn × complexity hotspots. |
 
 Pass `render_line_numbers=False` to drop line numbers from rendered text while
 keeping the structured line metadata on the result objects.
+
+The git tools return a `GitTextResult` (`.text`), the slopcop tools return a
+`CodeQualityReport` (`.report`), and the rest return structured dataclasses from
+`bifrost_searchtools.models`. The per-rule tuning knobs on the smell reports are
+passed through `options` (keys map 1:1 to the Rust tool arguments).
 
 ## Semantic search
 
