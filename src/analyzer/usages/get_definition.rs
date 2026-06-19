@@ -858,10 +858,24 @@ fn resolve_go(
         if let Some((_, name)) = reference.split_once('.')
             && let Some(package) = resolution.resolved_import_packages.first()
         {
+            if !go_import_path_is_workspace(support, package) {
+                return boundary(format!(
+                    "`{package}` is outside this partial Go workspace analysis"
+                ));
+            }
             return no_definition(
                 "no_indexed_definition",
                 format!("`{name}` is not indexed in Go package `{package}`"),
             );
+        }
+        if let Some(package) = resolution
+            .resolved_import_packages
+            .iter()
+            .find(|package| !go_import_path_is_workspace(support, package))
+        {
+            return boundary(format!(
+                "`{package}` is outside this partial Go workspace analysis"
+            ));
         }
     }
 
@@ -900,6 +914,11 @@ fn resolve_go(
     let same_file = support.file_identifier(file, reference);
     if !same_file.is_empty() {
         return candidates_outcome(same_file);
+    }
+    if let Some(import_path) = go_external_dot_import_path(go, support, file) {
+        return boundary(format!(
+            "`{import_path}` is outside this partial Go workspace analysis"
+        ));
     }
     no_definition(
         "no_indexed_definition",
@@ -946,6 +965,19 @@ fn go_import_paths(
 
 fn go_import_path_is_workspace(support: &DefinitionLookupIndex, import_path: &str) -> bool {
     support.fqn_prefix_exists(import_path)
+}
+
+fn go_external_dot_import_path(
+    go: &crate::analyzer::GoAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+) -> Option<String> {
+    go.import_info_of(file).iter().find_map(|import| {
+        (import.alias.as_deref() == Some("."))
+            .then(|| extract_go_import_path(&import.raw_snippet))
+            .flatten()
+            .filter(|import_path| !go_import_path_is_workspace(support, import_path))
+    })
 }
 
 fn resolve_go_shadowed_selector_chain(

@@ -85,7 +85,7 @@ fn resolve_with_namespaces(
     );
     GoReferenceResolution {
         fqn_candidates,
-        resolved_import_packages: Vec::new(),
+        resolved_import_packages: dot_packages,
         shadowed: false,
     }
 }

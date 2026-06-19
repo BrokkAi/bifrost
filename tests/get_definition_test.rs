@@ -689,6 +689,72 @@ func Helper() {}
 }
 
 #[test]
+fn go_external_import_selector_reports_boundary() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n")
+        .file(
+            "main.go",
+            r#"
+package main
+
+import "fmt"
+
+func Run() {
+    fmt.Println("hello")
+}
+"#,
+        )
+        .build();
+
+    let line = r#"    fmt.Println("hello")"#;
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"main.go","line":7,"column":{}}}]}}"#,
+            column_of(line, "Println")
+        ),
+    );
+
+    assert_eq!(
+        value["results"][0]["status"], "unresolvable_import_boundary",
+        "{value}"
+    );
+}
+
+#[test]
+fn go_external_dot_import_reference_reports_boundary() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n")
+        .file(
+            "main.go",
+            r#"
+package main
+
+import . "fmt"
+
+func Run() {
+    Println("hello")
+}
+"#,
+        )
+        .build();
+
+    let line = r#"    Println("hello")"#;
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"main.go","line":7,"column":{}}}]}}"#,
+            column_of(line, "Println")
+        ),
+    );
+
+    assert_eq!(
+        value["results"][0]["status"], "unresolvable_import_boundary",
+        "{value}"
+    );
+}
+
+#[test]
 fn go_dot_import_resolves_unqualified_definition() {
     let project = InlineTestProject::with_language(Language::Go)
         .file("go.mod", "module example.com/app\n")
