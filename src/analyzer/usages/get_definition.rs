@@ -32,9 +32,9 @@ use crate::analyzer::usages::scala_graph::{
 use crate::analyzer::{
     AliasResolver, CSharpAnalyzer, CodeUnit, CppAnalyzer, DefinitionLookupIndex, GoAnalyzer,
     IAnalyzer, ImportAnalysisProvider, JavaAnalyzer, Language, PhpAnalyzer, ProjectFile,
-    PythonAnalyzer, Range, RustAnalyzer, ScalaAnalyzer, cpp_node_text,
-    parse_php_use_aliases_from_source, quoted_include_paths, resolve_analyzer,
-    resolve_include_targets,
+    PythonAnalyzer, Range, RustAnalyzer, ScalaAnalyzer, cpp_include_paths, cpp_node_text,
+    parse_php_use_aliases_from_source, resolve_analyzer,
+    resolve_include_targets_with_unique_fallback,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
@@ -1722,12 +1722,12 @@ fn cpp_unresolved_include_boundary(
         return false;
     }
     analyzer.import_statements(file).iter().any(|import| {
-        if import.contains('<') && import.contains('>') {
-            return true;
-        }
-        quoted_include_paths(std::slice::from_ref(import))
+        cpp_include_paths(std::slice::from_ref(import))
             .iter()
-            .any(|include| resolve_include_targets(analyzer.project(), file, include).is_empty())
+            .any(|include| {
+                resolve_include_targets_with_unique_fallback(analyzer.project(), file, include)
+                    .is_empty()
+            })
     })
 }
 

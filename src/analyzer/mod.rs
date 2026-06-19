@@ -36,8 +36,8 @@ pub(crate) use capabilities::{build_reverse_import_index, direct_descendants_via
 pub use config::AnalyzerConfig;
 pub use cpp::CppAnalyzer;
 pub(crate) use cpp::{
-    node_text as cpp_node_text, normalize_cpp_whitespace, quoted_include_paths,
-    resolve_include_targets,
+    include_paths as cpp_include_paths, node_text as cpp_node_text, normalize_cpp_whitespace,
+    resolve_include_targets_with_unique_fallback,
 };
 pub use csharp::CSharpAnalyzer;
 pub use definition_lookup_index::DefinitionLookupIndex;

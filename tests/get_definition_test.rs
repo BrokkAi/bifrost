@@ -1719,6 +1719,59 @@ fn cpp_typed_receiver_method_resolves_to_definition() {
 }
 
 #[test]
+fn cpp_workspace_angle_include_receiver_method_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "include/target.h",
+            "namespace ns { class Service { public: void run(); }; }\n",
+        )
+        .file(
+            "target.cpp",
+            "#include \"include/target.h\"\nnamespace ns { void Service::run() {} }\n",
+        )
+        .file(
+            "src/app.cpp",
+            "#include <target.h>\nusing namespace ns;\nvoid handle(Service& service) { service.run(); }\n",
+        )
+        .build();
+
+    let line = "void handle(Service& service) { service.run(); }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/app.cpp","line":3,"column":{}}}]}}"#,
+            column_of(line, "run")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definition"]["fqn"], "ns.Service.run", "{value}");
+}
+
+#[test]
+fn cpp_workspace_angle_include_missing_type_returns_no_definition() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("include/target.h", "namespace ns { class Service {}; }\n")
+        .file(
+            "src/app.cpp",
+            "#include <target.h>\nusing namespace ns;\nMissingType value;\n",
+        )
+        .build();
+
+    let line = "MissingType value;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/app.cpp","line":3,"column":{}}}]}}"#,
+            column_of(line, "MissingType")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
 fn cpp_relative_namespace_call_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(

@@ -100,6 +100,16 @@ pub(crate) fn parse_quoted_include(line: &str) -> Option<String> {
     Some(trimmed[quote_start + 1..quote_start + 1 + quote_end].to_string())
 }
 
+pub(crate) fn parse_include_path(line: &str) -> Option<String> {
+    if let Some(path) = parse_quoted_include(line) {
+        return Some(path);
+    }
+    let trimmed = line.trim();
+    let angle_start = trimmed.find('<')?;
+    let angle_end = trimmed[angle_start + 1..].find('>')?;
+    Some(trimmed[angle_start + 1..angle_start + 1 + angle_end].to_string())
+}
+
 pub(crate) fn resolve_include_targets(
     project: &dyn Project,
     source_file: &ProjectFile,
@@ -120,9 +130,48 @@ pub(crate) fn resolve_include_targets(
     if relative_file.exists() {
         candidates.push(relative_file);
     }
+    if !include_path.is_absolute() {
+        let project_relative_file = ProjectFile::new(source_root.clone(), include_path);
+        if project_relative_file.exists() {
+            candidates.push(project_relative_file);
+        }
+    }
 
     candidates.sort();
     candidates.dedup();
+    candidates
+}
+
+pub(crate) fn resolve_include_targets_with_unique_fallback(
+    project: &dyn Project,
+    source_file: &ProjectFile,
+    include: &str,
+) -> Vec<ProjectFile> {
+    let mut candidates = resolve_include_targets(project, source_file, include);
+    if !candidates.is_empty() {
+        return candidates;
+    }
+    let include_path = Path::new(include);
+    if include_path.is_absolute() {
+        return candidates;
+    }
+    if let Ok(files) = project.all_files() {
+        let matches: Vec<_> = files
+            .into_iter()
+            .filter(|file| {
+                if include_path.components().count() > 1 {
+                    file.rel_path().ends_with(include_path)
+                } else {
+                    file.rel_path()
+                        .file_name()
+                        .is_some_and(|name| name == include_path)
+                }
+            })
+            .collect();
+        if matches.len() == 1 {
+            candidates.extend(matches);
+        }
+    }
     candidates
 }
 
@@ -150,6 +199,13 @@ pub(crate) fn quoted_include_paths(parsed: &[String]) -> Vec<String> {
     parsed
         .iter()
         .filter_map(|line| parse_quoted_include(line))
+        .collect()
+}
+
+pub(crate) fn include_paths(parsed: &[String]) -> Vec<String> {
+    parsed
+        .iter()
+        .filter_map(|line| parse_include_path(line))
         .collect()
 }
 
