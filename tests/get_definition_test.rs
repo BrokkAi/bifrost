@@ -671,11 +671,13 @@ export type ClientOptions = ClientOptionsWithUrl | ClientOptionsWithAdapter
 
     assert_eq!(value["results"][0]["status"], "resolved", "{value}");
     assert_eq!(
-        value["results"][0]["definitions"][0]["fqn"],
-        "app.ts.ClientOptionsWithUrl",
+        value["results"][0]["definitions"][0]["fqn"], "app.ts.ClientOptionsWithUrl",
         "{value}"
     );
-    assert_eq!(value["results"][0]["definitions"][0]["start_line"], 2, "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["start_line"], 2,
+        "{value}"
+    );
 }
 
 #[test]
@@ -3155,6 +3157,127 @@ fn cpp_same_file_global_value_resolves_to_definition() {
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(result["definitions"][0]["path"], "app.c", "{value}");
     assert_eq!(result["definitions"][0]["start_line"], 1, "{value}");
+}
+
+#[test]
+fn cpp_bare_enum_enumerator_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "app.cpp",
+            r#"
+enum Mode { Ready, Done };
+Mode current() { return Ready; }
+"#,
+        )
+        .build();
+
+    let line = "Mode current() { return Ready; }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.cpp","line":3,"column":{}}}]}}"#,
+            column_of(line, "Ready")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "Mode.Ready", "{value}");
+}
+
+#[test]
+fn cpp_bare_member_field_resolves_in_method_body() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "app.cpp",
+            r#"
+class Parser {
+    int fp_;
+    void run() {
+        if (!fp_) {}
+    }
+};
+"#,
+        )
+        .build();
+
+    let line = "        if (!fp_) {}";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.cpp","line":5,"column":{}}}]}}"#,
+            column_of(line, "fp_")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "Parser.fp_", "{value}");
+}
+
+#[test]
+fn cpp_bare_member_field_resolves_in_out_of_line_method_body() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "parser.h",
+            r#"
+namespace ns {
+class Parser {
+    int fp_;
+    void run();
+};
+}
+"#,
+        )
+        .file(
+            "parser.cpp",
+            r#"
+#include "parser.h"
+namespace ns {
+void Parser::run() {
+    if (!*fp_) {}
+}
+}
+"#,
+        )
+        .build();
+
+    let line = "    if (!*fp_) {}";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"parser.cpp","line":5,"column":{}}}]}}"#,
+            column_of(line, "fp_")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "ns.Parser.fp_", "{value}");
+}
+
+#[test]
+fn cpp_bare_identifier_does_not_resolve_unrelated_member_field() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "app.cpp",
+            r#"
+class File { int fp_; };
+int run() { return fp_; }
+"#,
+        )
+        .build();
+
+    let line = "int run() { return fp_; }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.cpp","line":3,"column":{}}}]}}"#,
+            column_of(line, "fp_")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
 }
 
 #[test]

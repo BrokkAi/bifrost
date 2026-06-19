@@ -1505,11 +1505,35 @@ fn resolve_cpp(
                     format!("`{text}` is a local C++ value"),
                 );
             }
-            let candidates = ctx.support.file_identifier(ctx.file, text);
+            if let Some(owner) =
+                cpp_enclosing_class(ctx.analyzer, ctx.file, ctx.source, identifier.start_byte())
+            {
+                let member_candidates = cpp_member_candidates(ctx, vec![owner], text, None, None)
+                    .into_iter()
+                    .filter(|unit| unit.is_field())
+                    .collect::<Vec<_>>();
+                if !member_candidates.is_empty() {
+                    return candidates_outcome(member_candidates);
+                }
+            }
+            let candidates = ctx
+                .support
+                .file_identifier(ctx.file, text)
+                .into_iter()
+                .filter(|unit| {
+                    cpp_unit_matches_kind(
+                        ctx.analyzer,
+                        ctx.support,
+                        unit,
+                        CppTargetKind::GlobalField,
+                    )
+                })
+                .collect::<Vec<_>>();
             if !candidates.is_empty() {
                 return candidates_outcome(candidates);
             }
             let candidates = cpp_visible_name_candidates(
+                ctx.analyzer,
                 ctx.visibility,
                 ctx.file,
                 ctx.support,
@@ -1635,6 +1659,7 @@ fn resolve_cpp_type(
     }
     let namespace = cpp_lexical_namespace(node, source);
     let candidates = cpp_visible_name_candidates(
+        analyzer,
         visibility,
         file,
         support,
@@ -1677,6 +1702,7 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
         "qualified_identifier" => {
             let text = cpp_node_text(function, ctx.source);
             let mut candidates = cpp_visible_name_candidates(
+                ctx.analyzer,
                 ctx.visibility,
                 ctx.file,
                 ctx.support,
@@ -1744,6 +1770,7 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                 );
             }
             let mut candidates = cpp_visible_name_candidates(
+                ctx.analyzer,
                 ctx.visibility,
                 ctx.file,
                 ctx.support,
@@ -1762,7 +1789,8 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                 );
                 return candidates_outcome(candidates);
             }
-            if let Some(owner) = cpp_enclosing_class(ctx.analyzer, ctx.file, function.start_byte())
+            if let Some(owner) =
+                cpp_enclosing_class(ctx.analyzer, ctx.file, ctx.source, function.start_byte())
             {
                 let member_candidates = cpp_member_candidates(
                     ctx,
@@ -1827,6 +1855,7 @@ fn resolve_cpp_field(
 }
 
 fn cpp_visible_name_candidates(
+    analyzer: &dyn IAnalyzer,
     visibility: &CppVisibilityIndex,
     file: &ProjectFile,
     support: &DefinitionLookupIndex,
@@ -1841,7 +1870,7 @@ fn cpp_visible_name_candidates(
     let mut candidates = Vec::new();
     for unit in visibility.visible_units(file) {
         if let Some(kind) = kind
-            && !cpp_unit_matches_kind(unit, kind)
+            && !cpp_unit_matches_kind(analyzer, support, unit, kind)
         {
             continue;
         }
@@ -1865,15 +1894,44 @@ fn cpp_visible_name_candidates(
     candidates
 }
 
-fn cpp_unit_matches_kind(unit: &CodeUnit, kind: CppTargetKind) -> bool {
+fn cpp_unit_matches_kind(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    unit: &CodeUnit,
+    kind: CppTargetKind,
+) -> bool {
     match kind {
         CppTargetKind::FreeFunction => unit.is_function(),
         CppTargetKind::Type => unit.is_class() || cpp_unit_is_type_alias(unit),
-        CppTargetKind::Constructor
-        | CppTargetKind::Method
-        | CppTargetKind::GlobalField
-        | CppTargetKind::MemberField => true,
+        CppTargetKind::GlobalField => {
+            unit.is_field() && cpp_is_unqualified_field(analyzer, support, unit)
+        }
+        CppTargetKind::MemberField => unit.is_field(),
+        CppTargetKind::Constructor | CppTargetKind::Method => true,
     }
+}
+
+fn cpp_is_unqualified_field(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    unit: &CodeUnit,
+) -> bool {
+    if !unit.short_name().contains('.') {
+        return true;
+    }
+    let fqn = unit.fq_name();
+    let Some((parent_fqn, _)) = fqn.rsplit_once('.') else {
+        return false;
+    };
+    support.fqn(parent_fqn).into_iter().any(|parent| {
+        parent
+            .signature()
+            .is_some_and(|signature| signature.trim_start().starts_with("enum "))
+            || analyzer
+                .signatures(&parent)
+                .iter()
+                .any(|signature| signature.trim_start().starts_with("enum "))
+    })
 }
 
 fn cpp_unit_is_type_alias(unit: &CodeUnit) -> bool {
@@ -2254,7 +2312,7 @@ fn cpp_receiver_type_units(
                 visibility.resolve_type(file, name).into_iter().collect()
             }
         }
-        "this" => cpp_enclosing_class(analyzer, file, receiver.start_byte())
+        "this" => cpp_enclosing_class(analyzer, file, source, receiver.start_byte())
             .into_iter()
             .collect(),
         "field_expression" => {
@@ -2276,12 +2334,28 @@ fn cpp_receiver_type_units(
 fn cpp_enclosing_class(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
+    source: &str,
     byte: usize,
 ) -> Option<CodeUnit> {
-    let fqn = ClassRangeIndex::build(analyzer, file)
-        .enclosing(byte)?
-        .to_string();
-    analyzer.definitions(&fqn).next().cloned()
+    if let Some(fqn) = ClassRangeIndex::build(analyzer, file).enclosing(byte) {
+        return analyzer.definitions(fqn).next().cloned();
+    }
+
+    let line_starts = compute_line_starts(source);
+    let line = find_line_index_for_offset(&line_starts, byte) + 1;
+    let range = Range {
+        start_byte: byte,
+        end_byte: byte.saturating_add(1),
+        start_line: line,
+        end_line: line,
+    };
+    let enclosing = analyzer.enclosing_code_unit(file, &range)?;
+    let enclosing_fqn = enclosing.fq_name();
+    let owner_fqn = enclosing_fqn.rsplit_once('.')?.0;
+    analyzer
+        .definitions(owner_fqn)
+        .find(|unit| unit.is_class())
+        .cloned()
 }
 
 const CPP_SCOPE_NODES: &[&str] = &[
