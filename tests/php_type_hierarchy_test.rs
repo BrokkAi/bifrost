@@ -1,8 +1,11 @@
 mod common;
 
-use brokk_bifrost::{CodeUnit, IAnalyzer, Language, PhpAnalyzer, TypeHierarchyProvider};
+use brokk_bifrost::{
+    CodeUnit, IAnalyzer, Language, OverlayProject, PhpAnalyzer, Project, TypeHierarchyProvider,
+};
 use common::{BuiltInlineTestProject, InlineTestProject};
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 fn php_analyzer_with_files(files: &[(&str, &str)]) -> (BuiltInlineTestProject, PhpAnalyzer) {
     let mut builder = InlineTestProject::with_language(Language::Php);
@@ -192,5 +195,42 @@ namespace B {
     assert_eq!(
         fq_names(analyzer.get_direct_ancestors(&second)),
         BTreeSet::from(["Lib.Two.Base".to_string()])
+    );
+}
+
+#[test]
+fn php_hierarchy_resolves_aliases_from_project_overlay() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "Base.php",
+            r#"<?php
+namespace Vendor;
+class Base {}
+"#,
+        )
+        .file(
+            "Child.php",
+            r#"<?php
+namespace App;
+class Child extends AliasBase {}
+"#,
+        )
+        .build();
+    let overlay = Arc::new(OverlayProject::new(project.project_dyn()));
+    overlay.set(
+        project.file("Child.php").abs_path(),
+        r#"<?php
+namespace App;
+use Vendor\Base as AliasBase;
+class Child extends AliasBase {}
+"#
+        .to_string(),
+    );
+
+    let analyzer = PhpAnalyzer::new(overlay as Arc<dyn Project>);
+    let child = definition(&analyzer, "App.Child");
+    assert_eq!(
+        fq_names(analyzer.get_direct_ancestors(&child)),
+        BTreeSet::from(["Vendor.Base".to_string()])
     );
 }

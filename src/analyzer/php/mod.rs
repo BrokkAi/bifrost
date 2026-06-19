@@ -105,16 +105,24 @@ impl PhpAnalyzer {
     }
 
     pub fn use_aliases_by_kind_of(&self, file: &ProjectFile) -> PhpUseAliases {
-        let Ok(source) = file.read_to_string() else {
+        let Ok(source) = self.inner.project().read_source(file) else {
             return PhpUseAliases::default();
         };
-        parse_php_use_aliases_from_source(&source)
+        Self::use_aliases_by_kind_from_source(&source)
     }
 
-    pub(crate) fn file_context(&self, file: &ProjectFile) -> PhpFileContext {
+    pub(crate) fn use_aliases_by_kind_from_source(source: &str) -> PhpUseAliases {
+        parse_php_use_aliases_from_source(source)
+    }
+
+    pub(crate) fn file_context_from_source(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+    ) -> PhpFileContext {
         PhpFileContext {
             namespace: self.namespace_of_file(file),
-            aliases: self.use_aliases_by_kind_of(file),
+            aliases: Self::use_aliases_by_kind_from_source(source),
         }
     }
 
@@ -139,7 +147,7 @@ impl PhpAnalyzer {
         file: &ProjectFile,
         declaration_start: usize,
     ) -> Option<PhpUseAliases> {
-        let source = file.read_to_string().ok()?;
+        let source = self.inner.project().read_source(file).ok()?;
         let mut parser = Parser::new();
         parser
             .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
@@ -153,11 +161,17 @@ impl PhpAnalyzer {
     }
 
     pub(crate) fn is_interface(&self, code_unit: &CodeUnit) -> bool {
-        code_unit.is_class()
-            && self
-                .signatures(code_unit)
-                .iter()
-                .any(|signature| signature.trim_start().starts_with("interface "))
+        if !code_unit.is_class() {
+            return false;
+        }
+        if let Some(kind) = self.declaration_kind(code_unit) {
+            return kind == "interface_declaration";
+        }
+        self.signatures(code_unit).iter().any(|signature| {
+            signature
+                .split_whitespace()
+                .any(|token| token == "interface")
+        })
     }
 
     fn resolve_declared_supertype(&self, code_unit: &CodeUnit, raw: &str) -> Option<CodeUnit> {
@@ -167,6 +181,53 @@ impl PhpAnalyzer {
             .find(|candidate| candidate.is_class())
             .cloned()
     }
+
+    pub(crate) fn direct_declared_class_parent(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
+        self.get_direct_ancestors(code_unit)
+            .into_iter()
+            .find(|ancestor| !self.is_interface(ancestor))
+    }
+
+    fn declaration_kind(&self, code_unit: &CodeUnit) -> Option<&'static str> {
+        let source = self.inner.project().read_source(code_unit.source()).ok()?;
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
+            .ok()?;
+        let tree = parser.parse(source.as_str(), None)?;
+        let ranges = self.ranges(code_unit);
+        let start = ranges.iter().map(|range| range.start_byte).min()?;
+        let end = ranges.iter().map(|range| range.end_byte).max()?;
+        php_declaration_kind_for_range(tree.root_node(), start, end)
+    }
+}
+
+fn php_declaration_kind_for_range(
+    root: Node<'_>,
+    start: usize,
+    end: usize,
+) -> Option<&'static str> {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if matches!(
+            node.kind(),
+            "class_declaration" | "interface_declaration" | "trait_declaration"
+        ) && node.start_byte() >= start
+            && node.end_byte() <= end
+        {
+            return Some(node.kind());
+        }
+
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index)
+                && child.end_byte() >= start
+                && child.start_byte() <= end
+            {
+                stack.push(child);
+            }
+        }
+    }
+    None
 }
 
 impl TestDetectionProvider for PhpAnalyzer {}

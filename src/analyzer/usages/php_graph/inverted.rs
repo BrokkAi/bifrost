@@ -56,7 +56,7 @@ where
     let language = tree_sitter_php::LANGUAGE_PHP.into();
     build_edges(files, keep_file, |file| {
         parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
-            let ctx = php.file_context(file);
+            let ctx = php.file_context_from_source(file, parsed.source.as_str());
             let mut scan = PhpScan {
                 ctx,
                 source: parsed.source.as_str(),

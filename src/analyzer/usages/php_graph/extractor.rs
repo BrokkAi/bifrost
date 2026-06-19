@@ -43,7 +43,7 @@ pub(super) fn scan_file(
         return;
     };
 
-    let ctx = php.file_context(file);
+    let ctx = php.file_context_from_source(file, &source);
 
     let line_starts = compute_line_starts(&source);
     if matches!(spec.kind, TargetKind::Method | TargetKind::Field) {
