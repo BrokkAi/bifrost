@@ -4007,6 +4007,48 @@ fn scala_object_apply_call_resolves_from_constructor_like_reference() {
 }
 
 #[test]
+fn scala_unqualified_inherited_helper_call_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "api/RestHelper.scala",
+            "package api\ntrait RestHelper { protected def collectResourceDocs(values: Seq[Int]): Seq[Int] = values }\n",
+        )
+        .file(
+            "api/v2/Api.scala",
+            r#"
+package api.v2
+
+import api.RestHelper
+
+object Api extends RestHelper {
+  def allResourceDocs: Seq[Int] = collectResourceDocs(Seq(1))
+}
+"#,
+        )
+        .build();
+
+    let line = "  def allResourceDocs: Seq[Int] = collectResourceDocs(Seq(1))";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"api/v2/Api.scala","line":7,"column":{}}}]}}"#,
+            column_of(line, "collectResourceDocs")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "api.RestHelper.collectResourceDocs",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["path"], "api/RestHelper.scala",
+        "{value}"
+    );
+}
+
+#[test]
 fn scala_unqualified_member_call_beats_same_named_object_apply() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(

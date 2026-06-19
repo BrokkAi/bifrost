@@ -3315,7 +3315,10 @@ fn resolve_scala_call(
                     scala_enclosing_class(ctx.analyzer, ctx.file, function.start_byte())
                 && owner.identifier() != name
             {
-                let candidates = ctx.support.fqn(&format!("{}.{}", owner.fq_name(), name));
+                let mut candidates = scala_member_candidate_units(ctx, &owner.fq_name(), name);
+                if candidates.is_empty() {
+                    candidates = scala_source_ancestor_member_units(ctx, resolver, function, name);
+                }
                 if !candidates.is_empty() {
                     return candidates_outcome(candidates);
                 }
@@ -3368,20 +3371,134 @@ fn resolve_scala_field(
     };
     if let Some(owner) = scala_receiver_type_fqn(ctx, resolver, root, receiver, field.start_byte())
     {
-        let candidates = ctx.support.fqn(&format!("{owner}.{member}"));
-        if !candidates.is_empty() {
-            return candidates_outcome(candidates);
-        }
-        return no_definition(
-            "unsupported_scala_receiver",
-            format!(
-                "receiver for Scala member `{member}` resolved to `{owner}`, but `{owner}.{member}` was not indexed"
-            ),
-        );
+        return scala_member_candidates(ctx, &owner, member);
     }
     no_definition(
         "unsupported_scala_receiver",
         format!("receiver for Scala member `{member}` is not resolved"),
+    )
+}
+
+fn scala_member_candidates(
+    ctx: ScalaLookupCtx<'_>,
+    owner_fqn: &str,
+    member: &str,
+) -> DefinitionLookupOutcome {
+    let candidates = scala_member_candidate_units(ctx, owner_fqn, member);
+    if !candidates.is_empty() {
+        return candidates_outcome(candidates);
+    }
+
+    scala_member_not_found(ctx, owner_fqn, member)
+}
+
+fn scala_member_candidate_units(
+    ctx: ScalaLookupCtx<'_>,
+    owner_fqn: &str,
+    member: &str,
+) -> Vec<CodeUnit> {
+    let mut candidates = ctx.support.fqn(&format!("{owner_fqn}.{member}"));
+    sort_units(&mut candidates);
+    candidates.dedup();
+    if !candidates.is_empty() {
+        return candidates;
+    }
+
+    if let Some(owner) = ctx.analyzer.definitions(owner_fqn).next().cloned()
+        && let Some(provider) = ctx.analyzer.type_hierarchy_provider()
+    {
+        let mut seen = HashSet::default();
+        let mut level = provider.get_direct_ancestors(&owner);
+        seen.insert(owner);
+        while !level.is_empty() {
+            let mut level_candidates = Vec::new();
+            let mut next_level = Vec::new();
+            for ancestor in level {
+                if !seen.insert(ancestor.clone()) {
+                    continue;
+                }
+                level_candidates
+                    .extend(ctx.support.fqn(&format!("{}.{member}", ancestor.fq_name())));
+                next_level.extend(provider.get_direct_ancestors(&ancestor));
+            }
+            sort_units(&mut level_candidates);
+            level_candidates.dedup();
+            if !level_candidates.is_empty() {
+                return level_candidates;
+            }
+            level = next_level;
+        }
+    }
+
+    Vec::new()
+}
+
+fn scala_source_ancestor_member_units(
+    ctx: ScalaLookupCtx<'_>,
+    resolver: &ScalaNameResolver,
+    node: Node<'_>,
+    member: &str,
+) -> Vec<CodeUnit> {
+    let Some(owner_node) = scala_enclosing_definition_node(node) else {
+        return Vec::new();
+    };
+    let mut ancestor_types = Vec::new();
+    scala_collect_extends_type_text(owner_node, ctx.source, &mut ancestor_types);
+    for ancestor_type in ancestor_types {
+        let Some(owner_fqn) = resolver.resolve(&ancestor_type) else {
+            continue;
+        };
+        let candidates = scala_member_candidate_units(ctx, &owner_fqn, member);
+        if !candidates.is_empty() {
+            return candidates;
+        }
+    }
+    Vec::new()
+}
+
+fn scala_enclosing_definition_node(mut node: Node<'_>) -> Option<Node<'_>> {
+    while let Some(parent) = node.parent() {
+        if matches!(
+            parent.kind(),
+            "class_definition" | "object_definition" | "trait_definition" | "enum_definition"
+        ) {
+            return Some(parent);
+        }
+        node = parent;
+    }
+    None
+}
+
+fn scala_collect_extends_type_text(node: Node<'_>, source: &str, out: &mut Vec<String>) {
+    let in_extends = node.kind() == "extends_clause";
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if in_extends
+            && matches!(
+                child.kind(),
+                "type_identifier" | "stable_type_identifier" | "generic_type"
+            )
+        {
+            let text = scala_node_text(child, source).trim();
+            if !text.is_empty() {
+                out.push(text.to_string());
+            }
+            continue;
+        }
+        scala_collect_extends_type_text(child, source, out);
+    }
+}
+
+fn scala_member_not_found(
+    _ctx: ScalaLookupCtx<'_>,
+    owner_fqn: &str,
+    member: &str,
+) -> DefinitionLookupOutcome {
+    no_definition(
+        "unsupported_scala_receiver",
+        format!(
+            "receiver for Scala member `{member}` resolved to `{owner_fqn}`, but `{owner_fqn}.{member}` was not indexed"
+        ),
     )
 }
 
