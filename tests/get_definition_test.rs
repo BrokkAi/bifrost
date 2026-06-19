@@ -1972,6 +1972,97 @@ function compile(query) {
 }
 
 #[test]
+fn javascript_local_member_assignment_does_not_cross_function_scope() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "app.js",
+            r#"
+function compile(query) {
+  query.windowaggrs = [];
+}
+
+function render(query) {
+  return query.windowaggrs;
+}
+"#,
+        )
+        .build();
+
+    let line = "  return query.windowaggrs;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.js","line":7,"column":{}}}]}}"#,
+            column_of(line, "windowaggrs")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn javascript_block_shadowed_member_assignment_does_not_resolve_outer_receiver() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "app.js",
+            r#"
+function render(query, cond) {
+  if (cond) {
+    let query = {};
+    query.windowaggrs = [];
+  }
+  return query.windowaggrs;
+}
+"#,
+        )
+        .build();
+
+    let line = "  return query.windowaggrs;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.js","line":7,"column":{}}}]}}"#,
+            column_of(line, "windowaggrs")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn javascript_var_receiver_assignment_remains_function_scoped_across_blocks() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "app.js",
+            r#"
+function render(cond) {
+  if (cond) {
+    var query = {};
+    query.windowaggrs = [];
+  }
+  return query.windowaggrs;
+}
+"#,
+        )
+        .build();
+
+    let line = "  return query.windowaggrs;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.js","line":7,"column":{}}}]}}"#,
+            column_of(line, "windowaggrs")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "query.windowaggrs",
+        "{value}"
+    );
+}
+
+#[test]
 fn javascript_member_expression_receiver_focus_resolves_receiver_definition() {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file(

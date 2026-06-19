@@ -1531,6 +1531,38 @@ fn resolve_js_ts(
         if !member_candidates.is_empty() {
             return candidates_outcome(member_candidates);
         }
+        let local_receiver_binding = (language == Language::JavaScript)
+            .then(|| {
+                jsts_visible_receiver_binding_scope(
+                    tree.root_node(),
+                    source,
+                    qualifier,
+                    site.range.start_byte,
+                )
+            })
+            .flatten();
+        if let Some(binding_scope) = local_receiver_binding {
+            let scoped_lookup = JstsScopedDottedLookup {
+                analyzer,
+                support,
+                file,
+                root: tree.root_node(),
+                source,
+                reference,
+                receiver: qualifier,
+                value_position,
+                binding_scope,
+                before_byte: site.range.start_byte,
+            };
+            let scoped = jsts_exact_scoped_dotted_candidates(scoped_lookup);
+            if !scoped.is_empty() {
+                return candidates_outcome(scoped);
+            }
+            return no_definition(
+                "no_indexed_definition",
+                format!("`{reference}` did not resolve to an indexed JS/TS definition"),
+            );
+        }
         let exact_same_file = jsts_exact_same_file_dotted_candidates(
             analyzer,
             support,
@@ -1728,6 +1760,46 @@ fn jsts_exact_same_file_dotted_candidates(
     candidates
 }
 
+#[derive(Clone, Copy)]
+struct JstsScopedDottedLookup<'a, 'tree> {
+    analyzer: &'a dyn IAnalyzer,
+    support: &'a DefinitionLookupIndex,
+    file: &'a ProjectFile,
+    root: Node<'tree>,
+    source: &'a str,
+    reference: &'a str,
+    receiver: &'a str,
+    value_position: bool,
+    binding_scope: JstsReceiverBindingScope,
+    before_byte: usize,
+}
+
+fn jsts_exact_scoped_dotted_candidates(ctx: JstsScopedDottedLookup<'_, '_>) -> Vec<CodeUnit> {
+    let mut candidates: Vec<_> = ctx
+        .support
+        .fqn(ctx.reference)
+        .into_iter()
+        .filter(|unit| unit.source() == ctx.file)
+        .filter(|unit| {
+            ctx.analyzer.ranges(unit).iter().any(|range| {
+                range.start_byte < ctx.before_byte
+                    && jsts_visible_receiver_binding_scope(
+                        ctx.root,
+                        ctx.source,
+                        ctx.receiver,
+                        range.start_byte,
+                    ) == Some(ctx.binding_scope)
+            })
+        })
+        .collect();
+    if ctx.value_position {
+        candidates = jsts_value_space_candidates(ctx.analyzer, candidates);
+    } else {
+        candidates = jsts_type_space_candidates(ctx.analyzer, candidates);
+    }
+    candidates
+}
+
 fn jsts_exact_dotted_candidates(
     analyzer: &dyn IAnalyzer,
     support: &DefinitionLookupIndex,
@@ -1752,6 +1824,213 @@ fn jsts_exact_dotted_candidates(
         candidates = jsts_type_space_candidates(analyzer, candidates);
     }
     candidates
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct JstsReceiverBindingScope {
+    start_byte: usize,
+    end_byte: usize,
+}
+
+fn jsts_visible_receiver_binding_scope(
+    root: Node<'_>,
+    source: &str,
+    receiver: &str,
+    before_byte: usize,
+) -> Option<JstsReceiverBindingScope> {
+    let mut node = smallest_named_node_covering(root, before_byte, before_byte)?;
+    loop {
+        if jsts_lexical_scope_kind(node.kind())
+            && jsts_scope_declares_name_before(node, source, receiver, before_byte)
+        {
+            return Some(JstsReceiverBindingScope {
+                start_byte: node.start_byte(),
+                end_byte: node.end_byte(),
+            });
+        }
+        node = node.parent()?;
+    }
+}
+
+fn jsts_lexical_scope_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "program"
+            | "statement_block"
+            | "function_declaration"
+            | "function_expression"
+            | "arrow_function"
+            | "method_definition"
+    )
+}
+
+fn jsts_scope_declares_name_before(
+    scope: Node<'_>,
+    source: &str,
+    name: &str,
+    before_byte: usize,
+) -> bool {
+    let mut found = false;
+    let scope_range = JstsReceiverBindingScope {
+        start_byte: scope.start_byte(),
+        end_byte: scope.end_byte(),
+    };
+    jsts_visit_scope_bindings_before(
+        scope,
+        source,
+        name,
+        before_byte,
+        true,
+        scope_range,
+        &mut found,
+    );
+    found
+}
+
+fn jsts_visit_scope_bindings_before(
+    node: Node<'_>,
+    source: &str,
+    name: &str,
+    before_byte: usize,
+    is_root: bool,
+    scope_range: JstsReceiverBindingScope,
+    found: &mut bool,
+) {
+    if *found || node.start_byte() >= before_byte {
+        return;
+    }
+    if !is_root
+        && matches!(
+            node.kind(),
+            "function_declaration"
+                | "function_expression"
+                | "arrow_function"
+                | "method_definition"
+                | "class_declaration"
+        )
+    {
+        return;
+    }
+    if matches!(
+        node.kind(),
+        "formal_parameter" | "required_parameter" | "optional_parameter" | "variable_declarator"
+    ) && let Some(pattern) = node
+        .child_by_field_name("pattern")
+        .or_else(|| node.child_by_field_name("name"))
+        && jsts_pattern_contains_name(pattern, source, name)
+        && jsts_binding_scope_for_declaration(node, source) == Some(scope_range)
+    {
+        *found = true;
+        return;
+    }
+    if matches!(node.kind(), "identifier" | "type_identifier")
+        && node
+            .parent()
+            .is_some_and(|parent| matches!(parent.kind(), "formal_parameters" | "parameters"))
+        && source
+            .get(node.start_byte()..node.end_byte())
+            .is_some_and(|text| text.trim() == name)
+        && jsts_binding_scope_for_declaration(node, source) == Some(scope_range)
+    {
+        *found = true;
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.start_byte() >= before_byte {
+            break;
+        }
+        jsts_visit_scope_bindings_before(
+            child,
+            source,
+            name,
+            before_byte,
+            false,
+            scope_range,
+            found,
+        );
+        if *found {
+            break;
+        }
+    }
+}
+
+fn jsts_binding_scope_for_declaration(
+    node: Node<'_>,
+    source: &str,
+) -> Option<JstsReceiverBindingScope> {
+    if node.kind() == "variable_declarator" && jsts_variable_declarator_is_var(node, source) {
+        return jsts_nearest_var_scope(node);
+    }
+    jsts_nearest_lexical_scope(node)
+}
+
+fn jsts_variable_declarator_is_var(node: Node<'_>, source: &str) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(
+            parent.kind(),
+            "variable_declaration" | "lexical_declaration"
+        ) {
+            return source
+                .get(parent.start_byte()..node.start_byte())
+                .is_some_and(|prefix| prefix.trim_start().starts_with("var"));
+        }
+        if jsts_lexical_scope_kind(parent.kind()) {
+            return false;
+        }
+        current = parent.parent();
+    }
+    false
+}
+
+fn jsts_nearest_var_scope(node: Node<'_>) -> Option<JstsReceiverBindingScope> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(
+            parent.kind(),
+            "program"
+                | "function_declaration"
+                | "function_expression"
+                | "arrow_function"
+                | "method_definition"
+        ) {
+            return Some(JstsReceiverBindingScope {
+                start_byte: parent.start_byte(),
+                end_byte: parent.end_byte(),
+            });
+        }
+        current = parent.parent();
+    }
+    None
+}
+
+fn jsts_nearest_lexical_scope(node: Node<'_>) -> Option<JstsReceiverBindingScope> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if jsts_lexical_scope_kind(parent.kind()) {
+            return Some(JstsReceiverBindingScope {
+                start_byte: parent.start_byte(),
+                end_byte: parent.end_byte(),
+            });
+        }
+        current = parent.parent();
+    }
+    None
+}
+
+fn jsts_pattern_contains_name(node: Node<'_>, source: &str, name: &str) -> bool {
+    if matches!(
+        node.kind(),
+        "identifier" | "shorthand_property_identifier_pattern"
+    ) {
+        return source
+            .get(node.start_byte()..node.end_byte())
+            .is_some_and(|text| text.trim() == name);
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| jsts_pattern_contains_name(child, source, name))
 }
 
 fn jsts_top_level_path_component(file: &ProjectFile) -> Option<&str> {
@@ -1893,7 +2172,7 @@ fn ts_synthetic_member_is_supported_by_receiver_initializer(
             continue;
         };
         let Some(call) =
-            ts_unwrap_expression(value, &source).filter(|value| value.kind() == "call_expression")
+            ts_unwrap_expression(value).filter(|value| value.kind() == "call_expression")
         else {
             return true;
         };
@@ -1953,17 +2232,17 @@ fn ts_call_direct_object_argument_index_with_member(
         .named_children(&mut cursor)
         .enumerate()
         .find_map(|(index, argument)| {
-            let object = ts_direct_object_literal_value(argument, source)?;
+            let object = ts_direct_object_literal_value(argument)?;
             ts_object_literal_has_member(object, source, member).then_some(index)
         })
 }
 
-fn ts_direct_object_literal_value<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
-    let node = ts_unwrap_expression(node, source)?;
+fn ts_direct_object_literal_value(node: Node<'_>) -> Option<Node<'_>> {
+    let node = ts_unwrap_expression(node)?;
     (node.kind() == "object").then_some(node)
 }
 
-fn ts_unwrap_expression<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+fn ts_unwrap_expression(node: Node<'_>) -> Option<Node<'_>> {
     match node.kind() {
         "as_expression"
         | "satisfies_expression"
@@ -1976,7 +2255,7 @@ fn ts_unwrap_expression<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'
                         && child.kind() != "type_identifier"
                         && child.kind() != "predefined_type"
                 })
-                .and_then(|child| ts_unwrap_expression(child, source))
+                .and_then(ts_unwrap_expression)
         }
         _ => Some(node),
     }
@@ -2102,7 +2381,7 @@ fn ts_expression_preserves_parameter_shape(
     source: &str,
     parameter_name: &str,
 ) -> bool {
-    let Some(expression) = ts_unwrap_expression(expression, source) else {
+    let Some(expression) = ts_unwrap_expression(expression) else {
         return false;
     };
     if matches!(expression.kind(), "identifier" | "property_identifier")
@@ -2118,7 +2397,7 @@ fn ts_expression_preserves_parameter_shape(
         child.kind() == "spread_element"
             && child
                 .named_child(0)
-                .and_then(|spread| ts_unwrap_expression(spread, source))
+                .and_then(ts_unwrap_expression)
                 .is_some_and(|spread| node_text_matches(spread, source, parameter_name))
     })
 }
