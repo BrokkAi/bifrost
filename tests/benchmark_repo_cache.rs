@@ -31,6 +31,7 @@ fn repo_target(source_root: &Path, commit: &str) -> BenchmarkRepoTarget {
         scenarios: vec![BenchmarkScenario::WorkspaceBuild],
         search_patterns: Vec::new(),
         location_symbols: Vec::new(),
+        ancestor_symbols: Vec::new(),
         summary_targets: Vec::new(),
         seed_file_paths: Vec::new(),
         usage_symbols: Vec::new(),

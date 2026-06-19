@@ -28,6 +28,7 @@ required_scenarios = [
   "workspace_build",
   "search_symbols",
   "get_symbol_locations",
+  "get_symbol_ancestors",
   "get_summaries",
   "most_relevant_files",
   "scan_usages",
@@ -44,6 +45,7 @@ scenarios = [
   "workspace_build",
   "search_symbols",
   "get_symbol_locations",
+  "get_symbol_ancestors",
   "get_summaries",
   "most_relevant_files",
   "scan_usages",
@@ -51,6 +53,7 @@ scenarios = [
 ]
 search_patterns = ["method2"]
 location_symbols = ["A.method2"]
+ancestor_symbols = ["XExtendsY"]
 summary_targets = ["A.java"]
 seed_file_paths = ["A.java"]
 usage_symbols = ["E.iMethod"]
@@ -89,7 +92,7 @@ definition_queries = [
     let scenarios = report["repos"][0]["scenarios"]
         .as_array()
         .expect("scenario array");
-    assert_eq!(scenarios.len(), 7, "report: {report}");
+    assert_eq!(scenarios.len(), 8, "report: {report}");
     for scenario in scenarios {
         assert_eq!(scenario["success"], true, "report: {report}");
     }
@@ -101,6 +104,7 @@ definition_queries = [
     assert!(names.contains(&"workspace_build"), "report: {report}");
     assert!(names.contains(&"search_symbols"), "report: {report}");
     assert!(names.contains(&"get_symbol_locations"), "report: {report}");
+    assert!(names.contains(&"get_symbol_ancestors"), "report: {report}");
     assert!(names.contains(&"get_summaries"), "report: {report}");
     assert!(names.contains(&"most_relevant_files"), "report: {report}");
     assert!(names.contains(&"scan_usages"), "report: {report}");
