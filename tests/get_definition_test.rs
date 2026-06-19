@@ -811,6 +811,109 @@ export function render() {
 }
 
 #[test]
+fn typescript_destructured_typed_parameter_member_resolves_to_schema_property() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "provider.ts",
+            r#"
+export const ProviderSchema = z.object({
+  isEnabled: z.boolean(),
+})
+export type Provider = z.infer<typeof ProviderSchema>
+"#,
+        )
+        .file(
+            "app.ts",
+            r#"
+import type { Provider } from './provider'
+
+interface Props {
+  provider: Provider
+}
+
+export function Item({ provider }: Props) {
+  return provider.isEnabled
+}
+"#,
+        )
+        .build();
+
+    let line = "  return provider.isEnabled";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.ts","line":9,"column":{}}}]}}"#,
+            column_of(line, "isEnabled")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "provider.ts.ProviderSchema.isEnabled",
+        "{value}"
+    );
+}
+
+#[test]
+fn typescript_call_initialized_local_member_resolves_to_returned_object_property() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "build.ts",
+            r#"
+export const getBuildConfig = () => {
+  return {
+    visionModels: '',
+  }
+}
+
+export type BuildConfig = ReturnType<typeof getBuildConfig>
+"#,
+        )
+        .file(
+            "client.ts",
+            r#"
+import { BuildConfig, getBuildConfig } from './build'
+
+export function getClientConfig() {
+  if (window) {
+    return JSON.parse('{}') as BuildConfig
+  }
+  return getBuildConfig()
+}
+"#,
+        )
+        .file(
+            "app.ts",
+            r#"
+import { getClientConfig } from './client'
+
+export function isVisionModel() {
+  const clientConfig = getClientConfig()
+  return clientConfig.visionModels
+}
+"#,
+        )
+        .build();
+
+    let line = "  return clientConfig.visionModels";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.ts","line":6,"column":{}}}]}}"#,
+            column_of(line, "visionModels")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "getBuildConfig.visionModels",
+        "{value}"
+    );
+}
+
+#[test]
 fn javascript_destructured_commonjs_require_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file(

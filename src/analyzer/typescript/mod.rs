@@ -102,6 +102,12 @@ impl crate::analyzer::LanguageAdapter for TypescriptAdapter {
                     }
                 }
                 "export_statement" => visit_ts_export(file, source, child, None, &mut parsed),
+                "ambient_declaration" => {
+                    visit_ts_ambient_declarations(file, source, child, None, &mut parsed, false);
+                }
+                "internal_module" if ts_is_global_internal_module(child, source) => {
+                    visit_ts_ambient_declarations(file, source, child, None, &mut parsed, false);
+                }
                 "class_declaration"
                 | "abstract_class_declaration"
                 | "interface_declaration"
@@ -660,6 +666,58 @@ impl TypescriptAnalyzer {
     }
 }
 
+fn visit_ts_ambient_declarations(
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    parent: Option<&CodeUnit>,
+    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+    exported: bool,
+) {
+    let definition = if node.kind() == "export_statement" {
+        node.child_by_field_name("declaration").unwrap_or(node)
+    } else {
+        node
+    };
+    match definition.kind() {
+        "ambient_declaration" | "statement_block" => {
+            let mut cursor = definition.walk();
+            for child in definition.named_children(&mut cursor) {
+                visit_ts_ambient_declarations(file, source, child, parent, parsed, exported);
+            }
+        }
+        "internal_module" if ts_is_global_internal_module(definition, source) => {
+            if let Some(body) = definition.child_by_field_name("body") {
+                let mut cursor = body.walk();
+                for child in body.named_children(&mut cursor) {
+                    visit_ts_ambient_declarations(file, source, child, parent, parsed, false);
+                }
+            }
+        }
+        "class_declaration"
+        | "abstract_class_declaration"
+        | "interface_declaration"
+        | "enum_declaration"
+        | "internal_module" => {
+            visit_ts_class_like(file, source, definition, parent, parsed, exported);
+        }
+        "function_declaration" | "function_signature" => {
+            visit_ts_function(file, source, definition, parent, parsed, exported);
+        }
+        "lexical_declaration" | "variable_declaration" | "type_alias_declaration" => {
+            visit_ts_value(file, source, definition, parent, parsed, exported);
+        }
+        _ => {}
+    }
+}
+
+fn ts_is_global_internal_module(node: Node<'_>, source: &str) -> bool {
+    node.kind() == "internal_module"
+        && node
+            .child_by_field_name("name")
+            .is_some_and(|name| trim_statement(node_text(name, source)) == "global")
+}
+
 fn visit_ts_export(
     file: &ProjectFile,
     source: &str,
@@ -669,6 +727,12 @@ fn visit_ts_export(
 ) {
     if let Some(declaration) = node.child_by_field_name("declaration") {
         match declaration.kind() {
+            "ambient_declaration" => {
+                visit_ts_ambient_declarations(file, source, declaration, parent, parsed, true);
+            }
+            "internal_module" if ts_is_global_internal_module(declaration, source) => {
+                visit_ts_ambient_declarations(file, source, declaration, parent, parsed, true);
+            }
             "class_declaration"
             | "abstract_class_declaration"
             | "interface_declaration"
@@ -823,9 +887,15 @@ fn visit_ts_function(
         range_node,
         source,
         parent.cloned(),
-        Some(top_level),
+        Some(top_level.clone()),
     );
-    parsed.add_signature(code_unit, ts_function_signature(node, source, exported));
+    parsed.add_signature(
+        code_unit.clone(),
+        ts_function_signature(node, source, exported),
+    );
+    visit_ts_return_object_literal_properties(
+        file, source, definition, &code_unit, &top_level, parsed,
+    );
 }
 
 fn visit_ts_value(
@@ -932,6 +1002,11 @@ fn visit_ts_value(
                 code_unit.clone(),
                 ts_variable_function_signature(definition, child, source, exported),
             );
+            if let Some(value) = value {
+                visit_ts_return_object_literal_properties(
+                    file, source, value, &code_unit, &top_level, parsed,
+                );
+            }
         } else {
             parsed.add_signature(
                 code_unit.clone(),
@@ -1190,6 +1265,66 @@ fn ts_object_shape_expression(node: Node<'_>) -> Option<Node<'_>> {
         _ => Some(node),
     }
 }
+
+fn visit_ts_return_object_literal_properties(
+    file: &ProjectFile,
+    source: &str,
+    function: Node<'_>,
+    parent: &CodeUnit,
+    top_level: &CodeUnit,
+    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+) {
+    let mut objects = Vec::new();
+    collect_ts_return_object_literals(function, function.id(), &mut objects);
+    for object in objects {
+        visit_ts_object_literal_properties(file, source, object, parent, top_level, parsed);
+    }
+}
+
+fn collect_ts_return_object_literals<'tree>(
+    node: Node<'tree>,
+    root_id: usize,
+    out: &mut Vec<Node<'tree>>,
+) {
+    if node.id() != root_id
+        && matches!(
+            node.kind(),
+            "function_declaration"
+                | "function_expression"
+                | "arrow_function"
+                | "method_definition"
+                | "class_declaration"
+                | "abstract_class_declaration"
+                | "interface_declaration"
+        )
+    {
+        return;
+    }
+
+    if node.kind() == "return_statement" {
+        let mut cursor = node.walk();
+        if let Some(object) = node
+            .named_children(&mut cursor)
+            .find_map(ts_object_literal_value)
+        {
+            out.push(object);
+        }
+        return;
+    }
+
+    if node.kind() == "arrow_function"
+        && let Some(body) = node.child_by_field_name("body")
+        && let Some(object) = ts_object_literal_value(body)
+    {
+        out.push(object);
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_ts_return_object_literals(child, root_id, out);
+    }
+}
+
 fn visit_ts_object_literal_properties(
     file: &ProjectFile,
     source: &str,
@@ -1205,11 +1340,13 @@ fn visit_ts_object_literal_properties(
         let Some(name) = ts_object_literal_property_name(child, source) else {
             continue;
         };
-        let code_unit = CodeUnit::new(
+        let code_unit = CodeUnit::with_signature(
             file.clone(),
             crate::analyzer::CodeUnitType::Field,
             "",
             format!("{}.{}", parent.short_name(), name),
+            None,
+            true,
         );
         parsed.add_code_unit(
             code_unit.clone(),
@@ -1222,7 +1359,10 @@ fn visit_ts_object_literal_properties(
     }
 }
 
-fn ts_object_literal_property_name(node: Node<'_>, source: &str) -> Option<String> {
+pub(in crate::analyzer) fn ts_object_literal_property_name(
+    node: Node<'_>,
+    source: &str,
+) -> Option<String> {
     let key = match node.kind() {
         "pair" => node
             .child_by_field_name("key")
