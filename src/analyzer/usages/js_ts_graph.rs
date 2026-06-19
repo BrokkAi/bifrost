@@ -36,14 +36,19 @@ mod hits;
 mod inverted;
 mod resolver;
 
+/// The cacheable JS/TS resolution index and its tree-free builder, exposed so the
+/// TypeScript and JavaScript analyzers can cache one per language.
+pub(crate) use resolver::{JsTsUsageIndex, build_jsts_usage_index};
+
 use crate::analyzer::usages::js_ts_graph::extractor::scan_files_for_seeds;
-use crate::analyzer::usages::js_ts_graph::resolver::{
-    build_js_ts_graph, target_language, top_level_identifier,
-};
+use crate::analyzer::usages::js_ts_graph::resolver::{target_language, top_level_identifier};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::{UsageAnalyzer, UsageEdgeResolver, UsageQueryResolver};
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
+use crate::analyzer::{
+    CodeUnit, IAnalyzer, JavascriptAnalyzer, Language, ProjectFile, TypescriptAnalyzer,
+    resolve_analyzer,
+};
 use crate::hash::HashSet;
 use std::collections::BTreeSet;
 
@@ -66,6 +71,21 @@ where
 {
     let resolver = JsTsEdgeResolver::try_new(analyzer)?;
     Some(resolver.build_edges(analyzer, nodes, keep_file))
+}
+
+/// Borrow the analyzer-cached [`JsTsUsageIndex`] for `language` off the concrete TS/JS
+/// analyzer behind `analyzer`, building it on first use. `None` when the analyzer does
+/// not expose the matching JS/TS analyzer.
+fn cached_jsts_index(analyzer: &dyn IAnalyzer, language: Language) -> Option<&JsTsUsageIndex> {
+    match language {
+        Language::TypeScript => {
+            Some(resolve_analyzer::<TypescriptAnalyzer>(analyzer)?.jsts_usage_index())
+        }
+        Language::JavaScript => {
+            Some(resolve_analyzer::<JavascriptAnalyzer>(analyzer)?.jsts_usage_index())
+        }
+        _ => None,
+    }
 }
 
 /// JS/TS resolves usages off the project file set rather than a single concrete
@@ -97,8 +117,16 @@ impl<'a> UsageQueryResolver<'a> for JsTsQueryResolver {
             );
         }
 
-        let graph = build_js_ts_graph(analyzer, language);
-        let seeds = graph.seeds_for_target(target.source(), top_level_identifier(target));
+        let Some(index) = cached_jsts_index(analyzer, language) else {
+            return GraphUsageOutcome::fallback_safe(
+                target.fq_name(),
+                GraphFailureReason::MissingAnalyzerCapability(
+                    "analyzer does not expose a JS/TS analyzer",
+                ),
+                "JsTsExportUsageGraphStrategy",
+            );
+        };
+        let seeds = index.seeds_for_target(target.source(), top_level_identifier(target));
         if seeds.is_empty() {
             return GraphUsageOutcome::fallback_safe(
                 target.fq_name(),
@@ -107,11 +135,11 @@ impl<'a> UsageQueryResolver<'a> for JsTsQueryResolver {
             );
         }
 
-        let importers = graph.importers_of_seeds(&seeds);
+        let importers = index.importers_of_seeds(&seeds);
         let scan_files: HashSet<ProjectFile> =
             candidate_files.iter().cloned().chain(importers).collect();
 
-        let hits = scan_files_for_seeds(analyzer, &graph, &scan_files, target, &seeds, language);
+        let hits = scan_files_for_seeds(analyzer, index, &scan_files, target, &seeds, language);
         let hits: BTreeSet<UsageHit> = hits
             .into_iter()
             .filter(|hit| &hit.enclosing != target)
@@ -168,8 +196,7 @@ impl<'a> UsageEdgeResolver<'a> for JsTsEdgeResolver {
             if !has_files {
                 continue;
             }
-            let graph = build_js_ts_graph(analyzer, language);
-            let result = inverted::build_jsts_edges(analyzer, &graph, nodes, &keep_file);
+            let result = inverted::build_jsts_edges(analyzer, language, nodes, &keep_file);
             for (key, weight) in result.edges {
                 *edges.entry(key).or_insert(0) += weight;
             }
@@ -218,10 +245,12 @@ where
         if language_nodes.is_empty() {
             continue;
         }
-        let graph = build_js_ts_graph(analyzer, language);
+        let Some(index) = cached_jsts_index(analyzer, language) else {
+            continue;
+        };
         let result = inverted::build_jsts_scoped_edges(
             analyzer,
-            &graph,
+            index,
             language,
             &language_nodes,
             keep_file,

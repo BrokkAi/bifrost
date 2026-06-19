@@ -1046,3 +1046,112 @@ fn parity_external_frontier_reporting_is_follow_up_work() {}
 #[test]
 #[ignore = "Brokk parity marker: cross-query caches and thread-safety hardening are follow-up work"]
 fn parity_jsts_cache_and_thread_safety_hardening_is_follow_up_work() {}
+
+// --- Phase 5: analyzer-cached JsTsUsageIndex invalidation guards (issue #191) ---
+//
+// The JS/TS resolution maps are now cached on the analyzer and reused across queries, so
+// correctness hinges on the cache being dropped on `update`/`update_all`. These edit →
+// `update` → re-query tests prove a stale cached index never survives an edit.
+
+fn widget_usages_in_consumer(analyzer: &dyn IAnalyzer, consumer: &ProjectFile) -> bool {
+    let units: Vec<_> = analyzer.all_declarations().cloned().collect();
+    let target = definition_in(units.iter(), |cu| {
+        cu.is_class() && cu.identifier() == "Widget"
+    });
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    JsTsExportUsageGraphStrategy::new()
+        .find_usages(analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph success")
+        .iter()
+        .any(|hit| &hit.file == consumer)
+}
+
+#[test]
+fn jsts_usage_index_invalidates_when_reexport_removed_on_update() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("core/widget.ts", "export class Widget {}\n")
+        .file("index.ts", "export { Widget } from \"./core/widget\";\n")
+        .file(
+            "consumer.ts",
+            "import { Widget } from \"./index\";\n\nexport function build(): Widget {\n    return new Widget();\n}\n",
+        )
+        .build();
+    let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
+    let consumer = project.file("consumer.ts");
+
+    assert!(
+        widget_usages_in_consumer(&analyzer, &consumer),
+        "expected the re-exported Widget usage in consumer.ts initially"
+    );
+
+    // Drop the barrel re-export: consumer's `import { Widget } from "./index"` no longer
+    // resolves to core/widget.ts's Widget. A stale cached reexport index would still report it.
+    let index_file = project.file("index.ts");
+    index_file.write("").expect("rewrite index.ts");
+    let updated = analyzer.update(&BTreeSet::from([index_file.clone()]));
+
+    assert!(
+        !widget_usages_in_consumer(&updated, &consumer),
+        "after removing the re-export and updating, the stale Widget usage must be gone"
+    );
+}
+
+#[test]
+fn jsts_usage_index_invalidates_when_importer_stops_using_symbol_on_update() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("core/widget.ts", "export class Widget {}\n")
+        .file("index.ts", "export { Widget } from \"./core/widget\";\n")
+        .file(
+            "consumer.ts",
+            "import { Widget } from \"./index\";\n\nexport function build(): Widget {\n    return new Widget();\n}\n",
+        )
+        .build();
+    let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
+    let consumer = project.file("consumer.ts");
+
+    assert!(
+        widget_usages_in_consumer(&analyzer, &consumer),
+        "expected the Widget usage in consumer.ts initially"
+    );
+
+    // Rewrite the importer so it no longer imports or uses Widget. A stale importer
+    // reverse-index would still point at consumer.ts.
+    consumer
+        .write("export function build(): number {\n    return 1;\n}\n")
+        .expect("rewrite consumer.ts");
+    let updated = analyzer.update(&BTreeSet::from([consumer.clone()]));
+
+    assert!(
+        !widget_usages_in_consumer(&updated, &consumer),
+        "after the importer stops using Widget and updating, the stale usage must be gone"
+    );
+}
+
+#[test]
+fn jsts_usage_index_invalidates_when_reexport_removed_on_update_javascript() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("core/widget.js", "export class Widget {}\n")
+        .file("index.js", "export { Widget } from \"./core/widget\";\n")
+        .file(
+            "consumer.js",
+            "import { Widget } from \"./index\";\n\nexport function build() {\n    return new Widget();\n}\n",
+        )
+        .build();
+    let analyzer = JavascriptAnalyzer::from_project(project.project().clone());
+    let consumer = project.file("consumer.js");
+
+    assert!(
+        widget_usages_in_consumer(&analyzer, &consumer),
+        "expected the re-exported Widget usage in consumer.js initially"
+    );
+
+    let index_file = project.file("index.js");
+    index_file.write("").expect("rewrite index.js");
+    let updated = analyzer.update(&BTreeSet::from([index_file.clone()]));
+
+    assert!(
+        !widget_usages_in_consumer(&updated, &consumer),
+        "after removing the re-export and updating, the stale Widget usage must be gone (JS)"
+    );
+}

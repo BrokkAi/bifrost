@@ -97,3 +97,7 @@ filetime = "0.2"
 pretty_assertions = "1.4.1"
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 tempfile = "3.23.0"
+
+# Only the Unix peak-RSS benchmark (getrusage) needs libc.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
