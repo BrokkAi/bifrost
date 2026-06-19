@@ -813,6 +813,51 @@ public class UseUtil {
 }
 
 #[test]
+fn java_static_method_receiver_resolves_inherited_member_to_definition() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "pkg/BaseUtil.java",
+            "package pkg; public class BaseUtil { public static boolean isEmpty(String value) { return value.isEmpty(); } }\n",
+        )
+        .file(
+            "pkg/StrUtil.java",
+            "package pkg; public class StrUtil extends BaseUtil {}\n",
+        )
+        .file(
+            "app/UseUtil.java",
+            r#"
+package app;
+
+import pkg.StrUtil;
+
+public class UseUtil {
+    public boolean call(String value) {
+        return StrUtil.isEmpty(value);
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        return StrUtil.isEmpty(value);";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/UseUtil.java","line":8,"column":{}}}]}}"#,
+            column_of(line, "isEmpty")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definition"]["fqn"], "pkg.BaseUtil.isEmpty",
+        "{value}"
+    );
+    assert_eq!(result["definition"]["path"], "pkg/BaseUtil.java", "{value}");
+}
+
+#[test]
 fn java_this_field_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(

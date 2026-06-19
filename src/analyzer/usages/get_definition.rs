@@ -2637,7 +2637,7 @@ fn resolve_java_method_invocation(
 
     if let Some(object) = node.child_by_field_name("object") {
         if let Some(owner) = java_receiver_type(analyzer, file, source, root, object) {
-            return java_member_candidates(support, &owner.fq_name(), name);
+            return java_member_candidates(analyzer, support, &owner.fq_name(), name);
         }
         return no_definition(
             "unsupported_java_receiver",
@@ -2652,7 +2652,7 @@ fn resolve_java_method_invocation(
 
     let class_ranges = ClassRangeIndex::build(analyzer, file);
     if let Some(owner_fqn) = class_ranges.enclosing(name_node.start_byte()) {
-        return java_member_candidates(support, owner_fqn, name);
+        return java_member_candidates(analyzer, support, owner_fqn, name);
     }
 
     no_definition(
@@ -2677,7 +2677,7 @@ fn resolve_java_field_access(
         return no_definition("no_field_receiver", "Java field access has no receiver");
     };
     if let Some(owner) = java_receiver_type(analyzer, file, source, root, object) {
-        return java_member_candidates(support, &owner.fq_name(), field);
+        return java_member_candidates(analyzer, support, &owner.fq_name(), field);
     }
     no_definition(
         "unsupported_java_receiver",
@@ -2900,11 +2900,21 @@ fn java_type_from_node(
 }
 
 fn java_member_candidates(
+    analyzer: &dyn IAnalyzer,
     support: &DefinitionLookupIndex,
     owner_fqn: &str,
     member: &str,
 ) -> DefinitionLookupOutcome {
-    let candidates = support.fqn(&format!("{owner_fqn}.{member}"));
+    let mut candidates = support.fqn(&format!("{owner_fqn}.{member}"));
+    if let Some(owner) = analyzer.definitions(owner_fqn).next().cloned()
+        && let Some(provider) = analyzer.type_hierarchy_provider()
+    {
+        for ancestor in provider.get_ancestors(&owner) {
+            candidates.extend(support.fqn(&format!("{}.{}", ancestor.fq_name(), member)));
+        }
+    }
+    sort_units(&mut candidates);
+    candidates.dedup();
     if candidates.is_empty() {
         no_definition(
             "no_indexed_definition",
