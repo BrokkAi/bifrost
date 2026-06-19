@@ -6325,6 +6325,36 @@ fn scala_singleton_typed_receiver_method_prefers_object_definition() {
 }
 
 #[test]
+fn scala_stable_identifier_object_val_resolves_in_case_pattern() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "common/ApiVersion.scala",
+            "package common\ntrait ApiVersion\nobject ApiVersion { val v2_1_0 = new ApiVersion {} }\n",
+        )
+        .file(
+            "app/Controller.scala",
+            "package app\nimport common.ApiVersion\nclass Controller { def docs(version: ApiVersion): Int = version match { case ApiVersion.v2_1_0 => 1; case _ => 0 } }\n",
+        )
+        .build();
+
+    let line = "class Controller { def docs(version: ApiVersion): Int = version match { case ApiVersion.v2_1_0 => 1; case _ => 0 } }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Controller.scala","line":3,"column":{}}}]}}"#,
+            column_of(line, "v2_1_0")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "common.ApiVersion$.v2_1_0",
+        "{value}"
+    );
+}
+
+#[test]
 fn scala_external_import_reports_boundary() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(

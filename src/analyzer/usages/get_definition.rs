@@ -6511,6 +6511,18 @@ fn resolve_scala(
             root,
             field,
         ),
+        Some(ScalaReferenceNode::StableIdentifier(identifier)) => resolve_scala_stable_identifier(
+            ScalaLookupCtx {
+                scala,
+                analyzer,
+                support,
+                file,
+                source,
+            },
+            &resolver,
+            root,
+            identifier,
+        ),
         Some(ScalaReferenceNode::Identifier(identifier)) => {
             let text = scala_node_text(identifier, source).trim();
             if text.is_empty() {
@@ -6559,6 +6571,7 @@ enum ScalaReferenceNode<'tree> {
     Type(Node<'tree>),
     Call(Node<'tree>),
     Field(Node<'tree>),
+    StableIdentifier(Node<'tree>),
     Identifier(Node<'tree>),
 }
 
@@ -6577,12 +6590,17 @@ fn scala_reference_node(node: Node<'_>) -> Option<ScalaReferenceNode<'_>> {
             current = parent;
             continue;
         }
+        if parent.kind() == "stable_identifier" {
+            current = parent;
+            continue;
+        }
         break;
     }
 
     match current.kind() {
         "call_expression" => Some(ScalaReferenceNode::Call(current)),
         "field_expression" => Some(ScalaReferenceNode::Field(current)),
+        "stable_identifier" => Some(ScalaReferenceNode::StableIdentifier(current)),
         "type_identifier" | "stable_type_identifier" | "generic_type" => {
             Some(ScalaReferenceNode::Type(current))
         }
@@ -6758,6 +6776,39 @@ fn resolve_scala_field(
     )
 }
 
+fn resolve_scala_stable_identifier(
+    ctx: ScalaLookupCtx<'_>,
+    resolver: &ScalaNameResolver,
+    root: Node<'_>,
+    identifier: Node<'_>,
+) -> DefinitionLookupOutcome {
+    let text = scala_node_text(identifier, ctx.source).trim();
+    let Some((owner_text, member)) = text.rsplit_once('.') else {
+        return resolve_scala_type(ctx, resolver, root, identifier);
+    };
+    if owner_text.is_empty() || member.is_empty() {
+        return no_definition("no_reference_text", "Scala stable identifier is blank");
+    }
+    let bindings = scala_bindings_before(resolver, ctx.source, root, identifier.start_byte());
+    let owner = first_precise(&bindings, owner_text).or_else(|| {
+        (!bindings.is_shadowed(owner_text))
+            .then(|| resolver.resolve(owner_text))
+            .flatten()
+    });
+    if let Some(owner) = owner {
+        return scala_member_candidates(ctx, &owner, member);
+    }
+    if scala_import_boundary_for_name(ctx.scala, ctx.support, ctx.file, owner_text) {
+        return boundary(format!(
+            "`{owner_text}` appears to cross a Scala import boundary not indexed in this workspace"
+        ));
+    }
+    no_definition(
+        "no_indexed_definition",
+        format!("`{text}` did not resolve to an indexed Scala definition"),
+    )
+}
+
 fn scala_member_candidates(
     ctx: ScalaLookupCtx<'_>,
     owner_fqn: &str,
@@ -6781,6 +6832,15 @@ fn scala_member_candidate_units(
     candidates.dedup();
     if !candidates.is_empty() {
         return candidates;
+    }
+
+    if !owner_fqn.ends_with('$') {
+        let mut object_candidates = ctx.support.fqn(&format!("{owner_fqn}$.{member}"));
+        sort_units(&mut object_candidates);
+        object_candidates.dedup();
+        if !object_candidates.is_empty() {
+            return object_candidates;
+        }
     }
 
     if let Some(owner) = ctx.analyzer.definitions(owner_fqn).next().cloned()
