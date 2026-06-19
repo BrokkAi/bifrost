@@ -3419,11 +3419,13 @@ fn resolve_java(
 
     match node.kind() {
         "type_identifier" | "scoped_type_identifier" | "generic_type" => {
-            resolve_java_type_reference(java, support, file, source, node)
+            resolve_java_type_reference(analyzer, java, support, file, source, node)
         }
         "object_creation_expression" => node
             .child_by_field_name("type")
-            .map(|type_node| resolve_java_type_reference(java, support, file, source, type_node))
+            .map(|type_node| {
+                resolve_java_type_reference(analyzer, java, support, file, source, type_node)
+            })
             .unwrap_or_else(|| {
                 no_definition(
                     "no_indexed_definition",
@@ -3518,6 +3520,7 @@ fn is_java_declaration_or_import_name(node: Node<'_>) -> bool {
 }
 
 fn resolve_java_type_reference(
+    analyzer: &dyn IAnalyzer,
     java: &JavaAnalyzer,
     support: &DefinitionLookupIndex,
     file: &ProjectFile,
@@ -3530,6 +3533,10 @@ fn resolve_java_type_reference(
         return no_definition("no_reference_text", "Java type reference is blank");
     }
     if let Some(unit) = java.resolve_type_name_in_file(file, normalized) {
+        return candidates_outcome(vec![unit]);
+    }
+    if let Some(unit) = java_nested_type_from_context(analyzer, file, normalized, node.start_byte())
+    {
         return candidates_outcome(vec![unit]);
     }
     if java_import_boundary_for_type(java, support, file, normalized) {
@@ -3644,7 +3651,7 @@ fn java_receiver_type(
     object: Node<'_>,
 ) -> Option<CodeUnit> {
     let java = resolve_analyzer::<JavaAnalyzer>(analyzer)?;
-    java_receiver_type_for_java(java, file, source, root, object).or_else(|| {
+    java_receiver_type_for_java(analyzer, java, file, source, root, object).or_else(|| {
         matches!(object.kind(), "this" | "super")
             .then(|| {
                 ClassRangeIndex::build(analyzer, file)
@@ -3656,6 +3663,7 @@ fn java_receiver_type(
 }
 
 fn java_receiver_type_for_java(
+    analyzer: &dyn IAnalyzer,
     java: &JavaAnalyzer,
     file: &ProjectFile,
     source: &str,
@@ -3663,12 +3671,18 @@ fn java_receiver_type_for_java(
     object: Node<'_>,
 ) -> Option<CodeUnit> {
     match object.kind() {
-        "object_creation_expression" => object
-            .child_by_field_name("type")
-            .and_then(|type_node| java_type_from_node(java, file, source, type_node)),
+        "object_creation_expression" => object.child_by_field_name("type").and_then(|type_node| {
+            java_type_from_node_with_context(analyzer, java, file, source, type_node)
+        }),
         "type_identifier" | "scoped_type_identifier" | "generic_type" => {
             let raw = java_node_text(object, source);
-            java.resolve_type_name_in_file(file, normalize_java_type_text(raw))
+            java_type_text_with_context(
+                analyzer,
+                java,
+                file,
+                normalize_java_type_text(raw),
+                object.start_byte(),
+            )
         }
         "identifier" => {
             let name = java_node_text(object, source);
@@ -3681,6 +3695,60 @@ fn java_receiver_type_for_java(
         }
         _ => None,
     }
+}
+
+fn java_type_from_node_with_context(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    type_node: Node<'_>,
+) -> Option<CodeUnit> {
+    java_type_text_with_context(
+        analyzer,
+        java,
+        file,
+        normalize_java_type_text(java_node_text(type_node, source)),
+        type_node.start_byte(),
+    )
+}
+
+fn java_type_text_with_context(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    file: &ProjectFile,
+    normalized: &str,
+    byte: usize,
+) -> Option<CodeUnit> {
+    java.resolve_type_name_in_file(file, normalized)
+        .or_else(|| java_nested_type_from_context(analyzer, file, normalized, byte))
+}
+
+fn java_nested_type_from_context(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    normalized: &str,
+    byte: usize,
+) -> Option<CodeUnit> {
+    if normalized.contains('.') || normalized.is_empty() {
+        return None;
+    }
+    let class_ranges = ClassRangeIndex::build(analyzer, file);
+    let mut owner = class_ranges
+        .enclosing(byte)
+        .and_then(|fqn| analyzer.definitions(fqn).next().cloned());
+    while let Some(current) = owner {
+        let child_fqn = format!("{}.{}", current.fq_name(), normalized);
+        if let Some(child) = analyzer
+            .definitions(&child_fqn)
+            .find(|code_unit| code_unit.is_class())
+            .cloned()
+        {
+            return Some(child);
+        }
+        owner = analyzer.parent_of(&current);
+    }
+    None
 }
 
 fn java_type_of_identifier_before(

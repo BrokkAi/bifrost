@@ -1245,6 +1245,49 @@ public class UseGson {
 }
 
 #[test]
+fn java_nested_type_constructor_resolves_from_enclosing_context() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "org/asynchttpclient/channel/ChannelPoolPartitioning.java",
+            r#"
+package org.asynchttpclient.channel;
+
+public interface ChannelPoolPartitioning {
+    enum PerHostChannelPoolPartitioning implements ChannelPoolPartitioning {
+        INSTANCE;
+
+        public Object getPartitionKey(String scheme, String host, int port) {
+            return new PartitionKey(scheme, host, port);
+        }
+    }
+
+    class PartitionKey {
+        PartitionKey(String scheme, String host, int port) {}
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "            return new PartitionKey(scheme, host, port);";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"org/asynchttpclient/channel/ChannelPoolPartitioning.java","line":9,"column":{}}}]}}"#,
+            column_of(line, "PartitionKey")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"],
+        "org.asynchttpclient.channel.ChannelPoolPartitioning.PartitionKey",
+        "{value}"
+    );
+}
+
+#[test]
 fn java_static_method_receiver_resolves_imported_type_to_definition() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(
