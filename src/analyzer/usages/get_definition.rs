@@ -2513,6 +2513,8 @@ fn resolve_cpp(
                 return no_definition("no_reference_text", "C++ identifier is blank");
             }
             let bindings = cpp_local_bindings_before(
+                ctx.analyzer,
+                ctx.support,
                 ctx.visibility,
                 ctx.file,
                 ctx.source,
@@ -2778,6 +2780,8 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                 return no_definition("no_function_name", "C++ call name is blank");
             }
             let bindings = cpp_bindings_before(
+                ctx.analyzer,
+                ctx.support,
                 ctx.visibility,
                 ctx.file,
                 ctx.source,
@@ -3319,14 +3323,22 @@ fn cpp_expression_type(
     match node.kind() {
         "identifier" => {
             let name = cpp_node_text(node, source);
-            let bindings = cpp_bindings_before(visibility, file, source, root, node.start_byte());
+            let bindings = cpp_bindings_before(
+                analyzer,
+                support,
+                visibility,
+                file,
+                source,
+                root,
+                node.start_byte(),
+            );
             first_precise(&bindings, name)
         }
         "field_expression" => {
             cpp_field_expression_type(analyzer, support, visibility, file, source, root, node)
         }
         "new_expression" | "call_expression" => {
-            cpp_infer_type_from_value(visibility, file, source, node)
+            cpp_infer_type_from_value(analyzer, support, visibility, file, source, node)
         }
         "parenthesized_expression" => node
             .child_by_field_name("argument")
@@ -3425,8 +3437,15 @@ fn cpp_receiver_type_units(
     match receiver.kind() {
         "identifier" => {
             let name = cpp_node_text(receiver, source);
-            let bindings =
-                cpp_bindings_before(visibility, file, source, root, receiver.start_byte());
+            let bindings = cpp_bindings_before(
+                analyzer,
+                support,
+                visibility,
+                file,
+                source,
+                root,
+                receiver.start_byte(),
+            );
             if let Some(cpp_type) = first_precise(&bindings, name) {
                 return vec![cpp_type.unit];
             }
@@ -3494,6 +3513,8 @@ const CPP_SCOPE_NODES: &[&str] = &[
 ];
 
 fn cpp_bindings_before(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
     visibility: &CppVisibilityIndex,
     file: &ProjectFile,
     source: &str,
@@ -3501,11 +3522,22 @@ fn cpp_bindings_before(
     cutoff_start: usize,
 ) -> LocalInferenceEngine<CppType> {
     let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
-    cpp_seed_active_path(visibility, file, source, root, cutoff_start, &mut bindings);
+    cpp_seed_active_path(
+        analyzer,
+        support,
+        visibility,
+        file,
+        source,
+        root,
+        cutoff_start,
+        &mut bindings,
+    );
     bindings
 }
 
 fn cpp_local_bindings_before(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
     visibility: &CppVisibilityIndex,
     file: &ProjectFile,
     source: &str,
@@ -3516,7 +3548,15 @@ fn cpp_local_bindings_before(
     let Some(local_root) = cpp_enclosing_local_scope(node) else {
         return LocalInferenceEngine::new(LocalInferenceConfig::default());
     };
-    cpp_bindings_before(visibility, file, source, local_root, cutoff_start)
+    cpp_bindings_before(
+        analyzer,
+        support,
+        visibility,
+        file,
+        source,
+        local_root,
+        cutoff_start,
+    )
 }
 
 fn cpp_enclosing_local_scope(mut node: Node<'_>) -> Option<Node<'_>> {
@@ -3534,6 +3574,8 @@ fn cpp_enclosing_local_scope(mut node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn cpp_seed_active_path(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
     visibility: &CppVisibilityIndex,
     file: &ProjectFile,
     source: &str,
@@ -3555,13 +3597,29 @@ fn cpp_seed_active_path(
         "parameter_declaration" | "optional_parameter_declaration"
             if node.end_byte() <= cutoff_start =>
         {
-            cpp_seed_typed_binding(visibility, file, source, node, bindings)
+            cpp_seed_typed_binding(analyzer, support, visibility, file, source, node, bindings)
         }
-        "for_range_loop" if node.start_byte() < cutoff_start => {
-            cpp_seed_for_range_binding(visibility, file, source, node, cutoff_start, bindings)
-        }
+        "for_range_loop" if node.start_byte() < cutoff_start => cpp_seed_for_range_binding(
+            analyzer,
+            support,
+            visibility,
+            file,
+            source,
+            node,
+            cutoff_start,
+            bindings,
+        ),
         "declaration" | "field_declaration" if node.start_byte() < cutoff_start => {
-            cpp_seed_variable_declaration(visibility, file, source, node, cutoff_start, bindings)
+            cpp_seed_variable_declaration(
+                analyzer,
+                support,
+                visibility,
+                file,
+                source,
+                node,
+                cutoff_start,
+                bindings,
+            )
         }
         _ => {}
     }
@@ -3571,11 +3629,22 @@ fn cpp_seed_active_path(
         if child.start_byte() >= cutoff_start {
             break;
         }
-        cpp_seed_active_path(visibility, file, source, child, cutoff_start, bindings);
+        cpp_seed_active_path(
+            analyzer,
+            support,
+            visibility,
+            file,
+            source,
+            child,
+            cutoff_start,
+            bindings,
+        );
     }
 }
 
 fn cpp_seed_typed_binding(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
     visibility: &CppVisibilityIndex,
     file: &ProjectFile,
     source: &str,
@@ -3593,6 +3662,8 @@ fn cpp_seed_typed_binding(
         .or_else(|| cpp_first_type_child(node))
         .map(|type_node| normalize_cpp_type_text(cpp_node_text(type_node, source)));
     cpp_seed_binding(
+        analyzer,
+        support,
         visibility,
         file,
         source,
@@ -3605,6 +3676,8 @@ fn cpp_seed_typed_binding(
 }
 
 fn cpp_seed_for_range_binding(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
     visibility: &CppVisibilityIndex,
     file: &ProjectFile,
     source: &str,
@@ -3629,6 +3702,8 @@ fn cpp_seed_for_range_binding(
         .or_else(|| cpp_first_type_child(node))
         .map(|type_node| normalize_cpp_type_text(cpp_node_text(type_node, source)));
     cpp_seed_binding(
+        analyzer,
+        support,
         visibility,
         file,
         source,
@@ -3641,6 +3716,8 @@ fn cpp_seed_for_range_binding(
 }
 
 fn cpp_seed_variable_declaration(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
     visibility: &CppVisibilityIndex,
     file: &ProjectFile,
     source: &str,
@@ -3684,6 +3761,8 @@ fn cpp_seed_variable_declaration(
                 .child_by_field_name("value")
                 .filter(|value| value.end_byte() <= cutoff_start);
             cpp_seed_binding(
+                analyzer,
+                support,
                 visibility,
                 file,
                 source,
@@ -3804,6 +3883,8 @@ fn cpp_builtin_type_text(text: &str) -> bool {
 
 #[allow(clippy::too_many_arguments)]
 fn cpp_seed_binding(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
     visibility: &CppVisibilityIndex,
     file: &ProjectFile,
     source: &str,
@@ -3824,7 +3905,9 @@ fn cpp_seed_binding(
             indirection: 0,
         })
         .or_else(|| {
-            value.and_then(|value| cpp_infer_type_from_value(visibility, file, source, value))
+            value.and_then(|value| {
+                cpp_infer_type_from_value(analyzer, support, visibility, file, source, value)
+            })
         });
     match resolved {
         Some(mut cpp_type) => {
@@ -3838,6 +3921,8 @@ fn cpp_seed_binding(
 }
 
 fn cpp_infer_type_from_value(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
     visibility: &CppVisibilityIndex,
     file: &ProjectFile,
     source: &str,
@@ -3855,15 +3940,93 @@ fn cpp_infer_type_from_value(
                     indirection: 1,
                 })
         }
-        "call_expression" => node
-            .child_by_field_name("function")
-            .and_then(|function| visibility.resolve_type(file, cpp_node_text(function, source)))
-            .map(|unit| CppType {
-                unit,
-                indirection: 0,
-            }),
+        "call_expression" => {
+            cpp_call_return_type(analyzer, support, visibility, file, source, node).or_else(|| {
+                node.child_by_field_name("function")
+                    .and_then(|function| {
+                        visibility.resolve_type(file, cpp_node_text(function, source))
+                    })
+                    .map(|unit| CppType {
+                        unit,
+                        indirection: 0,
+                    })
+            })
+        }
         _ => None,
     }
+}
+
+fn cpp_call_return_type(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+    call: Node<'_>,
+) -> Option<CppType> {
+    let function = call.child_by_field_name("function")?;
+    let arity = cpp_call_arity(call);
+    let candidates = match function.kind() {
+        "qualified_identifier" => {
+            let scope = function.child_by_field_name("scope")?;
+            let name = function.child_by_field_name("name")?;
+            let owner = visibility.resolve_type(file, cpp_node_text(scope, source))?;
+            cpp_filter_candidates_by_arity(
+                cpp_direct_member_candidates(support, &[owner], cpp_node_text(name, source)),
+                Some(arity),
+            )
+        }
+        "identifier" => cpp_filter_candidates_by_arity(
+            cpp_visible_name_candidates(
+                analyzer,
+                visibility,
+                file,
+                support,
+                cpp_node_text(function, source),
+                Some(CppTargetKind::FreeFunction),
+                None,
+            ),
+            Some(arity),
+        ),
+        _ => Vec::new(),
+    };
+    candidates
+        .iter()
+        .find_map(|candidate| cpp_function_return_type(analyzer, visibility, file, candidate))
+}
+
+fn cpp_function_return_type(
+    analyzer: &dyn IAnalyzer,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    function: &CodeUnit,
+) -> Option<CppType> {
+    let signature = function
+        .signature()
+        .filter(|signature| signature.contains(function.identifier()))
+        .map(str::to_string)
+        .or_else(|| analyzer.signatures(function).first().cloned())
+        .or_else(|| analyzer.get_source(function, false))?;
+    let name_at = signature.find(function.identifier())?;
+    let type_text = signature[..name_at]
+        .split_whitespace()
+        .filter(|token| {
+            !matches!(
+                *token,
+                "static" | "virtual" | "inline" | "constexpr" | "explicit" | "friend"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let type_text = type_text.trim();
+    if type_text.is_empty() {
+        return None;
+    }
+    let indirection = cpp_type_text_pointer_depth(type_text);
+    let type_text = normalize_cpp_type_text(type_text);
+    visibility
+        .resolve_type(file, &type_text)
+        .map(|unit| CppType { unit, indirection })
 }
 
 fn cpp_unresolved_include_boundary(

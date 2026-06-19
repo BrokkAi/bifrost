@@ -4125,6 +4125,42 @@ fn cpp_auto_new_receiver_method_resolves_to_definition() {
 }
 
 #[test]
+fn cpp_auto_static_call_receiver_method_resolves_to_return_type() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "app.cpp",
+            r#"
+class Board {
+public:
+    static Board& GetInstance();
+    void SetPowerSaveLevel();
+};
+void run() {
+    auto& board = Board::GetInstance();
+    board.SetPowerSaveLevel();
+}
+"#,
+        )
+        .build();
+
+    let line = "    board.SetPowerSaveLevel();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.cpp","line":9,"column":{}}}]}}"#,
+            column_of(line, "SetPowerSaveLevel")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Board.SetPowerSaveLevel",
+        "{value}"
+    );
+}
+
+#[test]
 fn cpp_unqualified_typo_with_angle_include_returns_no_definition() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file("app.cpp", "#include <vector>\nvoid run() { typo(); }\n")
