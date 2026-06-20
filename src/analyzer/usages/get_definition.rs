@@ -6329,9 +6329,7 @@ fn cpp_receiver_type_units(
             let bindings = cpp_bindings_before(ctx, ctx.root, receiver.start_byte());
             if let Some(cpp_type) = first_precise(&bindings, name) {
                 return vec![cpp_receiver_unit_for_access(
-                    ctx.analyzer,
-                    ctx.visibility,
-                    ctx.file,
+                    ctx,
                     cpp_type,
                     unwrap_template_alias,
                 )];
@@ -6349,9 +6347,7 @@ fn cpp_receiver_type_units(
                 name,
             ) {
                 vec![cpp_receiver_unit_for_access(
-                    ctx.analyzer,
-                    ctx.visibility,
-                    ctx.file,
+                    ctx,
                     cpp_type,
                     unwrap_template_alias,
                 )]
@@ -6420,16 +6416,13 @@ fn cpp_field_receiver_type_units(
 }
 
 fn cpp_receiver_unit_for_access(
-    analyzer: &dyn IAnalyzer,
-    visibility: &CppVisibilityIndex,
-    file: &ProjectFile,
+    ctx: CppLookupCtx<'_, '_>,
     cpp_type: CppType,
     unwrap_template_alias: bool,
 ) -> CodeUnit {
     if unwrap_template_alias
         && let Some(alias) = cpp_type.alias_unit.as_ref()
-        && let Some(target) =
-            cpp_alias_template_first_argument_target_unit(analyzer, visibility, file, alias)
+        && let Some(target) = cpp_alias_arrow_target_unit(ctx, alias)
     {
         return target;
     }
@@ -7342,17 +7335,122 @@ fn cpp_alias_target_unit(
         .find_map(|rhs| cpp_resolve_type_unit_inner(analyzer, visibility, file, &rhs, seen))
 }
 
-fn cpp_alias_template_first_argument_target_unit(
-    analyzer: &dyn IAnalyzer,
-    visibility: &CppVisibilityIndex,
-    file: &ProjectFile,
-    unit: &CodeUnit,
-) -> Option<CodeUnit> {
-    let mut seen = HashSet::default();
-    cpp_alias_target_texts(analyzer, unit).find_map(|rhs| {
-        let target = cpp_template_first_argument(&rhs)?;
-        cpp_resolve_type_unit_inner(analyzer, visibility, file, target, &mut seen)
+/// Resolve the receiver type reached by `receiver->member` when `receiver` has a template
+/// alias type such as `using NodeDefPtr = shared_ptr<NodeDef>`. `->` is governed by the
+/// wrapper's `operator->` return type, so we resolve the wrapper class, read that operator's
+/// declared return type, substitute the alias's template arguments for the wrapper's
+/// parameters, and resolve the pointee. This models the language rule rather than assuming the
+/// wrapper exposes its first template argument.
+fn cpp_alias_arrow_target_unit(ctx: CppLookupCtx<'_, '_>, alias: &CodeUnit) -> Option<CodeUnit> {
+    cpp_alias_target_texts(ctx.analyzer, alias).find_map(|rhs| {
+        let head = rhs.split('<').next()?.trim();
+        let args = cpp_angle_group_items(&rhs);
+        let mut wrapper_seen = HashSet::default();
+        let wrapper = cpp_resolve_type_unit_inner(
+            ctx.analyzer,
+            ctx.visibility,
+            ctx.file,
+            head,
+            &mut wrapper_seen,
+        )?;
+        let params = cpp_template_parameter_names(ctx.analyzer, &wrapper);
+        let arrow = cpp_member_candidates(ctx, vec![wrapper], "operator->", None, None)
+            .into_iter()
+            .next()?;
+        let return_text = cpp_function_return_type_text(ctx.analyzer, &arrow)?;
+        // `receiver->member` follows one level of pointer indirection from operator->'s result.
+        if cpp_type_text_pointer_depth(&return_text) < 1 {
+            return None;
+        }
+        let pointee = return_text
+            .trim()
+            .strip_suffix('*')
+            .unwrap_or(&return_text)
+            .trim();
+        let pointee = cpp_substitute_template_param(&params, &args, pointee);
+        let mut pointee_seen = HashSet::default();
+        cpp_resolve_type_unit_inner(
+            ctx.analyzer,
+            ctx.visibility,
+            ctx.file,
+            &pointee,
+            &mut pointee_seen,
+        )
     })
+}
+
+/// Substitute a wrapper template parameter name appearing in `type_text` with the matching
+/// argument supplied by the alias, by declaration order. Non-parameter text (a concrete return
+/// type) is returned unchanged.
+fn cpp_substitute_template_param(params: &[String], args: &[String], type_text: &str) -> String {
+    let target = type_text.trim();
+    params
+        .iter()
+        .position(|param| param == target)
+        .and_then(|index| args.get(index))
+        .map(|arg| arg.trim().to_string())
+        .unwrap_or_else(|| target.to_string())
+}
+
+/// Names of the template parameters a class/alias unit declares, e.g. `["T"]` for
+/// `template <class T> class shared_ptr`. Empty when the unit is not a template.
+fn cpp_template_parameter_names(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Vec<String> {
+    let signature = unit
+        .signature()
+        .map(str::to_string)
+        .or_else(|| analyzer.signatures(unit).first().cloned())
+        .unwrap_or_default();
+    let Some(group) = cpp_first_angle_group(&signature) else {
+        return Vec::new();
+    };
+    cpp_split_top_level_commas(group)
+        .filter_map(|param| cpp_trailing_identifier(param.split('=').next().unwrap_or(param)))
+        .collect()
+}
+
+/// Top-level comma-separated items inside the first balanced `<...>` group of `text`, e.g. the
+/// template arguments of `shared_ptr<NodeDef>`.
+fn cpp_angle_group_items(text: &str) -> Vec<String> {
+    cpp_first_angle_group(text)
+        .map(|group| {
+            cpp_split_top_level_commas(group)
+                .map(|item| item.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Contents of the first balanced `<...>` group in `text`, ignoring nested angle brackets.
+fn cpp_first_angle_group(text: &str) -> Option<&str> {
+    let open = text.find('<')?;
+    let mut depth = 0i32;
+    for (offset, ch) in text[open..].char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(text[open + 1..open + offset].trim());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The trailing identifier of a template parameter declaration, e.g. `T` from `class T`.
+fn cpp_trailing_identifier(text: &str) -> Option<String> {
+    let name: String = text
+        .trim()
+        .chars()
+        .rev()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    (!name.is_empty()).then_some(name)
 }
 
 fn cpp_alias_target_texts<'a>(
@@ -7377,12 +7475,6 @@ fn cpp_alias_target_text(signature: &str) -> Option<String> {
         return None;
     };
     Some(rhs.trim().trim_end_matches(';').trim().to_string())
-}
-
-fn cpp_template_first_argument(type_text: &str) -> Option<&str> {
-    let open = type_text.find('<')?;
-    let close = type_text.rfind('>')?;
-    (close > open).then_some(type_text[open + 1..close].split(',').next()?.trim())
 }
 
 fn cpp_infer_type_from_value(
@@ -7468,6 +7560,22 @@ fn cpp_function_return_type(
     file: &ProjectFile,
     function: &CodeUnit,
 ) -> Option<CppType> {
+    let type_text = cpp_function_return_type_text(analyzer, function)?;
+    let indirection = cpp_type_text_pointer_depth(&type_text);
+    let type_text = normalize_cpp_type_text(&type_text);
+    visibility
+        .resolve_type(file, &type_text)
+        .map(|unit| CppType {
+            unit,
+            indirection,
+            alias_unit: cpp_resolve_type_alias_unit(analyzer, visibility, file, &type_text),
+        })
+}
+
+/// The declared return type text of a function unit, with leading declaration specifiers
+/// stripped, e.g. `T*` for `T* operator->()`. Unlike [`cpp_function_return_type`] this does not
+/// resolve the type, so it is usable for return types that mention template parameters.
+fn cpp_function_return_type_text(analyzer: &dyn IAnalyzer, function: &CodeUnit) -> Option<String> {
     let signature = function
         .signature()
         .filter(|signature| signature.contains(function.identifier()))
@@ -7475,7 +7583,7 @@ fn cpp_function_return_type(
         .or_else(|| analyzer.signatures(function).first().cloned())
         .or_else(|| analyzer.get_source(function, false))?;
     let name_at = signature.find(function.identifier())?;
-    let type_text = signature[..name_at]
+    let type_text = cpp_strip_leading_template_clause(&signature[..name_at])
         .split_whitespace()
         .filter(|token| {
             !matches!(
@@ -7486,18 +7594,34 @@ fn cpp_function_return_type(
         .collect::<Vec<_>>()
         .join(" ");
     let type_text = type_text.trim();
-    if type_text.is_empty() {
-        return None;
+    (!type_text.is_empty()).then(|| type_text.to_string())
+}
+
+/// Strip a leading `template <...>` parameter clause, leaving the declaration that follows.
+/// Returns the input unchanged when there is no such clause.
+fn cpp_strip_leading_template_clause(text: &str) -> &str {
+    let trimmed = text.trim_start();
+    let Some(rest) = trimmed.strip_prefix("template") else {
+        return text;
+    };
+    let rest = rest.trim_start();
+    if !rest.starts_with('<') {
+        return text;
     }
-    let indirection = cpp_type_text_pointer_depth(type_text);
-    let type_text = normalize_cpp_type_text(type_text);
-    visibility
-        .resolve_type(file, &type_text)
-        .map(|unit| CppType {
-            unit,
-            indirection,
-            alias_unit: cpp_resolve_type_alias_unit(analyzer, visibility, file, &type_text),
-        })
+    let mut depth = 0i32;
+    for (offset, ch) in rest.char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' => {
+                depth -= 1;
+                if depth == 0 {
+                    return rest[offset + ch.len_utf8()..].trim_start();
+                }
+            }
+            _ => {}
+        }
+    }
+    text
 }
 
 fn cpp_unresolved_include_boundary(
