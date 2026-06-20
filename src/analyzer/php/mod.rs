@@ -6,16 +6,22 @@ mod tests;
 
 use crate::analyzer::clone_detection::{CloneCandidateProfile, detect_structural_clone_smells};
 use crate::analyzer::common::language_for_file as file_language;
+use crate::analyzer::js_ts::build_weighted_cache;
 use crate::analyzer::{
     AnalyzerConfig, CodeUnit, IAnalyzer, Language, Project, ProjectFile, Range, TestAssertionSmell,
-    TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer,
+    TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
+    build_direct_descendant_index,
 };
-use crate::hash::HashMap;
+use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
+use moka::sync::Cache;
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::mem::size_of;
+use std::sync::{Arc, OnceLock};
+use tree_sitter::{Node, Parser};
 
 use adapter::PhpAdapter;
+pub(crate) use aliases::{PhpFileContext, resolve_php_type};
 pub use aliases::{
     PhpUseAliases, parse_php_use_aliases, parse_php_use_aliases_by_kind,
     parse_php_use_aliases_from_source, php_namespace_to_fq,
@@ -26,6 +32,10 @@ use tests::detect_php_test_assertion_smells;
 #[derive(Clone)]
 pub struct PhpAnalyzer {
     inner: TreeSitterAnalyzer<PhpAdapter>,
+    memo_budget: u64,
+    direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
+    direct_descendants: Cache<CodeUnit, Arc<HashSet<CodeUnit>>>,
+    direct_descendant_index: Arc<OnceLock<HashMap<String, Arc<HashSet<CodeUnit>>>>>,
 }
 
 impl PhpAnalyzer {
@@ -34,9 +44,9 @@ impl PhpAnalyzer {
     }
 
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
-        Self {
-            inner: TreeSitterAnalyzer::new_with_config(project, PhpAdapter, config),
-        }
+        let memo_budget = config.memo_cache_budget_bytes();
+        let inner = TreeSitterAnalyzer::new_with_config(project, PhpAdapter, config);
+        Self::from_inner(inner, memo_budget)
     }
 
     pub fn new_with_config_and_storage(
@@ -44,10 +54,19 @@ impl PhpAnalyzer {
         config: AnalyzerConfig,
         storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
     ) -> Self {
+        let memo_budget = config.memo_cache_budget_bytes();
+        let inner =
+            TreeSitterAnalyzer::new_with_config_and_storage(project, PhpAdapter, config, storage);
+        Self::from_inner(inner, memo_budget)
+    }
+
+    fn from_inner(inner: TreeSitterAnalyzer<PhpAdapter>, memo_budget: u64) -> Self {
         Self {
-            inner: TreeSitterAnalyzer::new_with_config_and_storage(
-                project, PhpAdapter, config, storage,
-            ),
+            inner,
+            memo_budget,
+            direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec),
+            direct_descendants: build_weighted_cache(memo_budget / 8, weight_code_unit_set_by_unit),
+            direct_descendant_index: Arc::new(OnceLock::new()),
         }
     }
 
@@ -83,14 +102,155 @@ impl PhpAnalyzer {
     }
 
     pub fn use_aliases_by_kind_of(&self, file: &ProjectFile) -> PhpUseAliases {
-        let Ok(source) = file.read_to_string() else {
+        let Ok(source) = self.inner.project().read_source(file) else {
             return PhpUseAliases::default();
         };
-        parse_php_use_aliases_from_source(&source)
+        Self::use_aliases_by_kind_from_source(&source)
+    }
+
+    pub(crate) fn use_aliases_by_kind_from_source(source: &str) -> PhpUseAliases {
+        parse_php_use_aliases_from_source(source)
+    }
+
+    fn declaration_context(&self, code_unit: &CodeUnit) -> PhpFileContext {
+        let namespace = code_unit.package_name().to_string();
+        let aliases = self
+            .declaration_start(code_unit)
+            .and_then(|start| self.aliases_visible_before(code_unit.source(), start))
+            .unwrap_or_else(|| self.use_aliases_by_kind_of(code_unit.source()));
+        PhpFileContext { namespace, aliases }
+    }
+
+    fn declaration_start(&self, code_unit: &CodeUnit) -> Option<usize> {
+        self.ranges(code_unit)
+            .iter()
+            .map(|range| range.start_byte)
+            .min()
+    }
+
+    fn aliases_visible_before(
+        &self,
+        file: &ProjectFile,
+        declaration_start: usize,
+    ) -> Option<PhpUseAliases> {
+        let source = self.inner.project().read_source(file).ok()?;
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
+            .ok()?;
+        let tree = parser.parse(source.as_str(), None)?;
+        Some(php_aliases_visible_before(
+            tree.root_node(),
+            &source,
+            declaration_start,
+        ))
+    }
+
+    pub(crate) fn is_interface(&self, code_unit: &CodeUnit) -> bool {
+        if !code_unit.is_class() {
+            return false;
+        }
+        if let Some(kind) = self.declaration_kind(code_unit) {
+            return kind == "interface_declaration";
+        }
+        self.signatures(code_unit).iter().any(|signature| {
+            signature
+                .split_whitespace()
+                .any(|token| token == "interface")
+        })
+    }
+
+    fn resolve_declared_supertype(&self, code_unit: &CodeUnit, raw: &str) -> Option<CodeUnit> {
+        let ctx = self.declaration_context(code_unit);
+        let fq_name = resolve_php_type(raw, &ctx)?;
+        self.definitions(&fq_name)
+            .find(|candidate| candidate.is_class())
+            .cloned()
+    }
+
+    pub(crate) fn direct_declared_class_parent(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
+        self.get_direct_ancestors(code_unit)
+            .into_iter()
+            .find(|ancestor| !self.is_interface(ancestor))
+    }
+
+    fn declaration_kind(&self, code_unit: &CodeUnit) -> Option<&'static str> {
+        let source = self.inner.project().read_source(code_unit.source()).ok()?;
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
+            .ok()?;
+        let tree = parser.parse(source.as_str(), None)?;
+        let ranges = self.ranges(code_unit);
+        let start = ranges.iter().map(|range| range.start_byte).min()?;
+        let end = ranges.iter().map(|range| range.end_byte).max()?;
+        php_declaration_kind_for_range(tree.root_node(), start, end)
     }
 }
 
 impl TestDetectionProvider for PhpAnalyzer {}
+
+fn php_declaration_kind_for_range(
+    root: Node<'_>,
+    start: usize,
+    end: usize,
+) -> Option<&'static str> {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if matches!(
+            node.kind(),
+            "class_declaration" | "interface_declaration" | "trait_declaration"
+        ) && node.start_byte() >= start
+            && node.end_byte() <= end
+        {
+            return Some(node.kind());
+        }
+
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index)
+                && child.end_byte() >= start
+                && child.start_byte() <= end
+            {
+                stack.push(child);
+            }
+        }
+    }
+    None
+}
+
+impl TypeHierarchyProvider for PhpAnalyzer {
+    fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+        if let Some(cached) = self.direct_ancestors.get(code_unit) {
+            return (*cached).clone();
+        }
+
+        let ancestors: Vec<_> = self
+            .inner
+            .raw_supertypes_of(code_unit)
+            .iter()
+            .filter_map(|raw| self.resolve_declared_supertype(code_unit, raw))
+            .collect();
+        self.direct_ancestors
+            .insert(code_unit.clone(), Arc::new(ancestors.clone()));
+        ancestors
+    }
+
+    fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
+        if let Some(cached) = self.direct_descendants.get(code_unit) {
+            return (*cached).clone();
+        }
+
+        let descendants = self
+            .direct_descendant_index
+            .get_or_init(|| build_direct_descendant_index(self, self))
+            .get(&code_unit.fq_name())
+            .map(|descendants| descendants.as_ref().clone())
+            .unwrap_or_default();
+        self.direct_descendants
+            .insert(code_unit.clone(), Arc::new(descendants.clone()));
+        descendants
+    }
+}
 
 impl IAnalyzer for PhpAnalyzer {
     fn top_level_declarations<'a>(
@@ -159,15 +319,11 @@ impl IAnalyzer for PhpAnalyzer {
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
-        Self {
-            inner: self.inner.update(changed_files),
-        }
+        Self::from_inner(self.inner.update(changed_files), self.memo_budget)
     }
 
     fn update_all(&self) -> Self {
-        Self {
-            inner: self.inner.update_all(),
-        }
+        Self::from_inner(self.inner.update_all(), self.memo_budget)
     }
 
     fn project(&self) -> &dyn Project {
@@ -271,6 +427,10 @@ impl IAnalyzer for PhpAnalyzer {
         self.inner.signatures_of(code_unit).to_vec()
     }
 
+    fn type_hierarchy_provider(&self) -> Option<&dyn TypeHierarchyProvider> {
+        Some(self)
+    }
+
     fn contains_tests(&self, file: &ProjectFile) -> bool {
         self.inner.contains_tests(file)
     }
@@ -335,4 +495,70 @@ impl IAnalyzer for PhpAnalyzer {
     fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {
         Some(self)
     }
+}
+
+fn php_aliases_visible_before(
+    root: Node<'_>,
+    source: &str,
+    declaration_start: usize,
+) -> PhpUseAliases {
+    let namespace_scope = php_namespace_scope(root, declaration_start);
+    let mut aliases = PhpUseAliases::default();
+    let mut stack = vec![namespace_scope.unwrap_or(root)];
+    while let Some(node) = stack.pop() {
+        if node.start_byte() >= declaration_start {
+            continue;
+        }
+        if node.kind() == "namespace_use_declaration" {
+            aliases.extend(parse_php_use_aliases_by_kind(
+                &source[node.start_byte()..node.end_byte()],
+            ));
+            continue;
+        }
+
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    aliases
+}
+
+fn php_namespace_scope(root: Node<'_>, declaration_start: usize) -> Option<Node<'_>> {
+    let mut best = None;
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "namespace_definition"
+            && node.start_byte() <= declaration_start
+            && declaration_start <= node.end_byte()
+        {
+            best = Some(node);
+        }
+
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    best
+}
+
+fn weight_code_unit_vec(_key: &CodeUnit, value: &Arc<Vec<CodeUnit>>) -> u32 {
+    let size = value
+        .iter()
+        .map(|item| item.fq_name().len() + size_of::<CodeUnit>())
+        .sum::<usize>()
+        + size_of::<Vec<CodeUnit>>();
+    size.min(u32::MAX as usize) as u32
+}
+
+fn weight_code_unit_set_by_unit(_key: &CodeUnit, value: &Arc<HashSet<CodeUnit>>) -> u32 {
+    let size = value
+        .iter()
+        .map(|item| item.fq_name().len() + size_of::<CodeUnit>())
+        .sum::<usize>()
+        + size_of::<HashSet<CodeUnit>>();
+    size.min(u32::MAX as usize) as u32
 }

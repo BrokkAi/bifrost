@@ -2035,6 +2035,62 @@ fn bifrost_lsp_server_type_hierarchy_python_uses_same_handler() {
 }
 
 #[test]
+fn bifrost_lsp_server_type_hierarchy_php_uses_same_handler() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("Hierarchy.php");
+    fs::write(
+        &file_path,
+        "<?php\nnamespace App;\ninterface Contract {}\nclass Base {}\nclass Child extends Base implements Contract {\n    public function method(): void {}\n}\n",
+    )
+    .expect("write PHP hierarchy fixture");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let child_item =
+        prepare_type_hierarchy(&mut stdin, &mut reader, &mut stderr, 30, &file_uri, 4, 6);
+
+    let supertypes = type_hierarchy_relation(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        31,
+        "typeHierarchy/supertypes",
+        child_item,
+    );
+    let supertype_names: Vec<_> = supertypes
+        .iter()
+        .filter_map(|item| item["name"].as_str())
+        .collect();
+    assert_eq!(
+        supertype_names,
+        vec!["Base", "Contract"],
+        "supertypes: {supertypes:#?}"
+    );
+
+    let base_item = supertypes
+        .iter()
+        .find(|item| item["name"] == "Base")
+        .cloned()
+        .expect("Base supertype item");
+    let subtypes = type_hierarchy_relation(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        32,
+        "typeHierarchy/subtypes",
+        base_item,
+    );
+    let subtype_names: Vec<_> = subtypes
+        .iter()
+        .filter_map(|item| item["name"].as_str())
+        .collect();
+    assert_eq!(subtype_names, vec!["Child"], "subtypes: {subtypes:#?}");
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
 fn bifrost_lsp_server_type_hierarchy_returns_null_without_provider() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().canonicalize().expect("canon temp");

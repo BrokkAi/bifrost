@@ -24,6 +24,12 @@ impl PhpUseAliases {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct PhpFileContext {
+    pub namespace: String,
+    pub aliases: PhpUseAliases,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PhpUseKind {
     Type,
@@ -131,4 +137,41 @@ pub fn php_namespace_to_fq(name: &str) -> String {
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join(".")
+}
+
+pub fn resolve_php_type(raw: &str, ctx: &PhpFileContext) -> Option<String> {
+    let first = raw.split('|').next().unwrap_or(raw).trim();
+    if first.is_empty() || matches!(first, "self" | "static" | "parent") {
+        return None;
+    }
+    if first.starts_with('\\') {
+        return Some(php_namespace_to_fq(first));
+    }
+    let normalized = php_namespace_to_fq(first);
+    let local = normalized.split('.').next().unwrap_or(normalized.as_str());
+    if let Some(imported) = ctx.aliases.type_aliases.get(local) {
+        if normalized == local {
+            return Some(imported.clone());
+        }
+        let suffix = normalized
+            .strip_prefix(local)
+            .unwrap_or("")
+            .trim_start_matches('.');
+        return Some(if suffix.is_empty() {
+            imported.clone()
+        } else {
+            format!("{imported}.{suffix}")
+        });
+    }
+    Some(join_namespace(&ctx.namespace, &normalized))
+}
+
+fn join_namespace(namespace: &str, name: &str) -> String {
+    if namespace.is_empty() {
+        name.to_string()
+    } else if name.is_empty() {
+        namespace.to_string()
+    } else {
+        format!("{namespace}.{name}")
+    }
 }

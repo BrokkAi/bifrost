@@ -43,7 +43,7 @@ pub(super) fn resolve_php(
 
     let ctx = FileContext {
         namespace: php.namespace_of_file(file),
-        aliases: parse_php_use_aliases_from_source(source),
+        aliases: PhpAnalyzer::use_aliases_by_kind_from_source(source),
     };
     let class_ranges = ClassRangeIndex::build(analyzer, file);
     match php_reference_node(node) {
@@ -334,70 +334,8 @@ fn php_parent_fqn(
     enclosing_fqn: &str,
 ) -> Option<String> {
     let child = support.fqn(enclosing_fqn).into_iter().next()?;
-    let source = child.source();
-    let raw_source = source.read_to_string().ok()?;
-    let tree = parse_php_tree(&raw_source)?;
-    let ctx = FileContext {
-        namespace: php.namespace_of_file(source),
-        aliases: parse_php_use_aliases_from_source(&raw_source),
-    };
-    let ranges = php.ranges(&child);
-    let class_range = ranges.first()?;
-    php_declared_parent_type(
-        tree.root_node(),
-        &raw_source,
-        &ctx,
-        class_range.start_byte,
-        class_range.end_byte,
-    )
-}
-
-fn php_declared_parent_type(
-    mut node: Node<'_>,
-    source: &str,
-    ctx: &FileContext,
-    start: usize,
-    end: usize,
-) -> Option<String> {
-    loop {
-        if node.start_byte() <= start
-            && node.end_byte() >= end
-            && matches!(
-                node.kind(),
-                "class_declaration" | "interface_declaration" | "trait_declaration"
-            )
-        {
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                if matches!(child.kind(), "base_clause" | "class_interface_clause") {
-                    let mut clause_cursor = child.walk();
-                    for clause_child in child.named_children(&mut clause_cursor) {
-                        if matches!(
-                            clause_child.kind(),
-                            "name" | "qualified_name" | "namespace_name"
-                        ) {
-                            return resolve_php_type(
-                                &php_qualified_candidate_text(clause_child, source),
-                                ctx,
-                            );
-                        }
-                    }
-                }
-            }
-        }
-        let mut cursor = node.walk();
-        let mut next = None;
-        for child in node.named_children(&mut cursor) {
-            if child.start_byte() <= start && child.end_byte() >= end {
-                next = Some(child);
-                break;
-            }
-        }
-        match next {
-            Some(child) => node = child,
-            None => return None,
-        }
-    }
+    php.direct_declared_class_parent(&child)
+        .map(|parent| parent.fq_name())
 }
 
 fn php_instance_receiver_fqn(

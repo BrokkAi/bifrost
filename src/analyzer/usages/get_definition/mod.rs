@@ -36,7 +36,7 @@ use crate::analyzer::{
     AliasResolver, CSharpAnalyzer, CodeUnit, CppAnalyzer, DefinitionLookupIndex, GoAnalyzer,
     IAnalyzer, ImportAnalysisProvider, JavaAnalyzer, Language, PhpAnalyzer, ProjectFile,
     PythonAnalyzer, Range, RustAnalyzer, ScalaAnalyzer, cpp_include_paths, cpp_node_text,
-    parse_php_use_aliases_from_source, resolve_analyzer, resolve_include_targets,
+    resolve_analyzer, resolve_include_targets,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;

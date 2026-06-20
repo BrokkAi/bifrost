@@ -286,6 +286,12 @@ impl SearchToolsService {
         Self::new_with_strategy(root, UpdateStrategy::WatchFiles, false)
     }
 
+    /// Construct with no file watcher and no semantic indexer. This is useful
+    /// for immutable, short-lived workspaces such as inline test fixtures.
+    pub fn new_manual_without_semantic_index(root: PathBuf) -> Result<Self, String> {
+        Self::new_with_strategy(root, UpdateStrategy::Manual, false)
+    }
+
     /// Construct with no file watcher and no semantic indexer: the caller drives
     /// updates via the incremental `update_paths` tool. For batch consumers that
     /// re-use one session across many revisions of one worktree.

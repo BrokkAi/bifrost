@@ -170,6 +170,8 @@ impl<'a> PhpVisitor<'a> {
             .set_primary_range(&code_unit, php_declaration_range(node, self.source));
         self.parsed
             .add_signature(code_unit.clone(), php_type_signature(node, self.source));
+        self.parsed
+            .set_raw_supertypes(code_unit.clone(), extract_php_supertypes(node, self.source));
 
         if let Some(body) = php_class_body(node) {
             stack.push(PhpWork::Container(PhpContainer {
@@ -419,6 +421,40 @@ fn php_type_signature(node: Node<'_>, source: &str) -> String {
         return trimmed.to_string();
     };
     format!("{} {{", head.trim_end())
+}
+
+fn extract_php_supertypes(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut raw = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if matches!(child.kind(), "base_clause" | "class_interface_clause") {
+            collect_php_supertype_nodes(child, source, &mut raw);
+        }
+    }
+    raw
+}
+
+fn collect_php_supertype_nodes(node: Node<'_>, source: &str, raw: &mut Vec<String>) {
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if matches!(
+            current.kind(),
+            "name" | "namespace_name" | "qualified_name" | "fully_qualified_name"
+        ) {
+            let text = php_node_text(current, source);
+            let text = text.trim();
+            if !text.is_empty() {
+                raw.push(text.to_string());
+            }
+            continue;
+        }
+
+        for index in (0..current.named_child_count()).rev() {
+            if let Some(child) = current.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
 }
 
 fn php_function_signature(node: Node<'_>, source: &str) -> String {
