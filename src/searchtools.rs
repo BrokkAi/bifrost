@@ -2071,15 +2071,26 @@ pub struct UsageGraphNode {
     pub signature: Option<String>,
 }
 
+/// One concrete reference site behind a [`UsageGraphEdge`]: the workspace-relative
+/// file `path` and the 1-based `line` where the reference occurs. Lines match the
+/// `line` of a [`scan_usages`] hit and a node's `start_line`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct UsageGraphCallSite {
+    pub path: String,
+    pub line: usize,
+}
+
 /// A directed edge from a caller to a callee, aggregated across call sites.
 ///
 /// `from` and `to` are fully qualified names: `from` is the enclosing
 /// definition of each reference, `to` is the symbol being referenced. `weight`
 /// is the number of distinct `(file, line, caller)` reference sites, which
 /// mirrors the reference-count weighting an aider-style repo map uses (two
-/// references to the same callee on one line count once). Per-call-site detail
-/// (snippets, lines) is intentionally left to [`scan_usages`]; this tool returns
-/// the aggregated graph so consumers can rank without re-deriving it.
+/// references to the same callee on one line count once).
+///
+/// `sites` lists those reference locations (`{path, line}`), so a consumer can
+/// build a caller→callee map *with* call sites instead of re-scraping them;
+/// `sites.len() == weight`. Per-site snippets remain the domain of [`scan_usages`].
 #[derive(Debug, Clone, Serialize)]
 pub struct UsageGraphEdge {
     pub from: String,
@@ -2088,6 +2099,9 @@ pub struct UsageGraphEdge {
     /// when the same fqn exists in more than one language.
     pub language: String,
     pub weight: usize,
+    /// Reference locations for this edge, sorted by `(path, line)`. One per distinct
+    /// `(file, line, caller)` site, so `sites.len() == weight`.
+    pub sites: Vec<UsageGraphCallSite>,
 }
 
 /// A symbol whose call sites exceeded the analyzer's enumeration guardrail.
@@ -2220,8 +2234,10 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
 
     // Edges keyed by `(ecosystem, from_fqn, to_fqn)`: both endpoints share the
     // builder's ecosystem, so the ecosystem disambiguates a fqn that exists in
-    // more than one language.
-    let mut edge_weights: BTreeMap<(Ecosystem, String, String), usize> = BTreeMap::new();
+    // more than one language. The value is the edge's call sites; its length is the
+    // edge weight (so weight and sites can never disagree).
+    let mut edge_sites: BTreeMap<(Ecosystem, String, String), Vec<UsageGraphCallSite>> =
+        BTreeMap::new();
     let mut truncated_symbols: Vec<UsageGraphTruncatedSymbol> = Vec::new();
 
     // Go edges in a single inverted pass over the workspace: walk each file once
@@ -2244,13 +2260,19 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
     let record_inverted =
         |ecosystem: Ecosystem,
          edges: Option<crate::analyzer::usages::inverted_edges::UsageEdges>,
-         edge_weights: &mut BTreeMap<(Ecosystem, String, String), usize>,
+         edge_sites: &mut BTreeMap<(Ecosystem, String, String), Vec<UsageGraphCallSite>>,
          truncated_symbols: &mut Vec<UsageGraphTruncatedSymbol>| {
             let Some(edges) = edges else {
                 return;
             };
-            for ((from, to), weight) in edges.edges {
-                *edge_weights.entry((ecosystem, from, to)).or_insert(0) += weight;
+            for ((from, to), sites) in edges.edges {
+                edge_sites
+                    .entry((ecosystem, from, to))
+                    .or_default()
+                    .extend(sites.into_iter().map(|site| UsageGraphCallSite {
+                        path: site.path,
+                        line: site.line,
+                    }));
             }
             for (fqn, total_callsites) in edges.truncated {
                 truncated_symbols.push(UsageGraphTruncatedSymbol {
@@ -2271,7 +2293,7 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
         record_inverted(
             Ecosystem::Go,
             go_edges,
-            &mut edge_weights,
+            &mut edge_sites,
             &mut truncated_symbols,
         );
     }
@@ -2285,7 +2307,7 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
         record_inverted(
             Ecosystem::JavaScriptTypeScript,
             jsts_edges,
-            &mut edge_weights,
+            &mut edge_sites,
             &mut truncated_symbols,
         );
     }
@@ -2299,7 +2321,7 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
         record_inverted(
             Ecosystem::Python,
             python_edges,
-            &mut edge_weights,
+            &mut edge_sites,
             &mut truncated_symbols,
         );
     }
@@ -2313,7 +2335,7 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
         record_inverted(
             Ecosystem::Rust,
             rust_edges,
-            &mut edge_weights,
+            &mut edge_sites,
             &mut truncated_symbols,
         );
     }
@@ -2327,7 +2349,7 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
         record_inverted(
             Ecosystem::Java,
             java_edges,
-            &mut edge_weights,
+            &mut edge_sites,
             &mut truncated_symbols,
         );
     }
@@ -2341,7 +2363,7 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
         record_inverted(
             Ecosystem::CSharp,
             csharp_edges,
-            &mut edge_weights,
+            &mut edge_sites,
             &mut truncated_symbols,
         );
     }
@@ -2355,7 +2377,7 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
         record_inverted(
             Ecosystem::Php,
             php_edges,
-            &mut edge_weights,
+            &mut edge_sites,
             &mut truncated_symbols,
         );
     }
@@ -2369,7 +2391,7 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
         record_inverted(
             Ecosystem::Scala,
             scala_edges,
-            &mut edge_weights,
+            &mut edge_sites,
             &mut truncated_symbols,
         );
     }
@@ -2383,7 +2405,7 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
         record_inverted(
             Ecosystem::Cpp,
             cpp_edges,
-            &mut edge_weights,
+            &mut edge_sites,
             &mut truncated_symbols,
         );
     }
@@ -2401,13 +2423,18 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
             .then_with(|| left.fqn.cmp(&right.fqn))
     });
 
-    let mut edges: Vec<UsageGraphEdge> = edge_weights
+    let mut edges: Vec<UsageGraphEdge> = edge_sites
         .into_iter()
-        .map(|((ecosystem, from, to), weight)| UsageGraphEdge {
-            from,
-            to,
-            language: ecosystem.as_str().to_string(),
-            weight,
+        .map(|((ecosystem, from, to), sites)| {
+            // Each `(ecosystem, from, to)` is produced by exactly one builder, whose
+            // sites already arrive sorted; `weight` is the site count.
+            UsageGraphEdge {
+                from,
+                to,
+                language: ecosystem.as_str().to_string(),
+                weight: sites.len(),
+                sites,
+            }
         })
         .collect();
     edges.sort_by(|left, right| {

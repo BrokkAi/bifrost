@@ -52,6 +52,7 @@ use crate::analyzer::{
 use crate::hash::HashSet;
 use std::collections::BTreeSet;
 
+use crate::analyzer::usages::inverted_edges::CallSite;
 use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::inverted_edges::UsageNodeKey;
 pub(in crate::analyzer::usages) use extractor::compute_import_binder as compute_jsts_import_binder;
@@ -185,7 +186,7 @@ impl<'a> UsageEdgeResolver<'a> for JsTsEdgeResolver {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        let mut edges: std::collections::BTreeMap<(String, String), usize> =
+        let mut edges: std::collections::BTreeMap<(String, String), Vec<CallSite>> =
             std::collections::BTreeMap::new();
         let mut truncated: std::collections::BTreeMap<String, usize> =
             std::collections::BTreeMap::new();
@@ -200,12 +201,18 @@ impl<'a> UsageEdgeResolver<'a> for JsTsEdgeResolver {
                 continue;
             }
             let result = inverted::build_jsts_edges(analyzer, language, nodes, &keep_file);
-            for (key, weight) in result.edges {
-                *edges.entry(key).or_insert(0) += weight;
+            for (key, sites) in result.edges {
+                edges.entry(key).or_default().extend(sites);
             }
             for (callee, total) in result.truncated {
                 *truncated.entry(callee).or_insert(0) += total;
             }
+        }
+
+        // TS and JS are distinct files, so per-language sites for a shared edge key
+        // never overlap; re-sort after concatenating the two runs for determinism.
+        for sites in edges.values_mut() {
+            sites.sort();
         }
 
         UsageEdges { edges, truncated }

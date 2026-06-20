@@ -21,15 +21,28 @@ use serde_json::Value;
 use std::path::PathBuf;
 
 fn go_usage_graph() -> Value {
+    go_usage_graph_with("{}")
+}
+
+fn go_usage_graph_with(args: &str) -> Value {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures")
         .join("usage-graph-go");
     let service = SearchToolsService::new(root).expect("failed to build searchtools service");
     let payload = service
-        .call_tool_json("usage_graph", "{}")
+        .call_tool_json("usage_graph", args)
         .expect("usage_graph call failed");
     serde_json::from_str(&payload).expect("usage_graph returned invalid JSON")
+}
+
+fn edge_sites<'a>(value: &'a Value, from: &str, to: &str) -> Option<&'a Vec<Value>> {
+    value["edges"]
+        .as_array()
+        .expect("edges array")
+        .iter()
+        .find(|edge| edge["from"].as_str() == Some(from) && edge["to"].as_str() == Some(to))
+        .and_then(|edge| edge["sites"].as_array())
 }
 
 fn edge_weight(value: &Value, from: &str, to: &str) -> Option<u64> {
@@ -103,6 +116,34 @@ fn repeated_calls_aggregate_edge_weight() {
         edge_weight(&graph, "example.com/app.total", "example.com/app.helper"),
         Some(2),
         "two distinct call sites should aggregate to weight 2"
+    );
+}
+
+#[test]
+fn edges_carry_call_site_locations() {
+    // `total` calls `helper` on calls.go lines 19 and 20; the edge carries both
+    // locations, and the site count matches the weight.
+    let graph = go_usage_graph();
+    let sites = edge_sites(&graph, "example.com/app.total", "example.com/app.helper")
+        .expect("total -> helper edge with sites");
+    let located: Vec<(&str, u64)> = sites
+        .iter()
+        .map(|site| {
+            (
+                site["path"].as_str().expect("site path"),
+                site["line"].as_u64().expect("site line"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        located,
+        vec![("calls.go", 19), ("calls.go", 20)],
+        "sites should be the two distinct call-site locations, sorted by (path, line)"
+    );
+    assert_eq!(
+        edge_weight(&graph, "example.com/app.total", "example.com/app.helper"),
+        Some(located.len() as u64),
+        "site count must equal the edge weight"
     );
 }
 

@@ -93,6 +93,15 @@ class SearchToolsClientTest(unittest.TestCase):
         # `a.unused` is never called, so nothing points to it.
         self.assertFalse(any(e.to_fqn.endswith("unused") for e in graph.edges))
 
+        # Every edge lists its reference locations, and the site count matches the
+        # weight. `run_twice` calls `helper` on b.py:14 and b.py:15.
+        for candidate in graph.edges:
+            self.assertEqual(len(candidate.sites), candidate.weight, candidate)
+        self.assertEqual(
+            [(site.path, site.line) for site in twice_edge.sites],
+            [("b.py", 14), ("b.py", 15)],
+        )
+
     def test_symbol_sources_use_original_file_line_numbers(self) -> None:
         with SearchToolsClient(root=self.fixture_root) as client:
             sources = client.get_symbol_sources(

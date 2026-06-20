@@ -337,8 +337,11 @@ class SearchToolsClient:
 
         Returns classes and functions as nodes and resolved references as
         weighted edges, ready to feed into a graph library for ranking (e.g.
-        PageRank for a code map). This is the bulk counterpart to a per-symbol
-        ``scan_usages``; expect to cache the result and rebuild on change.
+        PageRank for a code map). Each edge carries its reference locations in
+        ``UsageGraphEdge.sites`` (``{path, line}``, with ``len(edge.sites) ==
+        edge.weight``), so a consumer can map call sites without re-scanning.
+        This is the bulk counterpart to a per-symbol ``scan_usages``; expect to
+        cache the result and rebuild on change.
 
         Args:
             include_tests: Include references that live in detected test files.

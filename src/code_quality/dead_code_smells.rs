@@ -786,12 +786,7 @@ fn analyze_rust_candidates_with_usage_graph(
     };
 
     let declarations_by_fqn = rust_declarations_by_fqn(analyzer);
-    let mut incoming: BTreeMap<String, GraphIncomingUsage> = BTreeMap::new();
-    for ((caller, callee), weight) in edges.edges {
-        let usage = incoming.entry(callee).or_default();
-        usage.total += weight;
-        usage.callers.entry(caller.clone()).or_insert(weight);
-    }
+    let incoming = incoming_usage_by_callee(&edges);
 
     candidates
         .iter()
@@ -827,6 +822,22 @@ fn analyze_rust_candidates_with_usage_graph(
 struct GraphIncomingUsage {
     total: usize,
     callers: BTreeMap<String, usize>,
+}
+
+/// Fold workspace edges into per-callee inbound usage: each callee's total inbound
+/// weight and the per-caller weight. Shared by the Rust and per-language dead-code
+/// passes, which differ only in how they build `edges`. Reads weights via
+/// [`UsageEdges::edge_weights`], so it never touches per-edge call-site locations.
+fn incoming_usage_by_callee(
+    edges: &crate::analyzer::usages::inverted_edges::UsageEdges,
+) -> BTreeMap<String, GraphIncomingUsage> {
+    let mut incoming: BTreeMap<String, GraphIncomingUsage> = BTreeMap::new();
+    for (caller, callee, weight) in edges.edge_weights() {
+        let usage = incoming.entry(callee.to_string()).or_default();
+        usage.total += weight;
+        usage.callers.entry(caller.to_string()).or_insert(weight);
+    }
+    incoming
 }
 
 fn analyze_python_candidates_with_usage_graph(
@@ -1080,12 +1091,7 @@ where
     };
 
     let declarations_by_fqn = declarations_by_fqn_for_language(analyzer, language);
-    let mut incoming: BTreeMap<String, GraphIncomingUsage> = BTreeMap::new();
-    for ((caller, callee), weight) in edges.edges {
-        let usage = incoming.entry(callee).or_default();
-        usage.total += weight;
-        usage.callers.entry(caller.clone()).or_insert(weight);
-    }
+    let incoming = incoming_usage_by_callee(&edges);
 
     candidates
         .iter()

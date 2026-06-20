@@ -80,13 +80,37 @@ pub(crate) fn first_precise<T: Clone + Eq + Hash>(
 /// (`DEFAULT_MAX_USAGES`) so `usage_graph`'s truncation matches `scan_usages`.
 pub(crate) const MAX_CALLSITES: usize = crate::analyzer::usages::DEFAULT_MAX_USAGES;
 
+/// A single resolved call site for an edge: a workspace-relative file path and the
+/// 1-based line where a reference to the callee occurs. Lines are 1-based to match
+/// `scan_usages` hit lines and node `start_line`. The set of call sites for an edge
+/// is exactly its distinct `(file, line, caller)` reference sites, so an edge's
+/// weight equals its call-site count.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct CallSite {
+    pub(crate) path: String,
+    pub(crate) line: usize,
+}
+
 /// Aggregated result of an inverted edge build.
 #[derive(Default)]
 pub(crate) struct UsageEdges {
-    /// `(caller fqn, callee fqn) -> weight` (distinct `(file, line, caller)` sites).
-    pub(crate) edges: BTreeMap<(String, String), usize>,
+    /// `(caller fqn, callee fqn) -> call sites`. The site count is the edge weight
+    /// (distinct `(file, line, caller)` sites); sites are sorted by `(path, line)`.
+    pub(crate) edges: BTreeMap<(String, String), Vec<CallSite>>,
     /// Callees past the call-site cap: `fqn -> total call sites`.
     pub(crate) truncated: BTreeMap<String, usize>,
+}
+
+impl UsageEdges {
+    /// Iterate edges as `(caller, callee, weight)`, where weight is the call-site
+    /// count. The single place edge weight is derived from the site list, so
+    /// weight-only consumers (e.g. dead-code inbound counts) stay decoupled from
+    /// how — or whether — per-site locations are stored.
+    pub(crate) fn edge_weights(&self) -> impl Iterator<Item = (&str, &str, usize)> {
+        self.edges
+            .iter()
+            .map(|((caller, callee), sites)| (caller.as_str(), callee.as_str(), sites.len()))
+    }
 }
 
 /// File-scoped declaration identity for languages where a bare fqn/export name is
@@ -115,7 +139,11 @@ pub(crate) struct ScopedUsageEdges {
 /// One file's contribution, merged by [`merge_and_cap`].
 #[derive(Default)]
 pub(crate) struct PerFileEdges {
-    /// `(caller, callee) -> distinct lines` (edge weight before the cap).
+    /// Workspace-relative path of the file these edges came from. Every reference is
+    /// recorded in the file being scanned, so a single path covers all of this
+    /// file's sites; [`merge_and_cap`] pairs it with each line to build `CallSite`s.
+    path: String,
+    /// `(caller, callee) -> distinct 1-based lines` (edge weight before the cap).
     edge_lines: BTreeMap<(String, String), HashSet<usize>>,
     /// `callee -> distinct call-site offsets` (for the cap).
     callsites: BTreeMap<String, HashSet<usize>>,
@@ -237,7 +265,8 @@ impl<'a> EdgeCollector<'a> {
         if !self.nodes.contains(&caller) {
             return;
         }
-        let line = find_line_index_for_offset(self.line_starts, start);
+        // 1-based, matching `scan_usages` hit lines and node `start_line`.
+        let line = find_line_index_for_offset(self.line_starts, start) + 1;
         self.out
             .edge_lines
             .entry((caller, callee))
@@ -443,7 +472,9 @@ where
     let declarations = build_file_declarations(analyzer, file);
     let mut collector = EdgeCollector::new(line_starts, nodes, declarations);
     walk(&mut collector);
-    collector.finish()
+    let mut out = collector.finish();
+    out.path = crate::path_utils::rel_path_string(file);
+    out
 }
 
 /// Parse `file` on demand, build its edges via [`collect_file_edges`], and drop the
@@ -477,14 +508,18 @@ where
 /// Sum per-file results and drop callees past [`MAX_CALLSITES`] into `truncated`.
 pub(crate) fn merge_and_cap(per_file: Vec<PerFileEdges>) -> UsageEdges {
     // Each file's `edge_lines` already holds the distinct lines for that file, so
-    // summing the per-file counts yields distinct `(file, line)` sites per edge.
-    // Unioning the line sets across files would instead collapse the same line
-    // number appearing in two files (e.g. a partial class) and undercount.
-    let mut edge_weights: BTreeMap<(String, String), usize> = BTreeMap::new();
+    // concatenating per-file `(path, line)` pairs yields distinct `(file, line)`
+    // sites per edge. Unioning line numbers across files would instead collapse the
+    // same line number appearing in two files (e.g. a partial class) and undercount.
+    let mut edge_sites: BTreeMap<(String, String), Vec<CallSite>> = BTreeMap::new();
     let mut callsites: BTreeMap<String, usize> = BTreeMap::new();
     for file in per_file {
         for (key, lines) in file.edge_lines {
-            *edge_weights.entry(key).or_insert(0) += lines.len();
+            let sites = edge_sites.entry(key).or_default();
+            sites.extend(lines.into_iter().map(|line| CallSite {
+                path: file.path.clone(),
+                line,
+            }));
         }
         for (callee, sites) in file.callsites {
             *callsites.entry(callee).or_insert(0) += sites.len();
@@ -495,9 +530,14 @@ pub(crate) fn merge_and_cap(per_file: Vec<PerFileEdges>) -> UsageEdges {
         .into_iter()
         .filter(|(_, total)| *total > MAX_CALLSITES)
         .collect();
-    let edges: BTreeMap<(String, String), usize> = edge_weights
+    let edges: BTreeMap<(String, String), Vec<CallSite>> = edge_sites
         .into_iter()
         .filter(|((_, callee), _)| !truncated.contains_key(callee))
+        .map(|(key, mut sites)| {
+            // Deterministic output independent of file/line hash iteration order.
+            sites.sort();
+            (key, sites)
+        })
         .collect();
 
     UsageEdges { edges, truncated }
@@ -531,8 +571,11 @@ pub(crate) fn merge_scoped_and_cap(per_file: Vec<ScopedPerFileEdges>) -> ScopedU
 mod tests {
     use super::*;
 
-    fn per_file_with_edge(caller: &str, callee: &str, line: usize) -> PerFileEdges {
-        let mut edges = PerFileEdges::default();
+    fn per_file_with_edge(path: &str, caller: &str, callee: &str, line: usize) -> PerFileEdges {
+        let mut edges = PerFileEdges {
+            path: path.to_string(),
+            ..PerFileEdges::default()
+        };
         edges
             .edge_lines
             .entry((caller.to_string(), callee.to_string()))
@@ -546,14 +589,28 @@ mod tests {
         // The same (caller, callee) edge from two files, both on line 5. Distinct
         // (file, line) sites = 2; unioning line sets would collapse to 1.
         let merged = merge_and_cap(vec![
-            per_file_with_edge("caller", "callee", 5),
-            per_file_with_edge("caller", "callee", 5),
+            per_file_with_edge("a.rs", "caller", "callee", 5),
+            per_file_with_edge("b.rs", "caller", "callee", 5),
         ]);
+        let sites = merged
+            .edges
+            .get(&("caller".to_string(), "callee".to_string()))
+            .expect("edge present");
+        // Weight is the site count.
+        assert_eq!(sites.len(), 2);
+        // Sites carry their file path and 1-based line, sorted by (path, line).
         assert_eq!(
-            merged
-                .edges
-                .get(&("caller".to_string(), "callee".to_string())),
-            Some(&2),
+            sites,
+            &vec![
+                CallSite {
+                    path: "a.rs".to_string(),
+                    line: 5,
+                },
+                CallSite {
+                    path: "b.rs".to_string(),
+                    line: 5,
+                },
+            ],
         );
     }
 }

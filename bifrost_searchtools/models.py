@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 def _render_numbered_block(text: str, start_line: int) -> str:
@@ -818,6 +818,22 @@ class UsageGraphNode:
 
 
 @dataclass(frozen=True)
+class UsageGraphCallSite:
+    """One concrete reference site behind a :class:`UsageGraphEdge`.
+
+    ``path`` is workspace-relative and ``line`` is 1-based, matching the
+    ``line`` of a ``scan_usages`` hit and a node's ``start_line``.
+    """
+
+    path: str
+    line: int
+
+    @classmethod
+    def from_dict(cls, data: dict) -> UsageGraphCallSite:
+        return cls(path=data["path"], line=data["line"])
+
+
+@dataclass(frozen=True)
 class UsageGraphEdge:
     """A weighted caller -> callee reference edge.
 
@@ -827,12 +843,16 @@ class UsageGraphEdge:
     reference sites (two references to the same callee on one line count once).
     (The JSON keys are ``from``/``to``, renamed here because ``from`` is a
     Python keyword.)
+
+    ``sites`` lists those reference locations (``{path, line}``), one per
+    distinct ``(file, line, caller)`` site, so ``len(sites) == weight``.
     """
 
     from_fqn: str
     to_fqn: str
     language: str
     weight: int
+    sites: list[UsageGraphCallSite] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict) -> UsageGraphEdge:
@@ -841,6 +861,10 @@ class UsageGraphEdge:
             to_fqn=data["to"],
             language=data["language"],
             weight=data["weight"],
+            sites=[
+                UsageGraphCallSite.from_dict(item)
+                for item in data.get("sites", [])
+            ],
         )
 
 
