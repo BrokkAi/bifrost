@@ -18,6 +18,7 @@ required_scenarios = [
   "workspace_build",
   "search_symbols",
   "get_symbol_locations",
+  "get_symbol_ancestors",
   "get_summaries",
   "most_relevant_files",
   "scan_usages",
@@ -200,6 +201,7 @@ scenarios = [
   "workspace_build",
   "search_symbols",
   "get_symbol_locations",
+  "get_symbol_ancestors",
   "get_summaries",
   "most_relevant_files",
   "scan_usages",
@@ -207,8 +209,13 @@ scenarios = [
 ]
 search_patterns = ["RouteCollector"]
 location_symbols = ["FastRoute.RouteCollector.addRoute"]
+ancestor_symbols = ["FastRoute.Dispatcher.GroupCountBased"]
 summary_targets = ["src/RouteCollector.php"]
-seed_file_paths = ["src/RouteCollector.php"]
+seed_file_paths = [
+  "src/RouteCollector.php",
+  "src/Dispatcher/GroupCountBased.php",
+  "src/Dispatcher/RegexBasedAbstract.php",
+]
 usage_symbols = ["FastRoute.RouteCollector.addRoute"]
 definition_queries = [
   { path = "src/RouteCollector.php", line = 74, column = 16, symbol = "addRoute", expected_status = "resolved", expected_fqn = "FastRoute.RouteCollector.addRoute" },

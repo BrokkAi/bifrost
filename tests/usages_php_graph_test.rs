@@ -664,6 +664,33 @@ function consume(Service $service): void {
 }
 
 #[test]
+fn php_graph_keeps_attributed_interface_typed_receiver_unproven() {
+    let (_project, analyzer) = php_analyzer_with_files(&[
+        (
+            "Service.php",
+            r#"<?php
+namespace App;
+#[SomeAttribute]
+interface Service {
+    public function run(): void;
+}
+"#,
+        ),
+        (
+            "Consumer.php",
+            r#"<?php
+namespace App;
+function consume(Service $service): void {
+    $service->run();
+}
+"#,
+        ),
+    ]);
+
+    assert!(graph_hits(&analyzer, "App.Service.run").is_empty());
+}
+
+#[test]
 fn php_graph_blocks_shadowed_reassigned_unknown_and_sibling_receivers() {
     let (_project, analyzer) = php_analyzer_with_files(&[
         (

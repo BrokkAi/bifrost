@@ -29,14 +29,15 @@
 //! and receivers that need return-type inference (method chains) or whose type we
 //! cannot determine, are a recall gap — not a wrong edge.
 
-use super::resolver::{
-    FileContext, node_text, resolve_php_constant, resolve_php_function, resolve_php_type,
-};
+use super::resolver::node_text;
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, first_precise, parse_and_collect,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::analyzer::{IAnalyzer, PhpAnalyzer, ProjectFile, parse_php_use_aliases_from_source};
+use crate::analyzer::{
+    IAnalyzer, PhpAnalyzer, PhpFileContext, ProjectFile, resolve_php_constant,
+    resolve_php_function, resolve_php_type,
+};
 use crate::hash::HashSet;
 use tree_sitter::Node;
 
@@ -55,10 +56,7 @@ where
     let language = tree_sitter_php::LANGUAGE_PHP.into();
     build_edges(files, keep_file, |file| {
         parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
-            let ctx = FileContext {
-                namespace: php.namespace_of_file(file),
-                aliases: parse_php_use_aliases_from_source(&parsed.source),
-            };
+            let ctx = php.file_context_from_source(file, parsed.source.as_str());
             let mut scan = PhpScan {
                 ctx,
                 source: parsed.source.as_str(),
@@ -72,7 +70,7 @@ where
 }
 
 struct PhpScan<'a, 'b> {
-    ctx: FileContext,
+    ctx: PhpFileContext,
     source: &'a str,
     class_ranges: ClassRangeIndex,
     collector: &'a mut EdgeCollector<'b>,

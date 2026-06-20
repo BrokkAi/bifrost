@@ -166,6 +166,47 @@ pub fn resolve_php_type(raw: &str, ctx: &PhpFileContext) -> Option<String> {
     Some(join_namespace(&ctx.namespace, &normalized))
 }
 
+pub(crate) fn resolve_php_function(raw: &str, ctx: &PhpFileContext) -> Option<String> {
+    if raw.starts_with('\\') {
+        return Some(php_namespace_to_fq(raw));
+    }
+    let normalized = php_namespace_to_fq(raw);
+    if let Some(imported) = ctx.aliases.function_aliases.get(&normalized) {
+        return Some(imported.clone());
+    }
+    Some(join_namespace(&ctx.namespace, &normalized))
+}
+
+pub(crate) fn resolve_php_constant(raw: &str, ctx: &PhpFileContext) -> Option<String> {
+    if raw.starts_with('\\') {
+        return Some(module_constant_fq(&php_namespace_to_fq(raw)));
+    }
+    let normalized = php_namespace_to_fq(raw);
+    if let Some(imported) = ctx.aliases.const_aliases.get(&normalized) {
+        return Some(module_constant_fq(imported));
+    }
+    Some(join_namespace(
+        &ctx.namespace,
+        &format!("_module_.{normalized}"),
+    ))
+}
+
+fn module_constant_fq(fq_name: &str) -> String {
+    if fq_name.contains("._module_.") {
+        return fq_name.to_string();
+    }
+    let public = public_php_fq_name(fq_name);
+    if let Some((namespace, name)) = public.rsplit_once('.') {
+        format!("{namespace}._module_.{name}")
+    } else {
+        format!("_module_.{public}")
+    }
+}
+
+fn public_php_fq_name(fq_name: &str) -> String {
+    fq_name.replace("._module_.", ".")
+}
+
 fn join_namespace(namespace: &str, name: &str) -> String {
     if namespace.is_empty() {
         name.to_string()

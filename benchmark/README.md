@@ -15,6 +15,7 @@ Current probe-input fields are:
 
 - `search_patterns` for `search_symbols`
 - `location_symbols` for `get_symbol_locations`
+- `ancestor_symbols` for `get_symbol_ancestors`
 - `summary_targets` for `get_summaries`
 - `seed_file_paths` for `most_relevant_files`
 - `usage_symbols` for `scan_usages`

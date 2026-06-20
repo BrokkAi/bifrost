@@ -2,13 +2,15 @@ use crate::analyzer::usages::local_inference::{LocalInferenceEngine, SymbolResol
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::usages::php_graph::hits::{push_hit, push_hit_range};
 use crate::analyzer::usages::php_graph::resolver::{
-    FileContext, PhpHierarchyIndex, TargetKind, TargetSpec, is_const_declaration_name,
-    is_function_call_name, is_function_declaration_name, is_member_or_scoped_access_name,
-    is_object_creation_type_name, qualified_candidate_text, receiver_is_enclosing_subtype,
-    receiver_type_matches, resolve_php_constant, resolve_php_function, resolve_php_type,
+    PhpHierarchyIndex, TargetKind, TargetSpec, is_const_declaration_name, is_function_call_name,
+    is_function_declaration_name, is_member_or_scoped_access_name, is_object_creation_type_name,
+    qualified_candidate_text, receiver_is_enclosing_subtype, receiver_type_matches,
     static_receiver_matches,
 };
-use crate::analyzer::{IAnalyzer, PhpAnalyzer, ProjectFile, parse_php_use_aliases_from_source};
+use crate::analyzer::{
+    IAnalyzer, PhpAnalyzer, PhpFileContext, ProjectFile, resolve_php_constant,
+    resolve_php_function, resolve_php_type,
+};
 use crate::text_utils::compute_line_starts;
 use regex::Regex;
 use std::collections::BTreeSet;
@@ -41,10 +43,7 @@ pub(super) fn scan_file(
         return;
     };
 
-    let ctx = FileContext {
-        namespace: php.namespace_of_file(file),
-        aliases: parse_php_use_aliases_from_source(&source),
-    };
+    let ctx = php.file_context_from_source(file, &source);
 
     let line_starts = compute_line_starts(&source);
     if matches!(spec.kind, TargetKind::Method | TargetKind::Field) {
@@ -104,7 +103,7 @@ fn scan_node(
     file: &ProjectFile,
     source: &str,
     line_starts: &[usize],
-    ctx: &FileContext,
+    ctx: &PhpFileContext,
     spec: &TargetSpec,
     hits: &mut BTreeSet<UsageHit>,
 ) {
@@ -134,7 +133,7 @@ fn handle_candidate(
     file: &ProjectFile,
     source: &str,
     line_starts: &[usize],
-    ctx: &FileContext,
+    ctx: &PhpFileContext,
     spec: &TargetSpec,
     hits: &mut BTreeSet<UsageHit>,
 ) {
@@ -166,7 +165,7 @@ fn handle_candidate(
 fn candidate_resolves_to_type(
     node: Node<'_>,
     source: &str,
-    ctx: &FileContext,
+    ctx: &PhpFileContext,
     target_fq_name: &str,
 ) -> bool {
     if !is_reference_context(node) {
@@ -179,7 +178,7 @@ fn candidate_resolves_to_type(
 fn is_constructor_reference(
     node: Node<'_>,
     source: &str,
-    ctx: &FileContext,
+    ctx: &PhpFileContext,
     spec: &TargetSpec,
 ) -> bool {
     let Some(owner) = spec.owner_fq_name.as_deref() else {
@@ -198,7 +197,7 @@ fn is_constructor_reference(
 fn is_constant_reference(
     node: Node<'_>,
     source: &str,
-    ctx: &FileContext,
+    ctx: &PhpFileContext,
     spec: &TargetSpec,
 ) -> bool {
     if !is_reference_context(node) {
@@ -217,7 +216,7 @@ fn is_constant_reference(
 fn is_function_reference(
     node: Node<'_>,
     source: &str,
-    ctx: &FileContext,
+    ctx: &PhpFileContext,
     spec: &TargetSpec,
 ) -> bool {
     if !is_reference_context(node) {
@@ -260,7 +259,7 @@ fn scan_member_patterns(
     file: &ProjectFile,
     source: &str,
     line_starts: &[usize],
-    ctx: &FileContext,
+    ctx: &PhpFileContext,
     hierarchy: &PhpHierarchyIndex,
     spec: &TargetSpec,
     hits: &mut BTreeSet<UsageHit>,
@@ -332,7 +331,7 @@ fn scan_instance_members_in_order(
     file: &ProjectFile,
     full_source: &str,
     line_starts: &[usize],
-    ctx: &FileContext,
+    ctx: &PhpFileContext,
     hierarchy: &PhpHierarchyIndex,
     owner: &str,
     spec: &TargetSpec,
@@ -474,7 +473,7 @@ impl MemberScanEvent {
 
 fn seed_parameter_receivers(
     header: &str,
-    ctx: &FileContext,
+    ctx: &PhpFileContext,
     engine: &mut LocalInferenceEngine<String>,
 ) {
     for captures in PARAMETER_VARIABLE_RE.captures_iter(header) {
@@ -493,7 +492,7 @@ fn seed_parameter_receivers(
 fn apply_receiver_assignment(
     lhs: &str,
     rhs: &str,
-    ctx: &FileContext,
+    ctx: &PhpFileContext,
     engine: &mut LocalInferenceEngine<String>,
 ) {
     if let Some(type_name) = rhs.strip_prefix("new ").and_then(read_leading_type_name)

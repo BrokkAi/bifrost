@@ -273,6 +273,9 @@ fn tool_arguments(target: &BenchmarkRepoTarget, scenario: BenchmarkScenario) -> 
         BenchmarkScenario::GetSymbolLocations => json!({
             "symbols": target.location_symbols
         }),
+        BenchmarkScenario::GetSymbolAncestors => json!({
+            "symbols": target.ancestor_symbols
+        }),
         BenchmarkScenario::GetSummaries => json!({
             "targets": target.summary_targets
         }),
@@ -333,6 +336,32 @@ fn assert_scenario_result(
             if locations.is_empty() {
                 return Err(format!(
                     "get_symbol_locations returned no locations for `{}`",
+                    target.name
+                ));
+            }
+            Ok(())
+        }
+        BenchmarkScenario::GetSymbolAncestors => {
+            let ancestors = structured["ancestors"].as_array().ok_or_else(|| {
+                format!(
+                    "get_symbol_ancestors result missing ancestors array for `{}`",
+                    target.name
+                )
+            })?;
+            if ancestors.is_empty() {
+                return Err(format!(
+                    "get_symbol_ancestors returned no results for `{}`",
+                    target.name
+                ));
+            }
+            let has_ancestor = ancestors.iter().any(|entry| {
+                entry["ancestors"]
+                    .as_array()
+                    .is_some_and(|items| !items.is_empty())
+            });
+            if !has_ancestor {
+                return Err(format!(
+                    "get_symbol_ancestors returned no ancestor entries for `{}`",
                     target.name
                 ));
             }

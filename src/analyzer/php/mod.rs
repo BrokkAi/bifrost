@@ -6,7 +6,9 @@ mod tests;
 
 use crate::analyzer::clone_detection::{CloneCandidateProfile, detect_structural_clone_smells};
 use crate::analyzer::common::language_for_file as file_language;
-use crate::analyzer::js_ts::build_weighted_cache;
+use crate::analyzer::js_ts::{
+    build_weighted_cache, weight_code_unit_set_by_unit, weight_code_unit_vec_by_unit,
+};
 use crate::analyzer::{
     AnalyzerConfig, CodeUnit, IAnalyzer, Language, Project, ProjectFile, Range, TestAssertionSmell,
     TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
@@ -16,12 +18,13 @@ use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
 use moka::sync::Cache;
 use std::collections::BTreeSet;
-use std::mem::size_of;
 use std::sync::{Arc, OnceLock};
 use tree_sitter::{Node, Parser};
 
 use adapter::PhpAdapter;
-pub(crate) use aliases::{PhpFileContext, resolve_php_type};
+pub(crate) use aliases::{
+    PhpFileContext, resolve_php_constant, resolve_php_function, resolve_php_type,
+};
 pub use aliases::{
     PhpUseAliases, parse_php_use_aliases, parse_php_use_aliases_by_kind,
     parse_php_use_aliases_from_source, php_namespace_to_fq,
@@ -64,7 +67,7 @@ impl PhpAnalyzer {
         Self {
             inner,
             memo_budget,
-            direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec),
+            direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec_by_unit),
             direct_descendants: build_weighted_cache(memo_budget / 8, weight_code_unit_set_by_unit),
             direct_descendant_index: Arc::new(OnceLock::new()),
         }
@@ -110,6 +113,17 @@ impl PhpAnalyzer {
 
     pub(crate) fn use_aliases_by_kind_from_source(source: &str) -> PhpUseAliases {
         parse_php_use_aliases_from_source(source)
+    }
+
+    pub(crate) fn file_context_from_source(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+    ) -> PhpFileContext {
+        PhpFileContext {
+            namespace: self.namespace_of_file(file),
+            aliases: Self::use_aliases_by_kind_from_source(source),
+        }
     }
 
     fn declaration_context(&self, code_unit: &CodeUnit) -> PhpFileContext {
@@ -543,22 +557,4 @@ fn php_namespace_scope(root: Node<'_>, declaration_start: usize) -> Option<Node<
         }
     }
     best
-}
-
-fn weight_code_unit_vec(_key: &CodeUnit, value: &Arc<Vec<CodeUnit>>) -> u32 {
-    let size = value
-        .iter()
-        .map(|item| item.fq_name().len() + size_of::<CodeUnit>())
-        .sum::<usize>()
-        + size_of::<Vec<CodeUnit>>();
-    size.min(u32::MAX as usize) as u32
-}
-
-fn weight_code_unit_set_by_unit(_key: &CodeUnit, value: &Arc<HashSet<CodeUnit>>) -> u32 {
-    let size = value
-        .iter()
-        .map(|item| item.fq_name().len() + size_of::<CodeUnit>())
-        .sum::<usize>()
-        + size_of::<HashSet<CodeUnit>>();
-    size.min(u32::MAX as usize) as u32
 }

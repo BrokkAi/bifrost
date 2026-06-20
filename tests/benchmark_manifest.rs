@@ -65,7 +65,7 @@ url = "https://github.com/google/gson"
 commit = "deadbeef"
 languages = ["java"]
 extensions = ["java"]
-scenarios = ["workspace_build", "search_symbols", "get_symbol_locations", "get_summaries", "most_relevant_files"]
+scenarios = ["workspace_build", "search_symbols", "get_symbol_locations", "get_symbol_ancestors", "get_summaries", "most_relevant_files"]
 "#;
 
     let err = BenchmarkManifest::from_toml_str(manifest).expect_err("manifest should fail");
@@ -85,6 +85,13 @@ scenarios = ["workspace_build", "search_symbols", "get_symbol_locations", "get_s
             .messages()
             .iter()
             .any(|message| message.contains("get_symbol_locations")),
+        "{validation}"
+    );
+    assert!(
+        validation
+            .messages()
+            .iter()
+            .any(|message| message.contains("get_symbol_ancestors")),
         "{validation}"
     );
     assert!(

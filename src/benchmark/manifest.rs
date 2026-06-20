@@ -162,6 +162,8 @@ pub enum BenchmarkScenario {
     SearchSymbols,
     #[serde(rename = "get_symbol_locations")]
     GetSymbolLocations,
+    #[serde(rename = "get_symbol_ancestors")]
+    GetSymbolAncestors,
     #[serde(rename = "get_summaries")]
     GetSummaries,
     #[serde(rename = "most_relevant_files")]
@@ -173,10 +175,11 @@ pub enum BenchmarkScenario {
 }
 
 impl BenchmarkScenario {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::WorkspaceBuild,
         Self::SearchSymbols,
         Self::GetSymbolLocations,
+        Self::GetSymbolAncestors,
         Self::GetSummaries,
         Self::MostRelevantFiles,
         Self::ScanUsages,
@@ -188,6 +191,7 @@ impl BenchmarkScenario {
             Self::WorkspaceBuild => "workspace_build",
             Self::SearchSymbols => "search_symbols",
             Self::GetSymbolLocations => "get_symbol_locations",
+            Self::GetSymbolAncestors => "get_symbol_ancestors",
             Self::GetSummaries => "get_summaries",
             Self::MostRelevantFiles => "most_relevant_files",
             Self::ScanUsages => "scan_usages",
@@ -329,6 +333,8 @@ pub struct BenchmarkRepoTarget {
     #[serde(default)]
     pub location_symbols: Vec<String>,
     #[serde(default)]
+    pub ancestor_symbols: Vec<String>,
+    #[serde(default)]
     pub summary_targets: Vec<String>,
     #[serde(default)]
     pub seed_file_paths: Vec<String>,
@@ -425,6 +431,14 @@ impl BenchmarkRepoTarget {
         {
             errors.push(format!(
                 "repo `{name}` enables `get_symbol_locations` but does not define location_symbols"
+            ));
+        }
+
+        if scenarios.contains(&BenchmarkScenario::GetSymbolAncestors)
+            && !has_non_blank_values(&self.ancestor_symbols)
+        {
+            errors.push(format!(
+                "repo `{name}` enables `get_symbol_ancestors` but does not define ancestor_symbols"
             ));
         }
 
