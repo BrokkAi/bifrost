@@ -489,7 +489,7 @@ fn expand_reference_expression(source: &str, start: usize, end: usize) -> (usize
     let mut left = start;
     let mut right = end;
     loop {
-        if left >= 2 && &source[left - 2..left] == "::" {
+        if left >= 2 && &bytes[left - 2..left] == b"::" {
             left -= 2;
             while left > 0 && is_ident_byte(bytes[left - 1]) {
                 left -= 1;
@@ -506,7 +506,7 @@ fn expand_reference_expression(source: &str, start: usize, end: usize) -> (usize
         break;
     }
     loop {
-        if right + 2 <= source.len() && &source[right..right + 2] == "::" {
+        if right + 2 <= bytes.len() && &bytes[right..right + 2] == b"::" {
             right += 2;
             while right < bytes.len() && is_ident_byte(bytes[right]) {
                 right += 1;
@@ -669,4 +669,30 @@ fn sort_units(units: &mut [CodeUnit]) {
             .then_with(|| left.fq_name().cmp(&right.fq_name()))
             .then_with(|| left.signature().cmp(&right.signature()))
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::expand_reference_expression;
+
+    #[test]
+    fn expand_reference_expression_keeps_ascii_separator_checks_byte_pure() {
+        let source = "回.helper";
+        let start = source.find("helper").expect("target");
+        let end = start + "helper".len();
+
+        assert_eq!(
+            expand_reference_expression(source, start, end),
+            (start - 1, end)
+        );
+
+        let source = "helper:回";
+        let start = source.find("helper").expect("target");
+        let end = start + "helper".len();
+
+        assert_eq!(
+            expand_reference_expression(source, start, end),
+            (start, end)
+        );
+    }
 }
