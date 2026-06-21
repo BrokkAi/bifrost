@@ -449,8 +449,6 @@ class SummaryBlock:
 
     def render_text(self) -> str:
         blocks: list[str] = [self.path]
-        if self.preamble:
-            blocks.append(self.preamble)
         rendered_elements = [
             element.render_text() for element in self.elements if element.text
         ]

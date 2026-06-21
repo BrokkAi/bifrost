@@ -1,5 +1,6 @@
 use brokk_bifrost::{
     GoAnalyzer, JavaAnalyzer, JavascriptAnalyzer, Language, ScalaAnalyzer, TestProject,
+    searchtools_render::{RenderOptions, RenderText},
     TypescriptAnalyzer,
     searchtools::{SummariesParams, SummaryElement, get_summaries},
 };
@@ -62,6 +63,7 @@ fn file_summaries_preserve_fixture_line_numbers() {
     assert_eq!("A.java", summary.path);
     assert_eq!("A.java", summary.label);
     assert_eq!("import java.util.function.Function;", summary.preamble);
+    assert!(!result.render_text(RenderOptions::default()).contains("import java.util.function.Function;"));
 
     let rendered: Vec<_> = summary
         .elements
@@ -234,6 +236,7 @@ fn go_file_summaries_use_full_declaration_ranges() {
     assert_eq!("declarations.go", summary.path);
     assert_eq!("declarations.go", summary.label);
     assert_eq!("package declpkg", summary.preamble);
+    assert!(!result.render_text(RenderOptions::default()).contains("package declpkg"));
 
     let rendered: Vec<_> = summary
         .elements

@@ -281,9 +281,6 @@ fn append_symbol_hits(
 
 fn render_summary_block(block: &SummaryBlock, options: RenderOptions) -> String {
     let mut chunks = vec![block.path.clone()];
-    if !block.preamble.is_empty() {
-        chunks.push(block.preamble.clone());
-    }
     if let Some(fallback_reason) = &block.fallback_reason {
         chunks.push(format!("Note: {fallback_reason}"));
     }
