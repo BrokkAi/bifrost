@@ -249,11 +249,50 @@ fn seed_names_from_values(
     }
 
     for (name, value) in names.iter().zip(values.iter()) {
-        if expression_matches_owner_type(*value, ctx) {
+        if expression_matches_owner_type(*value, ctx)
+            || call_returns_owner_type(*value, ctx, locals)
+        {
             locals.seed_symbol(name.clone(), OWNER_TOKEN.to_string());
         } else if is_identifier_node(*value) {
             locals.alias_symbol(name.clone(), node_text(*value, ctx.source));
         }
+    }
+}
+
+/// Whether `value` is a call to a constructor whose result is the owner type, so
+/// the local it initializes carries the owner receiver. Covers a bare in-package
+/// call (`NewOwner()`) and a qualified call through an import (`pkg.NewOwner()`). A
+/// callee (or qualifier) shadowed by a local binding is not the package constructor.
+fn call_returns_owner_type(
+    value: Node<'_>,
+    ctx: &ScanCtx<'_>,
+    locals: &LocalInferenceEngine<String>,
+) -> bool {
+    if value.kind() != "call_expression" {
+        return false;
+    }
+    let Some(function) = value
+        .child_by_field_name("function")
+        .or_else(|| first_named_child(value))
+    else {
+        return false;
+    };
+    match function.kind() {
+        "identifier" => {
+            let name = node_text(function, ctx.source);
+            !locals.is_shadowed(name)
+                && ctx.bindings.owner_referable_directly()
+                && ctx.spec.is_owner_constructor(name)
+        }
+        "selector_expression" => {
+            let Some((qualifier, _, field)) = selector_parts(function, ctx.source) else {
+                return false;
+            };
+            !locals.is_shadowed(&qualifier)
+                && ctx.bindings.owner_namespace_contains(&qualifier)
+                && ctx.spec.is_owner_constructor(node_text(field, ctx.source))
+        }
+        _ => false,
     }
 }
 
