@@ -19,9 +19,6 @@ use tree_sitter::{Node, Parser, Tree};
 pub(super) struct ParsedFile {
     pub(super) source: Arc<String>,
     pub(super) tree: Tree,
-    /// Byte offsets of each line start, computed once at parse time for the
-    /// inverted edge scan.
-    pub(super) line_starts: Vec<usize>,
 }
 
 pub(crate) struct PythonProjectGraph {
@@ -30,14 +27,6 @@ pub(crate) struct PythonProjectGraph {
 }
 
 impl PythonProjectGraph {
-    pub(super) fn parsed_files(&self) -> impl Iterator<Item = &ProjectFile> {
-        self.parsed.keys()
-    }
-
-    pub(super) fn parsed_file(&self, file: &ProjectFile) -> Option<&ParsedFile> {
-        self.parsed.get(file)
-    }
-
     pub(super) fn scan_files(
         &self,
         candidate_files: &HashSet<ProjectFile>,
@@ -100,13 +89,11 @@ impl<'a> PythonGraphAdapter<'a> {
             let binder = self.analyzer.import_binder_of(&file);
             self.enqueue_frontier_files(&file, &exports, &binder, &mut scoped_files, &mut frontier);
 
-            let line_starts = crate::text_utils::compute_line_starts(&source);
             parsed.insert(
                 file.clone(),
                 ParsedFile {
                     source: Arc::new(source),
                     tree,
-                    line_starts,
                 },
             );
         }
