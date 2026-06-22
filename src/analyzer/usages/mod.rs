@@ -5,14 +5,12 @@
 //! omitted because Bifrost is tree-sitter-only and the LLM layer belongs to the embedding host.
 //!
 //! Public entry point is [`UsageFinder`], which wires a [`CandidateFileProvider`] together
-//! with a [`UsageAnalyzer`] strategy. The default fallback chain is:
+//! with a language-specific graph strategy. The default query chain is:
 //!
 //! - [`ImportGraphCandidateProvider`] for the candidate file set, with
 //!   [`TextSearchCandidateProvider`] as a substring-scan fallback.
 //! - Language-specific graph strategies for JavaScript / TypeScript, Python, PHP, Rust,
 //!   Java, C#, C++, Go, and Scala targets.
-//! - [`RegexUsageAnalyzer`] for unsupported languages and as a best-effort fallback when
-//!   an internal graph-strategy outcome is explicitly marked fallback-safe.
 
 mod candidates;
 mod common;
@@ -31,7 +29,6 @@ mod outcome;
 mod parsed_tree;
 pub(crate) mod php_graph;
 pub(crate) mod python_graph;
-mod regex_analyzer;
 pub(crate) mod rust_graph;
 pub(crate) mod scala_graph;
 mod traits;
@@ -57,7 +54,6 @@ pub use model::{
 };
 pub use php_graph::PhpUsageGraphStrategy;
 pub use python_graph::PythonExportUsageGraphStrategy;
-pub use regex_analyzer::RegexUsageAnalyzer;
 pub use rust_graph::RustExportUsageGraphStrategy;
 pub use scala_graph::ScalaUsageGraphStrategy;
 pub use traits::{CandidateFileProvider, UsageAnalyzer};

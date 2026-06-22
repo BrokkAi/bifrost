@@ -1087,16 +1087,16 @@ fn cpp_graph_v2_guardrails_cover_limits_fallback_zero_hits_and_extensions() {
         "graph success with zero hits should remain zero hits"
     );
 
-    let fallback_hits = UsageFinder::new()
+    let fallback_query = UsageFinder::new()
         .with_file_filter(|file| file.rel_path().to_string_lossy() == "fallback.cpp")
-        .find_usages_default(&analyzer, std::slice::from_ref(&run))
-        .into_either()
-        .expect("usage finder fallback success");
+        .query(&analyzer, std::slice::from_ref(&run), 1000, 1000);
     assert!(
-        fallback_hits
-            .iter()
-            .any(|hit| hit.file == project.file("fallback.cpp")),
-        "UsageFinder should use regex fallback for graph failure cases"
+        fallback_query.graph_failure.is_some(),
+        "UsageFinder should surface graph failure diagnostics"
+    );
+    assert!(
+        matches!(fallback_query.result, FuzzyResult::Failure { .. }),
+        "UsageFinder should not use regex fallback for graph failure cases"
     );
 }
 
@@ -1572,7 +1572,7 @@ void ambiguous(Target& target, Other& other) {
     );
     assert!(
         ambiguous_result.into_either().is_err(),
-        "ambiguous local same-name declarations should force regex fallback"
+        "ambiguous local same-name declarations should force graph failure"
     );
 }
 

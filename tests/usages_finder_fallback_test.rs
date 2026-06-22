@@ -64,7 +64,7 @@ export function build(): BaseClass {
 }
 
 #[test]
-fn usage_finder_uses_regex_for_fallback_safe_graph_failure() {
+fn usage_finder_reports_fallback_safe_graph_failure_without_regex() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(
             "Domain/Target.cs",
@@ -85,21 +85,16 @@ namespace Domain {
 
     let query = UsageFinder::new().query(&analyzer, std::slice::from_ref(&target), 1000, 1000);
     let diagnostic = query
-        .graph_fallback
+        .graph_failure
         .as_ref()
-        .expect("graph fallback diagnostic");
+        .expect("graph failure diagnostic");
     assert_eq!("CSharpUsageGraphStrategy", diagnostic.strategy);
     assert_eq!("unsafe_inference", diagnostic.reason_kind);
 
-    let hits = query
-        .result
-        .into_either()
-        .expect("fallback-safe graph failure should use regex");
-
-    assert_eq!(1, hits.len());
     assert!(
-        hits.iter()
-            .all(|hit| hit.file == project.file("Domain/Target.cs"))
+        matches!(query.result, FuzzyResult::Failure { .. }),
+        "fallback-safe graph failure should surface as a failure, got {:?}",
+        query.result
     );
 }
 
