@@ -1160,7 +1160,7 @@ fn analyze_jsts_candidates_with_scoped_usage_graph(
         .collect();
     nodes.extend(candidates.iter().map(scoped_key_for));
 
-    let Some(result) = crate::analyzer::usages::js_ts_graph::build_jsts_scoped_usage_edges(
+    let Some(mut result) = crate::analyzer::usages::js_ts_graph::build_jsts_scoped_usage_edges(
         analyzer,
         &nodes,
         |_| true,
@@ -1179,7 +1179,11 @@ fn analyze_jsts_candidates_with_scoped_usage_graph(
         &[Language::JavaScript, Language::TypeScript],
     );
     let mut incoming: BTreeMap<UsageNodeKey, ScopedGraphIncomingUsage> = BTreeMap::new();
-    for ((caller, callee), weight) in result.edges.edges {
+    // Inbound dead-code scoring needs only weights (per-edge site count). Drain the
+    // edge map by value so the `UsageNodeKey` endpoints move into `incoming` rather
+    // than being cloned; `result.edges.edges` is not read again (only `truncated`).
+    for ((caller, callee), sites) in std::mem::take(&mut result.edges.edges) {
+        let weight = sites.len();
         let usage = incoming.entry(callee).or_default();
         usage.total += weight;
         usage.callers.entry(caller).or_insert(weight);

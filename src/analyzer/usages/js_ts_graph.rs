@@ -229,7 +229,7 @@ pub(crate) fn build_jsts_scoped_usage_edges<F>(
 where
     F: Fn(&ProjectFile) -> bool + Sync + Copy,
 {
-    let mut edges: std::collections::BTreeMap<(UsageNodeKey, UsageNodeKey), usize> =
+    let mut edges: std::collections::BTreeMap<(UsageNodeKey, UsageNodeKey), Vec<CallSite>> =
         std::collections::BTreeMap::new();
     let mut truncated: std::collections::BTreeMap<UsageNodeKey, usize> =
         std::collections::BTreeMap::new();
@@ -265,8 +265,8 @@ where
             &language_nodes,
             keep_file,
         );
-        for (key, weight) in result.edges.edges {
-            *edges.entry(key).or_insert(0) += weight;
+        for (key, sites) in result.edges.edges {
+            edges.entry(key).or_default().extend(sites);
         }
         for (callee, total) in result.edges.truncated {
             *truncated.entry(callee).or_insert(0) += total;
@@ -274,8 +274,14 @@ where
         node_status.extend(result.node_status);
     }
 
+    // TS and JS are distinct files, so per-language sites for a shared edge key
+    // never overlap; re-sort after concatenating the two runs for determinism.
+    for sites in edges.values_mut() {
+        sites.sort();
+    }
+
     any.then_some(JsTsScopedUsageEdges {
-        edges: crate::analyzer::usages::inverted_edges::ScopedUsageEdges { edges, truncated },
+        edges: UsageEdges { edges, truncated },
         node_status,
     })
 }

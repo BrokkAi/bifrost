@@ -23,8 +23,7 @@ use super::extractor::{
 };
 use super::resolver::{JsTsUsageIndex, collect_jsts_files, tree_sitter_language_for};
 use crate::analyzer::usages::inverted_edges::{
-    EdgeCollector, ScopedEdgeCollector, ScopedUsageEdges, UsageEdges, UsageNodeKey, build_edges,
-    build_scoped_edges, collect_scoped_file_edges, parse_and_collect,
+    EdgeCollector, UsageEdges, UsageNodeKey, build_edges, collect_file_edges, parse_and_collect,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::{ExportEntry, ImportKind};
@@ -112,7 +111,7 @@ pub(crate) enum JsTsScopedNodeStatus {
 }
 
 pub(crate) struct JsTsScopedUsageEdges {
-    pub(crate) edges: ScopedUsageEdges,
+    pub(crate) edges: UsageEdges<UsageNodeKey>,
     pub(crate) node_status: BTreeMap<UsageNodeKey, JsTsScopedNodeStatus>,
 }
 
@@ -128,20 +127,20 @@ where
 {
     let Some(parser_language) = tree_sitter_language_for(language) else {
         return JsTsScopedUsageEdges {
-            edges: ScopedUsageEdges::default(),
+            edges: UsageEdges::default(),
             node_status: BTreeMap::new(),
         };
     };
     let files = collect_jsts_files(analyzer, language);
     let declarations = scoped_declarations_by_file_and_name(analyzer, language);
     let node_status = scoped_node_status(index, nodes, &declarations);
-    let edges = build_scoped_edges(&files, keep_file, |file| {
+    let edges = build_edges(&files, keep_file, |file| {
         // Parse on demand and drop the tree when this closure returns; cross-file
         // resolution comes from the analyzer-cached `index`, not retained trees.
         let parsed = parse_tree_sitter_file(file, &parser_language)?;
         let imports = scoped_import_bindings(index, file, &declarations);
         let same_file = scoped_same_file_declarations(analyzer, file, language);
-        Some(collect_scoped_file_edges(
+        Some(collect_file_edges(
             analyzer,
             file,
             nodes,
@@ -175,7 +174,7 @@ struct ScopedTsScan<'a, 'b> {
     declarations: &'a HashMap<(ProjectFile, String), BTreeSet<UsageNodeKey>>,
     imports: ScopedImportBindings,
     same_file: HashMap<String, UsageNodeKey>,
-    collector: &'a mut ScopedEdgeCollector<'b>,
+    collector: &'a mut EdgeCollector<'b, UsageNodeKey>,
 }
 
 impl<'a> ScopedTsScan<'a, '_> {
