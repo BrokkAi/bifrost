@@ -18,9 +18,7 @@ use crate::analyzer::{
 };
 use crate::hash::HashSet;
 
-pub(in crate::analyzer::usages) use inverted::{
-    NameResolver as ScalaNameResolver, ProjectTypes as ScalaProjectTypes,
-};
+pub(crate) use inverted::{NameResolver as ScalaNameResolver, ProjectTypes as ScalaProjectTypes};
 pub(in crate::analyzer::usages) use resolver::{package_name_of, scala_normalized_fq_name};
 pub(in crate::analyzer::usages) use syntax::{node_text as scala_node_text, scala_import_path};
 
