@@ -343,12 +343,47 @@ fn resolve_scala_field(
     };
     if let Some(owner) = scala_receiver_type_fqn(ctx, resolver, root, receiver, field.start_byte())
     {
-        return scala_member_candidates(ctx, &owner, member, false);
+        let include_companion = scala_receiver_allows_companion_lookup(
+            ctx,
+            resolver,
+            root,
+            receiver,
+            field.start_byte(),
+            &owner,
+        );
+        return scala_member_candidates(ctx, &owner, member, include_companion);
     }
     no_definition(
         "unsupported_scala_receiver",
         format!("receiver for Scala member `{member}` is not resolved"),
     )
+}
+
+fn scala_receiver_allows_companion_lookup(
+    ctx: ScalaLookupCtx<'_>,
+    resolver: &ScalaNameResolver,
+    root: Node<'_>,
+    receiver: Node<'_>,
+    cutoff_start: usize,
+    owner_fqn: &str,
+) -> bool {
+    if !matches!(receiver.kind(), "identifier" | "type_identifier") {
+        return false;
+    }
+    let name = scala_node_text(receiver, ctx.source).trim();
+    if name == "this" {
+        return false;
+    }
+    let bindings = scala_bindings_before(ctx, resolver, root, cutoff_start);
+    if first_precise(&bindings, name).is_some()
+        || bindings.is_shadowed(name)
+        || scala_enclosing_class_parameter_type(ctx, receiver, name, resolver).is_some()
+    {
+        return false;
+    }
+    resolver
+        .resolve(name)
+        .is_some_and(|resolved| resolved == owner_fqn)
 }
 
 fn resolve_scala_stable_identifier(

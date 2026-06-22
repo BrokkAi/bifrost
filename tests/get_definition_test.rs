@@ -7942,6 +7942,41 @@ fn scala_object_apply_call_resolves_to_definition() {
 }
 
 #[test]
+fn scala_companion_method_call_resolves_from_type_receiver() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "example/Service.scala",
+            "package example\nclass Repository\nclass Service(repository: Repository)\nobject Service { def build(repository: Repository): Service = new Service(repository) }\n",
+        )
+        .file(
+            "example/Consumer.scala",
+            "package example\nobject Consumer { def run(repository: Repository): Service = Service.build(repository) }\n",
+        )
+        .build();
+
+    let line =
+        "object Consumer { def run(repository: Repository): Service = Service.build(repository) }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"example/Consumer.scala","line":2,"column":{}}}]}}"#,
+            column_of(line, "build")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "example.Service$.build",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["path"], "example/Service.scala",
+        "{value}"
+    );
+}
+
+#[test]
 fn scala_object_apply_call_resolves_from_constructor_like_reference() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(
