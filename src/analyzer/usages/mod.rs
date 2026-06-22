@@ -37,8 +37,8 @@ pub(crate) mod scala_graph;
 mod traits;
 
 pub use candidates::{
-    FallbackCandidateProvider, ImportGraphCandidateProvider, TextSearchCandidateProvider,
-    default_provider,
+    ExplicitCandidateProvider, FallbackCandidateProvider, ImportGraphCandidateProvider,
+    TextSearchCandidateProvider, default_provider,
 };
 pub use cpp_graph::CppUsageGraphStrategy;
 pub use csharp_graph::CSharpUsageGraphStrategy;

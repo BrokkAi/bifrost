@@ -7,8 +7,9 @@ use crate::analyzer::symbol_lookup::{
     resolve_typeish_codeunit_fuzzy, strip_trailing_call_suffix,
 };
 use crate::analyzer::usages::{
-    CONFIDENCE_THRESHOLD, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, FuzzyResult, RegexUsageAnalyzer,
-    UsageAnalyzer, UsageFinder, UsageHit,
+    CONFIDENCE_THRESHOLD, CandidateFileProvider, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES,
+    ExplicitCandidateProvider, FuzzyResult, RegexUsageAnalyzer, UsageAnalyzer, UsageFinder,
+    UsageHit,
 };
 use crate::analyzer::{CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, Range};
 use crate::hash::{HashMap, HashSet};
@@ -2215,6 +2216,21 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
     let targets = params.targets;
     let path_filter = build_scan_usages_path_filter(analyzer, params.paths.as_deref());
 
+    // When the caller scopes the query to `paths`, the answer can only live in those files, so
+    // resolve the candidate set straight from them instead of enumerating references across the
+    // whole workspace and filtering after the fact. This bounds the search by the number of
+    // `paths`, not by how common the symbols are — a single high-fan-in name (`Context`, `func`)
+    // no longer drags an O(workspace) reference scan behind it. The set is built once and reused
+    // for every symbol; the finder's file filter still drops excluded test files on top.
+    let path_scoped_candidates = path_filter.as_ref().map(|filter| {
+        let files: HashSet<ProjectFile> = analyzer
+            .analyzed_files()
+            .filter(|file| filter.matches(file))
+            .cloned()
+            .collect();
+        ExplicitCandidateProvider::new(Arc::new(files))
+    });
+
     let test_files = excluded_test_files(analyzer, params.include_tests);
 
     let mut not_found = Vec::new();
@@ -2297,9 +2313,12 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
 
     for (symbol, overloads, location_selected) in resolved_targets {
         let finder = scoped_usage_finder(test_files.as_ref(), &path_filter);
-        let query = finder.query(
+        let query = finder.query_with_provider(
             analyzer,
             &overloads,
+            path_scoped_candidates
+                .as_ref()
+                .map(|provider| provider as &dyn CandidateFileProvider),
             DEFAULT_MAX_FILES,
             SCAN_USAGES_MAX_CALLSITES,
         );

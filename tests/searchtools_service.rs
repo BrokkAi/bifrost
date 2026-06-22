@@ -1621,6 +1621,152 @@ fn scan_usages_paths_filter_limits_candidate_files() {
 }
 
 #[test]
+fn scan_usages_paths_scope_is_independent_of_out_of_scope_callers() {
+    // `Helper` is a high-fan-in symbol: 50+ files call it. Scoping the query to one file must
+    // return only that file's call site, and the cost must not scale with how many other files
+    // reference the symbol — the search is bounded by `paths`, not by the symbol's popularity.
+    // This is the regression guard for the perf fix: candidates are resolved straight from
+    // `paths` rather than enumerated workspace-wide and filtered after the fact.
+    let temp = TempDir::new().unwrap();
+    fs::write(
+        temp.path().join("go.mod"),
+        "module example.com/app\n\ngo 1.22\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("helper.go"),
+        "package app\n\nfunc Helper() string { return \"hi\" }\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("want_caller.go"),
+        "package app\n\nfunc UseHere() string { return Helper() }\n",
+    )
+    .unwrap();
+    for idx in 0..50 {
+        fs::write(
+            temp.path().join(format!("decoy{idx}.go")),
+            format!("package app\n\nfunc Decoy{idx}() string {{ return Helper() }}\n"),
+        )
+        .unwrap();
+    }
+
+    let service =
+        SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "scan_usages",
+            r#"{"symbols":["Helper"],"include_tests":true,"paths":["want_caller.go"]}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    let files = value["usages"][0]["files"].as_array().unwrap();
+    let paths: Vec<&str> = files
+        .iter()
+        .map(|file| file["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(vec!["want_caller.go"], paths, "payload: {value}");
+    assert_eq!(
+        1,
+        value["usages"][0]["total_hits"].as_u64().unwrap(),
+        "payload: {value}"
+    );
+}
+
+#[test]
+fn scan_usages_paths_scope_returns_all_in_scope_callers() {
+    // A glob `paths` matching several files must return every in-scope call site (not just the
+    // first) while still excluding out-of-scope callers.
+    let temp = TempDir::new().unwrap();
+    fs::create_dir_all(temp.path().join("scoped")).unwrap();
+    fs::write(
+        temp.path().join("Greeter.java"),
+        "public class Greeter {\n    public String hello() { return \"hi\"; }\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("scoped").join("CallerA.java"),
+        "public class CallerA {\n    public String run() { return new Greeter().hello(); }\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("scoped").join("CallerB.java"),
+        "public class CallerB {\n    public String run() { return new Greeter().hello(); }\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("OutOfScope.java"),
+        "public class OutOfScope {\n    public String run() { return new Greeter().hello(); }\n}\n",
+    )
+    .unwrap();
+
+    let service =
+        SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "scan_usages",
+            r#"{"symbols":["Greeter.hello"],"include_tests":true,"paths":["scoped/*.java"]}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    let files = value["usages"][0]["files"].as_array().unwrap();
+    let mut paths: Vec<&str> = files
+        .iter()
+        .map(|file| file["path"].as_str().unwrap())
+        .collect();
+    paths.sort();
+    assert_eq!(
+        vec!["scoped/CallerA.java", "scoped/CallerB.java"],
+        paths,
+        "payload: {value}"
+    );
+}
+
+#[test]
+fn scan_usages_paths_scope_keeps_cross_language_scala_usages_of_java_type() {
+    // A Java class can be referenced from Scala, and the Java usage strategy discovers those by
+    // scanning Scala files in the candidate set. A path-scoped query that names a Scala file must
+    // therefore still surface the cross-language usage — the language filter on path-scoped
+    // candidates keeps Scala files for a Java-class target instead of dropping them.
+    let temp = TempDir::new().unwrap();
+    fs::create_dir_all(temp.path().join("com").join("example")).unwrap();
+    fs::create_dir_all(temp.path().join("app")).unwrap();
+    fs::write(
+        temp.path().join("com").join("example").join("Target.java"),
+        "package com.example;\n\npublic class Target {\n    public void run() {}\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("app").join("ScalaConsumer.scala"),
+        "package app\n\nimport com.example.Target\n\nclass ScalaConsumer {\n  val annotated: Target = new Target()\n}\n",
+    )
+    .unwrap();
+
+    let service =
+        SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "scan_usages",
+            r#"{"symbols":["com.example.Target"],"include_tests":true,"paths":["app/ScalaConsumer.scala"]}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    let files = value["usages"][0]["files"].as_array().unwrap();
+    let paths: Vec<&str> = files
+        .iter()
+        .map(|file| file["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        vec!["app/ScalaConsumer.scala"],
+        paths,
+        "cross-language Scala->Java usage must survive path scoping; payload: {value}"
+    );
+}
+
+#[test]
 fn scan_usages_demotes_large_result_to_summary_within_budget() {
     let temp = TempDir::new().unwrap();
     fs::write(
