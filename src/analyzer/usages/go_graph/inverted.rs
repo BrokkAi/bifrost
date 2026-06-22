@@ -22,9 +22,9 @@ use super::extractor::{
     lhs_identifiers, parameter_names, receiver_symbol_from_qualifier, rhs_expressions,
     selector_parts, type_ref_from_node, var_spec_names,
 };
-use super::resolver::{GoProjectGraph, TypeRef, node_text};
+use super::resolver::{GoEdgeIndex, TypeRef, node_text};
 use crate::analyzer::usages::inverted_edges::{
-    EdgeCollector, UsageEdges, build_edges, collect_file_edges,
+    EdgeCollector, UsageEdges, build_edges, parse_and_collect,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::{GoAnalyzer, IAnalyzer, ProjectFile};
@@ -37,38 +37,37 @@ use tree_sitter::Node;
 /// per-callee cap, dedup, merge) lives in [`build_edges`]; this function supplies
 /// only the two Go-specific pieces: the parsed line starts and the AST walk that
 /// resolves each reference to its callee fqn.
+///
+/// Trees are parsed on demand inside the per-file walk and dropped when the closure
+/// returns, so live trees are bounded by the worker count rather than the workspace
+/// size (#200). Cross-file resolution comes from the tree-free [`GoEdgeIndex`] and
+/// the analyzer's per-file import info — no other file's tree is read during a scan.
 pub(super) fn build_go_edges<F>(
     analyzer: &dyn IAnalyzer,
     go: &GoAnalyzer,
-    graph: &GoProjectGraph,
+    index: &GoEdgeIndex,
     nodes: &HashSet<String>,
     keep_file: F,
 ) -> UsageEdges
 where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
-    let files: Vec<ProjectFile> = graph.parsed_files().cloned().collect();
+    let files: Vec<ProjectFile> = index.files().cloned().collect();
+    let language = tree_sitter_go::LANGUAGE.into();
     build_edges(&files, keep_file, |file| {
-        let parsed = graph.parsed_file(file)?;
-        let file_pkg = graph.package_name_of(file)?;
-        Some(collect_file_edges(
-            analyzer,
-            file,
-            nodes,
-            &parsed.line_starts,
-            |collector| {
-                let (alias_packages, dot_packages) = graph.namespace_packages(go, file);
-                let mut ctx = FileScan {
-                    source: parsed.source.as_str(),
-                    file_pkg,
-                    alias_packages,
-                    dot_packages,
-                    collector,
-                };
-                let mut locals = LocalInferenceEngine::new(LocalInferenceConfig::default());
-                scan_node(parsed.tree.root_node(), &mut ctx, &mut locals);
-            },
-        ))
+        let file_pkg = index.package_name_of(file)?;
+        parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
+            let (alias_packages, dot_packages) = index.namespace_packages(go, file);
+            let mut ctx = FileScan {
+                source: parsed.source.as_str(),
+                file_pkg,
+                alias_packages,
+                dot_packages,
+                collector,
+            };
+            let mut locals = LocalInferenceEngine::new(LocalInferenceConfig::default());
+            scan_node(parsed.tree.root_node(), &mut ctx, &mut locals);
+        })
     })
 }
 

@@ -6,10 +6,12 @@ mod resolver;
 
 use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::go_graph::extractor::scan_files_for_target;
+use crate::analyzer::usages::go_graph::resolver::{
+    GoEdgeIndex, TargetSpec, build_go_edge_index, build_go_graph,
+};
 pub(in crate::analyzer::usages) use crate::analyzer::usages::go_graph::resolver::{
     GoProjectGraph, build_workspace_go_graph, preparse_go_files,
 };
-use crate::analyzer::usages::go_graph::resolver::{TargetSpec, build_go_graph};
 use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
@@ -75,7 +77,7 @@ impl<'a> UsageQueryResolver<'a> for GoQueryResolver<'a> {
 
 pub(crate) struct GoEdgeResolver<'a> {
     go: &'a GoAnalyzer,
-    graph: GoProjectGraph,
+    index: GoEdgeIndex,
 }
 
 impl<'a> UsageEdgeResolver<'a> for GoEdgeResolver<'a> {
@@ -90,9 +92,10 @@ impl<'a> UsageEdgeResolver<'a> for GoEdgeResolver<'a> {
         if files.is_empty() {
             return None;
         }
-        let cache = preparse_go_files(&files);
-        let graph = build_workspace_go_graph(go, &files, Some(&cache))?;
-        Some(Self { go, graph })
+        // A tree-free resolution index; the per-file walk re-parses on demand and
+        // drops each tree, so the whole-workspace build retains no syntax trees.
+        let index = build_go_edge_index(&files)?;
+        Some(Self { go, index })
     }
 
     fn build_edges<F>(
@@ -104,7 +107,7 @@ impl<'a> UsageEdgeResolver<'a> for GoEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        inverted::build_go_edges(analyzer, self.go, &self.graph, nodes, keep_file)
+        inverted::build_go_edges(analyzer, self.go, &self.index, nodes, keep_file)
     }
 }
 

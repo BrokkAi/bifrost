@@ -3,6 +3,7 @@ use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::usages::model::{
     ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind,
 };
+use crate::analyzer::usages::parsed_tree::parse_tree_sitter_file;
 use crate::analyzer::usages::{ImportEdge, ImportEdgeKind};
 use crate::analyzer::{
     CodeUnit, GoAnalyzer, IAnalyzer, ImportAnalysisProvider, Language, ProjectFile,
@@ -53,10 +54,6 @@ pub(crate) struct GoProjectGraph {
 }
 
 impl GoProjectGraph {
-    pub(super) fn parsed_files(&self) -> impl Iterator<Item = &ProjectFile> {
-        self.parsed.keys()
-    }
-
     pub(super) fn parsed_file(&self, file: &ProjectFile) -> Option<&ParsedFile> {
         self.parsed.get(file).map(|parsed| parsed.as_ref())
     }
@@ -79,58 +76,17 @@ impl GoProjectGraph {
         analyzer: &GoAnalyzer,
         file: &ProjectFile,
     ) -> (HashMap<String, Vec<String>>, Vec<String>) {
-        let mut by_alias: HashMap<String, Vec<String>> = HashMap::default();
-        let mut dot_imports: Vec<String> = Vec::new();
-        for import in analyzer.import_info_of(file) {
-            let alias = import.alias.as_deref();
-            if alias == Some("_") {
-                continue;
-            }
-            let Some(path) = extract_go_import_path(&import.raw_snippet) else {
-                continue;
-            };
-            let resolved = resolve_go_module(&path, &self.dir_index, self.module_path.as_deref());
-            // Each resolved package is `(clause name, canonical fqn prefix)`: the
-            // source refers to it by its `package` clause name (`row`), while the
-            // node fqn it must map to uses the canonical, module-qualified path
-            // (`example.com/.../row`).
-            let mut packages: Vec<(String, String)> = resolved
-                .iter()
-                .filter_map(|target| {
-                    let parsed = self.parsed.get(target)?;
-                    let clause = parsed.package_name.clone();
-                    let canonical = canonical_go_package_name(target, &parsed.package_name);
-                    (!clause.is_empty() && !canonical.is_empty()).then_some((clause, canonical))
-                })
-                .collect();
-            packages.sort();
-            packages.dedup();
-            if packages.is_empty() {
-                continue;
-            }
-            let canonicals = || packages.iter().map(|(_, canonical)| canonical.clone());
-            match alias {
-                Some(".") => dot_imports.extend(canonicals()),
-                Some(explicit) => by_alias
-                    .entry(default_go_import_local_name(explicit))
-                    .or_default()
-                    .extend(canonicals()),
-                None => {
-                    // A plain import is referred to by its package-clause name;
-                    // map that local name to the canonical node fqn prefix.
-                    for (clause, canonical) in packages {
-                        by_alias.entry(clause).or_default().push(canonical);
-                    }
-                }
-            }
-        }
-        for names in by_alias.values_mut() {
-            names.sort();
-            names.dedup();
-        }
-        dot_imports.sort();
-        dot_imports.dedup();
-        (by_alias, dot_imports)
+        namespace_packages_from(
+            analyzer,
+            file,
+            &self.dir_index,
+            self.module_path.as_deref(),
+            |target| {
+                self.parsed
+                    .get(target)
+                    .map(|parsed| parsed.package_name.clone())
+            },
+        )
     }
 
     pub(super) fn scan_files(
@@ -343,6 +299,149 @@ fn build_importer_reverse_go(
 
 /// Read and tree-sitter parse a single Go file. Returns `None` if the file
 /// cannot be read, the grammar fails to load, or parsing fails.
+/// Tree-free resolution metadata for the whole-workspace inverted edge build:
+/// each file's Go `package` clause name, the parent-dir index, and the module
+/// path. Built by parsing each file once to read its package clause and dropping
+/// the tree, so the edge build holds no syntax trees — they are re-parsed on
+/// demand inside the per-file walk and dropped immediately. Mirrors the JS/TS
+/// [`JsTsUsageIndex`]. The tree-holding [`GoProjectGraph`] still backs the
+/// per-symbol query and `get_definition` paths, which read node text from trees.
+///
+/// [`JsTsUsageIndex`]: crate::analyzer::usages::js_ts_graph::JsTsUsageIndex
+pub(crate) struct GoEdgeIndex {
+    package_names: HashMap<ProjectFile, String>,
+    dir_index: ParentDirIndex,
+    module_path: Option<String>,
+}
+
+impl GoEdgeIndex {
+    pub(super) fn files(&self) -> impl Iterator<Item = &ProjectFile> {
+        self.package_names.keys()
+    }
+
+    /// The file's canonical (module-qualified) package name; see
+    /// [`GoProjectGraph::package_name_of`].
+    pub(super) fn package_name_of(&self, file: &ProjectFile) -> Option<String> {
+        self.package_names
+            .get(file)
+            .map(|name| canonical_go_package_name(file, name))
+    }
+
+    /// See [`GoProjectGraph::namespace_packages`]; resolves target package names
+    /// from the tree-free per-file map instead of retained parse trees.
+    pub(super) fn namespace_packages(
+        &self,
+        analyzer: &GoAnalyzer,
+        file: &ProjectFile,
+    ) -> (HashMap<String, Vec<String>>, Vec<String>) {
+        namespace_packages_from(
+            analyzer,
+            file,
+            &self.dir_index,
+            self.module_path.as_deref(),
+            |target| self.package_names.get(target).cloned(),
+        )
+    }
+}
+
+/// Build the tree-free [`GoEdgeIndex`] over `files`: read each Go file's package
+/// clause (parsing then dropping the tree, so peak live trees during the build are
+/// bounded by the rayon worker count), then index parent directories for module
+/// resolution. `None` when there are no Go files.
+pub(crate) fn build_go_edge_index(files: &[ProjectFile]) -> Option<GoEdgeIndex> {
+    let go_files: Vec<ProjectFile> = files
+        .iter()
+        .filter(|file| language_for_file(file) == Language::Go)
+        .cloned()
+        .collect();
+    let module_path = read_go_module_path(go_files.first()?.root());
+
+    let package_names: HashMap<ProjectFile, String> = go_files
+        .par_iter()
+        .filter_map(|file| Some((file.clone(), package_clause_of_file(file)?)))
+        .collect();
+
+    let dir_index = build_parent_dir_index(package_names.keys());
+
+    Some(GoEdgeIndex {
+        package_names,
+        dir_index,
+        module_path,
+    })
+}
+
+/// Parse `file` solely to read its `package` clause, dropping the tree before
+/// returning. `None` when the file is unreadable, empty, or unparseable — the
+/// same skip-on-failure contract as the shared `parse_tree_sitter_file` it reuses.
+fn package_clause_of_file(file: &ProjectFile) -> Option<String> {
+    let parsed = parse_tree_sitter_file(file, &tree_sitter_go::LANGUAGE.into())?;
+    Some(package_name(parsed.tree.root_node(), &parsed.source))
+}
+
+/// Resolve `file`'s imports to the workspace package names they bind, given a
+/// lookup from a resolved target file to its `package` clause name. Shared by the
+/// tree-holding [`GoProjectGraph`] and the tree-free [`GoEdgeIndex`] so the two
+/// cannot drift; see [`GoProjectGraph::namespace_packages`] for the contract.
+fn namespace_packages_from(
+    analyzer: &GoAnalyzer,
+    file: &ProjectFile,
+    dir_index: &ParentDirIndex,
+    module_path: Option<&str>,
+    target_package_name: impl Fn(&ProjectFile) -> Option<String>,
+) -> (HashMap<String, Vec<String>>, Vec<String>) {
+    let mut by_alias: HashMap<String, Vec<String>> = HashMap::default();
+    let mut dot_imports: Vec<String> = Vec::new();
+    for import in analyzer.import_info_of(file) {
+        let alias = import.alias.as_deref();
+        if alias == Some("_") {
+            continue;
+        }
+        let Some(path) = extract_go_import_path(&import.raw_snippet) else {
+            continue;
+        };
+        let resolved = resolve_go_module(&path, dir_index, module_path);
+        // Each resolved package is `(clause name, canonical fqn prefix)`: the
+        // source refers to it by its `package` clause name (`row`), while the
+        // node fqn it must map to uses the canonical, module-qualified path
+        // (`example.com/.../row`).
+        let mut packages: Vec<(String, String)> = resolved
+            .iter()
+            .filter_map(|target| {
+                let clause = target_package_name(target)?;
+                let canonical = canonical_go_package_name(target, &clause);
+                (!clause.is_empty() && !canonical.is_empty()).then_some((clause, canonical))
+            })
+            .collect();
+        packages.sort();
+        packages.dedup();
+        if packages.is_empty() {
+            continue;
+        }
+        let canonicals = || packages.iter().map(|(_, canonical)| canonical.clone());
+        match alias {
+            Some(".") => dot_imports.extend(canonicals()),
+            Some(explicit) => by_alias
+                .entry(default_go_import_local_name(explicit))
+                .or_default()
+                .extend(canonicals()),
+            None => {
+                // A plain import is referred to by its package-clause name;
+                // map that local name to the canonical node fqn prefix.
+                for (clause, canonical) in packages {
+                    by_alias.entry(clause).or_default().push(canonical);
+                }
+            }
+        }
+    }
+    for names in by_alias.values_mut() {
+        names.sort();
+        names.dedup();
+    }
+    dot_imports.sort();
+    dot_imports.dedup();
+    (by_alias, dot_imports)
+}
+
 fn parse_go_file(file: &ProjectFile) -> Option<ParsedFile> {
     let source = file.read_to_string().ok()?;
     let mut parser = Parser::new();
@@ -402,7 +501,7 @@ pub(super) fn build_go_graph(
         parsed.insert(file, parsed_file);
     }
 
-    let dir_index = build_parent_dir_index(&parsed);
+    let dir_index = build_parent_dir_index(parsed.keys());
 
     let mut exports_by_file = HashMap::default();
     let mut binders_by_file = HashMap::default();
@@ -532,9 +631,9 @@ fn import_binder_of(
 /// graph build linear rather than quadratic in the file count.
 type ParentDirIndex = HashMap<String, Vec<ProjectFile>>;
 
-fn build_parent_dir_index(parsed: &HashMap<ProjectFile, Arc<ParsedFile>>) -> ParentDirIndex {
+fn build_parent_dir_index<'a>(files: impl Iterator<Item = &'a ProjectFile>) -> ParentDirIndex {
     let mut index: ParentDirIndex = HashMap::default();
-    for file in parsed.keys() {
+    for file in files {
         let parent = file.parent().to_string_lossy().replace('\\', "/");
         index.entry(parent).or_default().push(file.clone());
     }
