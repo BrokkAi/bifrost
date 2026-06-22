@@ -341,11 +341,15 @@ pub struct BenchmarkRepoTarget {
     #[serde(default)]
     pub usage_symbols: Vec<String>,
     #[serde(default)]
+    pub usage_targets: Vec<BenchmarkLocationSelector>,
+    #[serde(default)]
     pub definition_queries: Vec<DefinitionQueryTarget>,
 }
 
+pub type ScanUsageQueryTarget = BenchmarkLocationSelector;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DefinitionQueryTarget {
+pub struct BenchmarkLocationSelector {
     pub path: String,
     #[serde(default)]
     pub line: Option<usize>,
@@ -355,6 +359,12 @@ pub struct DefinitionQueryTarget {
     pub start_byte: Option<usize>,
     #[serde(default)]
     pub end_byte: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DefinitionQueryTarget {
+    #[serde(flatten)]
+    pub selector: BenchmarkLocationSelector,
     pub expected_status: String,
     #[serde(default)]
     pub expected_fqn: Option<String>,
@@ -460,10 +470,15 @@ impl BenchmarkRepoTarget {
 
         if scenarios.contains(&BenchmarkScenario::ScanUsages)
             && !has_non_blank_values(&self.usage_symbols)
+            && self.usage_targets.is_empty()
         {
             errors.push(format!(
-                "repo `{name}` enables `scan_usages` but does not define usage_symbols"
+                "repo `{name}` enables `scan_usages` but does not define usage_symbols or usage_targets"
             ));
+        }
+        for (index, query) in self.usage_targets.iter().enumerate() {
+            let label = format!("repo `{name}` usage_targets[{index}]");
+            query.validate(&label, false, errors);
         }
 
         if scenarios.contains(&BenchmarkScenario::GetDefinition) {
@@ -479,18 +494,23 @@ impl BenchmarkRepoTarget {
     }
 }
 
-impl DefinitionQueryTarget {
-    fn validate(&self, repo_name: &str, index: usize, errors: &mut Vec<String>) {
-        let label = format!("repo `{repo_name}` definition_queries[{index}]");
+impl BenchmarkLocationSelector {
+    fn validate(&self, label: &str, require_column_for_line: bool, errors: &mut Vec<String>) {
         if self.path.trim().is_empty() {
             errors.push(format!("{label} must define a non-empty path"));
         }
 
         let has_byte_location = self.start_byte.is_some();
-        let has_line_location = self.line.is_some() && self.column.is_some();
+        let has_line_location =
+            self.line.is_some() && (!require_column_for_line || self.column.is_some());
         if !has_byte_location && !has_line_location {
+            let line_requirement = if require_column_for_line {
+                "both line and column"
+            } else {
+                "line"
+            };
             errors.push(format!(
-                "{label} must define either start_byte or both line and column"
+                "{label} must define either start_byte or {line_requirement}"
             ));
         }
         if self.end_byte.is_some() && self.start_byte.is_none() {
@@ -499,12 +519,19 @@ impl DefinitionQueryTarget {
         if matches!((self.start_byte, self.end_byte), (Some(start), Some(end)) if start >= end) {
             errors.push(format!("{label} has an empty or inverted byte range"));
         }
-        if self.line == Some(0) {
-            errors.push(format!("{label} line must be 1-based"));
-        }
         if self.column == Some(0) {
             errors.push(format!("{label} column must be 1-based"));
         }
+        if self.line == Some(0) {
+            errors.push(format!("{label} line must be 1-based"));
+        }
+    }
+}
+
+impl DefinitionQueryTarget {
+    fn validate(&self, repo_name: &str, index: usize, errors: &mut Vec<String>) {
+        let label = format!("repo `{repo_name}` definition_queries[{index}]");
+        self.selector.validate(&label, true, errors);
 
         if !is_definition_status(&self.expected_status) {
             errors.push(format!(

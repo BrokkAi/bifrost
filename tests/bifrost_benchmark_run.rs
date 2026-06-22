@@ -157,7 +157,9 @@ search_patterns = ["method2"]
 location_symbols = ["A.method2"]
 summary_targets = ["A.java"]
 seed_file_paths = ["B.java"]
-usage_symbols = ["A.method2"]
+usage_targets = [
+  {{ path = "A.java", line = 8, column = 19 }},
+]
 definition_queries = [
   {{ path = "E.java", line = 10, column = 17, expected_status = "no_definition" }},
 ]

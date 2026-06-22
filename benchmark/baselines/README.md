@@ -4,6 +4,12 @@
 
 The first blessed Ubuntu baseline was promoted from the successful PR-path benchmark run on June 5, 2026 (`run-20260605T072813Z.json` from PR #172).
 
+The current blessed Ubuntu baseline was promoted from the successful PR-path
+benchmark run on June 22, 2026 (`run-20260622T104233Z.json` from PR #224),
+after the benchmark manifest switched Express `scan_usages` to a precise
+location target and restored the `fmt-cpp get_definition` scenario below the
+previous baseline.
+
 It is not written automatically. Promote it deliberately:
 
 1. Run the benchmark workflow or a local `bifrost_benchmark run`.

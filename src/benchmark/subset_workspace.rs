@@ -140,7 +140,13 @@ fn pinned_probe_files(
         .summary_targets
         .iter()
         .chain(target.seed_file_paths.iter())
-        .chain(target.definition_queries.iter().map(|query| &query.path))
+        .chain(target.usage_targets.iter().map(|query| &query.path))
+        .chain(
+            target
+                .definition_queries
+                .iter()
+                .map(|query| &query.selector.path),
+        )
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
     {

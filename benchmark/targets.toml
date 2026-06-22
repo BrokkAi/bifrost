@@ -116,7 +116,9 @@ search_patterns = ["listen"]
 location_symbols = ["request.js.accepts"]
 summary_targets = ["lib/application.js"]
 seed_file_paths = ["lib/application.js"]
-usage_symbols = ["request.js.accepts"]
+usage_targets = [
+  { path = "lib/request.js", line = 16, column = 5 },
+]
 definition_queries = [
   { path = "lib/application.js", line = 574, column = 3, symbol = "tryRender", expected_status = "resolved", expected_fqn = "tryRender" },
 ]
