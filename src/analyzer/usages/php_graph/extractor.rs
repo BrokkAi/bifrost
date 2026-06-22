@@ -4,7 +4,7 @@ use crate::analyzer::usages::php_graph::hits::{push_hit, push_hit_range};
 use crate::analyzer::usages::php_graph::resolver::{
     PhpHierarchyIndex, TargetKind, TargetSpec, is_const_declaration_name, is_function_call_name,
     is_function_declaration_name, is_member_or_scoped_access_name, is_object_creation_type_name,
-    qualified_candidate_text, receiver_is_enclosing_subtype, receiver_type_matches,
+    node_text, qualified_candidate_text, receiver_is_enclosing_subtype, receiver_type_matches,
     static_receiver_matches,
 };
 use crate::analyzer::{
@@ -12,9 +12,7 @@ use crate::analyzer::{
     resolve_php_function, resolve_php_type,
 };
 use crate::text_utils::compute_line_starts;
-use regex::Regex;
 use std::collections::BTreeSet;
-use std::sync::LazyLock;
 use tree_sitter::{Node, Parser};
 
 pub(super) fn scan_file(
@@ -71,30 +69,6 @@ pub(super) fn scan_file(
         );
     }
 }
-
-static PARAMETER_VARIABLE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"[(,]\s*(?P<type>\\?[A-Za-z_][A-Za-z0-9_\\]*(?:\|\\?[A-Za-z_][A-Za-z0-9_\\]*)?)\s+\$(?P<var>[A-Za-z_][A-Za-z0-9_]*)",
-    )
-    .expect("valid PHP parameter-variable regex")
-});
-
-static ASSIGNMENT_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\$(?P<lhs>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<rhs>[^;]+);")
-        .expect("valid PHP assignment regex")
-});
-
-static INSTANCE_MEMBER_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\$(?P<var>[A-Za-z_][A-Za-z0-9_]*)\s*->\s*(?P<member>[A-Za-z_][A-Za-z0-9_]*)\b")
-        .expect("valid PHP instance member regex")
-});
-
-static STATIC_MEMBER_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?P<recv>\\?[A-Za-z_][A-Za-z0-9_\\]*)\s*::\s*\$?(?P<member>[A-Za-z_][A-Za-z0-9_]*)\b",
-    )
-    .expect("valid PHP static member regex")
-});
 
 #[allow(clippy::too_many_arguments)]
 fn scan_node(
@@ -270,242 +244,247 @@ fn scan_member_patterns(
     let Some(owner) = spec.owner_fq_name.as_deref() else {
         return;
     };
-    for (scope_start, scope_end) in member_scope_ranges(root) {
-        let Some(scope_source) = source.get(scope_start..scope_end) else {
-            continue;
-        };
-        scan_instance_members_in_order(
-            scope_start,
-            scope_source,
-            analyzer,
-            file,
-            source,
-            line_starts,
-            ctx,
-            hierarchy,
-            owner,
-            spec,
-            hits,
-        );
-    }
-
-    for captures in STATIC_MEMBER_RE.captures_iter(source) {
-        let Some(receiver) = captures.name("recv") else {
-            continue;
-        };
-        let member = captures.name("member").expect("member capture");
-        if member.as_str() != spec.member_name {
-            continue;
-        }
-        if !static_receiver_matches(
-            analyzer,
-            file,
-            member.start(),
-            member.end(),
-            line_starts,
-            receiver.as_str(),
-            owner,
-            ctx,
-            hierarchy,
-        ) {
-            continue;
-        }
-        push_hit_range(
-            member.start(),
-            member.end(),
-            analyzer,
-            file,
-            source,
-            line_starts,
-            spec,
-            hits,
-        );
-    }
+    let mut engine = LocalInferenceEngine::default();
+    scan_member_tree(
+        root,
+        analyzer,
+        file,
+        source,
+        line_starts,
+        ctx,
+        hierarchy,
+        owner,
+        spec,
+        &mut engine,
+        hits,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
-fn scan_instance_members_in_order(
-    scope_start: usize,
-    scope_source: &str,
+fn scan_member_tree(
+    node: Node<'_>,
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
-    full_source: &str,
+    source: &str,
     line_starts: &[usize],
     ctx: &PhpFileContext,
     hierarchy: &PhpHierarchyIndex,
     owner: &str,
     spec: &TargetSpec,
+    engine: &mut LocalInferenceEngine<String>,
     hits: &mut BTreeSet<UsageHit>,
 ) {
-    let mut engine = LocalInferenceEngine::default();
-    let header = scope_source
-        .split_once('{')
-        .map(|(header, _)| header)
-        .unwrap_or(scope_source);
-    seed_parameter_receivers(header, ctx, &mut engine);
-
-    let mut events = Vec::new();
-    for captures in ASSIGNMENT_RE.captures_iter(scope_source) {
-        let Some(whole) = captures.get(0) else {
-            continue;
-        };
-        let Some(lhs) = captures.name("lhs") else {
-            continue;
-        };
-        let Some(rhs) = captures.name("rhs") else {
-            continue;
-        };
-        events.push(MemberScanEvent::Assignment {
-            start: whole.start(),
-            lhs_start: lhs.start(),
-            lhs_end: lhs.end(),
-            rhs_start: rhs.start(),
-            rhs_end: rhs.end(),
-        });
+    let enters_scope = is_php_local_scope(node);
+    if enters_scope {
+        engine.enter_scope();
+        seed_parameter_receivers(node, source, ctx, engine);
     }
-    for captures in INSTANCE_MEMBER_RE.captures_iter(scope_source) {
-        let Some(whole) = captures.get(0) else {
-            continue;
-        };
-        let Some(var) = captures.name("var") else {
-            continue;
-        };
-        let Some(member) = captures.name("member") else {
-            continue;
-        };
-        if member.as_str() != spec.member_name {
-            continue;
-        }
-        events.push(MemberScanEvent::InstanceMember {
-            start: whole.start(),
-            receiver_start: var.start(),
-            receiver_end: var.end(),
-            member_start: member.start(),
-            member_end: member.end(),
-        });
-    }
-    events.sort_by_key(MemberScanEvent::start);
 
-    for event in events {
-        match event {
-            MemberScanEvent::Assignment {
-                lhs_start,
-                lhs_end,
-                rhs_start,
-                rhs_end,
-                ..
-            } => {
-                let Some(lhs) = scope_source.get(lhs_start..lhs_end) else {
-                    continue;
-                };
-                let Some(rhs) = scope_source.get(rhs_start..rhs_end) else {
-                    continue;
-                };
-                apply_receiver_assignment(lhs, rhs.trim(), ctx, &mut engine);
-            }
-            MemberScanEvent::InstanceMember {
-                receiver_start,
-                receiver_end,
-                member_start,
-                member_end,
-                ..
-            } => {
-                let absolute_start = scope_start + member_start;
-                let absolute_end = scope_start + member_end;
-                let Some(receiver) = scope_source.get(receiver_start..receiver_end) else {
-                    continue;
-                };
-                let receiver_matches = if receiver == "this" {
-                    receiver_is_enclosing_subtype(
-                        analyzer,
-                        file,
-                        absolute_start,
-                        absolute_end,
-                        line_starts,
-                        owner,
-                        hierarchy,
-                    )
-                } else {
-                    precise_receiver_type(&engine, receiver)
-                        .is_some_and(|fq| receiver_type_matches(&fq, owner, hierarchy))
-                };
-                if receiver_matches {
-                    push_hit_range(
-                        absolute_start,
-                        absolute_end,
-                        analyzer,
-                        file,
-                        full_source,
-                        line_starts,
-                        spec,
-                        hits,
-                    );
-                }
-            }
-        }
+    apply_receiver_assignment(node, source, ctx, engine);
+    record_member_hit(
+        node,
+        analyzer,
+        file,
+        source,
+        line_starts,
+        ctx,
+        hierarchy,
+        owner,
+        spec,
+        engine,
+        hits,
+    );
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        scan_member_tree(
+            child,
+            analyzer,
+            file,
+            source,
+            line_starts,
+            ctx,
+            hierarchy,
+            owner,
+            spec,
+            engine,
+            hits,
+        );
+    }
+
+    if enters_scope {
+        engine.exit_scope();
     }
 }
 
-enum MemberScanEvent {
-    Assignment {
-        start: usize,
-        lhs_start: usize,
-        lhs_end: usize,
-        rhs_start: usize,
-        rhs_end: usize,
-    },
-    InstanceMember {
-        start: usize,
-        receiver_start: usize,
-        receiver_end: usize,
-        member_start: usize,
-        member_end: usize,
-    },
-}
+const PHP_LOCAL_SCOPE_NODES: &[&str] = &[
+    "function_definition",
+    "method_declaration",
+    "anonymous_function",
+    "anonymous_function_creation",
+    "arrow_function",
+];
 
-impl MemberScanEvent {
-    fn start(&self) -> usize {
-        match self {
-            Self::Assignment { start, .. } | Self::InstanceMember { start, .. } => *start,
-        }
-    }
+fn is_php_local_scope(node: Node<'_>) -> bool {
+    PHP_LOCAL_SCOPE_NODES.contains(&node.kind())
 }
 
 fn seed_parameter_receivers(
-    header: &str,
+    node: Node<'_>,
+    source: &str,
     ctx: &PhpFileContext,
     engine: &mut LocalInferenceEngine<String>,
 ) {
-    for captures in PARAMETER_VARIABLE_RE.captures_iter(header) {
-        let Some(type_match) = captures.name("type") else {
+    let Some(parameters) = node.child_by_field_name("parameters") else {
+        return;
+    };
+    let mut cursor = parameters.walk();
+    for child in parameters.named_children(&mut cursor) {
+        if !matches!(
+            child.kind(),
+            "simple_parameter" | "property_promotion_parameter"
+        ) {
+            continue;
+        }
+        let Some(name_node) = child.child_by_field_name("name") else {
             continue;
         };
-        let Some(var_match) = captures.name("var") else {
+        let name = variable_identifier(name_node, source);
+        if name.is_empty() {
             continue;
-        };
-        if let Some(fq) = resolve_php_type(type_match.as_str(), ctx) {
-            engine.seed_symbol(var_match.as_str(), fq);
+        }
+        match child
+            .child_by_field_name("type")
+            .and_then(|type_node| resolve_php_type(node_text(type_node, source), ctx))
+        {
+            Some(fq) => engine.seed_symbol(name.to_string(), fq),
+            None => engine.declare_shadow(name.to_string()),
         }
     }
 }
 
 fn apply_receiver_assignment(
-    lhs: &str,
-    rhs: &str,
+    node: Node<'_>,
+    source: &str,
     ctx: &PhpFileContext,
     engine: &mut LocalInferenceEngine<String>,
 ) {
-    if let Some(type_name) = rhs.strip_prefix("new ").and_then(read_leading_type_name)
-        && let Some(fq) = resolve_php_type(type_name, ctx)
-    {
-        engine.seed_symbol(lhs, fq);
+    if node.kind() != "assignment_expression" {
         return;
     }
-    if let Some(rhs_var) = rhs.strip_prefix('$').and_then(read_leading_variable_name) {
-        engine.alias_symbol(lhs, rhs_var);
+    let (Some(left), Some(right)) = (
+        node.child_by_field_name("left"),
+        node.child_by_field_name("right"),
+    ) else {
+        return;
+    };
+    if left.kind() != "variable_name" {
         return;
     }
-    engine.declare_shadow(lhs);
+    let lhs = variable_identifier(left, source);
+    if lhs.is_empty() {
+        return;
+    }
+    let resolved = (right.kind() == "object_creation_expression")
+        .then(|| object_creation_type(right))
+        .flatten()
+        .and_then(|type_node| resolve_php_type(node_text(type_node, source), ctx));
+    match resolved {
+        Some(fq) => engine.seed_symbol(lhs.to_string(), fq),
+        None => {
+            if right.kind() == "variable_name" {
+                let rhs = variable_identifier(right, source);
+                if !rhs.is_empty() {
+                    engine.alias_symbol(lhs.to_string(), rhs);
+                    return;
+                }
+            }
+            engine.declare_shadow(lhs.to_string());
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_member_hit(
+    node: Node<'_>,
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    line_starts: &[usize],
+    ctx: &PhpFileContext,
+    hierarchy: &PhpHierarchyIndex,
+    owner: &str,
+    spec: &TargetSpec,
+    engine: &LocalInferenceEngine<String>,
+    hits: &mut BTreeSet<UsageHit>,
+) {
+    match node.kind() {
+        "member_access_expression" | "member_call_expression" => {
+            let (Some(receiver_node), Some(member_node)) = (
+                node.child_by_field_name("object"),
+                node.child_by_field_name("name"),
+            ) else {
+                return;
+            };
+            if member_identifier(member_node, source) != spec.member_name {
+                return;
+            }
+            let receiver_matches = if variable_identifier(receiver_node, source) == "this" {
+                receiver_is_enclosing_subtype(
+                    analyzer,
+                    file,
+                    member_node.start_byte(),
+                    member_node.end_byte(),
+                    line_starts,
+                    owner,
+                    hierarchy,
+                )
+            } else {
+                precise_receiver_type(engine, variable_identifier(receiver_node, source))
+                    .is_some_and(|fq| receiver_type_matches(&fq, owner, hierarchy))
+            };
+            if receiver_matches {
+                push_member_hit(member_node, analyzer, file, source, line_starts, spec, hits);
+            }
+        }
+        "class_constant_access_expression"
+        | "scoped_call_expression"
+        | "scoped_property_access_expression" => {
+            let Some((receiver_node, member_node)) = static_access_parts(node) else {
+                return;
+            };
+            if member_identifier(member_node, source) != spec.member_name {
+                return;
+            }
+            if !static_receiver_matches(
+                analyzer,
+                file,
+                member_node.start_byte(),
+                member_node.end_byte(),
+                line_starts,
+                node_text(receiver_node, source),
+                owner,
+                ctx,
+                hierarchy,
+            ) {
+                return;
+            }
+            push_member_hit(member_node, analyzer, file, source, line_starts, spec, hits);
+        }
+        _ => {}
+    }
+}
+
+fn static_access_parts(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
+    let field_parts = node
+        .child_by_field_name("scope")
+        .zip(node.child_by_field_name("name"));
+    if field_parts.is_some() {
+        return field_parts;
+    }
+    let mut cursor = node.walk();
+    let named: Vec<_> = node.named_children(&mut cursor).collect();
+    named.first().copied().zip(named.last().copied())
 }
 
 fn precise_receiver_type(engine: &LocalInferenceEngine<String>, receiver: &str) -> Option<String> {
@@ -517,57 +496,39 @@ fn precise_receiver_type(engine: &LocalInferenceEngine<String>, receiver: &str) 
     }
 }
 
-fn member_scope_ranges(root: Node<'_>) -> Vec<(usize, usize)> {
-    let mut ranges = Vec::new();
-    collect_member_scope_ranges(root, &mut ranges);
-    ranges.sort_unstable();
-
-    let mut scoped = Vec::new();
-    let mut cursor = 0;
-    for (start, end) in ranges {
-        if cursor < start {
-            scoped.push((cursor, start));
-        }
-        scoped.push((start, end));
-        cursor = cursor.max(end);
-    }
-    if cursor < root.end_byte() {
-        scoped.push((cursor, root.end_byte()));
-    }
-    scoped
-}
-
-fn collect_member_scope_ranges(node: Node<'_>, ranges: &mut Vec<(usize, usize)>) {
-    match node.kind() {
-        "function_definition" | "method_declaration" | "anonymous_function_creation" => {
-            ranges.push((node.start_byte(), node.end_byte()));
-            return;
-        }
-        _ => {}
-    }
-
+fn object_creation_type(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_member_scope_ranges(child, ranges);
-    }
+    node.named_children(&mut cursor)
+        .find(|child| matches!(child.kind(), "name" | "qualified_name"))
 }
 
-fn read_leading_type_name(value: &str) -> Option<&str> {
-    let end = value
-        .char_indices()
-        .take_while(|(_, ch)| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '\\'))
-        .map(|(idx, ch)| idx + ch.len_utf8())
-        .last()
-        .unwrap_or(0);
-    (end > 0).then(|| &value[..end])
+fn variable_identifier<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    node_text(node, source).trim_start_matches('$')
 }
 
-fn read_leading_variable_name(value: &str) -> Option<&str> {
-    let end = value
-        .char_indices()
-        .take_while(|(_, ch)| ch.is_ascii_alphanumeric() || *ch == '_')
-        .map(|(idx, ch)| idx + ch.len_utf8())
-        .last()
-        .unwrap_or(0);
-    (end > 0).then(|| &value[..end])
+fn member_identifier<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    node_text(node, source).trim_start_matches('$')
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_member_hit(
+    node: Node<'_>,
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    line_starts: &[usize],
+    spec: &TargetSpec,
+    hits: &mut BTreeSet<UsageHit>,
+) {
+    let start = node.start_byte() + usize::from(node_text(node, source).starts_with('$'));
+    push_hit_range(
+        start,
+        node.end_byte(),
+        analyzer,
+        file,
+        source,
+        line_starts,
+        spec,
+        hits,
+    );
 }
