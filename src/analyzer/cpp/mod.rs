@@ -2,25 +2,29 @@ mod adapter;
 mod cache;
 mod clones;
 mod declarations;
+mod hierarchy;
 mod imports;
 mod tests;
 
 use crate::analyzer::clone_detection::{CloneCandidateProfile, detect_structural_clone_smells};
 use crate::analyzer::common::language_for_file as file_language;
-use crate::analyzer::js_ts::build_weighted_cache;
+use crate::analyzer::js_ts::{
+    build_weighted_cache, weight_code_unit_set_by_unit, weight_code_unit_vec_by_unit,
+};
 use crate::analyzer::{
     AnalyzerConfig, CloneSmell, CloneSmellWeights, CodeUnit, CodeUnitType, IAnalyzer,
     ImportAnalysisProvider, ImportInfo, Language, Project, ProjectFile, TestAssertionSmell,
     TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider,
+    TypeHierarchyProvider,
 };
-use crate::hash::HashSet;
+use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
 use regex::Regex;
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use adapter::CppAdapter;
-use cache::{weight_code_unit_set, weight_project_file_set};
+use cache::{weight_code_unit_set_by_file, weight_project_file_set};
 use clones::{build_clone_candidate_data, refine_cpp_clone_similarity};
 use tests::detect_cpp_test_assertion_smells;
 
@@ -31,8 +35,13 @@ pub(crate) use imports::{
 #[derive(Clone)]
 pub struct CppAnalyzer {
     inner: TreeSitterAnalyzer<CppAdapter>,
+    memo_budget: u64,
     imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
+    direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
+    direct_descendants: Cache<CodeUnit, Arc<HashSet<CodeUnit>>>,
+    direct_ancestor_index: Arc<OnceLock<HashMap<String, Arc<Vec<CodeUnit>>>>>,
+    direct_descendant_index: Arc<OnceLock<HashMap<String, Arc<HashSet<CodeUnit>>>>>,
 }
 
 impl CppAnalyzer {
@@ -42,11 +51,8 @@ impl CppAnalyzer {
 
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
-        Self {
-            inner: TreeSitterAnalyzer::new_with_config(project, CppAdapter, config),
-            imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
-            referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
-        }
+        let inner = TreeSitterAnalyzer::new_with_config(project, CppAdapter, config);
+        Self::from_inner(inner, memo_budget)
     }
 
     pub fn new_with_config_and_storage(
@@ -55,12 +61,43 @@ impl CppAnalyzer {
         storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
     ) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
+        let inner =
+            TreeSitterAnalyzer::new_with_config_and_storage(project, CppAdapter, config, storage);
+        Self::from_inner(inner, memo_budget)
+    }
+
+    fn from_inner(inner: TreeSitterAnalyzer<CppAdapter>, memo_budget: u64) -> Self {
         Self {
-            inner: TreeSitterAnalyzer::new_with_config_and_storage(
-                project, CppAdapter, config, storage,
+            inner,
+            memo_budget,
+            imported_code_units: build_weighted_cache(
+                memo_budget / 4,
+                weight_code_unit_set_by_file,
             ),
-            imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
+            direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec_by_unit),
+            direct_descendants: build_weighted_cache(memo_budget / 8, weight_code_unit_set_by_unit),
+            direct_ancestor_index: Arc::new(OnceLock::new()),
+            direct_descendant_index: Arc::new(OnceLock::new()),
+        }
+    }
+
+    fn with_updated_inner(&self, inner: TreeSitterAnalyzer<CppAdapter>) -> Self {
+        Self {
+            inner,
+            memo_budget: self.memo_budget,
+            imported_code_units: self.imported_code_units.clone(),
+            referencing_files: self.referencing_files.clone(),
+            direct_ancestors: build_weighted_cache(
+                self.memo_budget / 8,
+                weight_code_unit_vec_by_unit,
+            ),
+            direct_descendants: build_weighted_cache(
+                self.memo_budget / 8,
+                weight_code_unit_set_by_unit,
+            ),
+            direct_ancestor_index: Arc::new(OnceLock::new()),
+            direct_descendant_index: Arc::new(OnceLock::new()),
         }
     }
 
@@ -158,19 +195,11 @@ impl IAnalyzer for CppAnalyzer {
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
-        Self {
-            inner: self.inner.update(changed_files),
-            imported_code_units: self.imported_code_units.clone(),
-            referencing_files: self.referencing_files.clone(),
-        }
+        self.with_updated_inner(self.inner.update(changed_files))
     }
 
     fn update_all(&self) -> Self {
-        Self {
-            inner: self.inner.update_all(),
-            imported_code_units: self.imported_code_units.clone(),
-            referencing_files: self.referencing_files.clone(),
-        }
+        self.with_updated_inner(self.inner.update_all())
     }
 
     fn project(&self) -> &dyn Project {
@@ -275,6 +304,10 @@ impl IAnalyzer for CppAnalyzer {
     }
 
     fn type_alias_provider(&self) -> Option<&dyn TypeAliasProvider> {
+        Some(self)
+    }
+
+    fn type_hierarchy_provider(&self) -> Option<&dyn TypeHierarchyProvider> {
         Some(self)
     }
 

@@ -2091,6 +2091,55 @@ fn bifrost_lsp_server_type_hierarchy_php_uses_same_handler() {
 }
 
 #[test]
+fn bifrost_lsp_server_type_hierarchy_cpp_uses_same_handler() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("Hierarchy.cpp");
+    fs::write(
+        &file_path,
+        "struct Base {};\nstruct Child : Base {\n    void method() {}\n};\n",
+    )
+    .expect("write C++ hierarchy fixture");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let child_item =
+        prepare_type_hierarchy(&mut stdin, &mut reader, &mut stderr, 40, &file_uri, 1, 8);
+    assert_eq!(child_item["name"], "Child", "prepared child: {child_item}");
+
+    let supertypes = type_hierarchy_relation(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        41,
+        "typeHierarchy/supertypes",
+        child_item,
+    );
+    let supertype_names: Vec<_> = supertypes
+        .iter()
+        .filter_map(|item| item["name"].as_str())
+        .collect();
+    assert_eq!(supertype_names, vec!["Base"], "supertypes: {supertypes:#?}");
+
+    let base_item = supertypes[0].clone();
+    let subtypes = type_hierarchy_relation(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        42,
+        "typeHierarchy/subtypes",
+        base_item,
+    );
+    let subtype_names: Vec<_> = subtypes
+        .iter()
+        .filter_map(|item| item["name"].as_str())
+        .collect();
+    assert_eq!(subtype_names, vec!["Child"], "subtypes: {subtypes:#?}");
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
 fn bifrost_lsp_server_type_hierarchy_returns_null_without_provider() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().canonicalize().expect("canon temp");

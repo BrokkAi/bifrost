@@ -487,6 +487,10 @@ impl<'a> CppVisitor<'a> {
             self.parsed
                 .add_code_unit(code_unit.clone(), node, self.source, None, None);
         }
+        if matches!(node.kind(), "class_specifier" | "struct_specifier") {
+            self.parsed
+                .set_raw_supertypes(code_unit.clone(), extract_cpp_supertypes(node, self.source));
+        }
         self.parsed.add_signature(
             code_unit.clone(),
             render_cpp_type_signature(node, self.source, scope.template_signature.as_deref()),
@@ -956,6 +960,30 @@ fn looks_like_quoted_include_line(line: &str) -> bool {
         return false;
     };
     rest.trim_start().starts_with('"')
+}
+
+fn extract_cpp_supertypes(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut raw = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "base_class_clause" {
+            collect_cpp_base_nodes(child, source, &mut raw);
+        }
+    }
+    raw
+}
+
+fn collect_cpp_base_nodes(node: Node<'_>, source: &str, raw: &mut Vec<String>) {
+    walk_named_tree_preorder(node, false, |child| match child.kind() {
+        "type_identifier" | "qualified_identifier" | "template_type" => {
+            let text = normalize_cpp_whitespace(node_text(child, source));
+            if !text.is_empty() {
+                raw.push(text);
+            }
+            WalkControl::SkipChildren
+        }
+        _ => WalkControl::Continue,
+    });
 }
 
 fn strip_cpp_comments_from_line(line: &str, in_block_comment: &mut bool) -> String {

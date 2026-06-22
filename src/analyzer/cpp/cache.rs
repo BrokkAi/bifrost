@@ -2,7 +2,10 @@ use super::*;
 use std::mem::size_of;
 use std::sync::Arc;
 
-pub(super) fn weight_code_unit_set(_key: &ProjectFile, value: &Arc<HashSet<CodeUnit>>) -> u32 {
+pub(super) fn weight_code_unit_set_by_file(
+    _key: &ProjectFile,
+    value: &Arc<HashSet<CodeUnit>>,
+) -> u32 {
     let size = value.iter().fold(0usize, |acc, item| {
         acc + size_of::<CodeUnit>()
             + item.fq_name().len()
