@@ -443,12 +443,16 @@ namespace App {
         },
     );
 
+    // `return value;` is a genuine unqualified read of the field within its own
+    // class, so the graph resolves it on the precise path (#231) instead of
+    // reporting an unproven fallback. The field surfaces with its one same-owner
+    // usage rather than a "no proven structured hits" diagnostic.
     assert!(
-        report.contains("CSharpUsageGraphStrategy: no proven structured hits"),
-        "{report}"
+        !report.contains("CSharpUsageGraphStrategy: no proven structured hits"),
+        "the same-class self-read should resolve on the graph, not fall back: {report}"
     );
-    assert!(!report.contains("one workspace inbound edge"), "{report}");
-    assert!(!report.contains("no non-self usages found"), "{report}");
+    assert!(report.contains("`App.Service.value`"), "{report}");
+    assert!(report.contains("same owner"), "{report}");
 }
 
 #[test]

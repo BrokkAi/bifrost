@@ -1,8 +1,9 @@
 use crate::analyzer::usages::csharp_graph::hits::push_hit;
 use crate::analyzer::usages::csharp_graph::resolver::{
     TargetKind, TargetSpec, argument_count, binding_scope_node, first_type_child,
-    is_type_reference_node, node_text, normalize_type_text, receiver_targets_owner,
-    reference_type_text, resolves_to_target, same_node, seed_bindings_before,
+    is_type_reference_node, member_name_is_locally_bound, node_text, normalize_type_text,
+    receiver_targets_owner, reference_type_text, resolves_to_target, same_node,
+    seed_bindings_before, unqualified_member_resolves_to_owner,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::UsageHit;
@@ -192,7 +193,15 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         ctx.source,
         &mut bindings,
     );
-    match receiver_targets_owner(receiver, &ctx.spec.owner, &bindings) {
+    match receiver_targets_owner(
+        receiver_node,
+        receiver,
+        &ctx.spec.owner,
+        ctx.csharp,
+        ctx.file,
+        ctx.source,
+        &bindings,
+    ) {
         crate::analyzer::usages::local_inference::SymbolResolution::Precise(targets)
             if targets
                 .iter()
@@ -232,10 +241,62 @@ fn scan_unqualified_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             *ctx.saw_unproven_match = true;
         }
         TargetKind::Field if !is_type_reference_node(node) => {
-            *ctx.saw_unproven_match = true;
+            // `nameof(Field)` is a compile-time string, not a member reference.
+            if is_nameof_argument(node, ctx.source) {
+                return;
+            }
+            let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
+            seed_bindings_before(
+                binding_scope_node(node),
+                node.start_byte(),
+                ctx.csharp,
+                ctx.file,
+                ctx.source,
+                &mut bindings,
+            );
+            // A local or parameter of the same name is provably not the field. Skip
+            // it silently — treating it as an unproven match would force the whole
+            // file's result to a fallback and discard genuinely proven hits.
+            if member_name_is_locally_bound(&ctx.spec.member_name, &bindings) {
+                return;
+            }
+            if unqualified_member_resolves_to_owner(
+                node,
+                &ctx.spec.member_name,
+                &ctx.spec.owner,
+                ctx.csharp,
+                ctx.file,
+                ctx.source,
+                &bindings,
+            ) {
+                push_hit(node, ctx);
+            } else {
+                *ctx.saw_unproven_match = true;
+            }
         }
         _ => {}
     }
+}
+
+/// Whether `node` is the bare-identifier argument of a `nameof(...)` expression.
+/// Walks up through the argument wrappers to the nearest invocation and checks the
+/// invoked expression is `nameof`. `nameof(X)` evaluates to a compile-time string,
+/// so its argument is not a runtime member reference.
+fn is_nameof_argument(node: Node<'_>, source: &str) -> bool {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        match parent.kind() {
+            "argument" | "argument_list" => current = parent,
+            "invocation_expression" => {
+                return parent
+                    .child_by_field_name("function")
+                    .or_else(|| parent.named_child(0))
+                    .is_some_and(|function| node_text(function, source) == "nameof");
+            }
+            _ => return false,
+        }
+    }
+    false
 }
 
 pub(in crate::analyzer::usages) fn is_declaration_name(node: Node<'_>) -> bool {

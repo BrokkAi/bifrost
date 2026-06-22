@@ -1287,3 +1287,130 @@ namespace App {
 
     assert!(matches!(result, FuzzyResult::TooManyCallsites { .. }));
 }
+
+const FIELD_RECEIVER_FILES: &[(&str, &str)] = &[
+    (
+        "src/Service.cs",
+        r#"namespace Example;
+public sealed class Repository {
+    public string Last { get; set; } = "";
+    public void Save(string value) { Last = value; }
+}
+public sealed class Service {
+    private readonly Repository repository = new();
+    public void Run(string value) { repository.Save(value); }
+}
+"#,
+    ),
+    (
+        "src/Consumer.cs",
+        r#"namespace Example;
+public sealed class Consumer {
+    public string ReadLast(Repository repository) { return repository.Last; }
+}
+"#,
+    ),
+];
+
+#[test]
+fn csharp_graph_resolves_member_method_through_class_level_field_receiver() {
+    let (project, analyzer) = csharp_analyzer_with_files(FIELD_RECEIVER_FILES);
+
+    let save = member_function(&analyzer, "Repository", "Save");
+    let hits = graph_hits(&analyzer, &save);
+
+    assert_eq!(
+        1,
+        hits.len(),
+        "field receiver repository.Save(value) should be a proven hit: {hits:#?}"
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file == project.file("src/Service.cs")),
+        "the only call site lives in Service.cs: {hits:#?}"
+    );
+}
+
+#[test]
+fn csharp_graph_resolves_property_self_write_and_field_receiver_read() {
+    let (project, analyzer) = csharp_analyzer_with_files(FIELD_RECEIVER_FILES);
+
+    let last = member_field(&analyzer, "Repository", "Last");
+    let hits = graph_hits(&analyzer, &last);
+
+    assert_eq!(
+        2,
+        hits.len(),
+        "expected the self-write Last = value and the read repository.Last: {hits:#?}"
+    );
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == project.file("src/Service.cs")),
+        "the self-write Last = value lives in Service.cs: {hits:#?}"
+    );
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == project.file("src/Consumer.cs")),
+        "the read repository.Last lives in Consumer.cs: {hits:#?}"
+    );
+}
+
+// `nameof(Last)` is a compile-time string, not a runtime member reference, so it
+// must not be counted as a usage of the field.
+#[test]
+fn csharp_graph_excludes_nameof_field_argument() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[(
+        "src/Service.cs",
+        r#"namespace Example;
+public sealed class Repository {
+    public string Last { get; set; } = "";
+    public void Save(string value) { Last = value; }
+    public string NameOfLast() { return nameof(Last); }
+}
+"#,
+    )]);
+
+    let last = member_field(&analyzer, "Repository", "Last");
+    let hits = graph_hits(&analyzer, &last);
+
+    assert_eq!(
+        1,
+        hits.len(),
+        "only the Last = value write is a usage; nameof(Last) is not: {hits:#?}"
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file == project.file("src/Service.cs")),
+        "{hits:#?}"
+    );
+}
+
+// A local of the same name in an unrelated method is provably not the field, so it
+// must be skipped silently rather than poisoning the file's other proven hits.
+#[test]
+fn csharp_graph_local_shadow_does_not_discard_proven_field_hits() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[(
+        "src/Service.cs",
+        r#"namespace Example;
+public sealed class Repository {
+    public string Last { get; set; } = "";
+    public void Save(string value) { Last = value; }
+    public string Unrelated() { string Last = "x"; return Last; }
+}
+"#,
+    )]);
+
+    let last = member_field(&analyzer, "Repository", "Last");
+    let hits = graph_hits(&analyzer, &last);
+
+    assert_eq!(
+        1,
+        hits.len(),
+        "the Last = value write must survive a same-named local in another method: {hits:#?}"
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file == project.file("src/Service.cs")),
+        "{hits:#?}"
+    );
+}
