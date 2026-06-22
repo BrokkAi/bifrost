@@ -12,8 +12,35 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from bifrost_searchtools import SearchToolsClient, SearchToolsError, SymbolKindFilter
+from bifrost_searchtools import (
+    SearchToolsClient,
+    SearchToolsError,
+    SymbolKindFilter,
+    XmlSelectOutput,
+)
 from bifrost_searchtools.models import SemanticSearchResult, SemanticSearchStatus
+
+
+def _init_git_repo(root: Path) -> None:
+    subprocess.run(["git", "init"], cwd=root, check=True)
+
+
+def _git_commit(root: Path, message: str) -> None:
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Test User",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            message,
+        ],
+        cwd=root,
+        check=True,
+    )
 
 class SearchToolsClientTest(unittest.TestCase):
     @classmethod
@@ -440,6 +467,176 @@ namespace Demo
         self.assertEqual(3, status.waiting_files)
         self.assertEqual(1, status.pending_batches)
         self.assertEqual("ready", status.phase)
+
+
+    def test_refresh_returns_typed_metrics(self) -> None:
+        with SearchToolsClient(root=self.fixture_root) as client:
+            result = client.refresh()
+
+        self.assertGreater(result.analyzed_files, 0)
+        self.assertGreater(result.declarations, 0)
+        self.assertIn("java", result.languages)
+
+    def test_get_active_workspace_reports_root(self) -> None:
+        with SearchToolsClient(root=self.fixture_root) as client:
+            result = client.get_active_workspace()
+
+        self.assertEqual("testcode-java", Path(result.workspace_path).name)
+
+    def test_activate_workspace_switches_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            other = Path(tmp)
+            (other / "A.java").write_text("public class A { }\n")
+
+            with SearchToolsClient(root=self.fixture_root) as client:
+                activated = client.activate_workspace(other)
+                active = client.get_active_workspace()
+
+            # Rust canonicalizes the root (on Windows that adds a \\?\ prefix),
+            # so compare by filesystem identity rather than string equality.
+            self.assertTrue(os.path.samefile(activated.workspace_path, other))
+            self.assertTrue(
+                os.path.samefile(active.workspace_path, activated.workspace_path)
+            )
+
+    def test_get_file_contents_reads_fixture_file(self) -> None:
+        with SearchToolsClient(root=self.fixture_root) as client:
+            result = client.get_file_contents(["A.java"])
+
+        self.assertEqual(1, result.count)
+        self.assertEqual("A.java", result.files[0].path)
+        self.assertIn("public class A", result.files[0].content)
+        self.assertEqual([], result.not_found)
+
+    def test_find_filenames_matches_glob(self) -> None:
+        with SearchToolsClient(root=self.fixture_root) as client:
+            result = client.find_filenames(["*.java"], limit=5)
+
+        self.assertTrue(any(name.endswith("A.java") for name in result.files))
+        self.assertLessEqual(result.count, 5)
+
+    def test_search_file_contents_returns_matches_with_context(self) -> None:
+        with SearchToolsClient(root=self.fixture_root) as client:
+            result = client.search_file_contents(["public class A"], file_path="A.java")
+
+        self.assertTrue(result.matches)
+        group = result.matches[0]
+        self.assertEqual("A.java", group.path)
+        self.assertTrue(any("public class A" in m.text for m in group.matches))
+
+    def test_find_files_containing_matches_contents(self) -> None:
+        with SearchToolsClient(root=self.fixture_root) as client:
+            result = client.find_files_containing(["public class A\\b"])
+
+        self.assertTrue(any(name.endswith("A.java") for name in result.files))
+        self.assertEqual([], result.invalid_patterns)
+
+    def test_list_files_lists_workspace_root(self) -> None:
+        with SearchToolsClient(root=self.fixture_root) as client:
+            result = client.list_files("")
+
+        self.assertTrue(any(name.endswith("A.java") for name in result.files))
+
+    def test_compute_cyclomatic_complexity_reports(self) -> None:
+        with SearchToolsClient(root=self.fixture_root) as client:
+            result = client.compute_cyclomatic_complexity(["A.java"], threshold=1)
+
+        self.assertIsInstance(result.report, str)
+        self.assertTrue(result.report.strip())
+        self.assertEqual(result.report, result.render_text())
+
+    def test_structured_data_tools_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "data.json").write_text('{"name": "bifrost", "version": "0.2.0"}\n')
+            (root / "doc.xml").write_text(
+                "<root><item>alpha</item><item>beta</item></root>\n"
+            )
+            (root / "attrs.xml").write_text(
+                '<root><item id="1"/><item id="2"/></root>\n'
+            )
+
+            with SearchToolsClient(root=root) as client:
+                jq_result = client.jq("data.json", ".name")
+                skim = client.xml_skim("doc.xml")
+                selected = client.xml_select("doc.xml", "//item")
+                attrs = client.xml_select(
+                    "attrs.xml",
+                    "//item",
+                    output=XmlSelectOutput.ATTRIBUTE,
+                    attr_name="id",
+                )
+
+        self.assertEqual(['"bifrost"'], jq_result.files[0].matches)
+        self.assertTrue(any(el.tag == "item" for el in skim.files[0].elements))
+        self.assertEqual(["alpha", "beta"], selected.files[0].matches)
+        self.assertEqual(["1", "2"], attrs.files[0].matches)
+
+    def test_git_tools_return_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _init_git_repo(root)
+            (root / "a.txt").write_text("alpha\n")
+            _git_commit(root, "Add alpha file")
+
+            with SearchToolsClient(root=root) as client:
+                log = client.get_git_log()
+                diff = client.get_commit_diff("HEAD")
+                search = client.search_git_commit_messages("alpha")
+
+        self.assertIn("Add alpha file", log.text)
+        self.assertIn("a.txt", diff.text)
+        self.assertIn("alpha", search.text)
+        self.assertEqual(log.text, log.render_text())
+
+    def test_update_paths_returns_typed_metrics(self) -> None:
+        with SearchToolsClient(root=self.fixture_root) as client:
+            result = client.update_paths(["A.java"])
+
+        self.assertGreaterEqual(result.analyzed_files, 1)
+        self.assertIn("java", result.languages)
+
+    def test_code_quality_reports_on_java_fixture(self) -> None:
+        # One analyzer build, every Java-backed slopcop tool exercised so an
+        # argument-name typo in any single wrapper surfaces here.
+        with SearchToolsClient(root=self.fixture_root) as client:
+            reports = {
+                "cognitive": client.compute_cognitive_complexity(
+                    ["A.java"], threshold=1
+                ),
+                "density_unit": client.report_comment_density_for_code_unit("A"),
+                "density_files": client.report_comment_density_for_files(["A.java"]),
+                "exception": client.report_exception_handling_smells(["A.java"]),
+                "assertion": client.report_test_assertion_smells(["A.java"]),
+                "clone": client.report_structural_clone_smells(["A.java", "B.java"]),
+                "size": client.report_long_method_and_god_object_smells(["A.java"]),
+            }
+
+        for name, report in reports.items():
+            self.assertIsInstance(report.report, str, name)
+            self.assertEqual(report.report, report.render_text(), name)
+
+    def test_report_dead_code_on_rust_fixture(self) -> None:
+        rust_fixture = ROOT / "tests" / "fixtures" / "testcode-rs"
+        with SearchToolsClient(root=rust_fixture) as client:
+            report = client.report_dead_code_and_unused_abstraction_smells()
+
+        self.assertIsInstance(report.report, str)
+        self.assertEqual(report.report, report.render_text())
+
+    def test_secret_like_code_and_git_hotspots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _init_git_repo(root)
+            (root / "config.py").write_text('API_KEY = "AKIA1234567890ABCDEF"\n')
+            _git_commit(root, "Add config")
+
+            with SearchToolsClient(root=root) as client:
+                secrets = client.report_secret_like_code()
+                hotspots = client.analyze_git_hotspots()
+
+        self.assertIsInstance(secrets.report, str)
+        self.assertIsInstance(hotspots.report, str)
 
 
 if __name__ == "__main__":

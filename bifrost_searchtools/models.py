@@ -922,3 +922,408 @@ class UsageGraphResult:
         if self.truncated_symbols:
             summary += f", {len(self.truncated_symbols)} truncated"
         return summary
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AmbiguousPath:
+    """A path input that resolved to more than one workspace file.
+
+    The file, structured-data, and code-quality tools report these instead of
+    guessing which file a non-unique path meant.
+    """
+
+    input: str
+    matches: list[str]
+
+    @classmethod
+    def from_dict(cls, data: dict) -> AmbiguousPath:
+        return cls(input=data["input"], matches=list(data["matches"]))
+
+    def render_text(self) -> str:
+        return f"Ambiguous {self.input}: {', '.join(self.matches)}"
+
+
+def _ambiguous_paths(data: dict) -> list[AmbiguousPath]:
+    # Rust omits ambiguous_paths entirely when empty (skip_serializing_if).
+    return [AmbiguousPath.from_dict(item) for item in data.get("ambiguous_paths", [])]
+
+
+# ---------------------------------------------------------------------------
+# Workspace lifecycle
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RefreshResult:
+    """Index metrics returned by ``refresh`` and ``update_paths``."""
+
+    languages: list[str]
+    analyzed_files: int
+    declarations: int
+
+    @classmethod
+    def from_dict(cls, data: dict) -> RefreshResult:
+        return cls(
+            languages=list(data.get("languages", [])),
+            analyzed_files=int(data["analyzed_files"]),
+            declarations=int(data["declarations"]),
+        )
+
+    def render_text(self) -> str:
+        languages = ", ".join(self.languages) if self.languages else "none"
+        return (
+            f"{self.analyzed_files} files, {self.declarations} declarations "
+            f"({languages})"
+        )
+
+
+@dataclass(frozen=True)
+class WorkspaceResult:
+    """The active workspace root (``activate_workspace`` / ``get_active_workspace``)."""
+
+    workspace_path: str
+
+    @classmethod
+    def from_dict(cls, data: dict) -> WorkspaceResult:
+        return cls(workspace_path=data["workspace_path"])
+
+    def render_text(self) -> str:
+        return self.workspace_path
+
+
+# ---------------------------------------------------------------------------
+# File tools
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FileContent:
+    path: str
+    content: str
+    truncated: bool
+    total_lines: int | None = None
+    head_lines: int | None = None
+    tail_lines: int | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict) -> FileContent:
+        return cls(
+            path=data["path"],
+            content=data["content"],
+            truncated=bool(data.get("truncated", False)),
+            total_lines=data.get("total_lines"),
+            head_lines=data.get("head_lines"),
+            tail_lines=data.get("tail_lines"),
+        )
+
+
+@dataclass(frozen=True)
+class GetFileContentsResult:
+    files: list[FileContent]
+    not_found: list[str]
+    ambiguous_paths: list[AmbiguousPath] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> GetFileContentsResult:
+        return cls(
+            files=[FileContent.from_dict(item) for item in data.get("files", [])],
+            not_found=list(data.get("not_found", [])),
+            ambiguous_paths=_ambiguous_paths(data),
+        )
+
+    @property
+    def count(self) -> int:
+        return len(self.files)
+
+
+@dataclass(frozen=True)
+class FindFilenamesResult:
+    files: list[str]
+    truncated: bool
+
+    @classmethod
+    def from_dict(cls, data: dict) -> FindFilenamesResult:
+        return cls(
+            files=list(data.get("files", [])),
+            truncated=bool(data.get("truncated", False)),
+        )
+
+    @property
+    def count(self) -> int:
+        return len(self.files)
+
+
+@dataclass(frozen=True)
+class LineMatch:
+    line: int
+    text: str
+    before: list[str]
+    after: list[str]
+
+    @classmethod
+    def from_dict(cls, data: dict) -> LineMatch:
+        return cls(
+            line=int(data["line"]),
+            text=data["text"],
+            before=list(data.get("before", [])),
+            after=list(data.get("after", [])),
+        )
+
+
+@dataclass(frozen=True)
+class FileMatchGroup:
+    path: str
+    matches: list[LineMatch]
+    truncated: bool
+
+    @classmethod
+    def from_dict(cls, data: dict) -> FileMatchGroup:
+        return cls(
+            path=data["path"],
+            matches=[LineMatch.from_dict(item) for item in data.get("matches", [])],
+            truncated=bool(data.get("truncated", False)),
+        )
+
+
+@dataclass(frozen=True)
+class SearchFileContentsResult:
+    matches: list[FileMatchGroup]
+    truncated: bool
+    invalid_patterns: list[str]
+    ambiguous_paths: list[AmbiguousPath] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> SearchFileContentsResult:
+        return cls(
+            matches=[
+                FileMatchGroup.from_dict(item) for item in data.get("matches", [])
+            ],
+            truncated=bool(data.get("truncated", False)),
+            invalid_patterns=list(data.get("invalid_patterns", [])),
+            ambiguous_paths=_ambiguous_paths(data),
+        )
+
+    @property
+    def count(self) -> int:
+        return len(self.matches)
+
+
+@dataclass(frozen=True)
+class FindFilesContainingResult:
+    files: list[str]
+    truncated: bool
+    invalid_patterns: list[str]
+
+    @classmethod
+    def from_dict(cls, data: dict) -> FindFilesContainingResult:
+        return cls(
+            files=list(data.get("files", [])),
+            truncated=bool(data.get("truncated", False)),
+            invalid_patterns=list(data.get("invalid_patterns", [])),
+        )
+
+    @property
+    def count(self) -> int:
+        return len(self.files)
+
+
+@dataclass(frozen=True)
+class ListFilesResult:
+    directory: str
+    files: list[str]
+    truncated: bool
+
+    @classmethod
+    def from_dict(cls, data: dict) -> ListFilesResult:
+        return cls(
+            directory=data["directory"],
+            files=list(data.get("files", [])),
+            truncated=bool(data.get("truncated", False)),
+        )
+
+    @property
+    def count(self) -> int:
+        return len(self.files)
+
+
+# ---------------------------------------------------------------------------
+# Git tools
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class GitTextResult:
+    """A git tool result.
+
+    The Rust git tools (``get_git_log``, ``get_commit_diff``,
+    ``search_git_commit_messages``) render their own XML-shaped text rather than
+    structured JSON, so the payload is surfaced verbatim as ``text``.
+    """
+
+    text: str
+
+    @classmethod
+    def from_text(cls, text: str) -> GitTextResult:
+        return cls(text=text)
+
+    def render_text(self) -> str:
+        return self.text
+
+    def __str__(self) -> str:
+        return self.text
+
+
+# ---------------------------------------------------------------------------
+# Structured data tools
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class JqFileResult:
+    path: str
+    matches: list[str]
+    truncated: bool
+    error: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict) -> JqFileResult:
+        return cls(
+            path=data["path"],
+            matches=list(data.get("matches", [])),
+            truncated=bool(data.get("truncated", False)),
+            error=data.get("error"),
+        )
+
+
+@dataclass(frozen=True)
+class JqResult:
+    files: list[JqFileResult]
+    truncated_files: bool
+    error: str | None = None
+    ambiguous_paths: list[AmbiguousPath] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> JqResult:
+        return cls(
+            files=[JqFileResult.from_dict(item) for item in data.get("files", [])],
+            truncated_files=bool(data.get("truncated_files", False)),
+            error=data.get("error"),
+            ambiguous_paths=_ambiguous_paths(data),
+        )
+
+
+@dataclass(frozen=True)
+class XmlSkimElement:
+    tag: str
+    depth: int
+    attribute_count: int
+
+    @classmethod
+    def from_dict(cls, data: dict) -> XmlSkimElement:
+        return cls(
+            tag=data["tag"],
+            depth=int(data["depth"]),
+            attribute_count=int(data["attribute_count"]),
+        )
+
+
+@dataclass(frozen=True)
+class XmlSkimFile:
+    path: str
+    elements: list[XmlSkimElement]
+    error: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict) -> XmlSkimFile:
+        return cls(
+            path=data["path"],
+            elements=[
+                XmlSkimElement.from_dict(item) for item in data.get("elements", [])
+            ],
+            error=data.get("error"),
+        )
+
+
+@dataclass(frozen=True)
+class XmlSkimResult:
+    files: list[XmlSkimFile]
+    truncated_files: bool
+    ambiguous_paths: list[AmbiguousPath] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> XmlSkimResult:
+        return cls(
+            files=[XmlSkimFile.from_dict(item) for item in data.get("files", [])],
+            truncated_files=bool(data.get("truncated_files", False)),
+            ambiguous_paths=_ambiguous_paths(data),
+        )
+
+
+@dataclass(frozen=True)
+class XmlSelectFile:
+    path: str
+    matches: list[str]
+    error: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict) -> XmlSelectFile:
+        return cls(
+            path=data["path"],
+            matches=list(data.get("matches", [])),
+            error=data.get("error"),
+        )
+
+
+@dataclass(frozen=True)
+class XmlSelectResult:
+    files: list[XmlSelectFile]
+    truncated_files: bool
+    error: str | None = None
+    ambiguous_paths: list[AmbiguousPath] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> XmlSelectResult:
+        return cls(
+            files=[XmlSelectFile.from_dict(item) for item in data.get("files", [])],
+            truncated_files=bool(data.get("truncated_files", False)),
+            error=data.get("error"),
+            ambiguous_paths=_ambiguous_paths(data),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Code quality (slopcop) tools
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CodeQualityReport:
+    """Result of a code-quality (slopcop) tool.
+
+    The Rust analyzers render their own report text, surfaced verbatim as
+    ``report``. ``truncated`` is omitted by the git-backed tools and defaults to
+    ``False``; ``ambiguous_paths`` is present only for the file-based tools.
+    """
+
+    report: str
+    truncated: bool = False
+    ambiguous_paths: list[AmbiguousPath] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQualityReport:
+        return cls(
+            report=data["report"],
+            truncated=bool(data.get("truncated", False)),
+            ambiguous_paths=_ambiguous_paths(data),
+        )
+
+    def render_text(self) -> str:
+        return self.report
+
+    def __str__(self) -> str:
+        return self.report
