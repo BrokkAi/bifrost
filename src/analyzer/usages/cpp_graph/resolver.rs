@@ -41,7 +41,12 @@ impl TargetSpec {
         }
 
         if target.is_field() {
-            let owner = precise_parent_of(analyzer, target);
+            // A namespace (module) is not a receiver: a namespace-scoped constant such as
+            // `example::DefaultPrefix` is referenced unqualified from inside the namespace and
+            // qualified from outside, exactly like a global. Treating a module owner as a
+            // member-field owner makes the receiver/owner-context match reject every valid
+            // reference, so resolve it as a global field instead.
+            let owner = type_owner_of(analyzer, target);
             let kind = if owner.is_some() {
                 TargetKind::MemberField
             } else {
@@ -57,7 +62,9 @@ impl TargetSpec {
         }
 
         if target.is_function() {
-            let owner = precise_parent_of(analyzer, target);
+            // Free functions declared inside a namespace have a module owner; that namespace is
+            // not a call receiver, so resolve them as free functions rather than methods.
+            let owner = type_owner_of(analyzer, target);
             let kind = if owner
                 .as_ref()
                 .is_some_and(|owner| target.identifier() == owner.identifier())
@@ -281,6 +288,40 @@ impl VisibilityIndex {
                     && same_visible_symbol(unit, target)
             })
         })
+    }
+
+    /// Whether `target` is the *only* visible symbol of `kind` that `raw_name` could
+    /// resolve to. A qualified reference (`ns::Name`) already matches exactly, but a
+    /// bare `Name` can collide with a same-named symbol in another namespace; when it
+    /// does, the reference is ambiguous and must not be attributed to `target` by the
+    /// unspecified iteration order of the visible set.
+    pub(super) fn uniquely_resolves_to_target(
+        &self,
+        file: &ProjectFile,
+        raw_name: &str,
+        kind: TargetKind,
+        target: &CodeUnit,
+    ) -> bool {
+        let Some(normalized) = normalize_reference_name(raw_name) else {
+            return false;
+        };
+        let Some(visible) = self.visible_by_file.get(file) else {
+            return false;
+        };
+        let mut matched_target = false;
+        for unit in visible.iter() {
+            if !matches_kind_for_lookup(unit, kind) || !reference_matches_unit(&normalized, unit) {
+                continue;
+            }
+            if same_visible_symbol(unit, target) {
+                matched_target = true;
+            } else {
+                // A distinct same-named symbol is also visible — the reference is
+                // ambiguous, so it cannot be proven to be the target.
+                return false;
+            }
+        }
+        matched_target
     }
 }
 
@@ -892,6 +933,13 @@ pub(super) fn is_type_alias(unit: &CodeUnit) -> bool {
 pub(super) fn type_text_matches_target(type_text: &str, target: &CodeUnit) -> bool {
     let normalized = normalize_cpp_reference_text(type_text.trim().trim_end_matches(';'));
     normalized == cpp_name_for(target) || normalized == target.identifier()
+}
+
+/// Like [`precise_parent_of`], but drops module (namespace) parents. A namespace is a scope, not a
+/// type or receiver, so namespace-scoped functions and constants resolve as free functions and
+/// globals rather than members.
+pub(super) fn type_owner_of(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> Option<CodeUnit> {
+    precise_parent_of(analyzer, code_unit).filter(|owner| !owner.is_module())
 }
 
 pub(super) fn precise_parent_of(

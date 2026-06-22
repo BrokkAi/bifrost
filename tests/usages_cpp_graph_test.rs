@@ -1718,3 +1718,145 @@ fn cpp_graph_review_keeps_enum_enumerators_single_sourced() {
         .collect();
     assert_eq!(1, ready.len(), "Ready declarations were {ready:#?}");
 }
+
+/// Asserts the graph strategy returns a structured `Success` (never a `FallbackSafe`/`Failure`
+/// diagnostic), then returns the hit lines. Once the regex/text fallback is removed, anything but
+/// `Success` here means the reference is silently lost, so the regression must pin it down.
+fn graph_success_hits(analyzer: &CppAnalyzer, target: &CodeUnit) -> Vec<HitSummary> {
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let result = CppUsageGraphStrategy::new().find_usages(
+        analyzer,
+        std::slice::from_ref(target),
+        &candidates,
+        1000,
+    );
+    assert!(
+        matches!(result, FuzzyResult::Success { .. }),
+        "expected structured Success for {}, got {result:?}",
+        target.fq_name()
+    );
+    usage_hits(analyzer, target)
+}
+
+#[test]
+fn cpp_graph_resolves_namespace_function_method_and_constant_refs() {
+    // Issue #230: graph-only resolution of namespace-scoped free functions, instance methods whose
+    // receiver type is inferred from a free-function call, and namespace-scoped constants referenced
+    // both unqualified (inside the namespace) and qualified (outside).
+    let (_project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "include/service.h",
+            r#"#pragma once
+#include <string>
+namespace example {
+class Service {
+public:
+    std::string execute() const;
+};
+inline constexpr const char* DefaultPrefix = "svc";
+Service build_service();
+}
+"#,
+        ),
+        (
+            "src/service.cpp",
+            r#"#include "service.h"
+namespace example {
+std::string Service::execute() const { return DefaultPrefix; }
+Service build_service() { return Service{}; }
+}
+"#,
+        ),
+        (
+            "src/main.cpp",
+            r#"#include "service.h"
+int main() {
+    auto service = example::build_service();
+    auto value = service.execute();
+    return value == example::DefaultPrefix ? 0 : 1;
+}
+"#,
+        ),
+    ]);
+
+    // Free function: `example::build_service()` called from main.cpp.
+    let build_service = function_definition(&analyzer, "build_service");
+    let build_hits = graph_success_hits(&analyzer, &build_service);
+    assert_eq!(
+        1,
+        build_hits.len(),
+        "build_service hits were {build_hits:#?}"
+    );
+    assert_hit_contains(&build_hits, "src/main.cpp", "example::build_service()");
+
+    // Instance method: `service.execute()`, where `service` is bound to the return type of
+    // `example::build_service()`.
+    let execute = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function && unit.short_name() == "Service.execute"
+    });
+    let execute_hits = graph_success_hits(&analyzer, &execute);
+    assert_eq!(1, execute_hits.len(), "execute hits were {execute_hits:#?}");
+    assert_hit_contains(&execute_hits, "src/main.cpp", "service.execute()");
+
+    // Namespace constant: unqualified inside the namespace (service.cpp) and qualified outside it
+    // (main.cpp).
+    let prefix = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Field && unit.identifier() == "DefaultPrefix"
+    });
+    let prefix_hits = graph_success_hits(&analyzer, &prefix);
+    assert_eq!(
+        2,
+        prefix_hits.len(),
+        "DefaultPrefix hits were {prefix_hits:#?}"
+    );
+    assert_hit_contains(&prefix_hits, "src/service.cpp", "return DefaultPrefix");
+    assert_hit_contains(&prefix_hits, "src/main.cpp", "example::DefaultPrefix");
+}
+
+// Issue #230 / #220: a bare constant reference that also matches a same-named
+// constant in a different namespace is ambiguous and must never be recorded as a
+// (hash-order-dependent) false-positive hit for the target.
+#[test]
+fn cpp_graph_does_not_attribute_bare_constant_across_namespaces() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "include/a.h",
+            "#pragma once\nnamespace example { inline constexpr int DefaultPrefix = 1; }\n",
+        ),
+        (
+            "include/b.h",
+            "#pragma once\nnamespace other { inline constexpr int DefaultPrefix = 2; }\n",
+        ),
+        (
+            "src/use.cpp",
+            r#"#include "a.h"
+#include "b.h"
+namespace other {
+int pick() { return DefaultPrefix; }
+}
+"#,
+        ),
+    ]);
+
+    let prefix = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Field
+            && unit.identifier() == "DefaultPrefix"
+            && unit.fq_name().contains("example")
+    });
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let result = CppUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&prefix),
+        &candidates,
+        1000,
+    );
+    // The reference resolves to `other::DefaultPrefix`, so it must not be a proven hit
+    // for `example::DefaultPrefix`. Ambiguity surfaces conservatively as a structured
+    // fallback; either way the invariant is no false-positive hit.
+    if let FuzzyResult::Success { hits_by_overload } = &result {
+        assert!(
+            hits_by_overload.values().all(|hits| hits.is_empty()),
+            "bare DefaultPrefix in namespace other must not be attributed to example: {result:?}",
+        );
+    }
+}
