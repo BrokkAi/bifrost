@@ -4,7 +4,9 @@ use crate::benchmark::report::{
     BenchmarkRepoReport, BenchmarkRunReport, ScenarioReport, ScenarioTransport,
 };
 use crate::benchmark::subset_workspace::prepare_subset_workspace;
-use crate::benchmark::{BenchmarkManifest, BenchmarkRepoTarget, BenchmarkScenario};
+use crate::benchmark::{
+    BenchmarkLocationSelector, BenchmarkManifest, BenchmarkRepoTarget, BenchmarkScenario,
+};
 use crate::{AnalyzerConfig, FilesystemProject, WorkspaceAnalyzer};
 use chrono::Utc;
 use serde_json::{Value, json};
@@ -291,22 +293,32 @@ fn tool_arguments(target: &BenchmarkRepoTarget, scenario: BenchmarkScenario) -> 
                 args["symbols"] = json!(target.usage_symbols);
             }
             if !target.usage_targets.is_empty() {
-                args["targets"] = json!(target.usage_targets);
+                args["targets"] = json!(
+                    target
+                        .usage_targets
+                        .iter()
+                        .map(location_selector_arguments)
+                        .collect::<Vec<_>>()
+                );
             }
             args
         }
         BenchmarkScenario::GetDefinition => json!({
             "references": target.definition_queries.iter().map(|query| {
-                json!({
-                    "path": query.path,
-                    "line": query.line,
-                    "column": query.column,
-                    "start_byte": query.start_byte,
-                    "end_byte": query.end_byte
-                })
+                location_selector_arguments(&query.selector)
             }).collect::<Vec<_>>(),
         }),
     }
+}
+
+fn location_selector_arguments(selector: &BenchmarkLocationSelector) -> Value {
+    json!({
+        "path": selector.path,
+        "line": selector.line,
+        "column": selector.column,
+        "start_byte": selector.start_byte,
+        "end_byte": selector.end_byte
+    })
 }
 
 fn assert_scenario_result(
