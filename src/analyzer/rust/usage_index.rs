@@ -198,6 +198,69 @@ impl RustUsageIndex {
         }
         matches
     }
+
+    pub(super) fn export_targets_from_files(
+        &self,
+        analyzer: &RustAnalyzer,
+        module_files: &[ProjectFile],
+        export_name: &str,
+    ) -> BTreeSet<(ProjectFile, String)> {
+        let mut targets = BTreeSet::new();
+        let mut visited = HashSet::default();
+        for module_file in module_files {
+            self.export_targets_in_file(
+                analyzer,
+                module_file,
+                export_name,
+                &mut visited,
+                &mut targets,
+            );
+        }
+        targets
+    }
+
+    fn export_targets_in_file(
+        &self,
+        analyzer: &RustAnalyzer,
+        module_file: &ProjectFile,
+        export_name: &str,
+        visited: &mut HashSet<(ProjectFile, String)>,
+        targets: &mut BTreeSet<(ProjectFile, String)>,
+    ) {
+        if !visited.insert((module_file.clone(), export_name.to_string())) {
+            return;
+        }
+        let Some(index) = self.exports_by_file.get(module_file) else {
+            return;
+        };
+        if let Some(entry) = index.exports_by_name.get(export_name) {
+            match entry {
+                ExportEntry::Local { local_name } => {
+                    targets.insert((module_file.clone(), local_name.clone()));
+                }
+                ExportEntry::ReexportedNamed {
+                    module_specifier,
+                    imported_name,
+                } => {
+                    for file in analyzer.resolve_module_files(module_file, module_specifier) {
+                        self.export_targets_in_file(
+                            analyzer,
+                            &file,
+                            imported_name,
+                            visited,
+                            targets,
+                        );
+                    }
+                }
+                ExportEntry::Default { .. } => {}
+            }
+        }
+        for star in &index.reexport_stars {
+            for file in analyzer.resolve_module_files(module_file, &star.module_specifier) {
+                self.export_targets_in_file(analyzer, &file, export_name, visited, targets);
+            }
+        }
+    }
 }
 
 impl RustAnalyzer {
@@ -258,6 +321,15 @@ impl RustAnalyzer {
             .into_iter()
             .map(|edge| edge.local_name)
             .collect()
+    }
+
+    pub(crate) fn exported_targets_from_files(
+        &self,
+        module_files: &[ProjectFile],
+        export_name: &str,
+    ) -> BTreeSet<(ProjectFile, String)> {
+        self.usage_index()
+            .export_targets_from_files(self, module_files, export_name)
     }
 }
 

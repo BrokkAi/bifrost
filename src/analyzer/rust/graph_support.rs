@@ -1,16 +1,16 @@
-use crate::analyzer::usages::{
-    ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind, ReexportStar,
-};
+use crate::analyzer::usages::{ExportEntry, ExportIndex, ImportBinder, ImportKind, ReexportStar};
 use crate::analyzer::{CodeUnit, IAnalyzer, ImportAnalysisProvider, ProjectFile};
 use crate::hash::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tree_sitter::{Node, Parser};
+use tree_sitter::Node;
 
 use super::RustAnalyzer;
 use super::declarations::rust_package_name;
 use super::imports::{
     resolve_rust_module_path_with_crate, rust_crate_root_package, split_rust_import_module_and_name,
 };
+use super::lexical_scope::{insert_rust_import_binding, parse_rust_tree};
 
 /// Per-file reference-resolution context for Rust — the one primitive both usage
 /// paths share. Holds the binder-derived maps a reference resolves through, built
@@ -82,6 +82,25 @@ fn is_rooted_rust_module_path(path: &str) -> bool {
         || path.starts_with("super::")
 }
 
+fn rust_declaration_targets_in_files(
+    analyzer: &RustAnalyzer,
+    files: &[ProjectFile],
+    name: &str,
+) -> Vec<(ProjectFile, String)> {
+    let mut targets: Vec<_> = files
+        .iter()
+        .flat_map(|file| {
+            analyzer
+                .declarations(file)
+                .filter(move |unit| unit.identifier() == name)
+                .map(|unit| (file.clone(), unit.identifier().to_string()))
+        })
+        .collect();
+    targets.sort();
+    targets.dedup();
+    targets
+}
+
 impl RustAnalyzer {
     pub fn export_index_of(&self, file: &ProjectFile) -> ExportIndex {
         let mut index = ExportIndex::empty();
@@ -147,77 +166,74 @@ impl RustAnalyzer {
         let mut binder = ImportBinder::empty();
 
         for import in self.inner.import_info_of(file) {
-            let raw = import.raw_snippet.trim();
-            if raw.ends_with("::*;") {
-                let module_specifier = raw
-                    .trim_start_matches("pub ")
-                    .trim_start_matches("use ")
-                    .trim_end_matches("::*;")
-                    .trim()
-                    .to_string();
-                binder.bindings.insert(
-                    format!("*:{module_specifier}"),
-                    ImportBinding {
-                        module_specifier,
-                        kind: ImportKind::Glob,
-                        imported_name: None,
-                    },
-                );
-                continue;
-            }
-            let Some((module_specifier, imported_name)) =
-                split_rust_import_module_and_name(&import.raw_snippet)
-            else {
-                continue;
-            };
-            let local_name = import
-                .alias
-                .clone()
-                .or_else(|| import.identifier.clone())
-                .unwrap_or_else(|| imported_name.clone());
-            let (local_name, kind, imported_name, module_specifier) = if imported_name == "self" {
-                let namespace_name = module_specifier
-                    .rsplit("::")
-                    .next()
-                    .unwrap_or(module_specifier.as_str())
-                    .to_string();
-                (
-                    namespace_name,
-                    ImportKind::Namespace,
-                    None,
-                    module_specifier,
-                )
-            } else if !raw.contains('{')
-                && imported_name
-                    .chars()
-                    .all(|ch| ch.is_ascii_lowercase() || ch == '_')
-            {
-                (
-                    imported_name.clone(),
-                    ImportKind::Namespace,
-                    None,
-                    format!("{module_specifier}::{imported_name}"),
-                )
-            } else {
-                (
-                    local_name,
-                    ImportKind::Named,
-                    Some(imported_name),
-                    module_specifier,
-                )
-            };
-
-            binder.bindings.insert(
-                local_name,
-                ImportBinding {
-                    module_specifier,
-                    kind,
-                    imported_name,
-                },
-            );
+            insert_rust_import_binding(&mut binder, import);
         }
 
         binder
+    }
+
+    pub(crate) fn resolve_imported_export(
+        &self,
+        file: &ProjectFile,
+        reference: &str,
+    ) -> Vec<(ProjectFile, String)> {
+        let binder = self.import_binder_of(file);
+        self.resolve_imported_export_from_binder(file, &binder, reference)
+    }
+
+    pub(crate) fn resolve_imported_export_from_binder(
+        &self,
+        file: &ProjectFile,
+        binder: &ImportBinder,
+        reference: &str,
+    ) -> Vec<(ProjectFile, String)> {
+        let mut targets = HashSet::default();
+        let mut saw_explicit_binding = false;
+        for (local_name, binding) in &binder.bindings {
+            match binding.kind {
+                ImportKind::Named if local_name == reference => {
+                    saw_explicit_binding = true;
+                    let imported = binding.imported_name.as_deref().unwrap_or(reference);
+                    let files = self.resolve_module_files(file, &binding.module_specifier);
+                    targets.extend(self.exported_targets_from_files(&files, imported));
+                    if targets.is_empty() {
+                        targets.extend(rust_declaration_targets_in_files(self, &files, imported));
+                    }
+                }
+                ImportKind::Namespace if local_name == reference => {
+                    saw_explicit_binding = true;
+                    let Some((module_specifier, imported)) =
+                        binding.module_specifier.rsplit_once("::")
+                    else {
+                        continue;
+                    };
+                    let files = self.resolve_module_files(file, module_specifier);
+                    targets.extend(self.exported_targets_from_files(&files, imported));
+                    if targets.is_empty() {
+                        targets.extend(rust_declaration_targets_in_files(self, &files, imported));
+                    }
+                }
+                ImportKind::Named
+                | ImportKind::Namespace
+                | ImportKind::Default
+                | ImportKind::CommonJsRequire
+                | ImportKind::Glob => {}
+            }
+        }
+        if saw_explicit_binding {
+            let mut sorted: Vec<_> = targets.into_iter().collect();
+            sorted.sort();
+            return sorted;
+        }
+        for binding in binder.bindings.values() {
+            if matches!(binding.kind, ImportKind::Glob) {
+                let files = self.resolve_module_files(file, &binding.module_specifier);
+                targets.extend(self.exported_targets_from_files(&files, reference));
+            }
+        }
+        let mut sorted: Vec<_> = targets.into_iter().collect();
+        sorted.sort();
+        sorted
     }
 
     /// Resolve a `use`-path module specifier (e.g. `crate::util`, `super::svc`)
@@ -297,7 +313,7 @@ impl RustAnalyzer {
         let Some(resolved_module) =
             resolve_rust_module_path_with_crate(&package, &crate_package, module_specifier)
         else {
-            return Vec::new();
+            return rust_module_files_from_path(importing_file, module_specifier);
         };
 
         let mut files: Vec<_> = self
@@ -312,6 +328,10 @@ impl RustAnalyzer {
                     && (*file == *importing_file || self.is_visible_module_path(code_unit))
             })
         }));
+        files.extend(rust_module_files_from_path(
+            importing_file,
+            module_specifier,
+        ));
         files.sort();
         files.dedup();
         files
@@ -447,12 +467,58 @@ impl RustAnalyzer {
     }
 }
 
-fn parse_rust_tree(source: &str) -> Option<tree_sitter::Tree> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_rust::LANGUAGE.into())
-        .ok()?;
-    parser.parse(source, None)
+fn rust_module_files_from_path(file: &ProjectFile, module_specifier: &str) -> Vec<ProjectFile> {
+    let Some(relative_module) = rust_relative_module_path(file, module_specifier) else {
+        return Vec::new();
+    };
+    let mut files = Vec::new();
+    for rel_path in [
+        relative_module.with_extension("rs"),
+        relative_module.join("mod.rs"),
+        PathBuf::from("src")
+            .join(&relative_module)
+            .with_extension("rs"),
+        PathBuf::from("src").join(&relative_module).join("mod.rs"),
+    ] {
+        let candidate = ProjectFile::new(file.root().to_path_buf(), rel_path);
+        if candidate.exists() {
+            files.push(candidate);
+        }
+    }
+    files
+}
+
+fn rust_relative_module_path(file: &ProjectFile, module_specifier: &str) -> Option<PathBuf> {
+    let module = module_specifier
+        .strip_prefix("crate::")
+        .or_else(|| module_specifier.strip_prefix("self::"))
+        .map(PathBuf::from)
+        .or_else(|| {
+            module_specifier
+                .strip_prefix("super::")
+                .map(|rest| file.parent().parent().unwrap_or(Path::new("")).join(rest))
+        })
+        .or_else(|| {
+            let (crate_name, rest) = module_specifier.split_once("::")?;
+            (Some(crate_name) == rust_current_crate_name(file).as_deref()).then(|| rest.into())
+        })?;
+    Some(module.to_string_lossy().replace("::", "/").into())
+}
+
+fn rust_current_crate_name(file: &ProjectFile) -> Option<String> {
+    let manifest = file.root().join("Cargo.toml");
+    let source = std::fs::read_to_string(manifest).ok()?;
+    source.lines().find_map(|line| {
+        let trimmed = line.trim();
+        let value = trimmed.strip_prefix("name")?.trim_start();
+        let value = value.strip_prefix('=')?.trim();
+        value
+            .trim_matches('"')
+            .split('"')
+            .next()
+            .filter(|name| !name.is_empty())
+            .map(|name| name.replace('-', "_"))
+    })
 }
 
 fn rust_visibility_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {

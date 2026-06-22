@@ -3,6 +3,7 @@ mod cache;
 mod declarations;
 mod graph_support;
 mod imports;
+pub(crate) mod lexical_scope;
 mod tests;
 mod usage_index;
 
@@ -25,7 +26,6 @@ use declarations::collect_rust_type_identifiers;
 use tests::detect_rust_test_assertion_smells;
 
 pub use graph_support::RustReferenceContext;
-pub(crate) use imports::flatten_rust_use;
 use usage_index::RustUsageIndex;
 
 #[derive(Clone)]

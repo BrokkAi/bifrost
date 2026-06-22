@@ -18,7 +18,7 @@ use crate::analyzer::usages::go_graph::{
 use crate::analyzer::usages::inverted_edges::{ClassRangeIndex, first_precise};
 use crate::analyzer::usages::js_ts_graph::{cached_jsts_index, compute_jsts_import_binder};
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::analyzer::usages::model::{ExportEntry, ImportBinder, ImportKind};
+use crate::analyzer::usages::model::{ImportBinder, ImportKind};
 use crate::analyzer::usages::php_graph::{
     FileContext, php_node_text, php_qualified_candidate_text, resolve_php_constant,
     resolve_php_function, resolve_php_type,
@@ -41,7 +41,6 @@ use crate::analyzer::{
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tree_sitter::{Node, Parser, Tree};
 
