@@ -209,7 +209,8 @@ fn scan_usages_resolves_canonical_and_flags_bare_ambiguity() {
     let canonical = scan_usages(
         &analyzer,
         ScanUsagesParams {
-            symbols: vec!["example.com/repo/a/list.Run".to_string()],
+            symbols: Some(vec!["example.com/repo/a/list.Run".to_string()]),
+            targets: Vec::new(),
             include_tests: true,
             paths: None,
         },
@@ -227,7 +228,8 @@ fn scan_usages_resolves_canonical_and_flags_bare_ambiguity() {
     let bare = scan_usages(
         &analyzer,
         ScanUsagesParams {
-            symbols: vec!["list.Run".to_string()],
+            symbols: Some(vec!["list.Run".to_string()]),
+            targets: Vec::new(),
             include_tests: true,
             paths: None,
         },

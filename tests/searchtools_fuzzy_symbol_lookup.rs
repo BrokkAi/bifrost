@@ -704,7 +704,8 @@ fn scan_usages_uses_the_common_fuzzy_symbol_resolver() {
     let result = scan_usages(
         &analyzer,
         ScanUsagesParams {
-            symbols: vec!["A::method".to_string()],
+            symbols: Some(vec!["A::method".to_string()]),
+            targets: Vec::new(),
             include_tests: true,
             paths: None,
         },
@@ -734,7 +735,8 @@ fn scan_usages_finds_c_function_callers_through_header_declaration() {
     let result = scan_usages(
         &analyzer,
         ScanUsagesParams {
-            symbols: vec!["initialize_the_repository".to_string()],
+            symbols: Some(vec!["initialize_the_repository".to_string()]),
+            targets: Vec::new(),
             include_tests: true,
             paths: None,
         },

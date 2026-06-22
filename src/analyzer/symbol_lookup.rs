@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Debug, Clone)]
 pub(crate) enum CodeUnitResolution {
     Resolved(Vec<CodeUnit>),
-    Ambiguous(Vec<String>),
+    Ambiguous(Vec<CodeUnit>),
     NotFound,
 }
 
@@ -295,7 +295,9 @@ fn resolution_from_matches(
                 Some(CodeUnitResolution::Resolved(definitions))
             }
         }
-        _ => Some(CodeUnitResolution::Ambiguous(matches.into_keys().collect())),
+        _ => Some(CodeUnitResolution::Ambiguous(
+            matches.into_values().collect(),
+        )),
     }
 }
 

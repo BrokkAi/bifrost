@@ -1,8 +1,10 @@
 use brokk_bifrost::{
-    AnalyzerConfig, FilesystemProject, Project, SearchToolsService, SearchToolsServiceErrorCode,
-    WorkspaceAnalyzer, searchtools::SCAN_USAGES_RESPONSE_BUDGET_BYTES,
+    AnalyzerConfig, FilesystemProject, Language, Project, SearchToolsService,
+    SearchToolsServiceErrorCode, WorkspaceAnalyzer, searchtools::SCAN_USAGES_RESPONSE_BUDGET_BYTES,
     searchtools_render::RenderOptions,
 };
+mod common;
+use common::InlineTestProject;
 use git2::{Repository, Signature};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -1208,6 +1210,181 @@ fn scan_usages_returns_call_sites_grouped_by_file() {
 }
 
 #[test]
+fn scan_usages_accepts_location_target_without_symbols() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "Greeter.java",
+            "public class Greeter {\n    public String hello() { return \"hi\"; }\n}\n",
+        )
+        .file(
+            "Caller.java",
+            "public class Caller {\n    public String run() { return new Greeter().hello(); }\n}\n",
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages",
+            r#"{"targets":[{"path":"Greeter.java","line":2,"column":19}],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert_eq!(
+        1,
+        value["usages"].as_array().unwrap().len(),
+        "payload: {value}"
+    );
+    assert_eq!(0, array_len(&value, "not_found"));
+    assert_eq!(0, array_len(&value, "failures"));
+}
+
+#[test]
+fn scan_usages_requires_symbols_unless_targets_are_supplied() {
+    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
+
+    for args in [
+        r#"{}"#,
+        r#"{"symbols":[]}"#,
+        r#"{"symbols":["   "],"targets":[]}"#,
+    ] {
+        let err = service.call_tool_json("scan_usages", args).unwrap_err();
+        assert_eq!(SearchToolsServiceErrorCode::InvalidParams, err.code);
+        assert!(
+            err.message.contains("requires a non-empty `symbols` array"),
+            "unexpected error for {args}: {}",
+            err.message
+        );
+    }
+}
+
+#[test]
+fn scan_usages_location_target_disambiguates_commonjs_declarations() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "node_modules/accepts/index.js",
+            "module.exports = function accepts() {};\n",
+        )
+        .file(
+            "lib/request.js",
+            r#"
+var accepts = require("accepts");
+
+var req = exports = module.exports = {};
+
+req.accepts = function acceptsMethod(type) {
+  return accepts(this).types(type);
+};
+"#,
+        )
+        .file(
+            "app.js",
+            r#"
+var req = require("./lib/request");
+
+function run() {
+  return req.accepts("json");
+}
+"#,
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let string_payload = service
+        .call_tool_json(
+            "scan_usages",
+            r#"{"symbols":["accepts"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let string_value: Value = serde_json::from_str(&string_payload).unwrap();
+    assert!(
+        string_value["ambiguous"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+        "bare string selector should remain ambiguous: {string_value}"
+    );
+
+    let dependency_payload = service
+        .call_tool_json(
+            "scan_usages",
+            r#"{"targets":[{"path":"lib/request.js","line":2,"column":5}],"include_tests":true}"#,
+        )
+        .unwrap();
+    let dependency: Value = serde_json::from_str(&dependency_payload).unwrap();
+    assert_eq!(
+        0,
+        array_len(&dependency, "ambiguous"),
+        "payload: {dependency}"
+    );
+    assert_eq!(
+        "lib/request.js#request.js.accepts", dependency["usages"][0]["symbol"],
+        "payload: {dependency}"
+    );
+    assert!(dependency["usages"][0]["total_hits"].as_u64().unwrap() >= 1);
+
+    let method_payload = service
+        .call_tool_json(
+            "scan_usages",
+            r#"{"targets":[{"path":"lib/request.js","line":6,"column":5}],"include_tests":true}"#,
+        )
+        .unwrap();
+    let method: Value = serde_json::from_str(&method_payload).unwrap();
+    assert_eq!(0, array_len(&method, "ambiguous"), "payload: {method}");
+    assert_eq!(
+        "lib/request.js#req.accepts", method["usages"][0]["symbol"],
+        "payload: {method}"
+    );
+    assert!(
+        method["usages"][0]["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| file["path"] == "app.js"),
+        "prototype method target should find app.js caller: {method}"
+    );
+}
+
+#[test]
+fn scan_usages_ambiguous_symbol_includes_capped_location_details() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("a.js", "export function helper() {}\n")
+        .file("b.js", "export function helper() {}\n")
+        .file("c.js", "export function helper() {}\n")
+        .file("d.js", "export function helper() {}\n")
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages",
+            r#"{"symbols":["helper"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let ambiguous = &value["ambiguous"][0];
+
+    assert_eq!(4, ambiguous["candidate_targets"].as_array().unwrap().len());
+    assert_eq!(3, ambiguous["candidate_details"].as_array().unwrap().len());
+    assert_eq!(4, ambiguous["candidate_details_total"].as_u64().unwrap());
+    assert_eq!(true, ambiguous["candidate_details_truncated"]);
+    assert!(
+        ambiguous["note"]
+            .as_str()
+            .unwrap()
+            .contains("Showing first 3 of 4 candidate locations"),
+        "payload: {value}"
+    );
+    for detail in ambiguous["candidate_details"].as_array().unwrap() {
+        assert!(detail["scan_usages_target"]["path"].as_str().is_some());
+        assert_eq!(1, detail["scan_usages_target"]["line"].as_u64().unwrap());
+    }
+}
+
+#[test]
 fn scan_usages_reports_unknown_symbol_as_not_found() {
     let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
     let payload = service
@@ -1270,17 +1447,17 @@ namespace Domain {
 }
 
 #[test]
-fn scan_usages_skips_blank_symbols_without_error() {
+fn scan_usages_skips_blank_symbols_when_non_empty_symbol_is_present() {
     let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
     let payload = service
         .call_tool_json(
             "scan_usages",
-            r#"{"symbols":["", "   "],"include_tests":true}"#,
+            r#"{"symbols":["", "   ", "E.iMethod"],"include_tests":true}"#,
         )
         .unwrap();
     let value: Value = serde_json::from_str(&payload).unwrap();
 
-    assert_eq!(0, array_len(&value, "usages"));
+    assert_eq!(1, array_len(&value, "usages"));
     assert_eq!(0, array_len(&value, "not_found"));
     assert_eq!(0, array_len(&value, "fallbacks"));
     assert_eq!(0, array_len(&value, "failures"));

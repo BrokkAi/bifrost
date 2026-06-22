@@ -40,6 +40,7 @@ pub const SCAN_USAGES_RESPONSE_BUDGET_BYTES: usize = 8_192;
 const SCAN_USAGES_MAX_CALLSITES: usize = DEFAULT_MAX_USAGES;
 const SCAN_USAGES_SUMMARY_FILE_LIMIT: usize = 20;
 const SCAN_USAGES_TOP_ENCLOSING_LIMIT: usize = 10;
+const SCAN_USAGES_AMBIGUOUS_DETAILS_LIMIT: usize = 3;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefreshParams {}
 
@@ -88,11 +89,27 @@ pub struct MostRelevantFilesParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanUsagesParams {
-    pub symbols: Vec<String>,
+    #[serde(default)]
+    pub symbols: Option<Vec<String>>,
+    #[serde(default)]
+    pub targets: Vec<ScanUsagesTarget>,
     #[serde(default)]
     pub include_tests: bool,
     #[serde(default)]
     pub paths: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanUsagesTarget {
+    pub path: String,
+    #[serde(default)]
+    pub line: Option<usize>,
+    #[serde(default)]
+    pub column: Option<usize>,
+    #[serde(default)]
+    pub start_byte: Option<usize>,
+    #[serde(default)]
+    pub end_byte: Option<usize>,
 }
 
 /// Parameters for [`usage_graph`].
@@ -509,6 +526,12 @@ pub struct AmbiguousUsageSymbol {
     pub short_name: String,
     pub candidate_targets: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub candidate_details: Vec<AmbiguousUsageCandidateDetail>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_details_total: Option<usize>,
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub candidate_details_truncated: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub candidates: Vec<AmbiguousUsageCandidate>,
     /// True when the candidate file set exceeded the analyzer's per-query cap
     /// and an arbitrary subset was scanned. Results are partial when set.
@@ -524,6 +547,21 @@ pub struct AmbiguousUsageSymbol {
 pub struct AmbiguousUsageCandidate {
     pub target: String,
     pub total_hits: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AmbiguousUsageCandidateDetail {
+    pub target: String,
+    pub path: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub scan_usages_target: ScanUsagesTargetSuggestion,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScanUsagesTargetSuggestion {
+    pub path: String,
+    pub line: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -918,7 +956,10 @@ fn resolve_definition_context_symbol(
         CodeUnitResolution::Resolved(units) => Ok(units),
         CodeUnitResolution::Ambiguous(matches) => Err(vec![DefinitionDiagnostic {
             kind: "ambiguous_symbol".to_string(),
-            message: format!("`{symbol}` is ambiguous; matches: {}", matches.join(", ")),
+            message: format!(
+                "`{symbol}` is ambiguous; matches: {}",
+                code_unit_match_names(matches).join(", ")
+            ),
         }]),
         CodeUnitResolution::NotFound => Err(vec![DefinitionDiagnostic {
             kind: "symbol_not_found".to_string(),
@@ -1109,7 +1150,7 @@ pub fn get_symbol_ancestors(
             CodeUnitResolution::Ambiguous(matches) => {
                 ambiguous.push(AmbiguousSymbol {
                     target: symbol,
-                    matches,
+                    matches: code_unit_match_names(matches),
                 });
             }
             CodeUnitResolution::NotFound => not_found.push(symbol),
@@ -1211,9 +1252,10 @@ fn summarize_symbol_targets(analyzer: &dyn IAnalyzer, targets: Vec<String>) -> S
                     not_found.push(target);
                 }
             }
-            CodeUnitResolution::Ambiguous(matches) => {
-                ambiguous.push(AmbiguousSymbol { target, matches })
-            }
+            CodeUnitResolution::Ambiguous(matches) => ambiguous.push(AmbiguousSymbol {
+                target,
+                matches: code_unit_match_names(matches),
+            }),
             CodeUnitResolution::NotFound => not_found.push(target),
         }
     }
@@ -1314,7 +1356,7 @@ pub fn get_symbol_sources(
                     index,
                     SourceLookupOutcome::Ambiguous(AmbiguousSymbol {
                         target: symbol,
-                        matches,
+                        matches: code_unit_match_names(matches),
                     }),
                 ),
                 CodeUnitResolution::NotFound => (index, SourceLookupOutcome::NotFound(symbol)),
@@ -1761,14 +1803,348 @@ fn distinct_definitions(overloads: Vec<CodeUnit>) -> Vec<(String, Vec<CodeUnit>)
     groups
 }
 
+fn code_unit_match_names(matches: Vec<CodeUnit>) -> Vec<String> {
+    dedupe_preserving_order(matches.into_iter().map(|unit| unit.fq_name()).collect())
+}
+
+fn ambiguous_usage_symbol_from_groups(
+    analyzer: &dyn IAnalyzer,
+    symbol: String,
+    short_name: String,
+    groups: Vec<(String, Vec<CodeUnit>)>,
+    note: impl Into<String>,
+) -> AmbiguousUsageSymbol {
+    let note = note.into();
+    let total = groups.len();
+    let candidate_targets: Vec<String> = groups
+        .iter()
+        .map(|(selector, _)| selector.clone())
+        .collect();
+    let candidate_details: Vec<AmbiguousUsageCandidateDetail> = groups
+        .iter()
+        .take(SCAN_USAGES_AMBIGUOUS_DETAILS_LIMIT)
+        .filter_map(|(selector, units)| {
+            let unit = units.first()?;
+            let range = primary_range(analyzer, unit)?;
+            let path = rel_path_string(unit.source());
+            Some(AmbiguousUsageCandidateDetail {
+                target: selector.clone(),
+                path: path.clone(),
+                start_line: range.start_line,
+                end_line: range.end_line,
+                scan_usages_target: ScanUsagesTargetSuggestion {
+                    path,
+                    line: range.start_line,
+                },
+            })
+        })
+        .collect();
+
+    AmbiguousUsageSymbol {
+        symbol,
+        short_name,
+        candidate_targets,
+        candidate_details,
+        candidate_details_total: (total > 0).then_some(total),
+        candidate_details_truncated: total > SCAN_USAGES_AMBIGUOUS_DETAILS_LIMIT,
+        candidates: Vec::new(),
+        candidate_files_truncated: false,
+        definition_sites_excluded: None,
+        note: Some(if total > SCAN_USAGES_AMBIGUOUS_DETAILS_LIMIT {
+            format!(
+                "{} Showing first {} of {total} candidate locations.",
+                note, SCAN_USAGES_AMBIGUOUS_DETAILS_LIMIT
+            )
+        } else {
+            note
+        }),
+    }
+}
+
+enum ScanUsageTargetResolution {
+    Resolved {
+        symbol: String,
+        overloads: Vec<CodeUnit>,
+    },
+    NotFound(String),
+    Ambiguous(AmbiguousUsageSymbol),
+    Failure(UsageFailureInfo),
+}
+
+fn scan_usages_target_label(target: &ScanUsagesTarget) -> String {
+    if let Some(start) = target.start_byte {
+        match target.end_byte {
+            Some(end) => format!("{}@bytes:{start}..{end}", target.path),
+            None => format!("{}@byte:{start}", target.path),
+        }
+    } else if let Some(line) = target.line {
+        match target.column {
+            Some(column) => format!("{}:{line}:{column}", target.path),
+            None => format!("{}:{line}", target.path),
+        }
+    } else {
+        target.path.clone()
+    }
+}
+
+fn location_selector_failure(
+    target: &ScanUsagesTarget,
+    reason_kind: &str,
+    reason: impl Into<String>,
+) -> ScanUsageTargetResolution {
+    ScanUsageTargetResolution::Failure(UsageFailureInfo {
+        symbol: scan_usages_target_label(target),
+        fq_name: String::new(),
+        strategy: "location_selector".to_string(),
+        reason_kind: reason_kind.to_string(),
+        reason: reason.into(),
+        candidate_files_truncated: false,
+    })
+}
+
+fn resolve_scan_usages_target(
+    analyzer: &dyn IAnalyzer,
+    resolver: &WorkspaceFileResolver,
+    target: ScanUsagesTarget,
+) -> ScanUsageTargetResolution {
+    let file = match resolver.resolve_literal(target.path.trim()) {
+        ResolvedFileInput::File(file) => file,
+        ResolvedFileInput::Ambiguous(item) => {
+            return location_selector_failure(
+                &target,
+                "ambiguous_path",
+                format!(
+                    "`{}` is ambiguous; matches: {}",
+                    item.input,
+                    item.matches.join(", ")
+                ),
+            );
+        }
+        ResolvedFileInput::NotFound(path) => {
+            return ScanUsageTargetResolution::NotFound(format!(
+                "{} ({path} does not resolve to a workspace file)",
+                scan_usages_target_label(&target)
+            ));
+        }
+    };
+
+    if target.line.is_none() && target.start_byte.is_none() {
+        return location_selector_failure(
+            &target,
+            "invalid_location",
+            "provide either start_byte or line for a scan_usages target",
+        );
+    }
+    if target.column == Some(0) {
+        return location_selector_failure(&target, "invalid_location", "column must be 1-based");
+    }
+
+    let source = match file.read_to_string() {
+        Ok(source) => source,
+        Err(err) => {
+            return location_selector_failure(
+                &target,
+                "read_failed",
+                format!("failed to read `{}`: {err}", rel_path_string(&file)),
+            );
+        }
+    };
+
+    let line_starts = compute_line_starts(&source);
+    if let Some(line) = target.line {
+        if line == 0 || line > line_starts.len() {
+            return location_selector_failure(
+                &target,
+                "invalid_location",
+                format!(
+                    "line {line} is outside 1..={} for this file",
+                    line_starts.len()
+                ),
+            );
+        }
+        if let Some(column) = target.column {
+            let line_start = line_starts[line - 1];
+            let line_end = line_starts.get(line).copied().unwrap_or(source.len());
+            if byte_offset_for_character_column(&source, line_start, line_end, line, column)
+                .is_none()
+            {
+                return location_selector_failure(
+                    &target,
+                    "invalid_location",
+                    format!("column {column} is outside line {line}"),
+                );
+            }
+        }
+    }
+
+    if let Some(start) = target.start_byte {
+        if start >= source.len() {
+            return location_selector_failure(
+                &target,
+                "invalid_location",
+                format!("start_byte {start} is outside {} byte file", source.len()),
+            );
+        }
+        if !source.is_char_boundary(start) {
+            return location_selector_failure(
+                &target,
+                "invalid_location",
+                format!("start_byte {start} does not align to a UTF-8 character boundary"),
+            );
+        }
+        if let Some(end) = target.end_byte {
+            if start >= end || end > source.len() {
+                return location_selector_failure(
+                    &target,
+                    "invalid_location",
+                    format!(
+                        "invalid byte range [{start}, {end}) for {} byte file",
+                        source.len()
+                    ),
+                );
+            }
+            if !source.is_char_boundary(end) {
+                return location_selector_failure(
+                    &target,
+                    "invalid_location",
+                    format!("end_byte {end} does not align to a UTF-8 character boundary"),
+                );
+            }
+        }
+    }
+
+    let matching_units: Vec<(CodeUnit, usize)> = analyzer
+        .search_definitions(".*", false)
+        .into_iter()
+        .filter(|unit| unit.source() == &file)
+        .filter_map(|unit| {
+            let best_span = analyzer
+                .ranges_of(&unit)
+                .into_iter()
+                .filter(|range| scan_usages_target_matches_range(&target, *range))
+                .map(|range| range.end_byte.saturating_sub(range.start_byte))
+                .min()?;
+            Some((unit, best_span))
+        })
+        .collect();
+
+    if matching_units.is_empty() {
+        return ScanUsageTargetResolution::NotFound(format!(
+            "{} (no declaration at location)",
+            scan_usages_target_label(&target)
+        ));
+    }
+
+    let narrowest_span = matching_units
+        .iter()
+        .map(|(_, span)| *span)
+        .min()
+        .expect("non-empty matching units");
+    let mut matches: Vec<CodeUnit> = matching_units
+        .into_iter()
+        .filter_map(|(unit, span)| (span == narrowest_span).then_some(unit))
+        .collect();
+
+    matches.sort_by(|left, right| {
+        primary_range(analyzer, left)
+            .map(|range| (range.start_line, range.start_byte))
+            .cmp(&primary_range(analyzer, right).map(|range| (range.start_line, range.start_byte)))
+            .then_with(|| left.fq_name().cmp(&right.fq_name()))
+    });
+
+    let groups = distinct_definitions(matches);
+    if groups.len() > 1 {
+        let label = scan_usages_target_label(&target);
+        return ScanUsageTargetResolution::Ambiguous(ambiguous_usage_symbol_from_groups(
+            analyzer,
+            label.clone(),
+            label,
+            groups,
+            "Ambiguous location; refine line/column or byte target.",
+        ));
+    }
+
+    let (_, overloads) = groups.into_iter().next().expect("non-empty target groups");
+    let symbol = definition_selector(&overloads[0]);
+    ScanUsageTargetResolution::Resolved { symbol, overloads }
+}
+
+fn scan_usages_target_matches_range(target: &ScanUsagesTarget, range: Range) -> bool {
+    if let Some(start) = target.start_byte {
+        let end = target.end_byte.unwrap_or(start.saturating_add(1));
+        range.start_byte <= start && range.end_byte >= end
+    } else if let Some(line) = target.line {
+        range.start_line <= line && range.end_line >= line
+    } else {
+        false
+    }
+}
+
+fn retain_hits_resolving_to_overloads(
+    analyzer: &dyn IAnalyzer,
+    overloads: &[CodeUnit],
+    hits: Vec<UsageHit>,
+) -> Vec<UsageHit> {
+    if hits.is_empty() || overloads.is_empty() {
+        return hits;
+    }
+
+    let requests: Vec<_> = hits
+        .iter()
+        .map(
+            |hit| crate::analyzer::usages::get_definition::DefinitionLookupRequest {
+                file: hit.file.clone(),
+                line: None,
+                column: None,
+                start_byte: Some(hit.start_offset),
+                end_byte: Some(hit.end_offset),
+            },
+        )
+        .collect();
+    let outcomes =
+        crate::analyzer::usages::get_definition::resolve_definition_batch(analyzer, requests);
+
+    hits.into_iter()
+        .zip(outcomes)
+        .filter_map(|(hit, outcome)| {
+            (outcome.definitions.is_empty()
+                || outcome
+                    .definitions
+                    .iter()
+                    .any(|definition| overloads.contains(definition)))
+            .then_some(hit)
+        })
+        .collect()
+}
+
+fn byte_offset_for_character_column(
+    source: &str,
+    line_start: usize,
+    line_end: usize,
+    _line_number: usize,
+    column: usize,
+) -> Option<usize> {
+    let line = source.get(line_start..line_end)?;
+    let character_offset = column.checked_sub(1)?;
+    if character_offset == 0 {
+        return Some(line_start);
+    }
+    if let Some((byte_offset, _)) = line.char_indices().nth(character_offset) {
+        return Some(line_start + byte_offset);
+    }
+    (character_offset == line.chars().count()).then_some(line_end)
+}
+
 pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUsagesResult {
     let _scope = profiling::scope("searchtools::scan_usages");
 
     let symbols: Vec<String> = params
         .symbols
+        .unwrap_or_default()
         .into_iter()
         .filter(|symbol| !symbol.trim().is_empty())
         .collect();
+    let targets = params.targets;
     let path_filter = build_scan_usages_path_filter(analyzer, params.paths.as_deref());
 
     let test_files = excluded_test_files(analyzer, params.include_tests);
@@ -1779,24 +2155,33 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
     let mut ambiguous = Vec::new();
     let mut too_many_callsites = Vec::new();
     let mut render_states = Vec::new();
+    let mut resolved_targets = Vec::new();
+
+    let resolver = WorkspaceFileResolver::new(analyzer.project());
+    for target in targets {
+        match resolve_scan_usages_target(analyzer, &resolver, target) {
+            ScanUsageTargetResolution::Resolved { symbol, overloads } => {
+                resolved_targets.push((symbol, overloads, true));
+            }
+            ScanUsageTargetResolution::NotFound(target) => not_found.push(target),
+            ScanUsageTargetResolution::Ambiguous(entry) => ambiguous.push(entry),
+            ScanUsageTargetResolution::Failure(failure) => failures.push(failure),
+        }
+    }
 
     for symbol in symbols {
         let (anchor, lookup) = split_definition_selector(&symbol);
         let overloads = match resolve_codeunit_fuzzy(analyzer, lookup) {
             CodeUnitResolution::Resolved(overloads) => overloads,
             CodeUnitResolution::Ambiguous(candidate_targets) => {
-                ambiguous.push(AmbiguousUsageSymbol {
-                    symbol: symbol.clone(),
-                    short_name: symbol,
-                    candidate_targets: dedupe_preserving_order(candidate_targets),
-                    candidates: Vec::new(),
-                    candidate_files_truncated: false,
-                    definition_sites_excluded: None,
-                    note: Some(
-                        "Ambiguous; re-call with one fully qualified name from candidate_targets."
-                            .to_string(),
-                    ),
-                });
+                let groups = distinct_definitions(candidate_targets);
+                ambiguous.push(ambiguous_usage_symbol_from_groups(
+                    analyzer,
+                    symbol.clone(),
+                    symbol,
+                    groups,
+                    "Ambiguous; re-call with one selector from candidate_targets or scan_usages_target.",
+                ));
                 continue;
             }
             CodeUnitResolution::NotFound => {
@@ -1826,27 +2211,23 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
             None => {
                 let groups = distinct_definitions(overloads);
                 if groups.len() > 1 {
-                    ambiguous.push(AmbiguousUsageSymbol {
-                        symbol: symbol.clone(),
-                        short_name: symbol,
-                        candidate_targets: groups
-                            .into_iter()
-                            .map(|(selector, _)| selector)
-                            .collect(),
-                        candidates: Vec::new(),
-                        candidate_files_truncated: false,
-                        definition_sites_excluded: None,
-                        note: Some(
-                            "Ambiguous; re-call with one selector from candidate_targets."
-                                .to_string(),
-                        ),
-                    });
+                    ambiguous.push(ambiguous_usage_symbol_from_groups(
+                        analyzer,
+                        symbol.clone(),
+                        symbol,
+                        groups,
+                        "Ambiguous; re-call with one selector from candidate_targets or scan_usages_target.",
+                    ));
                     continue;
                 }
                 groups.into_iter().flat_map(|(_, units)| units).collect()
             }
         };
 
+        resolved_targets.push((symbol, overloads, false));
+    }
+
+    for (symbol, overloads, location_selected) in resolved_targets {
         let finder = scoped_usage_finder(test_files.as_ref(), &path_filter);
         let query = finder.query(
             analyzer,
@@ -1873,6 +2254,11 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
                     .flat_map(BTreeSet::into_iter)
                     .collect();
                 let mut base_note = None;
+                let hits = if location_selected && query.graph_fallback.is_some() {
+                    retain_hits_resolving_to_overloads(analyzer, &overloads, hits)
+                } else {
+                    hits
+                };
                 let mut filtered = filter_and_dedupe_hits(analyzer, &overloads, hits);
                 if filtered.hits.is_empty() && query.graph_fallback.is_none() {
                     match RegexUsageAnalyzer::new().find_usages(
@@ -1889,6 +2275,15 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
                                 .into_values()
                                 .flat_map(BTreeSet::into_iter)
                                 .collect();
+                            let fallback_hits = if location_selected {
+                                retain_hits_resolving_to_overloads(
+                                    analyzer,
+                                    &overloads,
+                                    fallback_hits,
+                                )
+                            } else {
+                                fallback_hits
+                            };
                             filtered = filter_and_dedupe_hits(analyzer, &overloads, fallback_hits);
                             if !filtered.hits.is_empty() {
                                 fallbacks.push(UsageFallbackInfo {
@@ -1943,20 +2338,42 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
                 candidate_targets,
                 hits_by_overload,
             } => {
-                let deduped_targets = dedupe_preserving_order(
-                    candidate_targets
+                if location_selected {
+                    let hits: Vec<UsageHit> = overloads
                         .iter()
-                        .map(|code_unit| code_unit.fq_name())
-                        .collect(),
+                        .flat_map(|code_unit| {
+                            hits_by_overload
+                                .get(code_unit)
+                                .into_iter()
+                                .flat_map(|hits| hits.iter().cloned())
+                        })
+                        .collect();
+                    let hits = retain_hits_resolving_to_overloads(analyzer, &overloads, hits);
+                    let filtered = filter_and_dedupe_hits(analyzer, &overloads, hits);
+                    render_states.push(SymbolUsageRenderState::new(
+                        symbol,
+                        truncated,
+                        filtered.definition_sites_excluded,
+                        filtered.hits,
+                        None,
+                    ));
+                    continue;
+                }
+                let groups = distinct_definitions(candidate_targets.iter().cloned().collect());
+                let detail_source = ambiguous_usage_symbol_from_groups(
+                    analyzer,
+                    symbol.clone(),
+                    short_name.clone(),
+                    groups.clone(),
+                    "Ambiguous; re-call with one selector from candidate_targets or scan_usages_target.",
                 );
+                let deduped_targets: Vec<String> = groups
+                    .iter()
+                    .map(|(selector, _)| selector.clone())
+                    .collect();
                 let mut candidates = Vec::new();
                 let mut definition_sites_excluded = 0usize;
-                for target in &deduped_targets {
-                    let grouped_overloads: Vec<CodeUnit> = candidate_targets
-                        .iter()
-                        .filter(|code_unit| code_unit.fq_name() == *target)
-                        .cloned()
-                        .collect();
+                for (target, grouped_overloads) in groups {
                     let grouped_hits: Vec<UsageHit> = grouped_overloads
                         .iter()
                         .flat_map(|code_unit| {
@@ -1971,7 +2388,7 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
                         filter_and_dedupe_hits(analyzer, &grouped_overloads, grouped_hits);
                     definition_sites_excluded += filtered.definition_sites_excluded;
                     candidates.push(AmbiguousUsageCandidate {
-                        target: target.clone(),
+                        target,
                         total_hits: filtered.hits.len(),
                     });
                 }
@@ -1979,13 +2396,13 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
                     symbol,
                     short_name,
                     candidate_targets: deduped_targets,
+                    candidate_details: detail_source.candidate_details,
+                    candidate_details_total: detail_source.candidate_details_total,
+                    candidate_details_truncated: detail_source.candidate_details_truncated,
                     candidates,
                     candidate_files_truncated: truncated,
                     definition_sites_excluded: some_if_nonzero(definition_sites_excluded),
-                    note: Some(
-                        "Ambiguous; re-call with one fully qualified name from candidate_targets."
-                            .to_string(),
-                    ),
+                    note: detail_source.note,
                 });
             }
             FuzzyResult::Failure { fq_name, reason } => {
