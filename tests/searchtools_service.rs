@@ -1323,7 +1323,11 @@ function run() {
         "lib/request.js#request.js.accepts", dependency["usages"][0]["symbol"],
         "payload: {dependency}"
     );
-    assert!(dependency["usages"][0]["total_hits"].as_u64().unwrap() >= 1);
+    assert_eq!(
+        1,
+        dependency["usages"][0]["total_hits"].as_u64().unwrap(),
+        "dependency target must not include req.accepts hits: {dependency}"
+    );
 
     let method_payload = service
         .call_tool_json(
@@ -1345,6 +1349,49 @@ function run() {
             .any(|file| file["path"] == "app.js"),
         "prototype method target should find app.js caller: {method}"
     );
+}
+
+#[test]
+fn scan_usages_location_target_uses_column_on_same_line_declarations() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "app.js",
+            "function first() {} function second() {}\nfirst();\nsecond();\n",
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages",
+            r#"{"targets":[{"path":"app.js","line":1,"column":30}],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert_eq!(0, array_len(&value, "ambiguous"), "payload: {value}");
+    assert_eq!("app.js#second", value["usages"][0]["symbol"], "{value}");
+}
+
+#[test]
+fn scan_usages_location_target_does_not_select_nested_same_line_member() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("app.js", "class Widget { render() {} }\nnew Widget();\n")
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages",
+            r#"{"targets":[{"path":"app.js","line":1,"column":7}],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert_eq!(0, array_len(&value, "ambiguous"), "payload: {value}");
+    assert_eq!("app.js#Widget", value["usages"][0]["symbol"]);
 }
 
 #[test]
@@ -1381,6 +1428,7 @@ fn scan_usages_ambiguous_symbol_includes_capped_location_details() {
     for detail in ambiguous["candidate_details"].as_array().unwrap() {
         assert!(detail["scan_usages_target"]["path"].as_str().is_some());
         assert_eq!(1, detail["scan_usages_target"]["line"].as_u64().unwrap());
+        assert!(detail["scan_usages_target"]["column"].as_u64().is_some());
     }
 }
 

@@ -438,7 +438,7 @@ fn resolve_reference_site(
     })
 }
 
-fn byte_offset_for_character_column(
+pub(crate) fn byte_offset_for_character_column(
     source: &str,
     line_start: usize,
     line_end: usize,

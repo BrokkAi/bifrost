@@ -562,6 +562,8 @@ pub struct AmbiguousUsageCandidateDetail {
 pub struct ScanUsagesTargetSuggestion {
     pub path: String,
     pub line: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub column: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1827,6 +1829,7 @@ fn ambiguous_usage_symbol_from_groups(
             let unit = units.first()?;
             let range = primary_range(analyzer, unit)?;
             let path = rel_path_string(unit.source());
+            let column = declaration_start_column(unit, range);
             Some(AmbiguousUsageCandidateDetail {
                 target: selector.clone(),
                 path: path.clone(),
@@ -1835,6 +1838,7 @@ fn ambiguous_usage_symbol_from_groups(
                 scan_usages_target: ScanUsagesTargetSuggestion {
                     path,
                     line: range.start_line,
+                    column,
                 },
             })
         })
@@ -1871,6 +1875,13 @@ enum ScanUsageTargetResolution {
     Failure(UsageFailureInfo),
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ScanUsagesLocationSelection {
+    ByteRange { start: usize, end: usize },
+    BytePoint(usize),
+    Line(usize),
+}
+
 fn scan_usages_target_label(target: &ScanUsagesTarget) -> String {
     if let Some(start) = target.start_byte {
         match target.end_byte {
@@ -1900,6 +1911,22 @@ fn location_selector_failure(
         reason: reason.into(),
         candidate_files_truncated: false,
     })
+}
+
+fn declaration_start_column(unit: &CodeUnit, range: Range) -> Option<usize> {
+    let source = unit.source().read_to_string().ok()?;
+    character_column_for_byte(&source, range.start_line, range.start_byte)
+}
+
+fn character_column_for_byte(source: &str, line: usize, byte: usize) -> Option<usize> {
+    if line == 0 || byte > source.len() || !source.is_char_boundary(byte) {
+        return None;
+    }
+    let line_starts = compute_line_starts(source);
+    let line_start = *line_starts.get(line - 1)?;
+    let line_end = line_starts.get(line).copied().unwrap_or(source.len());
+    let slice = source.get(line_start..byte.min(line_end))?;
+    Some(slice.chars().count() + 1)
 }
 
 fn resolve_scan_usages_target(
@@ -1951,6 +1978,7 @@ fn resolve_scan_usages_target(
     };
 
     let line_starts = compute_line_starts(&source);
+    let mut line_selection = None;
     if let Some(line) = target.line {
         if line == 0 || line > line_starts.len() {
             return location_selector_failure(
@@ -1965,18 +1993,20 @@ fn resolve_scan_usages_target(
         if let Some(column) = target.column {
             let line_start = line_starts[line - 1];
             let line_end = line_starts.get(line).copied().unwrap_or(source.len());
-            if byte_offset_for_character_column(&source, line_start, line_end, line, column)
-                .is_none()
-            {
-                return location_selector_failure(
-                    &target,
-                    "invalid_location",
-                    format!("column {column} is outside line {line}"),
-                );
+            match crate::analyzer::usages::get_definition::byte_offset_for_character_column(
+                &source, line_start, line_end, line, column,
+            ) {
+                Ok(point) => line_selection = Some(ScanUsagesLocationSelection::BytePoint(point)),
+                Err(reason) => {
+                    return location_selector_failure(&target, "invalid_location", reason);
+                }
             }
+        } else {
+            line_selection = Some(ScanUsagesLocationSelection::Line(line));
         }
     }
 
+    let mut selection = line_selection;
     if let Some(start) = target.start_byte {
         if start >= source.len() {
             return location_selector_failure(
@@ -2010,18 +2040,20 @@ fn resolve_scan_usages_target(
                     format!("end_byte {end} does not align to a UTF-8 character boundary"),
                 );
             }
+            selection = Some(ScanUsagesLocationSelection::ByteRange { start, end });
+        } else {
+            selection = Some(ScanUsagesLocationSelection::BytePoint(start));
         }
     }
+    let selection = selection.expect("validated scan_usages target location");
 
-    let matching_units: Vec<(CodeUnit, usize)> = analyzer
-        .search_definitions(".*", false)
+    let matching_units: Vec<(CodeUnit, usize)> = declarations_in_file(analyzer, &file)
         .into_iter()
-        .filter(|unit| unit.source() == &file)
         .filter_map(|unit| {
             let best_span = analyzer
                 .ranges_of(&unit)
                 .into_iter()
-                .filter(|range| scan_usages_target_matches_range(&target, *range))
+                .filter(|range| scan_usages_target_matches_range(selection, *range))
                 .map(|range| range.end_byte.saturating_sub(range.start_byte))
                 .min()?;
             Some((unit, best_span))
@@ -2069,14 +2101,29 @@ fn resolve_scan_usages_target(
     ScanUsageTargetResolution::Resolved { symbol, overloads }
 }
 
-fn scan_usages_target_matches_range(target: &ScanUsagesTarget, range: Range) -> bool {
-    if let Some(start) = target.start_byte {
-        let end = target.end_byte.unwrap_or(start.saturating_add(1));
-        range.start_byte <= start && range.end_byte >= end
-    } else if let Some(line) = target.line {
-        range.start_line <= line && range.end_line >= line
-    } else {
-        false
+fn declarations_in_file(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> Vec<CodeUnit> {
+    let mut declarations: Vec<CodeUnit> = analyzer.get_declarations(file).into_iter().collect();
+    let mut stack = declarations.clone();
+    while let Some(unit) = stack.pop() {
+        for child in analyzer.get_members_in_class(&unit) {
+            stack.push(child.clone());
+            declarations.push(child);
+        }
+    }
+    declarations
+}
+
+fn scan_usages_target_matches_range(selection: ScanUsagesLocationSelection, range: Range) -> bool {
+    match selection {
+        ScanUsagesLocationSelection::ByteRange { start, end } => {
+            range.start_byte <= start && range.end_byte >= end
+        }
+        ScanUsagesLocationSelection::BytePoint(point) => {
+            range.start_byte <= point && range.end_byte > point
+        }
+        ScanUsagesLocationSelection::Line(line) => {
+            range.start_line <= line && range.end_line >= line
+        }
     }
 }
 
@@ -2107,32 +2154,53 @@ fn retain_hits_resolving_to_overloads(
     hits.into_iter()
         .zip(outcomes)
         .filter_map(|(hit, outcome)| {
-            (outcome.definitions.is_empty()
-                || outcome
+            (!outcome.definitions.is_empty()
+                && outcome
                     .definitions
                     .iter()
-                    .any(|definition| overloads.contains(definition)))
+                    .any(|definition| overloads.contains(definition))
+                || (outcome.definitions.is_empty()
+                    && unresolved_hit_matches_target_shape(analyzer, overloads, &hit)))
             .then_some(hit)
         })
         .collect()
 }
 
-fn byte_offset_for_character_column(
-    source: &str,
-    line_start: usize,
-    line_end: usize,
-    _line_number: usize,
-    column: usize,
-) -> Option<usize> {
-    let line = source.get(line_start..line_end)?;
-    let character_offset = column.checked_sub(1)?;
-    if character_offset == 0 {
-        return Some(line_start);
-    }
-    if let Some((byte_offset, _)) = line.char_indices().nth(character_offset) {
-        return Some(line_start + byte_offset);
-    }
-    (character_offset == line.chars().count()).then_some(line_end)
+fn unresolved_hit_matches_target_shape(
+    analyzer: &dyn IAnalyzer,
+    overloads: &[CodeUnit],
+    hit: &UsageHit,
+) -> bool {
+    let hit_is_member_access = usage_hit_is_member_access(hit);
+    overloads.iter().any(|unit| {
+        declaration_is_member_access(analyzer, unit)
+            .map(|is_member| is_member == hit_is_member_access)
+            .unwrap_or(true)
+    })
+}
+
+fn usage_hit_is_member_access(hit: &UsageHit) -> bool {
+    source_has_dot_before(hit.file.read_to_string().ok().as_deref(), hit.start_offset)
+}
+
+fn declaration_is_member_access(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<bool> {
+    let range = primary_range(analyzer, unit)?;
+    let source = unit.source().read_to_string().ok()?;
+    let identifier_offset = source
+        .get(range.start_byte..range.end_byte)?
+        .find(unit.identifier())
+        .map(|offset| range.start_byte + offset)?;
+    Some(source_has_dot_before(Some(&source), identifier_offset))
+}
+
+fn source_has_dot_before(source: Option<&str>, byte: usize) -> bool {
+    let Some(source) = source else {
+        return false;
+    };
+    source
+        .get(..byte.min(source.len()))
+        .and_then(|prefix| prefix.chars().rev().find(|ch| !ch.is_whitespace()))
+        == Some('.')
 }
 
 pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUsagesResult {
