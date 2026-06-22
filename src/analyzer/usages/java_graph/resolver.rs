@@ -57,7 +57,7 @@ impl TargetSpec {
     }
 }
 
-fn signature_arity(signature: Option<&str>) -> usize {
+pub(in crate::analyzer::usages) fn signature_arity(signature: Option<&str>) -> usize {
     let Some(signature) = signature else {
         return 0;
     };

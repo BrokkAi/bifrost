@@ -342,25 +342,6 @@ fn java_filter_candidates_by_arity(
     }
 }
 
-fn java_signature_arity(signature: Option<&str>) -> usize {
-    let Some(signature) = signature else {
-        return 0;
-    };
-    let inner = signature
-        .find('(')
-        .and_then(|open| {
-            signature[open + 1..]
-                .find(')')
-                .map(|close| &signature[open + 1..open + 1 + close])
-        })
-        .unwrap_or(signature)
-        .trim();
-    if inner.is_empty() {
-        return 0;
-    }
-    inner.split(',').count()
-}
-
 fn java_argument_count(node: Node<'_>) -> usize {
     node.child_by_field_name("arguments")
         .map(|arguments| arguments.named_child_count())

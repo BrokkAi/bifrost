@@ -190,11 +190,19 @@ fn cpp_reference_node(node: Node<'_>) -> Option<CppReferenceNode<'_>> {
             current = parent;
             continue;
         }
+        if parent.kind() == "compound_literal_expression"
+            && parent.child_by_field_name("type") == Some(current)
+        {
+            current = parent;
+            continue;
+        }
         break;
     }
 
     match current.kind() {
-        "new_expression" => Some(CppReferenceNode::Constructor(current)),
+        "new_expression" | "compound_literal_expression" => {
+            Some(CppReferenceNode::Constructor(current))
+        }
         "call_expression" => Some(CppReferenceNode::Call(current)),
         "field_expression" => Some(CppReferenceNode::Field(current)),
         "type_identifier" | "qualified_identifier" | "template_type" | "scoped_type_identifier" => {
@@ -525,16 +533,6 @@ fn resolve_cpp_constructor(
         ctx.source,
         type_node,
     )
-}
-
-fn cpp_constructor_type_node(node: Node<'_>) -> Option<Node<'_>> {
-    match node.kind() {
-        "new_expression" => node
-            .child_by_field_name("type")
-            .or_else(|| node.named_child(0)),
-        "call_expression" => node.child_by_field_name("function"),
-        _ => None,
-    }
 }
 
 fn cpp_prefer_declaration_candidates(candidates: Vec<CodeUnit>) -> Vec<CodeUnit> {

@@ -1,8 +1,9 @@
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::usages::cpp_graph::{
-    CppTargetKind, CppVisibilityIndex, cpp_call_arity, cpp_first_type_child,
-    cpp_is_declaration_name, cpp_is_declarator_node, cpp_name_for, cpp_signature_arity,
-    cpp_split_top_level_commas, extract_variable_name, normalize_cpp_type_text,
+    CppTargetKind, CppVisibilityIndex, cpp_call_arity, cpp_constructor_type_node,
+    cpp_first_type_child, cpp_is_declaration_name, cpp_is_declarator_node, cpp_name_for,
+    cpp_signature_arity, cpp_split_top_level_commas, extract_variable_name,
+    normalize_cpp_type_text,
 };
 use crate::analyzer::usages::csharp_graph::{
     csharp_argument_count, csharp_first_type_child, csharp_is_declaration_name,
@@ -16,6 +17,7 @@ use crate::analyzer::usages::go_graph::{
     preparse_go_files, resolve_go_reference,
 };
 use crate::analyzer::usages::inverted_edges::{ClassRangeIndex, first_precise};
+use crate::analyzer::usages::java_graph::java_signature_arity;
 use crate::analyzer::usages::js_ts_graph::{cached_jsts_index, compute_jsts_import_binder};
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::{ImportBinder, ImportKind};

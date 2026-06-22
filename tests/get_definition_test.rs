@@ -6129,6 +6129,38 @@ fn cpp_constructor_call_resolves_to_header_constructor_declaration() {
 }
 
 #[test]
+fn cpp_braced_constructor_call_resolves_to_matching_constructor_declaration() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "target.h",
+            "namespace ns { class Target { public: Target(); explicit Target(int value); }; }\n",
+        )
+        .file(
+            "app.cpp",
+            "#include \"target.h\"\nnamespace ns { Target make() { return Target{1}; } }\n",
+        )
+        .build();
+
+    let line = "namespace ns { Target make() { return Target{1}; } }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.cpp","line":2,"column":{}}}]}}"#,
+            column_of(line, "Target{1}")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "ns.Target.Target",
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["signature"], "(int)", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "target.h", "{value}");
+}
+
+#[test]
 fn cpp_typed_receiver_method_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(
