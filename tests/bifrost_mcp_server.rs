@@ -240,6 +240,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     assert_tool_schema_omits_property(tools, "get_definition_by_location", "include_tests");
     assert_tool_schema_contains_property(tools, "scan_usages", "targets");
     assert_tool_schema_contains_property(tools, "scan_usages", "anyOf");
+    assert_scan_usages_schema_requires_non_empty_selectors(tools);
 
     let ping = round_trip(
         &mut stdin,
@@ -1621,6 +1622,26 @@ fn assert_tool_schema_contains_property(tools: &[Value], tool_name: &str, proper
     assert!(
         schema.contains(property_name),
         "{tool_name} schema should contain {property_name}: {schema}"
+    );
+}
+
+fn assert_scan_usages_schema_requires_non_empty_selectors(tools: &[Value]) {
+    let tool = tools
+        .iter()
+        .find(|tool| tool["name"] == "scan_usages")
+        .expect("missing scan_usages descriptor");
+    let schema = &tool["inputSchema"];
+
+    assert_eq!(schema["properties"]["symbols"]["minItems"], 1);
+    assert_eq!(schema["properties"]["symbols"]["items"]["pattern"], "\\S");
+    assert_eq!(schema["properties"]["targets"]["minItems"], 1);
+    assert_eq!(
+        schema["properties"]["targets"]["items"]["required"],
+        json!(["path"])
+    );
+    assert_eq!(
+        schema["properties"]["targets"]["items"]["anyOf"],
+        json!([{ "required": ["line"] }, { "required": ["start_byte"] }])
     );
 }
 

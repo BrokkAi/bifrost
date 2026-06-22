@@ -74,16 +74,22 @@ pub(crate) fn symbol_tool_descriptors(render_line_numbers: bool) -> Vec<Value> {
                 "properties": {
                     "symbols": {
                         "type": "array",
-                        "items": { "type": "string" },
+                        "minItems": 1,
+                        "items": {
+                            "type": "string",
+                            "pattern": "\\S"
+                        },
                         "description": "Fully qualified symbol names from search_symbols are preferred; short names may resolve fuzzily or become ambiguous. Required when targets is omitted."
                     },
                     "targets": {
                         "type": "array",
+                        "minItems": 1,
                         "items": {
                             "type": "object",
                             "properties": {
                                 "path": {
                                     "type": "string",
+                                    "minLength": 1,
                                     "description": "Project-relative source file path containing the declaration."
                                 },
                                 "line": {
@@ -107,7 +113,11 @@ pub(crate) fn symbol_tool_descriptors(render_line_numbers: bool) -> Vec<Value> {
                                     "description": "Optional exclusive byte end offset for a declaration range."
                                 }
                             },
-                            "required": ["path"]
+                            "required": ["path"],
+                            "anyOf": [
+                                { "required": ["line"] },
+                                { "required": ["start_byte"] }
+                            ]
                         },
                         "description": "Declaration selectors by project-relative path and line/column or byte offsets. Required when symbols is omitted."
                     },
