@@ -37,6 +37,9 @@ pub(super) fn resolve_csharp(
             let reference = csharp_reference_type_text(type_node, source);
             csharp_type_outcome(csharp, support, file, &reference)
         }
+        Some(CSharpReferenceNode::Constructor(creation)) => {
+            resolve_csharp_constructor(csharp, support, file, source, creation)
+        }
         Some(CSharpReferenceNode::Member { receiver, name }) => {
             let member = csharp_member_name_text(name, source);
             if member.is_empty() {
@@ -139,6 +142,7 @@ pub(super) fn parse_csharp_tree(source: &str) -> Option<Tree> {
 
 enum CSharpReferenceNode<'tree> {
     Type(Node<'tree>),
+    Constructor(Node<'tree>),
     Member {
         receiver: Node<'tree>,
         name: Node<'tree>,
@@ -157,6 +161,9 @@ fn csharp_reference_node(node: Node<'_>) -> Option<CSharpReferenceNode<'_>> {
             || (parent.kind() == "member_access_expression"
                 && (csharp_member_access_name(parent) == Some(current)
                     || csharp_member_access_name(parent) == Some(original)))
+            || (parent.kind() == "object_creation_expression"
+                && (parent.child_by_field_name("type") == Some(current)
+                    || csharp_first_type_child(parent) == Some(current)))
         {
             current = parent;
         } else {
@@ -169,10 +176,7 @@ fn csharp_reference_node(node: Node<'_>) -> Option<CSharpReferenceNode<'_>> {
             receiver: csharp_member_access_receiver(current)?,
             name: csharp_member_access_name(current)?,
         }),
-        "object_creation_expression" => current
-            .child_by_field_name("type")
-            .or_else(|| csharp_first_type_child(current))
-            .map(CSharpReferenceNode::Type),
+        "object_creation_expression" => Some(CSharpReferenceNode::Constructor(current)),
         "identifier" | "type" => {
             if csharp_is_unqualified_invocation_target(current) {
                 return Some(CSharpReferenceNode::UnqualifiedMember(current));
@@ -220,6 +224,37 @@ fn csharp_member_name_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
         .next()
         .unwrap_or_default()
         .trim()
+}
+
+fn resolve_csharp_constructor(
+    csharp: &CSharpAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    creation: Node<'_>,
+) -> DefinitionLookupOutcome {
+    let Some(type_node) = creation
+        .child_by_field_name("type")
+        .or_else(|| csharp_first_type_child(creation))
+    else {
+        return no_definition("no_reference_text", "C# constructor call has no type");
+    };
+    let reference = csharp_reference_type_text(type_node, source);
+    let owners = csharp_visible_type_candidates(csharp, file, &reference);
+    let mut constructors = Vec::new();
+    for owner in &owners {
+        constructors.extend(support.fqn(&format!("{}.{}", owner.fq_name(), owner.identifier())));
+    }
+    sort_units(&mut constructors);
+    constructors.dedup();
+    constructors = csharp_filter_candidates_by_arity(
+        constructors,
+        Some(csharp_argument_count(creation, source)),
+    );
+    if !constructors.is_empty() {
+        return candidates_outcome(constructors);
+    }
+    csharp_type_outcome(csharp, support, file, &reference)
 }
 
 fn csharp_type_outcome(

@@ -51,6 +51,9 @@ pub(super) fn resolve_scala(
         Some(ScalaReferenceNode::Type(type_node)) => {
             resolve_scala_type(ctx, &resolver, root, type_node)
         }
+        Some(ScalaReferenceNode::Constructor(constructor)) => {
+            resolve_scala_constructor(ctx, &resolver, constructor)
+        }
         Some(ScalaReferenceNode::Call(call)) => resolve_scala_call(ctx, &resolver, root, call),
         Some(ScalaReferenceNode::Field(field)) => resolve_scala_field(ctx, &resolver, root, field),
         Some(ScalaReferenceNode::StableIdentifier(identifier)) => {
@@ -102,6 +105,7 @@ pub(super) fn parse_scala_tree(source: &str) -> Option<Tree> {
 
 enum ScalaReferenceNode<'tree> {
     Type(Node<'tree>),
+    Constructor(Node<'tree>),
     Call(Node<'tree>),
     Field(Node<'tree>),
     StableIdentifier(Node<'tree>),
@@ -123,6 +127,13 @@ fn scala_reference_node(node: Node<'_>) -> Option<ScalaReferenceNode<'_>> {
             current = parent;
             continue;
         }
+        if parent.kind() == "instance_expression"
+            && parent.start_byte() <= current.start_byte()
+            && parent.end_byte() >= current.end_byte()
+        {
+            current = parent;
+            continue;
+        }
         if parent.kind() == "stable_identifier" {
             current = parent;
             continue;
@@ -132,6 +143,7 @@ fn scala_reference_node(node: Node<'_>) -> Option<ScalaReferenceNode<'_>> {
 
     match current.kind() {
         "call_expression" => Some(ScalaReferenceNode::Call(current)),
+        "instance_expression" => Some(ScalaReferenceNode::Constructor(current)),
         "field_expression" => Some(ScalaReferenceNode::Field(current)),
         "stable_identifier" => Some(ScalaReferenceNode::StableIdentifier(current)),
         "type_identifier" | "stable_type_identifier" | "generic_type" => {
@@ -228,6 +240,7 @@ fn resolve_scala_call(
         return no_definition("no_function_name", "Scala call expression has no function");
     };
     match function.kind() {
+        "instance_expression" => resolve_scala_constructor(ctx, resolver, function),
         "field_expression" => resolve_scala_field(ctx, resolver, root, function),
         "identifier" | "type_identifier" => {
             let name = scala_node_text(function, ctx.source).trim();
@@ -282,6 +295,33 @@ fn resolve_scala_call(
     }
 }
 
+fn resolve_scala_constructor(
+    ctx: ScalaLookupCtx<'_>,
+    resolver: &ScalaNameResolver,
+    constructor: Node<'_>,
+) -> DefinitionLookupOutcome {
+    let Some(owner_fqn) = scala_constructed_type(ctx, constructor, resolver) else {
+        return no_definition(
+            "no_indexed_definition",
+            "Scala constructor call did not resolve to an indexed type",
+        );
+    };
+    let member = scala_constructor_member_name(&owner_fqn);
+    let candidates = ctx.support.fqn(&format!("{owner_fqn}.{member}"));
+    if !candidates.is_empty() {
+        return candidates_outcome(candidates);
+    }
+    scala_fqn_outcome(ctx.support, &owner_fqn, member)
+}
+
+fn scala_constructor_member_name(owner_fqn: &str) -> &str {
+    owner_fqn
+        .trim_end_matches('$')
+        .rsplit('.')
+        .next()
+        .unwrap_or(owner_fqn)
+}
+
 fn resolve_scala_field(
     ctx: ScalaLookupCtx<'_>,
     resolver: &ScalaNameResolver,
@@ -303,12 +343,47 @@ fn resolve_scala_field(
     };
     if let Some(owner) = scala_receiver_type_fqn(ctx, resolver, root, receiver, field.start_byte())
     {
-        return scala_member_candidates(ctx, &owner, member, false);
+        let include_companion = scala_receiver_allows_companion_lookup(
+            ctx,
+            resolver,
+            root,
+            receiver,
+            field.start_byte(),
+            &owner,
+        );
+        return scala_member_candidates(ctx, &owner, member, include_companion);
     }
     no_definition(
         "unsupported_scala_receiver",
         format!("receiver for Scala member `{member}` is not resolved"),
     )
+}
+
+fn scala_receiver_allows_companion_lookup(
+    ctx: ScalaLookupCtx<'_>,
+    resolver: &ScalaNameResolver,
+    root: Node<'_>,
+    receiver: Node<'_>,
+    cutoff_start: usize,
+    owner_fqn: &str,
+) -> bool {
+    if !matches!(receiver.kind(), "identifier" | "type_identifier") {
+        return false;
+    }
+    let name = scala_node_text(receiver, ctx.source).trim();
+    if name == "this" {
+        return false;
+    }
+    let bindings = scala_bindings_before(ctx, resolver, root, cutoff_start);
+    if first_precise(&bindings, name).is_some()
+        || bindings.is_shadowed(name)
+        || scala_enclosing_class_parameter_type(ctx, receiver, name, resolver).is_some()
+    {
+        return false;
+    }
+    resolver
+        .resolve(name)
+        .is_some_and(|resolved| resolved == owner_fqn)
 }
 
 fn resolve_scala_stable_identifier(

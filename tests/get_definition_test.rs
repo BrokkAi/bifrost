@@ -4375,20 +4375,19 @@ public interface ChannelPoolPartitioning {
     enum PerHostChannelPoolPartitioning implements ChannelPoolPartitioning {
         INSTANCE;
 
-        public Object getPartitionKey(String scheme, String host, int port) {
-            return new PartitionKey(scheme, host, port);
+        public Object getPartitionKey() {
+            return new PartitionKey();
         }
     }
 
     class PartitionKey {
-        PartitionKey(String scheme, String host, int port) {}
     }
 }
 "#,
         )
         .build();
 
-    let line = "            return new PartitionKey(scheme, host, port);";
+    let line = "            return new PartitionKey();";
     let value = lookup(
         project.root(),
         &format!(
@@ -4402,6 +4401,50 @@ public interface ChannelPoolPartitioning {
     assert_eq!(
         result["definitions"][0]["fqn"],
         "org.asynchttpclient.channel.ChannelPoolPartitioning.PartitionKey",
+        "{value}"
+    );
+}
+
+#[test]
+fn java_explicit_constructor_call_resolves_to_constructor_definition() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "example/Service.java",
+            r#"
+package example;
+
+public class Service {
+    public Service(String name) {}
+}
+"#,
+        )
+        .file(
+            "example/Consumer.java",
+            r#"
+package example;
+
+public class Consumer {
+    public void run() {
+        new Service("job");
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        new Service(\"job\");";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"example/Consumer.java","line":6,"column":{}}}]}}"#,
+            column_of(line, "Service")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "example.Service.Service",
         "{value}"
     );
 }
@@ -5751,6 +5794,36 @@ fn csharp_typed_receiver_method_filters_overloads_by_call_arity() {
 }
 
 #[test]
+fn csharp_explicit_constructor_call_resolves_to_constructor_definition() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Lib/Service.cs",
+            "namespace Lib { public class Service { public Service(string name) {} } }\n",
+        )
+        .file(
+            "App/Controller.cs",
+            "using Lib;\nnamespace App { public class Controller { public void Handle() { var service = new Service(\"job\"); } } }\n",
+        )
+        .build();
+
+    let line = "namespace App { public class Controller { public void Handle() { var service = new Service(\"job\"); } } }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"App/Controller.cs","line":2,"column":{}}}]}}"#,
+            column_of(line, "Service")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Lib.Service.Service",
+        "{value}"
+    );
+}
+
+#[test]
 fn csharp_typed_receiver_method_wrong_arity_returns_overload_definitions() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(
@@ -6021,6 +6094,69 @@ fn cpp_included_type_resolves_to_definition() {
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(result["definitions"][0]["fqn"], "ns.Service", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "target.h", "{value}");
+}
+
+#[test]
+fn cpp_constructor_call_resolves_to_header_constructor_declaration() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "service.h",
+            "namespace example { class Repository {}; class Service { public: explicit Service(Repository& repository); }; }\n",
+        )
+        .file(
+            "service.cpp",
+            "#include \"service.h\"\nnamespace example { Service::Service(Repository& repository) {} Service build_service(Repository& repository) { return Service(repository); } }\n",
+        )
+        .build();
+
+    let line = "namespace example { Service::Service(Repository& repository) {} Service build_service(Repository& repository) { return Service(repository); } }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"service.cpp","line":2,"column":{}}}]}}"#,
+            column_of(line, "Service(repository)")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "example.Service.Service",
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["path"], "service.h", "{value}");
+}
+
+#[test]
+fn cpp_braced_constructor_call_resolves_to_matching_constructor_declaration() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "target.h",
+            "namespace ns { class Target { public: Target(); explicit Target(int value); }; }\n",
+        )
+        .file(
+            "app.cpp",
+            "#include \"target.h\"\nnamespace ns { Target make() { return Target{1}; } }\n",
+        )
+        .build();
+
+    let line = "namespace ns { Target make() { return Target{1}; } }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.cpp","line":2,"column":{}}}]}}"#,
+            column_of(line, "Target{1}")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "ns.Target.Target",
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["signature"], "(int)", "{value}");
     assert_eq!(result["definitions"][0]["path"], "target.h", "{value}");
 }
 
@@ -7746,6 +7882,36 @@ fn scala_same_package_type_resolves_to_definition() {
 }
 
 #[test]
+fn scala_constructor_call_resolves_to_primary_constructor_identity() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Service.scala",
+            "package app\nclass Repository\nclass Service(repository: Repository)\nobject Service {\n  def build(repository: Repository): Service = new Service(repository)\n}\n",
+        )
+        .build();
+
+    let line = "  def build(repository: Repository): Service = new Service(repository)";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Service.scala","line":5,"column":{}}}]}}"#,
+            column_of(line, "Service(repository)")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Service.Service",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["path"], "app/Service.scala",
+        "{value}"
+    );
+}
+
+#[test]
 fn scala_object_apply_call_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(
@@ -7771,6 +7937,41 @@ fn scala_object_apply_call_resolves_to_definition() {
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(
         result["definitions"][0]["fqn"], "app.Factory$.apply",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_companion_method_call_resolves_from_type_receiver() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "example/Service.scala",
+            "package example\nclass Repository\nclass Service(repository: Repository)\nobject Service { def build(repository: Repository): Service = new Service(repository) }\n",
+        )
+        .file(
+            "example/Consumer.scala",
+            "package example\nobject Consumer { def run(repository: Repository): Service = Service.build(repository) }\n",
+        )
+        .build();
+
+    let line =
+        "object Consumer { def run(repository: Repository): Service = Service.build(repository) }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"example/Consumer.scala","line":2,"column":{}}}]}}"#,
+            column_of(line, "build")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "example.Service$.build",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["path"], "example/Service.scala",
         "{value}"
     );
 }

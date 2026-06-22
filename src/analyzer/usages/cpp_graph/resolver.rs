@@ -476,7 +476,7 @@ pub(in crate::analyzer::usages) fn call_arity(node: Node<'_>) -> usize {
         .unwrap_or(0)
 }
 
-pub(super) fn constructor_type_node(node: Node<'_>) -> Option<Node<'_>> {
+pub(in crate::analyzer::usages) fn constructor_type_node(node: Node<'_>) -> Option<Node<'_>> {
     match node.kind() {
         "new_expression" => node
             .child_by_field_name("type")

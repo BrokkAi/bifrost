@@ -15,6 +15,8 @@ use crate::analyzer::usages::traits::{UsageAnalyzer, UsageEdgeResolver, UsageQue
 use crate::analyzer::{CodeUnit, IAnalyzer, JavaAnalyzer, Language, ProjectFile, resolve_analyzer};
 use crate::hash::HashSet;
 
+pub(in crate::analyzer::usages) use resolver::signature_arity as java_signature_arity;
+
 pub(crate) fn build_java_usage_edges<F>(
     analyzer: &dyn IAnalyzer,
     nodes: &HashSet<String>,
