@@ -2140,6 +2140,63 @@ fn bifrost_lsp_server_type_hierarchy_cpp_uses_same_handler() {
 }
 
 #[test]
+fn bifrost_lsp_server_type_hierarchy_scala_uses_same_handler() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("Hierarchy.scala");
+    fs::write(
+        &file_path,
+        "package app\ntrait Runnable\nclass Base\nclass Child extends Base with Runnable\n",
+    )
+    .expect("write Scala hierarchy fixture");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let child_item =
+        prepare_type_hierarchy(&mut stdin, &mut reader, &mut stderr, 50, &file_uri, 3, 6);
+    assert_eq!(child_item["name"], "Child", "prepared child: {child_item}");
+
+    let supertypes = type_hierarchy_relation(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        51,
+        "typeHierarchy/supertypes",
+        child_item,
+    );
+    let supertype_names: Vec<_> = supertypes
+        .iter()
+        .filter_map(|item| item["name"].as_str())
+        .collect();
+    assert_eq!(
+        supertype_names,
+        vec!["Base", "Runnable"],
+        "supertypes: {supertypes:#?}"
+    );
+
+    let base_item = supertypes
+        .iter()
+        .find(|item| item["name"] == "Base")
+        .cloned()
+        .expect("Base supertype item");
+    let subtypes = type_hierarchy_relation(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        52,
+        "typeHierarchy/subtypes",
+        base_item,
+    );
+    let subtype_names: Vec<_> = subtypes
+        .iter()
+        .filter_map(|item| item["name"].as_str())
+        .collect();
+    assert_eq!(subtype_names, vec!["Child"], "subtypes: {subtypes:#?}");
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
 fn bifrost_lsp_server_type_hierarchy_returns_null_without_provider() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().canonicalize().expect("canon temp");

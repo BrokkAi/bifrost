@@ -1,18 +1,25 @@
 mod adapter;
 mod clones;
 mod declarations;
+mod hierarchy;
 mod imports;
 mod tests;
 
 use crate::analyzer::clone_detection::{CloneCandidateProfile, detect_structural_clone_smells};
 use crate::analyzer::common::language_for_file as file_language;
+use crate::analyzer::js_ts::{
+    build_weighted_cache, weight_code_unit_set_by_unit, weight_code_unit_vec_by_unit,
+};
 use crate::analyzer::{
     AnalyzerConfig, CodeUnit, IAnalyzer, ImportAnalysisProvider, Language, Project, ProjectFile,
     TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer,
+    TypeHierarchyProvider, build_direct_descendant_index,
 };
+use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
+use moka::sync::Cache;
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use adapter::ScalaAdapter;
 use clones::{build_scala_clone_candidate_data, refine_scala_clone_similarity};
@@ -21,6 +28,10 @@ use tests::detect_scala_test_assertion_smells;
 #[derive(Clone)]
 pub struct ScalaAnalyzer {
     inner: TreeSitterAnalyzer<ScalaAdapter>,
+    memo_budget: u64,
+    direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
+    direct_descendants: Cache<CodeUnit, Arc<HashSet<CodeUnit>>>,
+    direct_descendant_index: Arc<OnceLock<HashMap<String, Arc<HashSet<CodeUnit>>>>>,
 }
 
 impl ScalaAnalyzer {
@@ -29,8 +40,18 @@ impl ScalaAnalyzer {
     }
 
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
+        let memo_budget = config.memo_cache_budget_bytes();
+        let inner = TreeSitterAnalyzer::new_with_config(project, ScalaAdapter, config);
+        Self::from_inner(inner, memo_budget)
+    }
+
+    fn from_inner(inner: TreeSitterAnalyzer<ScalaAdapter>, memo_budget: u64) -> Self {
         Self {
-            inner: TreeSitterAnalyzer::new_with_config(project, ScalaAdapter, config),
+            inner,
+            memo_budget,
+            direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec_by_unit),
+            direct_descendants: build_weighted_cache(memo_budget / 8, weight_code_unit_set_by_unit),
+            direct_descendant_index: Arc::new(OnceLock::new()),
         }
     }
 
@@ -39,14 +60,10 @@ impl ScalaAnalyzer {
         config: AnalyzerConfig,
         storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
     ) -> Self {
-        Self {
-            inner: TreeSitterAnalyzer::new_with_config_and_storage(
-                project,
-                ScalaAdapter,
-                config,
-                storage,
-            ),
-        }
+        let memo_budget = config.memo_cache_budget_bytes();
+        let inner =
+            TreeSitterAnalyzer::new_with_config_and_storage(project, ScalaAdapter, config, storage);
+        Self::from_inner(inner, memo_budget)
     }
 
     pub fn from_project<P>(project: P) -> Self
@@ -176,15 +193,11 @@ impl IAnalyzer for ScalaAnalyzer {
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
-        Self {
-            inner: self.inner.update(changed_files),
-        }
+        Self::from_inner(self.inner.update(changed_files), self.memo_budget)
     }
 
     fn update_all(&self) -> Self {
-        Self {
-            inner: self.inner.update_all(),
-        }
+        Self::from_inner(self.inner.update_all(), self.memo_budget)
     }
 
     fn project(&self) -> &dyn Project {
@@ -192,6 +205,10 @@ impl IAnalyzer for ScalaAnalyzer {
     }
 
     fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {
+        Some(self)
+    }
+
+    fn type_hierarchy_provider(&self) -> Option<&dyn TypeHierarchyProvider> {
         Some(self)
     }
 
