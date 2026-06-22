@@ -68,14 +68,58 @@ pub(crate) fn symbol_tool_descriptors(render_line_numbers: bool) -> Vec<Value> {
         ),
         tool_descriptor(
             "scan_usages",
-            "Find references, call sites, usages, callers, and related tests for known fully qualified symbols. Prefer over grep when changing existing behavior and callers may matter; use search_symbols first for partial names. Results are tiered by volume and budget: few callers include snippets, larger results degrade to lines or per-file summaries. Narrow with paths or one symbol at a time for detail.",
+            "Find references, call sites, usages, callers, and related tests for known fully qualified symbols or source-location declaration targets. Prefer over grep when changing existing behavior and callers may matter; use search_symbols first for partial names, or targets when a declaration is only known by path and location. Results are tiered by volume and budget: few callers include snippets, larger results degrade to lines or per-file summaries. Narrow with paths or one symbol/target at a time for detail.",
             json!({
                 "type": "object",
                 "properties": {
                     "symbols": {
                         "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Fully qualified symbol names from search_symbols are preferred; short names may resolve fuzzily or become ambiguous."
+                        "minItems": 1,
+                        "items": {
+                            "type": "string",
+                            "pattern": "\\S"
+                        },
+                        "description": "Fully qualified symbol names from search_symbols are preferred; short names may resolve fuzzily or become ambiguous. Required when targets is omitted."
+                    },
+                    "targets": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "description": "Project-relative source file path containing the declaration."
+                                },
+                                "line": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                    "description": "1-based declaration line. Use with column when byte offsets are not available."
+                                },
+                                "column": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                    "description": "1-based character column on the declaration line."
+                                },
+                                "start_byte": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "description": "0-based byte offset at or inside the declaration range."
+                                },
+                                "end_byte": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "description": "Optional exclusive byte end offset for a declaration range."
+                                }
+                            },
+                            "required": ["path"],
+                            "anyOf": [
+                                { "required": ["line"] },
+                                { "required": ["start_byte"] }
+                            ]
+                        },
+                        "description": "Declaration selectors by project-relative path and line/column or byte offsets. Required when symbols is omitted."
                     },
                     "include_tests": {
                         "type": "boolean",
@@ -88,7 +132,10 @@ pub(crate) fn symbol_tool_descriptors(render_line_numbers: bool) -> Vec<Value> {
                         "description": "Optional project-relative file paths or glob patterns used to narrow where usages are searched. Use paths from summary-mode scan_usages output to re-call for line or snippet detail."
                     }
                 },
-                "required": ["symbols"]
+                "anyOf": [
+                    { "required": ["symbols"] },
+                    { "required": ["targets"] }
+                ]
             }),
         ),
         definition_descriptor,

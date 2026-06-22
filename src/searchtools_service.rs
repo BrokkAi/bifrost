@@ -415,9 +415,12 @@ impl SearchToolsService {
                     most_relevant_files(workspace.analyzer(), params)
                 },
             ),
-            "scan_usages" => Self::decode_and_run(&snapshot, arguments, |workspace, params| {
-                scan_usages(workspace.analyzer(), params)
-            }),
+            "scan_usages" => {
+                Self::validate_scan_usages_arguments(&arguments)?;
+                Self::decode_and_run(&snapshot, arguments, |workspace, params| {
+                    scan_usages(workspace.analyzer(), params)
+                })
+            }
             "get_definition_by_location" => {
                 Self::decode_and_run(&snapshot, arguments, |workspace, params| {
                     get_definition_by_location(workspace.analyzer(), params)
@@ -774,6 +777,30 @@ impl SearchToolsService {
                 structured,
                 rendered_text: None,
             }),
+        }
+    }
+
+    fn validate_scan_usages_arguments(arguments: &Value) -> Result<(), SearchToolsServiceError> {
+        let has_symbols = arguments
+            .get("symbols")
+            .and_then(Value::as_array)
+            .is_some_and(|symbols| {
+                symbols
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|symbol| !symbol.trim().is_empty())
+            });
+        let has_targets = arguments
+            .get("targets")
+            .and_then(Value::as_array)
+            .is_some_and(|targets| !targets.is_empty());
+
+        if has_symbols || has_targets {
+            Ok(())
+        } else {
+            Err(SearchToolsServiceError::invalid_params(
+                "scan_usages requires a non-empty `symbols` array unless `targets` location selectors are supplied",
+            ))
         }
     }
 

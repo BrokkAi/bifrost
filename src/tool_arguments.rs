@@ -11,7 +11,10 @@ pub fn normalize_tool_arguments(
         "list_symbols" => {
             normalize_string_array_field(&mut arguments, "file_patterns", workspace_root)?
         }
-        "scan_usages" => normalize_string_array_field(&mut arguments, "paths", workspace_root)?,
+        "scan_usages" => {
+            normalize_string_array_field(&mut arguments, "paths", workspace_root)?;
+            normalize_object_array_string_field(&mut arguments, "targets", "path", workspace_root)?;
+        }
         "most_relevant_files" => {
             normalize_string_array_field(&mut arguments, "seed_file_paths", workspace_root)?
         }
@@ -78,6 +81,22 @@ fn normalize_optional_string_field(
     };
     if let Some(normalized) = normalize_mcp_path_argument(raw, workspace_root)? {
         *value = Value::String(normalized);
+    }
+    Ok(())
+}
+
+fn normalize_object_array_string_field(
+    arguments: &mut Value,
+    array_field: &str,
+    string_field: &str,
+    workspace_root: &Path,
+) -> Result<(), String> {
+    let Some(array) = arguments.get_mut(array_field).and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+
+    for item in array {
+        normalize_optional_string_field(item, string_field, workspace_root)?;
     }
     Ok(())
 }
@@ -301,6 +320,32 @@ mod tests {
         .expect("normalize");
 
         assert_eq!(normalized["paths"][0], "src/lib.rs");
+    }
+
+    #[test]
+    fn normalizes_scan_usages_target_paths_field() {
+        let root = TempDir::new().expect("temp dir");
+        let src = root.path().join("src");
+        fs::create_dir(&src).expect("src dir");
+        let file = src.join("lib.rs");
+        fs::write(&file, "fn helper() {}\n").expect("write file");
+
+        let normalized = normalize_tool_arguments(
+            "scan_usages",
+            json!({
+                "targets": [{
+                    "path": file.display().to_string(),
+                    "line": 1,
+                    "column": 4
+                }]
+            }),
+            root.path(),
+        )
+        .expect("normalize");
+
+        assert_eq!(normalized["targets"][0]["path"], "src/lib.rs");
+        assert_eq!(normalized["targets"][0]["line"], 1);
+        assert_eq!(normalized["targets"][0]["column"], 4);
     }
 
     #[test]
