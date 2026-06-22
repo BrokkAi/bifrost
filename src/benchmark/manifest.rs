@@ -341,7 +341,22 @@ pub struct BenchmarkRepoTarget {
     #[serde(default)]
     pub usage_symbols: Vec<String>,
     #[serde(default)]
+    pub usage_targets: Vec<ScanUsageQueryTarget>,
+    #[serde(default)]
     pub definition_queries: Vec<DefinitionQueryTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScanUsageQueryTarget {
+    pub path: String,
+    #[serde(default)]
+    pub line: Option<usize>,
+    #[serde(default)]
+    pub column: Option<usize>,
+    #[serde(default)]
+    pub start_byte: Option<usize>,
+    #[serde(default)]
+    pub end_byte: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -460,10 +475,14 @@ impl BenchmarkRepoTarget {
 
         if scenarios.contains(&BenchmarkScenario::ScanUsages)
             && !has_non_blank_values(&self.usage_symbols)
+            && self.usage_targets.is_empty()
         {
             errors.push(format!(
-                "repo `{name}` enables `scan_usages` but does not define usage_symbols"
+                "repo `{name}` enables `scan_usages` but does not define usage_symbols or usage_targets"
             ));
+        }
+        for (index, query) in self.usage_targets.iter().enumerate() {
+            query.validate(name, index, errors);
         }
 
         if scenarios.contains(&BenchmarkScenario::GetDefinition) {
@@ -475,6 +494,33 @@ impl BenchmarkRepoTarget {
             for (index, query) in self.definition_queries.iter().enumerate() {
                 query.validate(name, index, errors);
             }
+        }
+    }
+}
+
+impl ScanUsageQueryTarget {
+    fn validate(&self, repo_name: &str, index: usize, errors: &mut Vec<String>) {
+        let label = format!("repo `{repo_name}` usage_targets[{index}]");
+        if self.path.trim().is_empty() {
+            errors.push(format!("{label} must define a non-empty path"));
+        }
+
+        let has_byte_location = self.start_byte.is_some();
+        let has_line_location = self.line.is_some();
+        if !has_byte_location && !has_line_location {
+            errors.push(format!("{label} must define either start_byte or line"));
+        }
+        if self.end_byte.is_some() && self.start_byte.is_none() {
+            errors.push(format!("{label} defines end_byte without start_byte"));
+        }
+        if matches!((self.start_byte, self.end_byte), (Some(start), Some(end)) if start >= end) {
+            errors.push(format!("{label} has an empty or inverted byte range"));
+        }
+        if self.column == Some(0) {
+            errors.push(format!("{label} column must be 1-based"));
+        }
+        if self.line == Some(0) {
+            errors.push(format!("{label} line must be 1-based"));
         }
     }
 }

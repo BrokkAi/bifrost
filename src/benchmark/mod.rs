@@ -7,7 +7,7 @@ pub mod subset_workspace;
 
 pub use manifest::{
     BenchmarkManifest, BenchmarkRepoTarget, BenchmarkScenario, DefinitionQueryTarget,
-    ManifestLanguage, ManifestLoadError, ManifestValidationError,
+    ManifestLanguage, ManifestLoadError, ManifestValidationError, ScanUsageQueryTarget,
 };
 pub use report::{
     BenchmarkCompareReport, BenchmarkRepoReport, BenchmarkRunReport, CompareThresholds,

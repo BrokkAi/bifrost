@@ -283,10 +283,18 @@ fn tool_arguments(target: &BenchmarkRepoTarget, scenario: BenchmarkScenario) -> 
             "seed_file_paths": target.seed_file_paths,
             "limit": 20
         }),
-        BenchmarkScenario::ScanUsages => json!({
-            "symbols": target.usage_symbols,
-            "include_tests": true
-        }),
+        BenchmarkScenario::ScanUsages => {
+            let mut args = json!({
+                "include_tests": true
+            });
+            if !target.usage_symbols.is_empty() {
+                args["symbols"] = json!(target.usage_symbols);
+            }
+            if !target.usage_targets.is_empty() {
+                args["targets"] = json!(target.usage_targets);
+            }
+            args
+        }
         BenchmarkScenario::GetDefinition => json!({
             "references": target.definition_queries.iter().map(|query| {
                 json!({
