@@ -32,12 +32,10 @@ pub(super) fn resolve_rust(
             .map(|fqn| support.fqn(fqn))
             .unwrap_or_default();
         if resolved.is_empty() {
-            let imported = rust_import_candidates(
-                analyzer,
+            let imported = rust_imported_export_candidates(
                 rust,
                 support,
                 file,
-                source,
                 reference,
                 Some(site.range.start_byte),
             );
@@ -808,9 +806,7 @@ fn rust_resolve_type_node_fqn(
         {
             return Some(resolved.to_string());
         }
-        if let Some(imported) =
-            rust_import_type_fqn(analyzer, rust, support, file, name, reference_byte)
-        {
+        if let Some(imported) = rust_import_type_fqn(rust, support, file, name, reference_byte) {
             return Some(imported);
         }
     }
@@ -822,16 +818,14 @@ fn rust_resolve_type_node_fqn(
 }
 
 fn rust_import_type_fqn(
-    analyzer: &dyn IAnalyzer,
     rust: &RustAnalyzer,
     support: &DefinitionLookupIndex,
     file: &ProjectFile,
     name: &str,
     reference_byte: Option<usize>,
 ) -> Option<String> {
-    let source = file.read_to_string().ok()?;
     let mut candidates: Vec<_> =
-        rust_import_candidates(analyzer, rust, support, file, &source, name, reference_byte)
+        rust_imported_export_candidates(rust, support, file, name, reference_byte)
             .into_iter()
             .filter(|unit| unit.is_class())
             .collect();
@@ -1046,281 +1040,21 @@ fn rust_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
         .unwrap_or_default()
 }
 
-fn rust_import_candidates(
-    analyzer: &dyn IAnalyzer,
+fn rust_imported_export_candidates(
     rust: &crate::analyzer::RustAnalyzer,
     support: &DefinitionLookupIndex,
     file: &ProjectFile,
-    source: &str,
     reference: &str,
     reference_byte: Option<usize>,
 ) -> Vec<CodeUnit> {
-    let statement_candidates = rust_import_statement_candidates(
-        analyzer,
-        rust,
-        support,
-        file,
-        source,
-        reference,
-        reference_byte,
-    );
-    if !statement_candidates.is_empty() {
-        return statement_candidates;
-    }
-    if reference_byte.is_some() {
-        return Vec::new();
-    }
-
-    let binder = rust.import_binder_of(file);
-    let Some(binding) = binder.bindings.get(reference) else {
-        return Vec::new();
-    };
-    match binding.kind {
-        ImportKind::Named => {
-            let imported = binding.imported_name.as_deref().unwrap_or(reference);
-            let package = rust.resolve_module_package(file, &binding.module_specifier);
-            let mut candidates = package
-                .as_ref()
-                .map(|package| support.fqn(&format!("{package}.{imported}")))
-                .unwrap_or_default();
-            if candidates.is_empty() {
-                let files = rust_resolved_module_files(rust, file, &binding.module_specifier);
-                candidates = rust_export_candidates(rust, support, &files, imported);
-            }
-            if candidates.is_empty() {
-                let files = rust_resolved_module_files(rust, file, &binding.module_specifier);
-                candidates = support.file_identifier_in_files(&files, imported);
-            }
-            candidates
-        }
-        ImportKind::Namespace => {
-            let Some((module_specifier, imported)) = binding.module_specifier.rsplit_once("::")
-            else {
-                return Vec::new();
-            };
-            let files = rust_resolved_module_files(rust, file, module_specifier);
-            let mut candidates = rust_export_candidates(rust, support, &files, imported);
-            if candidates.is_empty() {
-                candidates = support.file_identifier_in_files(&files, imported);
-            }
-            candidates
-        }
-        ImportKind::Default | ImportKind::CommonJsRequire | ImportKind::Glob => Vec::new(),
-    }
-}
-
-fn rust_import_statement_candidates(
-    analyzer: &dyn IAnalyzer,
-    rust: &crate::analyzer::RustAnalyzer,
-    support: &DefinitionLookupIndex,
-    file: &ProjectFile,
-    source: &str,
-    reference: &str,
-    reference_byte: Option<usize>,
-) -> Vec<CodeUnit> {
-    let import_statements = analyzer.import_statements(file);
-    let visible_source_imports = rust_visible_use_statements_from_source(source, reference_byte);
-    let import_texts: Vec<&str> = if reference_byte.is_some() {
-        visible_source_imports.iter().map(String::as_str).collect()
-    } else {
-        import_statements.iter().map(String::as_str).collect()
-    };
-    let flattened_imports: Vec<String> = import_texts
-        .into_iter()
-        .flat_map(crate::analyzer::rust::flatten_rust_use)
-        .collect();
-    for raw in flattened_imports {
-        let mut path = raw.trim();
-        path = path.strip_prefix("pub ").unwrap_or(path).trim();
-        let Some(rest) = path.strip_prefix("use ") else {
-            continue;
-        };
-        path = rest.trim_end_matches(';').trim();
-        if path.contains('{') || path.ends_with("::*") {
-            continue;
-        }
-        let (path_without_alias, local_name) = match path.rsplit_once(" as ") {
-            Some((target, alias)) => (target.trim(), alias.trim()),
-            None => {
-                let local = path.rsplit("::").next().unwrap_or(path);
-                (path, local)
-            }
-        };
-        if local_name != reference {
-            continue;
-        }
-        let Some((module_specifier, imported_name)) = path_without_alias.rsplit_once("::") else {
-            continue;
-        };
-        let files = rust_resolved_module_files(rust, file, module_specifier);
-        let mut candidates = rust_export_candidates(rust, support, &files, imported_name);
-        if candidates.is_empty() {
-            candidates = support.file_identifier_in_files(&files, imported_name);
-        }
-        if !candidates.is_empty() {
-            return candidates;
-        }
-    }
-    Vec::new()
-}
-
-fn rust_resolved_module_files(
-    rust: &crate::analyzer::RustAnalyzer,
-    file: &ProjectFile,
-    module_specifier: &str,
-) -> Vec<ProjectFile> {
-    let mut files = rust.resolve_module_files(file, module_specifier);
-    files.extend(rust_module_files_from_path(file, module_specifier));
-    files.sort();
-    files.dedup();
-    files
-}
-
-fn rust_export_candidates(
-    rust: &crate::analyzer::RustAnalyzer,
-    support: &DefinitionLookupIndex,
-    module_files: &[ProjectFile],
-    export_name: &str,
-) -> Vec<CodeUnit> {
-    let mut visited = HashSet::default();
     let mut candidates = Vec::new();
-    for module_file in module_files {
-        candidates.extend(rust_export_candidates_in_file(
-            rust,
-            support,
-            module_file,
-            export_name,
-            &mut visited,
-        ));
-    }
-    sort_units(&mut candidates);
-    candidates.dedup();
-    candidates
-}
-
-fn rust_export_candidates_in_file(
-    rust: &crate::analyzer::RustAnalyzer,
-    support: &DefinitionLookupIndex,
-    module_file: &ProjectFile,
-    export_name: &str,
-    visited: &mut HashSet<(ProjectFile, String)>,
-) -> Vec<CodeUnit> {
-    if !visited.insert((module_file.clone(), export_name.to_string())) {
-        return Vec::new();
-    }
-
-    let index = rust.export_index_of(module_file);
-    let mut candidates = Vec::new();
-    if let Some(entry) = index.exports_by_name.get(export_name) {
-        match entry {
-            ExportEntry::Local { local_name } => {
-                candidates.extend(support.file_identifier(module_file, local_name));
-            }
-            ExportEntry::ReexportedNamed {
-                module_specifier,
-                imported_name,
-            } => {
-                let files = rust_resolved_module_files(rust, module_file, module_specifier);
-                for file in files {
-                    candidates.extend(rust_export_candidates_in_file(
-                        rust,
-                        support,
-                        &file,
-                        imported_name,
-                        visited,
-                    ));
-                }
-            }
-            ExportEntry::Default { .. } => {}
-        }
-    }
-
-    for star in &index.reexport_stars {
-        let files = rust_resolved_module_files(rust, module_file, &star.module_specifier);
-        for file in files {
-            candidates.extend(rust_export_candidates_in_file(
-                rust,
-                support,
-                &file,
-                export_name,
-                visited,
-            ));
-        }
-    }
-
-    sort_units(&mut candidates);
-    candidates.dedup();
-    candidates
-}
-
-fn rust_visible_use_statements_from_source(
-    source: &str,
-    reference_byte: Option<usize>,
-) -> Vec<String> {
-    let Some(tree) = parse_rust_tree(source) else {
-        return Vec::new();
-    };
-    let mut statements = Vec::new();
-    rust_collect_visible_use_statements(tree.root_node(), source, reference_byte, &mut statements);
-    statements
-}
-
-fn rust_collect_visible_use_statements(
-    node: Node<'_>,
-    source: &str,
-    reference_byte: Option<usize>,
-    out: &mut Vec<String>,
-) {
-    if node.kind() == "use_declaration" {
-        if rust_use_statement_visible_at(node, reference_byte) {
-            out.push(rust_node_text(node, source).trim().to_string());
-        }
-        return;
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        rust_collect_visible_use_statements(child, source, reference_byte, out);
-    }
-}
-
-fn rust_use_statement_visible_at(node: Node<'_>, reference_byte: Option<usize>) -> bool {
-    if let Some(byte) = reference_byte
-        && rust_enclosing_mod_item_range(node)
-            != rust_enclosing_mod_item_range_at(rust_root_node(node), byte)
+    for (target_file, target_name) in rust.resolve_imported_export(file, reference, reference_byte)
     {
-        return false;
+        candidates.extend(support.file_identifier(&target_file, &target_name));
     }
-    let mut current = node.parent();
-    while let Some(parent) = current {
-        if rust_use_lexical_scope_kind(parent.kind()) {
-            let Some(byte) = reference_byte else {
-                return false;
-            };
-            if !(parent.start_byte() <= byte && byte < parent.end_byte()) {
-                return false;
-            }
-        }
-        current = parent.parent();
-    }
-    true
-}
-
-fn rust_root_node(mut node: Node<'_>) -> Node<'_> {
-    while let Some(parent) = node.parent() {
-        node = parent;
-    }
-    node
-}
-
-fn rust_enclosing_mod_item_range(node: Node<'_>) -> Option<(usize, usize)> {
-    let mut current = node.parent();
-    while let Some(parent) = current {
-        if parent.kind() == "mod_item" {
-            return Some((parent.start_byte(), parent.end_byte()));
-        }
-        current = parent.parent();
-    }
-    None
+    sort_units(&mut candidates);
+    candidates.dedup();
+    candidates
 }
 
 fn rust_enclosing_mod_item_range_at(node: Node<'_>, byte: usize) -> Option<(usize, usize)> {
@@ -1350,60 +1084,6 @@ fn rust_use_lexical_scope_kind(kind: &str) -> bool {
         kind,
         "block" | "function_item" | "impl_item" | "trait_item" | "mod_item"
     )
-}
-
-fn rust_module_files_from_path(file: &ProjectFile, module_specifier: &str) -> Vec<ProjectFile> {
-    let Some(relative_module) = rust_relative_module_path(file, module_specifier) else {
-        return Vec::new();
-    };
-    let mut files = Vec::new();
-    for rel_path in [
-        relative_module.with_extension("rs"),
-        relative_module.join("mod.rs"),
-        PathBuf::from("src")
-            .join(&relative_module)
-            .with_extension("rs"),
-        PathBuf::from("src").join(&relative_module).join("mod.rs"),
-    ] {
-        let candidate = ProjectFile::new(file.root().to_path_buf(), rel_path);
-        if candidate.exists() {
-            files.push(candidate);
-        }
-    }
-    files
-}
-
-fn rust_relative_module_path(file: &ProjectFile, module_specifier: &str) -> Option<PathBuf> {
-    let module = module_specifier
-        .strip_prefix("crate::")
-        .or_else(|| module_specifier.strip_prefix("self::"))
-        .map(PathBuf::from)
-        .or_else(|| {
-            module_specifier
-                .strip_prefix("super::")
-                .map(|rest| file.parent().parent().unwrap_or(Path::new("")).join(rest))
-        })
-        .or_else(|| {
-            let (crate_name, rest) = module_specifier.split_once("::")?;
-            (Some(crate_name) == rust_current_crate_name(file).as_deref()).then(|| rest.into())
-        })?;
-    Some(module.to_string_lossy().replace("::", "/").into())
-}
-
-fn rust_current_crate_name(file: &ProjectFile) -> Option<String> {
-    let manifest = file.root().join("Cargo.toml");
-    let source = std::fs::read_to_string(manifest).ok()?;
-    source.lines().find_map(|line| {
-        let trimmed = line.trim();
-        let value = trimmed.strip_prefix("name")?.trim_start();
-        let value = value.strip_prefix('=')?.trim();
-        value
-            .trim_matches('"')
-            .split('"')
-            .next()
-            .filter(|name| !name.is_empty())
-            .map(|name| name.replace('-', "_"))
-    })
 }
 
 fn rust_reference_looks_external(reference: &str) -> bool {

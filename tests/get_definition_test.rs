@@ -114,6 +114,131 @@ fn main() {
 }
 
 #[test]
+fn rust_glob_import_resolves_public_export_to_definition() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("lib.rs", "mod service;\n")
+        .file("service.rs", "pub struct Foo;\n")
+        .file(
+            "main.rs",
+            r#"
+mod service;
+use crate::service::*;
+
+fn run() {
+    let _ = Foo {};
+}
+"#,
+        )
+        .build();
+
+    let line = "    let _ = Foo {};";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"main.rs","line":6,"column":{}}}]}}"#,
+            column_of(line, "Foo")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "service.rs", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "Foo", "{value}");
+}
+
+#[test]
+fn rust_glob_import_does_not_resolve_private_name() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("service.rs", "struct Hidden;\n")
+        .file(
+            "main.rs",
+            r#"
+mod service;
+use crate::service::*;
+
+fn run() {
+    let _ = Hidden {};
+}
+"#,
+        )
+        .build();
+
+    let line = "    let _ = Hidden {};";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"main.rs","line":6,"column":{}}}]}}"#,
+            column_of(line, "Hidden")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn rust_glob_reexport_resolves_to_original_definition() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("service.rs", "pub struct Foo;\n")
+        .file("index.rs", "pub use crate::service::*;\n")
+        .file(
+            "main.rs",
+            r#"
+mod service;
+mod index;
+use crate::index::Foo;
+
+fn run() {
+    let _ = Foo {};
+}
+"#,
+        )
+        .build();
+
+    let line = "    let _ = Foo {};";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"main.rs","line":7,"column":{}}}]}}"#,
+            column_of(line, "Foo")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "service.rs", "{value}");
+}
+
+#[test]
+fn rust_local_binding_shadows_glob_imported_definition() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("service.rs", "pub struct Foo;\n")
+        .file(
+            "main.rs",
+            r#"
+mod service;
+use crate::service::*;
+
+fn run() {
+    let Foo = ();
+    let _ = Foo;
+}
+"#,
+        )
+        .build();
+
+    let line = "    let _ = Foo;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"main.rs","line":7,"column":{}}}]}}"#,
+            column_of(line, "Foo")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
 fn rust_reference_context_resolves_target_definition() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(
