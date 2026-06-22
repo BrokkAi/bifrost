@@ -17,6 +17,9 @@ The public `get_definition_by_location` and `get_definition_by_reference` tools 
 - [x] (2026-06-22T10:18Z) Ran focused Rust definition validation: `cargo test --test get_definition_test rust_` passed with 32 tests.
 - [x] (2026-06-22T10:18Z) Ran Rust usage graph validation: `cargo test --test usages_rust_graph_test` passed with 61 tests.
 - [x] (2026-06-22T10:20Z) Ran final formatting and lint gates: `cargo fmt --check` and `cargo clippy --all-targets --all-features -- -D warnings` passed.
+- [x] (2026-06-22T10:37Z) Ran guided review over the milestone diff. Addressed correctness findings for explicit-vs-glob precedence, struct-pattern type names, function-local item shadowing, `let` initializer shadowing, closed inner-block leakage, later block-local items, and tuple-struct pattern binders.
+- [x] (2026-06-22T10:37Z) Reran focused Rust definition validation after review fixes: `cargo test --test get_definition_test rust_` passed with 39 tests.
+- [x] (2026-06-22T10:37Z) Reran Rust usage graph validation after review fixes: `cargo test --test usages_rust_graph_test` passed with 61 tests.
 
 ## Surprises & Discoveries
 
@@ -25,6 +28,9 @@ The public `get_definition_by_location` and `get_definition_by_reference` tools 
 
 - Observation: Rust top-level `use` items are order-independent for the existing definition behavior, but parent-module `use` items must not leak into inline child modules.
   Evidence: the first focused run failed `rust_later_module_use_resolves_earlier_same_module_reference` and `rust_parent_module_use_does_not_leak_into_inline_child_module` until the analyzer-owned visible-import helper preserved the old enclosing-`mod_item` check while allowing later top-level imports.
+
+- Observation: Cursor-local shadowing needs Rust lexical scope-chain semantics, not a flat "all earlier descendants" scan.
+  Evidence: guided review found uncovered failures for `let Foo = Foo {};`, `{ let Foo = (); } let _ = Foo {};`, later block-local `struct Foo;`, and tuple-struct binders. The helper now walks only the lexical scope chain containing the reference, treats block-local items as visible throughout their block, and only lets `let` patterns shadow after their declaration is complete.
 
 ## Decision Log
 
@@ -40,14 +46,22 @@ The public `get_definition_by_location` and `get_definition_by_reference` tools 
   Rationale: Existing Rust definition behavior allowed explicit same-crate imports of declarations that were not public module exports. Glob imports should expose only exported names, which is the behavior covered by the new private-name regression.
   Date/Author: 2026-06-22 / Codex.
 
+- Decision: Split Rust lexical-source helpers into `src/analyzer/rust/lexical_scope.rs` and keep `RustAnalyzer::resolve_imported_export_from_binder` independent of source byte positions and `DefinitionLookupIndex`.
+  Rationale: The analyzer-owned import/export helper remains reusable from usage and definition code, while `get_definition` owns the cursor-local adapter step that builds a visible binder and applies local shadowing for a concrete reference location.
+  Date/Author: 2026-06-22 / Codex.
+
+- Decision: Explicit named and namespace imports take precedence over glob imports even when the explicit target set is empty.
+  Rationale: Rust name binding should not merge an explicit local binding with same-named glob exports. Returning an empty target set is the conservative definition outcome for an unresolved explicit binding.
+  Date/Author: 2026-06-22 / Codex.
+
 ## Outcomes & Retrospective
 
-The Rust-first #206 slice is implemented. Rust definition lookup now delegates imported/exported target interpretation to `RustAnalyzer::resolve_imported_export`, `RustReferenceContext`, and `RustUsageIndex` instead of owning a second raw `use` parser and export walker inside `get_definition/rust.rs`. Existing Rust definition behavior remains covered, and new regressions prove public glob imports, private names behind glob imports, glob re-exports, and local shadowing behavior.
+The Rust-first #206 slice is implemented. Rust definition lookup now delegates imported/exported target interpretation to `RustAnalyzer::resolve_imported_export`, `RustAnalyzer::resolve_imported_export_from_binder`, `RustReferenceContext`, and `RustUsageIndex` instead of owning a second raw `use` parser and export walker inside `get_definition/rust.rs`. Cursor-local source handling lives in the Rust analyzer-owned `lexical_scope` helper and the definition adapter maps analyzer-level identities through `DefinitionLookupIndex`. Existing Rust definition behavior remains covered, and new regressions prove public glob imports, private names behind glob imports, glob re-exports, explicit import precedence, and local shadowing behavior across values, local items, struct patterns, tuple-struct patterns, and nested blocks.
 
 Validation completed from `/Users/dave/.codex/worktrees/d8b1/bifrost`:
 
     cargo test --test get_definition_test rust_
-    test result: ok. 32 passed; 0 failed
+    test result: ok. 39 passed; 0 failed
 
     cargo test --test usages_rust_graph_test
     test result: ok. 61 passed; 0 failed
@@ -87,7 +101,7 @@ Refresh the branch before implementation:
     git fetch
     git rebase
 
-Edit only the Rust analyzer, Rust definition resolver, Rust definition tests, and this ExecPlan unless validation exposes a directly related issue. This implementation touched `src/analyzer/rust/graph_support.rs`, `src/analyzer/rust/usage_index.rs`, `src/analyzer/rust/mod.rs`, `src/analyzer/usages/get_definition/mod.rs`, `src/analyzer/usages/get_definition/rust.rs`, `tests/get_definition_test.rs`, and this ExecPlan.
+Edit only the Rust analyzer, Rust definition resolver, Rust definition tests, and this ExecPlan unless validation exposes a directly related issue. This implementation touched `src/analyzer/rust/graph_support.rs`, `src/analyzer/rust/usage_index.rs`, `src/analyzer/rust/lexical_scope.rs`, `src/analyzer/rust/mod.rs`, `src/analyzer/usages/get_definition/mod.rs`, `src/analyzer/usages/get_definition/rust.rs`, `tests/get_definition_test.rs`, and this ExecPlan.
 
 Run focused validation after the code edits:
 
@@ -106,6 +120,11 @@ The work is accepted when the Rust definition tests show that:
 - `use crate::service::*; Hidden` returns `no_definition` when `Hidden` is not exported;
 - `pub use crate::service::*; use crate::index::Foo; Foo` resolves through the re-export;
 - a local value named `Foo` before a `Foo` reference blocks the glob-imported definition and returns `no_definition`;
+- an explicit `use crate::private_mod::Foo;` wins over a same-named glob import;
+- `let Foo = Foo {};` resolves the initializer `Foo` through the import instead of treating the new binding as already visible;
+- a binding inside a completed inner block does not shadow an outer later reference;
+- a later block-local `struct Foo;` shadows a same-block glob import;
+- a tuple-struct pattern binder named `Foo` shadows a later `Foo` reference while the tuple-struct type name itself is not treated as a binder;
 - existing Rust crate/super path, macro, field, and external-boundary tests continue to pass.
 
 The final validation commands listed in Concrete Steps must pass.
@@ -127,8 +146,8 @@ Initial branch evidence:
 Final validation evidence:
 
     cargo test --test get_definition_test rust_
-    running 32 tests
-    test result: ok. 32 passed; 0 failed; 201 filtered out
+    running 39 tests
+    test result: ok. 39 passed; 0 failed; 201 filtered out
 
     cargo test --test usages_rust_graph_test
     running 61 tests
@@ -140,4 +159,4 @@ Final validation evidence:
     cargo clippy --all-targets --all-features -- -D warnings
     Finished `dev` profile
 
-Revision note 2026-06-22 / Codex: Updated after completing the Rust-first implementation slice so the progress, discoveries, decisions, outcomes, touched files, and validation evidence reflect the current working tree.
+Revision note 2026-06-22 / Codex: Updated after completing the Rust-first implementation slice and post-milestone guided-review remediation so the progress, discoveries, decisions, outcomes, touched files, and validation evidence reflect the current working tree.

@@ -1,4 +1,5 @@
 use super::*;
+use crate::analyzer::rust::lexical_scope;
 
 pub(super) fn resolve_rust(
     analyzer: &dyn IAnalyzer,
@@ -846,8 +847,9 @@ fn rust_local_type_fqn_visible_at(
     reference_byte: usize,
 ) -> Option<String> {
     let source = file.read_to_string().ok()?;
-    let tree = parse_rust_tree(&source)?;
-    let reference_mod = rust_enclosing_mod_item_range_at(tree.root_node(), reference_byte);
+    let tree = lexical_scope::parse_rust_tree(&source)?;
+    let reference_mod =
+        lexical_scope::enclosing_mod_item_range_at(tree.root_node(), reference_byte);
     let mut candidates: Vec<_> = support
         .file_identifier(file, name)
         .into_iter()
@@ -855,8 +857,10 @@ fn rust_local_type_fqn_visible_at(
         .filter(|unit| {
             analyzer.ranges(unit).iter().any(|range| {
                 rust_definition_scope_visible_at(tree.root_node(), range.start_byte, reference_byte)
-                    && rust_enclosing_mod_item_range_at(tree.root_node(), range.start_byte)
-                        == reference_mod
+                    && lexical_scope::enclosing_mod_item_range_at(
+                        tree.root_node(),
+                        range.start_byte,
+                    ) == reference_mod
             })
         })
         .collect();
@@ -875,19 +879,8 @@ fn rust_definition_scope_visible_at(
     else {
         return false;
     };
-    rust_enclosing_visibility_scope_range(definition_node)
+    lexical_scope::enclosing_visibility_scope_range(definition_node)
         .is_none_or(|(start, end)| start <= reference_byte && reference_byte < end)
-}
-
-fn rust_enclosing_visibility_scope_range(node: Node<'_>) -> Option<(usize, usize)> {
-    let mut current = node.parent();
-    while let Some(parent) = current {
-        if rust_use_lexical_scope_kind(parent.kind()) {
-            return Some((parent.start_byte(), parent.end_byte()));
-        }
-        current = parent.parent();
-    }
-    None
 }
 
 fn rust_fqn_package(fqn: &str) -> &str {
@@ -1048,42 +1041,24 @@ fn rust_imported_export_candidates(
     reference_byte: Option<usize>,
 ) -> Vec<CodeUnit> {
     let mut candidates = Vec::new();
-    for (target_file, target_name) in rust.resolve_imported_export(file, reference, reference_byte)
+    let targets = if let Some(reference_byte) = reference_byte
+        && let Ok(source) = file.read_to_string()
     {
+        if lexical_scope::name_shadowed_at(&source, reference, reference_byte) {
+            Vec::new()
+        } else {
+            let binder = lexical_scope::visible_import_binder_at(&source, reference_byte);
+            rust.resolve_imported_export_from_binder(file, &binder, reference)
+        }
+    } else {
+        rust.resolve_imported_export(file, reference)
+    };
+    for (target_file, target_name) in targets {
         candidates.extend(support.file_identifier(&target_file, &target_name));
     }
     sort_units(&mut candidates);
     candidates.dedup();
     candidates
-}
-
-fn rust_enclosing_mod_item_range_at(node: Node<'_>, byte: usize) -> Option<(usize, usize)> {
-    let mut candidate = None;
-    let mut current = node;
-    loop {
-        let mut cursor = current.walk();
-        let mut next = None;
-        for child in current.named_children(&mut cursor) {
-            if child.start_byte() <= byte && byte < child.end_byte() {
-                if child.kind() == "mod_item" {
-                    candidate = Some((child.start_byte(), child.end_byte()));
-                }
-                next = Some(child);
-                break;
-            }
-        }
-        let Some(child) = next else {
-            return candidate;
-        };
-        current = child;
-    }
-}
-
-fn rust_use_lexical_scope_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "block" | "function_item" | "impl_item" | "trait_item" | "mod_item"
-    )
 }
 
 fn rust_reference_looks_external(reference: &str) -> bool {
@@ -1094,9 +1069,5 @@ fn rust_reference_looks_external(reference: &str) -> bool {
 }
 
 pub(super) fn parse_rust_tree(source: &str) -> Option<Tree> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_rust::LANGUAGE.into())
-        .ok()?;
-    parser.parse(source, None)
+    lexical_scope::parse_rust_tree(source)
 }

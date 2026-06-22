@@ -3,6 +3,7 @@ mod cache;
 mod declarations;
 mod graph_support;
 mod imports;
+pub(crate) mod lexical_scope;
 mod tests;
 mod usage_index;
 

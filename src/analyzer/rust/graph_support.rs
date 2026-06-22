@@ -1,18 +1,16 @@
-use crate::analyzer::usages::{
-    ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind, ReexportStar,
-};
-use crate::analyzer::{CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, ProjectFile};
+use crate::analyzer::usages::{ExportEntry, ExportIndex, ImportBinder, ImportKind, ReexportStar};
+use crate::analyzer::{CodeUnit, IAnalyzer, ImportAnalysisProvider, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tree_sitter::{Node, Parser};
+use tree_sitter::Node;
 
 use super::RustAnalyzer;
 use super::declarations::rust_package_name;
 use super::imports::{
-    flatten_rust_use, parse_rust_import_info, resolve_rust_module_path_with_crate,
-    rust_crate_root_package, split_rust_import_module_and_name,
+    resolve_rust_module_path_with_crate, rust_crate_root_package, split_rust_import_module_and_name,
 };
+use super::lexical_scope::{insert_rust_import_binding, parse_rust_tree};
 
 /// Per-file reference-resolution context for Rust — the one primitive both usage
 /// paths share. Holds the binder-derived maps a reference resolves through, built
@@ -82,271 +80,6 @@ fn is_rooted_rust_module_path(path: &str) -> bool {
         || path.starts_with("crate::")
         || path.starts_with("self::")
         || path.starts_with("super::")
-}
-
-fn insert_rust_import_binding(binder: &mut ImportBinder, import: &ImportInfo) {
-    let raw = import.raw_snippet.trim();
-    if raw.ends_with("::*;") {
-        let module_specifier = raw
-            .trim_start_matches("pub ")
-            .trim_start_matches("use ")
-            .trim_end_matches("::*;")
-            .trim()
-            .to_string();
-        binder.bindings.insert(
-            format!("*:{module_specifier}"),
-            ImportBinding {
-                module_specifier,
-                kind: ImportKind::Glob,
-                imported_name: None,
-            },
-        );
-        return;
-    }
-    let Some((module_specifier, imported_name)) =
-        split_rust_import_module_and_name(&import.raw_snippet)
-    else {
-        return;
-    };
-    let local_name = import
-        .alias
-        .clone()
-        .or_else(|| import.identifier.clone())
-        .unwrap_or_else(|| imported_name.clone());
-    let (local_name, kind, imported_name, module_specifier) = if imported_name == "self" {
-        let namespace_name = module_specifier
-            .rsplit("::")
-            .next()
-            .unwrap_or(module_specifier.as_str())
-            .to_string();
-        (
-            namespace_name,
-            ImportKind::Namespace,
-            None,
-            module_specifier,
-        )
-    } else if !raw.contains('{')
-        && imported_name
-            .chars()
-            .all(|ch| ch.is_ascii_lowercase() || ch == '_')
-    {
-        (
-            imported_name.clone(),
-            ImportKind::Namespace,
-            None,
-            format!("{module_specifier}::{imported_name}"),
-        )
-    } else {
-        (
-            local_name,
-            ImportKind::Named,
-            Some(imported_name),
-            module_specifier,
-        )
-    };
-
-    binder.bindings.insert(
-        local_name,
-        ImportBinding {
-            module_specifier,
-            kind,
-            imported_name,
-        },
-    );
-}
-
-fn rust_visible_import_binder_at(source: &str, reference_byte: usize) -> ImportBinder {
-    let mut binder = ImportBinder::empty();
-    let Some(tree) = parse_rust_tree(source) else {
-        return binder;
-    };
-    let mut imports = Vec::new();
-    rust_collect_visible_use_statements(tree.root_node(), source, reference_byte, &mut imports);
-    for import in imports
-        .into_iter()
-        .flat_map(|raw| flatten_rust_use(&raw))
-        .map(parse_rust_import_info)
-    {
-        insert_rust_import_binding(&mut binder, &import);
-    }
-    binder
-}
-
-fn rust_collect_visible_use_statements(
-    node: Node<'_>,
-    source: &str,
-    reference_byte: usize,
-    out: &mut Vec<String>,
-) {
-    if node.kind() == "use_declaration" {
-        if rust_use_statement_visible_at(node, reference_byte) {
-            out.push(
-                source
-                    .get(node.start_byte()..node.end_byte())
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string(),
-            );
-        }
-        return;
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.start_byte() <= reference_byte || child.end_byte() >= reference_byte {
-            rust_collect_visible_use_statements(child, source, reference_byte, out);
-        }
-    }
-}
-
-fn rust_use_statement_visible_at(node: Node<'_>, reference_byte: usize) -> bool {
-    if rust_enclosing_mod_item_range(node)
-        != rust_enclosing_mod_item_range_at(rust_root_node(node), reference_byte)
-    {
-        return false;
-    }
-    let Some((start, end)) = rust_use_visibility_scope_range(node) else {
-        return true;
-    };
-    start <= reference_byte && reference_byte < end
-}
-
-fn rust_root_node(mut node: Node<'_>) -> Node<'_> {
-    while let Some(parent) = node.parent() {
-        node = parent;
-    }
-    node
-}
-
-fn rust_enclosing_mod_item_range(node: Node<'_>) -> Option<(usize, usize)> {
-    let mut current = node.parent();
-    while let Some(parent) = current {
-        if parent.kind() == "mod_item" {
-            return Some((parent.start_byte(), parent.end_byte()));
-        }
-        current = parent.parent();
-    }
-    None
-}
-
-fn rust_enclosing_mod_item_range_at(node: Node<'_>, byte: usize) -> Option<(usize, usize)> {
-    let mut candidate = None;
-    let mut current = node;
-    loop {
-        let mut cursor = current.walk();
-        let mut next = None;
-        for child in current.named_children(&mut cursor) {
-            if child.start_byte() <= byte && byte < child.end_byte() {
-                if child.kind() == "mod_item" {
-                    candidate = Some((child.start_byte(), child.end_byte()));
-                }
-                next = Some(child);
-                break;
-            }
-        }
-        let Some(child) = next else {
-            return candidate;
-        };
-        current = child;
-    }
-}
-
-fn rust_use_visibility_scope_range(node: Node<'_>) -> Option<(usize, usize)> {
-    let mut current = node.parent();
-    while let Some(parent) = current {
-        if rust_use_lexical_scope_kind(parent.kind()) {
-            return Some((parent.start_byte(), parent.end_byte()));
-        }
-        current = parent.parent();
-    }
-    None
-}
-
-fn rust_use_lexical_scope_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "block" | "function_item" | "impl_item" | "trait_item" | "mod_item"
-    )
-}
-
-fn rust_name_shadowed_at(source: &str, name: &str, reference_byte: usize) -> bool {
-    let Some(tree) = parse_rust_tree(source) else {
-        return false;
-    };
-    let Some(scope) = rust_enclosing_function_or_closure(tree.root_node(), reference_byte) else {
-        return false;
-    };
-    let mut bindings = HashSet::default();
-    if let Some(params) = scope.child_by_field_name("parameters") {
-        rust_collect_pattern_bindings(params, source, &mut bindings);
-    }
-    if let Some(body) = scope.child_by_field_name("body") {
-        rust_collect_let_bindings_before(body, source, reference_byte, &mut bindings);
-    }
-    bindings.contains(name)
-}
-
-fn rust_enclosing_function_or_closure(root: Node<'_>, reference_byte: usize) -> Option<Node<'_>> {
-    let mut best = None;
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if node.start_byte() <= reference_byte && reference_byte < node.end_byte() {
-            if matches!(node.kind(), "function_item" | "closure_expression") {
-                best = Some(node);
-            }
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                stack.push(child);
-            }
-        }
-    }
-    best
-}
-
-fn rust_collect_let_bindings_before(
-    node: Node<'_>,
-    source: &str,
-    reference_byte: usize,
-    out: &mut HashSet<String>,
-) {
-    let mut stack = vec![node];
-    while let Some(node) = stack.pop() {
-        if node.start_byte() >= reference_byte {
-            continue;
-        }
-        match node.kind() {
-            "function_item" | "closure_expression" => continue,
-            "let_declaration" => {
-                if let Some(pattern) = node.child_by_field_name("pattern") {
-                    rust_collect_pattern_bindings(pattern, source, out);
-                }
-            }
-            _ => {}
-        }
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            stack.push(child);
-        }
-    }
-}
-
-fn rust_collect_pattern_bindings(node: Node<'_>, source: &str, out: &mut HashSet<String>) {
-    let mut stack = vec![node];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "identifier" {
-            let text = source
-                .get(node.start_byte()..node.end_byte())
-                .unwrap_or_default()
-                .trim();
-            if !text.is_empty() {
-                out.insert(text.to_string());
-            }
-            continue;
-        }
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            stack.push(child);
-        }
-    }
 }
 
 fn rust_declaration_targets_in_files(
@@ -443,24 +176,23 @@ impl RustAnalyzer {
         &self,
         file: &ProjectFile,
         reference: &str,
-        reference_byte: Option<usize>,
     ) -> Vec<(ProjectFile, String)> {
-        let source = reference_byte.and_then(|_| file.read_to_string().ok());
-        if let (Some(source), Some(reference_byte)) = (source.as_deref(), reference_byte)
-            && rust_name_shadowed_at(source, reference, reference_byte)
-        {
-            return Vec::new();
-        }
-        let binder =
-            if let (Some(source), Some(reference_byte)) = (source.as_deref(), reference_byte) {
-                rust_visible_import_binder_at(source, reference_byte)
-            } else {
-                self.import_binder_of(file)
-            };
+        let binder = self.import_binder_of(file);
+        self.resolve_imported_export_from_binder(file, &binder, reference)
+    }
+
+    pub(crate) fn resolve_imported_export_from_binder(
+        &self,
+        file: &ProjectFile,
+        binder: &ImportBinder,
+        reference: &str,
+    ) -> Vec<(ProjectFile, String)> {
         let mut targets = HashSet::default();
-        for (local_name, binding) in binder.bindings {
+        let mut saw_explicit_binding = false;
+        for (local_name, binding) in &binder.bindings {
             match binding.kind {
                 ImportKind::Named if local_name == reference => {
+                    saw_explicit_binding = true;
                     let imported = binding.imported_name.as_deref().unwrap_or(reference);
                     let files = self.resolve_module_files(file, &binding.module_specifier);
                     targets.extend(self.exported_targets_from_files(&files, imported));
@@ -469,6 +201,7 @@ impl RustAnalyzer {
                     }
                 }
                 ImportKind::Namespace if local_name == reference => {
+                    saw_explicit_binding = true;
                     let Some((module_specifier, imported)) =
                         binding.module_specifier.rsplit_once("::")
                     else {
@@ -480,14 +213,22 @@ impl RustAnalyzer {
                         targets.extend(rust_declaration_targets_in_files(self, &files, imported));
                     }
                 }
-                ImportKind::Glob => {
-                    let files = self.resolve_module_files(file, &binding.module_specifier);
-                    targets.extend(self.exported_targets_from_files(&files, reference));
-                }
                 ImportKind::Named
                 | ImportKind::Namespace
                 | ImportKind::Default
-                | ImportKind::CommonJsRequire => {}
+                | ImportKind::CommonJsRequire
+                | ImportKind::Glob => {}
+            }
+        }
+        if saw_explicit_binding {
+            let mut sorted: Vec<_> = targets.into_iter().collect();
+            sorted.sort();
+            return sorted;
+        }
+        for binding in binder.bindings.values() {
+            if matches!(binding.kind, ImportKind::Glob) {
+                let files = self.resolve_module_files(file, &binding.module_specifier);
+                targets.extend(self.exported_targets_from_files(&files, reference));
             }
         }
         let mut sorted: Vec<_> = targets.into_iter().collect();
@@ -724,14 +465,6 @@ impl RustAnalyzer {
             .map(|node| predicate(node, &source))
             .unwrap_or(false)
     }
-}
-
-fn parse_rust_tree(source: &str) -> Option<tree_sitter::Tree> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_rust::LANGUAGE.into())
-        .ok()?;
-    parser.parse(source, None)
 }
 
 fn rust_module_files_from_path(file: &ProjectFile, module_specifier: &str) -> Vec<ProjectFile> {
