@@ -412,6 +412,14 @@ impl RustAnalyzer {
         })
     }
 
+    /// Whether the declaration's own visibility makes it part of the crate's
+    /// exported surface (`pub` / `pub(crate)`), unlike the looser
+    /// [`Self::is_rust_public_like_declaration`] which also accepts module-private
+    /// forms such as `pub(self)`.
+    pub(crate) fn is_rust_export_visible_declaration(&self, code_unit: &CodeUnit) -> bool {
+        self.is_export_public_declaration(code_unit)
+    }
+
     fn is_export_public_declaration(&self, code_unit: &CodeUnit) -> bool {
         self.rust_declaration_node_is(code_unit, |node, source| {
             rust_visibility_text(node, source).is_some_and(is_export_visibility)

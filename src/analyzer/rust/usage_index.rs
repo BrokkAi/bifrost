@@ -138,11 +138,25 @@ impl RustUsageIndex {
             }
         }
 
-        let mut frontier: VecDeque<(ProjectFile, String)> = seeds.iter().cloned().collect();
+        // Bootstrap the re-export walk from the definition point as well. An item in
+        // a private `mod` exposes nothing through its own file's export index, yet
+        // still reaches the crate's public API via a `pub use` re-export; since
+        // `reexport_edges` is keyed by the defining file, walking from the definition
+        // discovers those sites. The bootstrap node is only retained as a seed when
+        // it actually reaches a re-export — an unexported, never-re-exported item
+        // resolves to no seeds, so it is not treated as graph-visible.
+        let bootstrap = (target_file.clone(), target_short.to_string());
+        let bootstrap_is_own_export = seeds.contains(&bootstrap);
+
+        let mut reexport_seeds: BTreeSet<(ProjectFile, String)> = BTreeSet::new();
+        let mut visited: BTreeSet<(ProjectFile, String)> = seeds.clone();
+        visited.insert(bootstrap.clone());
+        let mut frontier: VecDeque<(ProjectFile, String)> = visited.iter().cloned().collect();
         while let Some(seed) = frontier.pop_front() {
             if let Some(reexports) = self.reexport_edges.get(&seed) {
                 for next in reexports {
-                    if seeds.insert(next.clone()) {
+                    reexport_seeds.insert(next.clone());
+                    if visited.insert(next.clone()) {
                         frontier.push_back(next.clone());
                     }
                 }
@@ -150,11 +164,18 @@ impl RustUsageIndex {
             if let Some(star_files) = self.star_reexports.get(&seed.0) {
                 for star_file in star_files {
                     let next = (star_file.clone(), seed.1.clone());
-                    if seeds.insert(next.clone()) {
+                    reexport_seeds.insert(next.clone());
+                    if visited.insert(next.clone()) {
                         frontier.push_back(next);
                     }
                 }
             }
+        }
+
+        let reached_reexport = !reexport_seeds.is_empty();
+        seeds.extend(reexport_seeds);
+        if !bootstrap_is_own_export && reached_reexport {
+            seeds.insert(bootstrap);
         }
 
         seeds
