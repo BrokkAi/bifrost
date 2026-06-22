@@ -52,6 +52,9 @@ pub(super) fn resolve_cpp(
                 type_node,
             )
         }
+        Some(CppReferenceNode::Constructor(constructor)) => {
+            resolve_cpp_constructor(ctx, constructor)
+        }
         Some(CppReferenceNode::Call(call)) => resolve_cpp_call(ctx, call),
         Some(CppReferenceNode::Field(field)) => resolve_cpp_field(ctx, field, None, None),
         Some(CppReferenceNode::Identifier(identifier)) => {
@@ -142,6 +145,7 @@ pub(super) fn parse_cpp_tree(source: &str) -> Option<Tree> {
 
 enum CppReferenceNode<'tree> {
     Type(Node<'tree>),
+    Constructor(Node<'tree>),
     Call(Node<'tree>),
     Field(Node<'tree>),
     Identifier(Node<'tree>),
@@ -179,10 +183,18 @@ fn cpp_reference_node(node: Node<'_>) -> Option<CppReferenceNode<'_>> {
             current = parent;
             continue;
         }
+        if parent.kind() == "new_expression"
+            && parent.start_byte() <= current.start_byte()
+            && parent.end_byte() >= current.end_byte()
+        {
+            current = parent;
+            continue;
+        }
         break;
     }
 
     match current.kind() {
+        "new_expression" => Some(CppReferenceNode::Constructor(current)),
         "call_expression" => Some(CppReferenceNode::Call(current)),
         "field_expression" => Some(CppReferenceNode::Field(current)),
         "type_identifier" | "qualified_identifier" | "template_type" | "scoped_type_identifier" => {
@@ -289,6 +301,9 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                 call,
             );
             resolve_cpp_field(ctx, function, Some(call_arity), call_arg_types.as_deref())
+        }
+        "type_identifier" | "template_type" | "scoped_type_identifier" => {
+            resolve_cpp_constructor(ctx, call)
         }
         "qualified_identifier" => {
             let text = cpp_node_text(function, ctx.source);
@@ -404,6 +419,10 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                 );
                 return candidates_outcome(candidates);
             }
+            let constructor = resolve_cpp_constructor(ctx, call);
+            if constructor.status != DefinitionLookupStatus::NoDefinition {
+                return constructor;
+            }
             if let Some(owner) = cpp_enclosing_class(
                 ctx.analyzer,
                 ctx.visibility,
@@ -441,6 +460,99 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
             ),
         ),
     }
+}
+
+fn resolve_cpp_constructor(
+    ctx: CppLookupCtx<'_, '_>,
+    constructor: Node<'_>,
+) -> DefinitionLookupOutcome {
+    let Some(type_node) = cpp_constructor_type_node(constructor) else {
+        return no_definition("no_reference_text", "C++ constructor call has no type");
+    };
+    let text = normalize_cpp_type_text(cpp_node_text(type_node, ctx.source));
+    if text.is_empty() {
+        return no_definition("no_reference_text", "C++ constructor type is blank");
+    }
+
+    let mut owners = Vec::new();
+    if let Some(owner) = ctx.visibility.resolve_type(ctx.file, &text) {
+        owners.push(owner);
+    }
+    owners.extend(cpp_visible_name_candidates(
+        ctx.analyzer,
+        ctx.visibility,
+        ctx.file,
+        ctx.support,
+        &text,
+        Some(CppTargetKind::Type),
+        cpp_lexical_namespace(type_node, ctx.source).as_deref(),
+    ));
+    sort_units(&mut owners);
+    owners.dedup();
+
+    for owner in &owners {
+        let constructors = cpp_member_candidates_lazy(
+            ctx,
+            vec![owner.clone()],
+            owner.identifier(),
+            Some(cpp_call_arity(constructor)),
+            || {
+                cpp_call_argument_types(
+                    ctx.analyzer,
+                    ctx.support,
+                    ctx.visibility,
+                    ctx.file,
+                    ctx.source,
+                    ctx.root,
+                    constructor,
+                )
+            },
+        );
+        let constructors = cpp_prefer_declaration_candidates(constructors);
+        if !constructors.is_empty() {
+            return candidates_outcome(constructors);
+        }
+    }
+
+    if !owners.is_empty() {
+        return candidates_outcome(owners);
+    }
+    resolve_cpp_type(
+        ctx.analyzer,
+        ctx.support,
+        ctx.file,
+        ctx.visibility,
+        ctx.source,
+        type_node,
+    )
+}
+
+fn cpp_constructor_type_node(node: Node<'_>) -> Option<Node<'_>> {
+    match node.kind() {
+        "new_expression" => node
+            .child_by_field_name("type")
+            .or_else(|| node.named_child(0)),
+        "call_expression" => node.child_by_field_name("function"),
+        _ => None,
+    }
+}
+
+fn cpp_prefer_declaration_candidates(candidates: Vec<CodeUnit>) -> Vec<CodeUnit> {
+    let preferred: Vec<_> = candidates
+        .iter()
+        .filter(|unit| cpp_source_is_header(unit))
+        .cloned()
+        .collect();
+    if preferred.is_empty() {
+        candidates
+    } else {
+        preferred
+    }
+}
+
+fn cpp_source_is_header(unit: &CodeUnit) -> bool {
+    let path = rel_path_string(unit.source()).to_ascii_lowercase();
+    matches!(path.rsplit('.').next(), Some("h" | "hh" | "hpp" | "hxx"))
 }
 
 fn resolve_cpp_field(

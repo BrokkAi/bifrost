@@ -36,19 +36,16 @@ pub(super) fn resolve_java(
 
     match node.kind() {
         "type_identifier" | "scoped_type_identifier" | "generic_type" => {
+            if let Some(creation) = java_enclosing_object_creation(node) {
+                return resolve_java_constructor_call(
+                    analyzer, java, support, file, source, creation,
+                );
+            }
             resolve_java_type_reference(analyzer, java, support, file, source, node)
         }
-        "object_creation_expression" => node
-            .child_by_field_name("type")
-            .map(|type_node| {
-                resolve_java_type_reference(analyzer, java, support, file, source, type_node)
-            })
-            .unwrap_or_else(|| {
-                no_definition(
-                    "no_indexed_definition",
-                    format!("`{}` did not resolve to an indexed Java type", site.text),
-                )
-            }),
+        "object_creation_expression" => {
+            resolve_java_constructor_call(analyzer, java, support, file, source, node)
+        }
         "method_invocation" => {
             resolve_java_method_invocation(analyzer, support, file, source, root, node)
         }
@@ -218,6 +215,20 @@ fn resolve_java_method_reference(
         );
     }
     if member == "new" {
+        let owner = java_method_reference_receiver_node(node, node.start_byte() + separator)
+            .and_then(|receiver| java_receiver_type(analyzer, file, source, root, receiver))
+            .or_else(|| {
+                java_type_text_with_context(
+                    analyzer,
+                    java,
+                    file,
+                    normalize_java_type_text(receiver_text),
+                    node.start_byte(),
+                )
+            });
+        if let Some(owner) = owner {
+            return java_constructor_outcome(support, owner, None);
+        }
         return resolve_java_type_reference(analyzer, java, support, file, source, node);
     }
 
@@ -242,6 +253,118 @@ fn resolve_java_method_reference(
         "unsupported_java_receiver",
         format!("receiver for Java method reference `{member}` is not resolved"),
     )
+}
+
+fn resolve_java_constructor_call(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+) -> DefinitionLookupOutcome {
+    let Some(type_node) = node.child_by_field_name("type") else {
+        return no_definition("no_indexed_definition", "Java constructor call has no type");
+    };
+    let owner =
+        java_type_from_node_with_context(analyzer, java, file, source, type_node).or_else(|| {
+            let raw = java_node_text(type_node, source);
+            java_type_text_with_context(
+                analyzer,
+                java,
+                file,
+                normalize_java_type_text(raw),
+                type_node.start_byte(),
+            )
+        });
+    if let Some(owner) = owner {
+        return java_constructor_outcome(support, owner, Some(java_argument_count(node)));
+    }
+    resolve_java_type_reference(analyzer, java, support, file, source, type_node)
+}
+
+fn java_constructor_outcome(
+    support: &DefinitionLookupIndex,
+    owner: CodeUnit,
+    arity: Option<usize>,
+) -> DefinitionLookupOutcome {
+    let mut constructors = support.fqn(&format!("{}.{}", owner.fq_name(), owner.identifier()));
+    constructors.retain(|unit| unit.is_function() && !unit.is_synthetic());
+    constructors = java_filter_candidates_by_arity(constructors, arity);
+    if !constructors.is_empty() {
+        return candidates_outcome(constructors);
+    }
+
+    let indexed_owner = support.fqn(&owner.fq_name());
+    if indexed_owner.is_empty() {
+        candidates_outcome(vec![owner])
+    } else {
+        candidates_outcome(indexed_owner)
+    }
+}
+
+fn java_enclosing_object_creation(node: Node<'_>) -> Option<Node<'_>> {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if matches!(
+            parent.kind(),
+            "type_identifier" | "scoped_type_identifier" | "generic_type"
+        ) {
+            current = parent;
+            continue;
+        }
+        if parent.kind() == "object_creation_expression"
+            && parent.child_by_field_name("type") == Some(current)
+        {
+            return Some(parent);
+        }
+        return None;
+    }
+    None
+}
+
+fn java_filter_candidates_by_arity(
+    candidates: Vec<CodeUnit>,
+    arity: Option<usize>,
+) -> Vec<CodeUnit> {
+    let Some(expected) = arity else {
+        return candidates;
+    };
+    let filtered: Vec<_> = candidates
+        .iter()
+        .filter(|unit| java_signature_arity(unit.signature()) == expected)
+        .cloned()
+        .collect();
+    if filtered.is_empty() {
+        candidates
+    } else {
+        filtered
+    }
+}
+
+fn java_signature_arity(signature: Option<&str>) -> usize {
+    let Some(signature) = signature else {
+        return 0;
+    };
+    let inner = signature
+        .find('(')
+        .and_then(|open| {
+            signature[open + 1..]
+                .find(')')
+                .map(|close| &signature[open + 1..open + 1 + close])
+        })
+        .unwrap_or(signature)
+        .trim();
+    if inner.is_empty() {
+        return 0;
+    }
+    inner.split(',').count()
+}
+
+fn java_argument_count(node: Node<'_>) -> usize {
+    node.child_by_field_name("arguments")
+        .map(|arguments| arguments.named_child_count())
+        .unwrap_or(0)
 }
 
 fn java_method_reference_receiver_node(node: Node<'_>, separator_byte: usize) -> Option<Node<'_>> {
