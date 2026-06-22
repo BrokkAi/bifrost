@@ -277,17 +277,17 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
         return no_definition("no_function_name", "C++ call expression has no function");
     };
     let call_arity = cpp_call_arity(call);
-    let call_arg_types = cpp_call_argument_types(
-        ctx.analyzer,
-        ctx.support,
-        ctx.visibility,
-        ctx.file,
-        ctx.source,
-        ctx.root,
-        call,
-    );
     match function.kind() {
         "field_expression" => {
+            let call_arg_types = cpp_call_argument_types(
+                ctx.analyzer,
+                ctx.support,
+                ctx.visibility,
+                ctx.file,
+                ctx.source,
+                ctx.root,
+                call,
+            );
             resolve_cpp_field(ctx, function, Some(call_arity), call_arg_types.as_deref())
         }
         "qualified_identifier" => {
@@ -302,10 +302,20 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                 cpp_lexical_namespace(function, ctx.source).as_deref(),
             );
             if !candidates.is_empty() {
-                candidates = cpp_filter_candidates_by_call(
+                candidates = cpp_filter_candidates_by_call_lazy(
                     candidates,
                     Some(call_arity),
-                    call_arg_types.as_deref(),
+                    || {
+                        cpp_call_argument_types(
+                            ctx.analyzer,
+                            ctx.support,
+                            ctx.visibility,
+                            ctx.file,
+                            ctx.source,
+                            ctx.root,
+                            call,
+                        )
+                    },
                     ctx.analyzer,
                     ctx.visibility,
                     ctx.file,
@@ -320,12 +330,22 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                     .visibility
                     .resolve_type(ctx.file, cpp_node_text(scope, ctx.source))
                 {
-                    candidates = cpp_member_candidates(
+                    candidates = cpp_member_candidates_lazy(
                         ctx,
                         vec![owner],
                         member,
                         Some(call_arity),
-                        call_arg_types.as_deref(),
+                        || {
+                            cpp_call_argument_types(
+                                ctx.analyzer,
+                                ctx.support,
+                                ctx.visibility,
+                                ctx.file,
+                                ctx.source,
+                                ctx.root,
+                                call,
+                            )
+                        },
                     );
                     if !candidates.is_empty() {
                         return candidates_outcome(candidates);
@@ -364,10 +384,20 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                 None,
             );
             if !candidates.is_empty() {
-                candidates = cpp_filter_candidates_by_call(
+                candidates = cpp_filter_candidates_by_call_lazy(
                     candidates,
                     Some(call_arity),
-                    call_arg_types.as_deref(),
+                    || {
+                        cpp_call_argument_types(
+                            ctx.analyzer,
+                            ctx.support,
+                            ctx.visibility,
+                            ctx.file,
+                            ctx.source,
+                            ctx.root,
+                            call,
+                        )
+                    },
                     ctx.analyzer,
                     ctx.visibility,
                     ctx.file,
@@ -382,13 +412,18 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                 ctx.root,
                 function.start_byte(),
             ) {
-                let member_candidates = cpp_member_candidates(
-                    ctx,
-                    vec![owner],
-                    name,
-                    Some(call_arity),
-                    call_arg_types.as_deref(),
-                );
+                let member_candidates =
+                    cpp_member_candidates_lazy(ctx, vec![owner], name, Some(call_arity), || {
+                        cpp_call_argument_types(
+                            ctx.analyzer,
+                            ctx.support,
+                            ctx.visibility,
+                            ctx.file,
+                            ctx.source,
+                            ctx.root,
+                            call,
+                        )
+                    });
                 if !member_candidates.is_empty() {
                     return candidates_outcome(member_candidates);
                 }
@@ -587,6 +622,34 @@ fn cpp_member_candidates(
     candidates
 }
 
+fn cpp_member_candidates_lazy<F>(
+    ctx: CppLookupCtx<'_, '_>,
+    owners: Vec<CodeUnit>,
+    member: &str,
+    arity: Option<usize>,
+    resolve_arg_types: F,
+) -> Vec<CodeUnit>
+where
+    F: FnOnce() -> Option<Vec<Option<CppType>>>,
+{
+    let mut candidates = cpp_direct_member_candidates(ctx.support, &owners, member);
+    if candidates.is_empty() {
+        let mut seen = HashSet::default();
+        candidates = cpp_inherited_member_candidates(ctx, &owners, member, &mut seen);
+    }
+    candidates = cpp_filter_candidates_by_call_lazy(
+        candidates,
+        arity,
+        resolve_arg_types,
+        ctx.analyzer,
+        ctx.visibility,
+        ctx.file,
+    );
+    sort_units(&mut candidates);
+    candidates.dedup();
+    candidates
+}
+
 fn cpp_direct_member_candidates(
     support: &DefinitionLookupIndex,
     owners: &[CodeUnit],
@@ -646,6 +709,41 @@ fn cpp_filter_candidates_by_call(
     let filtered: Vec<_> = arity_filtered
         .iter()
         .filter(|unit| cpp_candidate_params_match_args(unit, arg_types, analyzer, visibility, file))
+        .cloned()
+        .collect();
+    if filtered.is_empty() {
+        arity_filtered
+    } else {
+        filtered
+    }
+}
+
+fn cpp_filter_candidates_by_call_lazy<F>(
+    candidates: Vec<CodeUnit>,
+    arity: Option<usize>,
+    resolve_arg_types: F,
+    analyzer: &dyn IAnalyzer,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+) -> Vec<CodeUnit>
+where
+    F: FnOnce() -> Option<Vec<Option<CppType>>>,
+{
+    let arity_filtered = cpp_filter_candidates_by_arity(candidates, arity);
+    if arity_filtered.len() <= 1 {
+        return arity_filtered;
+    }
+    let Some(arg_types) = resolve_arg_types() else {
+        return arity_filtered;
+    };
+    if arg_types.iter().any(Option::is_none) {
+        return arity_filtered;
+    }
+    let filtered: Vec<_> = arity_filtered
+        .iter()
+        .filter(|unit| {
+            cpp_candidate_params_match_args(unit, &arg_types, analyzer, visibility, file)
+        })
         .cloned()
         .collect();
     if filtered.is_empty() {
