@@ -7,6 +7,10 @@ use crate::analyzer::usages::php_graph::resolver::{
     node_text, qualified_candidate_text, receiver_is_enclosing_subtype, receiver_type_matches,
     static_receiver_matches,
 };
+use crate::analyzer::usages::php_graph::syntax::{
+    assignment_parts, is_local_scope, literal_member_identifier, object_creation_type,
+    seed_parameter_types, static_member_parts, static_property_identifier, variable_identifier,
+};
 use crate::analyzer::{
     IAnalyzer, PhpAnalyzer, PhpFileContext, ProjectFile, resolve_php_constant,
     resolve_php_function, resolve_php_type,
@@ -244,7 +248,6 @@ fn scan_member_patterns(
     let Some(owner) = spec.owner_fq_name.as_deref() else {
         return;
     };
-    let mut engine = LocalInferenceEngine::default();
     scan_member_tree(
         root,
         analyzer,
@@ -255,14 +258,49 @@ fn scan_member_patterns(
         hierarchy,
         owner,
         spec,
-        &mut engine,
         hits,
     );
 }
 
 #[allow(clippy::too_many_arguments)]
-fn scan_member_tree(
-    node: Node<'_>,
+fn scan_member_tree<'tree>(
+    node: Node<'tree>,
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    line_starts: &[usize],
+    ctx: &PhpFileContext,
+    hierarchy: &PhpHierarchyIndex,
+    owner: &str,
+    spec: &TargetSpec,
+    hits: &mut BTreeSet<UsageHit>,
+) {
+    let mut scopes: Vec<(Node<'tree>, bool)> = vec![(node, false)];
+    while let Some((scope_root, seed_parameters)) = scopes.pop() {
+        let mut engine = LocalInferenceEngine::default();
+        if seed_parameters {
+            seed_parameter_receivers(scope_root, source, ctx, &mut engine);
+        }
+        scan_member_scope(
+            scope_root,
+            analyzer,
+            file,
+            source,
+            line_starts,
+            ctx,
+            hierarchy,
+            owner,
+            spec,
+            &mut engine,
+            &mut scopes,
+            hits,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_member_scope<'tree>(
+    root: Node<'tree>,
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     source: &str,
@@ -272,33 +310,18 @@ fn scan_member_tree(
     owner: &str,
     spec: &TargetSpec,
     engine: &mut LocalInferenceEngine<String>,
+    scopes: &mut Vec<(Node<'tree>, bool)>,
     hits: &mut BTreeSet<UsageHit>,
 ) {
-    let enters_scope = is_php_local_scope(node);
-    if enters_scope {
-        engine.enter_scope();
-        seed_parameter_receivers(node, source, ctx, engine);
-    }
-
-    apply_receiver_assignment(node, source, ctx, engine);
-    record_member_hit(
-        node,
-        analyzer,
-        file,
-        source,
-        line_starts,
-        ctx,
-        hierarchy,
-        owner,
-        spec,
-        engine,
-        hits,
-    );
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        scan_member_tree(
-            child,
+    let mut stack: Vec<Node<'tree>> = vec![root];
+    while let Some(node) = stack.pop() {
+        if node != root && is_local_scope(node) {
+            scopes.push((node, true));
+            continue;
+        }
+        apply_receiver_assignment(node, source, ctx, engine);
+        record_member_hit(
+            node,
             analyzer,
             file,
             source,
@@ -310,23 +333,14 @@ fn scan_member_tree(
             engine,
             hits,
         );
-    }
-
-    if enters_scope {
-        engine.exit_scope();
+        push_named_children(node, &mut stack);
     }
 }
 
-const PHP_LOCAL_SCOPE_NODES: &[&str] = &[
-    "function_definition",
-    "method_declaration",
-    "anonymous_function",
-    "anonymous_function_creation",
-    "arrow_function",
-];
-
-fn is_php_local_scope(node: Node<'_>) -> bool {
-    PHP_LOCAL_SCOPE_NODES.contains(&node.kind())
+fn push_named_children<'tree>(node: Node<'tree>, stack: &mut Vec<Node<'tree>>) {
+    let mut cursor = node.walk();
+    let children: Vec<_> = node.named_children(&mut cursor).collect();
+    stack.extend(children.into_iter().rev());
 }
 
 fn seed_parameter_receivers(
@@ -335,32 +349,7 @@ fn seed_parameter_receivers(
     ctx: &PhpFileContext,
     engine: &mut LocalInferenceEngine<String>,
 ) {
-    let Some(parameters) = node.child_by_field_name("parameters") else {
-        return;
-    };
-    let mut cursor = parameters.walk();
-    for child in parameters.named_children(&mut cursor) {
-        if !matches!(
-            child.kind(),
-            "simple_parameter" | "property_promotion_parameter"
-        ) {
-            continue;
-        }
-        let Some(name_node) = child.child_by_field_name("name") else {
-            continue;
-        };
-        let name = variable_identifier(name_node, source);
-        if name.is_empty() {
-            continue;
-        }
-        match child
-            .child_by_field_name("type")
-            .and_then(|type_node| resolve_php_type(node_text(type_node, source), ctx))
-        {
-            Some(fq) => engine.seed_symbol(name.to_string(), fq),
-            None => engine.declare_shadow(name.to_string()),
-        }
-    }
+    seed_parameter_types(node, source, engine, |raw| resolve_php_type(raw, ctx));
 }
 
 fn apply_receiver_assignment(
@@ -369,13 +358,7 @@ fn apply_receiver_assignment(
     ctx: &PhpFileContext,
     engine: &mut LocalInferenceEngine<String>,
 ) {
-    if node.kind() != "assignment_expression" {
-        return;
-    }
-    let (Some(left), Some(right)) = (
-        node.child_by_field_name("left"),
-        node.child_by_field_name("right"),
-    ) else {
+    let Some((left, right)) = assignment_parts(node) else {
         return;
     };
     if left.kind() != "variable_name" {
@@ -426,7 +409,7 @@ fn record_member_hit(
             ) else {
                 return;
             };
-            if member_identifier(member_node, source) != spec.member_name {
+            if literal_member_identifier(member_node, source) != Some(spec.member_name.as_str()) {
                 return;
             }
             let receiver_matches = if variable_identifier(receiver_node, source) == "this" {
@@ -450,10 +433,12 @@ fn record_member_hit(
         "class_constant_access_expression"
         | "scoped_call_expression"
         | "scoped_property_access_expression" => {
-            let Some((receiver_node, member_node)) = static_access_parts(node) else {
+            let Some((receiver_node, member_node)) = static_member_parts(node) else {
                 return;
             };
-            if member_identifier(member_node, source) != spec.member_name {
+            if static_member_identifier(node, member_node, source)
+                != Some(spec.member_name.as_str())
+            {
                 return;
             }
             if !static_receiver_matches(
@@ -475,16 +460,16 @@ fn record_member_hit(
     }
 }
 
-fn static_access_parts(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
-    let field_parts = node
-        .child_by_field_name("scope")
-        .zip(node.child_by_field_name("name"));
-    if field_parts.is_some() {
-        return field_parts;
+fn static_member_identifier<'a>(
+    parent: Node<'_>,
+    member: Node<'_>,
+    source: &'a str,
+) -> Option<&'a str> {
+    if parent.kind() == "scoped_property_access_expression" {
+        static_property_identifier(member, source)
+    } else {
+        literal_member_identifier(member, source)
     }
-    let mut cursor = node.walk();
-    let named: Vec<_> = node.named_children(&mut cursor).collect();
-    named.first().copied().zip(named.last().copied())
 }
 
 fn precise_receiver_type(engine: &LocalInferenceEngine<String>, receiver: &str) -> Option<String> {
@@ -494,20 +479,6 @@ fn precise_receiver_type(engine: &LocalInferenceEngine<String>, receiver: &str) 
             None
         }
     }
-}
-
-fn object_creation_type(node: Node<'_>) -> Option<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .find(|child| matches!(child.kind(), "name" | "qualified_name"))
-}
-
-fn variable_identifier<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    node_text(node, source).trim_start_matches('$')
-}
-
-fn member_identifier<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    node_text(node, source).trim_start_matches('$')
 }
 
 #[allow(clippy::too_many_arguments)]

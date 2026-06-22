@@ -3,6 +3,7 @@ mod hits;
 mod inverted;
 mod resolver;
 mod shared;
+pub(in crate::analyzer::usages) mod syntax;
 
 pub(in crate::analyzer::usages) use crate::analyzer::{
     PhpFileContext as FileContext, resolve_php_constant, resolve_php_function, resolve_php_type,

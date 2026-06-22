@@ -963,11 +963,12 @@ namespace App;
 function dynamic(): void {
     $class = Target::class;
     new $class();
-    $method = 'run';
-    $property = 'name';
+    $run = 'run';
+    $name = 'name';
     $target = new Target();
-    $target->$method();
-    echo $target->$property;
+    $target->$run();
+    echo $target->$name;
+    Target::${$name};
     $fn = 'helper';
     $fn();
     include 'Target.php';
@@ -979,6 +980,33 @@ function dynamic(): void {
     assert!(graph_hits(&analyzer, "App.Target.run").is_empty());
     assert!(graph_hits(&analyzer, "App.Target.name").is_empty());
     assert!(graph_hits(&analyzer, "App.helper").is_empty());
+}
+
+#[test]
+fn php_graph_does_not_leak_top_level_receiver_facts_into_functions() {
+    let (_project, analyzer) = php_analyzer_with_files(&[
+        (
+            "Target.php",
+            r#"<?php
+namespace App;
+class Target {
+    public function run(): void {}
+}
+"#,
+        ),
+        (
+            "Consumer.php",
+            r#"<?php
+namespace App;
+$target = new Target();
+function consume(): void {
+    $target->run();
+}
+"#,
+        ),
+    ]);
+
+    assert!(graph_hits(&analyzer, "App.Target.run").is_empty());
 }
 
 #[test]

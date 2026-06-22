@@ -1,4 +1,9 @@
 use super::*;
+use crate::analyzer::usages::php_graph::syntax::{
+    assignment_parts, is_local_scope as php_is_local_scope,
+    object_creation_type as php_object_creation_type, seed_parameter_types,
+    static_member_parts as php_static_member_parts, variable_identifier as php_variable_identifier,
+};
 
 pub(super) fn resolve_php(
     analyzer: &dyn IAnalyzer,
@@ -169,18 +174,6 @@ fn php_is_instanceof_type_name(node: Node<'_>) -> bool {
         && parent.child_by_field_name("right").is_some_and(|right| {
             right.start_byte() <= node.start_byte() && node.end_byte() <= right.end_byte()
         })
-}
-
-fn php_static_member_parts(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
-    let scope = node
-        .child_by_field_name("scope")
-        .or_else(|| node.child_by_field_name("class"))
-        .or_else(|| node.named_child(0))?;
-    let name = node
-        .child_by_field_name("name")
-        .or_else(|| node.child_by_field_name("constant"))
-        .or_else(|| node.named_child(1))?;
-    Some((scope, name))
 }
 
 fn php_static_member_name(node: Node<'_>) -> Option<Node<'_>> {
@@ -373,7 +366,7 @@ fn php_bindings_before(
         if node.start_byte() >= byte {
             continue;
         }
-        if node != scope && PHP_SCOPE_NODES.contains(&node.kind()) {
+        if node != scope && php_is_local_scope(node) {
             continue;
         }
         php_seed_parameters(node, source, ctx, &mut bindings);
@@ -391,19 +384,12 @@ fn php_bindings_before(
     bindings
 }
 
-const PHP_SCOPE_NODES: &[&str] = &[
-    "function_definition",
-    "method_declaration",
-    "anonymous_function",
-    "arrow_function",
-];
-
 fn php_enclosing_scope<'tree>(root: Node<'tree>, byte: usize) -> Option<Node<'tree>> {
     let mut best = None;
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         if node.start_byte() <= byte && byte < node.end_byte() {
-            if PHP_SCOPE_NODES.contains(&node.kind()) {
+            if php_is_local_scope(node) {
                 best = Some(node);
             }
             let mut cursor = node.walk();
@@ -421,32 +407,7 @@ fn php_seed_parameters(
     ctx: &FileContext,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
-    let Some(parameters) = node.child_by_field_name("parameters") else {
-        return;
-    };
-    let mut cursor = parameters.walk();
-    for child in parameters.named_children(&mut cursor) {
-        if !matches!(
-            child.kind(),
-            "simple_parameter" | "property_promotion_parameter"
-        ) {
-            continue;
-        }
-        let Some(name_node) = child.child_by_field_name("name") else {
-            continue;
-        };
-        let name = php_variable_identifier(name_node, source);
-        if name.is_empty() {
-            continue;
-        }
-        match child
-            .child_by_field_name("type")
-            .and_then(|type_node| resolve_php_type(php_node_text(type_node, source), ctx))
-        {
-            Some(fqn) => bindings.seed_symbol(name.to_string(), fqn),
-            None => bindings.declare_shadow(name.to_string()),
-        }
-    }
+    seed_parameter_types(node, source, bindings, |raw| resolve_php_type(raw, ctx));
 }
 
 fn php_seed_assignment(
@@ -457,13 +418,7 @@ fn php_seed_assignment(
     ctx: &FileContext,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
-    if node.kind() != "assignment_expression" {
-        return;
-    }
-    let (Some(left), Some(right)) = (
-        node.child_by_field_name("left"),
-        node.child_by_field_name("right"),
-    ) else {
+    let Some((left, right)) = assignment_parts(node) else {
         return;
     };
     if left.kind() != "variable_name" {
@@ -481,12 +436,6 @@ fn php_seed_assignment(
         Some(fqn) => bindings.seed_symbol(name.to_string(), fqn),
         None => bindings.declare_shadow(name.to_string()),
     }
-}
-
-fn php_object_creation_type(node: Node<'_>) -> Option<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .find(|child| matches!(child.kind(), "name" | "qualified_name"))
 }
 
 fn php_is_in_object_creation(node: Node<'_>) -> bool {
@@ -519,10 +468,6 @@ fn php_is_bare_constant_reference(node: Node<'_>) -> bool {
             | "base_clause"
             | "class_interface_clause"
     )
-}
-
-fn php_variable_identifier<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    php_node_text(node, source).trim_start_matches('$')
 }
 
 fn php_is_declaration_name(node: Node<'_>) -> bool {

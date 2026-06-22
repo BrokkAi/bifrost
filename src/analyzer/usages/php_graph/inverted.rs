@@ -30,6 +30,10 @@
 //! cannot determine, are a recall gap — not a wrong edge.
 
 use super::resolver::node_text;
+use super::syntax::{
+    assignment_parts, is_local_scope, object_creation_type, seed_parameter_types,
+    variable_identifier,
+};
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, first_precise, parse_and_collect,
 };
@@ -92,18 +96,8 @@ impl PhpScan<'_, '_> {
     }
 }
 
-/// Nodes that open a fresh local-binding scope. Anonymous functions / arrow
-/// functions get their own parameter set; PHP has no block scoping for locals,
-/// so plain blocks are intentionally excluded.
-const SCOPE_NODES: &[&str] = &[
-    "function_definition",
-    "method_declaration",
-    "anonymous_function",
-    "arrow_function",
-];
-
 fn walk(node: Node<'_>, scan: &mut PhpScan<'_, '_>, bindings: &mut LocalInferenceEngine<String>) {
-    let enters_scope = SCOPE_NODES.contains(&node.kind());
+    let enters_scope = is_local_scope(node);
     if enters_scope {
         bindings.enter_scope();
         seed_parameters(node, scan, bindings);
@@ -244,32 +238,9 @@ fn seed_parameters(
     scan: &PhpScan<'_, '_>,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
-    let Some(parameters) = node.child_by_field_name("parameters") else {
-        return;
-    };
-    let mut cursor = parameters.walk();
-    for child in parameters.named_children(&mut cursor) {
-        if !matches!(
-            child.kind(),
-            "simple_parameter" | "property_promotion_parameter"
-        ) {
-            continue;
-        }
-        let Some(name_node) = child.child_by_field_name("name") else {
-            continue;
-        };
-        let name = variable_identifier(name_node, scan.source);
-        if name.is_empty() {
-            continue;
-        }
-        match child
-            .child_by_field_name("type")
-            .and_then(|type_node| scan.resolve_type_fqn(node_text(type_node, scan.source)))
-        {
-            Some(fqn) => bindings.seed_symbol(name.to_string(), fqn),
-            None => bindings.declare_shadow(name.to_string()),
-        }
-    }
+    seed_parameter_types(node, scan.source, bindings, |raw| {
+        scan.resolve_type_fqn(raw)
+    });
 }
 
 /// Seed `$x = new Foo()` locals into the binding scope. Other assignments shadow
@@ -279,13 +250,7 @@ fn seed_assignment(
     scan: &PhpScan<'_, '_>,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
-    if node.kind() != "assignment_expression" {
-        return;
-    }
-    let (Some(left), Some(right)) = (
-        node.child_by_field_name("left"),
-        node.child_by_field_name("right"),
-    ) else {
+    let Some((left, right)) = assignment_parts(node) else {
         return;
     };
     if left.kind() != "variable_name" {
@@ -303,13 +268,6 @@ fn seed_assignment(
         Some(fqn) => bindings.seed_symbol(name.to_string(), fqn),
         None => bindings.declare_shadow(name.to_string()),
     }
-}
-
-/// The type-name node of a `new X(..)` expression, skipping the `new` keyword.
-fn object_creation_type(node: Node<'_>) -> Option<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .find(|child| matches!(child.kind(), "name" | "qualified_name"))
 }
 
 /// True when `node` is the type name inside a `new X(..)` expression (so the
@@ -346,10 +304,4 @@ fn is_bare_constant_reference(node: Node<'_>) -> bool {
             | "base_clause"
             | "class_interface_clause"
     )
-}
-
-/// The identifier of a `variable_name` node, with the leading `$` stripped, so a
-/// receiver name matches the binding keys seeded from parameters/assignments.
-fn variable_identifier<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    node_text(node, source).trim_start_matches('$')
 }
