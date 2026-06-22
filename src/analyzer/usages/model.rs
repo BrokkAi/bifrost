@@ -89,7 +89,7 @@ pub enum ReferenceKind {
     Inheritance,
 }
 
-/// A resolved reference (graph-strategy output, not used by the regex strategy directly).
+/// A resolved reference emitted by graph strategies before rendering as a usage hit.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ReferenceHit {
     pub file: ProjectFile,

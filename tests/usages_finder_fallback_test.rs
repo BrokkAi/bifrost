@@ -99,7 +99,7 @@ namespace Domain {
 }
 
 #[test]
-fn usage_finder_routes_unsupported_graph_language_directly_to_regex() {
+fn usage_finder_reports_unsupported_language_without_regex() {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file(
             "app.js",
@@ -132,10 +132,15 @@ export function run() {
         1000,
     );
 
+    let diagnostic = result
+        .graph_failure
+        .as_ref()
+        .expect("unsupported-language diagnostic");
+    assert_eq!("UsageFinder", diagnostic.strategy);
+    assert_eq!("unsupported_target_language", diagnostic.reason_kind);
     assert!(
-        matches!(result.result, FuzzyResult::Success { .. }),
-        "unsupported graph language should go directly to regex, got {:?}",
+        matches!(result.result, FuzzyResult::Failure { .. }),
+        "unsupported graph language should fail without regex, got {:?}",
         result.result
     );
-    assert_eq!(1, result.result.into_either().expect("regex success").len());
 }

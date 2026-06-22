@@ -2,9 +2,10 @@ mod common;
 
 use brokk_bifrost::usages::CandidateFileProvider as _;
 use brokk_bifrost::usages::{
-    PythonExportUsageGraphStrategy, TextSearchCandidateProvider, UsageAnalyzer, UsageFinder,
+    FuzzyResult, PythonExportUsageGraphStrategy, TextSearchCandidateProvider, UsageAnalyzer,
+    UsageFinder,
 };
-use brokk_bifrost::{CodeUnit, IAnalyzer, Language, PythonAnalyzer};
+use brokk_bifrost::{CodeUnit, IAnalyzer, PythonAnalyzer};
 use common::py_fixture_project;
 
 fn fixture_analyzer() -> PythonAnalyzer {
@@ -76,45 +77,4 @@ fn empty_overloads_yields_empty_success() {
         }
         other => panic!("expected empty Success, got {other:?}"),
     }
-}
-
-#[test]
-fn search_patterns_table_is_populated_for_known_languages() {
-    use brokk_bifrost::CodeUnitType;
-
-    // Function patterns we explicitly ported.
-    for lang in [
-        Language::Java,
-        Language::Python,
-        Language::Rust,
-        Language::Cpp,
-        Language::Scala,
-        Language::Go,
-    ] {
-        let patterns = lang.search_patterns(CodeUnitType::Function);
-        assert!(
-            patterns.iter().any(|p| p.contains("$ident")),
-            "{lang:?} function search patterns must include $ident placeholder"
-        );
-    }
-
-    // Class patterns for the languages that ship them.
-    for lang in [
-        Language::Java,
-        Language::Python,
-        Language::Rust,
-        Language::Cpp,
-        Language::Scala,
-    ] {
-        let patterns = lang.search_patterns(CodeUnitType::Class);
-        assert!(
-            patterns.iter().any(|p| p.contains("$ident")),
-            "{lang:?} class search patterns must include $ident placeholder"
-        );
-    }
-
-    // Default fallback for any pair without an override.
-    let default_patterns = Language::CSharp.search_patterns(CodeUnitType::Class);
-    assert_eq!(default_patterns.len(), 1);
-    assert!(default_patterns[0].contains("$ident"));
 }

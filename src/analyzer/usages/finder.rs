@@ -284,11 +284,10 @@ fn graph_find_usages(
             max_usages,
         ),
         Language::None => GraphUsageOutcome::terminal_failure(
-            overloads
-                .first()
-                .map(|target| target.fq_name().to_string())
-                .unwrap_or_default(),
-            GraphFailureReason::UnsupportedTargetLanguage("target language is unsupported"),
+            overloads[0].fq_name(),
+            GraphFailureReason::UnsupportedTargetLanguage(
+                "no graph usage strategy is available for this target language",
+            ),
             "UsageFinder",
         ),
     }

@@ -34,6 +34,9 @@ make clippy shut up.
 We build for correctness and generality. Adding narrow "fallbacks" is a smell. Always follow problems
 to their source and fix the root cause, even when that increases the blast radius.
 
+For analyzer resolution and usage analysis, do not add regex/text-search fallbacks that mask missing structured support.
+Surface the structured failure and fix the graph/resolver instead.
+
 Backwards compatibility is not yet a concern. Clean up APIs instead when our requirements change.
 
 # Implementation details

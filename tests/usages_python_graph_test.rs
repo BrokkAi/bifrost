@@ -1539,7 +1539,7 @@ def run_b():
 }
 
 #[test]
-fn usage_finder_falls_back_to_regex_for_same_file_unseeded_function() {
+fn usage_finder_graph_finds_same_file_function_usage() {
     let project = InlineTestProject::with_language(Language::Python)
         .file(
             "service.py",
@@ -1555,14 +1555,14 @@ def run():
     let analyzer = PythonAnalyzer::from_project(project.project().clone());
     let target = definition(&analyzer, "service.helper");
 
-    let result = UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target));
-    let hits = result
-        .into_either()
-        .expect("UsageFinder should fall back to regex for unseeded same-file functions");
+    let query = UsageFinder::new().query(&analyzer, std::slice::from_ref(&target), 1000, 1000);
+    assert!(query.graph_failure.is_none(), "query: {:?}", query.result);
+    let hits = query.result.into_either().expect("graph success");
     assert_eq!(hits.len(), 1);
     assert!(
         hits.iter()
-            .all(|hit| hit.file == project.file("service.py"))
+            .all(|hit| hit.file == project.file("service.py")),
+        "UsageFinder should use graph hits for same-file functions"
     );
 }
 
