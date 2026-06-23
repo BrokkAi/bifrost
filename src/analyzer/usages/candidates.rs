@@ -5,6 +5,7 @@ use crate::hash::{HashSet, set_with_capacity};
 use rayon::prelude::*;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::Mutex;
 
 /// Candidate provider that walks the import graph and type hierarchy.
@@ -180,6 +181,50 @@ impl CandidateFileProvider for TextSearchCandidateProvider {
         });
 
         matches.into_inner().expect("candidate match set poisoned")
+    }
+}
+
+/// Candidate provider for path-scoped `scan_usages` queries (called with `paths`).
+/// The caller has already named the files to search, so enumerating references
+/// workspace-wide — the import-graph walk and the substring scan over every file — is pure
+/// waste: whatever it finds is immediately filtered back down to `paths`. This provider skips
+/// that sweep and hands the pre-resolved path-scoped files straight to the language strategy,
+/// making cost O(paths) instead of O(workspace) per symbol regardless of how common the symbol is.
+///
+/// The set is filtered to the target's language because [`super::finder::graph_find_usages`]
+/// dispatches each query to a single language strategy. The one exception is a Java class, whose
+/// strategy also scans Scala candidates for cross-language (Scala → Java) usages, so Scala files
+/// are kept for that case — mirroring the Scala candidates the workspace-wide path contributes via
+/// `add_scala_candidates_for_java_type`. Dropping them would silently lose those usages.
+pub struct ExplicitCandidateProvider {
+    files: Arc<HashSet<ProjectFile>>,
+}
+
+impl ExplicitCandidateProvider {
+    pub fn new(files: Arc<HashSet<ProjectFile>>) -> Self {
+        Self { files }
+    }
+}
+
+impl CandidateFileProvider for ExplicitCandidateProvider {
+    fn find_candidates(
+        &self,
+        target: &CodeUnit,
+        _analyzer: &dyn IAnalyzer,
+    ) -> HashSet<ProjectFile> {
+        let language = language_for_target(target);
+        // A Java-class query also resolves usages from Scala source (see the doc comment), so the
+        // Scala files must reach the strategy alongside the Java ones.
+        let keep_scala_for_java = language == Language::Java && target.is_class();
+        self.files
+            .iter()
+            .filter(|file| {
+                let file_language = language_for_file(file);
+                file_language == language
+                    || (keep_scala_for_java && file_language == Language::Scala)
+            })
+            .cloned()
+            .collect()
     }
 }
 
