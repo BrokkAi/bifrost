@@ -1627,32 +1627,26 @@ fn scan_usages_paths_scope_is_independent_of_out_of_scope_callers() {
     // reference the symbol — the search is bounded by `paths`, not by the symbol's popularity.
     // This is the regression guard for the perf fix: candidates are resolved straight from
     // `paths` rather than enumerated workspace-wide and filtered after the fact.
-    let temp = TempDir::new().unwrap();
-    fs::write(
-        temp.path().join("go.mod"),
-        "module example.com/app\n\ngo 1.22\n",
-    )
-    .unwrap();
-    fs::write(
-        temp.path().join("helper.go"),
-        "package app\n\nfunc Helper() string { return \"hi\" }\n",
-    )
-    .unwrap();
-    fs::write(
-        temp.path().join("want_caller.go"),
-        "package app\n\nfunc UseHere() string { return Helper() }\n",
-    )
-    .unwrap();
-    for idx in 0..50 {
-        fs::write(
-            temp.path().join(format!("decoy{idx}.go")),
-            format!("package app\n\nfunc Decoy{idx}() string {{ return Helper() }}\n"),
+    let mut project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file(
+            "helper.go",
+            "package app\n\nfunc Helper() string { return \"hi\" }\n",
         )
-        .unwrap();
+        .file(
+            "want_caller.go",
+            "package app\n\nfunc UseHere() string { return Helper() }\n",
+        );
+    for idx in 0..50 {
+        project = project.file(
+            format!("decoy{idx}.go"),
+            format!("package app\n\nfunc Decoy{idx}() string {{ return Helper() }}\n"),
+        );
     }
+    let project = project.build();
 
     let service =
-        SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
     let payload = service
         .call_tool_json(
             "scan_usages",
@@ -1678,31 +1672,27 @@ fn scan_usages_paths_scope_is_independent_of_out_of_scope_callers() {
 fn scan_usages_paths_scope_returns_all_in_scope_callers() {
     // A glob `paths` matching several files must return every in-scope call site (not just the
     // first) while still excluding out-of-scope callers.
-    let temp = TempDir::new().unwrap();
-    fs::create_dir_all(temp.path().join("scoped")).unwrap();
-    fs::write(
-        temp.path().join("Greeter.java"),
-        "public class Greeter {\n    public String hello() { return \"hi\"; }\n}\n",
-    )
-    .unwrap();
-    fs::write(
-        temp.path().join("scoped").join("CallerA.java"),
-        "public class CallerA {\n    public String run() { return new Greeter().hello(); }\n}\n",
-    )
-    .unwrap();
-    fs::write(
-        temp.path().join("scoped").join("CallerB.java"),
-        "public class CallerB {\n    public String run() { return new Greeter().hello(); }\n}\n",
-    )
-    .unwrap();
-    fs::write(
-        temp.path().join("OutOfScope.java"),
-        "public class OutOfScope {\n    public String run() { return new Greeter().hello(); }\n}\n",
-    )
-    .unwrap();
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "Greeter.java",
+            "public class Greeter {\n    public String hello() { return \"hi\"; }\n}\n",
+        )
+        .file(
+            "scoped/CallerA.java",
+            "public class CallerA {\n    public String run() { return new Greeter().hello(); }\n}\n",
+        )
+        .file(
+            "scoped/CallerB.java",
+            "public class CallerB {\n    public String run() { return new Greeter().hello(); }\n}\n",
+        )
+        .file(
+            "OutOfScope.java",
+            "public class OutOfScope {\n    public String run() { return new Greeter().hello(); }\n}\n",
+        )
+        .build();
 
     let service =
-        SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
     let payload = service
         .call_tool_json(
             "scan_usages",
@@ -1725,27 +1715,65 @@ fn scan_usages_paths_scope_returns_all_in_scope_callers() {
 }
 
 #[test]
+fn scan_usages_paths_scope_does_not_truncate_broad_glob_candidates_before_scanning() {
+    let mut project = InlineTestProject::with_language(Language::Java).file(
+        "Greeter.java",
+        "public class Greeter {\n    public String hello() { return \"hi\"; }\n}\n",
+    );
+    for idx in 0..1005 {
+        let body = if idx == 1004 {
+            "return new Greeter().hello();"
+        } else {
+            "return \"skip\";"
+        };
+        project = project.file(
+            format!("scoped/Caller{idx:04}.java"),
+            format!("public class Caller{idx:04} {{\n    public String run() {{ {body} }}\n}}\n"),
+        );
+    }
+    let project = project.build();
+
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "scan_usages",
+            r#"{"symbols":["Greeter.hello"],"include_tests":true,"paths":["scoped/*.java"]}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert_eq!(false, value["summary"]["partial"], "payload: {value}");
+    assert!(
+        value["usages"][0]["candidate_files_truncated"].is_null(),
+        "path-scoped scans must not apply the generic pre-scan candidate cap: {value}"
+    );
+    assert_eq!(
+        1,
+        value["usages"][0]["total_hits"].as_u64().unwrap(),
+        "payload: {value}"
+    );
+}
+
+#[test]
 fn scan_usages_paths_scope_keeps_cross_language_scala_usages_of_java_type() {
     // A Java class can be referenced from Scala, and the Java usage strategy discovers those by
     // scanning Scala files in the candidate set. A path-scoped query that names a Scala file must
     // therefore still surface the cross-language usage — the language filter on path-scoped
     // candidates keeps Scala files for a Java-class target instead of dropping them.
-    let temp = TempDir::new().unwrap();
-    fs::create_dir_all(temp.path().join("com").join("example")).unwrap();
-    fs::create_dir_all(temp.path().join("app")).unwrap();
-    fs::write(
-        temp.path().join("com").join("example").join("Target.java"),
-        "package com.example;\n\npublic class Target {\n    public void run() {}\n}\n",
-    )
-    .unwrap();
-    fs::write(
-        temp.path().join("app").join("ScalaConsumer.scala"),
-        "package app\n\nimport com.example.Target\n\nclass ScalaConsumer {\n  val annotated: Target = new Target()\n}\n",
-    )
-    .unwrap();
+    let project = InlineTestProject::new()
+        .file(
+            "com/example/Target.java",
+            "package com.example;\n\npublic class Target {\n    public void run() {}\n}\n",
+        )
+        .file(
+            "app/ScalaConsumer.scala",
+            "package app\n\nimport com.example.Target\n\nclass ScalaConsumer {\n  val annotated: Target = new Target()\n}\n",
+        )
+        .build();
 
     let service =
-        SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
     let payload = service
         .call_tool_json(
             "scan_usages",
