@@ -5,10 +5,7 @@ use crate::analyzer::usages::cpp_graph::hits::{
 use crate::analyzer::usages::cpp_graph::resolver::*;
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::UsageHit;
-use crate::analyzer::{
-    CodeUnit, IAnalyzer, Language, ProjectFile, cpp_node_text as node_text,
-    normalize_cpp_whitespace,
-};
+use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, cpp_node_text as node_text};
 use crate::hash::HashMap;
 use crate::text_utils::compute_line_starts;
 use std::collections::BTreeSet;
@@ -200,21 +197,9 @@ fn seed_binding_from_type_or_value(
 
 fn infer_type_from_value(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {
     match node.kind() {
-        "new_expression" => {
-            let text = normalize_cpp_whitespace(node_text(node, ctx.source));
-            let rest = text.strip_prefix("new ").unwrap_or(text.as_str());
-            ctx.visibility
-                .resolve_type(ctx.file, rest.split(['(', '{']).next().unwrap_or(rest))
+        "new_expression" | "call_expression" => {
+            infer_cpp_initializer_type(ctx.analyzer, ctx.visibility, ctx.file, ctx.source, node)
         }
-        "call_expression" => node.child_by_field_name("function").and_then(|function| {
-            let function_text = node_text(function, ctx.source);
-            // `auto x = T(...)` constructs `T` directly; `auto x = make()` takes `make`'s return
-            // type. Try the call target as a type first (constructor), then fall back to the
-            // declared return type of the matching free function so the local binds to that type.
-            ctx.visibility
-                .resolve_type(ctx.file, function_text)
-                .or_else(|| infer_call_return_type(function_text, ctx))
-        }),
         "initializer_list" => None,
         "identifier" => {
             let resolved = ctx.bindings.resolve_symbol(node_text(node, ctx.source));
@@ -228,25 +213,6 @@ fn infer_type_from_value(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeUnit> 
             .visibility
             .resolve_type(ctx.file, node_text(node, ctx.source)),
     }
-}
-
-fn infer_call_return_type(function_text: &str, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {
-    let function =
-        ctx.visibility
-            .resolve_named(ctx.file, function_text, TargetKind::FreeFunction)?;
-    let declaration = ctx.analyzer.get_source(&function, false)?;
-    let return_type = return_type_of_declaration(&declaration, function.identifier())?;
-    ctx.visibility.resolve_type(ctx.file, &return_type)
-}
-
-/// Extracts the declared return type from a C++ free-function declaration, e.g. `Service` from
-/// `Service build_service();`. Returns `None` when the function name cannot be located before the
-/// parameter list (defensive against unexpected declaration shapes).
-fn return_type_of_declaration(declaration: &str, function_name: &str) -> Option<String> {
-    let head = declaration.split('(').next().unwrap_or(declaration);
-    let name_start = head.rfind(function_name)?;
-    let return_type = head[..name_start].trim();
-    (!return_type.is_empty()).then(|| return_type.to_string())
 }
 
 fn maybe_record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -367,24 +333,17 @@ fn maybe_record_free_function_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         &ctx.spec.target,
     ) {
         push_hit(function, ctx);
-    } else if free_function_is_known_non_target(text, ctx) {
+    } else if ctx.visibility.resolve_known_non_target(
+        ctx.file,
+        text,
+        TargetKind::FreeFunction,
+        &ctx.spec.target,
+    ) {
         // An explicitly namespace-qualified call to a different namespace (e.g. `other::run()` when
         // the target is `ns::run`) is a proven non-match, not an unresolved reference.
     } else {
         *ctx.saw_unproven_match = true;
     }
-}
-
-/// True when a call's explicit namespace qualifier proves it cannot be the target free function.
-/// `other::run()` is a known non-target of `ns::run`; a bare `run()` is not (it could resolve to the
-/// target via the enclosing namespace), so only qualified mismatches count.
-fn free_function_is_known_non_target(text: &str, ctx: &ScanCtx<'_>) -> bool {
-    let normalized = normalize_cpp_reference_text(text);
-    if !normalized.contains("::") {
-        return false;
-    }
-    let target_cpp_name = cpp_name_for(&ctx.spec.target);
-    normalized != target_cpp_name
 }
 
 fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -474,20 +433,83 @@ fn maybe_record_global_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     *ctx.raw_match_count += 1;
-    // Require the target to be the *unique* visible global field of this name. A bare
-    // reference that also matches a same-named constant in another namespace is
-    // ambiguous and is left unproven rather than attributed to the target by the
-    // visible set's iteration order.
-    if ctx.visibility.uniquely_resolves_to_target(
-        ctx.file,
-        node_text(node, ctx.source),
-        TargetKind::GlobalField,
-        &ctx.spec.target,
-    ) {
+    if global_field_resolves_to_target(node, ctx) {
         push_hit(node, ctx);
+    } else if global_field_is_known_non_target(node, ctx) {
     } else {
         *ctx.saw_unproven_match = true;
     }
+}
+
+fn global_field_resolves_to_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    let text = node_text(node, ctx.source);
+    if text.contains("::") {
+        return ctx.visibility.contains_named_symbol(
+            ctx.file,
+            text,
+            TargetKind::GlobalField,
+            &ctx.spec.target,
+        );
+    }
+    if let Some(namespace) = enclosing_namespace_context(node, ctx.source)
+        && cpp_namespace_for(&ctx.spec.target).as_deref() == Some(namespace.as_str())
+    {
+        return ctx.visibility.contains_named_symbol(
+            ctx.file,
+            text,
+            TargetKind::GlobalField,
+            &ctx.spec.target,
+        );
+    }
+    bare_global_field_uniquely_resolves_to_target(text, ctx)
+}
+
+fn bare_global_field_uniquely_resolves_to_target(text: &str, ctx: &ScanCtx<'_>) -> bool {
+    let Some(visible) = ctx.visibility.visible_by_file.get(ctx.file) else {
+        return false;
+    };
+    let mut matched_target = false;
+    for unit in visible.iter() {
+        if !unit.is_field() || !name_matches_terminal(unit.identifier(), &ctx.spec.member_name) {
+            continue;
+        }
+        if !name_matches_terminal(cpp_name_for(unit).as_str(), text) {
+            continue;
+        }
+        if same_visible_symbol(unit, &ctx.spec.target) {
+            matched_target = true;
+        } else {
+            return false;
+        }
+    }
+    matched_target
+}
+
+fn global_field_is_known_non_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    let text = node_text(node, ctx.source);
+    if text.contains("::") {
+        return ctx.visibility.resolve_known_non_target(
+            ctx.file,
+            text,
+            TargetKind::GlobalField,
+            &ctx.spec.target,
+        );
+    }
+    let Some(namespace) = enclosing_namespace_context(node, ctx.source) else {
+        return false;
+    };
+    cpp_namespace_for(&ctx.spec.target).as_deref() != Some(namespace.as_str())
+        && ctx
+            .visibility
+            .visible_by_file
+            .get(ctx.file)
+            .is_some_and(|visible| {
+                visible.iter().any(|unit| {
+                    unit.is_field()
+                        && unit.identifier() == ctx.spec.member_name
+                        && cpp_namespace_for(unit).as_deref() == Some(namespace.as_str())
+                })
+            })
 }
 
 fn maybe_record_member_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
