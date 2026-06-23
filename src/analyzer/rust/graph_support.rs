@@ -1,6 +1,7 @@
 use crate::analyzer::usages::{ExportEntry, ExportIndex, ImportBinder, ImportKind, ReexportStar};
 use crate::analyzer::{CodeUnit, IAnalyzer, ImportAnalysisProvider, ProjectFile};
 use crate::hash::{HashMap, HashSet};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tree_sitter::Node;
@@ -71,6 +72,23 @@ fn join_rust_fqn(package: &str, name: &str) -> String {
     } else {
         format!("{package}.{name}")
     }
+}
+
+fn insert_single_reexport_target(
+    named: &mut HashMap<String, String>,
+    exported_name: String,
+    targets: BTreeSet<(ProjectFile, String)>,
+) {
+    let mut targets = targets.into_iter();
+    let Some((target_file, target_name)) = targets.next() else {
+        return;
+    };
+    if targets.next().is_some() {
+        return;
+    }
+    named
+        .entry(exported_name)
+        .or_insert_with(|| join_rust_fqn(&rust_package_name(&target_file), &target_name));
 }
 
 fn is_rooted_rust_module_path(path: &str) -> bool {
@@ -290,6 +308,7 @@ impl RustAnalyzer {
                 ImportKind::Default | ImportKind::CommonJsRequire | ImportKind::Glob => {}
             }
         }
+        self.insert_reexport_reference_bindings(file, &mut named);
         let same_file: HashMap<String, String> = self
             .declarations(file)
             .map(|unit| (unit.identifier().to_string(), unit.fq_name()))
@@ -300,6 +319,72 @@ impl RustAnalyzer {
             named,
             namespace,
             same_file,
+        }
+    }
+
+    fn insert_reexport_reference_bindings(
+        &self,
+        file: &ProjectFile,
+        named: &mut HashMap<String, String>,
+    ) {
+        let export_index = self.export_index_of(file);
+        for (exported_name, entry) in export_index.exports_by_name {
+            if let ExportEntry::ReexportedNamed {
+                module_specifier,
+                imported_name,
+            } = entry
+            {
+                let module_files = self.resolve_module_files(file, &module_specifier);
+                let mut targets = self.exported_targets_from_files(&module_files, &imported_name);
+                if targets.is_empty() {
+                    targets.extend(rust_declaration_targets_in_files(
+                        self,
+                        &module_files,
+                        &imported_name,
+                    ));
+                }
+                insert_single_reexport_target(named, exported_name, targets);
+            }
+        }
+
+        for star in export_index.reexport_stars {
+            let module_files = self.resolve_module_files(file, &star.module_specifier);
+            let mut export_names = HashSet::default();
+            self.collect_export_names_from_files(
+                &module_files,
+                &mut HashSet::default(),
+                &mut export_names,
+            );
+            for export_name in export_names {
+                let mut targets = self.exported_targets_from_files(&module_files, &export_name);
+                if targets.is_empty() {
+                    targets.extend(rust_declaration_targets_in_files(
+                        self,
+                        &module_files,
+                        &export_name,
+                    ));
+                }
+                insert_single_reexport_target(named, export_name, targets);
+            }
+        }
+    }
+
+    fn collect_export_names_from_files(
+        &self,
+        module_files: &[ProjectFile],
+        visited: &mut HashSet<ProjectFile>,
+        names: &mut HashSet<String>,
+    ) {
+        for module_file in module_files {
+            if !visited.insert(module_file.clone()) {
+                continue;
+            }
+            let export_index = self.export_index_of(module_file);
+            names.extend(export_index.exports_by_name.keys().cloned());
+            for star in export_index.reexport_stars {
+                let nested_files = self.resolve_module_files(module_file, &star.module_specifier);
+                self.collect_export_names_from_files(&nested_files, visited, names);
+            }
         }
     }
 

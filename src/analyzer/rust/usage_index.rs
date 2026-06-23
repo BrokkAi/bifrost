@@ -263,14 +263,23 @@ impl RustUsageIndex {
                     module_specifier,
                     imported_name,
                 } => {
-                    for file in analyzer.resolve_module_files(module_file, module_specifier) {
+                    let files = analyzer.resolve_module_files(module_file, module_specifier);
+                    let target_count = targets.len();
+                    for file in &files {
                         self.export_targets_in_file(
                             analyzer,
-                            &file,
+                            file,
                             imported_name,
                             visited,
                             targets,
                         );
+                    }
+                    if targets.len() == target_count {
+                        targets.extend(rust_declaration_targets_in_files(
+                            analyzer,
+                            &files,
+                            imported_name,
+                        ));
                     }
                 }
                 ExportEntry::Default { .. } => {}
@@ -282,6 +291,25 @@ impl RustUsageIndex {
             }
         }
     }
+}
+
+fn rust_declaration_targets_in_files(
+    analyzer: &RustAnalyzer,
+    files: &[ProjectFile],
+    name: &str,
+) -> Vec<(ProjectFile, String)> {
+    let mut targets: Vec<_> = files
+        .iter()
+        .flat_map(|file| {
+            analyzer
+                .declarations(file)
+                .filter(move |unit| unit.identifier() == name)
+                .map(|unit| (file.clone(), unit.identifier().to_string()))
+        })
+        .collect();
+    targets.sort();
+    targets.dedup();
+    targets
 }
 
 impl RustAnalyzer {
