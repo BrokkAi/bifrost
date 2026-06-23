@@ -23,7 +23,8 @@ use super::extractor::{
 };
 use super::resolver::{JsTsUsageIndex, collect_jsts_files, tree_sitter_language_for};
 use crate::analyzer::usages::inverted_edges::{
-    EdgeCollector, UsageEdges, UsageNodeKey, build_edges, collect_file_edges, parse_and_collect,
+    EdgeCollector, UsageEdgeWeights, UsageEdges, UsageNodeKey, build_edge_weights, build_edges,
+    collect_file_edges, parse_and_collect,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::{ExportEntry, ImportKind};
@@ -111,7 +112,7 @@ pub(crate) enum JsTsScopedNodeStatus {
 }
 
 pub(crate) struct JsTsScopedUsageEdges {
-    pub(crate) edges: UsageEdges<UsageNodeKey>,
+    pub(crate) edges: UsageEdgeWeights<UsageNodeKey>,
     pub(crate) node_status: BTreeMap<UsageNodeKey, JsTsScopedNodeStatus>,
 }
 
@@ -127,14 +128,14 @@ where
 {
     let Some(parser_language) = tree_sitter_language_for(language) else {
         return JsTsScopedUsageEdges {
-            edges: UsageEdges::default(),
+            edges: UsageEdgeWeights::default(),
             node_status: BTreeMap::new(),
         };
     };
     let files = collect_jsts_files(analyzer, language);
     let declarations = scoped_declarations_by_file_and_name(analyzer, language);
     let node_status = scoped_node_status(index, nodes, &declarations);
-    let edges = build_edges(&files, keep_file, |file| {
+    let edges = build_edge_weights(&files, keep_file, |file| {
         // Parse on demand and drop the tree when this closure returns; cross-file
         // resolution comes from the analyzer-cached `index`, not retained trees.
         let parsed = parse_tree_sitter_file(file, &parser_language)?;
