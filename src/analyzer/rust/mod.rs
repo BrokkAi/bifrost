@@ -2,6 +2,7 @@ mod adapter;
 mod cache;
 mod declarations;
 mod graph_support;
+mod hierarchy;
 mod imports;
 pub(crate) mod lexical_scope;
 mod tests;
@@ -11,7 +12,7 @@ use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::{
     AnalyzerConfig, CodeUnit, IAnalyzer, ImportAnalysisProvider, Language, Project, ProjectFile,
     TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer,
-    TypeAliasProvider,
+    TypeAliasProvider, TypeHierarchyProvider,
 };
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
@@ -310,6 +311,10 @@ impl IAnalyzer for RustAnalyzer {
     }
 
     fn type_alias_provider(&self) -> Option<&dyn TypeAliasProvider> {
+        Some(self)
+    }
+
+    fn type_hierarchy_provider(&self) -> Option<&dyn TypeHierarchyProvider> {
         Some(self)
     }
 
