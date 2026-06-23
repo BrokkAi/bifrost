@@ -1,4 +1,6 @@
 use super::RustAnalyzer;
+use super::declarations::rust_node_text;
+use super::imports::{resolve_rust_module_path_with_crate, rust_crate_root_package};
 use super::lexical_scope::{parse_rust_tree, visible_import_binder_at};
 use crate::analyzer::usages::{ImportBinder, ImportKind};
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, TypeHierarchyProvider};
@@ -90,12 +92,14 @@ impl RustAnalyzer {
         F: Fn(&CodeUnit) -> bool,
     {
         let normalized = normalize_type_ref(raw)?;
+        let lexical_package = lexical_package_name(file, impl_item, source);
         let mut candidates = Vec::new();
 
         if let Some((module_specifier, imported_name)) = normalized.rsplit_once("::") {
             candidates.extend(self.resolve_units_in_module(
                 file,
                 binder,
+                &lexical_package,
                 module_specifier,
                 imported_name,
             ));
@@ -113,10 +117,24 @@ impl RustAnalyzer {
         &self,
         file: &ProjectFile,
         binder: &ImportBinder,
+        lexical_package: &str,
         module_specifier: &str,
         name: &str,
     ) -> Vec<CodeUnit> {
-        let resolved_module = self.resolve_scoped_module_specifier(binder, module_specifier);
+        let Some(resolved_package) =
+            self.resolve_scoped_module_package(file, binder, lexical_package, module_specifier)
+        else {
+            return Vec::new();
+        };
+        let fq_name = join_rust_fqn(&resolved_package, name);
+        let mut candidates: Vec<_> = self.definitions(&fq_name).cloned().collect();
+        if !candidates.is_empty() {
+            candidates.sort();
+            candidates.dedup();
+            return candidates;
+        }
+
+        let resolved_module = resolved_package.replace('.', "::");
         let mut candidates = Vec::new();
         let module_files = self.resolve_module_files(file, &resolved_module);
         candidates.extend(
@@ -134,39 +152,35 @@ impl RustAnalyzer {
             }));
         }
 
-        if let Some(package) = self.resolve_module_package(file, &resolved_module) {
-            let fq_name = if package.is_empty() {
-                name.to_string()
-            } else {
-                format!("{package}.{name}")
-            };
-            candidates.extend(self.definitions(&fq_name).cloned());
-        }
-
         candidates.sort();
         candidates.dedup();
         candidates
     }
 
-    fn resolve_scoped_module_specifier(
+    fn resolve_scoped_module_package(
         &self,
+        file: &ProjectFile,
         binder: &ImportBinder,
+        lexical_package: &str,
         module_specifier: &str,
-    ) -> String {
-        let Some((head, tail)) = module_specifier.split_once("::") else {
-            return binder
+    ) -> Option<String> {
+        let expanded = if let Some((head, tail)) = module_specifier.split_once("::") {
+            binder
+                .bindings
+                .get(head)
+                .filter(|binding| matches!(binding.kind, ImportKind::Namespace))
+                .map(|binding| format!("{}::{tail}", binding.module_specifier))
+                .unwrap_or_else(|| module_specifier.to_string())
+        } else {
+            binder
                 .bindings
                 .get(module_specifier)
                 .filter(|binding| matches!(binding.kind, ImportKind::Namespace))
                 .map(|binding| binding.module_specifier.clone())
-                .unwrap_or_else(|| module_specifier.to_string());
+                .unwrap_or_else(|| module_specifier.to_string())
         };
-        binder
-            .bindings
-            .get(head)
-            .filter(|binding| matches!(binding.kind, ImportKind::Namespace))
-            .map(|binding| format!("{}::{tail}", binding.module_specifier))
-            .unwrap_or_else(|| module_specifier.to_string())
+        let crate_package = rust_crate_root_package(file);
+        resolve_rust_module_path_with_crate(lexical_package, &crate_package, &expanded)
     }
 
     fn same_module_declarations(
@@ -233,13 +247,16 @@ impl RustHierarchyIndex {
                 ) else {
                     continue;
                 };
-                let Some(implementer) = analyzer.resolve_rust_hierarchy_type_ref(
-                    &file,
-                    &source,
-                    impl_item,
-                    &binder,
-                    implementer_ref,
-                ) else {
+                let Some(implementer) = analyzer
+                    .resolve_rust_hierarchy_type_ref(
+                        &file,
+                        &source,
+                        impl_item,
+                        &binder,
+                        implementer_ref,
+                    )
+                    .and_then(|unit| analyzer.canonical_rust_hierarchy_type(unit))
+                else {
                     continue;
                 };
 
@@ -258,6 +275,31 @@ impl RustHierarchyIndex {
             direct_ancestors,
             direct_descendants,
         }
+    }
+}
+
+impl RustAnalyzer {
+    fn canonical_rust_hierarchy_type(&self, unit: CodeUnit) -> Option<CodeUnit> {
+        if !self.is_rust_type_alias_declaration(&unit) {
+            return Some(unit);
+        }
+        let source = self.project().read_source(unit.source()).ok()?;
+        let tree = parse_rust_tree(&source)?;
+        let alias_node = type_alias_node(tree.root_node(), &source, &unit)?;
+        let target = type_alias_target_ref(alias_node, &source)
+            .or_else(|| unit.signature().and_then(alias_target_text))?;
+        let binder = visible_import_binder_at(&source, alias_node.start_byte());
+        self.resolve_rust_hierarchy_ref(
+            unit.source(),
+            &source,
+            alias_node,
+            &binder,
+            target,
+            |candidate| {
+                self.is_rust_struct_declaration(candidate)
+                    || self.is_rust_enum_declaration(candidate)
+            },
+        )
     }
 }
 
@@ -281,7 +323,10 @@ fn trait_impl_parts<'source>(
 ) -> Option<(&'source str, &'source str)> {
     let trait_node = node.child_by_field_name("trait")?;
     let type_node = node.child_by_field_name("type")?;
-    Some((node_text(trait_node, source), node_text(type_node, source)))
+    Some((
+        rust_node_text(trait_node, source).trim(),
+        rust_node_text(type_node, source).trim(),
+    ))
 }
 
 fn normalize_type_ref(raw: &str) -> Option<&str> {
@@ -295,18 +340,31 @@ fn normalize_type_ref(raw: &str) -> Option<&str> {
     if value.is_empty() { None } else { Some(value) }
 }
 
-fn module_scoped_short_name(impl_item: Node<'_>, source: &str, name: &str) -> String {
-    let mut modules = Vec::new();
-    let mut current = impl_item.parent();
-    while let Some(parent) = current {
-        if parent.kind() == "mod_item"
-            && let Some(name_node) = parent.child_by_field_name("name")
-        {
-            modules.push(node_text(name_node, source).to_string());
-        }
-        current = parent.parent();
+fn alias_target_text(signature: &str) -> Option<&str> {
+    let rhs = signature
+        .split_once('=')?
+        .1
+        .trim()
+        .trim_end_matches(';')
+        .trim();
+    normalize_type_ref(rhs)
+}
+
+fn lexical_package_name(file: &ProjectFile, impl_item: Node<'_>, source: &str) -> String {
+    let file_package = super::declarations::rust_package_name(file);
+    let mut modules = inline_module_path(impl_item, source);
+    if file_package.is_empty() {
+        modules.join(".")
+    } else if modules.is_empty() {
+        file_package
+    } else {
+        modules.insert(0, file_package);
+        modules.join(".")
     }
-    modules.reverse();
+}
+
+fn module_scoped_short_name(impl_item: Node<'_>, source: &str, name: &str) -> String {
+    let modules = inline_module_path(impl_item, source);
     if modules.is_empty() {
         name.to_string()
     } else {
@@ -314,9 +372,55 @@ fn module_scoped_short_name(impl_item: Node<'_>, source: &str, name: &str) -> St
     }
 }
 
-fn node_text<'source>(node: Node<'_>, source: &'source str) -> &'source str {
-    source
-        .get(node.start_byte()..node.end_byte())
-        .unwrap_or("")
-        .trim()
+fn inline_module_path(impl_item: Node<'_>, source: &str) -> Vec<String> {
+    let mut modules = Vec::new();
+    let mut current = impl_item.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "mod_item"
+            && let Some(name_node) = parent.child_by_field_name("name")
+        {
+            modules.push(rust_node_text(name_node, source).trim().to_string());
+        }
+        current = parent.parent();
+    }
+    modules.reverse();
+    modules
+}
+
+fn join_rust_fqn(package: &str, name: &str) -> String {
+    if package.is_empty() {
+        name.to_string()
+    } else {
+        format!("{package}.{name}")
+    }
+}
+
+fn type_alias_node<'tree>(
+    root: Node<'tree>,
+    source: &str,
+    alias: &CodeUnit,
+) -> Option<Node<'tree>> {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "type_item"
+            && let Some(name_node) = node.child_by_field_name("name")
+        {
+            let name = rust_node_text(name_node, source).trim();
+            if module_scoped_short_name(node, source, name) == alias.short_name() {
+                return Some(node);
+            }
+        }
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.named_children(&mut cursor).collect();
+        stack.extend(children.into_iter().rev());
+    }
+    None
+}
+
+fn type_alias_target_ref<'source>(
+    alias_node: Node<'_>,
+    source: &'source str,
+) -> Option<&'source str> {
+    let target_node = alias_node.child_by_field_name("type")?;
+    normalize_type_ref(rust_node_text(target_node, source).trim())
 }

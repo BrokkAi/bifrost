@@ -119,6 +119,92 @@ impl crate::contracts::Runnable for Worker {}
 }
 
 #[test]
+fn rust_type_hierarchy_resolves_super_trait_reference_from_inline_module() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[(
+        "src/outer.rs",
+        r#"
+pub trait Runnable {}
+pub mod inner {
+    pub struct Worker;
+    impl super::Runnable for Worker {}
+}
+"#,
+    )]);
+
+    let runnable = definition(&analyzer, "outer.Runnable");
+    let worker = definition(&analyzer, "outer.inner.Worker");
+
+    assert_eq!(
+        fq_names(analyzer.get_direct_ancestors(&worker)),
+        BTreeSet::from(["outer.Runnable".to_string()])
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_descendants(&runnable)),
+        BTreeSet::from(["outer.inner.Worker".to_string()])
+    );
+}
+
+#[test]
+fn rust_type_hierarchy_resolves_self_trait_reference_from_inline_module() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[(
+        "src/lib.rs",
+        r#"
+trait Runnable {}
+mod worker {
+    pub trait Runnable {}
+    pub struct Worker;
+    impl self::Runnable for Worker {}
+}
+"#,
+    )]);
+
+    let root_runnable = definition(&analyzer, "Runnable");
+    let worker_runnable = definition(&analyzer, "worker.Runnable");
+    let worker = definition(&analyzer, "worker.Worker");
+
+    assert!(analyzer.get_direct_descendants(&root_runnable).is_empty());
+    assert_eq!(
+        fq_names(analyzer.get_direct_ancestors(&worker)),
+        BTreeSet::from(["worker.Runnable".to_string()])
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_descendants(&worker_runnable)),
+        BTreeSet::from(["worker.Worker".to_string()])
+    );
+}
+
+#[test]
+fn rust_type_hierarchy_resolves_scoped_inline_module_trait_without_short_name_ambiguity() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[(
+        "src/lib.rs",
+        r#"
+pub mod one {
+    pub trait Runnable {}
+}
+pub mod two {
+    pub trait Runnable {}
+}
+pub struct Worker;
+impl crate::one::Runnable for Worker {}
+"#,
+    )]);
+
+    let one_runnable = definition(&analyzer, "one.Runnable");
+    let two_runnable = definition(&analyzer, "two.Runnable");
+    let worker = definition(&analyzer, "Worker");
+
+    assert_eq!(
+        fq_names(analyzer.get_direct_ancestors(&worker)),
+        BTreeSet::from(["one.Runnable".to_string()])
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_descendants(&one_runnable)),
+        BTreeSet::from(["Worker".to_string()])
+    );
+    assert!(analyzer.get_direct_descendants(&two_runnable).is_empty());
+}
+
+#[test]
 fn rust_type_hierarchy_resolves_impls_in_other_files() {
     let (_project, analyzer) = rust_analyzer_with_files(&[
         ("src/contracts.rs", "pub trait Runnable {}"),
@@ -251,13 +337,48 @@ impl Runnable for WorkerAlias {}
     let runnable = definition(&analyzer, "Runnable");
     assert_eq!(
         fq_names(analyzer.get_direct_descendants(&runnable)),
-        BTreeSet::from(["Job".to_string(), "WorkerAlias".to_string()])
+        BTreeSet::from(["Job".to_string(), "Worker".to_string()])
     );
 
     let alias = definition(&analyzer, "WorkerAlias");
+    let worker = definition(&analyzer, "Worker");
+    assert!(analyzer.get_direct_ancestors(&alias).is_empty());
     assert_eq!(
-        fq_names(analyzer.get_direct_ancestors(&alias)),
+        fq_names(analyzer.get_direct_ancestors(&worker)),
         BTreeSet::from(["Runnable".to_string()])
+    );
+}
+
+#[test]
+fn rust_type_hierarchy_resolves_type_alias_target_from_alias_module() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        ("src/contracts.rs", "pub trait Runnable {}"),
+        (
+            "src/types.rs",
+            "pub struct Worker;\npub type WorkerAlias = Worker;",
+        ),
+        (
+            "src/impls.rs",
+            r#"
+use crate::contracts::Runnable;
+use crate::types::WorkerAlias;
+impl Runnable for WorkerAlias {}
+"#,
+        ),
+    ]);
+
+    let runnable = definition(&analyzer, "contracts.Runnable");
+    let worker = definition(&analyzer, "types.Worker");
+    let alias = definition(&analyzer, "types.WorkerAlias");
+
+    assert!(analyzer.get_direct_ancestors(&alias).is_empty());
+    assert_eq!(
+        fq_names(analyzer.get_direct_ancestors(&worker)),
+        BTreeSet::from(["contracts.Runnable".to_string()])
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_descendants(&runnable)),
+        BTreeSet::from(["types.Worker".to_string()])
     );
 }
 
