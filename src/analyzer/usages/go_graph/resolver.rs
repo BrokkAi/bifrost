@@ -311,6 +311,7 @@ fn build_importer_reverse_go(
 /// [`JsTsUsageIndex`]: crate::analyzer::usages::js_ts_graph::JsTsUsageIndex
 pub(crate) struct GoEdgeIndex {
     package_names: HashMap<ProjectFile, String>,
+    constructor_return_types: HashMap<String, Vec<String>>,
     dir_index: ParentDirIndex,
     module_path: Option<String>,
 }
@@ -343,6 +344,10 @@ impl GoEdgeIndex {
             |target| self.package_names.get(target).cloned(),
         )
     }
+
+    pub(super) fn constructor_return_types(&self, callee: &str) -> Option<&Vec<String>> {
+        self.constructor_return_types.get(callee)
+    }
 }
 
 /// Build the tree-free [`GoEdgeIndex`] over `files`: read each Go file's package
@@ -357,26 +362,78 @@ pub(crate) fn build_go_edge_index(files: &[ProjectFile]) -> Option<GoEdgeIndex> 
         .collect();
     let module_path = read_go_module_path(go_files.first()?.root());
 
-    let package_names: HashMap<ProjectFile, String> = go_files
+    let summaries: Vec<_> = go_files
         .par_iter()
-        .filter_map(|file| Some((file.clone(), package_clause_of_file(file)?)))
+        .filter_map(|file| Some((file.clone(), summarize_go_file(file)?)))
         .collect();
+    let package_names: HashMap<ProjectFile, String> = summaries
+        .iter()
+        .map(|(file, summary)| (file.clone(), summary.package_name.clone()))
+        .collect();
+    let mut constructor_return_types: HashMap<String, Vec<String>> = HashMap::default();
+    for (file, summary) in &summaries {
+        let package_fqn = canonical_go_package_name(file, &summary.package_name);
+        for (function, owner) in &summary.constructor_returns {
+            constructor_return_types
+                .entry(format!("{package_fqn}.{function}"))
+                .or_default()
+                .push(format!("{package_fqn}.{owner}"));
+        }
+    }
+    for return_types in constructor_return_types.values_mut() {
+        return_types.sort();
+        return_types.dedup();
+    }
 
     let dir_index = build_parent_dir_index(package_names.keys());
 
     Some(GoEdgeIndex {
         package_names,
+        constructor_return_types,
         dir_index,
         module_path,
     })
 }
 
-/// Parse `file` solely to read its `package` clause, dropping the tree before
-/// returning. `None` when the file is unreadable, empty, or unparseable — the
-/// same skip-on-failure contract as the shared `parse_tree_sitter_file` it reuses.
-fn package_clause_of_file(file: &ProjectFile) -> Option<String> {
+struct GoFileSummary {
+    package_name: String,
+    constructor_returns: Vec<(String, String)>,
+}
+
+/// Parse `file` solely to read tree-free edge metadata, dropping the tree before
+/// returning. `None` when the file is unreadable, empty, or unparseable — the same
+/// skip-on-failure contract as the shared `parse_tree_sitter_file` it reuses.
+fn summarize_go_file(file: &ProjectFile) -> Option<GoFileSummary> {
     let parsed = parse_tree_sitter_file(file, &tree_sitter_go::LANGUAGE.into())?;
-    Some(package_name(parsed.tree.root_node(), &parsed.source))
+    let root = parsed.tree.root_node();
+    Some(GoFileSummary {
+        package_name: package_name(root, &parsed.source),
+        constructor_returns: collect_constructor_returns(root, &parsed.source),
+    })
+}
+
+fn collect_constructor_returns(root: Node<'_>, source: &str) -> Vec<(String, String)> {
+    let mut returns = Vec::new();
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        if child.kind() != "function_declaration" {
+            continue;
+        }
+        let (Some(name_node), Some(result)) = (
+            child.child_by_field_name("name"),
+            child.child_by_field_name("result"),
+        ) else {
+            continue;
+        };
+        let Some(owner) = first_result_type_ref(result, source)
+            .filter(|ty| ty.qualifier.is_none())
+            .and_then(|ty| ty.name)
+        else {
+            continue;
+        };
+        returns.push((node_text(name_node, source).to_string(), owner));
+    }
+    returns
 }
 
 /// Resolve `file`'s imports to the workspace package names they bind, given a
@@ -819,16 +876,20 @@ fn collect_owner_constructor_names(
 /// `(Owner, error)` tuple idiom by inspecting the first component.
 fn result_names_owner_type(result: Node<'_>, source: &str, owner: &str) -> bool {
     let names_owner = |ty: &TypeRef| ty.qualifier.is_none() && ty.name.as_deref() == Some(owner);
+    first_result_type_ref(result, source).is_some_and(|ty| names_owner(&ty))
+}
+
+fn first_result_type_ref(result: Node<'_>, source: &str) -> Option<TypeRef> {
     if let Some(ty) = type_ref_from_node(result, source) {
-        return names_owner(&ty);
+        return Some(ty);
     }
     if result.kind() == "parameter_list"
         && let Some(first) = first_named_child(result)
     {
         let type_node = first.child_by_field_name("type").unwrap_or(first);
-        return type_ref_from_node(type_node, source).is_some_and(|ty| names_owner(&ty));
+        return type_ref_from_node(type_node, source);
     }
-    false
+    None
 }
 
 fn owner_name(target: &CodeUnit) -> Option<String> {

@@ -14,6 +14,19 @@ func describeAlpha(a *Alpha) string {
 	return a.Channel()
 }
 
+func runService() string {
+	service := NewService()
+	return service.Execute()
+}
+
+func shadowedGroupedService() string {
+	var (
+		NewService = func() Other { return Other{} }
+		service    = NewService()
+	)
+	return service.Execute()
+}
+
 // total calls helper twice on two distinct lines: the edge weight aggregates to 2.
 func total() int {
 	first := helper()

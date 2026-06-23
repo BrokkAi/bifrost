@@ -812,6 +812,161 @@ func Run(NewService func() string) {
 }
 
 #[test]
+fn go_graph_strategy_keeps_blank_lhs_constructor_seeds_positional() {
+    let (_project, analyzer) = go_analyzer_with_files(&[
+        (
+            "example/service.go",
+            r#"
+package example
+
+type Service struct{}
+
+func (s Service) Execute() string { return "service" }
+
+func NewService() Service { return Service{} }
+"#,
+        ),
+        (
+            "example/other.go",
+            r#"
+package example
+
+type Other struct{}
+
+func (o Other) Execute() string { return "other" }
+
+func NewOther() Other { return Other{} }
+"#,
+        ),
+        (
+            "example/consumer.go",
+            r#"
+package example
+
+func Run() string {
+    _, other := NewService(), NewOther()
+    return other.Execute()
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "example.com/app/example.Service.Execute");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = GoUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should resolve");
+
+    assert!(
+        hits.is_empty(),
+        "blank LHS must not shift NewService's receiver proof onto other: {hits:?}",
+    );
+}
+
+#[test]
+fn go_graph_strategy_resolves_constructor_before_short_var_lhs_scope() {
+    let (project, analyzer) = go_analyzer_with_files(&[
+        (
+            "example/service.go",
+            r#"
+package example
+
+type Service struct{}
+
+func (s Service) Execute() string { return "service" }
+
+func NewService() Service { return Service{} }
+"#,
+        ),
+        (
+            "example/consumer.go",
+            r#"
+package example
+
+func Run() string {
+    NewService, service := 0, NewService()
+    _ = NewService
+    return service.Execute()
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "example.com/app/example.Service.Execute");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = GoUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should resolve");
+
+    assert_eq!(
+        1,
+        hits.len(),
+        "short-var LHS names should not shadow RHS constructor calls: {hits:?}",
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file == project.file("example/consumer.go")),
+        "hit should be the consumer call site: {hits:?}",
+    );
+}
+
+#[test]
+fn go_graph_strategy_respects_grouped_var_spec_constructor_shadowing() {
+    let (_project, analyzer) = go_analyzer_with_files(&[
+        (
+            "example/service.go",
+            r#"
+package example
+
+type Service struct{}
+
+func (s Service) Execute() string { return "service" }
+
+func NewService() Service { return Service{} }
+"#,
+        ),
+        (
+            "example/other.go",
+            r#"
+package example
+
+type Other struct{}
+
+func (o Other) Execute() string { return "other" }
+"#,
+        ),
+        (
+            "example/consumer.go",
+            r#"
+package example
+
+func Run() string {
+    var (
+        NewService = func() Other { return Other{} }
+        service = NewService()
+    )
+    return service.Execute()
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "example.com/app/example.Service.Execute");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = GoUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should resolve");
+
+    assert!(
+        hits.is_empty(),
+        "later grouped var specs must see earlier constructor-shadowing specs: {hits:?}",
+    );
+}
+
+#[test]
 fn go_graph_strategy_keeps_mixed_multi_assignment_receiver_proofs_positional() {
     let (_project, analyzer) = go_analyzer_with_files(&[
         (

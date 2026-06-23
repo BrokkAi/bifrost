@@ -90,7 +90,6 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>, locals: &mut LocalInferenceE
             seed_parameter_declaration(node, ctx, locals);
         }
         "var_declaration" | "short_var_declaration" => {
-            declare_local_names(node, ctx, locals);
             seed_local_bindings(node, ctx, locals);
         }
         "assignment_statement" => {
@@ -165,16 +164,6 @@ pub(super) fn parameter_names(node: Node<'_>, source: &str) -> Vec<String> {
     out
 }
 
-fn declare_local_names(
-    node: Node<'_>,
-    ctx: &ScanCtx<'_>,
-    locals: &mut LocalInferenceEngine<String>,
-) {
-    for name in declared_names(node, ctx.source) {
-        locals.declare_shadow(name);
-    }
-}
-
 fn seed_local_bindings(
     node: Node<'_>,
     ctx: &ScanCtx<'_>,
@@ -185,7 +174,8 @@ fn seed_local_bindings(
             for_each_var_spec(node, &mut |var_spec| seed_var_spec(var_spec, ctx, locals));
         }
         "var_spec" => seed_var_spec(node, ctx, locals),
-        "short_var_declaration" | "assignment_statement" => seed_assignment_like(node, ctx, locals),
+        "short_var_declaration" => seed_assignment_like(node, ctx, locals, true),
+        "assignment_statement" => seed_assignment_like(node, ctx, locals, false),
         _ => {}
     }
 }
@@ -222,39 +212,78 @@ fn seed_var_spec(node: Node<'_>, ctx: &ScanCtx<'_>, locals: &mut LocalInferenceE
         return;
     }
 
-    seed_names_from_values(names, rhs_expressions(node), ctx, locals);
+    let bindings = infer_names_from_values(
+        var_spec_name_slots(node, ctx.source),
+        rhs_expressions(node),
+        ctx,
+        locals,
+    );
+    for name in names {
+        locals.declare_shadow(name);
+    }
+    apply_inferred_bindings(bindings, locals);
 }
 
 fn seed_assignment_like(
     node: Node<'_>,
     ctx: &ScanCtx<'_>,
     locals: &mut LocalInferenceEngine<String>,
+    declare_lhs: bool,
 ) {
-    seed_names_from_values(
-        lhs_identifiers(node, ctx.source),
-        rhs_expressions(node),
-        ctx,
-        locals,
-    );
+    let slots = lhs_identifier_slots(node, ctx.source);
+    let bindings = infer_names_from_values(slots.clone(), rhs_expressions(node), ctx, locals);
+    if declare_lhs {
+        for name in slots.into_iter().flatten() {
+            locals.declare_shadow(name);
+        }
+    }
+    apply_inferred_bindings(bindings, locals);
 }
 
-fn seed_names_from_values(
-    names: Vec<String>,
+enum InferredBinding {
+    Owner,
+    Alias(String),
+}
+
+fn infer_names_from_values(
+    names: Vec<Option<String>>,
     values: Vec<Node<'_>>,
     ctx: &ScanCtx<'_>,
-    locals: &mut LocalInferenceEngine<String>,
-) {
+    locals: &LocalInferenceEngine<String>,
+) -> Vec<(String, InferredBinding)> {
     if names.is_empty() || values.is_empty() {
-        return;
+        return Vec::new();
     }
 
-    for (name, value) in names.iter().zip(values.iter()) {
-        if expression_matches_owner_type(*value, ctx)
-            || call_returns_owner_type(*value, ctx, locals)
-        {
-            locals.seed_symbol(name.clone(), OWNER_TOKEN.to_string());
-        } else if is_identifier_node(*value) {
-            locals.alias_symbol(name.clone(), node_text(*value, ctx.source));
+    names
+        .iter()
+        .zip(values.iter())
+        .filter_map(|(name, value)| {
+            let name = name.as_ref()?;
+            if expression_matches_owner_type(*value, ctx)
+                || call_returns_owner_type(*value, ctx, locals)
+            {
+                Some((name.clone(), InferredBinding::Owner))
+            } else if is_identifier_node(*value) {
+                Some((
+                    name.clone(),
+                    InferredBinding::Alias(node_text(*value, ctx.source).to_string()),
+                ))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn apply_inferred_bindings(
+    bindings: Vec<(String, InferredBinding)>,
+    locals: &mut LocalInferenceEngine<String>,
+) {
+    for (name, binding) in bindings {
+        match binding {
+            InferredBinding::Owner => locals.seed_symbol(name, OWNER_TOKEN.to_string()),
+            InferredBinding::Alias(source) => locals.alias_symbol(name, &source),
         }
     }
 }
@@ -308,6 +337,16 @@ pub(super) fn var_spec_names(node: Node<'_>, source: &str) -> Vec<String> {
     out
 }
 
+fn var_spec_name_slots(node: Node<'_>, source: &str) -> Vec<Option<String>> {
+    let mut out = Vec::new();
+    let mut cursor = node.walk();
+    for name_node in node.children_by_field_name("name", &mut cursor) {
+        let name = node_text(name_node, source);
+        out.push((name != "_").then(|| name.to_string()));
+    }
+    out
+}
+
 pub(super) fn for_each_var_spec(node: Node<'_>, f: &mut impl FnMut(Node<'_>)) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
@@ -332,6 +371,16 @@ pub(super) fn lhs_identifiers(node: Node<'_>, source: &str) -> Vec<String> {
         .collect()
 }
 
+pub(super) fn lhs_identifier_slots(node: Node<'_>, source: &str) -> Vec<Option<String>> {
+    let Some(left) = node
+        .child_by_field_name("left")
+        .or_else(|| first_named_child(node))
+    else {
+        return Vec::new();
+    };
+    identifier_slots_in_node(left, source)
+}
+
 pub(super) fn rhs_expressions(node: Node<'_>) -> Vec<Node<'_>> {
     let Some(right) = node
         .child_by_field_name("right")
@@ -347,6 +396,22 @@ pub(super) fn rhs_expressions(node: Node<'_>) -> Vec<Node<'_>> {
         }
     }
     vec![right]
+}
+
+fn identifier_slots_in_node(node: Node<'_>, source: &str) -> Vec<Option<String>> {
+    if is_identifier_node(node) {
+        let text = node_text(node, source);
+        return vec![(text != "_").then(|| text.to_string())];
+    }
+    let mut out = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if is_identifier_node(child) {
+            let text = node_text(child, source);
+            out.push((text != "_").then(|| text.to_string()));
+        }
+    }
+    out
 }
 
 pub(super) fn identifiers_in_node(node: Node<'_>, source: &str) -> Vec<String> {
