@@ -8,8 +8,7 @@ use crate::analyzer::symbol_lookup::{
 };
 use crate::analyzer::usages::{
     CONFIDENCE_THRESHOLD, CandidateFileProvider, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES,
-    ExplicitCandidateProvider, FuzzyResult, RegexUsageAnalyzer, UsageAnalyzer, UsageFinder,
-    UsageHit,
+    ExplicitCandidateProvider, FuzzyResult, UsageFinder, UsageHit,
 };
 use crate::analyzer::{CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, Range};
 use crate::hash::{HashMap, HashSet};
@@ -420,8 +419,6 @@ pub struct ScanUsagesResult {
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub not_found: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub fallbacks: Vec<UsageFallbackInfo>,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub failures: Vec<UsageFailureInfo>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub ambiguous: Vec<AmbiguousUsageSymbol>,
@@ -590,22 +587,6 @@ pub struct UsageFailureInfo {
     /// True when the candidate file set exceeded the analyzer's per-query cap
     /// and an arbitrary subset was scanned before the failure was produced.
     pub candidate_files_truncated: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct UsageFallbackInfo {
-    /// Symbol requested by the caller.
-    pub symbol: String,
-    /// Fully qualified symbol reported by the graph strategy.
-    pub fq_name: String,
-    /// Graph strategy that requested fallback.
-    pub strategy: String,
-    /// Stable machine-readable fallback category.
-    pub reason_kind: String,
-    /// Human-readable fallback reason.
-    pub reason: String,
-    /// Fallback policy used by `UsageFinder`.
-    pub fallback_policy: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2235,7 +2216,6 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
     let test_files = excluded_test_files(analyzer, params.include_tests);
 
     let mut not_found = Vec::new();
-    let mut fallbacks = Vec::new();
     let mut failures = Vec::new();
     let mut ambiguous = Vec::new();
     let mut too_many_callsites = Vec::new();
@@ -2329,16 +2309,6 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
             SCAN_USAGES_MAX_CALLSITES,
         );
         let truncated = query.candidate_files_truncated;
-        if let Some(diagnostic) = query.graph_fallback.as_ref() {
-            fallbacks.push(UsageFallbackInfo {
-                symbol: symbol.clone(),
-                fq_name: diagnostic.fq_name.clone(),
-                strategy: diagnostic.strategy.clone(),
-                reason_kind: diagnostic.reason_kind.clone(),
-                reason: diagnostic.reason.clone(),
-                fallback_policy: "regex".to_string(),
-            });
-        }
 
         match query.result {
             FuzzyResult::Success { hits_by_overload } => {
@@ -2346,84 +2316,14 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
                     .into_values()
                     .flat_map(BTreeSet::into_iter)
                     .collect();
-                let mut base_note = None;
-                let hits = if location_selected && query.graph_fallback.is_some() {
-                    retain_hits_resolving_to_overloads(analyzer, &overloads, hits)
-                } else {
-                    hits
-                };
-                let mut filtered = filter_and_dedupe_hits(analyzer, &overloads, hits);
-                if filtered.hits.is_empty() && query.graph_fallback.is_none() {
-                    match RegexUsageAnalyzer::new().find_usages(
-                        analyzer,
-                        &overloads,
-                        &query.candidate_files,
-                        SCAN_USAGES_MAX_CALLSITES,
-                    ) {
-                        FuzzyResult::Success { hits_by_overload }
-                        | FuzzyResult::Ambiguous {
-                            hits_by_overload, ..
-                        } => {
-                            let fallback_hits: Vec<UsageHit> = hits_by_overload
-                                .into_values()
-                                .flat_map(BTreeSet::into_iter)
-                                .collect();
-                            let fallback_hits = if location_selected {
-                                retain_hits_resolving_to_overloads(
-                                    analyzer,
-                                    &overloads,
-                                    fallback_hits,
-                                )
-                            } else {
-                                fallback_hits
-                            };
-                            filtered = filter_and_dedupe_hits(analyzer, &overloads, fallback_hits);
-                            if !filtered.hits.is_empty() {
-                                fallbacks.push(UsageFallbackInfo {
-                                    symbol: symbol.clone(),
-                                    fq_name: overloads[0].fq_name(),
-                                    strategy: "RegexUsageAnalyzer".to_string(),
-                                    reason_kind: "zero_structured_hits".to_string(),
-                                    reason: "Structured usage analysis found no callers; regex fallback supplied text matches."
-                                        .to_string(),
-                                    fallback_policy: "regex".to_string(),
-                                });
-                            } else {
-                                base_note = Some(
-                                    "No callers found by graph or text scan. Callers in excluded scopes (tests, underscore-prefixed dirs, generated code) may not be visible to this tool."
-                                        .to_string(),
-                                );
-                            }
-                        }
-                        FuzzyResult::TooManyCallsites {
-                            short_name,
-                            total_callsites,
-                            limit,
-                        } => {
-                            too_many_callsites.push(TooManyCallsitesInfo {
-                                symbol,
-                                short_name,
-                                total_callsites,
-                                limit,
-                                note: Some(too_many_callsites_note(limit)),
-                            });
-                            continue;
-                        }
-                        FuzzyResult::Failure { .. } => {
-                            base_note = Some(
-                                "No callers found by graph or text scan. Callers in excluded scopes (tests, underscore-prefixed dirs, generated code) may not be visible to this tool."
-                                    .to_string(),
-                            );
-                        }
-                    }
-                }
+                let filtered = filter_and_dedupe_hits(analyzer, &overloads, hits);
 
                 render_states.push(SymbolUsageRenderState::new(
                     symbol,
                     truncated,
                     filtered.definition_sites_excluded,
                     filtered.hits,
-                    base_note,
+                    None,
                 ));
             }
             FuzzyResult::Ambiguous {
@@ -2532,7 +2432,6 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
     let usages = render_scan_usages_with_budget(
         render_states,
         &not_found,
-        &fallbacks,
         &failures,
         &ambiguous,
         &too_many_callsites,
@@ -2540,7 +2439,6 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
     let summary = build_scan_usages_summary(
         &usages,
         &not_found,
-        &fallbacks,
         &failures,
         &ambiguous,
         &too_many_callsites,
@@ -2550,7 +2448,6 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
         summary,
         usages,
         not_found,
-        fallbacks,
         failures,
         ambiguous,
         too_many_callsites,
@@ -2646,8 +2543,8 @@ pub struct UsageGraphResult {
 /// can run PageRank (or another ranking) to build a code map without issuing one
 /// `scan_usages` call per symbol.
 ///
-/// Edges reuse the same resolution path as `scan_usages` (the language usage
-/// graph with a regex fallback) and the same definition-site exclusion, so a
+/// Edges reuse the same graph-backed resolution path as `scan_usages` and the
+/// same definition-site exclusion, so a
 /// definition's own declaration never counts as a reference to itself. Self
 /// references (a recursive call whose enclosing definition *is* the callee) are
 /// dropped because they do not affect centrality ranking. Every edge endpoint
@@ -3127,7 +3024,6 @@ fn ranges_overlap(range: &Range, hit: &UsageHit) -> bool {
 fn render_scan_usages_with_budget(
     states: Vec<SymbolUsageRenderState>,
     not_found: &[String],
-    fallbacks: &[UsageFallbackInfo],
     failures: &[UsageFailureInfo],
     ambiguous: &[AmbiguousUsageSymbol],
     too_many_callsites: &[TooManyCallsitesInfo],
@@ -3138,7 +3034,6 @@ fn render_scan_usages_with_budget(
         let summary = build_scan_usages_summary(
             &rendered,
             not_found,
-            fallbacks,
             failures,
             ambiguous,
             too_many_callsites,
@@ -3147,7 +3042,6 @@ fn render_scan_usages_with_budget(
             summary,
             usages: rendered.clone(),
             not_found: not_found.to_vec(),
-            fallbacks: fallbacks.to_vec(),
             failures: failures.to_vec(),
             ambiguous: ambiguous.to_vec(),
             too_many_callsites: too_many_callsites.to_vec(),
@@ -3168,7 +3062,6 @@ fn render_scan_usages_with_budget(
 fn build_scan_usages_summary(
     usages: &[SymbolUsages],
     not_found: &[String],
-    fallbacks: &[UsageFallbackInfo],
     failures: &[UsageFailureInfo],
     ambiguous: &[AmbiguousUsageSymbol],
     too_many_callsites: &[TooManyCallsitesInfo],
@@ -3231,16 +3124,6 @@ fn build_scan_usages_summary(
         warnings.push(format!(
             "too_many_callsites: {}",
             too_many_callsites
-                .iter()
-                .map(|item| item.symbol.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
-    if !fallbacks.is_empty() {
-        warnings.push(format!(
-            "fallbacks_used: {}",
-            fallbacks
                 .iter()
                 .map(|item| item.symbol.as_str())
                 .collect::<Vec<_>>()

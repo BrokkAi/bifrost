@@ -874,8 +874,15 @@ class Target {
         matches!(direct, FuzzyResult::Failure { .. }),
         "unsupported synthetic constructor shape should fail graph seeding, got {direct:?}"
     );
-    let fallback_hits = hits(UsageFinder::new().find_usages_default(&analyzer, &[fallback_target]));
-    assert_hit_contains(&fallback_hits, "Ghost()");
+    let fallback_query = UsageFinder::new().query(&analyzer, &[fallback_target], 1000, 1000);
+    assert!(
+        fallback_query.graph_failure.is_some(),
+        "UsageFinder should surface graph failure diagnostics"
+    );
+    assert!(
+        matches!(fallback_query.result, FuzzyResult::Failure { .. }),
+        "UsageFinder should not use regex fallback for graph failure cases"
+    );
 }
 
 #[test]

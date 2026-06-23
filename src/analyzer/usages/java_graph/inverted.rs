@@ -208,6 +208,9 @@ fn receiver_type_fqn(
         "type_identifier" | "scoped_type_identifier" | "generic_type" => {
             ctx.resolve_type_fqn(object)
         }
+        "object_creation_expression" => object
+            .child_by_field_name("type")
+            .and_then(|type_node| ctx.resolve_type_fqn(type_node)),
         _ => None,
     }
 }

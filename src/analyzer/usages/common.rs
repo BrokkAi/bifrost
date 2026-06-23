@@ -2,7 +2,7 @@ use crate::analyzer::common as analyzer_common;
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::{CodeUnit, Language, ProjectFile};
 
-/// Graph-strategy hits land at the maximum confidence the regex analyzer also uses.
+/// Graph-strategy hits land at maximum confidence.
 pub(super) const GRAPH_HIT_CONFIDENCE: f64 = 1.0;
 /// Lines of context to include before/after a match in [`UsageHit::snippet`].
 pub(super) const SNIPPET_CONTEXT_LINES: usize = 1;

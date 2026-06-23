@@ -3,8 +3,7 @@
 //! Mirrors brokk's `JsTsExportUsageReferenceGraph` and `JsTsExportUsageExtractor`. Where
 //! brokk's pipeline drives the JDT/LLM disambiguator, bifrost is tree-sitter only — the
 //! graph here resolves on syntax + import binders alone, and reports an internal
-//! fallback-safe outcome when it cannot infer a seed so the caller can fall back to
-//! the regex analyzer.
+//! fallback-safe outcome when it cannot infer a seed.
 //!
 //! Pipeline overview:
 //! 1. Per-file [`ExportIndex`]: tree-sitter walk that captures local exports, named
