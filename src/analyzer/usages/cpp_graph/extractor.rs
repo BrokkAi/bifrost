@@ -1,6 +1,6 @@
 use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::usages::cpp_graph::hits::{
-    enclosing_context, is_member_field_declaration_context, push_hit,
+    enclosing_context, is_member_field_declaration_context, push_definition_hit, push_hit,
 };
 use crate::analyzer::usages::cpp_graph::resolver::*;
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
@@ -254,6 +254,10 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if node.kind() == "function_definition" {
+        maybe_record_constructor_definition_hit(node, ctx);
+        return;
+    }
     if !matches!(
         node.kind(),
         "call_expression"
@@ -309,7 +313,48 @@ fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
+fn maybe_record_constructor_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let Some(owner) = ctx.spec.owner.as_ref() else {
+        return;
+    };
+    let Some(function) = function_definition_name_node(node) else {
+        return;
+    };
+    let text = node_text(function, ctx.source);
+    if !name_matches_callable(text, &ctx.spec.member_name) {
+        return;
+    }
+    *ctx.raw_match_count += 1;
+    if !function_definition_signature_matches_target(node, ctx) {
+        return;
+    }
+    if definition_name_candidates(function, ctx)
+        .iter()
+        .any(|name| {
+            name.contains("::")
+                && ctx
+                    .visibility
+                    .resolves_to_type(ctx.file, constructor_owner_name(name), owner)
+        })
+        || qualified_owner_matches(text, ctx)
+    {
+        push_definition_hit(function, ctx);
+    } else if definition_name_candidates(function, ctx)
+        .iter()
+        .any(|name| name.contains("::"))
+        || known_non_target_owner_context(function, ctx)
+    {
+        // A constructor definition for another visible owner is a proven non-match.
+    } else {
+        *ctx.saw_unproven_match = true;
+    }
+}
+
 fn maybe_record_free_function_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if node.kind() == "function_definition" {
+        maybe_record_free_function_definition_hit(node, ctx);
+        return;
+    }
     if node.kind() != "call_expression" {
         return;
     }
@@ -346,7 +391,52 @@ fn maybe_record_free_function_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
+fn maybe_record_free_function_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let Some(function) = function_definition_name_node(node) else {
+        return;
+    };
+    let text = node_text(function, ctx.source);
+    if !name_matches_callable(text, &ctx.spec.member_name) {
+        return;
+    }
+    *ctx.raw_match_count += 1;
+    if !function_definition_signature_matches_target(node, ctx) {
+        return;
+    }
+    if definition_name_candidates(function, ctx)
+        .iter()
+        .any(|name| {
+            ctx.visibility.contains_named_symbol(
+                ctx.file,
+                name,
+                TargetKind::FreeFunction,
+                &ctx.spec.target,
+            )
+        })
+    {
+        push_definition_hit(function, ctx);
+    } else if definition_name_candidates(function, ctx)
+        .iter()
+        .any(|name| {
+            ctx.visibility.resolve_known_non_target(
+                ctx.file,
+                name,
+                TargetKind::FreeFunction,
+                &ctx.spec.target,
+            )
+        })
+    {
+        // A definition in another explicit namespace is a proven non-match.
+    } else {
+        *ctx.saw_unproven_match = true;
+    }
+}
+
 fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if node.kind() == "function_definition" {
+        maybe_record_method_definition_hit(node, ctx);
+        return;
+    }
     if node.kind() != "call_expression" {
         return;
     }
@@ -390,6 +480,50 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
+fn maybe_record_method_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let Some(function) = function_definition_name_node(node) else {
+        return;
+    };
+    let text = node_text(function, ctx.source);
+    if !name_matches_callable(text, &ctx.spec.member_name) {
+        return;
+    }
+    *ctx.raw_match_count += 1;
+    if !function_definition_signature_matches_target(node, ctx) {
+        return;
+    }
+    if definition_name_candidates(function, ctx)
+        .iter()
+        .any(|name| {
+            name.contains("::")
+                && ctx.visibility.contains_named_symbol(
+                    ctx.file,
+                    name,
+                    TargetKind::Method,
+                    &ctx.spec.target,
+                )
+        })
+        || qualified_owner_matches(text, ctx)
+    {
+        push_definition_hit(function, ctx);
+    } else if definition_name_candidates(function, ctx)
+        .iter()
+        .any(|name| {
+            ctx.visibility.resolve_known_non_target(
+                ctx.file,
+                name,
+                TargetKind::Method,
+                &ctx.spec.target,
+            )
+        })
+        || known_non_target_owner_context(function, ctx)
+    {
+        // A method definition for another visible owner is a proven non-match.
+    } else {
+        *ctx.saw_unproven_match = true;
+    }
+}
+
 fn explicit_operator_call(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
     let mut receiver = None;
     let mut cursor = node.walk();
@@ -405,6 +539,151 @@ fn explicit_operator_call(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
         }
     }
     None
+}
+
+fn function_definition_name_node(node: Node<'_>) -> Option<Node<'_>> {
+    if node.kind() != "function_definition" {
+        return None;
+    }
+    node.child_by_field_name("declarator")
+        .and_then(callable_declarator_name_node)
+}
+
+fn callable_declarator_name_node(node: Node<'_>) -> Option<Node<'_>> {
+    match node.kind() {
+        "identifier"
+        | "field_identifier"
+        | "qualified_identifier"
+        | "scoped_identifier"
+        | "operator_name"
+        | "destructor_name" => Some(node),
+        _ => node
+            .child_by_field_name("declarator")
+            .or_else(|| node.child_by_field_name("name"))
+            .or_else(|| node.child_by_field_name("field"))
+            .and_then(callable_declarator_name_node),
+    }
+}
+
+fn function_definition_signature_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    let definition = node_text(node, ctx.source);
+    let Some(expected) = ctx.spec.method_arity else {
+        return true;
+    };
+    if signature_arity(Some(definition)) != expected {
+        return false;
+    }
+    let Some(target_signature) = ctx.spec.target.signature() else {
+        return true;
+    };
+    signature_parameter_types(definition) == signature_parameter_types(target_signature)
+}
+
+fn definition_name_candidates(function: Node<'_>, ctx: &ScanCtx<'_>) -> Vec<String> {
+    let raw = normalize_cpp_reference_text(node_text(function, ctx.source));
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    let Some(namespace) = enclosing_namespace_context(function, ctx.source) else {
+        return vec![raw];
+    };
+    if !raw.contains("::") {
+        return vec![format!("{namespace}::{raw}")];
+    }
+    if raw
+        .split("::")
+        .next()
+        .is_some_and(|head| head != namespace && !namespace.ends_with(&format!("::{head}")))
+    {
+        vec![format!("{namespace}::{raw}"), raw]
+    } else {
+        vec![raw]
+    }
+}
+
+fn signature_parameter_types(signature: &str) -> Vec<String> {
+    let Some(parameters) = signature_parameter_text(signature) else {
+        return Vec::new();
+    };
+    if parameters.is_empty() || parameters == "void" {
+        return Vec::new();
+    }
+    split_top_level_commas(parameters)
+        .map(normalize_parameter_type)
+        .collect()
+}
+
+fn signature_parameter_text(signature: &str) -> Option<&str> {
+    let open = signature.find('(')?;
+    let mut depth = 0i32;
+    for (offset, ch) in signature[open..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(signature[open + 1..open + offset].trim());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn normalize_parameter_type(parameter: &str) -> String {
+    let without_default = parameter
+        .split_once('=')
+        .map(|(before, _)| before)
+        .unwrap_or(parameter)
+        .trim();
+    normalize_type_text(strip_parameter_name(without_default))
+        .replace(" &", "&")
+        .replace(" *", "*")
+}
+
+fn strip_parameter_name(parameter: &str) -> &str {
+    let trimmed = parameter.trim_end();
+    let Some(name_end) = trimmed
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| is_identifier_char(*ch))
+        .map(|(index, ch)| index + ch.len_utf8())
+    else {
+        return trimmed;
+    };
+    if name_end != trimmed.len() {
+        return trimmed;
+    }
+    let name_start = trimmed[..name_end]
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| !is_identifier_char(*ch))
+        .map(|(index, ch)| index + ch.len_utf8())
+        .unwrap_or(0);
+    if name_start == 0 {
+        return trimmed;
+    }
+    let before_name = &trimmed[..name_start];
+    if before_name
+        .chars()
+        .next_back()
+        .is_some_and(|ch| ch.is_whitespace() || ch == '*' || ch == '&')
+    {
+        before_name.trim_end()
+    } else {
+        trimmed
+    }
+}
+
+fn is_identifier_char(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphanumeric()
+}
+
+fn constructor_owner_name(name: &str) -> &str {
+    name.rsplit_once("::")
+        .map(|(owner, _)| owner)
+        .unwrap_or(name)
 }
 
 fn first_descendant_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {

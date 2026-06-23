@@ -8,6 +8,18 @@ use crate::text_utils::{find_line_index_for_offset, snippet_around_line};
 use tree_sitter::Node;
 
 pub(super) fn push_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    push_hit_with_options(node, ctx, false);
+}
+
+pub(super) fn push_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    push_hit_with_options(node, ctx, true);
+}
+
+fn push_hit_with_options(
+    node: Node<'_>,
+    ctx: &mut ScanCtx<'_>,
+    allow_logical_target_enclosing: bool,
+) {
     if *ctx.limit_exceeded {
         return;
     }
@@ -20,7 +32,9 @@ pub(super) fn push_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let Some(enclosing) = enclosing_context(node, ctx).enclosing.clone() else {
         return;
     };
-    if enclosing == ctx.spec.target || same_logical_symbol(&enclosing, &ctx.spec.target) {
+    if enclosing == ctx.spec.target
+        || (!allow_logical_target_enclosing && same_logical_symbol(&enclosing, &ctx.spec.target))
+    {
         return;
     }
     ctx.hits.insert(usage_hit(
