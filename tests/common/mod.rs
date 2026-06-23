@@ -1,4 +1,5 @@
 mod inline_project;
+pub mod memory_benchmark;
 pub mod usage_graph;
 
 use brokk_bifrost::{CodeUnit, GoAnalyzer, IAnalyzer, Language, ProjectFile, TestProject};
