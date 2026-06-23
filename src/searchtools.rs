@@ -2313,13 +2313,18 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
 
     for (symbol, overloads, location_selected) in resolved_targets {
         let finder = scoped_usage_finder(test_files.as_ref(), &path_filter);
+        let max_candidate_files = if path_scoped_candidates.is_some() {
+            usize::MAX
+        } else {
+            DEFAULT_MAX_FILES
+        };
         let query = finder.query_with_provider(
             analyzer,
             &overloads,
             path_scoped_candidates
                 .as_ref()
                 .map(|provider| provider as &dyn CandidateFileProvider),
-            DEFAULT_MAX_FILES,
+            max_candidate_files,
             SCAN_USAGES_MAX_CALLSITES,
         );
         let truncated = query.candidate_files_truncated;
