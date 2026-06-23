@@ -2578,6 +2578,144 @@ fn rust_graph_strategy_finds_field_read_through_self_field_receiver() {
     );
 }
 
+#[test]
+fn rust_graph_strategy_finds_field_assignment_through_direct_self_receiver() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/service.rs",
+            r#"
+pub const DEFAULT_PREFIX: &str = "job";
+
+#[derive(Default)]
+pub struct MemoryRepository {
+    pub last: String,
+}
+
+impl MemoryRepository {
+    pub fn save(&mut self, value: &str) -> String {
+        self.last = value.to_string();
+        value.trim().to_string()
+    }
+}
+
+pub struct Service {
+    repository: MemoryRepository,
+}
+
+impl Service {
+    pub fn new(repository: MemoryRepository) -> Self {
+        Self { repository }
+    }
+
+    pub fn execute(mut self, name: &str) -> String {
+        let stored = self.repository.save(name);
+        format!("{DEFAULT_PREFIX}:{stored}")
+    }
+}
+
+pub fn build_service(repository: MemoryRepository) -> Service {
+    Service::new(repository)
+}
+"#,
+        ),
+        (
+            "src/lib.rs",
+            r#"
+pub mod service;
+
+pub use service::{DEFAULT_PREFIX, MemoryRepository, Service, build_service};
+
+pub fn run_demo() -> String {
+    let mut repository = MemoryRepository::default();
+    repository.save("Ada");
+    let service = build_service(repository);
+    service.execute(" Grace ")
+}
+"#,
+        ),
+    ]);
+
+    let hits = rust_graph_hits(&analyzer, "service.MemoryRepository.last");
+    assert_eq!(
+        1,
+        hits.len(),
+        "expected self.last assignment in MemoryRepository::save: {hits:?}",
+    );
+    assert!(
+        hits.iter()
+            .any(|hit| hit.snippet.contains("self.last = value.to_string()")),
+        "expected hit snippet to include the self.last assignment: {hits:?}",
+    );
+}
+
+#[test]
+fn rust_graph_strategy_finds_direct_self_field_in_qualified_cross_module_impl() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/service.rs",
+            r#"
+pub struct MemoryRepository {
+    pub last: String,
+}
+"#,
+        ),
+        (
+            "src/lib.rs",
+            r#"
+pub mod service;
+
+pub use service::MemoryRepository;
+
+impl crate::service::MemoryRepository {
+    pub fn save(&mut self, value: &str) {
+        self.last = value.to_string();
+    }
+}
+"#,
+        ),
+    ]);
+
+    let hits = rust_graph_hits(&analyzer, "service.MemoryRepository.last");
+    assert_eq!(
+        1,
+        hits.len(),
+        "expected self.last assignment in qualified cross-module impl: {hits:?}",
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file == project.file("src/lib.rs")),
+        "hit should be the field assignment in lib.rs: {hits:?}",
+    );
+}
+
+#[test]
+fn rust_graph_strategy_does_not_count_direct_self_field_on_other_impl() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[(
+        "src/service.rs",
+        r#"
+pub struct MemoryRepository {
+    pub last: String,
+}
+
+pub struct Other {
+    pub last: String,
+}
+
+impl Other {
+    pub fn save(&mut self, value: &str) {
+        self.last = value.to_string();
+    }
+}
+"#,
+    )]);
+
+    let hits = rust_graph_hits(&analyzer, "service.MemoryRepository.last");
+    assert!(
+        hits.is_empty(),
+        "Other::save self.last assignment must not count as MemoryRepository.last usage: {hits:?}",
+    );
+}
+
 // A field whose declared type only *wraps* the owner (a map value here) is not a
 // field of the owner type, so a read through it must not be a false-positive usage.
 #[test]
