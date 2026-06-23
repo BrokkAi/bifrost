@@ -15,9 +15,7 @@ use crate::analyzer::{
 };
 use crate::hash::HashSet;
 use std::collections::BTreeSet;
-use std::sync::Arc;
 
-pub(crate) use extractor::PythonProjectGraph;
 pub(in crate::analyzer::usages) use extractor::{
     collect_assigned_identifiers, collect_scope_facts, enclosing_scope_facts,
     is_declaration_identifier, slice as python_slice,
@@ -37,25 +35,6 @@ where
 {
     let resolver = PythonEdgeResolver::try_new(analyzer)?;
     Some(resolver.build_edges(analyzer, nodes, keep_file))
-}
-
-/// Build the Python project graph once over the whole workspace so a bulk caller
-/// (`usage_graph`) can share it across every per-symbol query instead of
-/// rebuilding it (re-parsing the candidate closure) for each symbol. Module
-/// resolution is index-backed, so the one-time full build stays linear. `None`
-/// when there are no Python files.
-fn build_python_workspace_graph(
-    py: &PythonAnalyzer,
-    analyzer: &dyn IAnalyzer,
-) -> Option<Arc<PythonProjectGraph>> {
-    let files: HashSet<ProjectFile> = analyzer
-        .project()
-        .analyzable_files(Language::Python)
-        .ok()?
-        .into_iter()
-        .collect();
-    let target = files.iter().next()?.clone();
-    Some(Arc::new(build_python_graph(py, &files, &target)))
 }
 
 pub(crate) struct PythonQueryResolver<'a> {
@@ -125,14 +104,16 @@ impl<'a> UsageQueryResolver<'a> for PythonQueryResolver<'a> {
 
 pub(crate) struct PythonEdgeResolver<'a> {
     py: &'a PythonAnalyzer,
-    graph: Arc<PythonProjectGraph>,
 }
 
 impl<'a> UsageEdgeResolver<'a> for PythonEdgeResolver<'a> {
     fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
         let py = resolve_analyzer::<PythonAnalyzer>(analyzer)?;
-        let graph = build_python_workspace_graph(py, analyzer)?;
-        Some(Self { py, graph })
+        // No Python files → no edges to build; mirror the other languages' guard.
+        if py.get_analyzed_files().is_empty() {
+            return None;
+        }
+        Some(Self { py })
     }
 
     fn build_edges<F>(
@@ -144,7 +125,7 @@ impl<'a> UsageEdgeResolver<'a> for PythonEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        inverted::build_python_edges(analyzer, self.py, &self.graph, nodes, keep_file)
+        inverted::build_python_edges(analyzer, self.py, nodes, keep_file)
     }
 }
 
