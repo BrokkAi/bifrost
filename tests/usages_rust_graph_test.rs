@@ -2662,3 +2662,152 @@ pub fn run() {
         "items.execute() where items is Vec<Service> must not be a Service.execute usage: {hits:?}",
     );
 }
+
+#[test]
+fn rust_graph_strategy_does_not_treat_unbound_bare_call_as_constructor() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/service.rs",
+            r#"
+pub struct Service;
+
+impl Service {
+    pub fn execute(&self) -> &str {
+        ""
+    }
+}
+
+pub fn build_service() -> Service {
+    Service
+}
+"#,
+        ),
+        (
+            "src/lib.rs",
+            r#"
+mod service;
+
+pub use service::{build_service, Service};
+"#,
+        ),
+        (
+            "src/client.rs",
+            r#"
+use crate::Service;
+
+struct Other;
+
+fn build_service() -> Other {
+    Other
+}
+
+pub fn run() {
+    let service = build_service();
+    let _ = service.execute();
+}
+"#,
+        ),
+    ]);
+
+    let hits = rust_graph_hits(&analyzer, "service.Service.execute");
+    assert!(
+        hits.is_empty(),
+        "a local build_service() returning another type must not seed Service receivers: {hits:?}",
+    );
+}
+
+#[test]
+fn rust_graph_strategy_does_not_treat_option_result_return_as_direct_receiver() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/service.rs",
+            r#"
+pub struct Service;
+
+impl Service {
+    pub fn execute(&self) -> &str {
+        ""
+    }
+}
+
+pub fn maybe_service() -> Option<Service> {
+    Some(Service)
+}
+
+pub fn result_service() -> Result<Service, String> {
+    Ok(Service)
+}
+"#,
+        ),
+        (
+            "src/lib.rs",
+            r#"
+mod service;
+
+pub use service::{maybe_service, result_service, Service};
+
+pub fn run() {
+    let maybe = maybe_service();
+    let _ = maybe.execute();
+    let result = result_service();
+    let _ = result.execute();
+}
+"#,
+        ),
+    ]);
+
+    let hits = rust_graph_hits(&analyzer, "service.Service.execute");
+    assert!(
+        hits.is_empty(),
+        "Option<Service> and Result<Service, _> values must not be direct Service receivers: {hits:?}",
+    );
+}
+
+#[test]
+fn rust_graph_strategy_does_not_match_qualified_field_type_by_final_segment() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/service.rs",
+            r#"
+use crate::other;
+
+pub struct MemoryRepository {
+    pub last: String,
+}
+
+pub struct Cache {
+    repository: other::MemoryRepository,
+}
+
+impl Cache {
+    pub fn peek(&self) -> bool {
+        self.repository.last.is_empty()
+    }
+}
+"#,
+        ),
+        (
+            "src/other.rs",
+            r#"
+pub struct MemoryRepository {
+    pub last: String,
+}
+"#,
+        ),
+        (
+            "src/lib.rs",
+            r#"
+mod other;
+mod service;
+
+pub use service::{Cache, MemoryRepository};
+"#,
+        ),
+    ]);
+
+    let hits = rust_graph_hits(&analyzer, "service.MemoryRepository.last");
+    assert!(
+        hits.is_empty(),
+        "other::MemoryRepository.last must not be counted as service::MemoryRepository.last: {hits:?}",
+    );
+}

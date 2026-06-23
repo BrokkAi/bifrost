@@ -346,9 +346,16 @@ pub(super) fn scan_files_for_member_target(
         if owner_local_names.is_empty() && receiver_type_names.is_empty() {
             return;
         }
-        let self_like_constructors = self_like_constructor_names(rust, &owner);
-        let receiver_names =
-            infer_receiver_names(source, &receiver_type_names, &self_like_constructors);
+        let constructor_returns = self_like_constructor_returns(rust, &owner);
+        let self_like_constructors = self_like_constructor_seeds(rust, &owner);
+        let visible_bare_constructors =
+            visible_bare_constructor_names(rust, file, &self_like_constructors);
+        let receiver_names = infer_receiver_names(
+            source,
+            &receiver_type_names,
+            &constructor_returns,
+            &visible_bare_constructors,
+        );
         let static_owner_names = owner_local_names;
         if receiver_names.is_empty() && static_owner_names.is_empty() {
             return;
@@ -519,13 +526,24 @@ fn self_field_receiver_matches_owner(receiver: Node<'_>, ctx: &MemberScanCtx<'_>
 /// `[Owner; N]`) yields the wrapper (or nothing) and never the inner owner — a
 /// field of `HashMap<String, Owner>` is not a field *of* the owner type.
 fn field_declared_type_name(field_source: &str) -> Option<String> {
-    leading_type_name(field_source.split_once(':')?.1)
+    let ty = field_source.split_once(':')?.1;
+    let leading = leading_type_path(ty)?;
+    if leading.contains("::") {
+        return None;
+    }
+    leading.rsplit("::").next().map(str::to_string)
 }
 
 /// The leading type name of a type expression: strips `&`, lifetimes, `mut`,
 /// `dyn`/`impl`, takes the first token, cuts it at any generic/tuple/array opener,
 /// and returns its final path segment (`std::collections::HashMap<..>` -> `HashMap`).
 fn leading_type_name(ty: &str) -> Option<String> {
+    let head = leading_type_path(ty)?;
+    let segment = head.rsplit("::").next().unwrap_or(&head);
+    (!segment.is_empty()).then(|| segment.to_string())
+}
+
+fn leading_type_path(ty: &str) -> Option<String> {
     let cleaned = ty.replace('&', " ");
     let token = cleaned
         .split_whitespace()
@@ -534,26 +552,35 @@ fn leading_type_name(ty: &str) -> Option<String> {
         .find(|ch: char| !(ch.is_alphanumeric() || ch == '_' || ch == ':'))
         .unwrap_or(token.len());
     let head = &token[..head_end];
-    let segment = head.rsplit("::").next().unwrap_or(head);
-    (!segment.is_empty()).then(|| segment.to_string())
+    (!head.is_empty()).then(|| head.to_string())
 }
 
-/// Whether a function's return type produces the owner type by value — `Self`, the
-/// owner directly, or the owner/`Self` as the first type argument of a
-/// `Result`/`Option`/`Box`/`Arc`/`Rc` wrapper. A substring match is too loose: a
-/// function returning `Vec<Owner>` is not a constructor of the owner.
-fn return_type_is_owner_like(return_ty: &str, owner_ident: &str) -> bool {
-    let Some(head) = leading_type_name(return_ty) else {
-        return false;
-    };
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConstructorReturn {
+    DirectReceiver,
+    NeedsUnwrap,
+}
+
+/// Whether a function's return type produces the owner type either directly as a
+/// method receiver (`Self`, owner, `Box`/`Arc`/`Rc`) or behind an explicit
+/// `Option`/`Result` unwrap. A substring match is too loose: a function returning
+/// `Vec<Owner>` is not a constructor of the owner.
+fn constructor_return_kind(return_ty: &str, owner_ident: &str) -> Option<ConstructorReturn> {
+    let head = leading_type_name(return_ty)?;
     if head == "Self" || head == owner_ident {
-        return true;
+        return Some(ConstructorReturn::DirectReceiver);
     }
-    if matches!(head.as_str(), "Result" | "Option" | "Box" | "Arc" | "Rc") {
+    if matches!(head.as_str(), "Box" | "Arc" | "Rc") {
         return first_generic_argument(return_ty)
-            .is_some_and(|inner| return_type_is_owner_like(&inner, owner_ident));
+            .and_then(|inner| constructor_return_kind(&inner, owner_ident))
+            .filter(|kind| *kind == ConstructorReturn::DirectReceiver);
     }
-    false
+    if matches!(head.as_str(), "Result" | "Option") {
+        return first_generic_argument(return_ty)
+            .and_then(|inner| constructor_return_kind(&inner, owner_ident))
+            .map(|_| ConstructorReturn::NeedsUnwrap);
+    }
+    None
 }
 
 /// The first top-level generic argument of a type expression, e.g.
@@ -623,7 +650,10 @@ fn same_node(left: Node<'_>, right: Node<'_>) -> bool {
         && left.kind() == right.kind()
 }
 
-fn self_like_constructor_names(rust: &RustAnalyzer, owner: &CodeUnit) -> HashSet<String> {
+fn self_like_constructor_returns(
+    rust: &RustAnalyzer,
+    owner: &CodeUnit,
+) -> HashMap<String, ConstructorReturn> {
     rust.get_all_declarations()
         .into_iter()
         .filter(|code_unit| code_unit.source() == owner.source())
@@ -646,10 +676,42 @@ fn self_like_constructor_names(rust: &RustAnalyzer, owner: &CodeUnit) -> HashSet
                 .map(|(head, _)| head)
                 .unwrap_or(&source);
             let (_, return_ty) = head.split_once("->")?;
-            return_type_is_owner_like(return_ty, owner.identifier())
-                .then(|| code_unit.identifier().to_string())
+            constructor_return_kind(return_ty, owner.identifier())
+                .map(|kind| (code_unit.identifier().to_string(), kind))
         })
         .collect()
+}
+
+fn self_like_constructor_seeds(
+    rust: &RustAnalyzer,
+    owner: &CodeUnit,
+) -> HashMap<String, BTreeSet<(ProjectFile, String)>> {
+    self_like_constructor_returns(rust, owner)
+        .into_keys()
+        .map(|name| {
+            let seeds = rust.usage_seeds(owner.source(), &name);
+            (name, seeds)
+        })
+        .collect()
+}
+
+fn visible_bare_constructor_names(
+    rust: &RustAnalyzer,
+    file: &ProjectFile,
+    constructors: &HashMap<String, BTreeSet<(ProjectFile, String)>>,
+) -> HashSet<String> {
+    let mut visible = HashSet::default();
+    for (constructor, seeds) in constructors {
+        let (direct_names, _) = rust.usage_binding_names(file, seeds);
+        if direct_names.contains(constructor)
+            || seeds
+                .iter()
+                .any(|(seed_file, seed_name)| seed_file == file && seed_name == constructor)
+        {
+            visible.insert(constructor.clone());
+        }
+    }
+    visible
 }
 
 fn expanded_receiver_type_names(
@@ -699,10 +761,16 @@ fn receiver_explicitly_mismatched(
 fn infer_receiver_names(
     source: &str,
     owner_local_names: &HashSet<String>,
-    self_like_constructors: &HashSet<String>,
+    self_like_constructors: &HashMap<String, ConstructorReturn>,
+    visible_bare_constructors: &HashSet<String>,
 ) -> Vec<String> {
     let owner_type_names = expanded_receiver_type_names(source, owner_local_names);
-    let bindings = collect_receiver_bindings(source, &owner_type_names, self_like_constructors);
+    let bindings = collect_receiver_bindings(
+        source,
+        &owner_type_names,
+        self_like_constructors,
+        visible_bare_constructors,
+    );
     let mut receivers: Vec<_> = bindings
         .snapshot()
         .matching_symbols(|target| owner_type_names.contains(target))
@@ -715,7 +783,8 @@ fn infer_receiver_names(
 fn collect_receiver_bindings(
     source: &str,
     owner_type_names: &HashSet<String>,
-    self_like_constructors: &HashSet<String>,
+    self_like_constructors: &HashMap<String, ConstructorReturn>,
+    visible_bare_constructors: &HashSet<String>,
 ) -> LocalInferenceEngine<String> {
     let mut engine = LocalInferenceEngine::new(LocalInferenceConfig::default());
     let Some(tree) = parse_rust_source(source) else {
@@ -741,11 +810,16 @@ fn collect_receiver_bindings(
                 name,
                 ty,
                 constructor,
+                unwrapped,
             } => match constructor {
                 // `Owner::new(...)` / tuple-struct `Owner(...)`: the path text is the
                 // owner type and (for the scoped form) the associated fn must return it.
                 Some(ctor) => {
-                    if owner_type_names.contains(&ty) && self_like_constructors.contains(&ctor) {
+                    if owner_type_names.contains(&ty)
+                        && self_like_constructors
+                            .get(&ctor)
+                            .is_some_and(|kind| constructor_return_can_seed(*kind, unwrapped))
+                    {
                         engine.seed_symbol(name, ty);
                     }
                 }
@@ -755,7 +829,11 @@ fn collect_receiver_bindings(
                 // `let x = build_owner();` — a bare call to a free or associated
                 // function whose return type is the owner. Seed the receiver's type so
                 // method/field accesses on it resolve.
-                None if self_like_constructors.contains(&ty) => {
+                None if visible_bare_constructors.contains(&ty)
+                    && self_like_constructors
+                        .get(&ty)
+                        .is_some_and(|kind| constructor_return_can_seed(*kind, unwrapped)) =>
+                {
                     if let Some(owner_repr) = owner_repr.clone() {
                         engine.seed_symbol(name, owner_repr);
                     }
@@ -770,6 +848,10 @@ fn collect_receiver_bindings(
     engine
 }
 
+fn constructor_return_can_seed(kind: ConstructorReturn, unwrapped: bool) -> bool {
+    kind == ConstructorReturn::DirectReceiver || unwrapped
+}
+
 enum ReceiverEvent {
     TypedBinding {
         name: String,
@@ -779,6 +861,7 @@ enum ReceiverEvent {
         name: String,
         ty: String,
         constructor: Option<String>,
+        unwrapped: bool,
     },
     Alias {
         name: String,
@@ -921,11 +1004,12 @@ fn collect_let_receiver_event(
         return;
     };
 
-    if let Some((ty, constructor)) = constructed_receiver_type(value, source) {
+    if let Some((ty, constructor, unwrapped)) = constructed_receiver_type(value, source) {
         events.push(ReceiverEvent::Constructed {
             name,
             ty,
             constructor,
+            unwrapped,
         });
     } else if let Some(source) = simple_node_text(value, source) {
         events.push(ReceiverEvent::Alias { name, source });
@@ -1024,17 +1108,20 @@ fn self_field_as_ref_field_name(node: Node<'_>, source: &str) -> Option<String> 
     }
 }
 
-fn constructed_receiver_type(node: Node<'_>, source: &str) -> Option<(String, Option<String>)> {
+fn constructed_receiver_type(
+    node: Node<'_>,
+    source: &str,
+) -> Option<(String, Option<String>, bool)> {
     match node.kind() {
         "struct_expression" => node
             .child_by_field_name("name")
             .and_then(|name| simple_type_name(name, source))
-            .map(|name| (name, None)),
+            .map(|name| (name, None, false)),
         "call_expression" => {
             let function = node.child_by_field_name("function")?;
             match function.kind() {
                 "identifier" | "type_identifier" => {
-                    simple_node_text(function, source).map(|name| (name, None))
+                    simple_node_text(function, source).map(|name| (name, None, false))
                 }
                 "scoped_identifier" => {
                     let ty = function
@@ -1043,11 +1130,20 @@ fn constructed_receiver_type(node: Node<'_>, source: &str) -> Option<(String, Op
                     let constructor = function
                         .child_by_field_name("name")
                         .and_then(|name| simple_node_text(name, source));
-                    Some((ty, constructor))
+                    Some((ty, constructor, false))
                 }
-                "field_expression" => function
-                    .child_by_field_name("value")
-                    .and_then(|value| constructed_receiver_type(value, source)),
+                "field_expression" => {
+                    let method = function
+                        .child_by_field_name("field")
+                        .and_then(|field| simple_node_text(field, source));
+                    let unwrapped = matches!(method.as_deref(), Some("unwrap" | "expect"));
+                    function
+                        .child_by_field_name("value")
+                        .and_then(|value| constructed_receiver_type(value, source))
+                        .map(|(ty, constructor, inner_unwrapped)| {
+                            (ty, constructor, inner_unwrapped || unwrapped)
+                        })
+                }
                 _ => None,
             }
         }
