@@ -11,9 +11,10 @@
 //!
 //! Point at a real checkout with BIFROST_BENCH_REPO=/path/to/repo.
 
-mod common;
+#[path = "common/memory_benchmark.rs"]
+mod memory_benchmark;
 
-use common::memory_benchmark::run_usage_graph_peak_rss_benchmark;
+use memory_benchmark::run_usage_graph_peak_rss_benchmark;
 use std::fs;
 use std::path::Path;
 

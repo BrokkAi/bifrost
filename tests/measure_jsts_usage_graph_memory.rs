@@ -9,9 +9,10 @@
 //! Ignored by default (large fixture, several seconds). Run:
 //!   cargo test --test measure_jsts_usage_graph_memory -- --ignored --nocapture
 
-mod common;
+#[path = "common/memory_benchmark.rs"]
+mod memory_benchmark;
 
-use common::memory_benchmark::run_usage_graph_peak_rss_benchmark;
+use memory_benchmark::run_usage_graph_peak_rss_benchmark;
 use std::fs;
 use std::path::Path;
 

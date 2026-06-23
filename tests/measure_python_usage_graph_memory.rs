@@ -12,9 +12,10 @@
 //! Point at a real checkout with BIFROST_BENCH_REPO=/path/to/repo for the figures in #200
 //! (sentry ~2.1 GB, django ~0.75 GB before the cap).
 
-mod common;
+#[path = "common/memory_benchmark.rs"]
+mod memory_benchmark;
 
-use common::memory_benchmark::run_usage_graph_peak_rss_benchmark;
+use memory_benchmark::run_usage_graph_peak_rss_benchmark;
 use std::fs;
 use std::path::Path;
 
