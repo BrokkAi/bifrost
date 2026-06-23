@@ -76,6 +76,17 @@ pub(in crate::analyzer::usages) fn seed_bindings_before(
     seed_bindings_before_inner(node, cutoff_start, csharp, file, source, bindings);
 }
 
+pub(in crate::analyzer::usages) fn seed_visible_bindings_at(
+    scope: Node<'_>,
+    target: Node<'_>,
+    csharp: &CSharpAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    bindings: &mut LocalInferenceEngine<String>,
+) {
+    seed_visible_bindings_inner(scope, target, csharp, file, source, bindings);
+}
+
 fn seed_bindings_before_inner(
     node: Node<'_>,
     cutoff_start: usize,
@@ -101,6 +112,64 @@ fn seed_bindings_before_inner(
         }
         seed_bindings_before_inner(child, cutoff_start, csharp, file, source, bindings);
     }
+}
+
+const SCOPE_NODES: &[&str] = &[
+    "method_declaration",
+    "constructor_declaration",
+    "destructor_declaration",
+    "operator_declaration",
+    "property_declaration",
+    "accessor_declaration",
+    "local_function_statement",
+    "lambda_expression",
+    "block",
+    "for_statement",
+    "for_each_statement",
+    "using_statement",
+    "catch_clause",
+];
+
+fn seed_visible_bindings_inner(
+    node: Node<'_>,
+    target: Node<'_>,
+    csharp: &CSharpAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    bindings: &mut LocalInferenceEngine<String>,
+) {
+    if node.start_byte() >= target.start_byte() {
+        return;
+    }
+
+    let enters_scope = SCOPE_NODES.contains(&node.kind());
+    if enters_scope && !node_covers(node, target) {
+        return;
+    }
+    if enters_scope {
+        bindings.enter_scope();
+    }
+
+    match node.kind() {
+        "parameter" => seed_parameter(node, csharp, file, source, bindings),
+        "variable_declaration" => seed_variable_declaration(node, csharp, file, source, bindings),
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.start_byte() >= target.start_byte() {
+            break;
+        }
+        if SCOPE_NODES.contains(&child.kind()) && !node_covers(child, target) {
+            continue;
+        }
+        seed_visible_bindings_inner(child, target, csharp, file, source, bindings);
+    }
+}
+
+fn node_covers(container: Node<'_>, target: Node<'_>) -> bool {
+    container.start_byte() <= target.start_byte() && target.end_byte() <= container.end_byte()
 }
 
 fn seed_parameter(
@@ -496,41 +565,75 @@ pub(in crate::analyzer::usages) fn binding_scope_node(mut node: Node<'_>) -> Nod
 
 pub(super) fn receiver_targets_owner(
     receiver_node: Node<'_>,
-    receiver: &str,
     owner: &CodeUnit,
     csharp: &CSharpAnalyzer,
     file: &ProjectFile,
     source: &str,
     bindings: &LocalInferenceEngine<String>,
 ) -> SymbolResolution<String> {
-    match bindings.resolve_symbol(receiver) {
+    match receiver_type_fq_names(receiver_node, csharp, file, source, bindings) {
         SymbolResolution::Precise(targets)
             if targets.iter().any(|target| target == &owner.fq_name()) =>
         {
             SymbolResolution::Precise(targets)
         }
-        SymbolResolution::Unknown if !bindings.is_shadowed(receiver) => {
-            class_field_receiver_targets_owner(receiver_node, receiver, owner, csharp, file, source)
-        }
+        SymbolResolution::Precise(_) => SymbolResolution::Unknown,
         resolution => resolution,
     }
 }
 
-/// Resolve a receiver that is not bound locally (no parameter or local declaration)
-/// against the class-level fields of its enclosing type, mirroring `receiver_type_units`.
-/// This lets `field.Member` references prove a hit when `field` is a class-level field
-/// whose declared type is the owner of the target member.
-fn class_field_receiver_targets_owner(
+fn receiver_type_fq_names(
+    receiver_node: Node<'_>,
+    csharp: &CSharpAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    bindings: &LocalInferenceEngine<String>,
+) -> SymbolResolution<String> {
+    match receiver_node.kind() {
+        "identifier" => {
+            let receiver = node_text(receiver_node, source);
+            match bindings.resolve_symbol(receiver) {
+                SymbolResolution::Precise(targets) => SymbolResolution::Precise(targets),
+                SymbolResolution::Unknown if !bindings.is_shadowed(receiver) => {
+                    class_field_receiver_type(receiver_node, receiver, csharp, file, source)
+                }
+                resolution => resolution,
+            }
+        }
+        "member_access_expression" => {
+            expression_type_fq_name(receiver_node, csharp, file, source, bindings)
+                .map(|fq_name| SymbolResolution::Precise(std::iter::once(fq_name).collect()))
+                .unwrap_or(SymbolResolution::Unknown)
+        }
+        "this" => enclosing_declared_type(receiver_node, csharp, file, source)
+            .map(|owner| SymbolResolution::Precise(std::iter::once(owner.fq_name()).collect()))
+            .unwrap_or(SymbolResolution::Unknown),
+        _ => SymbolResolution::Unknown,
+    }
+}
+
+fn class_field_receiver_type(
     receiver_node: Node<'_>,
     receiver: &str,
-    owner: &CodeUnit,
     csharp: &CSharpAnalyzer,
     file: &ProjectFile,
     source: &str,
 ) -> SymbolResolution<String> {
-    let resolved = enclosing_declared_type(receiver_node, csharp, file, source)
-        .and_then(|enclosing| member_declared_type_fq_name(csharp, file, &enclosing, receiver));
-    match resolved {
+    enclosing_declared_type(receiver_node, csharp, file, source)
+        .and_then(|enclosing| member_declared_type_fq_name(csharp, file, &enclosing, receiver))
+        .map(|fq_name| SymbolResolution::Precise(std::iter::once(fq_name).collect()))
+        .unwrap_or(SymbolResolution::Unknown)
+}
+
+pub(super) fn expression_resolves_to_type(
+    expression: Node<'_>,
+    owner: &CodeUnit,
+    csharp: &CSharpAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    bindings: &LocalInferenceEngine<String>,
+) -> SymbolResolution<String> {
+    match expression_type_fq_name(expression, csharp, file, source, bindings) {
         Some(fq_name) if fq_name == owner.fq_name() => {
             SymbolResolution::Precise(std::iter::once(fq_name).collect())
         }

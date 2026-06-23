@@ -1,9 +1,9 @@
 use crate::analyzer::usages::csharp_graph::hits::push_hit;
 use crate::analyzer::usages::csharp_graph::resolver::{
-    TargetKind, TargetSpec, argument_count, binding_scope_node, first_type_child,
-    is_type_reference_node, member_name_is_locally_bound, node_text, normalize_type_text,
-    receiver_targets_owner, reference_type_text, resolves_to_target, same_node,
-    seed_bindings_before, unqualified_member_resolves_to_owner,
+    TargetKind, TargetSpec, argument_count, binding_scope_node, expression_resolves_to_type,
+    first_type_child, is_type_reference_node, member_name_is_locally_bound, node_text,
+    normalize_type_text, receiver_targets_owner, reference_type_text, resolves_to_target,
+    same_node, seed_visible_bindings_at, unqualified_member_resolves_to_owner,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::UsageHit;
@@ -159,6 +159,10 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if node_text(name_node, ctx.source) != ctx.spec.member_name {
         return;
     }
+    // `nameof(receiver.Member)` is a compile-time string, not a member reference.
+    if is_nameof_argument(node, ctx.source) {
+        return;
+    }
     if ctx.spec.kind == TargetKind::Method
         && let Some(invocation) = enclosing_invocation(node)
         && ctx
@@ -185,9 +189,9 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 
     let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
-    seed_bindings_before(
+    seed_visible_bindings_at(
         binding_scope_node(node),
-        node.start_byte(),
+        node,
         ctx.csharp,
         ctx.file,
         ctx.source,
@@ -195,7 +199,6 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     );
     match receiver_targets_owner(
         receiver_node,
-        receiver,
         &ctx.spec.owner,
         ctx.csharp,
         ctx.file,
@@ -246,14 +249,26 @@ fn scan_unqualified_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 return;
             }
             let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
-            seed_bindings_before(
+            seed_visible_bindings_at(
                 binding_scope_node(node),
-                node.start_byte(),
+                node,
                 ctx.csharp,
                 ctx.file,
                 ctx.source,
                 &mut bindings,
             );
+            match object_initializer_label_owner_resolution(node, ctx, &bindings) {
+                LabelOwnerResolution::MatchesTarget => {
+                    push_hit(node, ctx);
+                    return;
+                }
+                LabelOwnerResolution::KnownOther => return,
+                LabelOwnerResolution::Unknown => {
+                    *ctx.saw_unproven_match = true;
+                    return;
+                }
+                LabelOwnerResolution::NotLabel => {}
+            }
             // A local or parameter of the same name is provably not the field. Skip
             // it silently — treating it as an unproven match would force the whole
             // file's result to a fallback and discard genuinely proven hits.
@@ -278,7 +293,88 @@ fn scan_unqualified_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
-/// Whether `node` is the bare-identifier argument of a `nameof(...)` expression.
+enum LabelOwnerResolution {
+    NotLabel,
+    MatchesTarget,
+    KnownOther,
+    Unknown,
+}
+
+fn object_initializer_label_owner_resolution(
+    node: Node<'_>,
+    ctx: &ScanCtx<'_>,
+    bindings: &LocalInferenceEngine<String>,
+) -> LabelOwnerResolution {
+    let Some(initializer) = object_initializer_for_label(node) else {
+        return LabelOwnerResolution::NotLabel;
+    };
+    let Some(object_creation) = initializer.parent() else {
+        return LabelOwnerResolution::Unknown;
+    };
+    if object_creation.kind() != "object_creation_expression" {
+        return LabelOwnerResolution::Unknown;
+    }
+    let Some(type_node) = object_creation
+        .child_by_field_name("type")
+        .or_else(|| first_type_child(object_creation))
+    else {
+        return LabelOwnerResolution::Unknown;
+    };
+    match expression_resolves_to_type(
+        type_node,
+        &ctx.spec.owner,
+        ctx.csharp,
+        ctx.file,
+        ctx.source,
+        bindings,
+    ) {
+        crate::analyzer::usages::local_inference::SymbolResolution::Precise(_) => {
+            LabelOwnerResolution::MatchesTarget
+        }
+        crate::analyzer::usages::local_inference::SymbolResolution::Unknown
+            if resolves_to_target(
+                ctx.csharp,
+                ctx.file,
+                node_text(type_node, ctx.source),
+                &ctx.spec.owner,
+            ) =>
+        {
+            LabelOwnerResolution::MatchesTarget
+        }
+        crate::analyzer::usages::local_inference::SymbolResolution::Unknown
+            if ctx
+                .csharp
+                .resolve_visible_type(ctx.file, node_text(type_node, ctx.source))
+                .is_some() =>
+        {
+            LabelOwnerResolution::KnownOther
+        }
+        crate::analyzer::usages::local_inference::SymbolResolution::Unknown => {
+            LabelOwnerResolution::Unknown
+        }
+        crate::analyzer::usages::local_inference::SymbolResolution::Ambiguous => {
+            LabelOwnerResolution::Unknown
+        }
+    }
+}
+
+fn object_initializer_for_label(node: Node<'_>) -> Option<Node<'_>> {
+    let parent = node.parent()?;
+    if parent.kind() != "assignment_expression" {
+        return None;
+    }
+    if parent.child_by_field_name("left") != Some(node) && parent.named_child(0) != Some(node) {
+        return None;
+    }
+    let initializer = parent.parent()?;
+    matches!(
+        initializer.kind(),
+        "initializer_expression" | "object_initializer_expression"
+    )
+    .then_some(initializer)
+}
+
+/// Whether `node` is the argument of a `nameof(...)` expression.
 /// Walks up through the argument wrappers to the nearest invocation and checks the
 /// invoked expression is `nameof`. `nameof(X)` evaluates to a compile-time string,
 /// so its argument is not a runtime member reference.

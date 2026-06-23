@@ -1332,6 +1332,36 @@ fn csharp_graph_resolves_member_method_through_class_level_field_receiver() {
 }
 
 #[test]
+fn csharp_graph_resolves_member_method_through_this_field_receiver() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[(
+        "src/Service.cs",
+        r#"namespace Example;
+public sealed class Repository {
+    public void Save(string value) {}
+}
+public sealed class Service {
+    private readonly Repository repository = new();
+    public void Run(string value) { this.repository.Save(value); }
+}
+"#,
+    )]);
+
+    let save = member_function(&analyzer, "Repository", "Save");
+    let hits = graph_hits(&analyzer, &save);
+
+    assert_eq!(
+        1,
+        hits.len(),
+        "explicit this.field receiver should resolve as a proven hit: {hits:#?}"
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file == project.file("src/Service.cs")),
+        "{hits:#?}"
+    );
+}
+
+#[test]
 fn csharp_graph_resolves_property_self_write_and_field_receiver_read() {
     let (project, analyzer) = csharp_analyzer_with_files(FIELD_RECEIVER_FILES);
 
@@ -1385,6 +1415,37 @@ public sealed class Repository {
     );
 }
 
+#[test]
+fn csharp_graph_excludes_qualified_nameof_field_argument() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[(
+        "src/Service.cs",
+        r#"namespace Example;
+public sealed class Repository {
+    public string Last { get; set; } = "";
+    public void Save(string value) { Last = value; }
+}
+public sealed class Service {
+    private readonly Repository repository = new();
+    public string NameOfLast() { return nameof(repository.Last); }
+}
+"#,
+    )]);
+
+    let last = member_field(&analyzer, "Repository", "Last");
+    let hits = graph_hits(&analyzer, &last);
+
+    assert_eq!(
+        1,
+        hits.len(),
+        "only the Last = value write is a usage; nameof(repository.Last) is not: {hits:#?}"
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file == project.file("src/Service.cs")),
+        "{hits:#?}"
+    );
+}
+
 // A local of the same name in an unrelated method is provably not the field, so it
 // must be skipped silently rather than poisoning the file's other proven hits.
 #[test]
@@ -1412,5 +1473,82 @@ public sealed class Repository {
         hits.iter()
             .all(|hit| hit.file == project.file("src/Service.cs")),
         "{hits:#?}"
+    );
+}
+
+#[test]
+fn csharp_graph_inner_block_shadow_does_not_hide_later_self_field_read() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[(
+        "src/Service.cs",
+        r#"namespace Example;
+public sealed class Repository {
+    public string Last { get; set; } = "";
+    public string Read(bool flag) {
+        if (flag) {
+            string Last = "shadow";
+        }
+        return Last;
+    }
+}
+"#,
+    )]);
+
+    let last = member_field(&analyzer, "Repository", "Last");
+    let hits = graph_hits(&analyzer, &last);
+
+    assert_eq!(
+        1,
+        hits.len(),
+        "the out-of-scope nested local must not hide the later field read: {hits:#?}"
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file == project.file("src/Service.cs")),
+        "{hits:#?}"
+    );
+}
+
+#[test]
+fn csharp_graph_object_initializer_labels_resolve_to_initializer_type() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[(
+        "src/Service.cs",
+        r#"namespace Example;
+public sealed class Repository {
+    public string Last { get; set; } = "";
+    public Dto MakeDto() { return new Dto { Last = "x" }; }
+    public Repository MakeRepository() { return new Repository { Last = "x" }; }
+}
+public sealed class Dto {
+    public string Last { get; set; } = "";
+}
+"#,
+    )]);
+
+    let repository_last = member_field(&analyzer, "Repository", "Last");
+    let repository_hits = graph_hits(&analyzer, &repository_last);
+    assert_eq!(
+        1,
+        repository_hits.len(),
+        "only new Repository {{ Last = ... }} should count for Repository.Last: {repository_hits:#?}"
+    );
+    assert!(
+        repository_hits
+            .iter()
+            .all(|hit| hit.file == project.file("src/Service.cs")),
+        "{repository_hits:#?}"
+    );
+
+    let dto_last = member_field(&analyzer, "Dto", "Last");
+    let dto_hits = graph_hits(&analyzer, &dto_last);
+    assert_eq!(
+        1,
+        dto_hits.len(),
+        "new Dto {{ Last = ... }} should count for Dto.Last: {dto_hits:#?}"
+    );
+    assert!(
+        dto_hits
+            .iter()
+            .all(|hit| hit.file == project.file("src/Service.cs")),
+        "{dto_hits:#?}"
     );
 }
