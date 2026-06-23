@@ -207,8 +207,13 @@ fn infer_type_from_value(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeUnit> 
                 .resolve_type(ctx.file, rest.split(['(', '{']).next().unwrap_or(rest))
         }
         "call_expression" => node.child_by_field_name("function").and_then(|function| {
+            let function_text = node_text(function, ctx.source);
+            // `auto x = T(...)` constructs `T` directly; `auto x = make()` takes `make`'s return
+            // type. Try the call target as a type first (constructor), then fall back to the
+            // declared return type of the matching free function so the local binds to that type.
             ctx.visibility
-                .resolve_type(ctx.file, node_text(function, ctx.source))
+                .resolve_type(ctx.file, function_text)
+                .or_else(|| infer_call_return_type(function_text, ctx))
         }),
         "initializer_list" => None,
         "identifier" => {
@@ -223,6 +228,25 @@ fn infer_type_from_value(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeUnit> 
             .visibility
             .resolve_type(ctx.file, node_text(node, ctx.source)),
     }
+}
+
+fn infer_call_return_type(function_text: &str, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {
+    let function =
+        ctx.visibility
+            .resolve_named(ctx.file, function_text, TargetKind::FreeFunction)?;
+    let declaration = ctx.analyzer.get_source(&function, false)?;
+    let return_type = return_type_of_declaration(&declaration, function.identifier())?;
+    ctx.visibility.resolve_type(ctx.file, &return_type)
+}
+
+/// Extracts the declared return type from a C++ free-function declaration, e.g. `Service` from
+/// `Service build_service();`. Returns `None` when the function name cannot be located before the
+/// parameter list (defensive against unexpected declaration shapes).
+fn return_type_of_declaration(declaration: &str, function_name: &str) -> Option<String> {
+    let head = declaration.split('(').next().unwrap_or(declaration);
+    let name_start = head.rfind(function_name)?;
+    let return_type = head[..name_start].trim();
+    (!return_type.is_empty()).then(|| return_type.to_string())
 }
 
 fn maybe_record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -343,9 +367,24 @@ fn maybe_record_free_function_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         &ctx.spec.target,
     ) {
         push_hit(function, ctx);
+    } else if free_function_is_known_non_target(text, ctx) {
+        // An explicitly namespace-qualified call to a different namespace (e.g. `other::run()` when
+        // the target is `ns::run`) is a proven non-match, not an unresolved reference.
     } else {
         *ctx.saw_unproven_match = true;
     }
+}
+
+/// True when a call's explicit namespace qualifier proves it cannot be the target free function.
+/// `other::run()` is a known non-target of `ns::run`; a bare `run()` is not (it could resolve to the
+/// target via the enclosing namespace), so only qualified mismatches count.
+fn free_function_is_known_non_target(text: &str, ctx: &ScanCtx<'_>) -> bool {
+    let normalized = normalize_cpp_reference_text(text);
+    if !normalized.contains("::") {
+        return false;
+    }
+    let target_cpp_name = cpp_name_for(&ctx.spec.target);
+    normalized != target_cpp_name
 }
 
 fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -435,15 +474,16 @@ fn maybe_record_global_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     *ctx.raw_match_count += 1;
-    if ctx
-        .visibility
-        .resolve_named(
-            ctx.file,
-            node_text(node, ctx.source),
-            TargetKind::GlobalField,
-        )
-        .is_some_and(|resolved| same_visible_symbol(&resolved, &ctx.spec.target))
-    {
+    // Require the target to be the *unique* visible global field of this name. A bare
+    // reference that also matches a same-named constant in another namespace is
+    // ambiguous and is left unproven rather than attributed to the target by the
+    // visible set's iteration order.
+    if ctx.visibility.uniquely_resolves_to_target(
+        ctx.file,
+        node_text(node, ctx.source),
+        TargetKind::GlobalField,
+        &ctx.spec.target,
+    ) {
         push_hit(node, ctx);
     } else {
         *ctx.saw_unproven_match = true;
