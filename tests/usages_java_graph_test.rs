@@ -232,6 +232,44 @@ public class Consumer {
 }
 
 #[test]
+fn java_graph_strategy_resolves_inline_constructor_receiver_method_call() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "com/example/Target.java",
+            r#"
+package com.example;
+
+public class Target {
+    public void run() {}
+}
+"#,
+        ),
+        (
+            "com/example/Consumer.java",
+            r#"
+package com.example;
+
+public class Consumer {
+    void call() {
+        new Target().run();
+    }
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let method_target = definition(&analyzer, "com.example.Target.run");
+    let hits = JavaUsageGraphStrategy::new()
+        .find_usages(&analyzer, &[method_target], &candidates, 1000)
+        .into_either()
+        .expect("inline constructor receiver success");
+
+    assert_eq!(1, hits.len());
+    assert!(hits.iter().any(|hit| hit.snippet.contains("run()")));
+}
+
+#[test]
 fn java_graph_strategy_handles_nested_type_references() {
     let (_project, analyzer) = java_analyzer_with_files(&[
         (

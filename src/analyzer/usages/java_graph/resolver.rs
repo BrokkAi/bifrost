@@ -99,6 +99,10 @@ pub(super) fn receiver_matches_target(receiver: Node<'_>, ctx: &mut ScanCtx<'_>)
         "type_identifier" | "scoped_type_identifier" | "generic_type" => {
             resolve_type_from_node(receiver, ctx).is_some_and(|resolved| resolved == ctx.spec.owner)
         }
+        "object_creation_expression" => receiver
+            .child_by_field_name("type")
+            .and_then(|type_node| resolve_type_from_node(type_node, ctx))
+            .is_some_and(|resolved| resolved == ctx.spec.owner),
         "this" => {
             owner_matches_target_context(receiver, ctx)
                 || anonymous_creation_context_matches_target(receiver, ctx)

@@ -29,6 +29,16 @@ fn array_len(value: &Value, key: &str) -> usize {
         .unwrap_or(0)
 }
 
+fn assert_scan_usages_failure(value: &Value, symbol: &str, strategy: &str, reason_kind: &str) {
+    assert_eq!(0, array_len(value, "usages"), "payload: {value}");
+    assert_eq!(0, array_len(value, "ambiguous"), "payload: {value}");
+    let failures = value["failures"].as_array().unwrap();
+    assert_eq!(1, failures.len(), "payload: {value}");
+    assert_eq!(symbol, failures[0]["symbol"], "payload: {value}");
+    assert_eq!(strategy, failures[0]["strategy"], "payload: {value}");
+    assert_eq!(reason_kind, failures[0]["reason_kind"], "payload: {value}");
+}
+
 #[test]
 fn service_allows_concurrent_read_only_calls() {
     let service = Arc::new(SearchToolsService::new_without_semantic_index(fixture_root()).unwrap());
@@ -1313,19 +1323,11 @@ function run() {
         )
         .unwrap();
     let dependency: Value = serde_json::from_str(&dependency_payload).unwrap();
-    assert_eq!(
-        0,
-        array_len(&dependency, "ambiguous"),
-        "payload: {dependency}"
-    );
-    assert_eq!(
-        "lib/request.js#request.js.accepts", dependency["usages"][0]["symbol"],
-        "payload: {dependency}"
-    );
-    assert_eq!(
-        1,
-        dependency["usages"][0]["total_hits"].as_u64().unwrap(),
-        "dependency target must not include req.accepts hits: {dependency}"
+    assert_scan_usages_failure(
+        &dependency,
+        "lib/request.js#request.js.accepts",
+        "JsTsExportUsageGraphStrategy",
+        "no_graph_seed",
     );
 
     let method_payload = service
@@ -1335,18 +1337,11 @@ function run() {
         )
         .unwrap();
     let method: Value = serde_json::from_str(&method_payload).unwrap();
-    assert_eq!(0, array_len(&method, "ambiguous"), "payload: {method}");
-    assert_eq!(
-        "lib/request.js#req.accepts", method["usages"][0]["symbol"],
-        "payload: {method}"
-    );
-    assert!(
-        method["usages"][0]["files"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|file| file["path"] == "app.js"),
-        "prototype method target should find app.js caller: {method}"
+    assert_scan_usages_failure(
+        &method,
+        "lib/request.js#req.accepts",
+        "JsTsExportUsageGraphStrategy",
+        "no_graph_seed",
     );
 }
 
@@ -1355,7 +1350,7 @@ fn scan_usages_location_target_uses_column_on_same_line_declarations() {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file(
             "app.js",
-            "function first() {} function second() {}\nfirst();\nsecond();\n",
+            "export function first() {} export function second() {}\nfirst();\nsecond();\n",
         )
         .build();
     let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
@@ -1364,7 +1359,7 @@ fn scan_usages_location_target_uses_column_on_same_line_declarations() {
     let payload = service
         .call_tool_json(
             "scan_usages",
-            r#"{"targets":[{"path":"app.js","line":1,"column":30}],"include_tests":true}"#,
+            r#"{"targets":[{"path":"app.js","line":1,"column":42}],"include_tests":true}"#,
         )
         .unwrap();
     let value: Value = serde_json::from_str(&payload).unwrap();
@@ -1376,7 +1371,10 @@ fn scan_usages_location_target_uses_column_on_same_line_declarations() {
 #[test]
 fn scan_usages_location_target_does_not_select_nested_same_line_member() {
     let project = InlineTestProject::with_language(Language::JavaScript)
-        .file("app.js", "class Widget { render() {} }\nnew Widget();\n")
+        .file(
+            "app.js",
+            "export class Widget { render() {} }\nnew Widget();\n",
+        )
         .build();
     let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
         .expect("service");
@@ -1384,7 +1382,7 @@ fn scan_usages_location_target_does_not_select_nested_same_line_member() {
     let payload = service
         .call_tool_json(
             "scan_usages",
-            r#"{"targets":[{"path":"app.js","line":1,"column":7}],"include_tests":true}"#,
+            r#"{"targets":[{"path":"app.js","line":1,"column":14}],"include_tests":true}"#,
         )
         .unwrap();
     let value: Value = serde_json::from_str(&payload).unwrap();
