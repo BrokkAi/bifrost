@@ -401,8 +401,16 @@ impl RustAnalyzer {
         self.rust_declaration_node_is(code_unit, |node, _source| node.kind() == "trait_item")
     }
 
+    pub(crate) fn is_rust_struct_declaration(&self, code_unit: &CodeUnit) -> bool {
+        self.rust_declaration_node_is(code_unit, |node, _source| node.kind() == "struct_item")
+    }
+
     pub(crate) fn is_rust_enum_declaration(&self, code_unit: &CodeUnit) -> bool {
         self.rust_declaration_node_is(code_unit, |node, _source| node.kind() == "enum_item")
+    }
+
+    pub(crate) fn is_rust_type_alias_declaration(&self, code_unit: &CodeUnit) -> bool {
+        self.rust_declaration_node_is(code_unit, |node, _source| node.kind() == "type_item")
     }
 
     pub(crate) fn is_rust_public_like_declaration(&self, code_unit: &CodeUnit) -> bool {

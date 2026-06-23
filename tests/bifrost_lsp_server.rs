@@ -2197,11 +2197,67 @@ fn bifrost_lsp_server_type_hierarchy_scala_uses_same_handler() {
 }
 
 #[test]
-fn bifrost_lsp_server_type_hierarchy_returns_null_without_provider() {
+fn bifrost_lsp_server_type_hierarchy_rust_uses_same_handler() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().canonicalize().expect("canon temp");
     let file_path = root.join("lib.rs");
-    fs::write(&file_path, "struct Base;\n").expect("write Rust fixture");
+    fs::write(
+        &file_path,
+        "trait Runnable {}\nstruct Worker;\nimpl Runnable for Worker {}\n",
+    )
+    .expect("write Rust hierarchy fixture");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let worker_item =
+        prepare_type_hierarchy(&mut stdin, &mut reader, &mut stderr, 60, &file_uri, 1, 8);
+    assert_eq!(
+        worker_item["name"], "Worker",
+        "prepared worker: {worker_item}"
+    );
+
+    let supertypes = type_hierarchy_relation(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        61,
+        "typeHierarchy/supertypes",
+        worker_item,
+    );
+    let supertype_names: Vec<_> = supertypes
+        .iter()
+        .filter_map(|item| item["name"].as_str())
+        .collect();
+    assert_eq!(
+        supertype_names,
+        vec!["Runnable"],
+        "supertypes: {supertypes:#?}"
+    );
+
+    let runnable_item = supertypes[0].clone();
+    let subtypes = type_hierarchy_relation(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        62,
+        "typeHierarchy/subtypes",
+        runnable_item,
+    );
+    let subtype_names: Vec<_> = subtypes
+        .iter()
+        .filter_map(|item| item["name"].as_str())
+        .collect();
+    assert_eq!(subtype_names, vec!["Worker"], "subtypes: {subtypes:#?}");
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_type_hierarchy_returns_null_without_provider() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("main.go");
+    fs::write(&file_path, "package main\ntype Worker struct{}\n").expect("write Go fixture");
     fs::write(root.join("Supported.java"), "class Supported {}\n").expect("write Java fixture");
 
     let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
@@ -2214,7 +2270,7 @@ fn bifrost_lsp_server_type_hierarchy_returns_null_without_provider() {
             "method": "textDocument/prepareTypeHierarchy",
             "params": {
                 "textDocument": {"uri": file_uri},
-                "position": {"line": 0, "character": 7}
+                "position": {"line": 1, "character": 5}
             }
         }),
     );
