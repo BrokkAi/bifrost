@@ -37,6 +37,12 @@ to their source and fix the root cause, even when that increases the blast radiu
 For analyzer resolution and usage analysis, do not add regex/text-search fallbacks that mask missing structured support.
 Surface the structured failure and fix the graph/resolver instead.
 
+Do not replace parser support with small source-text "mini parsers" built from string splitting, regexes, or delimiter
+scanning. For example, do not parse Rust paths or type syntax with `split("::")`, `split_once(':')`, or manual generic
+delimiter walks when tree-sitter nodes, analyzer declaration ranges, import binders, or existing resolver helpers can
+provide the structure. Prefer reading AST fields such as `path`, `name`, `type`, `value`, and `field`, and add a shared
+structured helper if the same interpretation is needed in more than one place.
+
 Backwards compatibility is not yet a concern. Clean up APIs instead when our requirements change.
 
 # Implementation details

@@ -364,9 +364,11 @@ pub(super) fn scan_files_for_member_target(
         let mut local_hits = BTreeSet::new();
         let mut ctx = MemberScanCtx {
             analyzer,
+            rust,
             file,
             source,
             line_starts: &line_starts,
+            owner: &owner,
             member_name: &member_name,
             target_is_field: target.is_field(),
             receiver_names: &receiver_names,
@@ -387,9 +389,11 @@ pub(super) fn scan_files_for_member_target(
 
 struct MemberScanCtx<'a> {
     analyzer: &'a dyn IAnalyzer,
+    rust: &'a RustAnalyzer,
     file: &'a ProjectFile,
     source: &'a str,
     line_starts: &'a [usize],
+    owner: &'a CodeUnit,
     member_name: &'a str,
     target_is_field: bool,
     receiver_names: &'a Vec<String>,
@@ -430,21 +434,17 @@ fn record_instance_member_hit(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
     let Some(receiver) = node.child_by_field_name("value") else {
         return;
     };
-    let receiver_name = simple_node_text(receiver, ctx.source);
-    let receiver_ok = receiver_name
-        .as_ref()
-        .is_some_and(|name| ctx.receiver_names.contains(name))
-        || self_field_receiver_matches_owner(receiver, ctx);
-    if !receiver_ok {
-        return;
-    }
-
     let start = field.start_byte();
     let end = field.end_byte();
     let Some(enclosing) = member_hit_enclosing(ctx.analyzer, ctx.file, ctx.line_starts, start, end)
     else {
         return;
     };
+    let receiver_name = simple_node_text(receiver, ctx.source);
+    if !receiver_matches_owner(receiver, receiver_name.as_deref(), &enclosing, ctx) {
+        return;
+    }
+
     // The explicit-mismatch guard only applies to a simple named receiver whose type
     // could be re-annotated in the enclosing scope; a resolved `self.field` receiver
     // already proved its type structurally.
@@ -476,10 +476,44 @@ fn record_instance_member_hit(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
     );
 }
 
+fn receiver_matches_owner(
+    receiver: Node<'_>,
+    receiver_name: Option<&str>,
+    enclosing: &CodeUnit,
+    ctx: &MemberScanCtx<'_>,
+) -> bool {
+    if receiver_name.is_some_and(|name| ctx.receiver_names.iter().any(|receiver| receiver == name))
+    {
+        return true;
+    }
+
+    match receiver.kind() {
+        "self" => enclosing_impl_type_matches_owner(receiver, ctx),
+        "field_expression" => self_field_receiver_matches_owner(receiver, enclosing, ctx),
+        _ => false,
+    }
+}
+
+/// Whether `receiver` is direct `self` inside an inherent impl whose resolved
+/// target type is the owner, so `self.member` resolves to that owner member.
+fn enclosing_impl_type_matches_owner(receiver: Node<'_>, ctx: &MemberScanCtx<'_>) -> bool {
+    let Some(impl_item) = enclosing_impl_item(receiver) else {
+        return false;
+    };
+    let Some(type_node) = impl_item.child_by_field_name("type") else {
+        return false;
+    };
+    resolved_type_matches_owner(type_node, ctx)
+}
+
 /// Whether `receiver` is `self.<field>` and that field's declared type on the
 /// enclosing `impl` type is the owner type — so a `self.field.member` access
 /// resolves without the receiver being a simple local of the owner type.
-fn self_field_receiver_matches_owner(receiver: Node<'_>, ctx: &MemberScanCtx<'_>) -> bool {
+fn self_field_receiver_matches_owner(
+    receiver: Node<'_>,
+    enclosing: &CodeUnit,
+    ctx: &MemberScanCtx<'_>,
+) -> bool {
     if receiver.kind() != "field_expression" {
         return false;
     }
@@ -495,43 +529,104 @@ fn self_field_receiver_matches_owner(receiver: Node<'_>, ctx: &MemberScanCtx<'_>
     else {
         return false;
     };
-    let Some(enclosing) = member_hit_enclosing(
-        ctx.analyzer,
-        ctx.file,
-        ctx.line_starts,
-        receiver.start_byte(),
-        receiver.end_byte(),
-    ) else {
-        return false;
-    };
-    let Some(self_type) = ctx.analyzer.parent_of(&enclosing) else {
+    let Some(self_type) = ctx.analyzer.parent_of(enclosing) else {
         return false;
     };
     ctx.analyzer
         .get_members_in_class(&self_type)
         .into_iter()
         .filter(|member| member.is_field() && member.identifier() == field_name)
-        .any(|member| {
-            ctx.analyzer
-                .get_source(&member, false)
-                .as_deref()
-                .and_then(field_declared_type_name)
-                .is_some_and(|ty| ctx.receiver_type_names.contains(&ty))
-        })
+        .any(|member| field_declared_type_matches_receiver(&member, ctx))
 }
 
-/// The type name a struct field declaration is *directly* of, e.g.
-/// `repository: MemoryRepository` -> `MemoryRepository`. Uses the leading type
-/// token only, so a wrapper type (`Vec<Owner>`, `HashMap<K, Owner>`, `(A, Owner)`,
-/// `[Owner; N]`) yields the wrapper (or nothing) and never the inner owner — a
-/// field of `HashMap<String, Owner>` is not a field *of* the owner type.
-fn field_declared_type_name(field_source: &str) -> Option<String> {
-    let ty = field_source.split_once(':')?.1;
-    let leading = leading_type_path(ty)?;
-    if leading.contains("::") {
-        return None;
+fn enclosing_impl_item(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        if node.kind() == "impl_item" {
+            return Some(node);
+        }
+        node = node.parent()?;
     }
-    leading.rsplit("::").next().map(str::to_string)
+}
+
+fn resolved_type_matches_owner(type_node: Node<'_>, ctx: &MemberScanCtx<'_>) -> bool {
+    let Some(fqn) = resolved_type_node_fqn(type_node, ctx) else {
+        return false;
+    };
+    fqn_matches_owner(ctx.rust, &fqn, ctx.owner)
+}
+
+fn resolved_type_node_fqn(type_node: Node<'_>, ctx: &MemberScanCtx<'_>) -> Option<String> {
+    let refs = ctx.rust.reference_context_of(ctx.file);
+
+    match type_node.kind() {
+        "type_identifier" | "identifier" => {
+            let name = simple_node_text(type_node, ctx.source)?;
+            refs.resolve_bare(&name).map(str::to_string)
+        }
+        "scoped_type_identifier" | "scoped_identifier" => {
+            let path = type_node
+                .child_by_field_name("path")
+                .and_then(|path| simple_node_text(path, ctx.source))?;
+            let name = type_node
+                .child_by_field_name("name")
+                .and_then(|name| simple_node_text(name, ctx.source))?;
+            refs.resolve_scoped(&path, &name)
+        }
+        "generic_type" => {
+            let base = type_node.child_by_field_name("type").or_else(|| {
+                let mut cursor = type_node.walk();
+                type_node.named_children(&mut cursor).next()
+            })?;
+            resolved_type_node_fqn(base, ctx)
+        }
+        "reference_type" | "pointer_type" | "array_type" | "slice_type" => {
+            let mut cursor = type_node.walk();
+            type_node
+                .named_children(&mut cursor)
+                .find_map(|child| resolved_type_node_fqn(child, ctx))
+        }
+        _ => None,
+    }
+}
+
+fn fqn_matches_owner(rust: &RustAnalyzer, fqn: &str, owner: &CodeUnit) -> bool {
+    rust.definitions(fqn).any(|unit| unit == owner)
+}
+
+fn field_declared_type_matches_receiver(member: &CodeUnit, ctx: &MemberScanCtx<'_>) -> bool {
+    let Some(range) = ctx.analyzer.ranges(member).iter().next() else {
+        return false;
+    };
+    let Ok(source) = member.source().read_to_string() else {
+        return false;
+    };
+    let Some(tree) = parse_rust_source(&source) else {
+        return false;
+    };
+    let Some(field) = node_for_exact_range(tree.root_node(), range.start_byte, range.end_byte)
+    else {
+        return false;
+    };
+    field
+        .child_by_field_name("type")
+        .and_then(|ty| simple_type_name(ty, &source))
+        .is_some_and(|ty| ctx.receiver_type_names.contains(&ty))
+}
+
+fn node_for_exact_range(root: Node<'_>, start: usize, end: usize) -> Option<Node<'_>> {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.start_byte() == start && node.end_byte() == end {
+            return Some(node);
+        }
+        if node.start_byte() <= start && node.end_byte() >= end {
+            let mut cursor = node.walk();
+            let mut children: Vec<_> = node.named_children(&mut cursor).collect();
+            children.reverse();
+            stack.extend(children);
+        }
+    }
+    None
 }
 
 /// The leading type name of a type expression: strips `&`, lifetimes, `mut`,
