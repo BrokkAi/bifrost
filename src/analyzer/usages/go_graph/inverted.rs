@@ -18,9 +18,9 @@
 //! where the forward scan matches one target it resolves the reference's callee.
 
 use super::extractor::{
-    declared_names, for_each_var_spec, is_definition_identifier, is_identifier_node,
-    lhs_identifiers, parameter_names, receiver_symbol_from_qualifier, rhs_expressions,
-    selector_parts, type_ref_from_node, var_spec_names,
+    for_each_var_spec, is_definition_identifier, is_identifier_node, lhs_identifier_slots,
+    parameter_names, receiver_symbol_from_qualifier, rhs_expressions, selector_parts,
+    type_ref_from_node, var_spec_names,
 };
 use super::resolver::{GoEdgeIndex, TypeRef, node_text};
 use crate::analyzer::usages::inverted_edges::{
@@ -63,6 +63,7 @@ where
                 file_pkg,
                 alias_packages,
                 dot_packages,
+                index,
                 collector,
             };
             let mut locals = LocalInferenceEngine::new(LocalInferenceConfig::default());
@@ -76,6 +77,7 @@ struct FileScan<'a, 'b> {
     file_pkg: String,
     alias_packages: HashMap<String, Vec<String>>,
     dot_packages: Vec<String>,
+    index: &'a GoEdgeIndex,
     collector: &'a mut EdgeCollector<'b>,
 }
 
@@ -121,6 +123,68 @@ impl FileScan<'_, '_> {
         Vec::new()
     }
 
+    fn constructor_call_type_tokens(
+        &self,
+        node: Node<'_>,
+        locals: Option<&LocalInferenceEngine<String>>,
+    ) -> Vec<String> {
+        if node.kind() != "call_expression" {
+            return Vec::new();
+        }
+        let Some(function) = node
+            .child_by_field_name("function")
+            .or_else(|| super::extractor::first_named_child(node))
+        else {
+            return Vec::new();
+        };
+        match function.kind() {
+            "identifier" => {
+                let name = node_text(function, self.source);
+                if locals.is_some_and(|locals| locals.is_shadowed(name)) {
+                    return Vec::new();
+                }
+                self.constructor_return_types_for(name)
+            }
+            "selector_expression" => {
+                let Some((qualifier, _, field)) = selector_parts(function, self.source) else {
+                    return Vec::new();
+                };
+                if locals.is_some_and(|locals| locals.is_shadowed(&qualifier)) {
+                    return Vec::new();
+                }
+                let field = node_text(field, self.source);
+                let Some(packages) = self.alias_packages.get(&qualifier) else {
+                    return Vec::new();
+                };
+                packages
+                    .iter()
+                    .flat_map(|package| {
+                        self.constructor_return_types_for_fqn(&format!("{package}.{field}"))
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn constructor_return_types_for(&self, name: &str) -> Vec<String> {
+        let mut tokens =
+            self.constructor_return_types_for_fqn(&format!("{}.{}", self.file_pkg, name));
+        for package in &self.dot_packages {
+            tokens.extend(self.constructor_return_types_for_fqn(&format!("{package}.{name}")));
+        }
+        tokens.sort();
+        tokens.dedup();
+        tokens
+    }
+
+    fn constructor_return_types_for_fqn(&self, callee: &str) -> Vec<String> {
+        self.index
+            .constructor_return_types(callee)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// Hand a resolved reference to the shared collector, which applies the
     /// enclosing-caller attribution, cap counting, and edge dedup.
     fn record(&mut self, callee: String, node: Node<'_>) {
@@ -162,10 +226,11 @@ fn scan_node(
             if node.kind() == "var_declaration" && is_top_level_declaration(node) {
                 scan_top_level_value_initializers(node, ctx);
             }
-            declare_local_names(node, ctx, locals);
             seed_local_bindings(node, ctx, locals);
         }
-        "assignment_statement" => seed_local_bindings(node, ctx, locals),
+        "assignment_statement" => {
+            seed_local_bindings(node, ctx, locals);
+        }
         "selector_expression" | "qualified_type" => scan_selector(node, ctx, locals),
         "identifier" | "type_identifier" => scan_direct(node, ctx, locals),
         _ => {}
@@ -363,16 +428,6 @@ fn seed_parameter_declaration(
     seed_or_shadow(names, tokens, locals);
 }
 
-fn declare_local_names(
-    node: Node<'_>,
-    ctx: &FileScan<'_, '_>,
-    locals: &mut LocalInferenceEngine<String>,
-) {
-    for name in declared_names(node, ctx.source) {
-        locals.declare_shadow(name);
-    }
-}
-
 fn seed_local_bindings(
     node: Node<'_>,
     ctx: &FileScan<'_, '_>,
@@ -383,7 +438,8 @@ fn seed_local_bindings(
             for_each_var_spec(node, &mut |var_spec| seed_var_spec(var_spec, ctx, locals))
         }
         "var_spec" => seed_var_spec(node, ctx, locals),
-        "short_var_declaration" | "assignment_statement" => seed_assignment_like(node, ctx, locals),
+        "short_var_declaration" => seed_assignment_like(node, ctx, locals, true),
+        "assignment_statement" => seed_assignment_like(node, ctx, locals, false),
         _ => {}
     }
 }
@@ -406,39 +462,92 @@ fn seed_var_spec(
         seed_or_shadow(names, typed, locals);
         return;
     }
-    seed_names_from_values(names, rhs_expressions(node), ctx, locals);
+    let bindings = infer_names_from_values(
+        var_spec_name_slots(node, ctx.source),
+        rhs_expressions(node),
+        ctx,
+        locals,
+    );
+    for name in names {
+        locals.declare_shadow(name);
+    }
+    apply_inferred_bindings(bindings, locals);
 }
 
 fn seed_assignment_like(
     node: Node<'_>,
     ctx: &FileScan<'_, '_>,
     locals: &mut LocalInferenceEngine<String>,
+    declare_lhs: bool,
 ) {
-    seed_names_from_values(
-        lhs_identifiers(node, ctx.source),
-        rhs_expressions(node),
-        ctx,
-        locals,
-    );
-}
-
-fn seed_names_from_values(
-    names: Vec<String>,
-    values: Vec<Node<'_>>,
-    ctx: &FileScan<'_, '_>,
-    locals: &mut LocalInferenceEngine<String>,
-) {
-    if names.is_empty() || values.is_empty() {
-        return;
-    }
-    for (name, value) in names.iter().zip(values.iter()) {
-        let tokens = ctx.expression_type_tokens(*value);
-        if !tokens.is_empty() {
-            locals.seed_symbol_many(name.clone(), tokens);
-        } else if is_identifier_node(*value) {
-            locals.alias_symbol(name.clone(), node_text(*value, ctx.source));
+    let slots = lhs_identifier_slots(node, ctx.source);
+    let bindings = infer_names_from_values(slots.clone(), rhs_expressions(node), ctx, locals);
+    if declare_lhs {
+        for name in slots.into_iter().flatten() {
+            locals.declare_shadow(name);
         }
     }
+    apply_inferred_bindings(bindings, locals);
+}
+
+enum InferredBinding {
+    Types(Vec<String>),
+    Alias(String),
+}
+
+fn infer_names_from_values(
+    names: Vec<Option<String>>,
+    values: Vec<Node<'_>>,
+    ctx: &FileScan<'_, '_>,
+    locals: &LocalInferenceEngine<String>,
+) -> Vec<(String, InferredBinding)> {
+    if names.is_empty() || values.is_empty() {
+        return Vec::new();
+    }
+
+    names
+        .iter()
+        .zip(values.iter())
+        .filter_map(|(name, value)| {
+            let name = name.as_ref()?;
+            let mut tokens = ctx.constructor_call_type_tokens(*value, Some(locals));
+            if tokens.is_empty() {
+                tokens = ctx.expression_type_tokens(*value);
+            }
+            if !tokens.is_empty() {
+                Some((name.clone(), InferredBinding::Types(tokens)))
+            } else if is_identifier_node(*value) {
+                Some((
+                    name.clone(),
+                    InferredBinding::Alias(node_text(*value, ctx.source).to_string()),
+                ))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn apply_inferred_bindings(
+    bindings: Vec<(String, InferredBinding)>,
+    locals: &mut LocalInferenceEngine<String>,
+) {
+    for (name, binding) in bindings {
+        match binding {
+            InferredBinding::Types(tokens) => locals.seed_symbol_many(name, tokens),
+            InferredBinding::Alias(source) => locals.alias_symbol(name, &source),
+        }
+    }
+}
+
+fn var_spec_name_slots(node: Node<'_>, source: &str) -> Vec<Option<String>> {
+    let mut out = Vec::new();
+    let mut cursor = node.walk();
+    for name_node in node.children_by_field_name("name", &mut cursor) {
+        let name = node_text(name_node, source);
+        out.push((name != "_").then(|| name.to_string()));
+    }
+    out
 }
 
 /// Seed `names` with the inferred type tokens, or — when no workspace type was

@@ -12,3 +12,13 @@ func (a *Alpha) Channel() string { return "alpha" }
 type Beta struct{}
 
 func (b *Beta) Channel() string { return "beta" }
+
+type Service struct{}
+
+func NewService() Service { return Service{} }
+
+func (s Service) Execute() string { return "service" }
+
+type Other struct{}
+
+func (o Other) Execute() string { return "other" }

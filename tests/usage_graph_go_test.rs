@@ -86,6 +86,33 @@ fn member_call_resolves_to_the_receivers_type() {
 }
 
 #[test]
+fn constructor_returned_receiver_call_resolves_to_an_edge() {
+    let graph = go_usage_graph();
+    assert!(
+        has_edge(
+            &graph,
+            "example.com/app.runService",
+            "example.com/app.Service.Execute"
+        ),
+        "member call on a constructor-returned receiver should resolve to Service.Execute; edges: {:?}",
+        graph["edges"]
+    );
+}
+
+#[test]
+fn grouped_var_shadowed_constructor_does_not_resolve_to_package_constructor() {
+    let graph = go_usage_graph();
+    assert!(
+        !has_edge(
+            &graph,
+            "example.com/app.shadowedGroupedService",
+            "example.com/app.Service.Execute"
+        ),
+        "constructor shadowed by an earlier grouped var spec must not resolve to Service.Execute"
+    );
+}
+
+#[test]
 fn same_named_methods_are_not_cross_linked() {
     let graph = go_usage_graph();
     // The pathology the inverted builder fixes: Alpha.Channel and Beta.Channel
@@ -121,7 +148,7 @@ fn repeated_calls_aggregate_edge_weight() {
 
 #[test]
 fn edges_carry_call_site_locations() {
-    // `total` calls `helper` on calls.go lines 19 and 20; the edge carries both
+    // `total` calls `helper` on calls.go lines 32 and 33; the edge carries both
     // locations, and the site count matches the weight.
     let graph = go_usage_graph();
     let sites = edge_sites(&graph, "example.com/app.total", "example.com/app.helper")
@@ -137,7 +164,7 @@ fn edges_carry_call_site_locations() {
         .collect();
     assert_eq!(
         located,
-        vec![("calls.go", 19), ("calls.go", 20)],
+        vec![("calls.go", 32), ("calls.go", 33)],
         "sites should be the two distinct call-site locations, sorted by (path, line)"
     );
     assert_eq!(
