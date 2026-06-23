@@ -6,7 +6,13 @@ pub(super) fn supports_same_file_local_scan(analyzer: &RustAnalyzer, target: &Co
 }
 
 pub(super) fn is_member_target(analyzer: &RustAnalyzer, target: &CodeUnit) -> bool {
-    (target.is_function() || target.is_field()) && analyzer.parent_of(target).is_some()
+    // A member is referenced through a value of its owning type (`receiver.member`).
+    // A function or field whose parent is a module is a free item referenced by name,
+    // so it belongs on the top-level scan path, not the member-receiver path.
+    (target.is_function() || target.is_field())
+        && analyzer
+            .parent_of(target)
+            .is_some_and(|parent| !parent.is_module())
 }
 
 pub(super) fn is_trait_owner(rust: &RustAnalyzer, owner: &CodeUnit) -> bool {
@@ -15,6 +21,10 @@ pub(super) fn is_trait_owner(rust: &RustAnalyzer, owner: &CodeUnit) -> bool {
 
 fn is_public_like_declaration(rust: &RustAnalyzer, code_unit: &CodeUnit) -> bool {
     rust.is_rust_public_like_declaration(code_unit)
+}
+
+fn is_export_visible_declaration(rust: &RustAnalyzer, code_unit: &CodeUnit) -> bool {
+    rust.is_rust_export_visible_declaration(code_unit)
 }
 
 pub(super) fn is_graph_visible_member_target(rust: &RustAnalyzer, target: &CodeUnit) -> bool {
@@ -65,6 +75,15 @@ pub(super) fn infer_graph_seeds(
         }
     }
 
+    // Last resort: resolve an export-visible item that reaches the public API only
+    // through a `pub use` re-export of a private module. These names are tried only
+    // via real re-export chains, so a private, never-re-exported item stays unseeded.
+    if seeds.is_empty() {
+        for seed_name in reexport_fallback_export_names(analyzer, target) {
+            seeds.extend(analyzer.usage_seeds(target.source(), &seed_name));
+        }
+    }
+
     seeds
 }
 
@@ -103,6 +122,28 @@ fn infer_export_names(analyzer: &RustAnalyzer, target: &CodeUnit) -> BTreeSet<St
     }
 
     BTreeSet::new()
+}
+
+/// Export names to try only through actual re-export chains, after the primary
+/// inference yields no seeds. An export-visible item can live in a private `mod`
+/// whose own file exports nothing, reaching the crate's public API solely through a
+/// `pub use` re-export elsewhere. Seed by the export identifier — the owner's, for a
+/// member referenced through a value of the owner type. Unlike the primary names,
+/// these are never force-seeded onto the definition file: reachability is decided by
+/// whether the re-export chain exists, so an export-visible-but-never-re-exported
+/// item still resolves to no seeds.
+fn reexport_fallback_export_names(analyzer: &RustAnalyzer, target: &CodeUnit) -> BTreeSet<String> {
+    if !is_export_visible_declaration(analyzer, target) {
+        return BTreeSet::new();
+    }
+    if (target.is_function() || target.is_field())
+        && let Some(owner) = analyzer.parent_of(target)
+        && !owner.is_module()
+        && is_export_visible_declaration(analyzer, &owner)
+    {
+        return [owner.identifier().to_string()].into_iter().collect();
+    }
+    [target.identifier().to_string()].into_iter().collect()
 }
 
 fn infer_export_names_for_local(

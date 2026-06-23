@@ -2469,3 +2469,196 @@ fn run() {
         FuzzyResult::Failure { .. }
     ));
 }
+
+// Regression for #233: references that reach the crate's public API only through a
+// `pub use` re-export of a private module must resolve on the graph path — a
+// re-exported free function call, a method on a constructor-returned local, and a
+// struct field read through a `self.field` receiver. Before this, seed inference
+// bailed on the empty per-file export index and the regex fallback masked the gap.
+fn build_233_reexport_project() -> (common::BuiltInlineTestProject, RustAnalyzer) {
+    rust_analyzer_with_files(&[
+        (
+            "src/service.rs",
+            r#"
+pub struct MemoryRepository {
+    pub last: String,
+}
+
+pub struct Service {
+    repository: MemoryRepository,
+}
+
+impl Service {
+    pub fn execute(&self) -> &str {
+        &self.repository.last
+    }
+}
+
+pub fn build_service() -> Service {
+    Service {
+        repository: MemoryRepository {
+            last: "demo".to_string(),
+        },
+    }
+}
+"#,
+        ),
+        (
+            "src/lib.rs",
+            r#"
+mod service;
+
+pub use service::{build_service, MemoryRepository, Service};
+
+pub fn run() -> String {
+    let service = build_service();
+    service.execute().to_string()
+}
+"#,
+        ),
+    ])
+}
+
+fn rust_graph_hits(analyzer: &RustAnalyzer, fq_name: &str) -> Vec<brokk_bifrost::usages::UsageHit> {
+    let target = definition(analyzer, fq_name);
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
+        .find_usages(analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .unwrap_or_else(|_| panic!("expected graph success (not a fallback/failure) for {fq_name}"))
+        .into_iter()
+        .collect()
+}
+
+#[test]
+fn rust_graph_strategy_finds_reexported_free_function_call() {
+    let (project, analyzer) = build_233_reexport_project();
+    let hits = rust_graph_hits(&analyzer, "service.build_service");
+    assert_eq!(
+        1,
+        hits.len(),
+        "expected the build_service() call in run(): {hits:?}"
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file == project.file("src/lib.rs")),
+        "hit should be the call site in lib.rs: {hits:?}",
+    );
+}
+
+#[test]
+fn rust_graph_strategy_finds_method_call_on_constructor_returned_local() {
+    let (project, analyzer) = build_233_reexport_project();
+    let hits = rust_graph_hits(&analyzer, "service.Service.execute");
+    assert_eq!(
+        1,
+        hits.len(),
+        "expected service.execute() in run(): {hits:?}"
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file == project.file("src/lib.rs")),
+        "hit should be the call site in lib.rs: {hits:?}",
+    );
+}
+
+#[test]
+fn rust_graph_strategy_finds_field_read_through_self_field_receiver() {
+    let (project, analyzer) = build_233_reexport_project();
+    let hits = rust_graph_hits(&analyzer, "service.MemoryRepository.last");
+    assert_eq!(
+        1,
+        hits.len(),
+        "expected the self.repository.last read in Service::execute: {hits:?}",
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file == project.file("src/service.rs")),
+        "hit should be the field read in service.rs: {hits:?}",
+    );
+}
+
+// A field whose declared type only *wraps* the owner (a map value here) is not a
+// field of the owner type, so a read through it must not be a false-positive usage.
+#[test]
+fn rust_graph_strategy_does_not_treat_map_valued_field_as_owner_receiver() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/service.rs",
+            r#"
+use std::collections::HashMap;
+
+pub struct MemoryRepository {
+    pub last: String,
+}
+
+pub struct Cache {
+    entries: HashMap<String, MemoryRepository>,
+}
+
+impl Cache {
+    pub fn peek(&self) -> bool {
+        self.entries.last.is_empty()
+    }
+}
+"#,
+        ),
+        (
+            "src/lib.rs",
+            r#"
+mod service;
+
+pub use service::{Cache, MemoryRepository};
+"#,
+        ),
+    ]);
+
+    let hits = rust_graph_hits(&analyzer, "service.MemoryRepository.last");
+    assert!(
+        hits.is_empty(),
+        "self.entries.last where entries is a HashMap must not be a MemoryRepository.last usage: {hits:?}",
+    );
+}
+
+// A free function whose return type only *wraps* the owner (a `Vec` here) is not a
+// constructor of the owner, so a method call on the local it binds must not resolve.
+#[test]
+fn rust_graph_strategy_does_not_treat_vec_returning_function_as_constructor() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/service.rs",
+            r#"
+pub struct Service;
+
+impl Service {
+    pub fn execute(&self) -> &str {
+        ""
+    }
+}
+
+pub fn list_all() -> Vec<Service> {
+    Vec::new()
+}
+"#,
+        ),
+        (
+            "src/lib.rs",
+            r#"
+mod service;
+
+pub use service::{list_all, Service};
+
+pub fn run() {
+    let items = list_all();
+    let _ = items.execute();
+}
+"#,
+        ),
+    ]);
+
+    let hits = rust_graph_hits(&analyzer, "service.Service.execute");
+    assert!(
+        hits.is_empty(),
+        "items.execute() where items is Vec<Service> must not be a Service.execute usage: {hits:?}",
+    );
+}

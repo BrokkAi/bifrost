@@ -116,10 +116,21 @@ pub(super) fn scan_files_for_target(
         };
 
         let line_starts = compute_line_starts(source);
-        let (direct_names, namespace_names) = match seeds {
+        let (mut direct_names, namespace_names) = match seeds {
             Some(seeds) => rust.usage_binding_names(file, seeds),
             None => (HashSet::default(), HashSet::default()),
         };
+        // A file that re-exports a seed (`pub use path::name`) can also reference
+        // `name` directly in its own body, but a re-export is not recorded as a
+        // local import binding. Treat any seed rooted in this file as a direct name
+        // so those in-module references resolve.
+        if let Some(seeds) = seeds {
+            for (seed_file, seed_name) in seeds {
+                if seed_file == file {
+                    direct_names.insert(seed_name.clone());
+                }
+            }
+        }
         let target_self_file = file == target.source();
 
         let mut local_hits = BTreeSet::new();
@@ -350,6 +361,7 @@ pub(super) fn scan_files_for_member_target(
             source,
             line_starts: &line_starts,
             member_name: &member_name,
+            target_is_field: target.is_field(),
             receiver_names: &receiver_names,
             receiver_type_names: &receiver_type_names,
             static_owner_names: &static_owner_names,
@@ -372,6 +384,7 @@ struct MemberScanCtx<'a> {
     source: &'a str,
     line_starts: &'a [usize],
     member_name: &'a str,
+    target_is_field: bool,
     receiver_names: &'a Vec<String>,
     receiver_type_names: &'a HashSet<String>,
     static_owner_names: &'a HashSet<String>,
@@ -392,7 +405,13 @@ fn scan_member_node(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
 }
 
 fn record_instance_member_hit(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
-    if !field_expression_is_called(node) {
+    // A method target is referenced by a call (`receiver.method()`); a field target
+    // is referenced by a read/write (`receiver.field`), never as the callee.
+    if ctx.target_is_field {
+        if field_expression_is_called(node) {
+            return;
+        }
+    } else if !field_expression_is_called(node) {
         return;
     }
     let Some(field) = node.child_by_field_name("field") else {
@@ -401,13 +420,15 @@ fn record_instance_member_hit(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
     if simple_node_text(field, ctx.source).as_deref() != Some(ctx.member_name) {
         return;
     }
-    let Some(receiver_name) = node
-        .child_by_field_name("value")
-        .and_then(|receiver| simple_node_text(receiver, ctx.source))
-    else {
+    let Some(receiver) = node.child_by_field_name("value") else {
         return;
     };
-    if !ctx.receiver_names.contains(&receiver_name) {
+    let receiver_name = simple_node_text(receiver, ctx.source);
+    let receiver_ok = receiver_name
+        .as_ref()
+        .is_some_and(|name| ctx.receiver_names.contains(name))
+        || self_field_receiver_matches_owner(receiver, ctx);
+    if !receiver_ok {
         return;
     }
 
@@ -417,20 +438,25 @@ fn record_instance_member_hit(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
     else {
         return;
     };
-    let receiver_mismatched = ctx
-        .analyzer
-        .get_source(&enclosing, false)
-        .map(|enclosing_source| {
-            receiver_explicitly_mismatched(
-                ctx.source,
-                &enclosing_source,
-                ctx.receiver_type_names,
-                &receiver_name,
-            )
-        })
-        .unwrap_or(false);
-    if receiver_mismatched {
-        return;
+    // The explicit-mismatch guard only applies to a simple named receiver whose type
+    // could be re-annotated in the enclosing scope; a resolved `self.field` receiver
+    // already proved its type structurally.
+    if let Some(receiver_name) = receiver_name.as_ref() {
+        let receiver_mismatched = ctx
+            .analyzer
+            .get_source(&enclosing, false)
+            .map(|enclosing_source| {
+                receiver_explicitly_mismatched(
+                    ctx.source,
+                    &enclosing_source,
+                    ctx.receiver_type_names,
+                    receiver_name,
+                )
+            })
+            .unwrap_or(false);
+        if receiver_mismatched {
+            return;
+        }
     }
     push_member_hit(
         ctx.file,
@@ -441,6 +467,111 @@ fn record_instance_member_hit(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
         enclosing,
         ctx.hits,
     );
+}
+
+/// Whether `receiver` is `self.<field>` and that field's declared type on the
+/// enclosing `impl` type is the owner type — so a `self.field.member` access
+/// resolves without the receiver being a simple local of the owner type.
+fn self_field_receiver_matches_owner(receiver: Node<'_>, ctx: &MemberScanCtx<'_>) -> bool {
+    if receiver.kind() != "field_expression" {
+        return false;
+    }
+    if receiver
+        .child_by_field_name("value")
+        .is_none_or(|value| value.kind() != "self")
+    {
+        return false;
+    }
+    let Some(field_name) = receiver
+        .child_by_field_name("field")
+        .and_then(|field| simple_node_text(field, ctx.source))
+    else {
+        return false;
+    };
+    let Some(enclosing) = member_hit_enclosing(
+        ctx.analyzer,
+        ctx.file,
+        ctx.line_starts,
+        receiver.start_byte(),
+        receiver.end_byte(),
+    ) else {
+        return false;
+    };
+    let Some(self_type) = ctx.analyzer.parent_of(&enclosing) else {
+        return false;
+    };
+    ctx.analyzer
+        .get_members_in_class(&self_type)
+        .into_iter()
+        .filter(|member| member.is_field() && member.identifier() == field_name)
+        .any(|member| {
+            ctx.analyzer
+                .get_source(&member, false)
+                .as_deref()
+                .and_then(field_declared_type_name)
+                .is_some_and(|ty| ctx.receiver_type_names.contains(&ty))
+        })
+}
+
+/// The type name a struct field declaration is *directly* of, e.g.
+/// `repository: MemoryRepository` -> `MemoryRepository`. Uses the leading type
+/// token only, so a wrapper type (`Vec<Owner>`, `HashMap<K, Owner>`, `(A, Owner)`,
+/// `[Owner; N]`) yields the wrapper (or nothing) and never the inner owner — a
+/// field of `HashMap<String, Owner>` is not a field *of* the owner type.
+fn field_declared_type_name(field_source: &str) -> Option<String> {
+    leading_type_name(field_source.split_once(':')?.1)
+}
+
+/// The leading type name of a type expression: strips `&`, lifetimes, `mut`,
+/// `dyn`/`impl`, takes the first token, cuts it at any generic/tuple/array opener,
+/// and returns its final path segment (`std::collections::HashMap<..>` -> `HashMap`).
+fn leading_type_name(ty: &str) -> Option<String> {
+    let cleaned = ty.replace('&', " ");
+    let token = cleaned
+        .split_whitespace()
+        .find(|token| !matches!(*token, "mut" | "dyn" | "impl") && !token.starts_with('\''))?;
+    let head_end = token
+        .find(|ch: char| !(ch.is_alphanumeric() || ch == '_' || ch == ':'))
+        .unwrap_or(token.len());
+    let head = &token[..head_end];
+    let segment = head.rsplit("::").next().unwrap_or(head);
+    (!segment.is_empty()).then(|| segment.to_string())
+}
+
+/// Whether a function's return type produces the owner type by value — `Self`, the
+/// owner directly, or the owner/`Self` as the first type argument of a
+/// `Result`/`Option`/`Box`/`Arc`/`Rc` wrapper. A substring match is too loose: a
+/// function returning `Vec<Owner>` is not a constructor of the owner.
+fn return_type_is_owner_like(return_ty: &str, owner_ident: &str) -> bool {
+    let Some(head) = leading_type_name(return_ty) else {
+        return false;
+    };
+    if head == "Self" || head == owner_ident {
+        return true;
+    }
+    if matches!(head.as_str(), "Result" | "Option" | "Box" | "Arc" | "Rc") {
+        return first_generic_argument(return_ty)
+            .is_some_and(|inner| return_type_is_owner_like(&inner, owner_ident));
+    }
+    false
+}
+
+/// The first top-level generic argument of a type expression, e.g.
+/// `Result<Self, Error>` -> `Self`.
+fn first_generic_argument(ty: &str) -> Option<String> {
+    let start = ty.find('<')? + 1;
+    let rest = &ty[start..];
+    let mut depth = 0usize;
+    for (index, ch) in rest.char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' if depth == 0 => return Some(rest[..index].trim().to_string()),
+            '>' => depth -= 1,
+            ',' if depth == 0 => return Some(rest[..index].trim().to_string()),
+            _ => {}
+        }
+    }
+    None
 }
 
 fn field_expression_is_called(node: Node<'_>) -> bool {
@@ -498,19 +629,25 @@ fn self_like_constructor_names(rust: &RustAnalyzer, owner: &CodeUnit) -> HashSet
         .filter(|code_unit| code_unit.source() == owner.source())
         .filter(|code_unit| code_unit.is_function())
         .filter(|code_unit| {
-            rust.parent_of(code_unit)
-                .map(|parent| parent == *owner)
-                .unwrap_or(false)
+            // Associated constructors of the owner (`Owner::new`) and free functions
+            // in the same module (`build_owner`) both return the owner type; a method
+            // on a different type is excluded by the return-type check below.
+            match rust.parent_of(code_unit) {
+                None => true,
+                Some(parent) => parent.is_module() || parent == *owner,
+            }
         })
         .filter_map(|code_unit| {
             let source = rust.get_source(&code_unit, false)?;
-            let (_, return_ty) = source.split_once("->")?;
-            let normalized: String = return_ty.chars().filter(|ch| !ch.is_whitespace()).collect();
-            (normalized.contains("Self")
-                || normalized.contains(owner.identifier())
-                || normalized.contains("Result<Self")
-                || normalized.contains(&format!("Result<{}", owner.identifier())))
-            .then(|| code_unit.identifier().to_string())
+            // Use only the signature head (up to the body) so a `-> Owner` mention
+            // inside the function body can't be mistaken for the return type.
+            let head = source
+                .split_once('{')
+                .map(|(head, _)| head)
+                .unwrap_or(&source);
+            let (_, return_ty) = head.split_once("->")?;
+            return_type_is_owner_like(return_ty, owner.identifier())
+                .then(|| code_unit.identifier().to_string())
         })
         .collect()
 }
@@ -586,6 +723,11 @@ fn collect_receiver_bindings(
     };
     let root = tree.root_node();
 
+    // A stable owner-type name to seed receivers whose owner type is known only
+    // indirectly (a function whose return type is the owner). Any element of
+    // `owner_type_names` matches in `infer_receiver_names`, so pick deterministically.
+    let owner_repr = owner_type_names.iter().min().cloned();
+
     let option_field_types = collect_option_field_types(root, source);
     let mut aliases = Vec::new();
     for event in collect_receiver_events(root, source, &option_field_types) {
@@ -599,13 +741,27 @@ fn collect_receiver_bindings(
                 name,
                 ty,
                 constructor,
-            } => {
-                let allowed_constructor =
-                    constructor.is_none_or(|name| self_like_constructors.contains(&name));
-                if owner_type_names.contains(&ty) && allowed_constructor {
+            } => match constructor {
+                // `Owner::new(...)` / tuple-struct `Owner(...)`: the path text is the
+                // owner type and (for the scoped form) the associated fn must return it.
+                Some(ctor) => {
+                    if owner_type_names.contains(&ty) && self_like_constructors.contains(&ctor) {
+                        engine.seed_symbol(name, ty);
+                    }
+                }
+                None if owner_type_names.contains(&ty) => {
                     engine.seed_symbol(name, ty);
                 }
-            }
+                // `let x = build_owner();` — a bare call to a free or associated
+                // function whose return type is the owner. Seed the receiver's type so
+                // method/field accesses on it resolve.
+                None if self_like_constructors.contains(&ty) => {
+                    if let Some(owner_repr) = owner_repr.clone() {
+                        engine.seed_symbol(name, owner_repr);
+                    }
+                }
+                None => {}
+            },
             ReceiverEvent::Alias { name, source } => aliases.push((name, source)),
         }
     }
