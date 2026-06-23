@@ -39,6 +39,7 @@ const FILE_SKIM_LIMIT: usize = 20;
 // truncation limit after JSON escaping and tool wrapper overhead.
 pub const SCAN_USAGES_RESPONSE_BUDGET_BYTES: usize = 8_192;
 const SCAN_USAGES_MAX_CALLSITES: usize = DEFAULT_MAX_USAGES;
+const SCAN_USAGES_PATH_SCOPED_MAX_FILES: usize = 10_000;
 const SCAN_USAGES_SUMMARY_FILE_LIMIT: usize = 20;
 const SCAN_USAGES_TOP_ENCLOSING_LIMIT: usize = 10;
 const SCAN_USAGES_AMBIGUOUS_DETAILS_LIMIT: usize = 3;
@@ -2314,7 +2315,7 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
     for (symbol, overloads, location_selected) in resolved_targets {
         let finder = scoped_usage_finder(test_files.as_ref(), &path_filter);
         let max_candidate_files = if path_scoped_candidates.is_some() {
-            usize::MAX
+            SCAN_USAGES_PATH_SCOPED_MAX_FILES
         } else {
             DEFAULT_MAX_FILES
         };
