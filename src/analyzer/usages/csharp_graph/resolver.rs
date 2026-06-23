@@ -495,8 +495,12 @@ pub(in crate::analyzer::usages) fn binding_scope_node(mut node: Node<'_>) -> Nod
 }
 
 pub(super) fn receiver_targets_owner(
+    receiver_node: Node<'_>,
     receiver: &str,
     owner: &CodeUnit,
+    csharp: &CSharpAnalyzer,
+    file: &ProjectFile,
+    source: &str,
     bindings: &LocalInferenceEngine<String>,
 ) -> SymbolResolution<String> {
     match bindings.resolve_symbol(receiver) {
@@ -505,8 +509,67 @@ pub(super) fn receiver_targets_owner(
         {
             SymbolResolution::Precise(targets)
         }
+        SymbolResolution::Unknown if !bindings.is_shadowed(receiver) => {
+            class_field_receiver_targets_owner(receiver_node, receiver, owner, csharp, file, source)
+        }
         resolution => resolution,
     }
+}
+
+/// Resolve a receiver that is not bound locally (no parameter or local declaration)
+/// against the class-level fields of its enclosing type, mirroring `receiver_type_units`.
+/// This lets `field.Member` references prove a hit when `field` is a class-level field
+/// whose declared type is the owner of the target member.
+fn class_field_receiver_targets_owner(
+    receiver_node: Node<'_>,
+    receiver: &str,
+    owner: &CodeUnit,
+    csharp: &CSharpAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+) -> SymbolResolution<String> {
+    let resolved = enclosing_declared_type(receiver_node, csharp, file, source)
+        .and_then(|enclosing| member_declared_type_fq_name(csharp, file, &enclosing, receiver));
+    match resolved {
+        Some(fq_name) if fq_name == owner.fq_name() => {
+            SymbolResolution::Precise(std::iter::once(fq_name).collect())
+        }
+        _ => SymbolResolution::Unknown,
+    }
+}
+
+/// Whether an unqualified `member_name` is bound by a local (parameter or local
+/// variable) of the same name in scope — in which case it is provably *not* the
+/// field, so the occurrence should be skipped rather than treated as an ambiguous
+/// (fallback-forcing) match.
+pub(super) fn member_name_is_locally_bound(
+    member_name: &str,
+    bindings: &LocalInferenceEngine<String>,
+) -> bool {
+    !matches!(
+        bindings.resolve_symbol(member_name),
+        SymbolResolution::Unknown
+    ) || bindings.is_shadowed(member_name)
+}
+
+/// An unqualified identifier (no receiver) that matches a field/property name resolves to
+/// that field only when it appears inside the owning type and is not shadowed by a local
+/// binding (parameter or local variable) of the same name. This proves self-references such
+/// as `Last = value` inside a method of the field's own class.
+pub(super) fn unqualified_member_resolves_to_owner(
+    node: Node<'_>,
+    member_name: &str,
+    owner: &CodeUnit,
+    csharp: &CSharpAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    bindings: &LocalInferenceEngine<String>,
+) -> bool {
+    if member_name_is_locally_bound(member_name, bindings) {
+        return false;
+    }
+    enclosing_declared_type(node, csharp, file, source)
+        .is_some_and(|enclosing| enclosing.fq_name() == owner.fq_name())
 }
 
 pub(in crate::analyzer::usages) fn is_type_reference_node(mut node: Node<'_>) -> bool {
