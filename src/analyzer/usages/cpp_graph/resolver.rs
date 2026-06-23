@@ -1017,8 +1017,7 @@ fn cpp_function_signature_text(analyzer: &dyn IAnalyzer, function: &CodeUnit) ->
 
 fn cpp_function_return_type_text_from_signature(signature: &str) -> Option<String> {
     let open = signature.find('(')?;
-    let name_at = signature[..open].rfind(|ch: char| !(ch == '_' || ch.is_ascii_alphanumeric()))?;
-    let name_at = name_at + 1;
+    let name_at = cpp_function_name_start(signature, open)?;
     if let Some(return_type) = cpp_trailing_return_type(&signature[name_at..]) {
         return Some(return_type);
     }
@@ -1034,6 +1033,23 @@ fn cpp_function_return_type_text_from_signature(signature: &str) -> Option<Strin
         .join(" ");
     let type_text = type_text.trim();
     (!type_text.is_empty()).then(|| type_text.to_string())
+}
+
+fn cpp_function_name_start(signature: &str, open: usize) -> Option<usize> {
+    let before_parameters = &signature[..open];
+    if let Some(operator_at) = before_parameters.rfind("operator") {
+        let boundary = operator_at == 0
+            || before_parameters[..operator_at]
+                .chars()
+                .next_back()
+                .is_some_and(|ch| !(ch == '_' || ch.is_ascii_alphanumeric()));
+        if boundary {
+            return Some(operator_at);
+        }
+    }
+    before_parameters
+        .rfind(|ch: char| !(ch == '_' || ch.is_ascii_alphanumeric()))
+        .map(|index| index + 1)
 }
 
 fn cpp_trailing_return_type(signature_from_name: &str) -> Option<String> {
