@@ -7,6 +7,7 @@
 //!   with call-site weight aggregation;
 //! - a namespace import (`use crate::util;` then `util::format_value(..)`);
 //! - an associated function on an imported type (`Config::new()`);
+//! - a bare call through a chained/aliased in-crate `pub use` re-export;
 //! - self-recursion producing no edge;
 //! - a parameter shadowing an import producing no edge.
 
@@ -65,6 +66,17 @@ fn resolves_namespace_qualified_and_associated_calls() {
     assert!(
         find_edge(&value, "consumer.make_config", "util.Config.new").is_some(),
         "expected make_config -> util.Config.new edge: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn resolves_bare_call_through_in_crate_reexport() {
+    let value = usage_graph();
+
+    assert!(
+        find_edge(&value, "run_demo", "service.build_service").is_some(),
+        "expected run_demo -> service.build_service through chained/aliased pub use: {}",
         value["edges"]
     );
 }
