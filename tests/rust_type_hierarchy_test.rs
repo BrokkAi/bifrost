@@ -119,6 +119,122 @@ impl crate::contracts::Runnable for Worker {}
 }
 
 #[test]
+fn rust_type_hierarchy_resolves_impls_in_other_files() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        ("src/contracts.rs", "pub trait Runnable {}"),
+        ("src/types.rs", "pub struct Worker;"),
+        (
+            "src/impls.rs",
+            r#"
+use crate::contracts::Runnable;
+use crate::types::Worker;
+impl Runnable for Worker {}
+"#,
+        ),
+    ]);
+
+    let runnable = definition(&analyzer, "contracts.Runnable");
+    let worker = definition(&analyzer, "types.Worker");
+
+    assert_eq!(
+        fq_names(analyzer.get_direct_ancestors(&worker)),
+        BTreeSet::from(["contracts.Runnable".to_string()])
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_descendants(&runnable)),
+        BTreeSet::from(["types.Worker".to_string()])
+    );
+}
+
+#[test]
+fn rust_type_hierarchy_resolves_reexported_trait_reference() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        ("src/inner.rs", "pub trait Runnable {}"),
+        ("src/facade.rs", "pub use crate::inner::Runnable;"),
+        (
+            "src/worker.rs",
+            r#"
+use crate::facade::Runnable;
+pub struct Worker;
+impl Runnable for Worker {}
+"#,
+        ),
+    ]);
+
+    let runnable = definition(&analyzer, "inner.Runnable");
+    let worker = definition(&analyzer, "worker.Worker");
+
+    assert_eq!(
+        fq_names(analyzer.get_direct_ancestors(&worker)),
+        BTreeSet::from(["inner.Runnable".to_string()])
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_descendants(&runnable)),
+        BTreeSet::from(["worker.Worker".to_string()])
+    );
+}
+
+#[test]
+fn rust_type_hierarchy_uses_nested_module_imports() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        ("src/contracts.rs", "pub trait Runnable {}"),
+        (
+            "src/lib.rs",
+            r#"
+mod worker {
+    use crate::contracts::Runnable;
+    pub struct Worker;
+    impl Runnable for Worker {}
+}
+"#,
+        ),
+    ]);
+
+    let runnable = definition(&analyzer, "contracts.Runnable");
+    let worker = definition(&analyzer, "worker.Worker");
+
+    assert_eq!(
+        fq_names(analyzer.get_direct_ancestors(&worker)),
+        BTreeSet::from(["contracts.Runnable".to_string()])
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_descendants(&runnable)),
+        BTreeSet::from(["worker.Worker".to_string()])
+    );
+}
+
+#[test]
+fn rust_type_hierarchy_resolves_unqualified_impl_target_in_same_module() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[(
+        "src/lib.rs",
+        r#"
+trait Runnable {}
+mod one {
+    pub struct Worker;
+}
+mod two {
+    pub struct Worker;
+    impl crate::Runnable for Worker {}
+}
+"#,
+    )]);
+
+    let runnable = definition(&analyzer, "Runnable");
+    let one_worker = definition(&analyzer, "one.Worker");
+    let two_worker = definition(&analyzer, "two.Worker");
+
+    assert!(analyzer.get_direct_ancestors(&one_worker).is_empty());
+    assert_eq!(
+        fq_names(analyzer.get_direct_ancestors(&two_worker)),
+        BTreeSet::from(["Runnable".to_string()])
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_descendants(&runnable)),
+        BTreeSet::from(["two.Worker".to_string()])
+    );
+}
+
+#[test]
 fn rust_type_hierarchy_supports_enum_and_type_alias_implementers() {
     let (_project, analyzer) = rust_analyzer_with_files(&[(
         "src/lib.rs",

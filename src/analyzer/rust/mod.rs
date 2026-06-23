@@ -27,6 +27,7 @@ use declarations::collect_rust_type_identifiers;
 use tests::detect_rust_test_assertion_smells;
 
 pub use graph_support::RustReferenceContext;
+use hierarchy::RustHierarchyIndex;
 use usage_index::RustUsageIndex;
 
 #[derive(Clone)]
@@ -38,6 +39,7 @@ pub struct RustAnalyzer {
     reference_contexts: Cache<ProjectFile, Arc<RustReferenceContext>>,
     reverse_import_index: Arc<OnceLock<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     usage_index: Arc<OnceLock<RustUsageIndex>>,
+    hierarchy_index: Arc<OnceLock<RustHierarchyIndex>>,
 }
 
 impl RustAnalyzer {
@@ -55,6 +57,7 @@ impl RustAnalyzer {
             reference_contexts: build_weighted_cache(memo_budget / 8, weight_reference_context),
             reverse_import_index: Arc::new(OnceLock::new()),
             usage_index: Arc::new(OnceLock::new()),
+            hierarchy_index: Arc::new(OnceLock::new()),
         }
     }
 
@@ -77,6 +80,7 @@ impl RustAnalyzer {
             reference_contexts: build_weighted_cache(memo_budget / 8, weight_reference_context),
             reverse_import_index: Arc::new(OnceLock::new()),
             usage_index: Arc::new(OnceLock::new()),
+            hierarchy_index: Arc::new(OnceLock::new()),
         }
     }
 
@@ -191,6 +195,7 @@ impl IAnalyzer for RustAnalyzer {
             ),
             reverse_import_index: Arc::new(OnceLock::new()),
             usage_index: Arc::new(OnceLock::new()),
+            hierarchy_index: Arc::new(OnceLock::new()),
         }
     }
 
@@ -206,6 +211,7 @@ impl IAnalyzer for RustAnalyzer {
             ),
             reverse_import_index: Arc::new(OnceLock::new()),
             usage_index: Arc::new(OnceLock::new()),
+            hierarchy_index: Arc::new(OnceLock::new()),
         }
     }
 
