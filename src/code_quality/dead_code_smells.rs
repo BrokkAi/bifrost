@@ -1160,7 +1160,7 @@ fn analyze_jsts_candidates_with_scoped_usage_graph(
         .collect();
     nodes.extend(candidates.iter().map(scoped_key_for));
 
-    let Some(mut result) = crate::analyzer::usages::js_ts_graph::build_jsts_scoped_usage_edges(
+    let Some(result) = crate::analyzer::usages::js_ts_graph::build_jsts_scoped_usage_edges(
         analyzer,
         &nodes,
         |_| true,
@@ -1173,17 +1173,15 @@ fn analyze_jsts_candidates_with_scoped_usage_graph(
         }
         return Vec::new();
     };
+    let crate::analyzer::usages::js_ts_graph::JsTsScopedUsageEdges { edges, node_status } = result;
+    let crate::analyzer::usages::inverted_edges::UsageEdgeWeights { edges, truncated } = edges;
 
     let declarations_by_key = scoped_declarations_by_key_for_languages(
         analyzer,
         &[Language::JavaScript, Language::TypeScript],
     );
     let mut incoming: BTreeMap<UsageNodeKey, ScopedGraphIncomingUsage> = BTreeMap::new();
-    // Inbound dead-code scoring needs only weights (per-edge site count). Drain the
-    // edge map by value so the `UsageNodeKey` endpoints move into `incoming` rather
-    // than being cloned; `result.edges.edges` is not read again (only `truncated`).
-    for ((caller, callee), sites) in std::mem::take(&mut result.edges.edges) {
-        let weight = sites.len();
+    for ((caller, callee), weight) in edges {
         let usage = incoming.entry(callee).or_default();
         usage.total += weight;
         usage.callers.entry(caller).or_insert(weight);
@@ -1193,7 +1191,7 @@ fn analyze_jsts_candidates_with_scoped_usage_graph(
         .iter()
         .filter_map(|candidate| {
             let candidate_key = scoped_key_for(candidate);
-            match result.node_status.get(&candidate_key) {
+            match node_status.get(&candidate_key) {
                 Some(JsTsScopedNodeStatus::Resolved) => {}
                 Some(JsTsScopedNodeStatus::Ambiguous) => {
                     skipped.push(format!(
@@ -1210,7 +1208,7 @@ fn analyze_jsts_candidates_with_scoped_usage_graph(
                     return None;
                 }
             }
-            if let Some(total_callsites) = result.edges.truncated.get(&candidate_key) {
+            if let Some(total_callsites) = truncated.get(&candidate_key) {
                 skipped.push(format!(
                     "`{}`: too many workspace inbound call sites ({total_callsites}, limit {}); evidence is inconclusive",
                     candidate.fq_name(),

@@ -165,6 +165,23 @@ impl<K: NodeKey> UsageEdges<K> {
     }
 }
 
+/// Aggregated edge weights for callers that do not need per-site locations.
+pub(crate) struct UsageEdgeWeights<K = String> {
+    /// `(caller, callee) -> edge weight` (distinct `(file, line, caller)` sites).
+    pub(crate) edges: BTreeMap<(K, K), usize>,
+    /// Callees past the call-site cap: `callee -> total call sites`.
+    pub(crate) truncated: BTreeMap<K, usize>,
+}
+
+impl<K: Ord> Default for UsageEdgeWeights<K> {
+    fn default() -> Self {
+        Self {
+            edges: BTreeMap::new(),
+            truncated: BTreeMap::new(),
+        }
+    }
+}
+
 /// One file's contribution, merged by [`merge_and_cap`].
 pub(crate) struct PerFileEdges<K = String> {
     /// Workspace-relative path of the file these edges came from. Every reference is
@@ -338,14 +355,43 @@ where
     KeepFn: Fn(&ProjectFile) -> bool + Sync,
     ScanFn: Fn(&ProjectFile) -> Option<PerFileEdges<K>> + Sync,
 {
-    let per_file: Vec<PerFileEdges<K>> = files
+    let per_file = collect_per_file_edges(files, keep_file, scan);
+    merge_and_cap(per_file)
+}
+
+#[allow(clippy::redundant_closure)] // the closure borrows `scan`; see the note above
+pub(crate) fn build_edge_weights<K, KeepFn, ScanFn>(
+    files: &[ProjectFile],
+    keep_file: KeepFn,
+    scan: ScanFn,
+) -> UsageEdgeWeights<K>
+where
+    K: NodeKey + Send,
+    KeepFn: Fn(&ProjectFile) -> bool + Sync,
+    ScanFn: Fn(&ProjectFile) -> Option<PerFileEdges<K>> + Sync,
+{
+    let per_file = collect_per_file_edges(files, keep_file, scan);
+    merge_weights_and_cap(per_file)
+}
+
+#[allow(clippy::redundant_closure)] // the closure borrows `scan`; see the note below
+fn collect_per_file_edges<K, KeepFn, ScanFn>(
+    files: &[ProjectFile],
+    keep_file: KeepFn,
+    scan: ScanFn,
+) -> Vec<PerFileEdges<K>>
+where
+    K: NodeKey + Send,
+    KeepFn: Fn(&ProjectFile) -> bool + Sync,
+    ScanFn: Fn(&ProjectFile) -> Option<PerFileEdges<K>> + Sync,
+{
+    files
         .par_iter()
         .filter(|file| keep_file(file))
         // Borrow `scan` rather than move it: it's `Sync` but not necessarily `Send`,
         // and rayon shares one mapper across worker threads.
         .filter_map(|file| scan(file))
-        .collect();
-    merge_and_cap(per_file)
+        .collect()
 }
 
 /// Build one file's edges: construct its declaration index and an [`EdgeCollector`],
@@ -442,6 +488,32 @@ pub(crate) fn merge_and_cap<K: NodeKey>(per_file: Vec<PerFileEdges<K>>) -> Usage
     UsageEdges { edges, truncated }
 }
 
+pub(crate) fn merge_weights_and_cap<K: NodeKey>(
+    per_file: Vec<PerFileEdges<K>>,
+) -> UsageEdgeWeights<K> {
+    let mut edge_weights: BTreeMap<(K, K), usize> = BTreeMap::new();
+    let mut callsites: BTreeMap<K, usize> = BTreeMap::new();
+    for file in per_file {
+        for (key, lines) in file.edge_lines {
+            *edge_weights.entry(key).or_insert(0) += lines.len();
+        }
+        for (callee, sites) in file.callsites {
+            *callsites.entry(callee).or_insert(0) += sites.len();
+        }
+    }
+
+    let truncated: BTreeMap<K, usize> = callsites
+        .into_iter()
+        .filter(|(_, total)| *total > MAX_CALLSITES)
+        .collect();
+    let edges: BTreeMap<(K, K), usize> = edge_weights
+        .into_iter()
+        .filter(|((_, callee), _)| !truncated.contains_key(callee))
+        .collect();
+
+    UsageEdgeWeights { edges, truncated }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,6 +558,77 @@ mod tests {
                     line: 5,
                 },
             ],
+        );
+    }
+
+    #[test]
+    fn edge_weight_only_merge_sums_distinct_file_line_sites() {
+        let merged = merge_weights_and_cap(vec![
+            per_file_with_edge("a.rs", "caller", "callee", 5),
+            per_file_with_edge("b.rs", "caller", "callee", 5),
+        ]);
+
+        assert_eq!(
+            merged
+                .edges
+                .get(&("caller".to_string(), "callee".to_string())),
+            Some(&2)
+        );
+        let weights: Vec<_> = merged
+            .edges
+            .into_iter()
+            .map(|((caller, callee), weight)| (caller, callee, weight))
+            .collect();
+        assert_eq!(
+            weights,
+            vec![("caller".to_string(), "callee".to_string(), 2usize)]
+        );
+    }
+
+    #[test]
+    fn edge_weight_only_merge_matches_truncation_cap() {
+        let mut per_file = PerFileEdges {
+            path: "a.rs".to_string(),
+            ..PerFileEdges::default()
+        };
+        for index in 0..=MAX_CALLSITES {
+            per_file
+                .edge_lines
+                .entry(("caller".to_string(), "callee".to_string()))
+                .or_default()
+                .insert(index + 1);
+            per_file
+                .callsites
+                .entry("callee".to_string())
+                .or_default()
+                .insert(index);
+        }
+
+        let site_merged = merge_and_cap(vec![per_file]);
+        let mut weight_file = PerFileEdges {
+            path: "a.rs".to_string(),
+            ..PerFileEdges::default()
+        };
+        for index in 0..=MAX_CALLSITES {
+            weight_file
+                .edge_lines
+                .entry(("caller".to_string(), "callee".to_string()))
+                .or_default()
+                .insert(index + 1);
+            weight_file
+                .callsites
+                .entry("callee".to_string())
+                .or_default()
+                .insert(index);
+        }
+        let weight_merged = merge_weights_and_cap(vec![weight_file]);
+
+        assert!(site_merged.edges.is_empty());
+        assert!(weight_merged.edges.is_empty());
+        assert_eq!(site_merged.truncated, weight_merged.truncated);
+        assert_eq!(
+            weight_merged.truncated.get("callee"),
+            Some(&(MAX_CALLSITES + 1))
         );
     }
 
