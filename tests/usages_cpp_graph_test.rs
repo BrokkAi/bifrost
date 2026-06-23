@@ -1215,7 +1215,11 @@ void outside(Target& target, Other& other) {
         ),
     ]);
 
-    let run = function_definition_with_short_name_and_arity(&analyzer, "Target.run", 0);
+    let run = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.short_name() == "Target.run"
+            && slash_path(unit.source()) == "target.cpp"
+    });
     let run_hits = usage_hits(&analyzer, &run);
     assert_eq!(3, run_hits.len(), "run hits were {run_hits:#?}");
     assert_hit_contains(&run_hits, "target.cpp", "run();");
@@ -1780,7 +1784,11 @@ int main() {
     ]);
 
     // Free function: `example::build_service()` called from main.cpp.
-    let build_service = function_definition(&analyzer, "build_service");
+    let build_service = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.identifier() == "build_service"
+            && slash_path(unit.source()) == "src/service.cpp"
+    });
     let build_hits = graph_success_hits(&analyzer, &build_service);
     assert_eq!(
         1,
@@ -1791,9 +1799,8 @@ int main() {
 
     // Instance method: `service.execute()`, where `service` is bound to the return type of
     // `example::build_service()`.
-    let execute = definition_by(&analyzer, |unit| {
-        unit.kind() == CodeUnitType::Function && unit.short_name() == "Service.execute"
-    });
+    let execute =
+        member_function_definition_in_source(&analyzer, "Service", "execute", "src/service.cpp");
     let execute_hits = graph_success_hits(&analyzer, &execute);
     assert_eq!(1, execute_hits.len(), "execute hits were {execute_hits:#?}");
     assert_hit_contains(&execute_hits, "src/main.cpp", "service.execute()");
@@ -1811,6 +1818,194 @@ int main() {
     );
     assert_hit_contains(&prefix_hits, "src/service.cpp", "return DefaultPrefix");
     assert_hit_contains(&prefix_hits, "src/main.cpp", "example::DefaultPrefix");
+}
+
+#[test]
+fn cpp_graph_resolves_header_declaration_to_out_of_line_definition_sites() {
+    // Issue #248: querying the header declaration should return both graph-proven call sites and
+    // the matching out-of-line definition site in the source file.
+    let (_project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "include/service.h",
+            r#"#pragma once
+
+#include <string>
+
+namespace example {
+
+struct Repository {
+    std::string last;
+    std::string save(const std::string& value);
+};
+
+class Service {
+public:
+    explicit Service(Repository& repository);
+    std::string execute(const std::string& name);
+
+private:
+    Repository& repository_;
+};
+
+Service build_service(Repository& repository);
+
+} // namespace example
+"#,
+        ),
+        (
+            "src/service.cpp",
+            r#"#include "service.h"
+
+namespace example {
+
+Service::Service(Repository& repository) : repository_(repository) {}
+
+std::string Service::execute(const std::string& name) {
+    auto stored = repository_.save(name);
+    return stored;
+}
+
+Service build_service(Repository& repository) {
+    return Service(repository);
+}
+
+} // namespace example
+"#,
+        ),
+        (
+            "src/main.cpp",
+            r#"#include "service.h"
+
+std::string run_demo() {
+    example::Repository repository;
+    auto service = example::build_service(repository);
+    return service.execute("Ada");
+}
+"#,
+        ),
+        (
+            "src/unrelated.cpp",
+            r#"#include "service.h"
+
+namespace other {
+
+struct Repository {};
+
+class Service {
+public:
+    std::string execute(const std::string& name);
+};
+
+Service build_service(Repository& repository) {
+    return Service{};
+}
+
+std::string Service::execute(const std::string& name) {
+    return name;
+}
+
+} // namespace other
+"#,
+        ),
+    ]);
+
+    let build_service_header = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.identifier() == "build_service"
+            && slash_path(unit.source()) == "include/service.h"
+    });
+    let build_hits = graph_success_hits(&analyzer, &build_service_header);
+    assert_eq!(
+        2,
+        build_hits.len(),
+        "build_service hits were {build_hits:#?}"
+    );
+    assert_hit_contains(
+        &build_hits,
+        "src/service.cpp",
+        "Service build_service(Repository& repository)",
+    );
+    assert_hit_contains(
+        &build_hits,
+        "src/main.cpp",
+        "example::build_service(repository)",
+    );
+    assert_no_hit_contains(&build_hits, "src/unrelated.cpp");
+
+    let execute_header = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.short_name() == "Service.execute"
+            && slash_path(unit.source()) == "include/service.h"
+    });
+    let execute_hits = graph_success_hits(&analyzer, &execute_header);
+    assert_eq!(2, execute_hits.len(), "execute hits were {execute_hits:#?}");
+    assert_hit_contains(
+        &execute_hits,
+        "src/service.cpp",
+        "std::string Service::execute(const std::string& name)",
+    );
+    assert_hit_contains(&execute_hits, "src/main.cpp", "service.execute(\"Ada\")");
+    assert_no_hit_contains(&execute_hits, "src/unrelated.cpp");
+
+    let constructor_header = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.identifier() == "Service"
+            && slash_path(unit.source()) == "include/service.h"
+    });
+    let constructor_hits = graph_success_hits(&analyzer, &constructor_header);
+    assert_hit_contains(
+        &constructor_hits,
+        "src/service.cpp",
+        "Service::Service(Repository& repository)",
+    );
+    assert_hit_contains(&constructor_hits, "src/service.cpp", "Service(repository)");
+    assert_no_hit_contains(&constructor_hits, "src/unrelated.cpp");
+}
+
+#[test]
+fn cpp_graph_definition_sites_respect_overload_signatures_and_void_arity() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "include/api.h",
+            r#"#pragma once
+namespace example {
+int parse(int value);
+int parse(double value);
+int ping(void);
+}
+"#,
+        ),
+        (
+            "src/api.cpp",
+            r#"#include "api.h"
+namespace example {
+int parse(int value) { return value; }
+int parse(double value) { return static_cast<int>(value); }
+int ping(void) { return 1; }
+}
+"#,
+        ),
+    ]);
+
+    let parse_int = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.identifier() == "parse"
+            && slash_path(unit.source()) == "include/api.h"
+            && unit.signature() == Some("(int)")
+    });
+    let parse_hits = graph_success_hits(&analyzer, &parse_int);
+    assert_eq!(1, parse_hits.len(), "parse hits were {parse_hits:#?}");
+    assert_hit_contains(&parse_hits, "src/api.cpp", "int parse(int value)");
+    assert_no_hit_contains(&parse_hits, "int parse(double value)");
+
+    let ping = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.identifier() == "ping"
+            && slash_path(unit.source()) == "include/api.h"
+    });
+    let ping_hits = graph_success_hits(&analyzer, &ping);
+    assert_eq!(1, ping_hits.len(), "ping hits were {ping_hits:#?}");
+    assert_hit_contains(&ping_hits, "src/api.cpp", "int ping(void)");
 }
 
 // Issue #230 / #220: a bare constant reference that also matches a same-named
