@@ -640,6 +640,177 @@ func FromConstructors() string {
     assert_eq!(5, hits.len(), "receiver seed hits: {hits:?}");
 }
 
+// Regression for #232: a value-receiver method called on a local that is bound to
+// a constructor's return value (`service := NewService()`) must resolve on the
+// graph path. Before the constructor-return seeding it returned zero hits and the
+// regex fallback masked the gap.
+#[test]
+fn go_graph_strategy_finds_value_receiver_calls_on_constructor_locals() {
+    let (project, analyzer) = go_analyzer_with_files(&[
+        (
+            "example/service.go",
+            r#"
+package example
+
+type Service struct {
+    Name string
+}
+
+func (s Service) Execute() string {
+    return s.Name
+}
+
+func NewService() Service {
+    return Service{Name: "demo"}
+}
+"#,
+        ),
+        (
+            "example/service_test.go",
+            r#"
+package example
+
+import "testing"
+
+func TestExecute(t *testing.T) {
+    service := NewService()
+    if service.Execute() != "demo" {
+        t.Fatal("unexpected result")
+    }
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "example.com/app/example.Service.Execute");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = GoUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect(
+            "value-receiver call on a constructor-returned local should resolve on the graph path",
+        );
+
+    assert_eq!(
+        1,
+        hits.len(),
+        "expected the service.Execute() call: {hits:?}"
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file == project.file("example/service_test.go")),
+        "hit should be the test-file call site: {hits:?}",
+    );
+}
+
+// A value-receiver constructor returning the common `(Owner, error)` tuple should
+// also seed the receiver from its first result.
+#[test]
+fn go_graph_strategy_finds_value_receiver_calls_on_tuple_constructor_locals() {
+    let (project, analyzer) = go_analyzer_with_files(&[
+        (
+            "example/service.go",
+            r#"
+package example
+
+type Service struct {
+    Name string
+}
+
+func (s Service) Execute() string {
+    return s.Name
+}
+
+func NewService() (Service, error) {
+    return Service{Name: "demo"}, nil
+}
+"#,
+        ),
+        (
+            "consumer/consumer.go",
+            r#"
+package consumer
+
+import "example.com/app/example"
+
+func Run() string {
+    service, _ := example.NewService()
+    return service.Execute()
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "example.com/app/example.Service.Execute");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = GoUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect(
+            "value-receiver call on a tuple-constructor local should resolve on the graph path",
+        );
+
+    assert_eq!(
+        1,
+        hits.len(),
+        "expected the service.Execute() call: {hits:?}"
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file == project.file("consumer/consumer.go")),
+        "hit should be the consumer call site: {hits:?}",
+    );
+}
+
+// A local/parameter that shadows the package constructor name is not the package
+// constructor, so a method call on a local bound to it must not be a hit.
+#[test]
+fn go_graph_strategy_does_not_seed_local_shadowing_a_constructor_name() {
+    let (_project, analyzer) = go_analyzer_with_files(&[
+        (
+            "example/service.go",
+            r#"
+package example
+
+type Service struct {
+    Name string
+}
+
+func (s Service) Execute() string {
+    return s.Name
+}
+
+func NewService() Service {
+    return Service{Name: "demo"}
+}
+"#,
+        ),
+        (
+            "example/consumer.go",
+            r#"
+package example
+
+func Run(NewService func() string) {
+    x := NewService()
+    _ = x.Execute()
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "example.com/app/example.Service.Execute");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = GoUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should resolve");
+
+    assert!(
+        hits.is_empty(),
+        "x.Execute() where NewService is a shadowing parameter must not be a hit: {hits:?}",
+    );
+}
+
 #[test]
 fn go_graph_strategy_keeps_mixed_multi_assignment_receiver_proofs_positional() {
     let (_project, analyzer) = go_analyzer_with_files(&[

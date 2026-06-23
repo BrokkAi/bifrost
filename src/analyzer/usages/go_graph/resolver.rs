@@ -1,5 +1,6 @@
 use crate::analyzer::go::packages::{canonical_go_package_name, read_go_module_path};
 use crate::analyzer::usages::common::language_for_file;
+use crate::analyzer::usages::go_graph::extractor::{first_named_child, type_ref_from_node};
 use crate::analyzer::usages::model::{
     ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind,
 };
@@ -708,6 +709,7 @@ pub(super) struct TargetSpec {
     pub(super) owner: Option<String>,
     top_level_seeds: Option<BTreeSet<(ProjectFile, String)>>,
     owner_seeds: Option<BTreeSet<(ProjectFile, String)>>,
+    owner_constructor_names: HashSet<String>,
 }
 
 impl TargetSpec {
@@ -727,6 +729,10 @@ impl TargetSpec {
             }
             (!seeds.is_empty()).then_some(seeds)
         });
+        let owner_constructor_names = owner
+            .as_ref()
+            .map(|owner| collect_owner_constructor_names(graph, owner, target.source()))
+            .unwrap_or_default();
 
         Self {
             target: target.clone(),
@@ -734,6 +740,7 @@ impl TargetSpec {
             owner,
             top_level_seeds,
             owner_seeds,
+            owner_constructor_names,
         }
     }
 
@@ -752,6 +759,76 @@ impl TargetSpec {
     pub(super) fn is_member(&self) -> bool {
         self.owner.is_some() && !is_module_field(&self.target)
     }
+
+    /// Whether `name` is a package-level function in the owner type's package whose
+    /// result is the owner type (e.g. `NewService` for `Service`), so a local bound
+    /// to its return value can be seeded as the owner receiver.
+    pub(super) fn is_owner_constructor(&self, name: &str) -> bool {
+        self.owner_constructor_names.contains(name)
+    }
+}
+
+/// Names of package-level functions in the owner type's package whose first result
+/// is the owner type. A local bound to `NewOwner()` (or `pkg.NewOwner()`) then
+/// carries the owner type, so value-receiver method calls on it resolve on the
+/// graph path instead of silently returning no hits (#232).
+fn collect_owner_constructor_names(
+    graph: &GoProjectGraph,
+    owner: &str,
+    owner_source: &ProjectFile,
+) -> HashSet<String> {
+    let mut names = HashSet::default();
+    // A Go package is a single directory, so scope the scan to the owner source's
+    // directory via the prebuilt index rather than walking every parsed file — the
+    // bulk `usage_graph` path resolves many targets over the whole workspace and the
+    // surrounding code keeps that linear by construction.
+    let parent = owner_source.parent().to_string_lossy().replace('\\', "/");
+    let Some(package_files) = graph.dir_index.get(&parent) else {
+        return names;
+    };
+    for file in package_files {
+        if !same_go_package(graph, file, owner_source) {
+            continue;
+        }
+        let Some(parsed) = graph.parsed_file(file) else {
+            continue;
+        };
+        let root = parsed.tree.root_node();
+        let source = parsed.source.as_str();
+        let mut cursor = root.walk();
+        for child in root.named_children(&mut cursor) {
+            if child.kind() != "function_declaration" {
+                continue;
+            }
+            let (Some(name_node), Some(result)) = (
+                child.child_by_field_name("name"),
+                child.child_by_field_name("result"),
+            ) else {
+                continue;
+            };
+            if result_names_owner_type(result, source, owner) {
+                names.insert(node_text(name_node, source).to_string());
+            }
+        }
+    }
+    names
+}
+
+/// Whether the `result` node of a function declaration names the owner type as its
+/// (first) return value. Handles a bare type, a pointer type, and the common
+/// `(Owner, error)` tuple idiom by inspecting the first component.
+fn result_names_owner_type(result: Node<'_>, source: &str, owner: &str) -> bool {
+    let names_owner = |ty: &TypeRef| ty.qualifier.is_none() && ty.name.as_deref() == Some(owner);
+    if let Some(ty) = type_ref_from_node(result, source) {
+        return names_owner(&ty);
+    }
+    if result.kind() == "parameter_list"
+        && let Some(first) = first_named_child(result)
+    {
+        let type_node = first.child_by_field_name("type").unwrap_or(first);
+        return type_ref_from_node(type_node, source).is_some_and(|ty| names_owner(&ty));
+    }
+    false
 }
 
 fn owner_name(target: &CodeUnit) -> Option<String> {
@@ -828,6 +905,19 @@ impl ScanBindings {
 
     pub(super) fn matches_direct_target(&self, text: &str) -> bool {
         self.direct_names.contains(text)
+    }
+
+    /// Whether the owner type is referable by a bare (unqualified) name in this
+    /// file — true in the owner's own package and through dot imports — so a bare
+    /// constructor call like `NewOwner()` resolves to the owner type here.
+    pub(super) fn owner_referable_directly(&self) -> bool {
+        !self.owner_direct_names.is_empty()
+    }
+
+    /// Whether `qualifier` is an import name bound to the owner type's package, so a
+    /// qualified constructor call like `pkg.NewOwner()` resolves to the owner type.
+    pub(super) fn owner_namespace_contains(&self, qualifier: &str) -> bool {
+        self.owner_namespace_names.contains(qualifier)
     }
 
     pub(super) fn matches_owner_type(&self, ty: &TypeRef) -> bool {
