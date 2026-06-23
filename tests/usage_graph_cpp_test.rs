@@ -81,6 +81,48 @@ fn new_expression_and_type_reference_edge_to_the_class() {
 }
 
 #[test]
+fn namespace_free_function_return_type_edges() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "service.h",
+            r#"#pragma once
+namespace example {
+class Service {
+public:
+    void execute() const {}
+};
+Service build_service();
+}
+"#,
+        )
+        .file(
+            "main.cpp",
+            r#"#include "service.h"
+namespace example {
+Service build_service() { return Service{}; }
+}
+int main() {
+    auto service = example::build_service();
+    service.execute();
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&value, "main", "example.build_service"),
+        "expected main -> build_service from qualified namespace call: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(&value, "main", "example.Service.execute"),
+        "expected main -> Service.execute through auto return inference: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn receiver_typing_is_type_based_not_name_based() {
     let value = usage_graph();
 

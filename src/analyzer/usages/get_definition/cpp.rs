@@ -2480,58 +2480,6 @@ fn cpp_function_return_type(
         })
 }
 
-/// The declared return type text of a function unit, with leading declaration specifiers
-/// stripped, e.g. `T*` for `T* operator->()`. Unlike [`cpp_function_return_type`] this does not
-/// resolve the type, so it is usable for return types that mention template parameters.
-fn cpp_function_return_type_text(analyzer: &dyn IAnalyzer, function: &CodeUnit) -> Option<String> {
-    let signature = function
-        .signature()
-        .filter(|signature| signature.contains(function.identifier()))
-        .map(str::to_string)
-        .or_else(|| analyzer.signatures(function).first().cloned())
-        .or_else(|| analyzer.get_source(function, false))?;
-    let name_at = signature.find(function.identifier())?;
-    let type_text = cpp_strip_leading_template_clause(&signature[..name_at])
-        .split_whitespace()
-        .filter(|token| {
-            !matches!(
-                *token,
-                "static" | "virtual" | "inline" | "constexpr" | "explicit" | "friend"
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-    let type_text = type_text.trim();
-    (!type_text.is_empty()).then(|| type_text.to_string())
-}
-
-/// Strip a leading `template <...>` parameter clause, leaving the declaration that follows.
-/// Returns the input unchanged when there is no such clause.
-fn cpp_strip_leading_template_clause(text: &str) -> &str {
-    let trimmed = text.trim_start();
-    let Some(rest) = trimmed.strip_prefix("template") else {
-        return text;
-    };
-    let rest = rest.trim_start();
-    if !rest.starts_with('<') {
-        return text;
-    }
-    let mut depth = 0i32;
-    for (offset, ch) in rest.char_indices() {
-        match ch {
-            '<' => depth += 1,
-            '>' => {
-                depth -= 1;
-                if depth == 0 {
-                    return rest[offset + ch.len_utf8()..].trim_start();
-                }
-            }
-            _ => {}
-        }
-    }
-    text
-}
-
 fn cpp_unresolved_include_boundary(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,

@@ -290,12 +290,7 @@ impl VisibilityIndex {
         })
     }
 
-    /// Whether `target` is the *only* visible symbol of `kind` that `raw_name` could
-    /// resolve to. A qualified reference (`ns::Name`) already matches exactly, but a
-    /// bare `Name` can collide with a same-named symbol in another namespace; when it
-    /// does, the reference is ambiguous and must not be attributed to `target` by the
-    /// unspecified iteration order of the visible set.
-    pub(super) fn uniquely_resolves_to_target(
+    pub(super) fn resolve_known_non_target(
         &self,
         file: &ProjectFile,
         raw_name: &str,
@@ -305,23 +300,89 @@ impl VisibilityIndex {
         let Some(normalized) = normalize_reference_name(raw_name) else {
             return false;
         };
-        let Some(visible) = self.visible_by_file.get(file) else {
-            return false;
-        };
-        let mut matched_target = false;
-        for unit in visible.iter() {
-            if !matches_kind_for_lookup(unit, kind) || !reference_matches_unit(&normalized, unit) {
-                continue;
-            }
-            if same_visible_symbol(unit, target) {
-                matched_target = true;
-            } else {
-                // A distinct same-named symbol is also visible — the reference is
-                // ambiguous, so it cannot be proven to be the target.
-                return false;
+        normalized.contains("::")
+            && self.visible_by_file.get(file).is_some_and(|visible| {
+                visible.iter().any(|unit| {
+                    matches_kind_for_lookup(unit, kind)
+                        && reference_matches_unit(&normalized, unit)
+                        && !same_visible_symbol(unit, target)
+                })
+            })
+    }
+
+    pub(super) fn resolve_call_return_type(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        raw_name: &str,
+        arity: usize,
+        lexical_namespace: Option<&str>,
+    ) -> Option<CodeUnit> {
+        let normalized = normalize_reference_name(raw_name)?;
+        let visible = self.visible_by_file.get(file)?;
+        let mut candidates = Vec::new();
+        for function in visible.iter().filter(|unit| {
+            matches_kind_for_lookup(unit, TargetKind::FreeFunction)
+                && reference_matches_unit(&normalized, unit)
+        }) {
+            let signature = cpp_function_signature_text(analyzer, function)?;
+            if signature_arity(Some(&signature)) == arity {
+                candidates.push((function, signature));
             }
         }
-        matched_target
+        if !normalized.contains("::")
+            && let Some(namespace) = lexical_namespace
+        {
+            let scoped: Vec<_> = candidates
+                .iter()
+                .filter(|(function, _)| cpp_namespace_for(function).as_deref() == Some(namespace))
+                .cloned()
+                .collect();
+            if !scoped.is_empty() {
+                candidates = scoped;
+            }
+        }
+        let mut resolved_return: Option<CodeUnit> = None;
+        for (_function, signature) in candidates {
+            let return_text = cpp_function_return_type_text_from_signature(&signature)?;
+            let return_type = self.resolve_type(file, &return_text)?;
+            if let Some(existing) = resolved_return.as_ref()
+                && !same_visible_symbol(existing, &return_type)
+            {
+                return None;
+            }
+            resolved_return = Some(return_type);
+        }
+        resolved_return
+    }
+}
+
+pub(in crate::analyzer::usages) fn infer_cpp_initializer_type(
+    analyzer: &dyn IAnalyzer,
+    visibility: &VisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+) -> Option<CodeUnit> {
+    match node.kind() {
+        "new_expression" => {
+            let text = normalize_cpp_whitespace(node_text(node, source));
+            let rest = text.strip_prefix("new ").unwrap_or(text.as_str());
+            visibility.resolve_type(file, rest.split(['(', '{']).next().unwrap_or(rest))
+        }
+        "call_expression" => node.child_by_field_name("function").and_then(|function| {
+            let function_text = node_text(function, source);
+            visibility.resolve_type(file, function_text).or_else(|| {
+                visibility.resolve_call_return_type(
+                    analyzer,
+                    file,
+                    function_text,
+                    call_arity(node),
+                    enclosing_namespace_context(node, source).as_deref(),
+                )
+            })
+        }),
+        _ => None,
     }
 }
 
@@ -933,6 +994,149 @@ pub(super) fn is_type_alias(unit: &CodeUnit) -> bool {
 pub(super) fn type_text_matches_target(type_text: &str, target: &CodeUnit) -> bool {
     let normalized = normalize_cpp_reference_text(type_text.trim().trim_end_matches(';'));
     normalized == cpp_name_for(target) || normalized == target.identifier()
+}
+
+/// The declared return type text of a C++ function unit, with leading declaration specifiers
+/// stripped, e.g. `T*` for `T* operator->()`.
+pub(in crate::analyzer::usages) fn cpp_function_return_type_text(
+    analyzer: &dyn IAnalyzer,
+    function: &CodeUnit,
+) -> Option<String> {
+    let signature = cpp_function_signature_text(analyzer, function)?;
+    cpp_function_return_type_text_from_signature(&signature)
+}
+
+fn cpp_function_signature_text(analyzer: &dyn IAnalyzer, function: &CodeUnit) -> Option<String> {
+    function
+        .signature()
+        .filter(|signature| signature.contains(function.identifier()))
+        .map(str::to_string)
+        .or_else(|| analyzer.signatures(function).first().cloned())
+        .or_else(|| analyzer.get_source(function, false))
+}
+
+fn cpp_function_return_type_text_from_signature(signature: &str) -> Option<String> {
+    let open = signature.find('(')?;
+    let name_at = cpp_function_name_start(signature, open)?;
+    if let Some(return_type) = cpp_trailing_return_type(&signature[name_at..]) {
+        return Some(return_type);
+    }
+    let type_text = cpp_strip_leading_template_clause(&signature[..name_at])
+        .split_whitespace()
+        .filter(|token| {
+            !matches!(
+                *token,
+                "static" | "virtual" | "inline" | "constexpr" | "explicit" | "friend"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let type_text = type_text.trim();
+    (!type_text.is_empty()).then(|| type_text.to_string())
+}
+
+fn cpp_function_name_start(signature: &str, open: usize) -> Option<usize> {
+    let before_parameters = &signature[..open];
+    if let Some(operator_at) = before_parameters.rfind("operator") {
+        let boundary = operator_at == 0
+            || before_parameters[..operator_at]
+                .chars()
+                .next_back()
+                .is_some_and(|ch| !(ch == '_' || ch.is_ascii_alphanumeric()));
+        if boundary {
+            return Some(operator_at);
+        }
+    }
+    before_parameters
+        .rfind(|ch: char| !(ch == '_' || ch.is_ascii_alphanumeric()))
+        .map(|index| index + 1)
+}
+
+fn cpp_trailing_return_type(signature_from_name: &str) -> Option<String> {
+    let open = signature_from_name.find('(')?;
+    let mut depth = 0i32;
+    for (offset, ch) in signature_from_name[open..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    let rest = signature_from_name[open + offset + ch.len_utf8()..].trim_start();
+                    let arrow = rest.find("->")?;
+                    let return_type = rest[arrow + 2..].trim_start();
+                    let return_type = return_type
+                        .split(['{', ';'])
+                        .next()
+                        .unwrap_or(return_type)
+                        .trim();
+                    return (!return_type.is_empty()).then(|| return_type.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Strip a leading `template <...>` parameter clause, leaving the declaration that follows.
+/// Returns the input unchanged when there is no such clause.
+fn cpp_strip_leading_template_clause(text: &str) -> &str {
+    let trimmed = text.trim_start();
+    let Some(rest) = trimmed.strip_prefix("template") else {
+        return text;
+    };
+    let rest = rest.trim_start();
+    if !rest.starts_with('<') {
+        return text;
+    }
+    let mut depth = 0i32;
+    for (offset, ch) in rest.char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' => {
+                depth -= 1;
+                if depth == 0 {
+                    return rest[offset + ch.len_utf8()..].trim_start();
+                }
+            }
+            _ => {}
+        }
+    }
+    text
+}
+
+pub(super) fn cpp_namespace_for(unit: &CodeUnit) -> Option<String> {
+    cpp_name_for(unit).rsplit_once("::").map(|(namespace, _)| {
+        namespace
+            .strip_prefix("anonymous_namespace::")
+            .unwrap_or(namespace)
+            .to_string()
+    })
+}
+
+pub(in crate::analyzer::usages) fn enclosing_namespace_context(
+    node: Node<'_>,
+    source: &str,
+) -> Option<String> {
+    let mut namespaces = Vec::new();
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "namespace_definition"
+            && let Some(name) = parent.child_by_field_name("name")
+        {
+            let namespace = normalize_cpp_reference_text(node_text(name, source));
+            if !namespace.is_empty() {
+                namespaces.push(namespace);
+            }
+        }
+        current = parent.parent();
+    }
+    if namespaces.is_empty() {
+        None
+    } else {
+        namespaces.reverse();
+        Some(namespaces.join("::"))
+    }
 }
 
 /// Like [`precise_parent_of`], but drops module (namespace) parents. A namespace is a scope, not a

@@ -23,16 +23,14 @@
 //! receiver shapes the forward C++ scan proves.
 
 use super::resolver::{
-    VisibilityIndex, extract_variable_name, first_type_child, is_declaration_name,
-    is_declarator_node, normalize_type_text,
+    TargetKind, VisibilityIndex, extract_variable_name, first_type_child,
+    infer_cpp_initializer_type, is_declaration_name, is_declarator_node, normalize_type_text,
 };
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, first_precise, parse_and_collect,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::analyzer::{
-    CodeUnit, IAnalyzer, ProjectFile, cpp_node_text as node_text, normalize_cpp_whitespace,
-};
+use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, cpp_node_text as node_text};
 use crate::hash::HashSet;
 use tree_sitter::Node;
 
@@ -52,6 +50,7 @@ where
     build_edges(files, keep_file, |file| {
         parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
             let mut ctx = CppScan {
+                analyzer,
                 visibility,
                 file,
                 source: parsed.source.as_str(),
@@ -65,6 +64,7 @@ where
 }
 
 struct CppScan<'a, 'b> {
+    analyzer: &'a dyn IAnalyzer,
     visibility: &'a VisibilityIndex,
     file: &'a ProjectFile,
     source: &'a str,
@@ -131,6 +131,10 @@ fn record_reference(
             }
             // A `X::m(..)` static/scoped call appears as a `qualified_identifier`
             // function: resolve the `X` qualifier as a type and emit `Owner.m`.
+            if let Some(function) = scoped_free_function(node, ctx) {
+                ctx.record(function.fq_name(), node);
+                return;
+            }
             if let Some(owner) = scoped_call_owner(node, ctx) {
                 let member = scoped_call_member(node, ctx.source);
                 if !member.is_empty() {
@@ -184,11 +188,10 @@ fn record_call(
                 return;
             }
             // Free function in the visible set.
-            if let Some(unit) = ctx.visibility.resolve_named(
-                ctx.file,
-                name,
-                super::resolver::TargetKind::FreeFunction,
-            ) {
+            if let Some(unit) =
+                ctx.visibility
+                    .resolve_named(ctx.file, name, TargetKind::FreeFunction)
+            {
                 ctx.record(unit.fq_name(), function);
                 return;
             }
@@ -206,6 +209,22 @@ fn record_call(
 fn is_nested_type_node(node: Node<'_>) -> bool {
     node.parent()
         .is_some_and(|parent| parent.kind() == "qualified_identifier")
+}
+
+/// If `node` is the `function` of a namespace-qualified free-function call, its target.
+fn scoped_free_function(node: Node<'_>, ctx: &CppScan<'_, '_>) -> Option<CodeUnit> {
+    if node.kind() != "qualified_identifier" {
+        return None;
+    }
+    let parent = node.parent()?;
+    if parent.kind() != "call_expression" || parent.child_by_field_name("function") != Some(node) {
+        return None;
+    }
+    ctx.visibility.resolve_named(
+        ctx.file,
+        node_text(node, ctx.source),
+        TargetKind::FreeFunction,
+    )
 }
 
 /// If `node` is the `function` of a `X::m(..)` call, the fqn of `X`'s type.
@@ -354,15 +373,5 @@ fn seed_binding(
 
 /// Infer a class type from an initializer expression for `auto`/untyped locals.
 fn infer_type_from_value(node: Node<'_>, ctx: &CppScan<'_, '_>) -> Option<CodeUnit> {
-    match node.kind() {
-        "new_expression" => {
-            let text = normalize_cpp_whitespace(node_text(node, ctx.source));
-            let rest = text.strip_prefix("new ").unwrap_or(text.as_str());
-            ctx.resolve_type(rest.split(['(', '{']).next().unwrap_or(rest))
-        }
-        "call_expression" => node
-            .child_by_field_name("function")
-            .and_then(|function| ctx.resolve_type(node_text(function, ctx.source))),
-        _ => None,
-    }
+    infer_cpp_initializer_type(ctx.analyzer, ctx.visibility, ctx.file, ctx.source, node)
 }

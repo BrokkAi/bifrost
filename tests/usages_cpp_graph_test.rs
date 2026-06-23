@@ -1860,3 +1860,238 @@ int pick() { return DefaultPrefix; }
         );
     }
 }
+
+#[test]
+fn cpp_graph_uses_call_arity_for_auto_return_type_inference() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "include/service.h",
+            r#"#pragma once
+namespace example {
+class Service {
+public:
+    void execute() const;
+};
+class Other {
+public:
+    void execute() const;
+};
+Service make();
+Other make(int value);
+}
+"#,
+        ),
+        (
+            "src/main.cpp",
+            r#"#include "service.h"
+int main() {
+    auto service = example::make();
+    service.execute();
+    auto other = example::make(1);
+    other.execute();
+}
+"#,
+        ),
+    ]);
+
+    let service_execute = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function && unit.short_name() == "Service.execute"
+    });
+    let service_hits = graph_success_hits(&analyzer, &service_execute);
+    assert_eq!(
+        1,
+        service_hits.len(),
+        "Service.execute hits were {service_hits:#?}"
+    );
+    assert_hit_contains(&service_hits, "src/main.cpp", "service.execute()");
+
+    let other_execute = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function && unit.short_name() == "Other.execute"
+    });
+    let other_hits = graph_success_hits(&analyzer, &other_execute);
+    assert_eq!(
+        1,
+        other_hits.len(),
+        "Other.execute hits were {other_hits:#?}"
+    );
+    assert_hit_contains(&other_hits, "src/main.cpp", "other.execute()");
+}
+
+#[test]
+fn cpp_graph_infers_return_type_when_function_name_appears_in_return_type() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "include/service.h",
+            r#"#pragma once
+namespace make {
+class Result {
+public:
+    void execute() const;
+};
+}
+make::Result make();
+"#,
+        ),
+        (
+            "src/main.cpp",
+            r#"#include "service.h"
+int main() {
+    auto result = make();
+    result.execute();
+}
+"#,
+        ),
+    ]);
+
+    let execute = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function && unit.short_name() == "Result.execute"
+    });
+    let hits = graph_success_hits(&analyzer, &execute);
+    assert_eq!(1, hits.len(), "Result.execute hits were {hits:#?}");
+    assert_hit_contains(&hits, "src/main.cpp", "result.execute()");
+}
+
+#[test]
+fn cpp_graph_infers_noexcept_trailing_return_type() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "include/service.h",
+            r#"#pragma once
+namespace example {
+class Service {
+public:
+    void execute() const;
+};
+auto make_service() noexcept -> Service;
+}
+"#,
+        ),
+        (
+            "src/main.cpp",
+            r#"#include "service.h"
+int main() {
+    auto service = example::make_service();
+    service.execute();
+}
+"#,
+        ),
+    ]);
+
+    let execute = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function && unit.short_name() == "Service.execute"
+    });
+    let hits = graph_success_hits(&analyzer, &execute);
+    assert_eq!(1, hits.len(), "Service.execute hits were {hits:#?}");
+    assert_hit_contains(&hits, "src/main.cpp", "service.execute()");
+}
+
+#[test]
+fn cpp_graph_prefers_enclosing_namespace_for_factory_return_inference() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "include/service.h",
+            r#"#pragma once
+namespace example {
+class Service {
+public:
+    void execute() const;
+};
+Service make();
+}
+namespace other {
+class Other {
+public:
+    void execute() const;
+};
+Other make();
+}
+"#,
+        ),
+        (
+            "src/main.cpp",
+            r#"#include "service.h"
+namespace example {
+void run() {
+    auto service = make();
+    service.execute();
+}
+}
+"#,
+        ),
+    ]);
+
+    let service_execute = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function && unit.short_name() == "Service.execute"
+    });
+    let hits = graph_success_hits(&analyzer, &service_execute);
+    assert_eq!(1, hits.len(), "Service.execute hits were {hits:#?}");
+    assert_hit_contains(&hits, "src/main.cpp", "service.execute()");
+}
+
+#[test]
+fn cpp_graph_prefers_enclosing_namespace_for_bare_constants() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "include/a.h",
+            "#pragma once\nnamespace example { inline constexpr int DefaultPrefix = 1; }\n",
+        ),
+        (
+            "include/b.h",
+            "#pragma once\nnamespace other { inline constexpr int DefaultPrefix = 2; }\n",
+        ),
+        (
+            "src/use.cpp",
+            r#"#include "a.h"
+#include "b.h"
+namespace other {
+int pick() { return DefaultPrefix; }
+}
+"#,
+        ),
+    ]);
+
+    let other_prefix = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Field
+            && unit.identifier() == "DefaultPrefix"
+            && unit.fq_name().contains("other")
+    });
+    let hits = graph_success_hits(&analyzer, &other_prefix);
+    assert_eq!(1, hits.len(), "other::DefaultPrefix hits were {hits:#?}");
+    assert_hit_contains(&hits, "src/use.cpp", "return DefaultPrefix");
+}
+
+#[test]
+fn cpp_graph_keeps_unresolved_qualified_free_function_alias_unproven() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "include/service.h",
+            r#"#pragma once
+namespace example {
+void build_service();
+}
+"#,
+        ),
+        (
+            "src/main.cpp",
+            r#"#include "service.h"
+namespace ex = example;
+int main() {
+    ex::build_service();
+}
+"#,
+        ),
+    ]);
+
+    let build_service = function_definition(&analyzer, "build_service");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let result = CppUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&build_service),
+        &candidates,
+        1000,
+    );
+    assert!(
+        matches!(result, FuzzyResult::Failure { .. }),
+        "unresolved namespace alias should remain unproven, got {result:?}"
+    );
+}
