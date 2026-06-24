@@ -4,9 +4,10 @@ use crate::analyzer::{
 };
 use crate::hash::HashSet;
 use std::sync::Arc;
+use tree_sitter::Node;
 
 use super::RustAnalyzer;
-use super::declarations::rust_package_name;
+use super::declarations::{rust_node_text, rust_package_name};
 
 impl ImportAnalysisProvider for RustAnalyzer {
     fn imported_code_units_of(&self, file: &ProjectFile) -> HashSet<CodeUnit> {
@@ -70,119 +71,251 @@ impl ImportAnalysisProvider for RustAnalyzer {
     }
 }
 
-pub(crate) fn flatten_rust_use(raw: &str) -> Vec<String> {
-    let trimmed = raw.trim().trim_end_matches(';').trim();
-    let (prefix, body) = if let Some(body) = trimmed.strip_prefix("pub use ") {
-        ("pub use ", body)
-    } else if let Some(body) = trimmed.strip_prefix("use ") {
-        ("use ", body)
-    } else {
-        return vec![format!("{trimmed};")];
+pub(super) fn rust_imports_from_use_declaration(node: Node<'_>, source: &str) -> Vec<ImportInfo> {
+    if node.kind() != "use_declaration" {
+        return Vec::new();
+    }
+    let Some(argument) = node.child_by_field_name("argument") else {
+        return Vec::new();
     };
-    expand_rust_use_body("", body)
-        .into_iter()
-        .map(|path| format!("{prefix}{path};"))
-        .collect()
+    let visibility = import_visibility(node, source);
+    let mut imports = Vec::new();
+    collect_rust_use_tree(argument, source, None, visibility, &mut imports);
+    imports
 }
 
-fn expand_rust_use_body(prefix: &str, body: &str) -> Vec<String> {
-    let body = body.trim();
-    if let Some(open_index) = body.find('{') {
-        let close_index = body.rfind('}').unwrap_or(body.len());
-        let base = body[..open_index].trim_end_matches("::").trim();
-        let nested = &body[open_index + 1..close_index];
-        let nested_prefix = if prefix.is_empty() {
-            base.to_string()
-        } else if base.is_empty() {
-            prefix.to_string()
-        } else {
-            format!("{prefix}::{base}")
-        };
-        split_top_level(nested)
-            .into_iter()
-            .flat_map(|item| {
-                if item.trim() == "self" {
-                    vec![nested_prefix.clone()]
-                } else {
-                    expand_rust_use_body(&nested_prefix, item.trim())
-                }
-            })
-            .collect()
-    } else {
-        let leaf = if prefix.is_empty() {
-            body.to_string()
-        } else {
-            format!("{prefix}::{body}")
-        };
-        vec![leaf]
-    }
-}
-
-fn split_top_level(input: &str) -> Vec<&str> {
-    let mut result = Vec::new();
-    let mut depth = 0usize;
-    let mut start = 0usize;
-    for (index, ch) in input.char_indices() {
-        match ch {
-            '{' => depth += 1,
-            '}' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => {
-                result.push(input[start..index].trim());
-                start = index + 1;
+fn collect_rust_use_tree(
+    node: Node<'_>,
+    source: &str,
+    prefix: Option<&str>,
+    visibility: ImportVisibility,
+    out: &mut Vec<ImportInfo>,
+) {
+    match node.kind() {
+        "scoped_use_list" => {
+            let scoped_prefix = node
+                .child_by_field_name("path")
+                .and_then(|path| rust_use_path_text(path, source))
+                .map(|path| join_rust_path(prefix, &path))
+                .or_else(|| prefix.map(str::to_string));
+            if let Some(list) = node.child_by_field_name("list") {
+                collect_rust_use_tree(list, source, scoped_prefix.as_deref(), visibility, out);
             }
-            _ => {}
         }
+        "use_list" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect_rust_use_tree(child, source, prefix, visibility.clone(), out);
+            }
+        }
+        "use_as_clause" => {
+            let Some(path_node) = node.child_by_field_name("path") else {
+                return;
+            };
+            let Some(path) = rust_use_path_text(path_node, source) else {
+                return;
+            };
+            let Some(alias_node) = node.child_by_field_name("alias") else {
+                return;
+            };
+            let alias = rust_node_text(alias_node, source).trim();
+            if alias.is_empty() {
+                return;
+            }
+            let full_path = join_rust_path(prefix, &path);
+            let Some(identifier) = rust_use_path_leaf(path_node, source) else {
+                return;
+            };
+            out.push(rust_import_info(
+                visibility,
+                &full_path,
+                false,
+                Some(identifier),
+                Some(alias.to_string()),
+            ));
+        }
+        "use_wildcard" => {
+            let wildcard_path = first_named_child(node)
+                .and_then(|path| rust_use_path_text(path, source))
+                .map(|path| join_rust_path(prefix, &path))
+                .or_else(|| prefix.map(str::to_string));
+            if let Some(path) = wildcard_path
+                && !path.is_empty()
+            {
+                out.push(rust_import_info(visibility, &path, true, None, None));
+            }
+        }
+        "crate" | "identifier" | "metavariable" | "scoped_identifier" | "self" | "super" => {
+            let Some(path) = rust_use_path_text(node, source) else {
+                return;
+            };
+            let full_path = if node.kind() == "self" {
+                prefix.map(str::to_string).unwrap_or(path)
+            } else {
+                join_rust_path(prefix, &path)
+            };
+            let identifier = if node.kind() == "self" {
+                rust_path_leaf(&full_path)
+            } else {
+                rust_use_path_leaf(node, source)
+            };
+            let Some(identifier) = identifier else { return };
+            out.push(rust_import_info(
+                visibility,
+                &full_path,
+                false,
+                Some(identifier),
+                None,
+            ));
+        }
+        _ => {}
     }
-    let tail = input[start..].trim();
-    if !tail.is_empty() {
-        result.push(tail);
-    }
-    result
 }
 
-pub(super) fn parse_rust_import_info(raw: String) -> ImportInfo {
-    let trimmed = raw
-        .trim()
-        .trim_start_matches("use ")
-        .trim_end_matches(';')
-        .trim();
-    let is_wildcard = trimmed.ends_with("::*");
-    let alias = trimmed
-        .rsplit_once(" as ")
-        .map(|(_, alias)| alias.trim().to_string());
-    let path = trimmed
-        .rsplit_once(" as ")
-        .map(|(path, _)| path)
-        .unwrap_or(trimmed);
-    let identifier = (!is_wildcard)
-        .then(|| {
-            path.rsplit("::")
-                .next()
-                .map(str::trim)
-                .filter(|segment| !segment.is_empty())
-                .map(str::to_string)
-        })
-        .flatten();
+#[derive(Clone)]
+enum ImportVisibility {
+    Private,
+    Public,
+    Restricted(String),
+}
+
+fn import_visibility(node: Node<'_>, source: &str) -> ImportVisibility {
+    let mut cursor = node.walk();
+    let visibility = node
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "visibility_modifier")
+        .map(|child| rust_node_text(child, source).trim());
+    match visibility {
+        Some("pub") => ImportVisibility::Public,
+        Some(text) if !text.is_empty() => ImportVisibility::Restricted(text.to_string()),
+        _ => ImportVisibility::Private,
+    }
+}
+
+fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).next()
+}
+
+fn rust_use_path_text(node: Node<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "crate" | "identifier" | "metavariable" | "self" | "super" => {
+            let text = rust_node_text(node, source).trim();
+            (!text.is_empty()).then(|| text.to_string())
+        }
+        "scoped_identifier" => {
+            let path = node
+                .child_by_field_name("path")
+                .and_then(|child| rust_use_path_text(child, source));
+            let name = node
+                .child_by_field_name("name")
+                .and_then(|child| rust_use_path_text(child, source))?;
+            Some(join_rust_path(path.as_deref(), &name))
+        }
+        _ => None,
+    }
+}
+
+fn rust_use_path_leaf(node: Node<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "scoped_identifier" => node
+            .child_by_field_name("name")
+            .and_then(|child| rust_use_path_leaf(child, source)),
+        "crate" | "identifier" | "metavariable" | "self" | "super" => {
+            let text = rust_node_text(node, source).trim();
+            (!text.is_empty()).then(|| text.to_string())
+        }
+        _ => None,
+    }
+}
+
+fn rust_path_leaf(path: &str) -> Option<String> {
+    path.rsplit("::")
+        .next()
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_string)
+}
+
+fn join_rust_path(prefix: Option<&str>, path: &str) -> String {
+    match prefix {
+        Some(prefix) if !prefix.is_empty() && !path.is_empty() => format!("{prefix}::{path}"),
+        Some(prefix) if !prefix.is_empty() => prefix.to_string(),
+        _ => path.to_string(),
+    }
+}
+
+fn rust_import_info(
+    visibility: ImportVisibility,
+    path: &str,
+    is_wildcard: bool,
+    identifier: Option<String>,
+    alias: Option<String>,
+) -> ImportInfo {
+    let prefix = match visibility {
+        ImportVisibility::Private => "use ",
+        ImportVisibility::Public => "pub use ",
+        ImportVisibility::Restricted(ref visibility) => {
+            return restricted_rust_import_info(visibility, path, is_wildcard, identifier, alias);
+        }
+    };
+    let raw_snippet = if is_wildcard {
+        format!("{prefix}{path}::*;")
+    } else if let Some(alias) = &alias {
+        format!("{prefix}{path} as {alias};")
+    } else {
+        format!("{prefix}{path};")
+    };
 
     ImportInfo {
-        raw_snippet: raw,
+        raw_snippet,
         is_wildcard,
         identifier,
         alias,
     }
 }
 
+fn restricted_rust_import_info(
+    visibility: &str,
+    path: &str,
+    is_wildcard: bool,
+    identifier: Option<String>,
+    alias: Option<String>,
+) -> ImportInfo {
+    let raw_snippet = if is_wildcard {
+        format!("{visibility} use {path}::*;")
+    } else if let Some(alias) = &alias {
+        format!("{visibility} use {path} as {alias};")
+    } else {
+        format!("{visibility} use {path};")
+    };
+
+    ImportInfo {
+        raw_snippet,
+        is_wildcard,
+        identifier,
+        alias,
+    }
+}
+
+pub(super) fn rust_import_body(raw_import: &str) -> Option<&str> {
+    let trimmed = raw_import.trim().trim_end_matches(';').trim();
+    if let Some(body) = trimmed.strip_prefix("use ") {
+        return Some(body.trim());
+    }
+    if let Some(body) = trimmed.strip_prefix("pub use ") {
+        return Some(body.trim());
+    }
+    let (visibility, body) = trimmed.split_once(" use ")?;
+    let visibility = visibility.trim();
+    (visibility.starts_with("pub(") || visibility == "crate").then_some(body.trim())
+}
+
 pub(super) fn split_rust_import_module_and_name(raw_import: &str) -> Option<(String, String)> {
-    let trimmed = raw_import
-        .trim()
-        .trim_start_matches("pub ")
-        .trim_start_matches("use ")
-        .trim_end_matches(';')
-        .trim();
-    let path = trimmed
+    let body = rust_import_body(raw_import)?;
+    let path = body
         .rsplit_once(" as ")
         .map(|(path, _)| path)
-        .unwrap_or(trimmed)
+        .unwrap_or(body)
         .trim();
     if path.ends_with("::*") {
         return None;
@@ -249,16 +382,11 @@ pub(super) fn resolve_rust_import_fq_name(
     package: &str,
     raw_import: &str,
 ) -> Option<String> {
-    let trimmed = raw_import
-        .trim()
-        .trim_start_matches("pub ")
-        .trim_start_matches("use ")
-        .trim_end_matches(';')
-        .trim();
-    let path = trimmed
+    let body = rust_import_body(raw_import)?;
+    let path = body
         .rsplit_once(" as ")
         .map(|(path, _)| path)
-        .unwrap_or(trimmed)
+        .unwrap_or(body)
         .trim_end_matches("::*")
         .trim();
     let segments: Vec<_> = path

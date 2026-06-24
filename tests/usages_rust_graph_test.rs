@@ -1319,6 +1319,42 @@ fn run() {
 }
 
 #[test]
+fn rust_graph_strategy_does_not_treat_self_reexport_as_public_barrel() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/lib.rs",
+            r#"
+mod service;
+pub(self) use service::Foo;
+"#,
+        ),
+        ("src/service.rs", "pub struct Foo;\n"),
+        (
+            "src/main.rs",
+            r#"
+use crate::Foo;
+
+fn run() {
+    let _ = Foo {};
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "service.Foo");
+    let result = brokk_bifrost::usages::RustExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &analyzer.get_analyzed_files().into_iter().collect(),
+        1000,
+    );
+    assert!(
+        matches!(result, FuzzyResult::Failure { .. }),
+        "pub(self) use must not expose Foo as a public barrel reexport"
+    );
+}
+
+#[test]
 fn rust_graph_strategy_resolves_chained_and_aliased_barrel_reexports() {
     let (_project, analyzer) = rust_analyzer_with_files(&[
         (

@@ -61,6 +61,96 @@ fn test_import_statement_shapes() {
     assert!(imports.contains(&"use std::io;".to_string()));
     assert!(imports.contains(&"use std::io::Read;".to_string()));
     assert!(imports.contains(&"use std::io::Write;".to_string()));
+
+    let grouped_alias_self = RustAnalyzer::from_project(rust_project(&[(
+        "src/main.rs",
+        "use models::{self, MemoryRepository as Repo, OtherRepository};",
+    )]));
+    let grouped_file = ProjectFile::new(
+        grouped_alias_self.project().root().to_path_buf(),
+        "src/main.rs",
+    );
+    let imports = grouped_alias_self.import_statements_of(&grouped_file);
+    assert!(imports.contains(&"use models;".to_string()));
+    assert!(imports.contains(&"use models::MemoryRepository as Repo;".to_string()));
+    assert!(imports.contains(&"use models::OtherRepository;".to_string()));
+
+    let nested_groups = RustAnalyzer::from_project(rust_project(&[(
+        "src/main.rs",
+        "use app::{env::{env_init}, service::{self, Service as S}};",
+    )]));
+    let nested_file = ProjectFile::new(nested_groups.project().root().to_path_buf(), "src/main.rs");
+    let imports = nested_groups.import_statements_of(&nested_file);
+    assert!(imports.contains(&"use app::env::env_init;".to_string()));
+    assert!(imports.contains(&"use app::service;".to_string()));
+    assert!(imports.contains(&"use app::service::Service as S;".to_string()));
+
+    let public_reexports = RustAnalyzer::from_project(rust_project(&[(
+        "src/main.rs",
+        "pub use service::{build_service, MemoryRepository as Repo, Service};",
+    )]));
+    let public_file = ProjectFile::new(
+        public_reexports.project().root().to_path_buf(),
+        "src/main.rs",
+    );
+    let imports = public_reexports.import_statements_of(&public_file);
+    assert!(imports.contains(&"pub use service::build_service;".to_string()));
+    assert!(imports.contains(&"pub use service::MemoryRepository as Repo;".to_string()));
+    assert!(imports.contains(&"pub use service::Service;".to_string()));
+
+    let restricted_reexports = RustAnalyzer::from_project(rust_project(&[(
+        "src/main.rs",
+        "pub(crate) use service::{Foo as CrateFoo, Bar};\npub(self) use service::Hidden;",
+    )]));
+    let restricted_file = ProjectFile::new(
+        restricted_reexports.project().root().to_path_buf(),
+        "src/main.rs",
+    );
+    let imports = restricted_reexports.import_statements_of(&restricted_file);
+    assert!(imports.contains(&"pub(crate) use service::Foo as CrateFoo;".to_string()));
+    assert!(imports.contains(&"pub(crate) use service::Bar;".to_string()));
+    assert!(imports.contains(&"pub(self) use service::Hidden;".to_string()));
+    assert!(!imports.contains(&"pub use service::Foo as CrateFoo;".to_string()));
+    assert!(!imports.contains(&"pub use service::Bar;".to_string()));
+    assert!(!imports.contains(&"pub use service::Hidden;".to_string()));
+}
+
+#[test]
+fn test_structured_import_info_for_group_alias_self_and_wildcard() {
+    let analyzer = RustAnalyzer::from_project(rust_project(&[(
+        "src/main.rs",
+        r#"
+        use models::{self, MemoryRepository as Repo, OtherRepository};
+        use models::*;
+        "#,
+    )]));
+    let file = ProjectFile::new(analyzer.project().root().to_path_buf(), "src/main.rs");
+    let import_infos = analyzer.import_info_of(&file);
+
+    assert!(import_infos.iter().any(|info| {
+        info.raw_snippet == "use models;"
+            && !info.is_wildcard
+            && info.identifier.as_deref() == Some("models")
+            && info.alias.is_none()
+    }));
+    assert!(import_infos.iter().any(|info| {
+        info.raw_snippet == "use models::MemoryRepository as Repo;"
+            && !info.is_wildcard
+            && info.identifier.as_deref() == Some("MemoryRepository")
+            && info.alias.as_deref() == Some("Repo")
+    }));
+    assert!(import_infos.iter().any(|info| {
+        info.raw_snippet == "use models::OtherRepository;"
+            && !info.is_wildcard
+            && info.identifier.as_deref() == Some("OtherRepository")
+            && info.alias.is_none()
+    }));
+    assert!(import_infos.iter().any(|info| {
+        info.raw_snippet == "use models::*;"
+            && info.is_wildcard
+            && info.identifier.is_none()
+            && info.alias.is_none()
+    }));
 }
 
 #[test]

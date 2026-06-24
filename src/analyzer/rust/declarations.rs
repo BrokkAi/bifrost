@@ -4,7 +4,7 @@ use crate::hash::HashSet;
 use std::path::Path;
 use tree_sitter::{Node, Tree};
 
-use super::imports::{flatten_rust_use, parse_rust_import_info};
+use super::imports::rust_imports_from_use_declaration;
 
 pub(super) fn rust_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     source.get(node.start_byte()..node.end_byte()).unwrap_or("")
@@ -21,12 +21,11 @@ pub(super) fn parse_rust_file(file: &ProjectFile, source: &str, tree: &Tree) -> 
         };
         match child.kind() {
             "use_declaration" => {
-                let raw = rust_node_text(child, source).trim().to_string();
-                let flattened = flatten_rust_use(&raw);
-                parsed.import_statements.extend(flattened.iter().cloned());
+                let imports = rust_imports_from_use_declaration(child, source);
                 parsed
-                    .imports
-                    .extend(flattened.into_iter().map(parse_rust_import_info));
+                    .import_statements
+                    .extend(imports.iter().map(|import| import.raw_snippet.clone()));
+                parsed.imports.extend(imports);
             }
             "struct_item" | "enum_item" | "trait_item" => {
                 visit_rust_class_like(

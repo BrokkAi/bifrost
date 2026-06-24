@@ -3,7 +3,9 @@ use crate::analyzer::usages::{ImportBinder, ImportBinding, ImportKind};
 use crate::hash::HashSet;
 use tree_sitter::{Node, Parser};
 
-use super::imports::{flatten_rust_use, parse_rust_import_info, split_rust_import_module_and_name};
+use super::imports::{
+    rust_import_body, rust_imports_from_use_declaration, split_rust_import_module_and_name,
+};
 
 pub(crate) fn parse_rust_tree(source: &str) -> Option<tree_sitter::Tree> {
     let mut parser = Parser::new();
@@ -16,12 +18,14 @@ pub(crate) fn parse_rust_tree(source: &str) -> Option<tree_sitter::Tree> {
 pub(crate) fn insert_rust_import_binding(binder: &mut ImportBinder, import: &ImportInfo) {
     let raw = import.raw_snippet.trim();
     if raw.ends_with("::*;") {
-        let module_specifier = raw
-            .trim_start_matches("pub ")
-            .trim_start_matches("use ")
-            .trim_end_matches("::*;")
+        let module_specifier = rust_import_body(raw)
+            .and_then(|body| body.strip_suffix("::*"))
+            .unwrap_or_default()
             .trim()
             .to_string();
+        if module_specifier.is_empty() {
+            return;
+        }
         binder.bindings.insert(
             format!("*:{module_specifier}"),
             ImportBinding {
@@ -90,39 +94,31 @@ pub(crate) fn visible_import_binder_at(source: &str, reference_byte: usize) -> I
         return binder;
     };
     let mut imports = Vec::new();
-    collect_visible_use_statements(tree.root_node(), source, reference_byte, &mut imports);
+    collect_visible_use_statements(tree.root_node(), reference_byte, &mut imports);
     for import in imports
         .into_iter()
-        .flat_map(|raw| flatten_rust_use(&raw))
-        .map(parse_rust_import_info)
+        .flat_map(|node| rust_imports_from_use_declaration(node, source))
     {
         insert_rust_import_binding(&mut binder, &import);
     }
     binder
 }
 
-fn collect_visible_use_statements(
-    node: Node<'_>,
-    source: &str,
+fn collect_visible_use_statements<'tree>(
+    node: Node<'tree>,
     reference_byte: usize,
-    out: &mut Vec<String>,
+    out: &mut Vec<Node<'tree>>,
 ) {
     if node.kind() == "use_declaration" {
         if use_statement_visible_at(node, reference_byte) {
-            out.push(
-                source
-                    .get(node.start_byte()..node.end_byte())
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string(),
-            );
+            out.push(node);
         }
         return;
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         if child.start_byte() <= reference_byte || child.end_byte() >= reference_byte {
-            collect_visible_use_statements(child, source, reference_byte, out);
+            collect_visible_use_statements(child, reference_byte, out);
         }
     }
 }
