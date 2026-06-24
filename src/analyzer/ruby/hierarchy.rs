@@ -21,13 +21,28 @@ impl RubyAnalyzer {
         }
 
         let last_segment = cleaned.rsplit('$').next().unwrap_or(cleaned);
-        self.inner
-            .all_declarations()
-            .find(|code_unit| {
-                (code_unit.is_class() || code_unit.is_module())
-                    && code_unit.identifier() == last_segment
-            })
+        self.types_by_identifier()
+            .get(last_segment)
+            .and_then(|types| types.first())
             .cloned()
+    }
+
+    /// Lazily indexes class/module declarations by trailing identifier so the
+    /// relative-supertype fallback is an O(1) lookup instead of a full
+    /// `all_declarations` scan per unresolved supertype.
+    fn types_by_identifier(&self) -> &HashMap<String, Vec<CodeUnit>> {
+        self.types_by_identifier.get_or_init(|| {
+            let mut index: HashMap<String, Vec<CodeUnit>> = HashMap::default();
+            for code_unit in self.inner.all_declarations() {
+                if code_unit.is_class() || code_unit.is_module() {
+                    index
+                        .entry(code_unit.identifier().to_string())
+                        .or_default()
+                        .push(code_unit.clone());
+                }
+            }
+            index
+        })
     }
 }
 

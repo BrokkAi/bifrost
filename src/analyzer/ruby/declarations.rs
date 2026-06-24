@@ -30,45 +30,77 @@ pub(super) struct RubyVisitor<'a> {
     pub(super) parsed: &'a mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
 }
 
+/// A pending traversal step: visit `node` as a statement within the enclosing
+/// type's `segments`/`parent` context. The visitor uses an explicit stack of
+/// these instead of native recursion so deeply nested input cannot overflow the
+/// call stack (per AGENTS.md, and mirroring the Python visitor).
+struct RubyWork<'tree> {
+    node: Node<'tree>,
+    segments: Vec<String>,
+    parent: Option<CodeUnit>,
+}
+
+/// Pushes a node's named children as statement work items. Children are pushed
+/// in reverse so the stack pops them in source order.
+fn push_named_children<'tree>(
+    node: Node<'tree>,
+    segments: &[String],
+    parent: Option<&CodeUnit>,
+    stack: &mut Vec<RubyWork<'tree>>,
+) {
+    let mut cursor = node.walk();
+    let children: Vec<_> = node.named_children(&mut cursor).collect();
+    for child in children.into_iter().rev() {
+        stack.push(RubyWork {
+            node: child,
+            segments: segments.to_vec(),
+            parent: parent.cloned(),
+        });
+    }
+}
+
 impl RubyVisitor<'_> {
     pub(super) fn visit_program(&mut self, root: Node<'_>) {
-        self.visit_container(root, &[], None);
-    }
-
-    fn visit_container(&mut self, node: Node<'_>, segments: &[String], parent: Option<&CodeUnit>) {
-        let mut cursor = node.walk();
-        let children: Vec<_> = node.named_children(&mut cursor).collect();
-        for child in children {
-            self.visit_statement(child, segments, parent);
+        let mut stack = Vec::new();
+        push_named_children(root, &[], None, &mut stack);
+        while let Some(work) = stack.pop() {
+            self.visit_statement(work.node, &work.segments, work.parent.as_ref(), &mut stack);
         }
     }
 
-    fn visit_statement(&mut self, node: Node<'_>, segments: &[String], parent: Option<&CodeUnit>) {
+    fn visit_statement<'tree>(
+        &mut self,
+        node: Node<'tree>,
+        segments: &[String],
+        parent: Option<&CodeUnit>,
+        stack: &mut Vec<RubyWork<'tree>>,
+    ) {
         match node.kind() {
-            "class" => self.visit_class_like(node, segments, parent, false),
-            "module" => self.visit_class_like(node, segments, parent, true),
+            "class" => self.visit_class_like(node, segments, parent, false, stack),
+            "module" => self.visit_class_like(node, segments, parent, true, stack),
             "singleton_class" => {
                 // `class << self` — its methods belong to the enclosing type.
                 if let Some(body) = node.child_by_field_name("body") {
-                    self.visit_container(body, segments, parent);
+                    push_named_children(body, segments, parent, stack);
                 }
             }
             "method" | "singleton_method" => self.visit_method(node, segments, parent),
             "assignment" => self.visit_assignment(node, segments, parent),
             "call" => self.visit_call(node, segments, parent),
             kind if is_descendable_container(kind) => {
-                self.visit_container(node, segments, parent);
+                push_named_children(node, segments, parent, stack);
             }
             _ => {}
         }
     }
 
-    fn visit_class_like(
+    fn visit_class_like<'tree>(
         &mut self,
-        node: Node<'_>,
+        node: Node<'tree>,
         segments: &[String],
         parent: Option<&CodeUnit>,
         is_module: bool,
+        stack: &mut Vec<RubyWork<'tree>>,
     ) {
         let Some(name_node) = node.child_by_field_name("name") else {
             return;
@@ -100,7 +132,7 @@ impl RubyVisitor<'_> {
         }
 
         if let Some(body) = node.child_by_field_name("body") {
-            self.visit_container(body, &new_segments, Some(&code_unit));
+            push_named_children(body, &new_segments, Some(&code_unit), stack);
         }
     }
 
@@ -275,35 +307,39 @@ fn extract_ruby_supertypes(node: Node<'_>, source: &str) -> Vec<String> {
 }
 
 /// Walks a type body for `include`/`prepend`/`extend` calls, descending through
-/// control-flow containers but not into nested types or methods.
-fn collect_mixins(node: Node<'_>, source: &str, supertypes: &mut Vec<String>) {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        match child.kind() {
-            "call" => {
-                let Some(method) = child.child_by_field_name("method") else {
-                    continue;
-                };
-                if !matches!(
-                    ruby_node_text(method, source).trim(),
-                    "include" | "prepend" | "extend"
-                ) {
-                    continue;
-                }
-                let Some(arguments) = child.child_by_field_name("arguments") else {
-                    continue;
-                };
-                let mut arg_cursor = arguments.walk();
-                for arg in arguments.named_children(&mut arg_cursor) {
-                    if matches!(arg.kind(), "constant" | "scope_resolution")
-                        && let Some(name) = qualified_internal_name(arg, source)
-                    {
-                        supertypes.push(name);
+/// control-flow containers (iteratively, to stay stack-safe) but not into
+/// nested types or methods.
+fn collect_mixins(body: Node<'_>, source: &str, supertypes: &mut Vec<String>) {
+    let mut stack = vec![body];
+    while let Some(node) = stack.pop() {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            match child.kind() {
+                "call" => {
+                    let Some(method) = child.child_by_field_name("method") else {
+                        continue;
+                    };
+                    if !matches!(
+                        ruby_node_text(method, source).trim(),
+                        "include" | "prepend" | "extend"
+                    ) {
+                        continue;
+                    }
+                    let Some(arguments) = child.child_by_field_name("arguments") else {
+                        continue;
+                    };
+                    let mut arg_cursor = arguments.walk();
+                    for arg in arguments.named_children(&mut arg_cursor) {
+                        if matches!(arg.kind(), "constant" | "scope_resolution")
+                            && let Some(name) = qualified_internal_name(arg, source)
+                        {
+                            supertypes.push(name);
+                        }
                     }
                 }
+                kind if is_descendable_container(kind) => stack.push(child),
+                _ => {}
             }
-            kind if is_descendable_container(kind) => collect_mixins(child, source, supertypes),
-            _ => {}
         }
     }
 }

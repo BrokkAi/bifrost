@@ -2,7 +2,10 @@
 // Covers ISC-3 (declarations + types), ISC-3b (`class << self`),
 // ISC-4 (class reopening), ISC-9 (nested namespaces), ISC-11 (graceful parse).
 
+mod common;
+
 use brokk_bifrost::{CodeUnit, IAnalyzer, ProjectFile, RubyAnalyzer, TestProject};
+use common::InlineTestProject;
 use std::collections::BTreeSet;
 
 fn analyzer() -> RubyAnalyzer {
@@ -162,4 +165,25 @@ fn syntax_error_file_does_not_panic() {
 fn empty_file_yields_no_declarations() {
     let analyzer = analyzer();
     assert!(declarations(&analyzer, "empty.rb").is_empty());
+}
+
+#[test]
+fn deeply_nested_input_does_not_overflow_the_stack() {
+    // The visitor must walk arbitrarily deep nesting without native recursion
+    // overflowing the stack (analyzers must never crash on malformed input).
+    // ~5000 deep comfortably exceeds the recursion depth that overflowed the
+    // previous implementation on a default test-thread stack.
+    let depth = 5_000;
+    let mut source = String::new();
+    for level in 0..depth {
+        source.push_str(&format!("module M{level}\n"));
+    }
+    source.push_str("end\n".repeat(depth).as_str());
+
+    let built = InlineTestProject::with_language(brokk_bifrost::Language::Ruby)
+        .file("deep.rb", source)
+        .build();
+    let analyzer = RubyAnalyzer::new(built.project_dyn());
+    // Completing analysis without aborting the process is the assertion.
+    let _ = analyzer.get_all_declarations();
 }

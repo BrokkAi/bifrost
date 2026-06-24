@@ -34,6 +34,10 @@ pub struct RubyAnalyzer {
     direct_descendants: Cache<CodeUnit, Arc<HashSet<CodeUnit>>>,
     direct_descendant_index: Arc<OnceLock<HashMap<String, Arc<HashSet<CodeUnit>>>>>,
     reverse_import_index: Arc<OnceLock<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
+    /// Class/module declarations indexed by their trailing identifier, for
+    /// resolving relative (unqualified) supertype references without scanning
+    /// every declaration.
+    types_by_identifier: Arc<OnceLock<HashMap<String, Vec<CodeUnit>>>>,
 }
 
 impl RubyAnalyzer {
@@ -68,6 +72,7 @@ impl RubyAnalyzer {
             direct_descendants: build_weighted_cache(memo_budget / 8, weight_code_unit_set_by_unit),
             direct_descendant_index: Arc::new(OnceLock::new()),
             reverse_import_index: Arc::new(OnceLock::new()),
+            types_by_identifier: Arc::new(OnceLock::new()),
         }
     }
 

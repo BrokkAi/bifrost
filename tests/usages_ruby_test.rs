@@ -1,6 +1,7 @@
-// Ruby usage discovery. Ruby has no dedicated usage-graph strategy yet, so
-// `find_usages` runs through the default finder's text-candidate fallback.
-// These tests pin that baseline behavior (cross-file call discovery).
+// Ruby usage discovery via `RubyUsageGraphStrategy`. Ruby's dynamic dispatch
+// rarely exposes a receiver's type statically, so usages are resolved by
+// method/constant name. These tests pin name-based cross-file call discovery,
+// including calls reaching a method through an included module.
 
 use brokk_bifrost::{CodeUnit, IAnalyzer, RubyAnalyzer, TestProject};
 
