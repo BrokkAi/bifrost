@@ -32,6 +32,23 @@ fn fq_names(units: impl IntoIterator<Item = CodeUnit>) -> Vec<String> {
     names
 }
 
+fn definition_in_file(
+    analyzer: &JavascriptAnalyzer,
+    file: &ProjectFile,
+    fq_name: &str,
+) -> CodeUnit {
+    analyzer
+        .get_declarations(file)
+        .into_iter()
+        .find(|unit| unit.fq_name() == fq_name)
+        .unwrap_or_else(|| {
+            panic!(
+                "missing definition for {fq_name} in {}",
+                file.rel_path().display()
+            )
+        })
+}
+
 #[test]
 fn javascript_type_hierarchy_resolves_same_file_extends() {
     let (_project, analyzer) =
@@ -109,6 +126,55 @@ fn javascript_type_hierarchy_direct_descendants_are_not_transitive() {
     );
     assert_eq!(
         fq_names(analyzer.get_direct_descendants(&mid)),
+        vec!["Child"]
+    );
+}
+
+#[test]
+fn javascript_type_hierarchy_keeps_same_named_modules_distinct() {
+    let (project, analyzer) = js_inline_analyzer(&[
+        ("one.js", "export class Base {}\n"),
+        ("two.js", "export class Base {}\n"),
+        (
+            "child.js",
+            "import { Base } from './one';\nexport class Child extends Base {}\n",
+        ),
+    ]);
+
+    let one_base = definition_in_file(&analyzer, &project.file("one.js"), "Base");
+    let two_base = definition_in_file(&analyzer, &project.file("two.js"), "Base");
+    let child = definition(&analyzer, "Child");
+
+    assert_eq!(
+        analyzer.get_direct_ancestors(&child),
+        vec![one_base.clone()]
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_descendants(&one_base)),
+        vec!["Child"]
+    );
+    assert!(analyzer.get_direct_descendants(&two_base).is_empty());
+}
+
+#[test]
+fn javascript_type_hierarchy_resolves_commonjs_default_parent() {
+    let (_project, analyzer) = js_inline_analyzer(&[
+        ("base.js", "class Base {}\nmodule.exports = Base;\n"),
+        (
+            "child.js",
+            "const Base = require('./base');\nclass Child extends Base {}\n",
+        ),
+    ]);
+
+    let base = definition(&analyzer, "Base");
+    let child = definition(&analyzer, "Child");
+
+    assert_eq!(
+        fq_names(analyzer.get_direct_ancestors(&child)),
+        vec!["Base"]
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_descendants(&base)),
         vec!["Child"]
     );
 }

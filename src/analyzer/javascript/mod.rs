@@ -10,7 +10,9 @@ use crate::analyzer::js_ts::cache::{
 use crate::analyzer::js_ts::clones::{
     build_js_ts_clone_ast_signature, normalized_clone_tokens_js_ts, refine_js_ts_clone_similarity,
 };
-use crate::analyzer::js_ts::hierarchy::{extract_js_supertypes, resolve_direct_ancestors};
+use crate::analyzer::js_ts::hierarchy::{
+    build_direct_descendant_index_by_unit, extract_js_supertypes, resolve_direct_ancestors,
+};
 use crate::analyzer::js_ts::identifiers::collect_js_ts_identifiers;
 use crate::analyzer::js_ts::imports::extract_js_ts_call_receiver;
 use crate::analyzer::js_ts::imports::{
@@ -24,8 +26,7 @@ use crate::analyzer::usages::js_ts_graph::{JsTsUsageIndex, build_jsts_usage_inde
 use crate::analyzer::{
     AliasResolver, AnalyzerConfig, CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo,
     Language, LanguageAdapter, Project, ProjectFile, TestAssertionSmell, TestAssertionWeights,
-    TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
-    build_direct_descendant_index, build_reverse_import_index,
+    TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider, build_reverse_import_index,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
@@ -151,7 +152,7 @@ struct JsMemoCaches {
     relevant_imports: Cache<CodeUnit, Arc<HashSet<String>>>,
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
     direct_descendants: Cache<CodeUnit, Arc<HashSet<CodeUnit>>>,
-    direct_descendant_index: OnceLock<HashMap<String, Arc<HashSet<CodeUnit>>>>,
+    direct_descendant_index: OnceLock<HashMap<CodeUnit, Arc<HashSet<CodeUnit>>>>,
     reverse_import_index: OnceLock<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
     /// Analyzer-cached JS/TS usage-resolution maps, built once and reused across queries.
     /// Reset (with the rest of this bucket) on `update`/`update_all`.
@@ -401,8 +402,8 @@ impl TypeHierarchyProvider for JavascriptAnalyzer {
         let descendants = self
             .memo_caches
             .direct_descendant_index
-            .get_or_init(|| build_direct_descendant_index(self, self))
-            .get(&code_unit.fq_name())
+            .get_or_init(|| build_direct_descendant_index_by_unit(self, self))
+            .get(code_unit)
             .map(|descendants| descendants.as_ref().clone())
             .unwrap_or_default();
         self.memo_caches

@@ -1,8 +1,12 @@
 use crate::analyzer::js_ts::AliasResolver;
 use crate::analyzer::js_ts::model::node_text;
 use crate::analyzer::usages::{ImportKind, js_ts_graph::JsTsUsageIndex};
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, resolve_js_ts_module_specifier};
-use crate::hash::HashSet;
+use crate::analyzer::{
+    CodeUnit, IAnalyzer, Language, ProjectFile, TypeHierarchyProvider,
+    resolve_js_ts_module_specifier,
+};
+use crate::hash::{HashMap, HashSet};
+use std::sync::Arc;
 use tree_sitter::Node;
 
 pub(crate) fn extract_js_supertypes(declaration: Node<'_>, source: &str) -> Vec<String> {
@@ -86,11 +90,38 @@ pub(crate) fn resolve_direct_ancestors(
         ) else {
             continue;
         };
-        if seen.insert(ancestor.fq_name()) {
+        if seen.insert(ancestor.clone()) {
             ancestors.push(ancestor);
         }
     }
     ancestors
+}
+
+pub(crate) fn build_direct_descendant_index_by_unit<A, P>(
+    analyzer: &A,
+    provider: &P,
+) -> HashMap<CodeUnit, Arc<HashSet<CodeUnit>>>
+where
+    A: IAnalyzer,
+    P: TypeHierarchyProvider + ?Sized,
+{
+    let mut reverse: HashMap<CodeUnit, HashSet<CodeUnit>> = HashMap::default();
+    for candidate in analyzer
+        .all_declarations()
+        .filter(|candidate| candidate.is_class())
+    {
+        for ancestor in provider.get_direct_ancestors(candidate) {
+            reverse
+                .entry(ancestor)
+                .or_default()
+                .insert(candidate.clone());
+        }
+    }
+
+    reverse
+        .into_iter()
+        .map(|(ancestor, descendants)| (ancestor, Arc::new(descendants)))
+        .collect()
 }
 
 fn collect_heritage_clause_types(
@@ -218,7 +249,7 @@ fn resolve_local_import_binding(
     let exported_name = match binding.kind {
         ImportKind::Default => "default",
         ImportKind::Named => binding.imported_name.as_deref().unwrap_or(local_name),
-        ImportKind::CommonJsRequire => binding.imported_name.as_deref().unwrap_or(local_name),
+        ImportKind::CommonJsRequire => binding.imported_name.as_deref().unwrap_or("default"),
         ImportKind::Namespace | ImportKind::Glob => return Vec::new(),
     };
     exported_type_declarations(analyzer, index, &module_files, exported_name)

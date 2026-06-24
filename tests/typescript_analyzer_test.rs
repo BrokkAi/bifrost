@@ -35,6 +35,23 @@ fn fq_names(units: impl IntoIterator<Item = CodeUnit>) -> Vec<String> {
     names
 }
 
+fn definition_in_file(
+    analyzer: &TypescriptAnalyzer,
+    file: &ProjectFile,
+    fq_name: &str,
+) -> CodeUnit {
+    analyzer
+        .get_declarations(file)
+        .into_iter()
+        .find(|unit| unit.fq_name() == fq_name)
+        .unwrap_or_else(|| {
+            panic!(
+                "missing definition for {fq_name} in {}",
+                file.rel_path().display()
+            )
+        })
+}
+
 #[test]
 fn typescript_type_hierarchy_resolves_same_file_class_extends() {
     let (_project, analyzer) =
@@ -117,6 +134,36 @@ fn typescript_type_hierarchy_keeps_ambiguous_barrel_import_conservative() {
     let worker = definition(&analyzer, "Worker");
 
     assert!(analyzer.get_direct_ancestors(&worker).is_empty());
+}
+
+#[test]
+fn typescript_type_hierarchy_keeps_same_named_interfaces_distinct() {
+    let (project, analyzer) = ts_inline_analyzer(&[
+        ("one.ts", "export interface Contract {}\n"),
+        ("two.ts", "export interface Contract {}\n"),
+        (
+            "worker.ts",
+            "import { Contract as One } from './one';\nimport { Contract as Two } from './two';\nexport class Worker implements One, Two {}\n",
+        ),
+    ]);
+
+    let one_contract = definition_in_file(&analyzer, &project.file("one.ts"), "Contract");
+    let two_contract = definition_in_file(&analyzer, &project.file("two.ts"), "Contract");
+    let worker = definition(&analyzer, "Worker");
+
+    let mut ancestors = analyzer.get_direct_ancestors(&worker);
+    ancestors.sort();
+    let mut expected = vec![one_contract.clone(), two_contract.clone()];
+    expected.sort();
+    assert_eq!(ancestors, expected);
+    assert_eq!(
+        fq_names(analyzer.get_direct_descendants(&one_contract)),
+        vec!["Worker"]
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_descendants(&two_contract)),
+        vec!["Worker"]
+    );
 }
 
 #[test]

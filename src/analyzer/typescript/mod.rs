@@ -7,7 +7,7 @@ use crate::analyzer::{
     AliasResolver, AnalyzerConfig, CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo,
     Language, Project, ProjectFile, TestAssertionSmell, TestAssertionWeights,
     TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
-    build_direct_descendant_index, build_reverse_import_index,
+    build_reverse_import_index,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
@@ -23,7 +23,9 @@ use crate::analyzer::js_ts::cache::{
 use crate::analyzer::js_ts::clones::{
     build_js_ts_clone_ast_signature, normalized_clone_tokens_js_ts, refine_js_ts_clone_similarity,
 };
-use crate::analyzer::js_ts::hierarchy::{extract_ts_supertypes, resolve_direct_ancestors};
+use crate::analyzer::js_ts::hierarchy::{
+    build_direct_descendant_index_by_unit, extract_ts_supertypes, resolve_direct_ancestors,
+};
 use crate::analyzer::js_ts::identifiers::collect_js_ts_identifiers;
 use crate::analyzer::js_ts::imports::{
     extract_js_ts_call_receiver, import_info_tokens, parse_commonjs_require_import_infos_from_node,
@@ -154,7 +156,7 @@ pub struct TypescriptAnalyzer {
     relevant_imports: Cache<CodeUnit, Arc<HashSet<String>>>,
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
     direct_descendants: Cache<CodeUnit, Arc<HashSet<CodeUnit>>>,
-    direct_descendant_index: Arc<OnceLock<HashMap<String, Arc<HashSet<CodeUnit>>>>>,
+    direct_descendant_index: Arc<OnceLock<HashMap<CodeUnit, Arc<HashSet<CodeUnit>>>>>,
     reverse_import_index: Arc<OnceLock<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     /// Analyzer-cached JS/TS usage-resolution maps, built once per analyzer and reused
     /// across `scan_usages`/`usage_graph` queries. Reset on `update`/`update_all`.
@@ -415,8 +417,8 @@ impl TypeHierarchyProvider for TypescriptAnalyzer {
 
         let descendants = self
             .direct_descendant_index
-            .get_or_init(|| build_direct_descendant_index(self, self))
-            .get(&code_unit.fq_name())
+            .get_or_init(|| build_direct_descendant_index_by_unit(self, self))
+            .get(code_unit)
             .map(|descendants| descendants.as_ref().clone())
             .unwrap_or_default();
         self.direct_descendants
