@@ -47,6 +47,16 @@ impl RustReferenceContext {
             .map(String::as_str)
     }
 
+    pub(crate) fn bare_names_resolving_to(&self, target_fqn: &str) -> HashSet<String> {
+        self.named
+            .iter()
+            .chain(self.namespace.iter())
+            .chain(self.same_file.iter())
+            .filter(|&(_, fqn)| fqn == target_fqn)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
     /// The callee fqn a `path::name` refers to: a module function via a namespace
     /// import, or an associated function on an imported / same-file type.
     pub fn resolve_scoped(&self, path: &str, name: &str) -> Option<String> {

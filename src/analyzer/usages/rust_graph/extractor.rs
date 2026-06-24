@@ -87,6 +87,7 @@ pub(super) fn scan_files_for_target(
     seeds: Option<&BTreeSet<(ProjectFile, String)>>,
 ) -> BTreeSet<UsageHit> {
     let target_short = target.identifier().to_string();
+    let target_fqn = target.fq_name();
     let parser_language = tree_sitter_rust::LANGUAGE.into();
     let hits = Mutex::new(BTreeSet::new());
     let files_vec: Vec<_> = files.into_iter().collect();
@@ -130,6 +131,10 @@ pub(super) fn scan_files_for_target(
                     direct_names.insert(seed_name.clone());
                 }
             }
+            direct_names.extend(
+                rust.reference_context_of(file)
+                    .bare_names_resolving_to(&target_fqn),
+            );
         }
         let target_self_file = file == target.source();
 

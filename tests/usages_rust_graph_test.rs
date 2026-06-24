@@ -2649,6 +2649,76 @@ pub fn run_demo() -> String {
 }
 
 #[test]
+fn rust_graph_strategy_finds_grouped_reexported_free_function_call_with_argument() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/service.rs",
+            r#"
+pub const DEFAULT_PREFIX: &str = "job";
+
+#[derive(Default)]
+pub struct MemoryRepository {
+    pub last: String,
+}
+
+impl MemoryRepository {
+    pub fn save(&mut self, value: &str) -> String {
+        self.last = value.to_string();
+        value.trim().to_string()
+    }
+}
+
+pub struct Service {
+    repository: MemoryRepository,
+}
+
+impl Service {
+    pub fn new(repository: MemoryRepository) -> Self {
+        Self { repository }
+    }
+
+    pub fn execute(mut self, name: &str) -> String {
+        let stored = self.repository.save(name);
+        format!("{DEFAULT_PREFIX}:{stored}")
+    }
+}
+
+pub fn build_service(repository: MemoryRepository) -> Service {
+    Service::new(repository)
+}
+"#,
+        ),
+        (
+            "src/lib.rs",
+            r#"
+pub mod service;
+
+pub use service::{DEFAULT_PREFIX, MemoryRepository, Service, build_service};
+
+pub fn run_demo() -> String {
+    let mut repository = MemoryRepository::default();
+    repository.save("Ada");
+    let service = build_service(repository);
+    service.execute(" Grace ")
+}
+"#,
+        ),
+    ]);
+
+    let hits = rust_graph_hits(&analyzer, "service.build_service");
+    assert_eq!(
+        1,
+        hits.len(),
+        "expected build_service(repository) call in run_demo: {hits:?}",
+    );
+    assert!(
+        hits.iter().any(|hit| hit.file == project.file("src/lib.rs")
+            && hit.snippet.contains("build_service(repository)")),
+        "expected hit snippet to include the grouped re-exported bare call: {hits:?}",
+    );
+}
+
+#[test]
 fn rust_graph_strategy_finds_direct_self_field_in_qualified_cross_module_impl() {
     let (project, analyzer) = rust_analyzer_with_files(&[
         (
