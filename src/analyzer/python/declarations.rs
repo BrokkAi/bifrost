@@ -424,7 +424,6 @@ impl<'a> PythonVisitor<'a> {
                     Some(parent_cu.clone()),
                     Some(parent_cu.clone()),
                 );
-                self.parsed.add_child(parent_cu.clone(), code_unit.clone());
             }
             self.parsed.add_signature(
                 code_unit.clone(),

@@ -1431,8 +1431,9 @@ fn ts_collect_receiver_owners_from_bindings(
         && let Some(name) = node.child_by_field_name("name")
         && node_text_matches(name, source, receiver)
     {
+        let mut latest = Vec::new();
         if let Some(type_node) = node.child_by_field_name("type") {
-            out.extend(ts_resolve_type_text_to_property_owners(
+            latest.extend(ts_resolve_type_text_to_property_owners(
                 analyzer,
                 support,
                 file,
@@ -1444,7 +1445,7 @@ fn ts_collect_receiver_owners_from_bindings(
             ));
         }
         if let Some(value) = node.child_by_field_name("value") {
-            out.extend(ts_expression_property_owners(
+            latest.extend(ts_expression_property_owners(
                 analyzer,
                 support,
                 file,
@@ -1455,6 +1456,32 @@ fn ts_collect_receiver_owners_from_bindings(
                 depth + 1,
             ));
         }
+        out.clear();
+        out.extend(latest);
+    }
+
+    if node.kind() == "assignment_expression"
+        && let Some(left) = node.child_by_field_name("left")
+        && matches!(left.kind(), "identifier" | "type_identifier")
+        && node_text_matches(left, source, receiver)
+    {
+        let latest = node
+            .child_by_field_name("right")
+            .map(|value| {
+                ts_expression_property_owners(
+                    analyzer,
+                    support,
+                    file,
+                    source,
+                    imports,
+                    aliases,
+                    value,
+                    depth + 1,
+                )
+            })
+            .unwrap_or_default();
+        out.clear();
+        out.extend(latest);
     }
 
     let mut cursor = node.walk();
@@ -1659,6 +1686,32 @@ fn jsts_collect_local_new_receiver_owner_candidates(
     {
         let owners = node
             .child_by_field_name("value")
+            .map(|value| {
+                jsts_local_receiver_value_owner_candidates(
+                    analyzer,
+                    support,
+                    file,
+                    language,
+                    source,
+                    root_node(node),
+                    imports,
+                    aliases,
+                    value,
+                    before_byte,
+                    depth + 1,
+                )
+            })
+            .unwrap_or_default();
+        *state = Some(owners);
+    }
+
+    if node.kind() == "assignment_expression"
+        && let Some(left) = node.child_by_field_name("left")
+        && matches!(left.kind(), "identifier" | "type_identifier")
+        && node_text_matches(left, source, receiver)
+    {
+        let owners = node
+            .child_by_field_name("right")
             .map(|value| {
                 jsts_local_receiver_value_owner_candidates(
                     analyzer,

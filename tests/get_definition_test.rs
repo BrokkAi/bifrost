@@ -2563,6 +2563,41 @@ export function run() {
 }
 
 #[test]
+fn typescript_reassigned_new_initialized_local_method_does_not_guess() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "app.ts",
+            r#"
+class Greeter {
+  greet(): string {
+    return 'hello'
+  }
+}
+
+declare function dynamicValue(): unknown
+
+export function run() {
+  let greeter = new Greeter()
+  greeter = dynamicValue()
+  return greeter.greet()
+}
+"#,
+        )
+        .build();
+
+    let line = "  return greeter.greet()";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.ts","line":13,"column":{}}}]}}"#,
+            column_of(line, "greet()")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
 fn typescript_contextual_callback_parameter_members_resolve() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file(

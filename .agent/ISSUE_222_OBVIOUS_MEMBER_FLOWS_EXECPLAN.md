@@ -19,6 +19,7 @@ The observable result is focused Rust tests in `tests/get_definition_test.rs` th
 - [x] (2026-06-24T10:04Z) Milestone 3 completed: fixed Python repeated `self.attribute` indexing to keep the first definition range, added issue-shaped PHP/Scala receiver tests, and validated `python_`, `php_`, `scala_`, and `python_analyzer_test`.
 - [x] (2026-06-24T10:05Z) Milestone 4 completed: added Rust typed receiver and unproven receiver regression tests; `cargo test --test get_definition_test rust_` passed 45 tests without Rust resolver changes.
 - [x] (2026-06-24T10:07Z) Milestone 5 completed: `cargo test --test get_definition_test` passed 257 tests, `cargo fmt` completed with no diff, `cargo clippy --all-targets --all-features -- -D warnings` passed, and `git diff --check` passed.
+- [x] (2026-06-24T10:14Z) Post-milestone guided review audit found and fixed stale JS/TS receiver evidence after reassignment plus redundant Python child insertion; focused TypeScript, JavaScript, Python get-definition, and `python_analyzer_test` checks passed after the fixes.
 
 ## Surprises & Discoveries
 
@@ -40,6 +41,9 @@ The observable result is focused Rust tests in `tests/get_definition_test.rs` th
 - Observation: Rust already resolved the issue-shaped typed receiver method flow and already avoided broad same-name guesses for unproven receivers.
   Evidence: new tests `rust_typed_receiver_method_resolves_to_definition` and `rust_unproven_receiver_method_does_not_guess_same_named_method` passed; `cargo test --test get_definition_test rust_` passed 45 tests.
 
+- Observation: The first JS/TS constructor receiver implementation could keep stale local evidence after a later assignment to the same receiver.
+  Evidence: a guided review regression `typescript_reassigned_new_initialized_local_method_does_not_guess` initially resolved `Greeter.greet` after `greeter = dynamicValue()`. The fix makes both TypeScript local binding owner collection and JS/TS constructor receiver collection treat the most recent structured assignment as the current receiver evidence.
+
 ## Decision Log
 
 - Decision: Keep `usagebench` edits out of scope.
@@ -48,6 +52,10 @@ The observable result is focused Rust tests in `tests/get_definition_test.rs` th
 
 - Decision: Add only structured local receiver/member support.
   Rationale: The project instructions reject regex/text-search fallbacks and source mini-parsers. Issue #222 asks for simple curated receiver flows, not advanced whole-program inference.
+  Date/Author: 2026-06-24 / Codex
+
+- Decision: Treat a later local assignment with unsupported receiver evidence as invalidating earlier constructor/type evidence.
+  Rationale: Returning `no_definition` is more accurate than resolving against a stale `new Class()` initializer after the local has been reassigned to a dynamic or unknown value.
   Date/Author: 2026-06-24 / Codex
 
 ## Outcomes & Retrospective
@@ -61,6 +69,8 @@ Milestone 3 outcome: Python `self.attribute` reads now prefer the first indexed 
 Milestone 4 outcome: Rust now has issue-shaped regression coverage for `service.execute()` through a typed receiver and for an unproven receiver that must not resolve by member name alone. No Rust resolver code change was required.
 
 Milestone 5 outcome: final validation is complete. The branch resolves the implemented issue #222 obvious flows without public API changes and without usagebench edits. No remaining issue #222 cases were discovered in this branch beyond the intentionally unsupported dynamic inference boundary described in this plan.
+
+Post-review outcome: the branch now includes an explicit stale-evidence regression for TypeScript local receivers. The resolver no longer guesses a class member after a local initialized with `new Class()` is reassigned to unsupported dynamic evidence. The Python instance-attribute fix also avoids re-adding a child edge that `replace_code_unit` already registers.
 
 ## Context and Orientation
 
