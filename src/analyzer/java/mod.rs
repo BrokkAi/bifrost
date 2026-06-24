@@ -67,7 +67,7 @@ impl JavaAnalyzer {
         }
     }
 
-    pub fn new_with_config_storage_and_progress(
+    pub(crate) fn new_with_config_storage_and_progress(
         project: Arc<dyn Project>,
         config: AnalyzerConfig,
         storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,

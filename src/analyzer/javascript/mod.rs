@@ -222,27 +222,7 @@ impl JavascriptAnalyzer {
         }
     }
 
-    pub fn new_with_config_and_progress(
-        project: Arc<dyn Project>,
-        config: AnalyzerConfig,
-        progress: BuildProgress,
-    ) -> Self {
-        let memo_budget = config.memo_cache_budget_bytes();
-        let alias_resolver = Arc::new(AliasResolver::new(project.root().to_path_buf()));
-        Self {
-            inner: TreeSitterAnalyzer::new_with_config_and_progress(
-                project,
-                JavascriptAdapter,
-                config,
-                move |event| progress(event),
-            ),
-            memo_budget,
-            memo_caches: Arc::new(JsMemoCaches::new(memo_budget)),
-            alias_resolver,
-        }
-    }
-
-    pub fn new_with_config_storage_and_progress(
+    pub(crate) fn new_with_config_storage_and_progress(
         project: Arc<dyn Project>,
         config: AnalyzerConfig,
         storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,

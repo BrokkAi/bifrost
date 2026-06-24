@@ -166,41 +166,12 @@ impl WorkspaceAnalyzer {
         Self::build_filtered(project, config, None, None, None)
     }
 
-    pub fn build_with_progress<F>(
-        project: Arc<dyn Project>,
-        config: AnalyzerConfig,
-        progress: F,
-    ) -> Self
-    where
-        F: Fn(crate::analyzer::BuildProgressEvent) + Send + Sync + 'static,
-    {
-        Self::build_filtered(project, config, None, None, Some(Arc::new(progress)))
-    }
-
     pub fn build_for_languages(
         project: Arc<dyn Project>,
         config: AnalyzerConfig,
         languages: &BTreeSet<Language>,
     ) -> Self {
         Self::build_filtered(project, config, Some(languages), None, None)
-    }
-
-    pub fn build_for_languages_with_progress<F>(
-        project: Arc<dyn Project>,
-        config: AnalyzerConfig,
-        languages: &BTreeSet<Language>,
-        progress: F,
-    ) -> Self
-    where
-        F: Fn(crate::analyzer::BuildProgressEvent) + Send + Sync + 'static,
-    {
-        Self::build_filtered(
-            project,
-            config,
-            Some(languages),
-            None,
-            Some(Arc::new(progress)),
-        )
     }
 
     /// Build the workspace analyzer with persistence enabled. Each
@@ -243,25 +214,6 @@ impl WorkspaceAnalyzer {
         Self::build_filtered(project, config, Some(languages), Some(storage), None)
     }
 
-    pub fn build_for_languages_with_storage_and_progress<F>(
-        project: Arc<dyn Project>,
-        config: AnalyzerConfig,
-        languages: &BTreeSet<Language>,
-        storage: Arc<AnalyzerStorage>,
-        progress: F,
-    ) -> Self
-    where
-        F: Fn(crate::analyzer::BuildProgressEvent) + Send + Sync + 'static,
-    {
-        Self::build_filtered(
-            project,
-            config,
-            Some(languages),
-            Some(storage),
-            Some(Arc::new(progress)),
-        )
-    }
-
     fn build_filtered(
         project: Arc<dyn Project>,
         config: AnalyzerConfig,
@@ -284,216 +236,43 @@ impl WorkspaceAnalyzer {
                 let _scope = profiling::scope(format!("WorkspaceAnalyzer::build[{language:?}]"));
                 let project = Arc::clone(&project);
                 let cfg = config.clone();
-                match (language, storage.as_ref(), progress.as_ref()) {
-                    (Language::Java, Some(s), Some(p)) => {
-                        AnalyzerDelegate::Java(JavaAnalyzer::new_with_config_storage_and_progress(
-                            project,
-                            cfg,
-                            Arc::clone(s),
-                            Arc::clone(p),
-                        ))
-                    }
-                    (Language::Java, Some(s), None) => AnalyzerDelegate::Java(
-                        JavaAnalyzer::new_with_config_and_storage(project, cfg, Arc::clone(s)),
-                    ),
-                    (Language::Java, None, Some(p)) => {
-                        let progress = Arc::clone(p);
-                        AnalyzerDelegate::Java(JavaAnalyzer::new_with_config_and_progress(
-                            project,
-                            cfg,
-                            move |event| progress(event),
-                        ))
-                    }
-                    (Language::Java, None, None) => {
-                        AnalyzerDelegate::Java(JavaAnalyzer::new_with_config(project, cfg))
-                    }
-                    (Language::Go, Some(s), Some(p)) => {
-                        AnalyzerDelegate::Go(GoAnalyzer::new_with_config_storage_and_progress(
-                            project,
-                            cfg,
-                            Arc::clone(s),
-                            Arc::clone(p),
-                        ))
-                    }
-                    (Language::Go, Some(s), None) => AnalyzerDelegate::Go(
-                        GoAnalyzer::new_with_config_and_storage(project, cfg, Arc::clone(s)),
-                    ),
-                    (Language::Go, None, Some(p)) => AnalyzerDelegate::Go(
-                        GoAnalyzer::new_with_config_and_progress(project, cfg, Arc::clone(p)),
-                    ),
-                    (Language::Go, None, None) => {
-                        AnalyzerDelegate::Go(GoAnalyzer::new_with_config(project, cfg))
-                    }
-                    (Language::Cpp, Some(s), Some(p)) => {
-                        AnalyzerDelegate::Cpp(CppAnalyzer::new_with_config_storage_and_progress(
-                            project,
-                            cfg,
-                            Arc::clone(s),
-                            Arc::clone(p),
-                        ))
-                    }
-                    (Language::Cpp, Some(s), None) => AnalyzerDelegate::Cpp(
-                        CppAnalyzer::new_with_config_and_storage(project, cfg, Arc::clone(s)),
-                    ),
-                    (Language::Cpp, None, Some(p)) => AnalyzerDelegate::Cpp(
-                        CppAnalyzer::new_with_config_and_progress(project, cfg, Arc::clone(p)),
-                    ),
-                    (Language::Cpp, None, None) => {
-                        AnalyzerDelegate::Cpp(CppAnalyzer::new_with_config(project, cfg))
-                    }
-                    (Language::JavaScript, Some(s), Some(p)) => AnalyzerDelegate::JavaScript(
-                        JavascriptAnalyzer::new_with_config_storage_and_progress(
-                            project,
-                            cfg,
-                            Arc::clone(s),
-                            Arc::clone(p),
-                        ),
-                    ),
-                    (Language::JavaScript, Some(s), None) => AnalyzerDelegate::JavaScript(
-                        JavascriptAnalyzer::new_with_config_and_storage(
-                            project,
-                            cfg,
-                            Arc::clone(s),
-                        ),
-                    ),
-                    (Language::JavaScript, None, Some(p)) => AnalyzerDelegate::JavaScript(
-                        JavascriptAnalyzer::new_with_config_and_progress(
-                            project,
-                            cfg,
-                            Arc::clone(p),
-                        ),
-                    ),
-                    (Language::JavaScript, None, None) => AnalyzerDelegate::JavaScript(
-                        JavascriptAnalyzer::new_with_config(project, cfg),
-                    ),
-                    (Language::TypeScript, Some(s), Some(p)) => AnalyzerDelegate::TypeScript(
-                        TypescriptAnalyzer::new_with_config_storage_and_progress(
-                            project,
-                            cfg,
-                            Arc::clone(s),
-                            Arc::clone(p),
-                        ),
-                    ),
-                    (Language::TypeScript, Some(s), None) => AnalyzerDelegate::TypeScript(
-                        TypescriptAnalyzer::new_with_config_and_storage(
-                            project,
-                            cfg,
-                            Arc::clone(s),
-                        ),
-                    ),
-                    (Language::TypeScript, None, Some(p)) => AnalyzerDelegate::TypeScript(
-                        TypescriptAnalyzer::new_with_config_and_progress(
-                            project,
-                            cfg,
-                            Arc::clone(p),
-                        ),
-                    ),
-                    (Language::TypeScript, None, None) => AnalyzerDelegate::TypeScript(
-                        TypescriptAnalyzer::new_with_config(project, cfg),
-                    ),
-                    (Language::Python, Some(s), Some(p)) => AnalyzerDelegate::Python(
-                        PythonAnalyzer::new_with_config_storage_and_progress(
-                            project,
-                            cfg,
-                            Arc::clone(s),
-                            Arc::clone(p),
-                        ),
-                    ),
-                    (Language::Python, Some(s), None) => AnalyzerDelegate::Python(
-                        PythonAnalyzer::new_with_config_and_storage(project, cfg, Arc::clone(s)),
-                    ),
-                    (Language::Python, None, Some(p)) => AnalyzerDelegate::Python(
-                        PythonAnalyzer::new_with_config_and_progress(project, cfg, Arc::clone(p)),
-                    ),
-                    (Language::Python, None, None) => {
-                        AnalyzerDelegate::Python(PythonAnalyzer::new_with_config(project, cfg))
-                    }
-                    (Language::Rust, Some(s), Some(p)) => {
-                        AnalyzerDelegate::Rust(RustAnalyzer::new_with_config_storage_and_progress(
-                            project,
-                            cfg,
-                            Arc::clone(s),
-                            Arc::clone(p),
-                        ))
-                    }
-                    (Language::Rust, Some(s), None) => AnalyzerDelegate::Rust(
-                        RustAnalyzer::new_with_config_and_storage(project, cfg, Arc::clone(s)),
-                    ),
-                    (Language::Rust, None, Some(p)) => AnalyzerDelegate::Rust(
-                        RustAnalyzer::new_with_config_and_progress(project, cfg, Arc::clone(p)),
-                    ),
-                    (Language::Rust, None, None) => {
-                        AnalyzerDelegate::Rust(RustAnalyzer::new_with_config(project, cfg))
-                    }
-                    (Language::Php, Some(s), Some(p)) => {
-                        AnalyzerDelegate::Php(PhpAnalyzer::new_with_config_storage_and_progress(
-                            project,
-                            cfg,
-                            Arc::clone(s),
-                            Arc::clone(p),
-                        ))
-                    }
-                    (Language::Php, Some(s), None) => AnalyzerDelegate::Php(
-                        PhpAnalyzer::new_with_config_and_storage(project, cfg, Arc::clone(s)),
-                    ),
-                    (Language::Php, None, Some(p)) => AnalyzerDelegate::Php(
-                        PhpAnalyzer::new_with_config_and_progress(project, cfg, Arc::clone(p)),
-                    ),
-                    (Language::Php, None, None) => {
-                        AnalyzerDelegate::Php(PhpAnalyzer::new_with_config(project, cfg))
-                    }
-                    (Language::Scala, Some(s), Some(p)) => AnalyzerDelegate::Scala(
-                        ScalaAnalyzer::new_with_config_storage_and_progress(
-                            project,
-                            cfg,
-                            Arc::clone(s),
-                            Arc::clone(p),
-                        ),
-                    ),
-                    (Language::Scala, Some(s), None) => AnalyzerDelegate::Scala(
-                        ScalaAnalyzer::new_with_config_and_storage(project, cfg, Arc::clone(s)),
-                    ),
-                    (Language::Scala, None, Some(p)) => AnalyzerDelegate::Scala(
-                        ScalaAnalyzer::new_with_config_and_progress(project, cfg, Arc::clone(p)),
-                    ),
-                    (Language::Scala, None, None) => {
-                        AnalyzerDelegate::Scala(ScalaAnalyzer::new_with_config(project, cfg))
-                    }
-                    (Language::CSharp, Some(s), Some(p)) => AnalyzerDelegate::CSharp(
-                        CSharpAnalyzer::new_with_config_storage_and_progress(
-                            project,
-                            cfg,
-                            Arc::clone(s),
-                            Arc::clone(p),
-                        ),
-                    ),
-                    (Language::CSharp, Some(s), None) => AnalyzerDelegate::CSharp(
-                        CSharpAnalyzer::new_with_config_and_storage(project, cfg, Arc::clone(s)),
-                    ),
-                    (Language::CSharp, None, Some(p)) => AnalyzerDelegate::CSharp(
-                        CSharpAnalyzer::new_with_config_and_progress(project, cfg, Arc::clone(p)),
-                    ),
-                    (Language::CSharp, None, None) => {
-                        AnalyzerDelegate::CSharp(CSharpAnalyzer::new_with_config(project, cfg))
-                    }
-                    (Language::Ruby, Some(s), Some(p)) => {
-                        AnalyzerDelegate::Ruby(RubyAnalyzer::new_with_config_storage_and_progress(
-                            project,
-                            cfg,
-                            Arc::clone(s),
-                            Arc::clone(p),
-                        ))
-                    }
-                    (Language::Ruby, Some(s), None) => AnalyzerDelegate::Ruby(
-                        RubyAnalyzer::new_with_config_and_storage(project, cfg, Arc::clone(s)),
-                    ),
-                    (Language::Ruby, None, Some(p)) => AnalyzerDelegate::Ruby(
-                        RubyAnalyzer::new_with_config_and_progress(project, cfg, Arc::clone(p)),
-                    ),
-                    (Language::Ruby, None, None) => {
-                        AnalyzerDelegate::Ruby(RubyAnalyzer::new_with_config(project, cfg))
-                    }
-                    (Language::None, _, _) => continue,
+                macro_rules! build_delegate {
+                    ($variant:ident, $analyzer:ty) => {
+                        match (storage.as_ref(), progress.as_ref()) {
+                            (Some(storage), Some(progress)) => AnalyzerDelegate::$variant(
+                                <$analyzer>::new_with_config_storage_and_progress(
+                                    project,
+                                    cfg,
+                                    Arc::clone(storage),
+                                    Arc::clone(progress),
+                                ),
+                            ),
+                            (Some(storage), None) => AnalyzerDelegate::$variant(
+                                <$analyzer>::new_with_config_and_storage(
+                                    project,
+                                    cfg,
+                                    Arc::clone(storage),
+                                ),
+                            ),
+                            (None, _) => AnalyzerDelegate::$variant(<$analyzer>::new_with_config(
+                                project, cfg,
+                            )),
+                        }
+                    };
+                }
+                match language {
+                    Language::Java => build_delegate!(Java, JavaAnalyzer),
+                    Language::Go => build_delegate!(Go, GoAnalyzer),
+                    Language::Cpp => build_delegate!(Cpp, CppAnalyzer),
+                    Language::JavaScript => build_delegate!(JavaScript, JavascriptAnalyzer),
+                    Language::TypeScript => build_delegate!(TypeScript, TypescriptAnalyzer),
+                    Language::Python => build_delegate!(Python, PythonAnalyzer),
+                    Language::Rust => build_delegate!(Rust, RustAnalyzer),
+                    Language::Php => build_delegate!(Php, PhpAnalyzer),
+                    Language::Scala => build_delegate!(Scala, ScalaAnalyzer),
+                    Language::CSharp => build_delegate!(CSharp, CSharpAnalyzer),
+                    Language::Ruby => build_delegate!(Ruby, RubyAnalyzer),
+                    Language::None => continue,
                 }
             };
             delegates.insert(language, delegate);

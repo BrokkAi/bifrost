@@ -750,13 +750,7 @@ fn build_workspace_for_lsp(
             )
         }
         (Some(storage), None) => WorkspaceAnalyzer::build_with_storage(project, config, storage),
-        (None, Some(progress)) => {
-            let progress = progress.clone_for_callback();
-            WorkspaceAnalyzer::build_with_progress(project, config, move |event| {
-                progress.report_analyzer_event(event)
-            })
-        }
-        (None, None) => WorkspaceAnalyzer::build(project, config),
+        (None, _) => WorkspaceAnalyzer::build(project, config),
     }
 }
 

@@ -54,24 +54,7 @@ impl GoAnalyzer {
         }
     }
 
-    pub fn new_with_config_and_progress(
-        project: Arc<dyn Project>,
-        config: AnalyzerConfig,
-        progress: BuildProgress,
-    ) -> Self {
-        let memo_budget = config.memo_cache_budget_bytes();
-        Self {
-            inner: TreeSitterAnalyzer::new_with_config_and_progress(
-                project,
-                GoAdapter,
-                config,
-                move |event| progress(event),
-            ),
-            memo_caches: GoMemoCaches::new(memo_budget),
-        }
-    }
-
-    pub fn new_with_config_storage_and_progress(
+    pub(crate) fn new_with_config_storage_and_progress(
         project: Arc<dyn Project>,
         config: AnalyzerConfig,
         storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,

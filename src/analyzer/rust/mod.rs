@@ -84,30 +84,7 @@ impl RustAnalyzer {
         }
     }
 
-    pub fn new_with_config_and_progress(
-        project: Arc<dyn Project>,
-        config: AnalyzerConfig,
-        progress: BuildProgress,
-    ) -> Self {
-        let memo_budget = config.memo_cache_budget_bytes();
-        Self {
-            inner: TreeSitterAnalyzer::new_with_config_and_progress(
-                project,
-                RustAdapter,
-                config,
-                move |event| progress(event),
-            ),
-            memo_budget,
-            imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
-            referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
-            reference_contexts: build_weighted_cache(memo_budget / 8, weight_reference_context),
-            reverse_import_index: Arc::new(OnceLock::new()),
-            usage_index: Arc::new(OnceLock::new()),
-            hierarchy_index: Arc::new(OnceLock::new()),
-        }
-    }
-
-    pub fn new_with_config_storage_and_progress(
+    pub(crate) fn new_with_config_storage_and_progress(
         project: Arc<dyn Project>,
         config: AnalyzerConfig,
         storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
