@@ -616,10 +616,10 @@ fn bifrost_defaults_to_cwd_searchtools_server() {
             }
         }),
     );
-    assert_eq!(list_symbols["result"]["isError"], false, "{list_symbols}");
+    assert_eq!(list_symbols["result"]["isError"], true, "{list_symbols}");
     assert_eq!(
-        list_symbols["result"]["structuredContent"]["files"][0]["path"],
-        "DefaultRoot.java"
+        list_symbols["result"]["content"][0]["text"],
+        "Unknown tool: list_symbols"
     );
 
     let symbol_sources = round_trip(
@@ -972,9 +972,10 @@ fn bifrost_searchtools_server_supports_runtime_workspace_switch() {
             }
         }),
     );
+    assert_eq!(after_switch["result"]["isError"], true, "{after_switch}");
     assert_eq!(
-        after_switch["result"]["structuredContent"]["files"][0]["path"],
-        "Switched.java"
+        after_switch["result"]["content"][0]["text"],
+        "Unknown tool: list_symbols"
     );
 
     let bad_path = round_trip(

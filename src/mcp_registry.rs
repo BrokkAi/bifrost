@@ -154,7 +154,11 @@ fn append_named_toolset(
     Ok(())
 }
 
-fn descriptors_for_toolset(name: &str, render_options: McpRenderOptions, git_repo: bool) -> Vec<Value> {
+fn descriptors_for_toolset(
+    name: &str,
+    render_options: McpRenderOptions,
+    git_repo: bool,
+) -> Vec<Value> {
     match name {
         "symbol" => crate::mcp_core::symbol_tool_descriptors(render_options.render_line_numbers),
         "nlp" => crate::mcp_nlp::nlp_tool_descriptors(git_repo),
@@ -168,7 +172,6 @@ fn descriptors_for_toolset(name: &str, render_options: McpRenderOptions, git_rep
 
 fn hidden_tool_names_for_toolset(name: &str) -> &'static [&'static str] {
     match name {
-        "symbol" => &["list_symbols"],
         #[cfg(feature = "nlp")]
         "nlp" => &["semantic_search_status"],
         _ => &[],
@@ -348,12 +351,12 @@ mod tests {
     }
 
     #[test]
-    fn symbol_accepts_list_symbols_without_advertising_it() {
+    fn symbol_does_not_accept_hidden_list_symbols() {
         let advertised = tool_names("symbol");
         assert_eq!(advertised, symbol_tool_names());
 
         let accepted = accepted_tool_names("symbol");
         assert!(accepted.contains(&"get_summaries".to_string()));
-        assert!(accepted.contains(&"list_symbols".to_string()));
+        assert!(!accepted.contains(&"list_symbols".to_string()));
     }
 }

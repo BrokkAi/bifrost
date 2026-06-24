@@ -200,7 +200,7 @@ Examples:
 
 This starts a stdio MCP server that publishes these tools:
 
-- `symbol`: `search_symbols`, `get_symbol_locations`, `get_symbol_sources`, `get_summaries`, `list_symbols`, `scan_usages`
+- `symbol`: `search_symbols`, `get_symbol_locations`, `get_symbol_sources`, `get_summaries`, `scan_usages`
 - `nlp`: `semantic_search`
 - `workspace`: `refresh`, `activate_workspace`, `get_active_workspace`
 - `extended`: `find_filenames`, `list_files`, `most_relevant_files`, `search_git_commit_messages`, `get_git_log`, `get_commit_diff`, `jq`, `xml_skim`, `xml_select`
