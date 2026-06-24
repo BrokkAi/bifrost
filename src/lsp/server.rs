@@ -62,10 +62,7 @@ pub(crate) fn run_with_connection(
 
     let workspace_root = pick_workspace_root(&init_params, fallback_root.as_path());
     let progress = if supports_work_done_progress {
-        Some(StartupProgress::create(
-            &connection,
-            "bifrost-startup-index".to_string(),
-        )?)
+        StartupProgress::create(&connection, "bifrost-startup-index".to_string())?
     } else {
         None
     };
@@ -148,17 +145,15 @@ struct StartupProgress {
 
 #[derive(Default)]
 struct StartupProgressState {
-    completed_units: usize,
-    total_units: usize,
-    last_percentage: u32,
+    last_parse_report_by_language: HashMap<crate::analyzer::Language, usize>,
 }
 
 impl StartupProgress {
-    fn create(connection: &Connection, token: String) -> Result<Self, String> {
+    fn create(connection: &Connection, token: String) -> Result<Option<Self>, String> {
         let request_id = RequestId::from("bifrost-startup-progress-create".to_string());
         let token = ProgressToken::String(token);
         let request = Request::new(
-            request_id,
+            request_id.clone(),
             WorkDoneProgressCreate::METHOD.to_string(),
             WorkDoneProgressCreateParams {
                 token: token.clone(),
@@ -168,8 +163,11 @@ impl StartupProgress {
             .sender
             .send(Message::Request(request))
             .map_err(|err| format!("Failed to request work-done progress token: {err}"))?;
+        if !Self::wait_for_create_response(connection, &request_id)? {
+            return Ok(None);
+        }
         let sender = connection.sender.clone();
-        Ok(Self {
+        Ok(Some(Self {
             token,
             send_message: Arc::new(move |message| {
                 sender
@@ -177,7 +175,28 @@ impl StartupProgress {
                     .map_err(|err| format!("Failed to send LSP progress message: {err}"))
             }),
             state: Arc::new(Mutex::new(StartupProgressState::default())),
-        })
+        }))
+    }
+
+    fn wait_for_create_response(
+        connection: &Connection,
+        request_id: &RequestId,
+    ) -> Result<bool, String> {
+        loop {
+            match connection.receiver.recv_timeout(Duration::from_secs(5)) {
+                Ok(Message::Response(response)) if response.id == *request_id => {
+                    return Ok(response.error.is_none());
+                }
+                Ok(Message::Response(_)) => continue,
+                Ok(Message::Notification(note)) if note.method == "initialized" => continue,
+                Ok(message) => {
+                    return Err(format!(
+                        "Unexpected LSP message before startup progress token response: {message:?}"
+                    ));
+                }
+                Err(_) => return Ok(false),
+            }
+        }
     }
 
     fn clone_for_callback(&self) -> Self {
@@ -186,11 +205,6 @@ impl StartupProgress {
             send_message: Arc::clone(&self.send_message),
             state: Arc::clone(&self.state),
         }
-    }
-
-    fn set_total_units(&self, total_units: usize) {
-        let mut state = self.state.lock().expect("startup progress state poisoned");
-        state.total_units = total_units.max(1);
     }
 
     fn begin(&self, title: &str) -> Result<(), String> {
@@ -203,28 +217,17 @@ impl StartupProgress {
     }
 
     fn report_analyzer_event(&self, event: BuildProgressEvent) {
-        let phase_units = match event.phase {
-            BuildProgressPhase::Enumerate
-            | BuildProgressPhase::Reconcile
-            | BuildProgressPhase::Persist
-            | BuildProgressPhase::Index => 1,
-            BuildProgressPhase::Parse => 1,
-        };
-        let (percentage, message) = {
+        let should_report = {
             let mut state = self.state.lock().expect("startup progress state poisoned");
-            state.completed_units = state.completed_units.saturating_add(phase_units);
-            let total = state.total_units.max(1);
-            let next = ((state.completed_units.saturating_mul(100)) / total).min(99) as u32;
-            state.last_percentage = state.last_percentage.max(next);
-            (
-                state.last_percentage,
-                progress_message_for_event(&event, state.completed_units, total),
-            )
+            should_report_progress_event(&mut state, &event)
         };
+        if !should_report {
+            return;
+        }
         let _ = self.send(WorkDoneProgress::Report(WorkDoneProgressReport {
             cancellable: Some(false),
-            message: Some(message),
-            percentage: Some(percentage),
+            message: Some(progress_message_for_event(&event)),
+            percentage: None,
         }));
     }
 
@@ -246,11 +249,7 @@ impl StartupProgress {
     }
 }
 
-fn progress_message_for_event(
-    event: &BuildProgressEvent,
-    completed_units: usize,
-    total_units: usize,
-) -> String {
+fn progress_message_for_event(event: &BuildProgressEvent) -> String {
     match event.phase {
         BuildProgressPhase::Enumerate => {
             format!("Found {} {:?} file(s)", event.total, event.language)
@@ -259,24 +258,45 @@ fn progress_message_for_event(
             "Reconciled {:?}: {} cached of {} file(s)",
             event.language, event.completed, event.total
         ),
-        BuildProgressPhase::Parse => {
-            let file = event
-                .file
-                .as_ref()
-                .map(|file| file.rel_path().display().to_string())
-                .unwrap_or_else(|| "workspace file".to_string());
-            format!(
-                "Parsed {:?} file {} of {}: {}",
-                event.language, event.completed, event.total, file
-            )
-        }
+        BuildProgressPhase::Parse => format!(
+            "Parsed {:?} files: {} of {}",
+            event.language, event.completed, event.total
+        ),
         BuildProgressPhase::Persist => {
             format!("Updated {:?} index cache", event.language)
         }
-        BuildProgressPhase::Index => format!(
-            "Indexed {:?} declarations ({completed_units}/{total_units})",
-            event.language
-        ),
+        BuildProgressPhase::Index => format!("Indexed {:?} declarations", event.language),
+    }
+}
+
+fn should_report_progress_event(
+    state: &mut StartupProgressState,
+    event: &BuildProgressEvent,
+) -> bool {
+    const PARSE_REPORT_INTERVAL: usize = 50;
+    match event.phase {
+        BuildProgressPhase::Parse => {
+            if event.completed == 1 || event.completed >= event.total {
+                state
+                    .last_parse_report_by_language
+                    .insert(event.language, event.completed);
+                return true;
+            }
+            let last = state
+                .last_parse_report_by_language
+                .get(&event.language)
+                .copied()
+                .unwrap_or(0);
+            if event.completed.saturating_sub(last) >= PARSE_REPORT_INTERVAL {
+                state
+                    .last_parse_report_by_language
+                    .insert(event.language, event.completed);
+                true
+            } else {
+                false
+            }
+        }
+        _ => true,
     }
 }
 
@@ -675,9 +695,6 @@ impl ServerState {
             })?);
         let overlay = Arc::new(OverlayProject::new(filesystem));
         let project = Arc::clone(&overlay) as Arc<dyn Project>;
-        if let Some(progress) = progress {
-            progress.set_total_units(estimate_startup_progress_units(project.as_ref()));
-        }
         let workspace = build_workspace_for_lsp(project, progress);
         Ok(Self {
             workspace,
@@ -736,37 +753,24 @@ fn build_workspace_for_lsp(
     progress: Option<&StartupProgress>,
 ) -> WorkspaceAnalyzer {
     let config = AnalyzerConfig::default();
-    let storage = AnalyzerStorage::open(default_db_path(project.root()))
-        .ok()
-        .map(Arc::new);
-    match (storage, progress) {
-        (Some(storage), Some(progress)) => {
+    match progress {
+        Some(progress) => {
             let progress = progress.clone_for_callback();
-            WorkspaceAnalyzer::build_with_storage_and_progress(
-                project,
-                config,
-                storage,
-                move |event| progress.report_analyzer_event(event),
-            )
+            match AnalyzerStorage::open(default_db_path(project.root()))
+                .ok()
+                .map(Arc::new)
+            {
+                Some(storage) => WorkspaceAnalyzer::build_with_storage_and_progress(
+                    project,
+                    config,
+                    storage,
+                    move |event| progress.report_analyzer_event(event),
+                ),
+                None => WorkspaceAnalyzer::build(project, config),
+            }
         }
-        (Some(storage), None) => WorkspaceAnalyzer::build_with_storage(project, config, storage),
-        (None, _) => WorkspaceAnalyzer::build(project, config),
+        None => WorkspaceAnalyzer::build(project, config),
     }
-}
-
-fn estimate_startup_progress_units(project: &dyn Project) -> usize {
-    let language_count = project.analyzer_languages().len();
-    let file_count: usize = project
-        .analyzer_languages()
-        .into_iter()
-        .map(|language| {
-            project
-                .analyzable_files(language)
-                .map(|files| files.len())
-                .unwrap_or(0)
-        })
-        .sum();
-    file_count + language_count.saturating_mul(4)
 }
 
 fn pick_workspace_root(params: &InitializeParams, fallback: &Path) -> PathBuf {

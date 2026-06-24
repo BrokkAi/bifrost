@@ -201,26 +201,7 @@ impl TypescriptAnalyzer {
         config: AnalyzerConfig,
         storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
     ) -> Self {
-        let memo_budget = config.memo_cache_budget_bytes();
-        let alias_resolver = Arc::new(AliasResolver::new(project.root().to_path_buf()));
-        Self {
-            inner: TreeSitterAnalyzer::new_with_config_and_storage(
-                project,
-                TypescriptAdapter,
-                config,
-                storage,
-            ),
-            memo_budget,
-            imported_code_units: build_weighted_cache(memo_budget / 3, weight_code_unit_set),
-            referencing_files: build_weighted_cache(memo_budget / 6, weight_project_file_set),
-            relevant_imports: build_weighted_cache(memo_budget / 6, weight_string_set),
-            direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec_by_unit),
-            direct_descendants: build_weighted_cache(memo_budget / 8, weight_code_unit_set_by_unit),
-            direct_descendant_index: Arc::new(OnceLock::new()),
-            reverse_import_index: Arc::new(OnceLock::new()),
-            jsts_usage_index: Arc::new(OnceLock::new()),
-            alias_resolver,
-        }
+        Self::new_with_config_storage(project, config, storage, None)
     }
 
     pub(crate) fn new_with_config_storage_and_progress(
@@ -229,16 +210,34 @@ impl TypescriptAnalyzer {
         storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
         progress: BuildProgress,
     ) -> Self {
+        Self::new_with_config_storage(project, config, storage, Some(progress))
+    }
+
+    fn new_with_config_storage(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
+        progress: Option<BuildProgress>,
+    ) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
         let alias_resolver = Arc::new(AliasResolver::new(project.root().to_path_buf()));
-        Self {
-            inner: TreeSitterAnalyzer::new_with_config_storage_and_progress(
+        let inner = match progress {
+            Some(progress) => TreeSitterAnalyzer::new_with_config_storage_and_progress(
                 project,
                 TypescriptAdapter,
                 config,
                 storage,
                 move |event| progress(event),
             ),
+            None => TreeSitterAnalyzer::new_with_config_and_storage(
+                project,
+                TypescriptAdapter,
+                config,
+                storage,
+            ),
+        };
+        Self {
+            inner,
             memo_budget,
             imported_code_units: build_weighted_cache(memo_budget / 3, weight_code_unit_set),
             referencing_files: build_weighted_cache(memo_budget / 6, weight_project_file_set),

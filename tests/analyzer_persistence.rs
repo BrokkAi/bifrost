@@ -1,11 +1,12 @@
 //! End-to-end tests for the SQLite-backed analyzer persistence layer.
 
-use brokk_bifrost::analyzer::persistence::{
-    AnalyzerStorage, PersistenceError, SymbolQueryMode, default_db_path,
+use brokk_bifrost::analyzer::{
+    BuildProgressEvent, BuildProgressPhase,
+    persistence::{AnalyzerStorage, PersistenceError, SymbolQueryMode, default_db_path},
 };
 use brokk_bifrost::{
-    AnalyzerConfig, BuildProgressEvent, BuildProgressPhase, IAnalyzer, Language, OverlayProject,
-    Project, ProjectFile, PythonAnalyzer, TestProject, WorkspaceAnalyzer,
+    AnalyzerConfig, IAnalyzer, Language, OverlayProject, Project, ProjectFile, PythonAnalyzer,
+    TestProject, WorkspaceAnalyzer,
 };
 use std::collections::BTreeSet;
 use std::fs;

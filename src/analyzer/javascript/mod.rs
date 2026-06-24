@@ -207,19 +207,7 @@ impl JavascriptAnalyzer {
         config: AnalyzerConfig,
         storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
     ) -> Self {
-        let memo_budget = config.memo_cache_budget_bytes();
-        let alias_resolver = Arc::new(AliasResolver::new(project.root().to_path_buf()));
-        Self {
-            inner: TreeSitterAnalyzer::new_with_config_and_storage(
-                project,
-                JavascriptAdapter,
-                config,
-                storage,
-            ),
-            memo_budget,
-            memo_caches: Arc::new(JsMemoCaches::new(memo_budget)),
-            alias_resolver,
-        }
+        Self::new_with_config_storage(project, config, storage, None)
     }
 
     pub(crate) fn new_with_config_storage_and_progress(
@@ -228,16 +216,34 @@ impl JavascriptAnalyzer {
         storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
         progress: BuildProgress,
     ) -> Self {
+        Self::new_with_config_storage(project, config, storage, Some(progress))
+    }
+
+    fn new_with_config_storage(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
+        progress: Option<BuildProgress>,
+    ) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
         let alias_resolver = Arc::new(AliasResolver::new(project.root().to_path_buf()));
-        Self {
-            inner: TreeSitterAnalyzer::new_with_config_storage_and_progress(
+        let inner = match progress {
+            Some(progress) => TreeSitterAnalyzer::new_with_config_storage_and_progress(
                 project,
                 JavascriptAdapter,
                 config,
                 storage,
                 move |event| progress(event),
             ),
+            None => TreeSitterAnalyzer::new_with_config_and_storage(
+                project,
+                JavascriptAdapter,
+                config,
+                storage,
+            ),
+        };
+        Self {
+            inner,
             memo_budget,
             memo_caches: Arc::new(JsMemoCaches::new(memo_budget)),
             alias_resolver,

@@ -166,10 +166,12 @@ fn bifrost_lsp_server_reports_cold_start_progress_when_client_supports_it() {
         match msg["params"]["value"]["kind"].as_str() {
             Some("report") => {
                 saw_report = true;
-                assert!(
-                    msg["params"]["value"]["percentage"].as_u64().unwrap_or(101) <= 99,
-                    "startup reports should leave completion to end: {msg}"
-                );
+                if let Some(percentage) = msg["params"]["value"]["percentage"].as_u64() {
+                    assert!(
+                        percentage <= 99,
+                        "startup reports should leave completion to end: {msg}"
+                    );
+                }
             }
             Some("end") => {
                 saw_end = true;
@@ -272,6 +274,97 @@ fn bifrost_lsp_server_skips_startup_progress_without_client_support() {
     assert_eq!(
         response["id"], 2,
         "expected documentSymbol response: {response}"
+    );
+    assert!(
+        !root.join(".bifrost").exists(),
+        "server should not create analyzer storage for clients without work-done progress"
+    );
+
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown"}),
+    );
+    let _ = read_response_for_id(&mut reader, &mut stderr, 3);
+    write_message(&mut stdin, json!({"jsonrpc": "2.0", "method": "exit"}));
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
+fn bifrost_lsp_server_disables_startup_progress_when_token_create_fails() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("RejectedProgress.java");
+    fs::write(&file_path, "class RejectedProgress {}\n").expect("write fixture");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(&root)
+        .arg("--server")
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bifrost");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "processId": null,
+                "rootUri": uri_for(&root),
+                "capabilities": {"window": {"workDoneProgress": true}}
+            }
+        }),
+    );
+    let initialize = read_message(&mut reader, &mut stderr);
+    assert_eq!(initialize["id"], 1);
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+    );
+
+    let create = read_message(&mut reader, &mut stderr);
+    assert_eq!(create["method"], "window/workDoneProgress/create");
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": create["id"].clone(),
+            "error": {"code": -32603, "message": "token rejected"}
+        }),
+    );
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "textDocument/documentSymbol",
+            "params": {"textDocument": {"uri": uri_for(&file_path)}}
+        }),
+    );
+    let response = read_message(&mut reader, &mut stderr);
+    assert_ne!(
+        response["method"], "$/progress",
+        "server must not emit progress after token creation fails"
+    );
+    assert_eq!(
+        response["id"], 2,
+        "expected documentSymbol response after rejected progress token: {response}"
+    );
+    assert!(
+        !root.join(".bifrost").exists(),
+        "server should not create analyzer storage after progress token creation fails"
     );
 
     write_message(

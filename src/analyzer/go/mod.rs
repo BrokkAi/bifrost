@@ -45,13 +45,7 @@ impl GoAnalyzer {
         config: AnalyzerConfig,
         storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
     ) -> Self {
-        let memo_budget = config.memo_cache_budget_bytes();
-        Self {
-            inner: TreeSitterAnalyzer::new_with_config_and_storage(
-                project, GoAdapter, config, storage,
-            ),
-            memo_caches: GoMemoCaches::new(memo_budget),
-        }
+        Self::new_with_config_storage(project, config, storage, None)
     }
 
     pub(crate) fn new_with_config_storage_and_progress(
@@ -60,15 +54,30 @@ impl GoAnalyzer {
         storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
         progress: BuildProgress,
     ) -> Self {
+        Self::new_with_config_storage(project, config, storage, Some(progress))
+    }
+
+    fn new_with_config_storage(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
+        progress: Option<BuildProgress>,
+    ) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
-        Self {
-            inner: TreeSitterAnalyzer::new_with_config_storage_and_progress(
+        let inner = match progress {
+            Some(progress) => TreeSitterAnalyzer::new_with_config_storage_and_progress(
                 project,
                 GoAdapter,
                 config,
                 storage,
                 move |event| progress(event),
             ),
+            None => {
+                TreeSitterAnalyzer::new_with_config_and_storage(project, GoAdapter, config, storage)
+            }
+        };
+        Self {
+            inner,
             memo_caches: GoMemoCaches::new(memo_budget),
         }
     }

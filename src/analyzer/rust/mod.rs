@@ -66,22 +66,7 @@ impl RustAnalyzer {
         config: AnalyzerConfig,
         storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
     ) -> Self {
-        let memo_budget = config.memo_cache_budget_bytes();
-        Self {
-            inner: TreeSitterAnalyzer::new_with_config_and_storage(
-                project,
-                RustAdapter,
-                config,
-                storage,
-            ),
-            memo_budget,
-            imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
-            referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
-            reference_contexts: build_weighted_cache(memo_budget / 8, weight_reference_context),
-            reverse_import_index: Arc::new(OnceLock::new()),
-            usage_index: Arc::new(OnceLock::new()),
-            hierarchy_index: Arc::new(OnceLock::new()),
-        }
+        Self::new_with_config_storage(project, config, storage, None)
     }
 
     pub(crate) fn new_with_config_storage_and_progress(
@@ -90,15 +75,33 @@ impl RustAnalyzer {
         storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
         progress: BuildProgress,
     ) -> Self {
+        Self::new_with_config_storage(project, config, storage, Some(progress))
+    }
+
+    fn new_with_config_storage(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
+        progress: Option<BuildProgress>,
+    ) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
-        Self {
-            inner: TreeSitterAnalyzer::new_with_config_storage_and_progress(
+        let inner = match progress {
+            Some(progress) => TreeSitterAnalyzer::new_with_config_storage_and_progress(
                 project,
                 RustAdapter,
                 config,
                 storage,
                 move |event| progress(event),
             ),
+            None => TreeSitterAnalyzer::new_with_config_and_storage(
+                project,
+                RustAdapter,
+                config,
+                storage,
+            ),
+        };
+        Self {
+            inner,
             memo_budget,
             imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),

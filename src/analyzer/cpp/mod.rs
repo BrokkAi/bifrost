@@ -60,10 +60,7 @@ impl CppAnalyzer {
         config: AnalyzerConfig,
         storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
     ) -> Self {
-        let memo_budget = config.memo_cache_budget_bytes();
-        let inner =
-            TreeSitterAnalyzer::new_with_config_and_storage(project, CppAdapter, config, storage);
-        Self::from_inner(inner, memo_budget)
+        Self::new_with_config_storage(project, config, storage, None)
     }
 
     pub(crate) fn new_with_config_storage_and_progress(
@@ -72,14 +69,28 @@ impl CppAnalyzer {
         storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
         progress: BuildProgress,
     ) -> Self {
+        Self::new_with_config_storage(project, config, storage, Some(progress))
+    }
+
+    fn new_with_config_storage(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
+        progress: Option<BuildProgress>,
+    ) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
-        let inner = TreeSitterAnalyzer::new_with_config_storage_and_progress(
-            project,
-            CppAdapter,
-            config,
-            storage,
-            move |event| progress(event),
-        );
+        let inner = match progress {
+            Some(progress) => TreeSitterAnalyzer::new_with_config_storage_and_progress(
+                project,
+                CppAdapter,
+                config,
+                storage,
+                move |event| progress(event),
+            ),
+            None => TreeSitterAnalyzer::new_with_config_and_storage(
+                project, CppAdapter, config, storage,
+            ),
+        };
         Self::from_inner(inner, memo_budget)
     }
 
