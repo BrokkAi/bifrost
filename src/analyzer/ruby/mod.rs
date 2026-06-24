@@ -3,6 +3,7 @@ mod cache;
 mod declarations;
 mod hierarchy;
 mod imports;
+mod mixins;
 mod tests;
 
 use crate::analyzer::js_ts::build_weighted_cache;
@@ -21,6 +22,7 @@ use cache::{
     weight_code_unit_set, weight_code_unit_set_by_unit, weight_code_unit_vec,
     weight_project_file_set,
 };
+use mixins::{RawMixins, extract_file_mixins};
 
 pub(crate) use declarations::parse_ruby_tree;
 
@@ -38,6 +40,11 @@ pub struct RubyAnalyzer {
     /// resolving relative (unqualified) supertype references without scanning
     /// every declaration.
     types_by_identifier: Arc<OnceLock<HashMap<String, Vec<CodeUnit>>>>,
+    /// Per-type mixin facts (`include`/`prepend`/`extend`), keyed by the type's
+    /// internal fully-qualified name. Built lazily by re-walking Ruby files;
+    /// kept separate from `raw_supertypes` so mixins are never superclass
+    /// ancestors.
+    mixin_index: Arc<OnceLock<HashMap<String, RawMixins>>>,
 }
 
 impl RubyAnalyzer {
@@ -73,7 +80,60 @@ impl RubyAnalyzer {
             direct_descendant_index: Arc::new(OnceLock::new()),
             reverse_import_index: Arc::new(OnceLock::new()),
             types_by_identifier: Arc::new(OnceLock::new()),
+            mixin_index: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// Modules mixed into `type_unit` via `include` (instance-method lookup).
+    pub fn included_modules(&self, type_unit: &CodeUnit) -> Vec<CodeUnit> {
+        self.resolve_mixin_modules(type_unit, |mixins| mixins.includes.as_slice())
+    }
+
+    /// Modules mixed into `type_unit` via `prepend` (instance-method lookup,
+    /// ahead of the type's own methods).
+    pub fn prepended_modules(&self, type_unit: &CodeUnit) -> Vec<CodeUnit> {
+        self.resolve_mixin_modules(type_unit, |mixins| mixins.prepends.as_slice())
+    }
+
+    /// Modules mixed into `type_unit` via `extend` (class/singleton-method
+    /// lookup).
+    pub fn extended_modules(&self, type_unit: &CodeUnit) -> Vec<CodeUnit> {
+        self.resolve_mixin_modules(type_unit, |mixins| mixins.extends.as_slice())
+    }
+
+    fn resolve_mixin_modules(
+        &self,
+        type_unit: &CodeUnit,
+        select: impl Fn(&RawMixins) -> &[String],
+    ) -> Vec<CodeUnit> {
+        let Some(mixins) = self.mixin_index().get(&type_unit.fq_name()) else {
+            return Vec::new();
+        };
+        select(mixins)
+            .iter()
+            .filter_map(|raw| self.resolve_supertype(raw))
+            .collect()
+    }
+
+    /// Lazily builds the per-type mixin index by re-walking Ruby files. Mixins
+    /// are not carried on the shared `ParsedFile`, so they are recovered here
+    /// once and cached for the analyzer's lifetime.
+    fn mixin_index(&self) -> &HashMap<String, RawMixins> {
+        self.mixin_index.get_or_init(|| {
+            let mut index: HashMap<String, RawMixins> = HashMap::default();
+            for file in self.inner.all_files() {
+                let Ok(source) = self.inner.project().read_source(file) else {
+                    continue;
+                };
+                let Some(tree) = parse_ruby_tree(&source) else {
+                    continue;
+                };
+                for (fq, mixins) in extract_file_mixins(tree.root_node(), &source) {
+                    index.entry(fq).or_default().merge(mixins);
+                }
+            }
+            index
+        })
     }
 
     pub fn from_project<P>(project: P) -> Self

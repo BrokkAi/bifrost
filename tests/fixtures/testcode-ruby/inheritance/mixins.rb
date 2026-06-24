@@ -10,10 +10,16 @@ module Swimmable
   end
 end
 
+module Quackable
+  def quack_loudly
+    "QUACK"
+  end
+end
+
 class Duck
   include Walkable
   include Swimmable
-  prepend Comparable
+  prepend Quackable
 
   def quack
     "Quack"

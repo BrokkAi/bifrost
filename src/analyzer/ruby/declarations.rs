@@ -255,7 +255,7 @@ fn member_short_name(segments: &[String], name: &str) -> String {
 /// AST (not by string-splitting `::`). A plain `(constant)` yields one segment;
 /// a `(scope_resolution)` like `A::B` walks its `scope` and `name` fields to
 /// yield `["A", "B"]`.
-fn extract_name_segments(name_node: Node<'_>, source: &str) -> Vec<String> {
+pub(super) fn extract_name_segments(name_node: Node<'_>, source: &str) -> Vec<String> {
     match name_node.kind() {
         "scope_resolution" => {
             let mut segments = name_node
@@ -280,13 +280,15 @@ fn extract_name_segments(name_node: Node<'_>, source: &str) -> Vec<String> {
 
 /// Renders a `constant`/`scope_resolution` reference node into the internal
 /// `$`-joined name used as a `CodeUnit` key (e.g. `A::B` -> `A$B`).
-fn qualified_internal_name(node: Node<'_>, source: &str) -> Option<String> {
+pub(super) fn qualified_internal_name(node: Node<'_>, source: &str) -> Option<String> {
     let segments = extract_name_segments(node, source);
     (!segments.is_empty()).then(|| segments.join("$"))
 }
 
-/// Collects a class/module's supertypes: its `< Superclass` and any
-/// `include`/`prepend`/`extend ModuleName` mixins declared directly in its body.
+/// Collects a class's true superclass ancestry (`< Superclass`). Mixins
+/// (`include`/`prepend`/`extend`) are deliberately excluded here and modeled
+/// separately in [`super::mixins`]; folding them into supertypes would make
+/// modules appear as superclass-style ancestors.
 fn extract_ruby_supertypes(node: Node<'_>, source: &str) -> Vec<String> {
     let mut supertypes = Vec::new();
 
@@ -299,49 +301,7 @@ fn extract_ruby_supertypes(node: Node<'_>, source: &str) -> Vec<String> {
         }
     }
 
-    if let Some(body) = node.child_by_field_name("body") {
-        collect_mixins(body, source, &mut supertypes);
-    }
-
     supertypes
-}
-
-/// Walks a type body for `include`/`prepend`/`extend` calls, descending through
-/// control-flow containers (iteratively, to stay stack-safe) but not into
-/// nested types or methods.
-fn collect_mixins(body: Node<'_>, source: &str, supertypes: &mut Vec<String>) {
-    let mut stack = vec![body];
-    while let Some(node) = stack.pop() {
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            match child.kind() {
-                "call" => {
-                    let Some(method) = child.child_by_field_name("method") else {
-                        continue;
-                    };
-                    if !matches!(
-                        ruby_node_text(method, source).trim(),
-                        "include" | "prepend" | "extend"
-                    ) {
-                        continue;
-                    }
-                    let Some(arguments) = child.child_by_field_name("arguments") else {
-                        continue;
-                    };
-                    let mut arg_cursor = arguments.walk();
-                    for arg in arguments.named_children(&mut arg_cursor) {
-                        if matches!(arg.kind(), "constant" | "scope_resolution")
-                            && let Some(name) = qualified_internal_name(arg, source)
-                        {
-                            supertypes.push(name);
-                        }
-                    }
-                }
-                kind if is_descendable_container(kind) => stack.push(child),
-                _ => {}
-            }
-        }
-    }
 }
 
 /// Extracts the bare name from a `attr_*` argument, which is usually a symbol
@@ -368,7 +328,7 @@ fn first_line(node: Node<'_>, source: &str) -> String {
 /// Container node kinds the visitor recurses through to find conditionally
 /// declared symbols (e.g. a `def` inside an `if`). Excludes `method`/
 /// `singleton_method`, whose bodies are treated as leaves.
-fn is_descendable_container(kind: &str) -> bool {
+pub(super) fn is_descendable_container(kind: &str) -> bool {
     matches!(
         kind,
         "if" | "unless"

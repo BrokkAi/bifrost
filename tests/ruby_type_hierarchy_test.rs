@@ -65,14 +65,29 @@ fn multilevel_ancestors_chain() {
 }
 
 #[test]
-fn mixins_are_ancestors() {
+fn mixins_are_not_type_hierarchy_ancestors() {
     let analyzer = analyzer();
     let decls = decls(&analyzer, "inheritance/mixins.rb");
     let duck = find(&decls, "Duck");
     let ancestors = ancestor_identifiers(&analyzer, duck);
-    // include Walkable, include Swimmable, prepend Comparable
-    assert!(ancestors.contains("Walkable"), "got {ancestors:?}");
-    assert!(ancestors.contains("Swimmable"), "got {ancestors:?}");
+    // include/prepend/extend are mixins, not superclass ancestry: Duck has no
+    // superclass, so the type hierarchy reports no direct ancestors.
+    assert!(!ancestors.contains("Walkable"), "got {ancestors:?}");
+    assert!(!ancestors.contains("Swimmable"), "got {ancestors:?}");
+    assert!(!ancestors.contains("Quackable"), "got {ancestors:?}");
+    assert!(ancestors.is_empty(), "got {ancestors:?}");
+}
+
+#[test]
+fn superclass_ancestry_excludes_mixins() {
+    // A class with both a superclass and mixins exposes only the superclass
+    // through the type hierarchy.
+    let analyzer = analyzer();
+    let decls = decls(&analyzer, "inheritance/mixin_kinds.rb");
+    let user = find(&decls, "User");
+    let ancestors = ancestor_identifiers(&analyzer, user);
+    assert!(!ancestors.contains("Auditable"), "got {ancestors:?}");
+    assert!(!ancestors.contains("Findable"), "got {ancestors:?}");
 }
 
 #[test]
