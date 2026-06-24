@@ -67,12 +67,43 @@ impl<'a> CSharpVisitor<'a> {
     ) {
         let mut cursor = node.walk();
         let children = node.named_children(&mut cursor).collect::<Vec<_>>();
-        for child in children.into_iter().rev() {
+        // A file-scoped namespace (`namespace X;`) has no body: its type declarations
+        // are following SIBLINGS, not children. Apply its namespace to everything after
+        // it so their package_name is populated. Block namespaces keep a body and flow
+        // through `queue_namespace`.
+        let mut current = scope;
+        let mut scoped: Vec<(Node<'tree>, CSharpScope)> = Vec::with_capacity(children.len());
+        for child in children {
+            if child.kind() == "file_scoped_namespace_declaration" {
+                if let Some(package_name) = self.namespace_scope_name(child, &current) {
+                    current = CSharpScope {
+                        package_name,
+                        class_unit: current.class_unit.clone(),
+                    };
+                }
+                continue;
+            }
+            scoped.push((child, current.clone()));
+        }
+        for (child, child_scope) in scoped.into_iter().rev() {
             stack.push(CSharpWork {
                 node: child,
-                scope: scope.clone(),
+                scope: child_scope,
             });
         }
+    }
+
+    fn namespace_scope_name(&self, node: Node<'_>, scope: &CSharpScope) -> Option<String> {
+        let name_node = node.child_by_field_name("name")?;
+        let raw_name = cs_node_text(name_node, self.source).trim();
+        if raw_name.is_empty() {
+            return None;
+        }
+        Some(if scope.package_name.is_empty() {
+            raw_name.to_string()
+        } else {
+            format!("{}.{}", scope.package_name, raw_name)
+        })
     }
 
     fn visit_node<'tree>(
@@ -82,9 +113,9 @@ impl<'a> CSharpVisitor<'a> {
         stack: &mut Vec<CSharpWork<'tree>>,
     ) {
         match node.kind() {
-            "namespace_declaration" | "file_scoped_namespace_declaration" => {
-                self.queue_namespace(node, scope, stack)
-            }
+            // Block namespaces only; file-scoped namespaces are handled in push_children
+            // (their types are following siblings, not body children).
+            "namespace_declaration" => self.queue_namespace(node, scope, stack),
             "class_declaration"
             | "interface_declaration"
             | "struct_declaration"
