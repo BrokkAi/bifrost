@@ -43,6 +43,7 @@ pub(crate) fn epoch_for(language: Language, ts_language: &TsLanguage) -> &'stati
         Language::Php => epoch_cell::<Php>(ts_language),
         Language::Scala => epoch_cell::<Scala>(ts_language),
         Language::CSharp => epoch_cell::<CSharp>(ts_language),
+        Language::Ruby => epoch_cell::<Ruby>(ts_language),
         Language::None => "",
     }
 }
@@ -243,6 +244,19 @@ const EMBEDDED_QUERIES: &[(&str, &str)] = &[
         "treesitter/scala/imports.scm",
         include_str!("../../../resources/treesitter/scala/imports.scm"),
     ),
+    // Ruby
+    (
+        "treesitter/ruby/definitions.scm",
+        include_str!("../../../resources/treesitter/ruby/definitions.scm"),
+    ),
+    (
+        "treesitter/ruby/imports.scm",
+        include_str!("../../../resources/treesitter/ruby/imports.scm"),
+    ),
+    (
+        "treesitter/ruby/identifiers.scm",
+        include_str!("../../../resources/treesitter/ruby/identifiers.scm"),
+    ),
 ];
 
 macro_rules! lang_epoch {
@@ -280,6 +294,7 @@ lang_epoch!(Rust, "rust", "treesitter/rust/");
 lang_epoch!(Php, "php", "treesitter/php/");
 lang_epoch!(Scala, "scala", "treesitter/scala/");
 lang_epoch!(CSharp, "csharp", "treesitter/c_sharp/");
+lang_epoch!(Ruby, "ruby", "treesitter/ruby/");
 
 #[cfg(test)]
 mod tests {

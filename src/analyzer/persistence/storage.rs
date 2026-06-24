@@ -507,5 +507,6 @@ pub(crate) fn language_key(language: Language) -> &'static str {
         Language::Php => "php",
         Language::Scala => "scala",
         Language::CSharp => "csharp",
+        Language::Ruby => "ruby",
     }
 }

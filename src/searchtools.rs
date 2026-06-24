@@ -4635,7 +4635,9 @@ impl Ecosystem {
             Language::Cpp => Self::Cpp,
             Language::Php => Self::Php,
             Language::Scala => Self::Scala,
-            Language::None => Self::Unknown,
+            // Ruby has no dedicated usage-graph ecosystem yet; it is fqn-merged
+            // across files (class reopening) like the non-module-scoped ones.
+            Language::Ruby | Language::None => Self::Unknown,
         }
     }
 
@@ -4679,6 +4681,7 @@ fn language_name(language: Language) -> String {
         Language::Php => "php",
         Language::Scala => "scala",
         Language::CSharp => "csharp",
+        Language::Ruby => "ruby",
     }
     .to_string()
 }

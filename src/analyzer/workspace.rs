@@ -2,7 +2,7 @@ use crate::analyzer::persistence::AnalyzerStorage;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerDelegate, CSharpAnalyzer, CppAnalyzer, GoAnalyzer, IAnalyzer,
     JavaAnalyzer, JavascriptAnalyzer, Language, MultiAnalyzer, PhpAnalyzer, Project,
-    PythonAnalyzer, RustAnalyzer, ScalaAnalyzer, TypescriptAnalyzer,
+    PythonAnalyzer, RubyAnalyzer, RustAnalyzer, ScalaAnalyzer, TypescriptAnalyzer,
 };
 use crate::profiling;
 use std::collections::{BTreeMap, BTreeSet};
@@ -286,6 +286,12 @@ impl WorkspaceAnalyzer {
                     (Language::CSharp, None) => {
                         AnalyzerDelegate::CSharp(CSharpAnalyzer::new_with_config(project, cfg))
                     }
+                    (Language::Ruby, Some(s)) => AnalyzerDelegate::Ruby(
+                        RubyAnalyzer::new_with_config_and_storage(project, cfg, Arc::clone(s)),
+                    ),
+                    (Language::Ruby, None) => {
+                        AnalyzerDelegate::Ruby(RubyAnalyzer::new_with_config(project, cfg))
+                    }
                     (Language::None, _) => continue,
                 }
             };
@@ -315,6 +321,7 @@ impl WorkspaceAnalyzer {
                 AnalyzerDelegate::TypeScript(analyzer) => analyzer,
                 AnalyzerDelegate::Rust(analyzer) => analyzer,
                 AnalyzerDelegate::Scala(analyzer) => analyzer,
+                AnalyzerDelegate::Ruby(analyzer) => analyzer,
             },
             Self::Multi(analyzer) => analyzer.as_ref(),
         }

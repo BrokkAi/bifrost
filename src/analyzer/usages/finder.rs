@@ -283,7 +283,9 @@ fn graph_find_usages(
             candidates,
             max_usages,
         ),
-        Language::None => GraphUsageOutcome::terminal_failure(
+        // Ruby has no dedicated graph strategy yet; it degrades to the
+        // candidate-provider fallback like any unsupported target language.
+        Language::Ruby | Language::None => GraphUsageOutcome::terminal_failure(
             overloads[0].fq_name(),
             GraphFailureReason::UnsupportedTargetLanguage(
                 "no graph usage strategy is available for this target language",

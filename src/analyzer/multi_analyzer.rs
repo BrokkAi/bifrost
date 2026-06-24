@@ -3,7 +3,7 @@ use crate::analyzer::{
     CSharpAnalyzer, CloneSmell, CloneSmellWeights, CodeUnit, CommentDensityStats, CppAnalyzer,
     DeclarationInfo, DefinitionLookupIndex, ExceptionHandlingSmell, ExceptionSmellWeights,
     GoAnalyzer, IAnalyzer, ImportAnalysisProvider, ImportInfo, JavaAnalyzer, JavascriptAnalyzer,
-    Language, PhpAnalyzer, Project, ProjectFile, PythonAnalyzer, Range, RustAnalyzer,
+    Language, PhpAnalyzer, Project, ProjectFile, PythonAnalyzer, Range, RubyAnalyzer, RustAnalyzer,
     ScalaAnalyzer, TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider,
     TypescriptAnalyzer,
 };
@@ -37,6 +37,7 @@ pub enum AnalyzerDelegate {
     TypeScript(TypescriptAnalyzer),
     Rust(RustAnalyzer),
     Scala(ScalaAnalyzer),
+    Ruby(RubyAnalyzer),
 }
 
 impl AnalyzerDelegate {
@@ -52,6 +53,7 @@ impl AnalyzerDelegate {
             Self::TypeScript(analyzer) => analyzer,
             Self::Rust(analyzer) => analyzer,
             Self::Scala(analyzer) => analyzer,
+            Self::Ruby(analyzer) => analyzer,
         }
     }
 
@@ -67,6 +69,7 @@ impl AnalyzerDelegate {
             Self::TypeScript(analyzer) => Some(analyzer),
             Self::Rust(analyzer) => Some(analyzer),
             Self::Scala(analyzer) => analyzer.import_analysis_provider(),
+            Self::Ruby(analyzer) => Some(analyzer),
         }
     }
 
@@ -82,6 +85,7 @@ impl AnalyzerDelegate {
             Self::TypeScript(analyzer) => analyzer.type_hierarchy_provider(),
             Self::Rust(analyzer) => analyzer.type_hierarchy_provider(),
             Self::Scala(analyzer) => analyzer.type_hierarchy_provider(),
+            Self::Ruby(analyzer) => Some(analyzer),
         }
     }
 
@@ -97,6 +101,7 @@ impl AnalyzerDelegate {
             Self::TypeScript(analyzer) => analyzer.type_alias_provider(),
             Self::Rust(analyzer) => analyzer.type_alias_provider(),
             Self::Scala(analyzer) => analyzer.type_alias_provider(),
+            Self::Ruby(analyzer) => analyzer.type_alias_provider(),
         }
     }
 
@@ -112,6 +117,7 @@ impl AnalyzerDelegate {
             Self::TypeScript(analyzer) => Some(analyzer),
             Self::Rust(analyzer) => Some(analyzer),
             Self::Scala(analyzer) => Some(analyzer),
+            Self::Ruby(analyzer) => Some(analyzer),
         }
     }
 
@@ -127,6 +133,7 @@ impl AnalyzerDelegate {
             Self::TypeScript(analyzer) => Self::TypeScript(analyzer.update(changed_files)),
             Self::Rust(analyzer) => Self::Rust(analyzer.update(changed_files)),
             Self::Scala(analyzer) => Self::Scala(analyzer.update(changed_files)),
+            Self::Ruby(analyzer) => Self::Ruby(analyzer.update(changed_files)),
         }
     }
 
@@ -142,6 +149,7 @@ impl AnalyzerDelegate {
             Self::TypeScript(analyzer) => Self::TypeScript(analyzer.update_all()),
             Self::Rust(analyzer) => Self::Rust(analyzer.update_all()),
             Self::Scala(analyzer) => Self::Scala(analyzer.update_all()),
+            Self::Ruby(analyzer) => Self::Ruby(analyzer.update_all()),
         }
     }
 }

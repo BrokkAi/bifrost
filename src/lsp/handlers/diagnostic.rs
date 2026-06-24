@@ -126,6 +126,7 @@ fn ts_language_for(language: Language) -> Option<TsLanguage> {
         Language::Php => tree_sitter_php::LANGUAGE_PHP.into(),
         Language::Scala => tree_sitter_scala::LANGUAGE.into(),
         Language::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
+        Language::Ruby => tree_sitter_ruby::LANGUAGE.into(),
         Language::None => return None,
     })
 }

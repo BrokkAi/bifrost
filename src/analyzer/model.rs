@@ -22,6 +22,7 @@ pub enum Language {
     Php,
     Scala,
     CSharp,
+    Ruby,
 }
 
 impl Language {
@@ -38,6 +39,7 @@ impl Language {
             Language::Php => &["php"],
             Language::Scala => &["scala"],
             Language::CSharp => &["cs"],
+            Language::Ruby => &["rb"],
         }
     }
 
@@ -54,6 +56,7 @@ impl Language {
             Language::Php,
             Language::Scala,
             Language::CSharp,
+            Language::Ruby,
         ] {
             if language.extensions().contains(&normalized.as_str()) {
                 return language;

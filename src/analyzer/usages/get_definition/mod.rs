@@ -215,7 +215,9 @@ fn resolve_one(
     request: DefinitionLookupRequest,
 ) -> DefinitionLookupOutcome {
     let language = language_for_file(&request.file);
-    if language == Language::None {
+    // Ruby has no go-to-definition resolver yet; report it as unsupported
+    // rather than reaching the resolver match below.
+    if matches!(language, Language::None | Language::Ruby) {
         return diagnostic_outcome(
             DefinitionLookupStatus::UnsupportedLanguage,
             "unsupported_language",
@@ -329,7 +331,9 @@ fn resolve_one(
             tree.as_ref(),
             &site,
         ),
-        Language::None => unreachable!("unsupported language handled before source extraction"),
+        Language::Ruby | Language::None => {
+            unreachable!("unsupported language handled before source extraction")
+        }
     };
 
     finish_lookup_outcome(resolved, site)
@@ -571,7 +575,7 @@ fn parse_tree_for_language(file: &ProjectFile, language: Language, source: &str)
         Language::CSharp => csharp::parse_csharp_tree(source),
         Language::Python => python::parse_python_tree(source),
         Language::Rust => rust::parse_rust_tree(source),
-        Language::Go | Language::None => None,
+        Language::Ruby | Language::Go | Language::None => None,
     }
 }
 

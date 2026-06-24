@@ -617,6 +617,6 @@ fn manifest_language_from_analyzer(language: Language) -> Option<ManifestLanguag
         Language::Php => Some(ManifestLanguage::Php),
         Language::Scala => Some(ManifestLanguage::Scala),
         Language::CSharp => Some(ManifestLanguage::CSharp),
-        Language::None => None,
+        Language::Ruby | Language::None => None,
     }
 }

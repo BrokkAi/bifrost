@@ -19,6 +19,7 @@ pub mod persistence;
 mod php;
 mod project;
 mod python;
+mod ruby;
 mod rust;
 mod scala;
 mod source_content;
@@ -67,6 +68,7 @@ pub use project::{
     TestProject,
 };
 pub use python::PythonAnalyzer;
+pub use ruby::RubyAnalyzer;
 pub use rust::{RustAnalyzer, RustReferenceContext};
 pub use scala::ScalaAnalyzer;
 pub use source_content::SourceContent;
