@@ -416,18 +416,19 @@ impl<'a> PythonVisitor<'a> {
                 self.package_name.to_string(),
                 format!("{}.{}", parent.path, name),
             );
-            self.parsed.replace_code_unit(
-                code_unit.clone(),
-                node,
-                self.source,
-                Some(parent_cu.clone()),
-                Some(parent_cu.clone()),
-            );
+            if !self.parsed.declarations.contains(&code_unit) {
+                self.parsed.replace_code_unit(
+                    code_unit.clone(),
+                    node,
+                    self.source,
+                    Some(parent_cu.clone()),
+                    Some(parent_cu.clone()),
+                );
+            }
             self.parsed.add_signature(
                 code_unit.clone(),
                 py_node_text(left, self.source).trim().to_string(),
             );
-            self.parsed.add_child(parent_cu.clone(), code_unit);
         }
     }
 

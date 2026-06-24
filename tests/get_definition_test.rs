@@ -1732,6 +1732,81 @@ fn run() {
 }
 
 #[test]
+fn rust_typed_receiver_method_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("lib.rs", "mod service;\nmod app;\n")
+        .file(
+            "service.rs",
+            r#"
+pub struct Service;
+
+impl Service {
+    pub fn execute(&self) {}
+}
+"#,
+        )
+        .file(
+            "app.rs",
+            r#"
+use crate::service::Service;
+
+pub fn run(service: Service) {
+    service.execute();
+}
+"#,
+        )
+        .build();
+
+    let line = "    service.execute();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.rs","line":5,"column":{}}}]}}"#,
+            column_of(line, "execute")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Service.execute",
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["path"], "service.rs", "{value}");
+}
+
+#[test]
+fn rust_unproven_receiver_method_does_not_guess_same_named_method() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+pub struct Service;
+
+impl Service {
+    pub fn execute(&self) {}
+}
+
+pub fn run(service: ()) {
+    service.execute();
+}
+"#,
+        )
+        .build();
+
+    let line = "    service.execute();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"lib.rs","line":9,"column":{}}}]}}"#,
+            column_of(line, "execute")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
 fn rust_crate_scoped_macro_resolves_inside_inline_module() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(
@@ -2447,6 +2522,82 @@ export function isVisionModel() {
 }
 
 #[test]
+fn typescript_new_initialized_local_method_resolves_to_class_member() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "greeter.ts",
+            r#"
+export class Greeter {
+  greet(): string {
+    return 'hello'
+  }
+}
+"#,
+        )
+        .file(
+            "app.ts",
+            r#"
+import { Greeter } from './greeter'
+
+export function run() {
+  const greeter = new Greeter()
+  return greeter.greet()
+}
+"#,
+        )
+        .build();
+
+    let line = "  return greeter.greet()";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.ts","line":6,"column":{}}}]}}"#,
+            column_of(line, "greet()")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "Greeter.greet", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "greeter.ts", "{value}");
+}
+
+#[test]
+fn typescript_reassigned_new_initialized_local_method_does_not_guess() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "app.ts",
+            r#"
+class Greeter {
+  greet(): string {
+    return 'hello'
+  }
+}
+
+declare function dynamicValue(): unknown
+
+export function run() {
+  let greeter = new Greeter()
+  greeter = dynamicValue()
+  return greeter.greet()
+}
+"#,
+        )
+        .build();
+
+    let line = "  return greeter.greet()";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.ts","line":13,"column":{}}}]}}"#,
+            column_of(line, "greet()")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
 fn typescript_contextual_callback_parameter_members_resolve() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file(
@@ -2862,6 +3013,40 @@ function render() {
     );
     assert_eq!(result["definitions"][0]["kind"], "function", "{value}");
     assert_eq!(result["definitions"][0]["start_line"], 3, "{value}");
+}
+
+#[test]
+fn javascript_new_initialized_local_method_resolves_to_class_member() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "app.js",
+            r#"
+class Greeter {
+  greet() {
+    return 'hello';
+  }
+}
+
+function run() {
+  const greeter = new Greeter();
+  return greeter.greet();
+}
+"#,
+        )
+        .build();
+
+    let line = "  return greeter.greet();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.js","line":10,"column":{}}}]}}"#,
+            column_of(line, "greet()")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "Greeter.greet", "{value}");
 }
 
 #[test]
@@ -5083,6 +5268,40 @@ fn php_typed_receiver_method_resolves_to_definition() {
 }
 
 #[test]
+fn php_repository_receiver_method_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "src/Repository.php",
+            "<?php\nnamespace App;\nclass Repository {\n    public function save(string $value): void {}\n}\n",
+        )
+        .file(
+            "src/Service.php",
+            "<?php\nnamespace App;\nclass Service {\n    public function handle(Repository $repository): void {\n        $repository->save('value');\n    }\n}\n",
+        )
+        .build();
+
+    let line = "        $repository->save('value');";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/Service.php","line":5,"column":{}}}]}}"#,
+            column_of(line, "save")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "App.Repository.save",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["path"], "src/Repository.php",
+        "{value}"
+    );
+}
+
+#[test]
 fn php_fully_qualified_type_resolves_from_final_segment() {
     let project = InlineTestProject::with_language(Language::Php)
         .file(
@@ -5586,6 +5805,43 @@ fn python_typed_receiver_inherited_method_resolves_to_base_definition() {
         "{value}"
     );
     assert_eq!(result["definitions"][0]["path"], "service.py", "{value}");
+}
+
+#[test]
+fn python_self_attribute_read_prefers_init_assignment_definition() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+class Service:
+    def __init__(self):
+        self.repository = None
+
+    def save(self, repository):
+        self.repository = repository
+
+    def current(self):
+        return self.repository
+"#,
+        )
+        .build();
+
+    let line = "        return self.repository";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"service.py","line":10,"column":{}}}]}}"#,
+            column_of(line, "repository")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "service.Service.repository",
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["start_line"], 4, "{value}");
 }
 
 #[test]
@@ -8445,6 +8701,36 @@ fn scala_typed_receiver_method_resolves_to_definition() {
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(
         result["definitions"][0]["fqn"], "app.Service.run",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_service_execute_receiver_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Service.scala",
+            "package app\nclass Service { def execute(): Int = 1 }\n",
+        )
+        .file(
+            "app/Controller.scala",
+            "package app\nclass Controller { def handle(service: Service): Int = service.execute() }\n",
+        )
+        .build();
+
+    let line = "class Controller { def handle(service: Service): Int = service.execute() }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Controller.scala","line":2,"column":{}}}]}}"#,
+            column_of(line, "execute")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Service.execute",
         "{value}"
     );
 }
