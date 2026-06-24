@@ -24,9 +24,10 @@ use crate::analyzer::js_ts::tests::detect_js_ts_test_assertion_smells;
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use crate::analyzer::usages::js_ts_graph::{JsTsUsageIndex, build_jsts_usage_index};
 use crate::analyzer::{
-    AliasResolver, AnalyzerConfig, CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo,
-    Language, LanguageAdapter, Project, ProjectFile, TestAssertionSmell, TestAssertionWeights,
-    TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider, build_reverse_import_index,
+    AliasResolver, AnalyzerConfig, BuildProgress, CodeUnit, IAnalyzer, ImportAnalysisProvider,
+    ImportInfo, Language, LanguageAdapter, Project, ProjectFile, TestAssertionSmell,
+    TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
+    build_reverse_import_index,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
@@ -214,6 +215,48 @@ impl JavascriptAnalyzer {
                 JavascriptAdapter,
                 config,
                 storage,
+            ),
+            memo_budget,
+            memo_caches: Arc::new(JsMemoCaches::new(memo_budget)),
+            alias_resolver,
+        }
+    }
+
+    pub fn new_with_config_and_progress(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        progress: BuildProgress,
+    ) -> Self {
+        let memo_budget = config.memo_cache_budget_bytes();
+        let alias_resolver = Arc::new(AliasResolver::new(project.root().to_path_buf()));
+        Self {
+            inner: TreeSitterAnalyzer::new_with_config_and_progress(
+                project,
+                JavascriptAdapter,
+                config,
+                move |event| progress(event),
+            ),
+            memo_budget,
+            memo_caches: Arc::new(JsMemoCaches::new(memo_budget)),
+            alias_resolver,
+        }
+    }
+
+    pub fn new_with_config_storage_and_progress(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
+        progress: BuildProgress,
+    ) -> Self {
+        let memo_budget = config.memo_cache_budget_bytes();
+        let alias_resolver = Arc::new(AliasResolver::new(project.root().to_path_buf()));
+        Self {
+            inner: TreeSitterAnalyzer::new_with_config_storage_and_progress(
+                project,
+                JavascriptAdapter,
+                config,
+                storage,
+                move |event| progress(event),
             ),
             memo_budget,
             memo_caches: Arc::new(JsMemoCaches::new(memo_budget)),

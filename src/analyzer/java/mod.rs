@@ -11,10 +11,11 @@ mod tests;
 use crate::analyzer::clone_detection::{CloneCandidateProfile, detect_structural_clone_smells};
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::{
-    AnalyzerConfig, CloneSmell, CloneSmellWeights, CodeUnit, CommentDensityStats, DeclarationInfo,
-    DeclarationKind, ExceptionHandlingSmell, ExceptionSmellWeights, IAnalyzer,
-    ImportAnalysisProvider, Language, Project, ProjectFile, TestAssertionSmell,
-    TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
+    AnalyzerConfig, BuildProgress, BuildProgressEvent, CloneSmell, CloneSmellWeights, CodeUnit,
+    CommentDensityStats, DeclarationInfo, DeclarationKind, ExceptionHandlingSmell,
+    ExceptionSmellWeights, IAnalyzer, ImportAnalysisProvider, Language, Project, ProjectFile,
+    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer,
+    TypeHierarchyProvider,
 };
 use crate::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
@@ -66,9 +67,29 @@ impl JavaAnalyzer {
         }
     }
 
+    pub fn new_with_config_storage_and_progress(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
+        progress: BuildProgress,
+    ) -> Self {
+        let memo_budget = config.memo_cache_budget_bytes();
+        let inner = TreeSitterAnalyzer::new_with_config_storage_and_progress(
+            project,
+            JavaAdapter,
+            config,
+            storage,
+            move |event| progress(event),
+        );
+        Self {
+            inner,
+            memo_caches: Arc::new(JavaMemoCaches::new(memo_budget)),
+        }
+    }
+
     pub fn new_with_progress<F>(project: Arc<dyn Project>, progress: F) -> Self
     where
-        F: Fn(usize, usize, &ProjectFile) + Send + Sync + 'static,
+        F: Fn(BuildProgressEvent) + Send + Sync + 'static,
     {
         Self::new_with_config_and_progress(project, AnalyzerConfig::default(), progress)
     }
@@ -79,7 +100,7 @@ impl JavaAnalyzer {
         progress: F,
     ) -> Self
     where
-        F: Fn(usize, usize, &ProjectFile) + Send + Sync + 'static,
+        F: Fn(BuildProgressEvent) + Send + Sync + 'static,
     {
         let memo_budget = config.memo_cache_budget_bytes();
         let inner = TreeSitterAnalyzer::new_with_config_and_progress(
@@ -111,7 +132,7 @@ impl JavaAnalyzer {
     pub fn from_project_with_progress<P, F>(project: P, progress: F) -> Self
     where
         P: Project + 'static,
-        F: Fn(usize, usize, &ProjectFile) + Send + Sync + 'static,
+        F: Fn(BuildProgressEvent) + Send + Sync + 'static,
     {
         Self::new_with_progress(Arc::new(project), progress)
     }
@@ -123,7 +144,7 @@ impl JavaAnalyzer {
     ) -> Self
     where
         P: Project + 'static,
-        F: Fn(usize, usize, &ProjectFile) + Send + Sync + 'static,
+        F: Fn(BuildProgressEvent) + Send + Sync + 'static,
     {
         Self::new_with_config_and_progress(Arc::new(project), config, progress)
     }

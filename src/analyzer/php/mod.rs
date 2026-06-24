@@ -10,9 +10,9 @@ use crate::analyzer::js_ts::{
     build_weighted_cache, weight_code_unit_set_by_unit, weight_code_unit_vec_by_unit,
 };
 use crate::analyzer::{
-    AnalyzerConfig, CodeUnit, IAnalyzer, Language, Project, ProjectFile, Range, TestAssertionSmell,
-    TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
-    build_direct_descendant_index,
+    AnalyzerConfig, BuildProgress, CodeUnit, IAnalyzer, Language, Project, ProjectFile, Range,
+    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer,
+    TypeHierarchyProvider, build_direct_descendant_index,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
@@ -60,6 +60,38 @@ impl PhpAnalyzer {
         let memo_budget = config.memo_cache_budget_bytes();
         let inner =
             TreeSitterAnalyzer::new_with_config_and_storage(project, PhpAdapter, config, storage);
+        Self::from_inner(inner, memo_budget)
+    }
+
+    pub fn new_with_config_and_progress(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        progress: BuildProgress,
+    ) -> Self {
+        let memo_budget = config.memo_cache_budget_bytes();
+        let inner = TreeSitterAnalyzer::new_with_config_and_progress(
+            project,
+            PhpAdapter,
+            config,
+            move |event| progress(event),
+        );
+        Self::from_inner(inner, memo_budget)
+    }
+
+    pub fn new_with_config_storage_and_progress(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
+        progress: BuildProgress,
+    ) -> Self {
+        let memo_budget = config.memo_cache_budget_bytes();
+        let inner = TreeSitterAnalyzer::new_with_config_storage_and_progress(
+            project,
+            PhpAdapter,
+            config,
+            storage,
+            move |event| progress(event),
+        );
         Self::from_inner(inner, memo_budget)
     }
 

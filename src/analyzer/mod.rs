@@ -73,6 +73,8 @@ pub use ruby::RubyAnalyzer;
 pub use rust::{RustAnalyzer, RustReferenceContext};
 pub use scala::ScalaAnalyzer;
 pub use source_content::SourceContent;
-pub use tree_sitter_analyzer::{LanguageAdapter, TreeSitterAnalyzer};
+pub use tree_sitter_analyzer::{
+    BuildProgress, BuildProgressEvent, BuildProgressPhase, LanguageAdapter, TreeSitterAnalyzer,
+};
 pub use typescript::TypescriptAnalyzer;
 pub use workspace::{EmptyAnalyzer, WorkspaceAnalyzer};

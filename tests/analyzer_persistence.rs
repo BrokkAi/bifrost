@@ -4,13 +4,13 @@ use brokk_bifrost::analyzer::persistence::{
     AnalyzerStorage, PersistenceError, SymbolQueryMode, default_db_path,
 };
 use brokk_bifrost::{
-    AnalyzerConfig, IAnalyzer, Language, OverlayProject, Project, ProjectFile, PythonAnalyzer,
-    TestProject, WorkspaceAnalyzer,
+    AnalyzerConfig, BuildProgressEvent, BuildProgressPhase, IAnalyzer, Language, OverlayProject,
+    Project, ProjectFile, PythonAnalyzer, TestProject, WorkspaceAnalyzer,
 };
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
 
@@ -293,6 +293,71 @@ fn workspace_analyzer_with_storage_round_trips() {
         .map(|cu| cu.fq_name())
         .collect();
     assert_eq!(cold_names, warm_names);
+}
+
+#[test]
+fn workspace_analyzer_with_storage_reports_cold_and_warm_progress() {
+    let (_tmp, project) = fresh_python_workspace();
+    let db_dir = tempfile::tempdir().unwrap();
+    let storage = Arc::new(AnalyzerStorage::open(db_dir.path().join("analyzer.db")).unwrap());
+
+    let cold_events = Arc::new(Mutex::new(Vec::<BuildProgressEvent>::new()));
+    let cold_sink = Arc::clone(&cold_events);
+    let analyzer = WorkspaceAnalyzer::build_with_storage_and_progress(
+        project.clone() as Arc<dyn brokk_bifrost::Project>,
+        AnalyzerConfig::default(),
+        Arc::clone(&storage),
+        move |event| cold_sink.lock().unwrap().push(event),
+    );
+    let cold_names: BTreeSet<String> = analyzer
+        .analyzer()
+        .all_declarations()
+        .map(|cu| cu.fq_name())
+        .collect();
+    assert!(contains_short(&cold_names, "hello"));
+    assert!(contains_short(&cold_names, "world"));
+    let cold_events = cold_events.lock().unwrap();
+    assert!(
+        cold_events
+            .iter()
+            .any(|event| event.phase == BuildProgressPhase::Parse),
+        "cold build should report parse progress: {cold_events:?}"
+    );
+    assert!(
+        cold_events
+            .iter()
+            .any(|event| event.phase == BuildProgressPhase::Index),
+        "cold build should report index progress: {cold_events:?}"
+    );
+    drop(cold_events);
+
+    let warm_events = Arc::new(Mutex::new(Vec::<BuildProgressEvent>::new()));
+    let warm_sink = Arc::clone(&warm_events);
+    let warm = WorkspaceAnalyzer::build_with_storage_and_progress(
+        project as Arc<dyn brokk_bifrost::Project>,
+        AnalyzerConfig::default(),
+        storage,
+        move |event| warm_sink.lock().unwrap().push(event),
+    );
+    let warm_names: BTreeSet<String> = warm
+        .analyzer()
+        .all_declarations()
+        .map(|cu| cu.fq_name())
+        .collect();
+    assert_eq!(cold_names, warm_names);
+    let warm_events = warm_events.lock().unwrap();
+    assert!(
+        warm_events
+            .iter()
+            .any(|event| event.phase == BuildProgressPhase::Reconcile && event.completed > 0),
+        "warm build should report hydrated reconcile progress: {warm_events:?}"
+    );
+    assert!(
+        warm_events
+            .iter()
+            .any(|event| event.phase == BuildProgressPhase::Index),
+        "warm build should report index progress: {warm_events:?}"
+    );
 }
 
 #[test]

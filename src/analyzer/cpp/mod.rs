@@ -12,10 +12,10 @@ use crate::analyzer::js_ts::{
     build_weighted_cache, weight_code_unit_set_by_unit, weight_code_unit_vec_by_unit,
 };
 use crate::analyzer::{
-    AnalyzerConfig, CloneSmell, CloneSmellWeights, CodeUnit, CodeUnitType, IAnalyzer,
-    ImportAnalysisProvider, ImportInfo, Language, Project, ProjectFile, TestAssertionSmell,
-    TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider,
-    TypeHierarchyProvider,
+    AnalyzerConfig, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit, CodeUnitType,
+    IAnalyzer, ImportAnalysisProvider, ImportInfo, Language, Project, ProjectFile,
+    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer,
+    TypeAliasProvider, TypeHierarchyProvider,
 };
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
@@ -63,6 +63,38 @@ impl CppAnalyzer {
         let memo_budget = config.memo_cache_budget_bytes();
         let inner =
             TreeSitterAnalyzer::new_with_config_and_storage(project, CppAdapter, config, storage);
+        Self::from_inner(inner, memo_budget)
+    }
+
+    pub fn new_with_config_and_progress(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        progress: BuildProgress,
+    ) -> Self {
+        let memo_budget = config.memo_cache_budget_bytes();
+        let inner = TreeSitterAnalyzer::new_with_config_and_progress(
+            project,
+            CppAdapter,
+            config,
+            move |event| progress(event),
+        );
+        Self::from_inner(inner, memo_budget)
+    }
+
+    pub fn new_with_config_storage_and_progress(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
+        progress: BuildProgress,
+    ) -> Self {
+        let memo_budget = config.memo_cache_budget_bytes();
+        let inner = TreeSitterAnalyzer::new_with_config_storage_and_progress(
+            project,
+            CppAdapter,
+            config,
+            storage,
+            move |event| progress(event),
+        );
         Self::from_inner(inner, memo_budget)
     }
 

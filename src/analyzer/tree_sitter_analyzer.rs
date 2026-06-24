@@ -108,7 +108,43 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     }
 }
 
-type BuildProgress = Arc<dyn Fn(usize, usize, &ProjectFile) + Send + Sync>;
+pub type BuildProgress = Arc<dyn Fn(BuildProgressEvent) + Send + Sync>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildProgressPhase {
+    Enumerate,
+    Reconcile,
+    Parse,
+    Persist,
+    Index,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildProgressEvent {
+    pub language: Language,
+    pub phase: BuildProgressPhase,
+    pub completed: usize,
+    pub total: usize,
+    pub file: Option<ProjectFile>,
+}
+
+impl BuildProgressEvent {
+    fn new(
+        language: Language,
+        phase: BuildProgressPhase,
+        completed: usize,
+        total: usize,
+        file: Option<ProjectFile>,
+    ) -> Self {
+        Self {
+            language,
+            phase,
+            completed,
+            total,
+            file,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct FileState {
@@ -411,7 +447,7 @@ where
 
     pub fn new_with_progress<F>(project: Arc<dyn Project>, adapter: A, progress: F) -> Self
     where
-        F: Fn(usize, usize, &ProjectFile) + Send + Sync + 'static,
+        F: Fn(BuildProgressEvent) + Send + Sync + 'static,
     {
         Self::new_with_config_and_progress(project, adapter, AnalyzerConfig::default(), progress)
     }
@@ -423,9 +459,28 @@ where
         progress: F,
     ) -> Self
     where
-        F: Fn(usize, usize, &ProjectFile) + Send + Sync + 'static,
+        F: Fn(BuildProgressEvent) + Send + Sync + 'static,
     {
         Self::new_internal(project, adapter, config, Some(Arc::new(progress)), None)
+    }
+
+    pub fn new_with_config_storage_and_progress<F>(
+        project: Arc<dyn Project>,
+        adapter: A,
+        config: AnalyzerConfig,
+        storage: Arc<AnalyzerStorage>,
+        progress: F,
+    ) -> Self
+    where
+        F: Fn(BuildProgressEvent) + Send + Sync + 'static,
+    {
+        Self::new_internal(
+            project,
+            adapter,
+            config,
+            Some(Arc::new(progress)),
+            Some(storage),
+        )
     }
 
     fn new_internal(
@@ -561,7 +616,13 @@ where
                         let state = Self::analyze_file(parser, adapter, project, &file);
                         if let Some(progress) = progress.as_ref() {
                             let current = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                            progress(current, total, &file);
+                            progress(BuildProgressEvent::new(
+                                adapter.language(),
+                                BuildProgressPhase::Parse,
+                                current,
+                                total,
+                                Some(file.clone()),
+                            ));
                         }
                         (file, state)
                     },
@@ -594,6 +655,15 @@ where
                 .into_iter()
                 .collect()
         };
+        if let Some(progress) = progress.as_ref() {
+            progress(BuildProgressEvent::new(
+                adapter.language(),
+                BuildProgressPhase::Enumerate,
+                analyzable_files.len(),
+                analyzable_files.len(),
+                None,
+            ));
+        }
         let analyzable_set: HashSet<_> = analyzable_files.iter().cloned().collect();
 
         // Decide reconcile partition.
@@ -610,12 +680,23 @@ where
                 epoch_now,
                 &analyzable_files,
             ) {
-                Ok(plan) => (
-                    plan.clean_hydrated,
-                    plan.dirty_to_analyze,
-                    plan.deletes,
-                    Some(epoch_now),
-                ),
+                Ok(plan) => {
+                    if let Some(progress) = progress.as_ref() {
+                        progress(BuildProgressEvent::new(
+                            adapter.language(),
+                            BuildProgressPhase::Reconcile,
+                            plan.clean_hydrated.len(),
+                            analyzable_files.len(),
+                            None,
+                        ));
+                    }
+                    (
+                        plan.clean_hydrated,
+                        plan.dirty_to_analyze,
+                        plan.deletes,
+                        Some(epoch_now),
+                    )
+                }
                 Err(_) => {
                     // Storage failed (corrupt, locked, etc.). Fall back to a
                     // full in-memory rebuild so the analyzer still produces
@@ -641,7 +722,9 @@ where
         let dirty_keys: HashSet<ProjectFile> = dirty_files.iter().cloned().collect();
         let storage_active = epoch_for_commit.is_some();
 
-        for (file, state) in Self::analyze_files(adapter, project, config, dirty_files, progress) {
+        for (file, state) in
+            Self::analyze_files(adapter, project, config, dirty_files, progress.clone())
+        {
             if let Some(state) = state {
                 files.insert(file, state);
             } else {
@@ -676,6 +759,16 @@ where
                 &writes,
                 &deletes,
             );
+            if let Some(progress) = progress.as_ref() {
+                let total = writes.len() + deletes.len();
+                progress(BuildProgressEvent::new(
+                    adapter.language(),
+                    BuildProgressPhase::Persist,
+                    total,
+                    total,
+                    None,
+                ));
+            }
         }
 
         {
@@ -683,6 +776,15 @@ where
                 "TreeSitterAnalyzer::{:?}::index_state",
                 adapter.language()
             ));
+            if let Some(progress) = progress.as_ref() {
+                progress(BuildProgressEvent::new(
+                    adapter.language(),
+                    BuildProgressPhase::Index,
+                    files.len(),
+                    files.len(),
+                    None,
+                ));
+            }
             Self::index_state(files, project, adapter)
         }
     }

@@ -9,9 +9,9 @@ mod tests;
 use crate::analyzer::clone_detection::{CloneCandidateProfile, detect_structural_clone_smells};
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::{
-    AnalyzerConfig, CodeUnit, CodeUnitType, IAnalyzer, ImportAnalysisProvider, Language, Project,
-    ProjectFile, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
-    TreeSitterAnalyzer, TypeHierarchyProvider,
+    AnalyzerConfig, BuildProgress, CodeUnit, CodeUnitType, IAnalyzer, ImportAnalysisProvider,
+    Language, Project, ProjectFile, TestAssertionSmell, TestAssertionWeights,
+    TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
 };
 use crate::hash::HashSet;
 use crate::{CloneSmell, CloneSmellWeights};
@@ -55,6 +55,42 @@ impl CSharpAnalyzer {
                 CSharpAdapter,
                 config,
                 storage,
+            ),
+            memo_caches: Arc::new(CSharpMemoCaches::new(memo_budget)),
+        }
+    }
+
+    pub fn new_with_config_and_progress(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        progress: BuildProgress,
+    ) -> Self {
+        let memo_budget = config.memo_cache_budget_bytes();
+        Self {
+            inner: TreeSitterAnalyzer::new_with_config_and_progress(
+                project,
+                CSharpAdapter,
+                config,
+                move |event| progress(event),
+            ),
+            memo_caches: Arc::new(CSharpMemoCaches::new(memo_budget)),
+        }
+    }
+
+    pub fn new_with_config_storage_and_progress(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
+        progress: BuildProgress,
+    ) -> Self {
+        let memo_budget = config.memo_cache_budget_bytes();
+        Self {
+            inner: TreeSitterAnalyzer::new_with_config_storage_and_progress(
+                project,
+                CSharpAdapter,
+                config,
+                storage,
+                move |event| progress(event),
             ),
             memo_caches: Arc::new(CSharpMemoCaches::new(memo_budget)),
         }

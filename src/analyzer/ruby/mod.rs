@@ -7,8 +7,9 @@ mod tests;
 
 use crate::analyzer::js_ts::build_weighted_cache;
 use crate::analyzer::{
-    AnalyzerConfig, CodeUnit, CodeUnitType, IAnalyzer, ImportAnalysisProvider, Language, Project,
-    ProjectFile, TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
+    AnalyzerConfig, BuildProgress, CodeUnit, CodeUnitType, IAnalyzer, ImportAnalysisProvider,
+    Language, Project, ProjectFile, TestDetectionProvider, TreeSitterAnalyzer,
+    TypeHierarchyProvider,
 };
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
@@ -59,6 +60,38 @@ impl RubyAnalyzer {
         let memo_budget = config.memo_cache_budget_bytes();
         let inner =
             TreeSitterAnalyzer::new_with_config_and_storage(project, RubyAdapter, config, storage);
+        Self::from_inner(inner, memo_budget)
+    }
+
+    pub fn new_with_config_and_progress(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        progress: BuildProgress,
+    ) -> Self {
+        let memo_budget = config.memo_cache_budget_bytes();
+        let inner = TreeSitterAnalyzer::new_with_config_and_progress(
+            project,
+            RubyAdapter,
+            config,
+            move |event| progress(event),
+        );
+        Self::from_inner(inner, memo_budget)
+    }
+
+    pub fn new_with_config_storage_and_progress(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
+        progress: BuildProgress,
+    ) -> Self {
+        let memo_budget = config.memo_cache_budget_bytes();
+        let inner = TreeSitterAnalyzer::new_with_config_storage_and_progress(
+            project,
+            RubyAdapter,
+            config,
+            storage,
+            move |event| progress(event),
+        );
         Self::from_inner(inner, memo_budget)
     }
 

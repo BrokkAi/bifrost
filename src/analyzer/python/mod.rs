@@ -14,8 +14,8 @@ use crate::analyzer::usages::{
     ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind, ReexportStar,
 };
 use crate::analyzer::{
-    AnalyzerConfig, CloneSmell, CloneSmellWeights, CodeUnit, CodeUnitType, IAnalyzer,
-    ImportAnalysisProvider, Language, Project, ProjectFile, TestAssertionSmell,
+    AnalyzerConfig, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit, CodeUnitType,
+    IAnalyzer, ImportAnalysisProvider, Language, Project, ProjectFile, TestAssertionSmell,
     TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
     build_reverse_import_index,
 };
@@ -75,6 +75,38 @@ impl PythonAnalyzer {
             PythonAdapter,
             config,
             storage,
+        );
+        Self::from_inner(inner, memo_budget)
+    }
+
+    pub fn new_with_config_and_progress(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        progress: BuildProgress,
+    ) -> Self {
+        let memo_budget = config.memo_cache_budget_bytes();
+        let inner = TreeSitterAnalyzer::new_with_config_and_progress(
+            project,
+            PythonAdapter,
+            config,
+            move |event| progress(event),
+        );
+        Self::from_inner(inner, memo_budget)
+    }
+
+    pub fn new_with_config_storage_and_progress(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
+        progress: BuildProgress,
+    ) -> Self {
+        let memo_budget = config.memo_cache_budget_bytes();
+        let inner = TreeSitterAnalyzer::new_with_config_storage_and_progress(
+            project,
+            PythonAdapter,
+            config,
+            storage,
+            move |event| progress(event),
         );
         Self::from_inner(inner, memo_budget)
     }
