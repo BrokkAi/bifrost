@@ -87,6 +87,91 @@ bifrost
 
 By default, `bifrost` uses the current working directory as `--root` and `searchtools` as `--server`. Run `bifrost --help` to see all options.
 
+### Integrating with MCP hosts
+
+Install a released `bifrost` binary first:
+
+```bash
+cargo install brokk-bifrost --locked --force
+```
+
+For local development, build this checkout instead and use the absolute path to
+`target/debug/bifrost` in the examples below:
+
+```bash
+cargo build --bin bifrost
+```
+
+`bifrost` is a stdio MCP server, so MCP hosts need a command plus arguments.
+Always pass an explicit `--root`; otherwise the server analyzes whatever
+directory the host uses as the subprocess working directory.
+
+Codex CLI:
+
+```bash
+codex mcp add bifrost -- bifrost --root /path/to/project --server core
+codex mcp list
+```
+
+Claude Code:
+
+```bash
+claude mcp add --scope user bifrost -- bifrost --root /path/to/project --server core
+claude mcp list
+```
+
+For JSON-based MCP configuration, such as Claude Desktop's
+`claude_desktop_config.json`, add a stdio server entry:
+
+```json
+{
+  "mcpServers": {
+    "bifrost": {
+      "command": "bifrost",
+      "args": [
+        "--root",
+        "/path/to/project",
+        "--server",
+        "core"
+      ]
+    }
+  }
+}
+```
+
+Use an absolute binary path if `bifrost` is not on the host's `PATH`, for
+example `/path/to/bifrost/target/debug/bifrost`. Replace `core` with
+`searchtools` to expose every Bifrost MCP tool, or with a smaller composition
+such as `symbol|workspace` when the host should see fewer tools.
+
+#### Skills and workflow commands
+
+The MCP configuration above exposes Bifrost tools such as `search_symbols`,
+`get_summaries`, and `scan_usages`. It does not install host-specific agent
+skills such as `/brokk:guided-review`.
+
+Those skills are currently packaged by the Brokk host plugin, whose source lives
+in `BrokkAi/brokk` under `claude-plugin/`. The repository name is historical:
+the plugin uses Bifrost for its analyzer-backed MCP tools, but the skill bundle
+has not yet moved into this repository.
+
+Claude Code plugin install:
+
+```text
+/plugin marketplace add BrokkAi/brokk
+/plugin install brokk@brokk-marketplace
+```
+
+Codex plugin install:
+
+```bash
+codex plugin marketplace add BrokkAi/brokk
+codex plugin add brokk@brokk-marketplace
+```
+
+Start a fresh host session after installing a plugin or adding an MCP server so
+the host can load the new skills and tools at startup.
+
 For one-shot terminal use, `bifrost` can also invoke a tool directly without starting an MCP session:
 
 ```bash
