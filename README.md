@@ -275,6 +275,17 @@ Run the Python test suite with:
 scripts/test_python.sh
 ```
 
+On macOS, all-features Rust tests also enable the PyO3 extension module. Pass
+the same linker flags used by CI so Python symbols are resolved by the loading
+interpreter:
+
+```bash
+RUSTFLAGS='-C link-arg=-undefined -C link-arg=dynamic_lookup' cargo test --all-targets --all-features
+```
+
+`scripts/test_python.sh` provisions Python 3.12 through `uv`; the default Xcode
+Python may be older than the package test requirements.
+
 Pass `render_line_numbers=False` to `SearchToolsClient(...)` to omit line numbers from rendered text while keeping the structured line metadata in the result objects.
 
 `SearchToolsClient.refresh()` forces a full rebuild of the code index. Query methods already apply watcher-detected file changes automatically, so most callers should treat `refresh()` as an escape hatch for recovery or explicit full rescans rather than a step to run before every request.
