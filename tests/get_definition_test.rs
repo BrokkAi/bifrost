@@ -1035,6 +1035,148 @@ fn fit_to_json(fit: &ModelFit) {
 }
 
 #[test]
+fn rust_get_definition_resolves_field_type_from_ast_node() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .file(
+            "src/lib.rs",
+            r#"
+pub mod models;
+
+use models::MemoryRepository;
+
+pub struct Service {
+    repository: MemoryRepository,
+}
+"#,
+        )
+        .file("src/models.rs", "pub struct MemoryRepository;\n")
+        .build();
+
+    let line = "    repository: MemoryRepository,";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/lib.rs","line":7,"column":{}}}]}}"#,
+            column_of(line, "MemoryRepository")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "models.MemoryRepository",
+        "{value}"
+    );
+}
+
+#[test]
+fn rust_get_definition_resolves_function_return_type_from_ast_node() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .file(
+            "src/lib.rs",
+            r#"
+pub mod models;
+
+use models::MemoryRepository;
+
+pub fn build() -> MemoryRepository {
+    MemoryRepository
+}
+"#,
+        )
+        .file("src/models.rs", "pub struct MemoryRepository;\n")
+        .build();
+
+    let line = "pub fn build() -> MemoryRepository {";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/lib.rs","line":6,"column":{}}}]}}"#,
+            column_of(line, "MemoryRepository")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "models.MemoryRepository",
+        "{value}"
+    );
+}
+
+#[test]
+fn rust_field_access_unwraps_wrapped_type_nodes() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .file(
+            "src/lib.rs",
+            r#"
+pub mod models;
+
+use models::{Error, MemoryRepository};
+
+pub struct Service {
+    maybe: Option<&'static MemoryRepository>,
+    result: Result<MemoryRepository, Error>,
+}
+
+pub fn build() -> anyhow::Result<MemoryRepository> {
+    MemoryRepository { name: String::new() }
+}
+
+pub fn run(service: Service) {
+    let _ = service.maybe.unwrap().name;
+    let _ = service.result.unwrap().name;
+    let _ = build().unwrap().name;
+}
+"#,
+        )
+        .file(
+            "src/models.rs",
+            r#"
+pub struct Error;
+
+pub struct MemoryRepository {
+    pub name: String,
+}
+"#,
+        )
+        .build();
+
+    for (line_number, line) in [
+        (16, "    let _ = service.maybe.unwrap().name;"),
+        (17, "    let _ = service.result.unwrap().name;"),
+        (18, "    let _ = build().unwrap().name;"),
+    ] {
+        let value = lookup(
+            project.root(),
+            &format!(
+                r#"{{"references":[{{"path":"src/lib.rs","line":{line_number},"column":{}}}]}}"#,
+                column_of(line, "name")
+            ),
+        );
+
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(
+            result["definitions"][0]["fqn"], "models.MemoryRepository.name",
+            "{value}"
+        );
+    }
+}
+
+#[test]
 fn rust_struct_field_access_resolves_borrowed_self_field() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(
