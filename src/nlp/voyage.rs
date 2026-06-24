@@ -13,6 +13,8 @@
 //! See the parity reference: brokkbench/localizer tools/native_localizer_helper.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{Embedding, Linear, Module, RmsNorm, VarBuilder};
@@ -31,6 +33,21 @@ pub const VOYAGE_OUTPUT_DIM: usize = 512;
 /// memory into the tens of GB. Capping padded tokens bounds peak memory; a single
 /// chunk longer than the budget still runs alone (it can't be split).
 const PADDED_TOKEN_BUDGET: usize = MAX_SEQ_TOKENS;
+const EMBED_PROFILE_ENV: &str = "BIFROST_EMBED_PROFILE";
+
+static FORCE_EMBED_PROFILE: AtomicBool = AtomicBool::new(false);
+
+pub fn enable_embed_profile_logging() {
+    FORCE_EMBED_PROFILE.store(true, Ordering::Relaxed);
+}
+
+fn embed_profile_enabled() -> bool {
+    FORCE_EMBED_PROFILE.load(Ordering::Relaxed)
+        || matches!(
+            std::env::var(EMBED_PROFILE_ENV).as_deref(),
+            Ok("1") | Ok("true") | Ok("on") | Ok("enabled")
+        )
+}
 
 /// Qwen3 hyper-parameters for voyage-4-nano. Parsed from the model `config.json`;
 /// fields not needed by the encoder forward are ignored.
@@ -390,6 +407,13 @@ impl VoyageEmbedder {
             .unwrap_or(1)
             .max(1);
         let b = encodings.len();
+        let token_lens: Vec<usize> = encodings
+            .iter()
+            .map(|encoding| encoding.get_ids().len().min(MAX_SEQ_TOKENS).max(1))
+            .collect();
+        let min_len = token_lens.iter().copied().min().unwrap_or(1);
+        let avg_len = token_lens.iter().sum::<usize>() as f64 / token_lens.len() as f64;
+        let padded_tokens = b * max_len;
         let mut ids = vec![0u32; b * max_len];
         let mut mask = vec![0f32; b * max_len];
         for (row, enc) in encodings.iter().enumerate() {
@@ -405,6 +429,7 @@ impl VoyageEmbedder {
         let attention_mask = Tensor::from_vec(mask, (b, max_len), &self.device)
             .map_err(|err| format!("attention_mask tensor: {err}"))?;
 
+        let start = Instant::now();
         let hidden = self
             .model
             .forward(&input_ids, &attention_mask)
@@ -415,10 +440,26 @@ impl VoyageEmbedder {
             .narrow(1, 0, VOYAGE_OUTPUT_DIM)
             .map_err(|err| format!("mrl truncate: {err}"))?;
         let normed = l2_normalize_rows(&truncated).map_err(|err| format!("normalize: {err}"))?;
-        normed
+        let vectors = normed
             .to_dtype(DType::F32)
             .and_then(|t| t.to_vec2::<f32>())
-            .map_err(|err| format!("collect vectors: {err}"))
+            .map_err(|err| format!("collect vectors: {err}"))?;
+        if embed_profile_enabled() {
+            let elapsed = start.elapsed();
+            let seconds = elapsed.as_secs_f64();
+            eprintln!(
+                "[embed] batch_vectors={} min_seq={} avg_seq={:.1} max_seq={} padded_tokens={} elapsed_s={:.3} vectors_per_s={:.2} padded_tokens_per_s={:.0}",
+                b,
+                min_len,
+                avg_len,
+                max_len,
+                padded_tokens,
+                seconds,
+                b as f64 / seconds,
+                padded_tokens as f64 / seconds,
+            );
+        }
+        Ok(vectors)
     }
 }
 
