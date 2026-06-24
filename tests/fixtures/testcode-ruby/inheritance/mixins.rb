@@ -10,10 +10,17 @@ module Swimmable
   end
 end
 
+module Comparable
+end
+
+module Findable
+end
+
 class Duck
   include Walkable
   include Swimmable
   prepend Comparable
+  extend Findable
 
   def quack
     "Quack"

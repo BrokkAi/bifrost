@@ -72,6 +72,8 @@ fn mixins_are_not_type_hierarchy_ancestors() {
     let ancestors = ancestor_identifiers(&analyzer, duck);
     assert!(!ancestors.contains("Walkable"), "got {ancestors:?}");
     assert!(!ancestors.contains("Swimmable"), "got {ancestors:?}");
+    assert!(!ancestors.contains("Comparable"), "got {ancestors:?}");
+    assert!(!ancestors.contains("Findable"), "got {ancestors:?}");
 }
 
 #[test]

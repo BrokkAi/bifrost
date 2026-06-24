@@ -7,8 +7,13 @@ use crate::analyzer::{CodeUnit, IAnalyzer};
 use tree_sitter::Node;
 
 impl RubyAnalyzer {
-    #[allow(dead_code)]
     pub(crate) fn mixin_relations(&self) -> Vec<TypeRelation> {
+        self.mixin_relations
+            .get_or_init(|| self.collect_mixin_relations())
+            .clone()
+    }
+
+    fn collect_mixin_relations(&self) -> Vec<TypeRelation> {
         let mut relations = Vec::new();
         for file in self.get_analyzed_files() {
             let Ok(source) = self.project().read_source(&file) else {
@@ -17,20 +22,37 @@ impl RubyAnalyzer {
             let Some(tree) = parse_ruby_tree(&source) else {
                 continue;
             };
-            let mut stack = vec![tree.root_node()];
-            while let Some(node) = stack.pop() {
+            let mut stack = vec![(tree.root_node(), Vec::<String>::new())];
+            while let Some((node, segments)) = stack.pop() {
                 match node.kind() {
                     "class" | "module" => {
-                        self.collect_mixin_relations_for_type(node, &source, &mut relations);
+                        let Some(name_node) = node.child_by_field_name("name") else {
+                            continue;
+                        };
+                        let Some(type_name) = qualified_internal_name(name_node, &source) else {
+                            continue;
+                        };
+                        let mut type_segments = segments.clone();
+                        if type_name.contains('$') {
+                            type_segments = type_name.split('$').map(str::to_string).collect();
+                        } else {
+                            type_segments.push(type_name);
+                        }
+                        self.collect_mixin_relations_for_type(
+                            node,
+                            &source,
+                            &type_segments,
+                            &mut relations,
+                        );
                         let mut cursor = node.walk();
                         for child in node.named_children(&mut cursor) {
-                            stack.push(child);
+                            stack.push((child, type_segments.clone()));
                         }
                     }
                     _ => {
                         let mut cursor = node.walk();
                         for child in node.named_children(&mut cursor) {
-                            stack.push(child);
+                            stack.push((child, segments.clone()));
                         }
                     }
                 }
@@ -43,14 +65,10 @@ impl RubyAnalyzer {
         &self,
         node: Node<'_>,
         source: &str,
+        segments: &[String],
         relations: &mut Vec<TypeRelation>,
     ) {
-        let Some(name_node) = node.child_by_field_name("name") else {
-            return;
-        };
-        let Some(owner_name) = qualified_internal_name(name_node, source) else {
-            return;
-        };
+        let owner_name = segments.join("$");
         let Some(owner) = self.resolve_ruby_type_by_name(&owner_name) else {
             return;
         };
@@ -107,6 +125,9 @@ impl RubyAnalyzer {
 }
 
 fn mixin_call_kind(node: Node<'_>, source: &str) -> Option<TypeRelationKind> {
+    if node.child_by_field_name("receiver").is_some() {
+        return None;
+    }
     let method = node.child_by_field_name("method")?;
     match ruby_node_text(method, source).trim() {
         "include" => Some(TypeRelationKind::MixinInclude),
@@ -146,7 +167,20 @@ class User
   prepend Ordered
   extend Findable
 end
-"#,
+
+class Other
+end
+
+module Admin
+  module Namespaced
+  end
+
+  class User
+    include Namespaced
+    Other.include Auditable
+  end
+end
+	"#,
         )
         .unwrap();
         let analyzer =
@@ -167,6 +201,14 @@ end
             relation.from.identifier() == "User"
                 && relation.to.identifier() == "Findable"
                 && relation.kind == TypeRelationKind::MixinExtend
+        }));
+        assert!(relations.iter().any(|relation| {
+            relation.from.short_name() == "Admin$User"
+                && relation.to.identifier() == "Namespaced"
+                && relation.kind == TypeRelationKind::MixinInclude
+        }));
+        assert!(!relations.iter().any(|relation| {
+            relation.from.short_name() == "Admin$User" && relation.to.identifier() == "Auditable"
         }));
     }
 }
