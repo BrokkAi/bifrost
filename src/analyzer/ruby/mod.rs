@@ -3,9 +3,11 @@ mod cache;
 mod declarations;
 mod hierarchy;
 mod imports;
+mod mixins;
 mod tests;
 
 use crate::analyzer::js_ts::build_weighted_cache;
+use crate::analyzer::type_relations::TypeRelation;
 use crate::analyzer::{
     AnalyzerConfig, CodeUnit, CodeUnitType, IAnalyzer, ImportAnalysisProvider, Language, Project,
     ProjectFile, TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
@@ -34,6 +36,8 @@ pub struct RubyAnalyzer {
     direct_descendants: Cache<CodeUnit, Arc<HashSet<CodeUnit>>>,
     direct_descendant_index: Arc<OnceLock<HashMap<String, Arc<HashSet<CodeUnit>>>>>,
     reverse_import_index: Arc<OnceLock<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
+    #[allow(dead_code)]
+    mixin_relations: Arc<OnceLock<Vec<TypeRelation>>>,
     /// Class/module declarations indexed by their trailing identifier, for
     /// resolving relative (unqualified) supertype references without scanning
     /// every declaration.
@@ -72,6 +76,7 @@ impl RubyAnalyzer {
             direct_descendants: build_weighted_cache(memo_budget / 8, weight_code_unit_set_by_unit),
             direct_descendant_index: Arc::new(OnceLock::new()),
             reverse_import_index: Arc::new(OnceLock::new()),
+            mixin_relations: Arc::new(OnceLock::new()),
             types_by_identifier: Arc::new(OnceLock::new()),
         }
     }
