@@ -73,11 +73,13 @@ impl MethodSet {
 mod tests {
     use super::*;
     use crate::analyzer::{CodeUnitType, ProjectFile};
-    use std::path::PathBuf;
 
     fn unit(name: &str) -> CodeUnit {
         CodeUnit::new(
-            ProjectFile::new(PathBuf::from("/tmp/project"), "main.go"),
+            ProjectFile::new(
+                std::env::temp_dir().join("bifrost-type-relations-test"),
+                "main.go",
+            ),
             CodeUnitType::Class,
             "example.com/app".to_string(),
             name.to_string(),
