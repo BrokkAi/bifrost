@@ -106,6 +106,34 @@ func (Worker) Run() error { return nil }
 }
 
 #[test]
+fn named_anonymous_struct_fields_do_not_promote_nested_embeds() {
+    let (_project, analyzer) = go_analyzer_with_files(&[(
+        "service.go",
+        r#"
+package app
+
+type Runner interface { Run() error }
+
+type Base struct{}
+func (Base) Run() error { return nil }
+
+type Worker struct {
+    Inner struct { Base }
+}
+"#,
+    )]);
+
+    let runner = definition(&analyzer, "example.com/app.Runner");
+    let worker = definition(&analyzer, "example.com/app.Worker");
+
+    assert!(analyzer.get_direct_ancestors(&worker).is_empty());
+    assert!(
+        !identifiers(analyzer.get_direct_descendants(&runner)).contains("Worker"),
+        "Worker must not satisfy Runner through an embedded field inside a named anonymous struct field"
+    );
+}
+
+#[test]
 fn direct_projection_omits_transitive_interface_ancestors() {
     let (_project, analyzer) = go_analyzer_with_files(&[(
         "service.go",
@@ -341,6 +369,34 @@ type Worker struct { A; B }
 }
 
 #[test]
+fn shared_embedded_type_reached_through_distinct_paths_is_ambiguous() {
+    let (_project, analyzer) = go_analyzer_with_files(&[(
+        "service.go",
+        r#"
+package app
+
+type Runner interface { Run() error }
+
+type X struct{}
+func (X) Run() error { return nil }
+
+type A struct { X }
+type B struct { X }
+type Worker struct { A; B }
+"#,
+    )]);
+
+    let runner = definition(&analyzer, "example.com/app.Runner");
+    let worker = definition(&analyzer, "example.com/app.Worker");
+
+    assert!(analyzer.get_direct_ancestors(&worker).is_empty());
+    assert!(
+        !identifiers(analyzer.get_direct_descendants(&runner)).contains("Worker"),
+        "Worker must not satisfy Runner when distinct embedded paths promote the same method"
+    );
+}
+
+#[test]
 fn shallower_promoted_methods_hide_deeper_conflicts() {
     let (_project, analyzer) = go_analyzer_with_files(&[(
         "service.go",
@@ -537,6 +593,36 @@ func (Worker) Handle(dep.Payload) error { return nil }
 
     assert!(analyzer.get_direct_ancestors(&worker).is_empty());
     assert!(analyzer.get_direct_descendants(&handler).is_empty());
+}
+
+#[test]
+fn unaliased_versioned_import_uses_default_local_name_without_version_suffix() {
+    let (_project, analyzer) = go_analyzer_with_files(&[(
+        "service.go",
+        r#"
+package app
+
+import "gopkg.in/yaml.v3"
+import y "gopkg.in/yaml.v3"
+
+type Handler interface { Handle(yaml.Node) error }
+type Worker struct{}
+
+func (Worker) Handle(y.Node) error { return nil }
+"#,
+    )]);
+
+    let handler = definition(&analyzer, "example.com/app.Handler");
+    let worker = definition(&analyzer, "example.com/app.Worker");
+
+    assert_eq!(
+        BTreeSet::from(["Handler".to_string()]),
+        identifiers(analyzer.get_direct_ancestors(&worker))
+    );
+    assert_eq!(
+        BTreeSet::from(["Worker".to_string()]),
+        identifiers(analyzer.get_direct_descendants(&handler))
+    );
 }
 
 #[test]

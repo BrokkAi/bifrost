@@ -21,9 +21,8 @@ use crate::hash::HashSet;
 pub(in crate::analyzer::usages) use reference::resolve_go_reference;
 use std::collections::BTreeSet;
 
-pub(in crate::analyzer::usages) use resolver::{
-    default_go_import_local_name, extract_go_import_path,
-};
+pub(crate) use resolver::default_go_import_local_name;
+pub(in crate::analyzer::usages) use resolver::extract_go_import_path;
 
 /// Build the whole Go `caller -> callee` edge set in a single inverted pass over
 /// the workspace (see [`inverted`]). Returns `None` when the analyzer exposes no

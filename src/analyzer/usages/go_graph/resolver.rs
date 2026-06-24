@@ -1026,9 +1026,7 @@ pub(in crate::analyzer::usages) fn extract_go_import_path(raw_import: &str) -> O
         .filter(|path| !path.is_empty())
 }
 
-pub(in crate::analyzer::usages) fn default_go_import_local_name(
-    import_path_or_identifier: &str,
-) -> String {
+pub(crate) fn default_go_import_local_name(import_path_or_identifier: &str) -> String {
     let tail = import_path_or_identifier
         .rsplit('/')
         .next()

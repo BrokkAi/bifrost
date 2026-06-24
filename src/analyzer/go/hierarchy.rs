@@ -1,13 +1,17 @@
 use super::GoAnalyzer;
 use super::declarations::{determine_go_package_name, go_node_text};
 use super::imports::extract_go_import_path;
-use crate::analyzer::type_relations::{MethodKey, MethodSet, TypeRelation, TypeRelationKind};
+use crate::analyzer::type_relations::{MethodKey, MethodSet};
+#[cfg(test)]
+use crate::analyzer::type_relations::{TypeRelation, TypeRelationKind};
+use crate::analyzer::usages::go_graph::default_go_import_local_name;
 use crate::analyzer::{CodeUnit, IAnalyzer, ImportAnalysisProvider, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use std::sync::Arc;
 use tree_sitter::{Node, Parser};
 
 const EMPTY_INTERFACE_DESCENDANT_CAP: usize = 0;
+const MAX_STRUCTURAL_SATISFACTION_PAIRS: usize = 2_000_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GoTypeKind {
@@ -43,7 +47,7 @@ pub(super) struct GoHierarchyIndex {
     direct_ancestors: HashMap<String, Vec<CodeUnit>>,
     direct_descendants: HashMap<String, HashSet<CodeUnit>>,
     supported: HashSet<String>,
-    #[allow(dead_code)]
+    #[cfg(test)]
     relations: Vec<TypeRelation>,
 }
 
@@ -94,6 +98,7 @@ struct GoHierarchyBuilder<'a> {
     types: HashMap<String, GoTypeInfo>,
     aliases: HashMap<String, String>,
     alias_units: HashMap<String, CodeUnit>,
+    #[cfg(test)]
     relations: Vec<TypeRelation>,
 }
 
@@ -105,6 +110,7 @@ impl<'a> GoHierarchyBuilder<'a> {
             types: HashMap::default(),
             aliases: HashMap::default(),
             alias_units: HashMap::default(),
+            #[cfg(test)]
             relations: Vec::new(),
         }
     }
@@ -121,8 +127,8 @@ impl<'a> GoHierarchyBuilder<'a> {
 
     fn finish(self) -> GoHierarchyIndex {
         let mut direct_ancestors: HashMap<String, Vec<CodeUnit>> = HashMap::default();
-        let mut direct_descendants: HashMap<String, HashSet<CodeUnit>> = HashMap::default();
         let mut supported = HashSet::default();
+        #[cfg(test)]
         let mut relations = self.relations;
 
         let interfaces: Vec<_> = self
@@ -138,48 +144,61 @@ impl<'a> GoHierarchyBuilder<'a> {
             }
         }
 
-        for concrete in self
+        let concrete_count = self
             .types
             .values()
             .filter(|info| info.kind == GoTypeKind::Concrete && info.alias_target.is_none())
-        {
-            for interface in &interfaces {
-                if interface.has_type_terms
-                    || interface.method_set.methods.len() == EMPTY_INTERFACE_DESCENDANT_CAP
-                {
-                    continue;
-                }
-                if method_set_satisfies(&concrete.method_set, &interface.method_set) {
-                    record_structural_relation(
-                        &mut direct_ancestors,
-                        &mut direct_descendants,
-                        &mut relations,
-                        &concrete.unit,
-                        &interface.unit,
-                    );
+            .count();
+        let interface_count = interfaces
+            .iter()
+            .filter(|info| !info.has_type_terms && !info.method_set.methods.is_empty())
+            .count();
+        if concrete_count.saturating_mul(interface_count) <= MAX_STRUCTURAL_SATISFACTION_PAIRS {
+            for concrete in self
+                .types
+                .values()
+                .filter(|info| info.kind == GoTypeKind::Concrete && info.alias_target.is_none())
+            {
+                for interface in &interfaces {
+                    if interface.has_type_terms
+                        || interface.method_set.methods.len() == EMPTY_INTERFACE_DESCENDANT_CAP
+                    {
+                        continue;
+                    }
+                    if method_set_satisfies(&concrete.method_set, &interface.method_set) {
+                        record_structural_relation(
+                            &mut direct_ancestors,
+                            #[cfg(test)]
+                            &mut relations,
+                            &concrete.unit,
+                            &interface.unit,
+                        );
+                    }
                 }
             }
         }
 
-        for candidate in interfaces
-            .iter()
-            .filter(|info| !info.has_type_terms && info.alias_target.is_none())
-        {
-            for interface in interfaces
+        if interface_count.saturating_mul(interface_count) <= MAX_STRUCTURAL_SATISFACTION_PAIRS {
+            for candidate in interfaces
                 .iter()
-                .filter(|info| !info.has_type_terms && info.unit != candidate.unit)
+                .filter(|info| !info.has_type_terms && info.alias_target.is_none())
             {
-                if interface.method_set.methods.len() == EMPTY_INTERFACE_DESCENDANT_CAP {
-                    continue;
-                }
-                if method_set_satisfies(&candidate.method_set, &interface.method_set) {
-                    record_structural_relation(
-                        &mut direct_ancestors,
-                        &mut direct_descendants,
-                        &mut relations,
-                        &candidate.unit,
-                        &interface.unit,
-                    );
+                for interface in &interfaces {
+                    if interface.has_type_terms
+                        || interface.method_set.methods.len() == EMPTY_INTERFACE_DESCENDANT_CAP
+                        || interface.unit == candidate.unit
+                    {
+                        continue;
+                    }
+                    if method_set_satisfies(&candidate.method_set, &interface.method_set) {
+                        record_structural_relation(
+                            &mut direct_ancestors,
+                            #[cfg(test)]
+                            &mut relations,
+                            &candidate.unit,
+                            &interface.unit,
+                        );
+                    }
                 }
             }
         }
@@ -194,7 +213,7 @@ impl<'a> GoHierarchyBuilder<'a> {
             .values()
             .map(|info| (info.unit.fq_name(), info.unit.clone()))
             .collect();
-        direct_descendants = rebuild_direct_descendants(&direct_ancestors, &units_by_fqn);
+        let mut direct_descendants = rebuild_direct_descendants(&direct_ancestors, &units_by_fqn);
 
         for (alias_fqn, target_fqn) in &self.aliases {
             let Some(alias_unit) = self.alias_units.get(alias_fqn) else {
@@ -213,6 +232,7 @@ impl<'a> GoHierarchyBuilder<'a> {
             direct_ancestors,
             direct_descendants,
             supported,
+            #[cfg(test)]
             relations,
         }
     }
@@ -220,6 +240,9 @@ impl<'a> GoHierarchyBuilder<'a> {
     fn parse_files(&mut self) {
         let mut files: Vec<_> = self.analyzer.get_analyzed_files().into_iter().collect();
         files.sort();
+        let mut parsed_files = Vec::new();
+        let mut package_index = Vec::new();
+        let mut declared_names = HashMap::default();
         for file in files {
             let Ok(source) = self.analyzer.project().read_source(&file) else {
                 continue;
@@ -234,16 +257,27 @@ impl<'a> GoHierarchyBuilder<'a> {
             let Some(tree) = parser.parse(source.as_str(), None) else {
                 continue;
             };
-            let package_name = canonical_file_package(&file, tree.root_node(), &source);
-            let (imports, dot_imports) = import_packages(self.analyzer, &file);
-            self.files.push(ParsedGoFile {
-                file,
+            let declared_name = determine_go_package_name(tree.root_node(), &source);
+            let package_name = super::packages::canonical_go_package_name(&file, &declared_name);
+            declared_names
+                .entry(package_name.clone())
+                .or_insert(declared_name);
+            package_index.push((file.clone(), package_name.clone()));
+            parsed_files.push(ParsedGoFile {
+                file: file.clone(),
                 source: Arc::new(source),
                 root: tree,
                 package_name,
-                imports,
-                dot_imports,
+                imports: HashMap::default(),
+                dot_imports: Vec::new(),
             });
+        }
+        for mut parsed in parsed_files {
+            let (imports, dot_imports) =
+                import_packages(self.analyzer, &parsed.file, &package_index, &declared_names);
+            parsed.imports = imports;
+            parsed.dot_imports = dot_imports;
+            self.files.push(parsed);
         }
     }
 
@@ -583,6 +617,7 @@ impl<'a> GoHierarchyBuilder<'a> {
                 continue;
             };
             info.method_set.extend(&promoted);
+            #[cfg(test)]
             for embedded in &original.embedded {
                 if let Some(embedded_unit) =
                     snapshot.get(&embedded.fqn).map(|info| info.unit.clone())
@@ -727,14 +762,11 @@ impl<'a> GoHierarchyBuilder<'a> {
     }
 }
 
-fn canonical_file_package(file: &ProjectFile, root: Node<'_>, source: &str) -> String {
-    let declared = determine_go_package_name(root, source);
-    super::packages::canonical_go_package_name(file, &declared)
-}
-
 fn import_packages(
     analyzer: &GoAnalyzer,
     file: &ProjectFile,
+    package_index: &[(ProjectFile, String)],
+    declared_names: &HashMap<String, String>,
 ) -> (HashMap<String, Vec<String>>, Vec<String>) {
     let mut by_alias: HashMap<String, Vec<String>> = HashMap::default();
     let mut dot_imports = Vec::new();
@@ -746,28 +778,14 @@ fn import_packages(
         let Some(path) = extract_go_import_path(&import.raw_snippet) else {
             continue;
         };
-        let packages: Vec<_> = analyzer
-            .imported_code_units_of(file)
-            .into_iter()
-            .filter(|unit| {
-                unit.package_name() == path || path_suffix_matches(&unit.source().parent(), &path)
+        let mut packages: Vec<_> = package_index
+            .iter()
+            .filter(|(candidate, _package)| candidate != file)
+            .filter(|(candidate, package)| {
+                package == &path || path_suffix_matches(&candidate.parent(), &path)
             })
-            .map(|unit| unit.package_name().to_string())
+            .map(|(_candidate, package)| package.clone())
             .collect();
-        let mut packages: Vec<_> = if packages.is_empty() {
-            analyzer
-                .get_analyzed_files()
-                .into_iter()
-                .filter(|candidate| candidate != file)
-                .filter_map(|candidate| {
-                    analyzer.go_package_of(&candidate).filter(|package| {
-                        package == &path || path_suffix_matches(&candidate.parent(), &path)
-                    })
-                })
-                .collect()
-        } else {
-            packages
-        };
         if packages.is_empty() {
             packages.push(path.clone());
         }
@@ -784,9 +802,10 @@ fn import_packages(
                 .extend(packages),
             None => {
                 for package in packages {
-                    let local = package_declared_name(analyzer, &package).unwrap_or_else(|| {
-                        package.rsplit('/').next().unwrap_or(&package).to_string()
-                    });
+                    let local = declared_names
+                        .get(&package)
+                        .cloned()
+                        .unwrap_or_else(|| default_go_import_local_name(&package));
                     by_alias.entry(local).or_default().push(package);
                 }
             }
@@ -887,23 +906,33 @@ fn receiver_type_node(receiver: Node<'_>) -> Option<Node<'_>> {
 
 fn embedded_type_refs(node: Node<'_>) -> impl Iterator<Item = EmbeddedTypeRef<'_>> {
     let mut embedded = Vec::new();
-    let mut stack = vec![node];
-    while let Some(current) = stack.pop() {
-        let mut cursor = current.walk();
-        for child in current.named_children(&mut cursor) {
-            if child.kind() == "field_declaration" && is_embedded_field(child) {
-                if let Some(ty) = child.child_by_field_name("type") {
-                    embedded.push(EmbeddedTypeRef {
-                        node: ty,
-                        pointer: is_pointer_embedded_field(child, ty),
-                    });
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "field_declaration" => collect_embedded_field(child, &mut embedded),
+            "field_declaration_list" => {
+                let mut field_cursor = child.walk();
+                for field in child.named_children(&mut field_cursor) {
+                    if field.kind() == "field_declaration" {
+                        collect_embedded_field(field, &mut embedded);
+                    }
                 }
-            } else {
-                stack.push(child);
             }
+            _ => {}
         }
     }
     embedded.into_iter()
+}
+
+fn collect_embedded_field<'tree>(field: Node<'tree>, embedded: &mut Vec<EmbeddedTypeRef<'tree>>) {
+    if is_embedded_field(field)
+        && let Some(ty) = field.child_by_field_name("type")
+    {
+        embedded.push(EmbeddedTypeRef {
+            node: ty,
+            pointer: is_pointer_embedded_field(field, ty),
+        });
+    }
 }
 
 fn is_embedded_field(node: Node<'_>) -> bool {
@@ -988,13 +1017,21 @@ fn struct_promoted_methods(types: &HashMap<String, GoTypeInfo>, info: &GoTypeInf
     let mut stack: Vec<_> = info
         .embedded
         .iter()
-        .map(|embedded| (embedded.fqn.clone(), embedded.pointer, 1usize))
+        .map(|embedded| {
+            (
+                embedded.fqn.clone(),
+                embedded.pointer,
+                1usize,
+                Vec::<String>::new(),
+            )
+        })
         .collect();
-    let mut seen = HashSet::default();
-    while let Some((fqn, pointer_path, depth)) = stack.pop() {
-        if !seen.insert((fqn.clone(), pointer_path)) {
+    while let Some((fqn, pointer_path, depth, path)) = stack.pop() {
+        if path.iter().any(|seen| seen == &fqn) {
             continue;
         }
+        let mut next_path = path;
+        next_path.push(fqn.clone());
         let Some(embedded_info) = types.get(&fqn) else {
             continue;
         };
@@ -1017,6 +1054,7 @@ fn struct_promoted_methods(types: &HashMap<String, GoTypeInfo>, info: &GoTypeInf
                 nested.fqn.clone(),
                 pointer_path || nested.pointer,
                 depth + 1,
+                next_path.clone(),
             ));
         }
     }
@@ -1136,26 +1174,6 @@ fn channel_direction(node: Node<'_>) -> &'static str {
     }
 }
 
-fn package_declared_name(analyzer: &GoAnalyzer, package: &str) -> Option<String> {
-    analyzer
-        .get_analyzed_files()
-        .into_iter()
-        .filter(|file| analyzer.go_package_of(file).as_deref() == Some(package))
-        .filter_map(|file| {
-            analyzer
-                .project()
-                .read_source(&file)
-                .ok()
-                .map(|source| (file, source))
-        })
-        .find_map(|(_file, source)| {
-            let mut parser = Parser::new();
-            parser.set_language(&tree_sitter_go::LANGUAGE.into()).ok()?;
-            let tree = parser.parse(source.as_str(), None)?;
-            Some(determine_go_package_name(tree.root_node(), &source))
-        })
-}
-
 fn external_qualified_type_token(file: &ParsedGoFile, node: Node<'_>) -> Option<String> {
     let qualifier = node.child_by_field_name("package")?;
     let name = node.child_by_field_name("name")?;
@@ -1175,8 +1193,7 @@ fn method_set_satisfies(candidate: &MethodSet, required: &MethodSet) -> bool {
 
 fn record_structural_relation(
     direct_ancestors: &mut HashMap<String, Vec<CodeUnit>>,
-    direct_descendants: &mut HashMap<String, HashSet<CodeUnit>>,
-    relations: &mut Vec<TypeRelation>,
+    #[cfg(test)] relations: &mut Vec<TypeRelation>,
     from: &CodeUnit,
     to: &CodeUnit,
 ) {
@@ -1184,10 +1201,7 @@ fn record_structural_relation(
     if !ancestors.contains(to) {
         ancestors.push(to.clone());
     }
-    direct_descendants
-        .entry(to.fq_name())
-        .or_default()
-        .insert(from.clone());
+    #[cfg(test)]
     relations.push(TypeRelation {
         from: from.clone(),
         to: to.clone(),
