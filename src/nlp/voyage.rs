@@ -34,6 +34,7 @@ pub const VOYAGE_OUTPUT_DIM: usize = 512;
 /// chunk longer than the budget still runs alone (it can't be split).
 const PADDED_TOKEN_BUDGET: usize = MAX_SEQ_TOKENS;
 const EMBED_PROFILE_ENV: &str = "BIFROST_EMBED_PROFILE";
+const EMBED_DTYPE_ENV: &str = "BIFROST_EMBED_DTYPE";
 
 static FORCE_EMBED_PROFILE: AtomicBool = AtomicBool::new(false);
 
@@ -311,7 +312,7 @@ impl VoyageEmbedder {
     /// Load from a local model directory containing config.json, tokenizer.json, and
     /// model.safetensors.
     pub fn load(model_dir: &Path, device: Device, label: String) -> Result<Self, String> {
-        let dtype = preferred_dtype(&device);
+        let dtype = preferred_dtype(&device)?;
         let cfg: VoyageConfig = {
             let text = std::fs::read_to_string(model_dir.join("config.json"))
                 .map_err(|err| format!("read config.json: {err}"))?;
@@ -326,6 +327,7 @@ impl VoyageEmbedder {
         let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
             .map_err(|err| format!("load tokenizer: {err}"))?;
         let weights = model_dir.join("model.safetensors");
+        let label = format!("{label}:dtype={}", dtype_label(dtype));
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(&[weights], dtype, &device)
                 .map_err(|err| format!("load safetensors: {err}"))?
@@ -351,7 +353,7 @@ impl VoyageEmbedder {
             .map(|text| {
                 self.tokenizer
                     .encode(text.as_str(), true)
-                    .map(|enc| enc.get_ids().len().min(MAX_SEQ_TOKENS).max(1))
+                    .map(|enc| enc.get_ids().len().clamp(1, MAX_SEQ_TOKENS))
                     .unwrap_or(1)
             })
             .collect();
@@ -386,7 +388,7 @@ impl VoyageEmbedder {
     ) -> Result<(), String> {
         let subset: Vec<String> = idx.iter().map(|&i| texts[i].clone()).collect();
         let vecs = self.embed_sub_batch(&subset)?;
-        for (&i, vec) in idx.iter().zip(vecs.into_iter()) {
+        for (&i, vec) in idx.iter().zip(vecs) {
             out[i] = vec;
         }
         Ok(())
@@ -409,7 +411,7 @@ impl VoyageEmbedder {
         let b = encodings.len();
         let token_lens: Vec<usize> = encodings
             .iter()
-            .map(|encoding| encoding.get_ids().len().min(MAX_SEQ_TOKENS).max(1))
+            .map(|encoding| encoding.get_ids().len().clamp(1, MAX_SEQ_TOKENS))
             .collect();
         let min_len = token_lens.iter().copied().min().unwrap_or(1);
         let avg_len = token_lens.iter().sum::<usize>() as f64 / token_lens.len() as f64;
@@ -506,8 +508,27 @@ fn l2_normalize_rows(x: &Tensor) -> candle_core::Result<Tensor> {
     x.broadcast_div(&norm)
 }
 
-/// Weights load and run in f32. bf16 on accelerators is a later optimization; f32
-/// keeps CPU-force runs and the torch-parity test numerically clean.
-fn preferred_dtype(_device: &Device) -> DType {
-    DType::F32
+fn dtype_label(dtype: DType) -> &'static str {
+    match dtype {
+        DType::F32 => "f32",
+        DType::F16 => "f16",
+        DType::BF16 => "bf16",
+        _ => "other",
+    }
+}
+
+/// Use the model's native bf16 by default. Set `BIFROST_EMBED_DTYPE` to override.
+fn preferred_dtype(_device: &Device) -> Result<DType, String> {
+    let Some(value) = std::env::var(EMBED_DTYPE_ENV).ok() else {
+        return Ok(DType::BF16);
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "f32" | "float32" => Ok(DType::F32),
+        "f16" | "fp16" | "float16" => Ok(DType::F16),
+        "bf16" | "bfloat16" => Ok(DType::BF16),
+        "auto" | "native" => Ok(DType::BF16),
+        other => Err(format!(
+            "unsupported {EMBED_DTYPE_ENV}={other:?}; expected f32, f16, bf16, or auto"
+        )),
+    }
 }
