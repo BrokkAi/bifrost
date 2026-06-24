@@ -2,7 +2,10 @@
 //! materializes a `TempDir` workspace, builds a `WorkspaceAnalyzer` over
 //! it, and exposes both for assertions. Test-only.
 
-use crate::analyzer::{AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer};
+use crate::analyzer::{
+    AnalyzerConfig, FilesystemProject, Language, Project, ProjectFile, TestProject,
+    WorkspaceAnalyzer,
+};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,6 +15,7 @@ use tempfile::TempDir;
 pub(crate) struct AnalyzerFixture {
     _temp: TempDir,
     pub(crate) analyzer: WorkspaceAnalyzer,
+    test_project: Option<TestProject>,
 }
 
 impl AnalyzerFixture {
@@ -31,7 +35,32 @@ impl AnalyzerFixture {
         Self {
             _temp: temp,
             analyzer,
+            test_project: None,
         }
+    }
+
+    pub(crate) fn new_for_language(language: Language, files: &[(&str, &str)]) -> Self {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        for (rel, content) in files {
+            ProjectFile::new(root.clone(), rel)
+                .write(content)
+                .unwrap_or_else(|err| panic!("failed to write {rel}: {err}"));
+        }
+        let project = TestProject::new(root, language);
+        let analyzer =
+            WorkspaceAnalyzer::build(Arc::new(project.clone()), AnalyzerConfig::default());
+        Self {
+            _temp: temp,
+            analyzer,
+            test_project: Some(project),
+        }
+    }
+
+    pub(crate) fn test_project(&self) -> &TestProject {
+        self.test_project
+            .as_ref()
+            .expect("fixture was not built with TestProject")
     }
 
     pub(crate) fn project_root(&self) -> PathBuf {

@@ -255,7 +255,7 @@ fn member_short_name(segments: &[String], name: &str) -> String {
 /// AST (not by string-splitting `::`). A plain `(constant)` yields one segment;
 /// a `(scope_resolution)` like `A::B` walks its `scope` and `name` fields to
 /// yield `["A", "B"]`.
-fn extract_name_segments(name_node: Node<'_>, source: &str) -> Vec<String> {
+pub(super) fn extract_name_segments(name_node: Node<'_>, source: &str) -> Vec<String> {
     match name_node.kind() {
         "scope_resolution" => {
             let mut segments = name_node
