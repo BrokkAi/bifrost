@@ -3,6 +3,7 @@ mod cache;
 mod declarations;
 mod hierarchy;
 mod imports;
+mod mixins;
 mod tests;
 
 use crate::analyzer::js_ts::build_weighted_cache;

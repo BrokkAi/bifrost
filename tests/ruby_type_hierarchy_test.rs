@@ -65,14 +65,13 @@ fn multilevel_ancestors_chain() {
 }
 
 #[test]
-fn mixins_are_ancestors() {
+fn mixins_are_not_type_hierarchy_ancestors() {
     let analyzer = analyzer();
     let decls = decls(&analyzer, "inheritance/mixins.rb");
     let duck = find(&decls, "Duck");
     let ancestors = ancestor_identifiers(&analyzer, duck);
-    // include Walkable, include Swimmable, prepend Comparable
-    assert!(ancestors.contains("Walkable"), "got {ancestors:?}");
-    assert!(ancestors.contains("Swimmable"), "got {ancestors:?}");
+    assert!(!ancestors.contains("Walkable"), "got {ancestors:?}");
+    assert!(!ancestors.contains("Swimmable"), "got {ancestors:?}");
 }
 
 #[test]
