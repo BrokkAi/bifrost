@@ -6,11 +6,14 @@
 //! localizer prototype; see `analysis/{bm25,coedit-reranker}/REPORT.md`
 //! there for the sweeps that selected these values.
 
+pub mod active_index;
 pub mod bm25;
 pub mod chunker;
 pub mod engine;
+pub mod gitcache;
 pub mod indexer;
 pub mod keys;
+pub mod materialize;
 pub mod query;
 pub mod store;
 pub mod voyage;

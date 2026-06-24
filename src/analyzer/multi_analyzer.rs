@@ -288,6 +288,12 @@ impl IAnalyzer for MultiAnalyzer {
         )
     }
 
+    fn is_analyzed(&self, file: &ProjectFile) -> bool {
+        self.delegates
+            .values()
+            .any(|delegate| delegate.analyzer().is_analyzed(file))
+    }
+
     fn languages(&self) -> BTreeSet<Language> {
         self.delegates.keys().copied().collect()
     }

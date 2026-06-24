@@ -9,7 +9,12 @@ pub fn run_core_stdio_server(
     root: PathBuf,
     render_options: McpRenderOptions,
 ) -> Result<(), String> {
-    let spec = crate::mcp_registry::resolve_server_spec_for_render_options("core", render_options)?;
+    let git_repo = crate::mcp_registry::workspace_is_git(&root);
+    let spec = crate::mcp_registry::resolve_server_spec_for_render_options(
+        "core",
+        render_options,
+        git_repo,
+    )?;
     run_stdio_server(root, render_options, &spec)
 }
 
@@ -17,8 +22,12 @@ pub fn run_searchtools_stdio_server(
     root: PathBuf,
     render_options: McpRenderOptions,
 ) -> Result<(), String> {
-    let spec =
-        crate::mcp_registry::resolve_server_spec_for_render_options("searchtools", render_options)?;
+    let git_repo = crate::mcp_registry::workspace_is_git(&root);
+    let spec = crate::mcp_registry::resolve_server_spec_for_render_options(
+        "searchtools",
+        render_options,
+        git_repo,
+    )?;
     run_stdio_server(root, render_options, &spec)
 }
 

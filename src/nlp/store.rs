@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
-const DB_FILE_NAME: &str = "semantic_index.db";
+const DB_FILE_NAME: &str = "semantic_cache.db";
 const DB_DIR_NAME: &str = ".brokk";
 const LATEST_SCHEMA_VERSION: i64 = 1;
 const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
@@ -15,8 +15,15 @@ const META_SCHEMA_VERSION: &str = "schema_version";
 const META_EMBED_FINGERPRINT: &str = "embed_fingerprint";
 const META_BM25_TOKENIZER_VERSION: &str = "bm25_tokenizer_version";
 const META_CHUNKER_VERSION: &str = "chunker_version";
+const META_LAST_GC_AT: &str = "last_gc_at";
 const SQLITE_IN_LIMIT: usize = 500;
 
+/// Resolve the per-primary-repo cache path. Worktrees collapse to the primary
+/// repo so every checkout of one repo shares a single content-addressed cache.
+///
+/// Callers must already have gated on git availability (semantic search is git
+/// only); for a non-repo path this still returns a path, but the indexer is
+/// never started there.
 pub fn semantic_db_path(workspace_root: &Path) -> PathBuf {
     let primary_root = Repository::discover(workspace_root)
         .ok()
@@ -69,33 +76,45 @@ pub struct SemanticStore {
     conn: Mutex<Connection>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileState {
-    pub file_hash: [u8; 32],
-    pub mtime_ns: i64,
-    pub size: i64,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct ChunkRowIn<'a> {
+/// A single chunk's persisted metadata, written by `put_blob`. The chunk's own
+/// text and the parent summary's text are NOT stored (re-derived from git on a
+/// fingerprint/chunker change); only the content-hash keys into the vector pools
+/// plus the display metadata and precomputed bm25 tokens are kept.
+#[derive(Debug, Clone)]
+pub struct BlobChunkIn<'a> {
     pub chunk_ord: i64,
     pub kind: &'a str,
     pub symbol: Option<&'a str>,
     pub start_line: Option<i64>,
     pub end_line: Option<i64>,
-    pub composed_key: [u8; 32],
-    pub text_hash: [u8; 32],
     pub fts_tokens: &'a str,
+    /// `hash(text)` — key into `component_vectors`.
+    pub hash: [u8; 32],
+    /// `hash(parent_summary)` — key into `component_vectors` and `blob_summaries`.
+    pub parent_summary_hash: Option<[u8; 32]>,
+    /// `compose(...)` — key into `vectors` (the searchable vector).
+    pub composed_hash: [u8; 32],
 }
 
+/// A chunk row read back for active-index construction. Carries `blob_oid` so the
+/// caller can attach the per-worktree path; `text`/keys for embedding are not
+/// needed here (the vectors already live in the cache, keyed by `composed_hash`).
 #[derive(Debug, Clone, PartialEq)]
-pub struct ScanRow {
-    pub file_path: String,
-    pub kind_is_summary: bool,
+pub struct BlobChunkRow {
+    pub blob_oid: String,
     pub chunk_ord: i64,
-    /// Fully-qualified function name for function chunks; `None` for the
-    /// file-summary chunk.
+    pub kind: String,
     pub symbol: Option<String>,
+    pub start_line: Option<i64>,
+    pub end_line: Option<i64>,
+    pub fts_tokens: String,
+    pub composed_hash: [u8; 32],
+}
+
+/// One row streamed by `scan_active_vectors`: a searchable vector and its key.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VectorRow {
+    pub composed_hash: [u8; 32],
     pub vector: Vec<f32>,
 }
 
@@ -115,305 +134,322 @@ impl SemanticStore {
         conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
 
         migrate(&mut conn)?;
+        conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS active_chunks(
+                 composed_hash BLOB PRIMARY KEY
+             ) WITHOUT ROWID;",
+        )?;
 
         Ok(Self {
             conn: Mutex::new(conn),
         })
     }
 
-    pub fn ensure_embed_fingerprint(&self, fingerprint: &str) -> Result<bool> {
-        let mut conn = self.conn.lock().expect("semantic store mutex poisoned");
-        let tx = conn.transaction()?;
-        let stored = meta_value_tx(&tx, META_EMBED_FINGERPRINT)?;
-        let wiped = match stored {
-            None => false,
-            Some(value) if value == fingerprint => false,
-            Some(_) => {
-                tx.execute("DELETE FROM vectors", [])?;
-                tx.execute("DELETE FROM component_vectors", [])?;
-                tx.execute("DELETE FROM chunks", [])?;
-                tx.execute("DELETE FROM files", [])?;
-                true
-            }
-        };
-        set_meta_value_tx(&tx, META_EMBED_FINGERPRINT, fingerprint)?;
-        tx.commit()?;
-        Ok(wiped)
-    }
-
-    pub fn ensure_text_versions(
+    /// Wipe all cached content when the embedding fingerprint or text-derivation
+    /// versions change. Because chunk/summary text is not persisted, a version
+    /// bump means the cache must be rebuilt from git, so we drop everything and
+    /// let the next full build re-materialize. Returns whether a wipe happened.
+    pub fn ensure_index_compatible(
         &self,
-        bm25_tokenizer_version: &str,
+        fingerprint: &str,
         chunker_version: &str,
+        bm25_tokenizer_version: &str,
     ) -> Result<bool> {
         let mut conn = self.conn.lock().expect("semantic store mutex poisoned");
         let tx = conn.transaction()?;
-        let stored_bm25 = meta_value_tx(&tx, META_BM25_TOKENIZER_VERSION)?;
+        let stored_fp = meta_value_tx(&tx, META_EMBED_FINGERPRINT)?;
         let stored_chunker = meta_value_tx(&tx, META_CHUNKER_VERSION)?;
-        let first_run = stored_bm25.is_none() && stored_chunker.is_none();
-        let matches = stored_bm25.as_deref() == Some(bm25_tokenizer_version)
-            && stored_chunker.as_deref() == Some(chunker_version);
+        let stored_bm25 = meta_value_tx(&tx, META_BM25_TOKENIZER_VERSION)?;
+        let first_run =
+            stored_fp.is_none() && stored_chunker.is_none() && stored_bm25.is_none();
+        let matches = stored_fp.as_deref() == Some(fingerprint)
+            && stored_chunker.as_deref() == Some(chunker_version)
+            && stored_bm25.as_deref() == Some(bm25_tokenizer_version);
         let wiped = if first_run || matches {
             false
         } else {
-            tx.execute("DELETE FROM chunks", [])?;
-            tx.execute("DELETE FROM files", [])?;
-            tx.execute("DELETE FROM bm25_idx", [])?;
-            tx.execute("DELETE FROM bm25_docs", [])?;
+            // blob_chunks cascade from blobs.
+            tx.execute("DELETE FROM blobs", [])?;
+            tx.execute("DELETE FROM blob_summaries", [])?;
+            tx.execute("DELETE FROM vectors", [])?;
+            tx.execute("DELETE FROM component_vectors", [])?;
             true
         };
-        set_meta_value_tx(&tx, META_BM25_TOKENIZER_VERSION, bm25_tokenizer_version)?;
+        set_meta_value_tx(&tx, META_EMBED_FINGERPRINT, fingerprint)?;
         set_meta_value_tx(&tx, META_CHUNKER_VERSION, chunker_version)?;
+        set_meta_value_tx(&tx, META_BM25_TOKENIZER_VERSION, bm25_tokenizer_version)?;
         tx.commit()?;
         Ok(wiped)
     }
 
-    pub fn workspace_id(&self, root_path: &str) -> Result<i64> {
-        let conn = self.conn.lock().expect("semantic store mutex poisoned");
-        conn.execute(
-            "INSERT OR IGNORE INTO workspaces(root_path) VALUES(?1)",
-            [root_path],
-        )?;
-        let id = conn.query_row(
-            "SELECT workspace_id FROM workspaces WHERE root_path = ?1",
-            [root_path],
-            |row| row.get(0),
-        )?;
-        Ok(id)
-    }
+    // ---- materialization (write path) ------------------------------------
 
-    pub fn file_states(&self, workspace_id: i64) -> Result<HashMap<String, FileState>> {
+    /// Which of `oids` are not yet materialized in the cache.
+    pub fn missing_blobs(&self, oids: &[String]) -> Result<Vec<String>> {
         let conn = self.conn.lock().expect("semantic store mutex poisoned");
-        let mut stmt = conn.prepare(
-            "SELECT file_path, file_hash, mtime_ns, size
-             FROM files
-             WHERE workspace_id = ?1",
-        )?;
-        let mut rows = stmt.query([workspace_id])?;
-        let mut out = HashMap::new();
-        while let Some(row) = rows.next()? {
-            out.insert(
-                row.get::<_, String>(0)?,
-                FileState {
-                    file_hash: decode_key_blob(row.get::<_, Vec<u8>>(1)?)?,
-                    mtime_ns: row.get(2)?,
-                    size: row.get(3)?,
-                },
-            );
+        let mut stmt = conn.prepare("SELECT 1 FROM blobs WHERE blob_oid = ?1 LIMIT 1")?;
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for oid in oids {
+            if !seen.insert(oid.clone()) {
+                continue;
+            }
+            let exists = stmt
+                .query_row([oid], |_| Ok(()))
+                .optional()?
+                .is_some();
+            if !exists {
+                out.push(oid.clone());
+            }
         }
         Ok(out)
     }
 
-    pub fn remove_files(&self, workspace_id: i64, paths: &[String]) -> Result<()> {
-        if paths.is_empty() {
-            return Ok(());
-        }
-
-        let mut conn = self.conn.lock().expect("semantic store mutex poisoned");
-        let tx = conn.transaction()?;
-        let mut delete_chunks =
-            tx.prepare("DELETE FROM chunks WHERE workspace_id = ?1 AND file_path = ?2")?;
-        let mut delete_files =
-            tx.prepare("DELETE FROM files WHERE workspace_id = ?1 AND file_path = ?2")?;
-        for path in paths {
-            delete_chunks.execute(params![workspace_id, path])?;
-            delete_files.execute(params![workspace_id, path])?;
-        }
-        drop(delete_chunks);
-        drop(delete_files);
-        tx.commit()?;
-        Ok(())
+    pub fn missing_component_hashes(&self, hashes: &[[u8; 32]]) -> Result<Vec<[u8; 32]>> {
+        self.missing_hashes("component_vectors", "hash", hashes)
     }
 
-    pub fn touch_built(&self, workspace_id: i64) -> Result<()> {
+    pub fn missing_composed_hashes(&self, hashes: &[[u8; 32]]) -> Result<Vec<[u8; 32]>> {
+        self.missing_hashes("vectors", "composed_hash", hashes)
+    }
+
+    pub fn component_vectors(&self, hashes: &[[u8; 32]]) -> Result<HashMap<[u8; 32], Vec<f32>>> {
         let conn = self.conn.lock().expect("semantic store mutex poisoned");
-        conn.execute(
-            "UPDATE workspaces SET last_built_at = ?2 WHERE workspace_id = ?1",
-            params![workspace_id, now_unix_seconds()],
-        )?;
-        Ok(())
-    }
-
-    pub fn missing_component_keys(&self, keys: &[[u8; 32]]) -> Result<Vec<[u8; 32]>> {
-        self.missing_keys("component_vectors", keys)
-    }
-
-    pub fn missing_composed_keys(&self, keys: &[[u8; 32]]) -> Result<Vec<[u8; 32]>> {
-        self.missing_keys("vectors", keys)
-    }
-
-    pub fn component_vectors(&self, keys: &[[u8; 32]]) -> Result<HashMap<[u8; 32], Vec<f32>>> {
-        let mut conn = self.conn.lock().expect("semantic store mutex poisoned");
-        let tx = conn.transaction()?;
-        let now = now_unix_seconds();
-        let mut select = tx.prepare("SELECT vector FROM component_vectors WHERE key = ?1")?;
-        let mut update =
-            tx.prepare("UPDATE component_vectors SET last_used_at = ?2 WHERE key = ?1")?;
+        let mut select = conn.prepare("SELECT vector FROM component_vectors WHERE hash = ?1")?;
         let mut out = HashMap::new();
         let mut seen = HashSet::new();
-        for key in keys {
-            if !seen.insert(*key) {
+        for hash in hashes {
+            if !seen.insert(*hash) {
                 continue;
             }
             let vector_blob: Option<Vec<u8>> = select
-                .query_row(params![key.as_slice()], |row| row.get(0))
+                .query_row(params![hash.as_slice()], |row| row.get(0))
                 .optional()?;
             if let Some(vector_blob) = vector_blob {
-                update.execute(params![key.as_slice(), now])?;
-                out.insert(*key, blob_to_vector(&vector_blob));
+                out.insert(*hash, blob_to_vector(&vector_blob));
             }
         }
-        drop(select);
-        drop(update);
-        tx.commit()?;
         Ok(out)
     }
 
     pub fn upsert_component_vectors(&self, items: &[([u8; 32], Vec<f32>)]) -> Result<()> {
-        if items.is_empty() {
-            return Ok(());
-        }
-
-        let mut conn = self.conn.lock().expect("semantic store mutex poisoned");
-        let tx = conn.transaction()?;
-        let now = now_unix_seconds();
-        let mut stmt = tx.prepare(
-            "INSERT INTO component_vectors(key, dim, vector, last_used_at)
-             VALUES(?1, ?2, ?3, ?4)
-             ON CONFLICT(key) DO NOTHING",
-        )?;
-        for (key, vector) in items {
-            stmt.execute(params![
-                key.as_slice(),
-                vector.len() as i64,
-                vector_to_blob(vector),
-                now
-            ])?;
-        }
-        drop(stmt);
-        tx.commit()?;
-        Ok(())
+        self.upsert_vectors("component_vectors", "hash", items)
     }
 
     pub fn upsert_composed_vectors(&self, items: &[([u8; 32], Vec<f32>)]) -> Result<()> {
+        self.upsert_vectors("vectors", "composed_hash", items)
+    }
+
+    fn upsert_vectors(
+        &self,
+        table: &str,
+        key_col: &str,
+        items: &[([u8; 32], Vec<f32>)],
+    ) -> Result<()> {
         if items.is_empty() {
             return Ok(());
         }
-
         let mut conn = self.conn.lock().expect("semantic store mutex poisoned");
         let tx = conn.transaction()?;
-        let mut stmt = tx.prepare(
-            "INSERT INTO vectors(key, dim, vector)
-             VALUES(?1, ?2, ?3)
-             ON CONFLICT(key) DO NOTHING",
-        )?;
+        let sql = format!(
+            "INSERT INTO {table}({key_col}, dim, vector) VALUES(?1, ?2, ?3)
+             ON CONFLICT({key_col}) DO NOTHING"
+        );
+        let mut stmt = tx.prepare(&sql)?;
         for (key, vector) in items {
-            stmt.execute(params![
-                key.as_slice(),
-                vector.len() as i64,
-                vector_to_blob(vector)
-            ])?;
+            stmt.execute(params![key.as_slice(), vector.len() as i64, vector_to_blob(vector)])?;
         }
         drop(stmt);
         tx.commit()?;
         Ok(())
     }
 
-    pub fn replace_file_chunks(
+    /// Replace one blob's materialized chunks (and intern its parent summaries).
+    /// The component/composed vectors must already be upserted.
+    pub fn put_blob(
         &self,
-        workspace_id: i64,
-        file_path: &str,
-        state: &FileState,
-        rows: &[ChunkRowIn<'_>],
+        blob_oid: &str,
+        language: Option<&str>,
+        chunks: &[BlobChunkIn<'_>],
     ) -> Result<()> {
         let mut conn = self.conn.lock().expect("semantic store mutex poisoned");
         let tx = conn.transaction()?;
         tx.execute(
-            "INSERT INTO files(workspace_id, file_path, file_hash, mtime_ns, size)
-             VALUES(?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(workspace_id, file_path) DO UPDATE SET
-                 file_hash = excluded.file_hash,
-                 mtime_ns = excluded.mtime_ns,
-                 size = excluded.size",
-            params![
-                workspace_id,
-                file_path,
-                state.file_hash.as_slice(),
-                state.mtime_ns,
-                state.size
-            ],
+            "INSERT INTO blobs(blob_oid, language) VALUES(?1, ?2)
+             ON CONFLICT(blob_oid) DO UPDATE SET
+                 language = excluded.language,
+                 materialized_at = datetime('now')",
+            params![blob_oid, language],
         )?;
-        tx.execute(
-            "DELETE FROM chunks WHERE workspace_id = ?1 AND file_path = ?2",
-            params![workspace_id, file_path],
-        )?;
+        tx.execute("DELETE FROM blob_chunks WHERE blob_oid = ?1", [blob_oid])?;
 
-        let mut insert_doc = tx.prepare(
-            "INSERT INTO bm25_docs(text_hash) VALUES(?1)
-             ON CONFLICT(text_hash) DO NOTHING",
+        let mut intern_summary = tx.prepare(
+            "INSERT INTO blob_summaries(hash) VALUES(?1) ON CONFLICT(hash) DO NOTHING",
         )?;
-        let mut select_doc = tx.prepare("SELECT doc_id FROM bm25_docs WHERE text_hash = ?1")?;
-        let mut insert_fts = tx.prepare("INSERT INTO bm25_idx(rowid, tokens) VALUES(?1, ?2)")?;
+        let mut select_summary =
+            tx.prepare("SELECT blob_summary_id FROM blob_summaries WHERE hash = ?1")?;
         let mut insert_chunk = tx.prepare(
-            "INSERT INTO chunks(
-                 workspace_id, file_path, chunk_ord, kind, symbol,
-                 start_line, end_line, composed_key, bm25_doc_id
-             )
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO blob_chunks(
+                 blob_oid, chunk_ord, kind, symbol, start_line, end_line,
+                 fts_tokens, hash, parent_summary_id, composed_hash
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         )?;
-        for row in rows {
-            let inserted = insert_doc.execute(params![row.text_hash.as_slice()])? > 0;
-            let doc_id: i64 =
-                select_doc.query_row(params![row.text_hash.as_slice()], |db_row| db_row.get(0))?;
-            if inserted {
-                insert_fts.execute(params![doc_id, row.fts_tokens])?;
-            }
+        let mut summary_ids: HashMap<[u8; 32], i64> = HashMap::new();
+        for chunk in chunks {
+            let parent_summary_id = match chunk.parent_summary_hash {
+                None => None,
+                Some(hash) => {
+                    let id = match summary_ids.get(&hash) {
+                        Some(id) => *id,
+                        None => {
+                            intern_summary.execute(params![hash.as_slice()])?;
+                            let id: i64 = select_summary
+                                .query_row(params![hash.as_slice()], |row| row.get(0))?;
+                            summary_ids.insert(hash, id);
+                            id
+                        }
+                    };
+                    Some(id)
+                }
+            };
             insert_chunk.execute(params![
-                workspace_id,
-                file_path,
-                row.chunk_ord,
-                row.kind,
-                row.symbol,
-                row.start_line,
-                row.end_line,
-                row.composed_key.as_slice(),
-                doc_id
+                blob_oid,
+                chunk.chunk_ord,
+                chunk.kind,
+                chunk.symbol,
+                chunk.start_line,
+                chunk.end_line,
+                chunk.fts_tokens,
+                chunk.hash.as_slice(),
+                parent_summary_id,
+                chunk.composed_hash.as_slice(),
             ])?;
         }
-        drop(insert_doc);
-        drop(select_doc);
-        drop(insert_fts);
+        drop(intern_summary);
+        drop(select_summary);
         drop(insert_chunk);
         tx.commit()?;
         Ok(())
     }
 
-    pub fn scan_vectors(
+    // ---- active-index construction (read path) ---------------------------
+
+    /// All chunk rows for the given blob OIDs, for building the in-memory active
+    /// index. Returned rows carry `blob_oid`; the caller groups + attaches paths.
+    pub fn chunks_for_oids(&self, oids: &[String]) -> Result<Vec<BlobChunkRow>> {
+        let conn = self.conn.lock().expect("semantic store mutex poisoned");
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        let unique: Vec<&String> = oids.iter().filter(|oid| seen.insert(*oid)).collect();
+        for batch in unique.chunks(SQLITE_IN_LIMIT) {
+            let placeholders = std::iter::repeat_n("?", batch.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT blob_oid, chunk_ord, kind, symbol, start_line, end_line,
+                        fts_tokens, composed_hash
+                 FROM blob_chunks
+                 WHERE blob_oid IN ({placeholders})
+                 ORDER BY blob_oid, chunk_ord"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let params_iter = batch
+                .iter()
+                .map(|oid| rusqlite::types::Value::Text((*oid).clone()));
+            let mut rows = stmt.query(rusqlite::params_from_iter(params_iter))?;
+            while let Some(row) = rows.next()? {
+                out.push(BlobChunkRow {
+                    blob_oid: row.get(0)?,
+                    chunk_ord: row.get(1)?,
+                    kind: row.get(2)?,
+                    symbol: row.get(3)?,
+                    start_line: row.get(4)?,
+                    end_line: row.get(5)?,
+                    fts_tokens: row.get(6)?,
+                    composed_hash: decode_key_blob(row.get::<_, Vec<u8>>(7)?)?,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Set the connection-local active set used to scope `scan_active_vectors`.
+    /// `active_chunks` is a TEMP table (per connection), so concurrent worktree
+    /// processes on the shared DB file never collide.
+    pub fn set_active_composed_hashes(&self, hashes: &HashSet<[u8; 32]>) -> Result<()> {
+        let mut conn = self.conn.lock().expect("semantic store mutex poisoned");
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM active_chunks", [])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO active_chunks(composed_hash) VALUES(?1)
+                 ON CONFLICT(composed_hash) DO NOTHING",
+            )?;
+            for hash in hashes {
+                stmt.execute(params![hash.as_slice()])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Incrementally add composed hashes to the active set (watcher add path).
+    pub fn add_active_composed(&self, hashes: &[[u8; 32]]) -> Result<()> {
+        if hashes.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().expect("semantic store mutex poisoned");
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO active_chunks(composed_hash) VALUES(?1)
+                 ON CONFLICT(composed_hash) DO NOTHING",
+            )?;
+            for hash in hashes {
+                stmt.execute(params![hash.as_slice()])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Incrementally drop composed hashes from the active set (watcher evict path).
+    pub fn remove_active_composed(&self, hashes: &[[u8; 32]]) -> Result<()> {
+        if hashes.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().expect("semantic store mutex poisoned");
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare("DELETE FROM active_chunks WHERE composed_hash = ?1")?;
+            for hash in hashes {
+                stmt.execute(params![hash.as_slice()])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Stream the active set's searchable vectors in batches. Producer side of
+    /// the parallel vector scan: consumers score cosine off-thread.
+    pub fn scan_active_vectors(
         &self,
-        workspace_id: i64,
         batch_size: usize,
-        visit: &mut dyn FnMut(Vec<ScanRow>),
+        visit: &mut dyn FnMut(Vec<VectorRow>),
     ) -> Result<()> {
         let effective_batch = batch_size.max(1);
         let conn = self.conn.lock().expect("semantic store mutex poisoned");
         let mut stmt = conn.prepare(
-            "SELECT c.file_path, c.kind, c.chunk_ord, c.symbol, v.vector
-             FROM chunks c
-             JOIN vectors v ON v.key = c.composed_key
-             WHERE c.workspace_id = ?1
-             ORDER BY c.file_path, c.chunk_ord",
+            "SELECT v.composed_hash, v.vector
+             FROM vectors v
+             JOIN active_chunks a ON a.composed_hash = v.composed_hash",
         )?;
-        let mut rows = stmt.query([workspace_id])?;
+        let mut rows = stmt.query([])?;
         let mut batch = Vec::with_capacity(effective_batch);
         while let Some(row) = rows.next()? {
-            let kind: String = row.get(1)?;
-            let vector_blob: Vec<u8> = row.get(4)?;
-            batch.push(ScanRow {
-                file_path: row.get(0)?,
-                kind_is_summary: kind == "file_summary",
-                chunk_ord: row.get(2)?,
-                symbol: row.get(3)?,
-                vector: blob_to_vector(&vector_blob),
+            batch.push(VectorRow {
+                composed_hash: decode_key_blob(row.get::<_, Vec<u8>>(0)?)?,
+                vector: blob_to_vector(&row.get::<_, Vec<u8>>(1)?),
             });
             if batch.len() == effective_batch {
                 visit(std::mem::take(&mut batch));
@@ -426,141 +462,95 @@ impl SemanticStore {
         Ok(())
     }
 
-    /// BM25 relevance per function symbol (fqfn). The file-summary chunk has no
-    /// symbol and is excluded; a symbol's score is the max over its chunks.
-    pub fn bm25_symbol_scores(
-        &self,
-        workspace_id: i64,
-        match_query: &str,
-        limit: usize,
-    ) -> Result<Vec<(String, f64)>> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
+    // ---- garbage collection ----------------------------------------------
 
-        let conn = self.conn.lock().expect("semantic store mutex poisoned");
-        let mut fts_stmt = conn.prepare(
-            "SELECT rowid, bm25(bm25_idx)
-             FROM bm25_idx
-             WHERE bm25_idx MATCH ?1",
-        )?;
-        let mut fts_rows = fts_stmt.query([match_query])?;
-        let mut doc_scores = HashMap::<i64, f64>::new();
-        while let Some(row) = fts_rows.next()? {
-            let doc_id: i64 = row.get(0)?;
-            let score: f64 = -row.get::<_, f64>(1)?;
-            doc_scores.insert(doc_id, score);
-        }
-        drop(fts_rows);
-        drop(fts_stmt);
-        if doc_scores.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut symbol_scores = HashMap::<String, f64>::new();
-        let doc_ids: Vec<i64> = doc_scores.keys().copied().collect();
-        for chunk in doc_ids.chunks(SQLITE_IN_LIMIT) {
-            let placeholders = std::iter::repeat_n("?", chunk.len())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let sql = format!(
-                "SELECT symbol, bm25_doc_id
-                 FROM chunks
-                 WHERE workspace_id = ? AND symbol IS NOT NULL
-                   AND bm25_doc_id IN ({placeholders})"
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let params_iter = std::iter::once(rusqlite::types::Value::Integer(workspace_id))
-                .chain(chunk.iter().copied().map(rusqlite::types::Value::Integer));
-            let mut rows = stmt.query(rusqlite::params_from_iter(params_iter))?;
-            while let Some(row) = rows.next()? {
-                let symbol: String = row.get(0)?;
-                let doc_id: i64 = row.get(1)?;
-                if let Some(score) = doc_scores.get(&doc_id) {
-                    symbol_scores
-                        .entry(symbol)
-                        .and_modify(|best| {
-                            if *score > *best {
-                                *best = *score;
-                            }
-                        })
-                        .or_insert(*score);
-                }
-            }
-        }
-
-        let mut scored: Vec<(String, f64)> = symbol_scores.into_iter().collect();
-        scored.sort_by(|(sym_a, score_a), (sym_b, score_b)| {
-            score_b
-                .partial_cmp(score_a)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| sym_a.cmp(sym_b))
-        });
-        scored.truncate(limit);
-        Ok(scored)
-    }
-
-    pub fn gc(&self, component_ttl_secs: i64) -> Result<()> {
+    /// Drop everything no longer reachable from git (or held by a worktree's
+    /// uncommitted working set). `live` is the union of reachable blob OIDs and
+    /// currently-checked-out dirty/untracked OIDs.
+    pub fn gc(&self, live: &HashSet<String>) -> Result<()> {
         let mut conn = self.conn.lock().expect("semantic store mutex poisoned");
         let tx = conn.transaction()?;
-
+        tx.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS gc_live(oid TEXT PRIMARY KEY) WITHOUT ROWID;
+             DELETE FROM gc_live;",
+        )?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO gc_live(oid) VALUES(?1) ON CONFLICT(oid) DO NOTHING",
+            )?;
+            for oid in live {
+                stmt.execute([oid])?;
+            }
+        }
+        // blob_chunks cascade from blobs.
+        tx.execute(
+            "DELETE FROM blobs WHERE blob_oid NOT IN (SELECT oid FROM gc_live)",
+            [],
+        )?;
         tx.execute(
             "DELETE FROM vectors
-             WHERE NOT EXISTS (
-                 SELECT 1 FROM chunks WHERE chunks.composed_key = vectors.key
+             WHERE composed_hash NOT IN (SELECT composed_hash FROM blob_chunks)",
+            [],
+        )?;
+        tx.execute(
+            "DELETE FROM blob_summaries
+             WHERE blob_summary_id NOT IN (
+                 SELECT parent_summary_id FROM blob_chunks
+                 WHERE parent_summary_id IS NOT NULL
              )",
             [],
         )?;
-
-        let mut orphan_stmt = tx.prepare(
-            "SELECT doc_id FROM bm25_docs
-             WHERE NOT EXISTS (
-                 SELECT 1 FROM chunks WHERE chunks.bm25_doc_id = bm25_docs.doc_id
-             )",
-        )?;
-        let mut orphan_rows = orphan_stmt.query([])?;
-        let mut orphan_doc_ids = Vec::new();
-        while let Some(row) = orphan_rows.next()? {
-            orphan_doc_ids.push(row.get::<_, i64>(0)?);
-        }
-        drop(orphan_rows);
-        drop(orphan_stmt);
-        let mut delete_fts = tx.prepare("DELETE FROM bm25_idx WHERE rowid = ?1")?;
-        let mut delete_doc = tx.prepare("DELETE FROM bm25_docs WHERE doc_id = ?1")?;
-        for doc_id in orphan_doc_ids {
-            delete_fts.execute([doc_id])?;
-            delete_doc.execute([doc_id])?;
-        }
-        drop(delete_fts);
-        drop(delete_doc);
-
-        let cutoff = now_unix_seconds() - component_ttl_secs;
         tx.execute(
-            "DELETE FROM component_vectors WHERE last_used_at < ?1",
-            [cutoff],
+            "DELETE FROM component_vectors
+             WHERE hash NOT IN (
+                 SELECT hash FROM blob_chunks
+                 UNION SELECT hash FROM blob_summaries
+             )",
+            [],
         )?;
-
+        tx.execute("DROP TABLE gc_live", [])?;
+        set_meta_value_tx(&tx, META_LAST_GC_AT, &now_unix_seconds().to_string())?;
         tx.commit()?;
         conn.pragma_update(None, "incremental_vacuum", 0)?;
         Ok(())
     }
 
-    fn missing_keys(&self, table: &str, keys: &[[u8; 32]]) -> Result<Vec<[u8; 32]>> {
+    /// Seconds since the last `gc`, or `None` if never run.
+    pub fn seconds_since_gc(&self) -> Result<Option<i64>> {
         let conn = self.conn.lock().expect("semantic store mutex poisoned");
-        let sql = format!("SELECT 1 FROM {table} WHERE key = ?1 LIMIT 1");
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                [META_LAST_GC_AT],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(stored
+            .and_then(|value| value.parse::<i64>().ok())
+            .map(|at| now_unix_seconds() - at))
+    }
+
+    fn missing_hashes(
+        &self,
+        table: &str,
+        key_col: &str,
+        hashes: &[[u8; 32]],
+    ) -> Result<Vec<[u8; 32]>> {
+        let conn = self.conn.lock().expect("semantic store mutex poisoned");
+        let sql = format!("SELECT 1 FROM {table} WHERE {key_col} = ?1 LIMIT 1");
         let mut stmt = conn.prepare(&sql)?;
         let mut out = Vec::new();
         let mut seen = HashSet::new();
-        for key in keys {
-            if !seen.insert(*key) {
+        for hash in hashes {
+            if !seen.insert(*hash) {
                 continue;
             }
             let exists = stmt
-                .query_row(params![key.as_slice()], |_row| Ok(()))
+                .query_row(params![hash.as_slice()], |_| Ok(()))
                 .optional()?
                 .is_some();
             if !exists {
-                out.push(*key);
+                out.push(*hash);
             }
         }
         Ok(out)
@@ -570,82 +560,84 @@ impl SemanticStore {
 fn migrate(conn: &mut Connection) -> Result<()> {
     assert_sqlite_version(conn)?;
     let current = schema_version(conn)?;
-    if current > LATEST_SCHEMA_VERSION {
-        return Err(StoreError::new(format!(
-            "semantic store schema version {current} is newer than supported version {LATEST_SCHEMA_VERSION}"
-        )));
+    if current != 0 && current != LATEST_SCHEMA_VERSION {
+        // The index is a rebuildable cache: on any schema mismatch, drop and
+        // recreate rather than carry migration code.
+        recreate_schema(conn)?;
+        return Ok(());
     }
-
-    for version in (current + 1)..=LATEST_SCHEMA_VERSION {
+    if current == 0 {
         let tx = conn.transaction()?;
-        apply_migration(&tx, version)?;
-        set_meta_value_tx(&tx, META_SCHEMA_VERSION, &version.to_string())?;
+        create_schema(&tx)?;
+        set_meta_value_tx(&tx, META_SCHEMA_VERSION, &LATEST_SCHEMA_VERSION.to_string())?;
         tx.commit()?;
     }
     Ok(())
 }
 
-fn apply_migration(tx: &rusqlite::Transaction<'_>, version: i64) -> Result<()> {
-    match version {
-        1 => {
-            tx.execute_batch(
-                r#"
-                CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                CREATE TABLE workspaces(
-                  workspace_id INTEGER PRIMARY KEY,
-                  root_path TEXT NOT NULL UNIQUE,
-                  last_built_at INTEGER
-                );
-                CREATE TABLE files(
-                  workspace_id INTEGER NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
-                  file_path TEXT NOT NULL,
-                  file_hash BLOB NOT NULL,
-                  mtime_ns INTEGER NOT NULL,
-                  size INTEGER NOT NULL,
-                  PRIMARY KEY(workspace_id, file_path)
-                );
-                CREATE TABLE chunks(
-                  workspace_id INTEGER NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
-                  file_path TEXT NOT NULL,
-                  chunk_ord INTEGER NOT NULL,
-                  kind TEXT NOT NULL,
-                  symbol TEXT,
-                  start_line INTEGER,
-                  end_line INTEGER,
-                  composed_key BLOB NOT NULL,
-                  bm25_doc_id INTEGER,
-                  PRIMARY KEY(workspace_id, file_path, chunk_ord)
-                );
-                CREATE INDEX chunks_by_workspace_key ON chunks(workspace_id, composed_key);
-                CREATE INDEX chunks_by_doc ON chunks(bm25_doc_id);
-                CREATE TABLE vectors(
-                  key BLOB PRIMARY KEY,
-                  dim INTEGER NOT NULL,
-                  vector BLOB NOT NULL
-                ) WITHOUT ROWID;
-                CREATE TABLE component_vectors(
-                  key BLOB PRIMARY KEY,
-                  dim INTEGER NOT NULL,
-                  vector BLOB NOT NULL,
-                  last_used_at INTEGER NOT NULL
-                ) WITHOUT ROWID;
-                CREATE TABLE bm25_docs(
-                  doc_id INTEGER PRIMARY KEY,
-                  text_hash BLOB NOT NULL UNIQUE
-                );
-                CREATE VIRTUAL TABLE bm25_idx USING fts5(
-                  tokens,
-                  content='',
-                  contentless_delete=1
-                );
-                "#,
-            )?;
-            Ok(())
-        }
-        other => Err(StoreError::new(format!(
-            "no semantic store migration registered for schema version {other}"
-        ))),
-    }
+fn recreate_schema(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction()?;
+    tx.execute_batch(
+        "DROP TABLE IF EXISTS blob_chunks;
+         DROP TABLE IF EXISTS blob_summaries;
+         DROP TABLE IF EXISTS blobs;
+         DROP TABLE IF EXISTS vectors;
+         DROP TABLE IF EXISTS component_vectors;
+         DROP TABLE IF EXISTS meta;",
+    )?;
+    create_schema(&tx)?;
+    set_meta_value_tx(&tx, META_SCHEMA_VERSION, &LATEST_SCHEMA_VERSION.to_string())?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn create_schema(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    tx.execute_batch(
+        r#"
+        CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+
+        CREATE TABLE blobs(
+          blob_oid        TEXT PRIMARY KEY,
+          language        TEXT,
+          materialized_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE blob_summaries(
+          blob_summary_id INTEGER PRIMARY KEY,
+          hash            BLOB NOT NULL UNIQUE
+        );
+
+        CREATE TABLE blob_chunks(
+          blob_oid          TEXT NOT NULL REFERENCES blobs(blob_oid) ON DELETE CASCADE,
+          chunk_ord         INTEGER NOT NULL,
+          kind              TEXT NOT NULL,
+          symbol            TEXT,
+          start_line        INTEGER,
+          end_line          INTEGER,
+          fts_tokens        TEXT NOT NULL,
+          hash              BLOB NOT NULL,
+          parent_summary_id INTEGER REFERENCES blob_summaries(blob_summary_id),
+          composed_hash     BLOB NOT NULL,
+          PRIMARY KEY(blob_oid, chunk_ord)
+        ) WITHOUT ROWID;
+        CREATE INDEX blob_chunks_by_hash     ON blob_chunks(hash);
+        CREATE INDEX blob_chunks_by_parent   ON blob_chunks(parent_summary_id);
+        CREATE INDEX blob_chunks_by_composed ON blob_chunks(composed_hash);
+
+        CREATE TABLE component_vectors(
+          hash   BLOB PRIMARY KEY,
+          dim    INTEGER NOT NULL,
+          vector BLOB NOT NULL
+        ) WITHOUT ROWID;
+
+        CREATE TABLE vectors(
+          composed_hash BLOB PRIMARY KEY,
+          dim           INTEGER NOT NULL,
+          vector        BLOB NOT NULL
+        ) WITHOUT ROWID;
+        "#,
+    )?;
+    Ok(())
 }
 
 fn schema_version(conn: &Connection) -> Result<i64> {
@@ -740,30 +732,133 @@ fn now_unix_seconds() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nlp::keys::content_hash;
-    use tempfile::TempDir;
+    use std::process::Command;
 
-    #[test]
-    fn semantic_db_path_uses_workspace_for_plain_dir() {
-        let temp = TempDir::new().unwrap();
-        assert_eq!(
-            semantic_db_path(temp.path()),
-            temp.path().join(".brokk/semantic_index.db")
-        );
+    fn open_temp() -> (tempfile::TempDir, SemanticStore) {
+        let temp = tempfile::TempDir::new().unwrap();
+        let store = SemanticStore::open(&temp.path().join("semantic_cache.db")).unwrap();
+        (temp, store)
+    }
+
+    fn chunk(ord: i64, hash: [u8; 32], composed: [u8; 32], parent: Option<[u8; 32]>) -> BlobChunkIn<'static> {
+        BlobChunkIn {
+            chunk_ord: ord,
+            kind: if ord == 0 { "file_summary" } else { "function" },
+            symbol: if ord == 0 { None } else { Some("pkg.Cls.method") },
+            start_line: Some(ord),
+            end_line: Some(ord + 5),
+            fts_tokens: "alpha beta gamma",
+            hash,
+            parent_summary_hash: parent,
+            composed_hash: composed,
+        }
+    }
+
+    fn run_git<const N: usize>(dir: &Path, args: [&str; N]) {
+        let status = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
     }
 
     #[test]
-    fn semantic_db_path_uses_repo_root_for_git_repo() {
-        let temp = TempDir::new().unwrap();
-        Repository::init(temp.path()).unwrap();
-        let nested = temp.path().join("nested").join("deeper");
-        std::fs::create_dir_all(&nested).unwrap();
-        assert_semantic_db_path_root(&nested, temp.path());
+    fn put_blob_roundtrips_chunks_and_dedupes_summaries() {
+        let (_temp, store) = open_temp();
+        let parent = [9u8; 32];
+        store
+            .upsert_component_vectors(&[([1; 32], vec![1.0, 0.0]), (parent, vec![0.0, 1.0])])
+            .unwrap();
+        store
+            .upsert_composed_vectors(&[([5; 32], vec![1.0, 0.0]), ([6; 32], vec![0.0, 1.0])])
+            .unwrap();
+        store
+            .put_blob(
+                "oid_a",
+                Some("rust"),
+                &[
+                    chunk(0, [2; 32], [5; 32], None),
+                    chunk(1, [1; 32], [6; 32], Some(parent)),
+                ],
+            )
+            .unwrap();
+
+        let rows = store.chunks_for_oids(&["oid_a".to_string()]).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].kind, "file_summary");
+        assert_eq!(rows[1].symbol.as_deref(), Some("pkg.Cls.method"));
+        assert_eq!(rows[1].composed_hash, [6; 32]);
+
+        assert!(store.missing_blobs(&["oid_a".into(), "oid_b".into()]).unwrap() == vec!["oid_b".to_string()]);
+    }
+
+    #[test]
+    fn scan_active_vectors_respects_active_set() {
+        let (_temp, store) = open_temp();
+        store
+            .upsert_composed_vectors(&[([5; 32], vec![1.0, 0.0]), ([6; 32], vec![0.0, 1.0])])
+            .unwrap();
+        store
+            .put_blob("oid_a", None, &[chunk(1, [1; 32], [5; 32], None)])
+            .unwrap();
+
+        let active: HashSet<[u8; 32]> = [[5u8; 32]].into_iter().collect();
+        store.set_active_composed_hashes(&active).unwrap();
+
+        let mut seen = Vec::new();
+        store
+            .scan_active_vectors(8, &mut |batch| seen.extend(batch))
+            .unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].composed_hash, [5; 32]);
+    }
+
+    #[test]
+    fn gc_drops_unreachable_blobs_and_orphans() {
+        let (_temp, store) = open_temp();
+        store
+            .upsert_component_vectors(&[([1; 32], vec![1.0, 0.0])])
+            .unwrap();
+        store
+            .upsert_composed_vectors(&[([5; 32], vec![1.0, 0.0])])
+            .unwrap();
+        store
+            .put_blob("oid_keep", None, &[chunk(1, [1; 32], [5; 32], None)])
+            .unwrap();
+        store
+            .put_blob("oid_drop", None, &[chunk(1, [1; 32], [5; 32], None)])
+            .unwrap();
+
+        let live: HashSet<String> = ["oid_keep".to_string()].into_iter().collect();
+        store.gc(&live).unwrap();
+
+        assert_eq!(store.chunks_for_oids(&["oid_drop".into()]).unwrap().len(), 0);
+        assert_eq!(store.chunks_for_oids(&["oid_keep".into()]).unwrap().len(), 1);
+        // The shared vector/component are still referenced by oid_keep.
+        assert!(store.missing_composed_hashes(&[[5; 32]]).unwrap().is_empty());
+        assert!(store.seconds_since_gc().unwrap().is_some());
+    }
+
+    #[test]
+    fn version_change_wipes_cache() {
+        let (_temp, store) = open_temp();
+        assert!(!store.ensure_index_compatible("fp1", "ck1", "bm1").unwrap());
+        store
+            .upsert_composed_vectors(&[([5; 32], vec![1.0, 0.0])])
+            .unwrap();
+        store
+            .put_blob("oid_a", None, &[chunk(1, [1; 32], [5; 32], None)])
+            .unwrap();
+
+        assert!(store.ensure_index_compatible("fp2", "ck1", "bm1").unwrap());
+        assert_eq!(store.chunks_for_oids(&["oid_a".into()]).unwrap().len(), 0);
+        assert!(!store.missing_composed_hashes(&[[5; 32]]).unwrap().is_empty());
     }
 
     #[test]
     fn semantic_db_path_uses_primary_root_for_linked_worktree() {
-        let temp = TempDir::new().unwrap();
+        let temp = tempfile::TempDir::new().unwrap();
         let repo_root = temp.path().join("repo");
         std::fs::create_dir_all(&repo_root).unwrap();
         run_git(&repo_root, ["init"]);
@@ -779,296 +874,15 @@ mod tests {
             ["worktree", "add", worktree_root.to_str().unwrap(), "HEAD"],
         );
 
-        assert_semantic_db_path_root(&worktree_root, &repo_root);
-    }
-
-    fn assert_semantic_db_path_root(workspace_root: &Path, expected_root: &Path) {
-        let actual = semantic_db_path(workspace_root);
+        let actual = semantic_db_path(&worktree_root);
         assert_eq!(
-            actual.file_name().and_then(|name| name.to_str()),
+            actual.file_name().and_then(|n| n.to_str()),
             Some(DB_FILE_NAME)
         );
-        assert_eq!(
-            actual
-                .parent()
-                .and_then(|parent| parent.file_name())
-                .and_then(|name| name.to_str()),
-            Some(DB_DIR_NAME)
-        );
-        let actual_root = actual
-            .parent()
-            .and_then(Path::parent)
-            .expect("semantic db path should have repo root");
+        let actual_root = actual.parent().and_then(Path::parent).unwrap();
         assert_eq!(
             std::fs::canonicalize(actual_root).unwrap(),
-            std::fs::canonicalize(expected_root).unwrap()
+            std::fs::canonicalize(&repo_root).unwrap()
         );
-    }
-
-    #[test]
-    fn fingerprint_and_text_version_resets_preserve_expected_tables() {
-        let temp = TempDir::new().unwrap();
-        let store = SemanticStore::open(&temp.path().join("semantic.db")).unwrap();
-        let workspace_id = store.workspace_id("/workspace-a").unwrap();
-        let state = sample_file_state(b"file-a");
-        let row = sample_chunk(0, "alpha beta", [7; 32]);
-
-        store
-            .upsert_component_vectors(&[([1; 32], vec![0.25, 0.75])])
-            .unwrap();
-        store
-            .upsert_composed_vectors(&[(row.composed_key, vec![1.0, 0.0])])
-            .unwrap();
-        store
-            .replace_file_chunks(workspace_id, "src/lib.rs", &state, &[row])
-            .unwrap();
-
-        assert!(!store.ensure_embed_fingerprint("embed-v1").unwrap());
-        assert!(!store.ensure_text_versions("bm25-v1", "chunker-v1").unwrap());
-
-        store
-            .replace_file_chunks(workspace_id, "src/lib.rs", &state, &[row])
-            .unwrap();
-        store
-            .upsert_component_vectors(&[([1; 32], vec![0.25, 0.75])])
-            .unwrap();
-        store
-            .upsert_composed_vectors(&[(row.composed_key, vec![1.0, 0.0])])
-            .unwrap();
-
-        assert!(store.ensure_embed_fingerprint("embed-v2").unwrap());
-        assert_eq!(count_rows(&store, "vectors"), 0);
-        assert_eq!(count_rows(&store, "component_vectors"), 0);
-        assert_eq!(count_rows(&store, "chunks"), 0);
-        assert_eq!(count_rows(&store, "files"), 0);
-        assert_eq!(count_rows(&store, "bm25_docs"), 1);
-        assert_eq!(count_rows(&store, "bm25_idx"), 1);
-
-        store
-            .upsert_composed_vectors(&[(row.composed_key, vec![1.0, 0.0])])
-            .unwrap();
-        store
-            .replace_file_chunks(workspace_id, "src/lib.rs", &state, &[row])
-            .unwrap();
-
-        assert!(store.ensure_text_versions("bm25-v2", "chunker-v1").unwrap());
-        assert_eq!(count_rows(&store, "chunks"), 0);
-        assert_eq!(count_rows(&store, "files"), 0);
-        assert_eq!(count_rows(&store, "bm25_docs"), 0);
-        assert_eq!(count_rows(&store, "bm25_idx"), 0);
-        assert_eq!(count_rows(&store, "vectors"), 1);
-    }
-
-    #[test]
-    fn replace_file_chunks_is_idempotent_and_shares_docs_and_vectors() {
-        let temp = TempDir::new().unwrap();
-        let store = SemanticStore::open(&temp.path().join("semantic.db")).unwrap();
-        let workspace_a = store.workspace_id("/workspace-a").unwrap();
-        let workspace_b = store.workspace_id("/workspace-b").unwrap();
-        let state = sample_file_state(b"same file");
-        let row = sample_chunk(0, "shared token", [9; 32]);
-
-        store
-            .upsert_composed_vectors(&[(row.composed_key, vec![0.5, 0.5])])
-            .unwrap();
-
-        store
-            .replace_file_chunks(workspace_a, "src/lib.rs", &state, &[row])
-            .unwrap();
-        store
-            .replace_file_chunks(workspace_a, "src/lib.rs", &state, &[row])
-            .unwrap();
-        assert_eq!(count_rows(&store, "files"), 1);
-        assert_eq!(count_rows(&store, "chunks"), 1);
-        assert_eq!(count_rows(&store, "bm25_docs"), 1);
-        assert_eq!(count_rows(&store, "vectors"), 1);
-
-        store
-            .replace_file_chunks(workspace_b, "src/lib.rs", &state, &[row])
-            .unwrap();
-        assert_eq!(count_rows(&store, "files"), 2);
-        assert_eq!(count_rows(&store, "chunks"), 2);
-        assert_eq!(count_rows(&store, "bm25_docs"), 1);
-        assert_eq!(count_rows(&store, "vectors"), 1);
-    }
-
-    #[test]
-    fn scan_vectors_and_bm25_scores_work_in_batches() {
-        let temp = TempDir::new().unwrap();
-        let store = SemanticStore::open(&temp.path().join("semantic.db")).unwrap();
-        let workspace_id = store.workspace_id("/workspace-a").unwrap();
-
-        let summary_key = [3; 32];
-        let fn1_key = [4; 32];
-        let fn2_key = [5; 32];
-        store
-            .upsert_composed_vectors(&[
-                (summary_key, vec![1.0, 0.0]),
-                (fn1_key, vec![0.0, 1.0]),
-                (fn2_key, vec![0.5, 0.5]),
-            ])
-            .unwrap();
-
-        store
-            .replace_file_chunks(
-                workspace_id,
-                "a.rs",
-                &sample_file_state(b"a"),
-                &[
-                    ChunkRowIn {
-                        chunk_ord: 0,
-                        kind: "file_summary",
-                        symbol: None,
-                        start_line: None,
-                        end_line: None,
-                        composed_key: summary_key,
-                        text_hash: [13; 32],
-                        fts_tokens: "rarealpha",
-                    },
-                    ChunkRowIn {
-                        chunk_ord: 1,
-                        kind: "function",
-                        symbol: Some("alpha_fn"),
-                        start_line: Some(1),
-                        end_line: Some(4),
-                        composed_key: fn1_key,
-                        text_hash: [14; 32],
-                        fts_tokens: "rarealpha common",
-                    },
-                ],
-            )
-            .unwrap();
-        store
-            .replace_file_chunks(
-                workspace_id,
-                "b.rs",
-                &sample_file_state(b"b"),
-                &[ChunkRowIn {
-                    chunk_ord: 0,
-                    kind: "function",
-                    symbol: Some("beta_fn"),
-                    start_line: Some(1),
-                    end_line: Some(4),
-                    composed_key: fn2_key,
-                    text_hash: [15; 32],
-                    fts_tokens: "common",
-                }],
-            )
-            .unwrap();
-
-        let mut batches = Vec::new();
-        store
-            .scan_vectors(workspace_id, 2, &mut |rows| batches.push(rows))
-            .unwrap();
-        assert_eq!(batches.len(), 2);
-        assert_eq!(batches[0].len(), 2);
-        assert_eq!(batches[1].len(), 1);
-        assert!(batches[0][0].kind_is_summary);
-        assert_eq!(batches[0][0].symbol, None);
-        assert_eq!(batches[0][0].vector, vec![1.0, 0.0]);
-        assert_eq!(batches[0][1].symbol.as_deref(), Some("alpha_fn"));
-
-        // "rarealpha" matches the summary chunk (no symbol, excluded) and the
-        // alpha_fn function chunk, so only the function symbol is returned.
-        let scores = store
-            .bm25_symbol_scores(workspace_id, "rarealpha", 5)
-            .unwrap();
-        assert_eq!(scores.len(), 1);
-        assert_eq!(scores[0].0, "alpha_fn");
-    }
-
-    #[test]
-    fn gc_removes_orphans_and_keeps_referenced_rows() {
-        let temp = TempDir::new().unwrap();
-        let store = SemanticStore::open(&temp.path().join("semantic.db")).unwrap();
-        let workspace_id = store.workspace_id("/workspace-a").unwrap();
-        let row = sample_chunk(0, "kepttoken", [21; 32]);
-
-        store
-            .upsert_component_vectors(&[([31; 32], vec![1.0, 0.0]), ([32; 32], vec![0.0, 1.0])])
-            .unwrap();
-        set_component_last_used_at(&store, [31; 32], now_unix_seconds());
-        set_component_last_used_at(&store, [32; 32], now_unix_seconds() - 10_000);
-
-        store
-            .upsert_composed_vectors(&[
-                (row.composed_key, vec![0.2, 0.8]),
-                ([22; 32], vec![0.9, 0.1]),
-            ])
-            .unwrap();
-        store
-            .replace_file_chunks(workspace_id, "src/lib.rs", &sample_file_state(b"c"), &[row])
-            .unwrap();
-
-        store
-            .remove_files(workspace_id, &[String::from("src/lib.rs")])
-            .unwrap();
-        assert_eq!(count_rows(&store, "chunks"), 0);
-        assert_eq!(count_rows(&store, "files"), 0);
-        assert_eq!(count_rows(&store, "bm25_docs"), 1);
-        assert_eq!(count_rows(&store, "bm25_idx"), 1);
-        assert_eq!(count_rows(&store, "vectors"), 2);
-
-        store.gc(60).unwrap();
-
-        assert_eq!(count_rows(&store, "bm25_docs"), 0);
-        assert_eq!(count_rows(&store, "bm25_idx"), 0);
-        assert_eq!(count_rows(&store, "vectors"), 0);
-        assert_eq!(count_rows(&store, "component_vectors"), 1);
-    }
-
-    fn sample_file_state(bytes: &[u8]) -> FileState {
-        FileState {
-            file_hash: content_hash(bytes),
-            mtime_ns: 123,
-            size: bytes.len() as i64,
-        }
-    }
-
-    fn sample_chunk<'a>(
-        chunk_ord: i64,
-        fts_tokens: &'a str,
-        composed_key: [u8; 32],
-    ) -> ChunkRowIn<'a> {
-        ChunkRowIn {
-            chunk_ord,
-            kind: "function",
-            symbol: Some("symbol"),
-            start_line: Some(1),
-            end_line: Some(2),
-            composed_key,
-            text_hash: content_hash(fts_tokens.as_bytes()),
-            fts_tokens,
-        }
-    }
-
-    fn count_rows(store: &SemanticStore, table: &str) -> i64 {
-        let conn = store.conn.lock().expect("semantic store mutex poisoned");
-        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-            row.get(0)
-        })
-        .unwrap()
-    }
-
-    fn set_component_last_used_at(store: &SemanticStore, key: [u8; 32], last_used_at: i64) {
-        let conn = store.conn.lock().expect("semantic store mutex poisoned");
-        conn.execute(
-            "UPDATE component_vectors SET last_used_at = ?2 WHERE key = ?1",
-            params![key.as_slice(), last_used_at],
-        )
-        .unwrap();
-    }
-
-    fn run_git<I, S>(cwd: &Path, args: I)
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<std::ffi::OsStr>,
-    {
-        let status = std::process::Command::new("git")
-            .args(args)
-            .current_dir(cwd)
-            .status()
-            .unwrap();
-        assert!(status.success());
     }
 }

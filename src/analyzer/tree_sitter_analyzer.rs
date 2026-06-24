@@ -1111,6 +1111,10 @@ where
         Box::new(self.state.files.keys())
     }
 
+    fn is_analyzed(&self, file: &ProjectFile) -> bool {
+        self.state.files.contains_key(file)
+    }
+
     fn languages(&self) -> BTreeSet<Language> {
         BTreeSet::from([self.adapter.language()])
     }

@@ -1,13 +1,14 @@
 use serde_json::Value;
 
 #[cfg(feature = "nlp")]
-pub(crate) fn nlp_tool_descriptors() -> Vec<Value> {
+pub(crate) fn nlp_tool_descriptors(git_repo: bool) -> Vec<Value> {
     use crate::mcp_common::tool_descriptor;
     use serde_json::json;
 
-    // voyage-4-nano needs a CUDA/Metal accelerator; on CPU-only hosts the tool is
-    // omitted entirely unless the operator passes --force-semantic-cpu.
-    if !crate::nlp::semantic_search_available() {
+    // Semantic search is git-only (the cache is keyed by blob OID) and needs a
+    // CUDA/Metal accelerator for voyage-4-nano; on a non-git root or a CPU-only
+    // host the tool is omitted entirely (the latter unless --force-semantic-cpu).
+    if !git_repo || !crate::nlp::semantic_search_available() {
         return Vec::new();
     }
 
@@ -36,6 +37,6 @@ pub(crate) fn nlp_tool_descriptors() -> Vec<Value> {
 /// Builds without the `nlp` feature expose no nlp tools; toolset expressions
 /// that mention "nlp" (including "core") still resolve.
 #[cfg(not(feature = "nlp"))]
-pub(crate) fn nlp_tool_descriptors() -> Vec<Value> {
+pub(crate) fn nlp_tool_descriptors(_git_repo: bool) -> Vec<Value> {
     Vec::new()
 }

@@ -98,7 +98,8 @@ fn run() -> Result<(), String> {
     match server_mode.as_deref().unwrap_or("searchtools") {
         "lsp" => run_lsp_stdio_server(root),
         mode => {
-            let spec = resolve_server_spec_for_render_options(mode, render_options)?;
+            let git_repo = brokk_bifrost::mcp_registry::workspace_is_git(&root);
+            let spec = resolve_server_spec_for_render_options(mode, render_options, git_repo)?;
             run_stdio_server(root, render_options, &spec)
         }
     }

@@ -22,6 +22,12 @@ pub trait IAnalyzer: Send + Sync + Any {
     fn analyzed_files<'a>(&'a self) -> Box<dyn Iterator<Item = &'a ProjectFile> + 'a> {
         Box::new(std::iter::empty())
     }
+    /// Whether `file` is one this analyzer has indexed. The default scans
+    /// `analyzed_files`; concrete analyzers override with an O(1) lookup so
+    /// incremental callers don't pay O(repo) per changed file.
+    fn is_analyzed(&self, file: &ProjectFile) -> bool {
+        self.analyzed_files().any(|candidate| candidate == file)
+    }
     fn languages(&self) -> BTreeSet<Language>;
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self
     where

@@ -10,12 +10,14 @@
 
 use std::collections::HashMap;
 
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::analyzer::{IAnalyzer, WorkspaceAnalyzer};
 use crate::path_utils::rel_path_string;
 use crate::searchtools::{MostRelevantFilesParams, most_relevant_files};
 
+use super::active_index::ActiveIndex;
 use super::bm25::{RepoEntityUniverse, build_match_query, grounded_prompt_text, tokenize};
 use std::time::Duration;
 
@@ -114,48 +116,54 @@ pub fn semantic_search(
         }
         return Err("embedding model unavailable".to_string());
     };
-    let Some(workspace_id) = indexer.workspace_id() else {
+    let active_lock = indexer.active_index();
+    let active_guard = active_lock
+        .read()
+        .map_err(|_| "semantic active index lock poisoned".to_string())?;
+    let Some(active) = active_guard.as_ref() else {
         if timed_out {
-            notes.push("semantic index workspace is not registered yet".to_string());
+            notes.push("semantic active index is not built yet".to_string());
             return Ok(SemanticSearchResult::empty(notes));
         }
-        return Err("semantic index workspace unavailable".to_string());
+        return Err("semantic active index unavailable".to_string());
     };
     let analyzer = workspace.analyzer();
 
-    // 1. Exhaustive vector scan over function chunks; score = max cosine per fqfn.
-    //    Summary chunks are skipped: they are parent context only, not search targets.
+    // 1. Exhaustive vector scan over the active set. The store streams batches
+    //    (producer); cosine is scored in parallel (consumers); each composed
+    //    vector is then resolved to its function occurrences (fqfn + file).
+    //    Summary chunks have no fqfn and are dropped by `resolve`.
     let query_vector = embedder.embed_query(query)?;
-    let mut vector_by_symbol: HashMap<String, f32> = HashMap::new();
-    let mut symbol_file: HashMap<String, String> = HashMap::new();
+    let mut hash_scores: Vec<([u8; 32], f32)> = Vec::new();
     store
-        .scan_vectors(workspace_id, SCAN_BATCH, &mut |batch| {
-            for row in batch {
-                if row.kind_is_summary {
-                    continue;
-                }
-                let Some(symbol) = row.symbol else {
-                    continue;
-                };
-                let score = dot(&row.vector, &query_vector);
-                symbol_file
-                    .entry(symbol.clone())
-                    .or_insert_with(|| row.file_path.clone());
-                vector_by_symbol
-                    .entry(symbol)
-                    .and_modify(|best| *best = best.max(score))
-                    .or_insert(score);
-            }
+        .scan_active_vectors(SCAN_BATCH, &mut |batch| {
+            let scored: Vec<([u8; 32], f32)> = batch
+                .par_iter()
+                .map(|row| (row.composed_hash, dot(&row.vector, &query_vector)))
+                .collect();
+            hash_scores.extend(scored);
         })
         .map_err(|err| err.to_string())?;
+    let mut vector_by_symbol: HashMap<String, f32> = HashMap::new();
+    let mut symbol_file: HashMap<String, String> = HashMap::new();
+    for (hash, score) in &hash_scores {
+        for hit in active.resolve(hash) {
+            symbol_file
+                .entry(hit.fqfn.to_string())
+                .or_insert_with(|| hit.path.to_string());
+            vector_by_symbol
+                .entry(hit.fqfn.to_string())
+                .and_modify(|best| *best = best.max(*score))
+                .or_insert(*score);
+        }
+    }
     let vector_ranked = top_ranked_symbols(&vector_by_symbol, k);
 
-    // 2. Grounded-strings BM25 over function chunks.
-    let bm25_scores = bm25_symbol_candidates(analyzer, &store, workspace_id, query, k)
-        .unwrap_or_else(|err| {
-            notes.push(format!("bm25 retrieval skipped: {err}"));
-            Vec::new()
-        });
+    // 2. Grounded-strings BM25 over the in-memory active corpus.
+    let bm25_scores = bm25_symbol_candidates(analyzer, active, query, k).unwrap_or_else(|err| {
+        notes.push(format!("bm25 retrieval skipped: {err}"));
+        Vec::new()
+    });
     let bm25_ranked: Vec<RankedSymbol> = bm25_scores
         .iter()
         .map(|(fqfn, score)| RankedSymbol {
@@ -307,8 +315,7 @@ fn normalized_top(files: &HashMap<String, f32>, m: usize) -> Vec<(String, f64)> 
 /// then MATCH the FTS index, returning per-fqfn scores.
 fn bm25_symbol_candidates(
     analyzer: &dyn IAnalyzer,
-    store: &super::store::SemanticStore,
-    workspace_id: i64,
+    active: &ActiveIndex,
     query: &str,
     limit: usize,
 ) -> Result<Vec<(String, f64)>, String> {
@@ -326,9 +333,7 @@ fn bm25_symbol_candidates(
     let Some(match_query) = build_match_query(&tokens) else {
         return Ok(Vec::new());
     };
-    store
-        .bm25_symbol_scores(workspace_id, &match_query, limit)
-        .map_err(|err| err.to_string())
+    active.bm25_symbol_scores(&match_query, limit)
 }
 
 #[cfg(test)]

@@ -455,6 +455,10 @@ impl IAnalyzer for JavascriptAnalyzer {
         self.inner.analyzed_files()
     }
 
+    fn is_analyzed(&self, file: &ProjectFile) -> bool {
+        self.inner.is_analyzed(file)
+    }
+
     fn all_declarations<'a>(&'a self) -> Box<dyn Iterator<Item = &'a CodeUnit> + 'a> {
         self.inner.all_declarations()
     }

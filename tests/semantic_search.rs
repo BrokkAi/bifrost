@@ -27,6 +27,25 @@ fn snapshot_for(root: &Path) -> Arc<WorkspaceAnalyzer> {
     Arc::new(WorkspaceAnalyzer::build(project, AnalyzerConfig::default()))
 }
 
+/// Semantic search now requires a git repo (the cache is keyed by blob OID), so
+/// every fixture initializes one and commits the files written so far.
+fn init_git(dir: &Path) {
+    run_git(dir, &["init", "-q"]);
+    run_git(dir, &["config", "user.email", "t@example.com"]);
+    run_git(dir, &["config", "user.name", "T"]);
+    run_git(dir, &["add", "-A"]);
+    run_git(dir, &["commit", "-q", "-m", "init"]);
+}
+
+fn run_git(dir: &Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .status()
+        .unwrap();
+    assert!(status.success(), "git {args:?} failed");
+}
+
 struct BlockingEmbedder {
     state: Mutex<BlockingState>,
     entered: Condvar,
@@ -121,6 +140,7 @@ fn semantic_search_returns_constituent_rankings() {
         "HttpClient.java",
         "public class HttpClient {\n  public int fetchUrl(String url) { return url.length(); }\n}\n",
     );
+    init_git(dir.path());
     let snapshot = snapshot_for(dir.path());
     let embedder = Arc::new(FakeHashEmbedder::new(16));
     let indexer = SemanticIndexer::start_with_provider(
@@ -167,6 +187,7 @@ fn semantic_search_blocks_until_initial_build() {
         "Greeter.java",
         "public class Greeter {\n  public String greet(String name) { return name; }\n}\n",
     );
+    init_git(dir.path());
     let snapshot = snapshot_for(dir.path());
     let embedder = Arc::new(FakeHashEmbedder::new(16));
     let indexer = SemanticIndexer::start_with_provider(
@@ -204,6 +225,7 @@ fn semantic_search_times_out_and_returns_current_results() {
         "Greeter.java",
         "public class Greeter {\n  public String greet(String name) { return name; }\n}\n",
     );
+    init_git(dir.path());
     let snapshot = snapshot_for(dir.path());
     let embedder = BlockingEmbedder::new();
     let indexer = SemanticIndexer::start_with_provider(
@@ -250,6 +272,7 @@ fn semantic_index_status_counts_indexed_and_waiting_files() {
         "Greeter.java",
         "public class Greeter {\n  public String greet(String name) { return name; }\n}\n",
     );
+    init_git(dir.path());
     let snapshot = snapshot_for(dir.path());
     let embedder = Arc::new(FakeHashEmbedder::new(16));
     let indexer = SemanticIndexer::start_with_provider(
@@ -260,19 +283,67 @@ fn semantic_index_status_counts_indexed_and_waiting_files() {
 
     indexer.wait_ready(Duration::from_secs(30)).unwrap();
     let status = indexer.status(&snapshot);
-    assert_eq!(status.indexed_files, 1);
-    assert_eq!(status.waiting_files, 0);
+    // Greeter has a file-summary chunk plus the greet() function chunk.
+    assert!(
+        status.indexed_chunks >= 2,
+        "indexed chunks: {}",
+        status.indexed_chunks
+    );
     assert_eq!(status.pending_batches, 0);
     assert_eq!(status.phase, "ready");
+    indexer.close();
+}
 
-    write_java(
-        dir.path(),
-        "Greeter.java",
-        "public class Greeter {\n  public String greet(String name) { return \"hi\" + name; }\n}\n",
+#[test]
+fn revert_reuses_cached_blob_vectors() {
+    use std::collections::BTreeSet;
+
+    let dir = tempfile::tempdir().unwrap();
+    let original =
+        "public class Greeter {\n  public String greet(String name) { return name; }\n}\n";
+    let edited =
+        "public class Greeter {\n  public String greet(String name) { return \"hi \" + name; }\n}\n";
+    write_java(dir.path(), "Greeter.java", original);
+    init_git(dir.path());
+    let snapshot = snapshot_for(dir.path());
+    let embedder = Arc::new(FakeHashEmbedder::new(16));
+    let indexer = SemanticIndexer::start_with_provider(
+        dir.path().to_path_buf(),
+        snapshot.clone(),
+        FakeEngineProvider {
+            embedder: embedder.clone(),
+        },
     );
-    let status = indexer.status(&snapshot);
-    assert_eq!(status.indexed_files, 0);
-    assert_eq!(status.waiting_files, 1);
+    indexer.wait_ready(Duration::from_secs(30)).unwrap();
+
+    let file = snapshot
+        .analyzer()
+        .analyzed_files()
+        .next()
+        .cloned()
+        .expect("one analyzed file");
+    let changed: BTreeSet<_> = [file].into_iter().collect();
+
+    // Edit + commit -> new blob OID -> the new content is embedded.
+    write_java(dir.path(), "Greeter.java", edited);
+    run_git(dir.path(), &["commit", "-aqm", "edit"]);
+    let snapshot2 = Arc::new(snapshot.update(&changed));
+    indexer.request_update(snapshot2.clone(), changed.clone());
+    indexer.wait_ready(Duration::from_secs(30)).unwrap();
+    let after_edit = embedder.texts_embedded();
+    assert!(after_edit > 0, "editing embeds the new content");
+
+    // Revert + commit -> original blob OID already materialized -> no re-embed.
+    write_java(dir.path(), "Greeter.java", original);
+    run_git(dir.path(), &["commit", "-aqm", "revert"]);
+    let snapshot3 = Arc::new(snapshot2.update(&changed));
+    indexer.request_update(snapshot3, changed);
+    indexer.wait_ready(Duration::from_secs(30)).unwrap();
+    assert_eq!(
+        embedder.texts_embedded(),
+        after_edit,
+        "reverting to a cached blob must reuse vectors, not re-embed"
+    );
     indexer.close();
 }
 
@@ -284,6 +355,7 @@ fn semantic_search_caps_requested_k() {
         "Greeter.java",
         "public class Greeter {\n  public String greet(String name) { return name; }\n}\n",
     );
+    init_git(dir.path());
     let snapshot = snapshot_for(dir.path());
     let embedder = Arc::new(FakeHashEmbedder::new(16));
     let indexer = SemanticIndexer::start_with_provider(
