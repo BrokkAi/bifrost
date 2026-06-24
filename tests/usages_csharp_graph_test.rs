@@ -1316,7 +1316,7 @@ public sealed class Consumer {
 fn csharp_graph_resolves_member_method_through_class_level_field_receiver() {
     let (project, analyzer) = csharp_analyzer_with_files(FIELD_RECEIVER_FILES);
 
-    let save = member_function(&analyzer, "Repository", "Save");
+    let save = member_function(&analyzer, "Example.Repository", "Save");
     let hits = graph_hits(&analyzer, &save);
 
     assert_eq!(
@@ -1346,7 +1346,7 @@ public sealed class Service {
 "#,
     )]);
 
-    let save = member_function(&analyzer, "Repository", "Save");
+    let save = member_function(&analyzer, "Example.Repository", "Save");
     let hits = graph_hits(&analyzer, &save);
 
     assert_eq!(
@@ -1365,7 +1365,7 @@ public sealed class Service {
 fn csharp_graph_resolves_property_self_write_and_field_receiver_read() {
     let (project, analyzer) = csharp_analyzer_with_files(FIELD_RECEIVER_FILES);
 
-    let last = member_field(&analyzer, "Repository", "Last");
+    let last = member_field(&analyzer, "Example.Repository", "Last");
     let hits = graph_hits(&analyzer, &last);
 
     assert_eq!(
@@ -1400,7 +1400,7 @@ public sealed class Repository {
 "#,
     )]);
 
-    let last = member_field(&analyzer, "Repository", "Last");
+    let last = member_field(&analyzer, "Example.Repository", "Last");
     let hits = graph_hits(&analyzer, &last);
 
     assert_eq!(
@@ -1431,7 +1431,7 @@ public sealed class Service {
 "#,
     )]);
 
-    let last = member_field(&analyzer, "Repository", "Last");
+    let last = member_field(&analyzer, "Example.Repository", "Last");
     let hits = graph_hits(&analyzer, &last);
 
     assert_eq!(
@@ -1461,7 +1461,7 @@ public sealed class Repository {
 "#,
     )]);
 
-    let last = member_field(&analyzer, "Repository", "Last");
+    let last = member_field(&analyzer, "Example.Repository", "Last");
     let hits = graph_hits(&analyzer, &last);
 
     assert_eq!(
@@ -1493,7 +1493,7 @@ public sealed class Repository {
 "#,
     )]);
 
-    let last = member_field(&analyzer, "Repository", "Last");
+    let last = member_field(&analyzer, "Example.Repository", "Last");
     let hits = graph_hits(&analyzer, &last);
 
     assert_eq!(
@@ -1524,7 +1524,7 @@ public sealed class Dto {
 "#,
     )]);
 
-    let repository_last = member_field(&analyzer, "Repository", "Last");
+    let repository_last = member_field(&analyzer, "Example.Repository", "Last");
     let repository_hits = graph_hits(&analyzer, &repository_last);
     assert_eq!(
         1,
@@ -1538,7 +1538,7 @@ public sealed class Dto {
         "{repository_hits:#?}"
     );
 
-    let dto_last = member_field(&analyzer, "Dto", "Last");
+    let dto_last = member_field(&analyzer, "Example.Dto", "Last");
     let dto_hits = graph_hits(&analyzer, &dto_last);
     assert_eq!(
         1,

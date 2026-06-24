@@ -161,12 +161,12 @@ public class Ignored {
 
     let value = usage_graph_at(project.root(), r#"{"paths":["Kept.cs"]}"#);
     assert!(
-        has_edge(&value, "Kept.Run", "Util.Helper"),
+        has_edge(&value, "Example.Kept.Run", "Example.Util.Helper"),
         "kept caller should still resolve static callee nodes: {}",
         value["edges"]
     );
     assert!(
-        !has_edge(&value, "Ignored.Run", "Util.Helper"),
+        !has_edge(&value, "Example.Ignored.Run", "Example.Util.Helper"),
         "path-filtered usage_graph must not emit edges from ignored callers: {}",
         value["edges"]
     );
@@ -216,12 +216,12 @@ public class ProdTests {
 
     let value = usage_graph_at(project.root(), r#"{"include_tests":false}"#);
     assert!(
-        has_edge(&value, "Prod.Run", "Util.Helper"),
+        has_edge(&value, "Example.Prod.Run", "Example.Util.Helper"),
         "production caller should remain in the graph: {}",
         value["edges"]
     );
     assert!(
-        !has_edge(&value, "ProdTests.TestRun", "Util.Helper"),
+        !has_edge(&value, "Example.ProdTests.TestRun", "Example.Util.Helper"),
         "test callers should be excluded when include_tests is false: {}",
         value["edges"]
     );
@@ -265,7 +265,7 @@ public class Broken {
 
     let value = usage_graph_at(project.root(), r#"{"paths":["Kept.cs"]}"#);
     assert!(
-        has_edge(&value, "Kept.Run", "Util.Helper"),
+        has_edge(&value, "Example.Kept.Run", "Example.Util.Helper"),
         "filtered C# edge graph should not require parsing unrelated callers: {}",
         value["edges"]
     );
