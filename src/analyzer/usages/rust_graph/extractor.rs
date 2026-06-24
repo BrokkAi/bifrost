@@ -629,71 +629,10 @@ fn node_for_exact_range(root: Node<'_>, start: usize, end: usize) -> Option<Node
     None
 }
 
-/// The leading type name of a type expression: strips `&`, lifetimes, `mut`,
-/// `dyn`/`impl`, takes the first token, cuts it at any generic/tuple/array opener,
-/// and returns its final path segment (`std::collections::HashMap<..>` -> `HashMap`).
-fn leading_type_name(ty: &str) -> Option<String> {
-    let head = leading_type_path(ty)?;
-    let segment = head.rsplit("::").next().unwrap_or(&head);
-    (!segment.is_empty()).then(|| segment.to_string())
-}
-
-fn leading_type_path(ty: &str) -> Option<String> {
-    let cleaned = ty.replace('&', " ");
-    let token = cleaned
-        .split_whitespace()
-        .find(|token| !matches!(*token, "mut" | "dyn" | "impl") && !token.starts_with('\''))?;
-    let head_end = token
-        .find(|ch: char| !(ch.is_alphanumeric() || ch == '_' || ch == ':'))
-        .unwrap_or(token.len());
-    let head = &token[..head_end];
-    (!head.is_empty()).then(|| head.to_string())
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConstructorReturn {
     DirectReceiver,
     NeedsUnwrap,
-}
-
-/// Whether a function's return type produces the owner type either directly as a
-/// method receiver (`Self`, owner, `Box`/`Arc`/`Rc`) or behind an explicit
-/// `Option`/`Result` unwrap. A substring match is too loose: a function returning
-/// `Vec<Owner>` is not a constructor of the owner.
-fn constructor_return_kind(return_ty: &str, owner_ident: &str) -> Option<ConstructorReturn> {
-    let head = leading_type_name(return_ty)?;
-    if head == "Self" || head == owner_ident {
-        return Some(ConstructorReturn::DirectReceiver);
-    }
-    if matches!(head.as_str(), "Box" | "Arc" | "Rc") {
-        return first_generic_argument(return_ty)
-            .and_then(|inner| constructor_return_kind(&inner, owner_ident))
-            .filter(|kind| *kind == ConstructorReturn::DirectReceiver);
-    }
-    if matches!(head.as_str(), "Result" | "Option") {
-        return first_generic_argument(return_ty)
-            .and_then(|inner| constructor_return_kind(&inner, owner_ident))
-            .map(|_| ConstructorReturn::NeedsUnwrap);
-    }
-    None
-}
-
-/// The first top-level generic argument of a type expression, e.g.
-/// `Result<Self, Error>` -> `Self`.
-fn first_generic_argument(ty: &str) -> Option<String> {
-    let start = ty.find('<')? + 1;
-    let rest = &ty[start..];
-    let mut depth = 0usize;
-    for (index, ch) in rest.char_indices() {
-        match ch {
-            '<' => depth += 1,
-            '>' if depth == 0 => return Some(rest[..index].trim().to_string()),
-            '>' => depth -= 1,
-            ',' if depth == 0 => return Some(rest[..index].trim().to_string()),
-            _ => {}
-        }
-    }
-    None
 }
 
 fn field_expression_is_called(node: Node<'_>) -> bool {
@@ -763,18 +702,176 @@ fn self_like_constructor_returns(
             }
         })
         .filter_map(|code_unit| {
-            let source = rust.get_source(&code_unit, false)?;
-            // Use only the signature head (up to the body) so a `-> Owner` mention
-            // inside the function body can't be mistaken for the return type.
-            let head = source
-                .split_once('{')
-                .map(|(head, _)| head)
-                .unwrap_or(&source);
-            let (_, return_ty) = head.split_once("->")?;
-            constructor_return_kind(return_ty, owner.identifier())
+            let source = code_unit.source().read_to_string().ok()?;
+            let tree = parse_rust_source(&source)?;
+            let range = rust.ranges(&code_unit).iter().next()?;
+            let function =
+                node_for_exact_range(tree.root_node(), range.start_byte, range.end_byte)?;
+            let return_type = function_return_type_node(function)?;
+            let ctx = ConstructorReturnCtx {
+                rust,
+                file: code_unit.source(),
+                source: &source,
+                owner,
+            };
+            constructor_return_kind_from_type_node(return_type, &ctx)
                 .map(|kind| (code_unit.identifier().to_string(), kind))
         })
         .collect()
+}
+
+struct ConstructorReturnCtx<'a> {
+    rust: &'a RustAnalyzer,
+    file: &'a ProjectFile,
+    source: &'a str,
+    owner: &'a CodeUnit,
+}
+
+/// Whether a function's return type produces the owner type either directly as a
+/// method receiver (`Self`, owner, `Box`/`Arc`/`Rc`) or behind an explicit
+/// `Option`/`Result` unwrap. This inspects tree-sitter type nodes instead of
+/// reparsing Rust type syntax from source text.
+fn constructor_return_kind_from_type_node(
+    type_node: Node<'_>,
+    ctx: &ConstructorReturnCtx<'_>,
+) -> Option<ConstructorReturn> {
+    match type_node.kind() {
+        "type_identifier" | "identifier" | "scoped_type_identifier" | "scoped_identifier" => {
+            type_node_matches_constructor_owner(type_node, ctx)
+                .then_some(ConstructorReturn::DirectReceiver)
+        }
+        "generic_type" => {
+            let base = type_node.child_by_field_name("type").or_else(|| {
+                let mut cursor = type_node.walk();
+                type_node.named_children(&mut cursor).next()
+            })?;
+            let base_name = type_node_last_segment(base, ctx.source)?;
+            if matches!(base_name.as_str(), "Box" | "Arc" | "Rc") {
+                return first_generic_type_argument(type_node)
+                    .and_then(|inner| constructor_return_kind_from_type_node(inner, ctx))
+                    .filter(|kind| *kind == ConstructorReturn::DirectReceiver);
+            }
+            if matches!(base_name.as_str(), "Result" | "Option") {
+                return first_generic_type_argument(type_node)
+                    .and_then(|inner| constructor_return_kind_from_type_node(inner, ctx))
+                    .map(|_| ConstructorReturn::NeedsUnwrap);
+            }
+            type_node_matches_constructor_owner(base, ctx)
+                .then_some(ConstructorReturn::DirectReceiver)
+        }
+        "reference_type" | "pointer_type" => {
+            let mut cursor = type_node.walk();
+            type_node
+                .named_children(&mut cursor)
+                .find_map(|child| constructor_return_kind_from_type_node(child, ctx))
+        }
+        _ => None,
+    }
+}
+
+fn function_return_type_node(function: Node<'_>) -> Option<Node<'_>> {
+    if let Some(return_type) = function.child_by_field_name("return_type") {
+        return Some(return_type);
+    }
+
+    let parameters = function.child_by_field_name("parameters")?;
+    let body = function.child_by_field_name("body");
+    let mut cursor = function.walk();
+    function
+        .named_children(&mut cursor)
+        .filter(|child| child.start_byte() >= parameters.end_byte())
+        .filter(|child| body.is_none_or(|body| !same_node(*child, body)))
+        .find(|child| is_rust_type_node(*child))
+}
+
+fn first_generic_type_argument(type_node: Node<'_>) -> Option<Node<'_>> {
+    let type_arguments = type_node.child_by_field_name("type_arguments");
+    let mut cursor = type_arguments.unwrap_or(type_node).walk();
+    type_arguments
+        .unwrap_or(type_node)
+        .named_children(&mut cursor)
+        .filter(|child| is_rust_type_node(*child))
+        .find(|child| {
+            type_node
+                .child_by_field_name("type")
+                .is_none_or(|base| !same_node(*child, base))
+        })
+}
+
+fn is_rust_type_node(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "type_identifier"
+            | "identifier"
+            | "scoped_type_identifier"
+            | "scoped_identifier"
+            | "generic_type"
+            | "reference_type"
+            | "pointer_type"
+            | "array_type"
+            | "slice_type"
+            | "tuple_type"
+            | "unit_type"
+            | "never_type"
+    )
+}
+
+fn type_node_matches_constructor_owner(
+    type_node: Node<'_>,
+    ctx: &ConstructorReturnCtx<'_>,
+) -> bool {
+    if simple_node_text(type_node, ctx.source).as_deref() == Some("Self") {
+        return true;
+    }
+    constructor_type_node_fqn(type_node, ctx)
+        .as_deref()
+        .is_some_and(|fqn| fqn_matches_owner(ctx.rust, fqn, ctx.owner))
+}
+
+fn constructor_type_node_fqn(
+    type_node: Node<'_>,
+    ctx: &ConstructorReturnCtx<'_>,
+) -> Option<String> {
+    let refs = ctx.rust.reference_context_of(ctx.file);
+
+    match type_node.kind() {
+        "type_identifier" | "identifier" => {
+            let name = simple_node_text(type_node, ctx.source)?;
+            refs.resolve_bare(&name).map(str::to_string)
+        }
+        "scoped_type_identifier" | "scoped_identifier" => {
+            let path = type_node
+                .child_by_field_name("path")
+                .and_then(|path| simple_node_text(path, ctx.source))?;
+            let name = type_node
+                .child_by_field_name("name")
+                .and_then(|name| simple_node_text(name, ctx.source))?;
+            refs.resolve_scoped(&path, &name)
+        }
+        "generic_type" => type_node
+            .child_by_field_name("type")
+            .and_then(|base| constructor_type_node_fqn(base, ctx)),
+        "reference_type" | "pointer_type" => {
+            let mut cursor = type_node.walk();
+            type_node
+                .named_children(&mut cursor)
+                .find_map(|child| constructor_type_node_fqn(child, ctx))
+        }
+        _ => None,
+    }
+}
+
+fn type_node_last_segment(type_node: Node<'_>, source: &str) -> Option<String> {
+    match type_node.kind() {
+        "type_identifier" | "identifier" => simple_node_text(type_node, source),
+        "scoped_type_identifier" | "scoped_identifier" => type_node
+            .child_by_field_name("name")
+            .and_then(|name| simple_node_text(name, source)),
+        "generic_type" => type_node
+            .child_by_field_name("type")
+            .and_then(|base| type_node_last_segment(base, source)),
+        _ => None,
+    }
 }
 
 fn self_like_constructor_seeds(

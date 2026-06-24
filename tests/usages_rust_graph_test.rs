@@ -815,6 +815,72 @@ fn run() {
 }
 
 #[test]
+fn rust_graph_strategy_resolves_ast_constructor_return_shapes() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/models.rs",
+            r#"
+pub struct MemoryRepository;
+pub struct Error;
+
+impl MemoryRepository {
+    pub fn new() -> Self { Self }
+    pub fn scoped() -> crate::models::MemoryRepository { MemoryRepository }
+    pub fn boxed() -> Box<Self> { Box::new(Self) }
+    pub fn maybe() -> Option<Self> { Some(Self) }
+    pub fn fallible() -> Result<Self, Error> { Ok(Self) }
+    pub fn many() -> Vec<Self> { vec![Self] }
+    pub fn save(&self) {}
+}
+"#,
+        ),
+        (
+            "src/main.rs",
+            r#"
+use crate::models::MemoryRepository;
+
+fn run() {
+    let direct = MemoryRepository::new();
+    direct.save();
+
+    let scoped = MemoryRepository::scoped();
+    scoped.save();
+
+    let boxed = MemoryRepository::boxed();
+    boxed.save();
+
+    let maybe = MemoryRepository::maybe().unwrap();
+    maybe.save();
+
+    let fallible = MemoryRepository::fallible().expect("repository");
+    fallible.save();
+
+    let many = MemoryRepository::many();
+    many.save();
+}
+"#,
+        ),
+    ]);
+
+    let target = member(
+        &analyzer,
+        &project.file("src/models.rs"),
+        "MemoryRepository",
+        "save",
+    );
+    let hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &analyzer.get_analyzed_files().into_iter().collect(),
+            1000,
+        )
+        .into_either()
+        .expect("AST constructor return receiver success");
+    assert_eq!(5, hits.len());
+}
+
+#[test]
 fn rust_graph_strategy_resolves_multiline_constructor_receiver() {
     let (project, analyzer) = rust_analyzer_with_files(&[
         (
