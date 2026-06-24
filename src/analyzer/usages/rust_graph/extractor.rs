@@ -307,6 +307,8 @@ pub(super) fn scan_files_for_member_target(
     let member_name = target.identifier().to_string();
     let parser_language = tree_sitter_rust::LANGUAGE.into();
     let hits = Mutex::new(BTreeSet::new());
+    let constructor_returns = self_like_constructor_returns(rust, &owner);
+    let self_like_constructors = self_like_constructor_seeds(rust, &owner, &constructor_returns);
 
     files.par_iter().for_each(|file| {
         let owned_source: Option<Arc<String>>;
@@ -346,8 +348,6 @@ pub(super) fn scan_files_for_member_target(
         if owner_local_names.is_empty() && receiver_type_names.is_empty() {
             return;
         }
-        let constructor_returns = self_like_constructor_returns(rust, &owner);
-        let self_like_constructors = self_like_constructor_seeds(rust, &owner);
         let visible_bare_constructors =
             visible_bare_constructor_names(rust, file, &self_like_constructors);
         let receiver_names = infer_receiver_names(
@@ -688,6 +688,13 @@ fn self_like_constructor_returns(
     rust: &RustAnalyzer,
     owner: &CodeUnit,
 ) -> HashMap<String, ConstructorReturn> {
+    let Ok(source) = owner.source().read_to_string() else {
+        return HashMap::default();
+    };
+    let Some(tree) = parse_rust_source(&source) else {
+        return HashMap::default();
+    };
+
     rust.get_all_declarations()
         .into_iter()
         .filter(|code_unit| code_unit.source() == owner.source())
@@ -702,8 +709,6 @@ fn self_like_constructor_returns(
             }
         })
         .filter_map(|code_unit| {
-            let source = code_unit.source().read_to_string().ok()?;
-            let tree = parse_rust_source(&source)?;
             let range = rust.ranges(&code_unit).iter().next()?;
             let function =
                 node_for_exact_range(tree.root_node(), range.start_byte, range.end_byte)?;
@@ -877,12 +882,13 @@ fn type_node_last_segment(type_node: Node<'_>, source: &str) -> Option<String> {
 fn self_like_constructor_seeds(
     rust: &RustAnalyzer,
     owner: &CodeUnit,
+    constructor_returns: &HashMap<String, ConstructorReturn>,
 ) -> HashMap<String, BTreeSet<(ProjectFile, String)>> {
-    self_like_constructor_returns(rust, owner)
-        .into_keys()
+    constructor_returns
+        .keys()
         .map(|name| {
-            let seeds = rust.usage_seeds(owner.source(), &name);
-            (name, seeds)
+            let seeds = rust.usage_seeds(owner.source(), name);
+            (name.clone(), seeds)
         })
         .collect()
 }
