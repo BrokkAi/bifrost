@@ -25,6 +25,7 @@ mod scala;
 mod source_content;
 pub(crate) mod symbol_lookup;
 pub(crate) mod tree_sitter_analyzer;
+pub(crate) mod type_relations;
 mod typescript;
 pub mod usages;
 mod workspace;
