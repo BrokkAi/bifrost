@@ -1177,6 +1177,51 @@ pub struct MemoryRepository {
 }
 
 #[test]
+fn rust_field_access_does_not_unwrap_result_error_type() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .file(
+            "src/lib.rs",
+            r#"
+pub mod models;
+
+use models::Error;
+
+pub fn fallible() -> Result<(), Error> {
+    Ok(())
+}
+
+pub fn run() {
+    let _ = fallible().unwrap().message;
+}
+"#,
+        )
+        .file(
+            "src/models.rs",
+            r#"
+pub struct Error {
+    pub message: String,
+}
+"#,
+        )
+        .build();
+
+    let line = "    let _ = fallible().unwrap().message;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/lib.rs","line":11,"column":{}}}]}}"#,
+            column_of(line, "message")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
 fn rust_struct_field_access_resolves_borrowed_self_field() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(
