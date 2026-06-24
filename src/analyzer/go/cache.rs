@@ -1,3 +1,4 @@
+use super::hierarchy::GoHierarchyIndex;
 use crate::analyzer::{CodeUnit, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
@@ -12,6 +13,7 @@ pub(super) struct GoMemoCaches {
     pub(super) imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
     pub(super) referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     pub(super) reverse_import_index: Arc<OnceLock<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
+    pub(super) hierarchy_index: Arc<OnceLock<GoHierarchyIndex>>,
 }
 
 impl GoMemoCaches {
@@ -21,6 +23,7 @@ impl GoMemoCaches {
             imported_code_units: build_weighted_cache(budget_bytes / 4, weight_code_unit_set),
             referencing_files: build_weighted_cache(budget_bytes / 8, weight_project_file_set),
             reverse_import_index: Arc::new(OnceLock::new()),
+            hierarchy_index: Arc::new(OnceLock::new()),
         }
     }
 

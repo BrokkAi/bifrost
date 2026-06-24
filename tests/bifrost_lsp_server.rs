@@ -2359,31 +2359,45 @@ fn bifrost_lsp_server_type_hierarchy_rust_uses_same_handler() {
 }
 
 #[test]
-fn bifrost_lsp_server_type_hierarchy_returns_null_without_provider() {
+fn bifrost_lsp_server_go_type_hierarchy_returns_structural_interface_edges() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().canonicalize().expect("canon temp");
+    fs::write(root.join("go.mod"), "module example.com/app\n\ngo 1.22\n").expect("write go.mod");
     let file_path = root.join("main.go");
-    fs::write(&file_path, "package main\ntype Worker struct{}\n").expect("write Go fixture");
-    fs::write(root.join("Supported.java"), "class Supported {}\n").expect("write Java fixture");
+    fs::write(
+        &file_path,
+        "package app\ntype Runner interface { Run() error }\ntype Worker struct{}\nfunc (Worker) Run() error { return nil }\n",
+    )
+    .expect("write Go fixture");
 
     let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
     let file_uri = uri_for(&file_path);
-    write_message(
+    let worker = prepare_type_hierarchy(&mut stdin, &mut reader, &mut stderr, 30, &file_uri, 2, 6);
+    let supertypes = type_hierarchy_relation(
         &mut stdin,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 30,
-            "method": "textDocument/prepareTypeHierarchy",
-            "params": {
-                "textDocument": {"uri": file_uri},
-                "position": {"line": 1, "character": 5}
-            }
-        }),
+        &mut reader,
+        &mut stderr,
+        31,
+        "typeHierarchy/supertypes",
+        worker,
     );
-    let response = read_response_for_id(&mut reader, &mut stderr, 30);
     assert!(
-        response["result"].is_null(),
-        "expected null prepare result without provider, got {response}"
+        supertypes.iter().any(|item| item["name"] == "Runner"),
+        "expected Runner supertype, got {supertypes:#?}"
+    );
+
+    let runner = prepare_type_hierarchy(&mut stdin, &mut reader, &mut stderr, 32, &file_uri, 1, 6);
+    let subtypes = type_hierarchy_relation(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        33,
+        "typeHierarchy/subtypes",
+        runner,
+    );
+    assert!(
+        subtypes.iter().any(|item| item["name"] == "Worker"),
+        "expected Worker subtype, got {subtypes:#?}"
     );
 
     shutdown_lsp(child, stdin, reader, stderr);

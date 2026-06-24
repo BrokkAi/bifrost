@@ -1,0 +1,1123 @@
+use super::GoAnalyzer;
+use super::declarations::{determine_go_package_name, go_node_text};
+use super::imports::extract_go_import_path;
+use crate::analyzer::type_relations::{MethodKey, MethodSet, TypeRelation, TypeRelationKind};
+use crate::analyzer::{CodeUnit, IAnalyzer, ImportAnalysisProvider, ProjectFile};
+use crate::hash::{HashMap, HashSet};
+use std::sync::Arc;
+use tree_sitter::{Node, Parser};
+
+const EMPTY_INTERFACE_DESCENDANT_CAP: usize = 0;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GoTypeKind {
+    Concrete,
+    Interface,
+}
+
+#[derive(Clone, Debug)]
+struct GoTypeInfo {
+    unit: CodeUnit,
+    kind: GoTypeKind,
+    method_set: MethodSet,
+    pointer_method_set: MethodSet,
+    own_method_names: HashSet<String>,
+    ambiguous_method_names: HashSet<String>,
+    embedded: Vec<EmbeddedType>,
+    alias_target: Option<String>,
+    has_type_terms: bool,
+}
+
+#[derive(Clone, Debug)]
+struct EmbeddedType {
+    fqn: String,
+    pointer: bool,
+}
+
+struct EmbeddedTypeRef<'tree> {
+    node: Node<'tree>,
+    pointer: bool,
+}
+
+#[derive(Default)]
+pub(super) struct GoHierarchyIndex {
+    direct_ancestors: HashMap<String, Vec<CodeUnit>>,
+    direct_descendants: HashMap<String, HashSet<CodeUnit>>,
+    supported: HashSet<String>,
+    #[allow(dead_code)]
+    relations: Vec<TypeRelation>,
+}
+
+impl GoHierarchyIndex {
+    pub(super) fn build(analyzer: &GoAnalyzer) -> Self {
+        let mut builder = GoHierarchyBuilder::new(analyzer);
+        builder.collect();
+        builder.finish()
+    }
+
+    pub(super) fn direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+        self.direct_ancestors
+            .get(&code_unit.fq_name())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub(super) fn direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
+        self.direct_descendants
+            .get(&code_unit.fq_name())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub(super) fn supports(&self, code_unit: &CodeUnit) -> bool {
+        self.supported.contains(&code_unit.fq_name())
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(super) fn relations(&self) -> &[TypeRelation] {
+        &self.relations
+    }
+}
+
+struct ParsedGoFile {
+    file: ProjectFile,
+    source: Arc<String>,
+    root: tree_sitter::Tree,
+    package_name: String,
+    imports: HashMap<String, Vec<String>>,
+    dot_imports: Vec<String>,
+}
+
+struct GoHierarchyBuilder<'a> {
+    analyzer: &'a GoAnalyzer,
+    files: Vec<ParsedGoFile>,
+    types: HashMap<String, GoTypeInfo>,
+    aliases: HashMap<String, String>,
+    alias_units: HashMap<String, CodeUnit>,
+    relations: Vec<TypeRelation>,
+}
+
+impl<'a> GoHierarchyBuilder<'a> {
+    fn new(analyzer: &'a GoAnalyzer) -> Self {
+        Self {
+            analyzer,
+            files: Vec::new(),
+            types: HashMap::default(),
+            aliases: HashMap::default(),
+            alias_units: HashMap::default(),
+            relations: Vec::new(),
+        }
+    }
+
+    fn collect(&mut self) {
+        self.parse_files();
+        self.collect_types();
+        self.collect_type_details();
+        self.collect_methods();
+        self.resolve_aliases();
+        self.propagate_type_terms();
+        self.promote_embedded_methods();
+    }
+
+    fn finish(self) -> GoHierarchyIndex {
+        let mut direct_ancestors: HashMap<String, Vec<CodeUnit>> = HashMap::default();
+        let mut direct_descendants: HashMap<String, HashSet<CodeUnit>> = HashMap::default();
+        let mut supported = HashSet::default();
+        let mut relations = self.relations;
+
+        let interfaces: Vec<_> = self
+            .types
+            .values()
+            .filter(|info| info.kind == GoTypeKind::Interface)
+            .cloned()
+            .collect();
+
+        for info in self.types.values() {
+            if info.alias_target.is_none() {
+                supported.insert(info.unit.fq_name());
+            }
+        }
+
+        for concrete in self
+            .types
+            .values()
+            .filter(|info| info.kind == GoTypeKind::Concrete && info.alias_target.is_none())
+        {
+            for interface in &interfaces {
+                if interface.has_type_terms
+                    || interface.method_set.methods.len() == EMPTY_INTERFACE_DESCENDANT_CAP
+                {
+                    continue;
+                }
+                if method_set_satisfies(&concrete.method_set, &interface.method_set) {
+                    record_structural_relation(
+                        &mut direct_ancestors,
+                        &mut direct_descendants,
+                        &mut relations,
+                        &concrete.unit,
+                        &interface.unit,
+                    );
+                }
+            }
+        }
+
+        for candidate in interfaces
+            .iter()
+            .filter(|info| !info.has_type_terms && info.alias_target.is_none())
+        {
+            for interface in interfaces
+                .iter()
+                .filter(|info| !info.has_type_terms && info.unit != candidate.unit)
+            {
+                if interface.method_set.methods.len() == EMPTY_INTERFACE_DESCENDANT_CAP {
+                    continue;
+                }
+                if method_set_satisfies(&candidate.method_set, &interface.method_set) {
+                    record_structural_relation(
+                        &mut direct_ancestors,
+                        &mut direct_descendants,
+                        &mut relations,
+                        &candidate.unit,
+                        &interface.unit,
+                    );
+                }
+            }
+        }
+
+        for ancestors in direct_ancestors.values_mut() {
+            ancestors.sort();
+            ancestors.dedup();
+        }
+
+        for (alias_fqn, target_fqn) in &self.aliases {
+            let Some(alias_unit) = self.alias_units.get(alias_fqn) else {
+                continue;
+            };
+            supported.insert(alias_unit.fq_name());
+            if let Some(ancestors) = direct_ancestors.get(target_fqn).cloned() {
+                direct_ancestors.insert(alias_unit.fq_name(), ancestors);
+            }
+            if let Some(descendants) = direct_descendants.get(target_fqn).cloned() {
+                direct_descendants.insert(alias_unit.fq_name(), descendants);
+            }
+        }
+
+        GoHierarchyIndex {
+            direct_ancestors,
+            direct_descendants,
+            supported,
+            relations,
+        }
+    }
+
+    fn parse_files(&mut self) {
+        let mut files: Vec<_> = self.analyzer.get_analyzed_files().into_iter().collect();
+        files.sort();
+        for file in files {
+            let Ok(source) = self.analyzer.project().read_source(&file) else {
+                continue;
+            };
+            let mut parser = Parser::new();
+            if parser
+                .set_language(&tree_sitter_go::LANGUAGE.into())
+                .is_err()
+            {
+                continue;
+            }
+            let Some(tree) = parser.parse(source.as_str(), None) else {
+                continue;
+            };
+            let package_name = canonical_file_package(&file, tree.root_node(), &source);
+            let (imports, dot_imports) = import_packages(self.analyzer, &file);
+            self.files.push(ParsedGoFile {
+                file,
+                source: Arc::new(source),
+                root: tree,
+                package_name,
+                imports,
+                dot_imports,
+            });
+        }
+    }
+
+    fn collect_types(&mut self) {
+        let mut discovered = Vec::new();
+        for file in &self.files {
+            let mut stack = vec![file.root.root_node()];
+            while let Some(node) = stack.pop() {
+                match node.kind() {
+                    "type_spec" => {
+                        if let Some(info) = self.type_skeleton(file, node) {
+                            discovered.push(info);
+                        }
+                    }
+                    _ => {
+                        let mut cursor = node.walk();
+                        for child in node.named_children(&mut cursor) {
+                            stack.push(child);
+                        }
+                    }
+                }
+            }
+        }
+        for info in discovered {
+            self.types.insert(info.unit.fq_name(), info);
+        }
+    }
+
+    fn type_skeleton(&self, file: &ParsedGoFile, node: Node<'_>) -> Option<GoTypeInfo> {
+        let name_node = node.child_by_field_name("name")?;
+        let type_node = node.child_by_field_name("type")?;
+        let name = go_node_text(name_node, &file.source).trim();
+        if name.is_empty() {
+            return None;
+        }
+        let unit = self.type_unit(&file.file, &file.package_name, name)?;
+        let kind = if type_node.kind() == "interface_type" {
+            GoTypeKind::Interface
+        } else {
+            GoTypeKind::Concrete
+        };
+        Some(GoTypeInfo {
+            method_set: MethodSet::new(unit.clone()),
+            pointer_method_set: MethodSet::new(unit.clone()),
+            own_method_names: HashSet::default(),
+            ambiguous_method_names: HashSet::default(),
+            unit,
+            kind,
+            embedded: Vec::new(),
+            alias_target: None,
+            has_type_terms: false,
+        })
+    }
+
+    fn collect_type_details(&mut self) {
+        self.collect_aliases();
+        let mut embedded_by_type: HashMap<String, Vec<EmbeddedType>> = HashMap::default();
+        let mut methods_by_type: HashMap<String, Vec<MethodKey>> = HashMap::default();
+        let mut has_type_terms = HashSet::default();
+
+        for file in &self.files {
+            let mut stack = vec![file.root.root_node()];
+            while let Some(node) = stack.pop() {
+                match node.kind() {
+                    "type_spec" => {
+                        let Some(name_node) = node.child_by_field_name("name") else {
+                            continue;
+                        };
+                        let Some(type_node) = node.child_by_field_name("type") else {
+                            continue;
+                        };
+                        let name = go_node_text(name_node, &file.source).trim();
+                        let fqn = format!("{}.{name}", file.package_name);
+                        match type_node.kind() {
+                            "interface_type" => {
+                                let mut embedded = Vec::new();
+                                let mut methods = Vec::new();
+                                self.collect_interface_details(
+                                    file,
+                                    type_node,
+                                    &mut embedded,
+                                    &mut methods,
+                                    &mut has_type_terms,
+                                );
+                                embedded_by_type.insert(fqn.clone(), embedded);
+                                methods_by_type.insert(fqn, methods);
+                            }
+                            "struct_type" => {
+                                let embedded = embedded_type_refs(type_node)
+                                    .filter_map(|embedded| {
+                                        self.resolve_type_node(file, embedded.node).map(|fqn| {
+                                            EmbeddedType {
+                                                fqn,
+                                                pointer: embedded.pointer,
+                                            }
+                                        })
+                                    })
+                                    .collect();
+                                embedded_by_type.insert(fqn, embedded);
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {
+                        let mut cursor = node.walk();
+                        for child in node.named_children(&mut cursor) {
+                            stack.push(child);
+                        }
+                    }
+                }
+            }
+        }
+
+        for (fqn, embedded) in embedded_by_type {
+            if let Some(info) = self.types.get_mut(&fqn) {
+                info.embedded.extend(embedded);
+            }
+        }
+        for (fqn, methods) in methods_by_type {
+            if let Some(info) = self.types.get_mut(&fqn) {
+                for method in methods {
+                    info.method_set.insert(method);
+                }
+            }
+        }
+        for fqn in has_type_terms {
+            if let Some(info) = self.types.get_mut(&fqn) {
+                info.has_type_terms = true;
+            }
+        }
+    }
+
+    fn collect_aliases(&mut self) {
+        let mut aliases = HashMap::default();
+        let mut alias_units = HashMap::default();
+        for file in &self.files {
+            let mut stack = vec![file.root.root_node()];
+            while let Some(node) = stack.pop() {
+                if node.kind() == "type_alias" {
+                    let Some(name_node) = node.child_by_field_name("name") else {
+                        continue;
+                    };
+                    let Some(type_node) = node.child_by_field_name("type") else {
+                        continue;
+                    };
+                    let name = go_node_text(name_node, &file.source).trim();
+                    let alias_fqn = format!("{}.{name}", file.package_name);
+                    if let Some(target) = self.resolve_type_node(file, type_node) {
+                        aliases.insert(alias_fqn.clone(), target);
+                    }
+                    let alias_unit = self.analyzer.definitions(&alias_fqn).next().cloned();
+                    let alias_unit = alias_unit.or_else(|| {
+                        self.analyzer
+                            .declarations(&file.file)
+                            .find(|unit| unit.identifier() == name)
+                            .cloned()
+                    });
+                    if let Some(unit) = alias_unit {
+                        alias_units.insert(alias_fqn, unit);
+                    }
+                    continue;
+                }
+                let mut cursor = node.walk();
+                for child in node.named_children(&mut cursor) {
+                    stack.push(child);
+                }
+            }
+        }
+        self.aliases.extend(aliases);
+        self.alias_units.extend(alias_units);
+    }
+
+    fn collect_interface_details(
+        &self,
+        file: &ParsedGoFile,
+        node: Node<'_>,
+        embedded: &mut Vec<EmbeddedType>,
+        methods: &mut Vec<MethodKey>,
+        has_type_terms: &mut HashSet<String>,
+    ) {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            match child.kind() {
+                "method_elem" => {
+                    if let Some(method) =
+                        method_key(child, &file.source, &file.package_name, |ty| {
+                            self.type_token(file, ty)
+                        })
+                    {
+                        methods.push(method);
+                    }
+                }
+                "type_elem" => {
+                    let mut type_cursor = child.walk();
+                    for type_child in child.named_children(&mut type_cursor) {
+                        if let Some(target) = self.resolve_type_node(file, type_child) {
+                            let target = resolve_alias_fqn(&self.aliases, &target);
+                            if self
+                                .types
+                                .get(&target)
+                                .is_some_and(|info| info.kind == GoTypeKind::Interface)
+                            {
+                                embedded.push(EmbeddedType {
+                                    fqn: target,
+                                    pointer: false,
+                                });
+                            } else if let Some(name_node) = node
+                                .parent()
+                                .and_then(|parent| parent.child_by_field_name("name"))
+                            {
+                                if is_empty_interface_embed(type_child, &file.source) {
+                                    continue;
+                                }
+                                has_type_terms.insert(format!(
+                                    "{}.{}",
+                                    file.package_name,
+                                    go_node_text(name_node, &file.source).trim()
+                                ));
+                            }
+                        } else if let Some(name_node) = node
+                            .parent()
+                            .and_then(|parent| parent.child_by_field_name("name"))
+                        {
+                            if is_empty_interface_embed(type_child, &file.source) {
+                                continue;
+                            }
+                            has_type_terms.insert(format!(
+                                "{}.{}",
+                                file.package_name,
+                                go_node_text(name_node, &file.source).trim()
+                            ));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn collect_methods(&mut self) {
+        let mut additions: Vec<(String, bool, MethodKey)> = Vec::new();
+        for file in &self.files {
+            let mut stack = vec![file.root.root_node()];
+            while let Some(node) = stack.pop() {
+                if node.kind() == "method_declaration" {
+                    if let Some((receiver, pointer_receiver, method)) =
+                        self.method_declaration(file, node)
+                    {
+                        additions.push((receiver, pointer_receiver, method));
+                    }
+                    continue;
+                }
+                let mut cursor = node.walk();
+                for child in node.named_children(&mut cursor) {
+                    stack.push(child);
+                }
+            }
+        }
+        for (receiver, pointer_receiver, method) in additions {
+            if let Some(info) = self.types.get_mut(&receiver)
+                && info.kind == GoTypeKind::Concrete
+            {
+                if pointer_receiver {
+                    info.pointer_method_set.insert(method);
+                } else {
+                    info.own_method_names.insert(method.name.clone());
+                    info.method_set.insert(method);
+                }
+            }
+        }
+    }
+
+    fn method_declaration(
+        &self,
+        file: &ParsedGoFile,
+        node: Node<'_>,
+    ) -> Option<(String, bool, MethodKey)> {
+        let receiver = node.child_by_field_name("receiver")?;
+        let receiver_type = receiver_type_node(receiver)?;
+        let pointer_receiver = receiver_type.kind() == "pointer_type";
+        let receiver_fqn = self.resolve_type_node(file, receiver_type)?;
+        let method = method_key(node, &file.source, &file.package_name, |ty| {
+            self.type_token(file, ty)
+        })?;
+        Some((receiver_fqn, pointer_receiver, method))
+    }
+
+    fn resolve_aliases(&mut self) {
+        let aliases = self.aliases.clone();
+        for target in self.aliases.values_mut() {
+            *target = resolve_alias_fqn(&aliases, target);
+        }
+        for info in self.types.values_mut() {
+            for embedded in &mut info.embedded {
+                embedded.fqn = resolve_alias_fqn(&aliases, &embedded.fqn);
+            }
+        }
+    }
+
+    fn propagate_type_terms(&mut self) {
+        let mut changed = true;
+        while changed {
+            changed = false;
+            let constrained: HashSet<String> = self
+                .types
+                .iter()
+                .filter(|(_fqn, info)| info.has_type_terms)
+                .map(|(fqn, _info)| fqn.clone())
+                .collect();
+            for info in self.types.values_mut() {
+                if info.has_type_terms {
+                    continue;
+                }
+                if info
+                    .embedded
+                    .iter()
+                    .any(|embedded| constrained.contains(&embedded.fqn))
+                {
+                    info.has_type_terms = true;
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    fn promote_embedded_methods(&mut self) {
+        let mut changed = true;
+        while changed {
+            changed = false;
+            let snapshot: HashMap<String, (MethodSet, MethodSet)> = self
+                .types
+                .iter()
+                .map(|(fqn, info)| {
+                    (
+                        fqn.clone(),
+                        (info.method_set.clone(), info.pointer_method_set.clone()),
+                    )
+                })
+                .collect();
+            let keys: Vec<_> = self.types.keys().cloned().collect();
+            for fqn in keys {
+                let embedded = self
+                    .types
+                    .get(&fqn)
+                    .map(|info| info.embedded.clone())
+                    .unwrap_or_default();
+                for embedded in embedded {
+                    let Some((embedded_set, embedded_pointer_set)) = snapshot.get(&embedded.fqn)
+                    else {
+                        continue;
+                    };
+                    let embedded_unit = self.types.get(&embedded.fqn).map(|info| info.unit.clone());
+                    let Some(info) = self.types.get_mut(&fqn) else {
+                        continue;
+                    };
+                    let before = info.method_set.methods.len();
+                    promote_methods(info, embedded_set);
+                    if embedded.pointer {
+                        promote_methods(info, embedded_pointer_set);
+                    }
+                    if info.method_set.methods.len() != before {
+                        changed = true;
+                    }
+                    if let Some(embedded_unit) = embedded_unit {
+                        self.relations.push(TypeRelation {
+                            from: info.unit.clone(),
+                            to: embedded_unit,
+                            kind: TypeRelationKind::Embedding,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    fn resolve_type_node(&self, file: &ParsedGoFile, node: Node<'_>) -> Option<String> {
+        let reference = type_ref_node(node)?;
+        match reference.kind() {
+            "qualified_type" => {
+                let qualifier = reference.child_by_field_name("package")?;
+                let name = reference.child_by_field_name("name")?;
+                let qualifier = go_node_text(qualifier, &file.source).trim();
+                let name = go_node_text(name, &file.source).trim();
+                file.imports.get(qualifier)?.iter().find_map(|package| {
+                    let candidate = format!("{package}.{name}");
+                    (self.types.contains_key(&candidate) || self.aliases.contains_key(&candidate))
+                        .then_some(candidate)
+                })
+            }
+            "type_identifier" | "identifier" => {
+                let name = go_node_text(reference, &file.source).trim();
+                if name == "any" {
+                    return None;
+                }
+                let same_package = format!("{}.{name}", file.package_name);
+                if self.types.contains_key(&same_package)
+                    || self.aliases.contains_key(&same_package)
+                {
+                    return Some(same_package);
+                }
+                file.dot_imports
+                    .iter()
+                    .map(|package| format!("{package}.{name}"))
+                    .find(|candidate| {
+                        self.types.contains_key(candidate) || self.aliases.contains_key(candidate)
+                    })
+            }
+            _ => None,
+        }
+    }
+
+    fn type_token(&self, file: &ParsedGoFile, node: Node<'_>) -> String {
+        match node.kind() {
+            "qualified_type" => self
+                .resolve_type_node(file, node)
+                .map(|fqn| resolve_alias_fqn(&self.aliases, &fqn))
+                .or_else(|| external_qualified_type_token(file, node))
+                .unwrap_or_else(|| go_node_text(node, &file.source).trim().to_string()),
+            "type_identifier" | "identifier" => self
+                .resolve_type_node(file, node)
+                .map(|fqn| resolve_alias_fqn(&self.aliases, &fqn))
+                .unwrap_or_else(|| go_node_text(node, &file.source).trim().to_string()),
+            "pointer_type" => node
+                .named_child(0)
+                .map(|child| format!("*{}", self.type_token(file, child)))
+                .unwrap_or_else(|| go_node_text(node, &file.source).trim().to_string()),
+            "slice_type" => node
+                .named_child(0)
+                .map(|child| format!("[]{}", self.type_token(file, child)))
+                .unwrap_or_else(|| go_node_text(node, &file.source).trim().to_string()),
+            "array_type" => {
+                let length = node
+                    .child_by_field_name("length")
+                    .map(|child| go_node_text(child, &file.source).trim().to_string())
+                    .unwrap_or_default();
+                let element = node
+                    .child_by_field_name("element")
+                    .map(|child| self.type_token(file, child))
+                    .unwrap_or_default();
+                format!("[{length}]{element}")
+            }
+            "map_type" => {
+                let key = node
+                    .child_by_field_name("key")
+                    .map(|child| self.type_token(file, child))
+                    .unwrap_or_default();
+                let value = node
+                    .child_by_field_name("value")
+                    .map(|child| self.type_token(file, child))
+                    .unwrap_or_default();
+                format!("map[{key}]{value}")
+            }
+            "channel_type" => {
+                let direction = channel_direction(node);
+                let value = node
+                    .named_child(0)
+                    .map(|child| self.type_token(file, child))
+                    .unwrap_or_else(|| go_node_text(node, &file.source).trim().to_string());
+                format!("{direction}{value}")
+            }
+            "generic_type" => {
+                let mut cursor = node.walk();
+                let parts: Vec<_> = node
+                    .named_children(&mut cursor)
+                    .map(|child| self.type_token(file, child))
+                    .collect();
+                parts.join("[")
+            }
+            "type_elem" | "type_constraint" | "parenthesized_type" => {
+                let mut cursor = node.walk();
+                node.named_children(&mut cursor)
+                    .map(|child| self.type_token(file, child))
+                    .collect::<Vec<_>>()
+                    .join("|")
+            }
+            "negated_type" => node
+                .named_child(0)
+                .map(|child| format!("~{}", self.type_token(file, child)))
+                .unwrap_or_else(|| go_node_text(node, &file.source).trim().to_string()),
+            _ => go_node_text(node, &file.source).trim().to_string(),
+        }
+    }
+
+    fn type_unit(&self, file: &ProjectFile, package_name: &str, name: &str) -> Option<CodeUnit> {
+        let fqn = format!("{package_name}.{name}");
+        self.analyzer
+            .definitions(&fqn)
+            .find(|unit| unit.source() == file && unit.is_class())
+            .cloned()
+            .or_else(|| {
+                self.analyzer
+                    .declarations(file)
+                    .find(|unit| unit.is_class() && unit.identifier() == name)
+                    .cloned()
+            })
+    }
+}
+
+fn canonical_file_package(file: &ProjectFile, root: Node<'_>, source: &str) -> String {
+    let declared = determine_go_package_name(root, source);
+    super::packages::canonical_go_package_name(file, &declared)
+}
+
+fn import_packages(
+    analyzer: &GoAnalyzer,
+    file: &ProjectFile,
+) -> (HashMap<String, Vec<String>>, Vec<String>) {
+    let mut by_alias: HashMap<String, Vec<String>> = HashMap::default();
+    let mut dot_imports = Vec::new();
+    for import in analyzer.import_info_of(file) {
+        let alias = import.alias.as_deref();
+        if alias == Some("_") {
+            continue;
+        }
+        let Some(path) = extract_go_import_path(&import.raw_snippet) else {
+            continue;
+        };
+        let packages: Vec<_> = analyzer
+            .imported_code_units_of(file)
+            .into_iter()
+            .filter(|unit| {
+                unit.package_name() == path || path_suffix_matches(&unit.source().parent(), &path)
+            })
+            .map(|unit| unit.package_name().to_string())
+            .collect();
+        let mut packages: Vec<_> = if packages.is_empty() {
+            analyzer
+                .get_analyzed_files()
+                .into_iter()
+                .filter(|candidate| candidate != file)
+                .filter_map(|candidate| {
+                    analyzer.go_package_of(&candidate).filter(|package| {
+                        package == &path || path_suffix_matches(&candidate.parent(), &path)
+                    })
+                })
+                .collect()
+        } else {
+            packages
+        };
+        if packages.is_empty() {
+            packages.push(path.clone());
+        }
+        packages.sort();
+        packages.dedup();
+        if packages.is_empty() {
+            continue;
+        }
+        match alias {
+            Some(".") => dot_imports.extend(packages),
+            Some(alias) => by_alias
+                .entry(alias.to_string())
+                .or_default()
+                .extend(packages),
+            None => {
+                for package in packages {
+                    let local = package_declared_name(analyzer, &package).unwrap_or_else(|| {
+                        package.rsplit('/').next().unwrap_or(&package).to_string()
+                    });
+                    by_alias.entry(local).or_default().push(package);
+                }
+            }
+        }
+    }
+    for packages in by_alias.values_mut() {
+        packages.sort();
+        packages.dedup();
+    }
+    dot_imports.sort();
+    dot_imports.dedup();
+    (by_alias, dot_imports)
+}
+
+fn method_key(
+    node: Node<'_>,
+    source: &str,
+    package_name: &str,
+    mut type_token: impl FnMut(Node<'_>) -> String,
+) -> Option<MethodKey> {
+    let name_node = node.child_by_field_name("name")?;
+    let name = go_node_text(name_node, source).trim();
+    if name.is_empty() {
+        return None;
+    }
+    let name = if is_exported_go_identifier(name) {
+        name.to_string()
+    } else {
+        format!("{package_name}.{name}")
+    };
+    let mut tokens = Vec::new();
+    if let Some(parameters) = node.child_by_field_name("parameters") {
+        tokens.push(format!(
+            "params({})",
+            parameter_type_tokens(parameters, &mut type_token).join(",")
+        ));
+    }
+    if let Some(result) = node.child_by_field_name("result") {
+        let result_types = if result.kind() == "parameter_list" {
+            parameter_type_tokens(result, &mut type_token)
+        } else {
+            vec![type_token(result)]
+        };
+        tokens.push(format!("results({})", result_types.join(",")));
+    }
+    Some(MethodKey::new(name, Some(tokens.join(" "))))
+}
+
+fn parameter_type_tokens(
+    node: Node<'_>,
+    type_token: &mut impl FnMut(Node<'_>) -> String,
+) -> Vec<String> {
+    let mut types = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "parameter_declaration" => {
+                let Some(ty) = parameter_type_node(child) else {
+                    continue;
+                };
+                let token = type_token(ty);
+                let count = parameter_name_count(child).max(1);
+                types.extend(std::iter::repeat_n(token, count));
+            }
+            "variadic_parameter_declaration" => {
+                let Some(ty) = parameter_type_node(child) else {
+                    continue;
+                };
+                let token = format!("...{}", type_token(ty));
+                let count = parameter_name_count(child).max(1);
+                types.extend(std::iter::repeat_n(token, count));
+            }
+            _ => {}
+        }
+    }
+    types
+}
+
+fn parameter_type_node(node: Node<'_>) -> Option<Node<'_>> {
+    node.child_by_field_name("type")
+        .or_else(|| node.named_child(node.named_child_count().saturating_sub(1)))
+}
+
+fn parameter_name_count(node: Node<'_>) -> usize {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .filter(|child| child.kind() == "identifier")
+        .count()
+}
+
+fn receiver_type_node(receiver: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = receiver.walk();
+    receiver
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "parameter_declaration")
+        .and_then(parameter_type_node)
+}
+
+fn embedded_type_refs(node: Node<'_>) -> impl Iterator<Item = EmbeddedTypeRef<'_>> {
+    let mut embedded = Vec::new();
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        let mut cursor = current.walk();
+        for child in current.named_children(&mut cursor) {
+            if child.kind() == "field_declaration" && is_embedded_field(child) {
+                if let Some(ty) = child.child_by_field_name("type") {
+                    embedded.push(EmbeddedTypeRef {
+                        node: ty,
+                        pointer: is_pointer_embedded_field(child, ty),
+                    });
+                }
+            } else {
+                stack.push(child);
+            }
+        }
+    }
+    embedded.into_iter()
+}
+
+fn is_embedded_field(node: Node<'_>) -> bool {
+    node.child_by_field_name("name")
+        .is_none_or(|name| name.kind() == "type_identifier")
+}
+
+fn is_pointer_embedded_field(field: Node<'_>, ty: Node<'_>) -> bool {
+    if ty.kind() == "pointer_type" {
+        return true;
+    }
+    (0..field.child_count()).any(|index| {
+        field
+            .child(index)
+            .is_some_and(|child| child.end_byte() <= ty.start_byte() && child.kind() == "*")
+    })
+}
+
+fn type_ref_node(node: Node<'_>) -> Option<Node<'_>> {
+    match node.kind() {
+        "type_identifier" | "identifier" | "qualified_type" => Some(node),
+        "pointer_type" | "generic_type" | "parenthesized_type" | "negated_type" => {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor).find_map(type_ref_node)
+        }
+        _ => None,
+    }
+}
+
+fn is_empty_interface_embed(node: Node<'_>, source: &str) -> bool {
+    if matches!(node.kind(), "identifier" | "type_identifier")
+        && go_node_text(node, source).trim() == "any"
+    {
+        return true;
+    }
+    if node.kind() != "interface_type" {
+        return false;
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).next().is_none()
+}
+
+fn resolve_alias_fqn(aliases: &HashMap<String, String>, fqn: &str) -> String {
+    let mut current = fqn.to_string();
+    let mut seen = HashSet::default();
+    while seen.insert(current.clone()) {
+        let Some(next) = aliases.get(&current) else {
+            break;
+        };
+        current = next.clone();
+    }
+    current
+}
+
+fn promote_methods(info: &mut GoTypeInfo, embedded_set: &MethodSet) {
+    for method in &embedded_set.methods {
+        if info.own_method_names.contains(&method.name)
+            || info.ambiguous_method_names.contains(&method.name)
+        {
+            continue;
+        }
+
+        let same_name: Vec<_> = info
+            .method_set
+            .methods
+            .iter()
+            .filter(|existing| existing.name == method.name)
+            .cloned()
+            .collect();
+        if same_name.is_empty() {
+            info.method_set.insert(method.clone());
+            continue;
+        }
+        if same_name.iter().any(|existing| existing != method) {
+            info.ambiguous_method_names.insert(method.name.clone());
+            info.method_set
+                .methods
+                .retain(|existing| existing.name != method.name);
+        }
+    }
+}
+
+fn path_suffix_matches(path: &std::path::Path, suffix: &str) -> bool {
+    let parent = path.to_string_lossy().replace('\\', "/");
+    parent == suffix || parent.ends_with(&format!("/{suffix}"))
+}
+
+fn is_exported_go_identifier(name: &str) -> bool {
+    name.chars()
+        .next()
+        .is_some_and(|first| first.is_uppercase())
+}
+
+fn channel_direction(node: Node<'_>) -> &'static str {
+    let mut chan_start = None;
+    let mut arrow_start = None;
+    for index in 0..node.child_count() {
+        let Some(child) = node.child(index) else {
+            continue;
+        };
+        match child.kind() {
+            "<-" => arrow_start = Some(child.start_byte()),
+            "chan" => chan_start = Some(child.start_byte()),
+            _ => {}
+        }
+    }
+    match (arrow_start, chan_start) {
+        (Some(arrow), Some(chan)) if arrow < chan => "<-chan ",
+        (Some(_), Some(_)) => "chan<- ",
+        _ => "chan ",
+    }
+}
+
+fn package_declared_name(analyzer: &GoAnalyzer, package: &str) -> Option<String> {
+    analyzer
+        .get_analyzed_files()
+        .into_iter()
+        .filter(|file| analyzer.go_package_of(file).as_deref() == Some(package))
+        .filter_map(|file| {
+            analyzer
+                .project()
+                .read_source(&file)
+                .ok()
+                .map(|source| (file, source))
+        })
+        .find_map(|(_file, source)| {
+            let mut parser = Parser::new();
+            parser.set_language(&tree_sitter_go::LANGUAGE.into()).ok()?;
+            let tree = parser.parse(source.as_str(), None)?;
+            Some(determine_go_package_name(tree.root_node(), &source))
+        })
+}
+
+fn external_qualified_type_token(file: &ParsedGoFile, node: Node<'_>) -> Option<String> {
+    let qualifier = node.child_by_field_name("package")?;
+    let name = node.child_by_field_name("name")?;
+    let qualifier = go_node_text(qualifier, &file.source).trim();
+    let name = go_node_text(name, &file.source).trim();
+    let mut packages = file.imports.get(qualifier)?.iter();
+    let package = packages.next()?;
+    packages
+        .next()
+        .is_none()
+        .then(|| format!("{package}.{name}"))
+}
+
+fn method_set_satisfies(candidate: &MethodSet, required: &MethodSet) -> bool {
+    candidate.satisfies_with(required, |candidate, required| candidate == required)
+}
+
+fn record_structural_relation(
+    direct_ancestors: &mut HashMap<String, Vec<CodeUnit>>,
+    direct_descendants: &mut HashMap<String, HashSet<CodeUnit>>,
+    relations: &mut Vec<TypeRelation>,
+    from: &CodeUnit,
+    to: &CodeUnit,
+) {
+    let ancestors = direct_ancestors.entry(from.fq_name()).or_default();
+    if !ancestors.contains(to) {
+        ancestors.push(to.clone());
+    }
+    direct_descendants
+        .entry(to.fq_name())
+        .or_default()
+        .insert(from.clone());
+    relations.push(TypeRelation {
+        from: from.clone(),
+        to: to.clone(),
+        kind: TypeRelationKind::StructuralSatisfaction,
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::type_relations::TypeRelationKind;
+    use crate::analyzer::{Language, TestProject};
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn analyzer(files: &[(&str, &str)]) -> GoAnalyzer {
+        let temp = tempdir().unwrap();
+        let root = temp.keep();
+        fs::write(root.join("go.mod"), "module example.com/app\n\ngo 1.22\n").unwrap();
+        for (path, source) in files {
+            let path = root.join(path);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(path, source).unwrap();
+        }
+        GoAnalyzer::from_project(TestProject::new(root, Language::Go))
+    }
+
+    #[test]
+    fn structural_relation_records_satisfied_interface() {
+        let analyzer = analyzer(&[(
+            "service.go",
+            "package app\ntype Runner interface { Run() error }\ntype Worker struct{}\nfunc (Worker) Run() error { return nil }\n",
+        )]);
+        let index = GoHierarchyIndex::build(&analyzer);
+        assert!(index.relations().iter().any(|relation| {
+            relation.kind == TypeRelationKind::StructuralSatisfaction
+                && relation.from.identifier() == "Worker"
+                && relation.to.identifier() == "Runner"
+        }));
+    }
+}

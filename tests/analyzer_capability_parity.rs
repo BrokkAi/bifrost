@@ -57,7 +57,7 @@ fn direct_analyzers_match_brokk_capability_matrix() {
 
     assert!(java.type_hierarchy_provider().is_some());
     assert!(python.type_hierarchy_provider().is_some());
-    assert!(go.type_hierarchy_provider().is_none());
+    assert!(go.type_hierarchy_provider().is_some());
     assert!(javascript.type_hierarchy_provider().is_some());
     assert!(typescript.type_hierarchy_provider().is_some());
     assert!(rust.type_hierarchy_provider().is_some());

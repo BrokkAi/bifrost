@@ -125,7 +125,7 @@ impl ImportAnalysisProvider for GoAnalyzer {
 impl GoAnalyzer {
     /// Canonical package identity (import path) of a file, taken from any of
     /// its declarations. `None` for files with no top-level declarations.
-    fn go_package_of(&self, file: &ProjectFile) -> Option<String> {
+    pub(super) fn go_package_of(&self, file: &ProjectFile) -> Option<String> {
         self.inner
             .top_level_declarations(file)
             .next()

@@ -1,6 +1,7 @@
 mod adapter;
 mod cache;
 mod declarations;
+mod hierarchy;
 mod imports;
 pub(crate) mod packages;
 mod tests;
@@ -9,7 +10,7 @@ use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::{
     AnalyzerConfig, CodeUnit, IAnalyzer, ImportAnalysisProvider, Language, Project, ProjectFile,
     TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer,
-    TypeAliasProvider,
+    TypeAliasProvider, TypeHierarchyProvider,
 };
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -105,6 +106,29 @@ impl GoAnalyzer {
 impl TypeAliasProvider for GoAnalyzer {
     fn is_type_alias(&self, code_unit: &CodeUnit) -> bool {
         self.inner.is_type_alias(code_unit)
+    }
+}
+
+impl TypeHierarchyProvider for GoAnalyzer {
+    fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+        self.memo_caches
+            .hierarchy_index
+            .get_or_init(|| hierarchy::GoHierarchyIndex::build(self))
+            .direct_ancestors(code_unit)
+    }
+
+    fn get_direct_descendants(&self, code_unit: &CodeUnit) -> crate::hash::HashSet<CodeUnit> {
+        self.memo_caches
+            .hierarchy_index
+            .get_or_init(|| hierarchy::GoHierarchyIndex::build(self))
+            .direct_descendants(code_unit)
+    }
+
+    fn supports_type_hierarchy(&self, code_unit: &CodeUnit) -> bool {
+        self.memo_caches
+            .hierarchy_index
+            .get_or_init(|| hierarchy::GoHierarchyIndex::build(self))
+            .supports(code_unit)
     }
 }
 
@@ -307,6 +331,10 @@ impl IAnalyzer for GoAnalyzer {
     }
 
     fn type_alias_provider(&self) -> Option<&dyn TypeAliasProvider> {
+        Some(self)
+    }
+
+    fn type_hierarchy_provider(&self) -> Option<&dyn TypeHierarchyProvider> {
         Some(self)
     }
 
