@@ -3,25 +3,24 @@ use crate::analyzer::build_direct_descendant_index;
 use std::sync::Arc;
 
 impl RubyAnalyzer {
-    /// Resolves a raw supertype string (a superclass or an
+    /// Resolves a raw supertype name (a superclass or an
     /// `include`/`prepend`/`extend` argument) to a declared type.
     ///
-    /// Ruby supertypes are written with `::` namespaces (`A::B`); internally
-    /// types are keyed with `$` separators, so we first try the direct
-    /// translation and fall back to matching the trailing identifier across all
-    /// declared types (covers relative references like `Comparable`).
+    /// The visitor already renders supertype names into the internal `$`-joined
+    /// key form, so a fully-qualified reference resolves directly. Relative
+    /// references (e.g. `Comparable` named inside a namespace) fall back to
+    /// matching the trailing identifier across all declared types.
     pub(super) fn resolve_supertype(&self, raw: &str) -> Option<CodeUnit> {
-        let cleaned = raw.trim().trim_start_matches("::");
+        let cleaned = raw.trim();
         if cleaned.is_empty() {
             return None;
         }
 
-        let fq_candidate = cleaned.replace("::", "$");
-        if let Some(found) = self.inner.definitions(&fq_candidate).next() {
+        if let Some(found) = self.inner.definitions(cleaned).next() {
             return Some(found.clone());
         }
 
-        let last_segment = cleaned.rsplit("::").next().unwrap_or(cleaned);
+        let last_segment = cleaned.rsplit('$').next().unwrap_or(cleaned);
         self.inner
             .all_declarations()
             .find(|code_unit| {

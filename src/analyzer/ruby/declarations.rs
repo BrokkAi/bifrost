@@ -219,19 +219,38 @@ fn member_short_name(segments: &[String], name: &str) -> String {
     }
 }
 
-/// Extracts the namespace segments from a class/module name node. A plain
-/// `(constant)` yields one segment; a `(scope_resolution)` like `A::B` yields
-/// `["A", "B"]`.
+/// Extracts the namespace segments from a class/module name node by walking the
+/// AST (not by string-splitting `::`). A plain `(constant)` yields one segment;
+/// a `(scope_resolution)` like `A::B` walks its `scope` and `name` fields to
+/// yield `["A", "B"]`.
 fn extract_name_segments(name_node: Node<'_>, source: &str) -> Vec<String> {
-    let text = ruby_node_text(name_node, source).trim();
-    if text.is_empty() {
-        return Vec::new();
+    match name_node.kind() {
+        "scope_resolution" => {
+            let mut segments = name_node
+                .child_by_field_name("scope")
+                .map(|scope| extract_name_segments(scope, source))
+                .unwrap_or_default();
+            if let Some(name) = name_node.child_by_field_name("name") {
+                segments.extend(extract_name_segments(name, source));
+            }
+            segments
+        }
+        _ => {
+            let text = ruby_node_text(name_node, source).trim();
+            if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![text.to_string()]
+            }
+        }
     }
-    text.split("::")
-        .map(str::trim)
-        .filter(|segment| !segment.is_empty())
-        .map(str::to_string)
-        .collect()
+}
+
+/// Renders a `constant`/`scope_resolution` reference node into the internal
+/// `$`-joined name used as a `CodeUnit` key (e.g. `A::B` -> `A$B`).
+fn qualified_internal_name(node: Node<'_>, source: &str) -> Option<String> {
+    let segments = extract_name_segments(node, source);
+    (!segments.is_empty()).then(|| segments.join("$"))
 }
 
 /// Collects a class/module's supertypes: its `< Superclass` and any
@@ -241,11 +260,10 @@ fn extract_ruby_supertypes(node: Node<'_>, source: &str) -> Vec<String> {
 
     if let Some(superclass) = node.child_by_field_name("superclass") {
         let mut cursor = superclass.walk();
-        if let Some(expr) = superclass.named_children(&mut cursor).next() {
-            let text = ruby_node_text(expr, source).trim();
-            if !text.is_empty() {
-                supertypes.push(text.to_string());
-            }
+        if let Some(expr) = superclass.named_children(&mut cursor).next()
+            && let Some(name) = qualified_internal_name(expr, source)
+        {
+            supertypes.push(name);
         }
     }
 
@@ -277,11 +295,10 @@ fn collect_mixins(node: Node<'_>, source: &str, supertypes: &mut Vec<String>) {
                 };
                 let mut arg_cursor = arguments.walk();
                 for arg in arguments.named_children(&mut arg_cursor) {
-                    if matches!(arg.kind(), "constant" | "scope_resolution") {
-                        let text = ruby_node_text(arg, source).trim();
-                        if !text.is_empty() {
-                            supertypes.push(text.to_string());
-                        }
+                    if matches!(arg.kind(), "constant" | "scope_resolution")
+                        && let Some(name) = qualified_internal_name(arg, source)
+                    {
+                        supertypes.push(name);
                     }
                 }
             }
