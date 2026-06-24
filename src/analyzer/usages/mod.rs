@@ -29,6 +29,7 @@ mod outcome;
 mod parsed_tree;
 pub(crate) mod php_graph;
 pub(crate) mod python_graph;
+pub(crate) mod ruby_graph;
 pub(crate) mod rust_graph;
 pub(crate) mod scala_graph;
 mod traits;
@@ -54,6 +55,7 @@ pub use model::{
 };
 pub use php_graph::PhpUsageGraphStrategy;
 pub use python_graph::PythonExportUsageGraphStrategy;
+pub use ruby_graph::RubyUsageGraphStrategy;
 pub use rust_graph::RustExportUsageGraphStrategy;
 pub use scala_graph::ScalaUsageGraphStrategy;
 pub use traits::{CandidateFileProvider, UsageAnalyzer};

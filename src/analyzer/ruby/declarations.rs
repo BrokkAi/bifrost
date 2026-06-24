@@ -1,7 +1,16 @@
 use super::imports::parse_ruby_require_call;
 use super::*;
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
-use tree_sitter::Node;
+use tree_sitter::{Node, Parser, Tree};
+
+/// Parses Ruby source into a tree-sitter tree, or `None` if parsing fails.
+pub(crate) fn parse_ruby_tree(source: &str) -> Option<Tree> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_ruby::LANGUAGE.into())
+        .expect("failed to load ruby parser");
+    parser.parse(source, None)
+}
 
 /// Reads the source text backing a tree-sitter node.
 pub(super) fn ruby_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {

@@ -22,6 +22,8 @@ use cache::{
     weight_project_file_set,
 };
 
+pub(crate) use declarations::parse_ruby_tree;
+
 #[derive(Clone)]
 pub struct RubyAnalyzer {
     inner: TreeSitterAnalyzer<RubyAdapter>,

@@ -12,6 +12,7 @@ use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::php_graph::PhpUsageGraphStrategy;
 use crate::analyzer::usages::python_graph::PythonExportUsageGraphStrategy;
+use crate::analyzer::usages::ruby_graph::RubyUsageGraphStrategy;
 use crate::analyzer::usages::rust_graph::RustExportUsageGraphStrategy;
 use crate::analyzer::usages::scala_graph::ScalaUsageGraphStrategy;
 use crate::analyzer::usages::traits::{CandidateFileProvider, GraphUsageAnalyzer};
@@ -201,6 +202,7 @@ impl_graph_usage_analyzer!(CSharpUsageGraphStrategy);
 impl_graph_usage_analyzer!(CppUsageGraphStrategy);
 impl_graph_usage_analyzer!(GoUsageGraphStrategy);
 impl_graph_usage_analyzer!(ScalaUsageGraphStrategy);
+impl_graph_usage_analyzer!(RubyUsageGraphStrategy);
 
 fn graph_strategy_find_usages(
     strategy: &dyn GraphUsageAnalyzer,
@@ -283,9 +285,14 @@ fn graph_find_usages(
             candidates,
             max_usages,
         ),
-        // Ruby has no dedicated graph strategy yet; it degrades to the
-        // candidate-provider fallback like any unsupported target language.
-        Language::Ruby | Language::None => GraphUsageOutcome::terminal_failure(
+        Language::Ruby => graph_strategy_find_usages(
+            &RubyUsageGraphStrategy::new(),
+            analyzer,
+            overloads,
+            candidates,
+            max_usages,
+        ),
+        Language::None => GraphUsageOutcome::terminal_failure(
             overloads[0].fq_name(),
             GraphFailureReason::UnsupportedTargetLanguage(
                 "no graph usage strategy is available for this target language",
