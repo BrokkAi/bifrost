@@ -1732,6 +1732,81 @@ fn run() {
 }
 
 #[test]
+fn rust_typed_receiver_method_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("lib.rs", "mod service;\nmod app;\n")
+        .file(
+            "service.rs",
+            r#"
+pub struct Service;
+
+impl Service {
+    pub fn execute(&self) {}
+}
+"#,
+        )
+        .file(
+            "app.rs",
+            r#"
+use crate::service::Service;
+
+pub fn run(service: Service) {
+    service.execute();
+}
+"#,
+        )
+        .build();
+
+    let line = "    service.execute();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.rs","line":5,"column":{}}}]}}"#,
+            column_of(line, "execute")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Service.execute",
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["path"], "service.rs", "{value}");
+}
+
+#[test]
+fn rust_unproven_receiver_method_does_not_guess_same_named_method() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+pub struct Service;
+
+impl Service {
+    pub fn execute(&self) {}
+}
+
+pub fn run(service: ()) {
+    service.execute();
+}
+"#,
+        )
+        .build();
+
+    let line = "    service.execute();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"lib.rs","line":9,"column":{}}}]}}"#,
+            column_of(line, "execute")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
 fn rust_crate_scoped_macro_resolves_inside_inline_module() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(

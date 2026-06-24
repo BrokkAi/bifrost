@@ -17,7 +17,7 @@ The observable result is focused Rust tests in `tests/get_definition_test.rs` th
 - [x] (2026-06-24T09:54Z) Created this issue-specific ExecPlan before code edits.
 - [x] (2026-06-24T10:00Z) Milestone 2 completed: added JS/TS local `new Class()` receiver inference and focused TypeScript/JavaScript tests for `greeter.greet`; `cargo test --test get_definition_test typescript_` passed 21 tests and `cargo test --test get_definition_test javascript_` passed 12 tests.
 - [x] (2026-06-24T10:04Z) Milestone 3 completed: fixed Python repeated `self.attribute` indexing to keep the first definition range, added issue-shaped PHP/Scala receiver tests, and validated `python_`, `php_`, `scala_`, and `python_analyzer_test`.
-- [ ] Milestone 4: implement and test Rust obvious local method flow.
+- [x] (2026-06-24T10:05Z) Milestone 4 completed: added Rust typed receiver and unproven receiver regression tests; `cargo test --test get_definition_test rust_` passed 45 tests without Rust resolver changes.
 - [ ] Milestone 5: run final formatting, linting, and retrospective validation.
 
 ## Surprises & Discoveries
@@ -37,6 +37,9 @@ The observable result is focused Rust tests in `tests/get_definition_test.rs` th
 - Observation: PHP and Scala already resolved the issue-shaped typed receiver examples.
   Evidence: new tests `php_repository_receiver_method_resolves_to_definition` and `scala_service_execute_receiver_resolves_to_definition` passed without resolver changes.
 
+- Observation: Rust already resolved the issue-shaped typed receiver method flow and already avoided broad same-name guesses for unproven receivers.
+  Evidence: new tests `rust_typed_receiver_method_resolves_to_definition` and `rust_unproven_receiver_method_does_not_guess_same_named_method` passed; `cargo test --test get_definition_test rust_` passed 45 tests.
+
 ## Decision Log
 
 - Decision: Keep `usagebench` edits out of scope.
@@ -54,6 +57,8 @@ Milestone 1 outcome: the branch started clean and rebased, and this living plan 
 Milestone 2 outcome: JS/TS `get_definition_by_location` now resolves local variables initialized from `new Class()` to indexed class members, including imported TypeScript classes and same-file JavaScript classes. The focused tests `typescript_new_initialized_local_method_resolves_to_class_member` and `javascript_new_initialized_local_method_resolves_to_class_member` pass, and the existing TypeScript/JavaScript get-definition test groups remain green.
 
 Milestone 3 outcome: Python `self.attribute` reads now prefer the first indexed instance-attribute assignment, so an initialization in `__init__` is not displaced by a later method assignment. The issue-shaped PHP `$repository->save` and Scala `service.execute()` receiver tests are documented and passing. Validation evidence: `cargo test --test get_definition_test python_` passed 15 tests, `php_` passed 15 tests, `scala_` passed 27 tests, and `cargo test --test python_analyzer_test` passed 12 tests.
+
+Milestone 4 outcome: Rust now has issue-shaped regression coverage for `service.execute()` through a typed receiver and for an unproven receiver that must not resolve by member name alone. No Rust resolver code change was required.
 
 ## Context and Orientation
 
@@ -87,6 +92,8 @@ For Python, PHP, and Scala, inspect the current resolver behavior before editing
 Milestone 3 implementation note: Python instance-attribute declaration collection now preserves the first declaration range for a repeated field CodeUnit and still records later assignment signatures. PHP and Scala needed only focused issue-shaped regression tests because their typed receiver/member paths already resolved the target flows.
 
 For Rust, reuse the existing AST-based local binding and type lookup helpers in `src/analyzer/usages/get_definition/rust.rs`. Add only the `service.execute` style flow if it is still missing: a local or parameter whose type can be resolved to an indexed struct/impl owner and whose method name is indexed as `Owner.execute`. Add a negative test for an unresolved or shadowed receiver so the resolver does not start guessing by member name.
+
+Milestone 4 implementation note: Rust required test coverage only. The existing resolver already resolves typed parameter receivers to indexed impl methods and returns `no_definition` for an unproven unit-typed receiver with a same-named method elsewhere in the file.
 
 Keep this ExecPlan current after every milestone. When a milestone passes, update `Progress`, record any new surprise, and add a short `Outcomes & Retrospective` entry. Because the repository instructions say to commit between ExecPlan milestones, checkpoint commit after each completed milestone with a message that explains both the code change and why the milestone boundary is correct.
 
