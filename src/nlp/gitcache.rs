@@ -126,10 +126,10 @@ pub fn reachable_oids(repo: &Repository) -> Result<HashSet<String>> {
             .split(|b| *b == b' ')
             .next()
             .map(|tok| String::from_utf8_lossy(tok).into_owned());
-        if let Some(oid) = oid {
-            if oid.len() >= 40 {
-                out.insert(oid);
-            }
+        if let Some(oid) = oid
+            && oid.len() >= 40
+        {
+            out.insert(oid);
         }
     }
     Ok(out)
@@ -190,10 +190,10 @@ fn dirty_paths(repo: &Repository) -> Result<HashSet<String>> {
     let mut dirty = HashSet::new();
     let changed = dirty_flags();
     for entry in statuses.iter() {
-        if entry.status().intersects(changed) {
-            if let Some(path) = entry.path() {
-                dirty.insert(path.to_string());
-            }
+        if entry.status().intersects(changed)
+            && let Some(path) = entry.path()
+        {
+            dirty.insert(path.to_string());
         }
     }
     Ok(dirty)

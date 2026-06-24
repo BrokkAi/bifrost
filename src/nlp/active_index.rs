@@ -266,17 +266,17 @@ impl ActiveIndex {
         while let Some(row) = rows.next().map_err(|e| e.to_string())? {
             let occ_id: i64 = row.get(0).map_err(|e| e.to_string())?;
             let score: f64 = -row.get::<_, f64>(1).map_err(|e| e.to_string())?;
-            if let Some(Some(occ)) = self.occ.get(occ_id as usize) {
-                if let Some(fqfn) = &occ.fqfn {
-                    symbol_scores
-                        .entry(fqfn.clone())
-                        .and_modify(|best| {
-                            if score > *best {
-                                *best = score;
-                            }
-                        })
-                        .or_insert(score);
-                }
+            if let Some(Some(occ)) = self.occ.get(occ_id as usize)
+                && let Some(fqfn) = &occ.fqfn
+            {
+                symbol_scores
+                    .entry(fqfn.clone())
+                    .and_modify(|best| {
+                        if score > *best {
+                            *best = score;
+                        }
+                    })
+                    .or_insert(score);
             }
         }
         drop(rows);
