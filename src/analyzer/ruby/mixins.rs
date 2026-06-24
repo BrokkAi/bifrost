@@ -373,14 +373,16 @@ end
         ]);
 
         let relations = analyzer.mixin_relations();
+        let visible_shared = std::path::Path::new("visible").join("shared.rb");
+        let unloaded_shared = std::path::Path::new("unloaded").join("shared.rb");
         assert!(relations.iter().any(|relation| {
             relation.from.identifier() == "Repository"
-                && relation.to.source().rel_path().to_string_lossy() == "visible/shared.rb"
+                && relation.to.source().rel_path() == visible_shared.as_path()
                 && relation.kind == TypeRelationKind::MixinInclude
         }));
         assert!(!relations.iter().any(|relation| {
             relation.from.identifier() == "Repository"
-                && relation.to.source().rel_path().to_string_lossy() == "unloaded/shared.rb"
+                && relation.to.source().rel_path() == unloaded_shared.as_path()
         }));
         assert!(!relations.iter().any(|relation| {
             relation.from.identifier() == "OtherRepository" && relation.to.identifier() == "Shared"
