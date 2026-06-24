@@ -22,7 +22,6 @@ struct GoTypeInfo {
     method_set: MethodSet,
     pointer_method_set: MethodSet,
     own_method_names: HashSet<String>,
-    ambiguous_method_names: HashSet<String>,
     embedded: Vec<EmbeddedType>,
     alias_target: Option<String>,
     has_type_terms: bool,
@@ -189,6 +188,13 @@ impl<'a> GoHierarchyBuilder<'a> {
             ancestors.sort();
             ancestors.dedup();
         }
+        prune_transitive_ancestors(&mut direct_ancestors);
+        let units_by_fqn: HashMap<String, CodeUnit> = self
+            .types
+            .values()
+            .map(|info| (info.unit.fq_name(), info.unit.clone()))
+            .collect();
+        direct_descendants = rebuild_direct_descendants(&direct_ancestors, &units_by_fqn);
 
         for (alias_fqn, target_fqn) in &self.aliases {
             let Some(alias_unit) = self.alias_units.get(alias_fqn) else {
@@ -283,7 +289,6 @@ impl<'a> GoHierarchyBuilder<'a> {
             method_set: MethodSet::new(unit.clone()),
             pointer_method_set: MethodSet::new(unit.clone()),
             own_method_names: HashSet::default(),
-            ambiguous_method_names: HashSet::default(),
             unit,
             kind,
             embedded: Vec::new(),
@@ -564,50 +569,29 @@ impl<'a> GoHierarchyBuilder<'a> {
     }
 
     fn promote_embedded_methods(&mut self) {
-        let mut changed = true;
-        while changed {
-            changed = false;
-            let snapshot: HashMap<String, (MethodSet, MethodSet)> = self
-                .types
-                .iter()
-                .map(|(fqn, info)| {
-                    (
-                        fqn.clone(),
-                        (info.method_set.clone(), info.pointer_method_set.clone()),
-                    )
-                })
-                .collect();
-            let keys: Vec<_> = self.types.keys().cloned().collect();
-            for fqn in keys {
-                let embedded = self
-                    .types
-                    .get(&fqn)
-                    .map(|info| info.embedded.clone())
-                    .unwrap_or_default();
-                for embedded in embedded {
-                    let Some((embedded_set, embedded_pointer_set)) = snapshot.get(&embedded.fqn)
-                    else {
-                        continue;
-                    };
-                    let embedded_unit = self.types.get(&embedded.fqn).map(|info| info.unit.clone());
-                    let Some(info) = self.types.get_mut(&fqn) else {
-                        continue;
-                    };
-                    let before = info.method_set.methods.len();
-                    promote_methods(info, embedded_set);
-                    if embedded.pointer {
-                        promote_methods(info, embedded_pointer_set);
-                    }
-                    if info.method_set.methods.len() != before {
-                        changed = true;
-                    }
-                    if let Some(embedded_unit) = embedded_unit {
-                        self.relations.push(TypeRelation {
-                            from: info.unit.clone(),
-                            to: embedded_unit,
-                            kind: TypeRelationKind::Embedding,
-                        });
-                    }
+        let snapshot = self.types.clone();
+        let keys: Vec<_> = self.types.keys().cloned().collect();
+        for fqn in keys {
+            let Some(original) = snapshot.get(&fqn) else {
+                continue;
+            };
+            let promoted = match original.kind {
+                GoTypeKind::Interface => interface_promoted_methods(&snapshot, &original.embedded),
+                GoTypeKind::Concrete => struct_promoted_methods(&snapshot, original),
+            };
+            let Some(info) = self.types.get_mut(&fqn) else {
+                continue;
+            };
+            info.method_set.extend(&promoted);
+            for embedded in &original.embedded {
+                if let Some(embedded_unit) =
+                    snapshot.get(&embedded.fqn).map(|info| info.unit.clone())
+                {
+                    self.relations.push(TypeRelation {
+                        from: info.unit.clone(),
+                        to: embedded_unit,
+                        kind: TypeRelationKind::Embedding,
+                    });
                 }
             }
         }
@@ -659,7 +643,14 @@ impl<'a> GoHierarchyBuilder<'a> {
             "type_identifier" | "identifier" => self
                 .resolve_type_node(file, node)
                 .map(|fqn| resolve_alias_fqn(&self.aliases, &fqn))
-                .unwrap_or_else(|| go_node_text(node, &file.source).trim().to_string()),
+                .unwrap_or_else(|| {
+                    let name = go_node_text(node, &file.source).trim();
+                    if is_predeclared_go_type(name) {
+                        name.to_string()
+                    } else {
+                        format!("{}.{name}", file.package_name)
+                    }
+                }),
             "pointer_type" => node
                 .named_child(0)
                 .map(|child| format!("*{}", self.type_token(file, child)))
@@ -967,32 +958,119 @@ fn resolve_alias_fqn(aliases: &HashMap<String, String>, fqn: &str) -> String {
     current
 }
 
-fn promote_methods(info: &mut GoTypeInfo, embedded_set: &MethodSet) {
-    for method in &embedded_set.methods {
-        if info.own_method_names.contains(&method.name)
-            || info.ambiguous_method_names.contains(&method.name)
-        {
+fn interface_promoted_methods(
+    types: &HashMap<String, GoTypeInfo>,
+    embedded: &[EmbeddedType],
+) -> MethodSet {
+    let mut promoted = MethodSet {
+        methods: HashSet::default(),
+    };
+    let mut stack: Vec<_> = embedded
+        .iter()
+        .map(|embedded| embedded.fqn.clone())
+        .collect();
+    let mut seen = HashSet::default();
+    while let Some(fqn) = stack.pop() {
+        if !seen.insert(fqn.clone()) {
             continue;
         }
+        let Some(info) = types.get(&fqn) else {
+            continue;
+        };
+        promoted.extend(&info.method_set);
+        stack.extend(info.embedded.iter().map(|embedded| embedded.fqn.clone()));
+    }
+    promoted
+}
 
-        let same_name: Vec<_> = info
-            .method_set
-            .methods
-            .iter()
-            .filter(|existing| existing.name == method.name)
-            .cloned()
-            .collect();
-        if same_name.is_empty() {
-            info.method_set.insert(method.clone());
+fn struct_promoted_methods(types: &HashMap<String, GoTypeInfo>, info: &GoTypeInfo) -> MethodSet {
+    let mut candidates: HashMap<String, Vec<(usize, MethodKey)>> = HashMap::default();
+    let mut stack: Vec<_> = info
+        .embedded
+        .iter()
+        .map(|embedded| (embedded.fqn.clone(), embedded.pointer, 1usize))
+        .collect();
+    let mut seen = HashSet::default();
+    while let Some((fqn, pointer_embed, depth)) = stack.pop() {
+        if !seen.insert((fqn.clone(), pointer_embed, depth)) {
             continue;
         }
-        if same_name.iter().any(|existing| existing != method) {
-            info.ambiguous_method_names.insert(method.name.clone());
-            info.method_set
-                .methods
-                .retain(|existing| existing.name != method.name);
+        let Some(embedded_info) = types.get(&fqn) else {
+            continue;
+        };
+        for method in &embedded_info.method_set.methods {
+            candidates
+                .entry(method.name.clone())
+                .or_default()
+                .push((depth, method.clone()));
+        }
+        if pointer_embed {
+            for method in &embedded_info.pointer_method_set.methods {
+                candidates
+                    .entry(method.name.clone())
+                    .or_default()
+                    .push((depth, method.clone()));
+            }
+        }
+        for nested in &embedded_info.embedded {
+            stack.push((nested.fqn.clone(), nested.pointer, depth + 1));
         }
     }
+
+    let mut promoted = MethodSet {
+        methods: HashSet::default(),
+    };
+    for (name, methods) in candidates {
+        if info.own_method_names.contains(&name) {
+            continue;
+        }
+        let Some(min_depth) = methods.iter().map(|(depth, _method)| *depth).min() else {
+            continue;
+        };
+        let at_min: Vec<_> = methods
+            .into_iter()
+            .filter_map(|(depth, method)| (depth == min_depth).then_some(method))
+            .collect();
+        if at_min.len() == 1 {
+            promoted.insert(at_min[0].clone());
+        }
+    }
+    promoted
+}
+
+fn prune_transitive_ancestors(direct_ancestors: &mut HashMap<String, Vec<CodeUnit>>) {
+    let snapshot = direct_ancestors.clone();
+    for (from, ancestors) in direct_ancestors {
+        ancestors.retain(|ancestor| {
+            !snapshot.get(from).is_some_and(|siblings| {
+                siblings.iter().any(|middle| {
+                    middle != ancestor
+                        && snapshot
+                            .get(&middle.fq_name())
+                            .is_some_and(|middle_ancestors| middle_ancestors.contains(ancestor))
+                })
+            })
+        });
+    }
+}
+
+fn rebuild_direct_descendants(
+    direct_ancestors: &HashMap<String, Vec<CodeUnit>>,
+    units_by_fqn: &HashMap<String, CodeUnit>,
+) -> HashMap<String, HashSet<CodeUnit>> {
+    let mut direct_descendants: HashMap<String, HashSet<CodeUnit>> = HashMap::default();
+    for (from_fqn, ancestors) in direct_ancestors {
+        let Some(from) = units_by_fqn.get(from_fqn) else {
+            continue;
+        };
+        for ancestor in ancestors {
+            direct_descendants
+                .entry(ancestor.fq_name())
+                .or_default()
+                .insert(from.clone());
+        }
+    }
+    direct_descendants
 }
 
 fn path_suffix_matches(path: &std::path::Path, suffix: &str) -> bool {
@@ -1004,6 +1082,34 @@ fn is_exported_go_identifier(name: &str) -> bool {
     name.chars()
         .next()
         .is_some_and(|first| first.is_uppercase())
+}
+
+fn is_predeclared_go_type(name: &str) -> bool {
+    matches!(
+        name,
+        "any"
+            | "bool"
+            | "byte"
+            | "comparable"
+            | "complex64"
+            | "complex128"
+            | "error"
+            | "float32"
+            | "float64"
+            | "int"
+            | "int8"
+            | "int16"
+            | "int32"
+            | "int64"
+            | "rune"
+            | "string"
+            | "uint"
+            | "uint8"
+            | "uint16"
+            | "uint32"
+            | "uint64"
+            | "uintptr"
+    )
 }
 
 fn channel_direction(node: Node<'_>) -> &'static str {

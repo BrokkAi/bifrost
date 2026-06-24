@@ -96,12 +96,44 @@ func (Worker) Run() error { return nil }
     let worker = definition(&analyzer, "example.com/app.Worker");
 
     assert_eq!(
-        BTreeSet::from(["Reader".to_string(), "Runner".to_string()]),
+        BTreeSet::from(["Runner".to_string()]),
         identifiers(analyzer.get_direct_ancestors(&worker))
     );
     assert_eq!(
         BTreeSet::from(["Worker".to_string()]),
         identifiers(analyzer.get_direct_descendants(&runner))
+    );
+}
+
+#[test]
+fn direct_projection_omits_transitive_interface_ancestors() {
+    let (_project, analyzer) = go_analyzer_with_files(&[(
+        "service.go",
+        r#"
+package app
+
+type Reader interface { Read() string }
+type Runner interface {
+    Reader
+    Run() error
+}
+
+type Worker struct{}
+func (Worker) Read() string { return "" }
+func (Worker) Run() error { return nil }
+"#,
+    )]);
+
+    let reader = definition(&analyzer, "example.com/app.Reader");
+    let worker = definition(&analyzer, "example.com/app.Worker");
+
+    assert_eq!(
+        BTreeSet::from(["Runner".to_string()]),
+        identifiers(analyzer.get_direct_ancestors(&worker))
+    );
+    assert!(
+        !identifiers(analyzer.get_direct_descendants(&reader)).contains("Worker"),
+        "Worker should be reached through Runner, not directly under Reader"
     );
 }
 
@@ -216,6 +248,63 @@ type Worker struct { A; B }
     assert!(
         !identifiers(analyzer.get_direct_descendants(&runner)).contains("Worker"),
         "Worker must not satisfy Runner through ambiguous promoted methods"
+    );
+}
+
+#[test]
+fn identical_same_depth_promoted_methods_are_ambiguous() {
+    let (_project, analyzer) = go_analyzer_with_files(&[(
+        "service.go",
+        r#"
+package app
+
+type Runner interface { Run() error }
+
+type A struct{}
+func (A) Run() error { return nil }
+
+type B struct{}
+func (B) Run() error { return nil }
+
+type Worker struct { A; B }
+"#,
+    )]);
+
+    let runner = definition(&analyzer, "example.com/app.Runner");
+    let worker = definition(&analyzer, "example.com/app.Worker");
+
+    assert!(analyzer.get_direct_ancestors(&worker).is_empty());
+    assert!(
+        !identifiers(analyzer.get_direct_descendants(&runner)).contains("Worker"),
+        "Worker must not satisfy Runner through ambiguous same-depth promoted methods"
+    );
+}
+
+#[test]
+fn shallower_promoted_methods_hide_deeper_conflicts() {
+    let (_project, analyzer) = go_analyzer_with_files(&[(
+        "service.go",
+        r#"
+package app
+
+type Runner interface { Run(int) error }
+
+type A struct{}
+func (A) Run(int) error { return nil }
+
+type C struct{}
+func (C) Run(string) error { return nil }
+
+type B struct { C }
+type Worker struct { A; B }
+"#,
+    )]);
+
+    let worker = definition(&analyzer, "example.com/app.Worker");
+
+    assert_eq!(
+        BTreeSet::from(["Runner".to_string()]),
+        identifiers(analyzer.get_direct_ancestors(&worker))
     );
 }
 
@@ -379,6 +468,35 @@ import dep "external.example/two"
 
 type Worker struct{}
 func (Worker) Handle(dep.Payload) error { return nil }
+"#,
+        ),
+    ]);
+
+    let handler = definition(&analyzer, "example.com/app/api.Handler");
+    let worker = definition(&analyzer, "example.com/app/worker.Worker");
+
+    assert!(analyzer.get_direct_ancestors(&worker).is_empty());
+    assert!(analyzer.get_direct_descendants(&handler).is_empty());
+}
+
+#[test]
+fn unresolved_local_type_tokens_are_package_scoped() {
+    let (_project, analyzer) = go_analyzer_with_files(&[
+        (
+            "api/runner.go",
+            r#"
+package api
+
+type Handler interface { Handle(Payload) error }
+"#,
+        ),
+        (
+            "worker/worker.go",
+            r#"
+package worker
+
+type Worker struct{}
+func (Worker) Handle(Payload) error { return nil }
 "#,
         ),
     ]);
