@@ -860,6 +860,71 @@ fn js_commonjs_exports_property_resolves_member_declaration() {
 }
 
 #[test]
+fn js_commonjs_exports_property_does_not_seed_unrelated_member_by_short_name() {
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file(
+            "lib/request.js",
+            "function accepts(type) { return type; }\nconst request = {};\nrequest.accepts = function acceptsMember(type) { return type; };\nexports.accepts = accepts;\n",
+        )
+        .file(
+            "consumer.js",
+            "const request = require('./lib/request');\nfunction run() { return request.accepts('json'); }\n",
+        )
+        .build()
+    });
+
+    let target = find_js_target(&analyzer, &project.file("lib/request.js"), |cu| {
+        cu.short_name() == "request.accepts" && cu.is_function()
+    });
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = JsTsExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+
+    assert!(
+        matches!(result, FuzzyResult::Failure { .. }),
+        "member-qualified target must not seed from an unrelated local export with the same property name"
+    );
+}
+
+#[test]
+fn js_commonjs_barrel_reexports_required_member_declaration() {
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file(
+            "lib/request.js",
+            "const request = {};\nrequest.accepts = function accepts(type) { return type; };\nexports.accepts = request.accepts;\n",
+        )
+        .file(
+            "index.js",
+            "const request = require('./lib/request');\nexports.accepts = request.accepts;\n",
+        )
+        .file(
+            "consumer.js",
+            "const api = require('./index');\nfunction run() { return api.accepts('json'); }\n",
+        )
+        .build()
+    });
+
+    let target = find_js_target(&analyzer, &project.file("lib/request.js"), |cu| {
+        cu.short_name() == "request.accepts" && cu.is_function()
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == project.file("consumer.js")),
+        "expected CommonJS barrel re-export of member declaration to reach consumer"
+    );
+}
+
+#[test]
 fn js_commonjs_module_exports_object_resolves_required_module_member() {
     let (project, analyzer) = js_inline_analyzer(|p| {
         p.file("lib.js", "class Foo {}\nmodule.exports = { Foo };\n")
