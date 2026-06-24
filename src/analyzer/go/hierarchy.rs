@@ -991,8 +991,8 @@ fn struct_promoted_methods(types: &HashMap<String, GoTypeInfo>, info: &GoTypeInf
         .map(|embedded| (embedded.fqn.clone(), embedded.pointer, 1usize))
         .collect();
     let mut seen = HashSet::default();
-    while let Some((fqn, pointer_embed, depth)) = stack.pop() {
-        if !seen.insert((fqn.clone(), pointer_embed, depth)) {
+    while let Some((fqn, pointer_path, depth)) = stack.pop() {
+        if !seen.insert((fqn.clone(), pointer_path)) {
             continue;
         }
         let Some(embedded_info) = types.get(&fqn) else {
@@ -1004,7 +1004,7 @@ fn struct_promoted_methods(types: &HashMap<String, GoTypeInfo>, info: &GoTypeInf
                 .or_default()
                 .push((depth, method.clone()));
         }
-        if pointer_embed {
+        if pointer_path {
             for method in &embedded_info.pointer_method_set.methods {
                 candidates
                     .entry(method.name.clone())
@@ -1013,7 +1013,11 @@ fn struct_promoted_methods(types: &HashMap<String, GoTypeInfo>, info: &GoTypeInf
             }
         }
         for nested in &embedded_info.embedded {
-            stack.push((nested.fqn.clone(), nested.pointer, depth + 1));
+            stack.push((
+                nested.fqn.clone(),
+                pointer_path || nested.pointer,
+                depth + 1,
+            ));
         }
     }
 

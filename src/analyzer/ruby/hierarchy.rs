@@ -48,7 +48,6 @@ impl RubyAnalyzer {
 
 impl TypeHierarchyProvider for RubyAnalyzer {
     fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        let _ = self.mixin_relations();
         if let Some(cached) = self.direct_ancestors.get(code_unit) {
             return (*cached).clone();
         }

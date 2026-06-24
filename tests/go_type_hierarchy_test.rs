@@ -223,6 +223,66 @@ type Worker struct { *Base }
 }
 
 #[test]
+fn transitive_pointer_embedding_promotes_pointer_receiver_methods() {
+    let (_project, analyzer) = go_analyzer_with_files(&[(
+        "service.go",
+        r#"
+package app
+
+type Runner interface { Run() error }
+
+type Leaf struct{}
+func (*Leaf) Run() error { return nil }
+
+type Mid struct { Leaf }
+type Worker struct { *Mid }
+"#,
+    )]);
+
+    let runner = definition(&analyzer, "example.com/app.Runner");
+    let worker = definition(&analyzer, "example.com/app.Worker");
+
+    assert_eq!(
+        BTreeSet::from(["Runner".to_string()]),
+        identifiers(analyzer.get_direct_ancestors(&worker))
+    );
+    assert_eq!(
+        BTreeSet::from(["Worker".to_string()]),
+        identifiers(analyzer.get_direct_descendants(&runner))
+    );
+}
+
+#[test]
+fn pointer_embedding_cycles_do_not_loop_during_promotion() {
+    let (_project, analyzer) = go_analyzer_with_files(&[(
+        "service.go",
+        r#"
+package app
+
+type Runner interface { Run() error }
+
+type A struct { *B }
+func (A) Run() error { return nil }
+
+type B struct { *A }
+type Worker struct { *B }
+"#,
+    )]);
+
+    let runner = definition(&analyzer, "example.com/app.Runner");
+    let worker = definition(&analyzer, "example.com/app.Worker");
+
+    assert_eq!(
+        BTreeSet::from(["Runner".to_string()]),
+        identifiers(analyzer.get_direct_ancestors(&worker))
+    );
+    assert!(
+        identifiers(analyzer.get_direct_descendants(&runner)).contains("Worker"),
+        "cyclic embedding should terminate and still expose reachable promoted methods"
+    );
+}
+
+#[test]
 fn conflicting_promoted_methods_do_not_satisfy_by_union() {
     let (_project, analyzer) = go_analyzer_with_files(&[(
         "service.go",
