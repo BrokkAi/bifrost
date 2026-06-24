@@ -2447,6 +2447,47 @@ export function isVisionModel() {
 }
 
 #[test]
+fn typescript_new_initialized_local_method_resolves_to_class_member() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "greeter.ts",
+            r#"
+export class Greeter {
+  greet(): string {
+    return 'hello'
+  }
+}
+"#,
+        )
+        .file(
+            "app.ts",
+            r#"
+import { Greeter } from './greeter'
+
+export function run() {
+  const greeter = new Greeter()
+  return greeter.greet()
+}
+"#,
+        )
+        .build();
+
+    let line = "  return greeter.greet()";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.ts","line":6,"column":{}}}]}}"#,
+            column_of(line, "greet()")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "Greeter.greet", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "greeter.ts", "{value}");
+}
+
+#[test]
 fn typescript_contextual_callback_parameter_members_resolve() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file(
@@ -2862,6 +2903,40 @@ function render() {
     );
     assert_eq!(result["definitions"][0]["kind"], "function", "{value}");
     assert_eq!(result["definitions"][0]["start_line"], 3, "{value}");
+}
+
+#[test]
+fn javascript_new_initialized_local_method_resolves_to_class_member() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "app.js",
+            r#"
+class Greeter {
+  greet() {
+    return 'hello';
+  }
+}
+
+function run() {
+  const greeter = new Greeter();
+  return greeter.greet();
+}
+"#,
+        )
+        .build();
+
+    let line = "  return greeter.greet();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.js","line":10,"column":{}}}]}}"#,
+            column_of(line, "greet()")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "Greeter.greet", "{value}");
 }
 
 #[test]

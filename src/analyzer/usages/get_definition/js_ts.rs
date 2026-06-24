@@ -70,6 +70,39 @@ pub(super) fn resolve_js_ts(
         if !member_candidates.is_empty() {
             return candidates_outcome(member_candidates);
         }
+        let new_receiver_candidates = jsts_local_new_receiver_owner_candidates(
+            analyzer,
+            support,
+            file,
+            language,
+            source,
+            tree.root_node(),
+            &imports,
+            &aliases,
+            qualifier,
+            site.range.start_byte,
+            0,
+        );
+        let new_receiver_member_candidates = if language == Language::TypeScript {
+            ts_member_candidates(
+                analyzer,
+                support,
+                new_receiver_candidates,
+                name,
+                value_position,
+            )
+        } else {
+            jsts_member_candidates(
+                analyzer,
+                support,
+                new_receiver_candidates,
+                name,
+                value_position,
+            )
+        };
+        if !new_receiver_member_candidates.is_empty() {
+            return candidates_outcome(new_receiver_member_candidates);
+        }
         let local_receiver_binding = (language == Language::JavaScript)
             .then(|| {
                 jsts_visible_receiver_binding_scope(
@@ -1027,6 +1060,23 @@ fn jsts_enclosing_function_scope(root: Node<'_>, byte: usize) -> Option<Node<'_>
     }
 }
 
+fn jsts_enclosing_function_or_program_scope(root: Node<'_>, byte: usize) -> Option<Node<'_>> {
+    let mut current = smallest_named_node_covering(root, byte, byte)?;
+    loop {
+        if matches!(
+            current.kind(),
+            "program"
+                | "function_declaration"
+                | "function_expression"
+                | "arrow_function"
+                | "method_definition"
+        ) {
+            return Some(current);
+        }
+        current = current.parent()?;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn ts_receiver_owners_from_parameters(
     analyzer: &dyn IAnalyzer,
@@ -1476,6 +1526,22 @@ fn ts_expression_property_owners(
                 })
                 .unwrap_or_default()
         }
+        "new_expression" => expression
+            .child_by_field_name("constructor")
+            .map(|constructor| {
+                jsts_constructor_owner_candidates(
+                    analyzer,
+                    support,
+                    file,
+                    Language::TypeScript,
+                    source,
+                    imports,
+                    aliases,
+                    constructor,
+                    false,
+                )
+            })
+            .unwrap_or_default(),
         "as_expression" | "satisfies_expression" | "type_assertion" => expression
             .child_by_field_name("type")
             .or_else(|| ts_assertion_type_child(expression))
@@ -1511,6 +1577,236 @@ fn ts_expression_property_owners(
                     .unwrap_or_default()
             }),
         _ => Vec::new(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn jsts_local_new_receiver_owner_candidates(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    language: Language,
+    source: &str,
+    root: Node<'_>,
+    imports: &ImportBinder,
+    aliases: &AliasResolver,
+    receiver: &str,
+    before_byte: usize,
+    depth: usize,
+) -> Vec<CodeUnit> {
+    if depth > 8 {
+        return Vec::new();
+    }
+    let Some(scope) = jsts_enclosing_function_or_program_scope(root, before_byte) else {
+        return Vec::new();
+    };
+    let mut state = None;
+    jsts_collect_local_new_receiver_owner_candidates(
+        analyzer,
+        support,
+        file,
+        language,
+        source,
+        scope,
+        scope.id(),
+        imports,
+        aliases,
+        receiver,
+        before_byte,
+        depth,
+        &mut state,
+    );
+    state.unwrap_or_default()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn jsts_collect_local_new_receiver_owner_candidates(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    language: Language,
+    source: &str,
+    node: Node<'_>,
+    root_id: usize,
+    imports: &ImportBinder,
+    aliases: &AliasResolver,
+    receiver: &str,
+    before_byte: usize,
+    depth: usize,
+    state: &mut Option<Vec<CodeUnit>>,
+) {
+    if node.start_byte() >= before_byte {
+        return;
+    }
+    if node.id() != root_id
+        && matches!(
+            node.kind(),
+            "function_declaration"
+                | "function_expression"
+                | "arrow_function"
+                | "method_definition"
+                | "class_declaration"
+                | "abstract_class_declaration"
+                | "interface_declaration"
+        )
+    {
+        return;
+    }
+
+    if node.kind() == "variable_declarator"
+        && let Some(name) = node.child_by_field_name("name")
+        && node_text_matches(name, source, receiver)
+    {
+        let owners = node
+            .child_by_field_name("value")
+            .map(|value| {
+                jsts_local_receiver_value_owner_candidates(
+                    analyzer,
+                    support,
+                    file,
+                    language,
+                    source,
+                    root_node(node),
+                    imports,
+                    aliases,
+                    value,
+                    before_byte,
+                    depth + 1,
+                )
+            })
+            .unwrap_or_default();
+        *state = Some(owners);
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        jsts_collect_local_new_receiver_owner_candidates(
+            analyzer,
+            support,
+            file,
+            language,
+            source,
+            child,
+            root_id,
+            imports,
+            aliases,
+            receiver,
+            before_byte,
+            depth,
+            state,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn jsts_local_receiver_value_owner_candidates(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    language: Language,
+    source: &str,
+    root: Node<'_>,
+    imports: &ImportBinder,
+    aliases: &AliasResolver,
+    value: Node<'_>,
+    _before_byte: usize,
+    depth: usize,
+) -> Vec<CodeUnit> {
+    if depth > 8 {
+        return Vec::new();
+    }
+    match value.kind() {
+        "new_expression" => value
+            .child_by_field_name("constructor")
+            .map(|constructor| {
+                jsts_constructor_owner_candidates(
+                    analyzer,
+                    support,
+                    file,
+                    language,
+                    source,
+                    imports,
+                    aliases,
+                    constructor,
+                    false,
+                )
+            })
+            .unwrap_or_default(),
+        "identifier" | "type_identifier" => source
+            .get(value.start_byte()..value.end_byte())
+            .map(str::trim)
+            .filter(|alias| !alias.is_empty())
+            .map(|alias| {
+                jsts_local_new_receiver_owner_candidates(
+                    analyzer,
+                    support,
+                    file,
+                    language,
+                    source,
+                    root,
+                    imports,
+                    aliases,
+                    alias,
+                    value.start_byte(),
+                    depth + 1,
+                )
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn jsts_constructor_owner_candidates(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    language: Language,
+    source: &str,
+    imports: &ImportBinder,
+    aliases: &AliasResolver,
+    constructor: Node<'_>,
+    value_position: bool,
+) -> Vec<CodeUnit> {
+    let Some(name) = jsts_constructor_name(constructor, source) else {
+        return Vec::new();
+    };
+    let mut candidates = if let Some(binding) = imports.bindings.get(name) {
+        let exported_name = match binding.kind {
+            ImportKind::Named => binding.imported_name.as_deref().unwrap_or(name),
+            ImportKind::Default => "default",
+            ImportKind::Namespace | ImportKind::CommonJsRequire | ImportKind::Glob => name,
+        };
+        if matches!(binding.kind, ImportKind::Named | ImportKind::Default) {
+            resolve_js_ts_module_binding_candidates(
+                analyzer,
+                support,
+                language,
+                file,
+                &binding.module_specifier,
+                exported_name,
+                Some(aliases),
+                value_position,
+            )
+        } else {
+            Vec::new()
+        }
+    } else {
+        support.file_identifier(file, name)
+    };
+    candidates.retain(|unit| unit.is_class());
+    sort_units(&mut candidates);
+    candidates.dedup();
+    candidates
+}
+
+fn jsts_constructor_name<'a>(constructor: Node<'_>, source: &'a str) -> Option<&'a str> {
+    match constructor.kind() {
+        "identifier" | "type_identifier" => source
+            .get(constructor.start_byte()..constructor.end_byte())
+            .map(str::trim)
+            .filter(|name| !name.is_empty()),
+        _ => None,
     }
 }
 

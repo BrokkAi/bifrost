@@ -15,7 +15,7 @@ The observable result is focused Rust tests in `tests/get_definition_test.rs` th
 - [x] (2026-06-24T09:54Z) Fetched and rebased branch `222-improve-get_definition_by_location-receiver-and-member-resolution`; Git reported the branch is up to date at `53fad27`.
 - [x] (2026-06-24T09:54Z) Confirmed the worktree is clean and on branch `222-improve-get_definition_by_location-receiver-and-member-resolution`, not detached.
 - [x] (2026-06-24T09:54Z) Created this issue-specific ExecPlan before code edits.
-- [ ] Milestone 2: implement and test JS/TS obvious local flows.
+- [x] (2026-06-24T10:00Z) Milestone 2 completed: added JS/TS local `new Class()` receiver inference and focused TypeScript/JavaScript tests for `greeter.greet`; `cargo test --test get_definition_test typescript_` passed 21 tests and `cargo test --test get_definition_test javascript_` passed 12 tests.
 - [ ] Milestone 3: implement and test Python/PHP/Scala obvious flows.
 - [ ] Milestone 4: implement and test Rust obvious local method flow.
 - [ ] Milestone 5: run final formatting, linting, and retrospective validation.
@@ -24,6 +24,12 @@ The observable result is focused Rust tests in `tests/get_definition_test.rs` th
 
 - Observation: The issue branch already exists and is tracking `origin/222-improve-get_definition_by_location-receiver-and-member-resolution`.
   Evidence: `git status --short --branch` printed `## 222-improve-get_definition_by_location-receiver-and-member-resolution...origin/222-improve-get_definition_by_location-receiver-and-member-resolution`.
+
+- Observation: Most JS/TS property/member flows from the issue already had focused coverage, but local `new Class()` receiver calls did not.
+  Evidence: existing tests covered object literal properties, returned object properties, contextual callback members, `this` members, and JS member assignments. New tests for `const greeter = new Greeter(); greeter.greet()` initially returned `no_definition` for `greeter.greet`.
+
+- Observation: The JS/TS resolver could fix the local constructor receiver gap with AST fields, not string parsing.
+  Evidence: the implementation reads `variable_declarator` `name`/`value` fields and `new_expression` `constructor` fields, then resolves the constructor through the existing import binder and `DefinitionLookupIndex`.
 
 ## Decision Log
 
@@ -37,7 +43,9 @@ The observable result is focused Rust tests in `tests/get_definition_test.rs` th
 
 ## Outcomes & Retrospective
 
-No implementation milestones are complete yet. The current outcome is a clean, rebased branch with this living plan ready for code work.
+Milestone 1 outcome: the branch started clean and rebased, and this living plan was created before implementation work.
+
+Milestone 2 outcome: JS/TS `get_definition_by_location` now resolves local variables initialized from `new Class()` to indexed class members, including imported TypeScript classes and same-file JavaScript classes. The focused tests `typescript_new_initialized_local_method_resolves_to_class_member` and `javascript_new_initialized_local_method_resolves_to_class_member` pass, and the existing TypeScript/JavaScript get-definition test groups remain green.
 
 ## Context and Orientation
 
@@ -63,6 +71,8 @@ This plan targets the following files first:
 Start with focused tests that describe the desired obvious flows. Use `tests/common/inline_project.rs` through `InlineTestProject`, as required by the analyzer test guidance, so each test defines a tiny project inline. Keep tests in `tests/get_definition_test.rs` near the existing language-specific `get_definition` tests.
 
 For JS/TS, extend `src/analyzer/usages/get_definition/js_ts.rs` without changing the public API. Reuse existing import binder and JS/TS graph resolver helpers when possible. Add support only for locally proven receiver owners: class instances created with `new Owner`, TypeScript typed locals or parameters, simple aliases, `this.member` inside an indexed class, and object/schema property lookup patterns that are already represented in the analyzer index. If a dynamic object shape is not indexed or the receiver cannot be proven, return the existing `no_indexed_definition` style outcome.
+
+Milestone 2 implementation note: `src/analyzer/usages/get_definition/js_ts.rs` now has a bounded local constructor receiver path. It scans the enclosing function or program scope before the reference, tracks the most recent matching local declaration, resolves `new Class()` constructors through existing imports or same-file indexed classes, supports simple local aliases, and then performs the normal `Owner.member` lookup. It intentionally leaves unsupported constructor expressions unresolved.
 
 For Python, PHP, and Scala, inspect the current resolver behavior before editing because these languages already have substantial receiver paths. Prefer filling narrow gaps, such as Python field/attribute definition priority, PHP typed receiver or `$this` gaps, and Scala constructor-created or typed receiver gaps. Reuse `LocalInferenceEngine`, `ClassRangeIndex`, type hierarchy providers, import binders, and language-specific AST helpers already present in the corresponding graph modules. Do not add source-text splitting fallbacks.
 
