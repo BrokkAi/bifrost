@@ -130,7 +130,11 @@ impl<'a> UsageQueryResolver<'a> for JsTsQueryResolver {
                 "JsTsExportUsageGraphStrategy",
             );
         };
-        let seeds = index.seeds_for_target(target.source(), top_level_identifier(target));
+        let seeds = index.seeds_for_target(
+            target.source(),
+            top_level_identifier(target),
+            target.short_name(),
+        );
         if seeds.is_empty() {
             return GraphUsageOutcome::fallback_safe(
                 target.fq_name(),

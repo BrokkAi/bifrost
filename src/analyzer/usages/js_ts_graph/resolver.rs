@@ -154,12 +154,13 @@ impl JsTsUsageIndex {
         self.binders_by_file.get(importer)?.bindings.get(local_name)
     }
 
-    /// Export seeds for `target_short` in `target_file`, following named and star
-    /// re-export chains across files.
+    /// Export seeds for `target_short`/`target_name` in `target_file`, following named
+    /// and star re-export chains across files.
     pub(super) fn seeds_for_target(
         &self,
         target_file: &ProjectFile,
         target_short: &str,
+        target_name: &str,
     ) -> BTreeSet<(ProjectFile, String)> {
         let mut seeds: BTreeSet<(ProjectFile, String)> = BTreeSet::new();
         if let Some(exports) = self.exports_by_file.get(target_file) {
@@ -170,7 +171,7 @@ impl JsTsUsageIndex {
                     ExportEntry::ReexportedNamed { .. } => None,
                 };
                 if let Some(local_name) = local
-                    && local_name == target_short
+                    && (local_name == target_short || local_name == target_name)
                 {
                     seeds.insert((target_file.clone(), exported_name.clone()));
                 }

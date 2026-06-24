@@ -831,6 +831,35 @@ fn js_commonjs_exports_property_resolves_destructured_require() {
 }
 
 #[test]
+fn js_commonjs_exports_property_resolves_member_declaration() {
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file(
+            "lib/request.js",
+            "const request = {};\nrequest.accepts = function accepts(type) { return type; };\nexports.accepts = request.accepts;\n",
+        )
+        .file(
+            "consumer.js",
+            "const request = require('./lib/request');\nfunction run() { return request.accepts('json'); }\n",
+        )
+        .build()
+    });
+
+    let target = find_js_target(&analyzer, &project.file("lib/request.js"), |cu| {
+        cu.short_name() == "request.accepts" && cu.is_function()
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == project.file("consumer.js")),
+        "expected CommonJS module-object use of exported member declaration"
+    );
+}
+
+#[test]
 fn js_commonjs_module_exports_object_resolves_required_module_member() {
     let (project, analyzer) = js_inline_analyzer(|p| {
         p.file("lib.js", "class Foo {}\nmodule.exports = { Foo };\n")
