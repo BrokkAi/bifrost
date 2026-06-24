@@ -18,7 +18,7 @@ The observable result is focused Rust tests in `tests/get_definition_test.rs` th
 - [x] (2026-06-24T10:00Z) Milestone 2 completed: added JS/TS local `new Class()` receiver inference and focused TypeScript/JavaScript tests for `greeter.greet`; `cargo test --test get_definition_test typescript_` passed 21 tests and `cargo test --test get_definition_test javascript_` passed 12 tests.
 - [x] (2026-06-24T10:04Z) Milestone 3 completed: fixed Python repeated `self.attribute` indexing to keep the first definition range, added issue-shaped PHP/Scala receiver tests, and validated `python_`, `php_`, `scala_`, and `python_analyzer_test`.
 - [x] (2026-06-24T10:05Z) Milestone 4 completed: added Rust typed receiver and unproven receiver regression tests; `cargo test --test get_definition_test rust_` passed 45 tests without Rust resolver changes.
-- [ ] Milestone 5: run final formatting, linting, and retrospective validation.
+- [x] (2026-06-24T10:07Z) Milestone 5 completed: `cargo test --test get_definition_test` passed 257 tests, `cargo fmt` completed with no diff, `cargo clippy --all-targets --all-features -- -D warnings` passed, and `git diff --check` passed.
 
 ## Surprises & Discoveries
 
@@ -59,6 +59,8 @@ Milestone 2 outcome: JS/TS `get_definition_by_location` now resolves local varia
 Milestone 3 outcome: Python `self.attribute` reads now prefer the first indexed instance-attribute assignment, so an initialization in `__init__` is not displaced by a later method assignment. The issue-shaped PHP `$repository->save` and Scala `service.execute()` receiver tests are documented and passing. Validation evidence: `cargo test --test get_definition_test python_` passed 15 tests, `php_` passed 15 tests, `scala_` passed 27 tests, and `cargo test --test python_analyzer_test` passed 12 tests.
 
 Milestone 4 outcome: Rust now has issue-shaped regression coverage for `service.execute()` through a typed receiver and for an unproven receiver that must not resolve by member name alone. No Rust resolver code change was required.
+
+Milestone 5 outcome: final validation is complete. The branch resolves the implemented issue #222 obvious flows without public API changes and without usagebench edits. No remaining issue #222 cases were discovered in this branch beyond the intentionally unsupported dynamic inference boundary described in this plan.
 
 ## Context and Orientation
 
