@@ -5158,6 +5158,40 @@ fn php_typed_receiver_method_resolves_to_definition() {
 }
 
 #[test]
+fn php_repository_receiver_method_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "src/Repository.php",
+            "<?php\nnamespace App;\nclass Repository {\n    public function save(string $value): void {}\n}\n",
+        )
+        .file(
+            "src/Service.php",
+            "<?php\nnamespace App;\nclass Service {\n    public function handle(Repository $repository): void {\n        $repository->save('value');\n    }\n}\n",
+        )
+        .build();
+
+    let line = "        $repository->save('value');";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/Service.php","line":5,"column":{}}}]}}"#,
+            column_of(line, "save")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "App.Repository.save",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["path"], "src/Repository.php",
+        "{value}"
+    );
+}
+
+#[test]
 fn php_fully_qualified_type_resolves_from_final_segment() {
     let project = InlineTestProject::with_language(Language::Php)
         .file(
@@ -5661,6 +5695,43 @@ fn python_typed_receiver_inherited_method_resolves_to_base_definition() {
         "{value}"
     );
     assert_eq!(result["definitions"][0]["path"], "service.py", "{value}");
+}
+
+#[test]
+fn python_self_attribute_read_prefers_init_assignment_definition() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+class Service:
+    def __init__(self):
+        self.repository = None
+
+    def save(self, repository):
+        self.repository = repository
+
+    def current(self):
+        return self.repository
+"#,
+        )
+        .build();
+
+    let line = "        return self.repository";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"service.py","line":10,"column":{}}}]}}"#,
+            column_of(line, "repository")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "service.Service.repository",
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["start_line"], 4, "{value}");
 }
 
 #[test]
@@ -8520,6 +8591,36 @@ fn scala_typed_receiver_method_resolves_to_definition() {
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(
         result["definitions"][0]["fqn"], "app.Service.run",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_service_execute_receiver_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Service.scala",
+            "package app\nclass Service { def execute(): Int = 1 }\n",
+        )
+        .file(
+            "app/Controller.scala",
+            "package app\nclass Controller { def handle(service: Service): Int = service.execute() }\n",
+        )
+        .build();
+
+    let line = "class Controller { def handle(service: Service): Int = service.execute() }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Controller.scala","line":2,"column":{}}}]}}"#,
+            column_of(line, "execute")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Service.execute",
         "{value}"
     );
 }

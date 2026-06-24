@@ -16,7 +16,7 @@ The observable result is focused Rust tests in `tests/get_definition_test.rs` th
 - [x] (2026-06-24T09:54Z) Confirmed the worktree is clean and on branch `222-improve-get_definition_by_location-receiver-and-member-resolution`, not detached.
 - [x] (2026-06-24T09:54Z) Created this issue-specific ExecPlan before code edits.
 - [x] (2026-06-24T10:00Z) Milestone 2 completed: added JS/TS local `new Class()` receiver inference and focused TypeScript/JavaScript tests for `greeter.greet`; `cargo test --test get_definition_test typescript_` passed 21 tests and `cargo test --test get_definition_test javascript_` passed 12 tests.
-- [ ] Milestone 3: implement and test Python/PHP/Scala obvious flows.
+- [x] (2026-06-24T10:04Z) Milestone 3 completed: fixed Python repeated `self.attribute` indexing to keep the first definition range, added issue-shaped PHP/Scala receiver tests, and validated `python_`, `php_`, `scala_`, and `python_analyzer_test`.
 - [ ] Milestone 4: implement and test Rust obvious local method flow.
 - [ ] Milestone 5: run final formatting, linting, and retrospective validation.
 
@@ -30,6 +30,12 @@ The observable result is focused Rust tests in `tests/get_definition_test.rs` th
 
 - Observation: The JS/TS resolver could fix the local constructor receiver gap with AST fields, not string parsing.
   Evidence: the implementation reads `variable_declarator` `name`/`value` fields and `new_expression` `constructor` fields, then resolves the constructor through the existing import binder and `DefinitionLookupIndex`.
+
+- Observation: Python's wrong attribute target was caused by declaration replacement, not by `get_definition` receiver lookup.
+  Evidence: `python_self_attribute_read_prefers_init_assignment_definition` initially resolved `service.Service.repository` at the later `save` assignment on line 7. `src/analyzer/python/declarations.rs` used `replace_code_unit` for every repeated `self.repository` assignment, so the later assignment replaced the initialization range.
+
+- Observation: PHP and Scala already resolved the issue-shaped typed receiver examples.
+  Evidence: new tests `php_repository_receiver_method_resolves_to_definition` and `scala_service_execute_receiver_resolves_to_definition` passed without resolver changes.
 
 ## Decision Log
 
@@ -46,6 +52,8 @@ The observable result is focused Rust tests in `tests/get_definition_test.rs` th
 Milestone 1 outcome: the branch started clean and rebased, and this living plan was created before implementation work.
 
 Milestone 2 outcome: JS/TS `get_definition_by_location` now resolves local variables initialized from `new Class()` to indexed class members, including imported TypeScript classes and same-file JavaScript classes. The focused tests `typescript_new_initialized_local_method_resolves_to_class_member` and `javascript_new_initialized_local_method_resolves_to_class_member` pass, and the existing TypeScript/JavaScript get-definition test groups remain green.
+
+Milestone 3 outcome: Python `self.attribute` reads now prefer the first indexed instance-attribute assignment, so an initialization in `__init__` is not displaced by a later method assignment. The issue-shaped PHP `$repository->save` and Scala `service.execute()` receiver tests are documented and passing. Validation evidence: `cargo test --test get_definition_test python_` passed 15 tests, `php_` passed 15 tests, `scala_` passed 27 tests, and `cargo test --test python_analyzer_test` passed 12 tests.
 
 ## Context and Orientation
 
@@ -75,6 +83,8 @@ For JS/TS, extend `src/analyzer/usages/get_definition/js_ts.rs` without changing
 Milestone 2 implementation note: `src/analyzer/usages/get_definition/js_ts.rs` now has a bounded local constructor receiver path. It scans the enclosing function or program scope before the reference, tracks the most recent matching local declaration, resolves `new Class()` constructors through existing imports or same-file indexed classes, supports simple local aliases, and then performs the normal `Owner.member` lookup. It intentionally leaves unsupported constructor expressions unresolved.
 
 For Python, PHP, and Scala, inspect the current resolver behavior before editing because these languages already have substantial receiver paths. Prefer filling narrow gaps, such as Python field/attribute definition priority, PHP typed receiver or `$this` gaps, and Scala constructor-created or typed receiver gaps. Reuse `LocalInferenceEngine`, `ClassRangeIndex`, type hierarchy providers, import binders, and language-specific AST helpers already present in the corresponding graph modules. Do not add source-text splitting fallbacks.
+
+Milestone 3 implementation note: Python instance-attribute declaration collection now preserves the first declaration range for a repeated field CodeUnit and still records later assignment signatures. PHP and Scala needed only focused issue-shaped regression tests because their typed receiver/member paths already resolved the target flows.
 
 For Rust, reuse the existing AST-based local binding and type lookup helpers in `src/analyzer/usages/get_definition/rust.rs`. Add only the `service.execute` style flow if it is still missing: a local or parameter whose type can be resolved to an indexed struct/impl owner and whose method name is indexed as `Owner.execute`. Add a negative test for an unresolved or shadowed receiver so the resolver does not start guessing by member name.
 
