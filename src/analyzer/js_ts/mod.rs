@@ -1,5 +1,6 @@
 pub(crate) mod cache;
 pub(crate) mod clones;
+pub(crate) mod hierarchy;
 pub(crate) mod identifiers;
 pub(crate) mod imports;
 pub(crate) mod model;

@@ -1,16 +1,122 @@
 mod common;
 
 use brokk_bifrost::{
-    CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, TestProject, TypescriptAnalyzer,
+    CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, TestProject, TypeHierarchyProvider,
+    TypescriptAnalyzer,
 };
 use pretty_assertions::assert_eq;
 use std::collections::BTreeSet;
 use tempfile::tempdir;
 
-use common::{assert_code_eq, assert_linewise_eq, definition, ts_fixture_project, write_file};
+use common::{
+    InlineTestProject, assert_code_eq, assert_linewise_eq, definition, ts_fixture_project,
+    write_file,
+};
 
 fn fixture_analyzer() -> TypescriptAnalyzer {
     TypescriptAnalyzer::from_project(ts_fixture_project())
+}
+
+fn ts_inline_analyzer(
+    files: &[(&str, &str)],
+) -> (common::BuiltInlineTestProject, TypescriptAnalyzer) {
+    let mut builder = InlineTestProject::with_language(Language::TypeScript);
+    for (path, contents) in files {
+        builder = builder.file(*path, *contents);
+    }
+    let project = builder.build();
+    let analyzer = TypescriptAnalyzer::from_project(project.project().clone());
+    (project, analyzer)
+}
+
+fn fq_names(units: impl IntoIterator<Item = CodeUnit>) -> Vec<String> {
+    let mut names: Vec<_> = units.into_iter().map(|unit| unit.fq_name()).collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn typescript_type_hierarchy_resolves_same_file_class_extends() {
+    let (_project, analyzer) =
+        ts_inline_analyzer(&[("models.ts", "class Base {}\nclass Child extends Base {}\n")]);
+
+    let base = definition(&analyzer, "Base");
+    let child = definition(&analyzer, "Child");
+
+    assert_eq!(
+        fq_names(analyzer.get_direct_ancestors(&child)),
+        vec!["Base"]
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_descendants(&base)),
+        vec!["Child"]
+    );
+}
+
+#[test]
+fn typescript_type_hierarchy_resolves_imported_class_implements_interface() {
+    let (_project, analyzer) = ts_inline_analyzer(&[
+        ("contract.ts", "export interface Runnable {}\n"),
+        (
+            "worker.ts",
+            "import { Runnable } from './contract';\nexport class Worker implements Runnable {}\n",
+        ),
+    ]);
+
+    let runnable = definition(&analyzer, "Runnable");
+    let worker = definition(&analyzer, "Worker");
+
+    assert_eq!(
+        fq_names(analyzer.get_direct_ancestors(&worker)),
+        vec!["Runnable"]
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_descendants(&runnable)),
+        vec!["Worker"]
+    );
+}
+
+#[test]
+fn typescript_type_hierarchy_resolves_imported_interface_extends() {
+    let (_project, analyzer) = ts_inline_analyzer(&[
+        ("base.ts", "export interface BaseContract {}\n"),
+        (
+            "child.ts",
+            "import { BaseContract } from './base';\nexport interface ChildContract extends BaseContract {}\n",
+        ),
+    ]);
+
+    let base = definition(&analyzer, "BaseContract");
+    let child = definition(&analyzer, "ChildContract");
+
+    assert_eq!(
+        fq_names(analyzer.get_direct_ancestors(&child)),
+        vec!["BaseContract"]
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_descendants(&base)),
+        vec!["ChildContract"]
+    );
+}
+
+#[test]
+fn typescript_type_hierarchy_keeps_ambiguous_barrel_import_conservative() {
+    let (_project, analyzer) = ts_inline_analyzer(&[
+        ("one.ts", "export interface Contract {}\n"),
+        ("two.ts", "export interface Contract {}\n"),
+        (
+            "barrel.ts",
+            "export * from './one';\nexport * from './two';\n",
+        ),
+        (
+            "worker.ts",
+            "import { Contract } from './barrel';\nexport class Worker implements Contract {}\n",
+        ),
+    ]);
+
+    let worker = definition(&analyzer, "Worker");
+
+    assert!(analyzer.get_direct_ancestors(&worker).is_empty());
 }
 
 #[test]

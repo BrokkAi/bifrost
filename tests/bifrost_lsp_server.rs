@@ -2035,6 +2035,112 @@ fn bifrost_lsp_server_type_hierarchy_python_uses_same_handler() {
 }
 
 #[test]
+fn bifrost_lsp_server_type_hierarchy_javascript_uses_same_handler() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("hierarchy.js");
+    fs::write(
+        &file_path,
+        "class Base {}\nclass Child extends Base {\n    method() {}\n}\n",
+    )
+    .expect("write JavaScript hierarchy fixture");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let child_item =
+        prepare_type_hierarchy(&mut stdin, &mut reader, &mut stderr, 25, &file_uri, 1, 6);
+    assert_eq!(child_item["name"], "Child", "prepared child: {child_item}");
+
+    let supertypes = type_hierarchy_relation(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        26,
+        "typeHierarchy/supertypes",
+        child_item,
+    );
+    let supertype_names: Vec<_> = supertypes
+        .iter()
+        .filter_map(|item| item["name"].as_str())
+        .collect();
+    assert_eq!(supertype_names, vec!["Base"], "supertypes: {supertypes:#?}");
+
+    let base_item = supertypes[0].clone();
+    let subtypes = type_hierarchy_relation(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        27,
+        "typeHierarchy/subtypes",
+        base_item,
+    );
+    let subtype_names: Vec<_> = subtypes
+        .iter()
+        .filter_map(|item| item["name"].as_str())
+        .collect();
+    assert_eq!(subtype_names, vec!["Child"], "subtypes: {subtypes:#?}");
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_type_hierarchy_typescript_uses_same_handler() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("hierarchy.ts");
+    fs::write(
+        &file_path,
+        "interface Runnable {}\nclass Base {}\nclass Child extends Base implements Runnable {\n    method(): void {}\n}\n",
+    )
+    .expect("write TypeScript hierarchy fixture");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let child_item =
+        prepare_type_hierarchy(&mut stdin, &mut reader, &mut stderr, 28, &file_uri, 2, 6);
+    assert_eq!(child_item["name"], "Child", "prepared child: {child_item}");
+
+    let supertypes = type_hierarchy_relation(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        29,
+        "typeHierarchy/supertypes",
+        child_item,
+    );
+    let supertype_names: Vec<_> = supertypes
+        .iter()
+        .filter_map(|item| item["name"].as_str())
+        .collect();
+    assert_eq!(
+        supertype_names,
+        vec!["Base", "Runnable"],
+        "supertypes: {supertypes:#?}"
+    );
+
+    let base_item = supertypes
+        .iter()
+        .find(|item| item["name"] == "Base")
+        .cloned()
+        .expect("Base supertype item");
+    let subtypes = type_hierarchy_relation(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        34,
+        "typeHierarchy/subtypes",
+        base_item,
+    );
+    let subtype_names: Vec<_> = subtypes
+        .iter()
+        .filter_map(|item| item["name"].as_str())
+        .collect();
+    assert_eq!(subtype_names, vec!["Child"], "subtypes: {subtypes:#?}");
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
 fn bifrost_lsp_server_type_hierarchy_php_uses_same_handler() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().canonicalize().expect("canon temp");

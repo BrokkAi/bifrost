@@ -6,7 +6,8 @@ use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::{
     AliasResolver, AnalyzerConfig, CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo,
     Language, Project, ProjectFile, TestAssertionSmell, TestAssertionWeights,
-    TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider, build_reverse_import_index,
+    TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
+    build_direct_descendant_index, build_reverse_import_index,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
@@ -16,11 +17,13 @@ use std::sync::{Arc, OnceLock};
 use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
 
 use crate::analyzer::js_ts::cache::{
-    build_weighted_cache, weight_code_unit_set, weight_project_file_set, weight_string_set,
+    build_weighted_cache, weight_code_unit_set, weight_code_unit_set_by_unit,
+    weight_code_unit_vec_by_unit, weight_project_file_set, weight_string_set,
 };
 use crate::analyzer::js_ts::clones::{
     build_js_ts_clone_ast_signature, normalized_clone_tokens_js_ts, refine_js_ts_clone_similarity,
 };
+use crate::analyzer::js_ts::hierarchy::{extract_ts_supertypes, resolve_direct_ancestors};
 use crate::analyzer::js_ts::identifiers::collect_js_ts_identifiers;
 use crate::analyzer::js_ts::imports::{
     extract_js_ts_call_receiver, import_info_tokens, parse_commonjs_require_import_infos_from_node,
@@ -149,6 +152,9 @@ pub struct TypescriptAnalyzer {
     imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     relevant_imports: Cache<CodeUnit, Arc<HashSet<String>>>,
+    direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
+    direct_descendants: Cache<CodeUnit, Arc<HashSet<CodeUnit>>>,
+    direct_descendant_index: Arc<OnceLock<HashMap<String, Arc<HashSet<CodeUnit>>>>>,
     reverse_import_index: Arc<OnceLock<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     /// Analyzer-cached JS/TS usage-resolution maps, built once per analyzer and reused
     /// across `scan_usages`/`usage_graph` queries. Reset on `update`/`update_all`.
@@ -172,6 +178,9 @@ impl TypescriptAnalyzer {
             imported_code_units: build_weighted_cache(memo_budget / 3, weight_code_unit_set),
             referencing_files: build_weighted_cache(memo_budget / 6, weight_project_file_set),
             relevant_imports: build_weighted_cache(memo_budget / 6, weight_string_set),
+            direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec_by_unit),
+            direct_descendants: build_weighted_cache(memo_budget / 8, weight_code_unit_set_by_unit),
+            direct_descendant_index: Arc::new(OnceLock::new()),
             reverse_import_index: Arc::new(OnceLock::new()),
             jsts_usage_index: Arc::new(OnceLock::new()),
             alias_resolver,
@@ -203,6 +212,9 @@ impl TypescriptAnalyzer {
             imported_code_units: build_weighted_cache(memo_budget / 3, weight_code_unit_set),
             referencing_files: build_weighted_cache(memo_budget / 6, weight_project_file_set),
             relevant_imports: build_weighted_cache(memo_budget / 6, weight_string_set),
+            direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec_by_unit),
+            direct_descendants: build_weighted_cache(memo_budget / 8, weight_code_unit_set_by_unit),
+            direct_descendant_index: Arc::new(OnceLock::new()),
             reverse_import_index: Arc::new(OnceLock::new()),
             jsts_usage_index: Arc::new(OnceLock::new()),
             alias_resolver,
@@ -377,6 +389,42 @@ impl TypeAliasProvider for TypescriptAnalyzer {
 
 impl TestDetectionProvider for TypescriptAnalyzer {}
 
+impl TypeHierarchyProvider for TypescriptAnalyzer {
+    fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+        if let Some(cached) = self.direct_ancestors.get(code_unit) {
+            return (*cached).clone();
+        }
+
+        let ancestors = resolve_direct_ancestors(
+            self,
+            self.jsts_usage_index(),
+            Language::TypeScript,
+            &self.alias_resolver,
+            code_unit,
+            self.inner.raw_supertypes_of(code_unit),
+        );
+        self.direct_ancestors
+            .insert(code_unit.clone(), Arc::new(ancestors.clone()));
+        ancestors
+    }
+
+    fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
+        if let Some(cached) = self.direct_descendants.get(code_unit) {
+            return (*cached).clone();
+        }
+
+        let descendants = self
+            .direct_descendant_index
+            .get_or_init(|| build_direct_descendant_index(self, self))
+            .get(&code_unit.fq_name())
+            .map(|descendants| descendants.as_ref().clone())
+            .unwrap_or_default();
+        self.direct_descendants
+            .insert(code_unit.clone(), Arc::new(descendants.clone()));
+        descendants
+    }
+}
+
 impl IAnalyzer for TypescriptAnalyzer {
     fn top_level_declarations<'a>(
         &'a self,
@@ -450,6 +498,15 @@ impl IAnalyzer for TypescriptAnalyzer {
             imported_code_units: build_weighted_cache(self.memo_budget / 3, weight_code_unit_set),
             referencing_files: build_weighted_cache(self.memo_budget / 6, weight_project_file_set),
             relevant_imports: build_weighted_cache(self.memo_budget / 6, weight_string_set),
+            direct_ancestors: build_weighted_cache(
+                self.memo_budget / 8,
+                weight_code_unit_vec_by_unit,
+            ),
+            direct_descendants: build_weighted_cache(
+                self.memo_budget / 8,
+                weight_code_unit_set_by_unit,
+            ),
+            direct_descendant_index: Arc::new(OnceLock::new()),
             reverse_import_index: Arc::new(OnceLock::new()),
             jsts_usage_index: Arc::new(OnceLock::new()),
             alias_resolver,
@@ -464,6 +521,15 @@ impl IAnalyzer for TypescriptAnalyzer {
             imported_code_units: build_weighted_cache(self.memo_budget / 3, weight_code_unit_set),
             referencing_files: build_weighted_cache(self.memo_budget / 6, weight_project_file_set),
             relevant_imports: build_weighted_cache(self.memo_budget / 6, weight_string_set),
+            direct_ancestors: build_weighted_cache(
+                self.memo_budget / 8,
+                weight_code_unit_vec_by_unit,
+            ),
+            direct_descendants: build_weighted_cache(
+                self.memo_budget / 8,
+                weight_code_unit_set_by_unit,
+            ),
+            direct_descendant_index: Arc::new(OnceLock::new()),
             reverse_import_index: Arc::new(OnceLock::new()),
             jsts_usage_index: Arc::new(OnceLock::new()),
             alias_resolver,
@@ -563,6 +629,9 @@ impl IAnalyzer for TypescriptAnalyzer {
         Some(self)
     }
     fn type_alias_provider(&self) -> Option<&dyn TypeAliasProvider> {
+        Some(self)
+    }
+    fn type_hierarchy_provider(&self) -> Option<&dyn TypeHierarchyProvider> {
         Some(self)
     }
     fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {
@@ -800,6 +869,10 @@ fn visit_ts_class_like(
             code_unit.clone(),
             ts_class_signature(node, source, exported),
         );
+        let supertypes = extract_ts_supertypes(definition, source);
+        if !supertypes.is_empty() {
+            parsed.set_raw_supertypes(code_unit.clone(), supertypes);
+        }
 
         if definition.kind() == "enum_declaration" {
             if let Some(body) = definition.child_by_field_name("body") {

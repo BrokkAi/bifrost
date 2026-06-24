@@ -2,7 +2,9 @@ use crate::analyzer::usages::common::language_for_target_filtered;
 use crate::analyzer::usages::js_ts_graph::extractor::{
     compute_export_index, compute_import_binder,
 };
-use crate::analyzer::usages::model::{ExportEntry, ExportIndex, ImportBinder, ImportKind};
+use crate::analyzer::usages::model::{
+    ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind,
+};
 use crate::analyzer::usages::{ImportEdge, ImportEdgeKind};
 use crate::analyzer::{
     AliasResolver, CodeUnit, IAnalyzer, Language, ProjectFile, resolve_js_ts_module_specifier,
@@ -20,6 +22,7 @@ use tree_sitter::Parser;
 #[derive(Default, Clone)]
 pub(crate) struct JsTsUsageIndex {
     pub(super) exports_by_file: HashMap<ProjectFile, ExportIndex>,
+    pub(super) binders_by_file: HashMap<ProjectFile, ImportBinder>,
     pub(super) reexport_edges: HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>>,
     pub(super) direct_reexport_edges: HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>>,
     pub(super) star_reexports: HashMap<ProjectFile, Vec<ProjectFile>>,
@@ -77,13 +80,14 @@ pub(crate) fn build_jsts_usage_index(
         star_reexports,
         direct_star_reexports,
         importer_reverse,
+        binders_by_file,
     }
 }
 
 impl JsTsUsageIndex {
     /// Resolve `exported_name` as exported by `module_files` to concrete local
     /// declarations, following named re-export chains and `export *` barrels.
-    pub(in crate::analyzer::usages) fn local_bindings_for_exported_name(
+    pub(crate) fn local_bindings_for_exported_name(
         &self,
         module_files: &[ProjectFile],
         exported_name: &str,
@@ -140,6 +144,14 @@ impl JsTsUsageIndex {
         }
 
         resolved
+    }
+
+    pub(crate) fn import_binding(
+        &self,
+        importer: &ProjectFile,
+        local_name: &str,
+    ) -> Option<&ImportBinding> {
+        self.binders_by_file.get(importer)?.bindings.get(local_name)
     }
 
     /// Export seeds for `target_short` in `target_file`, following named and star
