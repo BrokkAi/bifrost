@@ -7,6 +7,7 @@ use super::declarations::{
 };
 use crate::analyzer::type_relations::{TypeRelation, TypeRelationKind};
 use crate::analyzer::{CodeUnit, CodeUnitType, IAnalyzer, ImportAnalysisProvider, ProjectFile};
+use crate::hash::HashSet;
 use tree_sitter::Node;
 
 impl RubyAnalyzer {
@@ -136,9 +137,9 @@ impl RubyAnalyzer {
     }
 
     fn resolve_mixin_target(&self, file: &ProjectFile, raw: &str) -> Option<CodeUnit> {
-        self.inner
-            .definitions(raw)
-            .find(|unit| unit.is_class() || unit.is_module())
+        let visible_files = self.visible_mixin_files(file);
+        self.declarations(file)
+            .find(|unit| ruby_type_matches(unit, raw))
             .cloned()
             .or_else(|| {
                 self.imported_code_units_of(file)
@@ -146,11 +147,31 @@ impl RubyAnalyzer {
                     .find(|unit| ruby_type_matches(unit, raw))
             })
             .or_else(|| {
-                self.declarations(file)
+                self.inner
+                    .definitions(raw)
+                    .find(|unit| {
+                        (unit.is_class() || unit.is_module())
+                            && visible_files.contains(unit.source())
+                    })
+                    .cloned()
+            })
+            .or_else(|| {
+                self.all_declarations()
+                    .filter(|unit| visible_files.contains(unit.source()))
                     .find(|unit| ruby_type_matches(unit, raw))
                     .cloned()
             })
-            .or_else(|| self.resolve_supertype(raw))
+    }
+
+    fn visible_mixin_files(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
+        let mut files = HashSet::default();
+        files.insert(file.clone());
+        files.extend(
+            self.imported_code_units_of(file)
+                .into_iter()
+                .map(|unit| unit.source().clone()),
+        );
+        files
     }
 }
 
@@ -188,12 +209,12 @@ fn mixin_call_kind(node: Node<'_>, source: &str) -> Option<TypeRelationKind> {
 mod tests {
     use super::*;
     use crate::analyzer::Language;
-    use crate::test_support::InlineProjectFixture;
+    use crate::test_support::AnalyzerFixture;
 
-    fn analyzer_with_files(files: &[(&str, &str)]) -> (InlineProjectFixture, RubyAnalyzer) {
-        let project = InlineProjectFixture::with_language(Language::Ruby, files);
-        let analyzer = RubyAnalyzer::from_project(project.project().clone());
-        (project, analyzer)
+    fn analyzer_with_files(files: &[(&str, &str)]) -> (AnalyzerFixture, RubyAnalyzer) {
+        let fixture = AnalyzerFixture::new_for_language(Language::Ruby, files);
+        let analyzer = RubyAnalyzer::from_project(fixture.test_project().clone());
+        (fixture, analyzer)
     }
 
     #[test]
@@ -323,6 +344,46 @@ end
 
         assert!(!analyzer.mixin_relations().iter().any(|relation| {
             relation.from.identifier() == "Repository" && relation.to.identifier() == "Auditable"
+        }));
+    }
+
+    #[test]
+    fn unqualified_mixin_uses_import_visibility_over_global_same_name() {
+        let (_project, analyzer) = analyzer_with_files(&[
+            ("unloaded/shared.rb", "module Shared\nend\n"),
+            ("visible/shared.rb", "module Shared\nend\n"),
+            (
+                "app/repository.rb",
+                r#"
+require_relative "../visible/shared"
+
+class Repository
+  include Shared
+end
+"#,
+            ),
+            (
+                "app/other.rb",
+                r#"
+class OtherRepository
+  include Shared
+end
+"#,
+            ),
+        ]);
+
+        let relations = analyzer.mixin_relations();
+        assert!(relations.iter().any(|relation| {
+            relation.from.identifier() == "Repository"
+                && relation.to.source().rel_path().to_string_lossy() == "visible/shared.rb"
+                && relation.kind == TypeRelationKind::MixinInclude
+        }));
+        assert!(!relations.iter().any(|relation| {
+            relation.from.identifier() == "Repository"
+                && relation.to.source().rel_path().to_string_lossy() == "unloaded/shared.rb"
+        }));
+        assert!(!relations.iter().any(|relation| {
+            relation.from.identifier() == "OtherRepository" && relation.to.identifier() == "Shared"
         }));
     }
 }
