@@ -49,10 +49,7 @@ pub fn server_capabilities() -> ServerCapabilities {
         workspace: Some(lsp_types::WorkspaceServerCapabilities {
             workspace_folders: Some(WorkspaceFoldersServerCapabilities {
                 supported: Some(true),
-                // Dynamic workspace folder changes are intentionally not
-                // registered yet; startup-time multi-root is the supported
-                // contract for now.
-                change_notifications: None,
+                change_notifications: Some(OneOf::Left(true)),
             }),
             file_operations: None,
         }),

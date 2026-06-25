@@ -63,6 +63,11 @@ impl CompletionCache {
     pub(crate) fn invalidate(&mut self, path: &Path) {
         self.files.remove(path);
     }
+
+    pub(crate) fn clear(&mut self) {
+        self.files.clear();
+        self.last_log_failure.clear();
+    }
 }
 
 /// Resolve `textDocument/completion` for the identifier prefix immediately

@@ -23,16 +23,7 @@ pub fn read_document_for_uri(
 /// returning empty" can see the cause.
 pub fn project_file_for_uri(project: &dyn Project, uri: &Uri) -> Option<ProjectFile> {
     let abs_path = path_for_file_uri(uri)?;
-    // Canonicalize so Windows extended-length paths (`\\?\C:\…` produced by
-    // FilesystemProject's canonicalize) line up with the URI-decoded path
-    // (`C:/…`). Fall back to the as-is path when canonicalize fails — for
-    // example, didChangeWatchedFiles DELETED events reference paths that no
-    // longer exist on disk.
-    let canonical = abs_path.canonicalize().unwrap_or_else(|_| abs_path.clone());
-    if let Some(file) = project.file_by_abs_path(&canonical) {
-        return Some(file);
-    }
-    if let Some(file) = project.file_by_abs_path(&abs_path) {
+    if let Some(file) = project_file_for_abs_path(project, &abs_path) {
         return Some(file);
     }
     eprintln!(
@@ -40,6 +31,27 @@ pub fn project_file_for_uri(project: &dyn Project, uri: &Uri) -> Option<ProjectF
         abs_path.display(),
         project.root().display()
     );
+    None
+}
+
+pub(crate) fn project_file_for_abs_path(
+    project: &dyn Project,
+    abs_path: &std::path::Path,
+) -> Option<ProjectFile> {
+    // Canonicalize so Windows extended-length paths (`\\?\C:\…` produced by
+    // FilesystemProject's canonicalize) line up with the URI-decoded path
+    // (`C:/…`). Fall back to the as-is path when canonicalize fails — for
+    // example, didChangeWatchedFiles DELETED events reference paths that no
+    // longer exist on disk.
+    let canonical = abs_path
+        .canonicalize()
+        .unwrap_or_else(|_| abs_path.to_path_buf());
+    if let Some(file) = project.file_by_abs_path(&canonical) {
+        return Some(file);
+    }
+    if let Some(file) = project.file_by_abs_path(abs_path) {
+        return Some(file);
+    }
     None
 }
 
