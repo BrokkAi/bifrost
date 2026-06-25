@@ -173,11 +173,11 @@ class Embedder:
         bias = torch.zeros_like(key_valid, dtype=self.dtype).masked_fill(~key_valid, min_val)
         o = inner(inputs_embeds=embeds, attention_mask={"full_attention": bias},
                   use_cache=False)
-        hidden = self.model.linear(o.last_hidden_state).float()  # (b,seq,2048) fp32
+        hidden = self.model.linear(o.last_hidden_state)          # (b,seq,2048)
 
-        m = attention_mask[:, :, None].float()
+        m = attention_mask[:, :, None].to(dtype=self.dtype)
         pooled = (hidden * m).sum(1) / m.sum(1)        # masked mean -> (b,2048)
-        v = pooled[:, :OUT_DIM]                         # MRL truncate
+        v = pooled[:, :OUT_DIM].float()                 # MRL truncate, then fp32
         v = v / (v.norm(dim=-1, keepdim=True) + 1e-12)  # renorm
         vecs = v.cpu().numpy().astype(np.float32)
         for j, i in enumerate(idxs):
