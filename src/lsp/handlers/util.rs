@@ -55,6 +55,12 @@ pub(crate) fn project_file_for_uri_allow_missing(
     if let Some(file) = project.file_by_abs_path_allow_missing(&abs_path) {
         return Some(file);
     }
+    if let Some(canonical) = canonicalize_existing_prefix(&abs_path)
+        && canonical != abs_path
+        && let Some(file) = project.file_by_abs_path_allow_missing(&canonical)
+    {
+        return Some(file);
+    }
     eprintln!(
         "[bifrost-lsp] ignoring path outside project: {} (root: {})",
         abs_path.display(),
@@ -73,6 +79,23 @@ fn path_for_file_uri(uri: &Uri) -> Option<std::path::PathBuf> {
             );
             None
         }
+    }
+}
+
+fn canonicalize_existing_prefix(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut current = path;
+    let mut suffix = std::path::PathBuf::new();
+
+    loop {
+        if let Ok(canonical) = current.canonicalize() {
+            return Some(canonical.join(suffix));
+        }
+
+        let name = current.file_name()?;
+        let mut new_suffix = std::path::PathBuf::from(name);
+        new_suffix.push(suffix);
+        suffix = new_suffix;
+        current = current.parent()?;
     }
 }
 
