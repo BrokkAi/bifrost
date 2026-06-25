@@ -9,6 +9,7 @@ mod tests;
 mod usage_index;
 
 use crate::analyzer::common::language_for_file as file_language;
+use crate::analyzer::type_relations::TypeRelation;
 use crate::analyzer::{
     AnalyzerConfig, BuildProgress, CodeUnit, IAnalyzer, ImportAnalysisProvider, Language, Project,
     ProjectFile, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
@@ -40,6 +41,8 @@ pub struct RustAnalyzer {
     reverse_import_index: Arc<OnceLock<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     usage_index: Arc<OnceLock<RustUsageIndex>>,
     hierarchy_index: Arc<OnceLock<RustHierarchyIndex>>,
+    #[allow(dead_code)]
+    type_relations: Arc<OnceLock<Vec<TypeRelation>>>,
 }
 
 impl RustAnalyzer {
@@ -58,6 +61,7 @@ impl RustAnalyzer {
             reverse_import_index: Arc::new(OnceLock::new()),
             usage_index: Arc::new(OnceLock::new()),
             hierarchy_index: Arc::new(OnceLock::new()),
+            type_relations: Arc::new(OnceLock::new()),
         }
     }
 
@@ -109,6 +113,7 @@ impl RustAnalyzer {
             reverse_import_index: Arc::new(OnceLock::new()),
             usage_index: Arc::new(OnceLock::new()),
             hierarchy_index: Arc::new(OnceLock::new()),
+            type_relations: Arc::new(OnceLock::new()),
         }
     }
 
@@ -228,6 +233,7 @@ impl IAnalyzer for RustAnalyzer {
             reverse_import_index: Arc::new(OnceLock::new()),
             usage_index: Arc::new(OnceLock::new()),
             hierarchy_index: Arc::new(OnceLock::new()),
+            type_relations: Arc::new(OnceLock::new()),
         }
     }
 
@@ -244,6 +250,7 @@ impl IAnalyzer for RustAnalyzer {
             reverse_import_index: Arc::new(OnceLock::new()),
             usage_index: Arc::new(OnceLock::new()),
             hierarchy_index: Arc::new(OnceLock::new()),
+            type_relations: Arc::new(OnceLock::new()),
         }
     }
 

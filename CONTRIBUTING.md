@@ -23,8 +23,14 @@ Rust:
 ```bash
 cargo test
 cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy-no-cuda
 ```
+
+`cargo clippy-no-cuda` checks all targets with the optional `nlp` and `python`
+features enabled, but leaves `nlp-gpu` off. Use
+`cargo clippy --all-targets --all-features -- -D warnings` only on machines with
+NVIDIA CUDA tooling available; `--all-features` enables Candle's CUDA backend,
+whose build script expects `nvcc`.
 
 Python:
 

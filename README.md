@@ -275,8 +275,22 @@ Run the Python test suite with:
 scripts/test_python.sh
 ```
 
-On macOS, all-features Rust tests also enable the PyO3 extension module. Pass
-the same linker flags used by CI so Python symbols are resolved by the loading
+On macOS, all-features Rust checks also enable `nlp-gpu`, which requires
+NVIDIA CUDA tooling (`nvcc`) and is not a local Apple Silicon path. For local
+non-CUDA clippy coverage, use the repo alias:
+
+```bash
+cargo clippy-no-cuda
+```
+
+CUDA-capable environments can still run the full all-features check:
+
+```bash
+cargo clippy --all-targets --all-features -- -D warnings
+```
+
+All-features Rust tests also enable the PyO3 extension module. Pass the same
+linker flags used by CI so Python symbols are resolved by the loading
 interpreter:
 
 ```bash
