@@ -227,8 +227,11 @@ def serve(emb: Embedder) -> None:
 
 
 def selftest(emb: Embedder) -> None:
-    ref_path = "/home/jonathan/Projects/bifrost/tests/fixtures/voyage_parity_ref.json"
-    ref = json.load(open(ref_path))
+    # scripts/voyage_sidecar.py -> repo root -> tests/fixtures (works on any checkout/OS).
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    ref_path = os.path.join(repo_root, "tests", "fixtures", "voyage_parity_ref.json")
+    with open(ref_path) as f:
+        ref = json.load(f)
     worst = 1.0
     for kind, prefix in [("docs", PASSAGE_PREFIX), ("queries", QUERY_PREFIX)]:
         texts = list(ref[kind].keys())
