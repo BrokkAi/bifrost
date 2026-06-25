@@ -130,7 +130,12 @@ impl Attention {
     }
 
     /// `x`: (b, seq, hidden). `mask`: (b, 1, seq, seq) additive (0 / -inf), bidirectional.
-    fn forward(&self, x: &Tensor, mask: &Tensor, rotary: &RotaryEmbedding) -> candle_core::Result<Tensor> {
+    fn forward(
+        &self,
+        x: &Tensor,
+        mask: &Tensor,
+        rotary: &RotaryEmbedding,
+    ) -> candle_core::Result<Tensor> {
         let (b, seq, _) = x.dims3()?;
         let q = self.q_proj.forward(x)?;
         let k = self.k_proj.forward(x)?;
@@ -223,7 +228,12 @@ impl DecoderLayer {
         })
     }
 
-    fn forward(&self, x: &Tensor, mask: &Tensor, rotary: &RotaryEmbedding) -> candle_core::Result<Tensor> {
+    fn forward(
+        &self,
+        x: &Tensor,
+        mask: &Tensor,
+        rotary: &RotaryEmbedding,
+    ) -> candle_core::Result<Tensor> {
         let residual = x;
         let h = self.input_layernorm.forward(x)?;
         let h = self.self_attn.forward(&h, mask, rotary)?;
@@ -247,7 +257,12 @@ struct Qwen3BidirectionalModel {
 }
 
 impl Qwen3BidirectionalModel {
-    fn load(cfg: &VoyageConfig, vb: VarBuilder, device: &Device, dtype: DType) -> candle_core::Result<Self> {
+    fn load(
+        cfg: &VoyageConfig,
+        vb: VarBuilder,
+        device: &Device,
+        dtype: DType,
+    ) -> candle_core::Result<Self> {
         let model = vb.pp("model");
         let embed_tokens =
             candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, model.pp("embed_tokens"))?;
@@ -284,7 +299,11 @@ impl Qwen3BidirectionalModel {
 
     /// Additive bidirectional mask (b, 1, seq, seq): 0 where the key token is real,
     /// -inf where it is padding. No causal component.
-    fn bidirectional_mask(&self, attention_mask: &Tensor, seq: usize) -> candle_core::Result<Tensor> {
+    fn bidirectional_mask(
+        &self,
+        attention_mask: &Tensor,
+        seq: usize,
+    ) -> candle_core::Result<Tensor> {
         let (b, _) = attention_mask.dims2()?;
         // A large FINITE negative, not -inf: `(1 - 1) * -inf = NaN` would poison every
         // real key. With a finite value `0 * NEG = 0`, and `exp(NEG - max)` underflows
@@ -436,8 +455,8 @@ impl VoyageEmbedder {
             .model
             .forward(&input_ids, &attention_mask)
             .map_err(|err| format!("forward: {err}"))?; // (b, seq, 2048)
-        let pooled = masked_mean(&hidden, &attention_mask)
-            .map_err(|err| format!("mean pool: {err}"))?; // (b, 2048)
+        let pooled =
+            masked_mean(&hidden, &attention_mask).map_err(|err| format!("mean pool: {err}"))?; // (b, 2048)
         let truncated = pooled
             .narrow(1, 0, VOYAGE_OUTPUT_DIM)
             .map_err(|err| format!("mrl truncate: {err}"))?;
@@ -471,7 +490,10 @@ impl Embedder for VoyageEmbedder {
     }
 
     fn embed_passages(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, String> {
-        let prefixed: Vec<String> = texts.iter().map(|t| format!("{PASSAGE_PREFIX}{t}")).collect();
+        let prefixed: Vec<String> = texts
+            .iter()
+            .map(|t| format!("{PASSAGE_PREFIX}{t}"))
+            .collect();
         self.embed_prefixed(&prefixed)
     }
 
@@ -504,7 +526,11 @@ fn masked_mean(hidden: &Tensor, mask: &Tensor) -> candle_core::Result<Tensor> {
 
 /// Row-wise L2 normalize a (b, d) tensor.
 fn l2_normalize_rows(x: &Tensor) -> candle_core::Result<Tensor> {
-    let norm = x.sqr()?.sum_keepdim(1)?.sqrt()?.clamp(1e-12, f64::INFINITY)?;
+    let norm = x
+        .sqr()?
+        .sum_keepdim(1)?
+        .sqrt()?
+        .clamp(1e-12, f64::INFINITY)?;
     x.broadcast_div(&norm)
 }
 

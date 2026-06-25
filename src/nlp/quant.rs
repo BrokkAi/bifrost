@@ -24,7 +24,11 @@ fn quantizer(dim: usize) -> &'static RotationalQuantizer {
     }
     let mut writer = cache.write().expect("quant cache poisoned");
     writer.entry(dim).or_insert_with(|| {
-        Box::leak(Box::new(RotationalQuantizer::new(dim, Bits::Eight, Metric::Dot)))
+        Box::leak(Box::new(RotationalQuantizer::new(
+            dim,
+            Bits::Eight,
+            Metric::Dot,
+        )))
     })
 }
 
