@@ -28,7 +28,9 @@ use crate::analyzer::usages::inverted_edges::{
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::{ExportEntry, ImportKind};
-use crate::analyzer::usages::parsed_tree::parse_tree_sitter_file;
+use crate::analyzer::usages::parsed_tree::{
+    js_ts_tree_sitter_language_for_file, parse_tree_sitter_file,
+};
 use crate::analyzer::{IAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use std::collections::{BTreeMap, BTreeSet};
@@ -46,14 +48,15 @@ pub(super) fn build_jsts_edges<F>(
 where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
-    let Some(parser_language) = tree_sitter_language_for(language) else {
+    if tree_sitter_language_for(language).is_none() {
         return UsageEdges::default();
-    };
+    }
     let files = collect_jsts_files(analyzer, language);
     build_edges(&files, keep_file, |file| {
         // The non-scoped scan needs only the file's own tree (binder + declarations),
         // no cross-file resolution index. parse_and_collect drops the tree when this
         // closure returns, capping live trees to the worker count.
+        let parser_language = js_ts_tree_sitter_language_for_file(file, language)?;
         parse_and_collect(
             analyzer,
             file,
@@ -126,18 +129,19 @@ pub(super) fn build_jsts_scoped_edges<F>(
 where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
-    let Some(parser_language) = tree_sitter_language_for(language) else {
+    if tree_sitter_language_for(language).is_none() {
         return JsTsScopedUsageEdges {
             edges: UsageEdgeWeights::default(),
             node_status: BTreeMap::new(),
         };
-    };
+    }
     let files = collect_jsts_files(analyzer, language);
     let declarations = scoped_declarations_by_file_and_name(analyzer, language);
     let node_status = scoped_node_status(index, nodes, &declarations);
     let edges = build_edge_weights(&files, keep_file, |file| {
         // Parse on demand and drop the tree when this closure returns; cross-file
         // resolution comes from the analyzer-cached `index`, not retained trees.
+        let parser_language = js_ts_tree_sitter_language_for_file(file, language)?;
         let parsed = parse_tree_sitter_file(file, &parser_language)?;
         let imports = scoped_import_bindings(index, file, &declarations);
         let same_file = scoped_same_file_declarations(analyzer, file, language);

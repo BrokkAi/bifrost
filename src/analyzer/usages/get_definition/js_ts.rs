@@ -2580,14 +2580,8 @@ pub(super) fn parse_js_ts_tree(
     language: Language,
 ) -> Option<Tree> {
     let mut parser = Parser::new();
-    let tree_sitter_language = match language {
-        Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
-        Language::TypeScript if file.rel_path().extension().is_some_and(|ext| ext == "tsx") => {
-            tree_sitter_typescript::LANGUAGE_TSX.into()
-        }
-        Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-        _ => return None,
-    };
+    let tree_sitter_language =
+        crate::analyzer::usages::parsed_tree::js_ts_tree_sitter_language_for_file(file, language)?;
     parser.set_language(&tree_sitter_language).ok()?;
     parser.parse(source, None)
 }
