@@ -10,6 +10,7 @@ use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::js_ts::{
     build_weighted_cache, weight_code_unit_set_by_unit, weight_code_unit_vec_by_unit,
 };
+use crate::analyzer::type_relations::TypeRelation;
 use crate::analyzer::{
     AnalyzerConfig, BuildProgress, CodeUnit, IAnalyzer, ImportAnalysisProvider, Language, Project,
     ProjectFile, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
@@ -32,6 +33,8 @@ pub struct ScalaAnalyzer {
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
     direct_descendants: Cache<CodeUnit, Arc<HashSet<CodeUnit>>>,
     direct_descendant_index: Arc<OnceLock<HashMap<String, Arc<HashSet<CodeUnit>>>>>,
+    #[allow(dead_code)]
+    type_relations: Arc<OnceLock<Vec<TypeRelation>>>,
 }
 
 impl ScalaAnalyzer {
@@ -52,6 +55,7 @@ impl ScalaAnalyzer {
             direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec_by_unit),
             direct_descendants: build_weighted_cache(memo_budget / 8, weight_code_unit_set_by_unit),
             direct_descendant_index: Arc::new(OnceLock::new()),
+            type_relations: Arc::new(OnceLock::new()),
         }
     }
 
