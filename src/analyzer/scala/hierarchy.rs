@@ -43,20 +43,24 @@ impl ScalaAnalyzer {
 
     #[allow(dead_code)]
     fn collect_type_relations(&self) -> Vec<TypeRelation> {
+        let types = ScalaProjectTypes::build(self);
+        let traits = self.scala_trait_fqns();
         self.all_declarations()
             .filter(|unit| unit.is_class())
-            .flat_map(|unit| self.resolve_direct_ancestor_relations(unit))
+            .flat_map(|unit| self.resolve_direct_ancestor_relations(unit, &types, &traits))
             .collect()
     }
 
     fn resolve_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        self.resolve_direct_ancestor_relations(code_unit)
-            .into_iter()
-            .map(|relation| relation.to)
-            .collect()
+        let types = ScalaProjectTypes::build(self);
+        self.resolve_direct_ancestor_units(code_unit, &types)
     }
 
-    fn resolve_direct_ancestor_relations(&self, code_unit: &CodeUnit) -> Vec<TypeRelation> {
+    fn resolve_direct_ancestor_units(
+        &self,
+        code_unit: &CodeUnit,
+        types: &ScalaProjectTypes,
+    ) -> Vec<CodeUnit> {
         if !code_unit.is_class() {
             return Vec::new();
         }
@@ -76,10 +80,8 @@ impl ScalaAnalyzer {
             return Vec::new();
         };
 
-        let types = ScalaProjectTypes::build(self);
-        let resolver = ScalaNameResolver::for_file(self, code_unit.source(), &types);
-        let owner_kind = declaration.kind();
-        let mut relations = Vec::new();
+        let resolver = ScalaNameResolver::for_file(self, code_unit.source(), types);
+        let mut ancestors = Vec::new();
         let mut seen = HashSet::default();
         for parent in direct_parent_type_nodes(extends_clause) {
             let raw = node_text(parent, &source);
@@ -90,34 +92,60 @@ impl ScalaAnalyzer {
                 continue;
             }
             if let Some(definition) = self.definitions(&fqn).find(|unit| unit.is_class()).cloned() {
-                let kind = self.relation_kind(owner_kind, &definition);
-                relations.push(TypeRelation {
-                    from: code_unit.clone(),
-                    to: definition,
-                    kind,
-                });
+                ancestors.push(definition);
             }
         }
-        relations
+        ancestors
     }
 
-    fn relation_kind(&self, owner_kind: &str, ancestor: &CodeUnit) -> TypeRelationKind {
-        if owner_kind != "trait_definition" && self.is_scala_trait(ancestor) {
+    fn resolve_direct_ancestor_relations(
+        &self,
+        code_unit: &CodeUnit,
+        types: &ScalaProjectTypes,
+        traits: &HashSet<String>,
+    ) -> Vec<TypeRelation> {
+        let owner_is_trait = traits.contains(&code_unit.fq_name());
+        self.resolve_direct_ancestor_units(code_unit, types)
+            .into_iter()
+            .map(|ancestor| {
+                let kind = self.relation_kind(owner_is_trait, &ancestor, traits);
+                TypeRelation {
+                    from: code_unit.clone(),
+                    to: ancestor,
+                    kind,
+                }
+            })
+            .collect()
+    }
+
+    fn relation_kind(
+        &self,
+        owner_is_trait: bool,
+        ancestor: &CodeUnit,
+        traits: &HashSet<String>,
+    ) -> TypeRelationKind {
+        if !owner_is_trait && traits.contains(&ancestor.fq_name()) {
             TypeRelationKind::TraitImplementation
         } else {
             TypeRelationKind::NominalInheritance
         }
     }
 
-    fn is_scala_trait(&self, code_unit: &CodeUnit) -> bool {
-        let Ok(source) = self.inner.project().read_source(code_unit.source()) else {
-            return false;
-        };
-        let Some(tree) = parse_scala_source(&source) else {
-            return false;
-        };
-        declaration_node_for_unit(tree.root_node(), &source, code_unit, self)
-            .is_some_and(|node| node.kind() == "trait_definition")
+    fn scala_trait_fqns(&self) -> HashSet<String> {
+        self.all_declarations()
+            .filter(|unit| unit.is_class())
+            .filter(|unit| {
+                let Ok(source) = self.inner.project().read_source(unit.source()) else {
+                    return false;
+                };
+                let Some(tree) = parse_scala_source(&source) else {
+                    return false;
+                };
+                declaration_node_for_unit(tree.root_node(), &source, unit, self)
+                    .is_some_and(|node| node.kind() == "trait_definition")
+            })
+            .map(|unit| unit.fq_name())
+            .collect()
     }
 }
 
@@ -236,18 +264,28 @@ mod tests {
 
     #[test]
     fn scala_type_relations_distinguish_trait_mixins_from_nominal_inheritance() {
-        let (_fixture, analyzer) = analyzer_with_files(&[(
-            "Types.scala",
-            r#"
+        let (_fixture, analyzer) = analyzer_with_files(&[
+            (
+                "Types.scala",
+                r#"
 package app
+import lib.External
 class Base
 trait Runnable
 trait Logged
 trait Derived extends Logged
-class Worker extends Base with Runnable
+class Worker extends Base with Runnable with External
 object Singleton extends Runnable
 "#,
-        )]);
+            ),
+            (
+                "lib/Types.scala",
+                r#"
+package lib
+trait External
+"#,
+            ),
+        ]);
 
         let relations = analyzer.type_relations();
         assert!(relations.iter().any(|relation| {
@@ -263,6 +301,11 @@ object Singleton extends Runnable
         assert!(relations.iter().any(|relation| {
             relation.from.fq_name() == "app.Singleton$"
                 && relation.to.fq_name() == "app.Runnable"
+                && relation.kind == TypeRelationKind::TraitImplementation
+        }));
+        assert!(relations.iter().any(|relation| {
+            relation.from.fq_name() == "app.Worker"
+                && relation.to.fq_name() == "lib.External"
                 && relation.kind == TypeRelationKind::TraitImplementation
         }));
         assert!(relations.iter().any(|relation| {
