@@ -1,3 +1,13 @@
+//! Full-pipeline indexing profiler: throughput, peak RSS, and DB growth over a
+//! complete index run.
+//!
+//! Builds the workspace analyzer for a repo, then runs the production `SemanticIndexer`
+//! to completion while a background thread samples (every 2s) the phase, cumulative
+//! indexed chunks and chunks/s, pending batches, current/peak RSS, and on-disk DB size
+//! (`.db` + `.db-wal`). Unlike the narrower probes (`chunk_probe`, `embed_probe`,
+//! `embed_seq_probe`) this exercises extract -> embed -> store end to end, so it is the
+//! tool for whole-pipeline throughput and memory regressions. Honors
+//! `BIFROST_EMBED_BACKEND` like production. Usage: `semantic_index_profile <repo-root>`.
 #[cfg(not(feature = "nlp"))]
 fn main() {
     eprintln!("semantic_index_profile requires the nlp feature");
