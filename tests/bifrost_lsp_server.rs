@@ -73,6 +73,10 @@ fn bifrost_lsp_server_handles_initialize_and_shutdown() {
         initialize["result"]["capabilities"]["typeHierarchyProvider"], true,
         "typeHierarchyProvider should be advertised: {initialize}"
     );
+    assert_eq!(
+        initialize["result"]["capabilities"]["callHierarchyProvider"], true,
+        "callHierarchyProvider should be advertised: {initialize}"
+    );
 
     write_message(
         &mut stdin,
@@ -92,6 +96,897 @@ fn bifrost_lsp_server_handles_initialize_and_shutdown() {
     drop(stdin);
     let status = child.wait().expect("wait bifrost");
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
+fn bifrost_lsp_server_indexes_all_startup_workspace_folders() {
+    let temp = TempDir::new().expect("tempdir");
+    let parent = temp.path().canonicalize().expect("canon temp");
+    let root_a = parent.join("service-a");
+    let root_b = parent.join("service-b");
+    fs::create_dir_all(&root_a).expect("create service-a");
+    fs::create_dir_all(&root_b).expect("create service-b");
+    let alpha_path = root_a.join("Alpha.java");
+    let beta_path = root_b.join("Beta.java");
+    fs::write(
+        &alpha_path,
+        "class AlphaRoot {\n    void alphaOnly() {}\n}\n",
+    )
+    .expect("write Alpha.java");
+    fs::write(&beta_path, "class BetaRoot {\n    void betaOnly() {}\n}\n")
+        .expect("write Beta.java");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(&parent)
+        .arg("--server")
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bifrost");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "processId": null,
+                "rootUri": null,
+                "workspaceFolders": [
+                    {"uri": uri_for(&root_a), "name": "service-a"},
+                    {"uri": uri_for(&root_b), "name": "service-b"}
+                ],
+                "capabilities": {"workspace": {"workspaceFolders": true}}
+            }
+        }),
+    );
+    let initialize = read_message(&mut reader, &mut stderr);
+    assert_eq!(initialize["id"], 1);
+    assert_eq!(
+        initialize["result"]["capabilities"]["workspace"]["workspaceFolders"]["supported"], true,
+        "workspace folder support should be advertised: {initialize}"
+    );
+    assert_eq!(
+        initialize["result"]["capabilities"]["workspace"]["workspaceFolders"]["changeNotifications"],
+        true,
+        "dynamic workspace folder changes should be advertised: {initialize}"
+    );
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "workspace/symbol",
+            "params": {"query": "Only"}
+        }),
+    );
+    let symbols_response = read_message(&mut reader, &mut stderr);
+    let symbols = symbols_response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected workspace symbols, got {symbols_response}"));
+    assert!(
+        symbols.iter().any(|symbol| symbol["name"] == "alphaOnly"),
+        "expected alphaOnly from first root in {symbols:#?}"
+    );
+    assert!(
+        symbols.iter().any(|symbol| symbol["name"] == "betaOnly"),
+        "expected betaOnly from second root in {symbols:#?}"
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "textDocument/documentSymbol",
+            "params": {"textDocument": {"uri": uri_for(&beta_path)}}
+        }),
+    );
+    let document_symbols_response = read_message(&mut reader, &mut stderr);
+    assert_eq!(
+        document_symbols_response["id"], 3,
+        "expected documentSymbol response: {document_symbols_response}"
+    );
+    let document_symbols = document_symbols_response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected document symbols, got {document_symbols_response}"));
+    assert!(
+        document_symbols
+            .iter()
+            .any(|symbol| symbol["name"] == "BetaRoot"),
+        "expected BetaRoot document symbol from second root in {document_symbols:#?}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_adds_workspace_folder_dynamically() {
+    let temp = TempDir::new().expect("tempdir");
+    let parent = temp.path().canonicalize().expect("canon temp");
+    let root_a = parent.join("service-a");
+    let root_b = parent.join("service-b");
+    let outside = parent.join("outside");
+    fs::create_dir_all(&root_a).expect("create service-a");
+    fs::create_dir_all(&root_b).expect("create service-b");
+    fs::create_dir_all(&outside).expect("create outside");
+    fs::write(
+        root_a.join("Alpha.java"),
+        "class AlphaRoot {\n    void alphaOnly() {}\n}\n",
+    )
+    .expect("write Alpha.java");
+    let beta_path = root_b.join("Beta.java");
+    fs::write(
+        &beta_path,
+        "class BetaRoot {\n    void betaDynamic() {}\n}\n",
+    )
+    .expect("write Beta.java");
+    fs::write(
+        outside.join("Outside.java"),
+        "class OutsideRoot {\n    void outsideLeak() {}\n}\n",
+    )
+    .expect("write Outside.java");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server_with_params(
+        &parent,
+        json!({
+            "processId": null,
+            "rootUri": null,
+            "workspaceFolders": [{"uri": uri_for(&root_a), "name": "service-a"}],
+            "capabilities": {"workspace": {"workspaceFolders": true}}
+        }),
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "workspace/didChangeWorkspaceFolders",
+            "params": {
+                "event": {
+                    "added": [{"uri": uri_for(&root_b), "name": "service-b"}],
+                    "removed": []
+                }
+            }
+        }),
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "workspace/symbol",
+            "params": {"query": "Dynamic"}
+        }),
+    );
+    let symbols_response = read_response_for_id(&mut reader, &mut stderr, 2);
+    let symbols = symbols_response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected workspace symbols, got {symbols_response}"));
+    assert!(
+        symbols.iter().any(|symbol| symbol["name"] == "betaDynamic"),
+        "expected betaDynamic from added root in {symbols:#?}"
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "textDocument/documentSymbol",
+            "params": {"textDocument": {"uri": uri_for(&beta_path)}}
+        }),
+    );
+    let document_symbols_response = read_response_for_id(&mut reader, &mut stderr, 3);
+    let document_symbols = document_symbols_response["result"]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!("expected document symbols from added root, got {document_symbols_response}")
+        });
+    assert!(
+        document_symbols
+            .iter()
+            .any(|symbol| symbol["name"] == "BetaRoot"),
+        "expected BetaRoot document symbol from added root in {document_symbols:#?}"
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "workspace/symbol",
+            "params": {"query": "outsideLeak"}
+        }),
+    );
+    let outside_response = read_response_for_id(&mut reader, &mut stderr, 4);
+    let outside_symbols = outside_response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected workspace symbols, got {outside_response}"));
+    assert!(
+        outside_symbols.is_empty(),
+        "sibling outside active workspace folders should not be indexed: {outside_symbols:#?}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_removes_workspace_folder_dynamically() {
+    let temp = TempDir::new().expect("tempdir");
+    let parent = temp.path().canonicalize().expect("canon temp");
+    let root_a = parent.join("service-a");
+    let root_b = parent.join("service-b");
+    fs::create_dir_all(&root_a).expect("create service-a");
+    fs::create_dir_all(&root_b).expect("create service-b");
+    let request_path = root_a.join("Requester.java");
+    let removed_path = root_b.join("Removed.java");
+    fs::write(
+        &request_path,
+        "class Requester {\n    void caller() {\n        removed\n    }\n}\n",
+    )
+    .expect("write Requester.java");
+    fs::write(
+        &removed_path,
+        "class RemovedRoot {\n    void removedCompletion() {}\n    void broken( {\n}\n",
+    )
+    .expect("write Removed.java");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server_with_params(
+        &parent,
+        json!({
+            "processId": null,
+            "rootUri": null,
+            "workspaceFolders": [
+                {"uri": uri_for(&root_a), "name": "service-a"},
+                {"uri": uri_for(&root_b), "name": "service-b"}
+            ],
+            "capabilities": {}
+        }),
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "textDocument/completion",
+            "params": {
+                "textDocument": {"uri": uri_for(&request_path)},
+                "position": {"line": 2, "character": 15}
+            }
+        }),
+    );
+    let before_completion = read_response_for_id(&mut reader, &mut stderr, 2);
+    let before_items = before_completion["result"]["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected completion items, got {before_completion}"));
+    assert!(
+        before_items
+            .iter()
+            .any(|item| item["label"] == "removedCompletion"),
+        "expected completion from second root before removal: {before_items:#?}"
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didSave",
+            "params": {"textDocument": {"uri": uri_for(&removed_path)}}
+        }),
+    );
+    let publish_before =
+        read_notification(&mut reader, &mut stderr, "textDocument/publishDiagnostics");
+    assert_eq!(
+        publish_before["params"]["uri"],
+        uri_for(&removed_path),
+        "expected diagnostics for removed-root file before removal: {publish_before}"
+    );
+    assert!(
+        !publish_before["params"]["diagnostics"]
+            .as_array()
+            .unwrap_or_else(|| panic!("expected diagnostics array, got {publish_before}"))
+            .is_empty(),
+        "expected parse diagnostics before removing root: {publish_before}"
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "workspace/didChangeWorkspaceFolders",
+            "params": {
+                "event": {
+                    "added": [],
+                    "removed": [{"uri": uri_for(&root_b), "name": "service-b"}]
+                }
+            }
+        }),
+    );
+    let publish_clear =
+        read_notification(&mut reader, &mut stderr, "textDocument/publishDiagnostics");
+    assert_eq!(
+        publish_clear["params"]["uri"],
+        uri_for(&removed_path),
+        "expected removed-root diagnostics to be cleared: {publish_clear}"
+    );
+    assert!(
+        publish_clear["params"]["diagnostics"]
+            .as_array()
+            .unwrap_or_else(|| panic!("expected diagnostics array, got {publish_clear}"))
+            .is_empty(),
+        "expected empty diagnostics after root removal: {publish_clear}"
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "workspace/symbol",
+            "params": {"query": "removedCompletion"}
+        }),
+    );
+    let after_symbols = read_response_for_id(&mut reader, &mut stderr, 3);
+    let symbols = after_symbols["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected workspace symbols, got {after_symbols}"));
+    assert!(
+        symbols.is_empty(),
+        "removed root symbols should disappear: {symbols:#?}"
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "textDocument/completion",
+            "params": {
+                "textDocument": {"uri": uri_for(&request_path)},
+                "position": {"line": 2, "character": 15}
+            }
+        }),
+    );
+    let after_completion = read_response_for_id(&mut reader, &mut stderr, 4);
+    let after_items = after_completion["result"]["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected completion items, got {after_completion}"));
+    assert!(
+        !after_items
+            .iter()
+            .any(|item| item["label"] == "removedCompletion"),
+        "completion cache should not retain removed-root symbols: {after_items:#?}"
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "textDocument/documentSymbol",
+            "params": {"textDocument": {"uri": uri_for(&removed_path)}}
+        }),
+    );
+    let removed_document = read_response_for_id(&mut reader, &mut stderr, 5);
+    assert!(
+        removed_document["result"].is_null(),
+        "document requests should no longer route to removed roots: {removed_document}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_replays_open_document_after_workspace_folder_readd() {
+    let temp = TempDir::new().expect("tempdir");
+    let parent = temp.path().canonicalize().expect("canon temp");
+    let root_a = parent.join("service-a");
+    let root_b = parent.join("service-b");
+    fs::create_dir_all(&root_a).expect("create service-a");
+    fs::create_dir_all(&root_b).expect("create service-b");
+    fs::write(root_a.join("Alpha.java"), "class AlphaRoot {}\n").expect("write Alpha.java");
+    let beta_path = root_b.join("Beta.java");
+    fs::write(&beta_path, "class BetaRoot {\n    void diskOnly() {}\n}\n")
+        .expect("write Beta.java");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server_with_params(
+        &parent,
+        json!({
+            "processId": null,
+            "rootUri": null,
+            "workspaceFolders": [
+                {"uri": uri_for(&root_a), "name": "service-a"},
+                {"uri": uri_for(&root_b), "name": "service-b"}
+            ],
+            "capabilities": {}
+        }),
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": uri_for(&beta_path),
+                    "languageId": "java",
+                    "version": 1,
+                    "text": "class BetaRoot {\n    void overlayOnly() {}\n}\n"
+                }
+            }
+        }),
+    );
+    let _ = read_notification(&mut reader, &mut stderr, "textDocument/publishDiagnostics");
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "workspace/didChangeWorkspaceFolders",
+            "params": {
+                "event": {
+                    "added": [],
+                    "removed": [{"uri": uri_for(&root_b), "name": "service-b"}]
+                }
+            }
+        }),
+    );
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "workspace/didChangeWorkspaceFolders",
+            "params": {
+                "event": {
+                    "added": [{"uri": uri_for(&root_b), "name": "service-b"}],
+                    "removed": []
+                }
+            }
+        }),
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "workspace/symbol",
+            "params": {"query": "overlayOnly"}
+        }),
+    );
+    let response = read_response_for_id(&mut reader, &mut stderr, 2);
+    let symbols = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected workspace symbols, got {response}"));
+    assert!(
+        symbols.iter().any(|symbol| symbol["name"] == "overlayOnly"),
+        "re-added root should replay still-open document overlay: {symbols:#?}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[cfg(unix)]
+#[test]
+fn bifrost_lsp_server_removes_symlinked_workspace_folder_after_symlink_disappears() {
+    let temp = TempDir::new().expect("tempdir");
+    let parent = temp.path().canonicalize().expect("canon temp");
+    let real_root = parent.join("real-service");
+    let link_root = parent.join("linked-service");
+    fs::create_dir_all(&real_root).expect("create real service");
+    std::os::unix::fs::symlink(&real_root, &link_root).expect("create root symlink");
+    fs::write(
+        real_root.join("Linked.java"),
+        "class LinkedRoot {\n    void linkedOnly() {}\n}\n",
+    )
+    .expect("write Linked.java");
+    let link_uri = uri_for(&link_root);
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server_with_params(
+        &parent,
+        json!({
+            "processId": null,
+            "rootUri": null,
+            "workspaceFolders": [{"uri": link_uri, "name": "linked-service"}],
+            "capabilities": {}
+        }),
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "workspace/symbol",
+            "params": {"query": "linkedOnly"}
+        }),
+    );
+    let before = read_response_for_id(&mut reader, &mut stderr, 2);
+    let before_symbols = before["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected workspace symbols, got {before}"));
+    assert!(
+        before_symbols
+            .iter()
+            .any(|symbol| symbol["name"] == "linkedOnly"),
+        "expected linked root symbol before removal: {before_symbols:#?}"
+    );
+
+    fs::remove_file(&link_root).expect("remove root symlink");
+    assert!(
+        !link_root.exists(),
+        "root symlink should be gone before removal notification"
+    );
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "workspace/didChangeWorkspaceFolders",
+            "params": {
+                "event": {
+                    "added": [],
+                    "removed": [{"uri": link_uri, "name": "linked-service"}]
+                }
+            }
+        }),
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "workspace/symbol",
+            "params": {"query": "linkedOnly"}
+        }),
+    );
+    let response = read_response_for_id(&mut reader, &mut stderr, 3);
+    let symbols = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected workspace symbols, got {response}"));
+    assert!(
+        symbols.is_empty(),
+        "removing the original symlink URI should remove its canonical analyzer root: {symbols:#?}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_ignores_invalid_dynamic_workspace_folder_additions() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let not_a_dir = root.join("NotADir.java");
+    fs::write(
+        root.join("Alpha.java"),
+        "class AlphaRoot {\n    void alphaStillIndexed() {}\n}\n",
+    )
+    .expect("write Alpha.java");
+    fs::write(&not_a_dir, "class NotADir {}\n").expect("write NotADir.java");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "workspace/didChangeWorkspaceFolders",
+            "params": {
+                "event": {
+                    "added": [
+                        {"uri": "untitled:dynamic-root", "name": "bad-scheme"},
+                        {"uri": uri_for(&not_a_dir), "name": "not-a-dir"}
+                    ],
+                    "removed": []
+                }
+            }
+        }),
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "workspace/symbol",
+            "params": {"query": "alphaStillIndexed"}
+        }),
+    );
+    let response = read_response_for_id(&mut reader, &mut stderr, 2);
+    let symbols = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected workspace symbols, got {response}"));
+    assert!(
+        symbols
+            .iter()
+            .any(|symbol| symbol["name"] == "alphaStillIndexed"),
+        "invalid additions should not disturb the existing workspace: {symbols:#?}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_indexes_new_file_in_second_workspace_folder() {
+    let temp = TempDir::new().expect("tempdir");
+    let parent = temp.path().canonicalize().expect("canon temp");
+    let root_a = parent.join("service-a");
+    let root_b = parent.join("service-b");
+    fs::create_dir_all(&root_a).expect("create service-a");
+    fs::create_dir_all(&root_b).expect("create service-b");
+    fs::write(
+        root_a.join("Alpha.java"),
+        "class AlphaRoot {\n    void alphaOnly() {}\n}\n",
+    )
+    .expect("write Alpha.java");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(&parent)
+        .arg("--server")
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bifrost");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+    let beta_path = root_b.join("Beta.java");
+    let beta_uri = uri_for(&beta_path);
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "processId": null,
+                "rootUri": null,
+                "workspaceFolders": [
+                    {"uri": uri_for(&root_a), "name": "service-a"},
+                    {"uri": uri_for(&root_b), "name": "service-b"}
+                ],
+                "capabilities": {}
+            }
+        }),
+    );
+    let initialize = read_message(&mut reader, &mut stderr);
+    assert_eq!(initialize["id"], 1);
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+    );
+
+    fs::write(
+        &beta_path,
+        "class BetaRoot {\n    void betaCreatedLater() {}\n}\n",
+    )
+    .expect("write Beta.java");
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "workspace/didChangeWatchedFiles",
+            "params": {
+                "changes": [{"uri": beta_uri, "type": 1}]
+            }
+        }),
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "workspace/symbol",
+            "params": {"query": "betaCreatedLater"}
+        }),
+    );
+    let response = read_message(&mut reader, &mut stderr);
+    let symbols = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected workspace symbols, got {response}"));
+    assert!(
+        symbols
+            .iter()
+            .any(|symbol| symbol["name"] == "betaCreatedLater"),
+        "expected newly created second-root symbol in {symbols:#?}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_watched_delete_removes_workspace_symbol() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("Watch.java");
+    fs::write(&file_path, "class Watch {\n    void removedLater() {}\n}\n")
+        .expect("write Watch.java");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(&root)
+        .arg("--server")
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bifrost");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+    let file_uri = uri_for(&file_path);
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"processId": null, "rootUri": uri_for(&root), "capabilities": {}}
+        }),
+    );
+    let initialize = read_message(&mut reader, &mut stderr);
+    assert_eq!(initialize["id"], 1);
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "workspace/symbol",
+            "params": {"query": "removedLater"}
+        }),
+    );
+    let before = read_message(&mut reader, &mut stderr);
+    let before_symbols = before["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected workspace symbols, got {before}"));
+    assert!(
+        before_symbols
+            .iter()
+            .any(|symbol| symbol["name"] == "removedLater"),
+        "expected symbol before delete in {before_symbols:#?}"
+    );
+
+    fs::remove_file(&file_path).expect("delete Watch.java");
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "workspace/didChangeWatchedFiles",
+            "params": {
+                "changes": [{"uri": file_uri, "type": 3}]
+            }
+        }),
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "workspace/symbol",
+            "params": {"query": "removedLater"}
+        }),
+    );
+    let after = read_message(&mut reader, &mut stderr);
+    let after_symbols = after["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected workspace symbols, got {after}"));
+    assert!(
+        !after_symbols
+            .iter()
+            .any(|symbol| symbol["name"] == "removedLater"),
+        "deleted file symbol should be gone, got {after_symbols:#?}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_falls_back_to_root_uri_when_workspace_folders_null() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("Fallback.java");
+    fs::write(
+        &file_path,
+        "class FallbackRoot {\n    void fallbackOnly() {}\n}\n",
+    )
+    .expect("write Fallback.java");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(root.join("unused-fallback"))
+        .arg("--server")
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bifrost");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "processId": null,
+                "rootUri": uri_for(&root),
+                "workspaceFolders": null,
+                "capabilities": {}
+            }
+        }),
+    );
+    let initialize = read_message(&mut reader, &mut stderr);
+    assert_eq!(initialize["id"], 1);
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "textDocument/documentSymbol",
+            "params": {"textDocument": {"uri": uri_for(&file_path)}}
+        }),
+    );
+    let response = read_message(&mut reader, &mut stderr);
+    assert_eq!(
+        response["id"], 2,
+        "expected documentSymbol response: {response}"
+    );
+    let symbols = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected document symbols, got {response}"));
+    assert!(
+        symbols
+            .iter()
+            .any(|symbol| symbol["name"] == "FallbackRoot"),
+        "expected rootUri-backed document symbol in {symbols:#?}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
 }
 
 #[test]
@@ -1112,6 +2007,255 @@ fn bifrost_lsp_server_references_finds_class_a_usages() {
     drop(stdin);
     let status = child.wait().expect("wait bifrost");
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
+fn bifrost_lsp_server_call_hierarchy_finds_java_incoming_and_outgoing_calls() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("Calls.java");
+    fs::write(
+        &file_path,
+        "class Service {\n    static void target() {}\n}\nclass Caller {\n    void helper() {\n        Service.target();\n    }\n}\n",
+    )
+    .expect("write Java call hierarchy fixture");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+
+    let target = prepare_call_hierarchy(&mut stdin, &mut reader, &mut stderr, 10, &file_uri, 1, 16);
+    assert_eq!(target["name"], "target", "prepared target: {target}");
+
+    let incoming = call_hierarchy_relation(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        11,
+        "callHierarchy/incomingCalls",
+        target.clone(),
+    );
+    assert_eq!(incoming.len(), 1, "incoming calls: {incoming:#?}");
+    assert_eq!(
+        incoming[0]["from"]["name"], "helper",
+        "incoming caller should be helper: {incoming:#?}"
+    );
+    assert_call_range(&incoming[0]["fromRanges"], 5, 16, 22);
+
+    let helper = prepare_call_hierarchy(&mut stdin, &mut reader, &mut stderr, 12, &file_uri, 4, 10);
+    assert_eq!(helper["name"], "helper", "prepared helper: {helper}");
+
+    let outgoing = call_hierarchy_relation(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        13,
+        "callHierarchy/outgoingCalls",
+        helper,
+    );
+    assert!(
+        outgoing.iter().any(|call| call["to"]["name"] == "target"),
+        "outgoing calls should include target: {outgoing:#?}"
+    );
+    let target_call = outgoing
+        .iter()
+        .find(|call| call["to"]["name"] == "target")
+        .expect("target outgoing call");
+    assert_call_range(&target_call["fromRanges"], 5, 16, 22);
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_call_hierarchy_preserves_java_overload_identity() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("Overloads.java");
+    fs::write(
+        &file_path,
+        "class Service {\n    static void target() {}\n    static void target(String value) {}\n    static void stringCaller() {\n        target(\"x\");\n    }\n    static void noArgCaller() {\n        target();\n    }\n}\n",
+    )
+    .expect("write Java overload call hierarchy fixture");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+
+    let string_target =
+        prepare_call_hierarchy(&mut stdin, &mut reader, &mut stderr, 20, &file_uri, 2, 16);
+    assert_eq!(
+        string_target["detail"], "(String)",
+        "prepared overload should carry String signature: {string_target}"
+    );
+
+    let incoming = call_hierarchy_relation(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        21,
+        "callHierarchy/incomingCalls",
+        string_target,
+    );
+    let callers: Vec<_> = incoming
+        .iter()
+        .filter_map(|call| call["from"]["name"].as_str())
+        .collect();
+    assert_eq!(
+        callers,
+        vec!["stringCaller"],
+        "String overload should not include no-arg caller: {incoming:#?}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_call_hierarchy_ignores_non_call_type_references() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("TypeReference.java");
+    fs::write(
+        &file_path,
+        "class Service {}\nclass Caller {\n    void helper() {\n        Service value = null;\n    }\n}\n",
+    )
+    .expect("write Java type-reference call hierarchy fixture");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let service = prepare_call_hierarchy(&mut stdin, &mut reader, &mut stderr, 30, &file_uri, 0, 6);
+    assert_eq!(service["name"], "Service", "prepared service: {service}");
+
+    let incoming = call_hierarchy_relation(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        31,
+        "callHierarchy/incomingCalls",
+        service,
+    );
+    assert!(
+        incoming.is_empty(),
+        "type references without calls must not produce incoming call hierarchy edges: {incoming:#?}"
+    );
+
+    let helper = prepare_call_hierarchy(&mut stdin, &mut reader, &mut stderr, 30, &file_uri, 2, 10);
+
+    let outgoing = call_hierarchy_relation(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        32,
+        "callHierarchy/outgoingCalls",
+        helper,
+    );
+    assert!(
+        outgoing.is_empty(),
+        "type references without calls must not produce outgoing call hierarchy edges: {outgoing:#?}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_call_hierarchy_finds_qualified_java_constructor_calls() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let pkg_dir = root.join("pkg");
+    fs::create_dir(&pkg_dir).expect("create package dir");
+    let service_path = pkg_dir.join("Service.java");
+    fs::write(&service_path, "package pkg;\npublic class Service {}\n")
+        .expect("write Java service fixture");
+    let caller_path = root.join("Caller.java");
+    fs::write(
+        &caller_path,
+        "class Caller {\n    void helper() {\n        new pkg.Service();\n    }\n}\n",
+    )
+    .expect("write Java qualified constructor fixture");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let caller_uri = uri_for(&caller_path);
+    let helper =
+        prepare_call_hierarchy(&mut stdin, &mut reader, &mut stderr, 40, &caller_uri, 1, 10);
+
+    let outgoing = call_hierarchy_relation(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        41,
+        "callHierarchy/outgoingCalls",
+        helper,
+    );
+    assert!(
+        outgoing.iter().any(|call| call["to"]["name"] == "Service"),
+        "qualified constructor calls should produce outgoing class edges: {outgoing:#?}"
+    );
+    let service_call = outgoing
+        .iter()
+        .find(|call| call["to"]["name"] == "Service")
+        .expect("Service outgoing call");
+    assert_call_range(&service_call["fromRanges"], 2, 16, 23);
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_call_hierarchy_does_not_include_nested_function_calls() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("nested.js");
+    fs::write(
+        &file_path,
+        "function target() {}\nfunction outer() {\n    function inner() {\n        target();\n    }\n}\n",
+    )
+    .expect("write JavaScript nested call hierarchy fixture");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let outer = prepare_call_hierarchy(&mut stdin, &mut reader, &mut stderr, 40, &file_uri, 1, 9);
+
+    let outgoing = call_hierarchy_relation(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        41,
+        "callHierarchy/outgoingCalls",
+        outer,
+    );
+    assert!(
+        outgoing.is_empty(),
+        "calls inside nested functions must not be attributed to the outer function: {outgoing:#?}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_call_hierarchy_does_not_include_nested_type_calls() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("NestedType.java");
+    fs::write(
+        &file_path,
+        "class Target {\n    static int value() { return 1; }\n}\nclass Outer {\n    class Inner {\n        int field = Target.value();\n    }\n}\n",
+    )
+    .expect("write Java nested type call hierarchy fixture");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let outer = prepare_call_hierarchy(&mut stdin, &mut reader, &mut stderr, 50, &file_uri, 3, 6);
+
+    let outgoing = call_hierarchy_relation(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        51,
+        "callHierarchy/outgoingCalls",
+        outer,
+    );
+    assert!(
+        outgoing.is_empty(),
+        "calls inside nested types must not be attributed to the outer type: {outgoing:#?}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
 }
 
 #[test]
@@ -2201,6 +3345,22 @@ fn start_lsp_server(
     BufReader<std::process::ChildStdout>,
     std::process::ChildStderr,
 ) {
+    let root_uri = uri_for(root);
+    start_lsp_server_with_params(
+        root,
+        json!({"processId": null, "rootUri": root_uri, "capabilities": {}}),
+    )
+}
+
+fn start_lsp_server_with_params(
+    root: &Path,
+    initialize_params: Value,
+) -> (
+    std::process::Child,
+    std::process::ChildStdin,
+    BufReader<std::process::ChildStdout>,
+    std::process::ChildStderr,
+) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
         .arg("--root")
         .arg(root)
@@ -2216,14 +3376,13 @@ fn start_lsp_server(
     let mut stderr = child.stderr.take().expect("stderr");
     let mut reader = BufReader::new(stdout);
 
-    let root_uri = uri_for(root);
     write_message(
         &mut stdin,
         json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "initialize",
-            "params": {"processId": null, "rootUri": root_uri, "capabilities": {}}
+            "params": initialize_params
         }),
     );
     let _ = read_message(&mut reader, &mut stderr);
@@ -2696,12 +3855,75 @@ fn prepare_type_hierarchy(
     line: u64,
     character: u64,
 ) -> Value {
+    prepare_hierarchy(
+        stdin,
+        reader,
+        stderr,
+        id,
+        "textDocument/prepareTypeHierarchy",
+        uri,
+        (line, character),
+    )
+}
+
+fn type_hierarchy_relation(
+    stdin: &mut impl Write,
+    reader: &mut impl BufRead,
+    stderr: &mut impl Read,
+    id: u64,
+    method: &str,
+    item: Value,
+) -> Vec<Value> {
+    hierarchy_relation(stdin, reader, stderr, id, method, item)
+}
+
+fn prepare_call_hierarchy(
+    stdin: &mut impl Write,
+    reader: &mut impl BufRead,
+    stderr: &mut impl Read,
+    id: u64,
+    uri: &str,
+    line: u64,
+    character: u64,
+) -> Value {
+    prepare_hierarchy(
+        stdin,
+        reader,
+        stderr,
+        id,
+        "textDocument/prepareCallHierarchy",
+        uri,
+        (line, character),
+    )
+}
+
+fn call_hierarchy_relation(
+    stdin: &mut impl Write,
+    reader: &mut impl BufRead,
+    stderr: &mut impl Read,
+    id: u64,
+    method: &str,
+    item: Value,
+) -> Vec<Value> {
+    hierarchy_relation(stdin, reader, stderr, id, method, item)
+}
+
+fn prepare_hierarchy(
+    stdin: &mut impl Write,
+    reader: &mut impl BufRead,
+    stderr: &mut impl Read,
+    id: u64,
+    method: &str,
+    uri: &str,
+    position: (u64, u64),
+) -> Value {
+    let (line, character) = position;
     write_message(
         stdin,
         json!({
             "jsonrpc": "2.0",
             "id": id,
-            "method": "textDocument/prepareTypeHierarchy",
+            "method": method,
             "params": {
                 "textDocument": {"uri": uri},
                 "position": {"line": line, "character": character}
@@ -2716,7 +3938,7 @@ fn prepare_type_hierarchy(
     items[0].clone()
 }
 
-fn type_hierarchy_relation(
+fn hierarchy_relation(
     stdin: &mut impl Write,
     reader: &mut impl BufRead,
     stderr: &mut impl Read,
@@ -2738,6 +3960,21 @@ fn type_hierarchy_relation(
         .as_array()
         .unwrap_or_else(|| panic!("expected {method} array, got {response}"))
         .clone()
+}
+
+fn assert_call_range(ranges: &Value, line: u64, start_character: u64, end_character: u64) {
+    let ranges = ranges
+        .as_array()
+        .unwrap_or_else(|| panic!("expected call range array, got {ranges}"));
+    assert!(
+        ranges.iter().any(|range| {
+            range["start"]["line"] == line
+                && range["start"]["character"] == start_character
+                && range["end"]["line"] == line
+                && range["end"]["character"] == end_character
+        }),
+        "expected call range {line}:{start_character}-{end_character}, got {ranges:#?}"
+    );
 }
 
 fn shutdown_lsp(

@@ -135,6 +135,116 @@ class Service:
 }
 
 #[test]
+fn python_imported_code_units_resolve_package_reexport_to_original_definition() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    write_file(
+        root,
+        "src/example/service.py",
+        "def build_service():\n    pass\n",
+    );
+    write_file(
+        root,
+        "src/example/__init__.py",
+        "from .service import build_service\n",
+    );
+    let test_file = write_file(
+        root,
+        "tests/test_service.py",
+        "from example import build_service\n\ndef test_service():\n    build_service()\n",
+    );
+    let analyzer = PythonAnalyzer::from_project(TestProject::new(root, Language::Python));
+
+    let imports = analyzer.imported_code_units_of(&test_file);
+    let service_file = ProjectFile::new(root.to_path_buf(), "src/example/service.py");
+
+    assert!(
+        imports
+            .iter()
+            .any(|unit| unit.fq_name() == "example.service.build_service"
+                && unit.source() == &service_file),
+        "{imports:?}"
+    );
+}
+
+#[test]
+fn python_imported_code_units_prefer_later_local_binding_over_reexport() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    write_file(
+        root,
+        "src/example/service.py",
+        "def build_service():\n    pass\n",
+    );
+    write_file(
+        root,
+        "src/example/__init__.py",
+        "from .service import build_service\n\ndef build_service():\n    pass\n",
+    );
+    let test_file = write_file(
+        root,
+        "tests/test_service.py",
+        "from example import build_service\n\ndef test_service():\n    build_service()\n",
+    );
+    let analyzer = PythonAnalyzer::from_project(TestProject::new(root, Language::Python));
+
+    let imports = analyzer.imported_code_units_of(&test_file);
+    let init_file = ProjectFile::new(root.to_path_buf(), "src/example/__init__.py");
+
+    assert!(
+        imports
+            .iter()
+            .any(|unit| unit.fq_name() == "example.build_service" && unit.source() == &init_file),
+        "{imports:?}"
+    );
+    assert!(
+        imports
+            .iter()
+            .all(|unit| unit.fq_name() != "example.service.build_service"),
+        "{imports:?}"
+    );
+}
+
+#[test]
+fn python_imported_code_units_prefer_later_reexport_over_local_binding() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    write_file(
+        root,
+        "src/example/service.py",
+        "def build_service():\n    pass\n",
+    );
+    write_file(
+        root,
+        "src/example/__init__.py",
+        "def build_service():\n    pass\n\nfrom .service import build_service\n",
+    );
+    let test_file = write_file(
+        root,
+        "tests/test_service.py",
+        "from example import build_service\n\ndef test_service():\n    build_service()\n",
+    );
+    let analyzer = PythonAnalyzer::from_project(TestProject::new(root, Language::Python));
+
+    let imports = analyzer.imported_code_units_of(&test_file);
+    let service_file = ProjectFile::new(root.to_path_buf(), "src/example/service.py");
+
+    assert!(
+        imports
+            .iter()
+            .any(|unit| unit.fq_name() == "example.service.build_service"
+                && unit.source() == &service_file),
+        "{imports:?}"
+    );
+    assert!(
+        imports
+            .iter()
+            .all(|unit| unit.fq_name() != "example.build_service"),
+        "{imports:?}"
+    );
+}
+
+#[test]
 fn test_python_get_class_source_with_comments() {
     let analyzer = fixture_analyzer();
 

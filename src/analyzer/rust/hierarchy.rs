@@ -2,6 +2,7 @@ use super::RustAnalyzer;
 use super::declarations::rust_node_text;
 use super::imports::{resolve_rust_module_path_with_crate, rust_crate_root_package};
 use super::lexical_scope::{parse_rust_tree, visible_import_binder_at};
+use crate::analyzer::type_relations::{TypeRelation, TypeRelationKind};
 use crate::analyzer::usages::{ImportBinder, ImportKind};
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, TypeHierarchyProvider};
 use crate::hash::{HashMap, HashSet};
@@ -10,6 +11,8 @@ use tree_sitter::Node;
 pub(super) struct RustHierarchyIndex {
     direct_ancestors: HashMap<String, Vec<CodeUnit>>,
     direct_descendants: HashMap<String, HashSet<CodeUnit>>,
+    #[allow(dead_code)]
+    relations: Vec<TypeRelation>,
 }
 
 impl TypeHierarchyProvider for RustAnalyzer {
@@ -49,6 +52,13 @@ impl RustAnalyzer {
     fn hierarchy_index(&self) -> &RustHierarchyIndex {
         self.hierarchy_index
             .get_or_init(|| RustHierarchyIndex::build(self))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn type_relations(&self) -> &[TypeRelation] {
+        self.type_relations
+            .get_or_init(|| self.hierarchy_index().relations.clone())
+            .as_slice()
     }
 
     fn resolve_rust_hierarchy_trait_ref(
@@ -228,6 +238,7 @@ impl RustHierarchyIndex {
     fn build(analyzer: &RustAnalyzer) -> Self {
         let mut direct_ancestors: HashMap<String, Vec<CodeUnit>> = HashMap::default();
         let mut direct_descendants: HashMap<String, HashSet<CodeUnit>> = HashMap::default();
+        let mut relations = Vec::new();
 
         for file in analyzer.get_analyzed_files() {
             let Ok(source) = analyzer.project().read_source(&file) else {
@@ -267,13 +278,19 @@ impl RustHierarchyIndex {
                 direct_descendants
                     .entry(trait_unit.fq_name())
                     .or_default()
-                    .insert(implementer);
+                    .insert(implementer.clone());
+                relations.push(TypeRelation {
+                    from: implementer,
+                    to: trait_unit,
+                    kind: TypeRelationKind::TraitImplementation,
+                });
             }
         }
 
         Self {
             direct_ancestors,
             direct_descendants,
+            relations,
         }
     }
 }
@@ -423,4 +440,86 @@ fn type_alias_target_ref<'source>(
 ) -> Option<&'source str> {
     let target_node = alias_node.child_by_field_name("type")?;
     normalize_type_ref(rust_node_text(target_node, source).trim())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::Language;
+    use crate::test_support::AnalyzerFixture;
+
+    fn analyzer_with_files(files: &[(&str, &str)]) -> (AnalyzerFixture, RustAnalyzer) {
+        let fixture = AnalyzerFixture::new_for_language(Language::Rust, files);
+        let analyzer = RustAnalyzer::from_project(fixture.test_project().clone());
+        (fixture, analyzer)
+    }
+
+    fn definition(analyzer: &RustAnalyzer, fq_name: &str) -> CodeUnit {
+        analyzer
+            .get_definitions(fq_name)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("missing definition for {fq_name}"))
+    }
+
+    fn has_trait_implementation_relation(analyzer: &RustAnalyzer, from: &str, to: &str) -> bool {
+        analyzer.type_relations().iter().any(|relation| {
+            relation.from.fq_name() == from
+                && relation.to.fq_name() == to
+                && relation.kind == TypeRelationKind::TraitImplementation
+        })
+    }
+
+    #[test]
+    fn rust_type_relations_record_same_file_trait_implementation() {
+        let (_fixture, analyzer) = analyzer_with_files(&[(
+            "src/lib.rs",
+            r#"
+trait Runnable {}
+struct Worker;
+impl Runnable for Worker {}
+"#,
+        )]);
+
+        let runnable = definition(&analyzer, "Runnable");
+        let worker = definition(&analyzer, "Worker");
+
+        assert!(has_trait_implementation_relation(
+            &analyzer, "Worker", "Runnable"
+        ));
+        assert_eq!(
+            analyzer.get_direct_ancestors(&worker),
+            vec![runnable.clone()]
+        );
+        assert!(analyzer.get_direct_descendants(&runnable).contains(&worker));
+    }
+
+    #[test]
+    fn rust_type_relations_record_imported_trait_implementation() {
+        let (_fixture, analyzer) = analyzer_with_files(&[
+            ("src/contracts.rs", "pub trait Runnable {}"),
+            (
+                "src/worker.rs",
+                r#"
+use crate::contracts::Runnable;
+pub struct Worker;
+impl Runnable for Worker {}
+"#,
+            ),
+        ]);
+
+        let runnable = definition(&analyzer, "contracts.Runnable");
+        let worker = definition(&analyzer, "worker.Worker");
+
+        assert!(has_trait_implementation_relation(
+            &analyzer,
+            "worker.Worker",
+            "contracts.Runnable"
+        ));
+        assert_eq!(
+            analyzer.get_direct_ancestors(&worker),
+            vec![runnable.clone()]
+        );
+        assert!(analyzer.get_direct_descendants(&runnable).contains(&worker));
+    }
 }

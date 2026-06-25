@@ -46,7 +46,7 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             can-test: true
-            rustflags: ''
+            rustflags: '-C target-feature=+fullfp16'
             test-args: '--jobs 1'
             cargo-flags: '--features nlp'
           - target: aarch64-apple-darwin

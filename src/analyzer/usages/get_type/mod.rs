@@ -1,0 +1,240 @@
+use crate::analyzer::common::language_for_file;
+use crate::analyzer::usages::get_definition::RustTypeLookupCache;
+use crate::analyzer::usages::reference_site::{
+    ResolvedReferenceSite, SourceLocationRequest, resolve_reference_site,
+};
+use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
+use crate::hash::{HashMap, HashSet};
+use crate::path_utils::rel_path_string;
+use std::sync::Arc;
+use tree_sitter::Tree;
+
+mod rust;
+
+#[derive(Debug, Clone)]
+pub(crate) struct TypeLookupRequest {
+    pub(crate) file: ProjectFile,
+    pub(crate) line: Option<usize>,
+    pub(crate) column: Option<usize>,
+    pub(crate) start_byte: Option<usize>,
+    pub(crate) end_byte: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TypeLookupOutcome {
+    pub(crate) status: TypeLookupStatus,
+    pub(crate) reference: Option<ResolvedReferenceSite>,
+    pub(crate) types: Vec<TypeLookupType>,
+    pub(crate) diagnostics: Vec<TypeLookupDiagnostic>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TypeLookupStatus {
+    Resolved,
+    NoType,
+    Ambiguous,
+    UnsupportedLanguage,
+    InvalidLocation,
+    NotFound,
+}
+
+impl TypeLookupStatus {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Resolved => "resolved",
+            Self::NoType => "no_type",
+            Self::Ambiguous => "ambiguous",
+            Self::UnsupportedLanguage => "unsupported_language",
+            Self::InvalidLocation => "invalid_location",
+            Self::NotFound => "not_found",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TypeLookupDiagnostic {
+    pub(crate) kind: String,
+    pub(crate) message: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TypeLookupType {
+    pub(crate) fqn: String,
+    pub(crate) definitions: Vec<CodeUnit>,
+}
+
+pub(crate) fn resolve_type_batch(
+    analyzer: &dyn IAnalyzer,
+    requests: Vec<TypeLookupRequest>,
+) -> Vec<TypeLookupOutcome> {
+    let mut context = TypeBatchContext::default();
+    requests
+        .into_iter()
+        .map(|request| resolve_one(analyzer, &mut context, request))
+        .collect()
+}
+
+#[derive(Default)]
+struct TypeBatchContext {
+    sources: HashMap<ProjectFile, Result<Arc<String>, String>>,
+    trees: HashMap<(ProjectFile, Language), Option<Tree>>,
+    rust_cache: RustTypeLookupCache,
+}
+
+impl TypeBatchContext {
+    fn source(&mut self, file: &ProjectFile) -> Result<Arc<String>, String> {
+        self.sources
+            .entry(file.clone())
+            .or_insert_with(|| {
+                file.read_to_string()
+                    .map(Arc::new)
+                    .map_err(|err| format!("failed to read `{}`: {err}", rel_path_string(file)))
+            })
+            .clone()
+    }
+
+    fn tree(&mut self, file: &ProjectFile, language: Language, source: &str) -> Option<Tree> {
+        self.trees
+            .entry((file.clone(), language))
+            .or_insert_with(|| parse_tree_for_type_lookup(language, source))
+            .clone()
+    }
+}
+
+fn resolve_one(
+    analyzer: &dyn IAnalyzer,
+    context: &mut TypeBatchContext,
+    request: TypeLookupRequest,
+) -> TypeLookupOutcome {
+    let file = request.file.clone();
+    let language = language_for_file(&file);
+    let source = match context.source(&file) {
+        Ok(source) => source,
+        Err(message) => {
+            return diagnostic_outcome(TypeLookupStatus::NotFound, "file_read_failed", message);
+        }
+    };
+    let site = match resolve_reference_site(&request.as_source_location(), &source) {
+        Ok(site) => site,
+        Err(message) => {
+            return diagnostic_outcome(
+                TypeLookupStatus::InvalidLocation,
+                "invalid_location",
+                message,
+            );
+        }
+    };
+
+    if !matches!(language, Language::Rust) {
+        return finish_lookup_outcome(
+            diagnostic_outcome(
+                TypeLookupStatus::UnsupportedLanguage,
+                "unsupported_language",
+                format!("{language:?} type lookup is not implemented yet"),
+            ),
+            site,
+        );
+    }
+
+    let tree = context.tree(&file, language, &source);
+    let resolved = match language {
+        Language::Rust => rust::resolve_rust_type(
+            analyzer,
+            &file,
+            &source,
+            tree.as_ref(),
+            &site,
+            &mut context.rust_cache,
+        ),
+        _ => unreachable!("unsupported language handled above"),
+    };
+    finish_lookup_outcome(resolved, site)
+}
+
+fn finish_lookup_outcome(
+    mut outcome: TypeLookupOutcome,
+    site: ResolvedReferenceSite,
+) -> TypeLookupOutcome {
+    outcome.reference = Some(site);
+    outcome
+}
+
+impl TypeLookupRequest {
+    fn as_source_location(&self) -> SourceLocationRequest {
+        SourceLocationRequest {
+            file: self.file.clone(),
+            line: self.line,
+            column: self.column,
+            start_byte: self.start_byte,
+            end_byte: self.end_byte,
+        }
+    }
+}
+
+fn parse_tree_for_type_lookup(language: Language, source: &str) -> Option<Tree> {
+    match language {
+        Language::Rust => crate::analyzer::rust::lexical_scope::parse_rust_tree(source),
+        _ => None,
+    }
+}
+
+pub(super) fn candidates_outcome(
+    fqn: impl Into<String>,
+    mut candidates: Vec<CodeUnit>,
+) -> TypeLookupOutcome {
+    sort_units(&mut candidates);
+    candidates.dedup();
+    let mut semantic_keys = HashSet::default();
+    for candidate in &candidates {
+        semantic_keys.insert((candidate.fq_name(), candidate.source().clone()));
+    }
+    let status = if semantic_keys.len() <= 1 {
+        TypeLookupStatus::Resolved
+    } else {
+        TypeLookupStatus::Ambiguous
+    };
+    TypeLookupOutcome {
+        status,
+        reference: None,
+        types: vec![TypeLookupType {
+            fqn: fqn.into(),
+            definitions: candidates,
+        }],
+        diagnostics: if status == TypeLookupStatus::Ambiguous {
+            vec![TypeLookupDiagnostic {
+                kind: "ambiguous_type".to_string(),
+                message: "reference resolved to multiple possible types".to_string(),
+            }]
+        } else {
+            Vec::new()
+        },
+    }
+}
+
+pub(super) fn no_type(kind: impl Into<String>, message: impl Into<String>) -> TypeLookupOutcome {
+    diagnostic_outcome(TypeLookupStatus::NoType, kind, message)
+}
+
+fn diagnostic_outcome(
+    status: TypeLookupStatus,
+    kind: impl Into<String>,
+    message: impl Into<String>,
+) -> TypeLookupOutcome {
+    TypeLookupOutcome {
+        status,
+        reference: None,
+        types: Vec::new(),
+        diagnostics: vec![TypeLookupDiagnostic {
+            kind: kind.into(),
+            message: message.into(),
+        }],
+    }
+}
+
+fn sort_units(units: &mut [CodeUnit]) {
+    units.sort_by(|left, right| {
+        left.fq_name()
+            .cmp(&right.fq_name())
+            .then_with(|| left.source().cmp(right.source()))
+    });
+}

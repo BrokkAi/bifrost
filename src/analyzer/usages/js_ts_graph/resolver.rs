@@ -155,12 +155,15 @@ impl JsTsUsageIndex {
         self.binders_by_file.get(importer)?.bindings.get(local_name)
     }
 
-    /// Export seeds for `target_short` in `target_file`, following named and star
-    /// re-export chains across files.
+    /// Export seeds for `target_short`/`target_name` in `target_file`, following named
+    /// and star re-export chains across files. Member targets only match the owner
+    /// export when the analyzer reports that owner as the declaration parent.
     pub(super) fn seeds_for_target(
         &self,
         target_file: &ProjectFile,
         target_short: &str,
+        target_name: &str,
+        owner_seed_allowed: bool,
     ) -> BTreeSet<(ProjectFile, String)> {
         reexport_seeds::seeds_for_target(
             &self.exports_by_file,
@@ -168,6 +171,8 @@ impl JsTsUsageIndex {
             &self.star_reexports,
             target_file,
             target_short,
+            target_name,
+            owner_seed_allowed,
         )
     }
 
@@ -223,6 +228,21 @@ fn build_reexport_edges(
                     let Some(binder) = binders_by_file.get(file) else {
                         continue;
                     };
+                    if let Some((module_specifier, imported_name)) =
+                        imported_member_reexport_target(local_name, binder)
+                    {
+                        for resolved_file in resolve(file, module_specifier) {
+                            direct_reexport_edges
+                                .entry((file.clone(), exported_name.clone()))
+                                .or_default()
+                                .push((resolved_file.clone(), imported_name.clone()));
+                            reexport_edges
+                                .entry((resolved_file, imported_name.clone()))
+                                .or_default()
+                                .push((file.clone(), exported_name.clone()));
+                        }
+                        continue;
+                    }
                     let Some(binding) = binder.bindings.get(local_name) else {
                         continue;
                     };
@@ -277,6 +297,20 @@ fn build_reexport_edges(
         star_reexports,
         direct_star_reexports,
     )
+}
+
+fn imported_member_reexport_target<'a>(
+    local_name: &str,
+    binder: &'a ImportBinder,
+) -> Option<(&'a str, String)> {
+    let (object_name, member_name) = local_name.split_once('.')?;
+    let binding = binder.bindings.get(object_name)?;
+    match binding.kind {
+        ImportKind::CommonJsRequire | ImportKind::Namespace => {
+            Some((binding.module_specifier.as_str(), member_name.to_string()))
+        }
+        ImportKind::Default | ImportKind::Named | ImportKind::Glob => None,
+    }
 }
 
 fn build_importer_reverse(

@@ -50,7 +50,7 @@ fn build_report(
     project: &dyn Project,
     uri: &Uri,
 ) -> Option<Vec<Diagnostic>> {
-    let project_file = project_file_for_uri(project.root(), uri)?;
+    let project_file = project_file_for_uri(project, uri)?;
     let language = language_for_file(&project_file);
     let ts_language = ts_language_for(language)?;
 

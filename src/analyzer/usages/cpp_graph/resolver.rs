@@ -691,6 +691,21 @@ pub(super) fn declaration_mentions_type(
         .resolves_to_type(ctx.file, node_text(type_node, ctx.source), owner)
 }
 
+pub(super) fn declaration_is_object_construction_candidate(
+    node: Node<'_>,
+    ctx: &ScanCtx<'_>,
+) -> bool {
+    !ctx.analyzer
+        .get_declarations(ctx.file)
+        .into_iter()
+        .filter(|unit| unit.is_function())
+        .any(|unit| {
+            ctx.analyzer.ranges(&unit).iter().any(|range| {
+                node.start_byte() <= range.start_byte && range.end_byte <= node.end_byte()
+            })
+        })
+}
+
 pub(super) fn declaration_constructor_arity(node: Node<'_>, _ctx: &ScanCtx<'_>) -> usize {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {

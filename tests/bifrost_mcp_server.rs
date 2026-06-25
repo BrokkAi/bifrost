@@ -101,6 +101,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"));
     child.env("BIFROST_SEMANTIC_INDEX", "off");
     let mut child = child
+        .arg("--force-semantic-cpu")
         .arg("--root")
         .arg(fixture_root.path())
         .arg("--server")
@@ -167,6 +168,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "get_summaries",
             "scan_usages",
             "get_definition_by_location",
+            "get_type_by_location",
             "usage_graph",
             "refresh",
             "activate_workspace",
@@ -204,6 +206,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "get_summaries",
             "scan_usages",
             "get_definition_by_location",
+            "get_type_by_location",
             "usage_graph",
             "semantic_search",
             "refresh",
@@ -241,6 +244,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     assert_tool_schema_contains_property(tools, "scan_usages", "targets");
     assert_tool_schema_contains_property(tools, "scan_usages", "anyOf");
     assert_scan_usages_schema_requires_non_empty_selectors(tools);
+    assert_type_lookup_schema_limits_and_requires_location(tools);
 
     let ping = round_trip(
         &mut stdin,
@@ -674,6 +678,7 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
         "get_summaries",
         "scan_usages",
         "get_definition_by_location",
+        "get_type_by_location",
         "usage_graph",
     ];
     #[cfg(feature = "nlp")]
@@ -705,6 +710,7 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
             "get_summaries",
             "scan_usages",
             "get_definition_by_location",
+            "get_type_by_location",
             "usage_graph",
         ],
     );
@@ -786,6 +792,7 @@ fn bifrost_semantic_search_fails_cleanly_without_models() {
             "BIFROST_EMBED_MODEL_DIR",
             "/nonexistent/bifrost-test-models",
         )
+        .arg("--force-semantic-cpu")
         .arg("--root")
         .arg(&fixture_root)
         .arg("--server")
@@ -1027,6 +1034,7 @@ fn bifrost_searchtools_server_can_hide_line_numbers_in_text_preview() {
     );
     assert!(names.contains(&"get_definition_by_reference"), "{names:?}");
     assert!(!names.contains(&"get_definition_by_location"), "{names:?}");
+    assert!(!names.contains(&"get_type_by_location"), "{names:?}");
     assert_tool_schema_omits_property(
         list_tools["result"]["tools"]
             .as_array()
@@ -1122,6 +1130,7 @@ fn bifrost_core_server_can_hide_line_numbers_in_text_preview() {
     );
     assert!(names.contains(&"get_definition_by_reference"), "{names:?}");
     assert!(!names.contains(&"get_definition_by_location"), "{names:?}");
+    assert!(!names.contains(&"get_type_by_location"), "{names:?}");
 
     let unavailable_location_tool = round_trip(
         &mut stdin,
@@ -1646,6 +1655,24 @@ fn assert_scan_usages_schema_requires_non_empty_selectors(tools: &[Value]) {
     );
 }
 
+fn assert_type_lookup_schema_limits_and_requires_location(tools: &[Value]) {
+    let tool = tools
+        .iter()
+        .find(|tool| tool["name"] == "get_type_by_location")
+        .expect("missing get_type_by_location descriptor");
+    let schema = &tool["inputSchema"];
+
+    assert_eq!(schema["properties"]["references"]["maxItems"], 100);
+    assert_eq!(
+        schema["properties"]["references"]["items"]["required"],
+        json!(["path"])
+    );
+    assert_eq!(
+        schema["properties"]["references"]["items"]["anyOf"],
+        json!([{ "required": ["line"] }, { "required": ["start_byte"] }])
+    );
+}
+
 fn assert_unknown_tool(root: &std::path::Path, mode: &str, tool_name: &str, arguments: Value) {
     let mut child = spawn_server(root, mode, &[]);
     let mut stdin = child.stdin.take().expect("stdin");
@@ -1705,6 +1732,7 @@ fn initialize_session(stdin: &mut impl Write, reader: &mut impl BufRead, stderr:
 fn spawn_server(root: &std::path::Path, mode: &str, extra_args: &[&str]) -> std::process::Child {
     let mut command = Command::new(env!("CARGO_BIN_EXE_bifrost"));
     command.env("BIFROST_SEMANTIC_INDEX", "off");
+    command.arg("--force-semantic-cpu");
     command.arg("--root").arg(root).arg("--server").arg(mode);
     for arg in extra_args {
         command.arg(arg);

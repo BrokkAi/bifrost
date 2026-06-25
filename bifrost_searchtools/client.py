@@ -34,6 +34,7 @@ from .models import (
     SymbolAncestorsResult,
     SymbolLocationsResult,
     SymbolSourcesResult,
+    TypeLookupResult,
     UsageGraphResult,
     WorkspaceResult,
     XmlSelectResult,
@@ -252,6 +253,30 @@ class SearchToolsClient:
             },
         )
         return DefinitionByReferenceLookupResult.from_dict(result["results"][0])
+
+    def get_type_by_location(
+        self,
+        path: str,
+        *,
+        line: int | None = None,
+        column: int | None = None,
+        start_byte: int | None = None,
+        end_byte: int | None = None,
+    ) -> TypeLookupResult:
+        reference: dict[str, Any] = {"path": path}
+        if line is not None:
+            reference["line"] = line
+        if column is not None:
+            reference["column"] = column
+        if start_byte is not None:
+            reference["start_byte"] = start_byte
+        if end_byte is not None:
+            reference["end_byte"] = end_byte
+        result = self._call_tool(
+            "get_type_by_location",
+            {"references": [reference]},
+        )
+        return TypeLookupResult.from_dict(result["results"][0])
 
     def get_summaries(self, targets: list[str]) -> FileSummariesResult:
         payload = self._call_tool_payload("get_summaries", {"targets": targets})

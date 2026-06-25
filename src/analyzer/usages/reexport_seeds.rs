@@ -16,13 +16,19 @@ use crate::hash::HashMap;
 use std::collections::{BTreeSet, VecDeque};
 
 /// Export seeds for `target_short` in `target_file`, following named and star
-/// re-export chains across files.
+/// re-export chains across files. Member-qualified targets (a `target_name` containing
+/// `.`) only match the owner export when `owner_seed_allowed` (the analyzer reports that
+/// owner as the declaration's parent); otherwise they must match the full `target_name`.
+/// Languages without member exports pass `target_name == target_short` (or
+/// `owner_seed_allowed = true`), reducing to plain short-name matching.
 pub(crate) fn seeds_for_target(
     exports_by_file: &HashMap<ProjectFile, ExportIndex>,
     reexport_edges: &HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>>,
     star_reexports: &HashMap<ProjectFile, Vec<ProjectFile>>,
     target_file: &ProjectFile,
     target_short: &str,
+    target_name: &str,
+    owner_seed_allowed: bool,
 ) -> BTreeSet<(ProjectFile, String)> {
     let mut seeds: BTreeSet<(ProjectFile, String)> = BTreeSet::new();
     if let Some(exports) = exports_by_file.get(target_file) {
@@ -33,7 +39,12 @@ pub(crate) fn seeds_for_target(
                 ExportEntry::ReexportedNamed { .. } => None,
             };
             if let Some(local_name) = local
-                && local_name == target_short
+                && export_local_matches_target(
+                    local_name,
+                    target_short,
+                    target_name,
+                    owner_seed_allowed,
+                )
             {
                 seeds.insert((target_file.clone(), exported_name.clone()));
             }
@@ -79,6 +90,22 @@ pub(crate) fn matching_edges_for_importer(
         );
     }
     matches
+}
+
+/// Whether an export's local name identifies the target. For a member-qualified target
+/// (`target_name` contains `.`) where owner-name seeding is disallowed, the export's local
+/// name must equal the full `target_name`; otherwise the short name suffices.
+pub(crate) fn export_local_matches_target(
+    local_name: &str,
+    target_short: &str,
+    target_name: &str,
+    owner_seed_allowed: bool,
+) -> bool {
+    if target_name.contains('.') && !owner_seed_allowed {
+        local_name == target_name
+    } else {
+        local_name == target_short
+    }
 }
 
 /// Whether `edge` binds one of the `seeds`, accounting for each import kind.

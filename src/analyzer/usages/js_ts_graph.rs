@@ -40,7 +40,9 @@ mod resolver;
 pub(crate) use resolver::{JsTsUsageIndex, build_jsts_usage_index};
 
 use crate::analyzer::usages::js_ts_graph::extractor::scan_files_for_seeds;
-use crate::analyzer::usages::js_ts_graph::resolver::{target_language, top_level_identifier};
+use crate::analyzer::usages::js_ts_graph::resolver::{
+    is_static_member, target_language, top_level_identifier,
+};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::{UsageAnalyzer, UsageEdgeResolver, UsageQueryResolver};
@@ -130,7 +132,17 @@ impl<'a> UsageQueryResolver<'a> for JsTsQueryResolver {
                 "JsTsExportUsageGraphStrategy",
             );
         };
-        let seeds = index.seeds_for_target(target.source(), top_level_identifier(target));
+        let owner_seed_allowed = is_static_member(target)
+            || !target.short_name().contains('.')
+            || analyzer
+                .parent_of(target)
+                .is_some_and(|parent| parent.short_name() == top_level_identifier(target));
+        let seeds = index.seeds_for_target(
+            target.source(),
+            top_level_identifier(target),
+            target.short_name(),
+            owner_seed_allowed,
+        );
         if seeds.is_empty() {
             return GraphUsageOutcome::fallback_safe(
                 target.fq_name(),

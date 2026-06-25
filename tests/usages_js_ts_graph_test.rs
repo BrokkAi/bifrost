@@ -473,6 +473,40 @@ fn ts_named_import_alias_resolves_to_exported_symbol() {
 }
 
 #[test]
+fn ts_imported_class_static_member_call_counts_as_class_usage() {
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file(
+            "core/Ky.ts",
+            "export class Ky { static create(input: string): Ky { return new Ky(); } }\n",
+        )
+        .file("index.ts", "export { Ky } from './core/Ky';\n")
+        .file(
+            "consumer.ts",
+            "import { Ky } from './index';\nexport function run() { return Ky.create('url'); }\n",
+        )
+        .build()
+    });
+
+    let target = find_ts_target(&analyzer, &project.file("core/Ky.ts"), |cu| {
+        cu.identifier() == "Ky" && cu.is_class()
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == project.file("consumer.ts")),
+        "expected Ky.create call in importing file to count as a Ky usage, got {hits:?}"
+    );
+    assert!(
+        hits.iter().all(|hit| hit.enclosing != target),
+        "definition site must stay excluded from Ky usage hits, got {hits:?}"
+    );
+}
+
+#[test]
 fn js_named_export_imported_from_parent_directory_counts_calls_in_test_file() {
     let (project, analyzer) = js_inline_analyzer(|p| {
         p.file(
@@ -827,6 +861,129 @@ fn js_commonjs_exports_property_resolves_destructured_require() {
     assert!(
         hits.iter()
             .any(|hit| hit.file == project.file("consumer.js"))
+    );
+}
+
+#[test]
+fn js_commonjs_exports_property_resolves_member_declaration() {
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file(
+            "lib/request.js",
+            "const request = {};\nrequest.accepts = function accepts(type) { return type; };\nexports.accepts = request.accepts;\n",
+        )
+        .file(
+            "consumer.js",
+            "const request = require('./lib/request');\nfunction run() { return request.accepts('json'); }\n",
+        )
+        .build()
+    });
+
+    let target = find_js_target(&analyzer, &project.file("lib/request.js"), |cu| {
+        cu.short_name() == "request.accepts" && cu.is_function()
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == project.file("consumer.js")),
+        "expected CommonJS module-object use of exported member declaration"
+    );
+}
+
+#[test]
+fn js_commonjs_exports_named_function_expression_resolves_module_object_usage() {
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file(
+            "commonjs-request.js",
+            "exports.accepts = function accepts(contentType) { return contentType; };\n",
+        )
+        .file(
+            "consumer.js",
+            "const request = require('./commonjs-request');\nfunction run() { return request.accepts('json'); }\n",
+        )
+        .build()
+    });
+
+    let target = find_js_target(&analyzer, &project.file("commonjs-request.js"), |cu| {
+        cu.short_name() == "accepts" && cu.is_function()
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == project.file("consumer.js")),
+        "expected direct CommonJS exported named function expression to resolve module-object usage"
+    );
+}
+
+#[test]
+fn js_commonjs_exports_property_does_not_seed_unrelated_member_by_short_name() {
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file(
+            "lib/request.js",
+            "function accepts(type) { return type; }\nconst request = {};\nrequest.accepts = function acceptsMember(type) { return type; };\nexports.accepts = accepts;\n",
+        )
+        .file(
+            "consumer.js",
+            "const request = require('./lib/request');\nfunction run() { return request.accepts('json'); }\n",
+        )
+        .build()
+    });
+
+    let target = find_js_target(&analyzer, &project.file("lib/request.js"), |cu| {
+        cu.short_name() == "request.accepts" && cu.is_function()
+    });
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = JsTsExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+
+    assert!(
+        matches!(result, FuzzyResult::Failure { .. }),
+        "member-qualified target must not seed from an unrelated local export with the same property name"
+    );
+}
+
+#[test]
+fn js_commonjs_barrel_reexports_required_member_declaration() {
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file(
+            "lib/request.js",
+            "const request = {};\nrequest.accepts = function accepts(type) { return type; };\nexports.accepts = request.accepts;\n",
+        )
+        .file(
+            "index.js",
+            "const request = require('./lib/request');\nexports.accepts = request.accepts;\n",
+        )
+        .file(
+            "consumer.js",
+            "const api = require('./index');\nfunction run() { return api.accepts('json'); }\n",
+        )
+        .build()
+    });
+
+    let target = find_js_target(&analyzer, &project.file("lib/request.js"), |cu| {
+        cu.short_name() == "request.accepts" && cu.is_function()
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == project.file("consumer.js")),
+        "expected CommonJS barrel re-export of member declaration to reach consumer"
     );
 }
 

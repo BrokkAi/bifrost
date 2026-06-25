@@ -234,7 +234,7 @@ enum RustTypeMode {
 }
 
 #[derive(Default)]
-struct RustTypeLookupCache {
+pub(crate) struct RustTypeLookupCache {
     declarations: HashMap<ProjectFile, Option<RustParsedDeclarationSource>>,
 }
 
@@ -305,6 +305,29 @@ fn rust_expression_type_fqn(
         expression,
         before_byte,
         RustTypeMode::Direct,
+        cache,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rust_expression_type_definition_fqn_cached(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    expression: Node<'_>,
+    before_byte: usize,
+    cache: &mut RustTypeLookupCache,
+) -> Option<String> {
+    rust_expression_type_fqn(
+        analyzer,
+        support,
+        file,
+        source,
+        root,
+        expression,
+        before_byte,
         cache,
     )
 }
@@ -608,7 +631,7 @@ fn rust_call_expression_type_fqn(
         analyzer,
         support,
         file,
-        rust_named_candidates(support, file, &name),
+        rust_callable_candidates(analyzer, support, file, &name, function.start_byte()),
         mode,
         cache,
     )
@@ -733,7 +756,7 @@ fn rust_resolve_type_node_fqn(
             && support
                 .fqn(&resolved)
                 .into_iter()
-                .any(|unit| unit.is_class())
+                .any(|unit| rust_is_type_definition(analyzer, &unit))
         {
             return Some(resolved);
         }
@@ -747,7 +770,7 @@ fn rust_resolve_type_node_fqn(
             && support
                 .fqn(resolved)
                 .into_iter()
-                .any(|unit| unit.is_class())
+                .any(|unit| rust_is_type_definition(analyzer, &unit))
             && rust_type_fqn_visible_from_file(file, resolved)
         {
             return Some(resolved.to_string());
@@ -759,8 +782,15 @@ fn rust_resolve_type_node_fqn(
     support
         .fqn(name)
         .into_iter()
-        .find(|unit| unit.is_class())
+        .find(|unit| rust_is_type_definition(analyzer, unit))
         .map(|unit| unit.fq_name().to_string())
+}
+
+pub(crate) fn rust_is_type_definition(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> bool {
+    unit.is_class()
+        || analyzer
+            .type_alias_provider()
+            .is_some_and(|provider| provider.is_type_alias(unit))
 }
 
 #[derive(Debug)]
@@ -1010,6 +1040,23 @@ fn rust_named_candidates(
     candidates.extend(support.fqn(name));
     sort_units(&mut candidates);
     candidates.dedup();
+    candidates
+}
+
+fn rust_callable_candidates(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    name: &str,
+    reference_byte: usize,
+) -> Vec<CodeUnit> {
+    let mut candidates = rust_named_candidates(support, file, name);
+    if candidates.is_empty()
+        && let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer)
+    {
+        candidates =
+            rust_imported_export_candidates(rust, support, file, name, Some(reference_byte));
+    }
     candidates
 }
 

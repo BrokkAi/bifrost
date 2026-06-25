@@ -32,10 +32,13 @@ use cache::{
 };
 use clones::{build_clone_candidate_data, refine_python_clone_similarity};
 use declarations::{
-    build_python_module_code_units, collect_python_identifiers, parse_python_tree,
+    build_python_module_code_units, collect_python_identifiers, parse_python_tree, py_node_text,
     python_expanded_comment_start, python_module_name,
 };
-use imports::{PythonImportDetails, parse_python_import_details, resolve_python_relative_module};
+use imports::{
+    PythonImportDetails, parse_python_import_details, parse_python_import_infos,
+    resolve_python_relative_module,
+};
 use tests::detect_python_test_assertion_smells;
 use usage_index::PythonUsageIndex;
 
@@ -147,75 +150,142 @@ impl PythonAnalyzer {
 
     pub fn export_index_of(&self, file: &ProjectFile) -> ExportIndex {
         let mut index = ExportIndex::empty();
+        let mut events = Vec::new();
 
         for code_unit in self.inner.get_top_level_declarations(file) {
             let identifier = code_unit.identifier().trim();
             if identifier.is_empty() || identifier.starts_with('_') {
                 continue;
             }
-            index.exports_by_name.insert(
+            let start_byte = self
+                .inner
+                .ranges(&code_unit)
+                .iter()
+                .map(|range| range.start_byte)
+                .min()
+                .unwrap_or(usize::MAX);
+            events.push((
+                start_byte,
                 identifier.to_string(),
                 ExportEntry::Local {
                     local_name: identifier.to_string(),
                 },
-            );
+            ));
         }
 
-        for import in self.inner.import_info_of(file) {
-            let Some(details) = parse_python_import_details(&import.raw_snippet) else {
-                continue;
-            };
-            match details {
-                PythonImportDetails::Import { .. } => {}
-                PythonImportDetails::FromImport {
-                    module,
-                    name,
-                    alias,
-                    wildcard,
-                } => {
-                    let resolved_module = if module.starts_with('.') {
-                        resolve_python_relative_module(file, &module)
-                    } else {
-                        Some(module.clone())
-                    };
-                    let Some(resolved_module) = resolved_module else {
-                        continue;
-                    };
-
-                    if wildcard {
-                        index.reexport_stars.push(ReexportStar {
-                            module_specifier: resolved_module,
-                        });
-                        continue;
-                    }
-
-                    let exported_name = alias.unwrap_or(name.clone());
-                    if exported_name.starts_with('_') {
-                        continue;
-                    }
-                    let imported_name = format!("{resolved_module}.{name}");
-                    if self.resolve_module_code_unit(&imported_name).is_some() {
-                        index.exports_by_name.insert(
-                            exported_name,
-                            ExportEntry::ReexportedNamed {
-                                module_specifier: imported_name,
-                                imported_name: name,
-                            },
-                        );
-                        continue;
-                    }
-                    index.exports_by_name.insert(
-                        exported_name,
-                        ExportEntry::ReexportedNamed {
-                            module_specifier: resolved_module,
-                            imported_name: name,
-                        },
-                    );
-                }
-            }
+        if let Ok(source) = file.read_to_string()
+            && let Some(tree) = parse_python_tree(&source)
+        {
+            self.collect_reexport_events(file, tree.root_node(), &source, &mut events, &mut index);
+        } else {
+            self.collect_reexport_events_from_import_info(file, &mut events, &mut index);
         }
 
+        events.sort_by_key(|(start_byte, _, _)| *start_byte);
+        for (_, exported_name, entry) in events {
+            index.exports_by_name.insert(exported_name, entry);
+        }
         index
+    }
+
+    fn collect_reexport_events(
+        &self,
+        file: &ProjectFile,
+        root: tree_sitter::Node<'_>,
+        source: &str,
+        events: &mut Vec<(usize, String, ExportEntry)>,
+        index: &mut ExportIndex,
+    ) {
+        let mut cursor = root.walk();
+        for node in root.named_children(&mut cursor) {
+            if node.kind() != "import_from_statement" {
+                continue;
+            }
+            let raw = py_node_text(node, source).trim();
+            self.record_reexport_event(file, raw, node.start_byte(), events, index);
+        }
+    }
+
+    fn collect_reexport_events_from_import_info(
+        &self,
+        file: &ProjectFile,
+        events: &mut Vec<(usize, String, ExportEntry)>,
+        index: &mut ExportIndex,
+    ) {
+        for import in self.inner.import_info_of(file) {
+            self.record_reexport_event(file, &import.raw_snippet, usize::MAX, events, index);
+        }
+    }
+
+    fn record_reexport_event(
+        &self,
+        file: &ProjectFile,
+        raw: &str,
+        start_byte: usize,
+        events: &mut Vec<(usize, String, ExportEntry)>,
+        index: &mut ExportIndex,
+    ) {
+        for info in parse_python_import_infos(raw) {
+            self.record_single_reexport_event(file, &info.raw_snippet, start_byte, events, index);
+        }
+    }
+
+    fn record_single_reexport_event(
+        &self,
+        file: &ProjectFile,
+        raw: &str,
+        start_byte: usize,
+        events: &mut Vec<(usize, String, ExportEntry)>,
+        index: &mut ExportIndex,
+    ) {
+        let Some(PythonImportDetails::FromImport {
+            module,
+            name,
+            alias,
+            wildcard,
+        }) = parse_python_import_details(raw)
+        else {
+            return;
+        };
+        let resolved_module = if module.starts_with('.') {
+            resolve_python_relative_module(file, &module)
+        } else {
+            Some(module.clone())
+        };
+        let Some(resolved_module) = resolved_module else {
+            return;
+        };
+
+        if wildcard {
+            index.reexport_stars.push(ReexportStar {
+                module_specifier: resolved_module,
+            });
+            return;
+        }
+        let exported_name = alias.unwrap_or(name.clone());
+        if exported_name.starts_with('_') {
+            return;
+        }
+        let imported_name = format!("{resolved_module}.{name}");
+        if self.resolve_module_code_unit(&imported_name).is_some() {
+            events.push((
+                start_byte,
+                exported_name,
+                ExportEntry::ReexportedNamed {
+                    module_specifier: imported_name,
+                    imported_name: name,
+                },
+            ));
+            return;
+        }
+        events.push((
+            start_byte,
+            exported_name,
+            ExportEntry::ReexportedNamed {
+                module_specifier: resolved_module,
+                imported_name: name,
+            },
+        ));
     }
 
     pub fn import_binder_of(&self, file: &ProjectFile) -> ImportBinder {

@@ -2,7 +2,7 @@ use lsp_types::{
     CompletionOptions, DiagnosticOptions, DiagnosticServerCapabilities,
     FoldingRangeProviderCapability, HoverProviderCapability, OneOf, ServerCapabilities,
     TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
-    TextDocumentSyncSaveOptions, WorkDoneProgressOptions,
+    TextDocumentSyncSaveOptions, WorkDoneProgressOptions, WorkspaceFoldersServerCapabilities,
 };
 
 pub fn server_capabilities() -> ServerCapabilities {
@@ -46,6 +46,13 @@ pub fn server_capabilities() -> ServerCapabilities {
             workspace_diagnostics: false,
             work_done_progress_options: WorkDoneProgressOptions::default(),
         })),
+        workspace: Some(lsp_types::WorkspaceServerCapabilities {
+            workspace_folders: Some(WorkspaceFoldersServerCapabilities {
+                supported: Some(true),
+                change_notifications: Some(OneOf::Left(true)),
+            }),
+            file_operations: None,
+        }),
         // Per-feature capabilities are turned on as their handlers land.
         ..ServerCapabilities::default()
     }

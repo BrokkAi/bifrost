@@ -120,6 +120,10 @@ impl GoProjectGraph {
             &self.star_reexports,
             target_file,
             target_short,
+            // Go has no member exports, so short-name matching applies: the member-aware
+            // params are neutral (owner seeding always allowed).
+            target_short,
+            true,
         )
     }
 
