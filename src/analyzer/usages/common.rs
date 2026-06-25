@@ -28,6 +28,14 @@ pub(super) fn language_for_file(file: &ProjectFile) -> Language {
     analyzer_common::language_for_file(file)
 }
 
+/// Whether `left` and `right` are the same syntax node, by tree-sitter node
+/// identity. Exact where a byte-range comparison can collide a unit/wrapper node
+/// with its sole child (which share an identical span); both nodes must come from
+/// the same tree for the ids to be comparable.
+pub(super) fn same_node(left: Node<'_>, right: Node<'_>) -> bool {
+    left.id() == right.id()
+}
+
 /// The trimmed source text spanned by `node`, or `""` if the byte range is not a
 /// valid `str` boundary. Shared by the per-language usage resolvers that key on a
 /// node's identifier/type text.

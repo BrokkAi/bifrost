@@ -9,6 +9,7 @@ use crate::hash::HashSet;
 use rayon::prelude::*;
 use std::collections::BTreeSet;
 use std::sync::Mutex;
+use crate::analyzer::usages::common::same_node;
 use tree_sitter::Node;
 
 const OWNER_TOKEN: &str = "__go_target_owner__";
@@ -592,13 +593,7 @@ pub(super) fn is_definition_identifier(node: Node<'_>, source: &str) -> bool {
     ) && node
         .parent()
         .and_then(|parent| parent.child_by_field_name("name"))
-        .is_some_and(|name| {
-            name.start_byte() == node.start_byte() && name.end_byte() == node.end_byte()
-        })
-}
-
-pub(super) fn same_node(left: Node<'_>, right: Node<'_>) -> bool {
-    left.start_byte() == right.start_byte() && left.end_byte() == right.end_byte()
+        .is_some_and(|name| same_node(name, node))
 }
 
 pub(super) fn has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {

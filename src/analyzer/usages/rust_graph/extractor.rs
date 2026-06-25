@@ -10,6 +10,7 @@ use crate::text_utils::compute_line_starts;
 use rayon::prelude::*;
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
+use crate::analyzer::usages::common::same_node;
 use tree_sitter::{Node, Parser, Tree};
 
 struct ParsedFile {
@@ -681,12 +682,6 @@ fn record_static_member_hit(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
         enclosing,
         ctx.hits,
     );
-}
-
-fn same_node(left: Node<'_>, right: Node<'_>) -> bool {
-    left.start_byte() == right.start_byte()
-        && left.end_byte() == right.end_byte()
-        && left.kind() == right.kind()
 }
 
 fn self_like_constructor_returns(

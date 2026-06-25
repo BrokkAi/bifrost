@@ -1,3 +1,4 @@
+use crate::analyzer::usages::common::same_node;
 use crate::analyzer::usages::cpp_graph::extractor::ScanCtx;
 use crate::analyzer::{
     CodeUnit, CodeUnitType, CppAnalyzer, IAnalyzer, ProjectFile, cpp_include_paths,
@@ -490,11 +491,6 @@ fn extract_typedef_declarator_name(node: Node<'_>, source: &str) -> Option<Strin
     }
 }
 
-fn same_node(left: Node<'_>, right: Node<'_>) -> bool {
-    left.kind() == right.kind()
-        && left.start_byte() == right.start_byte()
-        && left.end_byte() == right.end_byte()
-}
 
 fn last_named_child(node: Node<'_>) -> Option<Node<'_>> {
     let count = node.named_child_count();
