@@ -52,6 +52,7 @@ pub(super) fn resolve_python(
             );
             if !object_shadowed && let Some(module) = ctx.namespace_module_for_object(object_text) {
                 return python_fqn_outcome(
+                    py,
                     support,
                     &format!("{module}.{attribute_text}"),
                     site.text.as_str(),
@@ -99,7 +100,7 @@ pub(super) fn resolve_python(
                 );
             }
             if let Some(fqn) = ctx.named.get(text).or_else(|| ctx.namespace.get(text)) {
-                return python_fqn_outcome(support, fqn, text);
+                return python_fqn_outcome(py, support, fqn, text);
             }
             if let Some(candidates) = ctx.same_file.get(text)
                 && !candidates.is_empty()
@@ -247,11 +248,16 @@ fn python_reference_node(node: Node<'_>) -> Option<PythonReferenceNode<'_>> {
 }
 
 fn python_fqn_outcome(
+    py: &PythonAnalyzer,
     support: &DefinitionLookupIndex,
     fqn: &str,
     raw: &str,
 ) -> DefinitionLookupOutcome {
     let candidates = support.fqn(fqn);
+    if !candidates.is_empty() {
+        return candidates_outcome(candidates);
+    }
+    let candidates = py.resolve_exported_fqn(fqn);
     if !candidates.is_empty() {
         return candidates_outcome(candidates);
     }
