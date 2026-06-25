@@ -1113,6 +1113,153 @@ public class Consumer {
 }
 
 #[test]
+fn java_graph_strategy_keeps_nested_constructor_usage_narrow() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "com/example/Service.java",
+            r#"
+package com.example;
+
+public class Service {
+    public Service(Repository repository) {}
+
+    public static class Repository {
+        public Repository() {}
+    }
+}
+"#,
+        ),
+        (
+            "com/example/ServiceTest.java",
+            r#"
+package com.example;
+
+public class ServiceTest {
+    public void runsService() {
+        Service.Repository repository = new Service.Repository();
+        Service service = new Service(repository);
+    }
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let service_constructor = definition(&analyzer, "com.example.Service.Service");
+    let repository_constructor = definition(&analyzer, "com.example.Service.Repository.Repository");
+
+    let service_hits: Vec<_> = JavaUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&service_constructor),
+            &candidates,
+            1000,
+        )
+        .into_either()
+        .expect("service constructor success")
+        .into_iter()
+        .collect();
+    assert_eq!(
+        1,
+        service_hits.len(),
+        "service constructor should stay narrow"
+    );
+    assert_hit_contains(&service_hits, "new Service(repository)");
+    assert_no_hit_line(&service_hits, 6);
+
+    let repository_hits: Vec<_> = JavaUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&repository_constructor),
+            &candidates,
+            1000,
+        )
+        .into_either()
+        .expect("repository constructor success")
+        .into_iter()
+        .collect();
+    assert_eq!(
+        1,
+        repository_hits.len(),
+        "repository constructor should be found"
+    );
+    assert_hit_line(&repository_hits, 6);
+}
+
+#[test]
+fn java_graph_strategy_resolves_absolute_dotted_type_before_nested_fallback() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "com/external/Widget.java",
+            r#"
+package com.external;
+
+public class Widget {
+    public Widget() {}
+}
+"#,
+        ),
+        (
+            "com/example/com/external/Widget.java",
+            r#"
+package com.example.com.external;
+
+public class Widget {
+    public Widget() {}
+}
+"#,
+        ),
+        (
+            "com/example/Consumer.java",
+            r#"
+package com.example;
+
+public class Consumer {
+    public Widget build() {
+        return new com.external.Widget();
+    }
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let absolute_constructor = definition(&analyzer, "com.external.Widget.Widget");
+    let same_package_subpackage_constructor =
+        definition(&analyzer, "com.example.com.external.Widget.Widget");
+
+    let absolute_hits: Vec<_> = JavaUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&absolute_constructor),
+            &candidates,
+            1000,
+        )
+        .into_either()
+        .expect("absolute constructor success")
+        .into_iter()
+        .collect();
+    assert_eq!(1, absolute_hits.len(), "absolute FQN should win");
+    assert_hit_contains(&absolute_hits, "new com.external.Widget()");
+
+    let subpackage_hits: Vec<_> = JavaUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&same_package_subpackage_constructor),
+            &candidates,
+            1000,
+        )
+        .into_either()
+        .expect("subpackage constructor success")
+        .into_iter()
+        .collect();
+    assert!(
+        subpackage_hits.is_empty(),
+        "subpackage lookalike must not capture absolute FQN: {subpackage_hits:#?}"
+    );
+}
+
+#[test]
 fn java_graph_strategy_counts_same_package_implicit_type_and_method_references() {
     let (_project, analyzer) = java_analyzer_with_files(&[
         (

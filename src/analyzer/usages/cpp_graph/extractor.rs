@@ -255,7 +255,6 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 
 fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if node.kind() == "function_definition" {
-        maybe_record_constructor_definition_hit(node, ctx);
         return;
     }
     if !matches!(
@@ -283,7 +282,8 @@ fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     if node.kind() == "declaration" {
-        if declaration_mentions_type(node, ctx, owner)
+        if declaration_is_object_construction_candidate(node, ctx)
+            && declaration_mentions_type(node, ctx, owner)
             && ctx
                 .spec
                 .method_arity
@@ -308,43 +308,6 @@ fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
     if ctx.visibility.resolves_to_type(ctx.file, text, owner) {
         push_hit(type_node, ctx);
-    } else {
-        *ctx.saw_unproven_match = true;
-    }
-}
-
-fn maybe_record_constructor_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    let Some(owner) = ctx.spec.owner.as_ref() else {
-        return;
-    };
-    let Some(function) = function_definition_name_node(node) else {
-        return;
-    };
-    let text = node_text(function, ctx.source);
-    if !name_matches_callable(text, &ctx.spec.member_name) {
-        return;
-    }
-    *ctx.raw_match_count += 1;
-    if !function_definition_signature_matches_target(node, ctx) {
-        return;
-    }
-    if definition_name_candidates(function, ctx)
-        .iter()
-        .any(|name| {
-            name.contains("::")
-                && ctx
-                    .visibility
-                    .resolves_to_type(ctx.file, constructor_owner_name(name), owner)
-        })
-        || qualified_owner_matches(text, ctx)
-    {
-        push_definition_hit(function, ctx);
-    } else if definition_name_candidates(function, ctx)
-        .iter()
-        .any(|name| name.contains("::"))
-        || known_non_target_owner_context(function, ctx)
-    {
-        // A constructor definition for another visible owner is a proven non-match.
     } else {
         *ctx.saw_unproven_match = true;
     }
@@ -678,12 +641,6 @@ fn strip_parameter_name(parameter: &str) -> &str {
 
 fn is_identifier_char(ch: char) -> bool {
     ch == '_' || ch.is_ascii_alphanumeric()
-}
-
-fn constructor_owner_name(name: &str) -> &str {
-    name.rsplit_once("::")
-        .map(|(owner, _)| owner)
-        .unwrap_or(name)
 }
 
 fn first_descendant_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
