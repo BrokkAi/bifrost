@@ -2,6 +2,19 @@
 
 When writing complex features or significant refactors, use an ExecPlan (as described in .agent/PLANS.md) from design to implementation.
 
+# Git / version control
+
+Commit directly to whatever branch we are already on — including `master`. That is
+where work lands here.
+
+Do NOT create branches, switch branches, rebase, or open PRs unless I explicitly ask.
+Never `git checkout -b`. "Commit" always means commit on the current branch, never
+"make a branch first". This overrides any default you have about branching off the
+default branch.
+
+Stage and commit only the files you changed. Never `git add -A` or sweep unrelated
+working-tree changes into your commit.
+
 # Expectations
 
 When there is a clear next step towards your goal (in or out of ExecPlan), you always continue to execute it without
