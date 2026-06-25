@@ -124,6 +124,159 @@ pub fn run() {
 }
 
 #[test]
+fn rust_type_lookup_resolves_explicit_parameter_type() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+mod model;
+use crate::model::Widget;
+
+pub fn render(input: Widget) {
+    let _ = input;
+}
+"#,
+        )
+        .file("model.rs", "pub struct Widget;\n")
+        .build();
+
+    let line = "    let _ = input;";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"lib.rs","line":6,"column":{}}}]}}"#,
+            column_of(line, "input")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["types"][0]["fqn"], "Widget", "{value}");
+    assert_eq!(
+        result["types"][0]["definitions"][0]["path"], "model.rs",
+        "{value}"
+    );
+}
+
+#[test]
+fn rust_type_lookup_resolves_member_receiver_type() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+mod model;
+use crate::model::Widget;
+
+pub fn render(input: Widget) {
+    let _ = input.name;
+}
+"#,
+        )
+        .file(
+            "model.rs",
+            r#"
+pub struct Widget {
+    pub name: String,
+}
+"#,
+        )
+        .build();
+
+    let line = "    let _ = input.name;";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"lib.rs","line":6,"column":{}}}]}}"#,
+            column_of(line, "input")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["types"][0]["fqn"], "Widget", "{value}");
+    assert_eq!(
+        result["types"][0]["definitions"][0]["path"], "model.rs",
+        "{value}"
+    );
+}
+
+#[test]
+fn rust_type_lookup_resolves_member_field_type_from_known_receiver() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+mod model;
+use crate::model::{Label, Widget};
+
+pub fn render(input: Widget) {
+    let _ = input.label;
+}
+"#,
+        )
+        .file(
+            "model.rs",
+            r#"
+pub struct Label;
+
+pub struct Widget {
+    pub label: Label,
+}
+"#,
+        )
+        .build();
+
+    let line = "    let _ = input.label;";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"lib.rs","line":6,"column":{}}}]}}"#,
+            column_of(line, "label")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["types"][0]["fqn"], "Label", "{value}");
+    assert_eq!(
+        result["types"][0]["definitions"][0]["path"], "model.rs",
+        "{value}"
+    );
+}
+
+#[test]
+fn rust_type_lookup_reports_no_type_for_untyped_local() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+pub fn render() {
+    let value = 1;
+    let _ = value;
+}
+"#,
+        )
+        .build();
+
+    let line = "    let _ = value;";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"lib.rs","line":4,"column":{}}}]}}"#,
+            column_of(line, "value")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_type", "{value}");
+    assert_eq!(result["reference"]["target"], "value", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "no_explicit_type",
+        "{value}"
+    );
+}
+
+#[test]
 fn rust_type_lookup_resolves_struct_literal_expression_type() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(
