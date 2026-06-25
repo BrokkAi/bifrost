@@ -1,3 +1,4 @@
+use crate::analyzer::usages::common::same_node;
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::usages::rust_graph::hits::{
@@ -10,7 +11,6 @@ use crate::text_utils::compute_line_starts;
 use rayon::prelude::*;
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
-use crate::analyzer::usages::common::same_node;
 use tree_sitter::{Node, Parser, Tree};
 
 struct ParsedFile {

@@ -810,4 +810,3 @@ fn first_named_child_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>>
     node.named_children(&mut cursor)
         .find(|child| child.kind() == kind)
 }
-

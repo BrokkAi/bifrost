@@ -152,13 +152,20 @@ fn decode_matrix(buf: &[u8], expected_rows: usize) -> Result<Vec<Vec<f32>>, Stri
 /// else a single CPU sidecar (empty string).
 fn sidecar_devices() -> Vec<String> {
     if let Ok(v) = std::env::var(DEVICES_ENV) {
-        return v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        return v
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
     }
     // Honor CUDA_VISIBLE_DEVICES: a GPU-pinned worker (e.g. the mass-gen orchestrator)
     // sets it to one device and must spawn exactly one sidecar there.
     if let Ok(v) = std::env::var("CUDA_VISIBLE_DEVICES") {
-        let devs: Vec<String> =
-            v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        let devs: Vec<String> = v
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
         if !devs.is_empty() {
             return devs;
         }
@@ -180,17 +187,25 @@ fn sidecar_devices() -> Vec<String> {
 }
 
 fn script_path() -> PathBuf {
-    std::env::var(SCRIPT_ENV).map(PathBuf::from).unwrap_or_else(|_| PathBuf::from(DEFAULT_SCRIPT))
+    std::env::var(SCRIPT_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(DEFAULT_SCRIPT))
 }
 
 /// Spawn one sidecar pinned to `device` (a CUDA_VISIBLE_DEVICES value) and wait for its
 /// ready frame.
-fn spawn_sidecar(device: &str, tokenizer: Arc<Tokenizer>, label: String) -> Result<SingleSidecar, String> {
+fn spawn_sidecar(
+    device: &str,
+    tokenizer: Arc<Tokenizer>,
+    label: String,
+) -> Result<SingleSidecar, String> {
     let script = script_path();
     let mut cmd = Command::new("uv");
     cmd.arg("run").arg(&script);
     cmd.env("CUDA_VISIBLE_DEVICES", device);
-    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit());
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
     // Lead a new process group so Drop can kill `uv` and its python grandchild together.
     #[cfg(unix)]
     {
@@ -202,7 +217,11 @@ fn spawn_sidecar(device: &str, tokenizer: Arc<Tokenizer>, label: String) -> Resu
         .map_err(|e| format!("spawn sidecar ({}): {e}", script.display()))?;
     let stdin = child.stdin.take().ok_or("sidecar stdin missing")?;
     let stdout = child.stdout.take().ok_or("sidecar stdout missing")?;
-    let mut proc = SidecarProc { child, stdin, stdout: BufReader::new(stdout) };
+    let mut proc = SidecarProc {
+        child,
+        stdin,
+        stdout: BufReader::new(stdout),
+    };
 
     // First frame is the ready handshake (blocks through model load).
     let ready = proc.read_frame()?;
@@ -211,7 +230,11 @@ fn spawn_sidecar(device: &str, tokenizer: Arc<Tokenizer>, label: String) -> Resu
     if info.get("ready").and_then(|v| v.as_bool()) != Some(true) {
         return Err(format!("sidecar did not report ready: {info}"));
     }
-    Ok(SingleSidecar { proc: Mutex::new(proc), tokenizer, label })
+    Ok(SingleSidecar {
+        proc: Mutex::new(proc),
+        tokenizer,
+        label,
+    })
 }
 
 /// Spawn one sidecar per device and fan a batch across them via `ScheduledEmbedder`.
@@ -229,6 +252,9 @@ pub fn load_sidecar_embedder() -> Result<Arc<dyn Embedder>, String> {
         let _ = worker.embed_passages(&["warmup"]);
         workers.push(Arc::new(worker));
     }
-    eprintln!("bifrost semantic index: {} sidecar device(s)", workers.len());
+    eprintln!(
+        "bifrost semantic index: {} sidecar device(s)",
+        workers.len()
+    );
     Ok(Arc::new(ScheduledEmbedder::new(workers)))
 }

@@ -27,7 +27,10 @@ fn main() -> Result<(), String> {
         .nth(1)
         .map(PathBuf::from)
         .ok_or("usage: embed_probe <repo-root>")?;
-    let warn_ms: u128 = std::env::var("WARN_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(3000);
+    let warn_ms: u128 = std::env::var("WARN_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3000);
 
     eprintln!("[embed] loading production embedder");
     let embedder = load_production_embedder()?;
@@ -38,7 +41,10 @@ fn main() -> Result<(), String> {
     let snapshot = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
     let analyzer = snapshot.analyzer();
     let files: Vec<_> = analyzer.analyzed_files().cloned().collect();
-    eprintln!("[embed] {} files; extracting + embedding in groups of 64", files.len());
+    eprintln!(
+        "[embed] {} files; extracting + embedding in groups of 64",
+        files.len()
+    );
 
     let stderr = std::io::stderr();
     for (gi, group) in files.chunks(64).enumerate() {
@@ -70,7 +76,10 @@ fn main() -> Result<(), String> {
                 embedder.embed_passages(&[r])?;
                 let bms = bt.elapsed().as_millis();
                 if bms >= warn_ms {
-                    eprintln!("[embed] SLOW-TEXT {bms}ms group {gi} text {ti} bytes={}", r.len());
+                    eprintln!(
+                        "[embed] SLOW-TEXT {bms}ms group {gi} text {ti} bytes={}",
+                        r.len()
+                    );
                 }
             }
         } else {
@@ -78,7 +87,10 @@ fn main() -> Result<(), String> {
         }
         let ms = t.elapsed().as_millis();
         if ms >= warn_ms {
-            eprintln!("[embed] SLOW-GROUP {ms}ms group {gi} ({} texts, max_bytes={max_bytes})", texts.len());
+            eprintln!(
+                "[embed] SLOW-GROUP {ms}ms group {gi} ({} texts, max_bytes={max_bytes})",
+                texts.len()
+            );
         }
     }
     eprintln!("[embed] done — no group hung");

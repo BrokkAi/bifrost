@@ -22,7 +22,9 @@ fn main() -> Result<(), String> {
 
     // Build a text of roughly `target` tokens by repeating varied words (so BPE
     // produces many distinct tokens rather than one giant merge).
-    let words = ["compute", "render", "buffer", "handle", "vector", "matrix", "kernel", "stream"];
+    let words = [
+        "compute", "render", "buffer", "handle", "vector", "matrix", "kernel", "stream",
+    ];
     let make_text = |target: usize| -> String {
         let mut s = String::new();
         let mut i = 0usize;
@@ -44,12 +46,19 @@ fn main() -> Result<(), String> {
         let toks = embedder.count_tokens(&text);
         {
             let mut h = stderr.lock();
-            let _ = writeln!(h, "[seq] BEGIN target={target} actual_tokens={toks} bytes={}", text.len());
+            let _ = writeln!(
+                h,
+                "[seq] BEGIN target={target} actual_tokens={toks} bytes={}",
+                text.len()
+            );
             let _ = h.flush();
         }
         let t = Instant::now();
         let _ = embedder.embed_passages(&[text.as_str()])?;
-        eprintln!("[seq] END   target={target} tokens={toks} {}ms", t.elapsed().as_millis());
+        eprintln!(
+            "[seq] END   target={target} tokens={toks} {}ms",
+            t.elapsed().as_millis()
+        );
     }
     eprintln!("[seq] done — no wedge across the sweep");
     Ok(())

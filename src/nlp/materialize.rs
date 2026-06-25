@@ -99,7 +99,10 @@ pub fn extract_group(
     let mut seen_components: BTreeSet<Key> = BTreeSet::new();
 
     for target in group {
-        metrics::trace(format_args!("extract file {}", target.file.rel_path().display()));
+        metrics::trace(format_args!(
+            "extract file {}",
+            target.file.rel_path().display()
+        ));
         let extracted = extract_file_chunks(analyzer, &target.file, &count_tokens);
         metrics::trace(format_args!(
             "extract done {} ({} chunks)",
@@ -254,8 +257,10 @@ pub fn embed_group(
             .copied()
             .filter(|k| !available.contains_key(k))
             .collect();
-        let cached = metrics::time(&metrics::SQLITE_NS, || store.component_vectors(&cached_needed))
-            .map_err(|e| e.to_string())?;
+        let cached = metrics::time(&metrics::SQLITE_NS, || {
+            store.component_vectors(&cached_needed)
+        })
+        .map_err(|e| e.to_string())?;
         available.extend(cached);
         let mut emitted: BTreeSet<Key> = BTreeSet::new();
         metrics::trace(format_args!("compose {} vectors", missing_composed.len()));
@@ -302,13 +307,19 @@ pub fn write_group(store: &SemanticStore, embedded: EmbeddedGroup) -> Result<(),
         composed_items,
     } = embedded;
     if !component_items.is_empty() {
-        metrics::trace(format_args!("upsert_component {} vectors", component_items.len()));
+        metrics::trace(format_args!(
+            "upsert_component {} vectors",
+            component_items.len()
+        ));
         store
             .upsert_component_vectors(&component_items)
             .map_err(|e| e.to_string())?;
     }
     if !composed_items.is_empty() {
-        metrics::trace(format_args!("upsert_composed {} vectors", composed_items.len()));
+        metrics::trace(format_args!(
+            "upsert_composed {} vectors",
+            composed_items.len()
+        ));
         store
             .upsert_composed_vectors(&composed_items)
             .map_err(|e| e.to_string())?;

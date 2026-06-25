@@ -1,5 +1,5 @@
-pub(in crate::analyzer::usages) use crate::analyzer::usages::common::node_text;
 use crate::analyzer::usages::common::language_for_file;
+pub(in crate::analyzer::usages) use crate::analyzer::usages::common::node_text;
 use crate::analyzer::{
     CodeUnit, IAnalyzer, Language, PhpAnalyzer, PhpFileContext, ProjectFile, Range,
     TypeHierarchyProvider, resolve_php_type,

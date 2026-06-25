@@ -1,3 +1,4 @@
+use crate::analyzer::usages::common::same_node;
 use crate::analyzer::usages::go_graph::hits::record_hit;
 use crate::analyzer::usages::go_graph::resolver::{
     GoProjectGraph, ScanBindings, TargetSpec, TypeRef, node_text,
@@ -9,7 +10,6 @@ use crate::hash::HashSet;
 use rayon::prelude::*;
 use std::collections::BTreeSet;
 use std::sync::Mutex;
-use crate::analyzer::usages::common::same_node;
 use tree_sitter::Node;
 
 const OWNER_TOKEN: &str = "__go_target_owner__";

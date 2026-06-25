@@ -491,7 +491,6 @@ fn extract_typedef_declarator_name(node: Node<'_>, source: &str) -> Option<Strin
     }
 }
 
-
 fn last_named_child(node: Node<'_>) -> Option<Node<'_>> {
     let count = node.named_child_count();
     if count == 0 {

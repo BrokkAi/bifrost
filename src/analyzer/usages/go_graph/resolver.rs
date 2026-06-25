@@ -1,6 +1,6 @@
 use crate::analyzer::go::packages::{canonical_go_package_name, read_go_module_path};
-pub(super) use crate::analyzer::usages::common::node_text;
 use crate::analyzer::usages::common::language_for_file;
+pub(super) use crate::analyzer::usages::common::node_text;
 use crate::analyzer::usages::go_graph::extractor::{first_named_child, type_ref_from_node};
 use crate::analyzer::usages::model::{
     ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind,
@@ -986,7 +986,6 @@ pub(crate) fn default_go_import_local_name(import_path_or_identifier: &str) -> S
         .unwrap_or(import_path_or_identifier);
     VERSION_SUFFIX_RE.replace(tail, "").to_string()
 }
-
 
 static VERSION_SUFFIX_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\.v\d+$").expect("valid Go module version suffix regex"));

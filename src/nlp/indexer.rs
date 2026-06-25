@@ -538,8 +538,9 @@ fn materialize_missing(
         let producer = scope.spawn(move || -> BuildResult {
             for group in targets.chunks(FILE_GROUP) {
                 check_cancelled(shared)?;
-                let extracted =
-                    metrics::time(&metrics::EXTRACT_NS, || extract_group(embedder, analyzer, group));
+                let extracted = metrics::time(&metrics::EXTRACT_NS, || {
+                    extract_group(embedder, analyzer, group)
+                });
                 if tx_extract.send(extracted).is_err() {
                     break; // downstream stopped (error or cancellation)
                 }

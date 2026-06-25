@@ -300,8 +300,9 @@ impl SemanticStore {
                      materialized_at = datetime('now')",
             )?;
             let mut delete_chunks = tx.prepare("DELETE FROM blob_chunks WHERE blob_oid = ?1")?;
-            let mut intern_summary = tx
-                .prepare("INSERT INTO blob_summaries(hash) VALUES(?1) ON CONFLICT(hash) DO NOTHING")?;
+            let mut intern_summary = tx.prepare(
+                "INSERT INTO blob_summaries(hash) VALUES(?1) ON CONFLICT(hash) DO NOTHING",
+            )?;
             let mut select_summary =
                 tx.prepare("SELECT blob_summary_id FROM blob_summaries WHERE hash = ?1")?;
             let mut insert_chunk = tx.prepare(
