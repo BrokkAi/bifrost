@@ -309,6 +309,7 @@ fn rust_expression_type_fqn(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn rust_expression_type_definition_fqn_cached(
     analyzer: &dyn IAnalyzer,
     support: &DefinitionLookupIndex,
