@@ -155,11 +155,10 @@ fn bifrost_lsp_server_indexes_all_startup_workspace_folders() {
         initialize["result"]["capabilities"]["workspace"]["workspaceFolders"]["supported"], true,
         "workspace folder support should be advertised: {initialize}"
     );
-    assert!(
-        initialize["result"]["capabilities"]["workspace"]["workspaceFolders"]
-            .get("changeNotifications")
-            .is_none(),
-        "dynamic workspace folder changes should not be advertised: {initialize}"
+    assert_eq!(
+        initialize["result"]["capabilities"]["workspace"]["workspaceFolders"]["changeNotifications"],
+        true,
+        "dynamic workspace folder changes should be advertised: {initialize}"
     );
     write_message(
         &mut stdin,
@@ -210,6 +209,515 @@ fn bifrost_lsp_server_indexes_all_startup_workspace_folders() {
             .iter()
             .any(|symbol| symbol["name"] == "BetaRoot"),
         "expected BetaRoot document symbol from second root in {document_symbols:#?}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_adds_workspace_folder_dynamically() {
+    let temp = TempDir::new().expect("tempdir");
+    let parent = temp.path().canonicalize().expect("canon temp");
+    let root_a = parent.join("service-a");
+    let root_b = parent.join("service-b");
+    let outside = parent.join("outside");
+    fs::create_dir_all(&root_a).expect("create service-a");
+    fs::create_dir_all(&root_b).expect("create service-b");
+    fs::create_dir_all(&outside).expect("create outside");
+    fs::write(
+        root_a.join("Alpha.java"),
+        "class AlphaRoot {\n    void alphaOnly() {}\n}\n",
+    )
+    .expect("write Alpha.java");
+    let beta_path = root_b.join("Beta.java");
+    fs::write(
+        &beta_path,
+        "class BetaRoot {\n    void betaDynamic() {}\n}\n",
+    )
+    .expect("write Beta.java");
+    fs::write(
+        outside.join("Outside.java"),
+        "class OutsideRoot {\n    void outsideLeak() {}\n}\n",
+    )
+    .expect("write Outside.java");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server_with_params(
+        &parent,
+        json!({
+            "processId": null,
+            "rootUri": null,
+            "workspaceFolders": [{"uri": uri_for(&root_a), "name": "service-a"}],
+            "capabilities": {"workspace": {"workspaceFolders": true}}
+        }),
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "workspace/didChangeWorkspaceFolders",
+            "params": {
+                "event": {
+                    "added": [{"uri": uri_for(&root_b), "name": "service-b"}],
+                    "removed": []
+                }
+            }
+        }),
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "workspace/symbol",
+            "params": {"query": "Dynamic"}
+        }),
+    );
+    let symbols_response = read_response_for_id(&mut reader, &mut stderr, 2);
+    let symbols = symbols_response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected workspace symbols, got {symbols_response}"));
+    assert!(
+        symbols.iter().any(|symbol| symbol["name"] == "betaDynamic"),
+        "expected betaDynamic from added root in {symbols:#?}"
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "textDocument/documentSymbol",
+            "params": {"textDocument": {"uri": uri_for(&beta_path)}}
+        }),
+    );
+    let document_symbols_response = read_response_for_id(&mut reader, &mut stderr, 3);
+    let document_symbols = document_symbols_response["result"]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!("expected document symbols from added root, got {document_symbols_response}")
+        });
+    assert!(
+        document_symbols
+            .iter()
+            .any(|symbol| symbol["name"] == "BetaRoot"),
+        "expected BetaRoot document symbol from added root in {document_symbols:#?}"
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "workspace/symbol",
+            "params": {"query": "outsideLeak"}
+        }),
+    );
+    let outside_response = read_response_for_id(&mut reader, &mut stderr, 4);
+    let outside_symbols = outside_response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected workspace symbols, got {outside_response}"));
+    assert!(
+        outside_symbols.is_empty(),
+        "sibling outside active workspace folders should not be indexed: {outside_symbols:#?}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_removes_workspace_folder_dynamically() {
+    let temp = TempDir::new().expect("tempdir");
+    let parent = temp.path().canonicalize().expect("canon temp");
+    let root_a = parent.join("service-a");
+    let root_b = parent.join("service-b");
+    fs::create_dir_all(&root_a).expect("create service-a");
+    fs::create_dir_all(&root_b).expect("create service-b");
+    let request_path = root_a.join("Requester.java");
+    let removed_path = root_b.join("Removed.java");
+    fs::write(
+        &request_path,
+        "class Requester {\n    void caller() {\n        removed\n    }\n}\n",
+    )
+    .expect("write Requester.java");
+    fs::write(
+        &removed_path,
+        "class RemovedRoot {\n    void removedCompletion() {}\n    void broken( {\n}\n",
+    )
+    .expect("write Removed.java");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server_with_params(
+        &parent,
+        json!({
+            "processId": null,
+            "rootUri": null,
+            "workspaceFolders": [
+                {"uri": uri_for(&root_a), "name": "service-a"},
+                {"uri": uri_for(&root_b), "name": "service-b"}
+            ],
+            "capabilities": {}
+        }),
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "textDocument/completion",
+            "params": {
+                "textDocument": {"uri": uri_for(&request_path)},
+                "position": {"line": 2, "character": 15}
+            }
+        }),
+    );
+    let before_completion = read_response_for_id(&mut reader, &mut stderr, 2);
+    let before_items = before_completion["result"]["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected completion items, got {before_completion}"));
+    assert!(
+        before_items
+            .iter()
+            .any(|item| item["label"] == "removedCompletion"),
+        "expected completion from second root before removal: {before_items:#?}"
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didSave",
+            "params": {"textDocument": {"uri": uri_for(&removed_path)}}
+        }),
+    );
+    let publish_before =
+        read_notification(&mut reader, &mut stderr, "textDocument/publishDiagnostics");
+    assert_eq!(
+        publish_before["params"]["uri"],
+        uri_for(&removed_path),
+        "expected diagnostics for removed-root file before removal: {publish_before}"
+    );
+    assert!(
+        !publish_before["params"]["diagnostics"]
+            .as_array()
+            .unwrap_or_else(|| panic!("expected diagnostics array, got {publish_before}"))
+            .is_empty(),
+        "expected parse diagnostics before removing root: {publish_before}"
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "workspace/didChangeWorkspaceFolders",
+            "params": {
+                "event": {
+                    "added": [],
+                    "removed": [{"uri": uri_for(&root_b), "name": "service-b"}]
+                }
+            }
+        }),
+    );
+    let publish_clear =
+        read_notification(&mut reader, &mut stderr, "textDocument/publishDiagnostics");
+    assert_eq!(
+        publish_clear["params"]["uri"],
+        uri_for(&removed_path),
+        "expected removed-root diagnostics to be cleared: {publish_clear}"
+    );
+    assert!(
+        publish_clear["params"]["diagnostics"]
+            .as_array()
+            .unwrap_or_else(|| panic!("expected diagnostics array, got {publish_clear}"))
+            .is_empty(),
+        "expected empty diagnostics after root removal: {publish_clear}"
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "workspace/symbol",
+            "params": {"query": "removedCompletion"}
+        }),
+    );
+    let after_symbols = read_response_for_id(&mut reader, &mut stderr, 3);
+    let symbols = after_symbols["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected workspace symbols, got {after_symbols}"));
+    assert!(
+        symbols.is_empty(),
+        "removed root symbols should disappear: {symbols:#?}"
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "textDocument/completion",
+            "params": {
+                "textDocument": {"uri": uri_for(&request_path)},
+                "position": {"line": 2, "character": 15}
+            }
+        }),
+    );
+    let after_completion = read_response_for_id(&mut reader, &mut stderr, 4);
+    let after_items = after_completion["result"]["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected completion items, got {after_completion}"));
+    assert!(
+        !after_items
+            .iter()
+            .any(|item| item["label"] == "removedCompletion"),
+        "completion cache should not retain removed-root symbols: {after_items:#?}"
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "textDocument/documentSymbol",
+            "params": {"textDocument": {"uri": uri_for(&removed_path)}}
+        }),
+    );
+    let removed_document = read_response_for_id(&mut reader, &mut stderr, 5);
+    assert!(
+        removed_document["result"].is_null(),
+        "document requests should no longer route to removed roots: {removed_document}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_replays_open_document_after_workspace_folder_readd() {
+    let temp = TempDir::new().expect("tempdir");
+    let parent = temp.path().canonicalize().expect("canon temp");
+    let root_a = parent.join("service-a");
+    let root_b = parent.join("service-b");
+    fs::create_dir_all(&root_a).expect("create service-a");
+    fs::create_dir_all(&root_b).expect("create service-b");
+    fs::write(root_a.join("Alpha.java"), "class AlphaRoot {}\n").expect("write Alpha.java");
+    let beta_path = root_b.join("Beta.java");
+    fs::write(&beta_path, "class BetaRoot {\n    void diskOnly() {}\n}\n")
+        .expect("write Beta.java");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server_with_params(
+        &parent,
+        json!({
+            "processId": null,
+            "rootUri": null,
+            "workspaceFolders": [
+                {"uri": uri_for(&root_a), "name": "service-a"},
+                {"uri": uri_for(&root_b), "name": "service-b"}
+            ],
+            "capabilities": {}
+        }),
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": uri_for(&beta_path),
+                    "languageId": "java",
+                    "version": 1,
+                    "text": "class BetaRoot {\n    void overlayOnly() {}\n}\n"
+                }
+            }
+        }),
+    );
+    let _ = read_notification(&mut reader, &mut stderr, "textDocument/publishDiagnostics");
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "workspace/didChangeWorkspaceFolders",
+            "params": {
+                "event": {
+                    "added": [],
+                    "removed": [{"uri": uri_for(&root_b), "name": "service-b"}]
+                }
+            }
+        }),
+    );
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "workspace/didChangeWorkspaceFolders",
+            "params": {
+                "event": {
+                    "added": [{"uri": uri_for(&root_b), "name": "service-b"}],
+                    "removed": []
+                }
+            }
+        }),
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "workspace/symbol",
+            "params": {"query": "overlayOnly"}
+        }),
+    );
+    let response = read_response_for_id(&mut reader, &mut stderr, 2);
+    let symbols = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected workspace symbols, got {response}"));
+    assert!(
+        symbols.iter().any(|symbol| symbol["name"] == "overlayOnly"),
+        "re-added root should replay still-open document overlay: {symbols:#?}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[cfg(unix)]
+#[test]
+fn bifrost_lsp_server_removes_symlinked_workspace_folder_after_symlink_disappears() {
+    let temp = TempDir::new().expect("tempdir");
+    let parent = temp.path().canonicalize().expect("canon temp");
+    let real_root = parent.join("real-service");
+    let link_root = parent.join("linked-service");
+    fs::create_dir_all(&real_root).expect("create real service");
+    std::os::unix::fs::symlink(&real_root, &link_root).expect("create root symlink");
+    fs::write(
+        real_root.join("Linked.java"),
+        "class LinkedRoot {\n    void linkedOnly() {}\n}\n",
+    )
+    .expect("write Linked.java");
+    let link_uri = uri_for(&link_root);
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server_with_params(
+        &parent,
+        json!({
+            "processId": null,
+            "rootUri": null,
+            "workspaceFolders": [{"uri": link_uri, "name": "linked-service"}],
+            "capabilities": {}
+        }),
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "workspace/symbol",
+            "params": {"query": "linkedOnly"}
+        }),
+    );
+    let before = read_response_for_id(&mut reader, &mut stderr, 2);
+    let before_symbols = before["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected workspace symbols, got {before}"));
+    assert!(
+        before_symbols
+            .iter()
+            .any(|symbol| symbol["name"] == "linkedOnly"),
+        "expected linked root symbol before removal: {before_symbols:#?}"
+    );
+
+    fs::remove_file(&link_root).expect("remove root symlink");
+    assert!(
+        !link_root.exists(),
+        "root symlink should be gone before removal notification"
+    );
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "workspace/didChangeWorkspaceFolders",
+            "params": {
+                "event": {
+                    "added": [],
+                    "removed": [{"uri": link_uri, "name": "linked-service"}]
+                }
+            }
+        }),
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "workspace/symbol",
+            "params": {"query": "linkedOnly"}
+        }),
+    );
+    let response = read_response_for_id(&mut reader, &mut stderr, 3);
+    let symbols = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected workspace symbols, got {response}"));
+    assert!(
+        symbols.is_empty(),
+        "removing the original symlink URI should remove its canonical analyzer root: {symbols:#?}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_ignores_invalid_dynamic_workspace_folder_additions() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let not_a_dir = root.join("NotADir.java");
+    fs::write(
+        root.join("Alpha.java"),
+        "class AlphaRoot {\n    void alphaStillIndexed() {}\n}\n",
+    )
+    .expect("write Alpha.java");
+    fs::write(&not_a_dir, "class NotADir {}\n").expect("write NotADir.java");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "workspace/didChangeWorkspaceFolders",
+            "params": {
+                "event": {
+                    "added": [
+                        {"uri": "untitled:dynamic-root", "name": "bad-scheme"},
+                        {"uri": uri_for(&not_a_dir), "name": "not-a-dir"}
+                    ],
+                    "removed": []
+                }
+            }
+        }),
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "workspace/symbol",
+            "params": {"query": "alphaStillIndexed"}
+        }),
+    );
+    let response = read_response_for_id(&mut reader, &mut stderr, 2);
+    let symbols = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected workspace symbols, got {response}"));
+    assert!(
+        symbols
+            .iter()
+            .any(|symbol| symbol["name"] == "alphaStillIndexed"),
+        "invalid additions should not disturb the existing workspace: {symbols:#?}"
     );
 
     shutdown_lsp(child, stdin, reader, stderr);
@@ -2837,6 +3345,22 @@ fn start_lsp_server(
     BufReader<std::process::ChildStdout>,
     std::process::ChildStderr,
 ) {
+    let root_uri = uri_for(root);
+    start_lsp_server_with_params(
+        root,
+        json!({"processId": null, "rootUri": root_uri, "capabilities": {}}),
+    )
+}
+
+fn start_lsp_server_with_params(
+    root: &Path,
+    initialize_params: Value,
+) -> (
+    std::process::Child,
+    std::process::ChildStdin,
+    BufReader<std::process::ChildStdout>,
+    std::process::ChildStderr,
+) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
         .arg("--root")
         .arg(root)
@@ -2852,14 +3376,13 @@ fn start_lsp_server(
     let mut stderr = child.stderr.take().expect("stderr");
     let mut reader = BufReader::new(stdout);
 
-    let root_uri = uri_for(root);
     write_message(
         &mut stdin,
         json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "initialize",
-            "params": {"processId": null, "rootUri": root_uri, "capabilities": {}}
+            "params": initialize_params
         }),
     );
     let _ = read_message(&mut reader, &mut stderr);
