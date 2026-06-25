@@ -25,10 +25,7 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 }
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
-    a.iter()
-        .zip(b)
-        .map(|(x, y)| (x - y).abs())
-        .fold(0.0, f32::max)
+    a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
 }
 
 #[test]
@@ -48,11 +45,7 @@ fn voyage_embeddings_match_torch_reference() {
 
     // f32 on CPU keeps the comparison numerically clean (the reference is f32 too).
     let embedder = load_production_embedder().expect("load voyage-4-nano via Candle");
-    assert_eq!(
-        embedder.dim(),
-        512,
-        "deployment embeds at the MRL-truncated 512 dim"
-    );
+    assert_eq!(embedder.dim(), 512, "deployment embeds at the MRL-truncated 512 dim");
 
     // Passages: embed_passages applies the document prompt, matching prompt_name="document".
     let doc_texts: Vec<&str> = ref_docs.keys().map(String::as_str).collect();

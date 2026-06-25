@@ -198,7 +198,9 @@ fn maybe_start_semantic_checked(
     }
     let root = snapshot.analyzer().project().root().to_path_buf();
     if !crate::nlp::gitcache::is_git_repo(&root) {
-        eprintln!("bifrost semantic index disabled: semantic search requires a git repository");
+        eprintln!(
+            "bifrost semantic index disabled: semantic search requires a git repository"
+        );
         return None;
     }
     Some(SemanticIndexer::start(root, snapshot.clone()))

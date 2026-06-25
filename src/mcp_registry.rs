@@ -154,11 +154,7 @@ fn append_named_toolset(
     Ok(())
 }
 
-fn descriptors_for_toolset(
-    name: &str,
-    render_options: McpRenderOptions,
-    git_repo: bool,
-) -> Vec<Value> {
+fn descriptors_for_toolset(name: &str, render_options: McpRenderOptions, git_repo: bool) -> Vec<Value> {
     match name {
         "symbol" => crate::mcp_core::symbol_tool_descriptors(render_options.render_line_numbers),
         "nlp" => crate::mcp_nlp::nlp_tool_descriptors(git_repo),

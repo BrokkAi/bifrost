@@ -159,11 +159,7 @@ fn resolve_embed_model_dir() -> Result<PathBuf, String> {
 pub fn load_production_embedder() -> Result<Arc<dyn Embedder>, String> {
     let device = select_device()?;
     let dir = resolve_embed_model_dir()?;
-    Ok(Arc::new(VoyageEmbedder::load(
-        &dir,
-        device,
-        embed_repo_id(),
-    )?))
+    Ok(Arc::new(VoyageEmbedder::load(&dir, device, embed_repo_id())?))
 }
 
 // ---------------------------------------------------------------------------

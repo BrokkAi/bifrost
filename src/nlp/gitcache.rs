@@ -16,9 +16,7 @@ type Result<T> = std::result::Result<T, String>;
 /// Discover the repository containing `root`, if any. Semantic search is gated on
 /// this being `Some` (non-git workspaces are unsupported).
 pub fn discover(root: &Path) -> Option<Repository> {
-    Repository::discover(root)
-        .ok()
-        .filter(|repo| !repo.is_bare())
+    Repository::discover(root).ok().filter(|repo| !repo.is_bare())
 }
 
 /// Whether `root` is inside a (non-bare) git repository.
@@ -29,10 +27,7 @@ pub fn is_git_repo(root: &Path) -> bool {
 /// Working-tree blob OID (hex) for each of `rel_paths`. Clean files use the index
 /// entry's OID; modified/untracked files are hashed from disk so the OID reflects
 /// the actual working-tree content the user is searching.
-pub fn working_tree_oids(
-    repo: &Repository,
-    rel_paths: &[String],
-) -> Result<HashMap<String, String>> {
+pub fn working_tree_oids(repo: &Repository, rel_paths: &[String]) -> Result<HashMap<String, String>> {
     let workdir = repo
         .workdir()
         .ok_or_else(|| "repository has no working directory".to_string())?
@@ -83,8 +78,7 @@ pub fn working_tree_oids_targeted(
         let path = Path::new(rel);
         // status_file errors on paths git refuses to stat (e.g. ignored); treat
         // anything we can't prove clean as dirty and hash it from disk.
-        let clean =
-            matches!(repo.status_file(path), Ok(status) if !status.intersects(dirty_flags()));
+        let clean = matches!(repo.status_file(path), Ok(status) if !status.intersects(dirty_flags()));
         let oid = if clean {
             match index.get_path(path, 0) {
                 Some(entry) => entry.id,
@@ -228,11 +222,7 @@ mod tests {
     use std::process::Command;
 
     fn run_git<const N: usize>(dir: &Path, args: [&str; N]) {
-        let status = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .status()
-            .unwrap();
+        let status = Command::new("git").current_dir(dir).args(args).status().unwrap();
         assert!(status.success(), "git {args:?} failed");
     }
 
@@ -253,7 +243,10 @@ mod tests {
         let repo = discover(temp.path()).unwrap();
         let oids = working_tree_oids(&repo, &["a.txt".to_string()]).unwrap();
         // git hash-object of "hello\n"
-        assert_eq!(oids["a.txt"], "ce013625030ba8dba906f756967f9e9ca394464a");
+        assert_eq!(
+            oids["a.txt"],
+            "ce013625030ba8dba906f756967f9e9ca394464a"
+        );
     }
 
     #[test]
@@ -299,15 +292,11 @@ mod tests {
         // clean uses the committed OID; dirty/untracked reflect working bytes.
         assert_eq!(
             targeted["clean.txt"],
-            Oid::hash_object(ObjectType::Blob, b"clean\n")
-                .unwrap()
-                .to_string()
+            Oid::hash_object(ObjectType::Blob, b"clean\n").unwrap().to_string()
         );
         assert_eq!(
             targeted["dirty.txt"],
-            Oid::hash_object(ObjectType::Blob, b"working\n")
-                .unwrap()
-                .to_string()
+            Oid::hash_object(ObjectType::Blob, b"working\n").unwrap().to_string()
         );
     }
 }

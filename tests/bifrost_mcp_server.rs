@@ -101,7 +101,6 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"));
     child.env("BIFROST_SEMANTIC_INDEX", "off");
     let mut child = child
-        .arg("--force-semantic-cpu")
         .arg("--root")
         .arg(fixture_root.path())
         .arg("--server")
@@ -787,7 +786,6 @@ fn bifrost_semantic_search_fails_cleanly_without_models() {
             "BIFROST_EMBED_MODEL_DIR",
             "/nonexistent/bifrost-test-models",
         )
-        .arg("--force-semantic-cpu")
         .arg("--root")
         .arg(&fixture_root)
         .arg("--server")
@@ -1706,7 +1704,6 @@ fn initialize_session(stdin: &mut impl Write, reader: &mut impl BufRead, stderr:
 fn spawn_server(root: &std::path::Path, mode: &str, extra_args: &[&str]) -> std::process::Child {
     let mut command = Command::new(env!("CARGO_BIN_EXE_bifrost"));
     command.env("BIFROST_SEMANTIC_INDEX", "off");
-    command.arg("--force-semantic-cpu");
     command.arg("--root").arg(root).arg("--server").arg(mode);
     for arg in extra_args {
         command.arg(arg);

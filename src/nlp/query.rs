@@ -181,15 +181,11 @@ pub fn semantic_search(
     //    Seeds carry their own-leg normalized weight (summed when a file is in both
     //    legs), which sidesteps the cosine-vs-BM25 scale mismatch.
     let vector_files = aggregate_symbols_to_files(
-        vector_by_symbol
-            .iter()
-            .map(|(sym, score)| (sym.as_str(), *score)),
+        vector_by_symbol.iter().map(|(sym, score)| (sym.as_str(), *score)),
         &symbol_file,
     );
     let bm25_files = aggregate_symbols_to_files(
-        bm25_scores
-            .iter()
-            .map(|(sym, score)| (sym.as_str(), *score as f32)),
+        bm25_scores.iter().map(|(sym, score)| (sym.as_str(), *score as f32)),
         &symbol_file,
     );
     let (seed_paths, seed_weights) = build_seeds(&vector_files, &bm25_files, k);
@@ -398,14 +394,16 @@ mod tests {
 
     #[test]
     fn aggregate_symbols_to_files_keeps_max_per_file() {
-        let symbol_file: HashMap<String, String> =
-            [("a.foo", "a.rs"), ("a.bar", "a.rs"), ("b.qux", "b.rs")]
-                .iter()
-                .map(|(s, f)| (s.to_string(), f.to_string()))
-                .collect();
+        let symbol_file: HashMap<String, String> = [
+            ("a.foo", "a.rs"),
+            ("a.bar", "a.rs"),
+            ("b.qux", "b.rs"),
+        ]
+        .iter()
+        .map(|(s, f)| (s.to_string(), f.to_string()))
+        .collect();
         let scored = [("a.foo", 0.3f32), ("a.bar", 0.8), ("b.qux", 0.5)];
-        let files =
-            aggregate_symbols_to_files(scored.iter().map(|(s, sc)| (*s, *sc)), &symbol_file);
+        let files = aggregate_symbols_to_files(scored.iter().map(|(s, sc)| (*s, *sc)), &symbol_file);
         assert_eq!(files.get("a.rs"), Some(&0.8));
         assert_eq!(files.get("b.rs"), Some(&0.5));
     }

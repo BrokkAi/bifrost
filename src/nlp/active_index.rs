@@ -68,11 +68,7 @@ impl ActiveIndex {
 
         let oids: Vec<String> = {
             let mut set: HashSet<&String> = HashSet::new();
-            path_to_oid
-                .values()
-                .filter(|o| set.insert(*o))
-                .cloned()
-                .collect()
+            path_to_oid.values().filter(|o| set.insert(*o)).cloned().collect()
         };
         let rows = store.chunks_for_oids(&oids).map_err(|e| e.to_string())?;
         let grouped = group_by_oid(rows);
@@ -92,11 +88,7 @@ impl ActiveIndex {
                     end_line: row.end_line,
                     composed_hash: row.composed_hash,
                 }));
-                index
-                    .by_composed
-                    .entry(row.composed_hash)
-                    .or_default()
-                    .push(occ_id);
+                index.by_composed.entry(row.composed_hash).or_default().push(occ_id);
                 index.by_file.entry(file_id).or_default().push(occ_id);
                 index.active_hashes.insert(row.composed_hash);
                 docs.push((occ_id as i64, row.fts_tokens.clone()));
@@ -112,9 +104,7 @@ impl ActiveIndex {
                     .prepare("INSERT INTO bm25_idx(rowid, tokens) VALUES(?1, ?2)")
                     .map_err(|e| e.to_string())?;
                 for (occ_id, tokens) in &docs {
-                    insert
-                        .execute(params![occ_id, tokens])
-                        .map_err(|e| e.to_string())?;
+                    insert.execute(params![occ_id, tokens]).map_err(|e| e.to_string())?;
                 }
             }
             tx.commit().map_err(|e| e.to_string())?;
@@ -162,12 +152,8 @@ impl ActiveIndex {
             .copied()
             .filter(|h| self.active_hashes.contains(h))
             .collect();
-        store
-            .remove_active_composed(&to_remove)
-            .map_err(|e| e.to_string())?;
-        store
-            .add_active_composed(&to_add)
-            .map_err(|e| e.to_string())?;
+        store.remove_active_composed(&to_remove).map_err(|e| e.to_string())?;
+        store.add_active_composed(&to_add).map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -186,10 +172,7 @@ impl ActiveIndex {
             self.bm25
                 .lock()
                 .expect("bm25 mutex poisoned")
-                .execute(
-                    "DELETE FROM bm25_idx WHERE rowid = ?1",
-                    params![occ_id as i64],
-                )
+                .execute("DELETE FROM bm25_idx WHERE rowid = ?1", params![occ_id as i64])
                 .map_err(|e| e.to_string())?;
             if let Some(bucket) = self.by_composed.get_mut(&occ.composed_hash) {
                 bucket.retain(|id| *id != occ_id);
@@ -237,10 +220,7 @@ impl ActiveIndex {
                     params![occ_id as i64, row.fts_tokens],
                 )
                 .map_err(|e| e.to_string())?;
-            self.by_composed
-                .entry(row.composed_hash)
-                .or_default()
-                .push(occ_id);
+            self.by_composed.entry(row.composed_hash).or_default().push(occ_id);
             self.by_file.entry(file_id).or_default().push(occ_id);
             self.active_hashes.insert(row.composed_hash);
             touched.insert(row.composed_hash);
