@@ -306,14 +306,18 @@ impl JavaAnalyzer {
             return None;
         }
 
-        if normalized.contains('.')
-            && let Some(code_unit) = self
+        if normalized.contains('.') {
+            if let Some(code_unit) = self
                 .inner
                 .definitions(normalized)
                 .find(|code_unit| code_unit.is_class())
                 .cloned()
-        {
-            return Some(code_unit);
+            {
+                return Some(code_unit);
+            }
+            if let Some(code_unit) = self.resolve_nested_type_name(file, normalized) {
+                return Some(code_unit);
+            }
         }
 
         let imports = self.resolve_imports(file);
@@ -321,12 +325,7 @@ impl JavaAnalyzer {
             return Some(code_unit.clone());
         }
 
-        let package_name = self.inner.package_name_of(file).unwrap_or("");
-        let same_package_fqn = if package_name.is_empty() {
-            normalized.to_string()
-        } else {
-            format!("{}.{}", package_name, normalized)
-        };
+        let same_package_fqn = self.same_package_fqn(file, normalized);
         if let Some(code_unit) = self
             .inner
             .definitions(&same_package_fqn)
@@ -340,6 +339,42 @@ impl JavaAnalyzer {
             .definitions(normalized)
             .find(|code_unit| code_unit.is_class())
             .cloned()
+    }
+
+    fn resolve_nested_type_name(&self, file: &ProjectFile, normalized: &str) -> Option<CodeUnit> {
+        let (first, rest) = normalized.split_once('.')?;
+        let owner = self.resolve_visible_simple_type(file, first)?;
+        let nested_fqn = format!("{}.{}", owner.fq_name(), rest);
+        self.inner
+            .definitions(&nested_fqn)
+            .find(|code_unit| code_unit.is_class())
+            .cloned()
+    }
+
+    fn resolve_visible_simple_type(&self, file: &ProjectFile, name: &str) -> Option<CodeUnit> {
+        if let Some(code_unit) = self.resolve_imports(file).get(name) {
+            return Some(code_unit.clone());
+        }
+        let same_package_fqn = self.same_package_fqn(file, name);
+        self.inner
+            .definitions(&same_package_fqn)
+            .find(|code_unit| code_unit.is_class())
+            .cloned()
+            .or_else(|| {
+                self.inner
+                    .definitions(name)
+                    .find(|code_unit| code_unit.is_class())
+                    .cloned()
+            })
+    }
+
+    fn same_package_fqn(&self, file: &ProjectFile, name: &str) -> String {
+        let package_name = self.inner.package_name_of(file).unwrap_or("");
+        if package_name.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}.{}", package_name, name)
+        }
     }
 }
 

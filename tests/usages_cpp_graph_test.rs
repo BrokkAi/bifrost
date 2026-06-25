@@ -872,6 +872,37 @@ void call() {
 }
 
 #[test]
+fn cpp_graph_counts_namespace_scope_object_constructors() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[(
+        "consumer.cpp",
+        r#"
+class Target {
+public:
+    Target();
+    explicit Target(int value);
+};
+
+Target global;
+
+namespace ns {
+Target cached(1);
+}
+"#,
+    )]);
+
+    let zero_arg = constructor_definition_with_arity(&analyzer, "Target", 0);
+    let one_arg = constructor_definition_with_arity(&analyzer, "Target", 1);
+
+    let zero_hits = usage_hits(&analyzer, &zero_arg);
+    assert_hit_contains(&zero_hits, "consumer.cpp", "Target global;");
+    assert_no_hit_contains(&zero_hits, "Target cached(1);");
+
+    let one_hits = usage_hits(&analyzer, &one_arg);
+    assert_hit_contains(&one_hits, "consumer.cpp", "Target cached(1);");
+    assert_no_hit_contains(&one_hits, "Target global;");
+}
+
+#[test]
 fn cpp_graph_v2_handles_static_methods_aliases_and_receiver_shadowing() {
     let (_project, analyzer) = cpp_analyzer_with_files(&[
         (
@@ -1822,8 +1853,8 @@ int main() {
 
 #[test]
 fn cpp_graph_resolves_header_declaration_to_out_of_line_definition_sites() {
-    // Issue #248: querying the header declaration should return both graph-proven call sites and
-    // the matching out-of-line definition site in the source file.
+    // Issue #248 keeps function/method header declarations connected to their out-of-line
+    // definition sites. Issue #290 narrows constructor queries back to real construction sites.
     let (_project, analyzer) = cpp_analyzer_with_files(&[
         (
             "include/service.h",
@@ -1953,12 +1984,20 @@ std::string Service::execute(const std::string& name) {
             && slash_path(unit.source()) == "include/service.h"
     });
     let constructor_hits = graph_success_hits(&analyzer, &constructor_header);
-    assert_hit_contains(
-        &constructor_hits,
-        "src/service.cpp",
-        "Service::Service(Repository& repository)",
+    assert_eq!(
+        1,
+        constructor_hits.len(),
+        "constructor hits were {constructor_hits:#?}"
     );
     assert_hit_contains(&constructor_hits, "src/service.cpp", "Service(repository)");
+    assert_no_hit_contains(
+        &constructor_hits,
+        "Service::Service(Repository& repository)",
+    );
+    assert_no_hit_contains(
+        &constructor_hits,
+        "Service build_service(Repository& repository)",
+    );
     assert_no_hit_contains(&constructor_hits, "src/unrelated.cpp");
 }
 
