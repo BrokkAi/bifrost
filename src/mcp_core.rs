@@ -38,7 +38,7 @@ pub(crate) fn symbol_tool_descriptors(render_line_numbers: bool) -> Vec<Value> {
         get_definition_by_reference_descriptor()
     };
 
-    vec![
+    let mut descriptors = vec![
         tool_descriptor(
             "search_symbols",
             "Find classes, functions, methods, fields, modules, and other indexed declarations by name. Use this first for broad or partial symbol discovery, then pass fully qualified results to get_symbol_sources or scan_usages.",
@@ -167,53 +167,85 @@ pub(crate) fn symbol_tool_descriptors(render_line_numbers: bool) -> Vec<Value> {
                 }
             }),
         ),
-    ]
+    ];
+    if render_line_numbers {
+        descriptors.insert(descriptors.len() - 1, get_type_by_location_descriptor());
+    }
+    descriptors
+}
+
+fn get_type_by_location_descriptor() -> Value {
+    tool_descriptor(
+        "get_type_by_location",
+        "Resolve source reference sites to the workspace type definitions known for those expressions or identifiers. Use as the shared backbone for typeDefinition, implementation, and diagnostics work when exact line/column or byte locations are available.",
+        location_references_schema(
+            "Project-relative source file path containing the expression or identifier.",
+            Some(crate::searchtools::TYPE_LOOKUP_MAX_REFERENCES),
+        ),
+    )
 }
 
 fn get_definition_by_location_descriptor() -> Value {
     tool_descriptor(
         "get_definition_by_location",
         "Resolve source reference sites back to workspace definition metadata from exact line/column or byte locations. Use when line numbers are visible and you need usage-to-definition navigation without building the whole usage_graph.",
-        json!({
+        location_references_schema(
+            "Project-relative source file path containing the reference.",
+            None,
+        ),
+    )
+}
+
+fn location_references_schema(path_description: &str, max_items: Option<usize>) -> Value {
+    let mut references = json!({
+        "type": "array",
+        "items": {
             "type": "object",
             "properties": {
-                "references": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "path": {
-                                "type": "string",
-                                "description": "Project-relative source file path containing the reference."
-                            },
-                            "line": {
-                                "type": "integer",
-                                "minimum": 1,
-                                "description": "1-based line containing the reference. Use with column when byte offsets are not available."
-                            },
-                            "column": {
-                                "type": "integer",
-                                "minimum": 1,
-                                "description": "1-based character column containing the reference token."
-                            },
-                            "start_byte": {
-                                "type": "integer",
-                                "minimum": 0,
-                                "description": "0-based byte offset at or inside the reference token."
-                            },
-                            "end_byte": {
-                                "type": "integer",
-                                "minimum": 0,
-                                "description": "Optional exclusive byte end offset for a selected reference range."
-                            }
-                        },
-                        "required": ["path"]
-                    }
+                "path": {
+                    "type": "string",
+                    "description": path_description
+                },
+                "line": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "1-based line containing the reference. Use with column when byte offsets are not available."
+                },
+                "column": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "1-based character column containing the reference token."
+                },
+                "start_byte": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "0-based byte offset at or inside the reference token."
+                },
+                "end_byte": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Optional exclusive byte end offset for a selected reference range."
                 }
             },
-            "required": ["references"]
-        }),
-    )
+            "required": ["path"],
+            "anyOf": [
+                { "required": ["line"] },
+                { "required": ["start_byte"] }
+            ]
+        }
+    });
+    if let Some(max_items) = max_items
+        && let Some(object) = references.as_object_mut()
+    {
+        object.insert("maxItems".to_string(), json!(max_items));
+    }
+    json!({
+        "type": "object",
+        "properties": {
+            "references": references
+        },
+        "required": ["references"]
+    })
 }
 
 fn get_definition_by_reference_descriptor() -> Value {

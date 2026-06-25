@@ -214,6 +214,7 @@ mod tests {
             "get_summaries",
             "scan_usages",
             "get_definition_by_location",
+            "get_type_by_location",
             "usage_graph",
         ]
         .into_iter()

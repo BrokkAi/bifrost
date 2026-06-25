@@ -67,6 +67,7 @@ exposes:
 | `get_symbol_sources(symbols, *, kind_filter=...)` | Pull full source for symbols. |
 | `get_definition_by_location(path, *, line=..., column=...)` | Resolve a reference at a known file location. |
 | `get_definition_by_reference(symbol, *, context=..., target=...)` | Resolve a copied reference inside a symbol source block. |
+| `get_type_by_location(path, *, line=..., column=...)` | Resolve the type of an expression or identifier at a known file location. |
 | `get_summaries(targets)` | Signature-level outline of files / classes / directories. |
 | `list_symbols(file_patterns)` | Skim the symbols declared in matching files. |
 | `scan_usages(symbols, *, include_tests=False, paths=None)` | Find references to a symbol. |

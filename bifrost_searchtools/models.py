@@ -363,6 +363,71 @@ class DefinitionLookupResult:
 
 
 @dataclass(frozen=True)
+class TypeLookupCandidate:
+    fqn: str
+    kind: str | None
+    language: str | None
+    definitions: list[DefinitionCandidate]
+
+    @classmethod
+    def from_dict(cls, data: dict) -> TypeLookupCandidate:
+        return cls(
+            fqn=data["fqn"],
+            kind=data.get("kind"),
+            language=data.get("language"),
+            definitions=[
+                DefinitionCandidate.from_dict(item)
+                for item in data.get("definitions", [])
+            ],
+        )
+
+    def render_text(self) -> str:
+        details = ", ".join(
+            part for part in [self.kind, self.language] if part is not None
+        )
+        suffix = f" ({details})" if details else ""
+        lines = [f"{self.fqn}{suffix}"]
+        lines.extend(definition.render_text() for definition in self.definitions)
+        return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class TypeLookupResult:
+    query: dict
+    status: str
+    reference: DefinitionReferenceSite | None
+    types: list[TypeLookupCandidate]
+    diagnostics: list[DefinitionDiagnostic]
+
+    @classmethod
+    def from_dict(cls, data: dict) -> TypeLookupResult:
+        return cls(
+            query=dict(data["query"]),
+            status=data["status"],
+            reference=(
+                DefinitionReferenceSite.from_dict(data["reference"])
+                if data.get("reference") is not None
+                else None
+            ),
+            types=[
+                TypeLookupCandidate.from_dict(item) for item in data.get("types", [])
+            ],
+            diagnostics=[
+                DefinitionDiagnostic.from_dict(item)
+                for item in data.get("diagnostics", [])
+            ],
+        )
+
+    def render_text(self) -> str:
+        lines = [f"status: {self.status}"]
+        if self.reference is not None:
+            lines.append(f"reference: {self.reference.path} -> {self.reference.target}")
+        lines.extend(item.render_text() for item in self.types)
+        lines.extend(diagnostic.render_text() for diagnostic in self.diagnostics)
+        return "\n".join(lines)
+
+
+@dataclass(frozen=True)
 class DefinitionByReferenceLookupResult:
     query: dict
     status: str

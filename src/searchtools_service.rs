@@ -19,8 +19,8 @@ use crate::{
         ActivateWorkspaceParams, ActiveWorkspaceResult, GetActiveWorkspaceParams,
         MostRelevantFilesParams, RefreshParams, contains_tests, get_definition_by_location,
         get_definition_by_reference, get_summaries, get_symbol_ancestors, get_symbol_locations,
-        get_symbol_sources, list_symbols, most_relevant_files, refresh_result, scan_usages,
-        search_symbols, usage_graph,
+        get_symbol_sources, get_type_by_location, list_symbols, most_relevant_files,
+        refresh_result, scan_usages, search_symbols, usage_graph,
     },
     searchtools_render::{RenderOptions, RenderText},
     structured_data::{jq, xml_select, xml_skim},
@@ -370,6 +370,11 @@ impl SearchToolsService {
             "get_definition_by_reference" => {
                 Self::decode_and_run(&snapshot, arguments, |workspace, params| {
                     get_definition_by_reference(workspace.analyzer(), params)
+                })
+            }
+            "get_type_by_location" => {
+                Self::decode_and_run(&snapshot, arguments, |workspace, params| {
+                    get_type_by_location(workspace.analyzer(), params)
                 })
             }
             "usage_graph" => Self::decode_and_run(&snapshot, arguments, |workspace, params| {

@@ -42,6 +42,7 @@ const SCAN_USAGES_PATH_SCOPED_MAX_FILES: usize = 10_000;
 const SCAN_USAGES_SUMMARY_FILE_LIMIT: usize = 20;
 const SCAN_USAGES_TOP_ENCLOSING_LIMIT: usize = 10;
 const SCAN_USAGES_AMBIGUOUS_DETAILS_LIMIT: usize = 3;
+pub const TYPE_LOOKUP_MAX_REFERENCES: usize = 100;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefreshParams {}
 
@@ -136,7 +137,25 @@ pub struct GetDefinitionParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetTypeParams {
+    pub references: Vec<TypeReferenceQuery>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DefinitionReferenceQuery {
+    pub path: String,
+    #[serde(default)]
+    pub line: Option<usize>,
+    #[serde(default)]
+    pub column: Option<usize>,
+    #[serde(default)]
+    pub start_byte: Option<usize>,
+    #[serde(default)]
+    pub end_byte: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TypeReferenceQuery {
     pub path: String,
     #[serde(default)]
     pub line: Option<usize>,
@@ -271,6 +290,11 @@ pub struct GetDefinitionResult {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct GetTypeResult {
+    pub results: Vec<TypeLookupResult>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct DefinitionLookupResult {
     pub query: DefinitionReferenceQuery,
     pub status: String,
@@ -280,6 +304,29 @@ pub struct DefinitionLookupResult {
     pub definitions: Vec<DefinitionCandidate>,
     #[serde(default)]
     pub diagnostics: Vec<DefinitionDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TypeLookupResult {
+    pub query: TypeReferenceQuery,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference: Option<DefinitionReferenceSite>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub types: Vec<TypeLookupCandidate>,
+    #[serde(default)]
+    pub diagnostics: Vec<DefinitionDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TypeLookupCandidate {
+    pub fqn: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub definitions: Vec<DefinitionCandidate>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -838,6 +885,97 @@ pub fn get_definition_by_location(
     }
 }
 
+pub fn get_type_by_location(analyzer: &dyn IAnalyzer, params: GetTypeParams) -> GetTypeResult {
+    let _scope = profiling::scope("searchtools::get_type_by_location");
+
+    if params.references.len() > TYPE_LOOKUP_MAX_REFERENCES {
+        return GetTypeResult {
+            results: vec![TypeLookupResult {
+                query: TypeReferenceQuery {
+                    path: String::new(),
+                    line: None,
+                    column: None,
+                    start_byte: None,
+                    end_byte: None,
+                },
+                status: "invalid_location".to_string(),
+                reference: None,
+                types: Vec::new(),
+                diagnostics: vec![DefinitionDiagnostic {
+                    kind: "too_many_references".to_string(),
+                    message: format!(
+                        "get_type_by_location accepts at most {TYPE_LOOKUP_MAX_REFERENCES} references per call"
+                    ),
+                }],
+            }],
+        };
+    }
+
+    let resolver = WorkspaceFileResolver::new(analyzer.project());
+    let mut pending = Vec::new();
+    let mut results: Vec<Option<TypeLookupResult>> = vec![None; params.references.len()];
+
+    for (index, query) in params.references.into_iter().enumerate() {
+        match resolver.resolve_literal(&query.path) {
+            ResolvedFileInput::File(file) => {
+                pending.push((
+                    index,
+                    query.clone(),
+                    crate::analyzer::usages::get_type::TypeLookupRequest {
+                        file,
+                        line: query.line,
+                        column: query.column,
+                        start_byte: query.start_byte,
+                        end_byte: query.end_byte,
+                    },
+                ));
+            }
+            ResolvedFileInput::Ambiguous(item) => {
+                results[index] = Some(TypeLookupResult {
+                    query,
+                    status: "not_found".to_string(),
+                    reference: None,
+                    types: Vec::new(),
+                    diagnostics: vec![DefinitionDiagnostic {
+                        kind: "ambiguous_path".to_string(),
+                        message: format!(
+                            "`{}` is ambiguous; matches: {}",
+                            item.input,
+                            item.matches.join(", ")
+                        ),
+                    }],
+                });
+            }
+            ResolvedFileInput::NotFound(path) => {
+                results[index] = Some(TypeLookupResult {
+                    query,
+                    status: "not_found".to_string(),
+                    reference: None,
+                    types: Vec::new(),
+                    diagnostics: vec![DefinitionDiagnostic {
+                        kind: "path_not_found".to_string(),
+                        message: format!("`{path}` does not resolve to a workspace file"),
+                    }],
+                });
+            }
+        }
+    }
+
+    let requests: Vec<_> = pending
+        .iter()
+        .map(|(_, _, request)| request.clone())
+        .collect();
+    let outcomes = crate::analyzer::usages::get_type::resolve_type_batch(analyzer, requests);
+
+    for ((index, query, _), outcome) in pending.into_iter().zip(outcomes) {
+        results[index] = Some(render_type_lookup(analyzer, query, outcome));
+    }
+
+    GetTypeResult {
+        results: results.into_iter().flatten().collect(),
+    }
+}
+
 pub fn get_definition_by_reference(
     analyzer: &dyn IAnalyzer,
     params: GetDefinitionByReferenceParams,
@@ -1068,6 +1206,48 @@ fn render_definition_lookup(
                 message: diagnostic.message,
             })
             .collect(),
+    }
+}
+
+fn render_type_lookup(
+    analyzer: &dyn IAnalyzer,
+    query: TypeReferenceQuery,
+    outcome: crate::analyzer::usages::get_type::TypeLookupOutcome,
+) -> TypeLookupResult {
+    TypeLookupResult {
+        query,
+        status: outcome.status.as_str().to_string(),
+        reference: outcome.reference.map(|site| DefinitionReferenceSite {
+            path: site.path,
+            target: site.text,
+        }),
+        types: outcome
+            .types
+            .iter()
+            .map(|item| type_lookup_candidate(analyzer, item))
+            .collect(),
+        diagnostics: outcome
+            .diagnostics
+            .into_iter()
+            .map(|diagnostic| DefinitionDiagnostic {
+                kind: diagnostic.kind,
+                message: diagnostic.message,
+            })
+            .collect(),
+    }
+}
+
+fn type_lookup_candidate(
+    analyzer: &dyn IAnalyzer,
+    item: &crate::analyzer::usages::get_type::TypeLookupType,
+) -> TypeLookupCandidate {
+    let definitions = definition_candidates(analyzer, &item.definitions);
+    let primary = definitions.first();
+    TypeLookupCandidate {
+        fqn: item.fqn.clone(),
+        kind: primary.map(|candidate| candidate.kind.clone()),
+        language: primary.map(|candidate| candidate.language.clone()),
+        definitions,
     }
 }
 

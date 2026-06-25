@@ -30,6 +30,11 @@ use crate::analyzer::usages::python_graph::{
     is_declaration_identifier as python_is_declaration_identifier, python_slice,
     resolve_receiver_type as resolve_python_receiver_type,
 };
+pub(crate) use crate::analyzer::usages::reference_site::byte_offset_for_character_column;
+pub(crate) use crate::analyzer::usages::reference_site::{
+    ResolvedReferenceSite, SourceLocationRequest, resolve_reference_site,
+    smallest_named_node_covering,
+};
 use crate::analyzer::usages::scala_graph::{
     ScalaNameResolver, ScalaProjectTypes, package_name_of as scala_package_name_of,
     scala_import_path, scala_node_text,
@@ -43,6 +48,9 @@ use crate::analyzer::{
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
+pub(crate) use rust::{
+    RustTypeLookupCache, rust_expression_type_definition_fqn_cached, rust_is_type_definition,
+};
 use std::sync::Arc;
 use tree_sitter::{Node, Parser, Tree};
 
@@ -63,6 +71,18 @@ pub(crate) struct DefinitionLookupRequest {
     pub(crate) column: Option<usize>,
     pub(crate) start_byte: Option<usize>,
     pub(crate) end_byte: Option<usize>,
+}
+
+impl DefinitionLookupRequest {
+    fn as_source_location(&self) -> SourceLocationRequest {
+        SourceLocationRequest {
+            file: self.file.clone(),
+            line: self.line,
+            column: self.column,
+            start_byte: self.start_byte,
+            end_byte: self.end_byte,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -96,15 +116,6 @@ impl DefinitionLookupStatus {
             Self::NotFound => "not_found",
         }
     }
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct ResolvedReferenceSite {
-    pub(crate) path: String,
-    pub(crate) text: String,
-    pub(crate) range: Range,
-    pub(crate) focus_start_byte: usize,
-    pub(crate) focus_end_byte: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -236,7 +247,7 @@ fn resolve_one(
         }
     };
 
-    let site = match resolve_reference_site(&request, &source) {
+    let site = match resolve_reference_site(&request.as_source_location(), &source) {
         Ok(site) => site,
         Err(message) => {
             return diagnostic_outcome(
@@ -347,193 +358,6 @@ fn finish_lookup_outcome(
     outcome
 }
 
-fn resolve_reference_site(
-    request: &DefinitionLookupRequest,
-    source: &str,
-) -> Result<ResolvedReferenceSite, String> {
-    let line_starts = compute_line_starts(source);
-    let (selection_start, selection_end) = match (
-        request.start_byte,
-        request.end_byte,
-        request.line,
-        request.column,
-    ) {
-        (Some(start), Some(end), _, _) => {
-            if start >= end || end > source.len() {
-                return Err(format!(
-                    "invalid byte range [{start}, {end}) for {} byte file",
-                    source.len()
-                ));
-            }
-            if !source.is_char_boundary(start) || !source.is_char_boundary(end) {
-                return Err(format!(
-                    "byte range [{start}, {end}) does not align to UTF-8 character boundaries"
-                ));
-            }
-            let token = token_bounds_at(source, start)
-                .ok_or_else(|| format!("no reference token at byte {start}"))?;
-            if end > token.1 {
-                return Err(
-                    "byte range must identify a single reference token; use start_byte inside the token for qualified expressions"
-                        .to_string(),
-                );
-            }
-            token
-        }
-        (Some(start), None, _, _) => {
-            if start >= source.len() {
-                return Err(format!(
-                    "start_byte {start} is outside {} byte file",
-                    source.len()
-                ));
-            }
-            if !source.is_char_boundary(start) {
-                return Err(format!(
-                    "start_byte {start} does not align to a UTF-8 character boundary"
-                ));
-            }
-            token_bounds_at(source, start)
-                .ok_or_else(|| format!("no reference token at byte {start}"))?
-        }
-        (_, _, Some(line), column) => {
-            if line == 0 || line > line_starts.len() {
-                return Err(format!(
-                    "line {line} is outside 1..={} for this file",
-                    line_starts.len()
-                ));
-            }
-            let line_start = line_starts[line - 1];
-            let line_end = line_starts.get(line).copied().unwrap_or(source.len());
-            let column = column.unwrap_or(1);
-            if column == 0 {
-                return Err("column must be 1-based".to_string());
-            }
-            let point =
-                byte_offset_for_character_column(source, line_start, line_end, line, column)?;
-            token_bounds_at(source, point.min(source.len().saturating_sub(1)))
-                .ok_or_else(|| format!("no reference token at line {line}, column {column}"))?
-        }
-        _ => return Err("provide either start_byte or line/column".to_string()),
-    };
-
-    let (start, end) = expand_reference_expression(source, selection_start, selection_end);
-    if start >= end {
-        return Err("reference selection is empty".to_string());
-    }
-    if !source.is_char_boundary(start) || !source.is_char_boundary(end) {
-        return Err("reference selection does not align to UTF-8 character boundaries".to_string());
-    }
-    let text = source[start..end].trim().to_string();
-    if text.is_empty() {
-        return Err("reference selection is blank".to_string());
-    }
-    let start_line = find_line_index_for_offset(&line_starts, start) + 1;
-    let end_line = find_line_index_for_offset(&line_starts, end.saturating_sub(1)) + 1;
-    Ok(ResolvedReferenceSite {
-        path: rel_path_string(&request.file),
-        text,
-        range: Range {
-            start_byte: start,
-            end_byte: end,
-            start_line,
-            end_line,
-        },
-        focus_start_byte: selection_start,
-        focus_end_byte: selection_end,
-    })
-}
-
-pub(crate) fn byte_offset_for_character_column(
-    source: &str,
-    line_start: usize,
-    line_end: usize,
-    line_number: usize,
-    column: usize,
-) -> Result<usize, String> {
-    let line = source
-        .get(line_start..line_end)
-        .ok_or_else(|| format!("line {line_number} is outside valid UTF-8 boundaries"))?;
-    let character_offset = column - 1;
-    if character_offset == 0 {
-        return Ok(line_start);
-    }
-    if let Some((byte_offset, _)) = line.char_indices().nth(character_offset) {
-        return Ok(line_start + byte_offset);
-    }
-    if character_offset == line.chars().count() {
-        return Ok(line_end);
-    }
-    Err(format!("column {column} is outside line {line_number}"))
-}
-
-fn token_bounds_at(source: &str, byte: usize) -> Option<(usize, usize)> {
-    if source.is_empty() {
-        return None;
-    }
-    let bytes = source.as_bytes();
-    let mut idx = byte.min(bytes.len().saturating_sub(1));
-    if !is_ident_byte(bytes[idx]) && idx > 0 && is_ident_byte(bytes[idx - 1]) {
-        idx -= 1;
-    }
-    if !is_ident_byte(bytes[idx]) {
-        return None;
-    }
-    let mut start = idx;
-    while start > 0 && is_ident_byte(bytes[start - 1]) {
-        start -= 1;
-    }
-    let mut end = idx + 1;
-    while end < bytes.len() && is_ident_byte(bytes[end]) {
-        end += 1;
-    }
-    Some((start, end))
-}
-
-fn expand_reference_expression(source: &str, start: usize, end: usize) -> (usize, usize) {
-    let bytes = source.as_bytes();
-    let mut left = start;
-    let mut right = end;
-    loop {
-        if left >= 2 && &bytes[left - 2..left] == b"::" {
-            left -= 2;
-            while left > 0 && is_ident_byte(bytes[left - 1]) {
-                left -= 1;
-            }
-            continue;
-        }
-        if left >= 1 && bytes[left - 1] == b'.' {
-            left -= 1;
-            while left > 0 && is_ident_byte(bytes[left - 1]) {
-                left -= 1;
-            }
-            continue;
-        }
-        break;
-    }
-    loop {
-        if right + 2 <= bytes.len() && &bytes[right..right + 2] == b"::" {
-            right += 2;
-            while right < bytes.len() && is_ident_byte(bytes[right]) {
-                right += 1;
-            }
-            continue;
-        }
-        if right < bytes.len() && bytes[right] == b'.' {
-            right += 1;
-            while right < bytes.len() && is_ident_byte(bytes[right]) {
-                right += 1;
-            }
-            continue;
-        }
-        break;
-    }
-    (left, right)
-}
-
-fn is_ident_byte(byte: u8) -> bool {
-    byte == b'_' || byte.is_ascii_alphanumeric()
-}
-
 fn dotted_reference_segments(site: &ResolvedReferenceSite) -> Option<Vec<(String, usize, usize)>> {
     let mut segments = Vec::new();
     let mut offset = 0usize;
@@ -576,30 +400,6 @@ fn parse_tree_for_language(file: &ProjectFile, language: Language, source: &str)
         Language::Python => python::parse_python_tree(source),
         Language::Rust => rust::parse_rust_tree(source),
         Language::Ruby | Language::Go | Language::None => None,
-    }
-}
-
-fn smallest_named_node_covering<'tree>(
-    mut node: Node<'tree>,
-    start: usize,
-    end: usize,
-) -> Option<Node<'tree>> {
-    if node.end_byte() < end || node.start_byte() > start {
-        return None;
-    }
-    loop {
-        let mut cursor = node.walk();
-        let mut containing_child = None;
-        for child in node.named_children(&mut cursor) {
-            if child.start_byte() <= start && child.end_byte() >= end {
-                containing_child = Some(child);
-                break;
-            }
-        }
-        match containing_child {
-            Some(child) => node = child,
-            None => return Some(node),
-        }
     }
 }
 
@@ -674,30 +474,4 @@ fn sort_units(units: &mut [CodeUnit]) {
             .then_with(|| left.fq_name().cmp(&right.fq_name()))
             .then_with(|| left.signature().cmp(&right.signature()))
     });
-}
-
-#[cfg(test)]
-mod tests {
-    use super::expand_reference_expression;
-
-    #[test]
-    fn expand_reference_expression_keeps_ascii_separator_checks_byte_pure() {
-        let source = "回.helper";
-        let start = source.find("helper").expect("target");
-        let end = start + "helper".len();
-
-        assert_eq!(
-            expand_reference_expression(source, start, end),
-            (start - 1, end)
-        );
-
-        let source = "helper:回";
-        let start = source.find("helper").expect("target");
-        let end = start + "helper".len();
-
-        assert_eq!(
-            expand_reference_expression(source, start, end),
-            (start, end)
-        );
-    }
 }

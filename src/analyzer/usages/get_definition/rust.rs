@@ -234,7 +234,7 @@ enum RustTypeMode {
 }
 
 #[derive(Default)]
-struct RustTypeLookupCache {
+pub(crate) struct RustTypeLookupCache {
     declarations: HashMap<ProjectFile, Option<RustParsedDeclarationSource>>,
 }
 
@@ -305,6 +305,28 @@ fn rust_expression_type_fqn(
         expression,
         before_byte,
         RustTypeMode::Direct,
+        cache,
+    )
+}
+
+pub(crate) fn rust_expression_type_definition_fqn_cached(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    expression: Node<'_>,
+    before_byte: usize,
+    cache: &mut RustTypeLookupCache,
+) -> Option<String> {
+    rust_expression_type_fqn(
+        analyzer,
+        support,
+        file,
+        source,
+        root,
+        expression,
+        before_byte,
         cache,
     )
 }
@@ -733,7 +755,7 @@ fn rust_resolve_type_node_fqn(
             && support
                 .fqn(&resolved)
                 .into_iter()
-                .any(|unit| unit.is_class())
+                .any(|unit| rust_is_type_definition(analyzer, &unit))
         {
             return Some(resolved);
         }
@@ -747,7 +769,7 @@ fn rust_resolve_type_node_fqn(
             && support
                 .fqn(resolved)
                 .into_iter()
-                .any(|unit| unit.is_class())
+                .any(|unit| rust_is_type_definition(analyzer, &unit))
             && rust_type_fqn_visible_from_file(file, resolved)
         {
             return Some(resolved.to_string());
@@ -759,8 +781,15 @@ fn rust_resolve_type_node_fqn(
     support
         .fqn(name)
         .into_iter()
-        .find(|unit| unit.is_class())
+        .find(|unit| rust_is_type_definition(analyzer, unit))
         .map(|unit| unit.fq_name().to_string())
+}
+
+pub(crate) fn rust_is_type_definition(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> bool {
+    unit.is_class()
+        || analyzer
+            .type_alias_provider()
+            .is_some_and(|provider| provider.is_type_alias(unit))
 }
 
 #[derive(Debug)]

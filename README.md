@@ -296,6 +296,7 @@ The client exposes a typed method per tool, each returning a dataclass from
 - workspace: `refresh()`, `update_paths(...)`, `activate_workspace(...)`, `get_active_workspace()`
 - symbols: `search_symbols(...)`, `get_symbol_locations(...)`, `get_symbol_ancestors(...)`, `get_symbol_sources(...)`, `get_summaries(...)`, `list_symbols(...)`, `contains_tests(...)`, `scan_usages(...)`, `usage_graph(...)`, `most_relevant_files(...)`
 - definitions: `get_definition_by_location(...)`, `get_definition_by_reference(...)`
+- types: `get_type_by_location(...)`
 - semantic: `semantic_search(...)`, `semantic_search_status()`
 - files: `get_file_contents(...)`, `find_filenames(...)`, `search_file_contents(...)`, `find_files_containing(...)`, `list_files(...)`
 - git: `get_git_log(...)`, `get_commit_diff(...)`, `search_git_commit_messages(...)`

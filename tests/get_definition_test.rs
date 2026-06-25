@@ -27,6 +27,16 @@ fn lookup_reference(root: &std::path::Path, args: &str) -> Value {
     serde_json::from_str(&payload).expect("get_definition_by_reference returned invalid JSON")
 }
 
+fn lookup_type(root: &std::path::Path, args: &str) -> Value {
+    let _guard = LOOKUP_LOCK.lock().expect("lookup lock poisoned");
+    let service = SearchToolsService::new_manual_without_semantic_index(root.to_path_buf())
+        .expect("failed to build searchtools service");
+    let payload = service
+        .call_tool_json("get_type_by_location", args)
+        .expect("get_type_by_location call failed");
+    serde_json::from_str(&payload).expect("get_type_by_location returned invalid JSON")
+}
+
 fn column_of(line: &str, needle: &str) -> usize {
     line.find(needle).expect("needle in line") + 1
 }
@@ -74,6 +84,220 @@ pub fn format_value() {}
     assert_eq!(result["reference"]["target"], "format_value", "{value}");
     assert_eq!(result["definitions"][0]["fqn"], "format_value", "{value}");
     assert_eq!(result["definitions"][0]["path"], "util.rs", "{value}");
+}
+
+#[test]
+fn rust_type_lookup_resolves_explicit_local_binding_type() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+mod model;
+use crate::model::Widget;
+
+pub fn run() {
+    let value: Widget = Widget {};
+    let _ = value;
+}
+"#,
+        )
+        .file("model.rs", "pub struct Widget;\n")
+        .build();
+
+    let line = "    let _ = value;";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"lib.rs","line":7,"column":{}}}]}}"#,
+            column_of(line, "value")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["reference"]["target"], "value", "{value}");
+    assert_eq!(result["types"][0]["fqn"], "Widget", "{value}");
+    assert_eq!(
+        result["types"][0]["definitions"][0]["path"], "model.rs",
+        "{value}"
+    );
+}
+
+#[test]
+fn rust_type_lookup_resolves_struct_literal_expression_type() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+mod model;
+use crate::model::Widget;
+
+pub fn run() {
+    let _ = Widget {};
+}
+"#,
+        )
+        .file("model.rs", "pub struct Widget;\n")
+        .build();
+
+    let line = "    let _ = Widget {};";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"lib.rs","line":6,"column":{}}}]}}"#,
+            column_of(line, "Widget")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["types"][0]["fqn"], "Widget", "{value}");
+    assert_eq!(
+        result["types"][0]["definitions"][0]["path"], "model.rs",
+        "{value}"
+    );
+}
+
+#[test]
+fn rust_type_lookup_resolves_function_call_return_type() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+mod model;
+use crate::model::Widget;
+
+fn make_widget() -> Widget {
+    Widget {}
+}
+
+pub fn run() {
+    let _ = make_widget();
+}
+"#,
+        )
+        .file("model.rs", "pub struct Widget;\n")
+        .build();
+
+    let line = "    let _ = make_widget();";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"lib.rs","line":10,"column":{}}}]}}"#,
+            column_of(line, "make_widget")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["types"][0]["fqn"], "Widget", "{value}");
+    assert_eq!(
+        result["types"][0]["definitions"][0]["path"], "model.rs",
+        "{value}"
+    );
+}
+
+#[test]
+fn rust_type_lookup_keeps_type_alias_definition() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+pub struct Widget;
+pub type Alias = Widget;
+
+pub fn run() {
+    let value: Alias = Widget;
+    let _ = value;
+}
+"#,
+        )
+        .build();
+
+    let line = "    let _ = value;";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"lib.rs","line":7,"column":{}}}]}}"#,
+            column_of(line, "value")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["types"][0]["fqn"], "Alias", "{value}");
+    assert_eq!(
+        result["types"][0]["definitions"][0]["kind"], "field",
+        "{value}"
+    );
+}
+
+#[test]
+fn type_lookup_reports_unsupported_language() {
+    let project = InlineTestProject::new()
+        .file(
+            "app.ts",
+            "const value: Widget = new Widget();\nclass Widget {}\n",
+        )
+        .build();
+
+    let value = lookup_type(
+        project.root(),
+        r#"{"references":[{"path":"app.ts","line":1,"column":7}]}"#,
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "unsupported_language", "{value}");
+    assert_eq!(result["reference"]["target"], "value", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "unsupported_language",
+        "{value}"
+    );
+}
+
+#[test]
+fn type_lookup_reports_invalid_location_before_unsupported_language() {
+    let project = InlineTestProject::new()
+        .file(
+            "app.ts",
+            "const value: Widget = new Widget();\nclass Widget {}\n",
+        )
+        .build();
+
+    let value = lookup_type(
+        project.root(),
+        r#"{"references":[{"path":"app.ts","line":99,"column":1}]}"#,
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "invalid_location", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "invalid_location",
+        "{value}"
+    );
+}
+
+#[test]
+fn type_lookup_rejects_oversized_batches() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("lib.rs", "pub struct Widget;\n")
+        .build();
+
+    let references = (0..101)
+        .map(|_| r#"{"path":"lib.rs","line":1,"column":12}"#)
+        .collect::<Vec<_>>()
+        .join(",");
+    let value = lookup_type(
+        project.root(),
+        &format!(r#"{{"references":[{references}]}}"#),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "invalid_location", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "too_many_references",
+        "{value}"
+    );
 }
 
 #[test]
