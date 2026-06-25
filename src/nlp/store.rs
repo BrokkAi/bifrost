@@ -160,8 +160,7 @@ impl SemanticStore {
         let stored_fp = meta_value_tx(&tx, META_EMBED_FINGERPRINT)?;
         let stored_chunker = meta_value_tx(&tx, META_CHUNKER_VERSION)?;
         let stored_bm25 = meta_value_tx(&tx, META_BM25_TOKENIZER_VERSION)?;
-        let first_run =
-            stored_fp.is_none() && stored_chunker.is_none() && stored_bm25.is_none();
+        let first_run = stored_fp.is_none() && stored_chunker.is_none() && stored_bm25.is_none();
         let matches = stored_fp.as_deref() == Some(fingerprint)
             && stored_chunker.as_deref() == Some(chunker_version)
             && stored_bm25.as_deref() == Some(bm25_tokenizer_version);
@@ -194,10 +193,7 @@ impl SemanticStore {
             if !seen.insert(oid.clone()) {
                 continue;
             }
-            let exists = stmt
-                .query_row([oid], |_| Ok(()))
-                .optional()?
-                .is_some();
+            let exists = stmt.query_row([oid], |_| Ok(())).optional()?.is_some();
             if !exists {
                 out.push(oid.clone());
             }
@@ -228,7 +224,10 @@ impl SemanticStore {
                 .query_row(params![hash.as_slice()], |row| row.get(0))
                 .optional()?;
             if let Some(code) = code {
-                out.insert(*hash, super::quant::decode_vector(&code).map_err(StoreError::new)?);
+                out.insert(
+                    *hash,
+                    super::quant::decode_vector(&code).map_err(StoreError::new)?,
+                );
             }
         }
         Ok(out)
@@ -289,9 +288,8 @@ impl SemanticStore {
         )?;
         tx.execute("DELETE FROM blob_chunks WHERE blob_oid = ?1", [blob_oid])?;
 
-        let mut intern_summary = tx.prepare(
-            "INSERT INTO blob_summaries(hash) VALUES(?1) ON CONFLICT(hash) DO NOTHING",
-        )?;
+        let mut intern_summary =
+            tx.prepare("INSERT INTO blob_summaries(hash) VALUES(?1) ON CONFLICT(hash) DO NOTHING")?;
         let mut select_summary =
             tx.prepare("SELECT blob_summary_id FROM blob_summaries WHERE hash = ?1")?;
         let mut insert_chunk = tx.prepare(
@@ -481,9 +479,8 @@ impl SemanticStore {
              DELETE FROM gc_live;",
         )?;
         {
-            let mut stmt = tx.prepare(
-                "INSERT INTO gc_live(oid) VALUES(?1) ON CONFLICT(oid) DO NOTHING",
-            )?;
+            let mut stmt =
+                tx.prepare("INSERT INTO gc_live(oid) VALUES(?1) ON CONFLICT(oid) DO NOTHING")?;
             for oid in live {
                 stmt.execute([oid])?;
             }
@@ -746,11 +743,20 @@ mod tests {
         (temp, store)
     }
 
-    fn chunk(ord: i64, hash: [u8; 32], composed: [u8; 32], parent: Option<[u8; 32]>) -> BlobChunkIn<'static> {
+    fn chunk(
+        ord: i64,
+        hash: [u8; 32],
+        composed: [u8; 32],
+        parent: Option<[u8; 32]>,
+    ) -> BlobChunkIn<'static> {
         BlobChunkIn {
             chunk_ord: ord,
             kind: if ord == 0 { "file_summary" } else { "function" },
-            symbol: if ord == 0 { None } else { Some("pkg.Cls.method") },
+            symbol: if ord == 0 {
+                None
+            } else {
+                Some("pkg.Cls.method")
+            },
             start_line: Some(ord),
             end_line: Some(ord + 5),
             fts_tokens: "alpha beta gamma",
@@ -796,7 +802,12 @@ mod tests {
         assert_eq!(rows[1].symbol.as_deref(), Some("pkg.Cls.method"));
         assert_eq!(rows[1].composed_hash, [6; 32]);
 
-        assert!(store.missing_blobs(&["oid_a".into(), "oid_b".into()]).unwrap() == vec!["oid_b".to_string()]);
+        assert!(
+            store
+                .missing_blobs(&["oid_a".into(), "oid_b".into()])
+                .unwrap()
+                == vec!["oid_b".to_string()]
+        );
     }
 
     #[test]
@@ -839,10 +850,21 @@ mod tests {
         let live: HashSet<String> = ["oid_keep".to_string()].into_iter().collect();
         store.gc(&live).unwrap();
 
-        assert_eq!(store.chunks_for_oids(&["oid_drop".into()]).unwrap().len(), 0);
-        assert_eq!(store.chunks_for_oids(&["oid_keep".into()]).unwrap().len(), 1);
+        assert_eq!(
+            store.chunks_for_oids(&["oid_drop".into()]).unwrap().len(),
+            0
+        );
+        assert_eq!(
+            store.chunks_for_oids(&["oid_keep".into()]).unwrap().len(),
+            1
+        );
         // The shared vector/component are still referenced by oid_keep.
-        assert!(store.missing_composed_hashes(&[[5; 32]]).unwrap().is_empty());
+        assert!(
+            store
+                .missing_composed_hashes(&[[5; 32]])
+                .unwrap()
+                .is_empty()
+        );
         assert!(store.seconds_since_gc().unwrap().is_some());
     }
 
@@ -859,7 +881,12 @@ mod tests {
 
         assert!(store.ensure_index_compatible("fp2", "ck1", "bm1").unwrap());
         assert_eq!(store.chunks_for_oids(&["oid_a".into()]).unwrap().len(), 0);
-        assert!(!store.missing_composed_hashes(&[[5; 32]]).unwrap().is_empty());
+        assert!(
+            !store
+                .missing_composed_hashes(&[[5; 32]])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
