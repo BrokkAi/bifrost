@@ -6,8 +6,9 @@
 //! liveness is "reachable from any ref" ∪ "checked out but uncommitted".
 
 use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use git2::{ObjectType, Oid, Repository, Status, StatusOptions};
 
@@ -105,40 +106,53 @@ pub fn read_blob(repo: &Repository, oid_hex: &str) -> Result<Vec<u8>> {
     Ok(blob.content().to_vec())
 }
 
-/// Every OID reachable from any ref (incl. per-worktree HEADs). Conservative GC
-/// root: shells `git rev-list --objects --all`, which is fast and complete.
-pub fn reachable_oids(repo: &Repository) -> Result<HashSet<String>> {
+/// The subset of `candidates` reachable from any ref (incl. per-worktree HEADs).
+///
+/// Streams `git rev-list --objects --all` and keeps only OIDs already in `candidates`,
+/// so peak memory is O(|candidates|) — the bounded cache OID set — rather than O(all
+/// objects ever). The full reachable set on a large monorepo is millions of objects and
+/// buffering it OOMs (see git history for the removed `reachable_oids`); intersecting on
+/// the fly against what the cache actually holds avoids that while keeping the exact
+/// "reachable from any ref" liveness. The history walk itself is still O(history) in time
+/// (a candidate for incremental GC later), but it no longer balloons memory.
+pub fn reachable_among(
+    repo: &Repository,
+    candidates: &HashSet<String>,
+) -> Result<HashSet<String>> {
+    if candidates.is_empty() {
+        return Ok(HashSet::new());
+    }
     let workdir = repo
         .workdir()
         .ok_or_else(|| "repository has no working directory".to_string())?;
-    let output = Command::new("git")
+    let mut child = Command::new("git")
         .current_dir(workdir)
         .args(["rev-list", "--objects", "--all"])
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .map_err(|e| format!("git rev-list failed to spawn: {e}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "git rev-list --objects --all failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    let mut out = HashSet::new();
-    for line in output.stdout.split(|b| *b == b'\n') {
-        if line.is_empty() {
-            continue;
-        }
-        // Each line is "<oid>" or "<oid> <path>"; take the first token.
-        let oid = line
-            .split(|b| *b == b' ')
-            .next()
-            .map(|tok| String::from_utf8_lossy(tok).into_owned());
-        if let Some(oid) = oid
-            && oid.len() >= 40
-        {
-            out.insert(oid);
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "git rev-list produced no stdout".to_string())?;
+
+    let mut live = HashSet::new();
+    for line in BufReader::new(stdout).lines() {
+        let line = line.map_err(|e| format!("reading git rev-list output: {e}"))?;
+        // Each line is "<oid>" or "<oid> <path>"; the OID is the first token.
+        let oid = line.split(' ').next().unwrap_or("");
+        if oid.len() >= 40 && candidates.contains(oid) {
+            live.insert(oid.to_string());
         }
     }
-    Ok(out)
+    let status = child
+        .wait()
+        .map_err(|e| format!("git rev-list wait failed: {e}"))?;
+    if !status.success() {
+        return Err("git rev-list --objects --all failed".to_string());
+    }
+    Ok(live)
 }
 
 /// Roots of every linked worktree of this repo (incl. the main worktree).
@@ -269,8 +283,15 @@ mod tests {
         let oids = working_tree_oids(&repo, &["a.txt".to_string()]).unwrap();
         assert_ne!(oids["a.txt"], "ce013625030ba8dba906f756967f9e9ca394464a");
 
-        let reachable = reachable_oids(&repo).unwrap();
-        assert!(reachable.contains("ce013625030ba8dba906f756967f9e9ca394464a"));
+        // reachable_among returns only the candidates reachable from a ref: the committed
+        // "hello\n" blob is (it's in HEAD), the dirty working-tree blob is not.
+        let committed = "ce013625030ba8dba906f756967f9e9ca394464a".to_string();
+        let candidates: HashSet<String> =
+            [committed.clone(), oids["a.txt"].clone()].into_iter().collect();
+        let reachable = reachable_among(&repo, &candidates).unwrap();
+        assert!(reachable.contains(&committed));
+        assert!(!reachable.contains(&oids["a.txt"]));
+        // ...but the dirty working-tree blob is held live by the uncommitted set.
         let uncommitted = uncommitted_oids(temp.path()).unwrap();
         assert!(uncommitted.contains(&oids["a.txt"]));
     }

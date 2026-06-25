@@ -115,6 +115,32 @@ fn main() -> Result<(), String> {
         peak_rss.load(Ordering::Relaxed) as f64 / 1024.0,
         db_size_mib(&root),
     );
+
+    // Optional: synchronously run a GC and sample its peak RSS (the background GC the
+    // worker would run after readiness, but measurable here since run_gc_blocking waits).
+    if std::env::var("BIFROST_PROFILE_GC").as_deref() == Ok("1") {
+        let gc_done = Arc::new(AtomicBool::new(false));
+        let gc_peak = Arc::new(AtomicU64::new(0));
+        let gc_start = Instant::now();
+        let mon = {
+            let (gc_done, gc_peak) = (gc_done.clone(), gc_peak.clone());
+            std::thread::spawn(move || {
+                while !gc_done.load(Ordering::Relaxed) {
+                    gc_peak.fetch_max(rss_kb(), Ordering::Relaxed);
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+            })
+        };
+        let gc_res = indexer.run_gc_blocking();
+        gc_done.store(true, Ordering::Relaxed);
+        let _ = mon.join();
+        eprintln!(
+            "[profile] GC {:.1}s peak_rss_mib={:.0} result={:?}",
+            gc_start.elapsed().as_secs_f64(),
+            gc_peak.load(Ordering::Relaxed) as f64 / 1024.0,
+            gc_res,
+        );
+    }
     indexer.close();
     Ok(())
 }

@@ -211,6 +211,20 @@ impl SemanticStore {
         Ok(out)
     }
 
+    /// Every blob OID currently in the cache. Bounded by the blobs we've indexed (the
+    /// repo's file versions seen across branches), so it is the small side of the GC
+    /// reachability intersection — see [`crate::nlp::gitcache::reachable_among`].
+    pub fn blob_oids(&self) -> Result<HashSet<String>> {
+        let conn = self.conn.lock().expect("semantic store mutex poisoned");
+        let mut stmt = conn.prepare("SELECT blob_oid FROM blobs")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = HashSet::new();
+        for oid in rows {
+            out.insert(oid?);
+        }
+        Ok(out)
+    }
+
     pub fn missing_component_hashes(&self, hashes: &[[u8; 32]]) -> Result<Vec<[u8; 32]>> {
         self.missing_hashes("component_vectors", "hash", hashes)
     }

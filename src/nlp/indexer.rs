@@ -416,6 +416,12 @@ fn worker_loop(
         }
         decrement_pending(&shared);
         shared.cond.notify_all();
+
+        // Opportunistic, throttled GC AFTER readiness + query wakeup: the git reachability
+        // walk can take minutes on a large repo, so running it here (not inside the build)
+        // keeps it off the path `wait_ready` and queries block on. Memory is bounded by
+        // run_gc's cache intersection.
+        maybe_gc(&store, &repo);
     }
 }
 
@@ -440,7 +446,8 @@ fn full_build(
     let index = ActiveIndex::build(store, &path_to_oid).map_err(BuildError::Failed)?;
     *active.write().expect("active index lock poisoned") = Some(index);
 
-    maybe_gc(store, repo);
+    // GC is deliberately NOT run here: it must not block the index from becoming Ready
+    // (the worker runs it after readiness — see worker_loop).
     Ok(())
 }
 
@@ -587,11 +594,19 @@ fn language_of(file: &ProjectFile) -> Option<String> {
 /// Compute the live OID set (reachable ∪ each worktree's uncommitted) and sweep.
 /// Used unthrottled by an explicit GC request and (throttled) by `maybe_gc`.
 fn run_gc(store: &SemanticStore, repo: &git2::Repository) -> Result<(), String> {
-    let mut live = gitcache::reachable_oids(repo)?;
-    let roots = gitcache::worktree_roots(repo)?;
-    for root in roots {
+    // Liveness is unchanged — "reachable from any ref" ∪ "held by a worktree's uncommitted
+    // working set" — but computed against only the cache's own OIDs. We never materialize
+    // the full reachable set (millions of objects on a monorepo, which OOMs); instead we
+    // stream `git rev-list` and keep the subset that is actually cached. Peak memory is
+    // O(cache), not O(history).
+    let cache_oids = store.blob_oids().map_err(|e| e.to_string())?;
+    if cache_oids.is_empty() {
+        return Ok(());
+    }
+    let mut live = gitcache::reachable_among(repo, &cache_oids)?;
+    for root in gitcache::worktree_roots(repo)? {
         if let Ok(dirty) = gitcache::uncommitted_oids(&root) {
-            live.extend(dirty);
+            live.extend(dirty.into_iter().filter(|oid| cache_oids.contains(oid)));
         }
     }
     store.gc(&live).map_err(|err| err.to_string())
