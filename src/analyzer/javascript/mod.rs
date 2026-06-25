@@ -1096,10 +1096,12 @@ fn visit_js_assignment_expression(
     let Some(left) = node.child_by_field_name("left") else {
         return;
     };
-    let Some(name) = js_member_assignment_name(left, source) else {
+    let value = node.child_by_field_name("right");
+    let Some(name) = js_commonjs_export_assignment_name(left, value, source)
+        .or_else(|| js_member_assignment_name(left, source))
+    else {
         return;
     };
-    let value = node.child_by_field_name("right");
     let is_function =
         value.is_some_and(|value| matches!(value.kind(), "arrow_function" | "function_expression"));
     let kind = if is_function {
@@ -1125,6 +1127,42 @@ fn visit_js_assignment_expression(
     {
         visit_js_object_literal_properties(file, source, value, &code_unit, &code_unit, parsed);
     }
+}
+
+fn js_commonjs_export_assignment_name(
+    left: Node<'_>,
+    value: Option<Node<'_>>,
+    source: &str,
+) -> Option<String> {
+    if !value.is_some_and(|value| matches!(value.kind(), "arrow_function" | "function_expression"))
+    {
+        return None;
+    }
+    let property = js_commonjs_export_assignment_property(left, source)?;
+    (!property.is_empty()).then_some(property)
+}
+
+fn js_commonjs_export_assignment_property(node: Node<'_>, source: &str) -> Option<String> {
+    if node.kind() != "member_expression" {
+        return None;
+    }
+    let object = node.child_by_field_name("object")?;
+    let property = node.child_by_field_name("property")?;
+    if property.kind() == "computed_property_name" {
+        return None;
+    }
+    let property_name = node_text(property, source)
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .to_string();
+
+    if node_text(object, source).trim() == "exports" || js_is_module_exports_object(object, source)
+    {
+        return Some(property_name);
+    }
+
+    None
 }
 
 fn js_member_assignment_name(node: Node<'_>, source: &str) -> Option<String> {
@@ -1160,6 +1198,19 @@ fn js_is_commonjs_export_assignment_target(node: Node<'_>, source: &str) -> bool
         || text.starts_with("exports.")
         || text == "module.exports"
         || text.starts_with("module.exports.")
+}
+
+fn js_is_module_exports_object(node: Node<'_>, source: &str) -> bool {
+    if node.kind() != "member_expression" {
+        return false;
+    }
+    let Some(object) = node.child_by_field_name("object") else {
+        return false;
+    };
+    let Some(property) = node.child_by_field_name("property") else {
+        return false;
+    };
+    node_text(object, source).trim() == "module" && node_text(property, source).trim() == "exports"
 }
 
 fn js_assignment_signature(

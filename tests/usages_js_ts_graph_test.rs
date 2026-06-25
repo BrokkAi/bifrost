@@ -860,6 +860,35 @@ fn js_commonjs_exports_property_resolves_member_declaration() {
 }
 
 #[test]
+fn js_commonjs_exports_named_function_expression_resolves_module_object_usage() {
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file(
+            "commonjs-request.js",
+            "exports.accepts = function accepts(contentType) { return contentType; };\n",
+        )
+        .file(
+            "consumer.js",
+            "const request = require('./commonjs-request');\nfunction run() { return request.accepts('json'); }\n",
+        )
+        .build()
+    });
+
+    let target = find_js_target(&analyzer, &project.file("commonjs-request.js"), |cu| {
+        cu.short_name() == "accepts" && cu.is_function()
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == project.file("consumer.js")),
+        "expected direct CommonJS exported named function expression to resolve module-object usage"
+    );
+}
+
+#[test]
 fn js_commonjs_exports_property_does_not_seed_unrelated_member_by_short_name() {
     let (project, analyzer) = js_inline_analyzer(|p| {
         p.file(
