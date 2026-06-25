@@ -20,13 +20,9 @@ crate-type = ["rlib", "cdylib"]
 [dependencies]
 bincode = "1.3.3"
 # NLP / semantic_search stack. The embedder is voyageai/voyage-4-nano
-# (Qwen3-bidirectional), served via Candle — see `nlp/voyage.rs`. CUDA/Metal are
-# toggled through Candle's own backend features (`nlp-gpu` / `nlp-coreml`).
-# Pinned to a post-0.10.2 git rev: the released kernels' CUDA-13 shim guard is
-# broken (defines intrinsics CUDA 13 already ships); this rev guards them by arch.
-candle-core = { git = "https://github.com/huggingface/candle", rev = "f53ed3bf", optional = true }
-candle-nn = { git = "https://github.com/huggingface/candle", rev = "f53ed3bf", optional = true }
-candle-transformers = { git = "https://github.com/huggingface/candle", rev = "f53ed3bf", optional = true }
+# (Qwen3-bidirectional), served by the PyTorch SDPA sidecar (one process per device,
+# fused attention on CUDA/Metal/CPU) — see `nlp/voyage_sidecar.rs` and
+# `scripts/voyage_sidecar.py`. Rust keeps the pipeline; only the GPU forward is Python.
 hf-hub = { version = "0.4", default-features = false, features = ["ureq"], optional = true }
 tokenizers = { version = "0.21", optional = true }
 # 8-bit rotational quantization for the searchable composed vectors (~4x smaller
@@ -83,13 +79,10 @@ xot = "0.31"
 
 [features]
 default = []
-# Semantic search: voyageai/voyage-4-nano embeddings via Candle. Opt in with
-# `--features nlp`. CPU-only by default; add an accelerator feature below.
-nlp = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:hf-hub", "dep:tokenizers", "dep:fastrq"]
-# Adds Candle's CUDA backend; the runtime still falls back to CPU if unavailable.
-nlp-gpu = ["nlp", "candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
-# Adds Candle's Metal backend for Apple platforms (the "Metal" accelerator path).
-nlp-coreml = ["nlp", "candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+# Semantic search: voyageai/voyage-4-nano embeddings via the PyTorch SDPA sidecar.
+# Opt in with `--features nlp`. Acceleration (CUDA/Metal) is selected inside the sidecar
+# at runtime — no compile-time backend features needed.
+nlp = ["dep:hf-hub", "dep:tokenizers", "dep:fastrq"]
 # Enables the pyo3-backed Python extension module (`bifrost_searchtools._native`).
 # Maturin turns this on automatically via pyproject.toml; the `bifrost` CLI
 # binary builds without it on every platform.

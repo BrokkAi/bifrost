@@ -31,7 +31,7 @@ fn main() -> Result<(), String> {
             s.push(' ');
             i += 1;
             // Re-measure only periodically to keep it cheap.
-            if i % 256 == 0 && embedder.count_tokens(&s) >= target {
+            if i.is_multiple_of(256) && embedder.count_tokens(&s) >= target {
                 break;
             }
         }

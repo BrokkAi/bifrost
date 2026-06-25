@@ -220,15 +220,13 @@ Models load via ONNX (`gte-rs`). Defaults are downloaded from the HuggingFace hu
 - `BIFROST_SEMANTIC_INDEX=auto` enables background indexing; the default is off
 - `BIFROST_EMBED_MODEL_DIR` / `BIFROST_RERANK_MODEL_DIR`: local directory containing `tokenizer.json` + `model.onnx` (e.g. a fine-tune); takes precedence over the hub
 - `BIFROST_EMBED_MODEL_ID` / `BIFROST_RERANK_MODEL_ID`: alternate HuggingFace repo ids
-- `BIFROST_ACCELERATOR=auto|cpu|cuda|coreml`: execution provider preference (default `auto`)
-- `BIFROST_CUDA_DEVICES=auto|0,1,...`: CUDA device ids for embedding workers when built with `nlp-gpu`; ids are logical ids after `CUDA_VISIBLE_DEVICES` masking/remapping
-- `BIFROST_CUDA_DEVICE`: legacy single CUDA device id for `nlp-gpu` when `BIFROST_CUDA_DEVICES` is unset (default 0)
-- `BIFROST_COREML_ANE_ONLY=1`: only enable CoreML on devices with a compatible Apple Neural Engine when built with `nlp-coreml`
+- `BIFROST_ACCELERATOR=auto|cpu|cuda|metal`: whether to advertise `semantic_search` based on the available accelerator (default `auto`); `cpu` hides the tool unless force-enabled. The sidecar still selects its own runtime device.
+- `BIFROST_SIDECAR_DEVICES=<uuid|index,...>`: which devices the sidecar spawns workers on (else every GPU `nvidia-smi` reports, honoring `CUDA_VISIBLE_DEVICES`)
 - `BIFROST_EMBED_BATCH_MAX_ITEMS` / `BIFROST_EMBED_BATCH_MAX_TOKENS`: cap scheduler batches by item count and by padded attention cost. Inputs are padded to the longest text in a batch, so a batch of `n` texts costs `n * longest^2`; `MAX_TOKENS` (default 8192, the model max) budgets each batch at the cost of one sequence of that length — a max-length chunk runs alone, 2k-token chunks batch 4 at a time, short chunks fill `MAX_ITEMS`
 
 `uv run scripts/optimize_onnx_attention.py <model.onnx>...` rewrites a downloaded model's per-head-tiled attention masks into MultiHeadAttention's `key_padding_mask` input plus one shared sliding-window bias, verifying output parity before writing a `.bifrost-opt.onnx` sibling that model resolution then prefers automatically. On the default embedding model this roughly halves peak inference memory and is several times faster at 8k-token chunks. (A head-broadcast `(batch,1,seq,seq)` bias would be smaller still, but the ONNX Runtime 1.20 CPU kernel bundled by `ort` 2.0.0-rc.9 misindexes that shape for batches > 1 — see the script docstring.)
 
-The `nlp` cargo feature is opt-in; build with `--features nlp` on targets where onnxruntime is available. Without that feature, the `nlp` toolset publishes no tools and `core` degrades to `symbol|workspace`. Add `--features nlp,nlp-gpu` for CUDA or `--features nlp,nlp-coreml` for Apple CoreML acceleration.
+The `nlp` cargo feature is opt-in; build with `--features nlp`. Without that feature, the `nlp` toolset publishes no tools and `core` degrades to `symbol|workspace`. There are no longer compile-time accelerator features: the embedder runs in the PyTorch SDPA sidecar (`scripts/voyage_sidecar.py`, launched via `uv`), which selects CUDA, Apple Metal (MPS), or CPU at runtime. Pin which devices it uses with `BIFROST_SIDECAR_DEVICES` (else every GPU `nvidia-smi` reports, honoring `CUDA_VISIBLE_DEVICES`).
 
 `refresh` forces a full rebuild of the code index. Normal tool calls already apply watcher-detected file changes automatically, so most hosts should not call it during routine operation. Keep it as a manual recovery tool when you want to discard incremental state and rescan the whole workspace from disk.
 

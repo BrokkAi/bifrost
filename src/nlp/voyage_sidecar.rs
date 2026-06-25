@@ -114,7 +114,7 @@ impl Embedder for SingleSidecar {
     }
 
     fn fingerprint(&self) -> String {
-        // bf16 sidecar vectors differ slightly from the candle f32 path, so use a
+        // bf16 sidecar vectors differ slightly from the fp32 reference, so use a
         // distinct contract id — switching backends rebuilds the cache.
         fingerprint_for(&format!("{}:sidecar-bf16", self.label), OUT_DIM)
     }
@@ -154,8 +154,8 @@ fn sidecar_devices() -> Vec<String> {
     if let Ok(v) = std::env::var(DEVICES_ENV) {
         return v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
     }
-    // Honor CUDA_VISIBLE_DEVICES like candle does: a GPU-pinned worker (e.g. the mass-gen
-    // orchestrator) sets it to one device and must spawn exactly one sidecar there.
+    // Honor CUDA_VISIBLE_DEVICES: a GPU-pinned worker (e.g. the mass-gen orchestrator)
+    // sets it to one device and must spawn exactly one sidecar there.
     if let Ok(v) = std::env::var("CUDA_VISIBLE_DEVICES") {
         let devs: Vec<String> =
             v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();

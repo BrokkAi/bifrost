@@ -1,21 +1,19 @@
 //! Embedding engine.
 //!
-//! `Embedder` is the seam the indexer and query pipeline depend on; the
-//! production impl ([`super::voyage::VoyageEmbedder`]) runs voyageai/voyage-4-nano
-//! through Candle, and a deterministic fake backs the model-free tests. Model files
-//! resolve from an env-pointed local directory first (fine-tune escape hatch), then
-//! the HF hub cache. Accelerator selection (CUDA / Metal / CPU) goes through Candle's
-//! own device backends.
+//! `Embedder` is the seam the indexer and query pipeline depend on; the production impl
+//! ([`super::voyage_sidecar`]) runs voyageai/voyage-4-nano in a PyTorch SDPA sidecar
+//! (one process per device, fused attention on CUDA/Metal/CPU), and a deterministic fake
+//! backs the model-free tests. Model files resolve from an env-pointed local directory
+//! first (fine-tune escape hatch), then the HF hub cache. The sidecar selects its device
+//! at runtime; [`accelerator_available`] only decides whether to advertise the tool.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use candle_core::Device;
 use sha2::{Digest, Sha256};
 
 use super::keys::l2_normalize;
-use super::voyage::VoyageEmbedder;
 use super::{PARENT_ALPHA, PASSAGE_PREFIX, QUERY_PREFIX, REPRESENTATION_KIND};
 
 pub trait Embedder: Send + Sync {
@@ -68,8 +66,6 @@ pub const DEFAULT_EMBED_MODEL_ID: &str = "voyageai/voyage-4-nano";
 pub const EMBED_MODEL_DIR_ENV: &str = "BIFROST_EMBED_MODEL_DIR";
 pub const EMBED_MODEL_ID_ENV: &str = "BIFROST_EMBED_MODEL_ID";
 const ACCELERATOR_ENV: &str = "BIFROST_ACCELERATOR";
-const CUDA_DEVICE_ENV: &str = "BIFROST_CUDA_DEVICE";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AcceleratorPreference {
     Auto,
@@ -87,90 +83,36 @@ fn accelerator_preference() -> AcceleratorPreference {
     }
 }
 
-fn cuda_ordinal() -> usize {
-    std::env::var(CUDA_DEVICE_ENV)
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .unwrap_or(0)
+/// Whether `nvidia-smi` reports at least one CUDA GPU. The sidecar enumerates devices
+/// the same way, so this mirrors what the embedder will actually run on.
+fn cuda_present() -> bool {
+    std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=uuid", "--format=csv,noheader"])
+        .output()
+        .map(|out| {
+            out.status.success()
+                && String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .any(|line| !line.trim().is_empty())
+        })
+        .unwrap_or(false)
 }
 
-/// The Candle device the embedder will run on, honoring `BIFROST_ACCELERATOR`.
-/// `Auto` prefers CUDA, then Metal, then CPU.
-pub fn select_device() -> Result<Device, String> {
-    match accelerator_preference() {
-        AcceleratorPreference::Cpu => Ok(Device::Cpu),
-        AcceleratorPreference::Cuda => Device::new_cuda(cuda_ordinal())
-            .map_err(|err| format!("CUDA device unavailable: {err}")),
-        AcceleratorPreference::Metal => {
-            Device::new_metal(0).map_err(|err| format!("Metal device unavailable: {err}"))
-        }
-        AcceleratorPreference::Auto => {
-            if let Ok(device) = Device::new_cuda(cuda_ordinal()) {
-                return Ok(device);
-            }
-            if let Ok(device) = Device::new_metal(0) {
-                return Ok(device);
-            }
-            Ok(Device::Cpu)
-        }
-    }
+/// Whether a Metal GPU is present: every Mac that runs this binary has one.
+fn metal_present() -> bool {
+    cfg!(target_os = "macos")
 }
 
-/// Every visible CUDA device, probed by ordinal (Candle/cudarc only see devices
-/// permitted by `CUDA_VISIBLE_DEVICES`, so this respects it automatically).
-fn all_cuda_devices() -> Vec<Device> {
-    let mut devices = Vec::new();
-    let mut ordinal = 0;
-    while let Ok(device) = Device::new_cuda(ordinal) {
-        devices.push(device);
-        ordinal += 1;
-    }
-    devices
-}
-
-/// Every Candle device the embedder should fan across, honoring `BIFROST_ACCELERATOR`.
-/// `Auto`/`Cuda` use ALL visible CUDA devices (so one repo's index can saturate the
-/// whole box); Metal and CPU are single-device.
-pub fn select_devices() -> Result<Vec<Device>, String> {
-    match accelerator_preference() {
-        AcceleratorPreference::Cpu => Ok(vec![Device::Cpu]),
-        AcceleratorPreference::Cuda => {
-            let devices = all_cuda_devices();
-            if devices.is_empty() {
-                Err("no CUDA devices available".to_string())
-            } else {
-                Ok(devices)
-            }
-        }
-        AcceleratorPreference::Metal => {
-            Ok(vec![Device::new_metal(0).map_err(|err| {
-                format!("Metal device unavailable: {err}")
-            })?])
-        }
-        AcceleratorPreference::Auto => {
-            let cuda = all_cuda_devices();
-            if !cuda.is_empty() {
-                return Ok(cuda);
-            }
-            if let Ok(device) = Device::new_metal(0) {
-                return Ok(vec![device]);
-            }
-            Ok(vec![Device::Cpu])
-        }
-    }
-}
-
-/// Whether a CUDA or Metal accelerator is actually usable under the current
-/// preference. Drives whether `semantic_search` is offered (an explicit `cpu`
-/// preference reports `false` — it must be force-enabled).
+/// Whether a CUDA or Metal accelerator is available under the current preference.
+/// Drives whether `semantic_search` is offered (an explicit `cpu` preference reports
+/// `false` — it must be force-enabled). The model runs in the PyTorch sidecar, which
+/// picks its own device at runtime; this only decides whether to advertise the tool.
 pub fn accelerator_available() -> bool {
     match accelerator_preference() {
         AcceleratorPreference::Cpu => false,
-        AcceleratorPreference::Cuda => Device::new_cuda(cuda_ordinal()).is_ok(),
-        AcceleratorPreference::Metal => Device::new_metal(0).is_ok(),
-        AcceleratorPreference::Auto => {
-            Device::new_cuda(cuda_ordinal()).is_ok() || Device::new_metal(0).is_ok()
-        }
+        AcceleratorPreference::Cuda => cuda_present(),
+        AcceleratorPreference::Metal => metal_present(),
+        AcceleratorPreference::Auto => cuda_present() || metal_present(),
     }
 }
 
@@ -201,42 +143,10 @@ pub(crate) fn resolve_embed_model_dir() -> Result<PathBuf, String> {
 }
 
 pub fn load_production_embedder() -> Result<Arc<dyn Embedder>, String> {
-    // Opt into the PyTorch SDPA sidecar backend (fused attention, all GPUs incl.
-    // Blackwell) with BIFROST_EMBED_BACKEND=sidecar; default stays the in-process
-    // Candle path.
-    if std::env::var("BIFROST_EMBED_BACKEND").as_deref() == Ok("sidecar") {
-        return super::voyage_sidecar::load_sidecar_embedder();
-    }
-    let devices = select_devices()?;
-    let dir = resolve_embed_model_dir()?;
-    let label = embed_repo_id();
-    // Load (and pre-warm) one embedder per device in parallel — each load + warmup is
-    // an independent multi-second GPU op, so doing them serially made startup scale
-    // with device count. Pre-warming forces the lazily-mmapped weights onto the device
-    // now, so a cold worker doesn't lose the first pull race and sit idle.
-    let dir_ref = &dir;
-    let label_ref = &label;
-    let workers: Vec<Arc<dyn Embedder>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = devices
-            .into_iter()
-            .map(|device| {
-                scope.spawn(move || -> Result<Arc<dyn Embedder>, String> {
-                    let worker = VoyageEmbedder::load(dir_ref, device, label_ref.clone())?;
-                    let _ = worker.embed_passages(&["warmup"]);
-                    Ok(Arc::new(worker) as Arc<dyn Embedder>)
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|handle| handle.join().expect("embedder load thread panicked"))
-            .collect::<Result<Vec<_>, String>>()
-    })?;
-    eprintln!(
-        "bifrost semantic index: {} embedder device(s)",
-        workers.len()
-    );
-    Ok(Arc::new(ScheduledEmbedder::new(workers)))
+    // voyage-4-nano runs in the PyTorch SDPA sidecar (fused attention on every backend,
+    // incl. Blackwell sm_120 where candle/flash-attn could not). The sidecar spawns one
+    // process per device and fans the batch across them via `ScheduledEmbedder`.
+    super::voyage_sidecar::load_sidecar_embedder()
 }
 
 /// Smallest pull, to keep GPU batches efficient (avoid kernel-launch-bound tiny calls).
@@ -436,7 +346,6 @@ mod tests {
         let prev = std::env::var(ACCELERATOR_ENV).ok();
         unsafe { std::env::set_var(ACCELERATOR_ENV, "cpu") };
         assert!(!accelerator_available());
-        assert!(matches!(select_device(), Ok(Device::Cpu)));
         match prev {
             Some(value) => unsafe { std::env::set_var(ACCELERATOR_ENV, value) },
             None => unsafe { std::env::remove_var(ACCELERATOR_ENV) },

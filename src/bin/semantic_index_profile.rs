@@ -26,7 +26,6 @@ fn main() -> Result<(), String> {
     use brokk_bifrost::{
         AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer,
         nlp::indexer::SemanticIndexer, nlp::store::semantic_db_path,
-        nlp::voyage::enable_embed_profile_logging,
     };
 
     fn rss_kb() -> u64 {
@@ -57,7 +56,6 @@ fn main() -> Result<(), String> {
         .nth(1)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("../brokk"));
-    enable_embed_profile_logging();
     let start = Instant::now();
     eprintln!("[profile] root={}", root.display());
 

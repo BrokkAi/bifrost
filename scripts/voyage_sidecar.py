@@ -16,7 +16,8 @@ to a dup'd copy of the real stdout.
 
 Attention is fused: the HF model runs attn_implementation="sdpa"; with our additive
 padding mask, torch selects the memory-efficient SDPA kernel (O(seq), Blackwell-ok).
-SDPA only fuses in fp16/bf16, so we run bf16 on GPU.
+SDPA only fuses in fp16/bf16, so we run bf16 on CUDA and fp16 on Apple Metal (MPS);
+CPU falls back to fp32 (math kernel).
 
 Run the sidecar:   uv run scripts/voyage_sidecar.py
 Self-test parity:  uv run scripts/voyage_sidecar.py --selftest
@@ -64,9 +65,17 @@ class Embedder:
     def __init__(self) -> None:
         from transformers import AutoModel, AutoTokenizer
 
+        # Device priority: CUDA -> Apple Metal (MPS) -> CPU. SDPA only fuses in fp16/bf16;
+        # bf16 is the model's native dtype on CUDA, while MPS bf16 support is partial across
+        # torch/macOS versions, so MPS uses fp16 (still a fused mem-efficient SDPA kernel).
         self.cuda = torch.cuda.is_available()
-        self.device = torch.device("cuda:0" if self.cuda else "cpu")
-        self.dtype = torch.bfloat16 if self.cuda else torch.float32
+        self.mps = (not self.cuda) and torch.backends.mps.is_available()
+        if self.cuda:
+            self.device, self.dtype = torch.device("cuda:0"), torch.bfloat16
+        elif self.mps:
+            self.device, self.dtype = torch.device("mps"), torch.float16
+        else:
+            self.device, self.dtype = torch.device("cpu"), torch.float32
         patch_masking_kwargs()
         log(f"loading {MODEL_ID} on {self.device} ({self.dtype})")
         model = AutoModel.from_pretrained(MODEL_ID, trust_remote_code=True, dtype=self.dtype,
@@ -85,10 +94,11 @@ class Embedder:
                 torch.cuda.empty_cache()
                 time.sleep(2.0)
         self.tok = AutoTokenizer.from_pretrained(MODEL_ID)
-        # backend selection report (helps confirm a fused kernel is eligible)
-        torch.backends.cuda.enable_flash_sdp(True)
-        torch.backends.cuda.enable_mem_efficient_sdp(True)
-        torch.backends.cuda.enable_math_sdp(True)
+        # Enable the fused SDPA kernels (CUDA only; MPS selects its own fused kernel).
+        if self.cuda:
+            torch.backends.cuda.enable_flash_sdp(True)
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
+            torch.backends.cuda.enable_math_sdp(True)
 
         # Optional embed profiling (BIFROST_SIDECAR_PROFILE=1): tokenize vs GPU-forward
         # time and actual batch sizes, to tell whether embed is overhead- or GPU-bound.

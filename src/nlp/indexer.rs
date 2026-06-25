@@ -49,7 +49,8 @@ pub trait EngineProvider: Send + 'static {
     fn embedder(&self) -> Result<Arc<dyn Embedder>, String>;
 }
 
-/// Production provider: resolves the model from env/HF hub and loads it via Candle.
+/// Production provider: resolves the model from env/HF hub and runs it in the PyTorch
+/// SDPA sidecar (one process per device).
 pub struct DefaultEngineProvider;
 
 impl EngineProvider for DefaultEngineProvider {
