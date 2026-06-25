@@ -116,6 +116,50 @@ pub(super) fn resolve_go(
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GoTypeLookupResolutionKind {
+    Expression,
+    InterfaceMethodOwner,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct GoTypeLookupResolution {
+    pub(crate) fqn: String,
+    pub(crate) kind: GoTypeLookupResolutionKind,
+}
+
+pub(crate) fn go_type_lookup_resolution(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    site: &ResolvedReferenceSite,
+) -> Option<GoTypeLookupResolution> {
+    let node = smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)?;
+    if let Some(fqn) = go_interface_method_owner_type_fqn(support, file, source, node) {
+        return Some(GoTypeLookupResolution {
+            fqn,
+            kind: GoTypeLookupResolutionKind::InterfaceMethodOwner,
+        });
+    }
+
+    let expression = go_type_lookup_expression(node);
+    let fqn = go_expression_type_fqn(
+        analyzer,
+        support,
+        file,
+        source,
+        root,
+        expression,
+        site.range.start_byte,
+    )?;
+    Some(GoTypeLookupResolution {
+        fqn,
+        kind: GoTypeLookupResolutionKind::Expression,
+    })
+}
+
 fn go_package_name(file: &ProjectFile, source: &str) -> String {
     let declared = source
         .lines()
@@ -597,6 +641,9 @@ fn go_expression_type_fqn(
         "selector_expression" => {
             go_selector_value_type_fqn(analyzer, support, file, source, root, expression, byte)
         }
+        "call_expression" | "composite_literal" | "index_expression" => {
+            go_value_type_fqn(analyzer, support, file, source, root, expression, byte)
+        }
         "parenthesized_expression" | "unary_expression" => {
             let mut cursor = expression.walk();
             expression.named_children(&mut cursor).find_map(|child| {
@@ -604,6 +651,67 @@ fn go_expression_type_fqn(
             })
         }
         _ => None,
+    }
+}
+
+fn go_type_lookup_expression(mut node: Node<'_>) -> Node<'_> {
+    loop {
+        let Some(parent) = node.parent() else {
+            return node;
+        };
+        let node_id = node.id();
+        let parent_is_semantic_expression = match parent.kind() {
+            "selector_expression" => parent
+                .child_by_field_name("field")
+                .or_else(|| go_last_named_child(parent))
+                .is_some_and(|field| field.id() == node_id),
+            "call_expression" => parent
+                .child_by_field_name("function")
+                .is_some_and(|function| function.id() == node_id),
+            "composite_literal" => parent
+                .child_by_field_name("type")
+                .is_some_and(|type_node| type_node.id() == node_id),
+            "parenthesized_expression" | "unary_expression" => true,
+            _ => false,
+        };
+        if !parent_is_semantic_expression {
+            return node;
+        }
+        node = parent;
+    }
+}
+
+fn go_interface_method_owner_type_fqn(
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    mut node: Node<'_>,
+) -> Option<String> {
+    let selected = node;
+    loop {
+        if node.kind() == "method_elem" {
+            let method_name = node
+                .child_by_field_name("name")
+                .or_else(|| go_first_named_child(node))?;
+            if selected.start_byte() < method_name.start_byte()
+                || selected.end_byte() > method_name.end_byte()
+            {
+                return None;
+            }
+            let interface = node
+                .parent()
+                .filter(|parent| parent.kind() == "interface_type")?;
+            let type_spec = interface
+                .parent()
+                .filter(|parent| parent.kind() == "type_spec")?;
+            let name = type_spec.child_by_field_name("name")?;
+            return go_resolve_type_name_in_package(
+                support,
+                &go_package_name(file, source),
+                go_node_text(name, source),
+            );
+        }
+        node = node.parent()?;
     }
 }
 

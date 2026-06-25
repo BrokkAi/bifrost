@@ -9,6 +9,7 @@ use crate::path_utils::rel_path_string;
 use std::sync::Arc;
 use tree_sitter::Tree;
 
+mod go;
 mod rust;
 
 #[derive(Debug, Clone)]
@@ -125,7 +126,7 @@ fn resolve_one(
         }
     };
 
-    if !matches!(language, Language::Rust) {
+    if !matches!(language, Language::Go | Language::Rust) {
         return finish_lookup_outcome(
             diagnostic_outcome(
                 TypeLookupStatus::UnsupportedLanguage,
@@ -138,6 +139,7 @@ fn resolve_one(
 
     let tree = context.tree(&file, language, &source);
     let resolved = match language {
+        Language::Go => go::resolve_go_type(analyzer, &file, &source, tree.as_ref(), &site),
         Language::Rust => rust::resolve_rust_type(
             analyzer,
             &file,
@@ -173,6 +175,11 @@ impl TypeLookupRequest {
 
 fn parse_tree_for_type_lookup(language: Language, source: &str) -> Option<Tree> {
     match language {
+        Language::Go => {
+            let mut parser = tree_sitter::Parser::new();
+            parser.set_language(&tree_sitter_go::LANGUAGE.into()).ok()?;
+            parser.parse(source, None)
+        }
         Language::Rust => crate::analyzer::rust::lexical_scope::parse_rust_tree(source),
         _ => None,
     }

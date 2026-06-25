@@ -66,6 +66,7 @@ mod rust;
 mod scala;
 
 pub(crate) use call_sites::{call_reference_ranges, is_call_reference_range};
+pub(crate) use go::{GoTypeLookupResolutionKind, go_type_lookup_resolution};
 
 #[derive(Debug, Clone)]
 pub(crate) struct DefinitionLookupRequest {

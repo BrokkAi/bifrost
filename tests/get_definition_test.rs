@@ -431,6 +431,335 @@ fn type_lookup_reports_invalid_location_before_unsupported_language() {
 }
 
 #[test]
+fn go_type_lookup_resolves_imported_explicit_local_type() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n")
+        .file(
+            "store/store.go",
+            r#"
+package store
+
+type Client struct{}
+"#,
+        )
+        .file(
+            "main.go",
+            r#"
+package main
+
+import "example.com/app/store"
+
+func Run() {
+    var client store.Client
+    _ = client
+}
+"#,
+        )
+        .build();
+
+    let line = "    _ = client";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"main.go","line":8,"column":{}}}]}}"#,
+            column_of(line, "client")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["types"][0]["fqn"], "example.com/app/store.Client",
+        "{value}"
+    );
+    assert_eq!(
+        result["types"][0]["definitions"][0]["path"], "store/store.go",
+        "{value}"
+    );
+}
+
+#[test]
+fn go_type_lookup_resolves_short_var_composite_literals() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n")
+        .file(
+            "main.go",
+            r#"
+package main
+
+type Client struct{}
+
+func Run() {
+    value := Client{}
+    _ = value
+    pointer := &Client{}
+    _ = pointer
+}
+"#,
+        )
+        .build();
+
+    for (line_no, line, name) in [
+        (8, "    _ = value", "value"),
+        (10, "    _ = pointer", "pointer"),
+    ] {
+        let value = lookup_type(
+            project.root(),
+            &format!(
+                r#"{{"references":[{{"path":"main.go","line":{line_no},"column":{}}}]}}"#,
+                column_of(line, name)
+            ),
+        );
+
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(
+            result["types"][0]["fqn"], "example.com/app.Client",
+            "{value}"
+        );
+    }
+}
+
+#[test]
+fn go_type_lookup_resolves_composite_literal_expression_type() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n")
+        .file(
+            "main.go",
+            r#"
+package main
+
+type Client struct{}
+
+func Run() {
+    _ = Client{}
+}
+"#,
+        )
+        .build();
+
+    let line = "    _ = Client{}";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"main.go","line":7,"column":{}}}]}}"#,
+            column_of(line, "Client")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["types"][0]["fqn"], "example.com/app.Client",
+        "{value}"
+    );
+}
+
+#[test]
+fn go_type_lookup_resolves_function_call_return_type() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n")
+        .file(
+            "main.go",
+            r#"
+package main
+
+type Client struct{}
+
+func NewClient() Client {
+    return Client{}
+}
+
+func Run() {
+    _ = NewClient()
+}
+"#,
+        )
+        .build();
+
+    let line = "    _ = NewClient()";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"main.go","line":11,"column":{}}}]}}"#,
+            column_of(line, "NewClient")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["types"][0]["fqn"], "example.com/app.Client",
+        "{value}"
+    );
+}
+
+#[test]
+fn go_type_lookup_resolves_parameters_and_receivers() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n")
+        .file(
+            "main.go",
+            r#"
+package main
+
+type Client struct{}
+
+func Use(client Client) {
+    _ = client
+}
+
+func (client Client) Run() {
+    _ = client
+}
+"#,
+        )
+        .build();
+
+    for (line_no, line) in [(7, "    _ = client"), (11, "    _ = client")] {
+        let value = lookup_type(
+            project.root(),
+            &format!(
+                r#"{{"references":[{{"path":"main.go","line":{line_no},"column":{}}}]}}"#,
+                column_of(line, "client")
+            ),
+        );
+
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(
+            result["types"][0]["fqn"], "example.com/app.Client",
+            "{value}"
+        );
+    }
+}
+
+#[test]
+fn go_type_lookup_resolves_selector_receiver_and_field_type() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n")
+        .file(
+            "main.go",
+            r#"
+package main
+
+type Profile struct{}
+
+type Client struct {
+    Profile Profile
+}
+
+func Run(client Client) {
+    _ = client.Profile
+}
+"#,
+        )
+        .build();
+
+    let line = "    _ = client.Profile";
+    let receiver_value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"main.go","line":11,"column":{}}}]}}"#,
+            column_of(line, "client")
+        ),
+    );
+    let receiver_result = &receiver_value["results"][0];
+    assert_eq!(receiver_result["status"], "resolved", "{receiver_value}");
+    assert_eq!(
+        receiver_result["types"][0]["fqn"], "example.com/app.Client",
+        "{receiver_value}"
+    );
+
+    let field_value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"main.go","line":11,"column":{}}}]}}"#,
+            column_of(line, "Profile")
+        ),
+    );
+    let field_result = &field_value["results"][0];
+    assert_eq!(field_result["status"], "resolved", "{field_value}");
+    assert_eq!(
+        field_result["types"][0]["fqn"], "example.com/app.Profile",
+        "{field_value}"
+    );
+}
+
+#[test]
+fn go_type_lookup_reports_interface_method_owner() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n")
+        .file(
+            "main.go",
+            r#"
+package main
+
+type Runner interface {
+    Run() error
+}
+"#,
+        )
+        .build();
+
+    let line = "    Run() error";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"main.go","line":5,"column":{}}}]}}"#,
+            column_of(line, "Run")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["types"][0]["fqn"], "example.com/app.Runner",
+        "{value}"
+    );
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "go_interface_method_owner",
+        "{value}"
+    );
+}
+
+#[test]
+fn go_type_lookup_reports_no_type_for_unsupported_inference() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n")
+        .file(
+            "main.go",
+            r#"
+package main
+
+func external() any { return nil }
+
+func Run() {
+    value := external()
+    _ = value
+}
+"#,
+        )
+        .build();
+
+    let line = "    _ = value";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"main.go","line":8,"column":{}}}]}}"#,
+            column_of(line, "value")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_type", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "go_no_supported_type",
+        "{value}"
+    );
+}
+
+#[test]
 fn type_lookup_rejects_oversized_batches() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file("lib.rs", "pub struct Widget;\n")
