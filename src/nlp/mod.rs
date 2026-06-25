@@ -25,6 +25,11 @@ pub mod voyage_sidecar;
 /// CUDA or Metal accelerator; on CPU-only hosts the tool is hidden unless the
 /// operator opts in with `--force-semantic-cpu` (`BIFROST_FORCE_SEMANTIC_CPU=1`).
 pub fn semantic_search_available() -> bool {
+    // The sidecar backend runs the model in an out-of-process PyTorch worker, so the
+    // in-process candle accelerator check doesn't apply — the tool is available.
+    if std::env::var("BIFROST_EMBED_BACKEND").as_deref() == Ok("sidecar") {
+        return true;
+    }
     force_semantic_cpu() || engine::accelerator_available()
 }
 

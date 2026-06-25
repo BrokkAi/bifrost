@@ -154,6 +154,15 @@ fn sidecar_devices() -> Vec<String> {
     if let Ok(v) = std::env::var(DEVICES_ENV) {
         return v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
     }
+    // Honor CUDA_VISIBLE_DEVICES like candle does: a GPU-pinned worker (e.g. the mass-gen
+    // orchestrator) sets it to one device and must spawn exactly one sidecar there.
+    if let Ok(v) = std::env::var("CUDA_VISIBLE_DEVICES") {
+        let devs: Vec<String> =
+            v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        if !devs.is_empty() {
+            return devs;
+        }
+    }
     let out = Command::new("nvidia-smi")
         .args(["--query-gpu=uuid", "--format=csv,noheader"])
         .output();
