@@ -156,12 +156,13 @@ fn python_imported_code_units_resolve_package_reexport_to_original_definition() 
     let analyzer = PythonAnalyzer::from_project(TestProject::new(root, Language::Python));
 
     let imports = analyzer.imported_code_units_of(&test_file);
+    let service_file = ProjectFile::new(root.to_path_buf(), "src/example/service.py");
 
     assert!(
         imports
             .iter()
             .any(|unit| unit.fq_name() == "example.service.build_service"
-                && unit.source().rel_path().to_string_lossy() == "src/example/service.py"),
+                && unit.source() == &service_file),
         "{imports:?}"
     );
 }
@@ -188,12 +189,12 @@ fn python_imported_code_units_prefer_later_local_binding_over_reexport() {
     let analyzer = PythonAnalyzer::from_project(TestProject::new(root, Language::Python));
 
     let imports = analyzer.imported_code_units_of(&test_file);
+    let init_file = ProjectFile::new(root.to_path_buf(), "src/example/__init__.py");
 
     assert!(
         imports
             .iter()
-            .any(|unit| unit.fq_name() == "example.build_service"
-                && unit.source().rel_path().to_string_lossy() == "src/example/__init__.py"),
+            .any(|unit| unit.fq_name() == "example.build_service" && unit.source() == &init_file),
         "{imports:?}"
     );
     assert!(
@@ -226,12 +227,13 @@ fn python_imported_code_units_prefer_later_reexport_over_local_binding() {
     let analyzer = PythonAnalyzer::from_project(TestProject::new(root, Language::Python));
 
     let imports = analyzer.imported_code_units_of(&test_file);
+    let service_file = ProjectFile::new(root.to_path_buf(), "src/example/service.py");
 
     assert!(
         imports
             .iter()
             .any(|unit| unit.fq_name() == "example.service.build_service"
-                && unit.source().rel_path().to_string_lossy() == "src/example/service.py"),
+                && unit.source() == &service_file),
         "{imports:?}"
     );
     assert!(
