@@ -5665,6 +5665,41 @@ fn python_from_import_resolves_to_definition() {
 }
 
 #[test]
+fn python_reexported_function_call_resolves_to_original_definition() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("src/example/service.py", "def build_service():\n    pass\n")
+        .file(
+            "src/example/__init__.py",
+            "from .service import build_service\n",
+        )
+        .file(
+            "tests/test_service.py",
+            "from example import build_service\n\ndef test_service():\n    build_service()\n",
+        )
+        .build();
+
+    let line = "    build_service()";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"tests/test_service.py","line":4,"column":{}}}]}}"#,
+            column_of(line, "build_service")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "example.service.build_service",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["path"], "src/example/service.py",
+        "{value}"
+    );
+}
+
+#[test]
 fn python_namespace_import_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::Python)
         .file("pkg/util.py", "def helper():\n    pass\n")

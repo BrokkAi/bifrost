@@ -1,5 +1,6 @@
 use super::*;
 use crate::analyzer::ImportInfo;
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 impl PythonAnalyzer {
@@ -59,6 +60,13 @@ impl PythonAnalyzer {
                     if let Some(code_unit) = self.resolve_module_code_unit(&module_candidate) {
                         return vec![(binding, code_unit)];
                     }
+                    let exported = self.resolve_exported_name_from_module(&resolved_module, &name);
+                    if !exported.is_empty() {
+                        return exported
+                            .into_iter()
+                            .map(|code_unit| (binding.clone(), code_unit))
+                            .collect();
+                    }
                     let definitions: Vec<_> =
                         self.inner.definitions(&module_candidate).cloned().collect();
                     if !definitions.is_empty() {
@@ -82,6 +90,102 @@ impl PythonAnalyzer {
             }
         }
         Vec::new()
+    }
+
+    pub(crate) fn resolve_exported_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
+        let Some((module, name)) = fqn.rsplit_once('.') else {
+            return Vec::new();
+        };
+        self.resolve_exported_name_from_module(module, name)
+    }
+
+    fn resolve_exported_name_from_module(&self, module: &str, name: &str) -> Vec<CodeUnit> {
+        let Some(module_unit) = self.resolve_module_code_unit(module) else {
+            return Vec::new();
+        };
+        self.resolve_exported_name(module_unit.source(), name)
+    }
+
+    fn resolve_exported_name(&self, module_file: &ProjectFile, name: &str) -> Vec<CodeUnit> {
+        let mut results = Vec::new();
+        let mut queue = VecDeque::from([(module_file.clone(), name.to_string())]);
+        let mut visited = HashSet::default();
+
+        while let Some((file, export_name)) = queue.pop_front() {
+            if !visited.insert((file.clone(), export_name.clone())) {
+                continue;
+            }
+
+            let index = self.export_index_of(&file);
+            if let Some(entry) = index.exports_by_name.get(&export_name) {
+                match entry {
+                    ExportEntry::Local { local_name } => {
+                        results.extend(self.local_export_declarations(&file, local_name));
+                    }
+                    ExportEntry::ReexportedNamed {
+                        module_specifier,
+                        imported_name,
+                    } => {
+                        for target_file in
+                            self.resolve_module_files_for_export(&file, module_specifier)
+                        {
+                            queue.push_back((target_file, imported_name.clone()));
+                        }
+                    }
+                    ExportEntry::Default { local_name } => {
+                        if let Some(local_name) = local_name {
+                            results.extend(self.local_export_declarations(&file, local_name));
+                        }
+                    }
+                }
+                continue;
+            }
+
+            for star in index.reexport_stars {
+                for target_file in
+                    self.resolve_module_files_for_export(&file, &star.module_specifier)
+                {
+                    queue.push_back((target_file, export_name.clone()));
+                }
+            }
+        }
+
+        results.sort_by(|left, right| {
+            left.source()
+                .cmp(right.source())
+                .then_with(|| left.fq_name().cmp(&right.fq_name()))
+        });
+        results.dedup();
+        results
+    }
+
+    fn local_export_declarations(&self, file: &ProjectFile, local_name: &str) -> Vec<CodeUnit> {
+        self.inner
+            .get_top_level_declarations(file)
+            .into_iter()
+            .filter(|unit| unit.identifier() == local_name)
+            .collect()
+    }
+
+    fn resolve_module_files_for_export(
+        &self,
+        importing_file: &ProjectFile,
+        module_specifier: &str,
+    ) -> Vec<ProjectFile> {
+        let resolved_module = if module_specifier.starts_with('.') {
+            resolve_python_relative_module(importing_file, module_specifier)
+        } else {
+            Some(module_specifier.to_string())
+        };
+        let Some(resolved_module) = resolved_module else {
+            return Vec::new();
+        };
+        // Tree-sitter tells us the import syntax, but module-to-file resolution
+        // is analyzer state. Use the prebuilt module code-unit map here instead
+        // of the usage index so interactive definition lookup stays lightweight.
+        self.resolve_module_code_unit(&resolved_module)
+            .map(|unit| vec![unit.source().clone()])
+            .unwrap_or_default()
     }
 }
 
