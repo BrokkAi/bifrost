@@ -1359,9 +1359,7 @@ fn extract_macro_name(node: Node<'_>, source: &str) -> Option<String> {
 }
 
 fn same_node(left: Node<'_>, right: Node<'_>) -> bool {
-    left.kind() == right.kind()
-        && left.start_byte() == right.start_byte()
-        && left.end_byte() == right.end_byte()
+    left.id() == right.id()
 }
 
 fn has_matching_declaration(
