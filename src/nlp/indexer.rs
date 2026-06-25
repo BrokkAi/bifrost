@@ -188,7 +188,11 @@ impl SemanticIndexer {
     /// the indexer's terminal error.
     pub fn wait_ready(&self, timeout: Duration) -> Result<(), String> {
         let deadline = std::time::Instant::now() + timeout;
-        let mut phase = self.shared.phase.lock().expect("semantic indexer mutex poisoned");
+        let mut phase = self
+            .shared
+            .phase
+            .lock()
+            .expect("semantic indexer mutex poisoned");
         loop {
             match &*phase {
                 Phase::Failed(message) => {
@@ -254,7 +258,10 @@ impl SemanticIndexer {
     pub fn close(&self) {
         mark_closed(&self.shared);
         self.tx.send(IndexerMsg::Shutdown).ok();
-        self.join.lock().expect("semantic indexer mutex poisoned").take();
+        self.join
+            .lock()
+            .expect("semantic indexer mutex poisoned")
+            .take();
     }
 }
 
@@ -262,7 +269,10 @@ impl Drop for SemanticIndexer {
     fn drop(&mut self) {
         mark_closed(&self.shared);
         self.tx.send(IndexerMsg::Shutdown).ok();
-        self.join.lock().expect("semantic indexer mutex poisoned").take();
+        self.join
+            .lock()
+            .expect("semantic indexer mutex poisoned")
+            .take();
     }
 }
 
@@ -279,7 +289,10 @@ fn mark_closed(shared: &Shared) {
         return;
     }
     shared.pending.store(0, Ordering::SeqCst);
-    let mut phase = shared.phase.lock().expect("semantic indexer mutex poisoned");
+    let mut phase = shared
+        .phase
+        .lock()
+        .expect("semantic indexer mutex poisoned");
     *phase = Phase::Closed;
     shared.cond.notify_all();
 }
@@ -311,8 +324,10 @@ fn worker_loop(
         if shared.closed.load(Ordering::SeqCst) {
             return;
         }
-        *shared.phase.lock().expect("semantic indexer mutex poisoned") =
-            Phase::Failed(message);
+        *shared
+            .phase
+            .lock()
+            .expect("semantic indexer mutex poisoned") = Phase::Failed(message);
         shared.pending.store(0, Ordering::SeqCst);
         shared.cond.notify_all();
     };
@@ -360,9 +375,14 @@ fn worker_loop(
                 done.send(run_gc(&store, &repo)).ok();
                 continue;
             }
-            IndexerMsg::FullBuild(snapshot) => {
-                full_build(&shared, &store, embedder.as_ref(), &repo, &snapshot, &active)
-            }
+            IndexerMsg::FullBuild(snapshot) => full_build(
+                &shared,
+                &store,
+                embedder.as_ref(),
+                &repo,
+                &snapshot,
+                &active,
+            ),
             IndexerMsg::Update(snapshot, changed) => update_files(
                 &shared,
                 &store,
@@ -382,7 +402,10 @@ fn worker_loop(
         }
         if !first_build_done {
             first_build_done = true;
-            let mut phase = shared.phase.lock().expect("semantic indexer mutex poisoned");
+            let mut phase = shared
+                .phase
+                .lock()
+                .expect("semantic indexer mutex poisoned");
             if matches!(*phase, Phase::Starting) {
                 *phase = Phase::Ready;
             }
@@ -405,8 +428,7 @@ fn full_build(
     let files: Vec<ProjectFile> = analyzer.analyzed_files().cloned().collect();
     let rel_paths: Vec<String> = files.iter().map(rel_path_string).collect();
 
-    let path_to_oid = gitcache::working_tree_oids(repo, &rel_paths)
-        .map_err(BuildError::Failed)?;
+    let path_to_oid = gitcache::working_tree_oids(repo, &rel_paths).map_err(BuildError::Failed)?;
     materialize_missing(shared, store, embedder, analyzer, &files, &path_to_oid)?;
 
     check_cancelled(shared)?;
@@ -440,9 +462,16 @@ fn update_files(
     }
 
     let rel_paths: Vec<String> = changed_files.iter().map(rel_path_string).collect();
-    let path_to_oid = gitcache::working_tree_oids_targeted(repo, &rel_paths)
-        .map_err(BuildError::Failed)?;
-    materialize_missing(shared, store, embedder, analyzer, &changed_files, &path_to_oid)?;
+    let path_to_oid =
+        gitcache::working_tree_oids_targeted(repo, &rel_paths).map_err(BuildError::Failed)?;
+    materialize_missing(
+        shared,
+        store,
+        embedder,
+        analyzer,
+        &changed_files,
+        &path_to_oid,
+    )?;
 
     check_cancelled(shared)?;
     if let Some(index) = active.write().expect("active index lock poisoned").as_mut() {
@@ -468,7 +497,9 @@ fn materialize_missing(
     for file in files {
         let rel = rel_path_string(file);
         if let Some(oid) = path_to_oid.get(&rel) {
-            oid_to_file.entry(oid.clone()).or_insert_with(|| file.clone());
+            oid_to_file
+                .entry(oid.clone())
+                .or_insert_with(|| file.clone());
         }
     }
     let oids: Vec<String> = oid_to_file.keys().cloned().collect();

@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use brokk_bifrost::nlp::engine::{Embedder, FakeHashEmbedder};
 use brokk_bifrost::nlp::indexer::{EngineProvider, FakeEngineProvider, SemanticIndexer};
-use brokk_bifrost::nlp::query::{SemanticSearchResult, SemanticSearchParams, semantic_search};
+use brokk_bifrost::nlp::query::{SemanticSearchParams, SemanticSearchResult, semantic_search};
 use brokk_bifrost::{AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer};
 
 fn all_legs_empty(result: &SemanticSearchResult) -> bool {
@@ -301,8 +301,7 @@ fn revert_reuses_cached_blob_vectors() {
     let dir = tempfile::tempdir().unwrap();
     let original =
         "public class Greeter {\n  public String greet(String name) { return name; }\n}\n";
-    let edited =
-        "public class Greeter {\n  public String greet(String name) { return \"hi \" + name; }\n}\n";
+    let edited = "public class Greeter {\n  public String greet(String name) { return \"hi \" + name; }\n}\n";
     write_java(dir.path(), "Greeter.java", original);
     init_git(dir.path());
     let snapshot = snapshot_for(dir.path());
