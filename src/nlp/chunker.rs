@@ -62,6 +62,9 @@ pub fn extract_file_chunks(
     count_tokens: &dyn Fn(&str) -> usize,
 ) -> FileChunks {
     let file_path = rel_path_string(file);
+    // Minified/generated bundles (single 100KB+ lines) are rejected upstream at the
+    // tree-sitter parse site (`is_unparseable_source`), so they reach here with no
+    // declarations and naturally produce zero chunks — no special-casing needed.
     let summary_text = file_summary_or_symbols(analyzer, file, count_tokens);
 
     let mut chunks = Vec::new();

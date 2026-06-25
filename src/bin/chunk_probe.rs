@@ -18,22 +18,24 @@ fn main() -> Result<(), String> {
     use std::time::Instant;
 
     use brokk_bifrost::{
-        AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer,
-        nlp::bm25::fts_text, nlp::chunker::extract_file_chunks,
+        AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer, nlp::bm25::fts_text,
+        nlp::chunker::extract_file_chunks,
     };
 
     let root = std::env::args_os()
         .nth(1)
         .map(PathBuf::from)
         .ok_or("usage: chunk_probe <repo-root>")?;
-    let warn_ms: u128 = std::env::var("WARN_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(500);
+    let warn_ms: u128 = std::env::var("WARN_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(500);
 
     // If BIFROST_PROBE_TOKENIZER points at a tokenizer.json, use the *real* BPE
     // tokenizer for count_tokens (reproduces the production hang). Otherwise fall
     // back to a cheap word count (analyzer-only test).
     let real_tok = std::env::var("BIFROST_PROBE_TOKENIZER").ok().map(|p| {
-        tokenizers::Tokenizer::from_file(&p)
-            .unwrap_or_else(|e| panic!("load tokenizer {p}: {e}"))
+        tokenizers::Tokenizer::from_file(&p).unwrap_or_else(|e| panic!("load tokenizer {p}: {e}"))
     });
 
     eprintln!("[probe] building workspace for {}", root.display());
@@ -42,7 +44,10 @@ fn main() -> Result<(), String> {
     let snapshot = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
     let analyzer = snapshot.analyzer();
     let files: Vec<_> = analyzer.analyzed_files().cloned().collect();
-    eprintln!("[probe] {} analyzed files; timing extract_file_chunks each", files.len());
+    eprintln!(
+        "[probe] {} analyzed files; timing extract_file_chunks each",
+        files.len()
+    );
 
     // Cheap, bounded token estimate (whitespace words) unless a real tokenizer was
     // provided. If extraction hangs with the cheap one, the spin is in the analyzer;
@@ -63,6 +68,16 @@ fn main() -> Result<(), String> {
         let t = Instant::now();
         let chunks = extract_file_chunks(analyzer, file, &count_tokens);
         let ms = t.elapsed().as_millis();
+        {
+            let mut h = stderr.lock();
+            let _ = writeln!(
+                h,
+                "[probe] extract-done {i} ({}ms, {} chunks)",
+                ms,
+                chunks.chunks.len()
+            );
+            let _ = h.flush();
+        }
         if ms >= warn_ms {
             eprintln!(
                 "[probe] SLOW-EXTRACT {ms}ms {} ({} chunks)",

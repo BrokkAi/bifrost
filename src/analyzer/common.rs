@@ -1,14 +1,26 @@
 use crate::analyzer::{CodeUnit, Language, ProjectFile};
 
-/// Longest single line a source file may contain before tree-sitter parsing is
-/// skipped, from `BIFROST_MAX_LINE_LENGTH` (unset = no limit). Minified/generated
-/// single-line bundles (e.g. committed webpack output) otherwise livelock the
-/// parser. 20000 mirrors VS Code's `editor.maxTokenizationLineLength`.
+/// Default longest single line a source file may contain before tree-sitter parsing is
+/// skipped. Minified/generated single-line bundles (committed webpack output, mermaid.min.js,
+/// etc.) have 100KB+ lines and otherwise both livelock the parser and explode downstream
+/// consumers (e.g. the semantic indexer extracting thousands of bogus chunks). Hand-written
+/// and normally-formatted generated source stays far below this, so the cap is effectively
+/// invisible to real code. 50000 matches the diff long-line threshold used elsewhere and sits
+/// well above VS Code's 20000 `editor.maxTokenizationLineLength`.
+pub(crate) const DEFAULT_MAX_LINE_LENGTH: usize = 50_000;
+
+/// Longest single line a source file may contain before tree-sitter parsing is skipped.
+/// Defaults to [`DEFAULT_MAX_LINE_LENGTH`]; `BIFROST_MAX_LINE_LENGTH` overrides it, and an
+/// explicit `0` disables the limit entirely (parse everything, at your own risk).
 pub(crate) fn max_line_length_limit() -> Option<usize> {
-    std::env::var("BIFROST_MAX_LINE_LENGTH")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|&n| n > 0)
+    match std::env::var("BIFROST_MAX_LINE_LENGTH") {
+        Ok(v) => match v.trim().parse::<usize>() {
+            Ok(0) => None,
+            Ok(n) => Some(n),
+            Err(_) => Some(DEFAULT_MAX_LINE_LENGTH),
+        },
+        Err(_) => Some(DEFAULT_MAX_LINE_LENGTH),
+    }
 }
 
 /// Whether `source` must NOT be handed to tree-sitter: it is binary (contains NUL
@@ -100,8 +112,23 @@ pub(crate) fn is_scala_object_like(target: &CodeUnit) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::display_symbol_name;
+    use super::{DEFAULT_MAX_LINE_LENGTH, display_symbol_name, is_unparseable_source};
     use crate::analyzer::Language;
+
+    #[test]
+    fn minified_and_binary_sources_are_unparseable_by_default() {
+        // Assumes BIFROST_MAX_LINE_LENGTH is unset (the normal test environment), so the
+        // default cap applies. A single line past the cap = minified bundle = skip.
+        let minified = format!("var x=1;{}", "a".repeat(DEFAULT_MAX_LINE_LENGTH + 1));
+        assert!(is_unparseable_source(&minified));
+
+        // Normal multi-line source stays parseable.
+        let normal: String = (0..2000).map(|i| format!("let v{i} = {i};\n")).collect();
+        assert!(!is_unparseable_source(&normal));
+
+        // NUL bytes => binary => unparseable regardless of line length.
+        assert!(is_unparseable_source("fn main() {\0}"));
+    }
 
     #[test]
     fn display_symbol_name_normalizes_scala_and_csharp_user_facing_names() {
