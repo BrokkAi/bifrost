@@ -631,7 +631,7 @@ fn rust_call_expression_type_fqn(
         analyzer,
         support,
         file,
-        rust_named_candidates(support, file, &name),
+        rust_callable_candidates(analyzer, support, file, &name, function.start_byte()),
         mode,
         cache,
     )
@@ -1040,6 +1040,23 @@ fn rust_named_candidates(
     candidates.extend(support.fqn(name));
     sort_units(&mut candidates);
     candidates.dedup();
+    candidates
+}
+
+fn rust_callable_candidates(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    name: &str,
+    reference_byte: usize,
+) -> Vec<CodeUnit> {
+    let mut candidates = rust_named_candidates(support, file, name);
+    if candidates.is_empty()
+        && let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer)
+    {
+        candidates =
+            rust_imported_export_candidates(rust, support, file, name, Some(reference_byte));
+    }
     candidates
 }
 

@@ -2000,6 +2000,75 @@ pub fn run(service: Service) {
 }
 
 #[test]
+fn rust_typed_receiver_method_resolves_src_module_definition() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .file(
+            "src/lib.rs",
+            r#"
+pub mod service;
+
+pub use service::{MemoryRepository, Service, build_service};
+
+pub fn run_demo() -> String {
+    let repository = MemoryRepository::default();
+    let service = build_service(repository);
+    service.execute(" Grace ")
+}
+"#,
+        )
+        .file(
+            "src/service.rs",
+            r#"
+#[derive(Default)]
+pub struct MemoryRepository;
+
+pub struct Service {
+    repository: MemoryRepository,
+}
+
+impl Service {
+    pub fn new(repository: MemoryRepository) -> Self {
+        Self { repository }
+    }
+
+    pub fn execute(self, name: &str) -> String {
+        name.trim().to_string()
+    }
+}
+
+pub fn build_service(repository: MemoryRepository) -> Service {
+    Service::new(repository)
+}
+"#,
+        )
+        .build();
+
+    let line = r#"    service.execute(" Grace ")"#;
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/lib.rs","line":9,"column":{}}}]}}"#,
+            column_of(line, "execute")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "service.Service.execute",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["path"], "src/service.rs",
+        "{value}"
+    );
+}
+
+#[test]
 fn rust_unproven_receiver_method_does_not_guess_same_named_method() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(
