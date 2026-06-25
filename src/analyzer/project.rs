@@ -39,6 +39,23 @@ pub trait Project: Send + Sync {
     fn analyzable_files(&self, language: Language) -> io::Result<BTreeSet<ProjectFile>>;
     fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile>;
 
+    fn file_by_abs_path(&self, abs_path: &Path) -> Option<ProjectFile> {
+        let rel_path = abs_path.strip_prefix(self.root()).ok()?;
+        self.file_by_rel_path(rel_path)
+    }
+
+    fn file_by_abs_path_allow_missing(&self, abs_path: &Path) -> Option<ProjectFile> {
+        let rel_path = abs_path.strip_prefix(self.root()).ok()?;
+        Some(ProjectFile::new(
+            self.root().to_path_buf(),
+            rel_path.to_path_buf(),
+        ))
+    }
+
+    fn persistence_root(&self) -> Option<&Path> {
+        Some(self.root())
+    }
+
     fn is_gitignored(&self, _rel_path: &Path) -> bool {
         false
     }
@@ -298,6 +315,132 @@ impl Project for FileSetProject {
     }
 }
 
+/// A [`Project`] backed by several filesystem roots. File enumeration is
+/// delegated to each root's own [`FilesystemProject`] so root-local ignore files
+/// still decide what belongs to the analyzer.
+#[derive(Debug, Clone)]
+pub struct MultiRootProject {
+    root: PathBuf,
+    roots: Vec<FilesystemProject>,
+}
+
+impl MultiRootProject {
+    pub fn new(roots: impl IntoIterator<Item = PathBuf>) -> io::Result<Self> {
+        let mut roots = roots
+            .into_iter()
+            .map(|root| root.canonicalize())
+            .collect::<io::Result<Vec<_>>>()?;
+        roots.sort();
+        roots.dedup();
+        if roots.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "multi-root project requires at least one root",
+            ));
+        }
+
+        let root = common_ancestor(&roots).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "multi-root project roots do not share a filesystem ancestor",
+            )
+        })?;
+        let roots = roots
+            .iter()
+            .map(FilesystemProject::new)
+            .collect::<io::Result<Vec<_>>>()?;
+        Ok(Self { root, roots })
+    }
+
+    fn common_file_for_root_file(&self, file: ProjectFile) -> ProjectFile {
+        let rel_path = file
+            .abs_path()
+            .strip_prefix(&self.root)
+            .expect("workspace root should be under common ancestor")
+            .to_path_buf();
+        ProjectFile::new(self.root.clone(), rel_path)
+    }
+}
+
+impl Project for MultiRootProject {
+    fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn analyzer_languages(&self) -> BTreeSet<Language> {
+        self.all_files()
+            .map(|files| {
+                files
+                    .iter()
+                    .map(language_for_file)
+                    .filter(|language| *language != Language::None)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>> {
+        let mut files = BTreeSet::new();
+        for root in &self.roots {
+            for file in root.all_files()? {
+                files.insert(self.common_file_for_root_file(file));
+            }
+        }
+        Ok(files)
+    }
+
+    fn analyzable_files(&self, language: Language) -> io::Result<BTreeSet<ProjectFile>> {
+        Ok(self
+            .all_files()?
+            .iter()
+            .filter(|file| language_for_file(file) == language)
+            .cloned()
+            .collect())
+    }
+
+    fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile> {
+        self.file_by_abs_path(&self.root.join(rel_path))
+    }
+
+    fn file_by_abs_path(&self, abs_path: &Path) -> Option<ProjectFile> {
+        for root in &self.roots {
+            let Ok(root_rel_path) = abs_path.strip_prefix(root.root()) else {
+                continue;
+            };
+            if let Some(file) = root.file_by_rel_path(root_rel_path) {
+                return Some(self.common_file_for_root_file(file));
+            }
+        }
+        None
+    }
+
+    fn file_by_abs_path_allow_missing(&self, abs_path: &Path) -> Option<ProjectFile> {
+        let rel_path = abs_path.strip_prefix(&self.root).ok()?;
+        for root in &self.roots {
+            if abs_path.strip_prefix(root.root()).is_ok() {
+                return Some(ProjectFile::new(self.root.clone(), rel_path.to_path_buf()));
+            }
+        }
+        None
+    }
+
+    fn persistence_root(&self) -> Option<&Path> {
+        None
+    }
+}
+
+fn common_ancestor(paths: &[PathBuf]) -> Option<PathBuf> {
+    let mut ancestor = paths[0].clone();
+    for path in &paths[1..] {
+        while !path.starts_with(&ancestor) {
+            if !ancestor.pop() {
+                return None;
+            }
+        }
+    }
+    Some(ancestor)
+}
+
 fn collect_project_files(root: &Path) -> io::Result<BTreeSet<ProjectFile>> {
     let mut files = BTreeSet::new();
     let walker = WalkBuilder::new(root)
@@ -476,6 +619,18 @@ impl Project for OverlayProject {
 
     fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile> {
         self.delegate.file_by_rel_path(rel_path)
+    }
+
+    fn file_by_abs_path(&self, abs_path: &Path) -> Option<ProjectFile> {
+        self.delegate.file_by_abs_path(abs_path)
+    }
+
+    fn file_by_abs_path_allow_missing(&self, abs_path: &Path) -> Option<ProjectFile> {
+        self.delegate.file_by_abs_path_allow_missing(abs_path)
+    }
+
+    fn persistence_root(&self) -> Option<&Path> {
+        self.delegate.persistence_root()
     }
 
     fn is_gitignored(&self, rel_path: &Path) -> bool {

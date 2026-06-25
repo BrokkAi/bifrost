@@ -150,7 +150,7 @@ fn resolve_item_code_unit(
         .and_then(|value| value.as_str())
         .unwrap_or_else(|| item.uri.as_str());
     let uri: Uri = uri.parse().ok()?;
-    let file = project_file_for_uri(project.root(), &uri)?;
+    let file = project_file_for_uri(project, &uri)?;
 
     analyzer
         .declarations(&file)

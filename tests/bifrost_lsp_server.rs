@@ -95,6 +95,389 @@ fn bifrost_lsp_server_handles_initialize_and_shutdown() {
 }
 
 #[test]
+fn bifrost_lsp_server_indexes_all_startup_workspace_folders() {
+    let temp = TempDir::new().expect("tempdir");
+    let parent = temp.path().canonicalize().expect("canon temp");
+    let root_a = parent.join("service-a");
+    let root_b = parent.join("service-b");
+    fs::create_dir_all(&root_a).expect("create service-a");
+    fs::create_dir_all(&root_b).expect("create service-b");
+    let alpha_path = root_a.join("Alpha.java");
+    let beta_path = root_b.join("Beta.java");
+    fs::write(
+        &alpha_path,
+        "class AlphaRoot {\n    void alphaOnly() {}\n}\n",
+    )
+    .expect("write Alpha.java");
+    fs::write(&beta_path, "class BetaRoot {\n    void betaOnly() {}\n}\n")
+        .expect("write Beta.java");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(&parent)
+        .arg("--server")
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bifrost");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "processId": null,
+                "rootUri": null,
+                "workspaceFolders": [
+                    {"uri": uri_for(&root_a), "name": "service-a"},
+                    {"uri": uri_for(&root_b), "name": "service-b"}
+                ],
+                "capabilities": {"workspace": {"workspaceFolders": true}}
+            }
+        }),
+    );
+    let initialize = read_message(&mut reader, &mut stderr);
+    assert_eq!(initialize["id"], 1);
+    assert_eq!(
+        initialize["result"]["capabilities"]["workspace"]["workspaceFolders"]["supported"], true,
+        "workspace folder support should be advertised: {initialize}"
+    );
+    assert!(
+        initialize["result"]["capabilities"]["workspace"]["workspaceFolders"]
+            .get("changeNotifications")
+            .is_none(),
+        "dynamic workspace folder changes should not be advertised: {initialize}"
+    );
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "workspace/symbol",
+            "params": {"query": "Only"}
+        }),
+    );
+    let symbols_response = read_message(&mut reader, &mut stderr);
+    let symbols = symbols_response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected workspace symbols, got {symbols_response}"));
+    assert!(
+        symbols.iter().any(|symbol| symbol["name"] == "alphaOnly"),
+        "expected alphaOnly from first root in {symbols:#?}"
+    );
+    assert!(
+        symbols.iter().any(|symbol| symbol["name"] == "betaOnly"),
+        "expected betaOnly from second root in {symbols:#?}"
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "textDocument/documentSymbol",
+            "params": {"textDocument": {"uri": uri_for(&beta_path)}}
+        }),
+    );
+    let document_symbols_response = read_message(&mut reader, &mut stderr);
+    assert_eq!(
+        document_symbols_response["id"], 3,
+        "expected documentSymbol response: {document_symbols_response}"
+    );
+    let document_symbols = document_symbols_response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected document symbols, got {document_symbols_response}"));
+    assert!(
+        document_symbols
+            .iter()
+            .any(|symbol| symbol["name"] == "BetaRoot"),
+        "expected BetaRoot document symbol from second root in {document_symbols:#?}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_indexes_new_file_in_second_workspace_folder() {
+    let temp = TempDir::new().expect("tempdir");
+    let parent = temp.path().canonicalize().expect("canon temp");
+    let root_a = parent.join("service-a");
+    let root_b = parent.join("service-b");
+    fs::create_dir_all(&root_a).expect("create service-a");
+    fs::create_dir_all(&root_b).expect("create service-b");
+    fs::write(
+        root_a.join("Alpha.java"),
+        "class AlphaRoot {\n    void alphaOnly() {}\n}\n",
+    )
+    .expect("write Alpha.java");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(&parent)
+        .arg("--server")
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bifrost");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+    let beta_path = root_b.join("Beta.java");
+    let beta_uri = uri_for(&beta_path);
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "processId": null,
+                "rootUri": null,
+                "workspaceFolders": [
+                    {"uri": uri_for(&root_a), "name": "service-a"},
+                    {"uri": uri_for(&root_b), "name": "service-b"}
+                ],
+                "capabilities": {}
+            }
+        }),
+    );
+    let initialize = read_message(&mut reader, &mut stderr);
+    assert_eq!(initialize["id"], 1);
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+    );
+
+    fs::write(
+        &beta_path,
+        "class BetaRoot {\n    void betaCreatedLater() {}\n}\n",
+    )
+    .expect("write Beta.java");
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "workspace/didChangeWatchedFiles",
+            "params": {
+                "changes": [{"uri": beta_uri, "type": 1}]
+            }
+        }),
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "workspace/symbol",
+            "params": {"query": "betaCreatedLater"}
+        }),
+    );
+    let response = read_message(&mut reader, &mut stderr);
+    let symbols = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected workspace symbols, got {response}"));
+    assert!(
+        symbols
+            .iter()
+            .any(|symbol| symbol["name"] == "betaCreatedLater"),
+        "expected newly created second-root symbol in {symbols:#?}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_watched_delete_removes_workspace_symbol() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("Watch.java");
+    fs::write(&file_path, "class Watch {\n    void removedLater() {}\n}\n")
+        .expect("write Watch.java");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(&root)
+        .arg("--server")
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bifrost");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+    let file_uri = uri_for(&file_path);
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"processId": null, "rootUri": uri_for(&root), "capabilities": {}}
+        }),
+    );
+    let initialize = read_message(&mut reader, &mut stderr);
+    assert_eq!(initialize["id"], 1);
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "workspace/symbol",
+            "params": {"query": "removedLater"}
+        }),
+    );
+    let before = read_message(&mut reader, &mut stderr);
+    let before_symbols = before["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected workspace symbols, got {before}"));
+    assert!(
+        before_symbols
+            .iter()
+            .any(|symbol| symbol["name"] == "removedLater"),
+        "expected symbol before delete in {before_symbols:#?}"
+    );
+
+    fs::remove_file(&file_path).expect("delete Watch.java");
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "workspace/didChangeWatchedFiles",
+            "params": {
+                "changes": [{"uri": file_uri, "type": 3}]
+            }
+        }),
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "workspace/symbol",
+            "params": {"query": "removedLater"}
+        }),
+    );
+    let after = read_message(&mut reader, &mut stderr);
+    let after_symbols = after["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected workspace symbols, got {after}"));
+    assert!(
+        !after_symbols
+            .iter()
+            .any(|symbol| symbol["name"] == "removedLater"),
+        "deleted file symbol should be gone, got {after_symbols:#?}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_falls_back_to_root_uri_when_workspace_folders_null() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("Fallback.java");
+    fs::write(
+        &file_path,
+        "class FallbackRoot {\n    void fallbackOnly() {}\n}\n",
+    )
+    .expect("write Fallback.java");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(root.join("unused-fallback"))
+        .arg("--server")
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bifrost");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "processId": null,
+                "rootUri": uri_for(&root),
+                "workspaceFolders": null,
+                "capabilities": {}
+            }
+        }),
+    );
+    let initialize = read_message(&mut reader, &mut stderr);
+    assert_eq!(initialize["id"], 1);
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "textDocument/documentSymbol",
+            "params": {"textDocument": {"uri": uri_for(&file_path)}}
+        }),
+    );
+    let response = read_message(&mut reader, &mut stderr);
+    assert_eq!(
+        response["id"], 2,
+        "expected documentSymbol response: {response}"
+    );
+    let symbols = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected document symbols, got {response}"));
+    assert!(
+        symbols
+            .iter()
+            .any(|symbol| symbol["name"] == "FallbackRoot"),
+        "expected rootUri-backed document symbol in {symbols:#?}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
 fn bifrost_lsp_server_reports_cold_start_progress_when_client_supports_it() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().canonicalize().expect("canon temp");

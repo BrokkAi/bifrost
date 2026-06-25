@@ -81,7 +81,7 @@ pub fn handle(
     params: &CompletionParams,
 ) -> Option<CompletionResponse> {
     let uri = &params.text_document_position.text_document.uri;
-    let project_file = project_file_for_uri(project.root(), uri)?;
+    let project_file = project_file_for_uri(project, uri)?;
     let abs_path = project_file.abs_path();
 
     // Overlay short-circuit: the mtime cache is keyed on disk mtime, which the

@@ -3,8 +3,9 @@
 //! `lsp-types` for protocol message shapes.
 //!
 //! `bifrost --server lsp` launches the server. The initial workspace is
-//! bootstrapped from `initialize.workspaceFolders[0]` when present; otherwise
-//! the `--root` path is used as a fallback.
+//! bootstrapped from every usable `initialize.workspaceFolders` entry when
+//! present; otherwise legacy root params and finally the `--root` path are used
+//! as fallbacks.
 
 mod capabilities;
 pub mod conversion;
