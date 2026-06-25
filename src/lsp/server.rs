@@ -12,7 +12,8 @@ use lsp_types::notification::{
     DidSaveTextDocument, Notification as LspNotificationTrait, Progress, PublishDiagnostics,
 };
 use lsp_types::request::{
-    Completion, DocumentDiagnosticRequest, DocumentHighlightRequest, DocumentSymbolRequest,
+    CallHierarchyIncomingCalls, CallHierarchyOutgoingCalls, CallHierarchyPrepare, Completion,
+    DocumentDiagnosticRequest, DocumentHighlightRequest, DocumentSymbolRequest,
     FoldingRangeRequest, GotoDefinition, HoverRequest, References, Request as LspRequestTrait,
     TypeHierarchyPrepare, TypeHierarchySubtypes, TypeHierarchySupertypes, WorkDoneProgressCreate,
     WorkspaceSymbolRequest,
@@ -37,8 +38,8 @@ use crate::lsp::handlers::util::{
     project_file_for_uri_allow_missing as resolve_project_file_allow_missing,
 };
 use crate::lsp::handlers::{
-    completion, definition, diagnostic, document_highlight, document_symbol, folding_range, hover,
-    references, type_hierarchy, workspace_symbol,
+    call_hierarchy, completion, definition, diagnostic, document_highlight, document_symbol,
+    folding_range, hover, references, type_hierarchy, workspace_symbol,
 };
 
 /// Run the LSP server over stdio. `fallback_root` is used when the client does
@@ -106,6 +107,10 @@ fn server_capabilities_json() -> Result<serde_json::Value, String> {
         // ServerCapabilities field for this standard 3.17+ capability.
         object.insert(
             "typeHierarchyProvider".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        object.insert(
+            "callHierarchyProvider".to_string(),
             serde_json::Value::Bool(true),
         );
     }
@@ -396,6 +401,31 @@ fn handle_request(
         TypeHierarchySubtypes::METHOD => {
             decode_and_run::<TypeHierarchySubtypes, _>(req, |params| {
                 Ok(type_hierarchy::subtypes(
+                    &state.workspace,
+                    state.project(),
+                    &params,
+                ))
+            })
+        }
+        CallHierarchyPrepare::METHOD => decode_and_run::<CallHierarchyPrepare, _>(req, |params| {
+            Ok(call_hierarchy::prepare(
+                &state.workspace,
+                state.project(),
+                &params,
+            ))
+        }),
+        CallHierarchyIncomingCalls::METHOD => {
+            decode_and_run::<CallHierarchyIncomingCalls, _>(req, |params| {
+                Ok(call_hierarchy::incoming_calls(
+                    &state.workspace,
+                    state.project(),
+                    &params,
+                ))
+            })
+        }
+        CallHierarchyOutgoingCalls::METHOD => {
+            decode_and_run::<CallHierarchyOutgoingCalls, _>(req, |params| {
+                Ok(call_hierarchy::outgoing_calls(
                     &state.workspace,
                     state.project(),
                     &params,

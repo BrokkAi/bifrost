@@ -124,6 +124,20 @@ pub(crate) fn resolve_definition_batch(
         .collect()
 }
 
+pub(crate) fn resolve_definition_batch_with_source(
+    analyzer: &dyn IAnalyzer,
+    requests: Vec<DefinitionLookupRequest>,
+    file: ProjectFile,
+    source: Arc<String>,
+) -> Vec<DefinitionLookupOutcome> {
+    let mut context = DefinitionBatchContext::new(analyzer);
+    context.sources.insert(file, Ok(source));
+    requests
+        .into_iter()
+        .map(|request| resolve_one(analyzer, &mut context, request))
+        .collect()
+}
+
 struct DefinitionBatchContext<'a> {
     support: &'a DefinitionLookupIndex,
     sources: HashMap<ProjectFile, Result<Arc<String>, String>>,
