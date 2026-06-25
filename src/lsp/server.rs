@@ -27,20 +27,24 @@ use lsp_types::{
 
 use crate::analyzer::persistence::{AnalyzerStorage, default_db_path};
 use crate::analyzer::{
-    AnalyzerConfig, BuildProgressEvent, BuildProgressPhase, FilesystemProject, OverlayProject,
-    Project, WorkspaceAnalyzer,
+    AnalyzerConfig, BuildProgressEvent, BuildProgressPhase, FilesystemProject, MultiRootProject,
+    OverlayProject, Project, WorkspaceAnalyzer,
 };
 use crate::lsp::capabilities::server_capabilities;
 use crate::lsp::conversion::uri_to_path;
-use crate::lsp::handlers::util::project_file_for_uri as resolve_project_file;
+use crate::lsp::handlers::util::{
+    project_file_for_uri as resolve_project_file,
+    project_file_for_uri_allow_missing as resolve_project_file_allow_missing,
+};
 use crate::lsp::handlers::{
     completion, definition, diagnostic, document_highlight, document_symbol, folding_range, hover,
     references, type_hierarchy, workspace_symbol,
 };
 
 /// Run the LSP server over stdio. `fallback_root` is used when the client does
-/// not advertise a `workspaceFolders[0]`. Returns when the client sends
-/// `exit` (after the standard `shutdown` request) or the connection drops.
+/// not advertise usable workspace folders or legacy root params. Returns when
+/// the client sends `exit` (after the standard `shutdown` request) or the
+/// connection drops.
 pub fn run_lsp_stdio_server(fallback_root: PathBuf) -> Result<(), String> {
     let (connection, io_threads) = Connection::stdio();
     run_with_connection(connection, io_threads, fallback_root)
@@ -60,7 +64,7 @@ pub(crate) fn run_with_connection(
     let init_params: InitializeParams = serde_json::from_value(init_params_value)
         .map_err(|err| format!("Failed to decode InitializeParams: {err}"))?;
 
-    let workspace_root = pick_workspace_root(&init_params, fallback_root.as_path());
+    let workspace_roots = collect_workspace_roots(&init_params, fallback_root.as_path());
     let progress = if supports_work_done_progress {
         StartupProgress::create(&connection, "bifrost-startup-index".to_string())?
     } else {
@@ -71,7 +75,7 @@ pub(crate) fn run_with_connection(
         progress.begin("Indexing workspace")?;
     }
 
-    let state_result = ServerState::new(workspace_root, progress.as_ref());
+    let state_result = ServerState::new(workspace_roots, progress.as_ref());
     if let Some(progress) = progress.as_ref() {
         let message = if state_result.is_ok() {
             "Indexing complete"
@@ -465,9 +469,7 @@ fn handle_notification(
                         DidOpenTextDocument::METHOD
                     )
                 })?;
-            if let Some(file) =
-                resolve_project_file(state.project().root(), &params.text_document.uri)
-            {
+            if let Some(file) = resolve_project_file(state.project(), &params.text_document.uri) {
                 state
                     .overlay
                     .set(file.abs_path(), params.text_document.text);
@@ -505,7 +507,7 @@ fn handle_notification(
                 .rev()
                 .find(|change| change.range.is_none())
                 .map(|change| change.text);
-            if let Some(file) = resolve_project_file(state.project().root(), &uri) {
+            if let Some(file) = resolve_project_file(state.project(), &uri) {
                 match full_text {
                     Some(text) => {
                         state.overlay.set(file.abs_path(), text);
@@ -539,9 +541,7 @@ fn handle_notification(
                         DidCloseTextDocument::METHOD
                     )
                 })?;
-            if let Some(file) =
-                resolve_project_file(state.project().root(), &params.text_document.uri)
-            {
+            if let Some(file) = resolve_project_file(state.project(), &params.text_document.uri) {
                 // Only reparse if we actually had an overlay — close without a
                 // prior open is a spec-permitted nop (e.g. some clients send it
                 // for files the server never opened).
@@ -568,9 +568,7 @@ fn handle_notification(
                         DidSaveTextDocument::METHOD
                     )
                 })?;
-            if let Some(file) =
-                resolve_project_file(state.project().root(), &params.text_document.uri)
-            {
+            if let Some(file) = resolve_project_file(state.project(), &params.text_document.uri) {
                 // Drop completion's mtime-cached content first — the save just
                 // bumped the file's mtime, but we want the next completion
                 // request to refresh from disk even if the editor's mtime is
@@ -612,7 +610,8 @@ fn handle_notification(
                 if matches!(
                     change.typ,
                     FileChangeType::CREATED | FileChangeType::CHANGED | FileChangeType::DELETED
-                ) && let Some(file) = resolve_project_file(state.project().root(), &change.uri)
+                ) && let Some(file) =
+                    resolve_project_file_allow_missing(state.project(), &change.uri)
                 {
                     state.completion_cache.invalidate(&file.abs_path());
                     changed.insert(file);
@@ -685,15 +684,25 @@ const MALFORMED_DIDCHANGE_LOG_THROTTLE: Duration = Duration::from_secs(60);
 const MALFORMED_DIDCHANGE_LOG_MAX_ENTRIES: usize = 256;
 
 impl ServerState {
-    fn new(root: PathBuf, progress: Option<&StartupProgress>) -> Result<Self, String> {
-        let filesystem: Arc<dyn Project> =
+    fn new(roots: Vec<PathBuf>, progress: Option<&StartupProgress>) -> Result<Self, String> {
+        let project: Arc<dyn Project> = if roots.len() == 1 {
+            let root = roots
+                .into_iter()
+                .next()
+                .expect("single-root state should contain one root");
             Arc::new(FilesystemProject::new(&root).map_err(|err| {
                 format!(
                     "Failed to initialize project root {}: {err}",
                     root.display()
                 )
-            })?);
-        let overlay = Arc::new(OverlayProject::new(filesystem));
+            })?)
+        } else {
+            Arc::new(
+                MultiRootProject::new(roots)
+                    .map_err(|err| format!("Failed to initialize multi-root project: {err}"))?,
+            )
+        };
+        let overlay = Arc::new(OverlayProject::new(project));
         let project = Arc::clone(&overlay) as Arc<dyn Project>;
         let workspace = build_workspace_for_lsp(project, progress);
         Ok(Self {
@@ -756,7 +765,10 @@ fn build_workspace_for_lsp(
     match progress {
         Some(progress) => {
             let progress = progress.clone_for_callback();
-            match AnalyzerStorage::open(default_db_path(project.root()))
+            let Some(persistence_root) = project.persistence_root() else {
+                return WorkspaceAnalyzer::build(project, config);
+            };
+            match AnalyzerStorage::open(default_db_path(persistence_root))
                 .ok()
                 .map(Arc::new)
             {
@@ -773,25 +785,56 @@ fn build_workspace_for_lsp(
     }
 }
 
-fn pick_workspace_root(params: &InitializeParams, fallback: &Path) -> PathBuf {
-    if let Some(folders) = &params.workspace_folders
-        && let Some(first) = folders.first()
-        && let Some(path) = uri_to_path(&first.uri)
-    {
-        return path;
+fn collect_workspace_roots(params: &InitializeParams, fallback: &Path) -> Vec<PathBuf> {
+    if let Some(folders) = &params.workspace_folders {
+        let roots: Vec<PathBuf> = folders
+            .iter()
+            .filter_map(|folder| workspace_folder_path(&folder.uri))
+            .collect();
+        if !roots.is_empty() {
+            return roots;
+        }
     }
 
-    // `root_uri` and the long-deprecated `root_path` are still common.
+    // `root_uri` and the long-deprecated `root_path` are still common, and
+    // remain the fallback when no usable startup workspace folders were sent.
     #[allow(deprecated)]
     if let Some(uri) = &params.root_uri
         && let Some(path) = uri_to_path(uri)
     {
-        return path;
+        return vec![path];
     }
     #[allow(deprecated)]
     if let Some(root_path) = &params.root_path {
-        return PathBuf::from(root_path);
+        return vec![PathBuf::from(root_path)];
     }
 
-    fallback.to_path_buf()
+    vec![fallback.to_path_buf()]
+}
+
+fn workspace_folder_path(uri: &Uri) -> Option<PathBuf> {
+    let Some(path) = uri_to_path(uri) else {
+        eprintln!(
+            "[bifrost-lsp] ignoring non-file workspace folder URI: {}",
+            uri.as_str()
+        );
+        return None;
+    };
+    match path.canonicalize() {
+        Ok(path) if path.is_dir() => Some(path),
+        Ok(path) => {
+            eprintln!(
+                "[bifrost-lsp] ignoring workspace folder that is not a directory: {}",
+                path.display()
+            );
+            None
+        }
+        Err(err) => {
+            eprintln!(
+                "[bifrost-lsp] ignoring unavailable workspace folder {}: {err}",
+                path.display()
+            );
+            None
+        }
+    }
 }

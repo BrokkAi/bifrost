@@ -1,5 +1,3 @@
-use std::path::Path;
-
 use crate::analyzer::{CodeUnit, Project, ProjectFile, Range as ByteRange};
 use crate::lsp::conversion::{byte_range_to_lsp_range, uri_to_path};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
@@ -8,54 +6,97 @@ use lsp_types::{Range as LspRange, Uri};
 /// Resolve an LSP `Uri` to a [`ProjectFile`], read its contents (consulting
 /// `project.read_source` so unsaved overlays win over disk), and compute the
 /// line-start index — the prologue used by every per-file handler. Returns
-/// `None` if the URI doesn't map into the project root, or the file cannot be
-/// read.
+/// `None` if the URI doesn't map into the project, or the file cannot be read.
 pub fn read_document_for_uri(
     project: &dyn Project,
     uri: &Uri,
 ) -> Option<(ProjectFile, String, Vec<usize>)> {
-    let project_file = project_file_for_uri(project.root(), uri)?;
+    let project_file = project_file_for_uri(project, uri)?;
     let content = project.read_source(&project_file).ok()?;
     let line_starts = compute_line_starts(&content);
     Some((project_file, content, line_starts))
 }
 
-/// Resolve an LSP `Uri` to a [`ProjectFile`] inside `project_root`. Returns
-/// `None` for non-`file:` URIs or paths outside the project, logging a
-/// single-line stderr warning so users debugging "why is my LSP request
+/// Resolve an LSP `Uri` to a [`ProjectFile`] that belongs to `project`.
+/// Returns `None` for non-`file:` URIs or paths outside the project, logging
+/// a single-line stderr warning so users debugging "why is my LSP request
 /// returning empty" can see the cause.
-pub fn project_file_for_uri(project_root: &Path, uri: &Uri) -> Option<ProjectFile> {
-    let abs_path = match uri_to_path(uri) {
-        Some(path) => path,
-        None => {
-            eprintln!(
-                "[bifrost-lsp] ignoring non-file URI: {} (only file:// is supported)",
-                uri.as_str()
-            );
-            return None;
-        }
-    };
+pub fn project_file_for_uri(project: &dyn Project, uri: &Uri) -> Option<ProjectFile> {
+    let abs_path = path_for_file_uri(uri)?;
     // Canonicalize so Windows extended-length paths (`\\?\C:\…` produced by
     // FilesystemProject's canonicalize) line up with the URI-decoded path
     // (`C:/…`). Fall back to the as-is path when canonicalize fails — for
     // example, didChangeWatchedFiles DELETED events reference paths that no
     // longer exist on disk.
     let canonical = abs_path.canonicalize().unwrap_or_else(|_| abs_path.clone());
-    let rel_path = match canonical.strip_prefix(project_root) {
-        Ok(rel) => rel.to_path_buf(),
-        Err(_) => match abs_path.strip_prefix(project_root) {
-            Ok(rel) => rel.to_path_buf(),
-            Err(_) => {
-                eprintln!(
-                    "[bifrost-lsp] ignoring path outside project root: {} (root: {})",
-                    abs_path.display(),
-                    project_root.display()
-                );
-                return None;
-            }
-        },
-    };
-    Some(ProjectFile::new(project_root.to_path_buf(), rel_path))
+    if let Some(file) = project.file_by_abs_path(&canonical) {
+        return Some(file);
+    }
+    if let Some(file) = project.file_by_abs_path(&abs_path) {
+        return Some(file);
+    }
+    eprintln!(
+        "[bifrost-lsp] ignoring path outside project: {} (root: {})",
+        abs_path.display(),
+        project.root().display()
+    );
+    None
+}
+
+/// Resolve a URI to a project path even when the file no longer exists on disk.
+/// This is reserved for watched-file delete events: normal document handlers
+/// should use [`project_file_for_uri`] so they only read files that currently
+/// belong to the project.
+pub(crate) fn project_file_for_uri_allow_missing(
+    project: &dyn Project,
+    uri: &Uri,
+) -> Option<ProjectFile> {
+    let abs_path = path_for_file_uri(uri)?;
+    if let Some(file) = project.file_by_abs_path_allow_missing(&abs_path) {
+        return Some(file);
+    }
+    if let Some(canonical) = canonicalize_existing_prefix(&abs_path)
+        && canonical != abs_path
+        && let Some(file) = project.file_by_abs_path_allow_missing(&canonical)
+    {
+        return Some(file);
+    }
+    eprintln!(
+        "[bifrost-lsp] ignoring path outside project: {} (root: {})",
+        abs_path.display(),
+        project.root().display()
+    );
+    None
+}
+
+fn path_for_file_uri(uri: &Uri) -> Option<std::path::PathBuf> {
+    match uri_to_path(uri) {
+        Some(path) => Some(path),
+        None => {
+            eprintln!(
+                "[bifrost-lsp] ignoring non-file URI: {} (only file:// is supported)",
+                uri.as_str()
+            );
+            None
+        }
+    }
+}
+
+fn canonicalize_existing_prefix(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut current = path;
+    let mut suffix = std::path::PathBuf::new();
+
+    loop {
+        if let Ok(canonical) = current.canonicalize() {
+            return Some(canonical.join(suffix));
+        }
+
+        let name = current.file_name()?;
+        let mut new_suffix = std::path::PathBuf::from(name);
+        new_suffix.push(suffix);
+        suffix = new_suffix;
+        current = current.parent()?;
+    }
 }
 
 /// Extract the alphanumeric/underscore identifier surrounding `offset` in

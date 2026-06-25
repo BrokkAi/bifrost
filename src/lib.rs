@@ -38,10 +38,11 @@ pub use analyzer::{
     CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType, CppAnalyzer, DeclarationInfo,
     DeclarationKind, EmptyAnalyzer, FileSetProject, FilesystemProject, GoAnalyzer, IAnalyzer,
     ImportAnalysisProvider, ImportInfo, JavaAnalyzer, JavascriptAnalyzer, Language, MultiAnalyzer,
-    OverlayProject, ParseError, ParseErrorKind, PhpAnalyzer, Project, ProjectFile, PythonAnalyzer,
-    Range, RubyAnalyzer, RustAnalyzer, ScalaAnalyzer, SourceContent, TestAssertionSmell,
-    TestAssertionWeights, TestDetectionProvider, TestProject, TreeSitterAnalyzer,
-    TypeAliasProvider, TypeHierarchyProvider, TypescriptAnalyzer, WorkspaceAnalyzer,
+    MultiRootProject, OverlayProject, ParseError, ParseErrorKind, PhpAnalyzer, Project,
+    ProjectFile, PythonAnalyzer, Range, RubyAnalyzer, RustAnalyzer, ScalaAnalyzer, SourceContent,
+    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TestProject,
+    TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider, TypescriptAnalyzer,
+    WorkspaceAnalyzer,
 };
 pub use project_watcher::{ChangeDelta, ProjectChangeWatcher};
 pub use searchtools_service::{
