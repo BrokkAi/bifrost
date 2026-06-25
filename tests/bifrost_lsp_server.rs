@@ -1612,8 +1612,7 @@ fn bifrost_lsp_server_call_hierarchy_ignores_non_call_type_references() {
 
     let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
     let file_uri = uri_for(&file_path);
-    let service =
-        prepare_call_hierarchy(&mut stdin, &mut reader, &mut stderr, 30, &file_uri, 0, 6);
+    let service = prepare_call_hierarchy(&mut stdin, &mut reader, &mut stderr, 30, &file_uri, 0, 6);
     assert_eq!(service["name"], "Service", "prepared service: {service}");
 
     let incoming = call_hierarchy_relation(

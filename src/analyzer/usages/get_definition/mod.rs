@@ -46,6 +46,7 @@ use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use std::sync::Arc;
 use tree_sitter::{Node, Parser, Tree};
 
+mod call_sites;
 mod cpp;
 mod csharp;
 mod go;
@@ -55,6 +56,8 @@ mod php;
 mod python;
 mod rust;
 mod scala;
+
+pub(crate) use call_sites::{call_reference_ranges, is_call_reference_range};
 
 #[derive(Debug, Clone)]
 pub(crate) struct DefinitionLookupRequest {
