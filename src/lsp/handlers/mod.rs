@@ -1,9 +1,11 @@
+pub mod call_hierarchy;
 pub mod completion;
 pub mod definition;
 pub mod diagnostic;
 pub mod document_highlight;
 pub mod document_symbol;
 pub mod folding_range;
+pub(crate) mod hierarchy_support;
 pub mod hover;
 pub mod references;
 pub mod type_hierarchy;

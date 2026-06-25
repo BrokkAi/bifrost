@@ -54,6 +54,7 @@ pub(crate) use rust::{
 use std::sync::Arc;
 use tree_sitter::{Node, Parser, Tree};
 
+mod call_sites;
 mod cpp;
 mod csharp;
 mod go;
@@ -63,6 +64,8 @@ mod php;
 mod python;
 mod rust;
 mod scala;
+
+pub(crate) use call_sites::{call_reference_ranges, is_call_reference_range};
 
 #[derive(Debug, Clone)]
 pub(crate) struct DefinitionLookupRequest {
@@ -129,6 +132,20 @@ pub(crate) fn resolve_definition_batch(
     requests: Vec<DefinitionLookupRequest>,
 ) -> Vec<DefinitionLookupOutcome> {
     let mut context = DefinitionBatchContext::new(analyzer);
+    requests
+        .into_iter()
+        .map(|request| resolve_one(analyzer, &mut context, request))
+        .collect()
+}
+
+pub(crate) fn resolve_definition_batch_with_source(
+    analyzer: &dyn IAnalyzer,
+    requests: Vec<DefinitionLookupRequest>,
+    file: ProjectFile,
+    source: Arc<String>,
+) -> Vec<DefinitionLookupOutcome> {
+    let mut context = DefinitionBatchContext::new(analyzer);
+    context.sources.insert(file, Ok(source));
     requests
         .into_iter()
         .map(|request| resolve_one(analyzer, &mut context, request))

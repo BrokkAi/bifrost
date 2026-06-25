@@ -2,12 +2,14 @@ use lsp_types::{
     TypeHierarchyItem, TypeHierarchyPrepareParams, TypeHierarchySubtypesParams,
     TypeHierarchySupertypesParams, Uri,
 };
-use serde_json::json;
 
-use crate::analyzer::{CodeUnit, IAnalyzer, Project, Range as ByteRange, WorkspaceAnalyzer};
+use crate::analyzer::{CodeUnit, IAnalyzer, Project, WorkspaceAnalyzer};
 use crate::lsp::conversion::{path_to_uri_string, position_to_byte_offset};
 use crate::lsp::handlers::document_symbol::lsp_symbol_parts;
-use crate::lsp::handlers::util::{project_file_for_uri, read_document_for_uri};
+use crate::lsp::handlers::hierarchy_support::{
+    cursor_byte_range, hierarchy_item_data, resolve_hierarchy_item_code_unit,
+};
+use crate::lsp::handlers::util::read_document_for_uri;
 use crate::text_utils::compute_line_starts;
 
 pub fn prepare(
@@ -91,26 +93,6 @@ fn nearest_type_unit(analyzer: &dyn IAnalyzer, mut code_unit: CodeUnit) -> Optio
     }
 }
 
-fn cursor_byte_range(content: &str, offset: usize) -> ByteRange {
-    let start = offset.min(content.len());
-    let end = if start < content.len() {
-        start
-            + content[start..]
-                .chars()
-                .next()
-                .map(char::len_utf8)
-                .unwrap_or(0)
-    } else {
-        start
-    };
-    ByteRange {
-        start_byte: start,
-        end_byte: end,
-        start_line: 0,
-        end_line: 0,
-    }
-}
-
 fn type_hierarchy_item(
     analyzer: &dyn IAnalyzer,
     project: &dyn Project,
@@ -131,10 +113,7 @@ fn type_hierarchy_item(
         uri: uri.clone(),
         range: parts.range,
         selection_range: parts.selection_range,
-        data: Some(json!({
-            "fqName": code_unit.fq_name(),
-            "uri": uri.as_str(),
-        })),
+        data: Some(hierarchy_item_data(analyzer, code_unit, &uri)),
     })
 }
 
@@ -143,23 +122,7 @@ fn resolve_item_code_unit(
     project: &dyn Project,
     item: &TypeHierarchyItem,
 ) -> Option<CodeUnit> {
-    let data = item.data.as_ref()?;
-    let fq_name = data.get("fqName")?.as_str()?;
-    let uri = data
-        .get("uri")
-        .and_then(|value| value.as_str())
-        .unwrap_or_else(|| item.uri.as_str());
-    let uri: Uri = uri.parse().ok()?;
-    let file = project_file_for_uri(project, &uri)?;
-
-    analyzer
-        .declarations(&file)
-        .find(|candidate| candidate.fq_name() == fq_name)
-        .cloned()
-        .or_else(|| {
-            analyzer
-                .definitions(fq_name)
-                .find(|candidate| candidate.source() == &file)
-                .cloned()
-        })
+    resolve_hierarchy_item_code_unit(analyzer, project, item.data.as_ref(), &item.uri, |unit| {
+        unit.is_class()
+    })
 }

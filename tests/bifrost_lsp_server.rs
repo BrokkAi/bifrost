@@ -73,6 +73,10 @@ fn bifrost_lsp_server_handles_initialize_and_shutdown() {
         initialize["result"]["capabilities"]["typeHierarchyProvider"], true,
         "typeHierarchyProvider should be advertised: {initialize}"
     );
+    assert_eq!(
+        initialize["result"]["capabilities"]["callHierarchyProvider"], true,
+        "callHierarchyProvider should be advertised: {initialize}"
+    );
 
     write_message(
         &mut stdin,
@@ -1495,6 +1499,255 @@ fn bifrost_lsp_server_references_finds_class_a_usages() {
     drop(stdin);
     let status = child.wait().expect("wait bifrost");
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
+fn bifrost_lsp_server_call_hierarchy_finds_java_incoming_and_outgoing_calls() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("Calls.java");
+    fs::write(
+        &file_path,
+        "class Service {\n    static void target() {}\n}\nclass Caller {\n    void helper() {\n        Service.target();\n    }\n}\n",
+    )
+    .expect("write Java call hierarchy fixture");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+
+    let target = prepare_call_hierarchy(&mut stdin, &mut reader, &mut stderr, 10, &file_uri, 1, 16);
+    assert_eq!(target["name"], "target", "prepared target: {target}");
+
+    let incoming = call_hierarchy_relation(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        11,
+        "callHierarchy/incomingCalls",
+        target.clone(),
+    );
+    assert_eq!(incoming.len(), 1, "incoming calls: {incoming:#?}");
+    assert_eq!(
+        incoming[0]["from"]["name"], "helper",
+        "incoming caller should be helper: {incoming:#?}"
+    );
+    assert_call_range(&incoming[0]["fromRanges"], 5, 16, 22);
+
+    let helper = prepare_call_hierarchy(&mut stdin, &mut reader, &mut stderr, 12, &file_uri, 4, 10);
+    assert_eq!(helper["name"], "helper", "prepared helper: {helper}");
+
+    let outgoing = call_hierarchy_relation(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        13,
+        "callHierarchy/outgoingCalls",
+        helper,
+    );
+    assert!(
+        outgoing.iter().any(|call| call["to"]["name"] == "target"),
+        "outgoing calls should include target: {outgoing:#?}"
+    );
+    let target_call = outgoing
+        .iter()
+        .find(|call| call["to"]["name"] == "target")
+        .expect("target outgoing call");
+    assert_call_range(&target_call["fromRanges"], 5, 16, 22);
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_call_hierarchy_preserves_java_overload_identity() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("Overloads.java");
+    fs::write(
+        &file_path,
+        "class Service {\n    static void target() {}\n    static void target(String value) {}\n    static void stringCaller() {\n        target(\"x\");\n    }\n    static void noArgCaller() {\n        target();\n    }\n}\n",
+    )
+    .expect("write Java overload call hierarchy fixture");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+
+    let string_target =
+        prepare_call_hierarchy(&mut stdin, &mut reader, &mut stderr, 20, &file_uri, 2, 16);
+    assert_eq!(
+        string_target["detail"], "(String)",
+        "prepared overload should carry String signature: {string_target}"
+    );
+
+    let incoming = call_hierarchy_relation(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        21,
+        "callHierarchy/incomingCalls",
+        string_target,
+    );
+    let callers: Vec<_> = incoming
+        .iter()
+        .filter_map(|call| call["from"]["name"].as_str())
+        .collect();
+    assert_eq!(
+        callers,
+        vec!["stringCaller"],
+        "String overload should not include no-arg caller: {incoming:#?}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_call_hierarchy_ignores_non_call_type_references() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("TypeReference.java");
+    fs::write(
+        &file_path,
+        "class Service {}\nclass Caller {\n    void helper() {\n        Service value = null;\n    }\n}\n",
+    )
+    .expect("write Java type-reference call hierarchy fixture");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let service = prepare_call_hierarchy(&mut stdin, &mut reader, &mut stderr, 30, &file_uri, 0, 6);
+    assert_eq!(service["name"], "Service", "prepared service: {service}");
+
+    let incoming = call_hierarchy_relation(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        31,
+        "callHierarchy/incomingCalls",
+        service,
+    );
+    assert!(
+        incoming.is_empty(),
+        "type references without calls must not produce incoming call hierarchy edges: {incoming:#?}"
+    );
+
+    let helper = prepare_call_hierarchy(&mut stdin, &mut reader, &mut stderr, 30, &file_uri, 2, 10);
+
+    let outgoing = call_hierarchy_relation(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        32,
+        "callHierarchy/outgoingCalls",
+        helper,
+    );
+    assert!(
+        outgoing.is_empty(),
+        "type references without calls must not produce outgoing call hierarchy edges: {outgoing:#?}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_call_hierarchy_finds_qualified_java_constructor_calls() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let pkg_dir = root.join("pkg");
+    fs::create_dir(&pkg_dir).expect("create package dir");
+    let service_path = pkg_dir.join("Service.java");
+    fs::write(&service_path, "package pkg;\npublic class Service {}\n")
+        .expect("write Java service fixture");
+    let caller_path = root.join("Caller.java");
+    fs::write(
+        &caller_path,
+        "class Caller {\n    void helper() {\n        new pkg.Service();\n    }\n}\n",
+    )
+    .expect("write Java qualified constructor fixture");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let caller_uri = uri_for(&caller_path);
+    let helper =
+        prepare_call_hierarchy(&mut stdin, &mut reader, &mut stderr, 40, &caller_uri, 1, 10);
+
+    let outgoing = call_hierarchy_relation(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        41,
+        "callHierarchy/outgoingCalls",
+        helper,
+    );
+    assert!(
+        outgoing.iter().any(|call| call["to"]["name"] == "Service"),
+        "qualified constructor calls should produce outgoing class edges: {outgoing:#?}"
+    );
+    let service_call = outgoing
+        .iter()
+        .find(|call| call["to"]["name"] == "Service")
+        .expect("Service outgoing call");
+    assert_call_range(&service_call["fromRanges"], 2, 16, 23);
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_call_hierarchy_does_not_include_nested_function_calls() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("nested.js");
+    fs::write(
+        &file_path,
+        "function target() {}\nfunction outer() {\n    function inner() {\n        target();\n    }\n}\n",
+    )
+    .expect("write JavaScript nested call hierarchy fixture");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let outer = prepare_call_hierarchy(&mut stdin, &mut reader, &mut stderr, 40, &file_uri, 1, 9);
+
+    let outgoing = call_hierarchy_relation(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        41,
+        "callHierarchy/outgoingCalls",
+        outer,
+    );
+    assert!(
+        outgoing.is_empty(),
+        "calls inside nested functions must not be attributed to the outer function: {outgoing:#?}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_call_hierarchy_does_not_include_nested_type_calls() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("NestedType.java");
+    fs::write(
+        &file_path,
+        "class Target {\n    static int value() { return 1; }\n}\nclass Outer {\n    class Inner {\n        int field = Target.value();\n    }\n}\n",
+    )
+    .expect("write Java nested type call hierarchy fixture");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let outer = prepare_call_hierarchy(&mut stdin, &mut reader, &mut stderr, 50, &file_uri, 3, 6);
+
+    let outgoing = call_hierarchy_relation(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        51,
+        "callHierarchy/outgoingCalls",
+        outer,
+    );
+    assert!(
+        outgoing.is_empty(),
+        "calls inside nested types must not be attributed to the outer type: {outgoing:#?}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
 }
 
 #[test]
@@ -3079,12 +3332,75 @@ fn prepare_type_hierarchy(
     line: u64,
     character: u64,
 ) -> Value {
+    prepare_hierarchy(
+        stdin,
+        reader,
+        stderr,
+        id,
+        "textDocument/prepareTypeHierarchy",
+        uri,
+        (line, character),
+    )
+}
+
+fn type_hierarchy_relation(
+    stdin: &mut impl Write,
+    reader: &mut impl BufRead,
+    stderr: &mut impl Read,
+    id: u64,
+    method: &str,
+    item: Value,
+) -> Vec<Value> {
+    hierarchy_relation(stdin, reader, stderr, id, method, item)
+}
+
+fn prepare_call_hierarchy(
+    stdin: &mut impl Write,
+    reader: &mut impl BufRead,
+    stderr: &mut impl Read,
+    id: u64,
+    uri: &str,
+    line: u64,
+    character: u64,
+) -> Value {
+    prepare_hierarchy(
+        stdin,
+        reader,
+        stderr,
+        id,
+        "textDocument/prepareCallHierarchy",
+        uri,
+        (line, character),
+    )
+}
+
+fn call_hierarchy_relation(
+    stdin: &mut impl Write,
+    reader: &mut impl BufRead,
+    stderr: &mut impl Read,
+    id: u64,
+    method: &str,
+    item: Value,
+) -> Vec<Value> {
+    hierarchy_relation(stdin, reader, stderr, id, method, item)
+}
+
+fn prepare_hierarchy(
+    stdin: &mut impl Write,
+    reader: &mut impl BufRead,
+    stderr: &mut impl Read,
+    id: u64,
+    method: &str,
+    uri: &str,
+    position: (u64, u64),
+) -> Value {
+    let (line, character) = position;
     write_message(
         stdin,
         json!({
             "jsonrpc": "2.0",
             "id": id,
-            "method": "textDocument/prepareTypeHierarchy",
+            "method": method,
             "params": {
                 "textDocument": {"uri": uri},
                 "position": {"line": line, "character": character}
@@ -3099,7 +3415,7 @@ fn prepare_type_hierarchy(
     items[0].clone()
 }
 
-fn type_hierarchy_relation(
+fn hierarchy_relation(
     stdin: &mut impl Write,
     reader: &mut impl BufRead,
     stderr: &mut impl Read,
@@ -3121,6 +3437,21 @@ fn type_hierarchy_relation(
         .as_array()
         .unwrap_or_else(|| panic!("expected {method} array, got {response}"))
         .clone()
+}
+
+fn assert_call_range(ranges: &Value, line: u64, start_character: u64, end_character: u64) {
+    let ranges = ranges
+        .as_array()
+        .unwrap_or_else(|| panic!("expected call range array, got {ranges}"));
+    assert!(
+        ranges.iter().any(|range| {
+            range["start"]["line"] == line
+                && range["start"]["character"] == start_character
+                && range["end"]["line"] == line
+                && range["end"]["character"] == end_character
+        }),
+        "expected call range {line}:{start_character}-{end_character}, got {ranges:#?}"
+    );
 }
 
 fn shutdown_lsp(
