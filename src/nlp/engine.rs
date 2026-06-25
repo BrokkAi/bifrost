@@ -174,14 +174,14 @@ pub fn accelerator_available() -> bool {
     }
 }
 
-fn embed_repo_id() -> String {
+pub(crate) fn embed_repo_id() -> String {
     std::env::var(EMBED_MODEL_ID_ENV).unwrap_or_else(|_| DEFAULT_EMBED_MODEL_ID.to_string())
 }
 
 /// Directory holding the model's `config.json`, `tokenizer.json`, and
 /// `model.safetensors`. Resolves from `BIFROST_EMBED_MODEL_DIR` first, else
 /// downloads (or reuses the cache of) the HF repo.
-fn resolve_embed_model_dir() -> Result<PathBuf, String> {
+pub(crate) fn resolve_embed_model_dir() -> Result<PathBuf, String> {
     if let Ok(dir) = std::env::var(EMBED_MODEL_DIR_ENV) {
         return Ok(PathBuf::from(dir));
     }
@@ -201,6 +201,12 @@ fn resolve_embed_model_dir() -> Result<PathBuf, String> {
 }
 
 pub fn load_production_embedder() -> Result<Arc<dyn Embedder>, String> {
+    // Opt into the PyTorch SDPA sidecar backend (fused attention, all GPUs incl.
+    // Blackwell) with BIFROST_EMBED_BACKEND=sidecar; default stays the in-process
+    // Candle path.
+    if std::env::var("BIFROST_EMBED_BACKEND").as_deref() == Ok("sidecar") {
+        return super::voyage_sidecar::load_sidecar_embedder();
+    }
     let devices = select_devices()?;
     let dir = resolve_embed_model_dir()?;
     let label = embed_repo_id();

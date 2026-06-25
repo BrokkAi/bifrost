@@ -19,6 +19,7 @@ pub mod quant;
 pub mod query;
 pub mod store;
 pub mod voyage;
+pub mod voyage_sidecar;
 
 /// Whether `semantic_search` should be offered. The voyage-4-nano embedder needs a
 /// CUDA or Metal accelerator; on CPU-only hosts the tool is hidden unless the
