@@ -756,7 +756,9 @@ fn visit_commonjs_export_statement(node: Node<'_>, source: &str, index: &mut Exp
 
     match commonjs_export_target(left, source) {
         Some(CommonJsExportTarget::Named(exported_name)) => {
-            if let Some(local_name) = local_export_name(right, source) {
+            if let Some(local_name) = local_export_name(right, source)
+                .or_else(|| exported_function_name(right, &exported_name))
+            {
                 index
                     .exports_by_name
                     .insert(exported_name, ExportEntry::Local { local_name });
@@ -876,7 +878,42 @@ fn register_module_exports_object(node: Node<'_>, source: &str, index: &mut Expo
 }
 
 fn local_export_name(node: Node<'_>, source: &str) -> Option<String> {
-    simple_identifier_text_for_source(node, source).map(str::to_string)
+    if let Some(name) = simple_identifier_text_for_source(node, source) {
+        return Some(name.to_string());
+    }
+    if let Some(name) = named_function_expression_name(node, source) {
+        return Some(name);
+    }
+    member_expression_name(node, source)
+}
+
+fn exported_function_name(node: Node<'_>, exported_name: &str) -> Option<String> {
+    matches!(node.kind(), "function_expression" | "arrow_function")
+        .then(|| exported_name.to_string())
+}
+
+fn named_function_expression_name(node: Node<'_>, source: &str) -> Option<String> {
+    if node.kind() != "function_expression" {
+        return None;
+    }
+    let name = node.child_by_field_name("name")?;
+    simple_identifier_text_for_source(name, source).map(str::to_string)
+}
+
+fn member_expression_name(node: Node<'_>, source: &str) -> Option<String> {
+    if node.kind() != "member_expression" {
+        return None;
+    }
+    let object = node.child_by_field_name("object")?;
+    let property = node.child_by_field_name("property")?;
+    if property.kind() == "computed_property_name" {
+        return None;
+    }
+    let object_name = simple_identifier_text_for_source(object, source)
+        .map(str::to_string)
+        .or_else(|| member_expression_name(object, source))?;
+    let property_name = property_name_text(property, source)?;
+    Some(format!("{object_name}.{property_name}"))
 }
 
 fn visit_export_statement(node: Node<'_>, source: &str, index: &mut ExportIndex) {
