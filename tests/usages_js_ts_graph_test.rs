@@ -774,6 +774,65 @@ fn ts_member_receiver_inference_handles_direct_and_aliased_receivers() {
 }
 
 #[test]
+fn tsx_class_method_call_inside_jsx_is_found() {
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file(
+            "components.tsx",
+            r#"
+export type User = {
+  name: string;
+};
+
+export default class Greeter {
+  greet(user: User): string {
+    return user.name;
+  }
+}
+
+export function WelcomeCard({ user }: { user: User }) {
+  const greeter = new Greeter();
+  return <section>{greeter.greet(user)}</section>;
+}
+"#,
+        )
+        .file(
+            "app.tsx",
+            r#"
+import Greeter, { User } from "./components";
+
+export function render(user: User) {
+  return new Greeter().greet(user);
+}
+"#,
+        )
+        .build()
+    });
+
+    let target = find_ts_target(&analyzer, &project.file("components.tsx"), |cu| {
+        cu.short_name() == "Greeter.greet" && cu.is_function()
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert_eq!(
+        2,
+        hits.len(),
+        "expected both TSX method calls, got {hits:?}"
+    );
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == project.file("components.tsx")),
+        "expected same-file JSX call to Greeter.greet, got {hits:?}"
+    );
+    assert!(
+        hits.iter().any(|hit| hit.file == project.file("app.tsx")),
+        "expected cross-file call to Greeter.greet, got {hits:?}"
+    );
+}
+
+#[test]
 fn ts_receiver_shadowing_and_unknown_sources_do_not_count() {
     let (project, analyzer) = ts_inline_analyzer(|p| {
         p.file("a.ts", "export class Foo { bar() {} }\n")

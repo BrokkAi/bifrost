@@ -5,12 +5,13 @@ use crate::analyzer::js_ts::imports::{
 use crate::analyzer::usages::graph_core::{ImportEdge, ImportEdgeKind};
 use crate::analyzer::usages::js_ts_graph::hits::record_hit;
 use crate::analyzer::usages::js_ts_graph::resolver::{
-    JsTsUsageIndex, is_static_member, member_name, top_level_identifier, tree_sitter_language_for,
+    JsTsUsageIndex, is_static_member, member_name, top_level_identifier,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::{
     ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind, UsageHit,
 };
+use crate::analyzer::usages::parsed_tree::js_ts_tree_sitter_language_for_file;
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::compute_line_starts;
@@ -36,10 +37,6 @@ pub(super) fn scan_files_for_seeds(
         .parent_of(target)
         .map(|owner| owner.source().clone());
 
-    let Some(parser_language) = tree_sitter_language_for(language) else {
-        return BTreeSet::new();
-    };
-
     let files_vec: Vec<&ProjectFile> = files.iter().collect();
 
     files_vec.par_iter().for_each(|file| {
@@ -53,6 +50,9 @@ pub(super) fn scan_files_for_seeds(
             return;
         }
         let mut parser = Parser::new();
+        let Some(parser_language) = js_ts_tree_sitter_language_for_file(file, language) else {
+            return;
+        };
         if parser.set_language(&parser_language).is_err() {
             return;
         }

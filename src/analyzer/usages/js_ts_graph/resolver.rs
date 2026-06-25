@@ -5,6 +5,7 @@ use crate::analyzer::usages::js_ts_graph::extractor::{
 use crate::analyzer::usages::model::{
     ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind,
 };
+use crate::analyzer::usages::parsed_tree::js_ts_tree_sitter_language_for_file;
 use crate::analyzer::usages::{ImportEdge, ImportEdgeKind};
 use crate::analyzer::{
     AliasResolver, CodeUnit, IAnalyzer, Language, ProjectFile, resolve_js_ts_module_specifier,
@@ -39,16 +40,17 @@ pub(crate) fn build_jsts_usage_index(
     language: Language,
 ) -> JsTsUsageIndex {
     let files = collect_jsts_files(analyzer, language);
-    let Some(parser_language) = tree_sitter_language_for(language) else {
+    if tree_sitter_language_for(language).is_none() {
         return JsTsUsageIndex::default();
-    };
+    }
 
     let per_file: Vec<(ProjectFile, ExportIndex, ImportBinder)> = files
         .par_iter()
         .filter_map(|file| {
             let source = file.read_to_string().ok()?;
             let mut parser = Parser::new();
-            parser.set_language(&parser_language).ok()?;
+            let file_language = js_ts_tree_sitter_language_for_file(file, language)?;
+            parser.set_language(&file_language).ok()?;
             let tree = parser.parse(source.as_str(), None)?;
             let exports = compute_export_index(&source, &tree);
             let binder = compute_import_binder(&source, &tree);
@@ -476,7 +478,7 @@ pub(super) fn collect_jsts_files(analyzer: &dyn IAnalyzer, language: Language) -
     result
 }
 
-/// The tree-sitter grammar for a JS/TS language, or `None` for anything else.
+/// The default tree-sitter grammar for a JS/TS language, or `None` for anything else.
 pub(super) fn tree_sitter_language_for(language: Language) -> Option<tree_sitter::Language> {
     match language {
         Language::JavaScript => Some(tree_sitter_javascript::LANGUAGE.into()),
