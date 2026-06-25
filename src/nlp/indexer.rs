@@ -595,21 +595,24 @@ fn language_of(file: &ProjectFile) -> Option<String> {
 /// Used unthrottled by an explicit GC request and (throttled) by `maybe_gc`.
 fn run_gc(store: &SemanticStore, repo: &git2::Repository) -> Result<(), String> {
     // Liveness is unchanged — "reachable from any ref" ∪ "held by a worktree's uncommitted
-    // working set" — but computed against only the cache's own OIDs. We never materialize
-    // the full reachable set (millions of objects on a monorepo, which OOMs); instead we
-    // stream `git rev-list` and keep the subset that is actually cached. Peak memory is
-    // O(cache), not O(history).
-    let cache_oids = store.blob_oids().map_err(|e| e.to_string())?;
-    if cache_oids.is_empty() {
-        return Ok(());
-    }
-    let mut live = gitcache::reachable_among(repo, &cache_oids)?;
+    // working set" — but represented as a Bloom filter we stream `git rev-list` into, plus
+    // each worktree's dirty OIDs. We never materialize the reachable OID set (millions of
+    // objects on a monorepo, which OOMs); the cache's blobs are then streamed past the
+    // filter, so peak memory is O(filter) ≈ a few MB. A Bloom false positive only lets a
+    // dead blob linger a cycle; there are no false negatives, so a reachable blob is never
+    // dropped (the repo-level cache keeps surviving branch switches).
+    let mut live = gitcache::reachable_bloom(repo)?;
     for root in gitcache::worktree_roots(repo)? {
         if let Ok(dirty) = gitcache::uncommitted_oids(&root) {
-            live.extend(dirty.into_iter().filter(|oid| cache_oids.contains(oid)));
+            for oid in dirty {
+                live.insert(oid);
+            }
         }
     }
-    store.gc(&live).map_err(|err| err.to_string())
+    store
+        .gc_with(|oid| live.contains(oid))
+        .map(|_| ())
+        .map_err(|err| err.to_string())
 }
 
 /// Best-effort throttled GC run after a full build; errors are swallowed.

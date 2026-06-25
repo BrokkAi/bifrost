@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use git2::{ObjectType, Oid, Repository, Status, StatusOptions};
+use growable_bloom_filter::GrowableBloom;
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -106,22 +107,25 @@ pub fn read_blob(repo: &Repository, oid_hex: &str) -> Result<Vec<u8>> {
     Ok(blob.content().to_vec())
 }
 
-/// The subset of `candidates` reachable from any ref (incl. per-worktree HEADs).
+/// Target false-positive rate for the GC reachability filter. A miss means an unreachable
+/// blob survives one GC cycle (collected on a later one as refs evolve); there are NO
+/// false negatives, so a reachable blob is never dropped.
+const GC_BLOOM_FP_RATE: f64 = 0.05;
+/// Initial sizing hint; the filter grows past this while holding the FP rate, so an
+/// undersized guess just costs a few reallocations, not correctness.
+const GC_BLOOM_EST_OIDS: usize = 1 << 19; // 524288
+
+/// A Bloom filter of every OID reachable from any ref (incl. per-worktree HEADs), built by
+/// streaming `git rev-list --objects --all`.
 ///
-/// Streams `git rev-list --objects --all` and keeps only OIDs already in `candidates`,
-/// so peak memory is O(|candidates|) — the bounded cache OID set — rather than O(all
-/// objects ever). The full reachable set on a large monorepo is millions of objects and
-/// buffering it OOMs (see git history for the removed `reachable_oids`); intersecting on
-/// the fly against what the cache actually holds avoids that while keeping the exact
-/// "reachable from any ref" liveness. The history walk itself is still O(history) in time
-/// (a candidate for incremental GC later), but it no longer balloons memory.
-pub fn reachable_among(
-    repo: &Repository,
-    candidates: &HashSet<String>,
-) -> Result<HashSet<String>> {
-    if candidates.is_empty() {
-        return Ok(HashSet::new());
-    }
+/// Membership has no false negatives — a reachable OID always tests present, so GC never
+/// drops a blob it might still need (the repo-level cache keeps surviving branch switches).
+/// The cost is a small false-positive rate ([`GC_BLOOM_FP_RATE`]): some unreachable blobs
+/// linger a cycle. Peak memory is the filter itself — ~1 byte/element, a few MB even for a
+/// monorepo's full object graph, and proportionally tiny for a small repo — never the
+/// materialized OID set (the old `reachable_oids` buffered all of it and OOM'd). The history
+/// walk is still O(history) in time (a candidate for incremental GC later).
+pub fn reachable_bloom(repo: &Repository) -> Result<GrowableBloom> {
     let workdir = repo
         .workdir()
         .ok_or_else(|| "repository has no working directory".to_string())?;
@@ -137,13 +141,13 @@ pub fn reachable_among(
         .take()
         .ok_or_else(|| "git rev-list produced no stdout".to_string())?;
 
-    let mut live = HashSet::new();
+    let mut bloom = GrowableBloom::new(GC_BLOOM_FP_RATE, GC_BLOOM_EST_OIDS);
     for line in BufReader::new(stdout).lines() {
         let line = line.map_err(|e| format!("reading git rev-list output: {e}"))?;
         // Each line is "<oid>" or "<oid> <path>"; the OID is the first token.
         let oid = line.split(' ').next().unwrap_or("");
-        if oid.len() >= 40 && candidates.contains(oid) {
-            live.insert(oid.to_string());
+        if oid.len() >= 40 {
+            bloom.insert(oid);
         }
     }
     let status = child
@@ -152,7 +156,7 @@ pub fn reachable_among(
     if !status.success() {
         return Err("git rev-list --objects --all failed".to_string());
     }
-    Ok(live)
+    Ok(bloom)
 }
 
 /// Roots of every linked worktree of this repo (incl. the main worktree).
@@ -283,15 +287,12 @@ mod tests {
         let oids = working_tree_oids(&repo, &["a.txt".to_string()]).unwrap();
         assert_ne!(oids["a.txt"], "ce013625030ba8dba906f756967f9e9ca394464a");
 
-        // reachable_among returns only the candidates reachable from a ref: the committed
-        // "hello\n" blob is (it's in HEAD), the dirty working-tree blob is not.
-        let committed = "ce013625030ba8dba906f756967f9e9ca394464a".to_string();
-        let candidates: HashSet<String> =
-            [committed.clone(), oids["a.txt"].clone()].into_iter().collect();
-        let reachable = reachable_among(&repo, &candidates).unwrap();
-        assert!(reachable.contains(&committed));
-        assert!(!reachable.contains(&oids["a.txt"]));
-        // ...but the dirty working-tree blob is held live by the uncommitted set.
+        // reachable_bloom contains every reachable OID (no false negatives): the committed
+        // "hello\n" blob is in HEAD, so it must test present.
+        let bloom = reachable_bloom(&repo).unwrap();
+        assert!(bloom.contains("ce013625030ba8dba906f756967f9e9ca394464a"));
+        // The dirty working-tree blob is not committed; it's held live separately by the
+        // uncommitted set (and run_gc inserts those into the filter).
         let uncommitted = uncommitted_oids(temp.path()).unwrap();
         assert!(uncommitted.contains(&oids["a.txt"]));
     }

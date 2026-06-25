@@ -211,20 +211,6 @@ impl SemanticStore {
         Ok(out)
     }
 
-    /// Every blob OID currently in the cache. Bounded by the blobs we've indexed (the
-    /// repo's file versions seen across branches), so it is the small side of the GC
-    /// reachability intersection — see [`crate::nlp::gitcache::reachable_among`].
-    pub fn blob_oids(&self) -> Result<HashSet<String>> {
-        let conn = self.conn.lock().expect("semantic store mutex poisoned");
-        let mut stmt = conn.prepare("SELECT blob_oid FROM blobs")?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-        let mut out = HashSet::new();
-        for oid in rows {
-            out.insert(oid?);
-        }
-        Ok(out)
-    }
-
     pub fn missing_component_hashes(&self, hashes: &[[u8; 32]]) -> Result<Vec<[u8; 32]>> {
         self.missing_hashes("component_vectors", "hash", hashes)
     }
@@ -561,28 +547,43 @@ impl SemanticStore {
 
     // ---- garbage collection ----------------------------------------------
 
-    /// Drop everything no longer reachable from git (or held by a worktree's
-    /// uncommitted working set). `live` is the union of reachable blob OIDs and
-    /// currently-checked-out dirty/untracked OIDs.
+    /// Drop everything no longer reachable from git (or held by a worktree's uncommitted
+    /// working set). `live` is the union of reachable blob OIDs and currently-checked-out
+    /// dirty/untracked OIDs. Convenience wrapper over [`gc_with`] for an exact set.
     pub fn gc(&self, live: &HashSet<String>) -> Result<()> {
+        self.gc_with(|oid| live.contains(oid)).map(|_| ())
+    }
+
+    /// Drop every cached blob for which `keep(blob_oid)` is false, cascading to its chunks
+    /// and any now-orphaned vectors/summaries. Returns the number of blobs dropped.
+    ///
+    /// Streams the blobs table past `keep` and materializes only the (usually small) dead
+    /// set, so peak memory is O(dropped), not O(all cached blobs) — letting the caller pass
+    /// a Bloom-filter membership test (`gitcache::reachable_bloom`) and never hold the OID
+    /// set. `keep` must not return false for a live blob; a Bloom test satisfies this (no
+    /// false negatives), at the cost of occasionally keeping a dead blob (false positive).
+    pub fn gc_with(&self, keep: impl Fn(&str) -> bool) -> Result<usize> {
         let mut conn = self.conn.lock().expect("semantic store mutex poisoned");
         let tx = conn.transaction()?;
-        tx.execute_batch(
-            "CREATE TEMP TABLE IF NOT EXISTS gc_live(oid TEXT PRIMARY KEY) WITHOUT ROWID;
-             DELETE FROM gc_live;",
-        )?;
+        let dead: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT blob_oid FROM blobs")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            let mut dead = Vec::new();
+            for oid in rows {
+                let oid = oid?;
+                if !keep(&oid) {
+                    dead.push(oid);
+                }
+            }
+            dead
+        };
         {
-            let mut stmt =
-                tx.prepare("INSERT INTO gc_live(oid) VALUES(?1) ON CONFLICT(oid) DO NOTHING")?;
-            for oid in live {
-                stmt.execute([oid])?;
+            // blob_chunks cascade from blobs.
+            let mut del = tx.prepare("DELETE FROM blobs WHERE blob_oid = ?1")?;
+            for oid in &dead {
+                del.execute([oid])?;
             }
         }
-        // blob_chunks cascade from blobs.
-        tx.execute(
-            "DELETE FROM blobs WHERE blob_oid NOT IN (SELECT oid FROM gc_live)",
-            [],
-        )?;
         tx.execute(
             "DELETE FROM vectors
              WHERE composed_hash NOT IN (SELECT composed_hash FROM blob_chunks)",
@@ -604,11 +605,10 @@ impl SemanticStore {
              )",
             [],
         )?;
-        tx.execute("DROP TABLE gc_live", [])?;
         set_meta_value_tx(&tx, META_LAST_GC_AT, &now_unix_seconds().to_string())?;
         tx.commit()?;
         conn.pragma_update(None, "incremental_vacuum", 0)?;
-        Ok(())
+        Ok(dead.len())
     }
 
     /// Seconds since the last `gc`, or `None` if never run.

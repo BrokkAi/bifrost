@@ -28,6 +28,10 @@ tokenizers = { version = "0.21", optional = true }
 # 8-bit rotational quantization for the searchable composed vectors (~4x smaller
 # blobs + a branch-free u8 scan).
 fastrq = { version = "0.1.1", optional = true }
+# Scalable Bloom filter for GC reachability: a few MB even for a monorepo's full object
+# set, and sized proportionally (~KB for a small repo). Grows to hold an unknown number
+# of OIDs while holding the target false-positive rate.
+growable-bloom-filter = { version = "2.1", optional = true }
 chrono = { version = "0.4.44", default-features = false, features = ["clock", "std"] }
 git2 = { version = "0.20.2", default-features = false }
 glob = "0.3.3"
@@ -82,7 +86,7 @@ default = []
 # Semantic search: voyageai/voyage-4-nano embeddings via the PyTorch SDPA sidecar.
 # Opt in with `--features nlp`. Acceleration (CUDA/Metal) is selected inside the sidecar
 # at runtime — no compile-time backend features needed.
-nlp = ["dep:hf-hub", "dep:tokenizers", "dep:fastrq"]
+nlp = ["dep:hf-hub", "dep:tokenizers", "dep:fastrq", "dep:growable-bloom-filter"]
 # Enables the pyo3-backed Python extension module (`bifrost_searchtools._native`).
 # Maturin turns this on automatically via pyproject.toml; the `bifrost` CLI
 # binary builds without it on every platform.
