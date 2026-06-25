@@ -473,6 +473,40 @@ fn ts_named_import_alias_resolves_to_exported_symbol() {
 }
 
 #[test]
+fn ts_imported_class_static_member_call_counts_as_class_usage() {
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file(
+            "core/Ky.ts",
+            "export class Ky { static create(input: string): Ky { return new Ky(); } }\n",
+        )
+        .file("index.ts", "export { Ky } from './core/Ky';\n")
+        .file(
+            "consumer.ts",
+            "import { Ky } from './index';\nexport function run() { return Ky.create('url'); }\n",
+        )
+        .build()
+    });
+
+    let target = find_ts_target(&analyzer, &project.file("core/Ky.ts"), |cu| {
+        cu.identifier() == "Ky" && cu.is_class()
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == project.file("consumer.ts")),
+        "expected Ky.create call in importing file to count as a Ky usage, got {hits:?}"
+    );
+    assert!(
+        hits.iter().all(|hit| hit.enclosing != target),
+        "definition site must stay excluded from Ky usage hits, got {hits:?}"
+    );
+}
+
+#[test]
 fn js_named_export_imported_from_parent_directory_counts_calls_in_test_file() {
     let (project, analyzer) = js_inline_analyzer(|p| {
         p.file(

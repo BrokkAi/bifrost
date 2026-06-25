@@ -415,6 +415,17 @@ fn handle_member_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
 
+    // `Ky.create()` style access still references the exported `Ky` value. The
+    // identifier visitor suppresses member-expression objects to avoid double-counting
+    // member targets, so record the object here for non-member target queries.
+    if ctx.target_member.is_none()
+        && simple_identifier_text(object, ctx.source).is_some()
+        && ctx.binds_target(object_text)
+    {
+        record_hit(object, ctx);
+        return;
+    }
+
     // `BaseClass.staticMethod()` style — object binds to the target's parent class, the
     // property is the requested member.
     if let Some(member) = ctx.target_member
