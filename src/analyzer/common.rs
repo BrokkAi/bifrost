@@ -1,4 +1,5 @@
 use crate::analyzer::{CodeUnit, Language, ProjectFile};
+use tree_sitter::Language as TsLanguage;
 
 /// Default longest single line a source file may contain before tree-sitter parsing is
 /// skipped. Minified/generated single-line bundles (committed webpack output, mermaid.min.js,
@@ -101,6 +102,48 @@ pub(crate) fn display_identifier_for_target(target: &CodeUnit) -> String {
         .to_string()
 }
 
+pub(crate) fn is_valid_rename_identifier(language: Language, name: &str) -> bool {
+    is_identifier_text(name) && !is_reserved_identifier(language, name)
+}
+
+fn is_identifier_text(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_alphabetic()) && chars.all(|ch| ch == '_' || ch.is_alphanumeric())
+}
+
+fn is_reserved_identifier(language: Language, name: &str) -> bool {
+    let Some(parser_language) = parser_language_for(language) else {
+        return false;
+    };
+    (0..parser_language.node_kind_count()).any(|id| {
+        let Ok(id) = u16::try_from(id) else {
+            return false;
+        };
+        !parser_language.node_kind_is_named(id)
+            && parser_language.node_kind_for_id(id) == Some(name)
+    })
+}
+
+fn parser_language_for(language: Language) -> Option<TsLanguage> {
+    Some(match language {
+        Language::Java => tree_sitter_java::LANGUAGE.into(),
+        Language::Go => tree_sitter_go::LANGUAGE.into(),
+        Language::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+        Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
+        Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        Language::Python => tree_sitter_python::LANGUAGE.into(),
+        Language::Rust => tree_sitter_rust::LANGUAGE.into(),
+        Language::Php => tree_sitter_php::LANGUAGE_PHP.into(),
+        Language::Scala => tree_sitter_scala::LANGUAGE.into(),
+        Language::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
+        Language::Ruby => tree_sitter_ruby::LANGUAGE.into(),
+        Language::None => return None,
+    })
+}
+
 pub(crate) fn is_scala_object_like(target: &CodeUnit) -> bool {
     language_for_target(target) == Language::Scala
         && (target.is_class() || target.is_module())
@@ -112,7 +155,10 @@ pub(crate) fn is_scala_object_like(target: &CodeUnit) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_MAX_LINE_LENGTH, display_symbol_name, is_unparseable_source};
+    use super::{
+        DEFAULT_MAX_LINE_LENGTH, display_symbol_name, is_unparseable_source,
+        is_valid_rename_identifier,
+    };
     use crate::analyzer::Language;
 
     #[test]
@@ -140,5 +186,18 @@ mod tests {
             "N.Outer.Inner.Method",
             display_symbol_name(Language::CSharp, "N.Outer$Inner.Method")
         );
+    }
+
+    #[test]
+    fn rename_identifier_validation_uses_language_grammar_keywords() {
+        assert!(is_valid_rename_identifier(Language::Java, "renamed_1"));
+        assert!(is_valid_rename_identifier(Language::Java, "café"));
+        assert!(!is_valid_rename_identifier(Language::Java, ""));
+        assert!(!is_valid_rename_identifier(Language::Java, "1renamed"));
+        assert!(!is_valid_rename_identifier(Language::Java, "renamed-name"));
+        assert!(!is_valid_rename_identifier(Language::Java, "class"));
+        assert!(!is_valid_rename_identifier(Language::Cpp, "namespace"));
+        assert!(!is_valid_rename_identifier(Language::Python, "def"));
+        assert!(!is_valid_rename_identifier(Language::Rust, "fn"));
     }
 }

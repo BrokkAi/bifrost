@@ -1,7 +1,7 @@
 use lsp_types::{
     CompletionOptions, DiagnosticOptions, DiagnosticServerCapabilities,
-    FoldingRangeProviderCapability, HoverProviderCapability, OneOf, ServerCapabilities,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+    FoldingRangeProviderCapability, HoverProviderCapability, OneOf, RenameOptions,
+    ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
     TextDocumentSyncSaveOptions, WorkDoneProgressOptions, WorkspaceFoldersServerCapabilities,
 };
 
@@ -39,6 +39,10 @@ pub fn server_capabilities() -> ServerCapabilities {
         folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         references_provider: Some(OneOf::Left(true)),
+        rename_provider: Some(OneOf::Right(RenameOptions {
+            prepare_provider: Some(true),
+            work_done_progress_options: WorkDoneProgressOptions::default(),
+        })),
         workspace_symbol_provider: Some(OneOf::Left(true)),
         diagnostic_provider: Some(DiagnosticServerCapabilities::Options(DiagnosticOptions {
             identifier: Some("bifrost-tree-sitter".to_string()),

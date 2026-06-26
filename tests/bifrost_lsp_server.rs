@@ -77,6 +77,10 @@ fn bifrost_lsp_server_handles_initialize_and_shutdown() {
         initialize["result"]["capabilities"]["callHierarchyProvider"], true,
         "callHierarchyProvider should be advertised: {initialize}"
     );
+    assert_eq!(
+        initialize["result"]["capabilities"]["renameProvider"]["prepareProvider"], true,
+        "renameProvider with prepare support should be advertised: {initialize}"
+    );
 
     write_message(
         &mut stdin,
@@ -2007,6 +2011,353 @@ fn bifrost_lsp_server_references_finds_class_a_usages() {
     drop(stdin);
     let status = child.wait().expect("wait bifrost");
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
+fn bifrost_lsp_server_prepare_rename_returns_identifier_range() {
+    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("testcode-java");
+    let canonical_root = fixture_root.canonicalize().expect("canon fixture");
+    let a_uri = uri_for(&canonical_root.join("A.java"));
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&fixture_root);
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "textDocument/prepareRename",
+            "params": {
+                "textDocument": {"uri": a_uri},
+                "position": {"line": 7, "character": 18}
+            }
+        }),
+    );
+    let response = read_response_for_id(&mut reader, &mut stderr, 10);
+    let result = &response["result"];
+    assert_eq!(
+        result["placeholder"], "method2",
+        "prepare result: {response}"
+    );
+    assert_eq!(
+        result["range"]["start"]["line"], 7,
+        "prepare range: {response}"
+    );
+    assert_eq!(
+        result["range"]["start"]["character"], 18,
+        "prepare range: {response}"
+    );
+    assert_eq!(
+        result["range"]["end"]["line"], 7,
+        "prepare range: {response}"
+    );
+    assert_eq!(
+        result["range"]["end"]["character"], 25,
+        "prepare range: {response}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_rename_returns_workspace_edit_for_java_method() {
+    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("testcode-java");
+    let canonical_root = fixture_root.canonicalize().expect("canon fixture");
+    let a_path = canonical_root.join("A.java");
+    let a_uri = uri_for(&a_path);
+    let b_uri = uri_for(&canonical_root.join("B.java"));
+    let before_a = fs::read_to_string(&a_path).expect("read A.java before rename");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&fixture_root);
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "textDocument/rename",
+            "params": {
+                "textDocument": {"uri": a_uri},
+                "position": {"line": 7, "character": 18},
+                "newName": "renamedMethod2"
+            }
+        }),
+    );
+    let response = read_response_for_id(&mut reader, &mut stderr, 11);
+    let changes = response["result"]["changes"]
+        .as_object()
+        .unwrap_or_else(|| panic!("expected WorkspaceEdit.changes, got {response}"));
+    let a_edits = changes
+        .get(&a_uri)
+        .and_then(|value| value.as_array())
+        .unwrap_or_else(|| panic!("expected A.java edits in {response}"));
+    let b_edits = changes
+        .get(&b_uri)
+        .and_then(|value| value.as_array())
+        .unwrap_or_else(|| panic!("expected B.java edits in {response}"));
+
+    assert!(
+        a_edits.iter().any(|edit| {
+            edit["newText"] == "renamedMethod2"
+                && edit["range"]["start"]["line"] == 7
+                && edit["range"]["start"]["character"] == 18
+                && edit["range"]["end"]["character"] == 25
+        }),
+        "expected declaration edit in A.java: {a_edits:#?}"
+    );
+    assert!(
+        b_edits.iter().any(|edit| {
+            edit["newText"] == "renamedMethod2"
+                && edit["range"]["start"]["line"] == 8
+                && edit["range"]["start"]["character"] == 26
+        }),
+        "expected usage edit in B.java: {b_edits:#?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&a_path).expect("read A.java after rename request"),
+        before_a,
+        "rename request must return edits without mutating files"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_rename_rejects_file_coupled_java_class_without_file_edit() {
+    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("testcode-java");
+    let canonical_root = fixture_root.canonicalize().expect("canon fixture");
+    let a_uri = uri_for(&canonical_root.join("A.java"));
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&fixture_root);
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 14,
+            "method": "textDocument/prepareRename",
+            "params": {
+                "textDocument": {"uri": a_uri},
+                "position": {"line": 2, "character": 13}
+            }
+        }),
+    );
+    let prepare = read_response_for_id(&mut reader, &mut stderr, 14);
+    assert!(
+        prepare["result"].is_null(),
+        "file-coupled Java class rename should not prepare without file operation support: {prepare}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_rename_returns_null_for_comment_token() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("CommentRename.java");
+    fs::write(
+        &file_path,
+        "class CommentRename {\n    // target\n    void target() {}\n}\n",
+    )
+    .expect("write fixture");
+    let file_uri = uri_for(&file_path);
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 15,
+            "method": "textDocument/rename",
+            "params": {
+                "textDocument": {"uri": file_uri},
+                "position": {"line": 1, "character": 7},
+                "newName": "renamedTarget"
+            }
+        }),
+    );
+    let response = read_response_for_id(&mut reader, &mut stderr, 15);
+    assert!(
+        response["result"].is_null(),
+        "comment token must not rename the real method with the same text: {response}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_rename_keeps_same_short_name_symbols_separate() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let p_service = root.join("p").join("Service.java");
+    let p_caller = root.join("p").join("Caller.java");
+    let q_service = root.join("q").join("Service.java");
+    let q_caller = root.join("q").join("Caller.java");
+    fs::create_dir_all(root.join("p")).expect("create p");
+    fs::create_dir_all(root.join("q")).expect("create q");
+    fs::write(
+        &p_service,
+        "package p;\npublic class Service {\n    void target() {}\n}\n",
+    )
+    .expect("write p service");
+    fs::write(
+        &p_caller,
+        "package p;\nclass Caller {\n    void call(Service service) {\n        service.target();\n    }\n}\n",
+    )
+    .expect("write p caller");
+    fs::write(
+        &q_service,
+        "package q;\npublic class Service {\n    void target() {}\n}\n",
+    )
+    .expect("write q service");
+    fs::write(
+        &q_caller,
+        "package q;\nclass Caller {\n    void call(Service service) {\n        service.target();\n    }\n}\n",
+    )
+    .expect("write q caller");
+
+    let p_service_uri = uri_for(&p_service);
+    let p_caller_uri = uri_for(&p_caller);
+    let q_service_uri = uri_for(&q_service);
+    let q_caller_uri = uri_for(&q_caller);
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 16,
+            "method": "textDocument/rename",
+            "params": {
+                "textDocument": {"uri": p_service_uri},
+                "position": {"line": 2, "character": 9},
+                "newName": "renamedTarget"
+            }
+        }),
+    );
+    let response = read_response_for_id(&mut reader, &mut stderr, 16);
+    let changes = response["result"]["changes"]
+        .as_object()
+        .unwrap_or_else(|| panic!("expected WorkspaceEdit.changes, got {response}"));
+    assert!(
+        changes.contains_key(&p_service_uri),
+        "expected selected declaration file edit: {response}"
+    );
+    assert!(
+        changes.contains_key(&p_caller_uri),
+        "expected selected package usage edit: {response}"
+    );
+    assert!(
+        !changes.contains_key(&q_service_uri) && !changes.contains_key(&q_caller_uri),
+        "rename must not edit same-short-name symbols in another package: {response}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_rename_uses_open_document_overlay() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("OverlayRename.java");
+    fs::write(&file_path, "class DiskOnly {\n    void diskOnly() {}\n}\n")
+        .expect("write disk fixture");
+    let file_uri = uri_for(&file_path);
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": file_uri,
+                    "languageId": "java",
+                    "version": 1,
+                    "text": "class LiveName {\n    LiveName make() { return new LiveName(); }\n}\n"
+                }
+            }
+        }),
+    );
+    let _ = read_notification(&mut reader, &mut stderr, "textDocument/publishDiagnostics");
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 12,
+            "method": "textDocument/rename",
+            "params": {
+                "textDocument": {"uri": file_uri},
+                "position": {"line": 0, "character": 6},
+                "newName": "RenamedLive"
+            }
+        }),
+    );
+    let response = read_response_for_id(&mut reader, &mut stderr, 12);
+    let changes = response["result"]["changes"]
+        .as_object()
+        .unwrap_or_else(|| panic!("expected WorkspaceEdit.changes, got {response}"));
+    let edits = changes
+        .get(&file_uri)
+        .and_then(|value| value.as_array())
+        .unwrap_or_else(|| panic!("expected overlay file edits in {response}"));
+    assert!(
+        edits.iter().any(|edit| edit["newText"] == "RenamedLive"
+            && edit["range"]["start"]["line"] == 0
+            && edit["range"]["start"]["character"] == 6),
+        "expected declaration edit from overlay text: {edits:#?}"
+    );
+    assert!(
+        !fs::read_to_string(&file_path)
+            .expect("read disk fixture")
+            .contains("LiveName"),
+        "overlay-only symbol must not be read from disk"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_rename_returns_null_for_unresolved_position() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("Whitespace.java");
+    fs::write(&file_path, "class Whitespace {}\n").expect("write fixture");
+    let file_uri = uri_for(&file_path);
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 13,
+            "method": "textDocument/rename",
+            "params": {
+                "textDocument": {"uri": file_uri},
+                "position": {"line": 0, "character": 5},
+                "newName": "RenamedWhitespace"
+            }
+        }),
+    );
+    let response = read_response_for_id(&mut reader, &mut stderr, 13);
+    assert!(
+        response["result"].is_null(),
+        "unresolved rename should return null: {response}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
 }
 
 #[test]

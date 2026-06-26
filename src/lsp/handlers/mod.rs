@@ -8,6 +8,7 @@ pub mod folding_range;
 pub(crate) mod hierarchy_support;
 pub mod hover;
 pub mod references;
+pub mod rename;
 pub mod type_hierarchy;
 pub(crate) mod util;
 pub mod workspace_symbol;
