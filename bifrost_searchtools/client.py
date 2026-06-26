@@ -25,6 +25,7 @@ from .models import (
     ListFilesResult,
     MostRelevantFilesResult,
     RefreshResult,
+    RenameSymbolResult,
     SearchFileContentsResult,
     SemanticSearchResult,
     SemanticSearchStatus,
@@ -277,6 +278,28 @@ class SearchToolsClient:
             {"references": [reference]},
         )
         return TypeLookupResult.from_dict(result["results"][0])
+
+    def rename_symbol(
+        self,
+        path: str,
+        *,
+        new_name: str,
+        line: int | None = None,
+        column: int | None = None,
+        start_byte: int | None = None,
+        end_byte: int | None = None,
+    ) -> RenameSymbolResult:
+        arguments: dict[str, Any] = {"path": path, "new_name": new_name}
+        if line is not None:
+            arguments["line"] = line
+        if column is not None:
+            arguments["column"] = column
+        if start_byte is not None:
+            arguments["start_byte"] = start_byte
+        if end_byte is not None:
+            arguments["end_byte"] = end_byte
+        result = self._call_tool("rename_symbol", arguments)
+        return RenameSymbolResult.from_dict(result)
 
     def get_summaries(self, targets: list[str]) -> FileSummariesResult:
         payload = self._call_tool_payload("get_summaries", {"targets": targets})

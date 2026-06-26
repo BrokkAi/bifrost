@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 use crate::analyzer::{CodeUnit, IAnalyzer, Project, ProjectFile, Range as ByteRange};
 use crate::lsp::conversion::{byte_range_to_lsp_range, path_to_uri_string, uri_to_path};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
+pub(crate) use crate::text_utils::{
+    find_word, identifier_at_offset, identifier_prefix_before_offset, identifier_span_at_offset,
+};
 use lsp_types::{Location, Range as LspRange, Uri};
 
 /// Resolve an LSP `Uri` to a [`ProjectFile`], read its contents (consulting
@@ -224,109 +227,6 @@ fn canonicalize_existing_prefix(path: &std::path::Path) -> Option<std::path::Pat
         suffix = new_suffix;
         current = current.parent()?;
     }
-}
-
-/// Extract the alphanumeric/underscore identifier surrounding `offset` in
-/// `content`. Returns `None` if neither the byte at `offset` nor the byte
-/// immediately before it is part of an identifier.
-pub fn identifier_at_offset(content: &str, offset: usize) -> Option<&str> {
-    let (start, end) = identifier_span_at_offset(content, offset)?;
-    content.get(start..end)
-}
-
-/// Like [`identifier_at_offset`] but returns the byte span `(start, end)`
-/// inside `content` instead of the slice. Useful for callers that need the
-/// range as a value (e.g. LSP hover wants to return the highlight range).
-pub fn identifier_span_at_offset(content: &str, offset: usize) -> Option<(usize, usize)> {
-    let bytes = content.as_bytes();
-    if bytes.is_empty() {
-        return None;
-    }
-    let mut start = offset.min(bytes.len());
-    let mut end = offset.min(bytes.len());
-
-    if start == bytes.len() && start > 0 && is_ident_byte(bytes[start - 1]) {
-        start -= 1;
-        end = start;
-    }
-    if start >= bytes.len() || !is_ident_byte(bytes[start]) {
-        if start == 0 {
-            return None;
-        }
-        start -= 1;
-        end = start;
-        if !is_ident_byte(bytes[start]) {
-            return None;
-        }
-    }
-
-    while start > 0 && is_ident_byte(bytes[start - 1]) {
-        start -= 1;
-    }
-    while end < bytes.len() && is_ident_byte(bytes[end]) {
-        end += 1;
-    }
-    if start == end {
-        return None;
-    }
-    Some((start, end))
-}
-
-/// Extract the identifier prefix that ends at `offset` (the byte position of
-/// the cursor). Walks backward while bytes match [`is_ident_byte`]; does NOT
-/// walk forward past the cursor. Used by `textDocument/completion`, where the
-/// suffix to the right of the cursor belongs to the identifier the user is
-/// currently typing over and must not be consumed.
-///
-/// Returns `None` when there is no identifier byte immediately before `offset`
-/// (cursor after whitespace, after `(`, at file start) OR when `offset` lies
-/// past the end of `content`. The past-EOF rejection is important: callers
-/// must clamp their offsets via `position_to_byte_offset` first, and a
-/// degenerate offset must not produce a fabricated prefix from the trailing
-/// bytes of the buffer.
-pub fn identifier_prefix_before_offset(content: &str, offset: usize) -> Option<&str> {
-    let bytes = content.as_bytes();
-    if offset > bytes.len() {
-        return None;
-    }
-    let end = offset;
-    let mut start = end;
-    while start > 0 && is_ident_byte(bytes[start - 1]) {
-        start -= 1;
-    }
-    if start == end {
-        return None;
-    }
-    content.get(start..end)
-}
-
-pub(super) fn is_ident_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
-}
-
-/// Find the first occurrence of `needle` in `haystack` that is bounded on
-/// both sides by a non-identifier byte (or buffer edge). Used by handlers to
-/// locate a symbol identifier inside a larger span (declaration body,
-/// signature) without matching substrings inside other identifiers.
-pub(super) fn find_word(haystack: &str, needle: &str) -> Option<usize> {
-    let needle_bytes = needle.as_bytes();
-    let bytes = haystack.as_bytes();
-    if needle_bytes.is_empty() || needle_bytes.len() > bytes.len() {
-        return None;
-    }
-    let mut start = 0;
-    while let Some(rel) = haystack[start..].find(needle) {
-        let candidate = start + rel;
-        let before_ok = candidate == 0 || !is_ident_byte(bytes[candidate - 1]);
-        let after_idx = candidate + needle_bytes.len();
-        let after_ok = after_idx >= bytes.len() || !is_ident_byte(bytes[after_idx]);
-        if before_ok && after_ok {
-            return Some(candidate);
-        }
-        // Advance past this candidate's first byte so we don't loop forever.
-        start = candidate + 1;
-    }
-    None
 }
 
 /// Locate the identifier of `code_unit` inside `fallback`'s byte span and

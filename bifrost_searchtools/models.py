@@ -428,6 +428,107 @@ class TypeLookupResult:
 
 
 @dataclass(frozen=True)
+class RenameSymbolTarget:
+    symbol: str
+    kind: str
+    path: str
+
+    @classmethod
+    def from_dict(cls, data: dict) -> RenameSymbolTarget:
+        return cls(symbol=data["symbol"], kind=data["kind"], path=data["path"])
+
+    def render_text(self) -> str:
+        return f"{self.symbol} ({self.kind}) at {self.path}"
+
+
+@dataclass(frozen=True)
+class RenameTextEdit:
+    old_text: str
+    start_byte: int
+    end_byte: int
+    start_line: int
+    start_column: int
+    end_line: int
+    end_column: int
+    new_text: str
+
+    @classmethod
+    def from_dict(cls, data: dict) -> RenameTextEdit:
+        return cls(
+            old_text=data["old_text"],
+            start_byte=int(data["start_byte"]),
+            end_byte=int(data["end_byte"]),
+            start_line=int(data["start_line"]),
+            start_column=int(data["start_column"]),
+            end_line=int(data["end_line"]),
+            end_column=int(data["end_column"]),
+            new_text=data["new_text"],
+        )
+
+    def render_text(self) -> str:
+        return (
+            f"{self.start_line}:{self.start_column}-{self.end_line}:{self.end_column} "
+            f"{self.old_text} -> {self.new_text}"
+        )
+
+
+@dataclass(frozen=True)
+class RenameFileEdits:
+    path: str
+    edits: list[RenameTextEdit]
+
+    @classmethod
+    def from_dict(cls, data: dict) -> RenameFileEdits:
+        return cls(
+            path=data["path"],
+            edits=[RenameTextEdit.from_dict(item) for item in data.get("edits", [])],
+        )
+
+    def render_text(self) -> str:
+        lines = [self.path]
+        lines.extend(f"  {edit.render_text()}" for edit in self.edits)
+        return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class RenameSymbolResult:
+    query: dict
+    status: str
+    target: RenameSymbolTarget | None
+    old_name: str | None
+    edits: list[RenameFileEdits]
+    diagnostics: list[DefinitionDiagnostic]
+
+    @classmethod
+    def from_dict(cls, data: dict) -> RenameSymbolResult:
+        return cls(
+            query=dict(data["query"]),
+            status=data["status"],
+            target=(
+                RenameSymbolTarget.from_dict(data["target"])
+                if data.get("target") is not None
+                else None
+            ),
+            old_name=data.get("old_name"),
+            edits=[RenameFileEdits.from_dict(item) for item in data.get("edits", [])],
+            diagnostics=[
+                DefinitionDiagnostic.from_dict(item)
+                for item in data.get("diagnostics", [])
+            ],
+        )
+
+    def render_text(self) -> str:
+        lines = [f"status: {self.status}"]
+        if self.target is not None:
+            lines.append(f"target: {self.target.render_text()}")
+        if self.old_name is not None:
+            lines.append(f"old_name: {self.old_name}")
+        lines.extend(file_edits.render_text() for file_edits in self.edits)
+        lines.extend(diagnostic.render_text() for diagnostic in self.diagnostics)
+        return "\n".join(lines)
+
+
+@dataclass(frozen=True)
 class DefinitionByReferenceLookupResult:
     query: dict
     status: str

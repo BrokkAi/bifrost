@@ -18,6 +18,7 @@ pub fn normalize_tool_arguments(
         "most_relevant_files" => {
             normalize_string_array_field(&mut arguments, "seed_file_paths", workspace_root)?
         }
+        "rename_symbol" => normalize_optional_string_field(&mut arguments, "path", workspace_root)?,
         "get_file_contents" => {
             normalize_string_array_field(&mut arguments, "file_paths", workspace_root)?
         }

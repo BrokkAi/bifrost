@@ -132,6 +132,145 @@ fn python_boundary_returns_structured_json() {
 }
 
 #[test]
+fn rename_symbol_returns_non_mutating_edit_set() {
+    let root = fixture_root();
+    let before_a = fs::read_to_string(root.join("A.java")).unwrap();
+    let service = SearchToolsService::new_without_semantic_index(root.clone()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "rename_symbol",
+            r#"{"path":"A.java","line":8,"column":19,"new_name":"renamedMethod2"}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert_eq!("ok", value["status"], "payload: {value}");
+    assert_eq!("A.method2", value["target"]["symbol"], "payload: {value}");
+    assert_eq!("method2", value["old_name"], "payload: {value}");
+    assert!(
+        value["edits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| file["path"] == "A.java"
+                && file["edits"].as_array().unwrap().iter().any(|edit| {
+                    edit["new_text"] == "renamedMethod2"
+                        && edit["old_text"] == "method2"
+                        && edit["start_line"] == 8
+                        && edit["start_column"] == 19
+                })),
+        "payload: {value}"
+    );
+    assert!(
+        value["edits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| file["path"] == "B.java"
+                && file["edits"].as_array().unwrap().iter().any(|edit| {
+                    edit["new_text"] == "renamedMethod2"
+                        && edit["start_line"] == 9
+                        && edit["start_column"] == 27
+                })),
+        "payload: {value}"
+    );
+    assert_eq!(
+        before_a,
+        fs::read_to_string(root.join("A.java")).unwrap(),
+        "rename_symbol must return edits without mutating files"
+    );
+}
+
+#[test]
+fn rename_symbol_rejects_oversized_identifier() {
+    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
+    let arguments = serde_json::json!({
+        "path": "A.java",
+        "line": 8,
+        "column": 19,
+        "new_name": "a".repeat(257)
+    });
+    let payload = service
+        .call_tool_json("rename_symbol", &arguments.to_string())
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert_eq!("invalid_name", value["status"], "payload: {value}");
+    assert!(
+        !value["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains(&"a".repeat(257)),
+        "payload: {value}"
+    );
+}
+
+#[test]
+fn rename_symbol_rejects_mixed_or_incomplete_locations() {
+    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
+    let mixed_payload = service
+        .call_tool_json(
+            "rename_symbol",
+            r#"{"path":"A.java","line":8,"column":19,"start_byte":120,"new_name":"renamedMethod2"}"#,
+        )
+        .unwrap();
+    let mixed: Value = serde_json::from_str(&mixed_payload).unwrap();
+    assert_eq!("invalid_location", mixed["status"], "payload: {mixed}");
+
+    let incomplete_payload = service
+        .call_tool_json(
+            "rename_symbol",
+            r#"{"path":"A.java","line":8,"column":19,"end_byte":125,"new_name":"renamedMethod2"}"#,
+        )
+        .unwrap();
+    let incomplete: Value = serde_json::from_str(&incomplete_payload).unwrap();
+    assert_eq!(
+        "invalid_location", incomplete["status"],
+        "payload: {incomplete}"
+    );
+}
+
+#[test]
+fn rename_symbol_rejects_file_coupled_java_class() {
+    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "rename_symbol",
+            r#"{"path":"A.java","line":3,"column":14,"new_name":"RenamedA"}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert_eq!("unsupported", value["status"], "payload: {value}");
+    assert!(
+        value["edits"].as_array().unwrap().is_empty(),
+        "payload: {value}"
+    );
+    assert_eq!(
+        "unsupported", value["diagnostics"][0]["kind"],
+        "payload: {value}"
+    );
+}
+
+#[test]
+fn rename_symbol_rejects_invalid_identifier() {
+    let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "rename_symbol",
+            r#"{"path":"A.java","line":8,"column":19,"new_name":"not-valid"}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert_eq!("invalid_name", value["status"], "payload: {value}");
+    assert!(
+        value["edits"].as_array().unwrap().is_empty(),
+        "payload: {value}"
+    );
+}
+
+#[test]
 fn get_summaries_directory_target_stays_narrow_on_service_path() {
     let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
     let payload = service
