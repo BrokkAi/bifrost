@@ -1074,27 +1074,51 @@ fn build_workspace_for_lsp(
     progress: Option<&StartupProgress>,
 ) -> WorkspaceAnalyzer {
     let config = AnalyzerConfig::default();
-    match progress {
-        Some(progress) => {
+    let storage = project
+        .persistence_root()
+        .and_then(safe_default_db_path)
+        .and_then(|path| AnalyzerStorage::open(path).ok())
+        .map(Arc::new);
+    match (storage, progress) {
+        (Some(storage), Some(progress)) => {
             let progress = progress.clone_for_callback();
-            let Some(persistence_root) = project.persistence_root() else {
-                return WorkspaceAnalyzer::build(project, config);
-            };
-            match AnalyzerStorage::open(default_db_path(persistence_root))
-                .ok()
-                .map(Arc::new)
-            {
-                Some(storage) => WorkspaceAnalyzer::build_with_storage_and_progress(
-                    project,
-                    config,
-                    storage,
-                    move |event| progress.report_analyzer_event(event),
-                ),
-                None => WorkspaceAnalyzer::build(project, config),
-            }
+            WorkspaceAnalyzer::build_with_storage_and_progress(
+                project,
+                config,
+                storage,
+                move |event| progress.report_analyzer_event(event),
+            )
         }
-        None => WorkspaceAnalyzer::build(project, config),
+        (Some(storage), None) => WorkspaceAnalyzer::build_with_storage(project, config, storage),
+        (None, _) => WorkspaceAnalyzer::build(project, config),
     }
+}
+
+fn safe_default_db_path(project_root: &Path) -> Option<PathBuf> {
+    let cache_dir = project_root.join(crate::analyzer::persistence::DEFAULT_CACHE_DIR);
+    if is_symlink(&cache_dir) {
+        eprintln!(
+            "[bifrost-lsp] disabling analyzer storage for {}: cache directory is a symlink",
+            project_root.display()
+        );
+        return None;
+    }
+
+    let db_path = default_db_path(project_root);
+    if is_symlink(&db_path) {
+        eprintln!(
+            "[bifrost-lsp] disabling analyzer storage for {}: cache database is a symlink",
+            project_root.display()
+        );
+        return None;
+    }
+    Some(db_path)
+}
+
+fn is_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
 }
 
 fn collect_workspace_roots(

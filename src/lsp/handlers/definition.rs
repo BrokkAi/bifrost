@@ -4,7 +4,9 @@ use crate::analyzer::{CodeUnit, IAnalyzer, Project, Range as ByteRange, Workspac
 use crate::lsp::conversion::{
     byte_range_to_lsp_range, path_to_uri_string, position_to_byte_offset,
 };
-use crate::lsp::handlers::util::{identifier_at_offset, read_document_for_uri};
+use crate::lsp::handlers::util::{
+    identifier_at_offset, read_document_for_uri, resolve_identifier_candidates,
+};
 use crate::text_utils::compute_line_starts;
 
 /// Resolve `textDocument/definition`. Strategy:
@@ -32,7 +34,7 @@ pub fn handle(
     let identifier = identifier_at_offset(&content, byte_offset)?;
 
     let analyzer = workspace.analyzer();
-    let candidates = resolve_candidates(analyzer, identifier);
+    let candidates = resolve_identifier_candidates(analyzer, identifier);
     if candidates.is_empty() {
         return None;
     }
@@ -47,23 +49,6 @@ pub fn handle(
         return None;
     }
     Some(GotoDefinitionResponse::Array(locations))
-}
-
-fn resolve_candidates(analyzer: &dyn IAnalyzer, identifier: &str) -> Vec<CodeUnit> {
-    let direct: Vec<CodeUnit> = analyzer.get_definitions(identifier);
-    if !direct.is_empty() {
-        return direct;
-    }
-    // search_definitions matches the regex against the *full* fq_name, so an
-    // anchored `^IDENT$` only finds package-less top-level symbols. Use a
-    // word-bounded substring instead, then filter by exact short-name match
-    // to keep the result tight.
-    let pattern = format!(r"\b{}\b", regex::escape(identifier));
-    analyzer
-        .search_definitions(&pattern, false)
-        .into_iter()
-        .filter(|cu| cu.identifier() == identifier)
-        .collect()
 }
 
 fn code_unit_location(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> Option<Location> {

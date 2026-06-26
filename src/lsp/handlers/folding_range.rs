@@ -53,18 +53,21 @@ fn collect_folds(
     line_starts: &[usize],
     out: &mut BTreeSet<(u32, u32)>,
 ) {
-    for range in analyzer.ranges(code_unit) {
-        let lsp = byte_range_to_lsp_range(content, line_starts, range);
-        // LSP foldingRange uses line numbers; single-line spans (block headers
-        // like `class Foo {}` on one line) are not foldable and are dropped.
-        if lsp.end.line > lsp.start.line {
-            out.insert((lsp.start.line, lsp.end.line));
+    let mut stack = vec![code_unit.clone()];
+    while let Some(unit) = stack.pop() {
+        for range in analyzer.ranges(&unit) {
+            let lsp = byte_range_to_lsp_range(content, line_starts, range);
+            // LSP foldingRange uses line numbers; single-line spans (block headers
+            // like `class Foo {}` on one line) are not foldable and are dropped.
+            if lsp.end.line > lsp.start.line {
+                out.insert((lsp.start.line, lsp.end.line));
+            }
         }
-    }
-    for child in analyzer.direct_children(code_unit) {
-        if child.is_anonymous() {
-            continue;
+        for child in analyzer.direct_children(&unit) {
+            if child.is_anonymous() {
+                continue;
+            }
+            stack.push(child.clone());
         }
-        collect_folds(analyzer, child, content, line_starts, out);
     }
 }

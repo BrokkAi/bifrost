@@ -5,6 +5,7 @@ use crate::analyzer::{CodeUnit, IAnalyzer, Project, Range as ByteRange, Workspac
 use crate::lsp::conversion::{byte_range_to_lsp_range, position_to_byte_offset};
 use crate::lsp::handlers::util::{
     identifier_at_offset, identifier_selection_range, read_document_for_uri,
+    resolve_identifier_candidates,
 };
 
 /// Resolve `textDocument/documentHighlight`. Scopes the usage scan to the
@@ -25,7 +26,7 @@ pub fn handle(
     let identifier = identifier_at_offset(&content, byte_offset)?;
 
     let analyzer = workspace.analyzer();
-    let overloads = resolve_overloads(analyzer, identifier);
+    let overloads = resolve_identifier_candidates(analyzer, identifier);
     if overloads.is_empty() {
         return None;
     }
@@ -78,24 +79,6 @@ fn kind_priority(kind: Option<DocumentHighlightKind>) -> u8 {
         Some(DocumentHighlightKind::READ) => 1,
         _ => 0,
     }
-}
-
-fn resolve_overloads(analyzer: &dyn IAnalyzer, identifier: &str) -> Vec<CodeUnit> {
-    let mut out = analyzer.get_definitions(identifier);
-    if !out.is_empty() {
-        return out;
-    }
-    // Mirror the references handler: word-bounded fq_name search plus a
-    // short-name post-filter, since the analyzer matches the regex against
-    // the full fq_name (including any package prefix).
-    let pattern = format!(r"\b{}\b", regex::escape(identifier));
-    out.extend(
-        analyzer
-            .search_definitions(&pattern, false)
-            .into_iter()
-            .filter(|cu| cu.identifier() == identifier),
-    );
-    out
 }
 
 fn usage_hit_to_highlight(

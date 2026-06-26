@@ -1,6 +1,3 @@
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-
 use lsp_types::{Location, ReferenceParams, Uri};
 
 use crate::analyzer::usages::{
@@ -10,8 +7,9 @@ use crate::analyzer::{CodeUnit, IAnalyzer, Project, Range as ByteRange, Workspac
 use crate::lsp::conversion::{
     byte_range_to_lsp_range, path_to_uri_string, position_to_byte_offset,
 };
-use crate::lsp::handlers::util::{identifier_at_offset, read_document_for_uri};
-use crate::text_utils::compute_line_starts;
+use crate::lsp::handlers::util::{
+    FileContentCache, identifier_at_offset, read_document_for_uri, resolve_identifier_candidates,
+};
 
 /// Resolve `textDocument/references`. Strategy:
 /// 1. Identifier under cursor -> resolve all matching CodeUnits (overloads).
@@ -34,7 +32,7 @@ pub fn handle(
     let identifier = identifier_at_offset(&content, byte_offset)?;
 
     let analyzer = workspace.analyzer();
-    let overloads = resolve_overloads(analyzer, identifier);
+    let overloads = resolve_identifier_candidates(analyzer, identifier);
     if overloads.is_empty() {
         return None;
     }
@@ -43,7 +41,7 @@ pub fn handle(
         UsageFinder::new().find_usages(analyzer, &overloads, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES);
     let hits = collect_hits(result);
 
-    let mut content_cache: HashMap<PathBuf, FileContent> = HashMap::new();
+    let mut content_cache = FileContentCache::default();
     let mut locations: Vec<Location> = hits
         .into_iter()
         .filter_map(|hit| usage_hit_to_location(&hit, &mut content_cache))
@@ -69,51 +67,13 @@ pub fn handle(
     Some(locations)
 }
 
-fn resolve_overloads(analyzer: &dyn IAnalyzer, identifier: &str) -> Vec<CodeUnit> {
-    let mut out = analyzer.get_definitions(identifier);
-    if !out.is_empty() {
-        return out;
-    }
-    // Word-bounded fq_name search (the regex runs against the full fq_name
-    // including any package prefix) plus a short-name post-filter. See
-    // definition::resolve_candidates for rationale.
-    let pattern = format!(r"\b{}\b", regex::escape(identifier));
-    out.extend(
-        analyzer
-            .search_definitions(&pattern, false)
-            .into_iter()
-            .filter(|cu| cu.identifier() == identifier),
-    );
-    out
-}
-
 fn collect_hits(result: FuzzyResult) -> Vec<UsageHit> {
     result.all_hits().into_iter().collect()
 }
 
-struct FileContent {
-    body: String,
-    line_starts: Vec<usize>,
-}
-
-fn ensure_cached<'a>(
-    cache: &'a mut HashMap<PathBuf, FileContent>,
-    abs_path: &Path,
-) -> Option<&'a FileContent> {
-    if !cache.contains_key(abs_path) {
-        let body = std::fs::read_to_string(abs_path).ok()?;
-        let line_starts = compute_line_starts(&body);
-        cache.insert(abs_path.to_path_buf(), FileContent { body, line_starts });
-    }
-    cache.get(abs_path)
-}
-
-fn usage_hit_to_location(
-    hit: &UsageHit,
-    cache: &mut HashMap<PathBuf, FileContent>,
-) -> Option<Location> {
+fn usage_hit_to_location(hit: &UsageHit, cache: &mut FileContentCache) -> Option<Location> {
     let abs_path = hit.file.abs_path();
-    let entry = ensure_cached(cache, &abs_path)?;
+    let entry = cache.read_disk(&abs_path)?;
     let range = ByteRange {
         start_byte: hit.start_offset,
         end_byte: hit.end_offset,
@@ -131,10 +91,10 @@ fn usage_hit_to_location(
 fn code_unit_location(
     analyzer: &dyn IAnalyzer,
     code_unit: &CodeUnit,
-    cache: &mut HashMap<PathBuf, FileContent>,
+    cache: &mut FileContentCache,
 ) -> Option<Location> {
     let abs_path = code_unit.source().abs_path();
-    let entry = ensure_cached(cache, &abs_path)?;
+    let entry = cache.read_disk(&abs_path)?;
     let range = analyzer
         .ranges(code_unit)
         .iter()

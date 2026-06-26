@@ -1,6 +1,3 @@
-use std::collections::HashMap;
-use std::path::PathBuf;
-
 use lsp_types::{
     Location, OneOf, SymbolKind, Uri, WorkspaceSymbol, WorkspaceSymbolParams,
     WorkspaceSymbolResponse,
@@ -9,7 +6,7 @@ use lsp_types::{
 use crate::analyzer::common::display_identifier_for_target;
 use crate::analyzer::{CodeUnit, CodeUnitType, IAnalyzer, Range as ByteRange, WorkspaceAnalyzer};
 use crate::lsp::conversion::{byte_range_to_lsp_range, path_to_uri_string};
-use crate::text_utils::compute_line_starts;
+use crate::lsp::handlers::util::FileContentCache;
 
 /// Soft cap: workspace/symbol queries can match thousands of definitions in
 /// a large repo, but most editors only display the top results.
@@ -43,7 +40,7 @@ pub fn handle(
     };
     matches.truncate(MAX_RESULTS);
 
-    let mut content_cache: HashMap<PathBuf, FileContent> = HashMap::new();
+    let mut content_cache = FileContentCache::default();
     let mut results = Vec::with_capacity(matches.len());
     for code_unit in matches {
         if code_unit.is_anonymous() || code_unit.is_synthetic() {
@@ -57,22 +54,13 @@ pub fn handle(
     Some(WorkspaceSymbolResponse::Nested(results))
 }
 
-struct FileContent {
-    body: String,
-    line_starts: Vec<usize>,
-}
-
 fn build_symbol(
     analyzer: &dyn IAnalyzer,
     code_unit: &CodeUnit,
-    cache: &mut HashMap<PathBuf, FileContent>,
+    cache: &mut FileContentCache,
 ) -> Option<WorkspaceSymbol> {
     let abs_path = code_unit.source().abs_path();
-    let entry = cache.entry(abs_path.clone()).or_insert_with(|| {
-        let body = code_unit.source().read_to_string().unwrap_or_default();
-        let line_starts = compute_line_starts(&body);
-        FileContent { body, line_starts }
-    });
+    let entry = cache.read_disk_or_empty(&abs_path);
 
     let range = analyzer
         .ranges(code_unit)
