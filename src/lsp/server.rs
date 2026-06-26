@@ -15,9 +15,9 @@ use lsp_types::notification::{
 use lsp_types::request::{
     CallHierarchyIncomingCalls, CallHierarchyOutgoingCalls, CallHierarchyPrepare, Completion,
     DocumentDiagnosticRequest, DocumentHighlightRequest, DocumentSymbolRequest,
-    FoldingRangeRequest, GotoDefinition, HoverRequest, References, Request as LspRequestTrait,
-    TypeHierarchyPrepare, TypeHierarchySubtypes, TypeHierarchySupertypes, WorkDoneProgressCreate,
-    WorkspaceSymbolRequest,
+    FoldingRangeRequest, GotoDefinition, HoverRequest, PrepareRenameRequest, References, Rename,
+    Request as LspRequestTrait, TypeHierarchyPrepare, TypeHierarchySubtypes,
+    TypeHierarchySupertypes, WorkDoneProgressCreate, WorkspaceSymbolRequest,
 };
 use lsp_types::{
     DidChangeTextDocumentParams, DidChangeWatchedFilesParams, DidChangeWorkspaceFoldersParams,
@@ -40,7 +40,7 @@ use crate::lsp::handlers::util::{
 };
 use crate::lsp::handlers::{
     call_hierarchy, completion, definition, diagnostic, document_highlight, document_symbol,
-    folding_range, hover, references, type_hierarchy, workspace_symbol,
+    folding_range, hover, references, rename, type_hierarchy, workspace_symbol,
 };
 
 /// Run the LSP server over stdio. `fallback_root` is used when the client does
@@ -364,6 +364,12 @@ fn handle_request(
                 state.project(),
                 &params,
             ))
+        }),
+        PrepareRenameRequest::METHOD => decode_and_run::<PrepareRenameRequest, _>(req, |params| {
+            Ok(rename::prepare(&state.workspace, state.project(), &params))
+        }),
+        Rename::METHOD => decode_and_run::<Rename, _>(req, |params| {
+            Ok(rename::handle(&state.workspace, state.project(), &params))
         }),
         DocumentHighlightRequest::METHOD => {
             decode_and_run::<DocumentHighlightRequest, _>(req, |params| {
