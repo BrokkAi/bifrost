@@ -33,6 +33,7 @@ pub(super) fn scan_files_for_seeds(
     let collected: Mutex<BTreeSet<UsageHit>> = Mutex::new(BTreeSet::new());
     let target_short = top_level_identifier(target).to_string();
     let target_member = member_name(target);
+    let reference_needle = target_member.as_deref().unwrap_or(&target_short);
     let target_owner_source = analyzer
         .parent_of(target)
         .map(|owner| owner.source().clone());
@@ -47,6 +48,12 @@ pub(super) fn scan_files_for_seeds(
             return;
         };
         if source.is_empty() {
+            return;
+        }
+        // Any structured reference we can resolve must still spell the target
+        // identifier/member in source; skip parsing importer files that cannot
+        // contain a match.
+        if !source.contains(reference_needle) {
             return;
         }
         let mut parser = Parser::new();
