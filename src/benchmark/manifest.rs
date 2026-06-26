@@ -172,10 +172,14 @@ pub enum BenchmarkScenario {
     ScanUsages,
     #[serde(rename = "get_definition")]
     GetDefinition,
+    #[serde(rename = "call_hierarchy")]
+    CallHierarchy,
+    #[serde(rename = "type_hierarchy")]
+    TypeHierarchy,
 }
 
 impl BenchmarkScenario {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 10] = [
         Self::WorkspaceBuild,
         Self::SearchSymbols,
         Self::GetSymbolLocations,
@@ -184,6 +188,8 @@ impl BenchmarkScenario {
         Self::MostRelevantFiles,
         Self::ScanUsages,
         Self::GetDefinition,
+        Self::CallHierarchy,
+        Self::TypeHierarchy,
     ];
 
     pub fn label(self) -> &'static str {
@@ -196,12 +202,15 @@ impl BenchmarkScenario {
             Self::MostRelevantFiles => "most_relevant_files",
             Self::ScanUsages => "scan_usages",
             Self::GetDefinition => "get_definition",
+            Self::CallHierarchy => "call_hierarchy",
+            Self::TypeHierarchy => "type_hierarchy",
         }
     }
 
     pub fn tool_name(self) -> &'static str {
         match self {
             Self::GetDefinition => "get_definition_by_location",
+            Self::CallHierarchy | Self::TypeHierarchy => self.label(),
             _ => self.label(),
         }
     }
@@ -344,6 +353,10 @@ pub struct BenchmarkRepoTarget {
     pub usage_targets: Vec<BenchmarkLocationSelector>,
     #[serde(default)]
     pub definition_queries: Vec<DefinitionQueryTarget>,
+    #[serde(default)]
+    pub call_hierarchy_queries: Vec<HierarchyQueryTarget>,
+    #[serde(default)]
+    pub type_hierarchy_queries: Vec<HierarchyQueryTarget>,
 }
 
 pub type ScanUsageQueryTarget = BenchmarkLocationSelector;
@@ -368,6 +381,20 @@ pub struct DefinitionQueryTarget {
     pub expected_status: String,
     #[serde(default)]
     pub expected_fqn: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HierarchyQueryTarget {
+    #[serde(flatten)]
+    pub selector: BenchmarkLocationSelector,
+    #[serde(default)]
+    pub min_incoming: usize,
+    #[serde(default)]
+    pub min_outgoing: usize,
+    #[serde(default)]
+    pub min_supertypes: usize,
+    #[serde(default)]
+    pub min_subtypes: usize,
 }
 
 impl BenchmarkRepoTarget {
@@ -491,6 +518,28 @@ impl BenchmarkRepoTarget {
                 query.validate(name, index, errors);
             }
         }
+
+        if scenarios.contains(&BenchmarkScenario::CallHierarchy) {
+            if self.call_hierarchy_queries.is_empty() {
+                errors.push(format!(
+                    "repo `{name}` enables `call_hierarchy` but does not define call_hierarchy_queries"
+                ));
+            }
+            for (index, query) in self.call_hierarchy_queries.iter().enumerate() {
+                query.validate(name, "call_hierarchy_queries", index, errors);
+            }
+        }
+
+        if scenarios.contains(&BenchmarkScenario::TypeHierarchy) {
+            if self.type_hierarchy_queries.is_empty() {
+                errors.push(format!(
+                    "repo `{name}` enables `type_hierarchy` but does not define type_hierarchy_queries"
+                ));
+            }
+            for (index, query) in self.type_hierarchy_queries.iter().enumerate() {
+                query.validate(name, "type_hierarchy_queries", index, errors);
+            }
+        }
     }
 }
 
@@ -546,6 +595,13 @@ impl DefinitionQueryTarget {
         {
             errors.push(format!("{label} has a blank expected_fqn"));
         }
+    }
+}
+
+impl HierarchyQueryTarget {
+    fn validate(&self, repo_name: &str, field_name: &str, index: usize, errors: &mut Vec<String>) {
+        let label = format!("repo `{repo_name}` {field_name}[{index}]");
+        self.selector.validate(&label, true, errors);
     }
 }
 

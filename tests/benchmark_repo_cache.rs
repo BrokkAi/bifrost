@@ -37,6 +37,8 @@ fn repo_target(source_root: &Path, commit: &str) -> BenchmarkRepoTarget {
         usage_symbols: Vec::new(),
         usage_targets: Vec::new(),
         definition_queries: Vec::new(),
+        call_hierarchy_queries: Vec::new(),
+        type_hierarchy_queries: Vec::new(),
     }
 }
 
