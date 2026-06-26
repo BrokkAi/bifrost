@@ -78,6 +78,14 @@ fn bifrost_lsp_server_handles_initialize_and_shutdown() {
         "callHierarchyProvider should be advertised: {initialize}"
     );
     assert_eq!(
+        initialize["result"]["capabilities"]["typeDefinitionProvider"], true,
+        "typeDefinitionProvider should be advertised: {initialize}"
+    );
+    assert_eq!(
+        initialize["result"]["capabilities"]["implementationProvider"], true,
+        "implementationProvider should be advertised: {initialize}"
+    );
+    assert_eq!(
         initialize["result"]["capabilities"]["renameProvider"]["prepareProvider"], true,
         "renameProvider with prepare support should be advertised: {initialize}"
     );
@@ -1175,8 +1183,8 @@ fn bifrost_lsp_server_skips_startup_progress_without_client_support() {
         "expected documentSymbol response: {response}"
     );
     assert!(
-        root.join(".bifrost").exists(),
-        "analyzer storage is independent from the client's work-done progress capability"
+        !root.join(".bifrost").exists(),
+        "server should not create analyzer storage for clients without work-done progress"
     );
 
     write_message(
@@ -1262,8 +1270,8 @@ fn bifrost_lsp_server_disables_startup_progress_when_token_create_fails() {
         "expected documentSymbol response after rejected progress token: {response}"
     );
     assert!(
-        root.join(".bifrost").exists(),
-        "analyzer storage is independent from whether progress token creation succeeds"
+        !root.join(".bifrost").exists(),
+        "server should not create analyzer storage after progress token creation fails"
     );
 
     write_message(
@@ -1812,6 +1820,285 @@ fn bifrost_lsp_server_goto_definition_finds_class_a_from_b() {
     drop(stdin);
     let status = child.wait().expect("wait bifrost");
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
+fn bifrost_lsp_server_type_definition_resolves_rust_explicit_local_type() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let lib_path = root.join("lib.rs");
+    let model_path = root.join("model.rs");
+    fs::write(
+        &lib_path,
+        "mod model;\nuse model::Widget;\n\nfn run() {\n    let value: Widget = Widget;\n    let _ = value;\n}\n",
+    )
+    .expect("write lib.rs");
+    fs::write(&model_path, "pub struct Widget;\n").expect("write model.rs");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let lib_uri = uri_for(&lib_path);
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "textDocument/typeDefinition",
+            "params": {
+                "textDocument": {"uri": lib_uri},
+                "position": {"line": 5, "character": 12}
+            }
+        }),
+    );
+    let response = read_message(&mut reader, &mut stderr);
+    let locations = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected location array, got {response}"));
+    assert_eq!(
+        locations.len(),
+        1,
+        "expected one type definition: {response}"
+    );
+    let uri = locations[0]["uri"].as_str().expect("location uri");
+    assert!(
+        uri.ends_with("model.rs"),
+        "expected model.rs type definition, got {response}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_implementation_returns_go_interface_descendants() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    fs::write(root.join("go.mod"), "module example.com/app\n").expect("write go.mod");
+    let file_path = root.join("main.go");
+    fs::write(
+        &file_path,
+        "package main\n\ntype Runner interface {\n    Run() error\n}\n\ntype Worker struct{}\n\nfunc (Worker) Run() error { return nil }\n\nfunc use() {\n    var runner Runner = Worker{}\n    _ = runner\n}\n",
+    )
+    .expect("write main.go");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "textDocument/implementation",
+            "params": {
+                "textDocument": {"uri": file_uri},
+                "position": {"line": 12, "character": 9}
+            }
+        }),
+    );
+    let response = read_message(&mut reader, &mut stderr);
+    let locations = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected location array, got {response}"));
+    assert_eq!(
+        locations.len(),
+        1,
+        "expected one implementation: {response}"
+    );
+    let start_line = locations[0]["range"]["start"]["line"]
+        .as_u64()
+        .expect("range.start.line");
+    assert_eq!(
+        start_line, 6,
+        "expected Worker declaration as implementation target: {response}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_implementation_works_from_go_interface_declaration() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    fs::write(root.join("go.mod"), "module example.com/app\n").expect("write go.mod");
+    let file_path = root.join("main.go");
+    fs::write(
+        &file_path,
+        "package main\n\ntype Runner interface {\n    Run() error\n}\n\ntype Worker struct{}\n\nfunc (Worker) Run() error { return nil }\n",
+    )
+    .expect("write main.go");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "textDocument/implementation",
+            "params": {
+                "textDocument": {"uri": file_uri},
+                "position": {"line": 2, "character": 5}
+            }
+        }),
+    );
+    let response = read_message(&mut reader, &mut stderr);
+    let locations = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected location array, got {response}"));
+    assert_eq!(
+        locations.len(),
+        1,
+        "expected one type implementation: {response}"
+    );
+    assert_eq!(
+        locations[0]["range"]["start"]["line"], 6,
+        "expected Worker declaration from interface declaration lookup: {response}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_implementation_works_from_go_interface_method() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    fs::write(root.join("go.mod"), "module example.com/app\n").expect("write go.mod");
+    let file_path = root.join("main.go");
+    fs::write(
+        &file_path,
+        "package main\n\ntype Runner interface {\n    Run() error\n}\n\ntype Worker struct{}\n\nfunc (Worker) Run() error { return nil }\n",
+    )
+    .expect("write main.go");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "textDocument/implementation",
+            "params": {
+                "textDocument": {"uri": file_uri},
+                "position": {"line": 3, "character": 4}
+            }
+        }),
+    );
+    let response = read_message(&mut reader, &mut stderr);
+    let locations = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected location array, got {response}"));
+    assert_eq!(
+        locations.len(),
+        1,
+        "expected one method implementation: {response}"
+    );
+    assert_eq!(
+        locations[0]["range"]["start"]["line"], 8,
+        "expected Worker.Run declaration from interface method lookup: {response}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_type_definition_returns_null_for_unresolved_type() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("plain.js");
+    fs::write(
+        &file_path,
+        "function run() {\n    const value = makeValue();\n    value;\n}\n",
+    )
+    .expect("write plain.js");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "textDocument/typeDefinition",
+            "params": {
+                "textDocument": {"uri": file_uri},
+                "position": {"line": 2, "character": 4}
+            }
+        }),
+    );
+    let response = read_message(&mut reader, &mut stderr);
+    assert!(
+        response["result"].is_null(),
+        "unresolved type definition should return null, got {response}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_type_definition_uses_did_open_overlay() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let app_path = root.join("app.ts");
+    let model_path = root.join("model.ts");
+    fs::write(&model_path, "export interface Widget {}\n").expect("write model.ts");
+    fs::write(
+        &app_path,
+        "import { Widget } from './model';\nlet value = null;\nvalue;\n",
+    )
+    .expect("write app.ts");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let app_uri = uri_for(&app_path);
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": app_uri,
+                    "languageId": "typescript",
+                    "version": 1,
+                    "text": "import { Widget } from './model';\nlet value: Widget = null as any;\nvalue;\n"
+                }
+            }
+        }),
+    );
+    let _ = read_notification(&mut reader, &mut stderr, "textDocument/publishDiagnostics");
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "textDocument/typeDefinition",
+            "params": {
+                "textDocument": {"uri": app_uri},
+                "position": {"line": 2, "character": 0}
+            }
+        }),
+    );
+    let response = read_message(&mut reader, &mut stderr);
+    let locations = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected location array, got {response}"));
+    assert_eq!(
+        locations.len(),
+        1,
+        "expected overlay type annotation to resolve: {response}"
+    );
+    let uri = locations[0]["uri"].as_str().expect("location uri");
+    assert!(
+        uri.ends_with("model.ts"),
+        "expected Widget definition from model.ts, got {response}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
 }
 
 #[test]

@@ -1,8 +1,9 @@
 use lsp_types::{
     CompletionOptions, DiagnosticOptions, DiagnosticServerCapabilities,
-    FoldingRangeProviderCapability, HoverProviderCapability, OneOf, RenameOptions,
-    ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
-    TextDocumentSyncSaveOptions, WorkDoneProgressOptions, WorkspaceFoldersServerCapabilities,
+    FoldingRangeProviderCapability, HoverProviderCapability, ImplementationProviderCapability,
+    OneOf, RenameOptions, ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind,
+    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TypeDefinitionProviderCapability,
+    WorkDoneProgressOptions, WorkspaceFoldersServerCapabilities,
 };
 
 pub fn server_capabilities() -> ServerCapabilities {
@@ -34,6 +35,8 @@ pub fn server_capabilities() -> ServerCapabilities {
             ..CompletionOptions::default()
         }),
         definition_provider: Some(OneOf::Left(true)),
+        type_definition_provider: Some(TypeDefinitionProviderCapability::Simple(true)),
+        implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
         document_highlight_provider: Some(OneOf::Left(true)),
         document_symbol_provider: Some(OneOf::Left(true)),
         folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),

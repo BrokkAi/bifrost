@@ -26,6 +26,7 @@ use super::resolver::{
     TargetKind, VisibilityIndex, extract_variable_name, first_type_child,
     infer_cpp_initializer_type, is_declaration_name, is_declarator_node, normalize_type_text,
 };
+use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, first_precise, parse_and_collect,
 };
@@ -99,16 +100,19 @@ const SCOPE_NODES: &[&str] = &[
 ];
 
 fn walk(node: Node<'_>, ctx: &mut CppScan<'_, '_>, bindings: &mut LocalInferenceEngine<CodeUnit>) {
-    let mut stack = vec![WalkFrame::Enter(node)];
-    while let Some(frame) = stack.pop() {
-        match frame {
-            WalkFrame::Enter(node) => {
-                let enters_scope = walk_enter(node, ctx, bindings);
-                push_exit_and_children(node, enters_scope, &mut stack);
+    let mut state = (ctx, bindings);
+    walk_tree_iterative(
+        node,
+        &mut state,
+        |node, (ctx, bindings)| {
+            if walk_enter(node, ctx, bindings) {
+                TreeWalkAction::DescendWithExit
+            } else {
+                TreeWalkAction::Descend
             }
-            WalkFrame::Exit => bindings.exit_scope(),
-        }
-    }
+        },
+        |(_, bindings)| bindings.exit_scope(),
+    );
 }
 
 fn walk_enter(
@@ -123,26 +127,6 @@ fn walk_enter(
     seed_declaration(node, ctx, bindings);
     record_reference(node, ctx, bindings);
     enters_scope
-}
-
-enum WalkFrame<'tree> {
-    Enter(Node<'tree>),
-    Exit,
-}
-
-fn push_exit_and_children<'tree>(
-    node: Node<'tree>,
-    exits_scope: bool,
-    stack: &mut Vec<WalkFrame<'tree>>,
-) {
-    if exits_scope {
-        stack.push(WalkFrame::Exit);
-    }
-    for index in (0..node.named_child_count()).rev() {
-        if let Some(child) = node.named_child(index) {
-            stack.push(WalkFrame::Enter(child));
-        }
-    }
 }
 
 fn record_reference(

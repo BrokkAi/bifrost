@@ -923,6 +923,7 @@ pub fn get_type_by_location(analyzer: &dyn IAnalyzer, params: GetTypeParams) -> 
                     query.clone(),
                     crate::analyzer::usages::get_type::TypeLookupRequest {
                         file,
+                        source: None,
                         line: query.line,
                         column: query.column,
                         start_byte: query.start_byte,

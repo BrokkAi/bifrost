@@ -22,6 +22,7 @@ use super::extractor::{
     is_property_key_in_member, rightmost_jsx_identifier, slice,
 };
 use super::resolver::{JsTsUsageIndex, collect_jsts_files, tree_sitter_language_for};
+use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
     EdgeCollector, UsageEdgeWeights, UsageEdges, UsageNodeKey, build_edge_weights, build_edges,
     collect_file_edges, parse_and_collect,
@@ -480,17 +481,17 @@ impl TsScan<'_, '_> {
 }
 
 fn scan_node(node: Node<'_>, ctx: &mut TsScan<'_, '_>, locals: &mut LocalInferenceEngine<String>) {
-    let mut stack = vec![ScanFrame::Enter(node)];
-    while let Some(frame) = stack.pop() {
-        match frame {
-            ScanFrame::Enter(node) => {
-                if let Some(introduces_scope) = scan_node_enter(node, ctx, locals) {
-                    push_exit_and_children(node, introduces_scope, &mut stack);
-                }
-            }
-            ScanFrame::Exit => locals.exit_scope(),
-        }
-    }
+    let mut state = (ctx, locals);
+    walk_tree_iterative(
+        node,
+        &mut state,
+        |node, (ctx, locals)| match scan_node_enter(node, ctx, locals) {
+            Some(true) => TreeWalkAction::DescendWithExit,
+            Some(false) => TreeWalkAction::Descend,
+            None => TreeWalkAction::Skip,
+        },
+        |(_, locals)| locals.exit_scope(),
+    );
 }
 
 fn scan_node_enter(
@@ -545,17 +546,17 @@ fn scan_scoped_node(
     ctx: &mut ScopedTsScan<'_, '_>,
     locals: &mut LocalInferenceEngine<String>,
 ) {
-    let mut stack = vec![ScopedScanFrame::Enter(node)];
-    while let Some(frame) = stack.pop() {
-        match frame {
-            ScopedScanFrame::Enter(node) => {
-                if let Some(introduces_scope) = scan_scoped_node_enter(node, ctx, locals) {
-                    push_scoped_exit_and_children(node, introduces_scope, &mut stack);
-                }
-            }
-            ScopedScanFrame::Exit => locals.exit_scope(),
-        }
-    }
+    let mut state = (ctx, locals);
+    walk_tree_iterative(
+        node,
+        &mut state,
+        |node, (ctx, locals)| match scan_scoped_node_enter(node, ctx, locals) {
+            Some(true) => TreeWalkAction::DescendWithExit,
+            Some(false) => TreeWalkAction::Descend,
+            None => TreeWalkAction::Skip,
+        },
+        |(_, locals)| locals.exit_scope(),
+    );
 }
 
 fn scan_scoped_node_enter(
@@ -614,46 +615,6 @@ fn introduces_js_ts_scope(kind: &str) -> bool {
             | "function_declaration"
             | "method_definition"
     )
-}
-
-enum ScanFrame<'tree> {
-    Enter(Node<'tree>),
-    Exit,
-}
-
-enum ScopedScanFrame<'tree> {
-    Enter(Node<'tree>),
-    Exit,
-}
-
-fn push_exit_and_children<'tree>(
-    node: Node<'tree>,
-    introduces_scope: bool,
-    stack: &mut Vec<ScanFrame<'tree>>,
-) {
-    if introduces_scope {
-        stack.push(ScanFrame::Exit);
-    }
-    for index in (0..node.named_child_count()).rev() {
-        if let Some(child) = node.named_child(index) {
-            stack.push(ScanFrame::Enter(child));
-        }
-    }
-}
-
-fn push_scoped_exit_and_children<'tree>(
-    node: Node<'tree>,
-    introduces_scope: bool,
-    stack: &mut Vec<ScopedScanFrame<'tree>>,
-) {
-    if introduces_scope {
-        stack.push(ScopedScanFrame::Exit);
-    }
-    for index in (0..node.named_child_count()).rev() {
-        if let Some(child) = node.named_child(index) {
-            stack.push(ScopedScanFrame::Enter(child));
-        }
-    }
 }
 
 /// Declare every identifier bound by a parameter / declaration pattern as a local

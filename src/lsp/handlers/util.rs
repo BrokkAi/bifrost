@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::analyzer::{CodeUnit, IAnalyzer, Project, ProjectFile, Range as ByteRange};
-use crate::lsp::conversion::{byte_range_to_lsp_range, uri_to_path};
+use crate::lsp::conversion::{byte_range_to_lsp_range, path_to_uri_string, uri_to_path};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
-use lsp_types::{Range as LspRange, Uri};
+use lsp_types::{Location, Range as LspRange, Uri};
 
 /// Resolve an LSP `Uri` to a [`ProjectFile`], read its contents (consulting
 /// `project.read_source` so unsaved overlays win over disk), and compute the
@@ -98,6 +98,34 @@ pub(super) fn resolve_first_identifier_candidate(
         .search_definitions(&pattern, false)
         .into_iter()
         .find(|cu| cu.identifier() == identifier)
+}
+
+pub(super) fn code_unit_location(
+    analyzer: &dyn IAnalyzer,
+    project: &dyn Project,
+    code_unit: &CodeUnit,
+) -> Option<Location> {
+    let body = project.read_source(code_unit.source()).ok()?;
+    let line_starts = compute_line_starts(&body);
+    let range = analyzer
+        .ranges(code_unit)
+        .iter()
+        .min()
+        .copied()
+        .unwrap_or(ByteRange {
+            start_byte: 0,
+            end_byte: body.len(),
+            start_line: 0,
+            end_line: 0,
+        });
+    let lsp_range = byte_range_to_lsp_range(&body, &line_starts, &range);
+    let uri: Uri = path_to_uri_string(&code_unit.source().abs_path())
+        .parse()
+        .ok()?;
+    Some(Location {
+        uri,
+        range: lsp_range,
+    })
 }
 
 fn short_name_pattern(identifier: &str) -> String {

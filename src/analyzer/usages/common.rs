@@ -46,6 +46,47 @@ pub(super) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
         .trim()
 }
 
+pub(super) enum TreeWalkAction {
+    Descend,
+    DescendWithExit,
+    Skip,
+}
+
+pub(super) fn walk_tree_iterative<State>(
+    root: Node<'_>,
+    state: &mut State,
+    mut enter: impl FnMut(Node<'_>, &mut State) -> TreeWalkAction,
+    mut exit: impl FnMut(&mut State),
+) {
+    let mut stack = vec![TreeWalkFrame::Enter(root)];
+    while let Some(frame) = stack.pop() {
+        match frame {
+            TreeWalkFrame::Enter(node) => match enter(node, state) {
+                TreeWalkAction::Descend => push_named_children(node, &mut stack),
+                TreeWalkAction::DescendWithExit => {
+                    stack.push(TreeWalkFrame::Exit);
+                    push_named_children(node, &mut stack);
+                }
+                TreeWalkAction::Skip => {}
+            },
+            TreeWalkFrame::Exit => exit(state),
+        }
+    }
+}
+
+enum TreeWalkFrame<'tree> {
+    Enter(Node<'tree>),
+    Exit,
+}
+
+fn push_named_children<'tree>(node: Node<'tree>, stack: &mut Vec<TreeWalkFrame<'tree>>) {
+    for index in (0..node.named_child_count()).rev() {
+        if let Some(child) = node.named_child(index) {
+            stack.push(TreeWalkFrame::Enter(child));
+        }
+    }
+}
+
 pub(super) fn usage_hit(
     file: &ProjectFile,
     line_idx: usize,

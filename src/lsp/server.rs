@@ -15,9 +15,9 @@ use lsp_types::notification::{
 use lsp_types::request::{
     CallHierarchyIncomingCalls, CallHierarchyOutgoingCalls, CallHierarchyPrepare, Completion,
     DocumentDiagnosticRequest, DocumentHighlightRequest, DocumentSymbolRequest,
-    FoldingRangeRequest, GotoDefinition, HoverRequest, PrepareRenameRequest, References, Rename,
-    Request as LspRequestTrait, TypeHierarchyPrepare, TypeHierarchySubtypes,
-    TypeHierarchySupertypes, WorkDoneProgressCreate, WorkspaceSymbolRequest,
+    FoldingRangeRequest, GotoDefinition, GotoImplementation, GotoTypeDefinition, HoverRequest,
+    PrepareRenameRequest, References, Rename, Request as LspRequestTrait, TypeHierarchyPrepare,
+    TypeHierarchySubtypes, TypeHierarchySupertypes, WorkDoneProgressCreate, WorkspaceSymbolRequest,
 };
 use lsp_types::{
     DidChangeTextDocumentParams, DidChangeWatchedFilesParams, DidChangeWorkspaceFoldersParams,
@@ -40,7 +40,7 @@ use crate::lsp::handlers::util::{
 };
 use crate::lsp::handlers::{
     call_hierarchy, completion, definition, diagnostic, document_highlight, document_symbol,
-    folding_range, hover, references, rename, type_hierarchy, workspace_symbol,
+    folding_range, hover, references, rename, type_definition, type_hierarchy, workspace_symbol,
 };
 
 /// Run the LSP server over stdio. `fallback_root` is used when the client does
@@ -340,6 +340,20 @@ fn handle_request(
         }
         GotoDefinition::METHOD => decode_and_run::<GotoDefinition, _>(req, |params| {
             Ok(definition::handle(
+                &state.workspace,
+                state.project(),
+                &params,
+            ))
+        }),
+        GotoTypeDefinition::METHOD => decode_and_run::<GotoTypeDefinition, _>(req, |params| {
+            Ok(type_definition::handle(
+                &state.workspace,
+                state.project(),
+                &params,
+            ))
+        }),
+        GotoImplementation::METHOD => decode_and_run::<GotoImplementation, _>(req, |params| {
+            Ok(type_definition::implementation(
                 &state.workspace,
                 state.project(),
                 &params,
@@ -1080,14 +1094,17 @@ fn build_workspace_for_lsp(
     progress: Option<&StartupProgress>,
 ) -> WorkspaceAnalyzer {
     let config = AnalyzerConfig::default();
-    let storage = project
-        .persistence_root()
-        .and_then(safe_default_db_path)
-        .and_then(|path| AnalyzerStorage::open(path).ok())
-        .map(Arc::new);
-    match (storage, progress) {
-        (Some(storage), Some(progress)) => {
+    match progress {
+        Some(progress) => {
             let progress = progress.clone_for_callback();
+            let Some(storage) = project
+                .persistence_root()
+                .and_then(safe_default_db_path)
+                .and_then(|path| AnalyzerStorage::open(path).ok())
+                .map(Arc::new)
+            else {
+                return WorkspaceAnalyzer::build(project, config);
+            };
             WorkspaceAnalyzer::build_with_storage_and_progress(
                 project,
                 config,
@@ -1095,8 +1112,7 @@ fn build_workspace_for_lsp(
                 move |event| progress.report_analyzer_event(event),
             )
         }
-        (Some(storage), None) => WorkspaceAnalyzer::build_with_storage(project, config, storage),
-        (None, _) => WorkspaceAnalyzer::build(project, config),
+        None => WorkspaceAnalyzer::build(project, config),
     }
 }
 

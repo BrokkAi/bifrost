@@ -20,6 +20,7 @@ mod scala;
 #[derive(Debug, Clone)]
 pub(crate) struct TypeLookupRequest {
     pub(crate) file: ProjectFile,
+    pub(crate) source: Option<Arc<String>>,
     pub(crate) line: Option<usize>,
     pub(crate) column: Option<usize>,
     pub(crate) start_byte: Option<usize>,
@@ -134,11 +135,14 @@ fn resolve_one(
 ) -> TypeLookupOutcome {
     let file = request.file.clone();
     let language = language_for_file(&file);
-    let source = match context.source(&file) {
-        Ok(source) => source,
-        Err(message) => {
-            return diagnostic_outcome(TypeLookupStatus::NotFound, "file_read_failed", message);
-        }
+    let source = match request.source.clone() {
+        Some(source) => source,
+        None => match context.source(&file) {
+            Ok(source) => source,
+            Err(message) => {
+                return diagnostic_outcome(TypeLookupStatus::NotFound, "file_read_failed", message);
+            }
+        },
     };
     let site = match resolve_reference_site(&request.as_source_location(), &source) {
         Ok(site) => site,
@@ -171,7 +175,11 @@ fn resolve_one(
         );
     }
 
-    let tree = context.tree(&file, language, &source);
+    let tree = if request.source.is_some() {
+        parse_tree_for_type_lookup(&file, language, &source)
+    } else {
+        context.tree(&file, language, &source)
+    };
     let resolved = match language {
         Language::CSharp => {
             csharp::resolve_csharp_type(analyzer, &file, &source, tree.as_ref(), &site)
