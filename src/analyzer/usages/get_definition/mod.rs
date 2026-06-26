@@ -59,7 +59,7 @@ mod cpp;
 mod csharp;
 mod go;
 mod java;
-mod js_ts;
+pub(crate) mod js_ts;
 mod php;
 mod python;
 mod rust;

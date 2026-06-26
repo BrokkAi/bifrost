@@ -386,8 +386,8 @@ pub fn run() {
 }
 
 #[test]
-fn type_lookup_reports_unsupported_language() {
-    let project = InlineTestProject::new()
+fn ts_type_lookup_resolves_local_variable_annotation() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
         .file(
             "app.ts",
             "const value: Widget = new Widget();\nclass Widget {}\n",
@@ -400,26 +400,283 @@ fn type_lookup_reports_unsupported_language() {
     );
 
     let result = &value["results"][0];
-    assert_eq!(result["status"], "unsupported_language", "{value}");
+    assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(result["reference"]["target"], "value", "{value}");
+    assert_eq!(result["types"][0]["fqn"], "Widget", "{value}");
     assert_eq!(
-        result["diagnostics"][0]["kind"], "unsupported_language",
+        result["types"][0]["definitions"][0]["path"], "app.ts",
         "{value}"
     );
 }
 
 #[test]
-fn type_lookup_reports_invalid_location_before_unsupported_language() {
-    let project = InlineTestProject::new()
+fn ts_type_lookup_resolves_imported_type_annotation() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("model.ts", "export interface Widget {}\n")
         .file(
             "app.ts",
-            "const value: Widget = new Widget();\nclass Widget {}\n",
+            "import { Widget } from './model';\nconst value: Widget = {};\nvalue;\n",
         )
+        .build();
+
+    let line = "value;";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.ts","line":3,"column":{}}}]}}"#,
+            column_of(line, "value")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["types"][0]["fqn"], "Widget", "{value}");
+    assert_eq!(
+        result["types"][0]["definitions"][0]["path"], "model.ts",
+        "{value}"
+    );
+}
+
+#[test]
+fn ts_type_lookup_resolves_parameter_and_return_annotations() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "app.ts",
+            "class Widget {}\nfunction render(input: Widget): Widget { return input; }\nrender(new Widget());\n",
+        )
+        .build();
+
+    for (line_no, line, name) in [
+        (
+            2,
+            "function render(input: Widget): Widget { return input; }",
+            "input",
+        ),
+        (3, "render(new Widget());", "render"),
+    ] {
+        let value = lookup_type(
+            project.root(),
+            &format!(
+                r#"{{"references":[{{"path":"app.ts","line":{line_no},"column":{}}}]}}"#,
+                column_of(line, name)
+            ),
+        );
+
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["types"][0]["fqn"], "Widget", "{value}");
+        assert_eq!(
+            result["types"][0]["definitions"][0]["path"], "app.ts",
+            "{value}"
+        );
+    }
+}
+
+#[test]
+fn ts_type_lookup_resolves_member_receiver_type() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "app.ts",
+            "class Widget { label(): string { return ''; } }\nconst value: Widget = new Widget();\nvalue.label();\n",
+        )
+        .build();
+
+    let line = "value.label();";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.ts","line":3,"column":{}}}]}}"#,
+            column_of(line, "value")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["types"][0]["fqn"], "Widget", "{value}");
+    assert_eq!(
+        result["types"][0]["definitions"][0]["path"], "app.ts",
+        "{value}"
+    );
+}
+
+#[test]
+fn ts_function_local_use_does_not_leak_to_sibling_function_type_lookup() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "app.ts",
+            "class Widget {}\nfunction first(value: Widget) { return value; }\nfunction second() { const value = 1; return value; }\n",
+        )
+        .build();
+
+    let line = "function second() { const value = 1; return value; }";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.ts","line":3,"column":{}}}]}}"#,
+            column_of(line, "value;")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_type", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "no_explicit_type",
+        "{value}"
+    );
+}
+
+#[test]
+fn ts_block_local_use_does_not_leak_to_outer_type_lookup() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "app.ts",
+            "class Widget {}\nfunction run(ok: boolean) {\n  if (ok) { const value: Widget = new Widget(); }\n  return value;\n}\n",
+        )
+        .build();
+
+    let line = "  return value;";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.ts","line":4,"column":{}}}]}}"#,
+            column_of(line, "value")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_type", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "no_explicit_type",
+        "{value}"
+    );
+}
+
+#[test]
+fn ts_nested_function_can_use_outer_typed_binding_for_type_lookup() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "app.ts",
+            "class Widget {}\nfunction outer(value: Widget) {\n  function inner() {\n    return value;\n  }\n}\n",
+        )
+        .build();
+
+    let line = "    return value;";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.ts","line":4,"column":{}}}]}}"#,
+            column_of(line, "value")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["types"][0]["fqn"], "Widget", "{value}");
+}
+
+#[test]
+fn ts_type_lookup_resolves_destructured_parameter_property_type() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "app.ts",
+            "class Widget {}\nfunction render({ value }: { value: Widget }) {\n  return value;\n}\n",
+        )
+        .build();
+
+    let line = "  return value;";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.ts","line":3,"column":{}}}]}}"#,
+            column_of(line, "value")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["types"][0]["fqn"], "Widget", "{value}");
+}
+
+#[test]
+fn ts_type_lookup_resolves_namespace_imported_type_annotation() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("model.ts", "export class Widget {}\n")
+        .file(
+            "app.ts",
+            "import * as Models from './model';\nconst value: Models.Widget = new Models.Widget();\nvalue;\n",
+        )
+        .build();
+
+    let line = "value;";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.ts","line":3,"column":{}}}]}}"#,
+            column_of(line, "value")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["types"][0]["fqn"], "Widget", "{value}");
+    assert_eq!(
+        result["types"][0]["definitions"][0]["path"], "model.ts",
+        "{value}"
+    );
+}
+
+#[test]
+fn ts_type_lookup_resolves_return_type_annotation_wrapper() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "app.ts",
+            "class Widget {}\nfunction makeWidget(): Widget { return new Widget(); }\nconst value: ReturnType<typeof makeWidget> = makeWidget();\nvalue;\n",
+        )
+        .build();
+
+    let line = "value;";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.ts","line":4,"column":{}}}]}}"#,
+            column_of(line, "value")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["types"][0]["fqn"], "Widget", "{value}");
+}
+
+#[test]
+fn javascript_type_lookup_reports_no_declared_type() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("app.js", "const value = new Widget();\nclass Widget {}\n")
         .build();
 
     let value = lookup_type(
         project.root(),
-        r#"{"references":[{"path":"app.ts","line":99,"column":1}]}"#,
+        r#"{"references":[{"path":"app.js","line":1,"column":7}]}"#,
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_type", "{value}");
+    assert_eq!(result["reference"]["target"], "value", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "javascript_declared_type_unsupported",
+        "{value}"
+    );
+}
+
+#[test]
+fn type_lookup_reports_invalid_location_before_language_diagnostics() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("app.js", "const value = new Widget();\nclass Widget {}\n")
+        .build();
+
+    let value = lookup_type(
+        project.root(),
+        r#"{"references":[{"path":"app.js","line":99,"column":1}]}"#,
     );
 
     let result = &value["results"][0];

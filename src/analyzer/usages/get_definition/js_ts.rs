@@ -264,7 +264,7 @@ fn resolve_js_ts_module_binding(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn resolve_js_ts_module_binding_candidates(
+pub(crate) fn resolve_js_ts_module_binding_candidates(
     analyzer: &dyn IAnalyzer,
     support: &DefinitionLookupIndex,
     language: Language,
@@ -1000,7 +1000,7 @@ fn ts_local_receiver_owner_candidates(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn ts_receiver_owner_candidates_at_byte(
+pub(crate) fn ts_receiver_owner_candidates_at_byte(
     analyzer: &dyn IAnalyzer,
     support: &DefinitionLookupIndex,
     file: &ProjectFile,
@@ -2030,7 +2030,7 @@ fn ts_identifier_candidates(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn ts_resolve_type_text_to_property_owners(
+pub(crate) fn ts_resolve_type_text_to_property_owners(
     analyzer: &dyn IAnalyzer,
     support: &DefinitionLookupIndex,
     file: &ProjectFile,
@@ -2181,7 +2181,7 @@ fn ts_resolve_type_from_unit_context(
     )
 }
 
-fn ts_function_return_property_owners(
+pub(crate) fn ts_function_return_property_owners(
     analyzer: &dyn IAnalyzer,
     support: &DefinitionLookupIndex,
     function: &CodeUnit,
@@ -2374,7 +2374,7 @@ fn node_text_matches(node: Node<'_>, source: &str, expected: &str) -> bool {
         .is_some_and(|text| text.trim() == expected)
 }
 
-fn ts_type_annotation_text(node: Node<'_>, source: &str) -> String {
+pub(crate) fn ts_type_annotation_text(node: Node<'_>, source: &str) -> String {
     ts_clean_type_text(source.get(node.start_byte()..node.end_byte()).unwrap_or(""))
 }
 
@@ -2528,7 +2528,7 @@ fn jsts_value_space_candidates(
     }
 }
 
-fn jsts_type_space_candidates(
+pub(crate) fn jsts_type_space_candidates(
     analyzer: &dyn IAnalyzer,
     candidates: Vec<CodeUnit>,
 ) -> Vec<CodeUnit> {
@@ -2574,7 +2574,7 @@ fn is_bare_js_ts_specifier(module: &str) -> bool {
     !module.starts_with("./") && !module.starts_with("../") && !module.starts_with('/')
 }
 
-pub(super) fn parse_js_ts_tree(
+pub(crate) fn parse_js_ts_tree(
     file: &ProjectFile,
     source: &str,
     language: Language,

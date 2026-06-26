@@ -4,7 +4,7 @@ use crate::analyzer::usages::reference_site::{
     ResolvedReferenceSite, SourceLocationRequest, resolve_reference_site,
 };
 use crate::analyzer::usages::scala_graph::ScalaProjectTypes;
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
+use crate::analyzer::{CodeUnit, DefinitionLookupIndex, IAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
 use std::sync::Arc;
@@ -13,6 +13,7 @@ use tree_sitter::Tree;
 mod csharp;
 mod go;
 mod java;
+mod js_ts;
 mod rust;
 mod scala;
 
@@ -72,22 +73,32 @@ pub(crate) fn resolve_type_batch(
     analyzer: &dyn IAnalyzer,
     requests: Vec<TypeLookupRequest>,
 ) -> Vec<TypeLookupOutcome> {
-    let mut context = TypeBatchContext::default();
+    let mut context = TypeBatchContext::new(analyzer);
     requests
         .into_iter()
         .map(|request| resolve_one(analyzer, &mut context, request))
         .collect()
 }
 
-#[derive(Default)]
-struct TypeBatchContext {
+struct TypeBatchContext<'a> {
+    support: &'a DefinitionLookupIndex,
     sources: HashMap<ProjectFile, Result<Arc<String>, String>>,
     trees: HashMap<(ProjectFile, Language), Option<Tree>>,
     rust_cache: RustTypeLookupCache,
     scala_project_types: Option<Arc<ScalaProjectTypes>>,
 }
 
-impl TypeBatchContext {
+impl<'a> TypeBatchContext<'a> {
+    fn new(analyzer: &'a dyn IAnalyzer) -> Self {
+        Self {
+            support: analyzer.definition_lookup_index(),
+            sources: HashMap::default(),
+            trees: HashMap::default(),
+            rust_cache: RustTypeLookupCache::default(),
+            scala_project_types: None,
+        }
+    }
+
     fn source(&mut self, file: &ProjectFile) -> Result<Arc<String>, String> {
         self.sources
             .entry(file.clone())
@@ -118,7 +129,7 @@ impl TypeBatchContext {
 
 fn resolve_one(
     analyzer: &dyn IAnalyzer,
-    context: &mut TypeBatchContext,
+    context: &mut TypeBatchContext<'_>,
     request: TypeLookupRequest,
 ) -> TypeLookupOutcome {
     let file = request.file.clone();
@@ -142,7 +153,13 @@ fn resolve_one(
 
     if !matches!(
         language,
-        Language::CSharp | Language::Go | Language::Java | Language::Rust | Language::Scala
+        Language::CSharp
+            | Language::Go
+            | Language::Java
+            | Language::JavaScript
+            | Language::Rust
+            | Language::Scala
+            | Language::TypeScript
     ) {
         return finish_lookup_outcome(
             diagnostic_outcome(
@@ -161,6 +178,15 @@ fn resolve_one(
         }
         Language::Go => go::resolve_go_type(analyzer, &file, &source, tree.as_ref(), &site),
         Language::Java => java::resolve_java_type(analyzer, &file, &source, tree.as_ref(), &site),
+        Language::JavaScript | Language::TypeScript => js_ts::resolve_js_ts_type(
+            analyzer,
+            context.support,
+            &file,
+            language,
+            &source,
+            tree.as_ref(),
+            &site,
+        ),
         Language::Rust => rust::resolve_rust_type(
             analyzer,
             &file,
