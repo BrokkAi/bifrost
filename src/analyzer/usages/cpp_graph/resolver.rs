@@ -506,12 +506,17 @@ pub(super) fn collect_include_closure(
     file: &ProjectFile,
     out: &mut HashSet<ProjectFile>,
 ) {
-    if !out.insert(file.clone()) {
-        return;
-    }
-    for include in cpp_include_paths(analyzer.import_statements(file)) {
-        for target in resolve_include_targets_with_unique_fallback(cpp.project(), file, &include) {
-            collect_include_closure(cpp, analyzer, &target, out);
+    let mut stack = vec![file.clone()];
+    while let Some(file) = stack.pop() {
+        if !out.insert(file.clone()) {
+            continue;
+        }
+        for include in cpp_include_paths(analyzer.import_statements(&file)) {
+            for target in
+                resolve_include_targets_with_unique_fallback(cpp.project(), &file, &include)
+            {
+                stack.push(target);
+            }
         }
     }
 }
@@ -524,22 +529,20 @@ pub(super) fn collect_visible_declarations(
     visited: &mut HashSet<ProjectFile>,
     out: &mut HashSet<CodeUnit>,
 ) {
-    if !visited.insert(file.clone()) {
-        return;
-    }
-    if let Some(declarations) = declarations_by_file.get(file) {
-        out.extend(declarations.iter().cloned());
-    }
-    for include in cpp_include_paths(analyzer.import_statements(file)) {
-        for target in resolve_include_targets_with_unique_fallback(cpp.project(), file, &include) {
-            collect_visible_declarations(
-                cpp,
-                analyzer,
-                declarations_by_file,
-                &target,
-                visited,
-                out,
-            );
+    let mut stack = vec![file.clone()];
+    while let Some(file) = stack.pop() {
+        if !visited.insert(file.clone()) {
+            continue;
+        }
+        if let Some(declarations) = declarations_by_file.get(&file) {
+            out.extend(declarations.iter().cloned());
+        }
+        for include in cpp_include_paths(analyzer.import_statements(&file)) {
+            for target in
+                resolve_include_targets_with_unique_fallback(cpp.project(), &file, &include)
+            {
+                stack.push(target);
+            }
         }
     }
 }

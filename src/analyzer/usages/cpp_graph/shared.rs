@@ -1,6 +1,6 @@
 use super::extractor::{ScanState, scan_file};
 use super::inverted;
-use super::resolver::{TargetSpec, VisibilityIndex, collect_include_closure};
+use super::resolver::{TargetSpec, VisibilityIndex};
 use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
@@ -116,13 +116,12 @@ impl<'a> UsageEdgeResolver<'a> for CppEdgeResolver<'a> {
         // index is seeded with every in-scope caller file as a root (mirroring the
         // forward scan, which builds it from the query's candidate files). Built here
         // rather than at construction so the trait's `try_new` needs no `keep_file`.
-        let roots: HashSet<ProjectFile> = {
-            let mut roots = HashSet::default();
-            for file in self.files.iter().filter(|file| keep_file(file)) {
-                collect_include_closure(self.cpp, analyzer, file, &mut roots);
-            }
-            roots
-        };
+        let roots: HashSet<ProjectFile> = self
+            .files
+            .iter()
+            .filter(|file| keep_file(file))
+            .cloned()
+            .collect();
         let visibility = VisibilityIndex::build(self.cpp, analyzer, &roots);
         inverted::build_cpp_edges(analyzer, &self.files, &visibility, nodes, keep_file)
     }

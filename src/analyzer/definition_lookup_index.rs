@@ -5,6 +5,7 @@ use crate::path_utils::rel_path_string;
 #[derive(Debug, Clone, Default)]
 pub struct DefinitionLookupIndex {
     by_fqn: HashMap<String, Vec<CodeUnit>>,
+    direct_children_by_fqn: HashMap<String, Vec<CodeUnit>>,
     by_file_identifier: HashMap<(ProjectFile, String), Vec<CodeUnit>>,
     packages: HashSet<String>,
     normalized_fqns: HashSet<String>,
@@ -27,6 +28,12 @@ impl DefinitionLookupIndex {
         self.packages.insert(unit.package_name().to_string());
         self.normalized_fqns
             .insert(fqn.replace("$.", ".").trim_end_matches('$').to_string());
+        if let Some((parent_fqn, _)) = fqn.rsplit_once('.') {
+            self.direct_children_by_fqn
+                .entry(parent_fqn.to_string())
+                .or_default()
+                .push(unit.clone());
+        }
         self.by_fqn.entry(fqn).or_default().push(unit.clone());
         self.by_file_identifier
             .entry((unit.source().clone(), unit.identifier().to_string()))
@@ -41,6 +48,10 @@ impl DefinitionLookupIndex {
         for units in self.by_file_identifier.values_mut() {
             sort_units(units);
         }
+        for units in self.direct_children_by_fqn.values_mut() {
+            sort_units(units);
+            units.dedup();
+        }
     }
 
     pub(crate) fn fqn(&self, fqn: &str) -> Vec<CodeUnit> {
@@ -48,20 +59,10 @@ impl DefinitionLookupIndex {
     }
 
     pub(crate) fn fqn_direct_children(&self, fqn: &str) -> Vec<CodeUnit> {
-        let prefix = format!("{fqn}.");
-        let mut out = Vec::new();
-        for (child_fqn, units) in &self.by_fqn {
-            let Some(rest) = child_fqn.strip_prefix(&prefix) else {
-                continue;
-            };
-            if rest.contains('.') {
-                continue;
-            }
-            out.extend(units.iter().cloned());
-        }
-        sort_units(&mut out);
-        out.dedup();
-        out
+        self.direct_children_by_fqn
+            .get(fqn)
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub(crate) fn file_identifier(&self, file: &ProjectFile, ident: &str) -> Vec<CodeUnit> {

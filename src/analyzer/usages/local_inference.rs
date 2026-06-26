@@ -199,7 +199,7 @@ where
         loop {
             let mut changed = false;
             for (lhs, rhs) in &aliases {
-                if self.resolve_symbol(lhs).is_unknown() && !self.resolve_symbol(rhs).is_unknown() {
+                if self.is_unknown_symbol(lhs) && !self.is_unknown_symbol(rhs) {
                     self.alias_symbol(lhs.clone(), rhs);
                     changed = true;
                 }
@@ -211,15 +211,25 @@ where
     }
 
     pub fn resolve_symbol(&self, symbol: &str) -> SymbolResolution<T> {
+        self.resolve_symbol_ref(symbol)
+            .cloned()
+            .unwrap_or(SymbolResolution::Unknown)
+    }
+
+    pub fn resolve_symbol_ref(&self, symbol: &str) -> Option<&SymbolResolution<T>> {
         for scope in self.scopes.iter().rev() {
             if let Some(resolution) = scope.bindings.get(symbol) {
-                return resolution.clone();
+                return Some(resolution);
             }
             if scope.shadows.contains(symbol) {
-                return SymbolResolution::Unknown;
+                return None;
             }
         }
-        SymbolResolution::Unknown
+        None
+    }
+
+    pub fn is_unknown_symbol(&self, symbol: &str) -> bool {
+        self.resolve_symbol_ref(symbol).is_none()
     }
 
     pub fn is_shadowed(&self, symbol: &str) -> bool {
