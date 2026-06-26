@@ -65,7 +65,9 @@ mod python;
 mod rust;
 mod scala;
 
-pub(crate) use call_sites::{call_reference_ranges, is_call_reference_range};
+pub(crate) use call_sites::{
+    call_reference_ranges, call_signature_context, is_call_reference_range,
+};
 pub(crate) use csharp::csharp_type_lookup_resolution;
 pub(crate) use go::{GoTypeLookupResolutionKind, go_type_lookup_resolution};
 pub(crate) use java::java_type_lookup_fqn;
@@ -424,7 +426,12 @@ pub(crate) fn parse_tree_for_language(
         Language::CSharp => csharp::parse_csharp_tree(source),
         Language::Python => python::parse_python_tree(source),
         Language::Rust => rust::parse_rust_tree(source),
-        Language::Ruby | Language::Go | Language::None => None,
+        Language::Go => {
+            let mut parser = Parser::new();
+            parser.set_language(&tree_sitter_go::LANGUAGE.into()).ok()?;
+            parser.parse(source, None)
+        }
+        Language::Ruby | Language::None => None,
     }
 }
 
