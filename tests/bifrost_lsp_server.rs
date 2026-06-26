@@ -1128,6 +1128,120 @@ fn bifrost_lsp_server_reports_cold_start_progress_when_client_supports_it() {
 }
 
 #[test]
+fn bifrost_lsp_server_replays_did_open_sent_before_startup_progress_response() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("EarlyOpen.java");
+    fs::write(&file_path, "class DiskOnly {}\n").expect("write fixture");
+    let uri = uri_for(&file_path);
+    let overlay_text = "class OverlayOnly {}\n";
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(&root)
+        .arg("--server")
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bifrost");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "processId": null,
+                "rootUri": uri_for(&root),
+                "capabilities": {"window": {"workDoneProgress": true}}
+            }
+        }),
+    );
+    let initialize = read_message(&mut reader, &mut stderr);
+    assert_eq!(initialize["id"], 1);
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+    );
+
+    let create = read_message(&mut reader, &mut stderr);
+    assert_eq!(create["method"], "window/workDoneProgress/create");
+    let token = create["params"]["token"].clone();
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "java",
+                    "version": 1,
+                    "text": overlay_text
+                }
+            }
+        }),
+    );
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": create["id"].clone(), "result": null}),
+    );
+
+    let begin = read_notification(&mut reader, &mut stderr, "$/progress");
+    assert_eq!(begin["params"]["token"], token);
+    assert_eq!(begin["params"]["value"]["kind"], "begin");
+    let mut saw_end = false;
+    for _ in 0..32 {
+        let msg = read_notification(&mut reader, &mut stderr, "$/progress");
+        if msg["params"]["value"]["kind"] == "end" {
+            saw_end = true;
+            break;
+        }
+    }
+    assert!(saw_end, "expected startup progress to finish");
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "textDocument/hover",
+            "params": {
+                "textDocument": {"uri": uri_for(&file_path)},
+                "position": {"line": 0, "character": 8}
+            }
+        }),
+    );
+    let hover = read_response_for_id(&mut reader, &mut stderr, 2);
+    let hover_text = hover["result"]["contents"]["value"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        hover_text.contains("OverlayOnly"),
+        "hover should use replayed didOpen overlay, got {hover}"
+    );
+
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown"}),
+    );
+    let _ = read_response_for_id(&mut reader, &mut stderr, 3);
+    write_message(&mut stdin, json!({"jsonrpc": "2.0", "method": "exit"}));
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
 fn bifrost_lsp_server_skips_startup_progress_without_client_support() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().canonicalize().expect("canon temp");

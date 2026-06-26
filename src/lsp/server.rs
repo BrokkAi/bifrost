@@ -1,6 +1,8 @@
+use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
+use std::panic;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
 use lsp_server::{
@@ -59,6 +61,7 @@ pub(crate) fn run_with_connection(
     io_threads: IoThreads,
     fallback_root: PathBuf,
 ) -> Result<(), String> {
+    install_lsp_panic_hook();
     let server_capabilities = server_capabilities_json()?;
 
     let init_params_value = connection
@@ -69,8 +72,13 @@ pub(crate) fn run_with_connection(
         .map_err(|err| format!("Failed to decode InitializeParams: {err}"))?;
 
     let workspace_roots = collect_workspace_roots(&init_params, fallback_root.as_path())?;
+    let mut pending_messages = Vec::new();
     let progress = if supports_work_done_progress {
-        StartupProgress::create(&connection, "bifrost-startup-index".to_string())?
+        StartupProgress::create(
+            &connection,
+            "bifrost-startup-index".to_string(),
+            &mut pending_messages,
+        )?
     } else {
         None
     };
@@ -90,7 +98,7 @@ pub(crate) fn run_with_connection(
     }
     let mut state = state_result?;
 
-    let result = main_loop(&connection, &mut state);
+    let result = main_loop(&connection, &mut state, pending_messages);
     drop(progress);
     // Drop the connection before joining the IO threads so the writer thread
     // sees its sender close and exits — otherwise io_threads.join() blocks
@@ -120,26 +128,184 @@ fn server_capabilities_json() -> Result<serde_json::Value, String> {
     Ok(capabilities)
 }
 
-fn main_loop(connection: &Connection, state: &mut ServerState) -> Result<(), String> {
+fn main_loop(
+    connection: &Connection,
+    state: &mut ServerState,
+    pending_messages: Vec<Message>,
+) -> Result<(), String> {
+    for msg in pending_messages {
+        if handle_message(connection, state, msg)? {
+            return Ok(());
+        }
+    }
     for msg in &connection.receiver {
-        match msg {
-            Message::Request(req) => {
-                if connection
-                    .handle_shutdown(&req)
-                    .map_err(|err| format!("LSP shutdown handling failed: {err}"))?
-                {
-                    return Ok(());
-                }
-                handle_request(connection, state, req)?;
-            }
-            Message::Notification(note) => handle_notification(connection, state, note)?,
-            Message::Response(_) => {
-                // We do not currently send server→client requests, so any
-                // inbound Response is unsolicited and safe to ignore.
-            }
+        if handle_message(connection, state, msg)? {
+            return Ok(());
         }
     }
     Ok(())
+}
+
+fn handle_message(
+    connection: &Connection,
+    state: &mut ServerState,
+    msg: Message,
+) -> Result<bool, String> {
+    let meta = LspMessageMeta::from_message(&msg);
+    let _scope = LspDebugScope::enter(meta.clone());
+    if lsp_debug_enabled() {
+        log_lsp_message("start", &meta, None, None);
+    }
+    let started = Instant::now();
+    let result = match msg {
+        Message::Request(req) => {
+            match connection
+                .handle_shutdown(&req)
+                .map_err(|err| format!("LSP shutdown handling failed: {err}"))
+            {
+                Ok(true) => Ok(true),
+                Ok(false) => handle_request(connection, state, req).map(|()| false),
+                Err(err) => Err(err),
+            }
+        }
+        Message::Notification(note) => handle_notification(connection, state, note).map(|()| false),
+        Message::Response(_) => {
+            // We do not currently send server→client requests outside the
+            // startup-progress token handshake, so any inbound Response that
+            // reaches the main loop is unsolicited and safe to ignore.
+            Ok(false)
+        }
+    };
+    let elapsed = started.elapsed();
+    match &result {
+        Ok(_) if lsp_debug_enabled() => log_lsp_message("finish", &meta, Some(elapsed), None),
+        Ok(_) if elapsed >= lsp_slow_threshold() => {
+            log_lsp_message("slow", &meta, Some(elapsed), None)
+        }
+        Err(err) => log_lsp_message("error", &meta, Some(elapsed), Some(err.as_str())),
+        Ok(_) => {}
+    }
+    result
+}
+
+#[derive(Clone)]
+struct LspMessageMeta {
+    kind: &'static str,
+    method: String,
+    id: Option<String>,
+}
+
+impl LspMessageMeta {
+    fn from_message(message: &Message) -> Self {
+        match message {
+            Message::Request(req) => Self {
+                kind: "request",
+                method: req.method.clone(),
+                id: Some(format!("{:?}", req.id)),
+            },
+            Message::Notification(note) => Self {
+                kind: "notification",
+                method: note.method.clone(),
+                id: None,
+            },
+            Message::Response(response) => Self {
+                kind: "response",
+                method: "<response>".to_string(),
+                id: Some(format!("{:?}", response.id)),
+            },
+        }
+    }
+}
+
+struct LspDebugContext {
+    meta: LspMessageMeta,
+    started: Instant,
+}
+
+struct LspDebugScope;
+
+thread_local! {
+    static LSP_DEBUG_CONTEXT: RefCell<Option<LspDebugContext>> = const { RefCell::new(None) };
+}
+
+impl LspDebugScope {
+    fn enter(meta: LspMessageMeta) -> Self {
+        LSP_DEBUG_CONTEXT.with(|context| {
+            *context.borrow_mut() = Some(LspDebugContext {
+                meta,
+                started: Instant::now(),
+            });
+        });
+        Self
+    }
+}
+
+impl Drop for LspDebugScope {
+    fn drop(&mut self) {
+        LSP_DEBUG_CONTEXT.with(|context| {
+            *context.borrow_mut() = None;
+        });
+    }
+}
+
+static LSP_PANIC_HOOK: Once = Once::new();
+
+fn install_lsp_panic_hook() {
+    LSP_PANIC_HOOK.call_once(|| {
+        let previous = panic::take_hook();
+        panic::set_hook(Box::new(move |info| {
+            LSP_DEBUG_CONTEXT.with(|context| {
+                if let Some(active) = context.borrow().as_ref() {
+                    log_lsp_message(
+                        "panic",
+                        &active.meta,
+                        Some(active.started.elapsed()),
+                        Some(&info.to_string()),
+                    );
+                } else {
+                    eprintln!("[bifrost-lsp] panic outside active LSP message: {info}");
+                }
+            });
+            previous(info);
+        }));
+    });
+}
+
+fn lsp_debug_enabled() -> bool {
+    std::env::var("BIFROST_LSP_DEBUG")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+fn lsp_slow_threshold() -> Duration {
+    std::env::var("BIFROST_LSP_SLOW_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_millis(2000))
+}
+
+fn log_lsp_message(
+    event: &str,
+    meta: &LspMessageMeta,
+    elapsed: Option<Duration>,
+    detail: Option<&str>,
+) {
+    let id = meta
+        .id
+        .as_deref()
+        .map(|id| format!(" id={id}"))
+        .unwrap_or_default();
+    let elapsed = elapsed
+        .map(|elapsed| format!(" elapsed_ms={}", elapsed.as_millis()))
+        .unwrap_or_default();
+    let detail = detail
+        .map(|detail| format!(" detail={detail}"))
+        .unwrap_or_default();
+    eprintln!(
+        "[bifrost-lsp] {event} {} method={}{}{}{}",
+        meta.kind, meta.method, id, elapsed, detail
+    );
 }
 
 fn raw_client_supports_work_done_progress(params: &serde_json::Value) -> bool {
@@ -161,7 +327,11 @@ struct StartupProgressState {
 }
 
 impl StartupProgress {
-    fn create(connection: &Connection, token: String) -> Result<Option<Self>, String> {
+    fn create(
+        connection: &Connection,
+        token: String,
+        pending_messages: &mut Vec<Message>,
+    ) -> Result<Option<Self>, String> {
         let request_id = RequestId::from("bifrost-startup-progress-create".to_string());
         let token = ProgressToken::String(token);
         let request = Request::new(
@@ -175,7 +345,7 @@ impl StartupProgress {
             .sender
             .send(Message::Request(request))
             .map_err(|err| format!("Failed to request work-done progress token: {err}"))?;
-        if !Self::wait_for_create_response(connection, &request_id)? {
+        if !Self::wait_for_create_response(connection, &request_id, pending_messages)? {
             return Ok(None);
         }
         let sender = connection.sender.clone();
@@ -193,6 +363,7 @@ impl StartupProgress {
     fn wait_for_create_response(
         connection: &Connection,
         request_id: &RequestId,
+        pending_messages: &mut Vec<Message>,
     ) -> Result<bool, String> {
         loop {
             match connection.receiver.recv_timeout(Duration::from_secs(5)) {
@@ -201,11 +372,7 @@ impl StartupProgress {
                 }
                 Ok(Message::Response(_)) => continue,
                 Ok(Message::Notification(note)) if note.method == "initialized" => continue,
-                Ok(message) => {
-                    return Err(format!(
-                        "Unexpected LSP message before startup progress token response: {message:?}"
-                    ));
-                }
+                Ok(message) => pending_messages.push(message),
                 Err(_) => return Ok(false),
             }
         }
@@ -318,6 +485,8 @@ fn handle_request(
     req: Request,
 ) -> Result<(), String> {
     let id = req.id.clone();
+    let id_for_log = format!("{id:?}");
+    let method = req.method.clone();
     let response = match req.method.as_str() {
         DocumentSymbolRequest::METHOD => {
             decode_and_run::<DocumentSymbolRequest, _>(req, |params| {
@@ -468,6 +637,12 @@ fn handle_request(
             format!("Method not implemented: {}", req.method),
         ),
     };
+    if let Some(error) = response.error.as_ref() {
+        eprintln!(
+            "[bifrost-lsp] request error method={} id={} code={} message={}",
+            method, id_for_log, error.code, error.message
+        );
+    }
     connection
         .sender
         .send(Message::Response(response))

@@ -9,6 +9,7 @@ At the tool level, this repository also provides:
 - `bifrost`, a stdio MCP server that exposes analyzer-backed search tools
 - `bifrost_searchtools`, a Python import package backed by a native Rust extension
 - `most_relevant_files`, a CLI that ranks related project files from one or more seed files
+- `editors/vscode`, a minimal VS Code extension that launches Bifrost's LSP server
 
 ## Status
 
@@ -143,6 +144,16 @@ Use an absolute binary path if `bifrost` is not on the host's `PATH`, for
 example `/path/to/bifrost/target/debug/bifrost`. Replace `core` with
 `searchtools` to expose every Bifrost MCP tool, or with a smaller composition
 such as `symbol|workspace` when the host should see fewer tools.
+
+## VS Code LSP Extension
+
+The repository includes a minimal VS Code language-client wrapper in
+`editors/vscode`. It starts the existing Bifrost stdio LSP server with
+`bifrost --root <workspace-root> --server lsp`.
+
+See `editors/vscode/README.md` for development-host setup, the
+`bifrost.serverPath` setting, and debug settings such as `bifrost.debug` and
+`bifrost.slowRequestMs`.
 
 #### Skills and workflow commands
 
