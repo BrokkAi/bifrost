@@ -66,7 +66,10 @@ mod rust;
 mod scala;
 
 pub(crate) use call_sites::{call_reference_ranges, is_call_reference_range};
+pub(crate) use csharp::csharp_type_lookup_resolution;
 pub(crate) use go::{GoTypeLookupResolutionKind, go_type_lookup_resolution};
+pub(crate) use java::java_type_lookup_fqn;
+pub(crate) use scala::scala_type_lookup_fqn;
 
 #[derive(Debug, Clone)]
 pub(crate) struct DefinitionLookupRequest {
@@ -405,7 +408,11 @@ fn dotted_focus_segment_index(
         .position(|(_, start, end)| *start <= focus && focus < *end)
 }
 
-fn parse_tree_for_language(file: &ProjectFile, language: Language, source: &str) -> Option<Tree> {
+pub(crate) fn parse_tree_for_language(
+    file: &ProjectFile,
+    language: Language,
+    source: &str,
+) -> Option<Tree> {
     match language {
         Language::JavaScript | Language::TypeScript => {
             js_ts::parse_js_ts_tree(file, source, language)

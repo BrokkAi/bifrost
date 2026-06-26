@@ -1,5 +1,17 @@
 use super::*;
 
+pub(crate) fn java_type_lookup_fqn(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    site: &ResolvedReferenceSite,
+) -> Option<String> {
+    let java = resolve_analyzer::<JavaAnalyzer>(analyzer)?;
+    let node = smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)?;
+    java_type_lookup_node_fqn(analyzer, java, file, source, root, node)
+}
+
 pub(super) fn resolve_java(
     analyzer: &dyn IAnalyzer,
     support: &DefinitionLookupIndex,
@@ -83,6 +95,97 @@ pub(super) fn resolve_java(
                 site.text,
                 node.kind()
             ),
+        ),
+    }
+}
+
+fn java_type_lookup_node_fqn(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    node: Node<'_>,
+) -> Option<String> {
+    if matches!(
+        node.kind(),
+        "type_identifier" | "scoped_type_identifier" | "generic_type"
+    ) {
+        return java_type_from_node_with_context(analyzer, java, file, source, node)
+            .map(|unit| unit.fq_name().to_string());
+    }
+
+    if node.kind() != "identifier" {
+        return None;
+    }
+
+    if let Some(parent) = node.parent() {
+        if parent.kind() == "field_access"
+            && parent.child_by_field_name("object") == Some(node)
+            && let Some(receiver) = java_receiver_type(analyzer, file, source, root, node)
+        {
+            return Some(receiver.fq_name().to_string());
+        }
+        if parent.kind() == "method_invocation"
+            && parent.child_by_field_name("object") == Some(node)
+            && let Some(receiver) = java_receiver_type(analyzer, file, source, root, node)
+        {
+            return Some(receiver.fq_name().to_string());
+        }
+        if let Some(declared) =
+            java_declaration_name_type(analyzer, java, file, source, root, parent, node)
+        {
+            return Some(declared.fq_name().to_string());
+        }
+    }
+
+    let name = java_node_text(node, source);
+    java_type_of_identifier_before(analyzer, java, file, source, root, name, node.start_byte())
+        .map(|unit| unit.fq_name().to_string())
+}
+
+fn java_declaration_name_type(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    parent: Node<'_>,
+    name: Node<'_>,
+) -> Option<CodeUnit> {
+    match parent.kind() {
+        "formal_parameter" if parent.child_by_field_name("name") == Some(name) => {
+            parent.child_by_field_name("type").and_then(|type_node| {
+                java_type_from_node_with_context(analyzer, java, file, source, type_node)
+            })
+        }
+        "variable_declarator" if parent.child_by_field_name("name") == Some(name) => {
+            let declaration = parent.parent()?;
+            if !matches!(
+                declaration.kind(),
+                "local_variable_declaration" | "field_declaration"
+            ) {
+                return None;
+            }
+            declaration
+                .child_by_field_name("type")
+                .and_then(|type_node| {
+                    java_type_from_node_with_context(analyzer, java, file, source, type_node)
+                })
+        }
+        "method_declaration" if parent.child_by_field_name("name") == Some(name) => {
+            parent.child_by_field_name("type").and_then(|type_node| {
+                java_type_from_node_with_context(analyzer, java, file, source, type_node)
+            })
+        }
+        _ => java_type_of_identifier_before(
+            analyzer,
+            java,
+            file,
+            source,
+            root,
+            java_node_text(name, source),
+            name.end_byte(),
         ),
     }
 }
@@ -463,24 +566,32 @@ fn java_receiver_type_for_java(
         }
         "identifier" => {
             let name = java_node_text(object, source);
-            java_type_of_identifier_before(java, file, source, root, name, object.start_byte())
-                .or_else(|| {
-                    java_lambda_parameter_type_before(
-                        analyzer,
-                        java,
-                        analyzer.definition_lookup_index(),
-                        file,
-                        source,
-                        root,
-                        name,
-                        object.start_byte(),
-                    )
-                })
-                .or_else(|| {
-                    (!java_identifier_binding_before(source, root, name, object.start_byte()))
-                        .then(|| java.resolve_type_name_in_file(file, name))
-                        .flatten()
-                })
+            java_type_of_identifier_before(
+                analyzer,
+                java,
+                file,
+                source,
+                root,
+                name,
+                object.start_byte(),
+            )
+            .or_else(|| {
+                java_lambda_parameter_type_before(
+                    analyzer,
+                    java,
+                    analyzer.definition_lookup_index(),
+                    file,
+                    source,
+                    root,
+                    name,
+                    object.start_byte(),
+                )
+            })
+            .or_else(|| {
+                (!java_identifier_binding_before(source, root, name, object.start_byte()))
+                    .then(|| java.resolve_type_name_in_file(file, name))
+                    .flatten()
+            })
         }
         _ => None,
     }
@@ -541,6 +652,7 @@ fn java_nested_type_from_context(
 }
 
 fn java_type_of_identifier_before(
+    analyzer: &dyn IAnalyzer,
     java: &JavaAnalyzer,
     file: &ProjectFile,
     source: &str,
@@ -548,9 +660,155 @@ fn java_type_of_identifier_before(
     name: &str,
     before_byte: usize,
 ) -> Option<CodeUnit> {
-    let mut found = None;
-    collect_java_typed_binding_before(java, file, source, root, name, before_byte, &mut found);
-    found
+    let bindings = java_bindings_before_scoped(analyzer, java, file, source, root, before_byte);
+    first_precise(&bindings, name)
+}
+
+const JAVA_TYPE_LOOKUP_SCOPE_NODES: &[&str] = &[
+    "method_declaration",
+    "constructor_declaration",
+    "block",
+    "lambda_expression",
+    "catch_clause",
+    "enhanced_for_statement",
+    "for_statement",
+];
+
+fn java_bindings_before_scoped(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    cutoff_start: usize,
+) -> LocalInferenceEngine<CodeUnit> {
+    let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
+    java_seed_active_path(
+        analyzer,
+        java,
+        file,
+        source,
+        root,
+        cutoff_start,
+        &mut bindings,
+    );
+    bindings
+}
+
+fn java_seed_active_path(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    cutoff_start: usize,
+    bindings: &mut LocalInferenceEngine<CodeUnit>,
+) {
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        if node.start_byte() >= cutoff_start {
+            continue;
+        }
+        let enters_scope = JAVA_TYPE_LOOKUP_SCOPE_NODES.contains(&node.kind());
+        if enters_scope && !(node.start_byte() <= cutoff_start && cutoff_start < node.end_byte()) {
+            continue;
+        }
+        if enters_scope {
+            bindings.enter_scope();
+            java_seed_scope_declarations(analyzer, java, file, source, node, bindings);
+        } else {
+            java_seed_inline_typed_binding(analyzer, java, file, source, node, bindings);
+        }
+
+        let mut cursor = node.walk();
+        let mut children: Vec<_> = node
+            .named_children(&mut cursor)
+            .take_while(|child| child.start_byte() < cutoff_start)
+            .collect();
+        children.reverse();
+        stack.extend(children);
+    }
+}
+
+fn java_seed_scope_declarations(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    bindings: &mut LocalInferenceEngine<CodeUnit>,
+) {
+    match node.kind() {
+        "method_declaration" | "constructor_declaration" => {
+            if let Some(parameters) = node.child_by_field_name("parameters") {
+                let mut cursor = parameters.walk();
+                for parameter in parameters.named_children(&mut cursor) {
+                    if parameter.kind() == "formal_parameter" {
+                        java_seed_inline_typed_binding(
+                            analyzer, java, file, source, parameter, bindings,
+                        );
+                    }
+                }
+            }
+        }
+        "catch_clause" => {
+            if let Some(parameter) = node.child_by_field_name("parameter") {
+                java_seed_inline_typed_binding(analyzer, java, file, source, parameter, bindings);
+            }
+        }
+        "enhanced_for_statement" => {
+            if let Some(name) = node.child_by_field_name("name") {
+                bindings.declare_shadow(java_node_text(name, source));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn java_seed_inline_typed_binding(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    bindings: &mut LocalInferenceEngine<CodeUnit>,
+) {
+    match node.kind() {
+        "local_variable_declaration" | "field_declaration" => {
+            let resolved = node.child_by_field_name("type").and_then(|type_node| {
+                java_type_from_node_with_context(analyzer, java, file, source, type_node)
+            });
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if child.kind() != "variable_declarator" {
+                    continue;
+                }
+                let Some(name) = child.child_by_field_name("name") else {
+                    continue;
+                };
+                let binding_name = java_node_text(name, source);
+                if let Some(unit) = resolved.as_ref() {
+                    bindings.seed_symbol(binding_name, unit.clone());
+                } else {
+                    bindings.declare_shadow(binding_name);
+                }
+            }
+        }
+        "formal_parameter" => {
+            let Some(name) = node.child_by_field_name("name") else {
+                return;
+            };
+            let binding_name = java_node_text(name, source);
+            if let Some(unit) = node.child_by_field_name("type").and_then(|type_node| {
+                java_type_from_node_with_context(analyzer, java, file, source, type_node)
+            }) {
+                bindings.seed_symbol(binding_name, unit);
+            } else {
+                bindings.declare_shadow(binding_name);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1051,74 +1309,6 @@ fn collect_java_identifier_binding_before(
             }
         }
     }
-}
-
-fn collect_java_typed_binding_before(
-    java: &JavaAnalyzer,
-    file: &ProjectFile,
-    source: &str,
-    node: Node<'_>,
-    name: &str,
-    before_byte: usize,
-    found: &mut Option<CodeUnit>,
-) {
-    let mut stack = vec![node];
-    while let Some(node) = stack.pop() {
-        if node.start_byte() >= before_byte {
-            continue;
-        }
-        match node.kind() {
-            "local_variable_declaration" | "field_declaration" => {
-                if let Some(resolved) = node
-                    .child_by_field_name("type")
-                    .and_then(|type_node| java_type_from_node(java, file, source, type_node))
-                {
-                    let mut cursor = node.walk();
-                    for child in node.named_children(&mut cursor) {
-                        if child.kind() == "variable_declarator"
-                            && let Some(name_node) = child.child_by_field_name("name")
-                            && name_node.start_byte() < before_byte
-                            && java_node_text(name_node, source) == name
-                        {
-                            *found = Some(resolved.clone());
-                        }
-                    }
-                }
-            }
-            "formal_parameter" => {
-                if let Some(name_node) = node.child_by_field_name("name")
-                    && name_node.start_byte() < before_byte
-                    && java_node_text(name_node, source) == name
-                    && let Some(resolved) = node
-                        .child_by_field_name("type")
-                        .and_then(|type_node| java_type_from_node(java, file, source, type_node))
-                {
-                    *found = Some(resolved);
-                }
-            }
-            _ => {}
-        }
-        let mut cursor = node.walk();
-        let mut children: Vec<_> = node.named_children(&mut cursor).collect();
-        children.reverse();
-        for child in children {
-            if child.start_byte() < before_byte {
-                stack.push(child);
-            }
-        }
-    }
-}
-
-fn java_type_from_node(
-    java: &JavaAnalyzer,
-    file: &ProjectFile,
-    source: &str,
-    type_node: Node<'_>,
-) -> Option<CodeUnit> {
-    java.resolve_type_name_in_file(
-        file,
-        normalize_java_type_text(java_node_text(type_node, source)),
-    )
 }
 
 fn java_member_candidates(
