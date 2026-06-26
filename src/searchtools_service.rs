@@ -10,6 +10,7 @@ use crate::{
         report_long_method_and_god_object_smells, report_secret_like_code,
         report_structural_clone_smells, report_test_assertion_smells,
     },
+    commit_analysis::{AnalyzeCommitParams, analyze_commit},
     file_tools::{
         find_filenames, find_files_containing, get_file_contents, list_files, search_file_contents,
     },
@@ -383,6 +384,11 @@ impl SearchToolsService {
             "usage_graph" => Self::decode_and_run(&snapshot, arguments, |workspace, params| {
                 usage_graph(workspace.analyzer(), params)
             }),
+            "analyze_commit" => {
+                Self::decode_and_try_run(&snapshot, arguments, |workspace, params: AnalyzeCommitParams| {
+                    analyze_commit(workspace.analyzer(), params)
+                })
+            }
             "get_file_contents" => {
                 Self::decode_and_run(&snapshot, arguments, |workspace, params| {
                     get_file_contents(workspace.analyzer(), params)
@@ -750,6 +756,30 @@ impl SearchToolsService {
             SearchToolsServiceError::invalid_params(format!("Invalid tool arguments: {err}"))
         })?;
         let result = handler(workspace, params);
+        match serde_json::to_value(result).map_err(|err| {
+            SearchToolsServiceError::internal(format!("Failed to serialize tool result: {err}"))
+        })? {
+            Value::String(text) => Ok(ToolOutput::Text(text)),
+            structured => Ok(ToolOutput::Structured {
+                structured,
+                rendered_text: None,
+            }),
+        }
+    }
+
+    fn decode_and_try_run<P, R>(
+        workspace: &WorkspaceAnalyzer,
+        arguments: Value,
+        handler: impl FnOnce(&WorkspaceAnalyzer, P) -> Result<R, String>,
+    ) -> Result<ToolOutput, SearchToolsServiceError>
+    where
+        P: serde::de::DeserializeOwned,
+        R: Serialize,
+    {
+        let params = serde_json::from_value::<P>(arguments).map_err(|err| {
+            SearchToolsServiceError::invalid_params(format!("Invalid tool arguments: {err}"))
+        })?;
+        let result = handler(workspace, params).map_err(SearchToolsServiceError::internal)?;
         match serde_json::to_value(result).map_err(|err| {
             SearchToolsServiceError::internal(format!("Failed to serialize tool result: {err}"))
         })? {

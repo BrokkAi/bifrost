@@ -172,6 +172,26 @@ pub(crate) fn symbol_tool_descriptors(render_line_numbers: bool) -> Vec<Value> {
             }
         }),
     ));
+    descriptors.push(tool_descriptor(
+        "analyze_commit",
+        "Analyze a normal single-parent commit against its parent and return Bifrost-resolved semantic patch effects: changed files, introduced/edited/deleted/moved symbols, dependency symbols, signature/import/call-edge changes, changed test symbols, and large-callsite truncation notices.",
+        json!({
+            "type": "object",
+            "properties": {
+                "revision": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Commit hash, branch, or tag resolving to a single-parent commit."
+                },
+                "include_tests": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Include symbols and call edges from detected test files."
+                }
+            },
+            "required": ["revision"]
+        }),
+    ));
     descriptors
 }
 

@@ -1107,6 +1107,212 @@ class UsageGraphResult:
         return summary
 
 
+@dataclass(frozen=True)
+class CommitPair:
+    hash: str
+    parent_hash: str
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CommitPair:
+        return cls(hash=data["hash"], parent_hash=data["parent_hash"])
+
+
+@dataclass(frozen=True)
+class FileChange:
+    old_path: str | None
+    path: str | None
+    status: str
+    loc_changed: int
+    is_test: bool
+    is_parseable: bool
+
+    @classmethod
+    def from_dict(cls, data: dict) -> FileChange:
+        return cls(
+            old_path=data.get("old_path"),
+            path=data.get("path"),
+            status=data["status"],
+            loc_changed=int(data["loc_changed"]),
+            is_test=bool(data["is_test"]),
+            is_parseable=bool(data["is_parseable"]),
+        )
+
+
+@dataclass(frozen=True)
+class CommitSymbol:
+    fqn: str
+    kind: str
+    signature: str
+    path: str
+    start_line: int
+    end_line: int
+    language: str
+    is_test: bool
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CommitSymbol:
+        return cls(
+            fqn=data["fqn"],
+            kind=data["kind"],
+            signature=data.get("signature", ""),
+            path=data["path"],
+            start_line=int(data["start_line"]),
+            end_line=int(data["end_line"]),
+            language=data["language"],
+            is_test=bool(data["is_test"]),
+        )
+
+
+@dataclass(frozen=True)
+class MovedSymbol:
+    before: CommitSymbol
+    after: CommitSymbol
+
+    @classmethod
+    def from_dict(cls, data: dict) -> MovedSymbol:
+        return cls(
+            before=CommitSymbol.from_dict(data["before"]),
+            after=CommitSymbol.from_dict(data["after"]),
+        )
+
+
+@dataclass(frozen=True)
+class SignatureChange:
+    before: CommitSymbol
+    after: CommitSymbol
+
+    @classmethod
+    def from_dict(cls, data: dict) -> SignatureChange:
+        return cls(
+            before=CommitSymbol.from_dict(data["before"]),
+            after=CommitSymbol.from_dict(data["after"]),
+        )
+
+
+@dataclass(frozen=True)
+class ImportChange:
+    path: str
+    added: list[str]
+    removed: list[str]
+
+    @classmethod
+    def from_dict(cls, data: dict) -> ImportChange:
+        return cls(
+            path=data["path"],
+            added=list(data.get("added", [])),
+            removed=list(data.get("removed", [])),
+        )
+
+
+@dataclass(frozen=True)
+class CallEdgeChange:
+    change: str
+    from_fqn: str
+    to_fqn: str
+    language: str
+    weight: int
+    sites: list[UsageGraphCallSite]
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CallEdgeChange:
+        return cls(
+            change=data["change"],
+            from_fqn=data["from"],
+            to_fqn=data["to"],
+            language=data["language"],
+            weight=int(data["weight"]),
+            sites=[UsageGraphCallSite.from_dict(item) for item in data.get("sites", [])],
+        )
+
+
+@dataclass(frozen=True)
+class ChangedTestSymbols:
+    introduced: list[CommitSymbol]
+    edited: list[CommitSymbol]
+    deleted: list[CommitSymbol]
+    moved: list[MovedSymbol]
+    signature_changes: list[SignatureChange]
+
+    @classmethod
+    def from_dict(cls, data: dict) -> ChangedTestSymbols:
+        return cls(
+            introduced=[CommitSymbol.from_dict(item) for item in data.get("introduced", [])],
+            edited=[CommitSymbol.from_dict(item) for item in data.get("edited", [])],
+            deleted=[CommitSymbol.from_dict(item) for item in data.get("deleted", [])],
+            moved=[MovedSymbol.from_dict(item) for item in data.get("moved", [])],
+            signature_changes=[
+                SignatureChange.from_dict(item) for item in data.get("signature_changes", [])
+            ],
+        )
+
+
+@dataclass(frozen=True)
+class LargeCallsiteSymbol:
+    fqn: str
+    language: str
+    total_callsites: int
+    limit: int
+
+    @classmethod
+    def from_dict(cls, data: dict) -> LargeCallsiteSymbol:
+        return cls(
+            fqn=data["fqn"],
+            language=data["language"],
+            total_callsites=int(data["total_callsites"]),
+            limit=int(data["limit"]),
+        )
+
+
+@dataclass(frozen=True)
+class CommitAnalysisResult:
+    commit: CommitPair
+    file_changes: list[FileChange]
+    introduced_symbols: list[CommitSymbol]
+    edited_symbols: list[CommitSymbol]
+    deleted_symbols: list[CommitSymbol]
+    moved_symbols: list[MovedSymbol]
+    dependency_symbols: list[CommitSymbol]
+    signature_changes: list[SignatureChange]
+    import_changes: list[ImportChange]
+    call_edge_changes: list[CallEdgeChange]
+    changed_test_symbols: ChangedTestSymbols
+    large_callsite_symbols: list[LargeCallsiteSymbol]
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CommitAnalysisResult:
+        return cls(
+            commit=CommitPair.from_dict(data["commit"]),
+            file_changes=[FileChange.from_dict(item) for item in data.get("file_changes", [])],
+            introduced_symbols=[
+                CommitSymbol.from_dict(item) for item in data.get("introduced_symbols", [])
+            ],
+            edited_symbols=[
+                CommitSymbol.from_dict(item) for item in data.get("edited_symbols", [])
+            ],
+            deleted_symbols=[
+                CommitSymbol.from_dict(item) for item in data.get("deleted_symbols", [])
+            ],
+            moved_symbols=[MovedSymbol.from_dict(item) for item in data.get("moved_symbols", [])],
+            dependency_symbols=[
+                CommitSymbol.from_dict(item) for item in data.get("dependency_symbols", [])
+            ],
+            signature_changes=[
+                SignatureChange.from_dict(item) for item in data.get("signature_changes", [])
+            ],
+            import_changes=[ImportChange.from_dict(item) for item in data.get("import_changes", [])],
+            call_edge_changes=[
+                CallEdgeChange.from_dict(item) for item in data.get("call_edge_changes", [])
+            ],
+            changed_test_symbols=ChangedTestSymbols.from_dict(
+                data.get("changed_test_symbols", {})
+            ),
+            large_callsite_symbols=[
+                LargeCallsiteSymbol.from_dict(item)
+                for item in data.get("large_callsite_symbols", [])
+            ],
+        )
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------

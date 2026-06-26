@@ -216,6 +216,7 @@ mod tests {
             "get_type_by_location",
             "rename_symbol",
             "usage_graph",
+            "analyze_commit",
         ]
         .into_iter()
         .map(str::to_string)

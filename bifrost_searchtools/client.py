@@ -13,6 +13,7 @@ from types import ModuleType
 from typing import Any, overload
 
 from .models import (
+    CommitAnalysisResult,
     CodeQualityReport,
     FileSummariesResult,
     DefinitionByReferenceLookupResult,
@@ -553,6 +554,20 @@ class SearchToolsClient:
             arguments["lines_per_file"] = lines_per_file
         return GitTextResult.from_text(
             self._call_tool_text("get_commit_diff", arguments)
+        )
+
+    def analyze_commit(
+        self,
+        revision: str,
+        *,
+        include_tests: bool = True,
+    ) -> CommitAnalysisResult:
+        """Analyze a single-parent commit against its parent and return semantic effects."""
+        return CommitAnalysisResult.from_dict(
+            self._call_tool(
+                "analyze_commit",
+                {"revision": revision, "include_tests": include_tests},
+            )
         )
 
     # ------------------------------------------------------------------
