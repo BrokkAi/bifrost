@@ -33,7 +33,7 @@ jobs:
       SLACK_DAILY_PERF_WEBHOOK_URL: ${{ secrets.SLACK_DAILY_PERF_WEBHOOK_URL }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -44,7 +44,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Cache benchmark repos
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: benchmark/.cache/repos
           key: benchmark-repos-${{ runner.os }}-${{ hashFiles('benchmark/targets.toml') }}
@@ -119,7 +119,7 @@ jobs:
 
       - name: Upload benchmark artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: benchmark-${{ github.run_id }}
           path: benchmark/benchmark-output
@@ -297,7 +297,7 @@ jobs:
       - name: Send benchmark data to Slack Workflow
         if: always() && env.SLACK_DAILY_PERF_WEBHOOK_URL != '' && steps.slack_payload.outputs.payload != ''
         continue-on-error: true
-        uses: slackapi/slack-github-action@v2.1.1
+        uses: slackapi/slack-github-action@v3
         with:
           webhook: ${{ env.SLACK_DAILY_PERF_WEBHOOK_URL }}
           webhook-type: webhook-trigger
