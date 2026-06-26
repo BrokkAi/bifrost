@@ -166,41 +166,59 @@ fn walk<'a>(
     shadows: &mut Vec<HashSet<String>>,
     facts: Option<&'a LocalBindingsSnapshot<String>>,
 ) {
-    match node.kind() {
-        "import_statement" | "import_from_statement" => return,
-        // A function (or lambda) opens a scope; its parameters and the names it
-        // assigns are local throughout it, so collect them up front. Resolve the
-        // scope's receiver-type facts once here and thread them down, rather than
-        // re-resolving the enclosing function per attribute access.
-        "function_definition" | "lambda" => {
-            shadows.push(collect_function_locals(node, ctx.source));
-            let scope_facts =
-                enclosing_scope_facts(ctx.analyzer, ctx.file, ctx.scope_facts, node).or(facts);
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                walk(child, ctx, shadows, scope_facts);
+    let mut stack = vec![WalkFrame::Enter { node, facts }];
+    while let Some(frame) = stack.pop() {
+        match frame {
+            WalkFrame::Enter { node, facts } => match node.kind() {
+                "import_statement" | "import_from_statement" => {}
+                // A function (or lambda) opens a scope; its parameters and the names it
+                // assigns are local throughout it, so collect them up front. Resolve the
+                // scope's receiver-type facts once here and thread them down.
+                "function_definition" | "lambda" => {
+                    shadows.push(collect_function_locals(node, ctx.source));
+                    let scope_facts =
+                        enclosing_scope_facts(ctx.analyzer, ctx.file, ctx.scope_facts, node)
+                            .or(facts);
+                    stack.push(WalkFrame::ExitScope);
+                    push_children(node, scope_facts, &mut stack);
+                }
+                // A class body is not a function scope: code at the class-body level has
+                // no enclosing-function facts. Methods inside re-resolve their own facts.
+                "class_definition" => push_children(node, None, &mut stack),
+                "identifier" => {
+                    handle_identifier(node, ctx, shadows);
+                    push_children(node, facts, &mut stack);
+                }
+                "attribute" => {
+                    handle_attribute(node, ctx, shadows, facts);
+                    push_children(node, facts, &mut stack);
+                }
+                _ => push_children(node, facts, &mut stack),
+            },
+            WalkFrame::ExitScope => {
+                shadows.pop();
             }
-            shadows.pop();
-            return;
         }
-        // A class body is not a function scope: code at the class-body level has
-        // no enclosing-function facts (the per-node lookup this replaced resolved
-        // such an attribute to the class, which is never a scope-facts key). Reset
-        // to None; methods inside re-resolve their own facts on the arm above.
-        "class_definition" => {
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                walk(child, ctx, shadows, None);
-            }
-            return;
-        }
-        "identifier" => handle_identifier(node, ctx, shadows),
-        "attribute" => handle_attribute(node, ctx, shadows, facts),
-        _ => {}
     }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        walk(child, ctx, shadows, facts);
+}
+
+enum WalkFrame<'tree, 'facts> {
+    Enter {
+        node: Node<'tree>,
+        facts: Option<&'facts LocalBindingsSnapshot<String>>,
+    },
+    ExitScope,
+}
+
+fn push_children<'tree, 'facts>(
+    node: Node<'tree>,
+    facts: Option<&'facts LocalBindingsSnapshot<String>>,
+    stack: &mut Vec<WalkFrame<'tree, 'facts>>,
+) {
+    for index in (0..node.named_child_count()).rev() {
+        if let Some(child) = node.named_child(index) {
+            stack.push(WalkFrame::Enter { node: child, facts });
+        }
     }
 }
 

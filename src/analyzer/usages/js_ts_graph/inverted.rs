@@ -138,12 +138,13 @@ where
     let files = collect_jsts_files(analyzer, language);
     let declarations = scoped_declarations_by_file_and_name(analyzer, language);
     let node_status = scoped_node_status(index, nodes, &declarations);
+    let imports_by_file = scoped_import_bindings_by_file(index, &declarations);
     let edges = build_edge_weights(&files, keep_file, |file| {
         // Parse on demand and drop the tree when this closure returns; cross-file
         // resolution comes from the analyzer-cached `index`, not retained trees.
         let parser_language = js_ts_tree_sitter_language_for_file(file, language)?;
         let parsed = parse_tree_sitter_file(file, &parser_language)?;
-        let imports = scoped_import_bindings(index, file, &declarations);
+        let imports = imports_by_file.get(file).cloned().unwrap_or_default();
         let same_file = scoped_same_file_declarations(analyzer, file, language);
         Some(collect_file_edges(
             analyzer,
@@ -167,7 +168,7 @@ where
     JsTsScopedUsageEdges { edges, node_status }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ScopedImportBindings {
     named: HashMap<String, UsageNodeKey>,
     namespace: HashMap<String, ProjectFile>,
@@ -261,19 +262,22 @@ fn scoped_same_file_declarations(
         .collect()
 }
 
-fn scoped_import_bindings(
+fn scoped_import_bindings_by_file(
     index: &JsTsUsageIndex,
-    file: &ProjectFile,
     declarations: &HashMap<(ProjectFile, String), BTreeSet<UsageNodeKey>>,
-) -> ScopedImportBindings {
-    let mut grouped_named: HashMap<String, BTreeSet<UsageNodeKey>> = HashMap::default();
-    let mut grouped_namespace: HashMap<String, BTreeSet<ProjectFile>> = HashMap::default();
+) -> HashMap<ProjectFile, ScopedImportBindings> {
+    let mut grouped_named: HashMap<ProjectFile, HashMap<String, BTreeSet<UsageNodeKey>>> =
+        HashMap::default();
+    let mut grouped_namespace: HashMap<ProjectFile, HashMap<String, BTreeSet<ProjectFile>>> =
+        HashMap::default();
     for edges in index.importer_reverse.values() {
-        for edge in edges.iter().filter(|edge| &edge.importer == file) {
+        for edge in edges {
             match &edge.kind {
                 crate::analyzer::usages::ImportEdgeKind::Named(name) => {
                     let keys = canonical_export_keys(index, declarations, &edge.target_file, name);
                     grouped_named
+                        .entry(edge.importer.clone())
+                        .or_default()
                         .entry(edge.local_name.clone())
                         .or_default()
                         .extend(keys);
@@ -282,6 +286,8 @@ fn scoped_import_bindings(
                     let keys =
                         canonical_export_keys(index, declarations, &edge.target_file, "default");
                     grouped_named
+                        .entry(edge.importer.clone())
+                        .or_default()
                         .entry(edge.local_name.clone())
                         .or_default()
                         .extend(keys);
@@ -289,6 +295,8 @@ fn scoped_import_bindings(
                 crate::analyzer::usages::ImportEdgeKind::Namespace
                 | crate::analyzer::usages::ImportEdgeKind::CommonJsRequire(_) => {
                     grouped_namespace
+                        .entry(edge.importer.clone())
+                        .or_default()
                         .entry(edge.local_name.clone())
                         .or_default()
                         .insert(edge.target_file.clone());
@@ -296,16 +304,21 @@ fn scoped_import_bindings(
             }
         }
     }
-    ScopedImportBindings {
-        named: grouped_named
+
+    let mut out: HashMap<ProjectFile, ScopedImportBindings> = HashMap::default();
+    for (file, named) in grouped_named {
+        out.entry(file).or_default().named = named
             .into_iter()
             .filter_map(|(name, keys)| single_key(keys).map(|key| (name, key)))
-            .collect(),
-        namespace: grouped_namespace
+            .collect();
+    }
+    for (file, namespace) in grouped_namespace {
+        out.entry(file).or_default().namespace = namespace
             .into_iter()
             .filter_map(|(name, files)| single_project_file(files).map(|file| (name, file)))
-            .collect(),
+            .collect();
     }
+    out
 }
 
 fn scoped_node_status(
@@ -467,16 +480,26 @@ impl TsScan<'_, '_> {
 }
 
 fn scan_node(node: Node<'_>, ctx: &mut TsScan<'_, '_>, locals: &mut LocalInferenceEngine<String>) {
+    let mut stack = vec![ScanFrame::Enter(node)];
+    while let Some(frame) = stack.pop() {
+        match frame {
+            ScanFrame::Enter(node) => {
+                if let Some(introduces_scope) = scan_node_enter(node, ctx, locals) {
+                    push_exit_and_children(node, introduces_scope, &mut stack);
+                }
+            }
+            ScanFrame::Exit => locals.exit_scope(),
+        }
+    }
+}
+
+fn scan_node_enter(
+    node: Node<'_>,
+    ctx: &mut TsScan<'_, '_>,
+    locals: &mut LocalInferenceEngine<String>,
+) -> Option<bool> {
     let kind = node.kind();
-    let introduces_scope = matches!(
-        kind,
-        "statement_block"
-            | "arrow_function"
-            | "function_expression"
-            | "generator_function"
-            | "function_declaration"
-            | "method_definition"
-    );
+    let introduces_scope = introduces_js_ts_scope(kind);
     if introduces_scope {
         locals.enter_scope();
         if let Some(parameters) = node.child_by_field_name("parameters") {
@@ -497,7 +520,7 @@ fn scan_node(node: Node<'_>, ctx: &mut TsScan<'_, '_>, locals: &mut LocalInferen
         if introduces_scope {
             locals.exit_scope();
         }
-        return;
+        return None;
     }
 
     if kind == "variable_declarator"
@@ -514,15 +537,7 @@ fn scan_node(node: Node<'_>, ctx: &mut TsScan<'_, '_>, locals: &mut LocalInferen
         "jsx_opening_element" | "jsx_self_closing_element" => handle_jsx(node, ctx, locals),
         _ => {}
     }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        scan_node(child, ctx, locals);
-    }
-
-    if introduces_scope {
-        locals.exit_scope();
-    }
+    Some(introduces_scope)
 }
 
 fn scan_scoped_node(
@@ -530,16 +545,26 @@ fn scan_scoped_node(
     ctx: &mut ScopedTsScan<'_, '_>,
     locals: &mut LocalInferenceEngine<String>,
 ) {
+    let mut stack = vec![ScopedScanFrame::Enter(node)];
+    while let Some(frame) = stack.pop() {
+        match frame {
+            ScopedScanFrame::Enter(node) => {
+                if let Some(introduces_scope) = scan_scoped_node_enter(node, ctx, locals) {
+                    push_scoped_exit_and_children(node, introduces_scope, &mut stack);
+                }
+            }
+            ScopedScanFrame::Exit => locals.exit_scope(),
+        }
+    }
+}
+
+fn scan_scoped_node_enter(
+    node: Node<'_>,
+    ctx: &mut ScopedTsScan<'_, '_>,
+    locals: &mut LocalInferenceEngine<String>,
+) -> Option<bool> {
     let kind = node.kind();
-    let introduces_scope = matches!(
-        kind,
-        "statement_block"
-            | "arrow_function"
-            | "function_expression"
-            | "generator_function"
-            | "function_declaration"
-            | "method_definition"
-    );
+    let introduces_scope = introduces_js_ts_scope(kind);
     if introduces_scope {
         locals.enter_scope();
         if let Some(parameters) = node.child_by_field_name("parameters") {
@@ -559,7 +584,7 @@ fn scan_scoped_node(
         if introduces_scope {
             locals.exit_scope();
         }
-        return;
+        return None;
     }
 
     if kind == "variable_declarator"
@@ -576,14 +601,58 @@ fn scan_scoped_node(
         "jsx_opening_element" | "jsx_self_closing_element" => handle_scoped_jsx(node, ctx, locals),
         _ => {}
     }
+    Some(introduces_scope)
+}
 
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        scan_scoped_node(child, ctx, locals);
-    }
+fn introduces_js_ts_scope(kind: &str) -> bool {
+    matches!(
+        kind,
+        "statement_block"
+            | "arrow_function"
+            | "function_expression"
+            | "generator_function"
+            | "function_declaration"
+            | "method_definition"
+    )
+}
 
+enum ScanFrame<'tree> {
+    Enter(Node<'tree>),
+    Exit,
+}
+
+enum ScopedScanFrame<'tree> {
+    Enter(Node<'tree>),
+    Exit,
+}
+
+fn push_exit_and_children<'tree>(
+    node: Node<'tree>,
+    introduces_scope: bool,
+    stack: &mut Vec<ScanFrame<'tree>>,
+) {
     if introduces_scope {
-        locals.exit_scope();
+        stack.push(ScanFrame::Exit);
+    }
+    for index in (0..node.named_child_count()).rev() {
+        if let Some(child) = node.named_child(index) {
+            stack.push(ScanFrame::Enter(child));
+        }
+    }
+}
+
+fn push_scoped_exit_and_children<'tree>(
+    node: Node<'tree>,
+    introduces_scope: bool,
+    stack: &mut Vec<ScopedScanFrame<'tree>>,
+) {
+    if introduces_scope {
+        stack.push(ScopedScanFrame::Exit);
+    }
+    for index in (0..node.named_child_count()).rev() {
+        if let Some(child) = node.named_child(index) {
+            stack.push(ScopedScanFrame::Enter(child));
+        }
     }
 }
 
@@ -594,17 +663,21 @@ fn declare_pattern_shadows(
     source: &str,
     locals: &mut LocalInferenceEngine<String>,
 ) {
-    match node.kind() {
-        "identifier" | "shorthand_property_identifier_pattern" => {
-            let text = slice(node, source);
-            if !text.is_empty() {
-                locals.declare_shadow(text.to_string());
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "identifier" | "shorthand_property_identifier_pattern" => {
+                let text = slice(node, source);
+                if !text.is_empty() {
+                    locals.declare_shadow(text.to_string());
+                }
             }
-        }
-        _ => {
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                declare_pattern_shadows(child, source, locals);
+            _ => {
+                for index in (0..node.named_child_count()).rev() {
+                    if let Some(child) = node.named_child(index) {
+                        stack.push(child);
+                    }
+                }
             }
         }
     }

@@ -27,7 +27,7 @@
 //! [`EdgeCollector::record`]; see the Go implementation in
 //! [`super::go_graph`] for the reference shape.
 
-use crate::analyzer::usages::local_inference::LocalInferenceEngine;
+use crate::analyzer::usages::local_inference::{LocalInferenceEngine, SymbolResolution};
 use crate::analyzer::usages::parsed_tree::{ParsedTreeFile, parse_tree_sitter_file};
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
 use crate::hash::{HashMap, HashSet};
@@ -77,8 +77,8 @@ pub(crate) fn first_precise<T: Clone + Eq + Hash>(
     name: &str,
 ) -> Option<T> {
     bindings
-        .resolve_symbol(name)
-        .as_precise()
+        .resolve_symbol_ref(name)
+        .and_then(SymbolResolution::as_precise)
         .and_then(|targets| targets.iter().next().cloned())
 }
 

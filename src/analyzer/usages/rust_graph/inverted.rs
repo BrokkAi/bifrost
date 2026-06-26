@@ -86,26 +86,45 @@ impl RustScan<'_, '_> {
 }
 
 fn walk(node: Node<'_>, ctx: &mut RustScan<'_, '_>, shadows: &mut Vec<HashSet<String>>) {
-    match node.kind() {
-        "use_declaration" => return,
-        // A function or closure opens a scope; its parameters and `let` bindings
-        // are local to it and shadow same-named imports/items.
-        "function_item" | "closure_expression" => {
-            shadows.push(collect_scope_locals(node, ctx.source));
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                walk(child, ctx, shadows);
+    let mut stack = vec![WalkFrame::Enter(node)];
+    while let Some(frame) = stack.pop() {
+        match frame {
+            WalkFrame::Enter(node) => match node.kind() {
+                "use_declaration" => {}
+                // A function or closure opens a scope; its parameters and `let` bindings
+                // are local to it and shadow same-named imports/items.
+                "function_item" | "closure_expression" => {
+                    shadows.push(collect_scope_locals(node, ctx.source));
+                    stack.push(WalkFrame::ExitScope);
+                    push_children(node, &mut stack);
+                }
+                "identifier" | "type_identifier" => {
+                    handle_identifier(node, ctx, shadows);
+                    push_children(node, &mut stack);
+                }
+                "scoped_identifier" | "scoped_type_identifier" => {
+                    handle_scoped(node, ctx, shadows);
+                    push_children(node, &mut stack);
+                }
+                _ => push_children(node, &mut stack),
+            },
+            WalkFrame::ExitScope => {
+                shadows.pop();
             }
-            shadows.pop();
-            return;
         }
-        "identifier" | "type_identifier" => handle_identifier(node, ctx, shadows),
-        "scoped_identifier" | "scoped_type_identifier" => handle_scoped(node, ctx, shadows),
-        _ => {}
     }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        walk(child, ctx, shadows);
+}
+
+enum WalkFrame<'tree> {
+    Enter(Node<'tree>),
+    ExitScope,
+}
+
+fn push_children<'tree>(node: Node<'tree>, stack: &mut Vec<WalkFrame<'tree>>) {
+    for index in (0..node.named_child_count()).rev() {
+        if let Some(child) = node.named_child(index) {
+            stack.push(WalkFrame::Enter(child));
+        }
     }
 }
 

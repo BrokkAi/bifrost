@@ -99,20 +99,49 @@ const SCOPE_NODES: &[&str] = &[
 ];
 
 fn walk(node: Node<'_>, ctx: &mut CppScan<'_, '_>, bindings: &mut LocalInferenceEngine<CodeUnit>) {
+    let mut stack = vec![WalkFrame::Enter(node)];
+    while let Some(frame) = stack.pop() {
+        match frame {
+            WalkFrame::Enter(node) => {
+                let enters_scope = walk_enter(node, ctx, bindings);
+                push_exit_and_children(node, enters_scope, &mut stack);
+            }
+            WalkFrame::Exit => bindings.exit_scope(),
+        }
+    }
+}
+
+fn walk_enter(
+    node: Node<'_>,
+    ctx: &mut CppScan<'_, '_>,
+    bindings: &mut LocalInferenceEngine<CodeUnit>,
+) -> bool {
     let enters_scope = SCOPE_NODES.contains(&node.kind());
     if enters_scope {
         bindings.enter_scope();
     }
     seed_declaration(node, ctx, bindings);
     record_reference(node, ctx, bindings);
+    enters_scope
+}
 
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        walk(child, ctx, bindings);
+enum WalkFrame<'tree> {
+    Enter(Node<'tree>),
+    Exit,
+}
+
+fn push_exit_and_children<'tree>(
+    node: Node<'tree>,
+    exits_scope: bool,
+    stack: &mut Vec<WalkFrame<'tree>>,
+) {
+    if exits_scope {
+        stack.push(WalkFrame::Exit);
     }
-
-    if enters_scope {
-        bindings.exit_scope();
+    for index in (0..node.named_child_count()).rev() {
+        if let Some(child) = node.named_child(index) {
+            stack.push(WalkFrame::Enter(child));
+        }
     }
 }
 
