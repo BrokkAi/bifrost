@@ -1,0 +1,65 @@
+{
+  "name": "bifrost-vscode",
+  "displayName": "Bifrost",
+  "description": "Minimal VS Code client for the Bifrost language server.",
+  "version": "0.0.1",
+  "private": true,
+  "license": "LGPL-3.0-only",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:java",
+    "onLanguage:javascript",
+    "onLanguage:javascriptreact",
+    "onLanguage:typescript",
+    "onLanguage:typescriptreact",
+    "onLanguage:rust",
+    "onLanguage:go",
+    "onLanguage:python",
+    "onLanguage:c",
+    "onLanguage:cpp",
+    "onLanguage:csharp",
+    "onLanguage:php",
+    "onLanguage:scala"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "Bifrost",
+      "properties": {
+        "bifrost.serverPath": {
+          "type": "string",
+          "default": "bifrost",
+          "description": "Path to the bifrost binary."
+        },
+        "bifrost.debug": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable verbose Bifrost LSP request and notification tracing."
+        },
+        "bifrost.slowRequestMs": {
+          "type": "number",
+          "default": 2000,
+          "minimum": 0,
+          "description": "Log Bifrost LSP requests and notifications that take at least this many milliseconds."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "1.90.0",
+    "typescript": "^5.4.0"
+  }
+}
