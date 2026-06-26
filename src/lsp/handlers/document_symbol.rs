@@ -22,30 +22,66 @@ pub fn handle(
         read_document_for_uri(project, &params.text_document.uri)?;
     let analyzer = workspace.analyzer();
 
-    let symbols: Vec<DocumentSymbol> = analyzer
+    let top_level: Vec<CodeUnit> = analyzer
         .top_level_declarations(&project_file)
         .filter(|cu| !cu.is_anonymous())
-        .map(|cu| build_symbol(analyzer, cu, &content, &line_starts, None))
+        .cloned()
         .collect();
+    let symbols = build_symbols_iterative(analyzer, top_level, &content, &line_starts);
 
     Some(DocumentSymbolResponse::Nested(symbols))
 }
 
-fn build_symbol(
+fn build_symbols_iterative(
     analyzer: &dyn IAnalyzer,
-    code_unit: &CodeUnit,
+    roots: Vec<CodeUnit>,
     content: &str,
     line_starts: &[usize],
-    parent_kind: Option<SymbolKind>,
-) -> DocumentSymbol {
-    let parts = lsp_symbol_parts(analyzer, code_unit, content, line_starts, parent_kind);
-
-    let children: Vec<DocumentSymbol> = analyzer
-        .direct_children(code_unit)
-        .filter(|child| !child.is_anonymous())
-        .map(|child| build_symbol(analyzer, child, content, line_starts, Some(parts.kind)))
+) -> Vec<DocumentSymbol> {
+    let mut completed = Vec::new();
+    let mut stack: Vec<SymbolWorkItem> = roots
+        .into_iter()
+        .rev()
+        .map(|code_unit| SymbolWorkItem::Enter(code_unit, None))
         .collect();
 
+    while let Some(item) = stack.pop() {
+        match item {
+            SymbolWorkItem::Enter(code_unit, parent_kind) => {
+                let parts =
+                    lsp_symbol_parts(analyzer, &code_unit, content, line_starts, parent_kind);
+                let child_parent_kind = Some(parts.kind);
+                let children: Vec<CodeUnit> = analyzer
+                    .direct_children(&code_unit)
+                    .filter(|child| !child.is_anonymous())
+                    .cloned()
+                    .collect();
+                let child_count = children.len();
+                stack.push(SymbolWorkItem::Exit { parts, child_count });
+                for child in children.into_iter().rev() {
+                    stack.push(SymbolWorkItem::Enter(child, child_parent_kind));
+                }
+            }
+            SymbolWorkItem::Exit { parts, child_count } => {
+                let split_at = completed.len().saturating_sub(child_count);
+                let children = completed.split_off(split_at);
+                completed.push(symbol_from_parts(parts, children));
+            }
+        }
+    }
+
+    completed
+}
+
+enum SymbolWorkItem {
+    Enter(CodeUnit, Option<SymbolKind>),
+    Exit {
+        parts: LspSymbolParts,
+        child_count: usize,
+    },
+}
+
+fn symbol_from_parts(parts: LspSymbolParts, children: Vec<DocumentSymbol>) -> DocumentSymbol {
     #[allow(deprecated)] // `deprecated` field is present on lsp-types DocumentSymbol.
     DocumentSymbol {
         name: parts.name,

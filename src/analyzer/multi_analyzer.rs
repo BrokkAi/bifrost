@@ -137,6 +137,16 @@ impl AnalyzerDelegate {
         }
     }
 
+    fn should_receive_changed_file(&self, language: Language, file: &ProjectFile) -> bool {
+        language_for_file(file) == language
+            || self.analyzer().is_analyzed(file)
+            || self.needs_config_update_for(file)
+    }
+
+    fn needs_config_update_for(&self, file: &ProjectFile) -> bool {
+        matches!(self, Self::JavaScript(_) | Self::TypeScript(_)) && is_js_ts_config_file(file)
+    }
+
     pub(crate) fn update_all(&self) -> Self {
         match self {
             Self::Java(analyzer) => Self::Java(analyzer.update_all()),
@@ -152,6 +162,13 @@ impl AnalyzerDelegate {
             Self::Ruby(analyzer) => Self::Ruby(analyzer.update_all()),
         }
     }
+}
+
+fn is_js_ts_config_file(file: &ProjectFile) -> bool {
+    matches!(
+        file.rel_path().file_name().and_then(|name| name.to_str()),
+        Some("tsconfig.json" | "jsconfig.json")
+    )
 }
 
 #[derive(Clone, Default)]
@@ -304,7 +321,18 @@ impl IAnalyzer for MultiAnalyzer {
             .iter()
             .collect::<Vec<_>>()
             .into_par_iter()
-            .map(|(language, delegate)| (*language, delegate.update(changed_files)))
+            .map(|(language, delegate)| {
+                let relevant: BTreeSet<ProjectFile> = changed_files
+                    .iter()
+                    .filter(|file| delegate.should_receive_changed_file(*language, file))
+                    .cloned()
+                    .collect();
+                if relevant.is_empty() {
+                    (*language, delegate.clone())
+                } else {
+                    (*language, delegate.update(&relevant))
+                }
+            })
             .collect();
         Self::new(delegates)
     }
@@ -634,5 +662,29 @@ impl IAnalyzer for MultiAnalyzer {
             }
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn project_file(rel_path: &str) -> ProjectFile {
+        let root = if cfg!(windows) {
+            std::path::PathBuf::from("C:\\tmp")
+        } else {
+            std::path::PathBuf::from("/tmp")
+        };
+        ProjectFile::new(root, rel_path)
+    }
+
+    #[test]
+    fn js_ts_config_files_are_routed_as_delegate_relevant_changes() {
+        assert!(is_js_ts_config_file(&project_file("tsconfig.json")));
+        assert!(is_js_ts_config_file(&project_file(
+            "packages/app/jsconfig.json"
+        )));
+        assert!(!is_js_ts_config_file(&project_file("package.json")));
+        assert!(!is_js_ts_config_file(&project_file("src/app.ts")));
     }
 }

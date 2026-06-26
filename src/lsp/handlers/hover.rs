@@ -8,6 +8,7 @@ use crate::analyzer::{
 use crate::lsp::conversion::{byte_range_to_lsp_range, position_to_byte_offset};
 use crate::lsp::handlers::util::{
     extract_leading_doc_comment, identifier_span_at_offset, read_document_for_uri,
+    resolve_first_identifier_candidate,
 };
 
 /// Resolve `textDocument/hover` for the symbol under the cursor. Returns the
@@ -72,19 +73,7 @@ fn leading_doc_comment(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> Option
 }
 
 fn pick_candidate(analyzer: &dyn IAnalyzer, identifier: &str) -> Option<CodeUnit> {
-    let direct: Vec<CodeUnit> = analyzer.get_definitions(identifier);
-    if let Some(first) = direct.into_iter().next() {
-        return Some(first);
-    }
-    // See definition::resolve_candidates for the rationale: the analyzer
-    // matches the regex against the full fq_name, so an anchored pattern
-    // misses package-qualified symbols. Word-boundaries plus a
-    // short-name post-filter is the correct shape.
-    let pattern = format!(r"\b{}\b", regex::escape(identifier));
-    analyzer
-        .search_definitions(&pattern, false)
-        .into_iter()
-        .find(|cu| cu.identifier() == identifier)
+    resolve_first_identifier_candidate(analyzer, identifier)
 }
 
 fn language_for_path(rel_path: &Path) -> &'static str {

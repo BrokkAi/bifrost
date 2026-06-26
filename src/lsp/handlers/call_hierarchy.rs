@@ -23,7 +23,7 @@ use crate::lsp::handlers::document_symbol::lsp_symbol_parts;
 use crate::lsp::handlers::hierarchy_support::{
     cursor_byte_range, hierarchy_item_data, resolve_hierarchy_item_code_unit,
 };
-use crate::lsp::handlers::util::read_document_for_uri;
+use crate::lsp::handlers::util::{FileContentCache, read_document_for_uri};
 use crate::text_utils::compute_line_starts;
 
 const MAX_OUTGOING_CANDIDATES: usize = DEFAULT_MAX_USAGES;
@@ -45,7 +45,13 @@ pub fn prepare(
     let enclosing = analyzer.enclosing_code_unit(&file, &range)?;
     let callable = nearest_call_hierarchy_unit(analyzer, enclosing)?;
 
-    Some(vec![call_hierarchy_item(analyzer, project, &callable)?])
+    let mut content_cache = FileContentCache::default();
+    Some(vec![call_hierarchy_item(
+        analyzer,
+        project,
+        &callable,
+        &mut content_cache,
+    )?])
 }
 
 pub fn incoming_calls(
@@ -65,6 +71,7 @@ pub fn incoming_calls(
         )
         .all_hits();
     let mut grouped: BTreeMap<String, (CodeUnit, Vec<LspRange>)> = BTreeMap::new();
+    let mut content_cache = FileContentCache::default();
     for hit in hits {
         let caller = nearest_call_hierarchy_unit(analyzer, hit.enclosing.clone())
             .or_else(|| caller_for_hit(analyzer, &hit));
@@ -74,10 +81,10 @@ pub fn incoming_calls(
         if same_symbol(&caller, &target) {
             continue;
         }
-        if !is_call_usage_hit(project, &hit) {
+        if !is_call_usage_hit(project, &hit, &mut content_cache) {
             continue;
         }
-        let Some(range) = usage_hit_range(project, &hit) else {
+        let Some(range) = usage_hit_range(project, &hit, &mut content_cache) else {
             continue;
         };
         grouped
@@ -94,7 +101,7 @@ pub fn incoming_calls(
                 from_ranges.sort_by(compare_lsp_range);
                 from_ranges.dedup();
                 Some(CallHierarchyIncomingCall {
-                    from: call_hierarchy_item(analyzer, project, &caller)?,
+                    from: call_hierarchy_item(analyzer, project, &caller, &mut content_cache)?,
                     from_ranges,
                 })
             })
@@ -150,6 +157,7 @@ pub fn outgoing_calls(
     );
 
     let mut grouped: BTreeMap<String, (CodeUnit, Vec<LspRange>)> = BTreeMap::new();
+    let mut content_cache = FileContentCache::default();
     for (node_range, outcome) in candidates
         .into_iter()
         .take(MAX_OUTGOING_CANDIDATES)
@@ -181,7 +189,7 @@ pub fn outgoing_calls(
                 from_ranges.sort_by(compare_lsp_range);
                 from_ranges.dedup();
                 Some(CallHierarchyOutgoingCall {
-                    to: call_hierarchy_item(analyzer, project, &callee)?,
+                    to: call_hierarchy_item(analyzer, project, &callee, &mut content_cache)?,
                     from_ranges,
                 })
             })
@@ -208,34 +216,40 @@ fn caller_for_hit(analyzer: &dyn IAnalyzer, hit: &UsageHit) -> Option<CodeUnit> 
         .and_then(|unit| nearest_call_hierarchy_unit(analyzer, unit))
 }
 
-fn usage_hit_range(project: &dyn Project, hit: &UsageHit) -> Option<LspRange> {
-    let source = project.read_source(&hit.file).ok()?;
-    let line_starts = compute_line_starts(&source);
+fn usage_hit_range(
+    project: &dyn Project,
+    hit: &UsageHit,
+    cache: &mut FileContentCache,
+) -> Option<LspRange> {
+    let entry = cache.read_project(project, &hit.file)?;
     let range = Range {
         start_byte: hit.start_offset,
         end_byte: hit.end_offset,
         start_line: hit.line,
         end_line: hit.line,
     };
-    Some(byte_range_to_lsp_range(&source, &line_starts, &range))
+    Some(byte_range_to_lsp_range(
+        &entry.body,
+        &entry.line_starts,
+        &range,
+    ))
 }
 
-fn is_call_usage_hit(project: &dyn Project, hit: &UsageHit) -> bool {
-    let source = match project.read_source(&hit.file) {
-        Ok(source) => source,
-        Err(_) => return false,
+fn is_call_usage_hit(project: &dyn Project, hit: &UsageHit, cache: &mut FileContentCache) -> bool {
+    let Some(entry) = cache.read_project(project, &hit.file) else {
+        return false;
     };
-    is_call_reference_range(&hit.file, &source, hit.start_offset, hit.end_offset)
+    is_call_reference_range(&hit.file, &entry.body, hit.start_offset, hit.end_offset)
 }
 
 fn call_hierarchy_item(
     analyzer: &dyn IAnalyzer,
     project: &dyn Project,
     code_unit: &CodeUnit,
+    cache: &mut FileContentCache,
 ) -> Option<CallHierarchyItem> {
-    let content = project.read_source(code_unit.source()).ok()?;
-    let line_starts = compute_line_starts(&content);
-    let parts = lsp_symbol_parts(analyzer, code_unit, &content, &line_starts, None);
+    let entry = cache.read_project(project, code_unit.source())?;
+    let parts = lsp_symbol_parts(analyzer, code_unit, &entry.body, &entry.line_starts, None);
     let uri: Uri = path_to_uri_string(&code_unit.source().abs_path())
         .parse()
         .ok()?;

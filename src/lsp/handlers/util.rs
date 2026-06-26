@@ -1,4 +1,7 @@
-use crate::analyzer::{CodeUnit, Project, ProjectFile, Range as ByteRange};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use crate::analyzer::{CodeUnit, IAnalyzer, Project, ProjectFile, Range as ByteRange};
 use crate::lsp::conversion::{byte_range_to_lsp_range, uri_to_path};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use lsp_types::{Range as LspRange, Uri};
@@ -15,6 +18,90 @@ pub fn read_document_for_uri(
     let content = project.read_source(&project_file).ok()?;
     let line_starts = compute_line_starts(&content);
     Some((project_file, content, line_starts))
+}
+
+#[derive(Default)]
+pub(super) struct FileContentCache {
+    files: HashMap<PathBuf, FileContent>,
+}
+
+pub(super) struct FileContent {
+    pub(super) body: String,
+    pub(super) line_starts: Vec<usize>,
+}
+
+impl FileContentCache {
+    pub(super) fn read_project<'a>(
+        &'a mut self,
+        project: &dyn Project,
+        file: &ProjectFile,
+    ) -> Option<&'a FileContent> {
+        self.read_with(file.abs_path(), || project.read_source(file).ok())
+    }
+
+    pub(super) fn read_disk<'a>(&'a mut self, path: &Path) -> Option<&'a FileContent> {
+        self.read_with(path.to_path_buf(), || std::fs::read_to_string(path).ok())
+    }
+
+    pub(super) fn read_disk_or_empty<'a>(&'a mut self, path: &Path) -> &'a FileContent {
+        let key = path.to_path_buf();
+        if !self.files.contains_key(&key) {
+            let body = std::fs::read_to_string(path).unwrap_or_default();
+            let line_starts = compute_line_starts(&body);
+            self.files
+                .insert(key.clone(), FileContent { body, line_starts });
+        }
+        self.files.get(&key).expect("cache entry inserted")
+    }
+
+    fn read_with(
+        &mut self,
+        key: PathBuf,
+        read: impl FnOnce() -> Option<String>,
+    ) -> Option<&FileContent> {
+        if !self.files.contains_key(&key) {
+            let body = read()?;
+            let line_starts = compute_line_starts(&body);
+            self.files
+                .insert(key.clone(), FileContent { body, line_starts });
+        }
+        self.files.get(&key)
+    }
+}
+
+pub(super) fn resolve_identifier_candidates(
+    analyzer: &dyn IAnalyzer,
+    identifier: &str,
+) -> Vec<CodeUnit> {
+    let direct: Vec<CodeUnit> = analyzer.get_definitions(identifier);
+    if !direct.is_empty() {
+        return direct;
+    }
+    let pattern = short_name_pattern(identifier);
+    analyzer
+        .search_definitions(&pattern, false)
+        .into_iter()
+        .filter(|cu| cu.identifier() == identifier)
+        .collect()
+}
+
+pub(super) fn resolve_first_identifier_candidate(
+    analyzer: &dyn IAnalyzer,
+    identifier: &str,
+) -> Option<CodeUnit> {
+    let direct: Vec<CodeUnit> = analyzer.get_definitions(identifier);
+    if let Some(first) = direct.into_iter().next() {
+        return Some(first);
+    }
+    let pattern = short_name_pattern(identifier);
+    analyzer
+        .search_definitions(&pattern, false)
+        .into_iter()
+        .find(|cu| cu.identifier() == identifier)
+}
+
+fn short_name_pattern(identifier: &str) -> String {
+    format!(r"\b{}\b", regex::escape(identifier))
 }
 
 /// Resolve an LSP `Uri` to a [`ProjectFile`] that belongs to `project`.
