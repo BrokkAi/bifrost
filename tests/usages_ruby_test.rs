@@ -3,7 +3,11 @@
 // method/constant name. These tests pin name-based cross-file call discovery,
 // including calls reaching a method through an included module.
 
-use brokk_bifrost::{CodeUnit, IAnalyzer, RubyAnalyzer, TestProject};
+mod common;
+
+use brokk_bifrost::usages::{ImportGraphCandidateProvider, UsageFinder};
+use brokk_bifrost::{CodeUnit, IAnalyzer, ProjectFile, RubyAnalyzer, TestProject};
+use common::ruby_analyzer_with_files;
 
 fn analyzer() -> RubyAnalyzer {
     RubyAnalyzer::from_project(TestProject::new(
@@ -71,4 +75,65 @@ fn does_not_report_the_declaration_as_a_usage() {
         .expect("usage lookup should succeed");
     // The `def greet` declaration itself must not be counted as a usage.
     assert!(hits.iter().all(|hit| hit.enclosing.identifier() != "greet"));
+}
+
+#[test]
+fn import_graph_candidates_include_indirect_ruby_require_importers() {
+    let (project, analyzer) = ruby_analyzer_with_files(&[
+        (
+            "app/main.rb",
+            r#"
+require "app/services/user_service"
+
+class App
+  def run
+    User.build
+  end
+end
+"#,
+        ),
+        (
+            "app/services/user_service.rb",
+            r#"
+require "app/models/user"
+
+class UserService
+end
+"#,
+        ),
+        (
+            "app/models/user.rb",
+            r#"
+class User
+  def self.build
+    new
+  end
+end
+"#,
+        ),
+    ]);
+    let target = definition(&analyzer, "User.build");
+    let provider = ImportGraphCandidateProvider::new();
+
+    let query =
+        UsageFinder::new().query_with_provider(&analyzer, &[target], Some(&provider), 100, 100);
+    assert!(
+        query.candidate_files.contains(&ProjectFile::new(
+            project.root().to_path_buf(),
+            "app/main.rb"
+        )),
+        "expected indirect importer to be an import-graph candidate, got {:?}",
+        query.candidate_files
+    );
+    let hits = query
+        .result
+        .into_either()
+        .expect("usage lookup should succeed");
+    assert!(
+        hits.iter().any(|hit| hit.enclosing.identifier() == "run"),
+        "expected User.build usage inside App#run, got {:?}",
+        hits.iter()
+            .map(|hit| hit.enclosing.fq_name())
+            .collect::<Vec<_>>()
+    );
 }

@@ -1,7 +1,9 @@
 mod inline_project;
 pub mod usage_graph;
 
-use brokk_bifrost::{CodeUnit, GoAnalyzer, IAnalyzer, Language, ProjectFile, TestProject};
+use brokk_bifrost::{
+    CodeUnit, GoAnalyzer, IAnalyzer, Language, ProjectFile, RubyAnalyzer, TestProject,
+};
 use pretty_assertions::assert_eq;
 use std::path::Path;
 
@@ -75,6 +77,17 @@ pub fn go_analyzer_with_files(files: &[(&str, &str)]) -> (BuiltInlineTestProject
     }
     let project = builder.build();
     let analyzer = GoAnalyzer::from_project(project.project().clone());
+    (project, analyzer)
+}
+
+#[allow(dead_code)]
+pub fn ruby_analyzer_with_files(files: &[(&str, &str)]) -> (BuiltInlineTestProject, RubyAnalyzer) {
+    let mut builder = InlineTestProject::with_language(Language::Ruby);
+    for (path, contents) in files {
+        builder = builder.file(*path, *contents);
+    }
+    let project = builder.build();
+    let analyzer = RubyAnalyzer::new(project.project_dyn());
     (project, analyzer)
 }
 
