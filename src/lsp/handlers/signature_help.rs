@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use lsp_types::{SignatureHelp, SignatureHelpParams, SignatureInformation};
 
+use crate::analyzer::common::is_unparseable_source;
 use crate::analyzer::usages::get_definition::{
     DefinitionLookupRequest, DefinitionLookupStatus, call_signature_context,
     resolve_definition_batch_with_source,
@@ -10,6 +11,8 @@ use crate::analyzer::{CodeUnit, Project, WorkspaceAnalyzer};
 use crate::lsp::conversion::position_to_byte_offset;
 use crate::lsp::handlers::util::read_document_for_uri;
 
+const MAX_SIGNATURE_HELP_SOURCE_BYTES: usize = 1_000_000;
+
 pub fn handle(
     workspace: &WorkspaceAnalyzer,
     project: &dyn Project,
@@ -17,6 +20,9 @@ pub fn handle(
 ) -> Option<SignatureHelp> {
     let uri = &params.text_document_position_params.text_document.uri;
     let (file, content, line_starts) = read_document_for_uri(project, uri)?;
+    if content.len() > MAX_SIGNATURE_HELP_SOURCE_BYTES || is_unparseable_source(&content) {
+        return None;
+    }
     let byte_offset = position_to_byte_offset(
         &content,
         &line_starts,
@@ -62,9 +68,15 @@ fn signature_information(
     analyzer: &dyn crate::analyzer::IAnalyzer,
     candidate: &CodeUnit,
 ) -> Option<SignatureInformation> {
-    let label = analyzer
-        .get_skeleton_header(candidate)
-        .or_else(|| analyzer.get_skeleton(candidate))?;
+    let label = if candidate.is_class() {
+        analyzer
+            .get_skeleton(candidate)
+            .or_else(|| analyzer.get_skeleton_header(candidate))?
+    } else {
+        analyzer
+            .get_skeleton_header(candidate)
+            .or_else(|| analyzer.get_skeleton(candidate))?
+    };
     let label = label.trim().to_string();
     if label.is_empty() {
         return None;

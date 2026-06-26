@@ -426,11 +426,7 @@ pub(crate) fn parse_tree_for_language(
         Language::CSharp => csharp::parse_csharp_tree(source),
         Language::Python => python::parse_python_tree(source),
         Language::Rust => rust::parse_rust_tree(source),
-        Language::Go => {
-            let mut parser = Parser::new();
-            parser.set_language(&tree_sitter_go::LANGUAGE.into()).ok()?;
-            parser.parse(source, None)
-        }
+        Language::Go => go::parse_go_tree(source),
         Language::Ruby | Language::None => None,
     }
 }

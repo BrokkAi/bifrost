@@ -35,8 +35,11 @@ pub fn server_capabilities() -> ServerCapabilities {
             ..CompletionOptions::default()
         }),
         signature_help_provider: Some(SignatureHelpOptions {
-            trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
-            retrigger_characters: Some(vec![",".to_string()]),
+            // Signature help currently reparses overlay source and may perform
+            // structured definition lookup, so v1 supports explicit requests
+            // without advertising automatic typing triggers.
+            trigger_characters: None,
+            retrigger_characters: None,
             work_done_progress_options: WorkDoneProgressOptions::default(),
         }),
         definition_provider: Some(OneOf::Left(true)),

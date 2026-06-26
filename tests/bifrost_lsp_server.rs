@@ -85,10 +85,14 @@ fn bifrost_lsp_server_handles_initialize_and_shutdown() {
         initialize["result"]["capabilities"]["implementationProvider"], true,
         "implementationProvider should be advertised: {initialize}"
     );
-    assert_eq!(
-        initialize["result"]["capabilities"]["signatureHelpProvider"]["triggerCharacters"],
-        json!(["(", ","]),
-        "signatureHelpProvider should advertise conservative triggers: {initialize}"
+    assert!(
+        initialize["result"]["capabilities"]["signatureHelpProvider"].is_object(),
+        "signatureHelpProvider should be advertised: {initialize}"
+    );
+    assert!(
+        initialize["result"]["capabilities"]["signatureHelpProvider"]["triggerCharacters"]
+            .is_null(),
+        "signatureHelpProvider should require explicit client requests: {initialize}"
     );
     assert_eq!(
         initialize["result"]["capabilities"]["renameProvider"]["prepareProvider"], true,
@@ -2077,6 +2081,41 @@ fn bifrost_lsp_server_signature_help_returns_typescript_function_signature() {
             .as_str()
             .is_some_and(|label| label.contains("combine") && label.contains("right")),
         "expected combine signature label, got {result}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_signature_help_returns_typescript_constructor_signature() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("widget.ts");
+    let source = "class Widget {\n  constructor(left: number, right: number) {}\n}\nconst result = new Widget(1, 2);\n";
+    fs::write(&file_path, source).expect("write widget.ts");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let (line, character) = position_after(source, "Widget(1, ");
+
+    let result = signature_help(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        2,
+        &file_uri,
+        line,
+        character,
+    );
+    assert_eq!(
+        result["activeParameter"], 1,
+        "unexpected signature help: {result}"
+    );
+    assert!(
+        result["signatures"][0]["label"]
+            .as_str()
+            .is_some_and(|label| label.contains("Widget") && label.contains("constructor")),
+        "expected Widget constructor signature label, got {result}"
     );
 
     shutdown_lsp(child, stdin, reader, stderr);

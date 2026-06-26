@@ -50,12 +50,13 @@ pub(crate) fn call_signature_context(
 ) -> Option<CallSignatureContext> {
     let language = language_for_file(file);
     let tree = parse_tree_for_language(file, language, source)?;
-    find_innermost_call_signature_context(tree.root_node(), language, byte_offset)
+    find_innermost_call_signature_context(tree.root_node(), language, source, byte_offset)
 }
 
 fn find_innermost_call_signature_context(
     root: Node<'_>,
     language: Language,
+    source: &str,
     byte_offset: usize,
 ) -> Option<CallSignatureContext> {
     let mut best: Option<(usize, CallSignatureContext)> = None;
@@ -64,7 +65,8 @@ fn find_innermost_call_signature_context(
         if node.start_byte() > byte_offset || node.end_byte() < byte_offset {
             continue;
         }
-        if let Some(context) = call_signature_context_for_node(node, language, byte_offset) {
+        if let Some(context) = call_signature_context_for_node(node, language, source, byte_offset)
+        {
             let width = node.end_byte().saturating_sub(node.start_byte());
             if best.is_none_or(|(best_width, _)| width < best_width) {
                 best = Some((width, context));
@@ -83,16 +85,28 @@ fn find_innermost_call_signature_context(
 fn call_signature_context_for_node(
     node: Node<'_>,
     language: Language,
+    source: &str,
     byte_offset: usize,
 ) -> Option<CallSignatureContext> {
     if !is_call_expression_node(node, language) {
         return None;
     }
-    let arguments = arguments_node_for_call(node)?;
+    let argument_nodes = argument_nodes_for_call(node);
+    let [arguments] = argument_nodes.as_slice() else {
+        return None;
+    };
+    let arguments = *arguments;
     if byte_offset < arguments.start_byte() || byte_offset > arguments.end_byte() {
         return None;
     }
     let callee = callee_node_for_call(node, language)?;
+    if callee_argument_gap_has_completed_call(callee, arguments, source) {
+        return None;
+    }
+    if is_call_expression_node(callee, language) || contains_call_expression_node(callee, language)
+    {
+        return None;
+    }
     let callee_reference = call_reference_leaf(callee, language)?;
     Some(CallSignatureContext {
         callee_range: node_range(callee_reference),
@@ -134,6 +148,9 @@ fn callee_node_for_call<'tree>(node: Node<'tree>, language: Language) -> Option<
         Language::Java => node
             .child_by_field_name("name")
             .or_else(|| node.child_by_field_name("type")),
+        Language::JavaScript | Language::TypeScript if node.kind() == "new_expression" => node
+            .child_by_field_name("constructor")
+            .or_else(|| node.child_by_field_name("function")),
         Language::CSharp => node
             .child_by_field_name("function")
             .or_else(|| node.child_by_field_name("type")),
@@ -146,22 +163,33 @@ fn callee_node_for_call<'tree>(node: Node<'tree>, language: Language) -> Option<
 }
 
 fn arguments_node_for_call(node: Node<'_>) -> Option<Node<'_>> {
-    node.child_by_field_name("arguments")
+    argument_nodes_for_call(node).into_iter().next()
+}
+
+fn argument_nodes_for_call(node: Node<'_>) -> Vec<Node<'_>> {
+    let mut nodes = Vec::new();
+    if let Some(arguments) = node
+        .child_by_field_name("arguments")
         .or_else(|| node.child_by_field_name("argument"))
-        .or_else(|| {
-            let mut cursor = node.walk();
-            node.named_children(&mut cursor).find(|child| {
-                matches!(
-                    child.kind(),
-                    "arguments"
-                        | "argument"
-                        | "argument_list"
-                        | "argument_clause"
-                        | "arguments_list"
-                        | "block"
-                )
-            })
-        })
+    {
+        nodes.push(arguments);
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if matches!(
+            child.kind(),
+            "arguments"
+                | "argument"
+                | "argument_list"
+                | "argument_clause"
+                | "arguments_list"
+                | "block"
+        ) && !nodes.contains(&child)
+        {
+            nodes.push(child);
+        }
+    }
+    nodes
 }
 
 fn first_named_child_not_arguments(node: Node<'_>) -> Option<Node<'_>> {
@@ -190,6 +218,33 @@ fn call_reference_leaf(node: Node<'_>, language: Language) -> Option<Node<'_>> {
         }
     }
     best
+}
+
+fn contains_call_expression_node(node: Node<'_>, language: Language) -> bool {
+    let mut stack = Vec::new();
+    let mut cursor = node.walk();
+    stack.extend(node.named_children(&mut cursor));
+    while let Some(current) = stack.pop() {
+        if is_call_expression_node(current, language) {
+            return true;
+        }
+        let mut cursor = current.walk();
+        stack.extend(current.named_children(&mut cursor));
+    }
+    false
+}
+
+fn callee_argument_gap_has_completed_call(
+    callee: Node<'_>,
+    arguments: Node<'_>,
+    source: &str,
+) -> bool {
+    if callee.end_byte() >= arguments.start_byte() {
+        return false;
+    }
+    source
+        .get(callee.end_byte()..arguments.start_byte())
+        .is_some_and(|gap| gap.contains(')'))
 }
 
 fn active_parameter(arguments: Node<'_>, byte_offset: usize) -> u32 {
@@ -380,8 +435,12 @@ fn jsts_call_reference_candidate(node: Node<'_>) -> bool {
     let mut current = node;
     while let Some(parent) = current.parent() {
         match parent.kind() {
-            "call_expression" | "new_expression"
-                if parent.child_by_field_name("function") == Some(current) =>
+            "call_expression" if parent.child_by_field_name("function") == Some(current) => {
+                return true;
+            }
+            "new_expression"
+                if parent.child_by_field_name("function") == Some(current)
+                    || parent.child_by_field_name("constructor") == Some(current) =>
             {
                 return true;
             }
@@ -553,5 +612,17 @@ mod tests {
             "target"
         );
         assert_eq!(context.active_parameter, 0);
+    }
+
+    #[test]
+    fn signature_context_rejects_higher_order_call_callee() {
+        let source = "function factory() { return (value: number) => value; }\nconst result = factory()(1);\n";
+        let context = call_signature_context(
+            &file("sample.ts"),
+            source,
+            offset_after(source, "factory()("),
+        );
+
+        assert_eq!(context, None);
     }
 }
