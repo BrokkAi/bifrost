@@ -195,6 +195,30 @@ class SearchToolsClientTest(unittest.TestCase):
         self.assertIn("A.method2", text)
         self.assertIsInstance(usages.structured, dict)
 
+    def test_rename_symbol_returns_typed_non_mutating_edit_set(self) -> None:
+        before_a = (self.fixture_root / "A.java").read_text()
+        with SearchToolsClient(root=self.fixture_root) as client:
+            result = client.rename_symbol(
+                "A.java", line=8, column=19, new_name="renamedMethod2"
+            )
+
+        self.assertEqual("ok", result.status)
+        self.assertIsNotNone(result.target)
+        assert result.target is not None
+        self.assertEqual("A.method2", result.target.symbol)
+        self.assertEqual("method2", result.old_name)
+        self.assertTrue(
+            any(
+                file_edits.path == "B.java"
+                and any(
+                    edit.old_text == "method2" and edit.new_text == "renamedMethod2"
+                    for edit in file_edits.edits
+                )
+                for file_edits in result.edits
+            )
+        )
+        self.assertEqual(before_a, (self.fixture_root / "A.java").read_text())
+
     def test_get_summaries_keeps_compact_symbols_for_wrapper_callers(self) -> None:
         with SearchToolsClient(root=self.fixture_root) as client:
             summaries = client.get_summaries(["."])

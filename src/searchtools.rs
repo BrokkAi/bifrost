@@ -142,6 +142,20 @@ pub struct GetTypeParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenameSymbolParams {
+    pub path: String,
+    #[serde(default)]
+    pub line: Option<usize>,
+    #[serde(default)]
+    pub column: Option<usize>,
+    #[serde(default)]
+    pub start_byte: Option<usize>,
+    #[serde(default)]
+    pub end_byte: Option<usize>,
+    pub new_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DefinitionReferenceQuery {
     pub path: String,
     #[serde(default)]
@@ -189,6 +203,43 @@ pub struct RefreshResult {
 #[derive(Debug, Clone, Serialize)]
 pub struct ActiveWorkspaceResult {
     pub workspace_path: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RenameSymbolResult {
+    pub query: RenameSymbolParams,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<RenameSymbolTarget>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_name: Option<String>,
+    pub edits: Vec<RenameFileEdits>,
+    pub diagnostics: Vec<DefinitionDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RenameSymbolTarget {
+    pub symbol: String,
+    pub kind: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RenameFileEdits {
+    pub path: String,
+    pub edits: Vec<RenameTextEdit>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RenameTextEdit {
+    pub old_text: String,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub start_line: usize,
+    pub start_column: usize,
+    pub end_line: usize,
+    pub end_column: usize,
+    pub new_text: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -974,6 +1025,167 @@ pub fn get_type_by_location(analyzer: &dyn IAnalyzer, params: GetTypeParams) -> 
 
     GetTypeResult {
         results: results.into_iter().flatten().collect(),
+    }
+}
+
+pub fn rename_symbol(analyzer: &dyn IAnalyzer, params: RenameSymbolParams) -> RenameSymbolResult {
+    let _scope = profiling::scope("searchtools::rename_symbol");
+
+    let resolver = WorkspaceFileResolver::new(analyzer.project());
+    let file = match resolver.resolve_literal(params.path.trim()) {
+        ResolvedFileInput::File(file) => file,
+        ResolvedFileInput::Ambiguous(item) => {
+            return rename_symbol_failure(
+                params,
+                "ambiguous_path",
+                format!(
+                    "`{}` is ambiguous; matches: {}",
+                    item.input,
+                    item.matches.join(", ")
+                ),
+            );
+        }
+        ResolvedFileInput::NotFound(path) => {
+            return rename_symbol_failure(
+                params,
+                "path_not_found",
+                format!("`{path}` does not resolve to a workspace file"),
+            );
+        }
+    };
+
+    let selection = match rename_selection_from_params(&params) {
+        Ok(selection) => selection,
+        Err(message) => return rename_symbol_failure(params, "invalid_location", message),
+    };
+
+    match crate::symbol_rename::rename_symbol(
+        analyzer,
+        analyzer.project(),
+        file,
+        selection,
+        &params.new_name,
+    ) {
+        Ok(result) => render_rename_symbol_result(analyzer, params, result),
+        Err(err) => rename_symbol_failure(params, err.kind, err.message),
+    }
+}
+
+fn rename_selection_from_params(
+    params: &RenameSymbolParams,
+) -> Result<crate::symbol_rename::RenameSelection, String> {
+    if let Some(start) = params.start_byte {
+        if params.line.is_some() || params.column.is_some() {
+            return Err(
+                "rename_symbol accepts either byte offsets or line and column, not both"
+                    .to_string(),
+            );
+        }
+        return Ok(if let Some(end) = params.end_byte {
+            crate::symbol_rename::RenameSelection::ByteRange { start, end }
+        } else {
+            crate::symbol_rename::RenameSelection::ByteOffset(start)
+        });
+    }
+    if params.end_byte.is_some() {
+        return Err("rename_symbol requires start_byte when end_byte is provided".to_string());
+    }
+    match (params.line, params.column) {
+        (Some(line), Some(column)) => {
+            Ok(crate::symbol_rename::RenameSelection::LineColumn { line, column })
+        }
+        (Some(_), None) => Err("rename_symbol requires column when line is provided".to_string()),
+        (None, Some(_)) => Err("rename_symbol requires line when column is provided".to_string()),
+        _ => Err("rename_symbol requires either start_byte or line and column".to_string()),
+    }
+}
+
+fn render_rename_symbol_result(
+    analyzer: &dyn IAnalyzer,
+    query: RenameSymbolParams,
+    result: crate::symbol_rename::RenameResult,
+) -> RenameSymbolResult {
+    let mut file_edits = Vec::new();
+    for file_result in result.files {
+        let source = match analyzer.project().read_source(&file_result.file) {
+            Ok(source) => source,
+            Err(err) => {
+                return rename_symbol_failure(
+                    query,
+                    "read_failed",
+                    format!(
+                        "failed to read `{}` while rendering rename edits: {err}",
+                        rel_path_string(&file_result.file)
+                    ),
+                );
+            }
+        };
+        let line_starts = compute_line_starts(&source);
+        let edits = file_result
+            .edits
+            .into_iter()
+            .map(|edit| {
+                let old_text = source
+                    .get(edit.start_byte..edit.end_byte)
+                    .unwrap_or_default()
+                    .to_string();
+                let (start_line, start_column) = crate::symbol_rename::line_column_for_byte_offset(
+                    &source,
+                    &line_starts,
+                    edit.start_byte,
+                );
+                let (end_line, end_column) = crate::symbol_rename::line_column_for_byte_offset(
+                    &source,
+                    &line_starts,
+                    edit.end_byte,
+                );
+                RenameTextEdit {
+                    old_text,
+                    start_byte: edit.start_byte,
+                    end_byte: edit.end_byte,
+                    start_line,
+                    start_column,
+                    end_line,
+                    end_column,
+                    new_text: edit.new_text,
+                }
+            })
+            .collect();
+        file_edits.push(RenameFileEdits {
+            path: rel_path_string(&file_result.file),
+            edits,
+        });
+    }
+
+    RenameSymbolResult {
+        query,
+        status: "ok".to_string(),
+        target: Some(RenameSymbolTarget {
+            symbol: result.target.fq_name().to_string(),
+            kind: result.target.kind().display_lowercase().to_string(),
+            path: rel_path_string(result.target.source()),
+        }),
+        old_name: Some(result.old_name),
+        edits: file_edits,
+        diagnostics: Vec::new(),
+    }
+}
+
+fn rename_symbol_failure(
+    query: RenameSymbolParams,
+    kind: &'static str,
+    message: String,
+) -> RenameSymbolResult {
+    RenameSymbolResult {
+        query,
+        status: kind.to_string(),
+        target: None,
+        old_name: None,
+        edits: Vec::new(),
+        diagnostics: vec![DefinitionDiagnostic {
+            kind: kind.to_string(),
+            message,
+        }],
     }
 }
 

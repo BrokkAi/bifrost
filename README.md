@@ -200,7 +200,7 @@ Examples:
 
 This starts a stdio MCP server that publishes these tools:
 
-- `symbol`: `search_symbols`, `get_symbol_locations`, `get_symbol_sources`, `get_summaries`, `scan_usages`
+- `symbol`: `search_symbols`, `get_symbol_locations`, `get_symbol_sources`, `get_summaries`, `scan_usages`, `rename_symbol`
 - `nlp`: `semantic_search`
 - `workspace`: `refresh`, `activate_workspace`, `get_active_workspace`
 - `extended`: `find_filenames`, `list_files`, `most_relevant_files`, `search_git_commit_messages`, `get_git_log`, `get_commit_diff`, `jq`, `xml_skim`, `xml_select`
@@ -306,7 +306,7 @@ The client exposes a typed method per tool, each returning a dataclass from
 `bifrost_searchtools.models` (rather than a raw dict):
 
 - workspace: `refresh()`, `update_paths(...)`, `activate_workspace(...)`, `get_active_workspace()`
-- symbols: `search_symbols(...)`, `get_symbol_locations(...)`, `get_symbol_ancestors(...)`, `get_symbol_sources(...)`, `get_summaries(...)`, `list_symbols(...)`, `contains_tests(...)`, `scan_usages(...)`, `usage_graph(...)`, `most_relevant_files(...)`
+- symbols: `search_symbols(...)`, `get_symbol_locations(...)`, `get_symbol_ancestors(...)`, `get_symbol_sources(...)`, `get_summaries(...)`, `list_symbols(...)`, `contains_tests(...)`, `scan_usages(...)`, `rename_symbol(...)`, `usage_graph(...)`, `most_relevant_files(...)`
 - definitions: `get_definition_by_location(...)`, `get_definition_by_reference(...)`
 - types: `get_type_by_location(...)`
 - semantic: `semantic_search(...)`, `semantic_search_status()`

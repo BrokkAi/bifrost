@@ -152,6 +152,7 @@ pub(crate) fn symbol_tool_descriptors(render_line_numbers: bool) -> Vec<Value> {
     if render_line_numbers {
         descriptors.push(get_type_by_location_descriptor());
     }
+    descriptors.push(rename_symbol_descriptor());
     descriptors.push(tool_descriptor(
         "usage_graph",
         "Return the whole-workspace caller->callee reference graph in one call: classes and functions as nodes, resolved references as weighted edges. Use to build a code map or rank symbols by importance (e.g. PageRank) instead of issuing one scan_usages call per symbol. Each edge carries its reference locations as a `sites` array of {path, line} (1-based), so you can map call sites without re-scanning; the site count equals the edge weight. Edges reuse scan_usages resolution; symbols whose call sites exceed the enumeration guardrail are listed under truncated_symbols with their inbound edges omitted.",
@@ -172,6 +173,70 @@ pub(crate) fn symbol_tool_descriptors(render_line_numbers: bool) -> Vec<Value> {
         }),
     ));
     descriptors
+}
+
+fn rename_symbol_descriptor() -> Value {
+    tool_descriptor(
+        "rename_symbol",
+        "Return the safe, non-mutating edit set for renaming one resolved workspace symbol from an exact source location. Use after locating a declaration or reference by path and line/column or byte offset; the tool rejects ambiguous, unsupported, invalid, truncated, or low-confidence renames instead of applying changes.",
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Project-relative source file path containing the declaration or reference to rename."
+                },
+                "line": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "1-based line containing the selected identifier. Must be paired with column when start_byte is omitted."
+                },
+                "column": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "1-based character column inside the selected identifier."
+                },
+                "start_byte": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "0-based byte offset at or inside the selected identifier."
+                },
+                "end_byte": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Optional exclusive byte end offset; when supplied, the byte range must select exactly one identifier."
+                },
+                "new_name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": crate::symbol_rename::MAX_RENAME_IDENTIFIER_BYTES,
+                    "description": "Replacement identifier. It must be valid for the target symbol's language."
+                }
+            },
+            "required": ["path", "new_name"],
+            "oneOf": [
+                {
+                    "required": ["line", "column"],
+                    "not": {
+                        "anyOf": [
+                            { "required": ["start_byte"] },
+                            { "required": ["end_byte"] }
+                        ]
+                    }
+                },
+                {
+                    "required": ["start_byte"],
+                    "not": {
+                        "anyOf": [
+                            { "required": ["line"] },
+                            { "required": ["column"] }
+                        ]
+                    }
+                }
+            ]
+        }),
+    )
 }
 
 fn get_type_by_location_descriptor() -> Value {

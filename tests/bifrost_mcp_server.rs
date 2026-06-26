@@ -169,6 +169,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "scan_usages",
             "get_definition_by_location",
             "get_type_by_location",
+            "rename_symbol",
             "usage_graph",
             "refresh",
             "activate_workspace",
@@ -207,6 +208,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "scan_usages",
             "get_definition_by_location",
             "get_type_by_location",
+            "rename_symbol",
             "usage_graph",
             "semantic_search",
             "refresh",
@@ -245,6 +247,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     assert_tool_schema_contains_property(tools, "scan_usages", "anyOf");
     assert_scan_usages_schema_requires_non_empty_selectors(tools);
     assert_type_lookup_schema_limits_and_requires_location(tools);
+    assert_rename_symbol_schema_requires_location_and_new_name(tools);
 
     let ping = round_trip(
         &mut stdin,
@@ -679,6 +682,7 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
         "scan_usages",
         "get_definition_by_location",
         "get_type_by_location",
+        "rename_symbol",
         "usage_graph",
     ];
     #[cfg(feature = "nlp")]
@@ -711,6 +715,7 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
             "scan_usages",
             "get_definition_by_location",
             "get_type_by_location",
+            "rename_symbol",
             "usage_graph",
         ],
     );
@@ -860,6 +865,66 @@ fn bifrost_split_servers_reject_tools_outside_their_registry() {
         "get_file_contents",
         json!({ "file_paths": ["A.java"] }),
     );
+}
+
+#[test]
+fn bifrost_mcp_rename_symbol_returns_structured_edit_set() {
+    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("testcode-java");
+    let before_a = fs::read_to_string(fixture_root.join("A.java")).expect("read A.java");
+    let mut child = spawn_server(&fixture_root, "core", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+
+    let response = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 31,
+            "method": "tools/call",
+            "params": {
+                "name": "rename_symbol",
+                "arguments": {
+                    "path": "A.java",
+                    "line": 8,
+                    "column": 19,
+                    "new_name": "renamedMethod2"
+                }
+            }
+        }),
+    );
+    let structured = &response["result"]["structuredContent"];
+    assert_eq!("ok", structured["status"], "response: {response}");
+    assert_eq!(
+        "A.method2", structured["target"]["symbol"],
+        "response: {response}"
+    );
+    assert!(
+        structured["edits"].as_array().unwrap().iter().any(|file| {
+            file["path"] == "B.java"
+                && file["edits"].as_array().unwrap().iter().any(|edit| {
+                    edit["old_text"] == "method2" && edit["new_text"] == "renamedMethod2"
+                })
+        }),
+        "response: {response}"
+    );
+    assert_eq!(
+        before_a,
+        fs::read_to_string(fixture_root.join("A.java")).expect("read A.java after rename"),
+        "rename_symbol must not mutate files"
+    );
+
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
 }
 
 #[test]
@@ -1671,6 +1736,19 @@ fn assert_type_lookup_schema_limits_and_requires_location(tools: &[Value]) {
         schema["properties"]["references"]["items"]["anyOf"],
         json!([{ "required": ["line"] }, { "required": ["start_byte"] }])
     );
+}
+
+fn assert_rename_symbol_schema_requires_location_and_new_name(tools: &[Value]) {
+    let tool = tools
+        .iter()
+        .find(|tool| tool["name"] == "rename_symbol")
+        .expect("missing rename_symbol descriptor");
+    let schema = &tool["inputSchema"];
+
+    assert_eq!(schema["required"], json!(["path", "new_name"]));
+    assert_eq!(schema["oneOf"].as_array().unwrap().len(), 2);
+    assert_eq!(schema["properties"]["new_name"]["minLength"], 1);
+    assert_eq!(schema["properties"]["new_name"]["maxLength"], json!(256));
 }
 
 fn assert_unknown_tool(root: &std::path::Path, mode: &str, tool_name: &str, arguments: Value) {

@@ -71,6 +71,7 @@ exposes:
 | `get_summaries(targets)` | Signature-level outline of files / classes / directories. |
 | `list_symbols(file_patterns)` | Skim the symbols declared in matching files. |
 | `scan_usages(symbols, *, include_tests=False, paths=None)` | Find references to a symbol. |
+| `rename_symbol(path, *, line=..., column=..., new_name=...)` | Return a non-mutating edit plan for a symbol rename. |
 | `usage_graph(*, include_tests=False, paths=None)` | Whole-workspace caller/callee graph; each edge carries its `{path, line}` call sites. |
 | `most_relevant_files(seed_files, *, limit=20, ...)` | Rank files related to seed files. |
 | `semantic_search(query, *, k=10)` | Meaning-based code search (opt-in). |

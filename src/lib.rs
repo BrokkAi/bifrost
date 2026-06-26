@@ -27,6 +27,7 @@ pub mod searchtools_render;
 pub mod searchtools_service;
 pub mod structured_data;
 pub mod summary;
+mod symbol_rename;
 #[cfg(test)]
 mod test_support;
 mod text_utils;
