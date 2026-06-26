@@ -102,10 +102,23 @@ pub(crate) fn export_local_matches_target(
     owner_seed_allowed: bool,
 ) -> bool {
     if target_name.contains('.') && !owner_seed_allowed {
-        local_name == target_name
+        local_name == target_name || module_qualified_member_matches(local_name, target_name)
     } else {
         local_name == target_short
     }
+}
+
+fn module_qualified_member_matches(local_name: &str, target_name: &str) -> bool {
+    if !target_name.contains(".js.") {
+        return false;
+    }
+    let Some((_, local_member)) = local_name.rsplit_once('.') else {
+        return false;
+    };
+    let Some((_, target_member)) = target_name.rsplit_once('.') else {
+        return false;
+    };
+    local_member == target_member
 }
 
 /// Whether `edge` binds one of the `seeds`, accounting for each import kind.

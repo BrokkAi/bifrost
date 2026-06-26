@@ -982,6 +982,69 @@ fn js_commonjs_exports_named_function_expression_resolves_module_object_usage() 
 }
 
 #[test]
+fn js_commonjs_module_exports_local_object_resolves_later_member_declaration() {
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file(
+            "lib/request.js",
+            "const req = {};\nmodule.exports = req;\nreq.accepts = function() { return true; };\n",
+        )
+        .file(
+            "consumer.js",
+            "const request = require('./lib/request');\nfunction run() { return request.accepts('json'); }\n",
+        )
+        .build()
+    });
+
+    let target = find_js_target(&analyzer, &project.file("lib/request.js"), |cu| {
+        cu.short_name() == "req.accepts" && cu.is_function()
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == project.file("consumer.js")),
+        "expected module.exports local object member declaration to resolve module-object usage"
+    );
+}
+
+#[test]
+fn js_commonjs_reexported_module_object_member_resolves_nested_usage() {
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file(
+            "lib/request.js",
+            "const req = {};\nmodule.exports = req;\nreq.accepts = function() { return true; };\n",
+        )
+        .file(
+            "lib/express.js",
+            "const req = require('./request');\nexports.request = req;\n",
+        )
+        .file("index.js", "module.exports = require('./lib/express');\n")
+        .file(
+            "consumer.js",
+            "const express = require('./');\nfunction run() { return express.request.accepts('json'); }\n",
+        )
+        .build()
+    });
+
+    let target = find_js_target(&analyzer, &project.file("lib/request.js"), |cu| {
+        cu.short_name() == "req.accepts" && cu.is_function()
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == project.file("consumer.js")),
+        "expected CommonJS re-exported module-object member to resolve nested usage"
+    );
+}
+
+#[test]
 fn js_commonjs_exports_property_does_not_seed_unrelated_member_by_short_name() {
     let (project, analyzer) = js_inline_analyzer(|p| {
         p.file(

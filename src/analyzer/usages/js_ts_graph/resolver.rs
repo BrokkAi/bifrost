@@ -73,8 +73,14 @@ pub(crate) fn build_jsts_usage_index(
     };
     let (reexport_edges, direct_reexport_edges, star_reexports, direct_star_reexports) =
         build_reexport_edges(&exports_by_file, &binders_by_file, &resolve);
-    let importer_reverse =
-        build_importer_reverse(&files, &binders_by_file, &exports_by_file, &resolve);
+    let importer_reverse = build_importer_reverse(
+        &files,
+        &binders_by_file,
+        &exports_by_file,
+        &direct_reexport_edges,
+        &direct_star_reexports,
+        &resolve,
+    );
 
     JsTsUsageIndex {
         exports_by_file,
@@ -248,6 +254,30 @@ fn build_reexport_edges(
                     let Some(binding) = binder.bindings.get(local_name) else {
                         continue;
                     };
+                    if binding.kind == ImportKind::CommonJsRequire
+                        && binding.imported_name.is_none()
+                    {
+                        for resolved_file in resolve(file, &binding.module_specifier) {
+                            let Some(target_exports) = exports_by_file.get(&resolved_file) else {
+                                continue;
+                            };
+                            for nested_export in target_exports.exports_by_name.keys() {
+                                if nested_export == "default" {
+                                    continue;
+                                }
+                                let exported_member = format!("{exported_name}.{nested_export}");
+                                direct_reexport_edges
+                                    .entry((file.clone(), exported_member.clone()))
+                                    .or_default()
+                                    .push((resolved_file.clone(), nested_export.clone()));
+                                reexport_edges
+                                    .entry((resolved_file.clone(), nested_export.clone()))
+                                    .or_default()
+                                    .push((file.clone(), exported_member));
+                            }
+                        }
+                        continue;
+                    }
                     let Some(imported_name) = binding.imported_name.as_ref() else {
                         continue;
                     };
@@ -319,6 +349,8 @@ fn build_importer_reverse(
     files: &[ProjectFile],
     binders_by_file: &HashMap<ProjectFile, ImportBinder>,
     exports_by_file: &HashMap<ProjectFile, ExportIndex>,
+    direct_reexport_edges: &HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>>,
+    direct_star_reexports: &HashMap<ProjectFile, Vec<ProjectFile>>,
     resolve: &impl Fn(&ProjectFile, &str) -> Vec<ProjectFile>,
 ) -> HashMap<ProjectFile, Vec<ImportEdge>> {
     let mut reverse: HashMap<ProjectFile, Vec<ImportEdge>> = HashMap::default();
@@ -371,6 +403,39 @@ fn build_importer_reverse(
                                 kind: ImportEdgeKind::CommonJsRequire(export_name.clone()),
                             });
                     }
+                    for (reexport_file, export_name) in direct_reexport_edges.keys() {
+                        if reexport_file != &target_file {
+                            continue;
+                        }
+                        reverse
+                            .entry(target_file.clone())
+                            .or_default()
+                            .push(ImportEdge {
+                                importer: file.clone(),
+                                local_name: local_name.clone(),
+                                target_file: target_file.clone(),
+                                kind: ImportEdgeKind::CommonJsRequire(export_name.clone()),
+                            });
+                    }
+                    if let Some(star_targets) = direct_star_reexports.get(&target_file) {
+                        for star_target in star_targets {
+                            for export_name in export_names_for_file(
+                                star_target,
+                                exports_by_file,
+                                direct_reexport_edges,
+                            ) {
+                                reverse
+                                    .entry(target_file.clone())
+                                    .or_default()
+                                    .push(ImportEdge {
+                                        importer: file.clone(),
+                                        local_name: local_name.clone(),
+                                        target_file: target_file.clone(),
+                                        kind: ImportEdgeKind::CommonJsRequire(export_name),
+                                    });
+                            }
+                        }
+                    }
                     continue;
                 }
 
@@ -398,6 +463,24 @@ fn build_importer_reverse(
         }
     }
     reverse
+}
+
+fn export_names_for_file(
+    file: &ProjectFile,
+    exports_by_file: &HashMap<ProjectFile, ExportIndex>,
+    direct_reexport_edges: &HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>>,
+) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    if let Some(exports) = exports_by_file.get(file) {
+        names.extend(exports.exports_by_name.keys().cloned());
+    }
+    names.extend(
+        direct_reexport_edges
+            .keys()
+            .filter(|(reexport_file, _)| reexport_file == file)
+            .map(|(_, export_name)| export_name.clone()),
+    );
+    names
 }
 
 pub(super) fn collect_jsts_files(analyzer: &dyn IAnalyzer, language: Language) -> Vec<ProjectFile> {

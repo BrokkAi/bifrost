@@ -224,7 +224,7 @@ pub(crate) fn commonjs_require_module_specifier_from_declarator(
     require_call_module_specifier(value, source)
 }
 
-fn require_call_module_specifier(node: Node<'_>, source: &str) -> Option<String> {
+pub(crate) fn require_call_module_specifier(node: Node<'_>, source: &str) -> Option<String> {
     if node.kind() != "call_expression" {
         return None;
     }
