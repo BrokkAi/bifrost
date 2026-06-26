@@ -147,6 +147,18 @@ fn pinned_probe_files(
                 .iter()
                 .map(|query| &query.selector.path),
         )
+        .chain(
+            target
+                .call_hierarchy_queries
+                .iter()
+                .map(|query| &query.selector.path),
+        )
+        .chain(
+            target
+                .type_hierarchy_queries
+                .iter()
+                .map(|query| &query.selector.path),
+        )
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
     {

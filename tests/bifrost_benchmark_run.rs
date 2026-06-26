@@ -33,6 +33,8 @@ required_scenarios = [
   "most_relevant_files",
   "scan_usages",
   "get_definition",
+  "call_hierarchy",
+  "type_hierarchy",
 ]
 
 [[repos]]
@@ -50,6 +52,8 @@ scenarios = [
   "most_relevant_files",
   "scan_usages",
   "get_definition",
+  "call_hierarchy",
+  "type_hierarchy",
 ]
 search_patterns = ["method2"]
 location_symbols = ["A.method2"]
@@ -59,6 +63,12 @@ seed_file_paths = ["A.java"]
 usage_symbols = ["E.iMethod"]
 definition_queries = [
   {{ path = "A.java", line = 8, column = 19, expected_status = "no_definition" }},
+]
+call_hierarchy_queries = [
+  {{ path = "E.java", line = 9, column = 17, min_incoming = 1 }},
+]
+type_hierarchy_queries = [
+  {{ path = "XExtendsY.java", line = 1, column = 14, min_supertypes = 1 }},
 ]
 "#,
             toml_basic_string(&repo_root.display().to_string()),
@@ -92,7 +102,7 @@ definition_queries = [
     let scenarios = report["repos"][0]["scenarios"]
         .as_array()
         .expect("scenario array");
-    assert_eq!(scenarios.len(), 8, "report: {report}");
+    assert_eq!(scenarios.len(), 10, "report: {report}");
     for scenario in scenarios {
         assert_eq!(scenario["success"], true, "report: {report}");
     }
@@ -109,6 +119,8 @@ definition_queries = [
     assert!(names.contains(&"most_relevant_files"), "report: {report}");
     assert!(names.contains(&"scan_usages"), "report: {report}");
     assert!(names.contains(&"get_definition"), "report: {report}");
+    assert!(names.contains(&"call_hierarchy"), "report: {report}");
+    assert!(names.contains(&"type_hierarchy"), "report: {report}");
 }
 
 #[test]

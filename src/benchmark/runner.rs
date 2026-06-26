@@ -6,9 +6,18 @@ use crate::benchmark::report::{
 use crate::benchmark::subset_workspace::prepare_subset_workspace;
 use crate::benchmark::{
     BenchmarkLocationSelector, BenchmarkManifest, BenchmarkRepoTarget, BenchmarkScenario,
+    HierarchyQueryTarget,
 };
-use crate::{AnalyzerConfig, FilesystemProject, WorkspaceAnalyzer};
+use crate::lsp::conversion::path_to_uri_string;
+use crate::lsp::handlers::{call_hierarchy, type_hierarchy};
+use crate::{AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer};
 use chrono::Utc;
+use lsp_types::{
+    CallHierarchyIncomingCallsParams, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
+    PartialResultParams, Position, TextDocumentIdentifier, TextDocumentPositionParams,
+    TypeHierarchyPrepareParams, TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, Uri,
+    WorkDoneProgressParams,
+};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -82,7 +91,14 @@ fn run_repo(
         .scenarios
         .iter()
         .copied()
-        .filter(|scenario| *scenario != BenchmarkScenario::WorkspaceBuild)
+        .filter(|scenario| {
+            !matches!(
+                scenario,
+                BenchmarkScenario::WorkspaceBuild
+                    | BenchmarkScenario::CallHierarchy
+                    | BenchmarkScenario::TypeHierarchy
+            )
+        })
         .collect();
     if !mcp_scenarios.is_empty() {
         match McpSession::start(&workspace_path).and_then(|mut session| {
@@ -117,6 +133,30 @@ fn run_repo(
         }
     }
 
+    if target
+        .scenario_set()
+        .contains(&BenchmarkScenario::CallHierarchy)
+    {
+        scenario_reports.push(run_hierarchy_scenario(
+            target,
+            manifest,
+            &workspace_path,
+            BenchmarkScenario::CallHierarchy,
+        ));
+    }
+
+    if target
+        .scenario_set()
+        .contains(&BenchmarkScenario::TypeHierarchy)
+    {
+        scenario_reports.push(run_hierarchy_scenario(
+            target,
+            manifest,
+            &workspace_path,
+            BenchmarkScenario::TypeHierarchy,
+        ));
+    }
+
     Ok(BenchmarkRepoReport {
         name: target.name.clone(),
         url: target.url.clone(),
@@ -126,6 +166,298 @@ fn run_repo(
         subset_max_files: request.max_files,
         scenarios: scenario_reports,
     })
+}
+
+fn run_hierarchy_scenario(
+    target: &BenchmarkRepoTarget,
+    manifest: &BenchmarkManifest,
+    checkout_path: &Path,
+    scenario: BenchmarkScenario,
+) -> ScenarioReport {
+    let mut warmup_durations_ms = Vec::with_capacity(manifest.warmup_iterations);
+    let mut measured_durations_ms = Vec::with_capacity(manifest.measured_iterations);
+
+    for _ in 0..manifest.warmup_iterations {
+        match measure_hierarchy_scenario(target, checkout_path, scenario) {
+            Ok(duration) => warmup_durations_ms.push(duration),
+            Err(err) => {
+                return ScenarioReport::from_timings(
+                    scenario,
+                    ScenarioTransport::Direct,
+                    false,
+                    warmup_durations_ms,
+                    measured_durations_ms,
+                    Some(err),
+                );
+            }
+        }
+    }
+
+    for _ in 0..manifest.measured_iterations {
+        match measure_hierarchy_scenario(target, checkout_path, scenario) {
+            Ok(duration) => measured_durations_ms.push(duration),
+            Err(err) => {
+                return ScenarioReport::from_timings(
+                    scenario,
+                    ScenarioTransport::Direct,
+                    false,
+                    warmup_durations_ms,
+                    measured_durations_ms,
+                    Some(err),
+                );
+            }
+        }
+    }
+
+    ScenarioReport::from_timings(
+        scenario,
+        ScenarioTransport::Direct,
+        true,
+        warmup_durations_ms,
+        measured_durations_ms,
+        None,
+    )
+}
+
+fn measure_hierarchy_scenario(
+    target: &BenchmarkRepoTarget,
+    checkout_path: &Path,
+    scenario: BenchmarkScenario,
+) -> Result<f64, String> {
+    let selected_languages = target
+        .language_set()
+        .into_iter()
+        .map(|language| language.analyzer_language())
+        .collect::<BTreeSet<_>>();
+    let project: Arc<dyn Project> =
+        Arc::new(FilesystemProject::new(checkout_path).map_err(|err| {
+            format!(
+                "failed to open workspace `{}`: {err}",
+                checkout_path.display()
+            )
+        })?);
+
+    let start = Instant::now();
+    let workspace = if selected_languages.is_empty() {
+        WorkspaceAnalyzer::build(Arc::clone(&project), AnalyzerConfig::default())
+    } else {
+        WorkspaceAnalyzer::build_for_languages(
+            Arc::clone(&project),
+            AnalyzerConfig::default(),
+            &selected_languages,
+        )
+    };
+
+    match scenario {
+        BenchmarkScenario::CallHierarchy => {
+            for query in &target.call_hierarchy_queries {
+                run_call_hierarchy_query(&workspace, project.as_ref(), checkout_path, query)?;
+            }
+        }
+        BenchmarkScenario::TypeHierarchy => {
+            for query in &target.type_hierarchy_queries {
+                run_type_hierarchy_query(&workspace, project.as_ref(), checkout_path, query)?;
+            }
+        }
+        _ => {
+            return Err(format!(
+                "scenario `{}` is not a hierarchy scenario",
+                scenario.label()
+            ));
+        }
+    }
+
+    Ok(elapsed_ms(start))
+}
+
+fn run_call_hierarchy_query(
+    workspace: &WorkspaceAnalyzer,
+    project: &dyn Project,
+    checkout_path: &Path,
+    query: &HierarchyQueryTarget,
+) -> Result<(), String> {
+    let params = call_hierarchy_prepare_params(checkout_path, &query.selector)?;
+    let items = call_hierarchy::prepare(workspace, project, &params)
+        .filter(|items| !items.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "call_hierarchy prepare returned no item for `{}`",
+                query.selector.path
+            )
+        })?;
+    let item = items
+        .into_iter()
+        .next()
+        .expect("non-empty call hierarchy item list");
+
+    let incoming = call_hierarchy::incoming_calls(
+        workspace,
+        project,
+        &CallHierarchyIncomingCallsParams {
+            item: item.clone(),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        },
+    )
+    .ok_or_else(|| {
+        format!(
+            "call_hierarchy incomingCalls failed for `{}`",
+            query.selector.path
+        )
+    })?;
+    if incoming.len() < query.min_incoming {
+        return Err(format!(
+            "call_hierarchy incomingCalls for `{}` returned {} result(s), expected at least {}",
+            query.selector.path,
+            incoming.len(),
+            query.min_incoming
+        ));
+    }
+
+    let outgoing = call_hierarchy::outgoing_calls(
+        workspace,
+        project,
+        &CallHierarchyOutgoingCallsParams {
+            item,
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        },
+    )
+    .ok_or_else(|| {
+        format!(
+            "call_hierarchy outgoingCalls failed for `{}`",
+            query.selector.path
+        )
+    })?;
+    if outgoing.len() < query.min_outgoing {
+        return Err(format!(
+            "call_hierarchy outgoingCalls for `{}` returned {} result(s), expected at least {}",
+            query.selector.path,
+            outgoing.len(),
+            query.min_outgoing
+        ));
+    }
+
+    Ok(())
+}
+
+fn run_type_hierarchy_query(
+    workspace: &WorkspaceAnalyzer,
+    project: &dyn Project,
+    checkout_path: &Path,
+    query: &HierarchyQueryTarget,
+) -> Result<(), String> {
+    let params = type_hierarchy_prepare_params(checkout_path, &query.selector)?;
+    let items = type_hierarchy::prepare(workspace, project, &params)
+        .filter(|items| !items.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "type_hierarchy prepare returned no item for `{}`",
+                query.selector.path
+            )
+        })?;
+    let item = items
+        .into_iter()
+        .next()
+        .expect("non-empty type hierarchy item list");
+
+    let supertypes = type_hierarchy::supertypes(
+        workspace,
+        project,
+        &TypeHierarchySupertypesParams {
+            item: item.clone(),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        },
+    )
+    .ok_or_else(|| {
+        format!(
+            "type_hierarchy supertypes failed for `{}`",
+            query.selector.path
+        )
+    })?;
+    if supertypes.len() < query.min_supertypes {
+        return Err(format!(
+            "type_hierarchy supertypes for `{}` returned {} result(s), expected at least {}",
+            query.selector.path,
+            supertypes.len(),
+            query.min_supertypes
+        ));
+    }
+
+    let subtypes = type_hierarchy::subtypes(
+        workspace,
+        project,
+        &TypeHierarchySubtypesParams {
+            item,
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        },
+    )
+    .ok_or_else(|| {
+        format!(
+            "type_hierarchy subtypes failed for `{}`",
+            query.selector.path
+        )
+    })?;
+    if subtypes.len() < query.min_subtypes {
+        return Err(format!(
+            "type_hierarchy subtypes for `{}` returned {} result(s), expected at least {}",
+            query.selector.path,
+            subtypes.len(),
+            query.min_subtypes
+        ));
+    }
+
+    Ok(())
+}
+
+fn call_hierarchy_prepare_params(
+    checkout_path: &Path,
+    selector: &BenchmarkLocationSelector,
+) -> Result<CallHierarchyPrepareParams, String> {
+    Ok(CallHierarchyPrepareParams {
+        text_document_position_params: text_document_position_params(checkout_path, selector)?,
+        work_done_progress_params: WorkDoneProgressParams::default(),
+    })
+}
+
+fn type_hierarchy_prepare_params(
+    checkout_path: &Path,
+    selector: &BenchmarkLocationSelector,
+) -> Result<TypeHierarchyPrepareParams, String> {
+    Ok(TypeHierarchyPrepareParams {
+        text_document_position_params: text_document_position_params(checkout_path, selector)?,
+        work_done_progress_params: WorkDoneProgressParams::default(),
+    })
+}
+
+fn text_document_position_params(
+    checkout_path: &Path,
+    selector: &BenchmarkLocationSelector,
+) -> Result<TextDocumentPositionParams, String> {
+    let line = selector
+        .line
+        .ok_or_else(|| format!("hierarchy selector `{}` is missing line", selector.path))?;
+    let column = selector
+        .column
+        .ok_or_else(|| format!("hierarchy selector `{}` is missing column", selector.path))?;
+    Ok(TextDocumentPositionParams {
+        text_document: TextDocumentIdentifier {
+            uri: file_uri(checkout_path, selector)?,
+        },
+        position: Position {
+            line: (line - 1) as u32,
+            character: (column - 1) as u32,
+        },
+    })
+}
+
+fn file_uri(checkout_path: &Path, selector: &BenchmarkLocationSelector) -> Result<Uri, String> {
+    let path = checkout_path.join(&selector.path);
+    path_to_uri_string(&path)
+        .parse()
+        .map_err(|err| format!("failed to convert `{}` to URI: {err}", path.display()))
 }
 
 fn run_workspace_build(
@@ -308,6 +640,7 @@ fn tool_arguments(target: &BenchmarkRepoTarget, scenario: BenchmarkScenario) -> 
                 location_selector_arguments(&query.selector)
             }).collect::<Vec<_>>(),
         }),
+        BenchmarkScenario::CallHierarchy | BenchmarkScenario::TypeHierarchy => json!({}),
     }
 }
 
@@ -538,6 +871,7 @@ fn assert_scenario_result(
             }
             Ok(())
         }
+        BenchmarkScenario::CallHierarchy | BenchmarkScenario::TypeHierarchy => Ok(()),
     }
 }
 

@@ -51,6 +51,30 @@ fn checked_in_targets_manifest_loads_and_validates() {
             repo.name
         );
     }
+
+    let gson = manifest
+        .repos
+        .iter()
+        .find(|repo| repo.name == "google-gson")
+        .expect("google-gson benchmark target");
+    assert!(
+        gson.scenario_set()
+            .contains(&BenchmarkScenario::CallHierarchy),
+        "google-gson must enable call_hierarchy coverage"
+    );
+    assert!(
+        gson.scenario_set()
+            .contains(&BenchmarkScenario::TypeHierarchy),
+        "google-gson must enable type_hierarchy coverage"
+    );
+    assert!(
+        !gson.call_hierarchy_queries.is_empty(),
+        "google-gson must define call_hierarchy_queries"
+    );
+    assert!(
+        !gson.type_hierarchy_queries.is_empty(),
+        "google-gson must define type_hierarchy_queries"
+    );
 }
 
 #[test]
@@ -120,6 +144,20 @@ scenarios = ["workspace_build", "search_symbols", "get_symbol_locations", "get_s
             .messages()
             .iter()
             .any(|message| message.contains("get_definition")),
+        "{validation}"
+    );
+    assert!(
+        validation
+            .messages()
+            .iter()
+            .any(|message| message.contains("call_hierarchy")),
+        "{validation}"
+    );
+    assert!(
+        validation
+            .messages()
+            .iter()
+            .any(|message| message.contains("type_hierarchy")),
         "{validation}"
     );
 }

@@ -23,6 +23,8 @@ required_scenarios = [
   "most_relevant_files",
   "scan_usages",
   "get_definition",
+  "call_hierarchy",
+  "type_hierarchy",
 ]
 
 [[repos]]
@@ -39,6 +41,8 @@ scenarios = [
   "most_relevant_files",
   "scan_usages",
   "get_definition",
+  "call_hierarchy",
+  "type_hierarchy",
 ]
 search_patterns = ["Gson"]
 location_symbols = ["Gson.fromJson"]
@@ -47,6 +51,12 @@ seed_file_paths = ["gson/src/main/java/com/google/gson/Gson.java"]
 usage_symbols = ["Gson.fromJson"]
 definition_queries = [
   { path = "gson/src/main/java/com/google/gson/Gson.java", line = 319, column = 14, symbol = "TypeAdapter", expected_status = "resolved", expected_fqn = "com.google.gson.TypeAdapter" },
+]
+call_hierarchy_queries = [
+  { path = "gson/src/main/java/com/google/gson/Gson.java", line = 827, column = 16, min_outgoing = 1 },
+]
+type_hierarchy_queries = [
+  { path = "gson/src/main/java/com/google/gson/TypeAdapter.java", line = 121, column = 23, min_subtypes = 1 },
 ]
 
 [[repos]]

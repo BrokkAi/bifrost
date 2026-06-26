@@ -9,7 +9,7 @@
 
 mod capabilities;
 pub mod conversion;
-mod handlers;
+pub(crate) mod handlers;
 mod server;
 
 pub use server::run_lsp_stdio_server;
