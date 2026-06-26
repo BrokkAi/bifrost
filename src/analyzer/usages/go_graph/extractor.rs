@@ -12,7 +12,8 @@ use std::collections::BTreeSet;
 use std::sync::Mutex;
 use tree_sitter::Node;
 
-const OWNER_TOKEN: &str = "__go_target_owner__";
+pub(super) const OWNER_TOKEN: &str = "__go_target_owner__";
+const FIELD_OWNER_TOKEN_PREFIX: &str = "__go_field_owner__:";
 
 pub(super) fn scan_files_for_target(
     analyzer: &dyn IAnalyzer,
@@ -116,15 +117,28 @@ fn scan_children(node: Node<'_>, ctx: &mut ScanCtx<'_>, locals: &mut LocalInfere
 }
 
 fn seed_parameters(node: Node<'_>, ctx: &ScanCtx<'_>, locals: &mut LocalInferenceEngine<String>) {
+    if node.kind() == "method_declaration"
+        && let Some(receiver) = node.child_by_field_name("receiver")
+    {
+        seed_parameter_list(receiver, ctx, locals);
+    }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         if child.kind() == "parameter_list" {
-            let mut params = child.walk();
-            for param in child.named_children(&mut params) {
-                if param.kind() == "parameter_declaration" {
-                    seed_parameter_declaration(param, ctx, locals);
-                }
-            }
+            seed_parameter_list(child, ctx, locals);
+        }
+    }
+}
+
+fn seed_parameter_list(
+    node: Node<'_>,
+    ctx: &ScanCtx<'_>,
+    locals: &mut LocalInferenceEngine<String>,
+) {
+    let mut params = node.walk();
+    for param in node.named_children(&mut params) {
+        if param.kind() == "parameter_declaration" {
+            seed_parameter_declaration(param, ctx, locals);
         }
     }
 }
@@ -141,16 +155,17 @@ fn seed_parameter_declaration(
         }
         return;
     };
-    if !type_ref_from_node(type_node, ctx.source)
-        .is_some_and(|ty| ctx.bindings.matches_owner_type(&ty))
-    {
+    let tokens = type_ref_from_node(type_node, ctx.source)
+        .map(|ty| ctx.bindings.receiver_tokens_for_type(&ty))
+        .unwrap_or_default();
+    if tokens.is_empty() {
         for name in parameter_names {
             locals.declare_shadow(name);
         }
         return;
     }
     for name in parameter_names {
-        locals.seed_symbol(name, OWNER_TOKEN.to_string());
+        locals.seed_symbol_many(name, tokens.clone());
     }
 }
 
@@ -202,13 +217,14 @@ fn seed_var_spec(node: Node<'_>, ctx: &ScanCtx<'_>, locals: &mut LocalInferenceE
         return;
     }
 
-    if node
+    if let Some(tokens) = node
         .child_by_field_name("type")
         .and_then(|type_node| type_ref_from_node(type_node, ctx.source))
-        .is_some_and(|ty| ctx.bindings.matches_owner_type(&ty))
+        .map(|ty| ctx.bindings.receiver_tokens_for_type(&ty))
+        .filter(|tokens| !tokens.is_empty())
     {
         for name in names {
-            locals.seed_symbol(name, OWNER_TOKEN.to_string());
+            locals.seed_symbol_many(name, tokens.clone());
         }
         return;
     }
@@ -464,6 +480,7 @@ fn scan_selector_like(
             .resolve_symbol(receiver)
             .as_precise()
             .is_some_and(|targets| targets.contains(OWNER_TOKEN))
+            || field_receiver_matches_owner(qualifier_node, ctx, locals)
         {
             record_hit(field_node, ctx);
         }
@@ -476,6 +493,25 @@ fn scan_selector_like(
     {
         record_hit(field_node, ctx);
     }
+}
+
+fn field_receiver_matches_owner(
+    qualifier_node: Node<'_>,
+    ctx: &ScanCtx<'_>,
+    locals: &LocalInferenceEngine<String>,
+) -> bool {
+    let Some((base, _base_node, field_node)) = selector_parts(qualifier_node, ctx.source) else {
+        return false;
+    };
+    let token = field_owner_token(node_text(field_node, ctx.source));
+    locals
+        .resolve_symbol(receiver_symbol_from_qualifier(&base))
+        .as_precise()
+        .is_some_and(|targets| targets.contains(token.as_str()))
+}
+
+pub(super) fn field_owner_token(field: &str) -> String {
+    format!("{FIELD_OWNER_TOKEN_PREFIX}{field}")
 }
 
 fn scan_direct_identifier(

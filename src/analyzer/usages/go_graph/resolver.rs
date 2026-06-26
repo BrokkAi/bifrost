@@ -1,7 +1,9 @@
 use crate::analyzer::go::packages::{canonical_go_package_name, read_go_module_path};
 use crate::analyzer::usages::common::language_for_file;
 pub(super) use crate::analyzer::usages::common::node_text;
-use crate::analyzer::usages::go_graph::extractor::{first_named_child, type_ref_from_node};
+use crate::analyzer::usages::go_graph::extractor::{
+    field_owner_token, first_named_child, type_ref_from_node,
+};
 use crate::analyzer::usages::model::{
     ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind,
 };
@@ -719,6 +721,8 @@ pub(super) struct TargetSpec {
     pub(super) owner: Option<String>,
     top_level_seeds: Option<BTreeSet<(ProjectFile, String)>>,
     owner_seeds: Option<BTreeSet<(ProjectFile, String)>>,
+    compatible_receiver_types: BTreeSet<(ProjectFile, String)>,
+    field_owner_direct_names: HashMap<String, HashSet<String>>,
     owner_constructor_names: HashSet<String>,
 }
 
@@ -732,12 +736,25 @@ impl TargetSpec {
         } else {
             None
         };
-        let owner_seeds = owner.as_ref().and_then(|owner| {
-            let mut seeds = graph.seeds_for_target(target.source(), owner);
-            if seeds.is_empty() && analyzer.parent_of(target).is_some() {
-                seeds.insert((target.source().clone(), owner.clone()));
+        let compatible_receiver_types = owner
+            .as_ref()
+            .map(|owner| {
+                collect_compatible_receiver_types(graph, target.source(), owner, &identifier)
+            })
+            .unwrap_or_default();
+        let field_owner_direct_names =
+            collect_field_owner_direct_names(graph, &compatible_receiver_types);
+        let owner_seeds = (!compatible_receiver_types.is_empty()).then(|| {
+            let mut seeds = BTreeSet::new();
+            for (file, receiver) in &compatible_receiver_types {
+                let receiver_seeds = graph.seeds_for_target(file, receiver);
+                if receiver_seeds.is_empty() && analyzer.parent_of(target).is_some() {
+                    seeds.insert((file.clone(), receiver.clone()));
+                } else {
+                    seeds.extend(receiver_seeds);
+                }
             }
-            (!seeds.is_empty()).then_some(seeds)
+            seeds
         });
         let owner_constructor_names = owner
             .as_ref()
@@ -750,6 +767,8 @@ impl TargetSpec {
             owner,
             top_level_seeds,
             owner_seeds,
+            compatible_receiver_types,
+            field_owner_direct_names,
             owner_constructor_names,
         }
     }
@@ -776,6 +795,334 @@ impl TargetSpec {
     pub(super) fn is_owner_constructor(&self, name: &str) -> bool {
         self.owner_constructor_names.contains(name)
     }
+}
+
+fn collect_compatible_receiver_types(
+    graph: &GoProjectGraph,
+    owner_source: &ProjectFile,
+    owner: &str,
+    method: &str,
+) -> BTreeSet<(ProjectFile, String)> {
+    let mut receivers = BTreeSet::from([(owner_source.clone(), owner.to_string())]);
+    let Some(target_signature) = target_method_signature(graph, owner_source, owner, method) else {
+        return receivers;
+    };
+    for (file, parsed) in &graph.parsed {
+        if !same_go_package(graph, file, owner_source) {
+            continue;
+        }
+        let root = parsed.tree.root_node();
+        let source = parsed.source.as_str();
+        let mut cursor = root.walk();
+        for child in root.named_children(&mut cursor) {
+            if child.kind() != "type_declaration" {
+                continue;
+            }
+            collect_interface_types_with_method(
+                child,
+                source,
+                method,
+                &target_signature,
+                file,
+                &mut receivers,
+            );
+        }
+    }
+    receivers
+}
+
+fn target_method_signature(
+    graph: &GoProjectGraph,
+    owner_source: &ProjectFile,
+    owner: &str,
+    method: &str,
+) -> Option<String> {
+    let parent = owner_source.parent().to_string_lossy().replace('\\', "/");
+    let package_files = graph.dir_index.get(&parent)?;
+    for file in package_files {
+        if !same_go_package(graph, file, owner_source) {
+            continue;
+        }
+        let Some(parsed) = graph.parsed_file(file) else {
+            continue;
+        };
+        let mut cursor = parsed.tree.root_node().walk();
+        for child in parsed.tree.root_node().named_children(&mut cursor) {
+            if child.kind() != "method_declaration" {
+                continue;
+            }
+            let Some(name_node) = child.child_by_field_name("name") else {
+                continue;
+            };
+            if node_text(name_node, parsed.source.as_str()) != method {
+                continue;
+            }
+            let Some(receiver) = child.child_by_field_name("receiver") else {
+                continue;
+            };
+            let Some(receiver_type) = first_receiver_type_ref(receiver, parsed.source.as_str())
+            else {
+                continue;
+            };
+            if receiver_type.qualifier.is_none() && receiver_type.name.as_deref() == Some(owner) {
+                return Some(method_signature(child, parsed.source.as_str()));
+            }
+        }
+    }
+    None
+}
+
+fn first_receiver_type_ref(receiver: Node<'_>, source: &str) -> Option<TypeRef> {
+    let mut cursor = receiver.walk();
+    receiver
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "parameter_declaration")
+        .and_then(|param| param.child_by_field_name("type"))
+        .and_then(|type_node| type_ref_from_node(type_node, source))
+}
+
+fn collect_interface_types_with_method(
+    node: Node<'_>,
+    source: &str,
+    method: &str,
+    target_signature: &str,
+    file: &ProjectFile,
+    receivers: &mut BTreeSet<(ProjectFile, String)>,
+) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "type_spec" | "type_alias" => {
+                let Some(name_node) = child.child_by_field_name("name") else {
+                    continue;
+                };
+                let Some(type_node) = child.child_by_field_name("type") else {
+                    continue;
+                };
+                if type_node.kind() == "interface_type"
+                    && interface_declares_method(type_node, source, method, target_signature)
+                {
+                    receivers.insert((file.clone(), node_text(name_node, source).to_string()));
+                }
+            }
+            "type_spec_list" => collect_interface_types_with_method(
+                child,
+                source,
+                method,
+                target_signature,
+                file,
+                receivers,
+            ),
+            _ => {}
+        }
+    }
+}
+
+fn interface_declares_method(
+    node: Node<'_>,
+    source: &str,
+    method: &str,
+    target_signature: &str,
+) -> bool {
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.kind() == "method_elem"
+            && current
+                .child_by_field_name("name")
+                .is_some_and(|name| node_text(name, source) == method)
+            && method_signature(current, source) == target_signature
+        {
+            return true;
+        }
+        let mut cursor = current.walk();
+        stack.extend(current.named_children(&mut cursor));
+    }
+    false
+}
+
+fn method_signature(node: Node<'_>, source: &str) -> String {
+    let mut parts = Vec::new();
+    if let Some(parameters) = node.child_by_field_name("parameters") {
+        parts.push(format!(
+            "params({})",
+            parameter_type_texts(parameters, source).join(",")
+        ));
+    }
+    if let Some(result) = node.child_by_field_name("result") {
+        let result_types = if result.kind() == "parameter_list" {
+            parameter_type_texts(result, source)
+        } else {
+            vec![normalized_type_text(result, source)]
+        };
+        parts.push(format!("results({})", result_types.join(",")));
+    }
+    parts.join(" ")
+}
+
+fn parameter_type_texts(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut types = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() != "parameter_declaration" {
+            continue;
+        }
+        let Some(type_node) = child.child_by_field_name("type") else {
+            continue;
+        };
+        let count = parameter_name_count(child).max(1);
+        types.extend(std::iter::repeat_n(
+            normalized_type_text(type_node, source),
+            count,
+        ));
+    }
+    types
+}
+
+fn parameter_name_count(node: Node<'_>) -> usize {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .filter(|child| child.kind() == "identifier")
+        .count()
+}
+
+fn normalized_type_text(node: Node<'_>, source: &str) -> String {
+    node_text(node, source)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn collect_field_owner_direct_names(
+    graph: &GoProjectGraph,
+    compatible_receiver_types: &BTreeSet<(ProjectFile, String)>,
+) -> HashMap<String, HashSet<String>> {
+    let mut by_owner = HashMap::default();
+    let Some((anchor_file, _)) = compatible_receiver_types.first() else {
+        return by_owner;
+    };
+    let parent = anchor_file.parent().to_string_lossy().replace('\\', "/");
+    let Some(package_files) = graph.dir_index.get(&parent) else {
+        return by_owner;
+    };
+    for type_file in package_files {
+        if !same_go_package(graph, anchor_file, type_file) {
+            continue;
+        }
+        let Some(parsed) = graph.parsed_file(type_file) else {
+            continue;
+        };
+        let mut cursor = parsed.tree.root_node().walk();
+        for child in parsed.tree.root_node().named_children(&mut cursor) {
+            if child.kind() != "type_declaration" {
+                continue;
+            }
+            collect_struct_fields_with_compatible_types(
+                graph,
+                type_file,
+                parsed.source.as_str(),
+                child,
+                compatible_receiver_types,
+                &mut by_owner,
+            );
+        }
+    }
+    by_owner
+}
+
+fn collect_struct_fields_with_compatible_types(
+    graph: &GoProjectGraph,
+    type_file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    compatible_receiver_types: &BTreeSet<(ProjectFile, String)>,
+    by_owner: &mut HashMap<String, HashSet<String>>,
+) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "type_spec" | "type_alias" => {
+                let Some(name_node) = child.child_by_field_name("name") else {
+                    continue;
+                };
+                let Some(type_node) = child.child_by_field_name("type") else {
+                    continue;
+                };
+                if type_node.kind() != "struct_type" {
+                    continue;
+                }
+                let owner = node_text(name_node, source).to_string();
+                let fields = struct_fields_with_compatible_types(
+                    graph,
+                    type_file,
+                    source,
+                    type_node,
+                    compatible_receiver_types,
+                );
+                if !fields.is_empty() {
+                    by_owner.insert(owner, fields);
+                }
+            }
+            "type_spec_list" => collect_struct_fields_with_compatible_types(
+                graph,
+                type_file,
+                source,
+                child,
+                compatible_receiver_types,
+                by_owner,
+            ),
+            _ => {}
+        }
+    }
+}
+
+fn struct_fields_with_compatible_types(
+    graph: &GoProjectGraph,
+    type_file: &ProjectFile,
+    source: &str,
+    struct_node: Node<'_>,
+    compatible_receiver_types: &BTreeSet<(ProjectFile, String)>,
+) -> HashSet<String> {
+    let mut fields = HashSet::default();
+    let mut stack = vec![struct_node];
+    while let Some(current) = stack.pop() {
+        if current.kind() == "field_declaration"
+            && let Some(type_node) = current.child_by_field_name("type")
+            && let Some(ty) = type_ref_from_node(type_node, source)
+            && type_ref_matches_compatible_receiver(
+                graph,
+                type_file,
+                &ty,
+                compatible_receiver_types,
+            )
+        {
+            let mut names = current.walk();
+            for name_node in current.children_by_field_name("name", &mut names) {
+                fields.insert(node_text(name_node, source).to_string());
+            }
+        }
+        let mut cursor = current.walk();
+        stack.extend(current.named_children(&mut cursor));
+    }
+    fields
+}
+
+fn type_ref_matches_compatible_receiver(
+    graph: &GoProjectGraph,
+    type_file: &ProjectFile,
+    ty: &TypeRef,
+    compatible_receiver_types: &BTreeSet<(ProjectFile, String)>,
+) -> bool {
+    let Some(name) = ty.name.as_deref() else {
+        return false;
+    };
+    if ty.qualifier.is_none() {
+        return compatible_receiver_types
+            .iter()
+            .any(|(receiver_file, receiver)| {
+                receiver == name && same_go_package(graph, type_file, receiver_file)
+            });
+    }
+    false
 }
 
 /// Names of package-level functions in the owner type's package whose first result
@@ -865,6 +1212,7 @@ pub(super) struct ScanBindings {
     pub(super) namespace_names: HashSet<String>,
     owner_direct_names: HashSet<String>,
     owner_namespace_names: HashSet<String>,
+    field_owner_direct_names: HashMap<String, HashSet<String>>,
 }
 
 impl ScanBindings {
@@ -903,17 +1251,23 @@ impl ScanBindings {
                 }
             }
         }
-        if same_go_package(graph, file, spec.target.source())
-            && let Some(owner) = &spec.owner
-        {
-            owner_direct_names.insert(owner.clone());
+        for (receiver_file, receiver) in &spec.compatible_receiver_types {
+            if same_go_package(graph, file, receiver_file) {
+                owner_direct_names.insert(receiver.clone());
+            }
         }
+        let field_owner_direct_names = if same_go_package(graph, file, spec.target.source()) {
+            spec.field_owner_direct_names.clone()
+        } else {
+            HashMap::default()
+        };
 
         Self {
             direct_names,
             namespace_names,
             owner_direct_names,
             owner_namespace_names,
+            field_owner_direct_names,
         }
     }
 
@@ -944,6 +1298,22 @@ impl ScanBindings {
         ty.qualifier
             .as_ref()
             .is_some_and(|qualifier| self.owner_namespace_names.contains(qualifier))
+    }
+
+    pub(super) fn receiver_tokens_for_type(&self, ty: &TypeRef) -> Vec<String> {
+        let mut tokens = Vec::new();
+        if self.matches_owner_type(ty) {
+            tokens.push(crate::analyzer::usages::go_graph::extractor::OWNER_TOKEN.to_string());
+        }
+        if ty.qualifier.is_none()
+            && let Some(name) = ty.name.as_deref()
+            && let Some(fields) = self.field_owner_direct_names.get(name)
+        {
+            tokens.extend(fields.iter().map(|field| field_owner_token(field)));
+        }
+        tokens.sort();
+        tokens.dedup();
+        tokens
     }
 }
 

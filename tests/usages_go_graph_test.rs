@@ -640,6 +640,127 @@ func FromConstructors() string {
     assert_eq!(5, hits.len(), "receiver seed hits: {hits:?}");
 }
 
+#[test]
+fn go_graph_strategy_finds_pointer_receiver_method_calls_through_interface_fields() {
+    let (project, analyzer) = go_analyzer_with_files(&[
+        (
+            "example/service.go",
+            r#"
+package example
+
+type Repository interface {
+    Save(value string) string
+}
+
+const DefaultPrefix = "job"
+
+var DefaultRepository Repository = MemoryRepository{}
+
+type MemoryRepository struct {
+    Last string
+}
+
+func (m *MemoryRepository) Save(value string) string {
+    m.Last = value
+    return value
+}
+
+type Service struct {
+    repository Repository
+}
+
+func NewService(repository Repository) Service {
+    return Service{repository: repository}
+}
+
+func (s Service) Execute(name string) string {
+    stored := s.repository.Save(name)
+    return DefaultPrefix + ":" + stored
+}
+"#,
+        ),
+        (
+            "example/service_test.go",
+            r#"
+package example
+
+func ExampleService() {
+    repository := &MemoryRepository{}
+    service := NewService(repository)
+    result := service.Execute("Ada")
+    _ = DefaultRepository
+    _ = DefaultPrefix + result
+    repository.Save("Grace")
+    _ = repository.Last
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "example.com/app/example.MemoryRepository.Save");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = GoUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("pointer-receiver method calls through interface fields should resolve");
+
+    assert_eq!(2, hits.len(), "expected both Save calls: {hits:?}");
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == project.file("example/service.go")),
+        "same-file interface-field call should be included: {hits:?}",
+    );
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == project.file("example/service_test.go")),
+        "test-file concrete pointer call should be included: {hits:?}",
+    );
+}
+
+#[test]
+fn go_graph_strategy_does_not_match_interface_fields_by_method_name_only() {
+    let (_project, analyzer) = go_analyzer_with_files(&[(
+        "example/service.go",
+        r#"
+package example
+
+type StringSaver interface {
+    Save(value string) string
+}
+
+type IntSaver interface {
+    Save(value int) int
+}
+
+type MemoryRepository struct{}
+
+func (m *MemoryRepository) Save(value string) string {
+    return value
+}
+
+type Worker struct {
+    saver IntSaver
+}
+
+func (w Worker) Run(value int) int {
+    return w.saver.Save(value)
+}
+"#,
+    )]);
+
+    let target = definition(&analyzer, "example.com/app/example.MemoryRepository.Save");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = GoUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("same-name interface methods should be resolved structurally");
+
+    assert!(
+        hits.is_empty(),
+        "IntSaver.Save(int) must not count as MemoryRepository.Save(string): {hits:?}",
+    );
+}
+
 // Regression for #232: a value-receiver method called on a local that is bound to
 // a constructor's return value (`service := NewService()`) must resolve on the
 // graph path. Before the constructor-return seeding it returned zero hits and the
