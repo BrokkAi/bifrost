@@ -1,9 +1,9 @@
 use lsp_types::{
     CompletionOptions, DiagnosticOptions, DiagnosticServerCapabilities,
     FoldingRangeProviderCapability, HoverProviderCapability, ImplementationProviderCapability,
-    OneOf, RenameOptions, ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind,
-    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TypeDefinitionProviderCapability,
-    WorkDoneProgressOptions, WorkspaceFoldersServerCapabilities,
+    OneOf, RenameOptions, ServerCapabilities, SignatureHelpOptions, TextDocumentSyncCapability,
+    TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions,
+    TypeDefinitionProviderCapability, WorkDoneProgressOptions, WorkspaceFoldersServerCapabilities,
 };
 
 pub fn server_capabilities() -> ServerCapabilities {
@@ -33,6 +33,14 @@ pub fn server_capabilities() -> ServerCapabilities {
             // names yet).
             resolve_provider: Some(false),
             ..CompletionOptions::default()
+        }),
+        signature_help_provider: Some(SignatureHelpOptions {
+            // Signature help currently reparses overlay source and may perform
+            // structured definition lookup, so v1 supports explicit requests
+            // without advertising automatic typing triggers.
+            trigger_characters: None,
+            retrigger_characters: None,
+            work_done_progress_options: WorkDoneProgressOptions::default(),
         }),
         definition_provider: Some(OneOf::Left(true)),
         type_definition_provider: Some(TypeDefinitionProviderCapability::Simple(true)),

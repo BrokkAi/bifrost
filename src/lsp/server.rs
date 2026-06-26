@@ -16,8 +16,9 @@ use lsp_types::request::{
     CallHierarchyIncomingCalls, CallHierarchyOutgoingCalls, CallHierarchyPrepare, Completion,
     DocumentDiagnosticRequest, DocumentHighlightRequest, DocumentSymbolRequest,
     FoldingRangeRequest, GotoDefinition, GotoImplementation, GotoTypeDefinition, HoverRequest,
-    PrepareRenameRequest, References, Rename, Request as LspRequestTrait, TypeHierarchyPrepare,
-    TypeHierarchySubtypes, TypeHierarchySupertypes, WorkDoneProgressCreate, WorkspaceSymbolRequest,
+    PrepareRenameRequest, References, Rename, Request as LspRequestTrait, SignatureHelpRequest,
+    TypeHierarchyPrepare, TypeHierarchySubtypes, TypeHierarchySupertypes, WorkDoneProgressCreate,
+    WorkspaceSymbolRequest,
 };
 use lsp_types::{
     DidChangeTextDocumentParams, DidChangeWatchedFilesParams, DidChangeWorkspaceFoldersParams,
@@ -40,7 +41,8 @@ use crate::lsp::handlers::util::{
 };
 use crate::lsp::handlers::{
     call_hierarchy, completion, definition, diagnostic, document_highlight, document_symbol,
-    folding_range, hover, references, rename, type_definition, type_hierarchy, workspace_symbol,
+    folding_range, hover, references, rename, signature_help, type_definition, type_hierarchy,
+    workspace_symbol,
 };
 
 /// Run the LSP server over stdio. `fallback_root` is used when the client does
@@ -361,6 +363,13 @@ fn handle_request(
         }),
         HoverRequest::METHOD => decode_and_run::<HoverRequest, _>(req, |params| {
             Ok(hover::handle(&state.workspace, state.project(), &params))
+        }),
+        SignatureHelpRequest::METHOD => decode_and_run::<SignatureHelpRequest, _>(req, |params| {
+            Ok(signature_help::handle(
+                &state.workspace,
+                state.project(),
+                &params,
+            ))
         }),
         Completion::METHOD => decode_and_run::<Completion, _>(req, |params| {
             // Borrow the overlay field directly (not via `state.project()`) so

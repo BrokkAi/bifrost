@@ -9,6 +9,7 @@ pub(crate) mod hierarchy_support;
 pub mod hover;
 pub mod references;
 pub mod rename;
+pub mod signature_help;
 pub mod type_definition;
 pub mod type_hierarchy;
 pub(crate) mod util;

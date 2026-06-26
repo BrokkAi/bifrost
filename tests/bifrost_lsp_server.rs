@@ -85,6 +85,15 @@ fn bifrost_lsp_server_handles_initialize_and_shutdown() {
         initialize["result"]["capabilities"]["implementationProvider"], true,
         "implementationProvider should be advertised: {initialize}"
     );
+    assert!(
+        initialize["result"]["capabilities"]["signatureHelpProvider"].is_object(),
+        "signatureHelpProvider should be advertised: {initialize}"
+    );
+    assert!(
+        initialize["result"]["capabilities"]["signatureHelpProvider"]["triggerCharacters"]
+            .is_null(),
+        "signatureHelpProvider should require explicit client requests: {initialize}"
+    );
     assert_eq!(
         initialize["result"]["capabilities"]["renameProvider"]["prepareProvider"], true,
         "renameProvider with prepare support should be advertised: {initialize}"
@@ -1998,6 +2007,264 @@ fn bifrost_lsp_server_implementation_works_from_go_interface_method() {
     assert_eq!(
         locations[0]["range"]["start"]["line"], 8,
         "expected Worker.Run declaration from interface method lookup: {response}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_signature_help_returns_java_method_signature() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("Calculator.java");
+    let source = "class Calculator {\n    int sum(int left, int right) { return left + right; }\n    void caller() {\n        int value = sum(1, 2);\n    }\n}\n";
+    fs::write(&file_path, source).expect("write Calculator.java");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let (line, character) = position_after(source, "sum(1, ");
+
+    let result = signature_help(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        2,
+        &file_uri,
+        line,
+        character,
+    );
+    assert_eq!(
+        result["activeSignature"], 0,
+        "unexpected signature help: {result}"
+    );
+    assert_eq!(
+        result["activeParameter"], 1,
+        "unexpected signature help: {result}"
+    );
+    assert!(
+        result["signatures"][0]["label"]
+            .as_str()
+            .is_some_and(|label| label.contains("sum") && label.contains("left")),
+        "expected sum signature label, got {result}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_signature_help_returns_typescript_function_signature() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("sample.ts");
+    let source = "function combine(left: number, right: number): number {\n  return left + right;\n}\nconst result = combine(1, 2);\n";
+    fs::write(&file_path, source).expect("write sample.ts");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let (line, character) = position_after(source, "combine(1, ");
+
+    let result = signature_help(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        2,
+        &file_uri,
+        line,
+        character,
+    );
+    assert_eq!(
+        result["activeParameter"], 1,
+        "unexpected signature help: {result}"
+    );
+    assert!(
+        result["signatures"][0]["label"]
+            .as_str()
+            .is_some_and(|label| label.contains("combine") && label.contains("right")),
+        "expected combine signature label, got {result}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_signature_help_returns_typescript_constructor_signature() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("widget.ts");
+    let source = "class Widget {\n  constructor(left: number, right: number) {}\n}\nconst result = new Widget(1, 2);\n";
+    fs::write(&file_path, source).expect("write widget.ts");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let (line, character) = position_after(source, "Widget(1, ");
+
+    let result = signature_help(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        2,
+        &file_uri,
+        line,
+        character,
+    );
+    assert_eq!(
+        result["activeParameter"], 1,
+        "unexpected signature help: {result}"
+    );
+    assert!(
+        result["signatures"][0]["label"]
+            .as_str()
+            .is_some_and(|label| label.contains("Widget") && label.contains("constructor")),
+        "expected Widget constructor signature label, got {result}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_signature_help_returns_go_function_signature() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    fs::write(root.join("go.mod"), "module example.com/signature\n").expect("write go.mod");
+    let file_path = root.join("main.go");
+    let source = "package main\n\nfunc combine(left int, right int) int { return left + right }\n\nfunc main() {\n    _ = combine(1, 2)\n}\n";
+    fs::write(&file_path, source).expect("write main.go");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let (line, character) = position_after(source, "combine(1, ");
+
+    let result = signature_help(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        2,
+        &file_uri,
+        line,
+        character,
+    );
+    assert_eq!(
+        result["activeParameter"], 1,
+        "unexpected signature help: {result}"
+    );
+    assert!(
+        result["signatures"][0]["label"]
+            .as_str()
+            .is_some_and(|label| label.contains("combine") && label.contains("right")),
+        "expected combine signature label, got {result}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_signature_help_handles_scala_brace_argument() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("App.scala");
+    let source =
+        "object App {\n  def target(value: Int): Int = value\n  val result = target { 1 }\n}\n";
+    fs::write(&file_path, source).expect("write App.scala");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let (line, character) = position_after(source, "target { ");
+
+    let result = signature_help(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        2,
+        &file_uri,
+        line,
+        character,
+    );
+    assert_eq!(
+        result["activeParameter"], 0,
+        "unexpected signature help: {result}"
+    );
+    assert!(
+        result["signatures"][0]["label"]
+            .as_str()
+            .is_some_and(|label| label.contains("target") && label.contains("value")),
+        "expected target signature label, got {result}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_signature_help_returns_null_outside_call_arguments() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("Calculator.java");
+    let source = "class Calculator {\n    int sum(int left, int right) { return left + right; }\n    void caller() {\n        int value = 1;\n    }\n}\n";
+    fs::write(&file_path, source).expect("write Calculator.java");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let (line, character) = position_after(source, "int value");
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "textDocument/signatureHelp",
+            "params": {
+                "textDocument": {"uri": file_uri},
+                "position": {"line": line, "character": character}
+            }
+        }),
+    );
+    let response = read_response_for_id(&mut reader, &mut stderr, 2);
+    assert!(
+        response["result"].is_null(),
+        "expected null signatureHelp, got {response}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_signature_help_uses_did_open_overlay_call_context() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("Overlay.java");
+    let disk_source = "class Overlay {\n    int target(int left, int right) { return left + right; }\n    void caller() {\n        int value = target(1);\n    }\n}\n";
+    let overlay_source = "class Overlay {\n    int target(int left, int right) { return left + right; }\n    void caller() {\n        int value = target(1, 2);\n    }\n}\n";
+    fs::write(&file_path, disk_source).expect("write Overlay.java");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": file_uri,
+                    "languageId": "java",
+                    "version": 1,
+                    "text": overlay_source
+                }
+            }
+        }),
+    );
+    let (line, character) = position_after(overlay_source, "target(1, ");
+
+    let result = signature_help(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        2,
+        &file_uri,
+        line,
+        character,
+    );
+    assert_eq!(
+        result["activeParameter"], 1,
+        "signatureHelp should use overlay call text, got {result}"
     );
 
     shutdown_lsp(child, stdin, reader, stderr);
@@ -4598,6 +4865,48 @@ fn hierarchy_relation(
         .as_array()
         .unwrap_or_else(|| panic!("expected {method} array, got {response}"))
         .clone()
+}
+
+fn signature_help(
+    stdin: &mut impl Write,
+    reader: &mut impl BufRead,
+    stderr: &mut impl Read,
+    id: u64,
+    uri: &str,
+    line: u64,
+    character: u64,
+) -> Value {
+    write_message(
+        stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "textDocument/signatureHelp",
+            "params": {
+                "textDocument": {"uri": uri},
+                "position": {"line": line, "character": character}
+            }
+        }),
+    );
+    let response = read_response_for_id(reader, stderr, id);
+    assert!(
+        response["error"].is_null(),
+        "unexpected signatureHelp error: {response}"
+    );
+    assert!(
+        response["result"].is_object(),
+        "expected signatureHelp result object, got {response}"
+    );
+    response["result"].clone()
+}
+
+fn position_after(source: &str, needle: &str) -> (u64, u64) {
+    let byte_offset = source.find(needle).expect("needle exists") + needle.len();
+    let before = &source[..byte_offset];
+    let line = before.bytes().filter(|byte| *byte == b'\n').count() as u64;
+    let line_start = before.rfind('\n').map(|index| index + 1).unwrap_or(0);
+    let character = source[line_start..byte_offset].chars().count() as u64;
+    (line, character)
 }
 
 fn assert_call_range(ranges: &Value, line: u64, start_character: u64, end_character: u64) {

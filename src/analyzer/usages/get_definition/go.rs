@@ -1,4 +1,11 @@
 use super::*;
+use tree_sitter::Tree;
+
+pub(super) fn parse_go_tree(source: &str) -> Option<Tree> {
+    let mut parser = Parser::new();
+    parser.set_language(&tree_sitter_go::LANGUAGE.into()).ok()?;
+    parser.parse(source, None)
+}
 
 pub(super) fn resolve_go(
     analyzer: &dyn IAnalyzer,
@@ -254,9 +261,7 @@ fn resolve_go_local_selector_chain(
         return None;
     }
 
-    let mut parser = Parser::new();
-    parser.set_language(&tree_sitter_go::LANGUAGE.into()).ok()?;
-    let tree = parser.parse(source, None)?;
+    let tree = parse_go_tree(source)?;
     let mut owner_fqn = go_binding_type_fqn(
         analyzer,
         support,
