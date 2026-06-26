@@ -535,13 +535,13 @@ fn csharp_call_reference_candidate(node: Node<'_>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::env;
 
     use super::call_signature_context;
     use crate::analyzer::ProjectFile;
 
     fn file(name: &str) -> ProjectFile {
-        ProjectFile::new(PathBuf::from("/tmp/bifrost-signature-help"), name)
+        ProjectFile::new(env::temp_dir().join("bifrost-signature-help"), name)
     }
 
     fn offset_after(source: &str, needle: &str) -> usize {
