@@ -1507,6 +1507,78 @@ fn bifrost_mcp_get_summaries_mixed_targets_include_compact_symbols() {
 }
 
 #[test]
+fn bifrost_mcp_get_summaries_accepts_go_import_path() {
+    let fixture_root = TempDir::new().expect("temp dir");
+    fs::write(
+        fixture_root.path().join("go.mod"),
+        "module example.com/m\n\ngo 1.21\n",
+    )
+    .expect("write go.mod");
+    let pkg_dir = fixture_root.path().join("internal").join("pkg");
+    fs::create_dir_all(&pkg_dir).expect("create package dir");
+    fs::write(
+        pkg_dir.join("foo.go"),
+        "package pkg\n\nfunc Foo() int { return 1 }\n\ntype Bar struct{}\n",
+    )
+    .expect("write go source");
+
+    let mut child = spawn_server(fixture_root.path(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+
+    // The import/package path resolves to the package's files and rides the compact
+    // "directory inventory" rail, returning symbol outlines rather than full signatures.
+    let response = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "get_summaries",
+                "arguments": { "targets": ["example.com/m/internal/pkg"] }
+            }
+        }),
+    );
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    let structured = &response["result"]["structuredContent"];
+    assert_eq!(false, structured["degraded"], "{structured}");
+    // Returns compact symbols (outlines), not full ranged `summaries` blocks.
+    assert!(
+        structured["summaries"]
+            .as_array()
+            .map(Vec::is_empty)
+            .unwrap_or(true),
+        "{structured}"
+    );
+    let files = structured["compact_symbols"]["files"]
+        .as_array()
+        .expect("compact_symbols files");
+    let pkg_file = files
+        .iter()
+        .find(|file| file["path"] == "internal/pkg/foo.go")
+        .unwrap_or_else(|| panic!("missing package file in {structured}"));
+    let lines = pkg_file["lines"]
+        .as_array()
+        .expect("file lines")
+        .iter()
+        .filter_map(|line| line.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(lines.contains("Foo"), "{structured}");
+
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
 fn bifrost_mcp_budgets_large_get_summaries_responses() {
     let fixture_root = TempDir::new().expect("temp dir");
     for class_idx in 0..18 {

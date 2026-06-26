@@ -4571,12 +4571,25 @@ fn resolve_directory_target(analyzer: &dyn IAnalyzer, target: &str) -> Vec<Proje
     if target == "." {
         return analyzer.analyzed_files().cloned().collect();
     }
-    let prefix = format!("{}/", target.trim_end_matches('/'));
-    analyzer
+    let normalized = target.trim_end_matches('/');
+    let prefix = format!("{normalized}/");
+    let fs_matches: Vec<_> = analyzer
         .analyzed_files()
         .filter(|file| rel_path_string(file).starts_with(&prefix))
         .cloned()
-        .collect()
+        .collect();
+    if !fs_matches.is_empty() {
+        return fs_matches;
+    }
+
+    // No filesystem directory matched: treat the target as a language import/package
+    // path (e.g. `github.com/cli/cli/v2/internal/skills/discovery`) and resolve it to
+    // the package's files so it rides the same compact "directory inventory" rail as a
+    // filesystem directory. Filesystem matches win first, so workspace-relative paths
+    // never collide with import paths.
+    analyzer
+        .definition_lookup_index()
+        .package_files_with_prefix(normalized)
 }
 
 fn select_files_for_display(

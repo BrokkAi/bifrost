@@ -8,6 +8,7 @@ pub struct DefinitionLookupIndex {
     direct_children_by_fqn: HashMap<String, Vec<CodeUnit>>,
     by_file_identifier: HashMap<(ProjectFile, String), Vec<CodeUnit>>,
     packages: HashSet<String>,
+    files_by_package: HashMap<String, Vec<ProjectFile>>,
     normalized_fqns: HashSet<String>,
 }
 
@@ -26,6 +27,10 @@ impl DefinitionLookupIndex {
     pub(crate) fn insert(&mut self, unit: &CodeUnit) {
         let fqn = unit.fq_name();
         self.packages.insert(unit.package_name().to_string());
+        self.files_by_package
+            .entry(unit.package_name().to_string())
+            .or_default()
+            .push(unit.source().clone());
         self.normalized_fqns
             .insert(fqn.replace("$.", ".").trim_end_matches('$').to_string());
         if let Some((parent_fqn, _)) = fqn.rsplit_once('.') {
@@ -51,6 +56,10 @@ impl DefinitionLookupIndex {
         for units in self.direct_children_by_fqn.values_mut() {
             sort_units(units);
             units.dedup();
+        }
+        for files in self.files_by_package.values_mut() {
+            files.sort_by_key(rel_path_string);
+            files.dedup();
         }
     }
 
@@ -82,6 +91,24 @@ impl DefinitionLookupIndex {
 
     pub(crate) fn package_exists(&self, package: &str) -> bool {
         self.packages.contains(package)
+    }
+
+    /// Files belonging to the package `prefix` exactly, or to any package nested
+    /// under `prefix/` (slash-separated, mirroring the recursion of a filesystem
+    /// directory target). Lets an import path such as
+    /// `github.com/cli/cli/v2/internal/skills/discovery` resolve to its package's
+    /// files. Returns sorted, deduped files.
+    pub(crate) fn package_files_with_prefix(&self, prefix: &str) -> Vec<ProjectFile> {
+        let nested = format!("{prefix}/");
+        let mut out = Vec::new();
+        for (package, files) in &self.files_by_package {
+            if package == prefix || package.starts_with(&nested) {
+                out.extend(files.iter().cloned());
+            }
+        }
+        out.sort_by_key(rel_path_string);
+        out.dedup();
+        out
     }
 
     pub(crate) fn fqn_prefix_exists(&self, prefix: &str) -> bool {
@@ -121,4 +148,79 @@ fn sort_units(units: &mut [CodeUnit]) {
             .then_with(|| left.fq_name().cmp(&right.fq_name()))
             .then_with(|| left.signature().cmp(&right.signature()))
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::CodeUnitType;
+    use std::path::Path;
+
+    fn unit(root: &Path, file: &str, package: &str, name: &str) -> CodeUnit {
+        CodeUnit::new(
+            ProjectFile::new(root, file),
+            CodeUnitType::Class,
+            package.to_string(),
+            name.to_string(),
+        )
+    }
+
+    #[test]
+    fn package_files_with_prefix_matches_exact_and_nested_packages() {
+        let root = std::env::temp_dir().join("bifrost-defindex-test");
+        let units = vec![
+            unit(
+                &root,
+                "internal/skills/discovery/a.go",
+                "github.com/cli/cli/v2/internal/skills/discovery",
+                "Foo",
+            ),
+            unit(
+                &root,
+                "internal/skills/discovery/b.go",
+                "github.com/cli/cli/v2/internal/skills/discovery",
+                "Bar",
+            ),
+            unit(
+                &root,
+                "internal/skills/registry/c.go",
+                "github.com/cli/cli/v2/internal/skills/registry",
+                "Baz",
+            ),
+            unit(
+                &root,
+                "internal/other/d.go",
+                "github.com/cli/cli/v2/internal/other",
+                "Qux",
+            ),
+        ];
+        let index = DefinitionLookupIndex::from_declarations(&units);
+
+        // Exact package match returns only that package's files, deduped.
+        let exact =
+            index.package_files_with_prefix("github.com/cli/cli/v2/internal/skills/discovery");
+        let exact_paths: Vec<_> = exact.iter().map(rel_path_string).collect();
+        assert_eq!(
+            exact_paths,
+            vec![
+                "internal/skills/discovery/a.go".to_string(),
+                "internal/skills/discovery/b.go".to_string(),
+            ]
+        );
+
+        // Parent prefix recurses into nested packages (discovery + registry), not `other`.
+        let nested = index.package_files_with_prefix("github.com/cli/cli/v2/internal/skills");
+        let nested_paths: Vec<_> = nested.iter().map(rel_path_string).collect();
+        assert_eq!(
+            nested_paths,
+            vec![
+                "internal/skills/discovery/a.go".to_string(),
+                "internal/skills/discovery/b.go".to_string(),
+                "internal/skills/registry/c.go".to_string(),
+            ]
+        );
+
+        // A non-package string resolves to nothing.
+        assert!(index.package_files_with_prefix("does/not/exist").is_empty());
+    }
 }
