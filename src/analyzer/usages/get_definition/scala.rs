@@ -1,5 +1,28 @@
 use super::*;
 
+pub(crate) fn scala_type_lookup_fqn(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    types: &ScalaProjectTypes,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    site: &ResolvedReferenceSite,
+) -> Option<String> {
+    let scala = resolve_analyzer::<ScalaAnalyzer>(analyzer)?;
+    let resolver = ScalaNameResolver::for_file(scala, file, types);
+    let ctx = ScalaLookupCtx {
+        scala,
+        analyzer,
+        support,
+        types,
+        file,
+        source,
+    };
+    let node = smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)?;
+    scala_type_lookup_node_fqn(ctx, &resolver, root, node)
+}
+
 pub(super) fn resolve_scala(
     analyzer: &dyn IAnalyzer,
     context: &mut DefinitionBatchContext<'_>,
@@ -92,6 +115,100 @@ pub(super) fn resolve_scala(
                 node.kind()
             ),
         ),
+    }
+}
+
+fn scala_type_lookup_node_fqn(
+    ctx: ScalaLookupCtx<'_>,
+    resolver: &ScalaNameResolver,
+    root: Node<'_>,
+    node: Node<'_>,
+) -> Option<String> {
+    if matches!(
+        node.kind(),
+        "type_identifier" | "stable_type_identifier" | "generic_type"
+    ) && scala_is_type_position(node)
+    {
+        return scala_resolve_visible_type_annotation(
+            ctx,
+            resolver,
+            scala_node_text(node, ctx.source),
+        );
+    }
+
+    if matches!(node.kind(), "instance_expression" | "call_expression") {
+        return scala_constructed_type(ctx, node, resolver);
+    }
+
+    if let Some(parent) = node.parent() {
+        if parent.kind() == "field_expression" && parent.child_by_field_name("object") == Some(node)
+        {
+            return scala_receiver_type_fqn(ctx, resolver, root, node, node.start_byte());
+        }
+        if let Some(fqn) = scala_declaration_name_type_fqn(ctx, resolver, root, parent, node) {
+            return Some(fqn);
+        }
+    }
+
+    if !matches!(
+        node.kind(),
+        "identifier" | "operator_identifier" | "type_identifier"
+    ) {
+        return None;
+    }
+
+    let name = scala_node_text(node, ctx.source).trim();
+    let bindings = scala_bindings_before(ctx, resolver, root, node.start_byte());
+    first_precise(&bindings, name)
+}
+
+fn scala_declaration_name_type_fqn(
+    ctx: ScalaLookupCtx<'_>,
+    resolver: &ScalaNameResolver,
+    root: Node<'_>,
+    parent: Node<'_>,
+    name: Node<'_>,
+) -> Option<String> {
+    match parent.kind() {
+        "parameter" | "class_parameter" if parent.child_by_field_name("name") == Some(name) => {
+            parent.child_by_field_name("type").and_then(|type_node| {
+                scala_resolve_visible_type_annotation(
+                    ctx,
+                    resolver,
+                    scala_node_text(type_node, ctx.source),
+                )
+            })
+        }
+        "val_definition" | "var_definition"
+            if parent
+                .child_by_field_name("pattern")
+                .is_some_and(|pattern| {
+                    pattern.start_byte() <= name.start_byte()
+                        && name.end_byte() <= pattern.end_byte()
+                }) =>
+        {
+            parent.child_by_field_name("type").and_then(|type_node| {
+                scala_resolve_visible_type_annotation(
+                    ctx,
+                    resolver,
+                    scala_node_text(type_node, ctx.source),
+                )
+            })
+        }
+        "function_definition" if parent.child_by_field_name("name") == Some(name) => parent
+            .child_by_field_name("return_type")
+            .and_then(|type_node| {
+                scala_resolve_visible_type_annotation(
+                    ctx,
+                    resolver,
+                    scala_node_text(type_node, ctx.source),
+                )
+            }),
+        _ => {
+            let name_text = scala_node_text(name, ctx.source).trim();
+            let bindings = scala_bindings_before(ctx, resolver, root, name.end_byte());
+            first_precise(&bindings, name_text)
+        }
     }
 }
 

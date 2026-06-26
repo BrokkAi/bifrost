@@ -479,6 +479,363 @@ func Run() {
 }
 
 #[test]
+fn java_type_lookup_resolves_imported_explicit_local_type() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "models/Widget.java",
+            "package models; public class Widget {}\n",
+        )
+        .file(
+            "app/UseWidget.java",
+            r#"
+package app;
+
+import models.Widget;
+
+public class UseWidget {
+    public void render(Widget input) {
+        Widget local = input;
+        local.toString();
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        local.toString();";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/UseWidget.java","line":9,"column":{}}}]}}"#,
+            column_of(line, "local")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["types"][0]["fqn"], "models.Widget", "{value}");
+    assert_eq!(
+        result["types"][0]["definitions"][0]["path"], "models/Widget.java",
+        "{value}"
+    );
+}
+
+#[test]
+fn java_type_lookup_reports_no_type_for_inferred_local() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "models/Widget.java",
+            "package models; public class Widget {}\n",
+        )
+        .file(
+            "app/UseWidget.java",
+            r#"
+package app;
+
+import models.Widget;
+
+public class UseWidget {
+    public void render() {
+        var local = new Widget();
+        local.toString();
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        local.toString();";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/UseWidget.java","line":9,"column":{}}}]}}"#,
+            column_of(line, "local")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_type", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "no_explicit_type",
+        "{value}"
+    );
+}
+
+#[test]
+fn java_type_lookup_does_not_leak_sibling_method_local_type() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "models/Label.java",
+            "package models; public class Label {}\n",
+        )
+        .file(
+            "models/Widget.java",
+            "package models; public class Widget {}\n",
+        )
+        .file(
+            "app/UseWidget.java",
+            r#"
+package app;
+
+import models.Label;
+import models.Widget;
+
+public class UseWidget {
+    private Label value;
+
+    public void seed() {
+        Widget value = new Widget();
+        value.toString();
+    }
+
+    public void render() {
+        value.toString();
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        value.toString();";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/UseWidget.java","line":16,"column":{}}}]}}"#,
+            column_of(line, "value")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["types"][0]["fqn"], "models.Label", "{value}");
+}
+
+#[test]
+fn java_type_lookup_resolves_explicit_method_return_type() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "models/Widget.java",
+            "package models; public class Widget {}\n",
+        )
+        .file(
+            "app/UseWidget.java",
+            r#"
+package app;
+
+import models.Widget;
+
+public class UseWidget {
+    public Widget create() {
+        return new Widget();
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "    public Widget create() {";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/UseWidget.java","line":7,"column":{}}}]}}"#,
+            column_of(line, "create")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["types"][0]["fqn"], "models.Widget", "{value}");
+}
+
+#[test]
+fn csharp_type_lookup_resolves_using_explicit_parameter_type() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Models/Widget.cs",
+            "namespace Models { public class Widget {} }\n",
+        )
+        .file(
+            "App/UseWidget.cs",
+            r#"
+using Models;
+
+namespace App {
+    public class UseWidget {
+        public void Render(Widget input) {
+            input.ToString();
+        }
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "            input.ToString();";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"App/UseWidget.cs","line":7,"column":{}}}]}}"#,
+            column_of(line, "input")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["types"][0]["fqn"], "Models.Widget", "{value}");
+    assert_eq!(
+        result["types"][0]["definitions"][0]["path"], "Models/Widget.cs",
+        "{value}"
+    );
+}
+
+#[test]
+fn csharp_type_lookup_preserves_ambiguous_visible_type_candidates() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("A/Widget.cs", "namespace A { public class Widget {} }\n")
+        .file("B/Widget.cs", "namespace B { public class Widget {} }\n")
+        .file(
+            "App/UseWidget.cs",
+            r#"
+using A;
+using B;
+
+namespace App {
+    public class UseWidget {
+        public void Render(Widget input) {
+            input.ToString();
+        }
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "            input.ToString();";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"App/UseWidget.cs","line":8,"column":{}}}]}}"#,
+            column_of(line, "input")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "ambiguous", "{value}");
+    let definitions = result["types"][0]["definitions"]
+        .as_array()
+        .expect("definitions array");
+    assert_eq!(definitions.len(), 2, "{value}");
+}
+
+#[test]
+fn csharp_type_lookup_resolves_explicit_method_return_type() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Models/Widget.cs",
+            "namespace Models { public class Widget {} }\n",
+        )
+        .file(
+            "App/UseWidget.cs",
+            r#"
+using Models;
+
+namespace App {
+    public class UseWidget {
+        public Widget Create() {
+            return new Widget();
+        }
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        public Widget Create() {";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"App/UseWidget.cs","line":6,"column":{}}}]}}"#,
+            column_of(line, "Create")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["types"][0]["fqn"], "Models.Widget", "{value}");
+}
+
+#[test]
+fn scala_type_lookup_resolves_imported_explicit_val_type() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("models/Widget.scala", "package models\nclass Widget\n")
+        .file(
+            "app/UseWidget.scala",
+            r#"
+package app
+
+import models.Widget
+
+class UseWidget {
+  def render(input: Widget): Unit = {
+    val local: Widget = input
+    local.toString
+  }
+}
+"#,
+        )
+        .build();
+
+    let line = "    local.toString";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/UseWidget.scala","line":9,"column":{}}}]}}"#,
+            column_of(line, "local")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["types"][0]["fqn"], "models.Widget", "{value}");
+    assert_eq!(
+        result["types"][0]["definitions"][0]["path"], "models/Widget.scala",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_type_lookup_resolves_explicit_function_return_type() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("models/Widget.scala", "package models\nclass Widget\n")
+        .file(
+            "app/UseWidget.scala",
+            r#"
+package app
+
+import models.Widget
+
+class UseWidget {
+  def create(): Widget = new Widget
+}
+"#,
+        )
+        .build();
+
+    let line = "  def create(): Widget = new Widget";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/UseWidget.scala","line":7,"column":{}}}]}}"#,
+            column_of(line, "create")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["types"][0]["fqn"], "models.Widget", "{value}");
+}
+
+#[test]
 fn go_type_lookup_resolves_short_var_composite_literals() {
     let project = InlineTestProject::with_language(Language::Go)
         .file("go.mod", "module example.com/app\n")

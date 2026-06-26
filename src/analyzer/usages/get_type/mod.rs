@@ -1,16 +1,20 @@
 use crate::analyzer::common::language_for_file;
-use crate::analyzer::usages::get_definition::RustTypeLookupCache;
+use crate::analyzer::usages::get_definition::{RustTypeLookupCache, parse_tree_for_language};
 use crate::analyzer::usages::reference_site::{
     ResolvedReferenceSite, SourceLocationRequest, resolve_reference_site,
 };
+use crate::analyzer::usages::scala_graph::ScalaProjectTypes;
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
 use std::sync::Arc;
 use tree_sitter::Tree;
 
+mod csharp;
 mod go;
+mod java;
 mod rust;
+mod scala;
 
 #[derive(Debug, Clone)]
 pub(crate) struct TypeLookupRequest {
@@ -80,6 +84,7 @@ struct TypeBatchContext {
     sources: HashMap<ProjectFile, Result<Arc<String>, String>>,
     trees: HashMap<(ProjectFile, Language), Option<Tree>>,
     rust_cache: RustTypeLookupCache,
+    scala_project_types: Option<Arc<ScalaProjectTypes>>,
 }
 
 impl TypeBatchContext {
@@ -97,7 +102,16 @@ impl TypeBatchContext {
     fn tree(&mut self, file: &ProjectFile, language: Language, source: &str) -> Option<Tree> {
         self.trees
             .entry((file.clone(), language))
-            .or_insert_with(|| parse_tree_for_type_lookup(language, source))
+            .or_insert_with(|| parse_tree_for_type_lookup(file, language, source))
+            .clone()
+    }
+
+    fn scala_project_types(
+        &mut self,
+        scala: &crate::analyzer::ScalaAnalyzer,
+    ) -> Arc<ScalaProjectTypes> {
+        self.scala_project_types
+            .get_or_insert_with(|| Arc::new(ScalaProjectTypes::build(scala)))
             .clone()
     }
 }
@@ -126,7 +140,10 @@ fn resolve_one(
         }
     };
 
-    if !matches!(language, Language::Go | Language::Rust) {
+    if !matches!(
+        language,
+        Language::CSharp | Language::Go | Language::Java | Language::Rust | Language::Scala
+    ) {
         return finish_lookup_outcome(
             diagnostic_outcome(
                 TypeLookupStatus::UnsupportedLanguage,
@@ -139,7 +156,11 @@ fn resolve_one(
 
     let tree = context.tree(&file, language, &source);
     let resolved = match language {
+        Language::CSharp => {
+            csharp::resolve_csharp_type(analyzer, &file, &source, tree.as_ref(), &site)
+        }
         Language::Go => go::resolve_go_type(analyzer, &file, &source, tree.as_ref(), &site),
+        Language::Java => java::resolve_java_type(analyzer, &file, &source, tree.as_ref(), &site),
         Language::Rust => rust::resolve_rust_type(
             analyzer,
             &file,
@@ -148,6 +169,9 @@ fn resolve_one(
             &site,
             &mut context.rust_cache,
         ),
+        Language::Scala => {
+            scala::resolve_scala_type(analyzer, context, &file, &source, tree.as_ref(), &site)
+        }
         _ => unreachable!("unsupported language handled above"),
     };
     finish_lookup_outcome(resolved, site)
@@ -173,15 +197,18 @@ impl TypeLookupRequest {
     }
 }
 
-fn parse_tree_for_type_lookup(language: Language, source: &str) -> Option<Tree> {
+fn parse_tree_for_type_lookup(
+    file: &ProjectFile,
+    language: Language,
+    source: &str,
+) -> Option<Tree> {
     match language {
         Language::Go => {
             let mut parser = tree_sitter::Parser::new();
             parser.set_language(&tree_sitter_go::LANGUAGE.into()).ok()?;
             parser.parse(source, None)
         }
-        Language::Rust => crate::analyzer::rust::lexical_scope::parse_rust_tree(source),
-        _ => None,
+        _ => parse_tree_for_language(file, language, source),
     }
 }
 

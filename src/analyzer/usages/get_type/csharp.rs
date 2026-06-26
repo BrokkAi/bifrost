@@ -1,0 +1,27 @@
+use super::{TypeLookupOutcome, candidates_outcome, no_type};
+use crate::analyzer::usages::get_definition::csharp_type_lookup_resolution;
+use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
+use crate::analyzer::{IAnalyzer, ProjectFile};
+use tree_sitter::Tree;
+
+pub(super) fn resolve_csharp_type(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    tree: Option<&Tree>,
+    site: &ResolvedReferenceSite,
+) -> TypeLookupOutcome {
+    let Some(tree) = tree else {
+        return no_type("csharp_parse_failed", "C# source could not be parsed");
+    };
+    let support = analyzer.definition_lookup_index();
+    let Some(resolution) =
+        csharp_type_lookup_resolution(analyzer, support, file, source, tree.root_node(), site)
+    else {
+        return no_type(
+            "no_explicit_type",
+            format!("`{}` does not have a supported explicit C# type", site.text),
+        );
+    };
+    candidates_outcome(resolution.fqn, resolution.candidates)
+}

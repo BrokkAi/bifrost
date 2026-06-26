@@ -1,5 +1,23 @@
 use super::*;
 
+pub(crate) struct CSharpTypeLookupResolution {
+    pub(crate) fqn: String,
+    pub(crate) candidates: Vec<CodeUnit>,
+}
+
+pub(crate) fn csharp_type_lookup_resolution(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    site: &ResolvedReferenceSite,
+) -> Option<CSharpTypeLookupResolution> {
+    let csharp = resolve_analyzer::<CSharpAnalyzer>(analyzer)?;
+    let node = smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)?;
+    csharp_type_lookup_node_resolution(analyzer, csharp, support, file, source, root, node)
+}
+
 pub(super) fn resolve_csharp(
     analyzer: &dyn IAnalyzer,
     support: &DefinitionLookupIndex,
@@ -129,6 +147,304 @@ pub(super) fn resolve_csharp(
                 node.kind()
             ),
         ),
+    }
+}
+
+fn csharp_type_lookup_node_resolution(
+    analyzer: &dyn IAnalyzer,
+    csharp: &CSharpAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    node: Node<'_>,
+) -> Option<CSharpTypeLookupResolution> {
+    if node.kind() == "member_access_expression"
+        && let Some(receiver) = csharp_member_access_receiver(node)
+    {
+        let candidates =
+            csharp_receiver_type_lookup_units(csharp, support, file, source, root, receiver);
+        return csharp_type_candidates_resolution(csharp_node_text(receiver, source), candidates);
+    }
+
+    if csharp_is_type_reference_node(node) {
+        let reference = csharp_reference_type_text(node, source);
+        return csharp_type_candidates_resolution(
+            &reference,
+            csharp_visible_type_candidates(csharp, file, &reference),
+        );
+    }
+
+    if let Some(parent) = node.parent() {
+        if parent.kind() == "member_access_expression"
+            && csharp_member_access_receiver(parent) == Some(node)
+        {
+            let candidates =
+                csharp_receiver_type_lookup_units(csharp, support, file, source, root, node);
+            return csharp_type_candidates_resolution(csharp_node_text(node, source), candidates);
+        }
+        if let Some(resolution) = csharp_declaration_name_type_resolution(
+            analyzer, csharp, support, file, source, root, parent, node,
+        ) {
+            return Some(resolution);
+        }
+    }
+
+    if node.kind() != "identifier" {
+        return None;
+    }
+
+    let name = csharp_node_text(node, source);
+    let bindings =
+        csharp_type_bindings_before_scoped(csharp, file, source, root, node.start_byte());
+    let candidates = bindings
+        .resolve_symbol(name)
+        .as_precise()
+        .map(|targets| targets.iter().cloned().collect())
+        .unwrap_or_default();
+    csharp_type_candidates_resolution(name, candidates)
+}
+
+fn csharp_receiver_type_lookup_units(
+    csharp: &CSharpAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    receiver: Node<'_>,
+) -> Vec<CodeUnit> {
+    if receiver.kind() == "identifier" {
+        let name = csharp_node_text(receiver, source);
+        let bindings =
+            csharp_type_bindings_before_scoped(csharp, file, source, root, receiver.start_byte());
+        if let Some(targets) = bindings.resolve_symbol(name).as_precise() {
+            return targets.iter().cloned().collect();
+        }
+        if bindings.is_shadowed(name) {
+            return Vec::new();
+        }
+    }
+    csharp_receiver_type_units(
+        csharp as &dyn IAnalyzer,
+        csharp,
+        support,
+        file,
+        source,
+        root,
+        receiver,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn csharp_declaration_name_type_resolution(
+    analyzer: &dyn IAnalyzer,
+    csharp: &CSharpAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    parent: Node<'_>,
+    name: Node<'_>,
+) -> Option<CSharpTypeLookupResolution> {
+    match parent.kind() {
+        "parameter" if parent.child_by_field_name("name") == Some(name) => {
+            parent.child_by_field_name("type").and_then(|type_node| {
+                csharp_type_node_resolution(
+                    csharp,
+                    file,
+                    &csharp_reference_type_text(type_node, source),
+                )
+            })
+        }
+        "variable_declarator" if parent.child_by_field_name("name") == Some(name) => {
+            parent.parent().and_then(|declaration| {
+                (declaration.kind() == "variable_declaration")
+                    .then(|| declaration.child_by_field_name("type"))
+                    .flatten()
+                    .and_then(|type_node| {
+                        csharp_type_node_resolution(
+                            csharp,
+                            file,
+                            &csharp_reference_type_text(type_node, source),
+                        )
+                    })
+            })
+        }
+        _ if matches!(parent.kind(), "property_declaration" | "field_declaration")
+            && parent.child_by_field_name("name") == Some(name) =>
+        {
+            let owner = csharp_enclosing_class(analyzer, file, name.start_byte())?;
+            let fqn = csharp_member_declared_type_fq_name(
+                csharp,
+                file,
+                &owner,
+                csharp_node_text(name, source),
+            )?;
+            csharp_type_candidates_resolution(csharp_node_text(name, source), support.fqn(&fqn))
+        }
+        "method_declaration" | "local_function_statement"
+            if parent.child_by_field_name("name") == Some(name) =>
+        {
+            parent
+                .child_by_field_name("returns")
+                .or_else(|| parent.child_by_field_name("return_type"))
+                .and_then(|type_node| {
+                    csharp_type_node_resolution(
+                        csharp,
+                        file,
+                        &csharp_reference_type_text(type_node, source),
+                    )
+                })
+        }
+        _ => {
+            let name_text = csharp_node_text(name, source);
+            let bindings =
+                csharp_type_bindings_before_scoped(csharp, file, source, root, name.end_byte());
+            let candidates = bindings
+                .resolve_symbol(name_text)
+                .as_precise()
+                .map(|targets| targets.iter().cloned().collect())
+                .unwrap_or_default();
+            csharp_type_candidates_resolution(name_text, candidates)
+        }
+    }
+}
+
+fn csharp_type_node_resolution(
+    csharp: &CSharpAnalyzer,
+    file: &ProjectFile,
+    reference: &str,
+) -> Option<CSharpTypeLookupResolution> {
+    csharp_type_candidates_resolution(
+        reference,
+        csharp_visible_type_candidates(csharp, file, reference),
+    )
+}
+
+fn csharp_type_candidates_resolution(
+    reference: &str,
+    candidates: Vec<CodeUnit>,
+) -> Option<CSharpTypeLookupResolution> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let fqn = if candidates.len() == 1 {
+        candidates[0].fq_name().to_string()
+    } else {
+        reference.to_string()
+    };
+    Some(CSharpTypeLookupResolution { fqn, candidates })
+}
+
+fn csharp_type_bindings_before_scoped(
+    csharp: &CSharpAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    cutoff_start: usize,
+) -> LocalInferenceEngine<CodeUnit> {
+    let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
+    csharp_seed_type_active_path(csharp, file, source, root, cutoff_start, &mut bindings);
+    bindings
+}
+
+fn csharp_seed_type_active_path(
+    csharp: &CSharpAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    cutoff_start: usize,
+    bindings: &mut LocalInferenceEngine<CodeUnit>,
+) {
+    if node.start_byte() >= cutoff_start {
+        return;
+    }
+
+    if node.kind() == "local_function_statement"
+        && let Some(name) = node.child_by_field_name("name")
+        && name.start_byte() < cutoff_start
+    {
+        bindings.declare_shadow(csharp_node_text(name, source));
+    }
+
+    let enters_scope = CSHARP_SCOPE_NODES.contains(&node.kind());
+    if enters_scope && !(node.start_byte() <= cutoff_start && cutoff_start < node.end_byte()) {
+        return;
+    }
+    if enters_scope {
+        bindings.enter_scope();
+    }
+
+    if matches!(node.kind(), "parameter" | "variable_declaration")
+        && node.end_byte() <= cutoff_start
+    {
+        csharp_seed_type_binding(node, csharp, file, source, bindings);
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.start_byte() >= cutoff_start {
+            break;
+        }
+        csharp_seed_type_active_path(csharp, file, source, child, cutoff_start, bindings);
+    }
+}
+
+fn csharp_seed_type_binding(
+    node: Node<'_>,
+    csharp: &CSharpAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    bindings: &mut LocalInferenceEngine<CodeUnit>,
+) {
+    match node.kind() {
+        "parameter" => {
+            let Some(name) = node.child_by_field_name("name") else {
+                return;
+            };
+            let Some(type_node) = node.child_by_field_name("type") else {
+                return;
+            };
+            csharp_seed_symbol_for_type(name, type_node, csharp, file, source, bindings);
+        }
+        "variable_declaration" => {
+            let Some(type_node) = node.child_by_field_name("type") else {
+                return;
+            };
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if child.kind() != "variable_declarator" {
+                    continue;
+                }
+                let Some(name) = child.child_by_field_name("name") else {
+                    continue;
+                };
+                csharp_seed_symbol_for_type(name, type_node, csharp, file, source, bindings);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn csharp_seed_symbol_for_type(
+    name: Node<'_>,
+    type_node: Node<'_>,
+    csharp: &CSharpAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    bindings: &mut LocalInferenceEngine<CodeUnit>,
+) {
+    let binding_name = csharp_node_text(name, source);
+    if csharp_node_text(type_node, source) == "var" {
+        bindings.declare_shadow(binding_name);
+        return;
+    }
+    let reference = csharp_reference_type_text(type_node, source);
+    let candidates = csharp_visible_type_candidates(csharp, file, &reference);
+    if candidates.is_empty() {
+        bindings.declare_shadow(binding_name);
+    } else {
+        bindings.seed_symbol_many(binding_name, candidates);
     }
 }
 
