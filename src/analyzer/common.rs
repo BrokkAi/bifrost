@@ -3,12 +3,12 @@ use tree_sitter::Language as TsLanguage;
 
 /// Default longest single line a source file may contain before tree-sitter parsing is
 /// skipped. Minified/generated single-line bundles (committed webpack output, mermaid.min.js,
-/// etc.) have 100KB+ lines and otherwise both livelock the parser and explode downstream
+/// etc.) have 16KB+ lines and otherwise both livelock the parser and explode downstream
 /// consumers (e.g. the semantic indexer extracting thousands of bogus chunks). Hand-written
 /// and normally-formatted generated source stays far below this, so the cap is effectively
-/// invisible to real code. 50000 matches the diff long-line threshold used elsewhere and sits
-/// well above VS Code's 20000 `editor.maxTokenizationLineLength`.
-pub(crate) const DEFAULT_MAX_LINE_LENGTH: usize = 50_000;
+/// invisible to real code. 16000 is comfortably above any human-authored line while still
+/// catching moderately-sized minified bundles that a higher cap would let through.
+pub(crate) const DEFAULT_MAX_LINE_LENGTH: usize = 16_000;
 
 /// Longest single line a source file may contain before tree-sitter parsing is skipped.
 /// Defaults to [`DEFAULT_MAX_LINE_LENGTH`]; `BIFROST_MAX_LINE_LENGTH` overrides it, and an
