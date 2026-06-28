@@ -148,23 +148,20 @@ fn print_help() {
         "bifrost {} — Tree-sitter-backed code analyzer with MCP search-tool and LSP servers (stdio).",
         env!("CARGO_PKG_VERSION")
     );
-    // Printed as a plain string (not a format template) so the JSON braces in
-    // the examples stay literal.
-    print!(
-        "{}",
-        r#"
+    // Bound to a variable and printed via an inlined placeholder so the JSON
+    // braces in the examples stay literal (they live in `body`, not the format
+    // string).
+    let body = r#"
 USAGE:
-    bifrost [--root DIR] [--server MODE] [--no-line-numbers]   Run an MCP server over stdio (default)
-    bifrost [--root DIR] --server lsp                          Run a Language Server (LSP) over stdio
-    bifrost [--root DIR] --tool NAME [--args JSON]             Run one tool once, print the result, exit
+    bifrost --server MODE      Run a server over stdio  (MODE: an MCP toolset or 'lsp'; default: searchtools)
+    bifrost --tool NAME        Run a single tool once, print the result, and exit
     bifrost --version | --help
 
 OPTIONS:
     --root DIR             Project root to analyze (default: current directory)
-    --server MODE          Server mode / toolset (default: searchtools; see SERVER MODES)
-    --tool NAME            Run a single tool once instead of starting a server
-                           (e.g. search_symbols, get_symbol_sources, get_summaries, scan_usages)
-    --args JSON            Inline JSON arguments for --tool, e.g. '{"patterns":["MyClass"]}' (default: {})
+    --args JSON            Inline JSON arguments for --tool, e.g. '{"patterns":["MyClass"]}'.
+                           Required for tools that take arguments; omit for those that don't
+                           (defaults to {}, which suits e.g. get_active_workspace).
     --no-line-numbers      Render source output without leading line numbers
     --force-semantic-cpu   Allow semantic_search without a CUDA/Metal accelerator (run the embedder on CPU)
     -h, --help             Show this help and exit
@@ -195,6 +192,6 @@ EXAMPLES:
 
 Servers speak their protocol over stdio (no network port). The workspace index is built
 in the background: the server is ready immediately and the first request waits for indexing.
-"#
-    );
+"#;
+    print!("{body}");
 }
