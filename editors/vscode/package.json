@@ -1,10 +1,15 @@
 {
   "name": "bifrost-vscode",
-  "displayName": "Bifrost",
-  "description": "Minimal VS Code client for the Bifrost language server.",
+  "displayName": "Bifrost: Multi-Language LSP & MCP Server",
+  "description": "Tree-sitter-backed code intelligence for definitions, references, symbols, hierarchy, rename, diagnostics, and MCP workflows.",
   "version": "0.0.1",
-  "private": true,
-  "license": "LGPL-3.0-only",
+  "publisher": "brokk",
+  "homepage": "https://brokk.ai",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/BrokkAi/bifrost"
+  },
+  "license": "LGPL-3.0-or-later",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -31,10 +36,25 @@
     "configuration": {
       "title": "Bifrost",
       "properties": {
+        "bifrost.launchMode": {
+          "type": "string",
+          "default": "auto",
+          "enum": [
+            "auto",
+            "bundled",
+            "path"
+          ],
+          "enumDescriptions": [
+            "Auto-detect a configured path, bundled binary, local development binary, or PATH binary.",
+            "Use the Bifrost binary bundled with the extension.",
+            "Use bifrost.serverPath, or the bifrost command on PATH when no path is configured."
+          ],
+          "description": "How to start the Bifrost language server."
+        },
         "bifrost.serverPath": {
           "type": "string",
           "default": "bifrost",
-          "description": "Path to the bifrost binary."
+          "description": "Path to the bifrost binary, or the command name to resolve on PATH."
         },
         "bifrost.debug": {
           "type": "boolean",
@@ -46,13 +66,41 @@
           "default": 2000,
           "minimum": 0,
           "description": "Log Bifrost LSP requests and notifications that take at least this many milliseconds."
+        },
+        "bifrost.extraArgs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Additional command-line arguments appended when launching the Bifrost LSP server."
         }
       }
-    }
+    },
+    "commands": [
+      {
+        "command": "bifrost.startServer",
+        "title": "Bifrost: Start Language Server"
+      },
+      {
+        "command": "bifrost.stopServer",
+        "title": "Bifrost: Stop Language Server"
+      },
+      {
+        "command": "bifrost.restartServer",
+        "title": "Bifrost: Restart Language Server"
+      },
+      {
+        "command": "bifrost.showOutput",
+        "title": "Bifrost: Show Output"
+      }
+    ]
   },
   "scripts": {
-    "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./"
+    "compile": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "lint": "tsc --noEmit",
+    "vscode:prepublish": "npm run compile"
   },
   "dependencies": {
     "vscode-languageclient": "^9.0.1"
@@ -60,6 +108,7 @@
   "devDependencies": {
     "@types/node": "^20.0.0",
     "@types/vscode": "1.90.0",
+    "esbuild": "^0.19.0",
     "typescript": "^5.4.0"
   }
 }
