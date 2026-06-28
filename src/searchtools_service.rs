@@ -979,7 +979,8 @@ fn build_workspace(root: PathBuf) -> Result<(Arc<dyn Project>, WorkspaceAnalyzer
         FilesystemProject::new(root)
             .map_err(|err| format!("Failed to initialize project root: {err}"))?,
     );
-    let workspace = WorkspaceAnalyzer::build(Arc::clone(&project), AnalyzerConfig::default());
+    let workspace =
+        WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default());
     Ok((project, workspace))
 }
 

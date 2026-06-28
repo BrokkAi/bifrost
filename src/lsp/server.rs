@@ -30,7 +30,6 @@ use lsp_types::{
     WorkDoneProgressCreateParams, WorkDoneProgressEnd, WorkDoneProgressReport,
 };
 
-use crate::analyzer::persistence::{AnalyzerStorage, default_db_path};
 use crate::analyzer::{
     AnalyzerConfig, BuildProgressEvent, BuildProgressPhase, FilesystemProject, MultiRootProject,
     OverlayProject, Project, WorkspaceAnalyzer,
@@ -1281,50 +1280,12 @@ fn build_workspace_for_lsp(
     match progress {
         Some(progress) => {
             let progress = progress.clone_for_callback();
-            let Some(storage) = project
-                .persistence_root()
-                .and_then(safe_default_db_path)
-                .and_then(|path| AnalyzerStorage::open(path).ok())
-                .map(Arc::new)
-            else {
-                return WorkspaceAnalyzer::build(project, config);
-            };
-            WorkspaceAnalyzer::build_with_storage_and_progress(
-                project,
-                config,
-                storage,
-                move |event| progress.report_analyzer_event(event),
-            )
+            WorkspaceAnalyzer::build_persisted_with_progress(project, config, move |event| {
+                progress.report_analyzer_event(event)
+            })
         }
-        None => WorkspaceAnalyzer::build(project, config),
+        None => WorkspaceAnalyzer::build_persisted(project, config),
     }
-}
-
-fn safe_default_db_path(project_root: &Path) -> Option<PathBuf> {
-    let cache_dir = project_root.join(crate::analyzer::persistence::DEFAULT_CACHE_DIR);
-    if is_symlink(&cache_dir) {
-        eprintln!(
-            "[bifrost-lsp] disabling analyzer storage for {}: cache directory is a symlink",
-            project_root.display()
-        );
-        return None;
-    }
-
-    let db_path = default_db_path(project_root);
-    if is_symlink(&db_path) {
-        eprintln!(
-            "[bifrost-lsp] disabling analyzer storage for {}: cache database is a symlink",
-            project_root.display()
-        );
-        return None;
-    }
-    Some(db_path)
-}
-
-fn is_symlink(path: &Path) -> bool {
-    std::fs::symlink_metadata(path)
-        .map(|metadata| metadata.file_type().is_symlink())
-        .unwrap_or(false)
 }
 
 fn collect_workspace_roots(

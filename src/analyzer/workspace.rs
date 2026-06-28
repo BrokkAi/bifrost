@@ -214,6 +214,50 @@ impl WorkspaceAnalyzer {
         Self::build_filtered(project, config, Some(languages), Some(storage), None)
     }
 
+    /// Build with on-disk persistence at the project's default cache location
+    /// (`<persistence_root>/.bifrost/analyzer.db`) when one is available,
+    /// reusing the persisted baseline so only changed files are re-analyzed.
+    ///
+    /// Persistence is best-effort: when the project has no persistence root,
+    /// the cache path is unsafe (symlinked), or the DB cannot be opened, this
+    /// transparently falls back to a full in-memory `build`. The returned
+    /// analyzer retains the storage handle, so later incremental `update`s
+    /// write their changes back.
+    pub fn build_persisted(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
+        match Self::open_default_storage(project.as_ref()) {
+            Some(storage) => Self::build_with_storage(project, config, storage),
+            None => Self::build(project, config),
+        }
+    }
+
+    /// Progress-reporting variant of `build_persisted`.
+    pub fn build_persisted_with_progress<F>(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        progress: F,
+    ) -> Self
+    where
+        F: Fn(crate::analyzer::BuildProgressEvent) + Send + Sync + 'static,
+    {
+        match Self::open_default_storage(project.as_ref()) {
+            Some(storage) => {
+                Self::build_with_storage_and_progress(project, config, storage, progress)
+            }
+            None => Self::build(project, config),
+        }
+    }
+
+    /// Open the analyzer DB at the project's default, symlink-safe cache path.
+    /// Returns `None` (disabling persistence) when there is no persistence
+    /// root, the path is unsafe, or the DB cannot be opened/migrated.
+    fn open_default_storage(project: &dyn Project) -> Option<Arc<AnalyzerStorage>> {
+        project
+            .persistence_root()
+            .and_then(crate::analyzer::persistence::safe_default_db_path)
+            .and_then(|path| AnalyzerStorage::open(path).ok())
+            .map(Arc::new)
+    }
+
     fn build_filtered(
         project: Arc<dyn Project>,
         config: AnalyzerConfig,

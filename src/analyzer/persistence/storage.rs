@@ -33,6 +33,38 @@ pub fn default_db_path(project_root: impl AsRef<Path>) -> PathBuf {
         .join(DB_FILE_NAME)
 }
 
+/// Resolve the default analyzer DB path for `project_root`, refusing to use it
+/// when the cache directory or the DB file is a symlink. Persisting through a
+/// symlink would let an attacker (or an accidental link) redirect writes
+/// outside the project, so we disable persistence and fall back to a full
+/// rebuild instead. Returns `None` when persistence should be skipped.
+pub fn safe_default_db_path(project_root: &Path) -> Option<PathBuf> {
+    let cache_dir = project_root.join(DEFAULT_CACHE_DIR);
+    if is_symlink(&cache_dir) {
+        eprintln!(
+            "[bifrost] disabling analyzer storage for {}: cache directory is a symlink",
+            project_root.display()
+        );
+        return None;
+    }
+
+    let db_path = default_db_path(project_root);
+    if is_symlink(&db_path) {
+        eprintln!(
+            "[bifrost] disabling analyzer storage for {}: cache database is a symlink",
+            project_root.display()
+        );
+        return None;
+    }
+    Some(db_path)
+}
+
+fn is_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
 #[derive(Debug)]
 pub enum PersistenceError {
     Io(std::io::Error),
