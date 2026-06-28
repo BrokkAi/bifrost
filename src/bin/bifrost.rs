@@ -24,7 +24,8 @@ fn run() -> Result<(), String> {
     let mut root =
         env::current_dir().map_err(|err| format!("Failed to get current directory: {err}"))?;
     let mut root_explicit = false;
-    let mut server_mode: Option<String> = None;
+    let mut mcp_mode: Option<String> = None;
+    let mut run_lsp = false;
     let mut tool_name: Option<String> = None;
     let mut tool_args = json!({});
     let mut render_options = McpRenderOptions::default();
@@ -38,11 +39,28 @@ fn run() -> Result<(), String> {
                 root = value.into();
                 root_explicit = true;
             }
+            "--mcp" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--mcp requires a toolset expression".to_string())?;
+                mcp_mode = Some(value);
+            }
+            "--lsp" => {
+                run_lsp = true;
+            }
+            // DEPRECATED: superseded by `--mcp <toolsets>` and `--lsp`. Kept as a
+            // backwards-compatible alias and intentionally undocumented in --help.
+            // `--server lsp` maps to `--lsp`; any other value maps to `--mcp <value>`.
             "--server" => {
                 let value = args
                     .next()
                     .ok_or_else(|| "--server requires a mode".to_string())?;
-                server_mode = Some(value);
+                eprintln!("bifrost: --server is deprecated; use --mcp <toolsets> or --lsp");
+                if value == "lsp" {
+                    run_lsp = true;
+                } else {
+                    mcp_mode = Some(value);
+                }
             }
             "--tool" => {
                 let value = args
@@ -82,10 +100,14 @@ fn run() -> Result<(), String> {
     }
 
     if let Some(tool_name) = tool_name {
-        if server_mode.is_some() {
-            return Err("--tool cannot be combined with --server".to_string());
+        if run_lsp || mcp_mode.is_some() {
+            return Err("--tool cannot be combined with --mcp or --lsp".to_string());
         }
         return run_tool(root, &tool_name, tool_args, render_options);
+    }
+
+    if run_lsp && mcp_mode.is_some() {
+        return Err("--lsp cannot be combined with --mcp".to_string());
     }
 
     if !root_explicit {
@@ -95,14 +117,20 @@ fn run() -> Result<(), String> {
         );
     }
 
-    match server_mode.as_deref().unwrap_or("searchtools") {
-        "lsp" => run_lsp_stdio_server(root),
-        mode => {
-            let git_repo = brokk_bifrost::mcp_registry::workspace_is_git(&root);
-            let spec = resolve_server_spec_for_render_options(mode, render_options, git_repo)?;
-            run_stdio_server(root, render_options, &spec)
-        }
+    if run_lsp {
+        return run_lsp_stdio_server(root);
     }
+
+    // A mode must be chosen explicitly; there is no implicit default.
+    let Some(mode) = mcp_mode.as_deref() else {
+        return Err(
+            "no mode selected: pass --mcp TOOLSETS (e.g. --mcp core), --lsp, or --tool NAME"
+                .to_string(),
+        );
+    };
+    let git_repo = brokk_bifrost::mcp_registry::workspace_is_git(&root);
+    let spec = resolve_server_spec_for_render_options(mode, render_options, git_repo)?;
+    run_stdio_server(root, render_options, &spec)
 }
 
 fn run_tool(
@@ -153,7 +181,8 @@ fn print_help() {
     // string).
     let body = r#"
 USAGE:
-    bifrost --server MODE      Run a server over stdio  (MODE: an MCP toolset or 'lsp'; default: searchtools)
+    bifrost --mcp TOOLSETS     Run an MCP server over stdio (e.g. --mcp core; see MCP TOOLSETS)
+    bifrost --lsp              Run a Language Server (LSP) over stdio
     bifrost --tool NAME        Run a single tool once, print the result, and exit
     bifrost --version | --help
 
@@ -167,28 +196,27 @@ OPTIONS:
     -h, --help             Show this help and exit
     -V, --version          Show version and exit
 
-SERVER MODES (--server):
-    searchtools   (default) Every toolset below
+MCP TOOLSETS (--mcp):
+    searchtools   Every toolset below
     core          Symbol search, usages, summaries, semantic search, and workspace lifecycle
                   — the set agents typically connect to
-    lsp           Language Server Protocol: definitions, references, hover, rename, diagnostics, ...
     symbol        Symbol discovery, sources, summaries, usages, type/definition lookup, commit analysis
     workspace     Index lifecycle: refresh, activate_workspace, get_active_workspace
     text          File contents, text/grep search, git log & diff, jq, XML
     extended      Symbol locations & ancestors, file listing, most-relevant-files, git, structured data
     slopcop       Code-quality smells: complexity, comment density, clones, dead code, secrets
     nlp           Semantic (embedding) search
-    Combine toolsets with '|', e.g. --server symbol|workspace
+    Combine toolsets with '|', e.g. --mcp symbol|workspace
 
 EXAMPLES:
     # MCP server an agent connects to (core toolset), speaking MCP over stdio:
-    bifrost --root /path/to/project --server core
+    bifrost --root /path/to/project --mcp core
 
     # One-shot: run a single tool and print its result, then exit:
     bifrost --root /path/to/project --tool search_symbols --args '{"patterns":["MyClass"]}'
 
     # Language server over stdio:
-    bifrost --root /path/to/project --server lsp
+    bifrost --root /path/to/project --lsp
 
 Servers speak their protocol over stdio (no network port). The workspace index is built
 in the background: the server is ready immediately and the first request waits for indexing.
