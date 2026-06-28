@@ -5,7 +5,7 @@ use notify::{
     recommended_watcher,
 };
 use std::mem;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -40,9 +40,7 @@ impl ProjectChangeWatcher {
         watcher
             .configure(Config::default())
             .map_err(|err| format!("Failed to configure project watcher: {err}"))?;
-        watcher
-            .watch(project.root(), RecursiveMode::Recursive)
-            .map_err(|err| format!("Failed to watch project root: {err}"))?;
+        watch_project_paths(&mut watcher, project.as_ref())?;
 
         Ok(Self {
             _watcher: WatcherBackend::Recommended { _watcher: watcher },
@@ -59,9 +57,7 @@ impl ProjectChangeWatcher {
         let mut watcher = PollWatcher::new(event_handler(&project, &pending), config)
             .map_err(|err| format!("Failed to create polling project watcher: {err}"))?;
 
-        watcher
-            .watch(project.root(), RecursiveMode::Recursive)
-            .map_err(|err| format!("Failed to watch project root: {err}"))?;
+        watch_project_paths(&mut watcher, project.as_ref())?;
 
         Ok(Self {
             _watcher: WatcherBackend::Poll { _watcher: watcher },
@@ -143,4 +139,100 @@ fn mark_full_refresh(pending: &Arc<Mutex<PendingChanges>>) {
         .lock()
         .expect("project watcher pending state poisoned");
     state.requires_full_refresh = true;
+}
+
+fn watch_project_paths(watcher: &mut impl Watcher, project: &dyn Project) -> Result<(), String> {
+    for path in watch_roots(project)? {
+        watcher
+            .watch(&path, RecursiveMode::Recursive)
+            .map_err(|err| format!("Failed to watch {}: {err}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn watch_roots(project: &dyn Project) -> Result<Vec<PathBuf>, String> {
+    let mut directories = Vec::new();
+    for language in project.analyzer_languages() {
+        let files = project
+            .analyzable_files(language)
+            .map_err(|err| format!("Failed to list analyzable files for {language:?}: {err}"))?;
+        for file in files {
+            let dir = file
+                .abs_path()
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| project.root().to_path_buf());
+            directories.push(dir);
+        }
+    }
+
+    if directories.is_empty() {
+        return Ok(vec![project.root().to_path_buf()]);
+    }
+
+    directories.sort();
+    directories.dedup();
+
+    let mut minimal = Vec::new();
+    for dir in directories {
+        if minimal
+            .iter()
+            .any(|existing: &PathBuf| dir.starts_with(existing))
+        {
+            continue;
+        }
+        minimal.push(dir);
+    }
+    Ok(minimal)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::watch_roots;
+    use crate::{FilesystemProject, Project};
+    use std::fs;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    fn project_with_files(paths: &[&str]) -> (TempDir, Arc<dyn Project>) {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        for path in paths {
+            let abs = root.join(path);
+            if let Some(parent) = abs.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(abs, "fn item() {}\n").unwrap();
+        }
+        let project = Arc::new(FilesystemProject::new(root).unwrap()) as Arc<dyn Project>;
+        (temp, project)
+    }
+
+    #[test]
+    fn watch_roots_collapse_to_top_level_analyzed_dirs() {
+        let (_temp, project) =
+            project_with_files(&["src/main.rs", "src/nested/lib.rs", "tests/a.rs"]);
+        let roots = watch_roots(project.as_ref()).unwrap();
+        let rels: Vec<_> = roots
+            .iter()
+            .map(|path| {
+                path.strip_prefix(project.root())
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        assert_eq!(rels, vec!["src", "tests"]);
+    }
+
+    #[test]
+    fn watch_roots_fall_back_to_project_root_when_no_analyzable_files_exist() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        fs::write(root.join(".gitignore"), "").unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        let project = FilesystemProject::new(root.clone()).unwrap();
+        let roots = watch_roots(&project).unwrap();
+        assert_eq!(roots, vec![root]);
+    }
 }
