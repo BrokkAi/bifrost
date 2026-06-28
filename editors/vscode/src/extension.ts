@@ -10,10 +10,12 @@ import {
 } from "vscode-languageclient/node";
 import {
   BifrostLaunchConfig,
+  BifrostInitializationOptions,
   buildLaunchConfig,
   formatError,
   LaunchMode,
   parseExtraArgs,
+  parsePathSettings,
   sourceFileWatchers,
   spawnBifrostServer,
   supportedWorkspaceRoot
@@ -81,6 +83,15 @@ async function startClient(context: vscode.ExtensionContext): Promise<void> {
   const debug = config.get<boolean>("debug") ?? false;
   const slowRequestMs = config.get<number>("slowRequestMs") ?? 2000;
   const extraArgs = parseExtraArgs(config.get<string[]>("extraArgs") ?? []);
+  const roots = parsePathSettings(config.get<string[]>("roots") ?? [], root);
+  const exclude = parsePathSettings(config.get<string[]>("exclude") ?? [], root);
+  const initializationOptions: BifrostInitializationOptions = {};
+  if (roots.length > 0) {
+    initializationOptions.roots = roots;
+  }
+  if (exclude.length > 0) {
+    initializationOptions.exclude = exclude;
+  }
 
   let launchConfig: BifrostLaunchConfig;
   try {
@@ -129,6 +140,7 @@ async function startClient(context: vscode.ExtensionContext): Promise<void> {
       { scheme: "file", language: "ruby" }
     ],
     outputChannel,
+    initializationOptions,
     revealOutputChannelOn: RevealOutputChannelOn.Error,
     initializationFailedHandler: (error) => {
       const message = formatError(error);

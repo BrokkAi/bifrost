@@ -18,6 +18,11 @@ export interface BifrostServerHandle {
   commandLine: string;
 }
 
+export interface BifrostInitializationOptions {
+  roots?: string[];
+  exclude?: string[];
+}
+
 export function resolveLaunchMode(
   mode: LaunchMode,
   extensionDir: string,
@@ -133,6 +138,13 @@ export function sourceFileWatchers(): vscode.FileSystemWatcher[] {
 
 export function parseExtraArgs(raw: string[]): string[] {
   return raw.map((arg) => arg.trim()).filter(Boolean);
+}
+
+export function parsePathSettings(raw: string[], workspaceRoot: string): string[] {
+  return raw
+    .map((value) => value.trim())
+    .filter(Boolean)
+    .map((value) => (path.isAbsolute(value) ? value : path.join(workspaceRoot, value)));
 }
 
 export function formatError(error: unknown): string {

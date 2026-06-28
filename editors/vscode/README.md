@@ -19,6 +19,8 @@ hover, and related editor features.
 | `bifrost.debug` | Enable verbose LSP request and notification tracing. |
 | `bifrost.slowRequestMs` | Log LSP handlers that take at least this many milliseconds. |
 | `bifrost.extraArgs` | Extra command-line arguments appended to the LSP server launch. |
+| `bifrost.roots` | Workspace-relative or absolute directories to index instead of the full VS Code workspace. |
+| `bifrost.exclude` | Workspace-relative or absolute files or directories to exclude from indexing and LSP lookups. |
 
 Launch mode behavior:
 
@@ -74,6 +76,20 @@ bifrost --root <workspace-root> --server lsp
 
 `--root` is the fallback root. VS Code still sends active workspace folders
 during LSP initialization, including multi-root workspaces.
+
+For large repositories, scope indexing before starting the server:
+
+```json
+{
+  "bifrost.roots": ["src", "tests"],
+  "bifrost.exclude": ["target", "vendor/generated"]
+}
+```
+
+After changing these settings, run `Bifrost: Restart Language Server` or accept
+the restart prompt. The extension sends the resolved paths as LSP
+`initializationOptions`, so excluded files should disappear from workspace
+symbol results and document-level LSP lookups.
 
 ## Packaging
 

@@ -74,6 +74,22 @@
           },
           "default": [],
           "description": "Additional command-line arguments appended when launching the Bifrost LSP server."
+        },
+        "bifrost.roots": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Workspace-relative or absolute directories to index instead of the full VS Code workspace. Empty means use VS Code workspace folders."
+        },
+        "bifrost.exclude": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Workspace-relative or absolute files or directories to exclude from Bifrost indexing and LSP lookups."
         }
       }
     },
