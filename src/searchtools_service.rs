@@ -586,10 +586,9 @@ impl SearchToolsService {
             let session = handle
                 .join()
                 .map_err(|_| SearchToolsServiceError::internal("index build thread panicked"))?;
-            let mut guard = self
-                .session
-                .write()
-                .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?;
+            let mut guard = self.session.write().map_err(|_| {
+                SearchToolsServiceError::internal("SearchToolsService lock poisoned")
+            })?;
             *guard = Some(session);
         }
         Ok(())

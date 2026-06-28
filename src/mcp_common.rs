@@ -108,6 +108,16 @@ pub fn run_stdio_server(
         }
     }
 
+    // Normal shutdown (stdin reached EOF): the process is about to exit, so skip
+    // the service's destructor. Dropping it would walk the whole in-memory index
+    // freeing millions of allocations and tear down the recursive file watcher --
+    // a noticeable pause that the OS would otherwise do for free on exit. We leak
+    // it deliberately: all responses are already flushed (above), and the
+    // analyzer DB is durable -- every reconcile/update committed its WAL
+    // transaction synchronously, so the next open recovers cleanly without the
+    // checkpoint that `Drop` would run here. Error paths above return early and
+    // are unaffected.
+    std::mem::forget(service);
     Ok(())
 }
 
