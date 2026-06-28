@@ -31,7 +31,8 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+use std::thread::JoinHandle;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchToolsServiceErrorCode {
@@ -129,6 +130,11 @@ enum UpdateStrategy {
 
 pub struct SearchToolsService {
     session: RwLock<Option<WorkspaceSession>>,
+    /// When constructed via `new_deferred`, the initial workspace build runs on
+    /// a background thread and lands here. `ensure_ready` joins it and installs
+    /// the resulting session into `session` on first access. `None` once the
+    /// session is ready (or for synchronously-built services).
+    pending_build: Mutex<Option<JoinHandle<WorkspaceSession>>>,
     update_strategy: UpdateStrategy,
 }
 
@@ -494,6 +500,10 @@ impl SearchToolsService {
     }
 
     pub fn active_workspace_root(&self) -> PathBuf {
+        // Blocks on the deferred build so the real root is returned rather than
+        // a default; this runs on the tool-call path, which waits for readiness
+        // anyway.
+        let _ = self.ensure_ready();
         self.session
             .read()
             .ok()
@@ -519,21 +529,70 @@ impl SearchToolsService {
         semantic_indexing: bool,
     ) -> Result<Self, String> {
         let (project, workspace) = build_workspace(root)?;
-        let watcher = maybe_start_watcher(project, update_strategy);
-        let snapshot = Arc::new(workspace);
-        #[cfg(feature = "nlp")]
-        let semantic = maybe_start_semantic(semantic_indexing, &snapshot);
-        #[cfg(not(feature = "nlp"))]
-        let _ = semantic_indexing;
+        let session = assemble_session(project, workspace, update_strategy, semantic_indexing);
         Ok(Self {
-            session: RwLock::new(Some(WorkspaceSession {
-                snapshot,
-                watcher,
-                #[cfg(feature = "nlp")]
-                semantic,
-            })),
+            session: RwLock::new(Some(session)),
+            pending_build: Mutex::new(None),
             update_strategy,
         })
+    }
+
+    /// Construct the searchtools service without blocking on the initial
+    /// workspace build. The expensive declaration index is built on a
+    /// background thread, so the MCP `initialize` handshake can be answered
+    /// immediately while indexing proceeds. The first tool call blocks (via
+    /// `ensure_ready`) only for whatever build time has not already elapsed.
+    ///
+    /// Used by the long-lived stdio server. The project root is validated
+    /// synchronously so an invalid `--root` still fails fast; only the parse /
+    /// index step is deferred (it is infallible — persistence is best-effort
+    /// and unparseable files yield empty results).
+    pub fn new_deferred(root: PathBuf) -> Result<Self, String> {
+        let update_strategy = UpdateStrategy::WatchFiles;
+        let semantic_indexing = semantic_indexing_enabled();
+        let project: Arc<dyn Project> = Arc::new(
+            FilesystemProject::new(root)
+                .map_err(|err| format!("Failed to initialize project root: {err}"))?,
+        );
+        let build_project = Arc::clone(&project);
+        let handle = std::thread::Builder::new()
+            .name("bifrost-index-build".to_string())
+            .spawn(move || {
+                let workspace = WorkspaceAnalyzer::build_persisted(
+                    Arc::clone(&build_project),
+                    AnalyzerConfig::default(),
+                );
+                assemble_session(build_project, workspace, update_strategy, semantic_indexing)
+            })
+            .map_err(|err| format!("Failed to spawn index build thread: {err}"))?;
+        Ok(Self {
+            session: RwLock::new(None),
+            pending_build: Mutex::new(Some(handle)),
+            update_strategy,
+        })
+    }
+
+    /// Block until the deferred initial build (if any) has completed and its
+    /// session is installed. A no-op for synchronously-built services and after
+    /// the first call. Safe under concurrency: the first caller joins the build
+    /// and installs the session while holding `pending_build`; later callers
+    /// wait on that mutex and then observe the installed session.
+    fn ensure_ready(&self) -> Result<(), SearchToolsServiceError> {
+        let mut pending = self
+            .pending_build
+            .lock()
+            .map_err(|_| SearchToolsServiceError::internal("index build lock poisoned"))?;
+        if let Some(handle) = pending.take() {
+            let session = handle
+                .join()
+                .map_err(|_| SearchToolsServiceError::internal("index build thread panicked"))?;
+            let mut guard = self
+                .session
+                .write()
+                .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?;
+            *guard = Some(session);
+        }
+        Ok(())
     }
 
     pub fn close(&self) -> Result<(), SearchToolsServiceError> {
@@ -558,6 +617,7 @@ impl SearchToolsService {
         }
         #[cfg(feature = "nlp")]
         {
+            self.ensure_ready()?;
             let indexer = {
                 let guard = self.session.read().map_err(|_| {
                     SearchToolsServiceError::internal("workspace session lock poisoned")
@@ -937,6 +997,7 @@ impl SearchToolsService {
         &self,
     ) -> Result<std::sync::RwLockReadGuard<'_, Option<WorkspaceSession>>, SearchToolsServiceError>
     {
+        self.ensure_ready()?;
         self.session
             .read()
             .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))
@@ -946,6 +1007,7 @@ impl SearchToolsService {
         &self,
     ) -> Result<std::sync::RwLockWriteGuard<'_, Option<WorkspaceSession>>, SearchToolsServiceError>
     {
+        self.ensure_ready()?;
         self.session
             .write()
             .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))
@@ -958,6 +1020,15 @@ impl SearchToolsService {
 
 impl Drop for SearchToolsService {
     fn drop(&mut self) {
+        // If a deferred build is still in flight, join it so its session (and
+        // any semantic indexer it started) is closed rather than detached.
+        if let Ok(pending) = self.pending_build.get_mut()
+            && let Some(handle) = pending.take()
+            && let Ok(session) = handle.join()
+        {
+            session.close_semantic();
+            return;
+        }
         let Ok(session) = self.session.get_mut() else {
             return;
         };
@@ -982,6 +1053,30 @@ fn build_workspace(root: PathBuf) -> Result<(Arc<dyn Project>, WorkspaceAnalyzer
     let workspace =
         WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default());
     Ok((project, workspace))
+}
+
+/// Assemble a ready `WorkspaceSession` from a built project + analyzer: wrap the
+/// analyzer in an `Arc`, start the file watcher (per `update_strategy`), and
+/// start the semantic indexer when enabled. Shared by the synchronous and
+/// deferred constructors so both produce identical sessions.
+fn assemble_session(
+    project: Arc<dyn Project>,
+    workspace: WorkspaceAnalyzer,
+    update_strategy: UpdateStrategy,
+    semantic_indexing: bool,
+) -> WorkspaceSession {
+    let watcher = maybe_start_watcher(project, update_strategy);
+    let snapshot = Arc::new(workspace);
+    #[cfg(feature = "nlp")]
+    let semantic = maybe_start_semantic(semantic_indexing, &snapshot);
+    #[cfg(not(feature = "nlp"))]
+    let _ = semantic_indexing;
+    WorkspaceSession {
+        snapshot,
+        watcher,
+        #[cfg(feature = "nlp")]
+        semantic,
+    }
 }
 
 fn maybe_start_watcher(
@@ -1058,6 +1153,7 @@ mod tests {
                 watcher: None,
                 semantic: Some(indexer.clone()),
             })),
+            pending_build: Mutex::new(None),
             update_strategy: UpdateStrategy::WatchFiles,
         };
 

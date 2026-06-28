@@ -73,7 +73,10 @@ pub fn run_stdio_server(
     render_options: McpRenderOptions,
     spec: &McpServerSpec,
 ) -> Result<(), String> {
-    let service = SearchToolsService::new(root)?;
+    // Build the index on a background thread so the MCP `initialize` handshake
+    // is answered immediately; the first tool call blocks only for whatever
+    // build time remains.
+    let service = SearchToolsService::new_deferred(root)?;
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
