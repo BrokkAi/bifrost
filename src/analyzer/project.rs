@@ -451,6 +451,14 @@ fn collect_project_files(root: &Path) -> io::Result<BTreeSet<ProjectFile>> {
         .git_exclude(true)
         .parents(true)
         .require_git(false)
+        // Never descend into `.git`. We keep hidden entries (`hidden(false)`) so
+        // legitimate dotted source/config like `.github/` is still analyzed, but
+        // `.git` is VCS internals, never source, and is not covered by
+        // `.gitignore`. Walking it is pure cost -- catastrophic on trees with
+        // many clones -- and would otherwise index git's own files. `git_exclude`
+        // detection (`.git/info/exclude`) is unaffected: the ignore crate reads
+        // it during repo detection, independent of whether the walk yields `.git`.
+        .filter_entry(|entry| entry.file_name() != std::ffi::OsStr::new(".git"))
         .build();
 
     for entry in walker {
@@ -690,6 +698,43 @@ mod tests {
         let project = FilesystemProject::new(&root).unwrap();
         assert_eq!(project.read_source(&file).unwrap(), "print('hi')\n");
         assert!(!project.has_overlay(&file));
+    }
+
+    #[test]
+    fn collect_project_files_skips_dot_git_but_keeps_other_dotdirs() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        write_file(&root, "real.rs", "fn real() {}\n");
+        // VCS internals must never be walked, even though `.git` is not matched
+        // by `.gitignore` and hidden entries are otherwise kept.
+        write_file(&root, ".git/sneaky.rs", "fn sneaky() {}\n");
+        write_file(&root, ".git/info/exclude", "excluded.rs\n");
+        write_file(&root, "excluded.rs", "fn excluded() {}\n");
+        write_file(&root, ".gitignore", "sub/\n");
+        write_file(&root, "sub/ignored.rs", "fn ignored() {}\n");
+        // Legitimate dotted source/config stays in scope.
+        write_file(&root, ".github/wf.rs", "fn wf() {}\n");
+
+        let rels: BTreeSet<String> = collect_project_files(&root)
+            .unwrap()
+            .into_iter()
+            .map(|file| file.rel_path().to_string_lossy().replace('\\', "/"))
+            .collect();
+
+        assert!(rels.contains("real.rs"), "{rels:?}");
+        assert!(rels.contains(".github/wf.rs"), "{rels:?}");
+        assert!(
+            !rels.iter().any(|p| p.starts_with(".git/")),
+            "`.git` internals must not be walked: {rels:?}"
+        );
+        assert!(
+            !rels.contains("excluded.rs"),
+            "`.git/info/exclude` must still apply: {rels:?}"
+        );
+        assert!(
+            !rels.contains("sub/ignored.rs"),
+            "`.gitignore` must still apply: {rels:?}"
+        );
     }
 
     #[test]
