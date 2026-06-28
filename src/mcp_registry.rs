@@ -7,6 +7,13 @@ use std::path::Path;
 
 const SEARCHTOOLS_ORDER: &[&str] = &["symbol", "nlp", "workspace", "extended", "text", "slopcop"];
 
+/// The individual toolset names that compose `searchtools`, in registry order.
+/// Exposed so the CLI `--help` can enumerate each toolset and its tools without
+/// duplicating the list.
+pub fn searchtools_toolset_order() -> &'static [&'static str] {
+    SEARCHTOOLS_ORDER
+}
+
 /// Whether the workspace root is a git repository. Semantic search is git-only,
 /// so the `nlp` toolset is hidden for non-git roots. Always false without the
 /// `nlp` feature (no nlp tools to gate).
