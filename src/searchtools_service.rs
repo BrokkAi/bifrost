@@ -244,6 +244,20 @@ impl SearchToolsService {
         Self::new_with_strategy(root, UpdateStrategy::Manual, false)
     }
 
+    /// Construct a manual, non-persistent, non-semantic service over an
+    /// already-selected project. One-shot CLI subset workspaces use this to
+    /// avoid whole-root watchers and analyzer DB reconciliation.
+    pub fn new_manual_for_project(project: Arc<dyn Project>) -> Result<Self, String> {
+        let workspace = WorkspaceAnalyzer::build(Arc::clone(&project), AnalyzerConfig::default());
+        let session = assemble_session(project, workspace, UpdateStrategy::Manual, false);
+        Ok(Self {
+            session: RwLock::new(Some(session)),
+            pending_build: Mutex::new(None),
+            build_error: Mutex::new(None),
+            update_strategy: UpdateStrategy::Manual,
+        })
+    }
+
     /// Construct with no file watcher and no semantic indexer: the caller drives
     /// updates via the incremental `update_paths` tool. For batch consumers that
     /// re-use one session across many revisions of one worktree.

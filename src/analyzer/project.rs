@@ -211,7 +211,7 @@ impl Project for FilesystemProject {
     }
 
     fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>> {
-        collect_project_files(&self.root)
+        collect_workspace_files(&self.root)
     }
 
     fn analyzable_files(&self, language: Language) -> io::Result<BTreeSet<ProjectFile>> {
@@ -312,6 +312,10 @@ impl Project for FileSetProject {
     fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile> {
         let file = ProjectFile::new(self.root.clone(), rel_path.to_path_buf());
         self.files.contains(&file).then_some(file)
+    }
+
+    fn persistence_root(&self) -> Option<&Path> {
+        None
     }
 }
 
@@ -441,7 +445,10 @@ fn common_ancestor(paths: &[PathBuf]) -> Option<PathBuf> {
     Some(ancestor)
 }
 
-fn collect_project_files(root: &Path) -> io::Result<BTreeSet<ProjectFile>> {
+/// Collect every file under `root` that belongs to the analyzer's view of the
+/// workspace. The walk is ignore-aware, skips `.git/`, and keeps other dotted
+/// directories in scope.
+pub fn collect_workspace_files(root: &Path) -> io::Result<BTreeSet<ProjectFile>> {
     let walker = WalkBuilder::new(root)
         .hidden(false)
         .ignore(false)
@@ -704,7 +711,7 @@ impl Project for OverlayProject {
 
 fn detect_languages(root: &Path) -> io::Result<BTreeSet<Language>> {
     let mut languages = BTreeSet::new();
-    for file in collect_project_files(root)? {
+    for file in collect_workspace_files(root)? {
         let language = language_for_file(&file);
         if language != Language::None {
             languages.insert(language);
@@ -752,7 +759,7 @@ mod tests {
         // Legitimate dotted source/config stays in scope.
         write_file(&root, ".github/wf.rs", "fn wf() {}\n");
 
-        let rels: BTreeSet<String> = collect_project_files(&root)
+        let rels: BTreeSet<String> = collect_workspace_files(&root)
             .unwrap()
             .into_iter()
             .map(|file| file.rel_path().to_string_lossy().replace('\\', "/"))
@@ -772,6 +779,15 @@ mod tests {
             !rels.contains("sub/ignored.rs"),
             "`.gitignore` must still apply: {rels:?}"
         );
+    }
+
+    #[test]
+    fn fileset_project_disables_persistence() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let project = FileSetProject::new(root.clone(), [PathBuf::from("A.java")]);
+        assert_eq!(project.root(), root.as_path());
+        assert!(project.persistence_root().is_none());
     }
 
     #[test]

@@ -1,5 +1,7 @@
 use std::env;
+use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use brokk_bifrost::lsp::run_lsp_stdio_server;
 use brokk_bifrost::mcp_common::{McpRenderOptions, run_stdio_server};
@@ -8,7 +10,8 @@ use brokk_bifrost::mcp_registry::{
 };
 use brokk_bifrost::searchtools_render::RenderOptions;
 use brokk_bifrost::tool_arguments::normalize_tool_arguments;
-use brokk_bifrost::{SearchToolsService, ToolOutput};
+use brokk_bifrost::{FileSetProject, SearchToolsService, ToolOutput, collect_workspace_files};
+use glob::Pattern;
 use serde_json::{Value, json};
 
 fn main() -> ExitCode {
@@ -30,6 +33,7 @@ fn run() -> Result<(), String> {
     let mut run_lsp = false;
     let mut tool_name: Option<String> = None;
     let mut tool_args = json!({});
+    let mut tool_sources = Vec::new();
     let mut render_options = McpRenderOptions::default();
 
     while let Some(arg) = args.next() {
@@ -79,6 +83,12 @@ fn run() -> Result<(), String> {
                 tool_args = serde_json::from_str(&value)
                     .map_err(|err| format!("--args must be valid JSON: {err}"))?;
             }
+            "--sources" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--sources requires a path".to_string())?;
+                tool_sources.push(value);
+            }
             "--no-line-numbers" => {
                 render_options.render_line_numbers = false;
             }
@@ -107,7 +117,11 @@ fn run() -> Result<(), String> {
         if run_lsp || mcp_mode.is_some() {
             return Err("--tool cannot be combined with --mcp or --lsp".to_string());
         }
-        return run_tool(root, &tool_name, tool_args, render_options);
+        return run_tool(root, &tool_name, tool_args, &tool_sources, render_options);
+    }
+
+    if !tool_sources.is_empty() {
+        return Err("--sources may only be used with --tool".to_string());
     }
 
     if run_lsp && mcp_mode.is_some() {
@@ -138,16 +152,23 @@ fn run() -> Result<(), String> {
 }
 
 fn run_tool(
-    root: std::path::PathBuf,
+    root: PathBuf,
     tool_name: &str,
     tool_args: Value,
+    tool_sources: &[String],
     render_options: McpRenderOptions,
 ) -> Result<(), String> {
     let root = root
         .canonicalize()
         .map_err(|err| format!("Failed to resolve project root {}: {err}", root.display()))?;
     let arguments = normalize_tool_arguments(tool_name, tool_args, &root)?;
-    let service = SearchToolsService::new(root)?;
+    let service = if tool_sources.is_empty() {
+        SearchToolsService::new(root.clone())?
+    } else {
+        let rel_paths = resolve_tool_sources(&root, tool_sources)?;
+        let project = Arc::new(FileSetProject::new(root.clone(), rel_paths));
+        SearchToolsService::new_manual_for_project(project)?
+    };
     let output = service
         .call_tool_output(
             tool_name,
@@ -173,6 +194,160 @@ fn run_tool(
         println!();
     }
     Ok(())
+}
+
+fn resolve_tool_sources(root: &Path, inputs: &[String]) -> Result<Vec<PathBuf>, String> {
+    let workspace_files = collect_workspace_files(root).map_err(|err| {
+        format!(
+            "Failed to enumerate workspace files under {}: {err}",
+            root.display()
+        )
+    })?;
+    let workspace_rel_paths: Vec<String> = workspace_files
+        .iter()
+        .map(|file| file.rel_path().to_string_lossy().replace('\\', "/"))
+        .collect();
+
+    let mut selected = std::collections::BTreeSet::new();
+    for input in inputs {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if contains_glob_syntax(trimmed) {
+            let pattern = normalize_source_pattern(trimmed, root)?;
+            let glob = Pattern::new(&pattern)
+                .map_err(|err| format!("Invalid --sources glob `{trimmed}`: {err}"))?;
+            let mut matched_any = false;
+            for rel in &workspace_rel_paths {
+                if glob.matches(rel) {
+                    matched_any = true;
+                    selected.insert(PathBuf::from(rel));
+                }
+            }
+            if !matched_any {
+                return Err(format!("--sources glob `{trimmed}` matched no files"));
+            }
+            continue;
+        }
+
+        let rel = normalize_literal_source_path(trimmed, root)?;
+        let abs = root.join(&rel);
+        if abs.is_file() {
+            selected.insert(rel);
+            continue;
+        }
+        if abs.is_dir() {
+            let prefix = rel.to_string_lossy().replace('\\', "/");
+            let prefix_slash = format!("{prefix}/");
+            let mut matched_any = false;
+            for workspace_rel in &workspace_rel_paths {
+                if workspace_rel == &prefix || workspace_rel.starts_with(&prefix_slash) {
+                    matched_any = true;
+                    selected.insert(PathBuf::from(workspace_rel));
+                }
+            }
+            if !matched_any {
+                return Err(format!(
+                    "--sources directory `{trimmed}` contains no analyzer-visible files"
+                ));
+            }
+            continue;
+        }
+
+        return Err(format!("--sources path does not exist: {trimmed}"));
+    }
+
+    if selected.is_empty() {
+        return Err("--sources resolved to an empty workspace".to_string());
+    }
+    Ok(selected.into_iter().collect())
+}
+
+fn normalize_source_pattern(raw: &str, root: &Path) -> Result<String, String> {
+    if looks_like_absolute_path(raw) {
+        normalize_relative_path(&normalize_absolute_source_string(raw, root)?)
+            .map(|path| path.to_string_lossy().replace('\\', "/"))
+    } else {
+        normalize_relative_path(raw).map(|path| path.to_string_lossy().replace('\\', "/"))
+    }
+}
+
+fn normalize_literal_source_path(raw: &str, root: &Path) -> Result<PathBuf, String> {
+    if looks_like_absolute_path(raw) {
+        let abs = Path::new(raw);
+        let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        if abs.exists() {
+            let normalized_abs = abs
+                .canonicalize()
+                .map_err(|err| format!("Failed to resolve source path {}: {err}", abs.display()))?;
+            let rel = normalized_abs
+                .strip_prefix(&canonical_root)
+                .map_err(|_| absolute_source_outside_workspace_error(raw, root))?;
+            return normalize_relative_path(&rel.to_string_lossy());
+        }
+        return normalize_relative_path(&normalize_absolute_source_string(raw, root)?);
+    }
+
+    normalize_relative_path(raw)
+}
+
+fn normalize_absolute_source_string(raw: &str, root: &Path) -> Result<String, String> {
+    let raw_norm = raw.replace('\\', "/");
+    let root_norm = root.display().to_string().replace('\\', "/");
+    let root_trimmed = root_norm.trim_end_matches('/');
+
+    if raw_norm == root_trimmed {
+        return Ok(String::new());
+    }
+
+    raw_norm
+        .strip_prefix(&format!("{root_trimmed}/"))
+        .map(str::to_string)
+        .ok_or_else(|| absolute_source_outside_workspace_error(raw, root))
+}
+
+fn absolute_source_outside_workspace_error(raw: &str, root: &Path) -> String {
+    format!(
+        "absolute path is outside active workspace: {} (workspace: {})",
+        raw,
+        root.display()
+    )
+}
+
+fn normalize_relative_path(raw: &str) -> Result<PathBuf, String> {
+    let normalized = raw.replace('\\', "/");
+    let mut rel = PathBuf::new();
+    for component in Path::new(&normalized).components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => rel.push(part),
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(format!("path escapes active workspace: {raw}"));
+            }
+        }
+    }
+    if rel.as_os_str().is_empty() {
+        return Err(format!("path is empty: {raw}"));
+    }
+    Ok(rel)
+}
+
+fn contains_glob_syntax(raw: &str) -> bool {
+    raw.contains(['*', '?', '['])
+}
+
+fn looks_like_absolute_path(raw: &str) -> bool {
+    Path::new(raw).is_absolute() || is_windows_absolute_path(raw)
+}
+
+fn is_windows_absolute_path(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\')
 }
 
 fn print_help(topic: Option<&str>) -> Result<(), String> {
@@ -209,6 +384,8 @@ OPTIONS:
     --args JSON            Inline JSON arguments for --tool, e.g. '{"patterns":["MyClass"]}'.
                            Required for tools that take arguments; omit for those that don't
                            (defaults to {}, which suits e.g. get_active_workspace).
+    --sources PATH         Restrict one-shot --tool workspace construction to selected files,
+                           directories, or globs. Repeatable; valid only with --tool.
     --no-line-numbers      Render source output without leading line numbers
     --force-semantic-cpu   Allow semantic_search without a CUDA/Metal accelerator (run the embedder on CPU)
     -h, --help [TOOL]      Show this help, or a single tool's description and parameters
@@ -243,6 +420,9 @@ EXAMPLES:
 
     # One-shot: run a single tool and print its result, then exit:
     bifrost --root /path/to/project --tool search_symbols --args '{"patterns":["MyClass"]}'
+
+    # One-shot against a subset workspace built from a directory and a glob:
+    bifrost --root /path/to/project --tool get_symbol_sources --sources src --sources 'tests/**/*.rs' --args '{"symbols":["src/main.rs"]}'
 
     # Language server over stdio:
     bifrost --root /path/to/project --lsp

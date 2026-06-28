@@ -44,7 +44,7 @@ pub use analyzer::{
     ProjectFile, PythonAnalyzer, Range, RubyAnalyzer, RustAnalyzer, ScalaAnalyzer, SourceContent,
     TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TestProject,
     TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider, TypescriptAnalyzer,
-    WorkspaceAnalyzer,
+    WorkspaceAnalyzer, collect_workspace_files,
 };
 pub use project_watcher::{ChangeDelta, ProjectChangeWatcher};
 pub use searchtools_service::{

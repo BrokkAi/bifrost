@@ -66,7 +66,7 @@ pub(crate) use php::{
 };
 pub use project::{
     DEFAULT_MAX_OVERLAY_BYTES, FileSetProject, FilesystemProject, MultiRootProject, OverlayProject,
-    Project, TestProject,
+    Project, TestProject, collect_workspace_files,
 };
 pub use python::PythonAnalyzer;
 pub use ruby::RubyAnalyzer;
