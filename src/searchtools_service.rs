@@ -130,11 +130,15 @@ enum UpdateStrategy {
 
 pub struct SearchToolsService {
     session: RwLock<Option<WorkspaceSession>>,
-    /// When constructed via `new_deferred`, the initial workspace build runs on
-    /// a background thread and lands here. `ensure_ready` joins it and installs
-    /// the resulting session into `session` on first access. `None` once the
-    /// session is ready (or for synchronously-built services).
-    pending_build: Mutex<Option<JoinHandle<WorkspaceSession>>>,
+    /// When constructed via `new_deferred`, the initial workspace build (file
+    /// discovery + parse) runs on a background thread and lands here.
+    /// `ensure_ready` joins it and installs the resulting session into `session`
+    /// on first access. `None` once the session is ready (or for
+    /// synchronously-built services).
+    pending_build: Mutex<Option<JoinHandle<Result<WorkspaceSession, String>>>>,
+    /// Records a deferred-build failure (e.g. the workspace walk hit an IO
+    /// error) so every access after the first surfaces it instead of hanging.
+    build_error: Mutex<Option<String>>,
     update_strategy: UpdateStrategy,
 }
 
@@ -533,6 +537,7 @@ impl SearchToolsService {
         Ok(Self {
             session: RwLock::new(Some(session)),
             pending_build: Mutex::new(None),
+            build_error: Mutex::new(None),
             update_strategy,
         })
     }
@@ -543,31 +548,50 @@ impl SearchToolsService {
     /// immediately while indexing proceeds. The first tool call blocks (via
     /// `ensure_ready`) only for whatever build time has not already elapsed.
     ///
-    /// Used by the long-lived stdio server. The project root is validated
-    /// synchronously so an invalid `--root` still fails fast; only the parse /
-    /// index step is deferred (it is infallible — persistence is best-effort
-    /// and unparseable files yield empty results).
+    /// Used by the long-lived stdio server. Only a cheap, O(1) root check
+    /// (canonicalize + is-dir) runs synchronously so an invalid `--root` still
+    /// fails fast. Everything that touches the tree -- file discovery
+    /// (`FilesystemProject::new` -> `detect_languages`), parsing, and the file
+    /// watcher -- is deferred to the build thread, so the MCP `initialize`
+    /// handshake is answered instantly even when the workspace is enormous or on
+    /// a slow filesystem (a tree of thousands of repo clones, a WSL `/mnt/c`
+    /// mount, etc.). Without this, the discovery walk alone could exceed an MCP
+    /// client's startup timeout.
     pub fn new_deferred(root: PathBuf) -> Result<Self, String> {
         let update_strategy = UpdateStrategy::WatchFiles;
         let semantic_indexing = semantic_indexing_enabled();
-        let project: Arc<dyn Project> = Arc::new(
-            FilesystemProject::new(root)
-                .map_err(|err| format!("Failed to initialize project root: {err}"))?,
-        );
-        let build_project = Arc::clone(&project);
+        let canonical = root
+            .canonicalize()
+            .map_err(|err| format!("Failed to resolve project root {}: {err}", root.display()))?;
+        if !canonical.is_dir() {
+            return Err(format!(
+                "project root is not a directory: {}",
+                canonical.display()
+            ));
+        }
         let handle = std::thread::Builder::new()
             .name("bifrost-index-build".to_string())
-            .spawn(move || {
+            .spawn(move || -> Result<WorkspaceSession, String> {
+                let project: Arc<dyn Project> = Arc::new(
+                    FilesystemProject::new(canonical)
+                        .map_err(|err| format!("Failed to initialize project root: {err}"))?,
+                );
                 let workspace = WorkspaceAnalyzer::build_persisted(
-                    Arc::clone(&build_project),
+                    Arc::clone(&project),
                     AnalyzerConfig::default(),
                 );
-                assemble_session(build_project, workspace, update_strategy, semantic_indexing)
+                Ok(assemble_session(
+                    project,
+                    workspace,
+                    update_strategy,
+                    semantic_indexing,
+                ))
             })
             .map_err(|err| format!("Failed to spawn index build thread: {err}"))?;
         Ok(Self {
             session: RwLock::new(None),
             pending_build: Mutex::new(Some(handle)),
+            build_error: Mutex::new(None),
             update_strategy,
         })
     }
@@ -583,13 +607,32 @@ impl SearchToolsService {
             .lock()
             .map_err(|_| SearchToolsServiceError::internal("index build lock poisoned"))?;
         if let Some(handle) = pending.take() {
-            let session = handle
+            let built = handle
                 .join()
                 .map_err(|_| SearchToolsServiceError::internal("index build thread panicked"))?;
-            let mut guard = self.session.write().map_err(|_| {
-                SearchToolsServiceError::internal("SearchToolsService lock poisoned")
-            })?;
-            *guard = Some(session);
+            match built {
+                Ok(session) => {
+                    let mut guard = self.session.write().map_err(|_| {
+                        SearchToolsServiceError::internal("SearchToolsService lock poisoned")
+                    })?;
+                    *guard = Some(session);
+                }
+                Err(err) => {
+                    *self.build_error.lock().map_err(|_| {
+                        SearchToolsServiceError::internal("index build lock poisoned")
+                    })? = Some(err.clone());
+                    return Err(SearchToolsServiceError::internal(err));
+                }
+            }
+        }
+        drop(pending);
+        if let Some(err) = self
+            .build_error
+            .lock()
+            .map_err(|_| SearchToolsServiceError::internal("index build lock poisoned"))?
+            .clone()
+        {
+            return Err(SearchToolsServiceError::internal(err));
         }
         Ok(())
     }
@@ -1023,7 +1066,7 @@ impl Drop for SearchToolsService {
         // any semantic indexer it started) is closed rather than detached.
         if let Ok(pending) = self.pending_build.get_mut()
             && let Some(handle) = pending.take()
-            && let Ok(session) = handle.join()
+            && let Ok(Ok(session)) = handle.join()
         {
             session.close_semantic();
             return;
@@ -1153,6 +1196,7 @@ mod tests {
                 semantic: Some(indexer.clone()),
             })),
             pending_build: Mutex::new(None),
+            build_error: Mutex::new(None),
             update_strategy: UpdateStrategy::WatchFiles,
         };
 
