@@ -25,8 +25,10 @@ let client: LanguageClient | undefined;
 let statusBarItem: vscode.StatusBarItem | undefined;
 let outputChannel: vscode.OutputChannel | undefined;
 let lastLaunchConfig: BifrostLaunchConfig | undefined;
+let extensionActive = false;
 
 export function activate(context: vscode.ExtensionContext): void {
+  extensionActive = true;
   outputChannel = vscode.window.createOutputChannel("Bifrost");
   context.subscriptions.push(outputChannel);
 
@@ -61,7 +63,8 @@ export function activate(context: vscode.ExtensionContext): void {
 }
 
 export function deactivate(): Thenable<void> | undefined {
-  return stopClient();
+  extensionActive = false;
+  return stopClient({ updateUi: false });
 }
 
 async function startClient(context: vscode.ExtensionContext): Promise<void> {
@@ -174,31 +177,38 @@ async function startClient(context: vscode.ExtensionContext): Promise<void> {
       "$(check) Bifrost",
       `Bifrost language server is running (${modeLabel}). Click to restart.`
     );
-    statusBarItem!.command = "bifrost.restartServer";
+    setStatusCommand("bifrost.restartServer");
     log("Bifrost language client started.");
   } catch (error) {
     const message = formatError(error);
     setStatus("$(error) Bifrost", `${message}\n\nClick to retry.`);
-    statusBarItem!.command = "bifrost.startServer";
+    setStatusCommand("bifrost.startServer");
     log(`Bifrost language client failed to start: ${message}`);
     outputChannel?.show(true);
   }
 }
 
-async function stopClient(): Promise<void> {
+async function stopClient(options: { updateUi?: boolean } = {}): Promise<void> {
+  const updateUi = options.updateUi ?? true;
   const current = client;
   if (!current) {
-    setStatus("$(circle-slash) Bifrost", "Bifrost language server is stopped.");
+    if (updateUi) {
+      setStatus("$(circle-slash) Bifrost", "Bifrost language server is stopped.");
+    }
     return;
   }
 
   if (current.state !== State.Running && current.state !== State.Starting) {
     client = undefined;
-    setStatus("$(circle-slash) Bifrost", "Bifrost language server is stopped.");
+    if (updateUi) {
+      setStatus("$(circle-slash) Bifrost", "Bifrost language server is stopped.");
+    }
     return;
   }
 
-  setStatus("$(sync~spin) Bifrost", "Stopping Bifrost language server...");
+  if (updateUi) {
+    setStatus("$(sync~spin) Bifrost", "Stopping Bifrost language server...");
+  }
   try {
     await current.stop();
     log("Bifrost language client stopped.");
@@ -206,9 +216,9 @@ async function stopClient(): Promise<void> {
     log(`Bifrost language client failed to stop: ${formatError(error)}`);
   } finally {
     client = undefined;
-    setStatus("$(circle-slash) Bifrost", "Bifrost language server is stopped.");
-    if (statusBarItem) {
-      statusBarItem.command = "bifrost.startServer";
+    if (updateUi) {
+      setStatus("$(circle-slash) Bifrost", "Bifrost language server is stopped.");
+      setStatusCommand("bifrost.startServer");
     }
   }
 }
@@ -233,11 +243,18 @@ async function promptRestartAfterConfigurationChange(
 }
 
 function setStatus(text: string, tooltip: string): void {
-  if (!statusBarItem) {
+  if (!extensionActive || !statusBarItem) {
     return;
   }
   statusBarItem.text = text;
   statusBarItem.tooltip = tooltip;
+}
+
+function setStatusCommand(command: string): void {
+  if (!extensionActive || !statusBarItem) {
+    return;
+  }
+  statusBarItem.command = command;
 }
 
 function log(message: string): void {
