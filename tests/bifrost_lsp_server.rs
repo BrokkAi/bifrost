@@ -1306,8 +1306,8 @@ fn bifrost_lsp_server_skips_startup_progress_without_client_support() {
         "expected documentSymbol response: {response}"
     );
     assert!(
-        !root.join(".bifrost").exists(),
-        "server should not create analyzer storage for clients without work-done progress"
+        root.join(".bifrost").exists(),
+        "server should still create the analyzer cache for clients without work-done progress (progress support is a UI capability, unrelated to persistence)"
     );
 
     write_message(
@@ -1393,8 +1393,8 @@ fn bifrost_lsp_server_disables_startup_progress_when_token_create_fails() {
         "expected documentSymbol response after rejected progress token: {response}"
     );
     assert!(
-        !root.join(".bifrost").exists(),
-        "server should not create analyzer storage after progress token creation fails"
+        root.join(".bifrost").exists(),
+        "server should still create the analyzer cache after progress token creation fails (progress reporting is independent of persistence)"
     );
 
     write_message(
