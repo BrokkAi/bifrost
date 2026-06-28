@@ -2364,6 +2364,108 @@ fn bifrost_lsp_server_signature_help_returns_typescript_function_signature() {
 }
 
 #[test]
+fn bifrost_lsp_server_signature_help_returns_javascript_function_signature() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("sample.js");
+    let source = "/**\n * Combines JavaScript values.\n */\nfunction combine(combine, right) {\n  return combine + right;\n}\nconst result = combine(1, 2);\n";
+    fs::write(&file_path, source).expect("write sample.js");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let (line, character) = position_after(source, "combine(1, ");
+
+    let result = signature_help(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        2,
+        &file_uri,
+        line,
+        character,
+    );
+    assert_eq!(
+        result["activeParameter"], 1,
+        "unexpected signature help: {result}"
+    );
+    assert!(
+        result["signatures"][0]["label"]
+            .as_str()
+            .is_some_and(|label| label.contains("combine") && label.contains("right")),
+        "expected combine signature label, got {result}"
+    );
+    assert_signature_parameter_offsets(&result, 0, &["combine", "right"]);
+    assert!(
+        result["signatures"][0]["documentation"]["value"]
+            .as_str()
+            .is_some_and(|doc| doc.contains("Combines JavaScript values.")),
+        "expected JavaScript signature documentation, got {result}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_signature_help_returns_javascript_default_and_rest_parameter_offsets() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("defaults.js");
+    let source = "function factory() { return 0; }\n/**\n * Configures JavaScript values.\n */\nfunction configure(left = factory(), right, ...rest) {\n  return right;\n}\nconst result = configure(1, 2, 3);\n";
+    fs::write(&file_path, source).expect("write defaults.js");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let (line, character) = position_after(source, "configure(1, ");
+
+    let result = signature_help(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        2,
+        &file_uri,
+        line,
+        character,
+    );
+    assert_eq!(
+        result["activeParameter"], 1,
+        "unexpected signature help: {result}"
+    );
+    assert_signature_parameter_offsets(&result, 0, &["left", "right", "rest"]);
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_signature_help_returns_javascript_single_arrow_parameter_offsets() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("arrow.js");
+    let source = "const identity = value => value;\nconst result = identity(1);\n";
+    fs::write(&file_path, source).expect("write arrow.js");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let (line, character) = position_after(source, "identity(");
+
+    let result = signature_help(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        2,
+        &file_uri,
+        line,
+        character,
+    );
+    assert_eq!(
+        result["activeParameter"], 0,
+        "unexpected signature help: {result}"
+    );
+    assert_signature_parameter_offsets(&result, 0, &["value"]);
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
 fn bifrost_lsp_server_signature_help_returns_typescript_constructor_signature() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().canonicalize().expect("canon temp");
@@ -2404,8 +2506,92 @@ fn bifrost_lsp_server_signature_help_returns_go_function_signature() {
     let root = temp.path().canonicalize().expect("canon temp");
     fs::write(root.join("go.mod"), "module example.com/signature\n").expect("write go.mod");
     let file_path = root.join("main.go");
-    let source = "package main\n\nfunc combine(left int, right int) int { return left + right }\n\nfunc main() {\n    _ = combine(1, 2)\n}\n";
+    let source = "package main\n\n// combine combines Go values.\nfunc combine(combine func() int, right int, rest ...int) int { return combine() + right + len(rest) }\n\nfunc main() {\n    _ = combine(nil, 2, 3)\n}\n";
     fs::write(&file_path, source).expect("write main.go");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let (line, character) = position_after(source, "combine(nil, ");
+
+    let result = signature_help(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        2,
+        &file_uri,
+        line,
+        character,
+    );
+    assert_eq!(
+        result["activeParameter"], 1,
+        "unexpected signature help: {result}"
+    );
+    assert!(
+        result["signatures"][0]["label"]
+            .as_str()
+            .is_some_and(|label| label.contains("combine") && label.contains("right")),
+        "expected combine signature label, got {result}"
+    );
+    assert_signature_parameter_offsets(&result, 0, &["combine", "right", "rest"]);
+    assert!(
+        result["signatures"][0]["documentation"]["value"]
+            .as_str()
+            .is_some_and(|doc| doc.contains("combine combines Go values.")),
+        "expected Go signature documentation, got {result}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_signature_help_returns_csharp_method_signature() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("Calculator.cs");
+    let source = "using System;\nclass Calculator {\n    /// <summary>Combines C# values.</summary>\n    int Combine(int Combine, Func<int> factory, int right = 0) { return Combine + factory() + right; }\n    void Caller() {\n        var value = Combine(1, () => 2, 3);\n    }\n}\n";
+    fs::write(&file_path, source).expect("write Calculator.cs");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let (line, character) = position_after(source, "Combine(1, ");
+
+    let result = signature_help(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        2,
+        &file_uri,
+        line,
+        character,
+    );
+    assert_eq!(
+        result["activeParameter"], 1,
+        "unexpected signature help: {result}"
+    );
+    assert!(
+        result["signatures"][0]["label"]
+            .as_str()
+            .is_some_and(|label| label.contains("Combine") && label.contains("right")),
+        "expected Combine signature label, got {result}"
+    );
+    assert_signature_parameter_offsets(&result, 0, &["Combine", "factory", "right"]);
+    assert!(
+        result["signatures"][0]["documentation"]["value"]
+            .as_str()
+            .is_some_and(|doc| doc.contains("Combines C# values.")),
+        "expected C# signature documentation, got {result}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_signature_help_returns_cpp_function_signature() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("calculator.cpp");
+    let source = "/* Combines C++ values. */\nint combine(int combine, int (*factory)(), int* right) { return combine + factory() + *right; }\nint main() {\n    int value = 2;\n    return combine(1, nullptr, &value);\n}\n";
+    fs::write(&file_path, source).expect("write calculator.cpp");
 
     let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
     let file_uri = uri_for(&file_path);
@@ -2429,6 +2615,181 @@ fn bifrost_lsp_server_signature_help_returns_go_function_signature() {
             .as_str()
             .is_some_and(|label| label.contains("combine") && label.contains("right")),
         "expected combine signature label, got {result}"
+    );
+    assert_signature_parameter_offsets(&result, 0, &["combine", "factory", "right"]);
+    assert!(
+        result["signatures"][0]["documentation"]["value"]
+            .as_str()
+            .is_some_and(|doc| doc.contains("Combines C++ values.")),
+        "expected C++ signature documentation, got {result}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_signature_help_returns_python_function_signature() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("calculator.py");
+    let source = "# Combines Python values.\ndef combine(combine: int, right: int = helper(1, 2), *rest: int) -> int:\n    return combine + right\n\nvalue = combine(1, 2, 3)\n";
+    fs::write(&file_path, source).expect("write calculator.py");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let (line, character) = position_after(source, "combine(1, ");
+
+    let result = signature_help(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        2,
+        &file_uri,
+        line,
+        character,
+    );
+    assert_eq!(
+        result["activeParameter"], 1,
+        "unexpected signature help: {result}"
+    );
+    assert!(
+        result["signatures"][0]["label"]
+            .as_str()
+            .is_some_and(|label| label.contains("combine") && label.contains("right")),
+        "expected combine signature label, got {result}"
+    );
+    assert_signature_parameter_offsets(&result, 0, &["combine", "right", "rest"]);
+    assert!(
+        result["signatures"][0]["documentation"]["value"]
+            .as_str()
+            .is_some_and(|doc| doc.contains("Combines Python values.")),
+        "expected Python signature documentation, got {result}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_signature_help_returns_rust_function_signature() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("calculator.rs");
+    let source = "/// Combines Rust values.\nfn combine(combine: i32, right: Option<Result<i32, i32>>) -> i32 {\n    combine + right.unwrap().unwrap()\n}\n\nfn main() {\n    let _ = combine(1, None);\n}\n";
+    fs::write(&file_path, source).expect("write calculator.rs");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let (line, character) = position_after(source, "combine(1, ");
+
+    let result = signature_help(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        2,
+        &file_uri,
+        line,
+        character,
+    );
+    assert_eq!(
+        result["activeParameter"], 1,
+        "unexpected signature help: {result}"
+    );
+    assert!(
+        result["signatures"][0]["label"]
+            .as_str()
+            .is_some_and(|label| label.contains("combine") && label.contains("right")),
+        "expected combine signature label, got {result}"
+    );
+    assert_signature_parameter_offsets(&result, 0, &["combine", "right"]);
+    assert!(
+        result["signatures"][0]["documentation"]["value"]
+            .as_str()
+            .is_some_and(|doc| doc.contains("Combines Rust values.")),
+        "expected Rust signature documentation, got {result}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_signature_help_returns_php_function_signature() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("calculator.php");
+    let source = "<?php\n/** Combines PHP values. */\nfunction combine($combine, callable $factory, int $right = helper(1, 2)) {\n    return $combine + $factory() + $right;\n}\n\n$result = combine(1, fn() => 2, 3);\n";
+    fs::write(&file_path, source).expect("write calculator.php");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let (line, character) = position_after(source, "combine(1, ");
+
+    let result = signature_help(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        2,
+        &file_uri,
+        line,
+        character,
+    );
+    assert_eq!(
+        result["activeParameter"], 1,
+        "unexpected signature help: {result}"
+    );
+    assert!(
+        result["signatures"][0]["label"]
+            .as_str()
+            .is_some_and(|label| label.contains("combine") && label.contains("right")),
+        "expected combine signature label, got {result}"
+    );
+    assert_signature_parameter_offsets(&result, 0, &["$combine", "$factory", "$right"]);
+    assert!(
+        result["signatures"][0]["documentation"]["value"]
+            .as_str()
+            .is_some_and(|doc| doc.contains("Combines PHP values.")),
+        "expected PHP signature documentation, got {result}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_signature_help_returns_scala_function_signature() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("App.scala");
+    let source = "object App {\n  /** Combines Scala values. */\n  def target(target: Int, right: Either[Int, Int] = Left(1)): Int = target + right.fold(identity, identity)\n  val result = target(1, Right(2))\n}\n";
+    fs::write(&file_path, source).expect("write App.scala");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let (line, character) = position_after(source, "target(1, ");
+
+    let result = signature_help(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        2,
+        &file_uri,
+        line,
+        character,
+    );
+    assert_eq!(
+        result["activeParameter"], 1,
+        "unexpected signature help: {result}"
+    );
+    assert!(
+        result["signatures"][0]["label"]
+            .as_str()
+            .is_some_and(|label| label.contains("target") && label.contains("right")),
+        "expected target signature label, got {result}"
+    );
+    assert_signature_parameter_offsets(&result, 0, &["target", "right"]);
+    assert!(
+        result["signatures"][0]["documentation"]["value"]
+            .as_str()
+            .is_some_and(|doc| doc.contains("Combines Scala values.")),
+        "expected Scala signature documentation, got {result}"
     );
 
     shutdown_lsp(child, stdin, reader, stderr);
@@ -2466,6 +2827,7 @@ fn bifrost_lsp_server_signature_help_handles_scala_brace_argument() {
             .is_some_and(|label| label.contains("target") && label.contains("value")),
         "expected target signature label, got {result}"
     );
+    assert_signature_parameter_offsets(&result, 0, &["value"]);
 
     shutdown_lsp(child, stdin, reader, stderr);
 }

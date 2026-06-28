@@ -835,6 +835,68 @@ fn test_constructor_destructor_scoped_definition_and_decl_vs_def_behavior() {
 }
 
 #[test]
+fn cpp_signature_metadata_labels_unnamed_pointer_parameters() {
+    let project = inline_cpp_project(&[(
+        "unnamed.hpp",
+        r#"
+        void consume(int*, int (*)());
+        "#,
+    )]);
+    let analyzer = CppAnalyzer::from_project(project.clone());
+    let function = analyzer
+        .get_declarations(&ProjectFile::new(
+            project.root().to_path_buf(),
+            "unnamed.hpp",
+        ))
+        .into_iter()
+        .find(|cu| cu.is_function() && base_function_name(cu) == "consume")
+        .unwrap();
+    let metadata = analyzer
+        .signature_metadata(&function)
+        .first()
+        .unwrap_or_else(|| panic!("missing metadata for {}", function.fq_name()));
+    let labels: Vec<_> = metadata
+        .parameters()
+        .iter()
+        .map(|parameter| &metadata.label()[parameter.start_byte()..parameter.end_byte()])
+        .collect();
+    assert_eq!(vec!["int*", "int (*)()"], labels);
+}
+
+#[test]
+fn cpp_signature_metadata_anchors_multi_declarator_parameters() {
+    let project = inline_cpp_project(&[(
+        "multi.hpp",
+        r#"
+        void a(int value), b(int value);
+        "#,
+    )]);
+    let analyzer = CppAnalyzer::from_project(project.clone());
+    let function = analyzer
+        .get_declarations(&ProjectFile::new(project.root().to_path_buf(), "multi.hpp"))
+        .into_iter()
+        .find(|cu| cu.is_function() && base_function_name(cu) == "b")
+        .unwrap();
+    let metadata = analyzer
+        .signature_metadata(&function)
+        .first()
+        .unwrap_or_else(|| panic!("missing metadata for {}", function.fq_name()));
+    let parameter = metadata
+        .parameters()
+        .first()
+        .unwrap_or_else(|| panic!("missing parameter metadata for {}", metadata.label()));
+    assert_eq!(
+        "value",
+        &metadata.label()[parameter.start_byte()..parameter.end_byte()]
+    );
+    assert!(
+        parameter.start_byte() > metadata.label().find("b(").expect("b declarator"),
+        "parameter offset should point inside b declarator, got {} with {parameter:?}",
+        metadata.label()
+    );
+}
+
+#[test]
 fn test_namespaced_overloaded_fq_names_and_signature_population() {
     let analyzer = fixture_analyzer();
     let file = ProjectFile::new(

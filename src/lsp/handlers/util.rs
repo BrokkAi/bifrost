@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::analyzer::{CodeUnit, IAnalyzer, Project, ProjectFile, Range as ByteRange};
+use crate::analyzer::common::language_for_file;
+use crate::analyzer::{CodeUnit, IAnalyzer, Language, Project, ProjectFile, Range as ByteRange};
 use crate::lsp::conversion::{byte_range_to_lsp_range, path_to_uri_string, uri_to_path};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 pub(crate) use crate::text_utils::{
@@ -272,7 +273,16 @@ pub(super) fn identifier_selection_range(
 /// /Scaladoc), `/* … */`, and `#` (Python). Rust attributes (`#[…]`) are
 /// intentionally NOT consumed — they aren't doc comments, and including them
 /// would corrupt the markdown.
-pub fn extract_leading_doc_comment(content: &str, decl_start_byte: usize) -> Option<String> {
+#[cfg(test)]
+fn extract_leading_doc_comment(content: &str, decl_start_byte: usize) -> Option<String> {
+    extract_leading_doc_comment_impl(content, decl_start_byte, false)
+}
+
+fn extract_leading_doc_comment_impl(
+    content: &str,
+    decl_start_byte: usize,
+    allow_bare_double_slash: bool,
+) -> Option<String> {
     let line_starts = compute_line_starts(content);
     let line_index = find_line_index_for_offset(&line_starts, decl_start_byte);
     if line_index == 0 {
@@ -290,7 +300,7 @@ pub fn extract_leading_doc_comment(content: &str, decl_start_byte: usize) -> Opt
         if stripped.is_empty() {
             break;
         }
-        if is_doc_comment_line(stripped) {
+        if is_doc_comment_line(stripped, allow_bare_double_slash) {
             comment_lines.push(trimmed);
             continue;
         }
@@ -335,7 +345,8 @@ pub fn leading_doc_comment_for_code_unit(
         return None;
     }
     let source = std::fs::read_to_string(path).ok()?;
-    extract_leading_doc_comment(&source, decl_range.start_byte)
+    let allow_bare_double_slash = language_for_file(candidate.source()) == Language::Go;
+    extract_leading_doc_comment_impl(&source, decl_range.start_byte, allow_bare_double_slash)
 }
 
 /// True for a single-line Rust outer attribute (e.g. `#[derive(Debug)]`,
@@ -346,11 +357,15 @@ fn is_rust_outer_attribute_line(stripped: &str) -> bool {
     stripped.starts_with("#[") && stripped.trim_end().ends_with(']')
 }
 
-fn is_doc_comment_line(stripped: &str) -> bool {
+fn is_doc_comment_line(stripped: &str, allow_bare_double_slash: bool) -> bool {
     // Bare `//` is too noisy (license headers, TODOs, commented-out code), so
     // require the explicit doc-comment prefixes `///` and `//!`.
     stripped.starts_with("///")
         || stripped.starts_with("//!")
+        || (allow_bare_double_slash
+            && stripped.starts_with("//")
+            && !stripped.starts_with("///")
+            && !stripped.starts_with("//!"))
         || stripped.starts_with("/**")
         || stripped.starts_with("/*!")
         || stripped.starts_with("/*")
@@ -371,6 +386,8 @@ fn clean_comment_line(line: &str) -> String {
     let body = if let Some(rest) = trimmed.strip_prefix("///") {
         rest
     } else if let Some(rest) = trimmed.strip_prefix("//!") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("//") {
         rest
     } else if let Some(rest) = trimmed.strip_prefix("/**") {
         rest.strip_suffix("*/").unwrap_or(rest)
@@ -454,6 +471,21 @@ mod tests {
         let decl_start = content.find("def foo").expect("decl");
         let doc = extract_leading_doc_comment(content, decl_start).expect("doc");
         assert_eq!(doc, "Helper module.\nUsed by tests.");
+    }
+
+    #[test]
+    fn extract_doc_comment_rejects_bare_double_slash_by_default() {
+        let content = "// Helper function.\nvoid foo() {}\n";
+        let decl_start = content.find("void foo").expect("decl");
+        assert_eq!(extract_leading_doc_comment(content, decl_start), None);
+    }
+
+    #[test]
+    fn extract_doc_comment_allows_bare_double_slash_when_requested() {
+        let content = "// Helper function.\n// Used by Go docs.\nfunc foo() {}\n";
+        let decl_start = content.find("func foo").expect("decl");
+        let doc = extract_leading_doc_comment_impl(content, decl_start, true).expect("doc");
+        assert_eq!(doc, "Helper function.\nUsed by Go docs.");
     }
 
     #[test]

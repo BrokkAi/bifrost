@@ -204,6 +204,67 @@ fn test_go_summary_orders_same_file_receiver_methods_after_fields() {
 }
 
 #[test]
+fn go_method_signature_metadata_offsets_start_after_receiver() {
+    let analyzer = GoAnalyzer::from_project(inline_project(&[(
+        "methods.go",
+        r#"
+        package main
+
+        type Box struct{}
+
+        func (box Box) Use(box Box) int { return 1 }
+        "#,
+    )]));
+    let method = definition(&analyzer, "main.Box.Use");
+    let metadata = analyzer
+        .signature_metadata(&method)
+        .first()
+        .unwrap_or_else(|| panic!("missing signature metadata for {}", method.fq_name()));
+    let label = metadata.label();
+    assert!(
+        label.contains("func (box Box) Use(box Box)"),
+        "expected receiver and matching parameter text, got {label}"
+    );
+    let parameter = metadata
+        .parameters()
+        .first()
+        .unwrap_or_else(|| panic!("missing parameter metadata for {label}"));
+    assert_eq!("box", parameter.label());
+    assert_eq!("box", &label[parameter.start_byte()..parameter.end_byte()]);
+    assert!(
+        parameter.start_byte() > label.find("Use").expect("method name"),
+        "parameter offset should point after method name, got {label:?} with {parameter:?}"
+    );
+}
+
+#[test]
+fn go_signature_metadata_keeps_anonymous_variadic_marker() {
+    let analyzer = GoAnalyzer::from_project(inline_project(&[(
+        "variadic.go",
+        r#"
+        package main
+
+        func collect(...int) int { return 0 }
+        "#,
+    )]));
+    let function = definition(&analyzer, "main.collect");
+    let metadata = analyzer
+        .signature_metadata(&function)
+        .first()
+        .unwrap_or_else(|| panic!("missing signature metadata for {}", function.fq_name()));
+    let label = metadata.label();
+    let parameter = metadata
+        .parameters()
+        .first()
+        .unwrap_or_else(|| panic!("missing parameter metadata for {label}"));
+    assert_eq!("...int", parameter.label());
+    assert_eq!(
+        "...int",
+        &label[parameter.start_byte()..parameter.end_byte()]
+    );
+}
+
+#[test]
 fn test_go_summary_recovers_top_level_functions_from_error_nodes() {
     let analyzer = GoAnalyzer::from_project(inline_project(&[(
         "proxygroup_test.go",

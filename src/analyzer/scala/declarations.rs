@@ -1,4 +1,4 @@
-use crate::analyzer::{CodeUnit, CodeUnitType, ProjectFile};
+use crate::analyzer::{CodeUnit, CodeUnitType, ParameterMetadata, ProjectFile, SignatureMetadata};
 use tree_sitter::{Node, Tree};
 
 use super::imports::parse_scala_import_infos;
@@ -176,9 +176,10 @@ impl<'a> ScalaVisitor<'a> {
                 Some(code_unit.clone()),
                 None,
             );
-            self.parsed.add_signature(
+            let signature = scala_primary_constructor_signature(node, self.source);
+            self.parsed.add_signature_with_metadata(
                 constructor,
-                scala_primary_constructor_signature(node, self.source),
+                scala_class_signature_metadata(signature, node, self.source),
             );
             self.visit_class_parameter_fields(node, package_name, &code_unit);
         }
@@ -306,8 +307,11 @@ impl<'a> ScalaVisitor<'a> {
         );
         self.parsed
             .add_code_unit(code_unit.clone(), node, self.source, parent, None);
-        self.parsed
-            .add_signature(code_unit, scala_function_signature(node, self.source));
+        let signature = scala_function_signature(node, self.source);
+        self.parsed.add_signature_with_metadata(
+            code_unit,
+            scala_function_signature_metadata(signature, node, self.source),
+        );
     }
 
     fn visit_field_declaration(
@@ -417,6 +421,17 @@ fn scala_primary_constructor_signature(node: Node<'_>, source: &str) -> String {
     format!("def {name}{params} = {{...}}")
 }
 
+fn scala_class_signature_metadata(
+    signature: String,
+    node: Node<'_>,
+    source: &str,
+) -> SignatureMetadata {
+    let Some(parameters_node) = node.child_by_field_name("class_parameters") else {
+        return SignatureMetadata::new(signature, Vec::new());
+    };
+    scala_signature_metadata_for_parameter_nodes(signature, &[parameters_node], source)
+}
+
 fn scala_function_signature(node: Node<'_>, source: &str) -> String {
     let name = node
         .child_by_field_name("name")
@@ -441,6 +456,72 @@ fn scala_function_signature(node: Node<'_>, source: &str) -> String {
         parts.join(""),
         return_type
     )
+}
+
+fn scala_function_signature_metadata(
+    signature: String,
+    node: Node<'_>,
+    source: &str,
+) -> SignatureMetadata {
+    let mut parameter_nodes = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "parameters" {
+            parameter_nodes.push(child);
+        }
+    }
+    scala_signature_metadata_for_parameter_nodes(signature, &parameter_nodes, source)
+}
+
+fn scala_signature_metadata_for_parameter_nodes(
+    signature: String,
+    parameter_nodes: &[Node<'_>],
+    source: &str,
+) -> SignatureMetadata {
+    let parameter_text = parameter_nodes
+        .iter()
+        .map(|node| scala_node_text(*node, source).trim().to_string())
+        .collect::<Vec<_>>()
+        .join("");
+    if parameter_text.is_empty() {
+        return SignatureMetadata::new(signature, Vec::new());
+    }
+    let Some(parameters_start) = signature.find(&parameter_text) else {
+        return SignatureMetadata::new(signature, Vec::new());
+    };
+    let parameters_end = parameters_start + parameter_text.len();
+    let mut search_start = parameters_start;
+    let parameters = scala_parameter_label_nodes(parameter_nodes)
+        .into_iter()
+        .filter_map(|label_node| {
+            let label = scala_node_text(label_node, source).trim();
+            if label.is_empty() || search_start > parameters_end {
+                return None;
+            }
+            let haystack = signature.get(search_start..parameters_end)?;
+            let relative_start = haystack.find(label)?;
+            let start_byte = search_start + relative_start;
+            let end_byte = start_byte + label.len();
+            search_start = end_byte;
+            Some(ParameterMetadata::new(label, start_byte, end_byte))
+        })
+        .collect();
+    SignatureMetadata::new(signature, parameters)
+}
+
+fn scala_parameter_label_nodes<'tree>(parameter_nodes: &[Node<'tree>]) -> Vec<Node<'tree>> {
+    let mut labels = Vec::new();
+    for node in parameter_nodes {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if matches!(child.kind(), "parameter" | "class_parameter")
+                && let Some(name_node) = child.child_by_field_name("name")
+            {
+                labels.push(name_node);
+            }
+        }
+    }
+    labels
 }
 
 fn scala_field_signature(node: Node<'_>, source: &str, name: &str) -> String {

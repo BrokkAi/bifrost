@@ -25,9 +25,9 @@ use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorde
 use crate::analyzer::usages::js_ts_graph::{JsTsUsageIndex, build_jsts_usage_index};
 use crate::analyzer::{
     AliasResolver, AnalyzerConfig, BuildProgress, CodeUnit, IAnalyzer, ImportAnalysisProvider,
-    ImportInfo, Language, LanguageAdapter, Project, ProjectFile, TestAssertionSmell,
-    TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
-    build_reverse_import_index,
+    ImportInfo, Language, LanguageAdapter, ParameterMetadata, Project, ProjectFile,
+    SignatureMetadata, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
+    TreeSitterAnalyzer, TypeHierarchyProvider, build_reverse_import_index,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
@@ -501,6 +501,10 @@ impl IAnalyzer for JavascriptAnalyzer {
         self.inner.signatures(code_unit)
     }
 
+    fn signature_metadata<'a>(&'a self, code_unit: &CodeUnit) -> &'a [SignatureMetadata] {
+        self.inner.signature_metadata(code_unit)
+    }
+
     fn get_top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
         self.inner.get_top_level_declarations(file)
     }
@@ -866,9 +870,10 @@ fn visit_js_function(
         parent.cloned(),
         Some(top_level),
     );
-    parsed.add_signature(
+    let (signature, parameter_text) = js_function_signature(definition, source, name, exported);
+    parsed.add_signature_with_metadata(
         code_unit.clone(),
-        js_function_signature(definition, source, name, exported),
+        js_signature_metadata(signature, definition, source, &parameter_text),
     );
     Some(code_unit)
 }
@@ -902,7 +907,11 @@ fn visit_js_method(
         Some(parent.clone()),
         Some(top_level.clone()),
     );
-    parsed.add_signature(code_unit, js_method_signature(node, source));
+    let (signature, parameter_text) = js_method_signature(node, source);
+    parsed.add_signature_with_metadata(
+        code_unit,
+        js_signature_metadata(signature, node, source, &parameter_text),
+    );
 }
 
 fn visit_js_field(
@@ -1002,10 +1011,16 @@ fn visit_js_variable_statement(
             Some(top_level.clone()),
         );
         if is_function {
-            parsed.add_signature(
-                code_unit.clone(),
-                js_variable_function_signature(definition, child, source, name, exported),
-            );
+            let (signature, parameter_text) =
+                js_variable_function_signature(definition, child, source, name, exported);
+            if let Some(value) = value {
+                parsed.add_signature_with_metadata(
+                    code_unit.clone(),
+                    js_signature_metadata(signature, value, source, &parameter_text),
+                );
+            } else {
+                parsed.add_signature(code_unit.clone(), signature);
+            }
         } else {
             parsed.add_signature(
                 code_unit.clone(),
@@ -1073,6 +1088,70 @@ fn js_object_literal_property_name(node: Node<'_>, source: &str) -> Option<Strin
     (!name.is_empty()).then_some(name)
 }
 
+fn js_signature_metadata(
+    signature: String,
+    function: Node<'_>,
+    source: &str,
+    parameter_text: &str,
+) -> SignatureMetadata {
+    let Some(parameters_start) = signature.find(parameter_text) else {
+        return SignatureMetadata::new(signature, Vec::new());
+    };
+    let parameters_end = parameters_start + parameter_text.len();
+    let mut search_start = parameters_start;
+    let parameters = js_parameter_label_nodes(function)
+        .into_iter()
+        .filter_map(|node| {
+            let label = node_text(node, source).trim();
+            if label.is_empty() || search_start > parameters_end {
+                return None;
+            }
+            let haystack = signature.get(search_start..parameters_end)?;
+            let relative_start = haystack.find(label)?;
+            let start_byte = search_start + relative_start;
+            let end_byte = start_byte + label.len();
+            search_start = end_byte;
+            Some(ParameterMetadata::new(label, start_byte, end_byte))
+        })
+        .collect();
+    SignatureMetadata::new(signature, parameters)
+}
+
+fn js_rendered_parameter_text(function: Node<'_>, source: &str) -> String {
+    if let Some(parameters) = function.child_by_field_name("parameters") {
+        return node_text(parameters, source).trim().to_string();
+    }
+    function
+        .child_by_field_name("parameter")
+        .map(|parameter| format!("({})", node_text(parameter, source).trim()))
+        .unwrap_or_else(|| "()".to_string())
+}
+
+fn js_parameter_label_nodes(function: Node<'_>) -> Vec<Node<'_>> {
+    if let Some(parameters) = function.child_by_field_name("parameters") {
+        let mut cursor = parameters.walk();
+        return parameters
+            .named_children(&mut cursor)
+            .filter_map(js_parameter_label_node)
+            .collect();
+    }
+    function
+        .child_by_field_name("parameter")
+        .and_then(js_parameter_label_node)
+        .into_iter()
+        .collect()
+}
+
+fn js_parameter_label_node(parameter: Node<'_>) -> Option<Node<'_>> {
+    match parameter.kind() {
+        "identifier" | "shorthand_property_identifier_pattern" => Some(parameter),
+        "assignment_pattern" => parameter.child_by_field_name("left"),
+        "rest_pattern" => parameter.named_child(0).or(Some(parameter)),
+        "object_pattern" | "array_pattern" => Some(parameter),
+        _ => None,
+    }
+}
+
 fn visit_js_assignment_declarations(
     file: &ProjectFile,
     source: &str,
@@ -1117,10 +1196,17 @@ fn visit_js_assignment_expression(
         None,
         Some(code_unit.clone()),
     );
-    parsed.add_signature(
-        code_unit.clone(),
-        js_assignment_signature(node, left, value, source),
-    );
+    let (signature, parameter_text) = js_assignment_signature(node, left, value, source);
+    if let Some(value) =
+        value.filter(|value| matches!(value.kind(), "arrow_function" | "function_expression"))
+    {
+        parsed.add_signature_with_metadata(
+            code_unit.clone(),
+            js_signature_metadata(signature, value, source, &parameter_text),
+        );
+    } else {
+        parsed.add_signature(code_unit.clone(), signature);
+    }
     if !is_function
         && let Some(value) = value
         && value.kind() == "object"
@@ -1218,22 +1304,22 @@ fn js_assignment_signature(
     left: Node<'_>,
     value: Option<Node<'_>>,
     source: &str,
-) -> String {
+) -> (String, String) {
     let left_text = trim_statement(node_text(left, source));
     let Some(value) = value else {
-        return trim_statement(node_text(assignment, source));
+        return (trim_statement(node_text(assignment, source)), String::new());
     };
     if matches!(value.kind(), "arrow_function" | "function_expression") {
-        let params = value
-            .child_by_field_name("parameters")
-            .map(|parameters| trim_statement(node_text(parameters, source)))
-            .unwrap_or_else(|| "()".to_string());
-        return format!("{left_text} = function{params} ...");
+        let params = js_rendered_parameter_text(value, source);
+        return (format!("{left_text} = function{params} ..."), params);
     }
     if is_simple_js_initializer(value) {
-        return format!("{left_text} = {}", trim_statement(node_text(value, source)));
+        return (
+            format!("{left_text} = {}", trim_statement(node_text(value, source))),
+            String::new(),
+        );
     }
-    format!("{left_text} = ...")
+    (format!("{left_text} = ..."), String::new())
 }
 
 fn one_line(text: &str) -> String {
@@ -1258,7 +1344,12 @@ fn js_class_signature(node: Node<'_>, source: &str, exported: bool) -> String {
     format!("{} {{", one_line(&signature))
 }
 
-fn js_function_signature(node: Node<'_>, source: &str, name: &str, exported: bool) -> String {
+fn js_function_signature(
+    node: Node<'_>,
+    source: &str,
+    name: &str,
+    exported: bool,
+) -> (String, String) {
     let mut prefix = if exported { "export " } else { "" }.to_string();
     let async_prefix = if node
         .child_by_field_name("body")
@@ -1269,38 +1360,35 @@ fn js_function_signature(node: Node<'_>, source: &str, name: &str, exported: boo
     } else {
         ""
     };
-    let params = node
-        .child_by_field_name("parameters")
-        .map(|parameters| node_text(parameters, source).trim().to_string())
-        .unwrap_or_else(|| "()".to_string());
+    let params = js_rendered_parameter_text(node, source);
     prefix.push_str(async_prefix);
     let jsx_suffix = if exported && is_component_like_name(name) && node_returns_jsx(node, source) {
         ": JSX.Element"
     } else {
         ""
     };
-    with_mutation_comment(
-        format!("{prefix}function {name}{params}{jsx_suffix} ..."),
-        node,
-        source,
+    (
+        with_mutation_comment(
+            format!("{prefix}function {name}{params}{jsx_suffix} ..."),
+            node,
+            source,
+        ),
+        params,
     )
 }
 
-fn js_method_signature(node: Node<'_>, source: &str) -> String {
+fn js_method_signature(node: Node<'_>, source: &str) -> (String, String) {
     let name = node
         .child_by_field_name("name")
         .map(|name| node_text(name, source).trim_matches('"').trim().to_string())
         .unwrap_or_else(|| "method".to_string());
-    let params = node
-        .child_by_field_name("parameters")
-        .map(|parameters| node_text(parameters, source).trim().to_string())
-        .unwrap_or_else(|| "()".to_string());
+    let params = js_rendered_parameter_text(node, source);
     let jsx_suffix = if name == "render" && node_returns_jsx(node, source) {
         ": JSX.Element"
     } else {
         ""
     };
-    format!("function {name}{params}{jsx_suffix} ...")
+    (format!("function {name}{params}{jsx_suffix} ..."), params)
 }
 
 fn js_variable_function_signature(
@@ -1309,7 +1397,7 @@ fn js_variable_function_signature(
     source: &str,
     name: &str,
     exported: bool,
-) -> String {
+) -> (String, String) {
     let value = declarator
         .child_by_field_name("value")
         .unwrap_or(declarator);
@@ -1318,10 +1406,7 @@ fn js_variable_function_signature(
     } else {
         ""
     };
-    let params = value
-        .child_by_field_name("parameters")
-        .map(|parameters| node_text(parameters, source).trim().to_string())
-        .unwrap_or_else(|| "()".to_string());
+    let params = js_rendered_parameter_text(value, source);
     let jsx_suffix = if exported && is_component_like_name(name) && node_returns_jsx(value, source)
     {
         ": JSX.Element"
@@ -1329,10 +1414,13 @@ fn js_variable_function_signature(
         ""
     };
     let export_prefix = if exported { "export " } else { "" };
-    with_mutation_comment(
-        format!("{export_prefix}{async_prefix}{name}{params}{jsx_suffix} => ..."),
-        value,
-        source,
+    (
+        with_mutation_comment(
+            format!("{export_prefix}{async_prefix}{name}{params}{jsx_suffix} => ..."),
+            value,
+            source,
+        ),
+        params,
     )
 }
 

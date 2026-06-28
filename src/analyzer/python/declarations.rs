@@ -1,5 +1,6 @@
 use super::imports::parse_python_import_infos;
 use super::*;
+use crate::analyzer::ParameterMetadata;
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use std::path::Path;
@@ -283,9 +284,10 @@ impl<'a> PythonVisitor<'a> {
             );
             self.parsed
                 .replace_code_unit(code_unit.clone(), range_node, self.source, None, None);
-            self.parsed.add_signature(
+            let signature = python_function_signature(range_node, self.source);
+            self.parsed.add_signature_with_metadata(
                 code_unit.clone(),
-                python_function_signature(range_node, self.source),
+                python_signature_metadata(signature, node, self.source),
             );
             if let Some(module) = &self.module
                 && scope.is_empty()
@@ -568,9 +570,65 @@ fn python_class_signature(node: Node<'_>, source: &str) -> String {
 fn python_function_signature(node: Node<'_>, source: &str) -> String {
     let header = python_header_with_decorators(node, source);
     if let Some((head, tail)) = header.rsplit_once('\n') {
-        format!("{head}\n{} ...", tail.trim_end_matches(':'))
+        format!("{head}\n{tail} ...")
     } else {
-        format!("{} ...", header.trim_end_matches(':'))
+        format!("{header} ...")
+    }
+}
+
+fn python_signature_metadata(signature: String, node: Node<'_>, source: &str) -> SignatureMetadata {
+    let Some(parameters_node) = node.child_by_field_name("parameters") else {
+        return SignatureMetadata::new(signature, Vec::new());
+    };
+    let parameter_text = py_node_text(parameters_node, source).trim();
+    let Some(parameters_start) = signature.find(parameter_text) else {
+        return SignatureMetadata::new(signature, Vec::new());
+    };
+    let parameters_end = parameters_start + parameter_text.len();
+    let mut search_start = parameters_start;
+    let parameters = python_parameter_label_nodes(parameters_node)
+        .into_iter()
+        .filter_map(|label_node| {
+            let label = py_node_text(label_node, source).trim();
+            if label.is_empty() || search_start > parameters_end {
+                return None;
+            }
+            let haystack = signature.get(search_start..parameters_end)?;
+            let relative_start = haystack.find(label)?;
+            let start_byte = search_start + relative_start;
+            let end_byte = start_byte + label.len();
+            search_start = end_byte;
+            Some(ParameterMetadata::new(label, start_byte, end_byte))
+        })
+        .collect();
+    SignatureMetadata::new(signature, parameters)
+}
+
+fn python_parameter_label_nodes(parameters_node: Node<'_>) -> Vec<Node<'_>> {
+    let mut labels = Vec::new();
+    let mut cursor = parameters_node.walk();
+    for child in parameters_node.named_children(&mut cursor) {
+        if let Some(label_node) = python_parameter_label_node(child) {
+            labels.push(label_node);
+        }
+    }
+    labels
+}
+
+fn python_parameter_label_node(node: Node<'_>) -> Option<Node<'_>> {
+    match node.kind() {
+        "identifier" => Some(node),
+        "typed_parameter"
+        | "typed_default_parameter"
+        | "default_parameter"
+        | "list_splat_pattern"
+        | "dictionary_splat_pattern"
+        | "keyword_separator" => node.child_by_field_name("name").or_else(|| {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .find_map(python_parameter_label_node)
+        }),
+        _ => None,
     }
 }
 

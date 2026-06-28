@@ -1,5 +1,6 @@
 use super::*;
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
+use crate::analyzer::{ParameterMetadata, SignatureMetadata};
 use regex::Regex;
 use tree_sitter::Node;
 
@@ -638,14 +639,15 @@ impl<'a> CppVisitor<'a> {
         let code_unit = function.code_unit(self.file.clone());
         self.parsed
             .replace_code_unit(code_unit.clone(), node, self.source, None, None);
-        self.parsed.add_signature(
+        let signature = render_cpp_function_display_signature_from_node(
+            node,
+            self.source,
+            scope.template_signature.as_deref(),
+            true,
+        );
+        self.parsed.add_signature_with_metadata(
             code_unit.clone(),
-            render_cpp_function_display_signature_from_node(
-                node,
-                self.source,
-                scope.template_signature.as_deref(),
-                true,
-            ),
+            cpp_signature_metadata(signature, function_declarator, self.source),
         );
         if let Some(parent) = &scope.class_unit {
             self.parsed.add_child(parent.clone(), code_unit);
@@ -744,14 +746,15 @@ impl<'a> CppVisitor<'a> {
         }
         self.parsed
             .add_code_unit(code_unit.clone(), declaration_node, self.source, None, None);
-        self.parsed.add_signature(
+        let signature = render_cpp_function_display_signature_from_node(
+            declaration_node,
+            self.source,
+            scope.template_signature.as_deref(),
+            false,
+        );
+        self.parsed.add_signature_with_metadata(
             code_unit.clone(),
-            render_cpp_function_display_signature_from_node(
-                declaration_node,
-                self.source,
-                scope.template_signature.as_deref(),
-                false,
-            ),
+            cpp_signature_metadata(signature, declarator, self.source),
         );
         if let Some(parent) = &scope.class_unit {
             self.parsed.add_child(parent.clone(), code_unit);
@@ -1590,6 +1593,101 @@ fn cpp_parameter_signature(parameters_node: Node<'_>, source: &str) -> String {
         "()".to_string()
     } else {
         format!("({})", params.join(", "))
+    }
+}
+
+fn cpp_signature_metadata(
+    signature: String,
+    function_declarator: Node<'_>,
+    source: &str,
+) -> SignatureMetadata {
+    let Some(parameters_node) = function_declarator.child_by_field_name("parameters") else {
+        return SignatureMetadata::new(signature, Vec::new());
+    };
+    let parameter_text = normalize_cpp_whitespace(node_text(parameters_node, source));
+    let search_from = cpp_signature_search_start(&signature, function_declarator, source);
+    let Some(relative_start) = signature
+        .get(search_from..)
+        .and_then(|suffix| suffix.find(&parameter_text))
+    else {
+        return SignatureMetadata::new(signature, Vec::new());
+    };
+    let parameters_start = search_from + relative_start;
+    let parameters_end = parameters_start + parameter_text.len();
+    let mut search_start = parameters_start;
+    let parameters = cpp_parameter_label_nodes(parameters_node)
+        .into_iter()
+        .filter_map(|label_node| {
+            let label = normalize_cpp_whitespace(node_text(label_node, source));
+            if label.is_empty() || search_start > parameters_end {
+                return None;
+            }
+            let haystack = signature.get(search_start..parameters_end)?;
+            let relative_start = haystack.find(&label)?;
+            let start_byte = search_start + relative_start;
+            let end_byte = start_byte + label.len();
+            search_start = end_byte;
+            Some(ParameterMetadata::new(label, start_byte, end_byte))
+        })
+        .collect();
+    SignatureMetadata::new(signature, parameters)
+}
+
+fn cpp_parameter_label_nodes(parameters_node: Node<'_>) -> Vec<Node<'_>> {
+    let mut labels = Vec::new();
+    let mut cursor = parameters_node.walk();
+    for child in parameters_node.named_children(&mut cursor) {
+        match child.kind() {
+            "parameter_declaration" | "optional_parameter_declaration" => {
+                if let Some(name_node) = child
+                    .child_by_field_name("declarator")
+                    .and_then(cpp_declarator_label_node)
+                {
+                    labels.push(name_node);
+                } else {
+                    labels.push(child);
+                }
+            }
+            "variadic_parameter" => labels.push(child),
+            _ => {}
+        }
+    }
+    labels
+}
+
+fn cpp_signature_search_start(
+    signature: &str,
+    function_declarator: Node<'_>,
+    source: &str,
+) -> usize {
+    let Some(enclosing) = enclosing_cpp_declaration_node(function_declarator) else {
+        return 0;
+    };
+    let raw = node_text(enclosing, source);
+    let leading_trim_bytes = raw.len().saturating_sub(raw.trim_start().len());
+    let offset = function_declarator
+        .start_byte()
+        .saturating_sub(enclosing.start_byte())
+        .saturating_sub(leading_trim_bytes);
+    offset.min(signature.len())
+}
+
+fn cpp_declarator_label_node(node: Node<'_>) -> Option<Node<'_>> {
+    match node.kind() {
+        "identifier" | "field_identifier" => Some(node),
+        "pointer_declarator" | "reference_declarator" | "parenthesized_declarator" => node
+            .child_by_field_name("declarator")
+            .or_else(|| last_named_child(node))
+            .and_then(cpp_declarator_label_node),
+        "array_declarator" => node
+            .child_by_field_name("declarator")
+            .and_then(cpp_declarator_label_node),
+        "function_declarator" => node
+            .child_by_field_name("declarator")
+            .or_else(|| node.child_by_field_name("name"))
+            .or_else(|| last_named_child(node))
+            .and_then(cpp_declarator_label_node),
+        _ => None,
     }
 }
 
