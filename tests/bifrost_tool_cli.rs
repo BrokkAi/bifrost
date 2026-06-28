@@ -125,13 +125,13 @@ fn tool_unknown_tool_is_reported() {
 }
 
 #[test]
-fn tool_cannot_be_combined_with_server() {
+fn tool_cannot_be_combined_with_mcp() {
     let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
         .arg("--root")
         .arg(fixture_root())
         .arg("--tool")
         .arg("get_summaries")
-        .arg("--server")
+        .arg("--mcp")
         .arg("searchtools")
         .output()
         .expect("run invalid bifrost args");
@@ -139,7 +139,7 @@ fn tool_cannot_be_combined_with_server() {
     assert!(!output.status.success(), "status should fail");
     let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
     assert!(
-        stderr.contains("--tool cannot be combined with --server"),
+        stderr.contains("--tool cannot be combined with --mcp or --lsp"),
         "{stderr}"
     );
 }
@@ -158,6 +158,6 @@ fn help_mentions_tool_mode() {
     );
 
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
-    assert!(stdout.contains("--tool TOOL_NAME"), "{stdout}");
+    assert!(stdout.contains("--tool NAME"), "{stdout}");
     assert!(stdout.contains("--args"), "{stdout}");
 }
