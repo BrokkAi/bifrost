@@ -1,7 +1,8 @@
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
+use std::io;
 use std::panic;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
@@ -32,7 +33,7 @@ use lsp_types::{
 
 use crate::analyzer::{
     AnalyzerConfig, BuildProgressEvent, BuildProgressPhase, FilesystemProject, MultiRootProject,
-    OverlayProject, Project, WorkspaceAnalyzer,
+    OverlayProject, Project, ProjectFile, WorkspaceAnalyzer,
 };
 use crate::lsp::capabilities::server_capabilities;
 use crate::lsp::conversion::{path_to_uri_string, uri_to_path};
@@ -70,7 +71,7 @@ pub(crate) fn run_with_connection(
     let init_params: InitializeParams = serde_json::from_value(init_params_value)
         .map_err(|err| format!("Failed to decode InitializeParams: {err}"))?;
 
-    let workspace_roots = collect_workspace_roots(&init_params, fallback_root.as_path())?;
+    let workspace_config = collect_workspace_config(&init_params, fallback_root.as_path())?;
     let mut pending_messages = Vec::new();
     let progress = if supports_work_done_progress {
         StartupProgress::create(
@@ -86,7 +87,7 @@ pub(crate) fn run_with_connection(
         progress.begin("Indexing workspace")?;
     }
 
-    let state_result = ServerState::new(workspace_roots, progress.as_ref());
+    let state_result = ServerState::new(workspace_config, progress.as_ref());
     if let Some(progress) = progress.as_ref() {
         let message = if state_result.is_ok() {
             "Indexing complete"
@@ -921,6 +922,8 @@ fn publish_empty_diagnostics(connection: &Connection, uri: &Uri) -> Result<(), S
 
 pub(crate) struct ServerState {
     active_roots: Vec<WorkspaceRoot>,
+    configured_roots: bool,
+    excluded_paths: Vec<PathBuf>,
     workspace: WorkspaceAnalyzer,
     /// The `OverlayProject` is shared with the analyzer (via `Arc<dyn Project>`
     /// inside `WorkspaceAnalyzer`) and with request-time read paths in
@@ -950,6 +953,22 @@ struct WorkspaceRoot {
     analyzer_path: PathBuf,
 }
 
+#[derive(Clone, Debug, Default)]
+struct LspWorkspaceConfig {
+    roots: Vec<WorkspaceRoot>,
+    configured_roots: bool,
+    excluded_paths: Vec<PathBuf>,
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct BifrostInitializationOptions {
+    #[serde(default)]
+    roots: Vec<String>,
+    #[serde(default)]
+    exclude: Vec<String>,
+}
+
 #[derive(Clone, Debug)]
 struct OpenDocument {
     uri: Uri,
@@ -968,13 +987,20 @@ const MALFORMED_DIDCHANGE_LOG_THROTTLE: Duration = Duration::from_secs(60);
 const MALFORMED_DIDCHANGE_LOG_MAX_ENTRIES: usize = 256;
 
 impl ServerState {
-    fn new(roots: Vec<WorkspaceRoot>, progress: Option<&StartupProgress>) -> Result<Self, String> {
-        let (project, active_roots) = build_project_for_roots(roots)?;
+    fn new(config: LspWorkspaceConfig, progress: Option<&StartupProgress>) -> Result<Self, String> {
+        let LspWorkspaceConfig {
+            roots,
+            configured_roots,
+            excluded_paths,
+        } = config;
+        let (project, active_roots) = build_project_for_roots(roots, &excluded_paths)?;
         let overlay = Arc::new(OverlayProject::new(project));
         let project = Arc::clone(&overlay) as Arc<dyn Project>;
         let workspace = build_workspace_for_lsp(project, progress);
         Ok(Self {
             active_roots,
+            configured_roots,
+            excluded_paths,
             workspace,
             overlay,
             completion_cache: completion::CompletionCache::new(),
@@ -992,6 +1018,9 @@ impl ServerState {
         &mut self,
         params: DidChangeWorkspaceFoldersParams,
     ) -> Result<Vec<Uri>, String> {
+        if self.configured_roots {
+            return Ok(Vec::new());
+        }
         let mut roots = self.active_roots.clone();
         for folder in params.event.removed {
             if let Some(path) = workspace_folder_identity_path(&folder.uri) {
@@ -1023,7 +1052,7 @@ impl ServerState {
                 Vec::new(),
             )
         } else {
-            build_project_for_roots(roots)?
+            build_project_for_roots(roots, &self.excluded_paths)?
         };
         let overlay = Arc::new(OverlayProject::new(project));
         for document in self.open_documents.values_mut() {
@@ -1170,8 +1199,104 @@ impl Project for NoWorkspaceProject {
     }
 }
 
+struct ScopedProject {
+    inner: Arc<dyn Project>,
+    excluded_paths: Vec<PathBuf>,
+}
+
+impl ScopedProject {
+    fn new(inner: Arc<dyn Project>, excluded_paths: Vec<PathBuf>) -> Self {
+        Self {
+            inner,
+            excluded_paths,
+        }
+    }
+
+    fn is_excluded_abs_path(&self, path: &Path) -> bool {
+        path_is_within_any(path, &self.excluded_paths)
+    }
+
+    fn is_excluded_file(&self, file: &ProjectFile) -> bool {
+        self.is_excluded_abs_path(&file.abs_path())
+    }
+
+    fn filter_files(&self, files: BTreeSet<ProjectFile>) -> BTreeSet<ProjectFile> {
+        files
+            .into_iter()
+            .filter(|file| !self.is_excluded_file(file))
+            .collect()
+    }
+}
+
+impl Project for ScopedProject {
+    fn root(&self) -> &Path {
+        self.inner.root()
+    }
+
+    fn analyzer_languages(&self) -> BTreeSet<crate::analyzer::Language> {
+        self.all_files()
+            .map(|files| {
+                files
+                    .iter()
+                    .map(crate::analyzer::common::language_for_file)
+                    .filter(|language| *language != crate::analyzer::Language::None)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>> {
+        self.inner.all_files().map(|files| self.filter_files(files))
+    }
+
+    fn analyzable_files(
+        &self,
+        language: crate::analyzer::Language,
+    ) -> io::Result<BTreeSet<ProjectFile>> {
+        self.inner
+            .analyzable_files(language)
+            .map(|files| self.filter_files(files))
+    }
+
+    fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile> {
+        let file = self.inner.file_by_rel_path(rel_path)?;
+        (!self.is_excluded_file(&file)).then_some(file)
+    }
+
+    fn file_by_abs_path(&self, abs_path: &Path) -> Option<ProjectFile> {
+        if self.is_excluded_abs_path(abs_path) {
+            return None;
+        }
+        self.inner.file_by_abs_path(abs_path)
+    }
+
+    fn file_by_abs_path_allow_missing(&self, abs_path: &Path) -> Option<ProjectFile> {
+        if self.is_excluded_abs_path(abs_path) {
+            return None;
+        }
+        self.inner.file_by_abs_path_allow_missing(abs_path)
+    }
+
+    fn persistence_root(&self) -> Option<&Path> {
+        self.inner.persistence_root()
+    }
+
+    fn is_gitignored(&self, rel_path: &Path) -> bool {
+        self.inner.is_gitignored(rel_path)
+    }
+
+    fn read_source(&self, file: &ProjectFile) -> io::Result<String> {
+        self.inner.read_source(file)
+    }
+
+    fn has_overlay(&self, file: &ProjectFile) -> bool {
+        self.inner.has_overlay(file)
+    }
+}
+
 fn build_project_for_roots(
     roots: Vec<WorkspaceRoot>,
+    excluded_paths: &[PathBuf],
 ) -> Result<(Arc<dyn Project>, Vec<WorkspaceRoot>), String> {
     let mut roots = roots;
     normalize_roots(&mut roots);
@@ -1179,7 +1304,7 @@ fn build_project_for_roots(
         .iter()
         .map(|root| root.analyzer_path.clone())
         .collect();
-    if roots.len() == 1 {
+    let project: Arc<dyn Project> = if roots.len() == 1 {
         let root = roots[0].analyzer_path.clone();
         let project = FilesystemProject::new(&root).map_err(|err| {
             format!(
@@ -1187,11 +1312,18 @@ fn build_project_for_roots(
                 root.display()
             )
         })?;
-        return Ok((Arc::new(project), roots));
-    }
-    let project = MultiRootProject::new(analyzer_roots)
-        .map_err(|err| format!("Failed to initialize multi-root project: {err}"))?;
-    Ok((Arc::new(project), roots))
+        Arc::new(project)
+    } else {
+        let project = MultiRootProject::new(analyzer_roots)
+            .map_err(|err| format!("Failed to initialize multi-root project: {err}"))?;
+        Arc::new(project)
+    };
+    let project = if excluded_paths.is_empty() {
+        project
+    } else {
+        Arc::new(ScopedProject::new(project, excluded_paths.to_vec())) as Arc<dyn Project>
+    };
+    Ok((project, roots))
 }
 
 fn normalize_roots(roots: &mut Vec<WorkspaceRoot>) {
@@ -1293,6 +1425,41 @@ fn build_workspace_for_lsp(
     }
 }
 
+fn collect_workspace_config(
+    params: &InitializeParams,
+    fallback: &Path,
+) -> Result<LspWorkspaceConfig, String> {
+    let options = bifrost_initialization_options(params);
+    let fallback_base = fallback
+        .canonicalize()
+        .unwrap_or_else(|_| fallback.to_path_buf());
+    let configured_roots = !options.roots.is_empty();
+    let roots = if configured_roots {
+        let roots: Vec<WorkspaceRoot> = options
+            .roots
+            .into_iter()
+            .filter_map(|root| workspace_root_for_config_path(&root, &fallback_base))
+            .collect();
+        if roots.is_empty() {
+            return Err("bifrost.roots did not contain any usable directories".to_string());
+        }
+        roots
+    } else {
+        collect_workspace_roots(params, fallback)?
+    };
+    let excluded_paths = options
+        .exclude
+        .into_iter()
+        .filter_map(|path| scoped_config_path(&path, &fallback_base))
+        .map(|path| path.canonicalize().unwrap_or(path))
+        .collect();
+    Ok(LspWorkspaceConfig {
+        roots,
+        configured_roots,
+        excluded_paths,
+    })
+}
+
 fn collect_workspace_roots(
     params: &InitializeParams,
     fallback: &Path,
@@ -1321,4 +1488,79 @@ fn collect_workspace_roots(
     }
 
     Ok(vec![workspace_root_for_path(fallback.to_path_buf())?])
+}
+
+fn bifrost_initialization_options(params: &InitializeParams) -> BifrostInitializationOptions {
+    params
+        .initialization_options
+        .clone()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default()
+}
+
+fn workspace_root_for_config_path(raw: &str, base: &Path) -> Option<WorkspaceRoot> {
+    let Some(path) = scoped_config_path(raw, base) else {
+        eprintln!("[bifrost-lsp] ignoring empty bifrost root setting");
+        return None;
+    };
+    match path.canonicalize() {
+        Ok(analyzer_path) if analyzer_path.is_dir() => Some(WorkspaceRoot {
+            identity_uri: path_to_uri_string(&path),
+            identity_path: path,
+            analyzer_path,
+        }),
+        Ok(path) => {
+            eprintln!(
+                "[bifrost-lsp] ignoring bifrost root that is not a directory: {}",
+                path.display()
+            );
+            None
+        }
+        Err(err) => {
+            eprintln!(
+                "[bifrost-lsp] ignoring unavailable bifrost root {}: {err}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+fn scoped_config_path(raw: &str, base: &Path) -> Option<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(trimmed);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        base.join(path)
+    };
+    Some(normalize_path_lexically(path))
+}
+
+fn normalize_path_lexically(path: PathBuf) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    normalized
+}
+
+fn path_is_within_any(path: &Path, candidates: &[PathBuf]) -> bool {
+    let normalized = path
+        .canonicalize()
+        .unwrap_or_else(|_| normalize_path_lexically(path.to_path_buf()));
+    candidates
+        .iter()
+        .any(|candidate| normalized == *candidate || normalized.starts_with(candidate))
 }

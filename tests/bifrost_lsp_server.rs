@@ -236,6 +236,155 @@ fn bifrost_lsp_server_indexes_all_startup_workspace_folders() {
 }
 
 #[test]
+fn bifrost_lsp_server_honors_configured_roots() {
+    let temp = TempDir::new().expect("tempdir");
+    let parent = temp.path().canonicalize().expect("canon temp");
+    let included = parent.join("included");
+    let sibling = parent.join("sibling");
+    fs::create_dir_all(&included).expect("create included");
+    fs::create_dir_all(&sibling).expect("create sibling");
+    fs::write(
+        included.join("Included.java"),
+        "class IncludedRoot {\n    void includedOnly() {}\n}\n",
+    )
+    .expect("write Included.java");
+    fs::write(
+        sibling.join("Sibling.java"),
+        "class SiblingRoot {\n    void siblingLeak() {}\n}\n",
+    )
+    .expect("write Sibling.java");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server_with_params(
+        &parent,
+        json!({
+            "processId": null,
+            "rootUri": uri_for(&parent),
+            "workspaceFolders": [{"uri": uri_for(&parent), "name": "workspace"}],
+            "initializationOptions": {
+                "roots": [included.display().to_string()]
+            },
+            "capabilities": {"workspace": {"workspaceFolders": true}}
+        }),
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "workspace/symbol",
+            "params": {"query": "Only"}
+        }),
+    );
+    let response = read_response_for_id(&mut reader, &mut stderr, 2);
+    let symbols = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected workspace symbols, got {response}"));
+    assert!(
+        symbols
+            .iter()
+            .any(|symbol| symbol["name"] == "includedOnly"),
+        "configured root should be indexed: {symbols:#?}"
+    );
+    assert!(
+        symbols.iter().all(|symbol| symbol["name"] != "siblingLeak"),
+        "workspace sibling outside configured roots should not be indexed: {symbols:#?}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_honors_excluded_paths() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let src = root.join("src");
+    let generated = root.join("generated");
+    fs::create_dir_all(&src).expect("create src");
+    fs::create_dir_all(&generated).expect("create generated");
+    let kept_path = src.join("Kept.java");
+    let excluded_path = generated.join("Generated.java");
+    fs::write(&kept_path, "class KeptRoot {\n    void keptOnly() {}\n}\n")
+        .expect("write Kept.java");
+    fs::write(
+        &excluded_path,
+        "class GeneratedRoot {\n    void generatedLeak() {}\n}\n",
+    )
+    .expect("write Generated.java");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server_with_params(
+        &root,
+        json!({
+            "processId": null,
+            "rootUri": uri_for(&root),
+            "workspaceFolders": [{"uri": uri_for(&root), "name": "workspace"}],
+            "initializationOptions": {
+                "exclude": ["generated"]
+            },
+            "capabilities": {"workspace": {"workspaceFolders": true}}
+        }),
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "workspace/symbol",
+            "params": {"query": "Only"}
+        }),
+    );
+    let symbols_response = read_response_for_id(&mut reader, &mut stderr, 2);
+    let symbols = symbols_response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected workspace symbols, got {symbols_response}"));
+    assert!(
+        symbols.iter().any(|symbol| symbol["name"] == "keptOnly"),
+        "non-excluded source should be indexed: {symbols:#?}"
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "workspace/symbol",
+            "params": {"query": "Leak"}
+        }),
+    );
+    let excluded_workspace_response = read_response_for_id(&mut reader, &mut stderr, 3);
+    let excluded_workspace_symbols = excluded_workspace_response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected workspace symbols, got {excluded_workspace_response}"));
+    assert!(
+        excluded_workspace_symbols
+            .iter()
+            .all(|symbol| symbol["name"] != "generatedLeak"),
+        "excluded source should not be indexed: {excluded_workspace_symbols:#?}"
+    );
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "textDocument/documentSymbol",
+            "params": {"textDocument": {"uri": uri_for(&excluded_path)}}
+        }),
+    );
+    let excluded_symbols_response = read_response_for_id(&mut reader, &mut stderr, 4);
+    assert!(
+        excluded_symbols_response["result"].is_null()
+            || excluded_symbols_response["result"]
+                .as_array()
+                .is_some_and(|symbols| symbols.is_empty()),
+        "excluded file should not resolve for documentSymbol: {excluded_symbols_response}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
 fn bifrost_lsp_server_adds_workspace_folder_dynamically() {
     let temp = TempDir::new().expect("tempdir");
     let parent = temp.path().canonicalize().expect("canon temp");
