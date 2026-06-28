@@ -1,6 +1,6 @@
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::{Language, ProjectFile};
-use ignore::WalkBuilder;
+use ignore::{WalkBuilder, WalkState};
 use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -442,7 +442,6 @@ fn common_ancestor(paths: &[PathBuf]) -> Option<PathBuf> {
 }
 
 fn collect_project_files(root: &Path) -> io::Result<BTreeSet<ProjectFile>> {
-    let mut files = BTreeSet::new();
     let walker = WalkBuilder::new(root)
         .hidden(false)
         .ignore(false)
@@ -459,24 +458,62 @@ fn collect_project_files(root: &Path) -> io::Result<BTreeSet<ProjectFile>> {
         // detection (`.git/info/exclude`) is unaffected: the ignore crate reads
         // it during repo detection, independent of whether the walk yields `.git`.
         .filter_entry(|entry| entry.file_name() != std::ffi::OsStr::new(".git"))
-        .build();
+        // Parallel traversal: the walk is `stat`/`readdir`-bound, so on large
+        // trees (and high-latency filesystems) spreading directory enumeration
+        // across threads is a substantial win. The ignore crate defaults the
+        // thread count to the available parallelism.
+        .build_parallel();
 
-    for entry in walker {
-        let entry = entry.map_err(|err| io::Error::other(err.to_string()))?;
-        if !entry
-            .file_type()
-            .is_some_and(|file_type| file_type.is_file())
-        {
-            continue;
-        }
+    // Each visitor thread streams its entries over the channel; a dedicated
+    // collector thread merges them into the ordered `BTreeSet` concurrently with
+    // the walk. We pay the ordering cost once, on the receiver side, instead of
+    // contending a shared sorted set across every walker thread -- and draining
+    // as we go keeps the peak memory to roughly one copy rather than buffering
+    // the whole channel before building the set. The first walk error wins and
+    // is surfaced after the traversal completes.
+    let (tx, rx) = std::sync::mpsc::channel::<ProjectFile>();
+    let collector = std::thread::spawn(move || rx.into_iter().collect::<BTreeSet<ProjectFile>>());
+    let first_error: Arc<Mutex<Option<io::Error>>> = Arc::new(Mutex::new(None));
+    walker.run(|| {
+        let tx = tx.clone();
+        let first_error = Arc::clone(&first_error);
+        Box::new(move |result| {
+            let entry = match result {
+                Ok(entry) => entry,
+                Err(err) => {
+                    let mut slot = first_error.lock().expect("walk error lock poisoned");
+                    if slot.is_none() {
+                        *slot = Some(io::Error::other(err.to_string()));
+                    }
+                    // Keep walking the rest of the tree; the captured error is
+                    // returned to the caller once the traversal finishes.
+                    return WalkState::Continue;
+                }
+            };
+            if entry
+                .file_type()
+                .is_some_and(|file_type| file_type.is_file())
+            {
+                let rel = entry
+                    .path()
+                    .strip_prefix(root)
+                    .expect("walker returned a path outside the project root");
+                // Receiver is dropped only after the walk returns, so a send
+                // failure is impossible here; ignore the result to stay panic-free.
+                let _ = tx.send(ProjectFile::new(root.to_path_buf(), rel.to_path_buf()));
+            }
+            WalkState::Continue
+        })
+    });
+    // Drop our retained sender so the collector's iterator terminates once every
+    // walker thread's clone has also been dropped.
+    drop(tx);
 
-        let rel = entry
-            .path()
-            .strip_prefix(root)
-            .expect("walkdir returned a path outside the project root");
-        files.insert(ProjectFile::new(root.to_path_buf(), rel.to_path_buf()));
+    let files = collector.join().expect("file-collector thread panicked");
+
+    if let Some(err) = first_error.lock().expect("walk error lock poisoned").take() {
+        return Err(err);
     }
-
     Ok(files)
 }
 
