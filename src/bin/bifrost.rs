@@ -307,23 +307,12 @@ fn print_tool_help(name: &str) -> Result<(), String> {
     match properties {
         Some(properties) if !properties.is_empty() => {
             println!("\nPARAMETERS:");
-            let width = properties
-                .keys()
-                .map(|key| key.chars().count())
-                .max()
-                .unwrap_or(0);
             for (param, param_schema) in properties {
-                let kind = param_type(param_schema);
-                let presence = if required.contains(param.as_str()) {
-                    "required"
-                } else {
-                    "optional"
-                };
-                let description = param_schema
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                println!("    {param:<width$}  {kind:<7}  {presence:<8}  {description}");
+                let summary = param_summary(param_schema, required.contains(param.as_str()));
+                println!("    {param}  ({summary})");
+                if let Some(description) = param_schema.get("description").and_then(Value::as_str) {
+                    println!("        {description}");
+                }
             }
         }
         _ => println!("\nPARAMETERS: none"),
@@ -331,20 +320,66 @@ fn print_tool_help(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// JSON-Schema "type" for a parameter, collapsing the common non-`type` shapes
-/// (`anyOf`, `enum`) into a readable label.
-fn param_type(schema: &Value) -> &'static str {
+/// A human-readable type/constraint summary for one parameter, built entirely
+/// from its JSON-Schema, e.g. `array of strings, required` or
+/// `integer, optional, default 20, minimum 1`.
+fn param_summary(schema: &Value, required: bool) -> String {
+    let mut parts = vec![type_phrase(schema)];
+    parts.push(if required { "required" } else { "optional" }.to_string());
+    if let Some(default) = schema.get("default") {
+        parts.push(format!("default {}", scalar(default)));
+    }
+    if let Some(minimum) = schema.get("minimum") {
+        parts.push(format!("minimum {}", scalar(minimum)));
+    }
+    if let Some(maximum) = schema.get("maximum") {
+        parts.push(format!("maximum {}", scalar(maximum)));
+    }
+    if let Some(min_items) = schema.get("minItems") {
+        parts.push(format!("min items {}", scalar(min_items)));
+    }
+    if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+        let rendered: Vec<String> = values.iter().map(scalar).collect();
+        parts.push(format!("one of: {}", rendered.join(", ")));
+    }
+    parts.join(", ")
+}
+
+/// The base type phrase, naming the element type for arrays (`array of strings`)
+/// and collapsing `anyOf`/untyped schemas to `value`.
+fn type_phrase(schema: &Value) -> String {
     match schema.get("type").and_then(Value::as_str) {
-        Some("string") => "string",
-        Some("integer") => "integer",
-        Some("number") => "number",
-        Some("boolean") => "boolean",
-        Some("array") => "array",
-        Some("object") => "object",
-        Some(_) => "value",
-        None if schema.get("anyOf").is_some() => "any",
-        None if schema.get("enum").is_some() => "enum",
-        None => "value",
+        Some("array") => {
+            let items = schema.get("items").map(array_item_noun).unwrap_or("items");
+            format!("array of {items}")
+        }
+        Some(other) => other.to_string(),
+        None => "value".to_string(),
+    }
+}
+
+/// Plural noun for an array's element type; `items` when the element schema is
+/// a composite (e.g. `anyOf`) with no single `type`.
+fn array_item_noun(items: &Value) -> &'static str {
+    match items.get("type").and_then(Value::as_str) {
+        Some("string") => "strings",
+        Some("integer") => "integers",
+        Some("number") => "numbers",
+        Some("boolean") => "booleans",
+        Some("object") => "objects",
+        Some("array") => "arrays",
+        _ => "items",
+    }
+}
+
+/// Render a scalar schema value (default/min/max/enum) without JSON quoting.
+fn scalar(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Bool(flag) => flag.to_string(),
+        Value::Number(number) => number.to_string(),
+        Value::Null => "null".to_string(),
+        other => other.to_string(),
     }
 }
 
