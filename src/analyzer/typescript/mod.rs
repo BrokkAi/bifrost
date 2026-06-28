@@ -5,9 +5,9 @@ use crate::analyzer::clone_detection::{
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::{
     AliasResolver, AnalyzerConfig, BuildProgress, CodeUnit, IAnalyzer, ImportAnalysisProvider,
-    ImportInfo, Language, Project, ProjectFile, TestAssertionSmell, TestAssertionWeights,
-    TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
-    build_reverse_import_index,
+    ImportInfo, Language, Project, ProjectFile, SignatureMetadata, TestAssertionSmell,
+    TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider,
+    TypeHierarchyProvider, build_reverse_import_index,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
@@ -513,6 +513,10 @@ impl IAnalyzer for TypescriptAnalyzer {
         self.inner.signatures(code_unit)
     }
 
+    fn signature_metadata<'a>(&'a self, code_unit: &CodeUnit) -> &'a [SignatureMetadata] {
+        self.inner.signature_metadata(code_unit)
+    }
+
     fn get_top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
         self.inner.get_top_level_declarations(file)
     }
@@ -996,9 +1000,13 @@ fn visit_ts_function(
         parent.cloned(),
         Some(top_level.clone()),
     );
-    parsed.add_signature(
+    let signature = ts_function_signature(node, source, exported);
+    parsed.add_signature_with_metadata(
         code_unit.clone(),
-        ts_function_signature(node, source, exported),
+        SignatureMetadata::with_parameter_labels(
+            signature,
+            ts_parameter_labels(definition, source),
+        ),
     );
     visit_ts_return_object_literal_properties(
         file, source, definition, &code_unit, &top_level, parsed,
@@ -1105,14 +1113,20 @@ fn visit_ts_value(
             Some(top_level.clone()),
         );
         if is_function {
-            parsed.add_signature(
-                code_unit.clone(),
-                ts_variable_function_signature(definition, child, source, exported),
-            );
+            let signature = ts_variable_function_signature(definition, child, source, exported);
             if let Some(value) = value {
+                parsed.add_signature_with_metadata(
+                    code_unit.clone(),
+                    SignatureMetadata::with_parameter_labels(
+                        signature,
+                        ts_parameter_labels(value, source),
+                    ),
+                );
                 visit_ts_return_object_literal_properties(
                     file, source, value, &code_unit, &top_level, parsed,
                 );
+            } else {
+                parsed.add_signature(code_unit.clone(), signature);
             }
         } else {
             parsed.add_signature(
@@ -1302,6 +1316,21 @@ fn ts_parameter_name_node(parameter: Node<'_>) -> Option<Node<'_>> {
             .or_else(|| parameter.child_by_field_name("name")),
         _ => None,
     }
+}
+
+fn ts_parameter_labels(function: Node<'_>, source: &str) -> Vec<String> {
+    let Some(parameters) = function.child_by_field_name("parameters") else {
+        return Vec::new();
+    };
+    let mut cursor = parameters.walk();
+    parameters
+        .named_children(&mut cursor)
+        .filter_map(ts_parameter_name_node)
+        .filter_map(|name| {
+            let label = node_text(name, source).trim();
+            (!label.is_empty()).then(|| label.to_string())
+        })
+        .collect()
 }
 
 fn ts_function_returns_parameter_shape(
@@ -1522,15 +1551,16 @@ fn visit_ts_method(
         Some(parent.clone()),
         Some(top_level.clone()),
     );
-    parsed.add_signature(
+    let signature = match node.kind() {
+        "method_definition" => format!(
+            "{} {{ ... }}",
+            trim_statement(node_text(node, source).split('{').next().unwrap_or(""))
+        ),
+        _ => trim_statement(node_text(node, source).split('{').next().unwrap_or("")),
+    };
+    parsed.add_signature_with_metadata(
         code_unit,
-        match node.kind() {
-            "method_definition" => format!(
-                "{} {{ ... }}",
-                trim_statement(node_text(node, source).split('{').next().unwrap_or(""))
-            ),
-            _ => trim_statement(node_text(node, source).split('{').next().unwrap_or("")),
-        },
+        SignatureMetadata::with_parameter_labels(signature, ts_parameter_labels(node, source)),
     );
 }
 

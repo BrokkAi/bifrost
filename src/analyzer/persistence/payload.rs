@@ -10,7 +10,7 @@
 //! re-attached on hydrate using the row key from the storage layer.
 
 use crate::analyzer::tree_sitter_analyzer::FileState;
-use crate::analyzer::{CodeUnit, CodeUnitType, ImportInfo, ProjectFile, Range};
+use crate::analyzer::{CodeUnit, CodeUnitType, ImportInfo, ProjectFile, Range, SignatureMetadata};
 use crate::hash::{HashMap, HashSet, map_with_capacity, set_with_capacity};
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -18,7 +18,7 @@ use std::io;
 /// Bincode envelope version. Bumped when the wire format changes in a way
 /// that cannot be deserialized by older readers; persisted rows tagged with
 /// an unknown version are treated as dirty and re-analyzed.
-pub(crate) const PAYLOAD_VERSION: u32 = 1;
+pub(crate) const PAYLOAD_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct PersistedCodeUnit {
@@ -65,6 +65,7 @@ struct PersistedFileState {
     raw_supertypes: Vec<(PersistedCodeUnit, Vec<String>)>,
     type_identifiers: Vec<String>,
     signatures: Vec<(PersistedCodeUnit, Vec<String>)>,
+    signature_metadata: Vec<(PersistedCodeUnit, Vec<SignatureMetadata>)>,
     ranges: Vec<(PersistedCodeUnit, Vec<Range>)>,
     children: Vec<(PersistedCodeUnit, Vec<PersistedCodeUnit>)>,
     type_aliases: Vec<PersistedCodeUnit>,
@@ -99,6 +100,11 @@ impl PersistedFileState {
                 .signatures
                 .iter()
                 .map(|(unit, sigs)| (PersistedCodeUnit::from_code_unit(unit), sigs.clone()))
+                .collect(),
+            signature_metadata: state
+                .signature_metadata
+                .iter()
+                .map(|(unit, metadata)| (PersistedCodeUnit::from_code_unit(unit), metadata.clone()))
                 .collect(),
             ranges: state
                 .ranges
@@ -153,6 +159,11 @@ impl PersistedFileState {
             signatures.insert(unit.into_code_unit(source), sigs);
         }
 
+        let mut signature_metadata = map_with_capacity(self.signature_metadata.len());
+        for (unit, metadata) in self.signature_metadata {
+            signature_metadata.insert(unit.into_code_unit(source), metadata);
+        }
+
         let mut ranges = map_with_capacity(self.ranges.len());
         for (unit, file_ranges) in self.ranges {
             ranges.insert(unit.into_code_unit(source), file_ranges);
@@ -183,6 +194,7 @@ impl PersistedFileState {
             raw_supertypes,
             type_identifiers,
             signatures,
+            signature_metadata,
             ranges,
             children,
             type_aliases,

@@ -7,7 +7,7 @@ use crate::analyzer::{
 };
 use crate::lsp::conversion::{byte_range_to_lsp_range, position_to_byte_offset};
 use crate::lsp::handlers::util::{
-    extract_leading_doc_comment, identifier_span_at_offset, read_document_for_uri,
+    identifier_span_at_offset, leading_doc_comment_for_code_unit, read_document_for_uri,
     resolve_first_identifier_candidate,
 };
 
@@ -48,7 +48,7 @@ pub fn handle(
     );
 
     let mut value = format!("```{language_tag}\n{}\n```", skeleton.trim_end());
-    if let Some(doc) = leading_doc_comment(analyzer, &candidate) {
+    if let Some(doc) = leading_doc_comment_for_code_unit(analyzer, &candidate) {
         value.push_str("\n\n---\n\n");
         value.push_str(&doc);
     }
@@ -60,16 +60,6 @@ pub fn handle(
         }),
         range: Some(highlight_range),
     })
-}
-
-/// Read the candidate's source file and lift any contiguous block of
-/// comment-like lines that immediately precedes the declaration. Returns
-/// `None` if the file can't be read, the candidate has no recorded range, or
-/// no doc comment is present.
-fn leading_doc_comment(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> Option<String> {
-    let decl_range = analyzer.ranges(candidate).iter().min().copied()?;
-    let source = candidate.source().read_to_string().ok()?;
-    extract_leading_doc_comment(&source, decl_range.start_byte)
 }
 
 fn pick_candidate(analyzer: &dyn IAnalyzer, identifier: &str) -> Option<CodeUnit> {

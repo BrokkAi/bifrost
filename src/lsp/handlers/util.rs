@@ -9,6 +9,8 @@ pub(crate) use crate::text_utils::{
 };
 use lsp_types::{Location, Range as LspRange, Uri};
 
+const MAX_DOC_COMMENT_SOURCE_BYTES: u64 = 1_000_000;
+
 /// Resolve an LSP `Uri` to a [`ProjectFile`], read its contents (consulting
 /// `project.read_source` so unsaved overlays win over disk), and compute the
 /// line-start index — the prologue used by every per-file handler. Returns
@@ -316,6 +318,24 @@ pub fn extract_leading_doc_comment(content: &str, decl_start_byte: usize) -> Opt
     } else {
         Some(joined)
     }
+}
+
+/// Read the candidate's source file and lift any contiguous block of
+/// comment-like lines that immediately precedes the declaration. Returns
+/// `None` if the file can't be read, the candidate has no recorded range, the
+/// source file is too large for an interactive LSP request, or no doc comment
+/// is present.
+pub fn leading_doc_comment_for_code_unit(
+    analyzer: &dyn IAnalyzer,
+    candidate: &CodeUnit,
+) -> Option<String> {
+    let decl_range = analyzer.ranges(candidate).iter().min().copied()?;
+    let path = candidate.source().abs_path();
+    if std::fs::metadata(&path).ok()?.len() > MAX_DOC_COMMENT_SOURCE_BYTES {
+        return None;
+    }
+    let source = std::fs::read_to_string(path).ok()?;
+    extract_leading_doc_comment(&source, decl_range.start_byte)
 }
 
 /// True for a single-line Rust outer attribute (e.g. `#[derive(Debug)]`,

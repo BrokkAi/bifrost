@@ -2280,7 +2280,7 @@ fn bifrost_lsp_server_signature_help_returns_java_method_signature() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().canonicalize().expect("canon temp");
     let file_path = root.join("Calculator.java");
-    let source = "class Calculator {\n    int sum(int left, int right) { return left + right; }\n    void caller() {\n        int value = sum(1, 2);\n    }\n}\n";
+    let source = "class Calculator {\n    /**\n     * Adds two values.\n     */\n    int sum(int sum, int right) { return sum + right; }\n    void caller() {\n        int value = sum(1, 2);\n    }\n}\n";
     fs::write(&file_path, source).expect("write Calculator.java");
 
     let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
@@ -2307,8 +2307,15 @@ fn bifrost_lsp_server_signature_help_returns_java_method_signature() {
     assert!(
         result["signatures"][0]["label"]
             .as_str()
-            .is_some_and(|label| label.contains("sum") && label.contains("left")),
+            .is_some_and(|label| label.contains("sum") && label.contains("right")),
         "expected sum signature label, got {result}"
+    );
+    assert_signature_parameter_offsets(&result, 0, &["sum", "right"]);
+    assert!(
+        result["signatures"][0]["documentation"]["value"]
+            .as_str()
+            .is_some_and(|doc| doc.contains("Adds two values.")),
+        "expected Java signature documentation, got {result}"
     );
 
     shutdown_lsp(child, stdin, reader, stderr);
@@ -2319,7 +2326,7 @@ fn bifrost_lsp_server_signature_help_returns_typescript_function_signature() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().canonicalize().expect("canon temp");
     let file_path = root.join("sample.ts");
-    let source = "function combine(left: number, right: number): number {\n  return left + right;\n}\nconst result = combine(1, 2);\n";
+    let source = "/**\n * Combines two values.\n */\nfunction combine(combine: number, right: number): number {\n  return combine + right;\n}\nconst result = combine(1, 2);\n";
     fs::write(&file_path, source).expect("write sample.ts");
 
     let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
@@ -2344,6 +2351,13 @@ fn bifrost_lsp_server_signature_help_returns_typescript_function_signature() {
             .as_str()
             .is_some_and(|label| label.contains("combine") && label.contains("right")),
         "expected combine signature label, got {result}"
+    );
+    assert_signature_parameter_offsets(&result, 0, &["combine", "right"]);
+    assert!(
+        result["signatures"][0]["documentation"]["value"]
+            .as_str()
+            .is_some_and(|doc| doc.contains("Combines two values.")),
+        "expected TypeScript signature documentation, got {result}"
     );
 
     shutdown_lsp(child, stdin, reader, stderr);
@@ -5161,6 +5175,41 @@ fn signature_help(
         "expected signatureHelp result object, got {response}"
     );
     response["result"].clone()
+}
+
+fn assert_signature_parameter_offsets(result: &Value, signature_index: usize, expected: &[&str]) {
+    let signature = &result["signatures"][signature_index];
+    let label = signature["label"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected signature label, got {result}"));
+    let parameters = signature["parameters"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected signature parameters, got {result}"));
+    assert_eq!(
+        parameters.len(),
+        expected.len(),
+        "unexpected parameter count in {result}"
+    );
+
+    for (parameter, expected_label) in parameters.iter().zip(expected) {
+        let offsets = parameter["label"]
+            .as_array()
+            .unwrap_or_else(|| panic!("expected label offsets, got {result}"));
+        assert_eq!(offsets.len(), 2, "expected two label offsets in {result}");
+        let start = offsets[0]
+            .as_u64()
+            .unwrap_or_else(|| panic!("expected start offset, got {result}"))
+            as usize;
+        let end = offsets[1]
+            .as_u64()
+            .unwrap_or_else(|| panic!("expected end offset, got {result}"))
+            as usize;
+        assert_eq!(
+            &label[start..end],
+            *expected_label,
+            "unexpected parameter label range in {result}"
+        );
+    }
 }
 
 fn position_after(source: &str, needle: &str) -> (u64, u64) {
