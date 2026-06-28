@@ -171,6 +171,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "get_type_by_location",
             "rename_symbol",
             "usage_graph",
+            "analyze_commit",
             "refresh",
             "activate_workspace",
             "get_active_workspace",
@@ -210,6 +211,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "get_type_by_location",
             "rename_symbol",
             "usage_graph",
+            "analyze_commit",
             "semantic_search",
             "refresh",
             "activate_workspace",
@@ -684,6 +686,7 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
         "get_type_by_location",
         "rename_symbol",
         "usage_graph",
+        "analyze_commit",
     ];
     #[cfg(feature = "nlp")]
     core_expected.push("semantic_search");
@@ -717,6 +720,7 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
             "get_type_by_location",
             "rename_symbol",
             "usage_graph",
+            "analyze_commit",
         ],
     );
     assert_server_tool_names(
