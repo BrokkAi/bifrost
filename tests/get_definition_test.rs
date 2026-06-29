@@ -7138,6 +7138,48 @@ fn php_fully_qualified_type_resolves_from_final_segment() {
 }
 
 #[test]
+fn php_composer_psr4_type_resolves_to_project_definition() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "composer.json",
+            r#"{
+  "autoload": {
+    "psr-4": {
+      "App\\": "src/"
+    }
+  }
+}
+"#,
+        )
+        .file(
+            "src/Service.php",
+            "<?php\nnamespace App;\nclass Service {}\n",
+        )
+        .file(
+            "tests/Controller.php",
+            "<?php\nnamespace Tests;\nclass Controller {\n    public function handle(\\App\\Service $service): void {}\n}\n",
+        )
+        .build();
+
+    let line = "    public function handle(\\App\\Service $service): void {}";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"tests/Controller.php","line":4,"column":{}}}]}}"#,
+            column_of(line, "Service")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "App.Service", "{value}");
+    assert_eq!(
+        result["definitions"][0]["path"], "src/Service.php",
+        "{value}"
+    );
+}
+
+#[test]
 fn php_parent_static_call_resolves_to_parent_definition() {
     let project = InlineTestProject::with_language(Language::Php)
         .file(

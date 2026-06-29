@@ -46,10 +46,7 @@ pub(super) fn resolve_php(
         );
     }
 
-    let ctx = FileContext {
-        namespace: php.namespace_of_file(file),
-        aliases: PhpAnalyzer::use_aliases_by_kind_from_source(source),
-    };
+    let ctx = php.file_context_from_source(file, source);
     let class_ranges = ClassRangeIndex::build(analyzer, file);
     match php_reference_node(node) {
         Some(PhpReferenceNode::Type(type_node)) => {

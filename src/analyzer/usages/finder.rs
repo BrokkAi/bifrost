@@ -16,8 +16,9 @@ use crate::analyzer::usages::ruby_graph::RubyUsageGraphStrategy;
 use crate::analyzer::usages::rust_graph::RustExportUsageGraphStrategy;
 use crate::analyzer::usages::scala_graph::ScalaUsageGraphStrategy;
 use crate::analyzer::usages::traits::{CandidateFileProvider, GraphUsageAnalyzer};
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
+use crate::analyzer::{CodeUnit, IAnalyzer, Language, PhpAnalyzer, ProjectFile, resolve_analyzer};
 use crate::hash::HashSet;
+use std::collections::BTreeSet;
 
 type DefaultCandidateProvider =
     FallbackCandidateProvider<ImportGraphCandidateProvider, TextSearchCandidateProvider>;
@@ -99,17 +100,20 @@ impl UsageFinder {
                 .fallback_candidate_provider
                 .find_candidates(target, analyzer),
         };
+        let mut protected_candidates = candidates.clone();
+
+        if explicit_provider.is_none() {
+            add_php_composer_candidates(target, analyzer, &mut candidates);
+        }
 
         if let Some(filter) = self.file_filter.as_ref() {
             candidates.retain(|file| filter(file));
+            protected_candidates.retain(|file| filter(file));
         }
 
         let candidate_files_truncated = candidates.len() > max_files;
         if candidate_files_truncated {
-            // HashSet has no insertion-order guarantee; the brokk Java code relies on
-            // Java's HashSet iteration too, so we accept the same nondeterminism here.
-            let kept: HashSet<ProjectFile> = candidates.into_iter().take(max_files).collect();
-            candidates = kept;
+            candidates = truncate_candidates(candidates, &protected_candidates, max_files);
         }
 
         let mut graph_failure = None;
@@ -169,6 +173,65 @@ impl Default for UsageFinder {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn add_php_composer_candidates(
+    target: &CodeUnit,
+    analyzer: &dyn IAnalyzer,
+    candidates: &mut HashSet<ProjectFile>,
+) {
+    if language_for_target(target) != Language::Php {
+        return;
+    }
+    let Some(php) = resolve_analyzer::<PhpAnalyzer>(analyzer) else {
+        return;
+    };
+    if !php.target_has_composer_autoload_visibility(target) {
+        return;
+    }
+    let Ok(files) = analyzer.project().analyzable_files(Language::Php) else {
+        return;
+    };
+    candidates.extend(files);
+}
+
+fn truncate_candidates(
+    candidates: HashSet<ProjectFile>,
+    protected_candidates: &HashSet<ProjectFile>,
+    max_files: usize,
+) -> HashSet<ProjectFile> {
+    if max_files == 0 {
+        return HashSet::default();
+    }
+
+    let mut kept = HashSet::default();
+    for file in sorted_files(protected_candidates)
+        .into_iter()
+        .take(max_files)
+    {
+        kept.insert(file);
+    }
+
+    if kept.len() >= max_files {
+        return kept;
+    }
+
+    for file in sorted_files(&candidates) {
+        if kept.len() >= max_files {
+            break;
+        }
+        kept.insert(file);
+    }
+    kept
+}
+
+fn sorted_files(files: &HashSet<ProjectFile>) -> Vec<ProjectFile> {
+    files
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 macro_rules! impl_graph_usage_analyzer {
