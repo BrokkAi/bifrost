@@ -325,3 +325,47 @@ fn deeply_nested_input_does_not_overflow_the_stack() {
     // Completing analysis without aborting the process is the assertion.
     let _ = analyzer.get_all_declarations();
 }
+
+#[test]
+fn records_method_signature_parameter_metadata() {
+    let built = InlineTestProject::with_language(brokk_bifrost::Language::Ruby)
+        .file(
+            "service.rb",
+            r#"class Service
+  def configure(left, right = default_value, *rest, key:, **opts, &block)
+  end
+end
+"#,
+        )
+        .build();
+    let analyzer = RubyAnalyzer::new(built.project_dyn());
+    let method = analyzer
+        .get_definitions("Service.configure")
+        .into_iter()
+        .next()
+        .expect("configure definition");
+    let metadata = analyzer.signature_metadata(&method);
+
+    assert_eq!(metadata.len(), 1, "metadata: {metadata:?}");
+    let label = metadata[0].label();
+    assert!(label.contains("def configure"), "label: {label}");
+    let parameter_labels: Vec<&str> = metadata[0]
+        .parameters()
+        .iter()
+        .map(|parameter| {
+            let start = parameter.start_byte();
+            let end = parameter.end_byte();
+            assert_eq!(
+                &label[start..end],
+                parameter.label(),
+                "bad offset for {parameter:?} in {label}"
+            );
+            parameter.label()
+        })
+        .collect();
+
+    assert_eq!(
+        parameter_labels,
+        vec!["left", "right", "rest", "key", "opts", "block"]
+    );
+}

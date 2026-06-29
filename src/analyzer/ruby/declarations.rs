@@ -1,5 +1,6 @@
 use super::imports::parse_ruby_require_call;
 use super::*;
+use crate::analyzer::SignatureMetadata;
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use tree_sitter::{Node, Parser, Tree};
 
@@ -158,8 +159,10 @@ impl RubyVisitor<'_> {
         );
         self.parsed
             .replace_code_unit(code_unit.clone(), node, self.source, parent.cloned(), None);
-        self.parsed
-            .add_signature(code_unit, first_line(node, self.source));
+        self.parsed.add_signature_with_metadata(
+            code_unit,
+            ruby_signature_metadata(first_line(node, self.source), node, self.source),
+        );
         // Method bodies are leaves for declaration purposes.
     }
 
@@ -321,6 +324,49 @@ fn first_line(node: Node<'_>, source: &str) -> String {
         .find(|line| !line.is_empty())
         .unwrap_or_default()
         .to_string()
+}
+
+fn ruby_signature_metadata(signature: String, node: Node<'_>, source: &str) -> SignatureMetadata {
+    let Some(parameters_node) = node.child_by_field_name("parameters") else {
+        return SignatureMetadata::new(signature, Vec::new());
+    };
+    let mut cursor = parameters_node.walk();
+    let labels = parameters_node
+        .named_children(&mut cursor)
+        .filter_map(|child| ruby_parameter_label_node(child))
+        .map(|label_node| ruby_node_text(label_node, source).trim().to_string())
+        .filter(|label| !label.is_empty())
+        .collect();
+    SignatureMetadata::with_parameter_labels(signature, labels)
+}
+
+fn ruby_parameter_label_node(node: Node<'_>) -> Option<Node<'_>> {
+    match node.kind() {
+        "identifier" => Some(node),
+        "optional_parameter"
+        | "keyword_parameter"
+        | "splat_parameter"
+        | "hash_splat_parameter"
+        | "block_parameter" => node
+            .child_by_field_name("name")
+            .or_else(|| first_identifier_descendant(node)),
+        _ => None,
+    }
+}
+
+fn first_identifier_descendant(node: Node<'_>) -> Option<Node<'_>> {
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.kind() == "identifier" {
+            return Some(current);
+        }
+        for index in (0..current.named_child_count()).rev() {
+            if let Some(child) = current.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    None
 }
 
 /// Container node kinds the visitor recurses through to find conditionally
