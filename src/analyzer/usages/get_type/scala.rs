@@ -1,4 +1,4 @@
-use super::{TypeBatchContext, TypeLookupOutcome, candidates_outcome, no_type};
+use super::{TypeBatchContext, TypeLookupOutcome, candidates_outcome_with_target_kind, no_type};
 use crate::analyzer::usages::get_definition::{
     ScalaTypeLookupResolution, scala_type_lookup_resolution,
 };
@@ -42,24 +42,23 @@ pub(super) fn resolve_scala_type(
             ),
         );
     };
-    let fqn = match resolution {
-        ScalaTypeLookupResolution::Type(fqn) => fqn,
-        ScalaTypeLookupResolution::InappropriateSymbolContext => {
-            return no_type(
-                "inappropriate_symbol_context",
-                format!(
-                    "`{}` is a callable declaration name, not a type-bearing expression",
-                    site.text
-                ),
-            );
+    match resolution {
+        ScalaTypeLookupResolution::Type { fqn, target_kind } => {
+            let candidates = support.fqn(&fqn);
+            if candidates.is_empty() {
+                return no_type(
+                    "no_indexed_type_definition",
+                    format!("`{fqn}` resolved as a Scala type but has no indexed definition"),
+                );
+            }
+            candidates_outcome_with_target_kind(fqn, candidates, target_kind)
         }
-    };
-    let candidates = support.fqn(&fqn);
-    if candidates.is_empty() {
-        return no_type(
-            "no_indexed_type_definition",
-            format!("`{fqn}` resolved as a Scala type but has no indexed definition"),
-        );
+        ScalaTypeLookupResolution::InappropriateSymbolContext => no_type(
+            "inappropriate_symbol_context",
+            format!(
+                "`{}` is a callable declaration name, not a type-bearing expression",
+                site.text
+            ),
+        ),
     }
-    candidates_outcome(fqn, candidates)
 }

@@ -60,6 +60,7 @@ use crate::path_utils::rel_path_string;
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 pub(crate) use rust::{
     RustTypeLookupCache, rust_expression_type_definition_fqn_cached, rust_is_type_definition,
+    rust_resolve_type_node_fqn,
 };
 use std::sync::Arc;
 use tree_sitter::{Node, Parser, Tree};

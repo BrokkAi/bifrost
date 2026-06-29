@@ -4,6 +4,7 @@ use crate::analyzer::usages::reference_site::{
     ResolvedReferenceSite, SourceLocationRequest, resolve_reference_site,
 };
 use crate::analyzer::usages::scala_graph::ScalaProjectTypes;
+use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::analyzer::{CodeUnit, DefinitionLookupIndex, IAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
@@ -33,6 +34,7 @@ pub(crate) struct TypeLookupOutcome {
     pub(crate) reference: Option<ResolvedReferenceSite>,
     pub(crate) types: Vec<TypeLookupType>,
     pub(crate) diagnostics: Vec<TypeLookupDiagnostic>,
+    pub(crate) target_kind: TypeLookupTargetKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -248,7 +250,22 @@ fn parse_tree_for_type_lookup(
 
 pub(super) fn candidates_outcome(
     fqn: impl Into<String>,
+    candidates: Vec<CodeUnit>,
+) -> TypeLookupOutcome {
+    candidates_outcome_with_target_kind(fqn, candidates, TypeLookupTargetKind::ValueExpression)
+}
+
+pub(super) fn type_reference_outcome(
+    fqn: impl Into<String>,
+    candidates: Vec<CodeUnit>,
+) -> TypeLookupOutcome {
+    candidates_outcome_with_target_kind(fqn, candidates, TypeLookupTargetKind::TypeReference)
+}
+
+pub(super) fn candidates_outcome_with_target_kind(
+    fqn: impl Into<String>,
     mut candidates: Vec<CodeUnit>,
+    target_kind: TypeLookupTargetKind,
 ) -> TypeLookupOutcome {
     sort_units(&mut candidates);
     candidates.dedup();
@@ -276,6 +293,7 @@ pub(super) fn candidates_outcome(
         } else {
             Vec::new()
         },
+        target_kind,
     }
 }
 
@@ -296,6 +314,7 @@ fn diagnostic_outcome(
             kind: kind.into(),
             message: message.into(),
         }],
+        target_kind: TypeLookupTargetKind::ValueExpression,
     }
 }
 

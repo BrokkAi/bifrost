@@ -1,8 +1,11 @@
-use super::{TypeLookupDiagnostic, TypeLookupOutcome, candidates_outcome, no_type};
+use super::{
+    TypeLookupDiagnostic, TypeLookupOutcome, candidates_outcome_with_target_kind, no_type,
+};
 use crate::analyzer::usages::get_definition::{
     GoTypeLookupResolutionKind, go_type_lookup_resolution,
 };
 use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
+use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::analyzer::{IAnalyzer, ProjectFile};
 use tree_sitter::Tree;
 
@@ -37,12 +40,27 @@ pub(super) fn resolve_go_type(
         );
     }
 
-    let mut outcome = candidates_outcome(resolution.fqn, candidates);
     if resolution.kind == GoTypeLookupResolutionKind::InterfaceMethodOwner {
+        let Some(member_name) = resolution.member_name else {
+            return no_type(
+                "go_interface_method_owner_missing_member",
+                "Go interface method owner lookup did not include the selected method name",
+            );
+        };
+        let mut outcome = candidates_outcome_with_target_kind(
+            resolution.fqn,
+            candidates,
+            TypeLookupTargetKind::MemberOwner { member_name },
+        );
         outcome.diagnostics.push(TypeLookupDiagnostic {
             kind: "go_interface_method_owner".to_string(),
             message: "selected Go interface method belongs to this interface type".to_string(),
         });
+        return outcome;
     }
-    outcome
+    candidates_outcome_with_target_kind(
+        resolution.fqn,
+        candidates,
+        TypeLookupTargetKind::ValueExpression,
+    )
 }

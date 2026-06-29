@@ -1,4 +1,4 @@
-use super::{TypeLookupOutcome, candidates_outcome, no_type};
+use super::{TypeLookupOutcome, candidates_outcome_with_target_kind, no_type};
 use crate::analyzer::usages::get_definition::{
     CSharpTypeLookupResolution, csharp_type_lookup_resolution,
 };
@@ -26,7 +26,11 @@ pub(super) fn resolve_csharp_type(
         );
     };
     match resolution {
-        CSharpTypeLookupResolution::Type { fqn, candidates } => candidates_outcome(fqn, candidates),
+        CSharpTypeLookupResolution::Type {
+            fqn,
+            candidates,
+            target_kind,
+        } => candidates_outcome_with_target_kind(fqn, candidates, target_kind),
         CSharpTypeLookupResolution::InappropriateSymbolContext => no_type(
             "inappropriate_symbol_context",
             format!(

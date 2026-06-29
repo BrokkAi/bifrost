@@ -1,7 +1,11 @@
 use super::*;
+use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 
 pub(crate) enum ScalaTypeLookupResolution {
-    Type(String),
+    Type {
+        fqn: String,
+        target_kind: TypeLookupTargetKind,
+    },
     InappropriateSymbolContext,
 }
 
@@ -139,24 +143,39 @@ fn scala_type_lookup_node_fqn(
             resolver,
             scala_node_text(node, ctx.source),
         )
-        .map(ScalaTypeLookupResolution::Type);
+        .map(|fqn| ScalaTypeLookupResolution::Type {
+            fqn,
+            target_kind: TypeLookupTargetKind::TypeReference,
+        });
     }
 
     if matches!(node.kind(), "instance_expression" | "call_expression") {
-        return scala_constructed_type(ctx, node, resolver).map(ScalaTypeLookupResolution::Type);
+        return scala_constructed_type(ctx, node, resolver).map(|fqn| {
+            ScalaTypeLookupResolution::Type {
+                fqn,
+                target_kind: TypeLookupTargetKind::ValueExpression,
+            }
+        });
     }
 
     if let Some(parent) = node.parent() {
         if parent.kind() == "field_expression" && parent.child_by_field_name("object") == Some(node)
         {
-            return scala_receiver_type_fqn(ctx, resolver, root, node, node.start_byte())
-                .map(ScalaTypeLookupResolution::Type);
+            return scala_receiver_type_fqn(ctx, resolver, root, node, node.start_byte()).map(
+                |fqn| ScalaTypeLookupResolution::Type {
+                    fqn,
+                    target_kind: TypeLookupTargetKind::ValueExpression,
+                },
+            );
         }
         if scala_is_callable_declaration_name(parent, node) {
             return Some(ScalaTypeLookupResolution::InappropriateSymbolContext);
         }
         if let Some(fqn) = scala_declaration_name_type_fqn(ctx, resolver, root, parent, node) {
-            return Some(ScalaTypeLookupResolution::Type(fqn));
+            return Some(ScalaTypeLookupResolution::Type {
+                fqn,
+                target_kind: TypeLookupTargetKind::ValueExpression,
+            });
         }
     }
 
@@ -169,7 +188,10 @@ fn scala_type_lookup_node_fqn(
 
     let name = scala_node_text(node, ctx.source).trim();
     let bindings = scala_bindings_before(ctx, resolver, root, node.start_byte());
-    first_precise(&bindings, name).map(ScalaTypeLookupResolution::Type)
+    first_precise(&bindings, name).map(|fqn| ScalaTypeLookupResolution::Type {
+        fqn,
+        target_kind: TypeLookupTargetKind::ValueExpression,
+    })
 }
 
 fn scala_declaration_name_type_fqn(
@@ -307,7 +329,9 @@ fn scala_is_declaration_name(node: Node<'_>) -> bool {
 fn scala_is_type_position(node: Node<'_>) -> bool {
     let mut current = node;
     while let Some(parent) = current.parent() {
-        if parent.child_by_field_name("type") == Some(current) {
+        if parent.child_by_field_name("type") == Some(current)
+            || parent.child_by_field_name("return_type") == Some(current)
+        {
             return true;
         }
         if matches!(parent.kind(), "generic_type" | "stable_type_identifier") {

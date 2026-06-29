@@ -4,12 +4,12 @@ use lsp_types::{
 };
 
 use crate::analyzer::{CodeUnit, IAnalyzer, Project, WorkspaceAnalyzer};
-use crate::lsp::conversion::{path_to_uri_string, position_to_byte_offset};
+use crate::lsp::conversion::path_to_uri_string;
 use crate::lsp::handlers::document_symbol::lsp_symbol_parts;
 use crate::lsp::handlers::hierarchy_support::{
-    cursor_byte_range, hierarchy_item_data, resolve_hierarchy_item_code_unit,
+    hierarchy_item_data, resolve_hierarchy_item_code_unit,
 };
-use crate::lsp::handlers::util::read_document_for_uri;
+use crate::lsp::handlers::type_target::{TypeTargetEligibility, resolve_type_target};
 use crate::text_utils::compute_line_starts;
 
 pub fn prepare(
@@ -20,15 +20,14 @@ pub fn prepare(
     let analyzer = workspace.analyzer();
     let provider = analyzer.type_hierarchy_provider()?;
     let uri = &params.text_document_position_params.text_document.uri;
-    let (file, content, line_starts) = read_document_for_uri(project, uri)?;
-    let offset = position_to_byte_offset(
-        &content,
-        &line_starts,
+    let target = resolve_type_target(
+        workspace,
+        project,
+        uri,
         &params.text_document_position_params.position,
-    );
-    let range = cursor_byte_range(&content, offset);
-    let enclosing = analyzer.enclosing_code_unit(&file, &range)?;
-    let type_unit = nearest_type_unit(analyzer, enclosing)?;
+        TypeTargetEligibility::TypeHierarchy,
+    )?;
+    let type_unit = target.units.into_iter().next()?;
     if !provider.supports_type_hierarchy(&type_unit) {
         return None;
     }
@@ -82,15 +81,6 @@ fn hierarchy_items(
             .filter_map(|code_unit| type_hierarchy_item(analyzer, project, &code_unit))
             .collect(),
     )
-}
-
-fn nearest_type_unit(analyzer: &dyn IAnalyzer, mut code_unit: CodeUnit) -> Option<CodeUnit> {
-    loop {
-        if code_unit.is_class() {
-            return Some(code_unit);
-        }
-        code_unit = analyzer.parent_of(&code_unit)?;
-    }
 }
 
 fn type_hierarchy_item(
