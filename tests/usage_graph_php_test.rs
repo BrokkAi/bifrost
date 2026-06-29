@@ -66,6 +66,50 @@ fn type_references_edge() {
 }
 
 #[test]
+fn composer_psr4_project_records_type_reference_edges() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "composer.json",
+            r#"{
+  "autoload-dev": {
+    "psr-4": {
+      "App\\": "src/"
+    }
+  }
+}
+"#,
+        )
+        .file(
+            "src/Service.php",
+            r#"<?php
+namespace App;
+
+class Service {}
+"#,
+        )
+        .file(
+            "tests/Consumer.php",
+            r#"<?php
+namespace Tests;
+
+class Consumer {
+    public function build(): \App\Service {
+        return new \App\Service();
+    }
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&value, "Tests.Consumer.build", "App.Service"),
+        "Composer PSR-4 consumer should edge to autoloaded class: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn receiver_typing_is_type_based_not_name_based() {
     let value = usage_graph();
 

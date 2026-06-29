@@ -2,7 +2,9 @@ mod common;
 
 use brokk_bifrost::analyzer::{parse_php_use_aliases, parse_php_use_aliases_by_kind};
 use brokk_bifrost::{CodeUnit, IAnalyzer, Language, PhpAnalyzer, ProjectFile, TestProject};
-use common::{assert_code_eq, definition, normalize_nonempty_lines, php_fixture_project};
+use common::{
+    InlineTestProject, assert_code_eq, definition, normalize_nonempty_lines, php_fixture_project,
+};
 use tempfile::tempdir;
 
 fn fixture_analyzer() -> PhpAnalyzer {
@@ -13,6 +15,42 @@ fn fixture_analyzer() -> PhpAnalyzer {
 fn test_php_initialization() {
     let analyzer = fixture_analyzer();
     assert!(!analyzer.is_empty());
+}
+
+#[test]
+fn php_composer_manifest_does_not_change_indexed_declarations() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "composer.json",
+            r#"{
+  "autoload": {
+    "psr-4": {
+      "App\\": ["src/", "lib/"]
+    },
+    "classmap": ["legacy/"]
+  },
+  "autoload-dev": {
+    "psr-4": {
+      "Tests\\": "tests/"
+    },
+    "files": ["tests/bootstrap.php"]
+  }
+}
+"#,
+        )
+        .file(
+            "src/Service.php",
+            "<?php\nnamespace App;\nclass Service {}\n",
+        )
+        .file(
+            "tests/ServiceTest.php",
+            "<?php\nnamespace Tests;\nclass ServiceTest {}\n",
+        )
+        .build();
+    let analyzer = PhpAnalyzer::from_project(project.project().clone());
+
+    assert_eq!(1, analyzer.get_definitions("App.Service").len());
+    assert_eq!(1, analyzer.get_definitions("Tests.ServiceTest").len());
 }
 
 #[test]

@@ -1,6 +1,7 @@
 mod adapter;
 mod aliases;
 mod clones;
+mod composer;
 mod declarations;
 mod tests;
 
@@ -30,6 +31,7 @@ pub use aliases::{
     parse_php_use_aliases_from_source, php_namespace_to_fq,
 };
 use clones::{build_php_clone_candidate_data, refine_php_clone_similarity};
+use composer::PhpComposerAutoload;
 use tests::detect_php_test_assertion_smells;
 
 #[derive(Clone)]
@@ -39,6 +41,7 @@ pub struct PhpAnalyzer {
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
     direct_descendants: Cache<CodeUnit, Arc<HashSet<CodeUnit>>>,
     direct_descendant_index: Arc<OnceLock<HashMap<String, Arc<HashSet<CodeUnit>>>>>,
+    composer_autoload: Arc<PhpComposerAutoload>,
 }
 
 impl PhpAnalyzer {
@@ -92,12 +95,22 @@ impl PhpAnalyzer {
     }
 
     fn from_inner(inner: TreeSitterAnalyzer<PhpAdapter>, memo_budget: u64) -> Self {
+        let composer_autoload = Arc::new(PhpComposerAutoload::from_project(inner.project()));
+        Self::from_inner_with_composer(inner, memo_budget, composer_autoload)
+    }
+
+    fn from_inner_with_composer(
+        inner: TreeSitterAnalyzer<PhpAdapter>,
+        memo_budget: u64,
+        composer_autoload: Arc<PhpComposerAutoload>,
+    ) -> Self {
         Self {
             inner,
             memo_budget,
             direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec_by_unit),
             direct_descendants: build_weighted_cache(memo_budget / 8, weight_code_unit_set_by_unit),
             direct_descendant_index: Arc::new(OnceLock::new()),
+            composer_autoload,
         }
     }
 
@@ -161,6 +174,10 @@ impl PhpAnalyzer {
             .and_then(|start| self.aliases_visible_before(code_unit.source(), start))
             .unwrap_or_else(|| self.use_aliases_by_kind_of(code_unit.source()));
         PhpFileContext { namespace, aliases }
+    }
+
+    pub(crate) fn target_has_composer_autoload_visibility(&self, target: &CodeUnit) -> bool {
+        self.composer_autoload.target_is_autoloaded(self, target)
     }
 
     fn declaration_start(&self, code_unit: &CodeUnit) -> Option<usize> {
@@ -369,7 +386,16 @@ impl IAnalyzer for PhpAnalyzer {
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
-        Self::from_inner(self.inner.update(changed_files), self.memo_budget)
+        let inner = self.inner.update(changed_files);
+        let composer_autoload = if changed_files
+            .iter()
+            .any(PhpComposerAutoload::manifest_changed)
+        {
+            Arc::new(PhpComposerAutoload::from_project(inner.project()))
+        } else {
+            self.composer_autoload.clone()
+        };
+        Self::from_inner_with_composer(inner, self.memo_budget, composer_autoload)
     }
 
     fn update_all(&self) -> Self {

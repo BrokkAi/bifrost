@@ -1,8 +1,9 @@
 mod common;
 
 use brokk_bifrost::usages::{FuzzyResult, PhpUsageGraphStrategy, UsageAnalyzer, UsageFinder};
-use brokk_bifrost::{CodeUnit, IAnalyzer, Language, PhpAnalyzer};
+use brokk_bifrost::{CodeUnit, IAnalyzer, Language, OverlayProject, PhpAnalyzer};
 use common::InlineTestProject;
+use std::sync::Arc;
 
 fn definition(analyzer: &PhpAnalyzer, fq_name: &str) -> CodeUnit {
     analyzer
@@ -63,6 +64,298 @@ function build(): Target {
         .into_either()
         .expect("php graph success");
     assert_eq!(2, hits.len());
+}
+
+#[test]
+fn composer_psr4_autoload_expands_php_usage_candidates_without_text_fallback() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "composer.json",
+            r#"{
+  "autoload": {
+    "psr-4": {
+      "App\\": "src/"
+    }
+  }
+}
+"#,
+        )
+        .file(
+            "src/Service.php",
+            r#"<?php
+namespace App;
+class Service {}
+"#,
+        )
+        .file(
+            "tests/Consumer.php",
+            r#"<?php
+namespace Tests;
+class Consumer {
+    public function build(): \App\Service {
+        return new \App\Service();
+    }
+}
+"#,
+        )
+        .build();
+    let analyzer = PhpAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "App.Service");
+
+    let query = UsageFinder::new().query(&analyzer, std::slice::from_ref(&target), 1000, 1000);
+    let hits = query
+        .result
+        .into_either()
+        .expect("composer-backed php usage query succeeds");
+
+    assert!(
+        query
+            .candidate_files
+            .contains(&project.file("tests/Consumer.php")),
+        "Composer PSR-4 target should make out-of-directory PHP consumers scan candidates"
+    );
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == project.file("tests/Consumer.php")),
+        "expected Composer consumer usage hit, got {hits:?}"
+    );
+}
+
+#[test]
+fn composer_expansion_preserves_structured_candidates_when_truncated() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "composer.json",
+            r#"{
+  "autoload": {
+    "psr-4": {
+      "App\\": "src/"
+    }
+  }
+}
+"#,
+        )
+        .file(
+            "src/Service.php",
+            r#"<?php
+namespace App;
+class Service {}
+"#,
+        )
+        .file(
+            "src/Consumer.php",
+            r#"<?php
+namespace App;
+function build(): Service {
+    return new Service();
+}
+"#,
+        )
+        .file(
+            "tests/ComposerOnly.php",
+            r#"<?php
+namespace Tests;
+function build(): \App\Service {
+    return new \App\Service();
+}
+"#,
+        )
+        .build();
+    let analyzer = PhpAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "App.Service");
+
+    let query = UsageFinder::new().query(&analyzer, std::slice::from_ref(&target), 2, 1000);
+    let hits = query
+        .result
+        .into_either()
+        .expect("truncated composer-backed php usage query succeeds");
+
+    assert!(query.candidate_files_truncated);
+    assert!(
+        query
+            .candidate_files
+            .contains(&project.file("src/Consumer.php")),
+        "structured sibling candidate must survive Composer expansion truncation"
+    );
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == project.file("src/Consumer.php")),
+        "expected protected sibling usage hit, got {hits:?}"
+    );
+}
+
+#[test]
+fn composer_psr4_paths_are_normalized_like_project_files() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "composer.json",
+            r#"{
+  "autoload": {
+    "psr-4": {
+      "App\\": "src/../lib/"
+    }
+  }
+}
+"#,
+        )
+        .file(
+            "lib/Service.php",
+            r#"<?php
+namespace App;
+class Service {}
+"#,
+        )
+        .file(
+            "tests/Consumer.php",
+            r#"<?php
+namespace Tests;
+function build(): \App\Service {
+    return new \App\Service();
+}
+"#,
+        )
+        .build();
+    let analyzer = PhpAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "App.Service");
+
+    let hits = UsageFinder::new()
+        .find_usages_default(&analyzer, std::slice::from_ref(&target))
+        .into_either()
+        .expect("normalized composer path usage query succeeds");
+
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == project.file("tests/Consumer.php")),
+        "expected Composer consumer usage hit with normalized PSR-4 path, got {hits:?}"
+    );
+}
+
+#[test]
+fn composer_manifest_reads_project_overlays() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "composer.json",
+            r#"{
+  "autoload": {
+    "psr-4": {
+      "Wrong\\": "src/"
+    }
+  }
+}
+"#,
+        )
+        .file(
+            "src/Service.php",
+            r#"<?php
+namespace App;
+class Service {}
+"#,
+        )
+        .file(
+            "tests/Consumer.php",
+            r#"<?php
+namespace Tests;
+function build(): \App\Service {
+    return new \App\Service();
+}
+"#,
+        )
+        .build();
+    let overlay = OverlayProject::new(project.project_dyn());
+    overlay.set(
+        project.root().join("composer.json"),
+        r#"{
+  "autoload": {
+    "psr-4": {
+      "App\\": "src/"
+    }
+  }
+}
+"#
+        .to_string(),
+    );
+    let analyzer = PhpAnalyzer::new(Arc::new(overlay));
+    let target = definition(&analyzer, "App.Service");
+
+    let hits = UsageFinder::new()
+        .find_usages_default(&analyzer, std::slice::from_ref(&target))
+        .into_either()
+        .expect("overlay composer usage query succeeds");
+
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == project.file("tests/Consumer.php")),
+        "expected Composer metadata to come from project overlay, got {hits:?}"
+    );
+}
+
+#[test]
+fn non_composer_php_project_does_not_expand_usage_candidates_by_namespace_shape() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "src/Service.php",
+            r#"<?php
+namespace App;
+class Service {}
+"#,
+        )
+        .file(
+            "tests/Consumer.php",
+            r#"<?php
+namespace Tests;
+class Consumer {
+    public function build(): \App\Service {
+        return new \App\Service();
+    }
+}
+"#,
+        )
+        .build();
+    let analyzer = PhpAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "App.Service");
+
+    let query = UsageFinder::new().query(&analyzer, std::slice::from_ref(&target), 1000, 1000);
+    assert!(
+        !query
+            .candidate_files
+            .contains(&project.file("tests/Consumer.php")),
+        "non-Composer PHP projects should keep the existing directory/import candidate scope"
+    );
+}
+
+#[test]
+fn invalid_composer_manifest_does_not_expand_php_usage_candidates() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file("composer.json", "{ invalid json")
+        .file(
+            "src/Service.php",
+            r#"<?php
+namespace App;
+class Service {}
+"#,
+        )
+        .file(
+            "tests/Consumer.php",
+            r#"<?php
+namespace Tests;
+class Consumer {
+    public function build(): \App\Service {
+        return new \App\Service();
+    }
+}
+"#,
+        )
+        .build();
+    let analyzer = PhpAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "App.Service");
+
+    let query = UsageFinder::new().query(&analyzer, std::slice::from_ref(&target), 1000, 1000);
+    assert!(
+        !query
+            .candidate_files
+            .contains(&project.file("tests/Consumer.php")),
+        "invalid Composer metadata must be ignored for PHP candidate expansion"
+    );
 }
 
 #[test]
