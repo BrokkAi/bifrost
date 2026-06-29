@@ -1,6 +1,11 @@
 use super::*;
 
-pub(crate) fn scala_type_lookup_fqn(
+pub(crate) enum ScalaTypeLookupResolution {
+    Type(String),
+    InappropriateSymbolContext,
+}
+
+pub(crate) fn scala_type_lookup_resolution(
     analyzer: &dyn IAnalyzer,
     support: &DefinitionLookupIndex,
     types: &ScalaProjectTypes,
@@ -8,7 +13,7 @@ pub(crate) fn scala_type_lookup_fqn(
     source: &str,
     root: Node<'_>,
     site: &ResolvedReferenceSite,
-) -> Option<String> {
+) -> Option<ScalaTypeLookupResolution> {
     let scala = resolve_analyzer::<ScalaAnalyzer>(analyzer)?;
     let resolver = ScalaNameResolver::for_file(scala, file, types);
     let ctx = ScalaLookupCtx {
@@ -123,7 +128,7 @@ fn scala_type_lookup_node_fqn(
     resolver: &ScalaNameResolver,
     root: Node<'_>,
     node: Node<'_>,
-) -> Option<String> {
+) -> Option<ScalaTypeLookupResolution> {
     if matches!(
         node.kind(),
         "type_identifier" | "stable_type_identifier" | "generic_type"
@@ -133,20 +138,25 @@ fn scala_type_lookup_node_fqn(
             ctx,
             resolver,
             scala_node_text(node, ctx.source),
-        );
+        )
+        .map(ScalaTypeLookupResolution::Type);
     }
 
     if matches!(node.kind(), "instance_expression" | "call_expression") {
-        return scala_constructed_type(ctx, node, resolver);
+        return scala_constructed_type(ctx, node, resolver).map(ScalaTypeLookupResolution::Type);
     }
 
     if let Some(parent) = node.parent() {
         if parent.kind() == "field_expression" && parent.child_by_field_name("object") == Some(node)
         {
-            return scala_receiver_type_fqn(ctx, resolver, root, node, node.start_byte());
+            return scala_receiver_type_fqn(ctx, resolver, root, node, node.start_byte())
+                .map(ScalaTypeLookupResolution::Type);
+        }
+        if scala_is_callable_declaration_name(parent, node) {
+            return Some(ScalaTypeLookupResolution::InappropriateSymbolContext);
         }
         if let Some(fqn) = scala_declaration_name_type_fqn(ctx, resolver, root, parent, node) {
-            return Some(fqn);
+            return Some(ScalaTypeLookupResolution::Type(fqn));
         }
     }
 
@@ -159,7 +169,7 @@ fn scala_type_lookup_node_fqn(
 
     let name = scala_node_text(node, ctx.source).trim();
     let bindings = scala_bindings_before(ctx, resolver, root, node.start_byte());
-    first_precise(&bindings, name)
+    first_precise(&bindings, name).map(ScalaTypeLookupResolution::Type)
 }
 
 fn scala_declaration_name_type_fqn(
@@ -210,6 +220,11 @@ fn scala_declaration_name_type_fqn(
             first_precise(&bindings, name_text)
         }
     }
+}
+
+fn scala_is_callable_declaration_name(parent: Node<'_>, name: Node<'_>) -> bool {
+    parent.child_by_field_name("name") == Some(name)
+        && matches!(parent.kind(), "function_definition")
 }
 
 pub(super) fn parse_scala_tree(source: &str) -> Option<Tree> {

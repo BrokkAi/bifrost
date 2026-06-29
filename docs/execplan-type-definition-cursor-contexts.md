@@ -19,8 +19,8 @@ After this work, Bifrost still advertises `typeDefinitionProvider`, but the hand
 - [x] (2026-06-29 14:30Z) Ran guided review for the JS/TS milestone and addressed the accepted short-circuit ordering finding.
 - [x] (2026-06-29 14:45Z) Tightened Java and C# cursor semantics, added regressions, and ran focused validation.
 - [x] (2026-06-29 14:52Z) Ran guided review for the JVM/.NET milestone and addressed the accepted structured-diagnostic finding.
-- [ ] Tighten Rust, Go, and Scala cursor semantics, add regressions, and run focused validation.
-- [ ] Run guided review for the Rust/Go/Scala milestone and address accepted findings.
+- [x] (2026-06-29 15:08Z) Tightened Rust, Go, and Scala cursor semantics, added regressions, and ran focused validation.
+- [x] (2026-06-29 15:15Z) Ran guided review for the Rust/Go/Scala milestone; no code changes were required.
 - [ ] Run final focused tests, formatting, non-CUDA clippy, and final guided review.
 
 ## Surprises & Discoveries
@@ -49,6 +49,12 @@ After this work, Bifrost still advertises `typeDefinitionProvider`, but the hand
 - Observation: The Java/C# review checkpoint found that returning `None` fixed LSP behavior but did not preserve the planned structured diagnostic reason.
   Evidence: Java now returns `JavaTypeLookupResolution::InappropriateSymbolContext`, C# now returns `CSharpTypeLookupResolution::InappropriateSymbolContext`, and `get_type/java.rs` plus `get_type/csharp.rs` map those outcomes to `no_type("inappropriate_symbol_context", ...)`.
 
+- Observation: Rust and Go already returned `null` for free function declaration names, while Scala had the same return-type navigation bug as TypeScript, Java, and C#.
+  Evidence: Before changing Scala resolver code, `cargo test --test bifrost_lsp_server type_definition --features nlp` passed the new Rust and Go function-name tests but failed the Scala function-name test by returning the `Widget` class location.
+
+- Observation: Go's implementation lookup from interface method names remains intact.
+  Evidence: `cargo test --test bifrost_lsp_server implementation_works_from_go_interface_method --features nlp` passed after the Rust/Go/Scala milestone.
+
 ## Decision Log
 
 - Decision: Keep `typeDefinitionProvider` advertised globally.
@@ -74,6 +80,10 @@ JS/TS guided-review outcome: one tactical finding was accepted and fixed. Inappr
 Java/C# milestone outcome: Java and C# method declaration names now return `null` from LSP typeDefinition instead of navigating to their return type. The focused LSP command passed 8/8 filtered tests, `cargo test --test usages_java_graph_test --features nlp` passed 35 tests, `cargo test --test usages_csharp_graph_test --features nlp` passed 33 tests, and `cargo fmt --check` passed after formatting.
 
 Java/C# guided-review outcome: one design/detail finding was accepted and fixed. The resolver helpers now return explicit inappropriate-context outcomes instead of losing the reason as a generic missing explicit type. No remaining blocker is known for this milestone.
+
+Rust/Go/Scala milestone outcome: Rust and Go now have LSP regression coverage proving free function declaration names return `null`. Scala function declaration names now return `null` instead of navigating to their return type, and Scala propagates `ScalaTypeLookupResolution::InappropriateSymbolContext` into `get_type`. The focused LSP command passed 11/11 filtered tests, `cargo test --test usages_rust_graph_test --features nlp` passed 75 tests, `cargo test --test usages_go_graph_test --features nlp` passed 37 tests, `cargo test --test usages_scala_graph_test --features nlp` passed 21 tests, the Go interface-method implementation regression passed, and `cargo fmt --check` passed after formatting.
+
+Rust/Go/Scala guided-review outcome: no findings required code changes. The slice stayed within analyzer-owned tree-sitter cursor classification and preserved Go implementation behavior.
 
 ## Context and Orientation
 

@@ -71,7 +71,7 @@ pub(crate) use call_sites::{
 pub(crate) use csharp::{CSharpTypeLookupResolution, csharp_type_lookup_resolution};
 pub(crate) use go::{GoTypeLookupResolutionKind, go_type_lookup_resolution};
 pub(crate) use java::{JavaTypeLookupResolution, java_type_lookup_resolution};
-pub(crate) use scala::scala_type_lookup_fqn;
+pub(crate) use scala::{ScalaTypeLookupResolution, scala_type_lookup_resolution};
 
 #[derive(Debug, Clone)]
 pub(crate) struct DefinitionLookupRequest {

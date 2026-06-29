@@ -1,5 +1,7 @@
 use super::{TypeBatchContext, TypeLookupOutcome, candidates_outcome, no_type};
-use crate::analyzer::usages::get_definition::scala_type_lookup_fqn;
+use crate::analyzer::usages::get_definition::{
+    ScalaTypeLookupResolution, scala_type_lookup_resolution,
+};
 use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
 use crate::analyzer::{IAnalyzer, ProjectFile, ScalaAnalyzer, resolve_analyzer};
 use tree_sitter::Tree;
@@ -23,7 +25,7 @@ pub(super) fn resolve_scala_type(
     };
     let support = analyzer.definition_lookup_index();
     let types = context.scala_project_types(scala);
-    let Some(fqn) = scala_type_lookup_fqn(
+    let Some(resolution) = scala_type_lookup_resolution(
         analyzer,
         support,
         types.as_ref(),
@@ -39,6 +41,18 @@ pub(super) fn resolve_scala_type(
                 site.text
             ),
         );
+    };
+    let fqn = match resolution {
+        ScalaTypeLookupResolution::Type(fqn) => fqn,
+        ScalaTypeLookupResolution::InappropriateSymbolContext => {
+            return no_type(
+                "inappropriate_symbol_context",
+                format!(
+                    "`{}` is a callable declaration name, not a type-bearing expression",
+                    site.text
+                ),
+            );
+        }
     };
     let candidates = support.fqn(&fqn);
     if candidates.is_empty() {
