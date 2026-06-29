@@ -21,7 +21,7 @@ After this work, Bifrost still advertises `typeDefinitionProvider`, but the hand
 - [x] (2026-06-29 14:52Z) Ran guided review for the JVM/.NET milestone and addressed the accepted structured-diagnostic finding.
 - [x] (2026-06-29 15:08Z) Tightened Rust, Go, and Scala cursor semantics, added regressions, and ran focused validation.
 - [x] (2026-06-29 15:15Z) Ran guided review for the Rust/Go/Scala milestone; no code changes were required.
-- [ ] Run final focused tests, formatting, non-CUDA clippy, and final guided review.
+- [x] (2026-06-29 15:25Z) Ran final focused tests, formatting, non-CUDA clippy, and final guided review.
 
 ## Surprises & Discoveries
 
@@ -55,6 +55,9 @@ After this work, Bifrost still advertises `typeDefinitionProvider`, but the hand
 - Observation: Go's implementation lookup from interface method names remains intact.
   Evidence: `cargo test --test bifrost_lsp_server implementation_works_from_go_interface_method --features nlp` passed after the Rust/Go/Scala milestone.
 
+- Observation: The final quality gate passed on this macOS worktree using the non-CUDA clippy path.
+  Evidence: `cargo test --test bifrost_lsp_server type_definition --features nlp` passed 11/11 filtered tests, `cargo fmt --check` passed, and `cargo clippy-no-cuda` finished successfully.
+
 ## Decision Log
 
 - Decision: Keep `typeDefinitionProvider` advertised globally.
@@ -71,7 +74,7 @@ After this work, Bifrost still advertises `typeDefinitionProvider`, but the hand
 
 ## Outcomes & Retrospective
 
-No implementation milestone is complete yet. The current expected outcome is a focused branch that keeps positive type-definition behavior while making inappropriate callable-symbol requests complete with `null`.
+The implementation is complete. Bifrost still advertises `typeDefinitionProvider`, but LSP typeDefinition now returns `null` for inappropriate callable declaration-name contexts across the planned language targets while preserving positive type lookup behavior and Go implementation lookup.
 
 Milestone 1 and the JS/TS resolver slice are implemented. TypeScript function and method declaration names now return `null` from LSP typeDefinition instead of navigating to their return type, and the JavaScript unsupported callable case remains a normal `null` response.
 
@@ -84,6 +87,8 @@ Java/C# guided-review outcome: one design/detail finding was accepted and fixed.
 Rust/Go/Scala milestone outcome: Rust and Go now have LSP regression coverage proving free function declaration names return `null`. Scala function declaration names now return `null` instead of navigating to their return type, and Scala propagates `ScalaTypeLookupResolution::InappropriateSymbolContext` into `get_type`. The focused LSP command passed 11/11 filtered tests, `cargo test --test usages_rust_graph_test --features nlp` passed 75 tests, `cargo test --test usages_go_graph_test --features nlp` passed 37 tests, `cargo test --test usages_scala_graph_test --features nlp` passed 21 tests, the Go interface-method implementation regression passed, and `cargo fmt --check` passed after formatting.
 
 Rust/Go/Scala guided-review outcome: no findings required code changes. The slice stayed within analyzer-owned tree-sitter cursor classification and preserved Go implementation behavior.
+
+Final guided-review outcome: the code changes were accepted. The only final finding was documentation drift in this ExecPlan after the helper return-shape changes and final quality gate; this update records the completed state and current helper names.
 
 ## Context and Orientation
 
@@ -101,9 +106,9 @@ First, add LSP integration tests in `tests/bifrost_lsp_server.rs` near the exist
 
 Second, tighten JS/TS in `src/analyzer/usages/get_type/js_ts.rs`. Add a language-local helper that recognizes selected function or method declaration names from tree-sitter nodes and returns `no_type("inappropriate_symbol_context", ...)` before `declaration_type_node_for_reference` can treat return types as the type-definition result. Preserve type-reference lookup, declaration-name lookup for parameters/variables/properties, local binding lookup, receiver lookup, and call-expression return-type lookup only when the selected node is the expression, not the callable declaration identity.
 
-Third, tighten Java and C#. Java logic lives in `src/analyzer/usages/get_definition/java.rs` behind `java_type_lookup_fqn`; C# logic lives in `src/analyzer/usages/get_definition/csharp.rs` behind `csharp_type_lookup_resolution`. For both, function or method declaration names must return no type instead of their return type, while parameter names, local variables, fields, receiver objects, and explicit type nodes continue to work.
+Third, tighten Java and C#. Java logic lives in `src/analyzer/usages/get_definition/java.rs` behind `java_type_lookup_resolution`; C# logic lives in `src/analyzer/usages/get_definition/csharp.rs` behind `csharp_type_lookup_resolution`. For both, function or method declaration names must return no type instead of their return type, while parameter names, local variables, fields, receiver objects, and explicit type nodes continue to work.
 
-Fourth, tighten Rust, Go, and Scala. Rust logic lives in `src/analyzer/usages/get_type/rust.rs` and uses `rust_type_lookup_expression`. Go logic lives in `src/analyzer/usages/get_definition/go.rs` behind `go_type_lookup_resolution` and must preserve interface method owner behavior used by `textDocument/implementation`. Scala logic lives in `src/analyzer/usages/get_definition/scala.rs` behind `scala_type_lookup_fqn`. Each language should reject selected callable-symbol identities using parsed node relationships rather than source text probes.
+Fourth, tighten Rust, Go, and Scala. Rust logic lives in `src/analyzer/usages/get_type/rust.rs` and uses `rust_type_lookup_expression`. Go logic lives in `src/analyzer/usages/get_definition/go.rs` behind `go_type_lookup_resolution` and must preserve interface method owner behavior used by `textDocument/implementation`. Scala logic lives in `src/analyzer/usages/get_definition/scala.rs` behind `scala_type_lookup_resolution`. Each language should reject selected callable-symbol identities using parsed node relationships rather than source text probes.
 
 After each milestone, update this document's living sections, run focused validation, run `brokk:brokk-guided-review` in uncommitted-changes mode for the milestone diff, and address accepted findings before moving on.
 
