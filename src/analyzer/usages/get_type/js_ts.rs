@@ -1,4 +1,4 @@
-use super::{TypeLookupOutcome, candidates_outcome, no_type};
+use super::{TypeLookupOutcome, candidates_outcome, no_type, type_reference_outcome};
 use crate::analyzer::usages::get_definition::js_ts::{
     jsts_type_space_candidates, resolve_js_ts_module_binding_candidates,
     ts_function_return_property_owners, ts_receiver_owner_candidates_at_byte,
@@ -155,7 +155,7 @@ fn resolve_declared_type_text(
     if let Some((type_name, candidates)) = qualified_imported_type_candidates(
         analyzer, support, file, type_node, source, imports, aliases,
     ) {
-        return candidates_outcome(type_name, candidates);
+        return type_reference_outcome(type_name, candidates);
     }
 
     if let Some(type_name) = leading_type_identifier(&type_text) {
@@ -170,7 +170,7 @@ fn resolve_declared_type_text(
             false,
         );
         if !candidates.is_empty() {
-            return candidates_outcome(type_name.to_string(), candidates);
+            return type_reference_outcome(type_name.to_string(), candidates);
         }
     }
 
@@ -179,7 +179,7 @@ fn resolve_declared_type_text(
     );
     let owners = prefer_type_definitions(owners);
     if !owners.is_empty() {
-        return candidates_outcome(type_lookup_name(&owners, &type_text), owners);
+        return type_reference_outcome(type_lookup_name(&owners, &type_text), owners);
     }
 
     no_type(
@@ -206,7 +206,7 @@ fn resolve_declared_type_name(
             format!("`{type_name}` did not resolve to an indexed TypeScript type"),
         );
     }
-    candidates_outcome(type_name.to_string(), candidates)
+    type_reference_outcome(type_name.to_string(), candidates)
 }
 
 #[allow(clippy::too_many_arguments)]

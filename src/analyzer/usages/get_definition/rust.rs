@@ -739,7 +739,7 @@ fn rust_code_unit_declaration_node<'tree>(
         .find(|node| node.child_by_field_name("name").is_some())
 }
 
-fn rust_resolve_type_node_fqn(
+pub(crate) fn rust_resolve_type_node_fqn(
     analyzer: &dyn IAnalyzer,
     support: &DefinitionLookupIndex,
     file: &ProjectFile,

@@ -1,6 +1,7 @@
-use super::{TypeLookupOutcome, candidates_outcome, no_type};
+use super::{TypeLookupOutcome, candidates_outcome, no_type, type_reference_outcome};
 use crate::analyzer::usages::get_definition::{
     RustTypeLookupCache, rust_expression_type_definition_fqn_cached, rust_is_type_definition,
+    rust_resolve_type_node_fqn,
 };
 use crate::analyzer::usages::reference_site::{
     ResolvedReferenceSite, smallest_named_node_covering,
@@ -27,8 +28,39 @@ pub(super) fn resolve_rust_type(
             "no Rust syntax node at reference location",
         );
     };
-    let expression = rust_type_lookup_expression(node);
     let support = analyzer.definition_lookup_index();
+    if rust_is_type_reference_position(node) {
+        let Some(fqn) = rust_resolve_type_node_fqn(
+            analyzer,
+            support,
+            file,
+            source,
+            node,
+            Some(node.start_byte()),
+        ) else {
+            return no_type(
+                "no_explicit_type",
+                format!(
+                    "`{}` does not have a supported explicit Rust type",
+                    site.text
+                ),
+            );
+        };
+        let candidates: Vec<_> = support
+            .fqn(&fqn)
+            .into_iter()
+            .filter(|unit| rust_is_type_definition(analyzer, unit))
+            .collect();
+        if candidates.is_empty() {
+            return no_type(
+                "no_indexed_type_definition",
+                format!("`{fqn}` resolved as a Rust type but has no indexed definition"),
+            );
+        }
+        return type_reference_outcome(fqn, candidates);
+    }
+
+    let expression = rust_type_lookup_expression(node);
     let Some(fqn) = rust_expression_type_definition_fqn_cached(
         analyzer,
         support,
@@ -88,4 +120,30 @@ fn rust_type_lookup_expression(mut node: Node<'_>) -> Node<'_> {
         }
         node = parent;
     }
+}
+
+fn rust_is_type_reference_position(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        if parent.child_by_field_name("type") == Some(node)
+            || parent.child_by_field_name("trait") == Some(node)
+        {
+            return true;
+        }
+        if matches!(
+            parent.kind(),
+            "generic_type"
+                | "scoped_type_identifier"
+                | "qualified_type"
+                | "reference_type"
+                | "pointer_type"
+                | "array_type"
+                | "bracketed_type"
+                | "tuple_type"
+        ) {
+            node = parent;
+            continue;
+        }
+        return false;
+    }
+    false
 }

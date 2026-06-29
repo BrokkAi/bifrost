@@ -1,7 +1,7 @@
-use lsp_types::{GotoDefinitionParams, GotoDefinitionResponse, Location};
+use lsp_types::{GotoDefinitionParams, GotoDefinitionResponse, Location, Position, Uri};
 use std::sync::Arc;
 
-use crate::analyzer::usages::get_type::{self, TypeLookupRequest};
+use crate::analyzer::usages::get_type::{self, TypeLookupRequest, TypeLookupTargetKind};
 use crate::analyzer::{CodeUnit, IAnalyzer, Project, Range as ByteRange, WorkspaceAnalyzer};
 use crate::hash::HashSet;
 use crate::lsp::conversion::position_to_byte_offset;
@@ -16,7 +16,13 @@ pub fn handle(
     params: &GotoDefinitionParams,
 ) -> Option<GotoDefinitionResponse> {
     let analyzer = workspace.analyzer();
-    let target = resolve_type_target(workspace, project, params)?;
+    let target = resolve_type_target(
+        workspace,
+        project,
+        &params.text_document_position_params.text_document.uri,
+        &params.text_document_position_params.position,
+        TypeTargetEligibility::TypeDefinition,
+    )?;
     let locations = locations_for_units(analyzer, project, target.units.into_iter());
     if locations.is_empty() {
         return None;
@@ -31,7 +37,13 @@ pub fn implementation(
 ) -> Option<GotoDefinitionResponse> {
     let analyzer = workspace.analyzer();
     let provider = analyzer.type_hierarchy_provider()?;
-    let target = resolve_type_target(workspace, project, params)?;
+    let target = resolve_type_target(
+        workspace,
+        project,
+        &params.text_document_position_params.text_document.uri,
+        &params.text_document_position_params.position,
+        TypeTargetEligibility::Implementation,
+    )?;
 
     let mut descendants = Vec::new();
     let mut seen = HashSet::default();
@@ -61,8 +73,8 @@ pub fn implementation(
     Some(GotoDefinitionResponse::Array(locations))
 }
 
-struct TypeTarget {
-    units: Vec<CodeUnit>,
+pub(crate) struct TypeTarget {
+    pub(crate) units: Vec<CodeUnit>,
     implementation_kind: ImplementationTargetKind,
 }
 
@@ -71,18 +83,22 @@ enum ImplementationTargetKind {
     Method { name: String },
 }
 
-fn resolve_type_target(
+#[derive(Clone, Copy)]
+pub(crate) enum TypeTargetEligibility {
+    TypeDefinition,
+    TypeHierarchy,
+    Implementation,
+}
+
+pub(crate) fn resolve_type_target(
     workspace: &WorkspaceAnalyzer,
     project: &dyn Project,
-    params: &GotoDefinitionParams,
+    uri: &Uri,
+    position: &Position,
+    eligibility: TypeTargetEligibility,
 ) -> Option<TypeTarget> {
-    let uri = &params.text_document_position_params.text_document.uri;
     let (file, content, line_starts) = read_document_for_uri(project, uri)?;
-    let start_byte = position_to_byte_offset(
-        &content,
-        &line_starts,
-        &params.text_document_position_params.position,
-    );
+    let start_byte = position_to_byte_offset(&content, &line_starts, position);
     let cursor_range = cursor_byte_range(&content, start_byte);
     if let Some(type_unit) = selected_type_declaration(
         workspace.analyzer(),
@@ -108,6 +124,9 @@ fn resolve_type_target(
         }],
     );
     let outcome = outcomes.into_iter().next()?;
+    if !eligibility.accepts(outcome.target_kind) {
+        return None;
+    }
     let implementation_kind = if outcome
         .diagnostics
         .iter()
@@ -139,6 +158,19 @@ fn resolve_type_target(
             units,
             implementation_kind,
         })
+    }
+}
+
+impl TypeTargetEligibility {
+    fn accepts(self, target_kind: TypeLookupTargetKind) -> bool {
+        match self {
+            Self::TypeDefinition => true,
+            Self::TypeHierarchy => target_kind == TypeLookupTargetKind::TypeReference,
+            Self::Implementation => matches!(
+                target_kind,
+                TypeLookupTargetKind::TypeReference | TypeLookupTargetKind::MemberOwner
+            ),
+        }
     }
 }
 

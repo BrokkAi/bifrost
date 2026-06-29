@@ -4,6 +4,7 @@ pub(crate) enum CSharpTypeLookupResolution {
     Type {
         fqn: String,
         candidates: Vec<CodeUnit>,
+        target_kind: crate::analyzer::usages::get_type::TypeLookupTargetKind,
     },
     InappropriateSymbolContext,
 }
@@ -172,9 +173,10 @@ fn csharp_type_lookup_node_resolution(
 
     if csharp_is_type_reference_node(node) {
         let reference = csharp_reference_type_text(node, source);
-        return csharp_type_candidates_resolution(
+        return csharp_type_candidates_resolution_with_kind(
             &reference,
             csharp_visible_type_candidates(csharp, file, &reference),
+            crate::analyzer::usages::get_type::TypeLookupTargetKind::TypeReference,
         );
     }
 
@@ -315,15 +317,28 @@ fn csharp_type_node_resolution(
     file: &ProjectFile,
     reference: &str,
 ) -> Option<CSharpTypeLookupResolution> {
-    csharp_type_candidates_resolution(
+    csharp_type_candidates_resolution_with_kind(
         reference,
         csharp_visible_type_candidates(csharp, file, reference),
+        crate::analyzer::usages::get_type::TypeLookupTargetKind::ValueExpression,
     )
 }
 
 fn csharp_type_candidates_resolution(
     reference: &str,
     candidates: Vec<CodeUnit>,
+) -> Option<CSharpTypeLookupResolution> {
+    csharp_type_candidates_resolution_with_kind(
+        reference,
+        candidates,
+        crate::analyzer::usages::get_type::TypeLookupTargetKind::ValueExpression,
+    )
+}
+
+fn csharp_type_candidates_resolution_with_kind(
+    reference: &str,
+    candidates: Vec<CodeUnit>,
+    target_kind: crate::analyzer::usages::get_type::TypeLookupTargetKind,
 ) -> Option<CSharpTypeLookupResolution> {
     if candidates.is_empty() {
         return None;
@@ -333,7 +348,11 @@ fn csharp_type_candidates_resolution(
     } else {
         reference.to_string()
     };
-    Some(CSharpTypeLookupResolution::Type { fqn, candidates })
+    Some(CSharpTypeLookupResolution::Type {
+        fqn,
+        candidates,
+        target_kind,
+    })
 }
 
 fn csharp_type_bindings_before_scoped(

@@ -1,4 +1,7 @@
-use super::{TypeLookupDiagnostic, TypeLookupOutcome, candidates_outcome, no_type};
+use super::{
+    TypeLookupDiagnostic, TypeLookupOutcome, TypeLookupTargetKind,
+    candidates_outcome_with_target_kind, no_type,
+};
 use crate::analyzer::usages::get_definition::{
     GoTypeLookupResolutionKind, go_type_lookup_resolution,
 };
@@ -37,12 +40,21 @@ pub(super) fn resolve_go_type(
         );
     }
 
-    let mut outcome = candidates_outcome(resolution.fqn, candidates);
     if resolution.kind == GoTypeLookupResolutionKind::InterfaceMethodOwner {
+        let mut outcome = candidates_outcome_with_target_kind(
+            resolution.fqn,
+            candidates,
+            TypeLookupTargetKind::MemberOwner,
+        );
         outcome.diagnostics.push(TypeLookupDiagnostic {
             kind: "go_interface_method_owner".to_string(),
             message: "selected Go interface method belongs to this interface type".to_string(),
         });
+        return outcome;
     }
-    outcome
+    candidates_outcome_with_target_kind(
+        resolution.fqn,
+        candidates,
+        TypeLookupTargetKind::ValueExpression,
+    )
 }

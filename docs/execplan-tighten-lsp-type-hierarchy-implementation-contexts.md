@@ -16,7 +16,9 @@ After this work, both providers remain advertised, but they return a normal JSON
 - [x] (2026-06-29 11:20Z) Added this ExecPlan as the living source of truth for issue `#332`.
 - [x] (2026-06-29 11:27Z) Ran Milestone 0 baseline focused LSP tests for existing type hierarchy and implementation positives.
 - [x] (2026-06-29 11:30Z) Prepared the ExecPlan-only Milestone 0 checkpoint for commit.
-- [ ] Milestone 1: implement shared resolver target classification and Java/C#/Scala cursor-context regressions.
+- [x] (2026-06-29 12:20Z) Milestone 1 implementation: added shared resolver target classification, tightened type hierarchy and implementation eligibility, and added Java/C#/Scala cursor-context regressions.
+- [x] (2026-06-29 12:28Z) Ran Milestone 1 focused validation: type hierarchy, implementation, and type definition LSP slices passed.
+- [x] (2026-06-29 13:15Z) Ran and resolved Milestone 1 guided review on the uncommitted diff.
 - [ ] Milestone 2: implement TypeScript/JavaScript and Rust cursor-context regressions.
 - [ ] Milestone 3: implement Go and implementation-specific cursor-context regressions.
 - [ ] Milestone 4: run the final focused LSP sweep, formatting, non-CUDA clippy, final guided review, and final cleanup.
@@ -41,6 +43,18 @@ After this work, both providers remain advertised, but they return a normal JSON
 - Observation: Existing positive type hierarchy and Go implementation behavior is green before production code changes.
   Evidence: `cargo test --test bifrost_lsp_server type_hierarchy --features nlp` passed 9 filtered tests, and `cargo test --test bifrost_lsp_server implementation --features nlp` passed 3 filtered tests.
 
+- Observation: Scala return type syntax was not classified as an explicit type position.
+  Evidence: The new `bifrost_lsp_server_type_hierarchy_filters_java_csharp_scala_value_contexts` regression initially returned `null` for the cursor on `Widget` in `def build(): Widget`; adding `return_type` to `scala_is_type_position` made the test pass.
+
+- Observation: The old Go implementation-from-local positive is now intentionally invalid under issue `#332`.
+  Evidence: After implementation eligibility started rejecting `ValueExpression` targets, `bifrost_lsp_server_implementation_returns_go_interface_descendants` returned `null` when invoked on a local variable of interface type, while Go interface declaration and interface method implementation tests still passed.
+
+- Observation: Guided review found the initial target-kind classification was incomplete.
+  Evidence: Reviewers noted that Rust and TypeScript declared type references still used the default `ValueExpression` helper. The fix marked TypeScript declared type resolution with `type_reference_outcome`, added Rust explicit type-node resolution through `rust_resolve_type_node_fqn`, and added TS/Rust LSP type-reference regressions.
+
+- Observation: Guided review found the first target-kind enum leaked a Go-specific name into generic code.
+  Evidence: `TypeLookupTargetKind::GoInterfaceMethodOwner` was replaced with language-neutral `TypeLookupTargetKind::MemberOwner`, while the existing `go_interface_method_owner` diagnostic remains the analyzer-owned way to recover the selected method name.
+
 ## Decision Log
 
 - Decision: Keep `typeHierarchyProvider` and `implementationProvider` advertised globally.
@@ -59,9 +73,32 @@ After this work, both providers remain advertised, but they return a normal JSON
   Rationale: Type definition may legitimately resolve the type of a value expression, such as a local variable or receiver. Type hierarchy and implementation have narrower target semantics and should opt into stricter eligibility.
   Date/Author: 2026-06-29 / Codex
 
+- Decision: Add `TypeLookupTargetKind` to `TypeLookupOutcome`.
+  Rationale: The LSP handlers need to distinguish type-syntax results from value-expression results without adding language-specific syntax tables in handler code. The classification is produced by analyzer-owned tree-sitter resolvers.
+  Date/Author: 2026-06-29 / Codex
+
+- Decision: Treat Go implementation from a local interface-typed variable as an invalid value context.
+  Rationale: Issue `#332` asks implementation to reject locals and ordinary value contexts while preserving type/interface declarations and Go interface method owner lookup. The existing declaration and interface-method tests continue to cover the preserved positives.
+  Date/Author: 2026-06-29 / Codex
+
+- Decision: Keep C# Milestone 1 coverage to negative cursor contexts for hierarchy.
+  Rationale: The C# hierarchy handler currently returns `null` for the attempted type-reference fixture. Rather than keep a weak `array or null` assertion, the milestone validates C# method/local rejection and leaves positive C# type-reference hierarchy coverage out of this slice.
+  Date/Author: 2026-06-29 / Codex
+
 ## Outcomes & Retrospective
 
 Milestone 0 baseline validation is complete. The branch is clean and current with its upstream. This document records the implementation scope, repository orientation, validation plan, and review checkpoint policy before production code changes begin. Existing positive type hierarchy and Go implementation LSP tests pass before production code changes.
+
+Milestone 1 implementation and guided-review resolution are complete. The shared `TypeLookupTargetKind` classification now lets `typeDefinition` keep broad behavior while `prepareTypeHierarchy` and `implementation` reject value-expression targets. Java, C#, and Scala regressions cover method/function names and locals returning `null`; Java, Scala, TypeScript, and Rust cover valid type-reference hierarchy behavior where supported, and TypeScript covers implementation from a type reference. The review-accepted fixes removed the Go-specific target-kind name from the generic enum and completed TypeScript/Rust type-reference classification. Focused validation passed after review fixes:
+
+    cargo test --test bifrost_lsp_server type_hierarchy --features nlp
+    result: 10 passed; 0 failed
+
+    cargo test --test bifrost_lsp_server implementation --features nlp
+    result: 5 passed; 0 failed
+
+    cargo test --test bifrost_lsp_server type_definition --features nlp
+    result: 11 passed; 0 failed
 
 ## Context and Orientation
 

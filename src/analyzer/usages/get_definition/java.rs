@@ -1,7 +1,10 @@
 use super::*;
 
 pub(crate) enum JavaTypeLookupResolution {
-    Type(String),
+    Type {
+        fqn: String,
+        target_kind: crate::analyzer::usages::get_type::TypeLookupTargetKind,
+    },
     InappropriateSymbolContext,
 }
 
@@ -116,8 +119,12 @@ fn java_type_lookup_node_fqn(
         node.kind(),
         "type_identifier" | "scoped_type_identifier" | "generic_type"
     ) {
-        return java_type_from_node_with_context(analyzer, java, file, source, node)
-            .map(|unit| JavaTypeLookupResolution::Type(unit.fq_name().to_string()));
+        return java_type_from_node_with_context(analyzer, java, file, source, node).map(|unit| {
+            JavaTypeLookupResolution::Type {
+                fqn: unit.fq_name().to_string(),
+                target_kind: crate::analyzer::usages::get_type::TypeLookupTargetKind::TypeReference,
+            }
+        });
     }
 
     if node.kind() != "identifier" {
@@ -129,17 +136,21 @@ fn java_type_lookup_node_fqn(
             && parent.child_by_field_name("object") == Some(node)
             && let Some(receiver) = java_receiver_type(analyzer, file, source, root, node)
         {
-            return Some(JavaTypeLookupResolution::Type(
-                receiver.fq_name().to_string(),
-            ));
+            return Some(JavaTypeLookupResolution::Type {
+                fqn: receiver.fq_name().to_string(),
+                target_kind:
+                    crate::analyzer::usages::get_type::TypeLookupTargetKind::ValueExpression,
+            });
         }
         if parent.kind() == "method_invocation"
             && parent.child_by_field_name("object") == Some(node)
             && let Some(receiver) = java_receiver_type(analyzer, file, source, root, node)
         {
-            return Some(JavaTypeLookupResolution::Type(
-                receiver.fq_name().to_string(),
-            ));
+            return Some(JavaTypeLookupResolution::Type {
+                fqn: receiver.fq_name().to_string(),
+                target_kind:
+                    crate::analyzer::usages::get_type::TypeLookupTargetKind::ValueExpression,
+            });
         }
         if java_is_callable_declaration_name(parent, node) {
             return Some(JavaTypeLookupResolution::InappropriateSymbolContext);
@@ -147,15 +158,21 @@ fn java_type_lookup_node_fqn(
         if let Some(declared) =
             java_declaration_name_type(analyzer, java, file, source, root, parent, node)
         {
-            return Some(JavaTypeLookupResolution::Type(
-                declared.fq_name().to_string(),
-            ));
+            return Some(JavaTypeLookupResolution::Type {
+                fqn: declared.fq_name().to_string(),
+                target_kind:
+                    crate::analyzer::usages::get_type::TypeLookupTargetKind::ValueExpression,
+            });
         }
     }
 
     let name = java_node_text(node, source);
-    java_type_of_identifier_before(analyzer, java, file, source, root, name, node.start_byte())
-        .map(|unit| JavaTypeLookupResolution::Type(unit.fq_name().to_string()))
+    java_type_of_identifier_before(analyzer, java, file, source, root, name, node.start_byte()).map(
+        |unit| JavaTypeLookupResolution::Type {
+            fqn: unit.fq_name().to_string(),
+            target_kind: crate::analyzer::usages::get_type::TypeLookupTargetKind::ValueExpression,
+        },
+    )
 }
 
 fn java_declaration_name_type(
