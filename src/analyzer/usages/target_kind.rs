@@ -1,6 +1,6 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TypeLookupTargetKind {
     TypeReference,
     ValueExpression,
-    MemberOwner,
+    MemberOwner { member_name: String },
 }

@@ -41,10 +41,16 @@ pub(super) fn resolve_go_type(
     }
 
     if resolution.kind == GoTypeLookupResolutionKind::InterfaceMethodOwner {
+        let Some(member_name) = resolution.member_name else {
+            return no_type(
+                "go_interface_method_owner_missing_member",
+                "Go interface method owner lookup did not include the selected method name",
+            );
+        };
         let mut outcome = candidates_outcome_with_target_kind(
             resolution.fqn,
             candidates,
-            TypeLookupTargetKind::MemberOwner,
+            TypeLookupTargetKind::MemberOwner { member_name },
         );
         outcome.diagnostics.push(TypeLookupDiagnostic {
             kind: "go_interface_method_owner".to_string(),

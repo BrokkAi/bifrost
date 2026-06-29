@@ -133,6 +133,7 @@ pub(crate) enum GoTypeLookupResolutionKind {
 pub(crate) struct GoTypeLookupResolution {
     pub(crate) fqn: String,
     pub(crate) kind: GoTypeLookupResolutionKind,
+    pub(crate) member_name: Option<String>,
 }
 
 pub(crate) fn go_type_lookup_resolution(
@@ -144,10 +145,13 @@ pub(crate) fn go_type_lookup_resolution(
     site: &ResolvedReferenceSite,
 ) -> Option<GoTypeLookupResolution> {
     let node = smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)?;
-    if let Some(fqn) = go_interface_method_owner_type_fqn(support, file, source, node) {
+    if let Some((fqn, member_name)) =
+        go_interface_method_owner_type_fqn(support, file, source, node)
+    {
         return Some(GoTypeLookupResolution {
             fqn,
             kind: GoTypeLookupResolutionKind::InterfaceMethodOwner,
+            member_name: Some(member_name),
         });
     }
 
@@ -164,6 +168,7 @@ pub(crate) fn go_type_lookup_resolution(
     Some(GoTypeLookupResolution {
         fqn,
         kind: GoTypeLookupResolutionKind::Expression,
+        member_name: None,
     })
 }
 
@@ -691,7 +696,7 @@ fn go_interface_method_owner_type_fqn(
     file: &ProjectFile,
     source: &str,
     mut node: Node<'_>,
-) -> Option<String> {
+) -> Option<(String, String)> {
     let selected = node;
     loop {
         if node.kind() == "method_elem" {
@@ -710,11 +715,12 @@ fn go_interface_method_owner_type_fqn(
                 .parent()
                 .filter(|parent| parent.kind() == "type_spec")?;
             let name = type_spec.child_by_field_name("name")?;
-            return go_resolve_type_name_in_package(
+            let owner_fqn = go_resolve_type_name_in_package(
                 support,
                 &go_package_name(file, source),
                 go_node_text(name, source),
-            );
+            )?;
+            return Some((owner_fqn, go_node_text(method_name, source).to_string()));
         }
         node = node.parent()?;
     }

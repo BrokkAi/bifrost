@@ -2,7 +2,7 @@ use brokk_bifrost::lsp::conversion::path_to_uri_string;
 use serde_json::{Value, json};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tempfile::TempDir;
 
@@ -25,6 +25,38 @@ fn write_completor_fixture(temp_root: &Path) -> std::path::PathBuf {
     let file = temp_root.join("Completor.java");
     fs::write(&file, COMPLETOR_JAVA_FIXTURE).expect("write Completor.java fixture");
     file
+}
+
+struct JvmTypeContextFixtures {
+    java_path: PathBuf,
+    java_source: &'static str,
+    csharp_path: PathBuf,
+    csharp_source: &'static str,
+    scala_path: PathBuf,
+    scala_source: &'static str,
+}
+
+fn write_jvm_type_context_fixtures(root: &Path, prefix: &str) -> JvmTypeContextFixtures {
+    let java_path = root.join(format!("{prefix}.java"));
+    let java_source = "class Widget {}\nclass Child extends Widget {}\nclass Service {\n    Widget build() {\n        Widget local = new Widget();\n        return local;\n    }\n}\n";
+    fs::write(&java_path, java_source).expect("write Java type-context fixture");
+
+    let csharp_path = root.join(format!("{prefix}.cs"));
+    let csharp_source = "class Widget {}\nclass Service { Widget Build() { Widget local = new Widget(); return local; } }\n";
+    fs::write(&csharp_path, csharp_source).expect("write C# type-context fixture");
+
+    let scala_path = root.join(format!("{prefix}.scala"));
+    let scala_source = "class Widget\nclass Child extends Widget\nclass Service {\n  def build(): Widget = {\n    val local: Widget = new Widget\n    local\n  }\n}\n";
+    fs::write(&scala_path, scala_source).expect("write Scala type-context fixture");
+
+    JvmTypeContextFixtures {
+        java_path,
+        java_source,
+        csharp_path,
+        csharp_source,
+        scala_path,
+        scala_source,
+    }
 }
 
 #[test]
@@ -2323,23 +2355,12 @@ fn bifrost_lsp_server_go_type_or_implementation_rejects_value_contexts() {
 fn bifrost_lsp_server_implementation_filters_java_csharp_scala_value_contexts() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().canonicalize().expect("canon temp");
-
-    let java_path = root.join("ImplContexts.java");
-    let java_source = "class Widget {}\nclass Child extends Widget {}\nclass Service {\n    Widget build() {\n        Widget local = new Widget();\n        return local;\n    }\n}\n";
-    fs::write(&java_path, java_source).expect("write Java implementation-context fixture");
-
-    let csharp_path = root.join("ImplContexts.cs");
-    let csharp_source = "class Widget {}\nclass Service { Widget Build() { Widget local = new Widget(); return local; } }\n";
-    fs::write(&csharp_path, csharp_source).expect("write C# implementation-context fixture");
-
-    let scala_path = root.join("ImplContexts.scala");
-    let scala_source = "class Widget\nclass Child extends Widget\nobject Service {\n  def build(): Widget = {\n    val local: Widget = new Widget\n    local\n  }\n}\n";
-    fs::write(&scala_path, scala_source).expect("write Scala implementation-context fixture");
+    let fixtures = write_jvm_type_context_fixtures(&root, "ImplContexts");
 
     let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
 
-    let java_uri = uri_for(&java_path);
-    let (line, character) = position_after(java_source, "    W");
+    let java_uri = uri_for(&fixtures.java_path);
+    let (line, character) = position_after(fixtures.java_source, "    W");
     let response = implementation_response(
         &mut stdin,
         &mut reader,
@@ -2358,67 +2379,32 @@ fn bifrost_lsp_server_implementation_filters_java_csharp_scala_value_contexts() 
             .any(|location| location["range"]["start"]["line"] == 1),
         "expected Java Child implementation from return type, got {response}"
     );
-    let (line, character) = position_after(java_source, "    Widget b");
-    let response = implementation_response(
+    assert_implementation_null_cases(
         &mut stdin,
         &mut reader,
         &mut stderr,
         11,
         &java_uri,
-        line,
-        character,
-    );
-    assert!(
-        response["result"].is_null(),
-        "Java method names must not resolve implementations, got {response}"
-    );
-    let (line, character) = position_after(java_source, "        Widget l");
-    let response = implementation_response(
-        &mut stdin,
-        &mut reader,
-        &mut stderr,
-        12,
-        &java_uri,
-        line,
-        character,
-    );
-    assert!(
-        response["result"].is_null(),
-        "Java locals must not resolve implementations, got {response}"
+        fixtures.java_source,
+        &[
+            ("    Widget b", "Java method names"),
+            ("        Widget l", "Java locals"),
+        ],
     );
 
-    let csharp_uri = uri_for(&csharp_path);
-    let (line, character) = position_after(csharp_source, " Widget B");
-    let response = implementation_response(
+    let csharp_uri = uri_for(&fixtures.csharp_path);
+    assert_implementation_null_cases(
         &mut stdin,
         &mut reader,
         &mut stderr,
         13,
         &csharp_uri,
-        line,
-        character,
-    );
-    assert!(
-        response["result"].is_null(),
-        "C# method names must not resolve implementations, got {response}"
-    );
-    let (line, character) = position_after(csharp_source, " Widget l");
-    let response = implementation_response(
-        &mut stdin,
-        &mut reader,
-        &mut stderr,
-        14,
-        &csharp_uri,
-        line,
-        character,
-    );
-    assert!(
-        response["result"].is_null(),
-        "C# locals must not resolve implementations, got {response}"
+        fixtures.csharp_source,
+        &[(" Widget B", "C# method names"), (" Widget l", "C# locals")],
     );
 
-    let scala_uri = uri_for(&scala_path);
-    let (line, character) = position_after(scala_source, ": W");
+    let scala_uri = uri_for(&fixtures.scala_path);
+    let (line, character) = position_after(fixtures.scala_source, ": W");
     let response = implementation_response(
         &mut stdin,
         &mut reader,
@@ -2437,33 +2423,14 @@ fn bifrost_lsp_server_implementation_filters_java_csharp_scala_value_contexts() 
             .any(|location| location["range"]["start"]["line"] == 1),
         "expected Scala Child implementation from return type, got {response}"
     );
-    let (line, character) = position_after(scala_source, "def b");
-    let response = implementation_response(
+    assert_implementation_null_cases(
         &mut stdin,
         &mut reader,
         &mut stderr,
         16,
         &scala_uri,
-        line,
-        character,
-    );
-    assert!(
-        response["result"].is_null(),
-        "Scala function names must not resolve implementations, got {response}"
-    );
-    let (line, character) = position_after(scala_source, "val l");
-    let response = implementation_response(
-        &mut stdin,
-        &mut reader,
-        &mut stderr,
-        17,
-        &scala_uri,
-        line,
-        character,
-    );
-    assert!(
-        response["result"].is_null(),
-        "Scala locals must not resolve implementations, got {response}"
+        fixtures.scala_source,
+        &[("def b", "Scala function names"), ("val l", "Scala locals")],
     );
 
     shutdown_lsp(child, stdin, reader, stderr);
@@ -6534,23 +6501,12 @@ fn bifrost_lsp_server_ruby_type_hierarchy_and_implementation_filter_value_contex
 fn bifrost_lsp_server_type_hierarchy_filters_java_csharp_scala_value_contexts() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().canonicalize().expect("canon temp");
-
-    let java_path = root.join("HierarchyContexts.java");
-    let java_source = "class Widget {}\nclass Child extends Widget {}\nclass Service {\n    Widget build() {\n        Widget local = new Widget();\n        return local;\n    }\n}\n";
-    fs::write(&java_path, java_source).expect("write Java hierarchy-context fixture");
-
-    let csharp_path = root.join("HierarchyContexts.cs");
-    let csharp_source = "class Widget {}\nclass Service { Widget Build() { Widget local = new Widget(); return local; } }\n";
-    fs::write(&csharp_path, csharp_source).expect("write C# hierarchy-context fixture");
-
-    let scala_path = root.join("HierarchyContexts.scala");
-    let scala_source = "class Widget\nclass Child extends Widget\nclass Service {\n  def build(): Widget = {\n    val local: Widget = new Widget\n    local\n  }\n}\n";
-    fs::write(&scala_path, scala_source).expect("write Scala hierarchy-context fixture");
+    let fixtures = write_jvm_type_context_fixtures(&root, "HierarchyContexts");
 
     let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
 
-    let java_uri = uri_for(&java_path);
-    let (line, character) = position_after(java_source, "class S");
+    let java_uri = uri_for(&fixtures.java_path);
+    let (line, character) = position_after(fixtures.java_source, "class S");
     let service = prepare_type_hierarchy(
         &mut stdin,
         &mut reader,
@@ -6564,7 +6520,7 @@ fn bifrost_lsp_server_type_hierarchy_filters_java_csharp_scala_value_contexts() 
         service["name"], "Service",
         "prepared Java Service: {service}"
     );
-    let (line, character) = position_after(java_source, "    W");
+    let (line, character) = position_after(fixtures.java_source, "    W");
     let widget_result = prepare_hierarchy_result(
         &mut stdin,
         &mut reader,
@@ -6584,67 +6540,32 @@ fn bifrost_lsp_server_type_hierarchy_filters_java_csharp_scala_value_contexts() 
     );
     let widget = widget[0].clone();
     assert_eq!(widget["name"], "Widget", "prepared Java Widget: {widget}");
-    let (line, character) = position_after(java_source, "    Widget b");
-    let result = prepare_hierarchy_result(
+    assert_prepare_type_hierarchy_null_cases(
         &mut stdin,
         &mut reader,
         &mut stderr,
         72,
-        "textDocument/prepareTypeHierarchy",
         &java_uri,
-        (line, character),
-    );
-    assert!(
-        result.is_null(),
-        "Java method names must not prepare type hierarchy: {result}"
-    );
-    let (line, character) = position_after(java_source, "        Widget l");
-    let result = prepare_hierarchy_result(
-        &mut stdin,
-        &mut reader,
-        &mut stderr,
-        73,
-        "textDocument/prepareTypeHierarchy",
-        &java_uri,
-        (line, character),
-    );
-    assert!(
-        result.is_null(),
-        "Java locals must not prepare type hierarchy: {result}"
+        fixtures.java_source,
+        &[
+            ("    Widget b", "Java method names"),
+            ("        Widget l", "Java locals"),
+        ],
     );
 
-    let csharp_uri = uri_for(&csharp_path);
-    let (line, character) = position_after(csharp_source, " Widget B");
-    let result = prepare_hierarchy_result(
+    let csharp_uri = uri_for(&fixtures.csharp_path);
+    assert_prepare_type_hierarchy_null_cases(
         &mut stdin,
         &mut reader,
         &mut stderr,
         74,
-        "textDocument/prepareTypeHierarchy",
         &csharp_uri,
-        (line, character),
-    );
-    assert!(
-        result.is_null(),
-        "C# method names must not prepare type hierarchy: {result}"
-    );
-    let (line, character) = position_after(csharp_source, " Widget l");
-    let result = prepare_hierarchy_result(
-        &mut stdin,
-        &mut reader,
-        &mut stderr,
-        75,
-        "textDocument/prepareTypeHierarchy",
-        &csharp_uri,
-        (line, character),
-    );
-    assert!(
-        result.is_null(),
-        "C# locals must not prepare type hierarchy: {result}"
+        fixtures.csharp_source,
+        &[(" Widget B", "C# method names"), (" Widget l", "C# locals")],
     );
 
-    let scala_uri = uri_for(&scala_path);
-    let (line, character) = position_after(scala_source, "class S");
+    let scala_uri = uri_for(&fixtures.scala_path);
+    let (line, character) = position_after(fixtures.scala_source, "class S");
     let service = prepare_type_hierarchy(
         &mut stdin,
         &mut reader,
@@ -6658,7 +6579,7 @@ fn bifrost_lsp_server_type_hierarchy_filters_java_csharp_scala_value_contexts() 
         service["name"], "Service",
         "prepared Scala Service: {service}"
     );
-    let (line, character) = position_after(scala_source, ": W");
+    let (line, character) = position_after(fixtures.scala_source, ": W");
     let widget_result = prepare_hierarchy_result(
         &mut stdin,
         &mut reader,
@@ -6678,36 +6599,71 @@ fn bifrost_lsp_server_type_hierarchy_filters_java_csharp_scala_value_contexts() 
     );
     let widget = widget[0].clone();
     assert_eq!(widget["name"], "Widget", "prepared Scala Widget: {widget}");
-    let (line, character) = position_after(scala_source, "def b");
-    let result = prepare_hierarchy_result(
+    assert_prepare_type_hierarchy_null_cases(
         &mut stdin,
         &mut reader,
         &mut stderr,
         79,
-        "textDocument/prepareTypeHierarchy",
         &scala_uri,
-        (line, character),
-    );
-    assert!(
-        result.is_null(),
-        "Scala function names must not prepare type hierarchy: {result}"
-    );
-    let (line, character) = position_after(scala_source, "val l");
-    let result = prepare_hierarchy_result(
-        &mut stdin,
-        &mut reader,
-        &mut stderr,
-        80,
-        "textDocument/prepareTypeHierarchy",
-        &scala_uri,
-        (line, character),
-    );
-    assert!(
-        result.is_null(),
-        "Scala locals must not prepare type hierarchy: {result}"
+        fixtures.scala_source,
+        &[("def b", "Scala function names"), ("val l", "Scala locals")],
     );
 
     shutdown_lsp(child, stdin, reader, stderr);
+}
+
+fn assert_implementation_null_cases(
+    stdin: &mut impl Write,
+    reader: &mut impl BufRead,
+    stderr: &mut impl Read,
+    start_id: u64,
+    uri: &str,
+    source: &str,
+    cases: &[(&str, &str)],
+) {
+    for (index, (needle, label)) in cases.iter().enumerate() {
+        let (line, character) = position_after(source, needle);
+        let response = implementation_response(
+            stdin,
+            reader,
+            stderr,
+            start_id + index as u64,
+            uri,
+            line,
+            character,
+        );
+        assert!(
+            response["result"].is_null(),
+            "{label} must not resolve implementations, got {response}"
+        );
+    }
+}
+
+fn assert_prepare_type_hierarchy_null_cases(
+    stdin: &mut impl Write,
+    reader: &mut impl BufRead,
+    stderr: &mut impl Read,
+    start_id: u64,
+    uri: &str,
+    source: &str,
+    cases: &[(&str, &str)],
+) {
+    for (index, (needle, label)) in cases.iter().enumerate() {
+        let (line, character) = position_after(source, needle);
+        let result = prepare_hierarchy_result(
+            stdin,
+            reader,
+            stderr,
+            start_id + index as u64,
+            "textDocument/prepareTypeHierarchy",
+            uri,
+            (line, character),
+        );
+        assert!(
+            result.is_null(),
+            "{label} must not prepare type hierarchy: {result}"
+        );
+    }
 }
 
 fn prepare_type_hierarchy(

@@ -25,6 +25,7 @@ After this work, both providers remain advertised, but they return a normal JSON
 - [x] (2026-06-29 14:45Z) Milestone 4 final validation: reran the focused LSP sweep, `cargo fmt`, and `cargo clippy-no-cuda`.
 - [x] (2026-06-29 15:05Z) Synced the feature branch onto `origin/master` after confirming the repository default branch is `master`.
 - [x] (2026-06-29 15:20Z) Milestone 5: added Ruby LSP coverage for declaration positives and value-context null behavior, then ran focused validation.
+- [x] (2026-06-29 16:05Z) Milestone 6: resolved guided-review findings by making member-owner targets carry the selected member name structurally and consolidating duplicated Java/C#/Scala LSP context-test setup.
 
 ## Surprises & Discoveries
 
@@ -70,6 +71,12 @@ After this work, both providers remain advertised, but they return a normal JSON
 - Observation: Ruby supports type hierarchy relations for class/module declarations but is not a `get_type::resolve_type_batch` language.
   Evidence: `RubyAnalyzer` implements `TypeHierarchyProvider`, while `src/analyzer/usages/get_type/mod.rs` only dispatches C#, Go, Java, JavaScript, Rust, Scala, and TypeScript. Ruby therefore needs LSP declaration/value-context coverage for this issue, not a Ruby type-reference resolver.
 
+- Observation: The branch-vs-master guided review found that `MemberOwner` was not self-contained enough.
+  Evidence: Reviewers noted that `TypeLookupTargetKind::MemberOwner` accepted implementation targets, but `src/lsp/handlers/type_target.rs` still scanned for the `go_interface_method_owner` diagnostic and derived the method name from reference text. The fix changed `MemberOwner` to carry `member_name` directly and made diagnostics informational rather than control flow.
+
+- Observation: The branch-vs-master guided review found duplicated Java/C#/Scala provider-context regressions.
+  Evidence: The implementation and type hierarchy tests recreated the same fixtures and method/local cursor cases. The fix added shared fixture setup and null-case assertion helpers while keeping provider-specific positive assertions in their respective tests.
+
 ## Decision Log
 
 - Decision: Keep `typeHierarchyProvider` and `implementationProvider` advertised globally.
@@ -114,6 +121,14 @@ After this work, both providers remain advertised, but they return a normal JSON
 
 - Decision: Cover Ruby as a declaration-target language without adding Ruby `get_type` support in this milestone.
   Rationale: Ruby has class/module hierarchy data but no static type annotation/reference syntax comparable to Java, TypeScript, Rust, or Scala. The shared LSP resolver already accepts selected class/module declarations and rejects Ruby value contexts through the unsupported-language type lookup path.
+  Date/Author: 2026-06-29 / Codex
+
+- Decision: Encode member-owner implementation identity in `TypeLookupTargetKind::MemberOwner { member_name }`.
+  Rationale: Implementation navigation needs the selected method name to return descendant methods instead of descendant types. Carrying the name in the structured target kind avoids treating diagnostics as semantic control flow and lets future member-owner languages use the same contract.
+  Date/Author: 2026-06-29 / Codex
+
+- Decision: Share Java/C#/Scala context-test fixtures and null-case assertions.
+  Rationale: `textDocument/implementation` and `textDocument/prepareTypeHierarchy` intentionally share the same target eligibility gate. Keeping their common negative cursor cases in one table reduces the chance that a later context addition is tested for only one provider.
   Date/Author: 2026-06-29 / Codex
 
 ## Outcomes & Retrospective
@@ -172,6 +187,29 @@ Milestone 5 is complete. The branch was rebased onto `origin/master`, whose remo
 
     cargo fmt
     result: passed
+
+    cargo clippy-no-cuda
+    result: passed
+
+Milestone 6 is complete. The branch-vs-master guided review reported one medium design finding and one low duplication finding. The design finding is fixed by changing `TypeLookupTargetKind::MemberOwner` from a marker to `MemberOwner { member_name }`; Go interface-method owner lookup fills this field, and `src/lsp/handlers/type_target.rs` uses it directly instead of scanning diagnostics. The duplication finding is fixed by adding shared Java/C#/Scala context fixture setup and shared null-case assertion helpers for implementation and type hierarchy. Validation passed:
+
+    cargo test --test bifrost_lsp_server bifrost_lsp_server_implementation_filters_java_csharp_scala_value_contexts --features nlp
+    result: 1 passed; 0 failed
+
+    cargo test --test bifrost_lsp_server bifrost_lsp_server_type_hierarchy_filters_java_csharp_scala_value_contexts --features nlp
+    result: 1 passed; 0 failed
+
+    cargo test --test bifrost_lsp_server bifrost_lsp_server_implementation_works_from_go_interface_method --features nlp
+    result: 1 passed; 0 failed
+
+    cargo test --test bifrost_lsp_server implementation --features nlp
+    result: 7 passed; 0 failed
+
+    cargo test --test bifrost_lsp_server type_hierarchy --features nlp
+    result: 11 passed; 0 failed
+
+    cargo test --test bifrost_lsp_server type_definition --features nlp
+    result: 11 passed; 0 failed
 
     cargo clippy-no-cuda
     result: passed
@@ -292,3 +330,5 @@ At the end of the implementation, `TypeLookupOutcome` should carry enough struct
 ## Revision Notes
 
 2026-06-29 / Codex: Created this ExecPlan from issue `#332` and the milestone implementation plan requested by the user. The document records the current handler seams, branch state, no-rebase decision, and review checkpoint protocol before production code changes begin.
+
+2026-06-29 / Codex: Updated after branch-vs-master guided review. The medium member-owner contract finding was resolved by carrying the member name structurally, and the low duplicated Java/C#/Scala test finding was resolved with shared fixture and null-case helpers.

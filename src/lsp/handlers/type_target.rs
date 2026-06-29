@@ -60,23 +60,14 @@ pub(crate) fn resolve_type_target(
         }],
     );
     let outcome = outcomes.into_iter().next()?;
-    if !eligibility.accepts(outcome.target_kind) {
+    if !eligibility.accepts(&outcome.target_kind) {
         return None;
     }
-    let implementation_kind = if outcome
-        .diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.kind == "go_interface_method_owner")
-    {
-        let name = outcome
-            .reference
-            .as_ref()
-            .map(|reference| reference.text.rsplit('.').next().unwrap_or(&reference.text))
-            .filter(|name| !name.is_empty())?
-            .to_string();
-        ImplementationTargetKind::Method { name }
-    } else {
-        ImplementationTargetKind::Type
+    let implementation_kind = match &outcome.target_kind {
+        TypeLookupTargetKind::MemberOwner { member_name } => ImplementationTargetKind::Method {
+            name: member_name.clone(),
+        },
+        _ => ImplementationTargetKind::Type,
     };
     let mut units = Vec::new();
     let mut seen = HashSet::default();
@@ -98,13 +89,13 @@ pub(crate) fn resolve_type_target(
 }
 
 impl TypeTargetEligibility {
-    fn accepts(self, target_kind: TypeLookupTargetKind) -> bool {
+    fn accepts(self, target_kind: &TypeLookupTargetKind) -> bool {
         match self {
             Self::TypeDefinition => true,
-            Self::TypeHierarchy => target_kind == TypeLookupTargetKind::TypeReference,
+            Self::TypeHierarchy => *target_kind == TypeLookupTargetKind::TypeReference,
             Self::Implementation => matches!(
                 target_kind,
-                TypeLookupTargetKind::TypeReference | TypeLookupTargetKind::MemberOwner
+                TypeLookupTargetKind::TypeReference | TypeLookupTargetKind::MemberOwner { .. }
             ),
         }
     }
