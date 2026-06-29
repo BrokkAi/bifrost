@@ -3847,6 +3847,527 @@ fn bifrost_lsp_server_call_hierarchy_finds_java_incoming_and_outgoing_calls() {
 }
 
 #[test]
+fn bifrost_lsp_server_call_hierarchy_prepare_filters_java_cursor_contexts() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("PrepareContexts.java");
+    let source = "class Service {\n    static int VALUE = 1;\n    static void target() {}\n}\nclass Caller {\n    void helper() {\n        int local = 1;\n        Service value = null;\n        Service.target();\n        int field = Service.VALUE;\n    }\n}\n";
+    fs::write(&file_path, source).expect("write Java prepare-context fixture");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+
+    let (line, character) = position_after(source, "int l");
+    let result = prepare_call_hierarchy_result(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        14,
+        &file_uri,
+        line,
+        character,
+    );
+    assert!(
+        result.is_null(),
+        "local variables must not prepare call hierarchy: {result}"
+    );
+
+    let (line, character) = position_after(source, "        S");
+    let result = prepare_call_hierarchy_result(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        15,
+        &file_uri,
+        line,
+        character,
+    );
+    assert!(
+        result.is_null(),
+        "type references must not prepare call hierarchy: {result}"
+    );
+
+    let (line, character) = position_after(source, "Service.t");
+    let target = prepare_call_hierarchy(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        16,
+        &file_uri,
+        line,
+        character,
+    );
+    assert_eq!(target["name"], "target", "prepared target call: {target}");
+
+    let (line, character) = position_after(source, "field = Service.V");
+    let result = prepare_call_hierarchy_result(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        17,
+        &file_uri,
+        line,
+        character,
+    );
+    assert!(
+        result.is_null(),
+        "field accesses must not prepare call hierarchy: {result}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_call_hierarchy_prepare_filters_js_ts_cursor_contexts() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let ts_path = root.join("prepare.ts");
+    let ts_source = "interface Shape {}\nclass Maker {}\nfunction target(): void {}\nfunction caller(): void {\n  let local = 1;\n  let typed: Shape | null = null;\n  target();\n  new Maker();\n}\n";
+    fs::write(&ts_path, ts_source).expect("write TypeScript prepare-context fixture");
+    let js_path = root.join("prepare.js");
+    let js_source = "class Worker {\n  run() {}\n}\nfunction caller() {\n  const local = 1;\n  new Worker().run();\n}\n";
+    fs::write(&js_path, js_source).expect("write JavaScript prepare-context fixture");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let ts_uri = uri_for(&ts_path);
+    let js_uri = uri_for(&js_path);
+
+    let (line, character) = position_after(ts_source, "function t");
+    let target = prepare_call_hierarchy(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        18,
+        &ts_uri,
+        line,
+        character,
+    );
+    assert_eq!(target["name"], "target", "prepared TS function: {target}");
+
+    let (line, character) = position_after(js_source, "  r");
+    let run = prepare_call_hierarchy(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        19,
+        &js_uri,
+        line,
+        character,
+    );
+    assert_eq!(run["name"], "run", "prepared JS method: {run}");
+
+    let (line, character) = position_after(ts_source, "let l");
+    let result = prepare_call_hierarchy_result(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        20,
+        &ts_uri,
+        line,
+        character,
+    );
+    assert!(
+        result.is_null(),
+        "TS local variables must not prepare call hierarchy: {result}"
+    );
+
+    let (line, character) = position_after(ts_source, "let typed: S");
+    let result = prepare_call_hierarchy_result(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        21,
+        &ts_uri,
+        line,
+        character,
+    );
+    assert!(
+        result.is_null(),
+        "TS type references must not prepare call hierarchy: {result}"
+    );
+
+    let (line, character) = position_after(ts_source, "  t");
+    let target = prepare_call_hierarchy(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        22,
+        &ts_uri,
+        line,
+        character,
+    );
+    assert_eq!(target["name"], "target", "prepared TS call: {target}");
+
+    let (line, character) = position_after(ts_source, "new M");
+    let maker = prepare_call_hierarchy(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        23,
+        &ts_uri,
+        line,
+        character,
+    );
+    assert_eq!(maker["name"], "Maker", "prepared TS new call: {maker}");
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_call_hierarchy_prepare_filters_rust_cursor_contexts() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("lib.rs");
+    let source = "struct Widget;\nfn target() {}\nfn caller() {\n    let local = 1;\n    let typed: Option<Widget> = None;\n    target();\n}\n";
+    fs::write(&file_path, source).expect("write Rust prepare-context fixture");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+
+    let (line, character) = position_after(source, "fn t");
+    let target = prepare_call_hierarchy(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        24,
+        &file_uri,
+        line,
+        character,
+    );
+    assert_eq!(target["name"], "target", "prepared Rust function: {target}");
+
+    let (line, character) = position_after(source, "let l");
+    let result = prepare_call_hierarchy_result(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        25,
+        &file_uri,
+        line,
+        character,
+    );
+    assert!(
+        result.is_null(),
+        "Rust local variables must not prepare call hierarchy: {result}"
+    );
+
+    let (line, character) = position_after(source, "Option<W");
+    let result = prepare_call_hierarchy_result(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        26,
+        &file_uri,
+        line,
+        character,
+    );
+    assert!(
+        result.is_null(),
+        "Rust type references must not prepare call hierarchy: {result}"
+    );
+
+    let (line, character) = position_after(source, "    t");
+    let target = prepare_call_hierarchy(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        27,
+        &file_uri,
+        line,
+        character,
+    );
+    assert_eq!(target["name"], "target", "prepared Rust call: {target}");
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_call_hierarchy_prepare_filters_remaining_language_contexts() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+
+    fs::write(
+        root.join("go.mod"),
+        "module example.com/prepare\n\ngo 1.22\n",
+    )
+    .expect("write go.mod");
+    let go_path = root.join("prepare.go");
+    let go_source = "package main\n\ntype Widget struct{}\nfunc target() {}\nfunc caller() {\n    local := 1\n    var typed Widget\n    _ = local\n    _ = typed\n    target()\n}\n";
+    fs::write(&go_path, go_source).expect("write Go prepare-context fixture");
+
+    let cs_path = root.join("Prepare.cs");
+    let cs_source = "namespace App { class Service { public static int Value; public static void Target() {} } class Caller { void Helper() { var local = 1; Service.Target(); var field = Service.Value; } } }\n";
+    fs::write(&cs_path, cs_source).expect("write C# prepare-context fixture");
+
+    let cpp_path = root.join("prepare.cpp");
+    let cpp_source = "struct Widget {};\nvoid target() {}\nvoid caller() {\n    int local = 1;\n    Widget typed;\n    target();\n}\n";
+    fs::write(&cpp_path, cpp_source).expect("write C++ prepare-context fixture");
+
+    let scala_path = root.join("Prepare.scala");
+    let scala_source = "package app\nclass Widget\nobject Service {\n  def target(): Unit = ()\n  def caller(): Unit = {\n    val local = 1\n    val typed: Widget = new Widget\n    target()\n  }\n}\n";
+    fs::write(&scala_path, scala_source).expect("write Scala prepare-context fixture");
+
+    let py_path = root.join("prepare.py");
+    let py_source = "class Widget:\n    pass\n\ndef target():\n    pass\n\ndef caller():\n    local = 1\n    target()\n";
+    fs::write(&py_path, py_source).expect("write Python prepare-context fixture");
+
+    let php_path = root.join("Prepare.php");
+    let php_source = "<?php\nnamespace App;\nclass Widget {}\nfunction target(): void {}\nfunction caller(): void {\n    $local = 1;\n    target();\n}\n";
+    fs::write(&php_path, php_source).expect("write PHP prepare-context fixture");
+
+    let rb_path = root.join("prepare.rb");
+    let rb_source = "class Worker\n  def target\n  end\n\n  def caller\n    target\n  end\nend\n";
+    fs::write(&rb_path, rb_source).expect("write Ruby prepare-context fixture");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+
+    let go_uri = uri_for(&go_path);
+    let (line, character) = position_after(go_source, "func t");
+    let target = prepare_call_hierarchy(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        28,
+        &go_uri,
+        line,
+        character,
+    );
+    assert_eq!(target["name"], "target", "prepared Go function: {target}");
+    let (line, character) = position_after(go_source, "local :");
+    let result = prepare_call_hierarchy_result(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        29,
+        &go_uri,
+        line,
+        character,
+    );
+    assert!(result.is_null(), "Go locals must not prepare: {result}");
+    let (line, character) = position_after(go_source, "    t");
+    let target = prepare_call_hierarchy(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        30,
+        &go_uri,
+        line,
+        character,
+    );
+    assert_eq!(target["name"], "target", "prepared Go call: {target}");
+
+    let cs_uri = uri_for(&cs_path);
+    let (line, character) = position_after(cs_source, "void T");
+    let target = prepare_call_hierarchy(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        31,
+        &cs_uri,
+        line,
+        character,
+    );
+    assert_eq!(target["name"], "Target", "prepared C# method: {target}");
+    let (line, character) = position_after(cs_source, "local =");
+    let result = prepare_call_hierarchy_result(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        32,
+        &cs_uri,
+        line,
+        character,
+    );
+    assert!(result.is_null(), "C# locals must not prepare: {result}");
+    let (line, character) = position_after(cs_source, "Service.T");
+    let target = prepare_call_hierarchy(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        33,
+        &cs_uri,
+        line,
+        character,
+    );
+    assert_eq!(target["name"], "Target", "prepared C# call: {target}");
+
+    let cpp_uri = uri_for(&cpp_path);
+    let (line, character) = position_after(cpp_source, "void t");
+    let target = prepare_call_hierarchy(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        34,
+        &cpp_uri,
+        line,
+        character,
+    );
+    assert_eq!(target["name"], "target", "prepared C++ function: {target}");
+    let (line, character) = position_after(cpp_source, "local =");
+    let result = prepare_call_hierarchy_result(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        35,
+        &cpp_uri,
+        line,
+        character,
+    );
+    assert!(result.is_null(), "C++ locals must not prepare: {result}");
+    let (line, character) = position_after(cpp_source, "    t");
+    let target = prepare_call_hierarchy(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        36,
+        &cpp_uri,
+        line,
+        character,
+    );
+    assert_eq!(target["name"], "target", "prepared C++ call: {target}");
+
+    let scala_uri = uri_for(&scala_path);
+    let (line, character) = position_after(scala_source, "def t");
+    let target = prepare_call_hierarchy(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        37,
+        &scala_uri,
+        line,
+        character,
+    );
+    assert_eq!(
+        target["name"], "target",
+        "prepared Scala function: {target}"
+    );
+    let (line, character) = position_after(scala_source, "val l");
+    let result = prepare_call_hierarchy_result(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        38,
+        &scala_uri,
+        line,
+        character,
+    );
+    assert!(result.is_null(), "Scala locals must not prepare: {result}");
+    let (line, character) = position_after(scala_source, "    t");
+    let target = prepare_call_hierarchy(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        39,
+        &scala_uri,
+        line,
+        character,
+    );
+    assert_eq!(target["name"], "target", "prepared Scala call: {target}");
+
+    let py_uri = uri_for(&py_path);
+    let (line, character) = position_after(py_source, "def t");
+    let target = prepare_call_hierarchy(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        40,
+        &py_uri,
+        line,
+        character,
+    );
+    assert_eq!(
+        target["name"], "target",
+        "prepared Python function: {target}"
+    );
+    let (line, character) = position_after(py_source, "local =");
+    let result = prepare_call_hierarchy_result(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        41,
+        &py_uri,
+        line,
+        character,
+    );
+    assert!(result.is_null(), "Python locals must not prepare: {result}");
+    let (line, character) = position_after(py_source, "    t");
+    let target = prepare_call_hierarchy(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        42,
+        &py_uri,
+        line,
+        character,
+    );
+    assert_eq!(target["name"], "target", "prepared Python call: {target}");
+
+    let php_uri = uri_for(&php_path);
+    let (line, character) = position_after(php_source, "function t");
+    let target = prepare_call_hierarchy(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        43,
+        &php_uri,
+        line,
+        character,
+    );
+    assert_eq!(target["name"], "target", "prepared PHP function: {target}");
+    let (line, character) = position_after(php_source, "$local");
+    let result = prepare_call_hierarchy_result(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        44,
+        &php_uri,
+        line,
+        character,
+    );
+    assert!(result.is_null(), "PHP locals must not prepare: {result}");
+    let (line, character) = position_after(php_source, "    t");
+    let target = prepare_call_hierarchy(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        45,
+        &php_uri,
+        line,
+        character,
+    );
+    assert_eq!(target["name"], "target", "prepared PHP call: {target}");
+
+    let rb_uri = uri_for(&rb_path);
+    let (line, character) = position_after(rb_source, "def t");
+    let target = prepare_call_hierarchy(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        46,
+        &rb_uri,
+        line,
+        character,
+    );
+    assert_eq!(target["name"], "target", "prepared Ruby method: {target}");
+    let (line, character) = position_after(rb_source, "    t");
+    let result = prepare_call_hierarchy_result(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        47,
+        &rb_uri,
+        line,
+        character,
+    );
+    assert!(
+        result.is_null(),
+        "Ruby call references stay unsupported until Ruby definition lookup lands: {result}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
 fn bifrost_lsp_server_call_hierarchy_preserves_java_overload_identity() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().canonicalize().expect("canon temp");
@@ -5678,6 +6199,26 @@ fn prepare_call_hierarchy(
     )
 }
 
+fn prepare_call_hierarchy_result(
+    stdin: &mut impl Write,
+    reader: &mut impl BufRead,
+    stderr: &mut impl Read,
+    id: u64,
+    uri: &str,
+    line: u64,
+    character: u64,
+) -> Value {
+    prepare_hierarchy_result(
+        stdin,
+        reader,
+        stderr,
+        id,
+        "textDocument/prepareCallHierarchy",
+        uri,
+        (line, character),
+    )
+}
+
 fn call_hierarchy_relation(
     stdin: &mut impl Write,
     reader: &mut impl BufRead,
@@ -5690,6 +6231,23 @@ fn call_hierarchy_relation(
 }
 
 fn prepare_hierarchy(
+    stdin: &mut impl Write,
+    reader: &mut impl BufRead,
+    stderr: &mut impl Read,
+    id: u64,
+    method: &str,
+    uri: &str,
+    position: (u64, u64),
+) -> Value {
+    let result = prepare_hierarchy_result(stdin, reader, stderr, id, method, uri, position);
+    let items = result
+        .as_array()
+        .unwrap_or_else(|| panic!("expected prepare array, got {result}"));
+    assert_eq!(items.len(), 1, "expected one prepared item: {items:#?}");
+    items[0].clone()
+}
+
+fn prepare_hierarchy_result(
     stdin: &mut impl Write,
     reader: &mut impl BufRead,
     stderr: &mut impl Read,
@@ -5712,11 +6270,7 @@ fn prepare_hierarchy(
         }),
     );
     let response = read_response_for_id(reader, stderr, id);
-    let items = response["result"]
-        .as_array()
-        .unwrap_or_else(|| panic!("expected prepare array, got {response}"));
-    assert_eq!(items.len(), 1, "expected one prepared item: {items:#?}");
-    items[0].clone()
+    response["result"].clone()
 }
 
 fn hierarchy_relation(

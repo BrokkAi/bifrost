@@ -4,13 +4,14 @@ use std::sync::Arc;
 use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
     CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
-    Range as LspRange, Uri,
+    Position, Range as LspRange, Uri,
 };
 
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::usages::get_definition::{
     DefinitionLookupRequest, DefinitionLookupStatus, call_reference_ranges,
-    is_call_reference_range, resolve_definition_batch_with_source,
+    is_call_reference_range, resolve_call_reference_definition_with_source,
+    resolve_definition_batch_with_source,
 };
 use crate::analyzer::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, UsageFinder, UsageHit};
 use crate::analyzer::{
@@ -42,8 +43,14 @@ pub fn prepare(
         &params.text_document_position_params.position,
     );
     let range = cursor_byte_range(&content, offset);
-    let enclosing = analyzer.enclosing_code_unit(&file, &range)?;
-    let callable = nearest_call_hierarchy_unit(analyzer, enclosing)?;
+    let callable = prepare_target_at_cursor(
+        analyzer,
+        &file,
+        &content,
+        &line_starts,
+        &params.text_document_position_params.position,
+        &range,
+    )?;
 
     let mut content_cache = FileContentCache::default();
     Some(vec![call_hierarchy_item(
@@ -52,6 +59,77 @@ pub fn prepare(
         &callable,
         &mut content_cache,
     )?])
+}
+
+fn prepare_target_at_cursor(
+    analyzer: &dyn IAnalyzer,
+    file: &crate::analyzer::ProjectFile,
+    content: &str,
+    line_starts: &[usize],
+    position: &Position,
+    range: &Range,
+) -> Option<CodeUnit> {
+    declaration_target_at_cursor(analyzer, file, content, line_starts, position, range)
+        .or_else(|| call_reference_target_at_cursor(analyzer, file, content, range))
+}
+
+fn declaration_target_at_cursor(
+    analyzer: &dyn IAnalyzer,
+    file: &crate::analyzer::ProjectFile,
+    content: &str,
+    line_starts: &[usize],
+    position: &Position,
+    range: &Range,
+) -> Option<CodeUnit> {
+    let enclosing = analyzer.enclosing_code_unit(file, range)?;
+    let callable = nearest_call_hierarchy_unit(analyzer, enclosing)?;
+    if callable.source() != file {
+        return None;
+    }
+    let parts = lsp_symbol_parts(analyzer, &callable, content, line_starts, None);
+    lsp_range_contains_position(&parts.selection_range, position).then_some(callable)
+}
+
+fn call_reference_target_at_cursor(
+    analyzer: &dyn IAnalyzer,
+    file: &crate::analyzer::ProjectFile,
+    content: &str,
+    range: &Range,
+) -> Option<CodeUnit> {
+    if range.start_byte >= range.end_byte {
+        return None;
+    }
+
+    let outcome = resolve_call_reference_definition_with_source(
+        analyzer,
+        DefinitionLookupRequest {
+            file: file.clone(),
+            line: None,
+            column: None,
+            start_byte: Some(range.start_byte),
+            end_byte: Some(range.end_byte),
+        },
+        file.clone(),
+        Arc::new(content.to_string()),
+    )?;
+    if outcome.status != DefinitionLookupStatus::Resolved {
+        return None;
+    }
+    outcome
+        .definitions
+        .into_iter()
+        .find_map(|definition| nearest_call_hierarchy_unit(analyzer, definition))
+}
+
+fn lsp_range_contains_position(range: &LspRange, position: &Position) -> bool {
+    compare_lsp_position(position, &range.start) != std::cmp::Ordering::Less
+        && compare_lsp_position(position, &range.end) == std::cmp::Ordering::Less
+}
+
+fn compare_lsp_position(left: &Position, right: &Position) -> std::cmp::Ordering {
+    left.line
+        .cmp(&right.line)
+        .then_with(|| left.character.cmp(&right.character))
 }
 
 pub fn incoming_calls(
@@ -294,10 +372,6 @@ fn same_symbol(left: &CodeUnit, right: &CodeUnit) -> bool {
 }
 
 fn compare_lsp_range(left: &LspRange, right: &LspRange) -> std::cmp::Ordering {
-    left.start
-        .line
-        .cmp(&right.start.line)
-        .then_with(|| left.start.character.cmp(&right.start.character))
-        .then_with(|| left.end.line.cmp(&right.end.line))
-        .then_with(|| left.end.character.cmp(&right.end.character))
+    compare_lsp_position(&left.start, &right.start)
+        .then_with(|| compare_lsp_position(&left.end, &right.end))
 }

@@ -67,6 +67,7 @@ mod scala;
 
 pub(crate) use call_sites::{
     call_reference_ranges, call_signature_context, is_call_reference_range,
+    is_call_reference_range_in_tree,
 };
 pub(crate) use csharp::{CSharpTypeLookupResolution, csharp_type_lookup_resolution};
 pub(crate) use go::{GoTypeLookupResolutionKind, go_type_lookup_resolution};
@@ -156,6 +157,33 @@ pub(crate) fn resolve_definition_batch_with_source(
         .into_iter()
         .map(|request| resolve_one(analyzer, &mut context, request))
         .collect()
+}
+
+pub(crate) fn resolve_call_reference_definition_with_source(
+    analyzer: &dyn IAnalyzer,
+    request: DefinitionLookupRequest,
+    file: ProjectFile,
+    source: Arc<String>,
+) -> Option<DefinitionLookupOutcome> {
+    let language = language_for_file(&request.file);
+    if matches!(language, Language::None | Language::Ruby) {
+        return None;
+    }
+    let start_byte = request.start_byte?;
+    let end_byte = request.end_byte?;
+    if start_byte >= end_byte {
+        return None;
+    }
+
+    let mut context = DefinitionBatchContext::new(analyzer);
+    context.sources.insert(file, Ok(source));
+    let source = context.source(&request.file).ok()?;
+    let tree = context.tree(&request.file, language, &source)?;
+    if !is_call_reference_range_in_tree(&tree, language, start_byte, end_byte) {
+        return None;
+    }
+
+    Some(resolve_one(analyzer, &mut context, request))
 }
 
 struct DefinitionBatchContext<'a> {
