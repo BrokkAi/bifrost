@@ -17,7 +17,7 @@ After this work, Bifrost still advertises `callHierarchyProvider`, but `textDocu
 - [x] (2026-06-29 16:25Z) Implemented Milestone 1 shared prepare gate and Java proof, ran focused validation, completed guided review, accepted two low-risk review fixes, and reran validation.
 - [x] (2026-06-29 16:45Z) Added Milestone 2 JS/TS and Rust prepare coverage, ran focused validation, and completed a manual guided-review fallback because the agent pool was at its thread limit.
 - [x] (2026-06-29 17:05Z) Added Milestone 3 coverage for Go, C#, C++, Scala, Python, PHP, and Ruby declaration-only behavior, ran focused validation, and completed manual guided review.
-- [ ] Milestone 4: final quality gate and final guided review.
+- [x] (2026-06-29 17:20Z) Ran the final quality gate, reviewed the accumulated branch diff, and recorded completion.
 
 ## Surprises & Discoveries
 
@@ -41,6 +41,9 @@ After this work, Bifrost still advertises `callHierarchyProvider`, but `textDocu
 
 - Observation: Remaining-language call-reference coverage also passed through the shared handler once cursors were placed inside identifier tokens.
   Evidence: Go, C#, C++, Scala, Python, and PHP declaration/call-reference positives plus local-variable negatives passed in `bifrost_lsp_server_call_hierarchy_prepare_filters_remaining_language_contexts`; Ruby declaration prepare passed while Ruby call-reference prepare returned `null`.
+
+- Observation: The final branch diff is limited to the intended implementation, tests, and ExecPlan.
+  Evidence: `git diff --stat origin/master...HEAD` listed only `docs/execplan-call-hierarchy-prepare-cursor-contexts.md`, `src/lsp/handlers/call_hierarchy.rs`, and `tests/bifrost_lsp_server.rs`; `git diff --check origin/master...HEAD` produced no output.
 
 ## Decision Log
 
@@ -106,6 +109,22 @@ Validation completed for Milestone 3:
     result: 10 passed; 0 failed
 
     cargo fmt --check
+    result: passed
+
+Milestone 4 is complete. The final quality gate passed, and the accumulated branch diff was reviewed manually because the agent pool was still unavailable for new reviewer batches. The final review found no unresolved findings. The branch contains four implementation/checkpoint commits before this final ExecPlan update: the initial plan, the Java/shared-handler slice, the JS/TS/Rust coverage slice, and the remaining-language coverage slice.
+
+Final validation completed:
+
+    cargo test --test bifrost_lsp_server call_hierarchy --features nlp
+    result: 10 passed; 0 failed
+
+    cargo fmt --check
+    result: passed
+
+    cargo clippy-no-cuda
+    result: passed
+
+    git diff --check origin/master...HEAD
     result: passed
 
 ## Context and Orientation
@@ -213,3 +232,5 @@ No new external dependencies are needed. Any helper added to call hierarchy prep
 2026-06-29 / Codex: Updated this ExecPlan after Milestone 2 test coverage. The document now records that JS/TS and Rust behavior passed with the shared handler and that the review checkpoint used the manual fallback path after the agent pool reached its thread limit.
 
 2026-06-29 / Codex: Updated this ExecPlan after Milestone 3 coverage. The document now records the remaining-language test outcomes, including Ruby's declaration-only boundary.
+
+2026-06-29 / Codex: Updated this ExecPlan after the final quality gate and accumulated-diff review. The document now records final validation and completion.
