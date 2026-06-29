@@ -1,7 +1,8 @@
 use lsp_types::{GotoDefinitionParams, GotoDefinitionResponse};
 
 use crate::analyzer::{Project, WorkspaceAnalyzer};
-use crate::lsp::handlers::util::{broad_symbol_target_at_position, code_unit_location};
+use crate::lsp::handlers::broad_symbol::broad_symbol_target_at_position;
+use crate::lsp::handlers::util::code_unit_location;
 
 /// Resolve `textDocument/definition`. Strategy:
 /// 1. Read the file at `uri` and find the identifier under the cursor.

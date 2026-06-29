@@ -1,10 +1,12 @@
 use lsp_types::{DocumentHighlight, DocumentHighlightKind, DocumentHighlightParams};
 
-use crate::analyzer::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, UsageFinder, UsageHit};
+use crate::analyzer::usages::UsageHit;
 use crate::analyzer::{CodeUnit, IAnalyzer, Project, Range as ByteRange, WorkspaceAnalyzer};
 use crate::lsp::conversion::byte_range_to_lsp_range;
-use crate::lsp::handlers::util::{
-    broad_symbol_target_at_position, code_unit_declaration_name_range, identifier_selection_range,
+use crate::lsp::handlers::{
+    broad_symbol::{broad_symbol_target_at_position, code_unit_declaration_name_range},
+    usage_hits::usage_hits_for_candidates_in_file,
+    util::identifier_selection_range,
 };
 
 /// Resolve `textDocument/documentHighlight`. Scopes the usage scan to the
@@ -24,25 +26,11 @@ pub fn handle(
         &params.text_document_position_params.position,
     )?;
 
-    let scoped_file = target.file.clone();
-    let result = UsageFinder::new()
-        .with_file_filter(move |file| file == &scoped_file)
-        .find_usages(
-            analyzer,
-            &target.candidates,
-            DEFAULT_MAX_FILES,
-            DEFAULT_MAX_USAGES,
-        );
-    let hits: Vec<UsageHit> = result
-        .all_hits()
-        .into_iter()
-        .filter(|hit| hit.file == target.file)
-        .collect();
-
-    let mut highlights: Vec<DocumentHighlight> = hits
-        .into_iter()
-        .map(|hit| usage_hit_to_highlight(&hit, &target.content, &target.line_starts))
-        .collect();
+    let mut highlights: Vec<DocumentHighlight> =
+        usage_hits_for_candidates_in_file(analyzer, &target.candidates, &target.file)
+            .into_iter()
+            .map(|hit| usage_hit_to_highlight(&hit, &target.content, &target.line_starts))
+            .collect();
 
     // Include each overload's declaration when it lives in this file — without
     // it, highlighting from the declaration site itself returns nothing on

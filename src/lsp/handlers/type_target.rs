@@ -6,8 +6,9 @@ use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::analyzer::{CodeUnit, IAnalyzer, Project, Range as ByteRange, WorkspaceAnalyzer};
 use crate::hash::HashSet;
 use crate::lsp::conversion::position_to_byte_offset;
+use crate::lsp::handlers::broad_symbol::selected_code_unit_declaration_at_cursor;
 use crate::lsp::handlers::hierarchy_support::cursor_byte_range;
-use crate::lsp::handlers::util::{read_document_for_uri, selected_code_unit_declaration_at_cursor};
+use crate::lsp::handlers::util::read_document_for_uri;
 
 pub(crate) struct TypeTarget {
     pub(crate) units: Vec<CodeUnit>,

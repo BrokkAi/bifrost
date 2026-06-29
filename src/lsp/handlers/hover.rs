@@ -4,9 +4,8 @@ use lsp_types::{Hover, HoverContents, HoverParams, MarkupContent, MarkupKind};
 
 use crate::analyzer::{Language, Project, Range as ByteRange, WorkspaceAnalyzer};
 use crate::lsp::conversion::byte_range_to_lsp_range;
-use crate::lsp::handlers::util::{
-    broad_symbol_target_at_position, leading_doc_comment_for_code_unit,
-};
+use crate::lsp::handlers::broad_symbol::broad_symbol_target_at_position;
+use crate::lsp::handlers::util::leading_doc_comment_for_code_unit;
 
 /// Resolve `textDocument/hover` for the symbol under the cursor. Returns the
 /// analyzer's skeleton header (signature plus enclosing context) wrapped in a

@@ -3,7 +3,7 @@ use serde_json::{Value, json};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use tempfile::TempDir;
 
 /// Build an LSP-correct `file://` URI for `path`. On Windows, `Path::display()`
@@ -4069,18 +4069,16 @@ fn bifrost_lsp_server_definition_ignores_literals_keywords_unresolved_and_ambigu
     let root = temp.path().canonicalize().expect("canon temp");
     let file_path = write_invalid_contexts_fixture(&root);
 
-    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let (child, stdin, reader, stderr) = start_lsp_server(&root);
+    let mut client = LspTestClient::new(stdin, reader, stderr, 10);
     let file_uri = uri_for(&file_path);
-    let mut next_id = 10;
     let responses = collect_invalid_context_endpoint_responses(
-        &mut stdin,
-        &mut reader,
-        &mut stderr,
-        &mut next_id,
+        &mut client,
         &file_uri,
         BroadEndpoint::Definition,
     );
 
+    let (stdin, reader, stderr) = client.into_parts();
     shutdown_lsp(child, stdin, reader, stderr);
 
     assert_no_invalid_context_results(BroadEndpoint::Definition, &responses);
@@ -4092,18 +4090,13 @@ fn bifrost_lsp_server_hover_ignores_literals_keywords_unresolved_and_ambiguous_t
     let root = temp.path().canonicalize().expect("canon temp");
     let file_path = write_invalid_contexts_fixture(&root);
 
-    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let (child, stdin, reader, stderr) = start_lsp_server(&root);
+    let mut client = LspTestClient::new(stdin, reader, stderr, 10);
     let file_uri = uri_for(&file_path);
-    let mut next_id = 10;
-    let responses = collect_invalid_context_endpoint_responses(
-        &mut stdin,
-        &mut reader,
-        &mut stderr,
-        &mut next_id,
-        &file_uri,
-        BroadEndpoint::Hover,
-    );
+    let responses =
+        collect_invalid_context_endpoint_responses(&mut client, &file_uri, BroadEndpoint::Hover);
 
+    let (stdin, reader, stderr) = client.into_parts();
     shutdown_lsp(child, stdin, reader, stderr);
 
     assert_no_invalid_context_results(BroadEndpoint::Hover, &responses);
@@ -4115,18 +4108,16 @@ fn bifrost_lsp_server_references_ignore_literals_keywords_unresolved_and_ambiguo
     let root = temp.path().canonicalize().expect("canon temp");
     let file_path = write_invalid_contexts_fixture(&root);
 
-    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let (child, stdin, reader, stderr) = start_lsp_server(&root);
+    let mut client = LspTestClient::new(stdin, reader, stderr, 10);
     let file_uri = uri_for(&file_path);
-    let mut next_id = 10;
     let responses = collect_invalid_context_endpoint_responses(
-        &mut stdin,
-        &mut reader,
-        &mut stderr,
-        &mut next_id,
+        &mut client,
         &file_uri,
         BroadEndpoint::References,
     );
 
+    let (stdin, reader, stderr) = client.into_parts();
     shutdown_lsp(child, stdin, reader, stderr);
 
     assert_no_invalid_context_results(BroadEndpoint::References, &responses);
@@ -4139,18 +4130,16 @@ fn bifrost_lsp_server_document_highlight_ignores_literals_keywords_unresolved_an
     let root = temp.path().canonicalize().expect("canon temp");
     let file_path = write_invalid_contexts_fixture(&root);
 
-    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let (child, stdin, reader, stderr) = start_lsp_server(&root);
+    let mut client = LspTestClient::new(stdin, reader, stderr, 10);
     let file_uri = uri_for(&file_path);
-    let mut next_id = 10;
     let responses = collect_invalid_context_endpoint_responses(
-        &mut stdin,
-        &mut reader,
-        &mut stderr,
-        &mut next_id,
+        &mut client,
         &file_uri,
         BroadEndpoint::DocumentHighlight,
     );
 
+    let (stdin, reader, stderr) = client.into_parts();
     shutdown_lsp(child, stdin, reader, stderr);
 
     assert_no_invalid_context_results(BroadEndpoint::DocumentHighlight, &responses);
@@ -7935,6 +7924,79 @@ fn references_response(
     read_response_for_id(reader, stderr, id)
 }
 
+struct LspTestClient {
+    stdin: ChildStdin,
+    reader: BufReader<ChildStdout>,
+    stderr: ChildStderr,
+    next_id: u64,
+}
+
+impl LspTestClient {
+    fn new(
+        stdin: ChildStdin,
+        reader: BufReader<ChildStdout>,
+        stderr: ChildStderr,
+        next_id: u64,
+    ) -> Self {
+        Self {
+            stdin,
+            reader,
+            stderr,
+            next_id,
+        }
+    }
+
+    fn into_parts(self) -> (ChildStdin, BufReader<ChildStdout>, ChildStderr) {
+        (self.stdin, self.reader, self.stderr)
+    }
+
+    fn text_document_position_response(
+        &mut self,
+        method: &str,
+        file_uri: &str,
+        line: u64,
+        character: u64,
+    ) -> Value {
+        let id = self.next_id();
+        text_document_position_response(
+            &mut self.stdin,
+            &mut self.reader,
+            &mut self.stderr,
+            id,
+            method,
+            file_uri,
+            line,
+            character,
+        )
+    }
+
+    fn references_response(
+        &mut self,
+        file_uri: &str,
+        line: u64,
+        character: u64,
+        include_declaration: bool,
+    ) -> Value {
+        let id = self.next_id();
+        references_response(
+            &mut self.stdin,
+            &mut self.reader,
+            &mut self.stderr,
+            id,
+            file_uri,
+            line,
+            character,
+            include_declaration,
+        )
+    }
+
+    fn next_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+}
+
 #[derive(Clone, Copy)]
 enum BroadEndpoint {
     Definition,
@@ -7978,12 +8040,8 @@ fn invalid_context_targets() -> Vec<(&'static str, u64, u64)> {
     .collect()
 }
 
-#[allow(clippy::too_many_arguments)]
 fn collect_invalid_context_endpoint_responses(
-    stdin: &mut impl Write,
-    reader: &mut impl BufRead,
-    stderr: &mut impl Read,
-    next_id: &mut u64,
+    client: &mut LspTestClient,
     file_uri: &str,
     endpoint: BroadEndpoint,
 ) -> Vec<(&'static str, Value)> {
@@ -7991,41 +8049,28 @@ fn collect_invalid_context_endpoint_responses(
         .into_iter()
         .map(|(label, line, character)| {
             let response = match endpoint {
-                BroadEndpoint::Definition => text_document_position_response(
-                    stdin,
-                    reader,
-                    stderr,
-                    *next_id,
+                BroadEndpoint::Definition => client.text_document_position_response(
                     "textDocument/definition",
                     file_uri,
                     line,
                     character,
                 ),
-                BroadEndpoint::Hover => text_document_position_response(
-                    stdin,
-                    reader,
-                    stderr,
-                    *next_id,
+                BroadEndpoint::Hover => client.text_document_position_response(
                     "textDocument/hover",
                     file_uri,
                     line,
                     character,
                 ),
-                BroadEndpoint::References => references_response(
-                    stdin, reader, stderr, *next_id, file_uri, line, character, true,
-                ),
-                BroadEndpoint::DocumentHighlight => text_document_position_response(
-                    stdin,
-                    reader,
-                    stderr,
-                    *next_id,
+                BroadEndpoint::References => {
+                    client.references_response(file_uri, line, character, true)
+                }
+                BroadEndpoint::DocumentHighlight => client.text_document_position_response(
                     "textDocument/documentHighlight",
                     file_uri,
                     line,
                     character,
                 ),
             };
-            *next_id += 1;
             (label, response)
         })
         .collect()
