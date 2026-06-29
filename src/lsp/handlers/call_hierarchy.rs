@@ -10,7 +10,8 @@ use lsp_types::{
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::usages::get_definition::{
     DefinitionLookupRequest, DefinitionLookupStatus, call_reference_ranges,
-    is_call_reference_range, resolve_definition_batch_with_source,
+    is_call_reference_range, resolve_call_reference_definition_with_source,
+    resolve_definition_batch_with_source,
 };
 use crate::analyzer::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, UsageFinder, UsageHit};
 use crate::analyzer::{
@@ -95,25 +96,22 @@ fn call_reference_target_at_cursor(
     content: &str,
     range: &Range,
 ) -> Option<CodeUnit> {
-    if range.start_byte >= range.end_byte
-        || !is_call_reference_range(file, content, range.start_byte, range.end_byte)
-    {
+    if range.start_byte >= range.end_byte {
         return None;
     }
 
-    let outcomes = resolve_definition_batch_with_source(
+    let outcome = resolve_call_reference_definition_with_source(
         analyzer,
-        vec![DefinitionLookupRequest {
+        DefinitionLookupRequest {
             file: file.clone(),
             line: None,
             column: None,
             start_byte: Some(range.start_byte),
             end_byte: Some(range.end_byte),
-        }],
+        },
         file.clone(),
         Arc::new(content.to_string()),
-    );
-    let outcome = outcomes.into_iter().next()?;
+    )?;
     if outcome.status != DefinitionLookupStatus::Resolved {
         return None;
     }

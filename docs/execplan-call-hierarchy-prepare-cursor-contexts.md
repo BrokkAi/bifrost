@@ -234,3 +234,5 @@ No new external dependencies are needed. Any helper added to call hierarchy prep
 2026-06-29 / Codex: Updated this ExecPlan after Milestone 3 coverage. The document now records the remaining-language test outcomes, including Ruby's declaration-only boundary.
 
 2026-06-29 / Codex: Updated this ExecPlan after the final quality gate and accumulated-diff review. The document now records final validation and completion.
+
+2026-06-29 / Codex: Addressed the final branch-vs-master guided-review finding by moving prepare call-reference eligibility into the definition resolver's parsed-tree context, avoiding a separate LSP-side call-site parse before definition resolution. Re-ran focused call hierarchy tests, formatting, and `cargo clippy-no-cuda`.
