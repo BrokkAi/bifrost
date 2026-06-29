@@ -2,10 +2,9 @@ use lsp_types::{DocumentHighlight, DocumentHighlightKind, DocumentHighlightParam
 
 use crate::analyzer::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, UsageFinder, UsageHit};
 use crate::analyzer::{CodeUnit, IAnalyzer, Project, Range as ByteRange, WorkspaceAnalyzer};
-use crate::lsp::conversion::{byte_range_to_lsp_range, position_to_byte_offset};
+use crate::lsp::conversion::byte_range_to_lsp_range;
 use crate::lsp::handlers::util::{
-    identifier_at_offset, identifier_selection_range, read_document_for_uri,
-    resolve_identifier_candidates,
+    broad_symbol_target_at_position, code_unit_declaration_name_range, identifier_selection_range,
 };
 
 /// Resolve `textDocument/documentHighlight`. Scopes the usage scan to the
@@ -17,41 +16,41 @@ pub fn handle(
     params: &DocumentHighlightParams,
 ) -> Option<Vec<DocumentHighlight>> {
     let uri = &params.text_document_position_params.text_document.uri;
-    let (project_file, content, line_starts) = read_document_for_uri(project, uri)?;
-    let byte_offset = position_to_byte_offset(
-        &content,
-        &line_starts,
-        &params.text_document_position_params.position,
-    );
-    let identifier = identifier_at_offset(&content, byte_offset)?;
-
     let analyzer = workspace.analyzer();
-    let overloads = resolve_identifier_candidates(analyzer, identifier);
-    if overloads.is_empty() {
-        return None;
-    }
+    let target = broad_symbol_target_at_position(
+        analyzer,
+        project,
+        uri,
+        &params.text_document_position_params.position,
+    )?;
 
-    let scoped_file = project_file.clone();
+    let scoped_file = target.file.clone();
     let result = UsageFinder::new()
         .with_file_filter(move |file| file == &scoped_file)
-        .find_usages(analyzer, &overloads, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES);
+        .find_usages(
+            analyzer,
+            &target.candidates,
+            DEFAULT_MAX_FILES,
+            DEFAULT_MAX_USAGES,
+        );
     let hits: Vec<UsageHit> = result
         .all_hits()
         .into_iter()
-        .filter(|hit| hit.file == project_file)
+        .filter(|hit| hit.file == target.file)
         .collect();
 
     let mut highlights: Vec<DocumentHighlight> = hits
         .into_iter()
-        .map(|hit| usage_hit_to_highlight(&hit, &content, &line_starts))
+        .map(|hit| usage_hit_to_highlight(&hit, &target.content, &target.line_starts))
         .collect();
 
     // Include each overload's declaration when it lives in this file — without
     // it, highlighting from the declaration site itself returns nothing on
     // languages where UsageFinder does not emit a hit at the declaration.
-    for cu in &overloads {
-        if cu.source() == &project_file
-            && let Some(decl) = code_unit_highlight(analyzer, cu, &content, &line_starts)
+    for cu in &target.candidates {
+        if cu.source() == &target.file
+            && let Some(decl) =
+                code_unit_highlight(analyzer, cu, &target.content, &target.line_starts)
         {
             highlights.push(decl);
         }
@@ -110,8 +109,11 @@ fn code_unit_highlight(
     // wash out the editor with a giant highlight on cursor over the name.
     // Fall back to the full range if the identifier can't be located word-
     // bounded inside it (e.g. synthetic units with no recoverable name).
-    let lsp_range = identifier_selection_range(code_unit, content, line_starts, &range)
-        .unwrap_or_else(|| byte_range_to_lsp_range(content, line_starts, &range));
+    let lsp_range =
+        code_unit_declaration_name_range(analyzer, code_unit.source(), content, code_unit)
+            .map(|name_range| byte_range_to_lsp_range(content, line_starts, &name_range))
+            .or_else(|| identifier_selection_range(code_unit, content, line_starts, &range))
+            .unwrap_or_else(|| byte_range_to_lsp_range(content, line_starts, &range));
     Some(DocumentHighlight {
         range: lsp_range,
         kind: Some(DocumentHighlightKind::WRITE),

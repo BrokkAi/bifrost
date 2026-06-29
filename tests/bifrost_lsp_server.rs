@@ -3699,6 +3699,8 @@ fn bifrost_lsp_server_references_finds_class_a_usages() {
 
 const COMMENT_TARGETS_SOURCE: &str = "class CommentTargets {\n    // target\n    void target() {}\n    void caller() {\n        target();\n    }\n}\n";
 
+const SHIFTED_COMMENT_TARGETS_SOURCE: &str = "// unsaved header\nclass CommentTargets {\n    // target\n    void target() {}\n    void caller() {\n        target();\n    }\n}\n";
+
 const DUPLICATE_DECLARATION_NAME_SOURCE: &str =
     "class Widget {\n    Widget Widget() {\n        return this;\n    }\n}\n";
 
@@ -3963,6 +3965,79 @@ fn bifrost_lsp_server_document_highlight_ignores_comment_token() {
                 .as_array()
                 .is_some_and(|items| items.is_empty()),
         "comment token must not produce highlights, got {comment_highlights}"
+    );
+}
+
+#[test]
+fn bifrost_lsp_server_references_and_document_highlight_use_shifted_overlay_declaration() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = write_comment_targets_fixture(&root);
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": file_uri,
+                    "languageId": "java",
+                    "version": 1,
+                    "text": SHIFTED_COMMENT_TARGETS_SOURCE
+                }
+            }
+        }),
+    );
+    let _ = read_notification(&mut reader, &mut stderr, "textDocument/publishDiagnostics");
+
+    let (line, character) = position_after(SHIFTED_COMMENT_TARGETS_SOURCE, "void ");
+    let references = references_response(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        10,
+        &file_uri,
+        line,
+        character,
+        true,
+    );
+    let highlights = text_document_position_response(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        11,
+        "textDocument/documentHighlight",
+        &file_uri,
+        line,
+        character,
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+
+    assert!(
+        references["result"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+        "shifted overlay declaration should find references, got {references}"
+    );
+    assert!(
+        highlights["result"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+        "shifted overlay declaration should produce highlights, got {highlights}"
+    );
+    assert!(
+        highlights["result"].as_array().is_some_and(|items| {
+            items.iter().any(|item| {
+                item["range"]["start"]["line"] == line
+                    && item["range"]["start"]["character"] == character
+            })
+        }),
+        "shifted overlay declaration should highlight the overlaid declaration name, got {highlights}"
     );
 }
 

@@ -16,7 +16,7 @@ After this work, Bifrost will still advertise the same LSP capabilities, but ina
 - [x] (2026-06-29 13:02Z) Confirmed branch/upstream state after kickoff fetch and recorded exact commit IDs in `Surprises & Discoveries`.
 - [x] (2026-06-29 13:06Z) Milestone 1 complete: added independent invalid-context LSP regressions without production-code changes, ran focused tests to prove the bug, ran guided review on the test-only diff, addressed accepted review findings, and prepared the milestone commit.
 - [x] (2026-06-29 14:23Z) Milestone 2 complete: introduced the shared structured cursor-target resolver, wired `definition` and `hover`, accepted and fixed guided-review findings, added the duplicate declaration-name regression, validated focused definition/hover/typeDefinition paths, updated this plan, and prepared the milestone commit.
-- [ ] Milestone 3: wire `references` and `documentHighlight` to the shared resolver while preserving declaration/reference behavior and overlay awareness, validate, run guided review and AGENTS.md audit, update this plan, and commit.
+- [x] (2026-06-29 15:05Z) Milestone 3 complete: wired `references` and `documentHighlight` through the shared resolver, removed the old raw identifier candidate resolver from production LSP code, added an overlay-shift declaration regression from guided-review feedback, validated focused endpoint filters, updated this plan, and prepared the milestone commit.
 - [ ] Milestone 4: broaden regressions across comments, literals, keywords, unresolved locals, ambiguous short names, and open-document overlays; run final quality gate, final guided review, update this plan, and commit.
 
 ## Surprises & Discoveries
@@ -48,6 +48,15 @@ After this work, Bifrost will still advertise the same LSP capabilities, but ina
 - Observation: The earlier declaration-name selection helper was not strong enough for the broad cursor gate.
   Evidence: Guided review found that `identifier_selection_range` chooses the first word-bounded occurrence of a code unit identifier inside the declaration range, so a Java declaration like `Widget Widget() {}` could select the return type instead of the method name. The accepted fix added a parser-backed declaration `name` field helper and the regression `bifrost_lsp_server_definition_and_hover_select_duplicate_declaration_name`.
 
+- Observation: Milestone 3 removes the production LSP path that resolved arbitrary cursor text through global short-name lookup.
+  Evidence: `src/lsp/handlers/references.rs` and `src/lsp/handlers/document_highlight.rs` now call `broad_symbol_target_at_position` before running `UsageFinder`. `resolve_identifier_candidates` and `short_name_pattern` were removed from `src/lsp/handlers/util.rs`; `identifier_at_offset` is now test-only in `src/text_utils.rs`.
+
+- Observation: Shifted open-document overlays continue to work for declaration-site references and document highlights.
+  Evidence: Guided review raised the risk that analyzer declaration byte ranges could be stale against overlay content. `src/lsp/server.rs` updates the overlay and immediately reindexes the changed file before publishing diagnostics on `didOpen`/`didChange`. The regression `bifrost_lsp_server_references_and_document_highlight_use_shifted_overlay_declaration` prepends an unsaved header before a Java declaration and then verifies both endpoints on the shifted declaration name. It passed under both `cargo test --test bifrost_lsp_server references --features nlp` and `cargo test --test bifrost_lsp_server document_highlight --features nlp`.
+
+- Observation: Milestone 3 fixes the references and documentHighlight comment-token regressions while preserving endpoint positives.
+  Evidence: `cargo check --test bifrost_lsp_server --features nlp` passed without warnings. `cargo fmt --check` and `git diff --check` passed. `cargo test --test bifrost_lsp_server references --features nlp` passed 4/4 filtered tests, `cargo test --test bifrost_lsp_server document_highlight --features nlp` passed 3/3 filtered tests, and smoke reruns for `definition`, `hover`, and `type_definition` all passed after the shared utility changes.
+
 ## Decision Log
 
 - Decision: Keep all provider advertisements unchanged.
@@ -75,6 +84,8 @@ Milestone 1 is complete. The test-only regressions now prove that a comment toke
 Milestone 1 guided-review outcome: security found no issues. DevOps, senior-dev, and architecture all flagged that the original combined regression did not independently prove each endpoint and could mislead focused milestone validation. DevOps also flagged that the expected-failing assertion could panic before LSP shutdown. Duplication review flagged that the new generic request helper should be reused by existing typeDefinition and implementation helpers. All findings were accepted and fixed: the regression is split into four endpoint-specific tests, each test collects responses then calls `shutdown_lsp` before asserting the expected failure, and existing position-based helpers now delegate to `text_document_position_response`.
 
 Milestone 2 is complete. Definition and hover now use the shared structured cursor-target resolver, so comment tokens no longer resolve through global short-name lookup for those endpoints. The declaration branch is parser-backed: it accepts an analyzer-enclosed code unit only when the cursor is on the declaration node's tree-sitter `name` field, which avoids treating return types or body occurrences as declaration selections. Guided review found one duplication issue and one correctness issue; both were accepted and fixed by sharing the corrected helper with `type_target.rs` and adding the duplicate declaration-name regression. References and documentHighlight intentionally still fail their Milestone 1 comment-token regressions until Milestone 3 wires them through the same target resolver.
+
+Milestone 3 is complete. References and documentHighlight now prove the cursor target through `BroadSymbolTarget` before invoking `UsageFinder`, so comment tokens no longer trigger workspace usage scans. References preserve `includeDeclaration`; documentHighlight preserves current-file filtering and declaration highlights. Guided review found one overlay-shift risk; the existing server update path already reindexes open-document overlays synchronously, and a new shifted-overlay LSP regression now protects that behavior. Security, duplication, testability, and architecture review found no blocking issues.
 
 ## Context and Orientation
 
@@ -238,3 +249,5 @@ The shared resolver should expose a small internal API that lets endpoint handle
 2026-06-29 / Codex: Updated this ExecPlan after implementing the Milestone 2 definition/hover slice. The document now records the shared structured cursor-target resolver and focused validation results before guided review.
 
 2026-06-29 / Codex: Updated this ExecPlan after guided review of Milestone 2. The document now records the accepted duplicate-helper and declaration-name correctness findings, the parser-backed declaration-name helper, the duplicate declaration-name regression, and the focused validation results after the review fix.
+
+2026-06-29 / Codex: Updated this ExecPlan after guided review of Milestone 3. The document now records the references/documentHighlight shared-resolver wiring, removal of the old production raw-identifier candidate resolver, the overlay-shift review investigation and regression, and the focused validation results before the milestone commit.

@@ -11,9 +11,11 @@ use crate::analyzer::{CodeUnit, IAnalyzer, Language, Project, ProjectFile, Range
 use crate::lsp::conversion::{
     byte_range_to_lsp_range, path_to_uri_string, position_to_byte_offset, uri_to_path,
 };
+#[cfg(test)]
+use crate::text_utils::identifier_at_offset;
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 pub(crate) use crate::text_utils::{
-    find_word, identifier_at_offset, identifier_prefix_before_offset, identifier_span_at_offset,
+    find_word, identifier_prefix_before_offset, identifier_span_at_offset,
 };
 use lsp_types::{Location, Position, Range as LspRange, Uri};
 use tree_sitter::Node;
@@ -35,6 +37,7 @@ pub fn read_document_for_uri(
 }
 
 pub(super) struct BroadSymbolTarget {
+    pub(super) file: ProjectFile,
     pub(super) content: String,
     pub(super) line_starts: Vec<usize>,
     pub(super) start_byte: usize,
@@ -71,6 +74,7 @@ pub(super) fn broad_symbol_target_at_position(
             })?;
 
     Some(BroadSymbolTarget {
+        file,
         content,
         line_starts,
         start_byte,
@@ -96,7 +100,7 @@ pub(super) fn selected_code_unit_declaration_at_cursor(
         .then_some(code_unit)
 }
 
-fn code_unit_declaration_name_range(
+pub(super) fn code_unit_declaration_name_range(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     content: &str,
@@ -253,22 +257,6 @@ impl FileContentCache {
     }
 }
 
-pub(super) fn resolve_identifier_candidates(
-    analyzer: &dyn IAnalyzer,
-    identifier: &str,
-) -> Vec<CodeUnit> {
-    let direct: Vec<CodeUnit> = analyzer.get_definitions(identifier);
-    if !direct.is_empty() {
-        return direct;
-    }
-    let pattern = short_name_pattern(identifier);
-    analyzer
-        .search_definitions(&pattern, false)
-        .into_iter()
-        .filter(|cu| cu.identifier() == identifier)
-        .collect()
-}
-
 pub(super) fn code_unit_location(
     analyzer: &dyn IAnalyzer,
     project: &dyn Project,
@@ -295,10 +283,6 @@ pub(super) fn code_unit_location(
         uri,
         range: lsp_range,
     })
-}
-
-fn short_name_pattern(identifier: &str) -> String {
-    format!(r"\b{}\b", regex::escape(identifier))
 }
 
 /// Resolve an LSP `Uri` to a [`ProjectFile`] that belongs to `project`.
