@@ -15,7 +15,7 @@ After this work, Bifrost still advertises `callHierarchyProvider`, but `textDocu
 - [x] (2026-06-29 15:45Z) Confirmed the worktree is clean on `331-tighten-lsp-call-hierarchy-prepare-cursor-contexts`; `HEAD`, `origin/master`, and `origin/331-tighten-lsp-call-hierarchy-prepare-cursor-contexts` all resolve to `fbfe670bf3dc4f73af991b6ff55a9d2d3fc65a18`.
 - [x] (2026-06-29 15:48Z) Added this ExecPlan as the living source of truth for issue `#331`.
 - [x] (2026-06-29 16:25Z) Implemented Milestone 1 shared prepare gate and Java proof, ran focused validation, completed guided review, accepted two low-risk review fixes, and reran validation.
-- [ ] Milestone 2: JS/TS and Rust coverage.
+- [x] (2026-06-29 16:45Z) Added Milestone 2 JS/TS and Rust prepare coverage, ran focused validation, and completed a manual guided-review fallback because the agent pool was at its thread limit.
 - [ ] Milestone 3: Go, C#, C++, Scala, Python, PHP, and Ruby declaration-scope documentation.
 - [ ] Milestone 4: final quality gate and final guided review.
 
@@ -35,6 +35,9 @@ After this work, Bifrost still advertises `callHierarchyProvider`, but `textDocu
 
 - Observation: The shared prepare gate currently parses a call-reference source once to prove call syntax and again through definition lookup to resolve the target.
   Evidence: Guided review flagged the double parse in `is_call_reference_range` plus `resolve_definition_batch_with_source`. The review did not find a correctness bug, and the larger parse-sharing API is left for a later cleanup rather than weakening this milestone with a broad source-size fallback.
+
+- Observation: Milestone 2 did not require production-code changes.
+  Evidence: Adding JS/TS and Rust LSP prepare regressions passed against the shared Milestone 1 handler with `cargo test --test bifrost_lsp_server call_hierarchy --features nlp`.
 
 ## Decision Log
 
@@ -68,6 +71,21 @@ Validation completed for Milestone 1:
 
     cargo test --test bifrost_lsp_server call_hierarchy --features nlp
     result: 7 passed; 0 failed
+
+    cargo fmt --check
+    result: passed
+
+Milestone 2 is complete. TypeScript coverage now proves function declarations, direct function calls, constructor calls, local variables, and type references go through the intended prepare outcomes. JavaScript coverage proves method declaration names still prepare. Rust coverage proves free function declarations and function calls prepare, while locals and type references return `null`.
+
+Milestone 2 guided-review outcome: spawning reviewer agents failed because the session had reached its agent thread limit, so the review was completed manually against the test-only diff using the same security, duplication, senior-dev, devops, and architecture lenses. No actionable findings were found.
+
+Validation completed for Milestone 2:
+
+    cargo test --test bifrost_lsp_server call_hierarchy_prepare --features nlp
+    result: 3 passed; 0 failed
+
+    cargo test --test bifrost_lsp_server call_hierarchy --features nlp
+    result: 9 passed; 0 failed
 
     cargo fmt --check
     result: passed
@@ -173,3 +191,5 @@ No new external dependencies are needed. Any helper added to call hierarchy prep
 2026-06-29 / Codex: Created this ExecPlan from issue `#331` and the implementation plan requested by the user. The document records the current prepare bug, the no-mini-parser constraint, the branch/rebase decision, and the milestone review workflow before code changes begin.
 
 2026-06-29 / Codex: Updated this ExecPlan after Milestone 1 implementation and guided review. The document now records the accepted review fixes, focused validation results, and the deferred parse-sharing cleanup concern.
+
+2026-06-29 / Codex: Updated this ExecPlan after Milestone 2 test coverage. The document now records that JS/TS and Rust behavior passed with the shared handler and that the review checkpoint used the manual fallback path after the agent pool reached its thread limit.

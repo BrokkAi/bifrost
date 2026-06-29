@@ -3918,6 +3918,170 @@ fn bifrost_lsp_server_call_hierarchy_prepare_filters_java_cursor_contexts() {
 }
 
 #[test]
+fn bifrost_lsp_server_call_hierarchy_prepare_filters_js_ts_cursor_contexts() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let ts_path = root.join("prepare.ts");
+    let ts_source = "interface Shape {}\nclass Maker {}\nfunction target(): void {}\nfunction caller(): void {\n  let local = 1;\n  let typed: Shape | null = null;\n  target();\n  new Maker();\n}\n";
+    fs::write(&ts_path, ts_source).expect("write TypeScript prepare-context fixture");
+    let js_path = root.join("prepare.js");
+    let js_source = "class Worker {\n  run() {}\n}\nfunction caller() {\n  const local = 1;\n  new Worker().run();\n}\n";
+    fs::write(&js_path, js_source).expect("write JavaScript prepare-context fixture");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let ts_uri = uri_for(&ts_path);
+    let js_uri = uri_for(&js_path);
+
+    let (line, character) = position_after(ts_source, "function t");
+    let target = prepare_call_hierarchy(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        18,
+        &ts_uri,
+        line,
+        character,
+    );
+    assert_eq!(target["name"], "target", "prepared TS function: {target}");
+
+    let (line, character) = position_after(js_source, "  r");
+    let run = prepare_call_hierarchy(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        19,
+        &js_uri,
+        line,
+        character,
+    );
+    assert_eq!(run["name"], "run", "prepared JS method: {run}");
+
+    let (line, character) = position_after(ts_source, "let l");
+    let result = prepare_call_hierarchy_result(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        20,
+        &ts_uri,
+        line,
+        character,
+    );
+    assert!(
+        result.is_null(),
+        "TS local variables must not prepare call hierarchy: {result}"
+    );
+
+    let (line, character) = position_after(ts_source, "let typed: S");
+    let result = prepare_call_hierarchy_result(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        21,
+        &ts_uri,
+        line,
+        character,
+    );
+    assert!(
+        result.is_null(),
+        "TS type references must not prepare call hierarchy: {result}"
+    );
+
+    let (line, character) = position_after(ts_source, "  t");
+    let target = prepare_call_hierarchy(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        22,
+        &ts_uri,
+        line,
+        character,
+    );
+    assert_eq!(target["name"], "target", "prepared TS call: {target}");
+
+    let (line, character) = position_after(ts_source, "new M");
+    let maker = prepare_call_hierarchy(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        23,
+        &ts_uri,
+        line,
+        character,
+    );
+    assert_eq!(maker["name"], "Maker", "prepared TS new call: {maker}");
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_call_hierarchy_prepare_filters_rust_cursor_contexts() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("lib.rs");
+    let source = "struct Widget;\nfn target() {}\nfn caller() {\n    let local = 1;\n    let typed: Option<Widget> = None;\n    target();\n}\n";
+    fs::write(&file_path, source).expect("write Rust prepare-context fixture");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+
+    let (line, character) = position_after(source, "fn t");
+    let target = prepare_call_hierarchy(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        24,
+        &file_uri,
+        line,
+        character,
+    );
+    assert_eq!(target["name"], "target", "prepared Rust function: {target}");
+
+    let (line, character) = position_after(source, "let l");
+    let result = prepare_call_hierarchy_result(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        25,
+        &file_uri,
+        line,
+        character,
+    );
+    assert!(
+        result.is_null(),
+        "Rust local variables must not prepare call hierarchy: {result}"
+    );
+
+    let (line, character) = position_after(source, "Option<W");
+    let result = prepare_call_hierarchy_result(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        26,
+        &file_uri,
+        line,
+        character,
+    );
+    assert!(
+        result.is_null(),
+        "Rust type references must not prepare call hierarchy: {result}"
+    );
+
+    let (line, character) = position_after(source, "    t");
+    let target = prepare_call_hierarchy(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        27,
+        &file_uri,
+        line,
+        character,
+    );
+    assert_eq!(target["name"], "target", "prepared Rust call: {target}");
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
 fn bifrost_lsp_server_call_hierarchy_preserves_java_overload_identity() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().canonicalize().expect("canon temp");
