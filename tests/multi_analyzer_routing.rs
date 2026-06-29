@@ -1,7 +1,11 @@
+mod common;
+
 use brokk_bifrost::{
-    AnalyzerDelegate, IAnalyzer, JavaAnalyzer, Language, MultiAnalyzer, ProjectFile, TestProject,
+    AnalyzerConfig, AnalyzerDelegate, IAnalyzer, JavaAnalyzer, Language, MultiAnalyzer,
+    ProjectFile, TestProject,
 };
-use std::collections::BTreeMap;
+use common::InlineTestProject;
+use std::collections::{BTreeMap, BTreeSet};
 
 fn java_project(files: &[(&str, &str)]) -> (tempfile::TempDir, TestProject) {
     let temp = tempfile::tempdir().unwrap();
@@ -62,6 +66,47 @@ fn multi_analyzer_routes_java_queries_and_capabilities() {
         .unwrap()
         .relevant_imports_for(&class_unit);
     assert!(imports.iter().any(|value| value.contains("java.util.List")));
+}
+
+#[test]
+fn workspace_analyzer_routes_inferred_ruby_and_python_files() {
+    let project = InlineTestProject::new()
+        .file(
+            "app/service.rb",
+            r#"
+class Service
+  def call
+  end
+end
+"#,
+        )
+        .file("pkg/tool.py", "def helper():\n    return 1\n")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let analyzer = workspace.analyzer();
+
+    assert_eq!(
+        BTreeSet::from([Language::Python, Language::Ruby]),
+        analyzer.languages()
+    );
+
+    let ruby_file = project.file("app/service.rb");
+    let ruby_declarations = analyzer.get_top_level_declarations(&ruby_file);
+    assert!(
+        ruby_declarations
+            .iter()
+            .any(|unit| unit.identifier() == "Service"),
+        "{ruby_declarations:?}"
+    );
+    assert!(!analyzer.contains_tests(&project.file("pkg/tool.py")));
+    let python_file = project.file("pkg/tool.py");
+    let python_declarations = analyzer.get_top_level_declarations(&python_file);
+    assert!(
+        python_declarations
+            .iter()
+            .any(|unit| unit.identifier() == "helper"),
+        "{python_declarations:?}"
+    );
 }
 
 #[test]

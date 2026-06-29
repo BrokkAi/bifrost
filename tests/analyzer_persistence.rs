@@ -6,7 +6,7 @@ use brokk_bifrost::analyzer::{
 };
 use brokk_bifrost::{
     AnalyzerConfig, IAnalyzer, Language, OverlayProject, Project, ProjectFile, PythonAnalyzer,
-    TestProject, WorkspaceAnalyzer,
+    RubyAnalyzer, TestProject, WorkspaceAnalyzer,
 };
 use std::collections::BTreeSet;
 use std::fs;
@@ -33,6 +33,23 @@ fn fresh_python_workspace() -> (TempDir, Arc<TestProject>) {
     write_file(tmp.path(), "beta.py", "def world():\n    return 2\n");
     let canon = fs::canonicalize(tmp.path()).unwrap();
     let project = Arc::new(TestProject::new(canon, Language::Python));
+    (tmp, project)
+}
+
+fn fresh_ruby_workspace() -> (TempDir, Arc<TestProject>) {
+    let tmp = tempfile::tempdir().unwrap();
+    write_file(
+        tmp.path(),
+        "app/service.rb",
+        "class Service\n  def call\n    1\n  end\nend\n",
+    );
+    write_file(
+        tmp.path(),
+        "lib/helper.rb",
+        "module Helper\n  def help\n    2\n  end\nend\n",
+    );
+    let canon = fs::canonicalize(tmp.path()).unwrap();
+    let project = Arc::new(TestProject::new(canon, Language::Ruby));
     (tmp, project)
 }
 
@@ -118,6 +135,53 @@ fn cold_then_warm_python_identical_results() {
 }
 
 #[test]
+fn cold_then_warm_ruby_identical_results() {
+    let (_tmp_workspace, project) = fresh_ruby_workspace();
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("analyzer.db");
+
+    let cold = {
+        let storage = Arc::new(AnalyzerStorage::open(&db_path).unwrap());
+        let analyzer = RubyAnalyzer::new_with_config_and_storage(
+            project.clone(),
+            AnalyzerConfig::default(),
+            Arc::clone(&storage),
+        );
+        let names = collect_fq_names(&analyzer);
+        let row_count = storage.row_count(Language::Ruby).unwrap();
+        let persisted: BTreeSet<_> = analyzer
+            .search_definitions_persisted("Service")
+            .into_iter()
+            .map(|unit| unit.fq_name())
+            .collect();
+        (names, persisted, row_count)
+    };
+    assert_eq!(cold.2, 2, "cold start should persist one row per file");
+    assert!(contains_short(&cold.0, "Service"), "names: {:?}", cold.0);
+    assert!(contains_short(&cold.0, "Helper"), "names: {:?}", cold.0);
+    assert!(
+        contains_short(&cold.1, "Service"),
+        "persisted names: {:?}",
+        cold.1
+    );
+
+    let warm = {
+        let storage = Arc::new(AnalyzerStorage::open(&db_path).unwrap());
+        let analyzer = RubyAnalyzer::new_with_config_and_storage(
+            project.clone(),
+            AnalyzerConfig::default(),
+            storage,
+        );
+        collect_fq_names(&analyzer)
+    };
+
+    assert_eq!(
+        cold.0, warm,
+        "warm-start Ruby declarations should match cold-start"
+    );
+}
+
+#[test]
 fn file_modification_triggers_partial_reanalysis() {
     let (tmp_workspace, project) = fresh_python_workspace();
     let db_dir = tempfile::tempdir().unwrap();
@@ -173,6 +237,76 @@ fn file_modification_triggers_partial_reanalysis() {
 }
 
 #[test]
+fn ruby_file_modification_replaces_baseline_and_symbol_rows() {
+    let (tmp_workspace, project) = fresh_ruby_workspace();
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("analyzer.db");
+
+    {
+        let storage = Arc::new(AnalyzerStorage::open(&db_path).unwrap());
+        let _ = RubyAnalyzer::new_with_config_and_storage(
+            project.clone(),
+            AnalyzerConfig::default(),
+            storage,
+        );
+    }
+
+    let service_path = tmp_workspace.path().join("app/service.rb");
+    fs::write(
+        &service_path,
+        "class RenamedService\n  def refreshed\n    99\n  end\nend\n",
+    )
+    .unwrap();
+    let one_min_future = SystemTime::now() + Duration::from_secs(60);
+    filetime::set_file_mtime(
+        &service_path,
+        filetime::FileTime::from_system_time(one_min_future),
+    )
+    .unwrap();
+
+    let storage = Arc::new(AnalyzerStorage::open(&db_path).unwrap());
+    let analyzer = RubyAnalyzer::new_with_config_and_storage(
+        project.clone(),
+        AnalyzerConfig::default(),
+        Arc::clone(&storage),
+    );
+
+    let names = collect_fq_names(&analyzer);
+    assert!(
+        contains_short(&names, "RenamedService"),
+        "modified symbol should appear: {:?}",
+        names
+    );
+    assert!(
+        !contains_short(&names, "Service"),
+        "old symbol should be gone: {:?}",
+        names
+    );
+    assert!(
+        contains_short(&names, "Helper"),
+        "untouched Ruby file should survive"
+    );
+    assert_eq!(storage.row_count(Language::Ruby).unwrap(), 2);
+
+    let stale = storage
+        .search_symbols(Language::Ruby, "Service", SymbolQueryMode::Substring)
+        .unwrap();
+    assert!(
+        stale.iter().all(|hit| hit.symbol.short_name != "Service"),
+        "stale Ruby symbol should be gone from FTS5 too: {stale:?}"
+    );
+    let refreshed = storage
+        .search_symbols(Language::Ruby, "RenamedService", SymbolQueryMode::Substring)
+        .unwrap();
+    assert!(
+        refreshed
+            .iter()
+            .any(|hit| hit.symbol.short_name == "RenamedService"),
+        "renamed Ruby symbol should be indexed: {refreshed:?}"
+    );
+}
+
+#[test]
 fn file_deletion_removes_row_from_baseline() {
     let (tmp_workspace, project) = fresh_python_workspace();
     let db_dir = tempfile::tempdir().unwrap();
@@ -210,6 +344,48 @@ fn file_deletion_removes_row_from_baseline() {
         storage.row_count(Language::Python).unwrap(),
         1,
         "deleted file's row should be purged from baseline"
+    );
+}
+
+#[test]
+fn ruby_file_deletion_removes_baseline_and_symbol_rows() {
+    let (tmp_workspace, project) = fresh_ruby_workspace();
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("analyzer.db");
+
+    {
+        let storage = Arc::new(AnalyzerStorage::open(&db_path).unwrap());
+        let _ = RubyAnalyzer::new_with_config_and_storage(
+            project.clone(),
+            AnalyzerConfig::default(),
+            storage,
+        );
+    }
+
+    fs::remove_file(tmp_workspace.path().join("lib/helper.rb")).unwrap();
+
+    let storage = Arc::new(AnalyzerStorage::open(&db_path).unwrap());
+    let analyzer = RubyAnalyzer::new_with_config_and_storage(
+        project.clone(),
+        AnalyzerConfig::default(),
+        Arc::clone(&storage),
+    );
+
+    let names = collect_fq_names(&analyzer);
+    assert!(contains_short(&names, "Service"));
+    assert!(
+        !contains_short(&names, "Helper"),
+        "deleted Ruby symbol should be gone: {:?}",
+        names
+    );
+    assert_eq!(storage.row_count(Language::Ruby).unwrap(), 1);
+
+    let helper_hits = storage
+        .search_symbols(Language::Ruby, "Helper", SymbolQueryMode::Substring)
+        .unwrap();
+    assert!(
+        helper_hits.is_empty(),
+        "deleted Ruby file's symbols should be purged from FTS5 too: {helper_hits:?}"
     );
 }
 

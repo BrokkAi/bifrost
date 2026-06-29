@@ -326,6 +326,60 @@ end
     }
 
     #[test]
+    fn update_all_rebuilds_mixin_relations_from_disk() {
+        let (project, analyzer) = analyzer_with_files(&[
+            (
+                "mixins/findable.rb",
+                "module Findable\n  def find; end\nend\n",
+            ),
+            (
+                "app/repository.rb",
+                r#"
+require_relative "../mixins/findable"
+
+class Repository
+  include Findable
+end
+"#,
+            ),
+        ]);
+
+        assert!(analyzer.mixin_relations().iter().any(|relation| {
+            relation.from.identifier() == "Repository"
+                && relation.to.identifier() == "Findable"
+                && relation.kind == TypeRelationKind::MixinInclude
+        }));
+
+        let file = |rel| ProjectFile::new(project.test_project().root_path().to_path_buf(), rel);
+        std::fs::remove_file(file("mixins/findable.rb").abs_path()).unwrap();
+        file("mixins/searchable.rb")
+            .write("module Searchable\n  def search; end\nend\n")
+            .unwrap();
+        file("app/repository.rb")
+            .write(
+                r#"
+require_relative "../mixins/searchable"
+
+class Repository
+  include Searchable
+end
+"#,
+            )
+            .unwrap();
+
+        let updated = analyzer.update_all();
+        let relations = updated.mixin_relations();
+        assert!(!relations.iter().any(|relation| {
+            relation.from.identifier() == "Repository" && relation.to.identifier() == "Findable"
+        }));
+        assert!(relations.iter().any(|relation| {
+            relation.from.identifier() == "Repository"
+                && relation.to.identifier() == "Searchable"
+                && relation.kind == TypeRelationKind::MixinInclude
+        }));
+    }
+
+    #[test]
     fn receiver_calls_do_not_create_mixin_relations() {
         let (_project, analyzer) = analyzer_with_files(&[(
             "app.rb",
