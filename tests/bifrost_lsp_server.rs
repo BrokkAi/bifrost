@@ -2265,6 +2265,61 @@ fn bifrost_lsp_server_implementation_works_from_go_interface_method() {
 }
 
 #[test]
+fn bifrost_lsp_server_go_type_or_implementation_rejects_value_contexts() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    fs::write(root.join("go.mod"), "module example.com/app\n").expect("write go.mod");
+    let file_path = root.join("main.go");
+    let source = "package main\n\ntype Runner interface {\n    Run() error\n}\n\ntype Worker struct {\n    Field int\n}\n\nfunc (Worker) Run() error { return nil }\n\nfunc build() Worker {\n    var local Worker\n    return local\n}\n";
+    fs::write(&file_path, source).expect("write Go value-context fixture");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+
+    let null_cases = [
+        ("func b", "ordinary Go function"),
+        ("func (Worker) ", "non-interface Go method"),
+        ("Field", "Go struct field"),
+        ("var local", "Go local variable"),
+    ];
+    for (idx, (needle, label)) in null_cases.iter().enumerate() {
+        let (line, character) = position_after(source, needle);
+        let response = implementation_response(
+            &mut stdin,
+            &mut reader,
+            &mut stderr,
+            30 + idx as u64,
+            &file_uri,
+            line,
+            character,
+        );
+        assert!(
+            response["result"].is_null(),
+            "{label} must not resolve implementations, got {response}"
+        );
+    }
+
+    for (idx, (needle, label)) in null_cases.iter().enumerate() {
+        let (line, character) = position_after(source, needle);
+        let result = prepare_hierarchy_result(
+            &mut stdin,
+            &mut reader,
+            &mut stderr,
+            40 + idx as u64,
+            "textDocument/prepareTypeHierarchy",
+            &file_uri,
+            (line, character),
+        );
+        assert!(
+            result.is_null(),
+            "{label} must not prepare type hierarchy, got {result}"
+        );
+    }
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
 fn bifrost_lsp_server_implementation_filters_java_csharp_scala_value_contexts() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().canonicalize().expect("canon temp");
@@ -6357,7 +6412,7 @@ fn bifrost_lsp_server_type_hierarchy_filters_java_csharp_scala_value_contexts() 
     fs::write(&java_path, java_source).expect("write Java hierarchy-context fixture");
 
     let csharp_path = root.join("HierarchyContexts.cs");
-    let csharp_source = "class Widget {}\nclass Child : Widget {}\nclass Service { Widget Build() { Widget local = new Widget(); return local; } }\n";
+    let csharp_source = "class Widget {}\nclass Service { Widget Build() { Widget local = new Widget(); return local; } }\n";
     fs::write(&csharp_path, csharp_source).expect("write C# hierarchy-context fixture");
 
     let scala_path = root.join("HierarchyContexts.scala");

@@ -20,7 +20,7 @@ After this work, both providers remain advertised, but they return a normal JSON
 - [x] (2026-06-29 12:28Z) Ran Milestone 1 focused validation: type hierarchy, implementation, and type definition LSP slices passed.
 - [x] (2026-06-29 13:15Z) Ran and resolved Milestone 1 guided review on the uncommitted diff.
 - [ ] Milestone 2: implement TypeScript/JavaScript and Rust cursor-context regressions.
-- [ ] Milestone 3: implement Go and implementation-specific cursor-context regressions.
+- [x] (2026-06-29 13:45Z) Milestone 3: added Go implementation/type-hierarchy value-context regressions, completed guided review, fixed accepted test findings, and reran focused validation.
 - [ ] Milestone 4: run the final focused LSP sweep, formatting, non-CUDA clippy, final guided review, and final cleanup.
 
 ## Surprises & Discoveries
@@ -54,6 +54,9 @@ After this work, both providers remain advertised, but they return a normal JSON
 
 - Observation: Guided review found the first target-kind enum leaked a Go-specific name into generic code.
   Evidence: `TypeLookupTargetKind::GoInterfaceMethodOwner` was replaced with language-neutral `TypeLookupTargetKind::MemberOwner`, while the existing `go_interface_method_owner` diagnostic remains the analyzer-owned way to recover the selected method name.
+
+- Observation: The Milestone 3 review found that the first Go local-variable case targeted the type annotation, not the local identifier.
+  Evidence: The case used `position_after(source, "local W")`, which lands inside `Worker` in `var local Worker`; the fix changed it to `position_after(source, "var local")` and reused one shared null-case table for implementation and hierarchy assertions.
 
 ## Decision Log
 
@@ -99,6 +102,14 @@ Milestone 1 implementation and guided-review resolution are complete. The shared
 
     cargo test --test bifrost_lsp_server type_definition --features nlp
     result: 11 passed; 0 failed
+
+Milestone 3 is complete. The new Go regression proves ordinary functions, non-interface methods, struct fields, and local variables return `null` for both `textDocument/implementation` and `textDocument/prepareTypeHierarchy`, while the existing Go interface declaration and interface-method positives remain green. Guided review found one duplicated case-table cleanup and one real cursor-target bug; both were fixed. Validation passed:
+
+    cargo test --test bifrost_lsp_server bifrost_lsp_server_go_type_or_implementation_rejects_value_contexts --features nlp
+    result: 1 passed; 0 failed
+
+    cargo test --test bifrost_lsp_server implementation --features nlp
+    result: 6 passed; 0 failed
 
 ## Context and Orientation
 
