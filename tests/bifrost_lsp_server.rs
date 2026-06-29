@@ -2670,6 +2670,48 @@ fn bifrost_lsp_server_signature_help_returns_python_function_signature() {
 }
 
 #[test]
+fn bifrost_lsp_server_signature_help_returns_ruby_method_signature() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("calculator.rb");
+    let source = "class Calculator\n  # Combines Ruby values.\n  def combine(combine, right = helper(1, 2), *rest)\n    combine + right\n  end\n\n  def caller\n    combine(1, 2, 3)\n  end\nend\n";
+    fs::write(&file_path, source).expect("write calculator.rb");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let (line, character) = position_after(source, "combine(1, ");
+
+    let result = signature_help(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        2,
+        &file_uri,
+        line,
+        character,
+    );
+    assert_eq!(
+        result["activeParameter"], 1,
+        "unexpected signature help: {result}"
+    );
+    assert!(
+        result["signatures"][0]["label"]
+            .as_str()
+            .is_some_and(|label| label.contains("combine") && label.contains("right")),
+        "expected Ruby combine signature label, got {result}"
+    );
+    assert_signature_parameter_offsets(&result, 0, &["combine", "right", "rest"]);
+    assert!(
+        result["signatures"][0]["documentation"]["value"]
+            .as_str()
+            .is_some_and(|doc| doc.contains("Combines Ruby values.")),
+        "expected Ruby signature documentation, got {result}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
 fn bifrost_lsp_server_signature_help_returns_rust_function_signature() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().canonicalize().expect("canon temp");

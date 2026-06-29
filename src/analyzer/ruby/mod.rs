@@ -10,7 +10,7 @@ use crate::analyzer::js_ts::build_weighted_cache;
 use crate::analyzer::type_relations::TypeRelation;
 use crate::analyzer::{
     AnalyzerConfig, BuildProgress, CodeUnit, CodeUnitType, IAnalyzer, ImportAnalysisProvider,
-    Language, Project, ProjectFile, TestDetectionProvider, TreeSitterAnalyzer,
+    Language, Project, ProjectFile, SignatureMetadata, TestDetectionProvider, TreeSitterAnalyzer,
     TypeHierarchyProvider,
 };
 use crate::hash::{HashMap, HashSet};
@@ -183,6 +183,10 @@ impl IAnalyzer for RubyAnalyzer {
 
     fn signatures<'a>(&'a self, code_unit: &CodeUnit) -> &'a [String] {
         self.inner.signatures(code_unit)
+    }
+
+    fn signature_metadata<'a>(&'a self, code_unit: &CodeUnit) -> &'a [SignatureMetadata] {
+        self.inner.signature_metadata(code_unit)
     }
 
     fn languages(&self) -> BTreeSet<Language> {

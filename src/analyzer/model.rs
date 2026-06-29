@@ -135,11 +135,13 @@ impl SignatureMetadata {
 
     pub fn with_parameter_labels(label: impl Into<String>, labels: Vec<String>) -> Self {
         let label = label.into();
-        let params_start = label.find('(').map(|index| index + 1).unwrap_or(0);
-        let params_end = label
-            .get(params_start..)
-            .and_then(|suffix| suffix.find(')').map(|index| params_start + index))
-            .unwrap_or(label.len());
+        let (params_start, params_end) = match label.find('(') {
+            Some(open_paren) => (
+                open_paren + 1,
+                matching_close_paren(&label, open_paren).unwrap_or(label.len()),
+            ),
+            None => (0, label.len()),
+        };
         let mut search_start = params_start;
         let parameters = labels
             .into_iter()
@@ -169,6 +171,23 @@ impl SignatureMetadata {
     pub fn parameters(&self) -> &[ParameterMetadata] {
         &self.parameters
     }
+}
+
+fn matching_close_paren(label: &str, open_paren: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, ch) in label.get(open_paren..)?.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(open_paren + index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]

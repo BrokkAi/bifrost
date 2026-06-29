@@ -106,7 +106,7 @@ fn call_signature_context_for_node(
     if !is_call_expression_node(node, language) {
         return None;
     }
-    let argument_nodes = argument_nodes_for_call(node);
+    let argument_nodes = argument_nodes_for_call(node, language);
     let [arguments] = argument_nodes.as_slice() else {
         return None;
     };
@@ -154,7 +154,8 @@ fn is_call_expression_node(node: Node<'_>, language: Language) -> bool {
             node.kind(),
             "invocation_expression" | "object_creation_expression"
         ),
-        Language::Ruby | Language::None => false,
+        Language::Ruby => node.kind() == "call",
+        Language::None => false,
     }
 }
 
@@ -169,19 +170,20 @@ fn callee_node_for_call<'tree>(node: Node<'tree>, language: Language) -> Option<
         Language::CSharp => node
             .child_by_field_name("function")
             .or_else(|| node.child_by_field_name("type")),
+        Language::Ruby => node.child_by_field_name("method"),
         _ => node
             .child_by_field_name("function")
             .or_else(|| node.child_by_field_name("name"))
             .or_else(|| node.child_by_field_name("type"))
-            .or_else(|| first_named_child_not_arguments(node)),
+            .or_else(|| first_named_child_not_arguments(node, language)),
     }
 }
 
-fn arguments_node_for_call(node: Node<'_>) -> Option<Node<'_>> {
-    argument_nodes_for_call(node).into_iter().next()
+fn arguments_node_for_call(node: Node<'_>, language: Language) -> Option<Node<'_>> {
+    argument_nodes_for_call(node, language).into_iter().next()
 }
 
-fn argument_nodes_for_call(node: Node<'_>) -> Vec<Node<'_>> {
+fn argument_nodes_for_call(node: Node<'_>, language: Language) -> Vec<Node<'_>> {
     let mut nodes = Vec::new();
     if let Some(arguments) = node
         .child_by_field_name("arguments")
@@ -200,6 +202,7 @@ fn argument_nodes_for_call(node: Node<'_>) -> Vec<Node<'_>> {
                 | "arguments_list"
                 | "block"
         ) && !nodes.contains(&child)
+            && !(language == Language::Ruby && matches!(child.kind(), "block" | "do_block"))
         {
             nodes.push(child);
         }
@@ -207,8 +210,8 @@ fn argument_nodes_for_call(node: Node<'_>) -> Vec<Node<'_>> {
     nodes
 }
 
-fn first_named_child_not_arguments(node: Node<'_>) -> Option<Node<'_>> {
-    let arguments = arguments_node_for_call(node);
+fn first_named_child_not_arguments(node: Node<'_>, language: Language) -> Option<Node<'_>> {
+    let arguments = arguments_node_for_call(node, language);
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .find(|child| Some(*child) != arguments)
@@ -348,6 +351,9 @@ fn is_nested_callable_node(node: Node<'_>, search_range: &Range) -> bool {
                 | "enum_declaration"
                 | "record_declaration"
                 | "class_definition"
+                | "method"
+                | "singleton_method"
+                | "module"
                 | "struct_declaration"
                 | "union_declaration"
                 | "trait_item"
@@ -370,7 +376,8 @@ fn is_call_reference_candidate(node: Node<'_>, language: Language) -> bool {
         Language::Php => php_call_reference_candidate(node),
         Language::Scala => scala_call_reference_candidate(node),
         Language::CSharp => csharp_call_reference_candidate(node),
-        Language::Ruby | Language::None => false,
+        Language::Ruby => ruby_call_reference_candidate(node),
+        Language::None => false,
     }
 }
 
@@ -548,6 +555,20 @@ fn csharp_call_reference_candidate(node: Node<'_>) -> bool {
     false
 }
 
+fn ruby_call_reference_candidate(node: Node<'_>) -> bool {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        match parent.kind() {
+            "call" if parent.child_by_field_name("method") == Some(current) => return true,
+            "scope_resolution" if parent.child_by_field_name("name") == Some(current) => {
+                current = parent;
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use std::env;
@@ -625,6 +646,88 @@ mod tests {
         assert_eq!(
             &source[context.callee_range.start_byte..context.callee_range.end_byte],
             "target"
+        );
+        assert_eq!(context.active_parameter, 0);
+    }
+
+    #[test]
+    fn signature_context_handles_ruby_bare_call() {
+        let source = "def target(left, right)\nend\n\ntarget(1, 2)\n";
+        let context = call_signature_context(
+            &file("sample.rb"),
+            source,
+            offset_after(source, "target(1, "),
+        )
+        .expect("signature context");
+
+        assert_eq!(
+            &source[context.callee_range.start_byte..context.callee_range.end_byte],
+            "target"
+        );
+        assert_eq!(context.active_parameter, 1);
+    }
+
+    #[test]
+    fn signature_context_handles_ruby_receiver_call() {
+        let source = "user.target(1, 2)\n";
+        let context = call_signature_context(
+            &file("sample.rb"),
+            source,
+            offset_after(source, "target(1, "),
+        )
+        .expect("signature context");
+
+        assert_eq!(
+            &source[context.callee_range.start_byte..context.callee_range.end_byte],
+            "target"
+        );
+        assert_eq!(context.active_parameter, 1);
+    }
+
+    #[test]
+    fn signature_context_handles_ruby_parenthesized_call_with_block() {
+        let source = "target(1, 2) { |item| item }\n";
+        let context = call_signature_context(
+            &file("sample.rb"),
+            source,
+            offset_after(source, "target(1, "),
+        )
+        .expect("signature context");
+
+        assert_eq!(
+            &source[context.callee_range.start_byte..context.callee_range.end_byte],
+            "target"
+        );
+        assert_eq!(context.active_parameter, 1);
+    }
+
+    #[test]
+    fn signature_context_handles_ruby_command_call_with_block() {
+        let source = "target 1, 2 do |item|\n  item\nend\n";
+        let context = call_signature_context(
+            &file("sample.rb"),
+            source,
+            offset_after(source, "target 1, "),
+        )
+        .expect("signature context");
+
+        assert_eq!(
+            &source[context.callee_range.start_byte..context.callee_range.end_byte],
+            "target"
+        );
+        assert_eq!(context.active_parameter, 1);
+    }
+
+    #[test]
+    fn signature_context_prefers_innermost_ruby_call() {
+        let source = "outer(inner(1), 2)\n";
+        let context =
+            call_signature_context(&file("sample.rb"), source, offset_after(source, "inner("))
+                .expect("signature context");
+
+        assert_eq!(
+            &source[context.callee_range.start_byte..context.callee_range.end_byte],
+            "inner"
         );
         assert_eq!(context.active_parameter, 0);
     }
