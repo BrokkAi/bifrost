@@ -8,6 +8,7 @@ pub mod document_symbol;
 pub mod folding_range;
 pub(crate) mod hierarchy_support;
 pub mod hover;
+pub(crate) mod import_ambiguity;
 pub mod references;
 pub mod rename;
 pub mod signature_help;

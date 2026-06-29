@@ -10,6 +10,7 @@ use crate::analyzer::usages::get_definition::{
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, Project, ProjectFile, Range as ByteRange};
 use crate::lsp::conversion::position_to_byte_offset;
+use crate::lsp::handlers::import_ambiguity::is_ambiguous_imported_reference;
 use crate::lsp::handlers::util::{identifier_span_at_offset, read_document_for_uri};
 
 pub(super) struct BroadSymbolTarget {
@@ -40,6 +41,10 @@ pub(super) fn broad_symbol_target_at_position(
         selected_code_unit_declaration_at_cursor(analyzer, &file, &content, &selected, |_| true)
             .map(|declaration| vec![declaration])
             .or_else(|| {
+                let identifier = content.get(start_byte..end_byte)?;
+                if is_ambiguous_imported_reference(analyzer, &file, identifier) {
+                    return None;
+                }
                 resolved_reference_candidates(
                     analyzer,
                     &file,

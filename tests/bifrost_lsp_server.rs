@@ -3703,6 +3703,10 @@ const SHIFTED_COMMENT_TARGETS_SOURCE: &str = "// unsaved header\nclass CommentTa
 
 const INVALID_CONTEXTS_SOURCE: &str = "import a.*;\nimport b.*;\nclass InvalidContexts {\n    String literal = \"Shared\";\n    void caller() {\n        Shared ambiguous = null;\n        int value = MissingShared;\n        if (true) {}\n    }\n}\n";
 
+const CSHARP_AMBIGUOUS_USING_SOURCE: &str = "using Alpha;\nusing Beta;\nnamespace App {\n    public class Consumer {\n        public void Execute() {\n            Target target = null;\n        }\n    }\n}\n";
+
+const SCALA_AMBIGUOUS_IMPORT_SOURCE: &str = "package app\nimport alpha.*\nimport beta.*\nclass Consumer {\n  val target: Target = null\n}\n";
+
 const DUPLICATE_DECLARATION_NAME_SOURCE: &str =
     "class Widget {\n    Widget Widget() {\n        return this;\n    }\n}\n";
 
@@ -3735,6 +3739,44 @@ fn write_invalid_contexts_fixture(root: &Path) -> PathBuf {
     .expect("write b.Shared");
     let file_path = root.join("InvalidContexts.java");
     fs::write(&file_path, INVALID_CONTEXTS_SOURCE).expect("write InvalidContexts.java");
+    file_path
+}
+
+fn write_csharp_ambiguous_using_fixture(root: &Path) -> PathBuf {
+    let alpha = root.join("Alpha");
+    let beta = root.join("Beta");
+    let app = root.join("App");
+    fs::create_dir_all(&alpha).expect("create Alpha namespace");
+    fs::create_dir_all(&beta).expect("create Beta namespace");
+    fs::create_dir_all(&app).expect("create App namespace");
+    fs::write(
+        alpha.join("Target.cs"),
+        "namespace Alpha { public class Target {} }\n",
+    )
+    .expect("write Alpha.Target");
+    fs::write(
+        beta.join("Target.cs"),
+        "namespace Beta { public class Target {} }\n",
+    )
+    .expect("write Beta.Target");
+    let file_path = app.join("Consumer.cs");
+    fs::write(&file_path, CSHARP_AMBIGUOUS_USING_SOURCE).expect("write Consumer.cs");
+    file_path
+}
+
+fn write_scala_ambiguous_import_fixture(root: &Path) -> PathBuf {
+    let alpha = root.join("alpha");
+    let beta = root.join("beta");
+    let app = root.join("app");
+    fs::create_dir_all(&alpha).expect("create alpha package");
+    fs::create_dir_all(&beta).expect("create beta package");
+    fs::create_dir_all(&app).expect("create app package");
+    fs::write(alpha.join("Target.scala"), "package alpha\nclass Target\n")
+        .expect("write alpha.Target");
+    fs::write(beta.join("Target.scala"), "package beta\nclass Target\n")
+        .expect("write beta.Target");
+    let file_path = app.join("Consumer.scala");
+    fs::write(&file_path, SCALA_AMBIGUOUS_IMPORT_SOURCE).expect("write Consumer.scala");
     file_path
 }
 
@@ -4143,6 +4185,86 @@ fn bifrost_lsp_server_document_highlight_ignores_literals_keywords_unresolved_an
     shutdown_lsp(child, stdin, reader, stderr);
 
     assert_no_invalid_context_results(BroadEndpoint::DocumentHighlight, &responses);
+}
+
+#[test]
+fn bifrost_lsp_server_broad_endpoints_ignore_csharp_ambiguous_using_type() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = write_csharp_ambiguous_using_fixture(&root);
+
+    let (child, stdin, reader, stderr) = start_lsp_server(&root);
+    let mut client = LspTestClient::new(stdin, reader, stderr, 10);
+    let file_uri = uri_for(&file_path);
+    let (line, character) = position_after(CSHARP_AMBIGUOUS_USING_SOURCE, "            ");
+    let responses = [
+        BroadEndpoint::Definition,
+        BroadEndpoint::Hover,
+        BroadEndpoint::References,
+        BroadEndpoint::DocumentHighlight,
+    ]
+    .into_iter()
+    .map(|endpoint| {
+        (
+            endpoint.label(),
+            endpoint_response(&mut client, &file_uri, endpoint, line, character),
+        )
+    })
+    .collect::<Vec<_>>();
+
+    let (stdin, reader, stderr) = client.into_parts();
+    shutdown_lsp(child, stdin, reader, stderr);
+
+    for (endpoint, response) in responses {
+        let no_result = response["result"].is_null()
+            || response["result"]
+                .as_array()
+                .is_some_and(|items| items.is_empty());
+        assert!(
+            no_result,
+            "C# ambiguous using type must not produce {endpoint} result, got {response}"
+        );
+    }
+}
+
+#[test]
+fn bifrost_lsp_server_broad_endpoints_ignore_scala_ambiguous_wildcard_import_type() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = write_scala_ambiguous_import_fixture(&root);
+
+    let (child, stdin, reader, stderr) = start_lsp_server(&root);
+    let mut client = LspTestClient::new(stdin, reader, stderr, 10);
+    let file_uri = uri_for(&file_path);
+    let (line, character) = position_after(SCALA_AMBIGUOUS_IMPORT_SOURCE, "  val target: ");
+    let responses = [
+        BroadEndpoint::Definition,
+        BroadEndpoint::Hover,
+        BroadEndpoint::References,
+        BroadEndpoint::DocumentHighlight,
+    ]
+    .into_iter()
+    .map(|endpoint| {
+        (
+            endpoint.label(),
+            endpoint_response(&mut client, &file_uri, endpoint, line, character),
+        )
+    })
+    .collect::<Vec<_>>();
+
+    let (stdin, reader, stderr) = client.into_parts();
+    shutdown_lsp(child, stdin, reader, stderr);
+
+    for (endpoint, response) in responses {
+        let no_result = response["result"].is_null()
+            || response["result"]
+                .as_array()
+                .is_some_and(|items| items.is_empty());
+        assert!(
+            no_result,
+            "Scala ambiguous wildcard import type must not produce {endpoint} result, got {response}"
+        );
+    }
 }
 
 #[test]
@@ -8048,32 +8170,37 @@ fn collect_invalid_context_endpoint_responses(
     invalid_context_targets()
         .into_iter()
         .map(|(label, line, character)| {
-            let response = match endpoint {
-                BroadEndpoint::Definition => client.text_document_position_response(
-                    "textDocument/definition",
-                    file_uri,
-                    line,
-                    character,
-                ),
-                BroadEndpoint::Hover => client.text_document_position_response(
-                    "textDocument/hover",
-                    file_uri,
-                    line,
-                    character,
-                ),
-                BroadEndpoint::References => {
-                    client.references_response(file_uri, line, character, true)
-                }
-                BroadEndpoint::DocumentHighlight => client.text_document_position_response(
-                    "textDocument/documentHighlight",
-                    file_uri,
-                    line,
-                    character,
-                ),
-            };
+            let response = endpoint_response(client, file_uri, endpoint, line, character);
             (label, response)
         })
         .collect()
+}
+
+fn endpoint_response(
+    client: &mut LspTestClient,
+    file_uri: &str,
+    endpoint: BroadEndpoint,
+    line: u64,
+    character: u64,
+) -> Value {
+    match endpoint {
+        BroadEndpoint::Definition => client.text_document_position_response(
+            "textDocument/definition",
+            file_uri,
+            line,
+            character,
+        ),
+        BroadEndpoint::Hover => {
+            client.text_document_position_response("textDocument/hover", file_uri, line, character)
+        }
+        BroadEndpoint::References => client.references_response(file_uri, line, character, true),
+        BroadEndpoint::DocumentHighlight => client.text_document_position_response(
+            "textDocument/documentHighlight",
+            file_uri,
+            line,
+            character,
+        ),
+    }
 }
 
 fn assert_no_invalid_context_results(endpoint: BroadEndpoint, responses: &[(&'static str, Value)]) {
