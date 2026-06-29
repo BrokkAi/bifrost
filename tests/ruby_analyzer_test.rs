@@ -4,7 +4,10 @@
 
 mod common;
 
-use brokk_bifrost::{CodeUnit, IAnalyzer, ProjectFile, RubyAnalyzer, TestProject};
+use brokk_bifrost::{
+    CodeUnit, IAnalyzer, ImportAnalysisProvider, ProjectFile, RubyAnalyzer, TestProject,
+    TypeHierarchyProvider,
+};
 use common::InlineTestProject;
 use std::collections::BTreeSet;
 
@@ -28,6 +31,14 @@ fn find<'a>(decls: &'a BTreeSet<CodeUnit>, identifier: &str) -> &'a CodeUnit {
         .iter()
         .find(|cu| cu.identifier() == identifier)
         .unwrap_or_else(|| panic!("no declaration with identifier {identifier:?}"))
+}
+
+fn all_identifiers(analyzer: &RubyAnalyzer) -> BTreeSet<String> {
+    analyzer
+        .get_all_declarations()
+        .into_iter()
+        .map(|cu| cu.identifier().to_string())
+        .collect()
 }
 
 #[test]
@@ -149,6 +160,133 @@ fn class_reopening_merges_across_files() {
         config_defs.len() >= 2,
         "expected Config defined in >=2 files, got {}",
         config_defs.len()
+    );
+}
+
+#[test]
+fn explicit_update_removes_stale_declarations_after_file_edit() {
+    let built = InlineTestProject::with_language(brokk_bifrost::Language::Ruby)
+        .file(
+            "app/service.rb",
+            r#"
+class LegacyService
+  def old_call
+  end
+end
+"#,
+        )
+        .build();
+    let analyzer = RubyAnalyzer::new(built.project_dyn());
+    let service = built.file("app/service.rb");
+
+    assert!(all_identifiers(&analyzer).contains("LegacyService"));
+    assert!(all_identifiers(&analyzer).contains("old_call"));
+
+    service
+        .write(
+            r#"
+class CurrentService
+  def new_call
+  end
+end
+"#,
+        )
+        .unwrap();
+    let updated = analyzer.update(&BTreeSet::from([service.clone()]));
+    let identifiers = all_identifiers(&updated);
+
+    assert!(!identifiers.contains("LegacyService"), "{identifiers:?}");
+    assert!(!identifiers.contains("old_call"), "{identifiers:?}");
+    assert!(identifiers.contains("CurrentService"), "{identifiers:?}");
+    assert!(identifiers.contains("new_call"), "{identifiers:?}");
+}
+
+#[test]
+fn update_all_rebuilds_ruby_declarations_imports_and_hierarchy_from_disk() {
+    let built = InlineTestProject::with_language(brokk_bifrost::Language::Ruby)
+        .file("lib/base.rb", "class Base\nend\n")
+        .file("lib/auditable.rb", "module Auditable\nend\n")
+        .file(
+            "app/service.rb",
+            r#"
+require_relative "../lib/base"
+require_relative "../lib/auditable"
+
+class Service < Base
+  include Auditable
+
+  def call
+  end
+end
+"#,
+        )
+        .build();
+    let analyzer = RubyAnalyzer::new(built.project_dyn());
+    let service_file = built.file("app/service.rb");
+
+    let service = analyzer
+        .get_definitions("Service")
+        .into_iter()
+        .next()
+        .expect("initial Service declaration");
+    let initial_ancestors: BTreeSet<_> = analyzer
+        .get_direct_ancestors(&service)
+        .iter()
+        .map(|unit| unit.identifier().to_string())
+        .collect();
+    assert!(initial_ancestors.contains("Base"), "{initial_ancestors:?}");
+    assert!(
+        analyzer
+            .imported_code_units_of(&service_file)
+            .iter()
+            .any(|unit| unit.identifier() == "Auditable")
+    );
+
+    built
+        .file("lib/new_base.rb")
+        .write("class NewBase\nend\n")
+        .unwrap();
+    service_file
+        .write(
+            r#"
+require_relative "../lib/new_base"
+
+class Service < NewBase
+  def refreshed
+  end
+end
+"#,
+        )
+        .unwrap();
+    std::fs::remove_file(built.file("lib/base.rb").abs_path()).unwrap();
+    std::fs::remove_file(built.file("lib/auditable.rb").abs_path()).unwrap();
+
+    let updated = analyzer.update_all();
+    let identifiers = all_identifiers(&updated);
+    assert!(!identifiers.contains("Base"), "{identifiers:?}");
+    assert!(!identifiers.contains("Auditable"), "{identifiers:?}");
+    assert!(identifiers.contains("NewBase"), "{identifiers:?}");
+    assert!(identifiers.contains("refreshed"), "{identifiers:?}");
+
+    let service = updated
+        .get_definitions("Service")
+        .into_iter()
+        .next()
+        .expect("updated Service declaration");
+    let updated_ancestors: BTreeSet<_> = updated
+        .get_direct_ancestors(&service)
+        .iter()
+        .map(|unit| unit.identifier().to_string())
+        .collect();
+    assert!(
+        updated_ancestors.contains("NewBase"),
+        "{updated_ancestors:?}"
+    );
+    assert!(
+        updated
+            .imported_code_units_of(&service_file)
+            .iter()
+            .any(|unit| unit.identifier() == "NewBase")
     );
 }
 
