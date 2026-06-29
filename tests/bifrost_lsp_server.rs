@@ -3701,6 +3701,8 @@ const COMMENT_TARGETS_SOURCE: &str = "class CommentTargets {\n    // target\n   
 
 const SHIFTED_COMMENT_TARGETS_SOURCE: &str = "// unsaved header\nclass CommentTargets {\n    // target\n    void target() {}\n    void caller() {\n        target();\n    }\n}\n";
 
+const INVALID_CONTEXTS_SOURCE: &str = "import a.*;\nimport b.*;\nclass InvalidContexts {\n    String literal = \"Shared\";\n    void caller() {\n        Shared ambiguous = null;\n        int value = MissingShared;\n        if (true) {}\n    }\n}\n";
+
 const DUPLICATE_DECLARATION_NAME_SOURCE: &str =
     "class Widget {\n    Widget Widget() {\n        return this;\n    }\n}\n";
 
@@ -3713,6 +3715,26 @@ fn write_comment_targets_fixture(root: &Path) -> PathBuf {
 fn write_duplicate_declaration_name_fixture(root: &Path) -> PathBuf {
     let file_path = root.join("Widget.java");
     fs::write(&file_path, DUPLICATE_DECLARATION_NAME_SOURCE).expect("write Widget.java");
+    file_path
+}
+
+fn write_invalid_contexts_fixture(root: &Path) -> PathBuf {
+    let package_a = root.join("a");
+    let package_b = root.join("b");
+    fs::create_dir_all(&package_a).expect("create package a");
+    fs::create_dir_all(&package_b).expect("create package b");
+    fs::write(
+        package_a.join("Shared.java"),
+        "package a;\npublic class Shared {}\n",
+    )
+    .expect("write a.Shared");
+    fs::write(
+        package_b.join("Shared.java"),
+        "package b;\npublic class Shared {}\n",
+    )
+    .expect("write b.Shared");
+    let file_path = root.join("InvalidContexts.java");
+    fs::write(&file_path, INVALID_CONTEXTS_SOURCE).expect("write InvalidContexts.java");
     file_path
 }
 
@@ -4039,6 +4061,99 @@ fn bifrost_lsp_server_references_and_document_highlight_use_shifted_overlay_decl
         }),
         "shifted overlay declaration should highlight the overlaid declaration name, got {highlights}"
     );
+}
+
+#[test]
+fn bifrost_lsp_server_definition_ignores_literals_keywords_unresolved_and_ambiguous_tokens() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = write_invalid_contexts_fixture(&root);
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let mut next_id = 10;
+    let responses = collect_invalid_context_endpoint_responses(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        &mut next_id,
+        &file_uri,
+        BroadEndpoint::Definition,
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+
+    assert_no_invalid_context_results(BroadEndpoint::Definition, &responses);
+}
+
+#[test]
+fn bifrost_lsp_server_hover_ignores_literals_keywords_unresolved_and_ambiguous_tokens() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = write_invalid_contexts_fixture(&root);
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let mut next_id = 10;
+    let responses = collect_invalid_context_endpoint_responses(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        &mut next_id,
+        &file_uri,
+        BroadEndpoint::Hover,
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+
+    assert_no_invalid_context_results(BroadEndpoint::Hover, &responses);
+}
+
+#[test]
+fn bifrost_lsp_server_references_ignore_literals_keywords_unresolved_and_ambiguous_tokens() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = write_invalid_contexts_fixture(&root);
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let mut next_id = 10;
+    let responses = collect_invalid_context_endpoint_responses(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        &mut next_id,
+        &file_uri,
+        BroadEndpoint::References,
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+
+    assert_no_invalid_context_results(BroadEndpoint::References, &responses);
+}
+
+#[test]
+fn bifrost_lsp_server_document_highlight_ignores_literals_keywords_unresolved_and_ambiguous_tokens()
+{
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = write_invalid_contexts_fixture(&root);
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let mut next_id = 10;
+    let responses = collect_invalid_context_endpoint_responses(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        &mut next_id,
+        &file_uri,
+        BroadEndpoint::DocumentHighlight,
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+
+    assert_no_invalid_context_results(BroadEndpoint::DocumentHighlight, &responses);
 }
 
 #[test]
@@ -7767,6 +7882,7 @@ fn type_definition_response(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn text_document_position_response(
     stdin: &mut impl Write,
     reader: &mut impl BufRead,
@@ -7792,6 +7908,7 @@ fn text_document_position_response(
     read_response_for_id(reader, stderr, id)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn references_response(
     stdin: &mut impl Write,
     reader: &mut impl BufRead,
@@ -7816,6 +7933,121 @@ fn references_response(
         }),
     );
     read_response_for_id(reader, stderr, id)
+}
+
+#[derive(Clone, Copy)]
+enum BroadEndpoint {
+    Definition,
+    Hover,
+    References,
+    DocumentHighlight,
+}
+
+impl BroadEndpoint {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Definition => "definition",
+            Self::Hover => "hover",
+            Self::References => "references",
+            Self::DocumentHighlight => "documentHighlight",
+        }
+    }
+}
+
+fn invalid_context_targets() -> Vec<(&'static str, u64, u64)> {
+    [
+        (
+            "string literal",
+            position_after(INVALID_CONTEXTS_SOURCE, "\""),
+        ),
+        (
+            "ambiguous type reference",
+            position_after(INVALID_CONTEXTS_SOURCE, "        "),
+        ),
+        (
+            "unresolved expression",
+            position_after(INVALID_CONTEXTS_SOURCE, "int value = "),
+        ),
+        (
+            "keyword",
+            position_after(INVALID_CONTEXTS_SOURCE, "        if"),
+        ),
+    ]
+    .into_iter()
+    .map(|(label, (line, character))| (label, line, character))
+    .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_invalid_context_endpoint_responses(
+    stdin: &mut impl Write,
+    reader: &mut impl BufRead,
+    stderr: &mut impl Read,
+    next_id: &mut u64,
+    file_uri: &str,
+    endpoint: BroadEndpoint,
+) -> Vec<(&'static str, Value)> {
+    invalid_context_targets()
+        .into_iter()
+        .map(|(label, line, character)| {
+            let response = match endpoint {
+                BroadEndpoint::Definition => text_document_position_response(
+                    stdin,
+                    reader,
+                    stderr,
+                    *next_id,
+                    "textDocument/definition",
+                    file_uri,
+                    line,
+                    character,
+                ),
+                BroadEndpoint::Hover => text_document_position_response(
+                    stdin,
+                    reader,
+                    stderr,
+                    *next_id,
+                    "textDocument/hover",
+                    file_uri,
+                    line,
+                    character,
+                ),
+                BroadEndpoint::References => references_response(
+                    stdin, reader, stderr, *next_id, file_uri, line, character, true,
+                ),
+                BroadEndpoint::DocumentHighlight => text_document_position_response(
+                    stdin,
+                    reader,
+                    stderr,
+                    *next_id,
+                    "textDocument/documentHighlight",
+                    file_uri,
+                    line,
+                    character,
+                ),
+            };
+            *next_id += 1;
+            (label, response)
+        })
+        .collect()
+}
+
+fn assert_no_invalid_context_results(endpoint: BroadEndpoint, responses: &[(&'static str, Value)]) {
+    for (label, response) in responses {
+        let no_result = match endpoint {
+            BroadEndpoint::Definition | BroadEndpoint::Hover => response["result"].is_null(),
+            BroadEndpoint::References | BroadEndpoint::DocumentHighlight => {
+                response["result"].is_null()
+                    || response["result"]
+                        .as_array()
+                        .is_some_and(|items| items.is_empty())
+            }
+        };
+        assert!(
+            no_result,
+            "{label} must not produce {} result, got {response}",
+            endpoint.label()
+        );
+    }
 }
 
 fn implementation_response(
