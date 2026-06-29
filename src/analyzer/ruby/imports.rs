@@ -1,4 +1,5 @@
 use super::*;
+use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use crate::analyzer::{ImportInfo, Language};
 use rayon::prelude::*;
 use std::ffi::OsStr;
@@ -156,6 +157,19 @@ impl RubyAnalyzer {
         })
     }
 
+    fn zeitwerk_consumer_files(&self) -> &HashSet<ProjectFile> {
+        self.zeitwerk_consumer_files.get_or_init(|| {
+            if !self.has_zeitwerk_autoload_conventions() {
+                return HashSet::default();
+            }
+            self.inner
+                .project()
+                .analyzable_files(Language::Ruby)
+                .map(|files| files.into_iter().collect())
+                .unwrap_or_default()
+        })
+    }
+
     fn zeitwerk_autoload_code_units(&self) -> &HashSet<CodeUnit> {
         self.zeitwerk_autoload_code_units.get_or_init(|| {
             let mut units = HashSet::default();
@@ -168,23 +182,49 @@ impl RubyAnalyzer {
         })
     }
 
-    pub(crate) fn zeitwerk_autoload_candidate_files_for_identifier(
+    pub(crate) fn zeitwerk_reference_files_for_identifier(
         &self,
         identifier: &str,
     ) -> HashSet<ProjectFile> {
         if identifier.is_empty() {
             return HashSet::default();
         }
-        self.zeitwerk_autoload_files()
-            .iter()
-            .filter(|file| {
-                self.inner
-                    .project()
-                    .read_source(file)
-                    .is_ok_and(|source| source.contains(identifier))
-            })
+        self.zeitwerk_reference_files()
+            .get(identifier)
+            .into_iter()
+            .flat_map(|files| files.iter())
             .cloned()
             .collect()
+    }
+
+    pub(crate) fn zeitwerk_visible_files_for(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<&HashSet<ProjectFile>> {
+        self.zeitwerk_consumer_files()
+            .contains(file)
+            .then(|| self.zeitwerk_autoload_files())
+    }
+
+    fn zeitwerk_reference_files(&self) -> &HashMap<String, HashSet<ProjectFile>> {
+        self.zeitwerk_reference_files.get_or_init(|| {
+            let mut references: HashMap<String, HashSet<ProjectFile>> = HashMap::default();
+            for file in self.zeitwerk_consumer_files() {
+                let Ok(source) = self.inner.project().read_source(file) else {
+                    continue;
+                };
+                let Some(tree) = parse_ruby_tree(&source) else {
+                    continue;
+                };
+                collect_ruby_reference_identifiers(&source, tree.root_node(), |identifier| {
+                    references
+                        .entry(identifier.to_string())
+                        .or_default()
+                        .insert(file.clone());
+                });
+            }
+            references
+        })
     }
 
     fn effective_imported_code_units(&self, file: &ProjectFile) -> HashSet<CodeUnit> {
@@ -194,7 +234,7 @@ impl RubyAnalyzer {
                 units.insert(code_unit.clone());
             }
         }
-        if self.zeitwerk_autoload_files().contains(file) {
+        if self.zeitwerk_consumer_files().contains(file) {
             units.extend(
                 self.zeitwerk_autoload_code_units()
                     .iter()
@@ -352,4 +392,47 @@ fn is_zeitwerk_autoload_file(file: &ProjectFile) -> bool {
         return false;
     };
     !ZEITWERK_AUTOLOAD_EXCLUDED_APP_DIRS.contains(&app_dir)
+}
+
+fn collect_ruby_reference_identifiers<'a>(
+    source: &'a str,
+    root: Node<'_>,
+    mut sink: impl FnMut(&'a str),
+) {
+    walk_named_tree_preorder(root, true, |node| {
+        if let Some(method) = method_call_identifier(node, source) {
+            sink(method);
+        }
+        if let Some(constant) = constant_reference_identifier(node, source) {
+            sink(constant);
+        }
+        WalkControl::Continue
+    });
+}
+
+fn method_call_identifier<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
+    if node.kind() != "call" {
+        return None;
+    }
+    let method = node.child_by_field_name("method")?;
+    Some(ruby_node_text(method, source))
+}
+
+fn constant_reference_identifier<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
+    if node.kind() != "constant" {
+        return None;
+    }
+    if let Some(parent) = node.parent()
+        && matches!(parent.kind(), "class" | "module")
+    {
+        return None;
+    }
+    Some(ruby_node_text(node, source))
+}
+
+fn ruby_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    source
+        .get(node.start_byte()..node.end_byte())
+        .unwrap_or("")
+        .trim()
 }

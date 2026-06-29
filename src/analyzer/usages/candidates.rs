@@ -1,6 +1,6 @@
 use crate::analyzer::usages::common::{language_for_file, language_for_target};
 use crate::analyzer::usages::traits::CandidateFileProvider;
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, RubyAnalyzer, resolve_analyzer};
+use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::{HashSet, set_with_capacity};
 use rayon::prelude::*;
 use std::collections::BTreeSet;
@@ -87,26 +87,9 @@ impl CandidateFileProvider for ImportGraphCandidateProvider {
             }
         }
 
-        add_ruby_zeitwerk_candidates(target, analyzer, &mut candidates);
         add_scala_candidates_for_java_type(target, analyzer, &mut candidates);
 
         candidates
-    }
-}
-
-fn add_ruby_zeitwerk_candidates(
-    target: &CodeUnit,
-    analyzer: &dyn IAnalyzer,
-    candidates: &mut HashSet<ProjectFile>,
-) {
-    if language_for_target(target) != Language::Ruby {
-        return;
-    }
-    let Some(ruby) = resolve_analyzer::<RubyAnalyzer>(analyzer) else {
-        return;
-    };
-    for file in ruby.zeitwerk_autoload_candidate_files_for_identifier(target.identifier()) {
-        candidates.insert(file);
     }
 }
 
