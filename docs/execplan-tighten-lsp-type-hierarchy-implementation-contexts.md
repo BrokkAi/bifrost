@@ -23,6 +23,8 @@ After this work, both providers remain advertised, but they return a normal JSON
 - [x] (2026-06-29 13:45Z) Milestone 3: added Go implementation/type-hierarchy value-context regressions, completed guided review, fixed accepted test findings, and reran focused validation.
 - [x] (2026-06-29 14:30Z) Milestone 4 final review: found and fixed TypeScript value-derived annotation misclassification, moved target classification to a neutral analyzer module, and moved shared LSP target resolution to a neutral handler module.
 - [x] (2026-06-29 14:45Z) Milestone 4 final validation: reran the focused LSP sweep, `cargo fmt`, and `cargo clippy-no-cuda`.
+- [x] (2026-06-29 15:05Z) Synced the feature branch onto `origin/master` after confirming the repository default branch is `master`.
+- [x] (2026-06-29 15:20Z) Milestone 5: added Ruby LSP coverage for declaration positives and value-context null behavior, then ran focused validation.
 
 ## Surprises & Discoveries
 
@@ -65,6 +67,9 @@ After this work, both providers remain advertised, but they return a normal JSON
 - Observation: Final guided review found two coupling issues in the shared target contract.
   Evidence: Java/C#/Scala definition helpers imported `TypeLookupTargetKind` from `get_type`, and `type_hierarchy.rs` imported shared cursor resolution from sibling handler `type_definition.rs`. The fix moved the enum to `src/analyzer/usages/target_kind.rs` and moved shared LSP target resolution to `src/lsp/handlers/type_target.rs`.
 
+- Observation: Ruby supports type hierarchy relations for class/module declarations but is not a `get_type::resolve_type_batch` language.
+  Evidence: `RubyAnalyzer` implements `TypeHierarchyProvider`, while `src/analyzer/usages/get_type/mod.rs` only dispatches C#, Go, Java, JavaScript, Rust, Scala, and TypeScript. Ruby therefore needs LSP declaration/value-context coverage for this issue, not a Ruby type-reference resolver.
+
 ## Decision Log
 
 - Decision: Keep `typeHierarchyProvider` and `implementationProvider` advertised globally.
@@ -105,6 +110,10 @@ After this work, both providers remain advertised, but they return a normal JSON
 
 - Decision: Treat TypeScript annotation lookup from a selected value/local as `ValueExpression`, not `TypeReference`.
   Rationale: The annotation is useful for broad `textDocument/typeDefinition`, but the cursor is on a value declaration or expression. Only a cursor on the explicit type syntax itself should seed hierarchy or implementation.
+  Date/Author: 2026-06-29 / Codex
+
+- Decision: Cover Ruby as a declaration-target language without adding Ruby `get_type` support in this milestone.
+  Rationale: Ruby has class/module hierarchy data but no static type annotation/reference syntax comparable to Java, TypeScript, Rust, or Scala. The shared LSP resolver already accepts selected class/module declarations and rejects Ruby value contexts through the unsupported-language type lookup path.
   Date/Author: 2026-06-29 / Codex
 
 ## Outcomes & Retrospective
@@ -149,6 +158,23 @@ Milestone 4 final review fixes are in place. `TypeLookupTargetKind` now lives in
 
     cargo clippy-no-cuda
     result: passed after adding a localized `#[allow(clippy::too_many_arguments)]` to the TypeScript declared-type helper whose resolver context now includes target classification.
+
+Milestone 5 is complete. The branch was rebased onto `origin/master`, whose remote HEAD is the repository default. Ruby coverage now verifies class declarations still prepare hierarchy and seed implementation through descendants, while Ruby method names, local declarations, constructor-style calls, and local references return `null` for both type hierarchy preparation and implementation. Focused validation passed:
+
+    cargo test --test bifrost_lsp_server bifrost_lsp_server_ruby_type_hierarchy_and_implementation_filter_value_contexts --features nlp
+    result: 1 passed; 0 failed
+
+    cargo test --test bifrost_lsp_server type_hierarchy --features nlp
+    result: 11 passed; 0 failed
+
+    cargo test --test bifrost_lsp_server implementation --features nlp
+    result: 7 passed; 0 failed
+
+    cargo fmt
+    result: passed
+
+    cargo clippy-no-cuda
+    result: passed
 
 ## Context and Orientation
 

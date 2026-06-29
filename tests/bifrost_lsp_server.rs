@@ -6433,6 +6433,104 @@ fn bifrost_lsp_server_go_type_hierarchy_returns_structural_interface_edges() {
 }
 
 #[test]
+fn bifrost_lsp_server_ruby_type_hierarchy_and_implementation_filter_value_contexts() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("hierarchy.rb");
+    let source = "class Base\nend\n\nclass Child < Base\nend\n\nclass Service\n  def build\n    local = Child.new\n    result = local\n  end\nend\n";
+    fs::write(&file_path, source).expect("write Ruby hierarchy-context fixture");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+
+    let (line, character) = position_after(source, "class C");
+    let child_item = prepare_type_hierarchy(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        65,
+        &file_uri,
+        line,
+        character,
+    );
+    assert_eq!(
+        child_item["name"], "Child",
+        "prepared Ruby Child declaration: {child_item}"
+    );
+    let supertypes = type_hierarchy_relation(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        66,
+        "typeHierarchy/supertypes",
+        child_item,
+    );
+    assert!(
+        supertypes.iter().any(|item| item["name"] == "Base"),
+        "expected Ruby Base supertype, got {supertypes:#?}"
+    );
+
+    let (line, character) = position_after(source, "class B");
+    let response = implementation_response(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        67,
+        &file_uri,
+        line,
+        character,
+    );
+    let locations = response["result"].as_array().unwrap_or_else(|| {
+        panic!("expected Ruby implementation from Base declaration, got {response}")
+    });
+    assert!(
+        locations
+            .iter()
+            .any(|location| location["range"]["start"]["line"] == 3),
+        "expected Ruby Child implementation from Base declaration, got {response}"
+    );
+
+    let null_cases = [
+        ("method name", "def b"),
+        ("local declaration", "local ="),
+        ("call receiver", "Child.n"),
+        ("local reference", "result = loc"),
+    ];
+    for (index, (label, needle)) in null_cases.iter().enumerate() {
+        let (line, character) = position_after(source, needle);
+        let result = prepare_hierarchy_result(
+            &mut stdin,
+            &mut reader,
+            &mut stderr,
+            68 + (index as u64 * 2),
+            "textDocument/prepareTypeHierarchy",
+            &file_uri,
+            (line, character),
+        );
+        assert!(
+            result.is_null(),
+            "Ruby {label} must not prepare type hierarchy: {result}"
+        );
+
+        let response = implementation_response(
+            &mut stdin,
+            &mut reader,
+            &mut stderr,
+            69 + (index as u64 * 2),
+            &file_uri,
+            line,
+            character,
+        );
+        assert!(
+            response["result"].is_null(),
+            "Ruby {label} must not resolve implementations, got {response}"
+        );
+    }
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
 fn bifrost_lsp_server_type_hierarchy_filters_java_csharp_scala_value_contexts() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().canonicalize().expect("canon temp");
