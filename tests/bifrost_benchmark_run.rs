@@ -65,7 +65,7 @@ definition_queries = [
   {{ path = "A.java", line = 8, column = 19, expected_status = "no_definition" }},
 ]
 call_hierarchy_queries = [
-  {{ path = "E.java", line = 9, column = 17, min_incoming = 1 }},
+  {{ path = "E.java", line = 10, column = 17, min_incoming = 1 }},
 ]
 type_hierarchy_queries = [
   {{ path = "XExtendsY.java", line = 1, column = 14, min_supertypes = 1 }},
