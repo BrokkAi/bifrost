@@ -3699,9 +3699,18 @@ fn bifrost_lsp_server_references_finds_class_a_usages() {
 
 const COMMENT_TARGETS_SOURCE: &str = "class CommentTargets {\n    // target\n    void target() {}\n    void caller() {\n        target();\n    }\n}\n";
 
+const DUPLICATE_DECLARATION_NAME_SOURCE: &str =
+    "class Widget {\n    Widget Widget() {\n        return this;\n    }\n}\n";
+
 fn write_comment_targets_fixture(root: &Path) -> PathBuf {
     let file_path = root.join("CommentTargets.java");
     fs::write(&file_path, COMMENT_TARGETS_SOURCE).expect("write CommentTargets.java");
+    file_path
+}
+
+fn write_duplicate_declaration_name_fixture(root: &Path) -> PathBuf {
+    let file_path = root.join("Widget.java");
+    fs::write(&file_path, DUPLICATE_DECLARATION_NAME_SOURCE).expect("write Widget.java");
     file_path
 }
 
@@ -3796,6 +3805,64 @@ fn bifrost_lsp_server_hover_ignores_comment_token() {
     assert!(
         comment_hover["result"].is_null(),
         "comment token must not produce hover, got {comment_hover}"
+    );
+}
+
+#[test]
+fn bifrost_lsp_server_definition_and_hover_select_duplicate_declaration_name() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = write_duplicate_declaration_name_fixture(&root);
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+
+    let (line, character) = position_after(DUPLICATE_DECLARATION_NAME_SOURCE, "    Widget ");
+    let definition = text_document_position_response(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        10,
+        "textDocument/definition",
+        &file_uri,
+        line,
+        character,
+    );
+    let hover = text_document_position_response(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        11,
+        "textDocument/hover",
+        &file_uri,
+        line,
+        character,
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+
+    let definition_items = definition["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected definition locations, got {definition}"));
+    assert_eq!(
+        definition_items.len(),
+        1,
+        "method declaration should resolve itself, got {definition}"
+    );
+    assert_eq!(
+        definition_items[0]["range"]["start"]["line"], 1,
+        "definition should target the method declaration, got {definition}"
+    );
+    let hover_value = hover["result"]["contents"]["value"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected hover contents, got {hover}"));
+    assert!(
+        hover_value.contains("Widget Widget()"),
+        "hover should describe the method declaration, got {hover_value}"
+    );
+    assert_eq!(
+        hover["result"]["range"]["start"]["character"], 11,
+        "hover should highlight the method name under the cursor, not the return type: {hover}"
     );
 }
 

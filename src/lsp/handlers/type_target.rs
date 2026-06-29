@@ -7,7 +7,7 @@ use crate::analyzer::{CodeUnit, IAnalyzer, Project, Range as ByteRange, Workspac
 use crate::hash::HashSet;
 use crate::lsp::conversion::position_to_byte_offset;
 use crate::lsp::handlers::hierarchy_support::cursor_byte_range;
-use crate::lsp::handlers::util::{identifier_selection_range, read_document_for_uri};
+use crate::lsp::handlers::util::{read_document_for_uri, selected_code_unit_declaration_at_cursor};
 
 pub(crate) struct TypeTarget {
     pub(crate) units: Vec<CodeUnit>,
@@ -36,13 +36,9 @@ pub(crate) fn resolve_type_target(
     let (file, content, line_starts) = read_document_for_uri(project, uri)?;
     let start_byte = position_to_byte_offset(&content, &line_starts, position);
     let cursor_range = cursor_byte_range(&content, start_byte);
-    if let Some(type_unit) = selected_type_declaration(
-        workspace.analyzer(),
-        &file,
-        &content,
-        &line_starts,
-        &cursor_range,
-    ) {
+    if let Some(type_unit) =
+        selected_type_declaration(workspace.analyzer(), &file, &content, &cursor_range)
+    {
         return Some(TypeTarget {
             units: vec![type_unit],
             implementation_kind: ImplementationTargetKind::Type,
@@ -105,16 +101,9 @@ fn selected_type_declaration(
     analyzer: &dyn IAnalyzer,
     file: &crate::analyzer::ProjectFile,
     content: &str,
-    line_starts: &[usize],
     cursor_range: &ByteRange,
 ) -> Option<CodeUnit> {
-    let code_unit = analyzer.enclosing_code_unit(file, cursor_range)?;
-    if !code_unit.is_class() {
-        return None;
-    }
-    let range = analyzer.ranges(&code_unit).iter().min().copied()?;
-    let selection = identifier_selection_range(&code_unit, content, line_starts, &range)?;
-    let cursor =
-        crate::lsp::conversion::byte_range_to_lsp_range(content, line_starts, cursor_range);
-    (cursor.start >= selection.start && cursor.start <= selection.end).then_some(code_unit)
+    selected_code_unit_declaration_at_cursor(analyzer, file, content, cursor_range, |code_unit| {
+        code_unit.is_class()
+    })
 }
