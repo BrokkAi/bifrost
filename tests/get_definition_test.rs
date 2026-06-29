@@ -895,13 +895,53 @@ public class UseWidget {
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"app/UseWidget.java","line":7,"column":{}}}]}}"#,
-            column_of(line, "create")
+            column_of(line, "Widget")
         ),
     );
 
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(result["types"][0]["fqn"], "models.Widget", "{value}");
+}
+
+#[test]
+fn java_type_lookup_reports_no_type_for_method_declaration_name() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "models/Widget.java",
+            "package models; public class Widget {}\n",
+        )
+        .file(
+            "app/UseWidget.java",
+            r#"
+package app;
+
+import models.Widget;
+
+public class UseWidget {
+    public Widget create() {
+        return new Widget();
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "    public Widget create() {";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/UseWidget.java","line":7,"column":{}}}]}}"#,
+            column_of(line, "create")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_type", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "inappropriate_symbol_context",
+        "{value}"
+    );
 }
 
 #[test]
@@ -985,7 +1025,7 @@ namespace App {
 }
 
 #[test]
-fn csharp_type_lookup_resolves_explicit_method_return_type() {
+fn csharp_type_lookup_reports_no_type_for_method_declaration_name() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(
             "Models/Widget.cs",
@@ -1017,8 +1057,11 @@ namespace App {
     );
 
     let result = &value["results"][0];
-    assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(result["types"][0]["fqn"], "Models.Widget", "{value}");
+    assert_eq!(result["status"], "no_type", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "inappropriate_symbol_context",
+        "{value}"
+    );
 }
 
 #[test]
@@ -1061,7 +1104,7 @@ class UseWidget {
 }
 
 #[test]
-fn scala_type_lookup_resolves_explicit_function_return_type() {
+fn scala_type_lookup_reports_no_type_for_function_declaration_name() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file("models/Widget.scala", "package models\nclass Widget\n")
         .file(
@@ -1088,8 +1131,11 @@ class UseWidget {
     );
 
     let result = &value["results"][0];
-    assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(result["types"][0]["fqn"], "models.Widget", "{value}");
+    assert_eq!(result["status"], "no_type", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "inappropriate_symbol_context",
+        "{value}"
+    );
 }
 
 #[test]
