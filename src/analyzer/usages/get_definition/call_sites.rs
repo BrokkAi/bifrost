@@ -2,7 +2,7 @@ use tree_sitter::{Node, Tree};
 
 use crate::analyzer::{Language, ProjectFile, Range};
 
-use super::parse_tree_for_language;
+use super::{parse_tree_for_language, scala::scala_postfix_method_node};
 use crate::analyzer::common::language_for_file;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +103,11 @@ fn call_signature_context_for_node(
     source: &str,
     byte_offset: usize,
 ) -> Option<CallSignatureContext> {
+    if language == Language::Scala
+        && let Some(context) = scala_call_signature_context_for_node(node, byte_offset)
+    {
+        return Some(context);
+    }
     if !is_call_expression_node(node, language) {
         return None;
     }
@@ -156,6 +161,36 @@ fn is_call_expression_node(node: Node<'_>, language: Language) -> bool {
         ),
         Language::Ruby => node.kind() == "call",
         Language::None => false,
+    }
+}
+
+fn scala_call_signature_context_for_node(
+    node: Node<'_>,
+    byte_offset: usize,
+) -> Option<CallSignatureContext> {
+    match node.kind() {
+        "infix_expression" => {
+            let operator = node.child_by_field_name("operator")?;
+            let right = node.child_by_field_name("right")?;
+            if byte_offset < right.start_byte() || byte_offset > right.end_byte() {
+                return None;
+            }
+            Some(CallSignatureContext {
+                callee_range: node_range(operator),
+                active_parameter: 0,
+            })
+        }
+        "postfix_expression" => {
+            let method = scala_postfix_method_node(node)?;
+            if byte_offset < method.start_byte() || byte_offset > method.end_byte() {
+                return None;
+            }
+            Some(CallSignatureContext {
+                callee_range: node_range(method),
+                active_parameter: 0,
+            })
+        }
+        _ => None,
     }
 }
 
@@ -728,6 +763,54 @@ mod tests {
         assert_eq!(
             &source[context.callee_range.start_byte..context.callee_range.end_byte],
             "inner"
+        );
+        assert_eq!(context.active_parameter, 0);
+    }
+
+    #[test]
+    fn signature_context_handles_scala_infix_call() {
+        let source = "object App {\n  class Box { def combine(value: Int): Int = value }\n  val box = new Box\n  val result = box combine 1\n}\n";
+        let context = call_signature_context(
+            &file("App.scala"),
+            source,
+            offset_after(source, "box combine "),
+        )
+        .expect("signature context");
+
+        assert_eq!(
+            &source[context.callee_range.start_byte..context.callee_range.end_byte],
+            "combine"
+        );
+        assert_eq!(context.active_parameter, 0);
+    }
+
+    #[test]
+    fn signature_context_handles_scala_postfix_call() {
+        let source = "object App {\n  class Box { def ready: Boolean = true }\n  val box = new Box\n  val result = box ready\n}\n";
+        let context = call_signature_context(
+            &file("App.scala"),
+            source,
+            offset_after(source, "box ready"),
+        )
+        .expect("signature context");
+
+        assert_eq!(
+            &source[context.callee_range.start_byte..context.callee_range.end_byte],
+            "ready"
+        );
+        assert_eq!(context.active_parameter, 0);
+    }
+
+    #[test]
+    fn signature_context_handles_scala_postfix_operator_call() {
+        let source = "object App {\n  class Box { def ! : Boolean = true }\n  val box = new Box\n  val result = box !\n}\n";
+        let context =
+            call_signature_context(&file("App.scala"), source, offset_after(source, "box !"))
+                .expect("signature context");
+
+        assert_eq!(
+            &source[context.callee_range.start_byte..context.callee_range.end_byte],
+            "!"
         );
         assert_eq!(context.active_parameter, 0);
     }

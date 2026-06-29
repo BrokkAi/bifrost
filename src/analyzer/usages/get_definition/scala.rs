@@ -87,6 +87,12 @@ pub(super) fn resolve_scala(
             resolve_scala_constructor(ctx, &resolver, constructor)
         }
         Some(ScalaReferenceNode::Call(call)) => resolve_scala_call(ctx, &resolver, root, call),
+        Some(ScalaReferenceNode::InfixCall(call)) => {
+            resolve_scala_infix_call(ctx, &resolver, root, call)
+        }
+        Some(ScalaReferenceNode::PostfixCall(call)) => {
+            resolve_scala_postfix_call(ctx, &resolver, root, call)
+        }
         Some(ScalaReferenceNode::Field(field)) => resolve_scala_field(ctx, &resolver, root, field),
         Some(ScalaReferenceNode::StableIdentifier(identifier)) => {
             resolve_scala_stable_identifier(ctx, &resolver, root, identifier)
@@ -261,6 +267,8 @@ enum ScalaReferenceNode<'tree> {
     Type(Node<'tree>),
     Constructor(Node<'tree>),
     Call(Node<'tree>),
+    InfixCall(Node<'tree>),
+    PostfixCall(Node<'tree>),
     Field(Node<'tree>),
     StableIdentifier(Node<'tree>),
     Identifier(Node<'tree>),
@@ -281,6 +289,18 @@ fn scala_reference_node(node: Node<'_>) -> Option<ScalaReferenceNode<'_>> {
             current = parent;
             continue;
         }
+        if parent.kind() == "infix_expression"
+            && parent.child_by_field_name("operator") == Some(current)
+        {
+            current = parent;
+            continue;
+        }
+        if parent.kind() == "postfix_expression"
+            && scala_postfix_method_node(parent) == Some(current)
+        {
+            current = parent;
+            continue;
+        }
         if parent.kind() == "instance_expression"
             && parent.start_byte() <= current.start_byte()
             && parent.end_byte() >= current.end_byte()
@@ -297,6 +317,8 @@ fn scala_reference_node(node: Node<'_>) -> Option<ScalaReferenceNode<'_>> {
 
     match current.kind() {
         "call_expression" => Some(ScalaReferenceNode::Call(current)),
+        "infix_expression" => Some(ScalaReferenceNode::InfixCall(current)),
+        "postfix_expression" => Some(ScalaReferenceNode::PostfixCall(current)),
         "instance_expression" => Some(ScalaReferenceNode::Constructor(current)),
         "field_expression" => Some(ScalaReferenceNode::Field(current)),
         "stable_identifier" => Some(ScalaReferenceNode::StableIdentifier(current)),
@@ -449,6 +471,85 @@ fn resolve_scala_call(
             ),
         ),
     }
+}
+
+fn resolve_scala_infix_call(
+    ctx: ScalaLookupCtx<'_>,
+    resolver: &ScalaNameResolver,
+    root: Node<'_>,
+    call: Node<'_>,
+) -> DefinitionLookupOutcome {
+    let Some(operator) = call.child_by_field_name("operator") else {
+        return no_definition("no_function_name", "Scala infix expression has no operator");
+    };
+    let Some(receiver) = call.child_by_field_name("left") else {
+        return no_definition(
+            "unsupported_scala_receiver",
+            "Scala infix expression has no receiver",
+        );
+    };
+    let name = scala_node_text(operator, ctx.source).trim();
+    if name.is_empty() {
+        return no_definition("no_function_name", "Scala infix operator is blank");
+    }
+    if let Some(owner) =
+        scala_receiver_type_fqn(ctx, resolver, root, receiver, operator.start_byte())
+    {
+        return scala_member_candidates(ctx, &owner, name, false);
+    }
+    no_definition(
+        "unsupported_scala_receiver",
+        format!("receiver for Scala infix member `{name}` is not resolved"),
+    )
+}
+
+fn resolve_scala_postfix_call(
+    ctx: ScalaLookupCtx<'_>,
+    resolver: &ScalaNameResolver,
+    root: Node<'_>,
+    call: Node<'_>,
+) -> DefinitionLookupOutcome {
+    let Some(method) = scala_postfix_method_node(call) else {
+        return no_definition("no_function_name", "Scala postfix expression has no method");
+    };
+    let Some(receiver) = scala_postfix_receiver_node(call, method) else {
+        return no_definition(
+            "unsupported_scala_receiver",
+            "Scala postfix expression has no receiver",
+        );
+    };
+    let name = scala_node_text(method, ctx.source).trim();
+    if name.is_empty() {
+        return no_definition("no_function_name", "Scala postfix method is blank");
+    }
+    if let Some(owner) = scala_receiver_type_fqn(ctx, resolver, root, receiver, method.start_byte())
+    {
+        return scala_member_candidates(ctx, &owner, name, false);
+    }
+    no_definition(
+        "unsupported_scala_receiver",
+        format!("receiver for Scala postfix member `{name}` is not resolved"),
+    )
+}
+
+pub(super) fn scala_postfix_method_node(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    let mut method = None;
+    for child in node.named_children(&mut cursor) {
+        if matches!(child.kind(), "identifier" | "operator_identifier") {
+            method = Some(child);
+        }
+    }
+    method
+}
+
+fn scala_postfix_receiver_node<'tree>(
+    node: Node<'tree>,
+    method: Node<'tree>,
+) -> Option<Node<'tree>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| child.end_byte() <= method.start_byte())
 }
 
 fn resolve_scala_constructor(

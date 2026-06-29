@@ -69,6 +69,25 @@ fn test_simple_unqualified_trait() {
 }
 
 #[test]
+fn scala_indexes_operator_method_name() {
+    let project = inline_scala_project(&[(
+        "app/Box.scala",
+        r#"
+        package app
+
+        class Box {
+          def ! : Boolean = true
+        }
+        "#,
+    )]);
+    let analyzer = ScalaAnalyzer::from_project(project);
+
+    let bang = definition(&analyzer, "app.Box.!");
+    assert!(bang.is_function());
+    assert_eq!("!", bang.identifier());
+}
+
+#[test]
 fn test_simple_qualified_classes() {
     let project = inline_scala_project(&[(
         "ai/brokk/Foo.scala",

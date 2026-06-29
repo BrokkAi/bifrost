@@ -44,15 +44,17 @@ pub(crate) fn resolve_reference_site(
                     "byte range [{start}, {end}) does not align to UTF-8 character boundaries"
                 ));
             }
-            let token = token_bounds_at(source, start)
-                .ok_or_else(|| format!("no reference token at byte {start}"))?;
-            if end > token.1 {
-                return Err(
-                    "byte range must identify a single reference token; use start_byte inside the token for qualified expressions"
-                        .to_string(),
-                );
+            if let Some(token) = token_bounds_at(source, start) {
+                if end > token.1 {
+                    return Err(
+                        "byte range must identify a single reference token; use start_byte inside the token for qualified expressions"
+                            .to_string(),
+                    );
+                }
+                token
+            } else {
+                (start, end)
             }
-            token
         }
         (Some(start), None, _, _) => {
             if start >= source.len() {
@@ -234,7 +236,9 @@ pub(crate) fn smallest_named_node_covering<'tree>(
 
 #[cfg(test)]
 mod tests {
-    use super::expand_reference_expression;
+    use super::{SourceLocationRequest, expand_reference_expression, resolve_reference_site};
+    use crate::analyzer::ProjectFile;
+    use std::env;
 
     #[test]
     fn expand_reference_expression_keeps_ascii_separator_checks_byte_pure() {
@@ -255,5 +259,26 @@ mod tests {
             expand_reference_expression(source, start, end),
             (start, end)
         );
+    }
+
+    #[test]
+    fn exact_byte_range_can_select_symbolic_reference() {
+        let source = "box !\n";
+        let start = source.find('!').expect("operator");
+        let site = resolve_reference_site(
+            &SourceLocationRequest {
+                file: ProjectFile::new(env::temp_dir(), "App.scala"),
+                line: None,
+                column: None,
+                start_byte: Some(start),
+                end_byte: Some(start + 1),
+            },
+            source,
+        )
+        .expect("symbolic reference site");
+
+        assert_eq!(site.text, "!");
+        assert_eq!(site.focus_start_byte, start);
+        assert_eq!(site.focus_end_byte, start + 1);
     }
 }

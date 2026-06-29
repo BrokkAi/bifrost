@@ -3119,6 +3119,112 @@ fn bifrost_lsp_server_signature_help_handles_scala_brace_argument() {
 }
 
 #[test]
+fn bifrost_lsp_server_signature_help_handles_scala_infix_call() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("App.scala");
+    let source = "object App {\n  class Box {\n    def combine(value: Int): Int = value\n  }\n  val box = new Box\n  val result = box combine 1\n}\n";
+    fs::write(&file_path, source).expect("write App.scala");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let (line, character) = position_after(source, "box combine ");
+
+    let result = signature_help(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        2,
+        &file_uri,
+        line,
+        character,
+    );
+    assert_eq!(
+        result["activeParameter"], 0,
+        "unexpected signature help: {result}"
+    );
+    assert!(
+        result["signatures"][0]["label"]
+            .as_str()
+            .is_some_and(|label| label.contains("combine") && label.contains("value")),
+        "expected combine signature label, got {result}"
+    );
+    assert_signature_parameter_offsets(&result, 0, &["value"]);
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_signature_help_handles_scala_postfix_call() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("App.scala");
+    let source = "object App {\n  class Box {\n    def ready: Boolean = true\n  }\n  val box = new Box\n  val result = box ready\n}\n";
+    fs::write(&file_path, source).expect("write App.scala");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let (line, character) = position_after(source, "box ready");
+
+    let result = signature_help(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        2,
+        &file_uri,
+        line,
+        character,
+    );
+    assert_eq!(
+        result["activeParameter"], 0,
+        "unexpected signature help: {result}"
+    );
+    assert!(
+        result["signatures"][0]["label"]
+            .as_str()
+            .is_some_and(|label| label.contains("ready") && label.contains("Boolean")),
+        "expected ready signature label, got {result}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_signature_help_handles_scala_postfix_operator_call() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("App.scala");
+    let source = "object App {\n  class Box {\n    def ! : Boolean = true\n  }\n  val box = new Box\n  val result = box !\n}\n";
+    fs::write(&file_path, source).expect("write App.scala");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let (line, character) = position_after(source, "box !");
+
+    let result = signature_help(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        2,
+        &file_uri,
+        line,
+        character,
+    );
+    assert_eq!(
+        result["activeParameter"], 0,
+        "unexpected signature help: {result}"
+    );
+    assert!(
+        result["signatures"][0]["label"]
+            .as_str()
+            .is_some_and(|label| label.contains("!") && label.contains("Boolean")),
+        "expected operator signature label, got {result}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
 fn bifrost_lsp_server_signature_help_returns_null_outside_call_arguments() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().canonicalize().expect("canon temp");

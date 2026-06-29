@@ -10592,6 +10592,32 @@ fn scala_typed_receiver_method_resolves_to_definition() {
 }
 
 #[test]
+fn scala_postfix_operator_method_resolves_to_definition() {
+    let controller = "package app\nclass Controller { def handle(box: Box): Boolean = box ! }\n";
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Box.scala",
+            "package app\nclass Box { def ! : Boolean = true }\n",
+        )
+        .file("app/Controller.scala", controller)
+        .build();
+
+    let start = controller.find('!').expect("operator");
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Controller.scala","start_byte":{},"end_byte":{}}}]}}"#,
+            start,
+            start + "!".len()
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "app.Box.!", "{value}");
+}
+
+#[test]
 fn scala_service_execute_receiver_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(
