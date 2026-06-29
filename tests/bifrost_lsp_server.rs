@@ -2502,6 +2502,21 @@ fn bifrost_lsp_server_implementation_works_from_typescript_type_reference() {
         "expected TypeScript Child implementation from Base annotation, got {response}"
     );
 
+    let (line, character) = position_after(ts_source, "let t");
+    let response = implementation_response(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        21,
+        &ts_uri,
+        line,
+        character,
+    );
+    assert!(
+        response["result"].is_null(),
+        "TypeScript local declaration names must not resolve implementations, got {response}"
+    );
+
     shutdown_lsp(child, stdin, reader, stderr);
 }
 
@@ -6122,6 +6137,21 @@ fn bifrost_lsp_server_type_hierarchy_typescript_uses_same_handler() {
     assert_eq!(
         base_ref["name"], "Base",
         "prepared TypeScript Base reference: {base_ref}"
+    );
+
+    let (line, character) = position_after(source, "let t");
+    let result = prepare_hierarchy_result(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        36,
+        "textDocument/prepareTypeHierarchy",
+        &file_uri,
+        (line, character),
+    );
+    assert!(
+        result.is_null(),
+        "TypeScript local declaration names must not prepare hierarchy: {result}"
     );
 
     shutdown_lsp(child, stdin, reader, stderr);

@@ -35,6 +35,7 @@ pub(crate) mod reference_site;
 pub(crate) mod ruby_graph;
 pub(crate) mod rust_graph;
 pub(crate) mod scala_graph;
+pub(crate) mod target_kind;
 mod traits;
 
 pub use candidates::{

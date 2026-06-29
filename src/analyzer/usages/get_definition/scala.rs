@@ -1,9 +1,10 @@
 use super::*;
+use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 
 pub(crate) enum ScalaTypeLookupResolution {
     Type {
         fqn: String,
-        target_kind: crate::analyzer::usages::get_type::TypeLookupTargetKind,
+        target_kind: TypeLookupTargetKind,
     },
     InappropriateSymbolContext,
 }
@@ -144,7 +145,7 @@ fn scala_type_lookup_node_fqn(
         )
         .map(|fqn| ScalaTypeLookupResolution::Type {
             fqn,
-            target_kind: crate::analyzer::usages::get_type::TypeLookupTargetKind::TypeReference,
+            target_kind: TypeLookupTargetKind::TypeReference,
         });
     }
 
@@ -152,8 +153,7 @@ fn scala_type_lookup_node_fqn(
         return scala_constructed_type(ctx, node, resolver).map(|fqn| {
             ScalaTypeLookupResolution::Type {
                 fqn,
-                target_kind:
-                    crate::analyzer::usages::get_type::TypeLookupTargetKind::ValueExpression,
+                target_kind: TypeLookupTargetKind::ValueExpression,
             }
         });
     }
@@ -164,8 +164,7 @@ fn scala_type_lookup_node_fqn(
             return scala_receiver_type_fqn(ctx, resolver, root, node, node.start_byte()).map(
                 |fqn| ScalaTypeLookupResolution::Type {
                     fqn,
-                    target_kind:
-                        crate::analyzer::usages::get_type::TypeLookupTargetKind::ValueExpression,
+                    target_kind: TypeLookupTargetKind::ValueExpression,
                 },
             );
         }
@@ -175,8 +174,7 @@ fn scala_type_lookup_node_fqn(
         if let Some(fqn) = scala_declaration_name_type_fqn(ctx, resolver, root, parent, node) {
             return Some(ScalaTypeLookupResolution::Type {
                 fqn,
-                target_kind:
-                    crate::analyzer::usages::get_type::TypeLookupTargetKind::ValueExpression,
+                target_kind: TypeLookupTargetKind::ValueExpression,
             });
         }
     }
@@ -192,7 +190,7 @@ fn scala_type_lookup_node_fqn(
     let bindings = scala_bindings_before(ctx, resolver, root, node.start_byte());
     first_precise(&bindings, name).map(|fqn| ScalaTypeLookupResolution::Type {
         fqn,
-        target_kind: crate::analyzer::usages::get_type::TypeLookupTargetKind::ValueExpression,
+        target_kind: TypeLookupTargetKind::ValueExpression,
     })
 }
 

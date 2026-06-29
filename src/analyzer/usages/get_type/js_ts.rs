@@ -1,4 +1,7 @@
-use super::{TypeLookupOutcome, candidates_outcome, no_type, type_reference_outcome};
+use super::{
+    TypeLookupOutcome, candidates_outcome, candidates_outcome_with_target_kind, no_type,
+    type_reference_outcome,
+};
 use crate::analyzer::usages::get_definition::js_ts::{
     jsts_type_space_candidates, resolve_js_ts_module_binding_candidates,
     ts_function_return_property_owners, ts_receiver_owner_candidates_at_byte,
@@ -9,6 +12,7 @@ use crate::analyzer::usages::model::{ImportBinder, ImportKind};
 use crate::analyzer::usages::reference_site::{
     ResolvedReferenceSite, smallest_named_node_covering,
 };
+use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::analyzer::{
     AliasResolver, CodeUnit, DefinitionLookupIndex, IAnalyzer, Language, ProjectFile,
 };
@@ -64,7 +68,14 @@ pub(super) fn resolve_js_ts_type(
 
     if let Some(type_node) = declaration_type_node_for_reference(node, source, site) {
         return resolve_declared_type_text(
-            analyzer, support, file, source, &imports, &aliases, type_node,
+            analyzer,
+            support,
+            file,
+            source,
+            &imports,
+            &aliases,
+            type_node,
+            TypeLookupTargetKind::ValueExpression,
         );
     }
 
@@ -116,7 +127,14 @@ pub(super) fn resolve_js_ts_type(
             )
         {
             return resolve_declared_type_text(
-                analyzer, support, file, source, &imports, &aliases, type_node,
+                analyzer,
+                support,
+                file,
+                source,
+                &imports,
+                &aliases,
+                type_node,
+                TypeLookupTargetKind::ValueExpression,
             );
         }
         if !owners.is_empty() {
@@ -129,7 +147,14 @@ pub(super) fn resolve_js_ts_type(
             local_binding_type_node_before(tree.root_node(), source, name, site.focus_start_byte)
     {
         return resolve_declared_type_text(
-            analyzer, support, file, source, &imports, &aliases, type_node,
+            analyzer,
+            support,
+            file,
+            source,
+            &imports,
+            &aliases,
+            type_node,
+            TypeLookupTargetKind::ValueExpression,
         );
     }
 
@@ -142,6 +167,7 @@ pub(super) fn resolve_js_ts_type(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_declared_type_text(
     analyzer: &dyn IAnalyzer,
     support: &DefinitionLookupIndex,
@@ -150,12 +176,13 @@ fn resolve_declared_type_text(
     imports: &ImportBinder,
     aliases: &AliasResolver,
     type_node: Node<'_>,
+    target_kind: TypeLookupTargetKind,
 ) -> TypeLookupOutcome {
     let type_text = ts_type_annotation_text(type_node, source);
     if let Some((type_name, candidates)) = qualified_imported_type_candidates(
         analyzer, support, file, type_node, source, imports, aliases,
     ) {
-        return type_reference_outcome(type_name, candidates);
+        return candidates_outcome_with_target_kind(type_name, candidates, target_kind);
     }
 
     if let Some(type_name) = leading_type_identifier(&type_text) {
@@ -170,7 +197,11 @@ fn resolve_declared_type_text(
             false,
         );
         if !candidates.is_empty() {
-            return type_reference_outcome(type_name.to_string(), candidates);
+            return candidates_outcome_with_target_kind(
+                type_name.to_string(),
+                candidates,
+                target_kind,
+            );
         }
     }
 
@@ -179,7 +210,11 @@ fn resolve_declared_type_text(
     );
     let owners = prefer_type_definitions(owners);
     if !owners.is_empty() {
-        return type_reference_outcome(type_lookup_name(&owners, &type_text), owners);
+        return candidates_outcome_with_target_kind(
+            type_lookup_name(&owners, &type_text),
+            owners,
+            target_kind,
+        );
     }
 
     no_type(

@@ -4,6 +4,7 @@ use crate::analyzer::usages::reference_site::{
     ResolvedReferenceSite, SourceLocationRequest, resolve_reference_site,
 };
 use crate::analyzer::usages::scala_graph::ScalaProjectTypes;
+use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::analyzer::{CodeUnit, DefinitionLookupIndex, IAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
@@ -57,13 +58,6 @@ impl TypeLookupStatus {
             Self::NotFound => "not_found",
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TypeLookupTargetKind {
-    TypeReference,
-    ValueExpression,
-    MemberOwner,
 }
 
 #[derive(Debug, Clone)]

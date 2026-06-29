@@ -1,9 +1,10 @@
 use super::*;
+use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 
 pub(crate) enum JavaTypeLookupResolution {
     Type {
         fqn: String,
-        target_kind: crate::analyzer::usages::get_type::TypeLookupTargetKind,
+        target_kind: TypeLookupTargetKind,
     },
     InappropriateSymbolContext,
 }
@@ -122,7 +123,7 @@ fn java_type_lookup_node_fqn(
         return java_type_from_node_with_context(analyzer, java, file, source, node).map(|unit| {
             JavaTypeLookupResolution::Type {
                 fqn: unit.fq_name().to_string(),
-                target_kind: crate::analyzer::usages::get_type::TypeLookupTargetKind::TypeReference,
+                target_kind: TypeLookupTargetKind::TypeReference,
             }
         });
     }
@@ -138,8 +139,7 @@ fn java_type_lookup_node_fqn(
         {
             return Some(JavaTypeLookupResolution::Type {
                 fqn: receiver.fq_name().to_string(),
-                target_kind:
-                    crate::analyzer::usages::get_type::TypeLookupTargetKind::ValueExpression,
+                target_kind: TypeLookupTargetKind::ValueExpression,
             });
         }
         if parent.kind() == "method_invocation"
@@ -148,8 +148,7 @@ fn java_type_lookup_node_fqn(
         {
             return Some(JavaTypeLookupResolution::Type {
                 fqn: receiver.fq_name().to_string(),
-                target_kind:
-                    crate::analyzer::usages::get_type::TypeLookupTargetKind::ValueExpression,
+                target_kind: TypeLookupTargetKind::ValueExpression,
             });
         }
         if java_is_callable_declaration_name(parent, node) {
@@ -160,8 +159,7 @@ fn java_type_lookup_node_fqn(
         {
             return Some(JavaTypeLookupResolution::Type {
                 fqn: declared.fq_name().to_string(),
-                target_kind:
-                    crate::analyzer::usages::get_type::TypeLookupTargetKind::ValueExpression,
+                target_kind: TypeLookupTargetKind::ValueExpression,
             });
         }
     }
@@ -170,7 +168,7 @@ fn java_type_lookup_node_fqn(
     java_type_of_identifier_before(analyzer, java, file, source, root, name, node.start_byte()).map(
         |unit| JavaTypeLookupResolution::Type {
             fqn: unit.fq_name().to_string(),
-            target_kind: crate::analyzer::usages::get_type::TypeLookupTargetKind::ValueExpression,
+            target_kind: TypeLookupTargetKind::ValueExpression,
         },
     )
 }

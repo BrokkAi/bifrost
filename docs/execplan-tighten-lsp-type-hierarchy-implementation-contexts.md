@@ -19,9 +19,10 @@ After this work, both providers remain advertised, but they return a normal JSON
 - [x] (2026-06-29 12:20Z) Milestone 1 implementation: added shared resolver target classification, tightened type hierarchy and implementation eligibility, and added Java/C#/Scala cursor-context regressions.
 - [x] (2026-06-29 12:28Z) Ran Milestone 1 focused validation: type hierarchy, implementation, and type definition LSP slices passed.
 - [x] (2026-06-29 13:15Z) Ran and resolved Milestone 1 guided review on the uncommitted diff.
-- [ ] Milestone 2: implement TypeScript/JavaScript and Rust cursor-context regressions.
+- [x] (2026-06-29 13:15Z) Milestone 2: completed TypeScript and Rust structured type-reference classification as part of the Milestone 1 guided-review fixes; JavaScript remains unsupported for declared type lookup.
 - [x] (2026-06-29 13:45Z) Milestone 3: added Go implementation/type-hierarchy value-context regressions, completed guided review, fixed accepted test findings, and reran focused validation.
-- [ ] Milestone 4: run the final focused LSP sweep, formatting, non-CUDA clippy, final guided review, and final cleanup.
+- [x] (2026-06-29 14:30Z) Milestone 4 final review: found and fixed TypeScript value-derived annotation misclassification, moved target classification to a neutral analyzer module, and moved shared LSP target resolution to a neutral handler module.
+- [x] (2026-06-29 14:45Z) Milestone 4 final validation: reran the focused LSP sweep, `cargo fmt`, and `cargo clippy-no-cuda`.
 
 ## Surprises & Discoveries
 
@@ -58,6 +59,12 @@ After this work, both providers remain advertised, but they return a normal JSON
 - Observation: The Milestone 3 review found that the first Go local-variable case targeted the type annotation, not the local identifier.
   Evidence: The case used `position_after(source, "local W")`, which lands inside `Worker` in `var local Worker`; the fix changed it to `position_after(source, "var local")` and reused one shared null-case table for implementation and hierarchy assertions.
 
+- Observation: Final guided review found that TypeScript local declarations could still seed implementation or hierarchy through the value-derived annotation path.
+  Evidence: `local_binding_type_node_before(...)` returned the `Base` annotation for a cursor on `typed`, and `resolve_declared_type_text(...)` previously marked that outcome as a type reference. The fix keeps cursor-on-type syntax as `TypeReference` through `resolve_declared_type_name(...)` while marking declaration-name, receiver, and local-binding annotation lookups as `ValueExpression`.
+
+- Observation: Final guided review found two coupling issues in the shared target contract.
+  Evidence: Java/C#/Scala definition helpers imported `TypeLookupTargetKind` from `get_type`, and `type_hierarchy.rs` imported shared cursor resolution from sibling handler `type_definition.rs`. The fix moved the enum to `src/analyzer/usages/target_kind.rs` and moved shared LSP target resolution to `src/lsp/handlers/type_target.rs`.
+
 ## Decision Log
 
 - Decision: Keep `typeHierarchyProvider` and `implementationProvider` advertised globally.
@@ -88,6 +95,18 @@ After this work, both providers remain advertised, but they return a normal JSON
   Rationale: The C# hierarchy handler currently returns `null` for the attempted type-reference fixture. Rather than keep a weak `array or null` assertion, the milestone validates C# method/local rejection and leaves positive C# type-reference hierarchy coverage out of this slice.
   Date/Author: 2026-06-29 / Codex
 
+- Decision: Store `TypeLookupTargetKind` in `src/analyzer/usages/target_kind.rs`.
+  Rationale: Definition lookup helpers and type lookup helpers both need to construct analyzer-owned target classifications. A neutral module avoids coupling `get_definition` back to `get_type` while keeping the enum inside the analyzer usage domain.
+  Date/Author: 2026-06-29 / Codex
+
+- Decision: Store shared LSP cursor-to-type-target resolution in `src/lsp/handlers/type_target.rs`.
+  Rationale: `typeDefinition`, `implementation`, and `prepareTypeHierarchy` share the same cursor classification and selected-type-declaration handling. A neutral handler support module avoids making type hierarchy depend on the type-definition provider implementation.
+  Date/Author: 2026-06-29 / Codex
+
+- Decision: Treat TypeScript annotation lookup from a selected value/local as `ValueExpression`, not `TypeReference`.
+  Rationale: The annotation is useful for broad `textDocument/typeDefinition`, but the cursor is on a value declaration or expression. Only a cursor on the explicit type syntax itself should seed hierarchy or implementation.
+  Date/Author: 2026-06-29 / Codex
+
 ## Outcomes & Retrospective
 
 Milestone 0 baseline validation is complete. The branch is clean and current with its upstream. This document records the implementation scope, repository orientation, validation plan, and review checkpoint policy before production code changes begin. Existing positive type hierarchy and Go implementation LSP tests pass before production code changes.
@@ -110,6 +129,26 @@ Milestone 3 is complete. The new Go regression proves ordinary functions, non-in
 
     cargo test --test bifrost_lsp_server implementation --features nlp
     result: 6 passed; 0 failed
+
+Milestone 4 final review fixes are in place. `TypeLookupTargetKind` now lives in a neutral analyzer usage module, shared LSP target resolution now lives in `src/lsp/handlers/type_target.rs`, and TypeScript local/value-derived annotation lookup no longer counts as a hierarchy or implementation type reference. The new TypeScript assertions verify `implementation` and `prepareTypeHierarchy` return `null` on the `typed` local declaration name while preserving positive behavior from the `Base` annotation. Focused validation after these fixes passed:
+
+    cargo test --test bifrost_lsp_server type_hierarchy --features nlp
+    result: 10 passed; 0 failed
+
+    cargo test --test bifrost_lsp_server implementation --features nlp
+    result: 6 passed; 0 failed
+
+    cargo test --test bifrost_lsp_server type_definition --features nlp
+    result: 11 passed; 0 failed
+
+    cargo test --test bifrost_lsp_server call_hierarchy --features nlp
+    result: 10 passed; 0 failed
+
+    cargo fmt
+    result: passed
+
+    cargo clippy-no-cuda
+    result: passed after adding a localized `#[allow(clippy::too_many_arguments)]` to the TypeScript declared-type helper whose resolver context now includes target classification.
 
 ## Context and Orientation
 

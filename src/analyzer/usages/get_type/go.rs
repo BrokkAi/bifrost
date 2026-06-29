@@ -1,11 +1,11 @@
 use super::{
-    TypeLookupDiagnostic, TypeLookupOutcome, TypeLookupTargetKind,
-    candidates_outcome_with_target_kind, no_type,
+    TypeLookupDiagnostic, TypeLookupOutcome, candidates_outcome_with_target_kind, no_type,
 };
 use crate::analyzer::usages::get_definition::{
     GoTypeLookupResolutionKind, go_type_lookup_resolution,
 };
 use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
+use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::analyzer::{IAnalyzer, ProjectFile};
 use tree_sitter::Tree;
 

@@ -9,7 +9,7 @@ use crate::lsp::handlers::document_symbol::lsp_symbol_parts;
 use crate::lsp::handlers::hierarchy_support::{
     hierarchy_item_data, resolve_hierarchy_item_code_unit,
 };
-use crate::lsp::handlers::type_definition::{TypeTargetEligibility, resolve_type_target};
+use crate::lsp::handlers::type_target::{TypeTargetEligibility, resolve_type_target};
 use crate::text_utils::compute_line_starts;
 
 pub fn prepare(

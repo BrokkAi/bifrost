@@ -12,5 +12,6 @@ pub mod rename;
 pub mod signature_help;
 pub mod type_definition;
 pub mod type_hierarchy;
+pub(crate) mod type_target;
 pub(crate) mod util;
 pub mod workspace_symbol;

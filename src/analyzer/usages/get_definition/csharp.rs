@@ -1,10 +1,11 @@
 use super::*;
+use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 
 pub(crate) enum CSharpTypeLookupResolution {
     Type {
         fqn: String,
         candidates: Vec<CodeUnit>,
-        target_kind: crate::analyzer::usages::get_type::TypeLookupTargetKind,
+        target_kind: TypeLookupTargetKind,
     },
     InappropriateSymbolContext,
 }
@@ -176,7 +177,7 @@ fn csharp_type_lookup_node_resolution(
         return csharp_type_candidates_resolution_with_kind(
             &reference,
             csharp_visible_type_candidates(csharp, file, &reference),
-            crate::analyzer::usages::get_type::TypeLookupTargetKind::TypeReference,
+            TypeLookupTargetKind::TypeReference,
         );
     }
 
@@ -320,7 +321,7 @@ fn csharp_type_node_resolution(
     csharp_type_candidates_resolution_with_kind(
         reference,
         csharp_visible_type_candidates(csharp, file, reference),
-        crate::analyzer::usages::get_type::TypeLookupTargetKind::ValueExpression,
+        TypeLookupTargetKind::ValueExpression,
     )
 }
 
@@ -331,14 +332,14 @@ fn csharp_type_candidates_resolution(
     csharp_type_candidates_resolution_with_kind(
         reference,
         candidates,
-        crate::analyzer::usages::get_type::TypeLookupTargetKind::ValueExpression,
+        TypeLookupTargetKind::ValueExpression,
     )
 }
 
 fn csharp_type_candidates_resolution_with_kind(
     reference: &str,
     candidates: Vec<CodeUnit>,
-    target_kind: crate::analyzer::usages::get_type::TypeLookupTargetKind,
+    target_kind: TypeLookupTargetKind,
 ) -> Option<CSharpTypeLookupResolution> {
     if candidates.is_empty() {
         return None;
