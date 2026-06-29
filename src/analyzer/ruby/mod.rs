@@ -37,6 +37,11 @@ pub struct RubyAnalyzer {
     direct_descendants: Cache<CodeUnit, Arc<HashSet<CodeUnit>>>,
     direct_descendant_index: Arc<OnceLock<HashMap<String, Arc<HashSet<CodeUnit>>>>>,
     reverse_import_index: Arc<OnceLock<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
+    zeitwerk_project: Arc<OnceLock<bool>>,
+    zeitwerk_autoload_files: Arc<OnceLock<HashSet<ProjectFile>>>,
+    zeitwerk_consumer_files: Arc<OnceLock<HashSet<ProjectFile>>>,
+    zeitwerk_autoload_code_units: Arc<OnceLock<HashSet<CodeUnit>>>,
+    zeitwerk_reference_files: Arc<OnceLock<HashMap<String, HashSet<ProjectFile>>>>,
     #[allow(dead_code)]
     mixin_relations: Arc<OnceLock<Vec<TypeRelation>>>,
     /// Class/module declarations indexed by their trailing identifier, for
@@ -108,6 +113,11 @@ impl RubyAnalyzer {
             direct_descendants: build_weighted_cache(memo_budget / 8, weight_code_unit_set_by_unit),
             direct_descendant_index: Arc::new(OnceLock::new()),
             reverse_import_index: Arc::new(OnceLock::new()),
+            zeitwerk_project: Arc::new(OnceLock::new()),
+            zeitwerk_autoload_files: Arc::new(OnceLock::new()),
+            zeitwerk_consumer_files: Arc::new(OnceLock::new()),
+            zeitwerk_autoload_code_units: Arc::new(OnceLock::new()),
+            zeitwerk_reference_files: Arc::new(OnceLock::new()),
             mixin_relations: Arc::new(OnceLock::new()),
             types_by_identifier: Arc::new(OnceLock::new()),
         }

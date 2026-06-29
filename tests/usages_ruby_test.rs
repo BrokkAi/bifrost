@@ -8,8 +8,8 @@ use brokk_bifrost::hash::HashSet;
 use brokk_bifrost::usages::{
     CandidateFileProvider, FuzzyResult, ImportGraphCandidateProvider, UsageFinder,
 };
-use brokk_bifrost::{CodeUnit, IAnalyzer, ProjectFile, RubyAnalyzer, TestProject};
-use common::ruby_analyzer_with_files;
+use brokk_bifrost::{CodeUnit, IAnalyzer, Language, ProjectFile, RubyAnalyzer, TestProject};
+use common::{InlineTestProject, ruby_analyzer_with_files};
 
 fn analyzer() -> RubyAnalyzer {
     RubyAnalyzer::from_project(TestProject::new(
@@ -487,5 +487,235 @@ end
         matches!(query.result, FuzzyResult::Failure { .. }),
         "expected failure, got {:?}",
         query.result
+    );
+}
+
+#[test]
+fn ruby_usage_graph_includes_rails_autoload_consumers() {
+    let (_project, analyzer) = ruby_analyzer_with_files(&[
+        (
+            "Gemfile",
+            r#"source "https://rubygems.org"
+
+gem "rails"
+"#,
+        ),
+        (
+            "app/controllers/users_controller.rb",
+            r#"
+class UsersController
+  def show
+    User.build
+  end
+end
+"#,
+        ),
+        (
+            "app/models/user.rb",
+            r#"
+class User
+  def self.build
+    new
+  end
+end
+"#,
+        ),
+    ]);
+    let target = definition(&analyzer, "User.build");
+    let provider = ImportGraphCandidateProvider::new();
+
+    let query =
+        UsageFinder::new().query_with_provider(&analyzer, &[target], Some(&provider), 100, 100);
+    let hits = query
+        .result
+        .into_either()
+        .expect("usage lookup should succeed");
+    assert!(
+        hits.iter().any(|hit| hit.enclosing.identifier() == "show"),
+        "expected User.build usage inside UsersController#show, got {:?}",
+        hits.iter()
+            .map(|hit| hit.enclosing.fq_name())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn zeitwerk_candidates_are_filtered_before_usage_file_cap() {
+    let mut builder = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "Gemfile",
+            "source \"https://rubygems.org\"\ngem \"rails\"\n",
+        )
+        .file(
+            "app/controllers/users_controller.rb",
+            r#"
+class UsersController
+  def show
+    User.build
+  end
+end
+"#,
+        )
+        .file(
+            "app/models/user.rb",
+            r#"
+class User
+  def self.build
+    new
+  end
+end
+"#,
+        );
+    for index in 0..40 {
+        builder = builder.file(
+            format!("app/services/noise_{index}.rb"),
+            format!(
+                r#"
+class Noise{index}
+  def call
+    :ok
+  end
+end
+"#
+            ),
+        );
+    }
+    let project = builder.build();
+    let analyzer = RubyAnalyzer::new(project.project_dyn());
+    let target = definition(&analyzer, "User.build");
+    let provider = ImportGraphCandidateProvider::new();
+
+    let query =
+        UsageFinder::new().query_with_provider(&analyzer, &[target], Some(&provider), 2, 100);
+    let hits = query
+        .result
+        .into_either()
+        .expect("usage lookup should succeed");
+    assert!(
+        hits.iter().any(|hit| hit.enclosing.identifier() == "show"),
+        "expected User.build usage inside UsersController#show despite many irrelevant Zeitwerk files, got {:?}",
+        hits.iter()
+            .map(|hit| hit.enclosing.fq_name())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn zeitwerk_usage_candidates_include_non_app_ruby_consumers() {
+    let (project, analyzer) = ruby_analyzer_with_files(&[
+        (
+            "Gemfile",
+            r#"source "https://rubygems.org"
+
+gem "rails"
+"#,
+        ),
+        (
+            "spec/models/user_spec.rb",
+            r#"
+class UserSpec
+  def verifies_build
+    User.build
+  end
+end
+"#,
+        ),
+        (
+            "app/models/user.rb",
+            r#"
+class User
+  def self.build
+    new
+  end
+end
+"#,
+        ),
+    ]);
+    let target = definition(&analyzer, "User.build");
+    let provider = ImportGraphCandidateProvider::new();
+
+    let query =
+        UsageFinder::new().query_with_provider(&analyzer, &[target], Some(&provider), 2, 100);
+    let hits = query
+        .result
+        .into_either()
+        .expect("usage lookup should succeed");
+    assert!(
+        hits.iter()
+            .any(|hit| hit.enclosing.source() == &project.file("spec/models/user_spec.rb")),
+        "expected User.build usage in spec/models/user_spec.rb, got {:?}",
+        hits.iter()
+            .map(|hit| hit.enclosing.fq_name())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn zeitwerk_structured_candidates_do_not_evict_precise_importers() {
+    let mut builder = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "Gemfile",
+            "source \"https://rubygems.org\"\ngem \"rails\"\n",
+        )
+        .file(
+            "app/controllers/users_controller.rb",
+            r#"
+require "app/models/user"
+
+class UsersController
+  def show
+    User.call
+  end
+end
+"#,
+        )
+        .file(
+            "app/models/user.rb",
+            r#"
+class User
+  def self.call
+    new
+  end
+end
+"#,
+        );
+    for index in 0..40 {
+        builder = builder.file(
+            format!("app/services/noise_{index}.rb"),
+            format!(
+                r#"
+class Noise{index}
+  def call
+    :ok
+  end
+end
+"#
+            ),
+        );
+    }
+    let project = builder.build();
+    let analyzer = RubyAnalyzer::new(project.project_dyn());
+    let target = definition(&analyzer, "User.call");
+    let provider = ImportGraphCandidateProvider::new();
+
+    let query =
+        UsageFinder::new().query_with_provider(&analyzer, &[target], Some(&provider), 2, 100);
+    assert!(
+        query
+            .candidate_files
+            .contains(&project.file("app/controllers/users_controller.rb")),
+        "explicit require importer should remain in capped provider candidates, got {:?}",
+        query.candidate_files
+    );
+    let hits = query
+        .result
+        .into_either()
+        .expect("usage lookup should succeed");
+    assert!(
+        hits.iter().any(|hit| hit.enclosing.identifier() == "show"),
+        "expected User.call usage inside UsersController#show despite noisy call methods, got {:?}",
+        hits.iter()
+            .map(|hit| hit.enclosing.fq_name())
+            .collect::<Vec<_>>()
     );
 }

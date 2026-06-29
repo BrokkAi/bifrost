@@ -81,6 +81,173 @@ end
 }
 
 #[test]
+fn rails_gemfile_autoload_roots_import_peer_declarations() {
+    let (project, analyzer) = ruby_analyzer_with_files(&[
+        (
+            "Gemfile",
+            r#"source "https://rubygems.org"
+
+gem "rails", "~> 7.1"
+"#,
+        ),
+        (
+            "app/controllers/users_controller.rb",
+            r#"
+class UsersController
+  def show
+    User.find(1)
+  end
+end
+"#,
+        ),
+        (
+            "app/models/user.rb",
+            r#"
+class User
+end
+"#,
+        ),
+    ]);
+
+    let imported =
+        analyzer.imported_code_units_of(&project.file("app/controllers/users_controller.rb"));
+    assert!(
+        imported.iter().any(|cu| cu.identifier() == "User"),
+        "expected User imported through Rails autoload roots, got {:?}",
+        imported.iter().map(|cu| cu.fq_name()).collect::<Vec<_>>()
+    );
+    assert!(
+        analyzer
+            .referencing_files_of(&project.file("app/models/user.rb"))
+            .is_empty(),
+        "Zeitwerk visibility must not materialize every app file as a reverse import edge"
+    );
+}
+
+#[test]
+fn rails_gemfile_lock_autoload_roots_when_gemfile_is_absent() {
+    let (project, analyzer) = ruby_analyzer_with_files(&[
+        (
+            "Gemfile.lock",
+            r#"
+GEM
+  remote: https://rubygems.org/
+  specs:
+    actionpack (7.1.3)
+    rails (7.1.3)
+
+DEPENDENCIES
+  rails
+"#,
+        ),
+        (
+            "app/jobs/sync_user_job.rb",
+            r#"
+class SyncUserJob
+  def perform
+    User.sync
+  end
+end
+"#,
+        ),
+        (
+            "app/models/user.rb",
+            r#"
+class User
+end
+"#,
+        ),
+    ]);
+
+    let imported = analyzer.imported_code_units_of(&project.file("app/jobs/sync_user_job.rb"));
+    assert!(
+        imported.iter().any(|cu| cu.identifier() == "User"),
+        "expected User imported through Gemfile.lock Rails detection, got {:?}",
+        imported.iter().map(|cu| cu.fq_name()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn zeitwerk_gemfile_autoload_roots_import_peer_declarations() {
+    let (project, analyzer) = ruby_analyzer_with_files(&[
+        (
+            "Gemfile",
+            r#"
+source "https://rubygems.org"
+gem "zeitwerk"
+"#,
+        ),
+        (
+            "app/services/user_lookup.rb",
+            r#"
+class UserLookup
+  def call
+    User.find(1)
+  end
+end
+"#,
+        ),
+        (
+            "app/models/user.rb",
+            r#"
+class User
+end
+"#,
+        ),
+    ]);
+
+    let imported = analyzer.imported_code_units_of(&project.file("app/services/user_lookup.rb"));
+    assert!(
+        imported.iter().any(|cu| cu.identifier() == "User"),
+        "expected User imported through Zeitwerk autoload roots, got {:?}",
+        imported.iter().map(|cu| cu.fq_name()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn non_rails_project_does_not_autoload_app_roots() {
+    let (project, analyzer) = ruby_analyzer_with_files(&[
+        (
+            "Gemfile",
+            r#"
+source "https://rubygems.org"
+gem "sinatra"
+"#,
+        ),
+        (
+            "app/controllers/users_controller.rb",
+            r#"
+class UsersController
+  def show
+    User.find(1)
+  end
+end
+"#,
+        ),
+        (
+            "app/models/user.rb",
+            r#"
+class User
+end
+"#,
+        ),
+    ]);
+
+    let imported =
+        analyzer.imported_code_units_of(&project.file("app/controllers/users_controller.rb"));
+    assert!(
+        imported.iter().all(|cu| cu.identifier() != "User"),
+        "non-Rails projects must not get implicit app-root imports, got {:?}",
+        imported.iter().map(|cu| cu.fq_name()).collect::<Vec<_>>()
+    );
+    assert!(
+        analyzer
+            .referencing_files_of(&project.file("app/models/user.rb"))
+            .is_empty()
+    );
+}
+
+#[test]
 fn require_relative_resolves_same_and_parent_directory_targets() {
     let (project, analyzer) = ruby_analyzer_with_files(&[
         (

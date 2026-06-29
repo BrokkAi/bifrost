@@ -73,6 +73,7 @@ impl RubyUsageGraphStrategy {
         let semantic = RubySemanticIndex::build(analyzer, ruby, &spec);
         let mut scan_files = candidate_files.clone();
         scan_files.insert(target.source().clone());
+        scan_files.extend(ruby.zeitwerk_reference_files_for_identifier(&spec.member_name));
 
         let mut hits = BTreeSet::new();
         let mut saw_unproven_match = false;
@@ -251,6 +252,9 @@ impl<'a> RubySemanticIndex<'a> {
     fn visible_files_from(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
         let mut visible = HashSet::default();
         visible.insert(file.clone());
+        if let Some(zeitwerk_files) = self.ruby.zeitwerk_visible_files_for(file) {
+            visible.extend(zeitwerk_files.iter().cloned());
+        }
         let mut stack = self.ruby.required_files(file);
         while let Some(next) = stack.pop() {
             if !visible.insert(next.clone()) {
