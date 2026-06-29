@@ -16,7 +16,7 @@ After this work, Bifrost still advertises `callHierarchyProvider`, but `textDocu
 - [x] (2026-06-29 15:48Z) Added this ExecPlan as the living source of truth for issue `#331`.
 - [x] (2026-06-29 16:25Z) Implemented Milestone 1 shared prepare gate and Java proof, ran focused validation, completed guided review, accepted two low-risk review fixes, and reran validation.
 - [x] (2026-06-29 16:45Z) Added Milestone 2 JS/TS and Rust prepare coverage, ran focused validation, and completed a manual guided-review fallback because the agent pool was at its thread limit.
-- [ ] Milestone 3: Go, C#, C++, Scala, Python, PHP, and Ruby declaration-scope documentation.
+- [x] (2026-06-29 17:05Z) Added Milestone 3 coverage for Go, C#, C++, Scala, Python, PHP, and Ruby declaration-only behavior, ran focused validation, and completed manual guided review.
 - [ ] Milestone 4: final quality gate and final guided review.
 
 ## Surprises & Discoveries
@@ -38,6 +38,9 @@ After this work, Bifrost still advertises `callHierarchyProvider`, but `textDocu
 
 - Observation: Milestone 2 did not require production-code changes.
   Evidence: Adding JS/TS and Rust LSP prepare regressions passed against the shared Milestone 1 handler with `cargo test --test bifrost_lsp_server call_hierarchy --features nlp`.
+
+- Observation: Remaining-language call-reference coverage also passed through the shared handler once cursors were placed inside identifier tokens.
+  Evidence: Go, C#, C++, Scala, Python, and PHP declaration/call-reference positives plus local-variable negatives passed in `bifrost_lsp_server_call_hierarchy_prepare_filters_remaining_language_contexts`; Ruby declaration prepare passed while Ruby call-reference prepare returned `null`.
 
 ## Decision Log
 
@@ -86,6 +89,21 @@ Validation completed for Milestone 2:
 
     cargo test --test bifrost_lsp_server call_hierarchy --features nlp
     result: 9 passed; 0 failed
+
+    cargo fmt --check
+    result: passed
+
+Milestone 3 is complete. Go, C#, C++, Scala, Python, and PHP now have LSP prepare coverage proving callable declarations and resolvable call references prepare call hierarchy items while local variables return `null`. Ruby has declaration-name coverage and an explicit `null` assertion for call-reference prepare, matching the current unsupported Ruby definition-lookup boundary.
+
+Milestone 3 guided-review outcome: the review was completed manually against the test-only diff because new reviewer agents were still unavailable. No actionable security, duplication, correctness, devops, or architecture findings were found. The single large integration test is intentional: it avoids spawning one LSP server per language while still making every language-specific assertion explicit.
+
+Validation completed for Milestone 3:
+
+    cargo test --test bifrost_lsp_server call_hierarchy_prepare --features nlp
+    result: 4 passed; 0 failed
+
+    cargo test --test bifrost_lsp_server call_hierarchy --features nlp
+    result: 10 passed; 0 failed
 
     cargo fmt --check
     result: passed
@@ -193,3 +211,5 @@ No new external dependencies are needed. Any helper added to call hierarchy prep
 2026-06-29 / Codex: Updated this ExecPlan after Milestone 1 implementation and guided review. The document now records the accepted review fixes, focused validation results, and the deferred parse-sharing cleanup concern.
 
 2026-06-29 / Codex: Updated this ExecPlan after Milestone 2 test coverage. The document now records that JS/TS and Rust behavior passed with the shared handler and that the review checkpoint used the manual fallback path after the agent pool reached its thread limit.
+
+2026-06-29 / Codex: Updated this ExecPlan after Milestone 3 coverage. The document now records the remaining-language test outcomes, including Ruby's declaration-only boundary.
