@@ -3033,6 +3033,66 @@ fn bifrost_lsp_server_type_definition_returns_null_for_javascript_callable_symbo
 }
 
 #[test]
+fn bifrost_lsp_server_type_definition_returns_null_for_java_method_name() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("Service.java");
+    let source =
+        "class Widget {}\nclass Service {\n    Widget build() { return new Widget(); }\n}\n";
+    fs::write(&file_path, source).expect("write Service.java");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let (line, character) = position_after(source, "    Widget ");
+
+    let response = type_definition_response(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        2,
+        &file_uri,
+        line,
+        character,
+    );
+    assert!(
+        response["result"].is_null(),
+        "Java method declaration name should not resolve a type definition, got {response}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_type_definition_returns_null_for_csharp_method_name() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("Service.cs");
+    let source =
+        "class Widget {}\nclass Service {\n    Widget Build() { return new Widget(); }\n}\n";
+    fs::write(&file_path, source).expect("write Service.cs");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let (line, character) = position_after(source, "    Widget ");
+
+    let response = type_definition_response(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        2,
+        &file_uri,
+        line,
+        character,
+    );
+    assert!(
+        response["result"].is_null(),
+        "C# method declaration name should not resolve a type definition, got {response}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
 fn bifrost_lsp_server_type_definition_uses_did_open_overlay() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().canonicalize().expect("canon temp");

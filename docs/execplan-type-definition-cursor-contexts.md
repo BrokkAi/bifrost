@@ -17,8 +17,8 @@ After this work, Bifrost still advertises `typeDefinitionProvider`, but the hand
 - [x] (2026-06-29 14:12Z) Added baseline LSP regressions for inappropriate TypeScript/JavaScript cursor contexts.
 - [x] (2026-06-29 14:18Z) Tightened JS/TS type lookup cursor semantics and ran focused validation.
 - [x] (2026-06-29 14:30Z) Ran guided review for the JS/TS milestone and addressed the accepted short-circuit ordering finding.
-- [ ] Tighten Java and C# cursor semantics, add regressions, and run focused validation.
-- [ ] Run guided review for the JVM/.NET milestone and address accepted findings.
+- [x] (2026-06-29 14:45Z) Tightened Java and C# cursor semantics, added regressions, and ran focused validation.
+- [x] (2026-06-29 14:52Z) Ran guided review for the JVM/.NET milestone and addressed the accepted structured-diagnostic finding.
 - [ ] Tighten Rust, Go, and Scala cursor semantics, add regressions, and run focused validation.
 - [ ] Run guided review for the Rust/Go/Scala milestone and address accepted findings.
 - [ ] Run final focused tests, formatting, non-CUDA clippy, and final guided review.
@@ -43,6 +43,12 @@ After this work, Bifrost still advertises `typeDefinitionProvider`, but the hand
 - Observation: The first JS/TS review checkpoint found the initial short-circuit was placed after import-binder construction, which was correct but not as cheap as it should be.
   Evidence: `is_callable_declaration_name` now runs immediately after `smallest_named_node_covering` succeeds and before `compute_jsts_import_binder`; the focused type-definition tests and `cargo fmt --check` pass after this change.
 
+- Observation: Java and C# had the same return-type navigation bug for method declaration names.
+  Evidence: Before changing Java/C# resolver code, `cargo test --test bifrost_lsp_server type_definition --features nlp` failed the new Java and C# method-name tests by returning the `Widget` type declaration location; the other 6 filtered type-definition tests passed.
+
+- Observation: The Java/C# review checkpoint found that returning `None` fixed LSP behavior but did not preserve the planned structured diagnostic reason.
+  Evidence: Java now returns `JavaTypeLookupResolution::InappropriateSymbolContext`, C# now returns `CSharpTypeLookupResolution::InappropriateSymbolContext`, and `get_type/java.rs` plus `get_type/csharp.rs` map those outcomes to `no_type("inappropriate_symbol_context", ...)`.
+
 ## Decision Log
 
 - Decision: Keep `typeDefinitionProvider` advertised globally.
@@ -64,6 +70,10 @@ No implementation milestone is complete yet. The current expected outcome is a f
 Milestone 1 and the JS/TS resolver slice are implemented. TypeScript function and method declaration names now return `null` from LSP typeDefinition instead of navigating to their return type, and the JavaScript unsupported callable case remains a normal `null` response.
 
 JS/TS guided-review outcome: one tactical finding was accepted and fixed. Inappropriate TypeScript declaration-name requests now short-circuit before import-binder and alias setup. No remaining blocker is known for this milestone.
+
+Java/C# milestone outcome: Java and C# method declaration names now return `null` from LSP typeDefinition instead of navigating to their return type. The focused LSP command passed 8/8 filtered tests, `cargo test --test usages_java_graph_test --features nlp` passed 35 tests, `cargo test --test usages_csharp_graph_test --features nlp` passed 33 tests, and `cargo fmt --check` passed after formatting.
+
+Java/C# guided-review outcome: one design/detail finding was accepted and fixed. The resolver helpers now return explicit inappropriate-context outcomes instead of losing the reason as a generic missing explicit type. No remaining blocker is known for this milestone.
 
 ## Context and Orientation
 

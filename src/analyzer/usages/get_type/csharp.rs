@@ -1,5 +1,7 @@
 use super::{TypeLookupOutcome, candidates_outcome, no_type};
-use crate::analyzer::usages::get_definition::csharp_type_lookup_resolution;
+use crate::analyzer::usages::get_definition::{
+    CSharpTypeLookupResolution, csharp_type_lookup_resolution,
+};
 use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
 use crate::analyzer::{IAnalyzer, ProjectFile};
 use tree_sitter::Tree;
@@ -23,5 +25,14 @@ pub(super) fn resolve_csharp_type(
             format!("`{}` does not have a supported explicit C# type", site.text),
         );
     };
-    candidates_outcome(resolution.fqn, resolution.candidates)
+    match resolution {
+        CSharpTypeLookupResolution::Type { fqn, candidates } => candidates_outcome(fqn, candidates),
+        CSharpTypeLookupResolution::InappropriateSymbolContext => no_type(
+            "inappropriate_symbol_context",
+            format!(
+                "`{}` is a callable declaration name, not a type-bearing expression",
+                site.text
+            ),
+        ),
+    }
 }

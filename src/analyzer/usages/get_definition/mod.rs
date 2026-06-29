@@ -68,9 +68,9 @@ mod scala;
 pub(crate) use call_sites::{
     call_reference_ranges, call_signature_context, is_call_reference_range,
 };
-pub(crate) use csharp::csharp_type_lookup_resolution;
+pub(crate) use csharp::{CSharpTypeLookupResolution, csharp_type_lookup_resolution};
 pub(crate) use go::{GoTypeLookupResolutionKind, go_type_lookup_resolution};
-pub(crate) use java::java_type_lookup_fqn;
+pub(crate) use java::{JavaTypeLookupResolution, java_type_lookup_resolution};
 pub(crate) use scala::scala_type_lookup_fqn;
 
 #[derive(Debug, Clone)]

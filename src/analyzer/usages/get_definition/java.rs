@@ -1,12 +1,17 @@
 use super::*;
 
-pub(crate) fn java_type_lookup_fqn(
+pub(crate) enum JavaTypeLookupResolution {
+    Type(String),
+    InappropriateSymbolContext,
+}
+
+pub(crate) fn java_type_lookup_resolution(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
     site: &ResolvedReferenceSite,
-) -> Option<String> {
+) -> Option<JavaTypeLookupResolution> {
     let java = resolve_analyzer::<JavaAnalyzer>(analyzer)?;
     let node = smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)?;
     java_type_lookup_node_fqn(analyzer, java, file, source, root, node)
@@ -106,13 +111,13 @@ fn java_type_lookup_node_fqn(
     source: &str,
     root: Node<'_>,
     node: Node<'_>,
-) -> Option<String> {
+) -> Option<JavaTypeLookupResolution> {
     if matches!(
         node.kind(),
         "type_identifier" | "scoped_type_identifier" | "generic_type"
     ) {
         return java_type_from_node_with_context(analyzer, java, file, source, node)
-            .map(|unit| unit.fq_name().to_string());
+            .map(|unit| JavaTypeLookupResolution::Type(unit.fq_name().to_string()));
     }
 
     if node.kind() != "identifier" {
@@ -124,24 +129,33 @@ fn java_type_lookup_node_fqn(
             && parent.child_by_field_name("object") == Some(node)
             && let Some(receiver) = java_receiver_type(analyzer, file, source, root, node)
         {
-            return Some(receiver.fq_name().to_string());
+            return Some(JavaTypeLookupResolution::Type(
+                receiver.fq_name().to_string(),
+            ));
         }
         if parent.kind() == "method_invocation"
             && parent.child_by_field_name("object") == Some(node)
             && let Some(receiver) = java_receiver_type(analyzer, file, source, root, node)
         {
-            return Some(receiver.fq_name().to_string());
+            return Some(JavaTypeLookupResolution::Type(
+                receiver.fq_name().to_string(),
+            ));
+        }
+        if java_is_callable_declaration_name(parent, node) {
+            return Some(JavaTypeLookupResolution::InappropriateSymbolContext);
         }
         if let Some(declared) =
             java_declaration_name_type(analyzer, java, file, source, root, parent, node)
         {
-            return Some(declared.fq_name().to_string());
+            return Some(JavaTypeLookupResolution::Type(
+                declared.fq_name().to_string(),
+            ));
         }
     }
 
     let name = java_node_text(node, source);
     java_type_of_identifier_before(analyzer, java, file, source, root, name, node.start_byte())
-        .map(|unit| unit.fq_name().to_string())
+        .map(|unit| JavaTypeLookupResolution::Type(unit.fq_name().to_string()))
 }
 
 fn java_declaration_name_type(
@@ -172,11 +186,6 @@ fn java_declaration_name_type(
                 .and_then(|type_node| {
                     java_type_from_node_with_context(analyzer, java, file, source, type_node)
                 })
-        }
-        "method_declaration" if parent.child_by_field_name("name") == Some(name) => {
-            parent.child_by_field_name("type").and_then(|type_node| {
-                java_type_from_node_with_context(analyzer, java, file, source, type_node)
-            })
         }
         _ => java_type_of_identifier_before(
             analyzer,
@@ -595,6 +604,14 @@ fn java_receiver_type_for_java(
         }
         _ => None,
     }
+}
+
+fn java_is_callable_declaration_name(parent: Node<'_>, name: Node<'_>) -> bool {
+    parent.child_by_field_name("name") == Some(name)
+        && matches!(
+            parent.kind(),
+            "method_declaration" | "constructor_declaration"
+        )
 }
 
 fn java_type_from_node_with_context(

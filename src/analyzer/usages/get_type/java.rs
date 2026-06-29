@@ -1,5 +1,7 @@
 use super::{TypeLookupOutcome, candidates_outcome, no_type};
-use crate::analyzer::usages::get_definition::java_type_lookup_fqn;
+use crate::analyzer::usages::get_definition::{
+    JavaTypeLookupResolution, java_type_lookup_resolution,
+};
 use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
 use crate::analyzer::{IAnalyzer, ProjectFile};
 use tree_sitter::Tree;
@@ -14,7 +16,9 @@ pub(super) fn resolve_java_type(
     let Some(tree) = tree else {
         return no_type("java_parse_failed", "Java source could not be parsed");
     };
-    let Some(fqn) = java_type_lookup_fqn(analyzer, file, source, tree.root_node(), site) else {
+    let Some(resolution) =
+        java_type_lookup_resolution(analyzer, file, source, tree.root_node(), site)
+    else {
         return no_type(
             "no_explicit_type",
             format!(
@@ -22,6 +26,18 @@ pub(super) fn resolve_java_type(
                 site.text
             ),
         );
+    };
+    let fqn = match resolution {
+        JavaTypeLookupResolution::Type(fqn) => fqn,
+        JavaTypeLookupResolution::InappropriateSymbolContext => {
+            return no_type(
+                "inappropriate_symbol_context",
+                format!(
+                    "`{}` is a callable declaration name, not a type-bearing expression",
+                    site.text
+                ),
+            );
+        }
     };
     let candidates = analyzer.definition_lookup_index().fqn(&fqn);
     if candidates.is_empty() {
