@@ -110,7 +110,7 @@ fn normalize_relative(path: &Path) -> Option<PathBuf> {
 
 impl RubyAnalyzer {
     /// Project files this file pulls in via supported Ruby require forms.
-    pub(super) fn required_files(&self, file: &ProjectFile) -> Vec<ProjectFile> {
+    pub(crate) fn required_files(&self, file: &ProjectFile) -> Vec<ProjectFile> {
         self.inner
             .import_info_of(file)
             .iter()
