@@ -35,6 +35,16 @@ pub(crate) use crate::analyzer::usages::reference_site::{
     ResolvedReferenceSite, SourceLocationRequest, resolve_reference_site,
     smallest_named_node_covering,
 };
+use crate::analyzer::usages::ruby_graph::{
+    ReceiverMode as RubyReceiverMode, ReceiverType as RubyReceiverType, RubySemanticIndex,
+    is_call_method_identifier as ruby_is_call_method_identifier,
+    is_declaration_constant as ruby_is_declaration_constant,
+    is_declaration_identifier as ruby_is_declaration_identifier,
+    is_dynamic_dispatch_method as ruby_is_dynamic_dispatch_method,
+    method_receiver_mode as ruby_method_receiver_mode, node_text as ruby_node_text,
+    ruby_enclosing_receiver, ruby_receiver_type, ruby_seed_assignment, ruby_seed_parameter_shadows,
+    ruby_type_owner, symbol_or_string_value as ruby_symbol_or_string_value,
+};
 use crate::analyzer::usages::scala_graph::{
     ScalaNameResolver, ScalaProjectTypes, package_name_of as scala_package_name_of,
     scala_import_path, scala_node_text,
@@ -42,8 +52,8 @@ use crate::analyzer::usages::scala_graph::{
 use crate::analyzer::{
     AliasResolver, CSharpAnalyzer, CodeUnit, CppAnalyzer, DefinitionLookupIndex, GoAnalyzer,
     IAnalyzer, ImportAnalysisProvider, JavaAnalyzer, Language, PhpAnalyzer, ProjectFile,
-    PythonAnalyzer, Range, RustAnalyzer, ScalaAnalyzer, cpp_include_paths, cpp_node_text,
-    resolve_analyzer, resolve_include_targets,
+    PythonAnalyzer, Range, RubyAnalyzer, RustAnalyzer, ScalaAnalyzer, cpp_include_paths,
+    cpp_node_text, resolve_analyzer, resolve_include_targets,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
@@ -62,6 +72,7 @@ mod java;
 pub(crate) mod js_ts;
 mod php;
 mod python;
+mod ruby;
 mod rust;
 mod scala;
 
@@ -277,9 +288,7 @@ fn resolve_one(
     request: DefinitionLookupRequest,
 ) -> DefinitionLookupOutcome {
     let language = language_for_file(&request.file);
-    // Ruby has no go-to-definition resolver yet; report it as unsupported
-    // rather than reaching the resolver match below.
-    if matches!(language, Language::None | Language::Ruby) {
+    if matches!(language, Language::None) {
         return diagnostic_outcome(
             DefinitionLookupStatus::UnsupportedLanguage,
             "unsupported_language",
@@ -393,7 +402,15 @@ fn resolve_one(
             tree.as_ref(),
             &site,
         ),
-        Language::Ruby | Language::None => {
+        Language::Ruby => ruby::resolve_ruby(
+            analyzer,
+            context.support,
+            &request.file,
+            &source,
+            tree.as_ref(),
+            &site,
+        ),
+        Language::None => {
             unreachable!("unsupported language handled before source extraction")
         }
     };
@@ -455,7 +472,8 @@ pub(crate) fn parse_tree_for_language(
         Language::Python => python::parse_python_tree(source),
         Language::Rust => rust::parse_rust_tree(source),
         Language::Go => go::parse_go_tree(source),
-        Language::Ruby | Language::None => None,
+        Language::Ruby => crate::analyzer::ruby::parse_ruby_tree(source),
+        Language::None => None,
     }
 }
 
