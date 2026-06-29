@@ -412,6 +412,7 @@ fn semantic_search_caps_requested_k() {
         FakeEngineProvider { embedder },
     );
 
+    indexer.wait_ready(Duration::from_secs(30)).unwrap();
     let result = semantic_search(
         &snapshot,
         &indexer,
