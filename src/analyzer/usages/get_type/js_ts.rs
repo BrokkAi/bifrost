@@ -41,6 +41,16 @@ pub(super) fn resolve_js_ts_type(
             "no JS/TS syntax node at reference location",
         );
     };
+    if is_callable_declaration_name(node) {
+        return no_type(
+            "inappropriate_symbol_context",
+            format!(
+                "`{}` is a callable declaration name, not a type-bearing expression",
+                site.text
+            ),
+        );
+    }
+
     let imports = compute_jsts_import_binder(source, tree);
     let aliases = AliasResolver::new(analyzer.project().root().to_path_buf());
 
@@ -279,6 +289,23 @@ fn type_reference_name<'source>(node: Node<'_>, source: &'source str) -> Option<
         .get(node.start_byte()..node.end_byte())
         .map(str::trim)
         .filter(|name| !name.is_empty())
+}
+
+fn is_callable_declaration_name(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    parent
+        .child_by_field_name("name")
+        .is_some_and(|name| name.id() == node.id())
+        && matches!(
+            parent.kind(),
+            "function_declaration"
+                | "function_signature"
+                | "method_definition"
+                | "method_signature"
+                | "abstract_method_signature"
+        )
 }
 
 fn declaration_type_node_for_reference<'tree>(

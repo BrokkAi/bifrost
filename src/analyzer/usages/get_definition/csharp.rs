@@ -1,8 +1,11 @@
 use super::*;
 
-pub(crate) struct CSharpTypeLookupResolution {
-    pub(crate) fqn: String,
-    pub(crate) candidates: Vec<CodeUnit>,
+pub(crate) enum CSharpTypeLookupResolution {
+    Type {
+        fqn: String,
+        candidates: Vec<CodeUnit>,
+    },
+    InappropriateSymbolContext,
 }
 
 pub(crate) fn csharp_type_lookup_resolution(
@@ -183,6 +186,9 @@ fn csharp_type_lookup_node_resolution(
                 csharp_receiver_type_lookup_units(csharp, support, file, source, root, node);
             return csharp_type_candidates_resolution(csharp_node_text(node, source), candidates);
         }
+        if csharp_is_callable_declaration_name(parent, node) {
+            return Some(CSharpTypeLookupResolution::InappropriateSymbolContext);
+        }
         if let Some(resolution) = csharp_declaration_name_type_resolution(
             analyzer, csharp, support, file, source, root, parent, node,
         ) {
@@ -282,20 +288,6 @@ fn csharp_declaration_name_type_resolution(
             )?;
             csharp_type_candidates_resolution(csharp_node_text(name, source), support.fqn(&fqn))
         }
-        "method_declaration" | "local_function_statement"
-            if parent.child_by_field_name("name") == Some(name) =>
-        {
-            parent
-                .child_by_field_name("returns")
-                .or_else(|| parent.child_by_field_name("return_type"))
-                .and_then(|type_node| {
-                    csharp_type_node_resolution(
-                        csharp,
-                        file,
-                        &csharp_reference_type_text(type_node, source),
-                    )
-                })
-        }
         _ => {
             let name_text = csharp_node_text(name, source);
             let bindings =
@@ -308,6 +300,14 @@ fn csharp_declaration_name_type_resolution(
             csharp_type_candidates_resolution(name_text, candidates)
         }
     }
+}
+
+fn csharp_is_callable_declaration_name(parent: Node<'_>, name: Node<'_>) -> bool {
+    parent.child_by_field_name("name") == Some(name)
+        && matches!(
+            parent.kind(),
+            "method_declaration" | "local_function_statement" | "constructor_declaration"
+        )
 }
 
 fn csharp_type_node_resolution(
@@ -333,7 +333,7 @@ fn csharp_type_candidates_resolution(
     } else {
         reference.to_string()
     };
-    Some(CSharpTypeLookupResolution { fqn, candidates })
+    Some(CSharpTypeLookupResolution::Type { fqn, candidates })
 }
 
 fn csharp_type_bindings_before_scoped(

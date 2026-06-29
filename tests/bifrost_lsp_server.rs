@@ -2945,6 +2945,243 @@ fn bifrost_lsp_server_type_definition_returns_null_for_unresolved_type() {
 }
 
 #[test]
+fn bifrost_lsp_server_type_definition_returns_null_for_typescript_function_name() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("app.ts");
+    let source = "interface Widget {}\nfunction build(): Widget { return {} as Widget; }\nconst value = build();\n";
+    fs::write(&file_path, source).expect("write app.ts");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let (line, character) = position_after(source, "function ");
+
+    let response = type_definition_response(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        2,
+        &file_uri,
+        line,
+        character,
+    );
+    assert!(
+        response["result"].is_null(),
+        "function declaration name should not resolve a type definition, got {response}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_type_definition_returns_null_for_typescript_method_name() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("app.ts");
+    let source =
+        "interface Widget {}\nclass Service {\n  build(): Widget { return {} as Widget; }\n}\n";
+    fs::write(&file_path, source).expect("write app.ts");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let (line, character) = position_after(source, "  ");
+
+    let response = type_definition_response(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        2,
+        &file_uri,
+        line,
+        character,
+    );
+    assert!(
+        response["result"].is_null(),
+        "method declaration name should not resolve a type definition, got {response}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_type_definition_returns_null_for_javascript_callable_symbol() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("plain.js");
+    let source = "function build() { return {}; }\nconst value = build();\n";
+    fs::write(&file_path, source).expect("write plain.js");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let (line, character) = position_after(source, "function ");
+
+    let response = type_definition_response(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        2,
+        &file_uri,
+        line,
+        character,
+    );
+    assert!(
+        response["result"].is_null(),
+        "JavaScript callable symbol should return null for type definition, got {response}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_type_definition_returns_null_for_java_method_name() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("Service.java");
+    let source =
+        "class Widget {}\nclass Service {\n    Widget build() { return new Widget(); }\n}\n";
+    fs::write(&file_path, source).expect("write Service.java");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let (line, character) = position_after(source, "    Widget ");
+
+    let response = type_definition_response(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        2,
+        &file_uri,
+        line,
+        character,
+    );
+    assert!(
+        response["result"].is_null(),
+        "Java method declaration name should not resolve a type definition, got {response}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_type_definition_returns_null_for_csharp_method_name() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("Service.cs");
+    let source =
+        "class Widget {}\nclass Service {\n    Widget Build() { return new Widget(); }\n}\n";
+    fs::write(&file_path, source).expect("write Service.cs");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let (line, character) = position_after(source, "    Widget ");
+
+    let response = type_definition_response(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        2,
+        &file_uri,
+        line,
+        character,
+    );
+    assert!(
+        response["result"].is_null(),
+        "C# method declaration name should not resolve a type definition, got {response}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_type_definition_returns_null_for_rust_function_name() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("lib.rs");
+    let source = "struct Widget;\nfn build() -> Widget { Widget }\nfn run() { let _ = build(); }\n";
+    fs::write(&file_path, source).expect("write lib.rs");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let (line, character) = position_after(source, "fn ");
+
+    let response = type_definition_response(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        2,
+        &file_uri,
+        line,
+        character,
+    );
+    assert!(
+        response["result"].is_null(),
+        "Rust function declaration name should not resolve a type definition, got {response}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_type_definition_returns_null_for_go_function_name() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    fs::write(root.join("go.mod"), "module example.com/typectx\n").expect("write go.mod");
+    let file_path = root.join("main.go");
+    let source =
+        "package main\n\ntype Widget struct{}\n\nfunc build() Widget { return Widget{} }\n";
+    fs::write(&file_path, source).expect("write main.go");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let (line, character) = position_after(source, "func ");
+
+    let response = type_definition_response(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        2,
+        &file_uri,
+        line,
+        character,
+    );
+    assert!(
+        response["result"].is_null(),
+        "Go function declaration name should not resolve a type definition, got {response}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_type_definition_returns_null_for_scala_function_name() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("App.scala");
+    let source = "class Widget\nobject App {\n  def build(): Widget = new Widget\n}\n";
+    fs::write(&file_path, source).expect("write App.scala");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+    let (line, character) = position_after(source, "def ");
+
+    let response = type_definition_response(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        2,
+        &file_uri,
+        line,
+        character,
+    );
+    assert!(
+        response["result"].is_null(),
+        "Scala function declaration name should not resolve a type definition, got {response}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
 fn bifrost_lsp_server_type_definition_uses_did_open_overlay() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().canonicalize().expect("canon temp");
@@ -6049,6 +6286,30 @@ fn read_response_for_id(reader: &mut impl BufRead, stderr: &mut impl Read, id: u
         }
     }
     panic!("did not receive response with id {id} within 32 messages");
+}
+
+fn type_definition_response(
+    stdin: &mut impl Write,
+    reader: &mut impl BufRead,
+    stderr: &mut impl Read,
+    id: u64,
+    file_uri: &str,
+    line: u64,
+    character: u64,
+) -> Value {
+    write_message(
+        stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "textDocument/typeDefinition",
+            "params": {
+                "textDocument": {"uri": file_uri},
+                "position": {"line": line, "character": character}
+            }
+        }),
+    );
+    read_response_for_id(reader, stderr, id)
 }
 
 fn write_message(stdin: &mut impl Write, payload: Value) {
