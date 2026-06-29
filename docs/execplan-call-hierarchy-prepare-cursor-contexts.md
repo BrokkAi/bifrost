@@ -14,7 +14,7 @@ After this work, Bifrost still advertises `callHierarchyProvider`, but `textDocu
 
 - [x] (2026-06-29 15:45Z) Confirmed the worktree is clean on `331-tighten-lsp-call-hierarchy-prepare-cursor-contexts`; `HEAD`, `origin/master`, and `origin/331-tighten-lsp-call-hierarchy-prepare-cursor-contexts` all resolve to `fbfe670bf3dc4f73af991b6ff55a9d2d3fc65a18`.
 - [x] (2026-06-29 15:48Z) Added this ExecPlan as the living source of truth for issue `#331`.
-- [ ] Milestone 1: shared prepare gate plus Java proof.
+- [x] (2026-06-29 16:25Z) Implemented Milestone 1 shared prepare gate and Java proof, ran focused validation, completed guided review, accepted two low-risk review fixes, and reran validation.
 - [ ] Milestone 2: JS/TS and Rust coverage.
 - [ ] Milestone 3: Go, C#, C++, Scala, Python, PHP, and Ruby declaration-scope documentation.
 - [ ] Milestone 4: final quality gate and final guided review.
@@ -30,6 +30,12 @@ After this work, Bifrost still advertises `callHierarchyProvider`, but `textDocu
 - Observation: There is an instruction conflict around rebasing at kickoff.
   Evidence: The worktree instructions say to run `git fetch && git rebase` when starting on a new worktree, while the project-doc section says not to rebase unless explicitly asked. This plan records the conflict and follows the project-doc override by fetching but not rebasing.
 
+- Observation: Consolidating the Java prepare regressions requires cursor positions inside identifier tokens, not after them.
+  Evidence: A consolidated test initially failed because the positive call-reference request placed the LSP cursor after `target`, making `cursor_byte_range` cover `(` and returning `null`. Moving the cursor inside `target` made the focused call hierarchy tests pass.
+
+- Observation: The shared prepare gate currently parses a call-reference source once to prove call syntax and again through definition lookup to resolve the target.
+  Evidence: Guided review flagged the double parse in `is_call_reference_range` plus `resolve_definition_batch_with_source`. The review did not find a correctness bug, and the larger parse-sharing API is left for a later cleanup rather than weakening this milestone with a broad source-size fallback.
+
 ## Decision Log
 
 - Decision: Keep `callHierarchyProvider` advertised globally.
@@ -44,9 +50,27 @@ After this work, Bifrost still advertises `callHierarchyProvider`, but `textDocu
   Rationale: `git fetch` is required by the worktree instructions and verified that local refs are aligned. The project-doc section explicitly says not to rebase unless asked, so no rebase was run.
   Date/Author: 2026-06-29 / Codex
 
+- Decision: Use one shared LSP position comparator for containment and sorting.
+  Rationale: Guided review found that the new containment helper duplicated position ordering already present in range sorting. A shared comparator prevents future drift in LSP position boundary semantics.
+  Date/Author: 2026-06-29 / Codex
+
+- Decision: Combine the Java prepare regressions into one server session.
+  Rationale: Guided review found unnecessary LSP server startup churn across four closely related single-file Java cases. A single test still verifies local-variable, type-reference, call-reference, and field-access behavior while reducing process/indexing overhead.
+  Date/Author: 2026-06-29 / Codex
+
 ## Outcomes & Retrospective
 
-No implementation milestones are complete yet. This ExecPlan records the intended behavior, current handler seam, and validation workflow before code changes begin.
+Milestone 1 is complete. `prepareCallHierarchy` now uses a shared prepare target helper that accepts callable declaration selection ranges and structured call references that resolve to callable declarations. Java LSP regressions prove local variables, type references, and field accesses return `null`, while a method declaration and call reference still prepare call hierarchy items. Existing Java relation tests for incoming/outgoing calls, overload identity, constructor calls, nested filtering, and non-call type-reference filtering remain green.
+
+Milestone 1 guided-review outcome: security, senior-dev, and architecture reviewers found no blocking issues. Duplication review found repeated LSP position comparison logic, which was fixed with a shared comparator. DevOps review found test process churn, which was fixed by consolidating Java prepare contexts into one LSP server session. DevOps also noted double parsing on call-reference prepare; this is recorded as a future structured parse-sharing cleanup because the current behavior is correct and a broad size fallback would reject valid large-file prepare requests.
+
+Validation completed for Milestone 1:
+
+    cargo test --test bifrost_lsp_server call_hierarchy --features nlp
+    result: 7 passed; 0 failed
+
+    cargo fmt --check
+    result: passed
 
 ## Context and Orientation
 
@@ -147,3 +171,5 @@ No new external dependencies are needed. Any helper added to call hierarchy prep
 ## Revision Notes
 
 2026-06-29 / Codex: Created this ExecPlan from issue `#331` and the implementation plan requested by the user. The document records the current prepare bug, the no-mini-parser constraint, the branch/rebase decision, and the milestone review workflow before code changes begin.
+
+2026-06-29 / Codex: Updated this ExecPlan after Milestone 1 implementation and guided review. The document now records the accepted review fixes, focused validation results, and the deferred parse-sharing cleanup concern.

@@ -3847,6 +3847,77 @@ fn bifrost_lsp_server_call_hierarchy_finds_java_incoming_and_outgoing_calls() {
 }
 
 #[test]
+fn bifrost_lsp_server_call_hierarchy_prepare_filters_java_cursor_contexts() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("PrepareContexts.java");
+    let source = "class Service {\n    static int VALUE = 1;\n    static void target() {}\n}\nclass Caller {\n    void helper() {\n        int local = 1;\n        Service value = null;\n        Service.target();\n        int field = Service.VALUE;\n    }\n}\n";
+    fs::write(&file_path, source).expect("write Java prepare-context fixture");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+
+    let (line, character) = position_after(source, "int l");
+    let result = prepare_call_hierarchy_result(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        14,
+        &file_uri,
+        line,
+        character,
+    );
+    assert!(
+        result.is_null(),
+        "local variables must not prepare call hierarchy: {result}"
+    );
+
+    let (line, character) = position_after(source, "        S");
+    let result = prepare_call_hierarchy_result(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        15,
+        &file_uri,
+        line,
+        character,
+    );
+    assert!(
+        result.is_null(),
+        "type references must not prepare call hierarchy: {result}"
+    );
+
+    let (line, character) = position_after(source, "Service.t");
+    let target = prepare_call_hierarchy(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        16,
+        &file_uri,
+        line,
+        character,
+    );
+    assert_eq!(target["name"], "target", "prepared target call: {target}");
+
+    let (line, character) = position_after(source, "field = Service.V");
+    let result = prepare_call_hierarchy_result(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        17,
+        &file_uri,
+        line,
+        character,
+    );
+    assert!(
+        result.is_null(),
+        "field accesses must not prepare call hierarchy: {result}"
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
 fn bifrost_lsp_server_call_hierarchy_preserves_java_overload_identity() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().canonicalize().expect("canon temp");
@@ -5678,6 +5749,26 @@ fn prepare_call_hierarchy(
     )
 }
 
+fn prepare_call_hierarchy_result(
+    stdin: &mut impl Write,
+    reader: &mut impl BufRead,
+    stderr: &mut impl Read,
+    id: u64,
+    uri: &str,
+    line: u64,
+    character: u64,
+) -> Value {
+    prepare_hierarchy_result(
+        stdin,
+        reader,
+        stderr,
+        id,
+        "textDocument/prepareCallHierarchy",
+        uri,
+        (line, character),
+    )
+}
+
 fn call_hierarchy_relation(
     stdin: &mut impl Write,
     reader: &mut impl BufRead,
@@ -5690,6 +5781,23 @@ fn call_hierarchy_relation(
 }
 
 fn prepare_hierarchy(
+    stdin: &mut impl Write,
+    reader: &mut impl BufRead,
+    stderr: &mut impl Read,
+    id: u64,
+    method: &str,
+    uri: &str,
+    position: (u64, u64),
+) -> Value {
+    let result = prepare_hierarchy_result(stdin, reader, stderr, id, method, uri, position);
+    let items = result
+        .as_array()
+        .unwrap_or_else(|| panic!("expected prepare array, got {result}"));
+    assert_eq!(items.len(), 1, "expected one prepared item: {items:#?}");
+    items[0].clone()
+}
+
+fn prepare_hierarchy_result(
     stdin: &mut impl Write,
     reader: &mut impl BufRead,
     stderr: &mut impl Read,
@@ -5712,11 +5820,7 @@ fn prepare_hierarchy(
         }),
     );
     let response = read_response_for_id(reader, stderr, id);
-    let items = response["result"]
-        .as_array()
-        .unwrap_or_else(|| panic!("expected prepare array, got {response}"));
-    assert_eq!(items.len(), 1, "expected one prepared item: {items:#?}");
-    items[0].clone()
+    response["result"].clone()
 }
 
 fn hierarchy_relation(
