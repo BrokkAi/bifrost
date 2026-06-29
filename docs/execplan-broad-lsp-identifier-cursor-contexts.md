@@ -13,8 +13,8 @@ After this work, Bifrost will still advertise the same LSP capabilities, but ina
 ## Progress
 
 - [x] (2026-06-29 12:53Z) Created this ExecPlan from the issue `#333` audit and recorded the required guided-review, AGENTS.md audit, validation, and milestone-commit workflow.
-- [ ] Confirm branch/upstream state after kickoff fetch and record exact commit IDs in `Surprises & Discoveries`.
-- [ ] Milestone 1: add failing invalid-context LSP regressions without production-code changes, run focused tests to prove the bug, run guided review on the test-only diff, update this plan, and commit.
+- [x] (2026-06-29 13:02Z) Confirmed branch/upstream state after kickoff fetch and recorded exact commit IDs in `Surprises & Discoveries`.
+- [x] (2026-06-29 13:06Z) Milestone 1 complete: added independent invalid-context LSP regressions without production-code changes, ran focused tests to prove the bug, ran guided review on the test-only diff, addressed accepted review findings, and prepared the milestone commit.
 - [ ] Milestone 2: introduce a shared structured cursor-target resolver for broad identifier endpoints, wire `definition` and `hover`, validate, run guided review and AGENTS.md audit, update this plan, and commit.
 - [ ] Milestone 3: wire `references` and `documentHighlight` to the shared resolver while preserving declaration/reference behavior and overlay awareness, validate, run guided review and AGENTS.md audit, update this plan, and commit.
 - [ ] Milestone 4: broaden regressions across comments, literals, keywords, unresolved locals, ambiguous short names, and open-document overlays; run final quality gate, final guided review, update this plan, and commit.
@@ -29,6 +29,15 @@ After this work, Bifrost will still advertise the same LSP capabilities, but ina
 
 - Observation: The project has recent LSP cursor-context ExecPlans that use the same milestone pattern requested here.
   Evidence: `docs/execplan-type-definition-cursor-contexts.md` and `docs/execplan-call-hierarchy-prepare-cursor-contexts.md` both keep provider advertisements unchanged, add LSP regressions, run focused tests, run guided-review checkpoints, and commit between milestones.
+
+- Observation: `origin/master` advanced after the initial plan commit, while the issue branch upstream stayed at the prior master commit.
+  Evidence: After `git fetch`, `git rev-parse HEAD origin/master origin/333-audit-broad-lsp-identifier-endpoints-for-inappropriate-cursor-contexts` printed `7a842496243f92952cab6fe8fefc13791a37e080`, `e3fc1367b41c22ede25934798349d0e3cc443fea`, and `f1e2cd37fc80877a09578fe685043e3de92ed8c3`. Per project instructions, no rebase was run.
+
+- Observation: The first Milestone 1 regression shape was too broad.
+  Evidence: Guided review found that one combined test name matched all four endpoint filters but failed at the first definition assertion, so `hover`, `references`, and `document_highlight` filter failures did not independently prove those endpoints. The review also found that the expected-failing assertion ran before LSP shutdown.
+
+- Observation: The revised Milestone 1 tests independently reproduce the issue for all four broad endpoints before production changes.
+  Evidence: `cargo test --test bifrost_lsp_server definition --features nlp` failed only `bifrost_lsp_server_definition_ignores_comment_token` because `// target` returned the real method definition. `cargo test --test bifrost_lsp_server hover --features nlp` failed only `bifrost_lsp_server_hover_ignores_comment_token` because the comment token returned a Java hover for `void target()`. `cargo test --test bifrost_lsp_server references --features nlp` failed only `bifrost_lsp_server_references_ignore_comment_token` because the comment token returned declaration and call-reference locations. `cargo test --test bifrost_lsp_server document_highlight --features nlp` failed only `bifrost_lsp_server_document_highlight_ignores_comment_token` because the comment token returned declaration and read highlights.
 
 ## Decision Log
 
@@ -51,6 +60,10 @@ After this work, Bifrost will still advertise the same LSP capabilities, but ina
 ## Outcomes & Retrospective
 
 No implementation milestone is complete yet. This initial plan converts the issue audit into an executable workflow and records the expected review, validation, and commit cadence before code changes begin.
+
+Milestone 1 is complete. The test-only regressions now prove that a comment token matching a real method name can resolve through each broad endpoint: definition, hover, references, and documentHighlight. Each regression also exercises valid declaration behavior first so future fixes must preserve useful broad endpoint behavior. The focused failures are expected until Milestones 2 and 3 replace the raw string-based cursor path.
+
+Milestone 1 guided-review outcome: security found no issues. DevOps, senior-dev, and architecture all flagged that the original combined regression did not independently prove each endpoint and could mislead focused milestone validation. DevOps also flagged that the expected-failing assertion could panic before LSP shutdown. Duplication review flagged that the new generic request helper should be reused by existing typeDefinition and implementation helpers. All findings were accepted and fixed: the regression is split into four endpoint-specific tests, each test collects responses then calls `shutdown_lsp` before asserting the expected failure, and existing position-based helpers now delegate to `text_document_position_response`.
 
 ## Context and Orientation
 
@@ -206,3 +219,7 @@ The shared resolver should expose a small internal API that lets endpoint handle
 ## Revision Notes
 
 2026-06-29 / Codex: Created this ExecPlan from the issue `#333` audit and the user's requested workflow. The plan records the broad LSP handler failure mode, the no-mini-parser constraint from AGENTS.md, the guided-review checkpoints, and the requirement to commit between milestones before code changes begin.
+
+2026-06-29 / Codex: Updated this ExecPlan after adding the Milestone 1 test-only regression. The document now records refreshed branch evidence and the focused failing LSP commands that prove the current broad handlers resolve comment tokens through global identifier lookup.
+
+2026-06-29 / Codex: Updated this ExecPlan after guided review of the Milestone 1 test-only diff. The document now records the accepted review findings, the split endpoint-specific regressions, teardown-before-assertion shape, and revised independent focused-test failures.

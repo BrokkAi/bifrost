@@ -3697,6 +3697,208 @@ fn bifrost_lsp_server_references_finds_class_a_usages() {
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");
 }
 
+const COMMENT_TARGETS_SOURCE: &str = "class CommentTargets {\n    // target\n    void target() {}\n    void caller() {\n        target();\n    }\n}\n";
+
+fn write_comment_targets_fixture(root: &Path) -> PathBuf {
+    let file_path = root.join("CommentTargets.java");
+    fs::write(&file_path, COMMENT_TARGETS_SOURCE).expect("write CommentTargets.java");
+    file_path
+}
+
+#[test]
+fn bifrost_lsp_server_definition_ignores_comment_token() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = write_comment_targets_fixture(&root);
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+
+    let (valid_line, valid_character) = position_after(COMMENT_TARGETS_SOURCE, "void ");
+    let valid_definition = text_document_position_response(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        10,
+        "textDocument/definition",
+        &file_uri,
+        valid_line,
+        valid_character,
+    );
+
+    let (comment_line, comment_character) = position_after(COMMENT_TARGETS_SOURCE, "    // ");
+    let comment_definition = text_document_position_response(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        11,
+        "textDocument/definition",
+        &file_uri,
+        comment_line,
+        comment_character,
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+
+    assert!(
+        valid_definition["result"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+        "valid declaration should resolve definition, got {valid_definition}"
+    );
+    assert!(
+        comment_definition["result"].is_null(),
+        "comment token must not resolve definition, got {comment_definition}"
+    );
+}
+
+#[test]
+fn bifrost_lsp_server_hover_ignores_comment_token() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = write_comment_targets_fixture(&root);
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+
+    let (valid_line, valid_character) = position_after(COMMENT_TARGETS_SOURCE, "void ");
+    let valid_hover = text_document_position_response(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        10,
+        "textDocument/hover",
+        &file_uri,
+        valid_line,
+        valid_character,
+    );
+
+    let (comment_line, comment_character) = position_after(COMMENT_TARGETS_SOURCE, "    // ");
+    let comment_hover = text_document_position_response(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        11,
+        "textDocument/hover",
+        &file_uri,
+        comment_line,
+        comment_character,
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+
+    assert!(
+        valid_hover["result"]["contents"]["value"]
+            .as_str()
+            .is_some_and(|value| value.contains("target")),
+        "valid declaration should produce hover, got {valid_hover}"
+    );
+    assert!(
+        comment_hover["result"].is_null(),
+        "comment token must not produce hover, got {comment_hover}"
+    );
+}
+
+#[test]
+fn bifrost_lsp_server_references_ignore_comment_token() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = write_comment_targets_fixture(&root);
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+
+    let (valid_line, valid_character) = position_after(COMMENT_TARGETS_SOURCE, "void ");
+    let valid_references = references_response(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        10,
+        &file_uri,
+        valid_line,
+        valid_character,
+        true,
+    );
+
+    let (comment_line, comment_character) = position_after(COMMENT_TARGETS_SOURCE, "    // ");
+    let comment_references = references_response(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        11,
+        &file_uri,
+        comment_line,
+        comment_character,
+        true,
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+
+    assert!(
+        valid_references["result"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+        "valid declaration should find references, got {valid_references}"
+    );
+    assert!(
+        comment_references["result"].is_null()
+            || comment_references["result"]
+                .as_array()
+                .is_some_and(|items| items.is_empty()),
+        "comment token must not find references, got {comment_references}"
+    );
+}
+
+#[test]
+fn bifrost_lsp_server_document_highlight_ignores_comment_token() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = write_comment_targets_fixture(&root);
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+
+    let (valid_line, valid_character) = position_after(COMMENT_TARGETS_SOURCE, "void ");
+    let valid_highlights = text_document_position_response(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        10,
+        "textDocument/documentHighlight",
+        &file_uri,
+        valid_line,
+        valid_character,
+    );
+
+    let (comment_line, comment_character) = position_after(COMMENT_TARGETS_SOURCE, "    // ");
+    let comment_highlights = text_document_position_response(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        11,
+        "textDocument/documentHighlight",
+        &file_uri,
+        comment_line,
+        comment_character,
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+
+    assert!(
+        valid_highlights["result"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+        "valid declaration should produce highlights, got {valid_highlights}"
+    );
+    assert!(
+        comment_highlights["result"].is_null()
+            || comment_highlights["result"]
+                .as_array()
+                .is_some_and(|items| items.is_empty()),
+        "comment token must not produce highlights, got {comment_highlights}"
+    );
+}
+
 #[test]
 fn bifrost_lsp_server_prepare_rename_returns_identifier_range() {
     let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -7411,15 +7613,63 @@ fn type_definition_response(
     line: u64,
     character: u64,
 ) -> Value {
+    text_document_position_response(
+        stdin,
+        reader,
+        stderr,
+        id,
+        "textDocument/typeDefinition",
+        file_uri,
+        line,
+        character,
+    )
+}
+
+fn text_document_position_response(
+    stdin: &mut impl Write,
+    reader: &mut impl BufRead,
+    stderr: &mut impl Read,
+    id: u64,
+    method: &str,
+    file_uri: &str,
+    line: u64,
+    character: u64,
+) -> Value {
     write_message(
         stdin,
         json!({
             "jsonrpc": "2.0",
             "id": id,
-            "method": "textDocument/typeDefinition",
+            "method": method,
             "params": {
                 "textDocument": {"uri": file_uri},
                 "position": {"line": line, "character": character}
+            }
+        }),
+    );
+    read_response_for_id(reader, stderr, id)
+}
+
+fn references_response(
+    stdin: &mut impl Write,
+    reader: &mut impl BufRead,
+    stderr: &mut impl Read,
+    id: u64,
+    file_uri: &str,
+    line: u64,
+    character: u64,
+    include_declaration: bool,
+) -> Value {
+    write_message(
+        stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "textDocument/references",
+            "params": {
+                "textDocument": {"uri": file_uri},
+                "position": {"line": line, "character": character},
+                "context": {"includeDeclaration": include_declaration}
             }
         }),
     );
@@ -7435,19 +7685,16 @@ fn implementation_response(
     line: u64,
     character: u64,
 ) -> Value {
-    write_message(
+    text_document_position_response(
         stdin,
-        json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": "textDocument/implementation",
-            "params": {
-                "textDocument": {"uri": file_uri},
-                "position": {"line": line, "character": character}
-            }
-        }),
-    );
-    read_response_for_id(reader, stderr, id)
+        reader,
+        stderr,
+        id,
+        "textDocument/implementation",
+        file_uri,
+        line,
+        character,
+    )
 }
 
 fn write_message(stdin: &mut impl Write, payload: Value) {
