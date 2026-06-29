@@ -1,9 +1,13 @@
 use super::*;
-use crate::analyzer::ImportInfo;
+use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
+use crate::analyzer::{ImportInfo, Language};
 use rayon::prelude::*;
+use std::ffi::OsStr;
 use std::path::{Component, PathBuf};
 use std::sync::Arc;
 use tree_sitter::Node;
+
+const ZEITWERK_AUTOLOAD_EXCLUDED_APP_DIRS: &[&str] = &["assets", "javascript", "views"];
 
 /// Parses a `require`/`require_relative`/`load`/`autoload` call into an
 /// [`ImportInfo`]. The required path string is stored in `identifier`; the kind
@@ -118,6 +122,129 @@ impl RubyAnalyzer {
             .collect()
     }
 
+    fn has_zeitwerk_autoload_conventions(&self) -> bool {
+        *self.zeitwerk_project.get_or_init(|| {
+            self.project_file_contents("Gemfile")
+                .as_deref()
+                .is_some_and(gemfile_declares_zeitwerk_autoloading)
+                || self
+                    .project_file_contents("Gemfile.lock")
+                    .as_deref()
+                    .is_some_and(gemfile_lock_declares_zeitwerk_autoloading)
+        })
+    }
+
+    fn project_file_contents(&self, rel_path: &str) -> Option<String> {
+        let file = ProjectFile::new(self.inner.project().root().to_path_buf(), rel_path);
+        self.inner.project().read_source(&file).ok()
+    }
+
+    pub(crate) fn zeitwerk_autoload_files(&self) -> &HashSet<ProjectFile> {
+        self.zeitwerk_autoload_files.get_or_init(|| {
+            if !self.has_zeitwerk_autoload_conventions() {
+                return HashSet::default();
+            }
+            self.inner
+                .project()
+                .analyzable_files(Language::Ruby)
+                .map(|files| {
+                    files
+                        .into_iter()
+                        .filter(is_zeitwerk_autoload_file)
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+    }
+
+    fn zeitwerk_consumer_files(&self) -> &HashSet<ProjectFile> {
+        self.zeitwerk_consumer_files.get_or_init(|| {
+            if !self.has_zeitwerk_autoload_conventions() {
+                return HashSet::default();
+            }
+            self.inner
+                .project()
+                .analyzable_files(Language::Ruby)
+                .map(|files| files.into_iter().collect())
+                .unwrap_or_default()
+        })
+    }
+
+    fn zeitwerk_autoload_code_units(&self) -> &HashSet<CodeUnit> {
+        self.zeitwerk_autoload_code_units.get_or_init(|| {
+            let mut units = HashSet::default();
+            for file in self.zeitwerk_autoload_files() {
+                for code_unit in self.inner.top_level_declarations(file) {
+                    units.insert(code_unit.clone());
+                }
+            }
+            units
+        })
+    }
+
+    pub(crate) fn zeitwerk_reference_files_for_identifier(
+        &self,
+        identifier: &str,
+    ) -> HashSet<ProjectFile> {
+        if identifier.is_empty() {
+            return HashSet::default();
+        }
+        self.zeitwerk_reference_files()
+            .get(identifier)
+            .into_iter()
+            .flat_map(|files| files.iter())
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn zeitwerk_visible_files_for(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<&HashSet<ProjectFile>> {
+        self.zeitwerk_consumer_files()
+            .contains(file)
+            .then(|| self.zeitwerk_autoload_files())
+    }
+
+    fn zeitwerk_reference_files(&self) -> &HashMap<String, HashSet<ProjectFile>> {
+        self.zeitwerk_reference_files.get_or_init(|| {
+            let mut references: HashMap<String, HashSet<ProjectFile>> = HashMap::default();
+            for file in self.zeitwerk_consumer_files() {
+                let Ok(source) = self.inner.project().read_source(file) else {
+                    continue;
+                };
+                let Some(tree) = parse_ruby_tree(&source) else {
+                    continue;
+                };
+                collect_ruby_reference_identifiers(&source, tree.root_node(), |identifier| {
+                    references
+                        .entry(identifier.to_string())
+                        .or_default()
+                        .insert(file.clone());
+                });
+            }
+            references
+        })
+    }
+
+    fn effective_imported_code_units(&self, file: &ProjectFile) -> HashSet<CodeUnit> {
+        let mut units = HashSet::default();
+        for required in self.required_files(file) {
+            for code_unit in self.inner.top_level_declarations(&required) {
+                units.insert(code_unit.clone());
+            }
+        }
+        if self.zeitwerk_consumer_files().contains(file) {
+            units.extend(
+                self.zeitwerk_autoload_code_units()
+                    .iter()
+                    .filter(|code_unit| code_unit.source() != file)
+                    .cloned(),
+            );
+        }
+        units
+    }
+
     pub(super) fn build_reverse_import_index(
         &self,
     ) -> &HashMap<ProjectFile, Arc<HashSet<ProjectFile>>> {
@@ -171,12 +298,7 @@ impl ImportAnalysisProvider for RubyAnalyzer {
         if let Some(cached) = self.imported_code_units.get(file) {
             return (*cached).clone();
         }
-        let mut units = HashSet::default();
-        for required in self.required_files(file) {
-            for code_unit in self.inner.top_level_declarations(&required) {
-                units.insert(code_unit.clone());
-            }
-        }
+        let units = self.effective_imported_code_units(file);
         self.imported_code_units
             .insert(file.clone(), Arc::new(units.clone()));
         units
@@ -195,4 +317,122 @@ impl ImportAnalysisProvider for RubyAnalyzer {
     fn import_info_of<'a>(&'a self, file: &ProjectFile) -> &'a [ImportInfo] {
         self.inner.import_info_of(file)
     }
+}
+
+fn gemfile_declares_zeitwerk_autoloading(contents: &str) -> bool {
+    contents.lines().any(|line| {
+        let line = line
+            .split_once('#')
+            .map_or(line, |(before, _)| before)
+            .trim();
+        let Some(after_gem) = line.strip_prefix("gem") else {
+            return false;
+        };
+        if !after_gem
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_whitespace() || ch == '(')
+        {
+            return false;
+        }
+        let args = after_gem
+            .trim_start()
+            .strip_prefix('(')
+            .unwrap_or(after_gem);
+        gem_args_name(args.trim_start()).is_some_and(is_zeitwerk_autoload_gem)
+    })
+}
+
+fn gemfile_lock_declares_zeitwerk_autoloading(contents: &str) -> bool {
+    contents.lines().any(|line| {
+        let trimmed = line.trim_start();
+        let Some((gem, rest)) = gemfile_lock_gem_line(trimmed) else {
+            return false;
+        };
+        is_zeitwerk_autoload_gem(gem) && rest.trim_start().starts_with('(')
+    })
+}
+
+fn gem_args_name(args: &str) -> Option<&str> {
+    let quote = args.chars().next()?;
+    if !matches!(quote, '"' | '\'') {
+        return None;
+    }
+    let rest = &args[quote.len_utf8()..];
+    rest.find(quote).map(|end| &rest[..end])
+}
+
+fn gemfile_lock_gem_line(line: &str) -> Option<(&str, &str)> {
+    let name_len = line
+        .char_indices()
+        .find_map(|(index, ch)| (ch.is_ascii_whitespace() || ch == '(').then_some(index))
+        .unwrap_or(line.len());
+    if name_len == 0 {
+        return None;
+    }
+    Some((&line[..name_len], &line[name_len..]))
+}
+
+fn is_zeitwerk_autoload_gem(gem: &str) -> bool {
+    matches!(gem, "rails" | "zeitwerk")
+}
+
+fn is_zeitwerk_autoload_file(file: &ProjectFile) -> bool {
+    if file.rel_path().extension() != Some(OsStr::new("rb")) {
+        return false;
+    }
+    let mut components = file.rel_path().components();
+    if components.next() != Some(Component::Normal(OsStr::new("app"))) {
+        return false;
+    }
+    let Some(Component::Normal(app_dir)) = components.next() else {
+        return false;
+    };
+    let Some(app_dir) = app_dir.to_str() else {
+        return false;
+    };
+    !ZEITWERK_AUTOLOAD_EXCLUDED_APP_DIRS.contains(&app_dir)
+}
+
+fn collect_ruby_reference_identifiers<'a>(
+    source: &'a str,
+    root: Node<'_>,
+    mut sink: impl FnMut(&'a str),
+) {
+    walk_named_tree_preorder(root, true, |node| {
+        if let Some(method) = method_call_identifier(node, source) {
+            sink(method);
+        }
+        if let Some(constant) = constant_reference_identifier(node, source) {
+            sink(constant);
+        }
+        WalkControl::Continue
+    });
+}
+
+fn method_call_identifier<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
+    if node.kind() != "call" {
+        return None;
+    }
+    let method = node.child_by_field_name("method")?;
+    Some(ruby_node_text(method, source))
+}
+
+fn constant_reference_identifier<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
+    if node.kind() != "constant" {
+        return None;
+    }
+    if let Some(parent) = node.parent()
+        && matches!(parent.kind(), "class" | "module")
+    {
+        return None;
+    }
+    Some(ruby_node_text(node, source))
+}
+
+fn ruby_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    source
+        .get(node.start_byte()..node.end_byte())
+        .unwrap_or("")
+        .trim()
 }

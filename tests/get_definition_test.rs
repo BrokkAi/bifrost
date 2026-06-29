@@ -49,6 +49,380 @@ fn character_column_of(line: &str, needle: &str) -> usize {
 }
 
 #[test]
+fn ruby_get_definition_resolves_constant_reference_to_class() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "app.rb",
+            r#"class User
+end
+
+class App
+  def run
+    User
+  end
+end
+"#,
+        )
+        .build();
+
+    let line = "    User";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.rb","line":6,"column":{}}}]}}"#,
+            column_of(line, "User")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["reference"]["target"], "User", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "User", "{value}");
+}
+
+#[test]
+fn ruby_get_definition_resolves_same_class_bare_method_call() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "app.rb",
+            r#"class User
+  def run
+    audit
+  end
+
+  def audit
+  end
+end
+"#,
+        )
+        .build();
+
+    let line = "    audit";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.rb","line":3,"column":{}}}]}}"#,
+            column_of(line, "audit")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "User.audit", "{value}");
+}
+
+#[test]
+fn ruby_get_definition_resolves_explicit_class_receiver_call() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "app.rb",
+            r#"class User
+  def self.find
+  end
+end
+
+class App
+  def run
+    User.find
+  end
+end
+"#,
+        )
+        .build();
+
+    let line = "    User.find";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.rb","line":8,"column":{}}}]}}"#,
+            column_of(line, "find")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "User.find", "{value}");
+}
+
+#[test]
+fn ruby_get_definition_resolves_mixin_methods_by_receiver_polarity() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "app.rb",
+            r#"module Findable
+  def find
+  end
+end
+
+module Auditable
+  def audit
+  end
+end
+
+class User
+  extend Findable
+  include Auditable
+end
+
+class App
+  def run
+    User.find
+    User.new.audit
+  end
+end
+"#,
+        )
+        .build();
+
+    let find_line = "    User.find";
+    let find_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.rb","line":18,"column":{}}}]}}"#,
+            column_of(find_line, "find")
+        ),
+    );
+    let find_result = &find_value["results"][0];
+    assert_eq!(find_result["status"], "resolved", "{find_value}");
+    assert_eq!(
+        find_result["definitions"][0]["fqn"], "Findable.find",
+        "{find_value}"
+    );
+
+    let audit_line = "    User.new.audit";
+    let audit_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.rb","line":19,"column":{}}}]}}"#,
+            column_of(audit_line, "audit")
+        ),
+    );
+    let audit_result = &audit_value["results"][0];
+    assert_eq!(audit_result["status"], "resolved", "{audit_value}");
+    assert_eq!(
+        audit_result["definitions"][0]["fqn"], "Auditable.audit",
+        "{audit_value}"
+    );
+}
+
+#[test]
+fn ruby_get_definition_resolves_constant_through_project_local_require() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "app/main.rb",
+            r#"require_relative "user"
+
+class App
+  def run
+    User
+  end
+end
+"#,
+        )
+        .file(
+            "app/user.rb",
+            r#"class User
+end
+"#,
+        )
+        .build();
+
+    let line = "    User";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/main.rb","line":5,"column":{}}}]}}"#,
+            column_of(line, "User")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "User", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "app/user.rb", "{value}");
+}
+
+#[test]
+fn ruby_get_definition_resolves_superclass_method_from_constructed_receiver() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "app.rb",
+            r#"class User
+  def audit
+  end
+end
+
+class Admin < User
+end
+
+class App
+  def run
+    Admin.new.audit
+  end
+end
+"#,
+        )
+        .build();
+
+    let line = "    Admin.new.audit";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.rb","line":11,"column":{}}}]}}"#,
+            column_of(line, "audit")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "User.audit", "{value}");
+}
+
+#[test]
+fn ruby_get_definition_prefers_direct_method_over_mixin_method() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "app.rb",
+            r#"module Auditable
+  def audit
+  end
+end
+
+class User
+  include Auditable
+
+  def audit
+  end
+end
+
+class App
+  def run
+    User.new.audit
+  end
+end
+"#,
+        )
+        .build();
+
+    let line = "    User.new.audit";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.rb","line":15,"column":{}}}]}}"#,
+            column_of(line, "audit")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "User.audit", "{value}");
+}
+
+#[test]
+fn ruby_get_definition_reports_dynamic_dispatch_without_guessing() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "app.rb",
+            r#"class User
+  def audit
+  end
+
+  def run
+    send(:audit)
+  end
+end
+"#,
+        )
+        .build();
+
+    let line = "    send(:audit)";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.rb","line":6,"column":{}}}]}}"#,
+            column_of(line, "send")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "unsupported_ruby_dynamic_dispatch",
+        "{value}"
+    );
+}
+
+#[test]
+fn ruby_get_definition_resolves_project_defined_send_without_symbol_dispatch() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "app.rb",
+            r#"class User
+  def run
+    send
+  end
+
+  def send
+  end
+end
+"#,
+        )
+        .build();
+
+    let line = "    send";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.rb","line":3,"column":{}}}]}}"#,
+            column_of(line, "send")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "User.send", "{value}");
+}
+
+#[test]
+fn ruby_get_definition_resolves_zeitwerk_visible_constant() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file("Gemfile", "gem \"rails\"\n")
+        .file(
+            "app/models/report_builder.rb",
+            r#"class ReportBuilder
+end
+"#,
+        )
+        .file(
+            "app/controllers/reports_controller.rb",
+            r#"class ReportsController
+  def show
+    ReportBuilder
+  end
+end
+"#,
+        )
+        .build();
+
+    let line = "    ReportBuilder";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/controllers/reports_controller.rb","line":3,"column":{}}}]}}"#,
+            column_of(line, "ReportBuilder")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "ReportBuilder", "{value}");
+    assert_eq!(
+        result["definitions"][0]["path"], "app/models/report_builder.rb",
+        "{value}"
+    );
+}
+
+#[test]
 fn rust_named_import_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(
