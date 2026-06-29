@@ -1,5 +1,7 @@
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
-use crate::analyzer::{CodeUnit, CodeUnitType, ImportInfo, ProjectFile};
+use crate::analyzer::{
+    CodeUnit, CodeUnitType, ImportInfo, ParameterMetadata, ProjectFile, SignatureMetadata,
+};
 use crate::hash::HashSet;
 use tree_sitter::{Node, Tree};
 
@@ -145,7 +147,11 @@ fn visit_go_function(
         parent.cloned(),
         Some(top_level),
     );
-    parsed.add_signature(code_unit.clone(), go_function_signature(node, source));
+    let (signature, parameter_text) = go_function_signature(node, source);
+    parsed.add_signature_with_metadata(
+        code_unit.clone(),
+        go_signature_metadata(signature, node, source, &parameter_text),
+    );
     Some(code_unit)
 }
 
@@ -525,7 +531,11 @@ fn visit_go_interface_methods(
                 Some(parent.clone()),
             );
         }
-        parsed.add_signature(code_unit, go_node_text(child, source).trim().to_string());
+        let (signature, parameter_text) = go_interface_method_signature(child, source);
+        parsed.add_signature_with_metadata(
+            code_unit,
+            go_signature_metadata(signature, child, source, &parameter_text),
+        );
     }
 }
 
@@ -609,14 +619,104 @@ fn go_type_signature(node: Node<'_>, source: &str) -> String {
     }
 }
 
-fn go_function_signature(node: Node<'_>, source: &str) -> String {
+fn go_function_signature(node: Node<'_>, source: &str) -> (String, String) {
     let raw = go_node_text(node, source).trim();
     let header = raw.split('{').next().unwrap_or(raw).trim();
+    let parameter_text = go_rendered_parameter_text(node, source);
     if node.kind() == "method_declaration" || node.kind() == "function_declaration" {
-        format!("{header} {{ ... }}")
+        (format!("{header} {{ ... }}"), parameter_text)
     } else {
-        header.to_string()
+        (header.to_string(), parameter_text)
     }
+}
+
+fn go_interface_method_signature(node: Node<'_>, source: &str) -> (String, String) {
+    (
+        go_node_text(node, source).trim().to_string(),
+        go_rendered_parameter_text(node, source),
+    )
+}
+
+fn go_rendered_parameter_text(node: Node<'_>, source: &str) -> String {
+    node.child_by_field_name("parameters")
+        .map(|parameters| go_node_text(parameters, source).trim().to_string())
+        .unwrap_or_else(|| "()".to_string())
+}
+
+fn go_signature_metadata(
+    signature: String,
+    node: Node<'_>,
+    source: &str,
+    parameter_text: &str,
+) -> SignatureMetadata {
+    let Some(parameters_node) = node.child_by_field_name("parameters") else {
+        return SignatureMetadata::new(signature, Vec::new());
+    };
+    let raw = go_node_text(node, source);
+    let leading_trim_bytes = raw.len().saturating_sub(raw.trim_start().len());
+    let parameters_start = parameters_node
+        .start_byte()
+        .saturating_sub(node.start_byte())
+        .saturating_sub(leading_trim_bytes);
+    let parameters_end = parameters_start + parameter_text.len();
+    if signature.get(parameters_start..parameters_end) != Some(parameter_text) {
+        return SignatureMetadata::new(signature, Vec::new());
+    }
+    let mut search_start = parameters_start;
+    let parameters = go_parameter_label_nodes(node)
+        .into_iter()
+        .filter_map(|label_node| {
+            let label = go_node_text(label_node, source).trim();
+            if label.is_empty() || search_start > parameters_end {
+                return None;
+            }
+            let haystack = signature.get(search_start..parameters_end)?;
+            let relative_start = haystack.find(label)?;
+            let start_byte = search_start + relative_start;
+            let end_byte = start_byte + label.len();
+            search_start = end_byte;
+            Some(ParameterMetadata::new(label, start_byte, end_byte))
+        })
+        .collect();
+    SignatureMetadata::new(signature, parameters)
+}
+
+fn go_parameter_label_nodes(node: Node<'_>) -> Vec<Node<'_>> {
+    let Some(parameters) = node.child_by_field_name("parameters") else {
+        return Vec::new();
+    };
+    let mut labels = Vec::new();
+    let mut cursor = parameters.walk();
+    for parameter in parameters.named_children(&mut cursor) {
+        match parameter.kind() {
+            "parameter_declaration" | "variadic_parameter_declaration" => {
+                let mut names = Vec::new();
+                let mut children = parameter.walk();
+                for child in parameter.named_children(&mut children) {
+                    if child.kind() == "identifier" {
+                        names.push(child);
+                    }
+                }
+                if names.is_empty() && parameter.kind() == "variadic_parameter_declaration" {
+                    labels.push(parameter);
+                } else if names.is_empty() {
+                    labels.push(
+                        parameter
+                            .child_by_field_name("type")
+                            .or_else(|| {
+                                parameter
+                                    .named_child(parameter.named_child_count().saturating_sub(1))
+                            })
+                            .unwrap_or(parameter),
+                    );
+                } else {
+                    labels.extend(names);
+                }
+            }
+            _ => {}
+        }
+    }
+    labels
 }
 
 fn go_value_signature(

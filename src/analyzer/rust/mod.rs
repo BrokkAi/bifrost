@@ -12,8 +12,8 @@ use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::type_relations::TypeRelation;
 use crate::analyzer::{
     AnalyzerConfig, BuildProgress, CodeUnit, IAnalyzer, ImportAnalysisProvider, Language, Project,
-    ProjectFile, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
-    TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
+    ProjectFile, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
+    TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
 };
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
@@ -206,6 +206,10 @@ impl IAnalyzer for RustAnalyzer {
 
     fn signatures<'a>(&'a self, code_unit: &CodeUnit) -> &'a [String] {
         self.inner.signatures(code_unit)
+    }
+
+    fn signature_metadata<'a>(&'a self, code_unit: &CodeUnit) -> &'a [SignatureMetadata] {
+        self.inner.signature_metadata(code_unit)
     }
 
     fn get_top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {

@@ -90,6 +90,87 @@ impl CodeUnitType {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ParameterMetadata {
+    label: String,
+    start_byte: usize,
+    end_byte: usize,
+}
+
+impl ParameterMetadata {
+    pub fn new(label: impl Into<String>, start_byte: usize, end_byte: usize) -> Self {
+        Self {
+            label: label.into(),
+            start_byte,
+            end_byte,
+        }
+    }
+
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub fn start_byte(&self) -> usize {
+        self.start_byte
+    }
+
+    pub fn end_byte(&self) -> usize {
+        self.end_byte
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SignatureMetadata {
+    label: String,
+    parameters: Vec<ParameterMetadata>,
+}
+
+impl SignatureMetadata {
+    pub fn new(label: impl Into<String>, parameters: Vec<ParameterMetadata>) -> Self {
+        Self {
+            label: label.into(),
+            parameters,
+        }
+    }
+
+    pub fn with_parameter_labels(label: impl Into<String>, labels: Vec<String>) -> Self {
+        let label = label.into();
+        let params_start = label.find('(').map(|index| index + 1).unwrap_or(0);
+        let params_end = label
+            .get(params_start..)
+            .and_then(|suffix| suffix.find(')').map(|index| params_start + index))
+            .unwrap_or(label.len());
+        let mut search_start = params_start;
+        let parameters = labels
+            .into_iter()
+            .filter_map(|parameter_label| {
+                if parameter_label.is_empty() || search_start > params_end {
+                    return None;
+                }
+                let haystack = label.get(search_start..params_end)?;
+                let relative_start = haystack.find(&parameter_label)?;
+                let start_byte = search_start + relative_start;
+                let end_byte = start_byte + parameter_label.len();
+                search_start = end_byte;
+                Some(ParameterMetadata::new(
+                    parameter_label,
+                    start_byte,
+                    end_byte,
+                ))
+            })
+            .collect();
+        Self { label, parameters }
+    }
+
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub fn parameters(&self) -> &[ParameterMetadata] {
+        &self.parameters
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct ProjectFileInner {
     root: PathBuf,

@@ -10,7 +10,7 @@ use crate::analyzer::clone_detection::{CloneCandidateProfile, detect_structural_
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::{
     AnalyzerConfig, BuildProgress, CodeUnit, CodeUnitType, IAnalyzer, ImportAnalysisProvider,
-    Language, Project, ProjectFile, TestAssertionSmell, TestAssertionWeights,
+    Language, Project, ProjectFile, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
     TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
 };
 use crate::hash::HashSet;
@@ -225,6 +225,10 @@ impl IAnalyzer for CSharpAnalyzer {
 
     fn signatures<'a>(&'a self, code_unit: &CodeUnit) -> &'a [String] {
         self.inner.signatures(code_unit)
+    }
+
+    fn signature_metadata<'a>(&'a self, code_unit: &CodeUnit) -> &'a [SignatureMetadata] {
+        self.inner.signature_metadata(code_unit)
     }
 
     fn get_top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {

@@ -1,5 +1,5 @@
 use crate::analyzer::tree_sitter_analyzer::ParsedFile;
-use crate::analyzer::{CodeUnit, ProjectFile};
+use crate::analyzer::{CodeUnit, ParameterMetadata, ProjectFile, SignatureMetadata};
 use crate::hash::HashSet;
 use std::path::Path;
 use tree_sitter::{Node, Tree};
@@ -309,7 +309,11 @@ fn visit_rust_function(
         parent.cloned(),
         Some(top_level),
     );
-    parsed.add_signature(code_unit.clone(), rust_function_signature(node, source));
+    let signature = rust_function_signature(node, source);
+    parsed.add_signature_with_metadata(
+        code_unit.clone(),
+        rust_signature_metadata(signature, node, source),
+    );
     Some(code_unit)
 }
 
@@ -500,6 +504,64 @@ fn rust_function_signature(node: Node<'_>, source: &str) -> String {
         header
     } else {
         format!("{header} {{ ... }}")
+    }
+}
+
+fn rust_signature_metadata(signature: String, node: Node<'_>, source: &str) -> SignatureMetadata {
+    let Some(parameters_node) = node.child_by_field_name("parameters") else {
+        return SignatureMetadata::new(signature, Vec::new());
+    };
+    let parameter_text = rust_node_text(parameters_node, source).trim();
+    let Some(parameters_start) = signature.find(parameter_text) else {
+        return SignatureMetadata::new(signature, Vec::new());
+    };
+    let parameters_end = parameters_start + parameter_text.len();
+    let mut search_start = parameters_start;
+    let parameters = rust_parameter_label_nodes(parameters_node)
+        .into_iter()
+        .filter_map(|label_node| {
+            let label = rust_node_text(label_node, source).trim();
+            if label.is_empty() || search_start > parameters_end {
+                return None;
+            }
+            let haystack = signature.get(search_start..parameters_end)?;
+            let relative_start = haystack.find(label)?;
+            let start_byte = search_start + relative_start;
+            let end_byte = start_byte + label.len();
+            search_start = end_byte;
+            Some(ParameterMetadata::new(label, start_byte, end_byte))
+        })
+        .collect();
+    SignatureMetadata::new(signature, parameters)
+}
+
+fn rust_parameter_label_nodes(parameters_node: Node<'_>) -> Vec<Node<'_>> {
+    let mut labels = Vec::new();
+    let mut cursor = parameters_node.walk();
+    for child in parameters_node.named_children(&mut cursor) {
+        match child.kind() {
+            "parameter" => {
+                if let Some(pattern) = child.child_by_field_name("pattern") {
+                    labels.push(rust_parameter_pattern_label_node(pattern).unwrap_or(pattern));
+                }
+            }
+            "self_parameter" => labels.push(child),
+            _ => {}
+        }
+    }
+    labels
+}
+
+fn rust_parameter_pattern_label_node(pattern: Node<'_>) -> Option<Node<'_>> {
+    match pattern.kind() {
+        "identifier" => Some(pattern),
+        "mut_pattern" | "ref_pattern" => {
+            let mut cursor = pattern.walk();
+            pattern
+                .named_children(&mut cursor)
+                .find_map(rust_parameter_pattern_label_node)
+        }
+        _ => None,
     }
 }
 

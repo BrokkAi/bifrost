@@ -1,4 +1,5 @@
 use super::*;
+use crate::analyzer::SignatureMetadata;
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use tree_sitter::{Node, Parser, Tree};
 
@@ -358,6 +359,10 @@ fn visit_callable(
         .map(|parameters| canonical_parameters_signature(parameters, source));
     let short_name = format!("{}.{}", parent.short_name(), name);
     let callable_sig = callable_signature(node, source);
+    let parameter_labels = node
+        .child_by_field_name("parameters")
+        .map(|parameters| parameter_labels(parameters, source))
+        .unwrap_or_default();
     let code_unit = CodeUnit::with_signature(
         file.clone(),
         crate::analyzer::CodeUnitType::Function,
@@ -374,7 +379,10 @@ fn visit_callable(
         Some(parent.clone()),
         Some(top_level.clone()),
     );
-    parsed.add_signature(code_unit.clone(), callable_sig);
+    parsed.add_signature_with_metadata(
+        code_unit.clone(),
+        SignatureMetadata::with_parameter_labels(callable_sig, parameter_labels),
+    );
 
     if let Some(body) = node.child_by_field_name("body") {
         collect_lambda_expressions(
@@ -875,6 +883,35 @@ fn canonical_parameters_signature(parameters: Node<'_>, source: &str) -> String 
     }
 
     format!("({})", parts.join(", "))
+}
+
+fn parameter_labels(parameters: Node<'_>, source: &str) -> Vec<String> {
+    let mut labels = Vec::new();
+    let mut cursor = parameters.walk();
+    for child in parameters.named_children(&mut cursor) {
+        let name = match child.kind() {
+            "formal_parameter" => child.child_by_field_name("name"),
+            "spread_parameter" => spread_parameter_name(child),
+            _ => None,
+        };
+        if let Some(name) = name {
+            let label = node_text(name, source).trim();
+            if !label.is_empty() {
+                labels.push(label.to_string());
+            }
+        }
+    }
+    labels
+}
+
+fn spread_parameter_name(parameter: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = parameter.walk();
+    for child in parameter.named_children(&mut cursor) {
+        if child.kind() == "variable_declarator" {
+            return child.child_by_field_name("name");
+        }
+    }
+    None
 }
 
 fn field_signature(field_node: Node<'_>, declarator: Node<'_>, source: &str) -> String {

@@ -4,8 +4,8 @@ use crate::analyzer::{
     DeclarationInfo, DefinitionLookupIndex, ExceptionHandlingSmell, ExceptionSmellWeights,
     GoAnalyzer, IAnalyzer, ImportAnalysisProvider, ImportInfo, JavaAnalyzer, JavascriptAnalyzer,
     Language, PhpAnalyzer, Project, ProjectFile, PythonAnalyzer, Range, RubyAnalyzer, RustAnalyzer,
-    ScalaAnalyzer, TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider,
-    TypescriptAnalyzer,
+    ScalaAnalyzer, SignatureMetadata, TestDetectionProvider, TypeAliasProvider,
+    TypeHierarchyProvider, TypescriptAnalyzer,
 };
 use crate::hash::HashSet;
 use rayon::prelude::*;
@@ -585,6 +585,12 @@ impl IAnalyzer for MultiAnalyzer {
     fn signatures<'a>(&'a self, code_unit: &CodeUnit) -> &'a [String] {
         self.delegate_for_code_unit(code_unit)
             .map(|delegate| delegate.analyzer().signatures(code_unit))
+            .unwrap_or(&[])
+    }
+
+    fn signature_metadata<'a>(&'a self, code_unit: &CodeUnit) -> &'a [SignatureMetadata] {
+        self.delegate_for_code_unit(code_unit)
+            .map(|delegate| delegate.analyzer().signature_metadata(code_unit))
             .unwrap_or(&[])
     }
 

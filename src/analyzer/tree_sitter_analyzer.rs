@@ -2,7 +2,7 @@ use crate::analyzer::cognitive_complexity;
 use crate::analyzer::persistence::{self, AnalyzerStorage};
 use crate::analyzer::{
     AnalyzerConfig, CodeBaseMetrics, CodeUnit, DeclarationInfo, DefinitionLookupIndex, ImportInfo,
-    Language, Project, ProjectFile, Range,
+    Language, Project, ProjectFile, Range, SignatureMetadata,
 };
 use crate::hash::{HashMap, HashSet, map_with_capacity, set_with_capacity};
 use crate::profiling;
@@ -157,6 +157,7 @@ pub(crate) struct FileState {
     pub(crate) raw_supertypes: HashMap<CodeUnit, Vec<String>>,
     pub(crate) type_identifiers: HashSet<String>,
     pub(crate) signatures: HashMap<CodeUnit, Vec<String>>,
+    pub(crate) signature_metadata: HashMap<CodeUnit, Vec<SignatureMetadata>>,
     pub(crate) ranges: HashMap<CodeUnit, Vec<Range>>,
     pub(crate) children: HashMap<CodeUnit, Vec<CodeUnit>>,
     pub(crate) type_aliases: HashSet<CodeUnit>,
@@ -184,6 +185,7 @@ struct AnalyzerState {
     ranges: HashMap<CodeUnit, Vec<Range>>,
     raw_supertypes: HashMap<CodeUnit, Vec<String>>,
     signatures: HashMap<CodeUnit, Vec<String>>,
+    signature_metadata: HashMap<CodeUnit, Vec<SignatureMetadata>>,
     classes_by_package: HashMap<String, Vec<CodeUnit>>,
     #[allow(dead_code)]
     type_aliases: HashSet<CodeUnit>,
@@ -197,6 +199,7 @@ struct IndexCapacities {
     ranges: usize,
     raw_supertypes: usize,
     signatures: usize,
+    signature_metadata: usize,
     classes_by_package: usize,
     type_aliases: usize,
 }
@@ -211,6 +214,7 @@ pub struct ParsedFile {
     pub raw_supertypes: HashMap<CodeUnit, Vec<String>>,
     pub type_identifiers: HashSet<String>,
     pub signatures: HashMap<CodeUnit, Vec<String>>,
+    pub signature_metadata: HashMap<CodeUnit, Vec<SignatureMetadata>>,
     pub type_aliases: HashSet<CodeUnit>,
     ranges: HashMap<CodeUnit, Vec<Range>>,
     children: HashMap<CodeUnit, Vec<CodeUnit>>,
@@ -227,6 +231,7 @@ impl ParsedFile {
             raw_supertypes: HashMap::default(),
             type_identifiers: HashSet::default(),
             signatures: HashMap::default(),
+            signature_metadata: HashMap::default(),
             type_aliases: HashSet::default(),
             ranges: HashMap::default(),
             children: HashMap::default(),
@@ -314,6 +319,18 @@ impl ParsedFile {
         }
     }
 
+    pub fn add_signature_with_metadata(
+        &mut self,
+        code_unit: CodeUnit,
+        metadata: SignatureMetadata,
+    ) {
+        self.add_signature(code_unit.clone(), metadata.label().to_string());
+        let entries = self.signature_metadata.entry(code_unit).or_default();
+        if !entries.contains(&metadata) {
+            entries.push(metadata);
+        }
+    }
+
     pub fn add_child(&mut self, parent: CodeUnit, child: CodeUnit) {
         self.children.entry(parent).or_default().push(child);
     }
@@ -342,6 +359,7 @@ impl ParsedFile {
         self.declarations.remove(code_unit);
         self.raw_supertypes.remove(code_unit);
         self.signatures.remove(code_unit);
+        self.signature_metadata.remove(code_unit);
         self.type_aliases.remove(code_unit);
         self.ranges.remove(code_unit);
     }
@@ -575,6 +593,7 @@ where
             raw_supertypes: parsed.raw_supertypes,
             type_identifiers: parsed.type_identifiers,
             signatures: parsed.signatures,
+            signature_metadata: parsed.signature_metadata,
             ranges: parsed.ranges,
             children: parsed.children,
             type_aliases: parsed.type_aliases,
@@ -806,6 +825,8 @@ where
         let mut raw_supertypes =
             map_with_capacity::<CodeUnit, Vec<String>>(capacities.raw_supertypes);
         let mut signatures = map_with_capacity::<CodeUnit, Vec<String>>(capacities.signatures);
+        let mut signature_metadata =
+            map_with_capacity::<CodeUnit, Vec<SignatureMetadata>>(capacities.signature_metadata);
         let mut classes_by_package =
             map_with_capacity::<String, Vec<CodeUnit>>(capacities.classes_by_package);
         let mut type_aliases = set_with_capacity::<CodeUnit>(capacities.type_aliases);
@@ -848,6 +869,13 @@ where
                     .entry(code_unit.clone())
                     .or_default()
                     .extend(sigs.iter().cloned());
+            }
+
+            for (code_unit, metadata) in &state.signature_metadata {
+                signature_metadata
+                    .entry(code_unit.clone())
+                    .or_default()
+                    .extend(metadata.iter().cloned());
             }
 
             type_aliases.extend(state.type_aliases.iter().cloned());
@@ -893,6 +921,7 @@ where
             ranges,
             raw_supertypes,
             signatures,
+            signature_metadata,
             classes_by_package,
             type_aliases,
         }
@@ -913,6 +942,7 @@ where
             capacities.ranges += state.ranges.len();
             capacities.raw_supertypes += state.raw_supertypes.len();
             capacities.signatures += state.signatures.len();
+            capacities.signature_metadata += state.signature_metadata.len();
             capacities.type_aliases += state.type_aliases.len();
             class_declarations += state
                 .declarations
@@ -984,6 +1014,21 @@ where
             .or_else(|| {
                 self.file_state(code_unit.source())
                     .and_then(|state| state.signatures.get(code_unit).map(Vec::as_slice))
+            })
+            .unwrap_or(&[])
+    }
+
+    pub(crate) fn signature_metadata_of<'a>(
+        &'a self,
+        code_unit: &CodeUnit,
+    ) -> &'a [SignatureMetadata] {
+        self.state
+            .signature_metadata
+            .get(code_unit)
+            .map(Vec::as_slice)
+            .or_else(|| {
+                self.file_state(code_unit.source())
+                    .and_then(|state| state.signature_metadata.get(code_unit).map(Vec::as_slice))
             })
             .unwrap_or(&[])
     }
@@ -1571,6 +1616,10 @@ where
 
     fn signatures<'a>(&'a self, code_unit: &CodeUnit) -> &'a [String] {
         self.signatures_of(code_unit)
+    }
+
+    fn signature_metadata<'a>(&'a self, code_unit: &CodeUnit) -> &'a [SignatureMetadata] {
+        self.signature_metadata_of(code_unit)
     }
 }
 

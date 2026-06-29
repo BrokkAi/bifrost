@@ -3,9 +3,9 @@ use crate::analyzer::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, FuzzyResult
 use crate::analyzer::{
     CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType, CommentDensityStats,
     DeclarationInfo, DefinitionLookupIndex, ExceptionHandlingSmell, ExceptionSmellWeights,
-    ImportAnalysisProvider, Language, ParseError, Project, ProjectFile, Range, TestAssertionSmell,
-    TestAssertionWeights, TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider,
-    metrics_from_declarations,
+    ImportAnalysisProvider, Language, ParseError, Project, ProjectFile, Range, SignatureMetadata,
+    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TypeAliasProvider,
+    TypeHierarchyProvider, metrics_from_declarations,
 };
 use std::any::Any;
 use std::cmp::Ordering;
@@ -111,6 +111,9 @@ pub trait IAnalyzer: Send + Sync + Any {
     fn signatures<'a>(&'a self, _code_unit: &CodeUnit) -> &'a [String] {
         &[]
     }
+    fn signature_metadata<'a>(&'a self, _code_unit: &CodeUnit) -> &'a [SignatureMetadata] {
+        &[]
+    }
 
     fn get_top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
         self.top_level_declarations(file).cloned().collect()
@@ -146,6 +149,10 @@ pub trait IAnalyzer: Send + Sync + Any {
 
     fn signatures_of(&self, code_unit: &CodeUnit) -> Vec<String> {
         self.signatures(code_unit).to_vec()
+    }
+
+    fn signature_metadata_of(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
+        self.signature_metadata(code_unit).to_vec()
     }
 
     fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {

@@ -15,9 +15,9 @@ use crate::analyzer::usages::{
 };
 use crate::analyzer::{
     AnalyzerConfig, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit, CodeUnitType,
-    IAnalyzer, ImportAnalysisProvider, Language, Project, ProjectFile, TestAssertionSmell,
-    TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
-    build_reverse_import_index,
+    IAnalyzer, ImportAnalysisProvider, Language, Project, ProjectFile, SignatureMetadata,
+    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer,
+    TypeHierarchyProvider, build_reverse_import_index,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::profiling;
@@ -557,6 +557,10 @@ impl IAnalyzer for PythonAnalyzer {
 
     fn signatures<'a>(&'a self, code_unit: &CodeUnit) -> &'a [String] {
         self.inner.signatures(code_unit)
+    }
+
+    fn signature_metadata<'a>(&'a self, code_unit: &CodeUnit) -> &'a [SignatureMetadata] {
+        self.inner.signature_metadata(code_unit)
     }
 
     fn get_top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {

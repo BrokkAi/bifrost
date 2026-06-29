@@ -4,7 +4,9 @@ use brokk_bifrost::{
     CodeUnit, IAnalyzer, ImportAnalysisProvider, Language, ProjectFile, PythonAnalyzer,
     TestProject, TypeHierarchyProvider,
 };
-use common::{assert_code_eq, normalize_nonempty_lines, py_fixture_project, write_file};
+use common::{
+    InlineTestProject, assert_code_eq, normalize_nonempty_lines, py_fixture_project, write_file,
+};
 use std::collections::BTreeSet;
 use tempfile::tempdir;
 
@@ -853,4 +855,37 @@ fn test_code_units_are_deduplicated_and_conditionals_are_captured() {
     let ancestors = analyzer.get_direct_ancestors(my_subclass);
     assert_eq!(1, ancestors.len());
     assert_eq!(base_class.fq_name(), ancestors[0].fq_name());
+}
+
+#[test]
+fn python_signature_metadata_labels_typed_default_and_rest_parameters() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "calculator.py",
+            "def combine(combine: int, right: int = helper(1, 2), *rest: int) -> int:\n    return combine + right\n",
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let function = analyzer
+        .get_declarations(&ProjectFile::new(
+            project.root().to_path_buf(),
+            "calculator.py",
+        ))
+        .into_iter()
+        .find(|cu| cu.is_function() && cu.identifier() == "combine")
+        .unwrap();
+    let metadata = analyzer
+        .signature_metadata(&function)
+        .first()
+        .unwrap_or_else(|| panic!("missing metadata for {}", function.fq_name()));
+    assert_eq!(
+        analyzer.get_skeleton_header(&function).as_deref(),
+        Some(metadata.label())
+    );
+    let labels: Vec<_> = metadata
+        .parameters()
+        .iter()
+        .map(|parameter| &metadata.label()[parameter.start_byte()..parameter.end_byte()])
+        .collect();
+    assert_eq!(vec!["combine", "right", "rest"], labels);
 }

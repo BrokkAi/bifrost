@@ -291,3 +291,26 @@ fn test_field_skeletons() {
             .contains("pub const ID: i32 = 1;")
     );
 }
+
+#[test]
+fn test_signature_metadata_keeps_rust_pattern_parameters() {
+    let analyzer = RustAnalyzer::from_project(rust_project(&[(
+        "lib.rs",
+        r#"
+        pub fn consume((left, right): (i32, i32), _: bool) -> i32 {
+            left + right
+        }
+        "#,
+    )]));
+    let function = definition(&analyzer, "consume");
+    let metadata = analyzer
+        .signature_metadata(&function)
+        .first()
+        .unwrap_or_else(|| panic!("missing signature metadata for {}", function.fq_name()));
+    let labels: Vec<_> = metadata
+        .parameters()
+        .iter()
+        .map(|parameter| &metadata.label()[parameter.start_byte()..parameter.end_byte()])
+        .collect();
+    assert_eq!(vec!["(left, right)", "_"], labels);
+}

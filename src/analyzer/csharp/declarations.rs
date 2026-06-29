@@ -1,5 +1,5 @@
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
-use crate::analyzer::{CodeUnit, CodeUnitType, ProjectFile};
+use crate::analyzer::{CodeUnit, CodeUnitType, ParameterMetadata, ProjectFile, SignatureMetadata};
 use crate::hash::HashSet;
 use tree_sitter::{Node, Tree};
 
@@ -254,8 +254,11 @@ impl<'a> CSharpVisitor<'a> {
             Some(parent.clone()),
             None,
         );
-        self.parsed
-            .add_signature(code_unit, csharp_method_skeleton(node, self.source));
+        let signature = csharp_method_skeleton(node, self.source);
+        self.parsed.add_signature_with_metadata(
+            code_unit,
+            csharp_signature_metadata(signature, node, self.source),
+        );
     }
 
     fn visit_constructor(&mut self, node: Node<'_>, scope: &CSharpScope) {
@@ -284,8 +287,11 @@ impl<'a> CSharpVisitor<'a> {
             Some(parent.clone()),
             None,
         );
-        self.parsed
-            .add_signature(code_unit, csharp_constructor_skeleton(node, self.source));
+        let signature = csharp_constructor_skeleton(node, self.source);
+        self.parsed.add_signature_with_metadata(
+            code_unit,
+            csharp_signature_metadata(signature, node, self.source),
+        );
     }
 
     fn visit_property(&mut self, node: Node<'_>, scope: &CSharpScope) {
@@ -546,6 +552,62 @@ fn csharp_method_skeleton(node: Node<'_>, source: &str) -> String {
 
 fn csharp_constructor_skeleton(node: Node<'_>, source: &str) -> String {
     csharp_method_skeleton(node, source)
+}
+
+fn csharp_signature_metadata(signature: String, node: Node<'_>, source: &str) -> SignatureMetadata {
+    let parameter_text = csharp_rendered_parameter_text(node, source);
+    let Some(parameters_start) = signature.find(&parameter_text) else {
+        return SignatureMetadata::new(signature, Vec::new());
+    };
+    let parameters_end = parameters_start + parameter_text.len();
+    let mut search_start = parameters_start;
+    let parameters = csharp_parameter_label_nodes(node)
+        .into_iter()
+        .filter_map(|label_node| {
+            let label = normalize_cs_whitespace(cs_node_text(label_node, source));
+            if label.is_empty() || search_start > parameters_end {
+                return None;
+            }
+            let haystack = signature.get(search_start..parameters_end)?;
+            let relative_start = haystack.find(&label)?;
+            let start_byte = search_start + relative_start;
+            let end_byte = start_byte + label.len();
+            search_start = end_byte;
+            Some(ParameterMetadata::new(label, start_byte, end_byte))
+        })
+        .collect();
+    SignatureMetadata::new(signature, parameters)
+}
+
+fn csharp_rendered_parameter_text(node: Node<'_>, source: &str) -> String {
+    node.child_by_field_name("parameters")
+        .map(|parameters| normalize_cs_whitespace(cs_node_text(parameters, source)))
+        .unwrap_or_else(|| "()".to_string())
+}
+
+fn csharp_parameter_label_nodes(node: Node<'_>) -> Vec<Node<'_>> {
+    let Some(parameters) = node.child_by_field_name("parameters") else {
+        return Vec::new();
+    };
+    let mut labels = Vec::new();
+    let mut cursor = parameters.walk();
+    for child in parameters.named_children(&mut cursor) {
+        if child.kind() != "parameter" {
+            continue;
+        }
+        if let Some(name) = child.child_by_field_name("name") {
+            labels.push(name);
+            continue;
+        }
+        let mut param_cursor = child.walk();
+        if let Some(name) = child
+            .named_children(&mut param_cursor)
+            .find(|candidate| candidate.kind() == "identifier")
+        {
+            labels.push(name);
+        }
+    }
+    labels
 }
 
 fn csharp_property_signature(node: Node<'_>, source: &str) -> String {

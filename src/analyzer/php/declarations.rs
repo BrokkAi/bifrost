@@ -1,4 +1,6 @@
-use crate::analyzer::{CodeUnit, CodeUnitType, ProjectFile, Range};
+use crate::analyzer::{
+    CodeUnit, CodeUnitType, ParameterMetadata, ProjectFile, Range, SignatureMetadata,
+};
 use tree_sitter::{Node, Point, Tree};
 
 pub(super) fn parse_php_file(
@@ -209,8 +211,11 @@ impl<'a> PhpVisitor<'a> {
         );
         self.parsed
             .set_primary_range(&code_unit, php_declaration_range(node, self.source));
-        self.parsed
-            .add_signature(code_unit, php_function_signature(node, self.source));
+        let signature = php_function_signature(node, self.source);
+        self.parsed.add_signature_with_metadata(
+            code_unit,
+            php_signature_metadata(signature, node, self.source),
+        );
     }
 
     fn visit_method(&mut self, node: Node<'_>, scope: &PhpScope) {
@@ -466,6 +471,52 @@ fn php_function_signature(node: Node<'_>, source: &str) -> String {
     } else {
         php_text_with_attributes(node, source).trim().to_string()
     }
+}
+
+fn php_signature_metadata(signature: String, node: Node<'_>, source: &str) -> SignatureMetadata {
+    let Some(parameters_node) = node.child_by_field_name("parameters") else {
+        return SignatureMetadata::new(signature, Vec::new());
+    };
+    let parameter_text = normalize_php_snippet(&php_node_text(parameters_node, source));
+    let Some(parameters_start) = signature.find(&parameter_text) else {
+        return SignatureMetadata::new(signature, Vec::new());
+    };
+    let parameters_end = parameters_start + parameter_text.len();
+    let mut search_start = parameters_start;
+    let parameters = php_parameter_label_nodes(parameters_node)
+        .into_iter()
+        .filter_map(|label_node| {
+            let label = normalize_php_snippet(&php_node_text(label_node, source));
+            if label.is_empty() || search_start > parameters_end {
+                return None;
+            }
+            let haystack = signature.get(search_start..parameters_end)?;
+            let relative_start = haystack.find(&label)?;
+            let start_byte = search_start + relative_start;
+            let end_byte = start_byte + label.len();
+            search_start = end_byte;
+            Some(ParameterMetadata::new(label, start_byte, end_byte))
+        })
+        .collect();
+    SignatureMetadata::new(signature, parameters)
+}
+
+fn php_parameter_label_nodes(parameters_node: Node<'_>) -> Vec<Node<'_>> {
+    let mut labels = Vec::new();
+    let mut cursor = parameters_node.walk();
+    for child in parameters_node.named_children(&mut cursor) {
+        if matches!(
+            child.kind(),
+            "simple_parameter"
+                | "optional_parameter"
+                | "variadic_parameter"
+                | "property_promotion_parameter"
+        ) && let Some(name_node) = child.child_by_field_name("name")
+        {
+            labels.push(name_node);
+        }
+    }
+    labels
 }
 
 fn php_property_prefix(node: Node<'_>, source: &str) -> String {

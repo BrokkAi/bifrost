@@ -14,8 +14,8 @@ use crate::analyzer::{
     AnalyzerConfig, BuildProgress, BuildProgressEvent, CloneSmell, CloneSmellWeights, CodeUnit,
     CommentDensityStats, DeclarationInfo, DeclarationKind, ExceptionHandlingSmell,
     ExceptionSmellWeights, IAnalyzer, ImportAnalysisProvider, Language, Project, ProjectFile,
-    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer,
-    TypeHierarchyProvider,
+    SignatureMetadata, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
+    TreeSitterAnalyzer, TypeHierarchyProvider,
 };
 use crate::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
@@ -250,6 +250,10 @@ impl IAnalyzer for JavaAnalyzer {
 
     fn signatures<'a>(&'a self, code_unit: &CodeUnit) -> &'a [String] {
         self.inner.signatures(code_unit)
+    }
+
+    fn signature_metadata<'a>(&'a self, code_unit: &CodeUnit) -> &'a [SignatureMetadata] {
+        self.inner.signature_metadata(code_unit)
     }
 
     fn get_top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
