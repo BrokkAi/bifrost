@@ -8,7 +8,8 @@ hover, and related editor features.
 ## Requirements
 
 - VS Code 1.90+
-- A `bifrost` binary available through one of the launch modes below
+- A supported platform for extension-managed downloads, or a `bifrost` binary
+  available through one of the launch modes below
 
 ## Configuration
 
@@ -24,11 +25,23 @@ hover, and related editor features.
 
 Launch mode behavior:
 
-- `auto`: use `bifrost.serverPath` when explicitly configured, then a bundled
-  binary if present, then a local development build under `target/`, then
+- `auto`: use `bifrost.serverPath` when explicitly configured, then the
+  extension-managed binary if present or accepted for installation, then a
+  local development build under `target/`, then
   `bifrost` on `PATH`.
-- `bundled`: require a binary under `bin/<platform>-<arch>/bifrost`.
+- `bundled`: require the extension-managed binary for this platform and prompt
+  to install it when missing.
 - `path`: use `bifrost.serverPath`, falling back to `bifrost` on `PATH`.
+
+The managed binary is pinned by the extension package metadata field
+`bifrost.binaryVersion`, with expected archive hashes in
+`bifrost.archiveSha256`. The extension downloads the existing GitHub Release
+archives (`.tar.gz` on macOS/Linux and `.zip` on Windows), verifies each
+archive against the package-pinned SHA-256 and the release `.sha256` sidecar,
+extracts the `bifrost` executable into VS Code global storage at
+`binaries/<version>/<platform>-<arch>/`, and removes older managed versions
+after a successful install. Managed binaries are checked with
+`bifrost --version` before the language server starts.
 
 ## Commands
 
@@ -54,6 +67,7 @@ Install and compile the extension:
 cd editors/vscode
 npm install
 npm run compile
+npm test
 ```
 
 Open `editors/vscode` in VS Code, run the extension in an Extension
@@ -103,6 +117,21 @@ npx vsce package
 
 The `.vscodeignore` file excludes TypeScript sources and package manager
 artifacts from the VSIX; run `npm run compile` before packaging.
+
+Before publishing the VSIX, ensure:
+
+- `package.json` has `bifrost.binaryVersion` set to the Bifrost release version
+  without the leading `v`.
+- `package.json` has `bifrost.archiveSha256` entries for every supported
+  extension target. These hashes are the VSIX trust anchor for downloaded
+  archives.
+- The matching GitHub Release contains archive assets named
+  `bifrost-v<version>-<target>.tar.gz` on macOS/Linux and
+  `bifrost-v<version>-<target>.zip` on Windows.
+- Each archive has a matching `.sha256` asset with the same filename plus
+  `.sha256`.
+- The release workflow has completed for macOS universal, Linux x64/arm64, and
+  Windows x64/arm64 targets.
 
 ## Debugging
 

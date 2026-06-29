@@ -4,13 +4,14 @@ import path from "path";
 import * as vscode from "vscode";
 
 export type LaunchMode = "auto" | "bundled" | "path";
+export type ResolvedLaunchMode = "managed" | "path";
 
 export interface BifrostLaunchConfig {
   command: string;
   args: string[];
   cwd: string;
   env: NodeJS.ProcessEnv;
-  label: string;
+  label: ResolvedLaunchMode;
 }
 
 export interface BifrostServerHandle {
@@ -25,17 +26,17 @@ export interface BifrostInitializationOptions {
 
 export function resolveLaunchMode(
   mode: LaunchMode,
-  extensionDir: string,
-  configuredPath: string
-): LaunchMode {
-  if (mode !== "auto") {
-    return mode;
+  configuredPath: string,
+  managedBinaryPath?: string | null
+): ResolvedLaunchMode {
+  if (mode === "bundled") {
+    return "managed";
   }
   if (configuredPath.trim() && configuredPath.trim() !== "bifrost") {
     return "path";
   }
-  if (findBundledBinary(extensionDir)) {
-    return "bundled";
+  if (mode === "auto" && managedBinaryPath) {
+    return "managed";
   }
   return "path";
 }
@@ -47,10 +48,16 @@ export function buildLaunchConfig(
   configuredPath: string,
   extraArgs: string[],
   debug: boolean,
-  slowRequestMs: number
+  slowRequestMs: number,
+  managedBinaryPath?: string | null
 ): BifrostLaunchConfig {
-  const resolvedMode = resolveLaunchMode(mode, extensionDir, configuredPath);
-  const command = commandForMode(resolvedMode, extensionDir, configuredPath);
+  const resolvedMode = resolveLaunchMode(mode, configuredPath, managedBinaryPath);
+  const command = commandForMode(
+    resolvedMode,
+    extensionDir,
+    configuredPath,
+    managedBinaryPath
+  );
   const args = ["--root", workspaceRoot, "--server", "lsp", ...extraArgs];
   return {
     command,
@@ -74,9 +81,10 @@ export function spawnBifrostServer(
   const commandLine = formatCommandLine(config.command, config.args);
 
   child.stderr?.on("data", (chunk: Buffer) => {
-    const message = chunk.toString().trimEnd();
-    if (message) {
-      log(`[server] ${message}`);
+    for (const line of chunk.toString().split(/\r?\n/)) {
+      if (line) {
+        log(`[server] ${line}`);
+      }
     }
   });
 
@@ -93,16 +101,6 @@ export function spawnBifrostServer(
   });
 
   return { process: child, commandLine };
-}
-
-export function findBundledBinary(extensionDir: string): string | null {
-  const executable = process.platform === "win32" ? "bifrost.exe" : "bifrost";
-  const platformArch = `${process.platform}-${process.arch}`;
-  const candidates = [
-    path.join(extensionDir, "bin", platformArch, executable),
-    path.join(extensionDir, "bin", executable)
-  ];
-  return candidates.find((candidate) => existsSync(candidate)) ?? null;
 }
 
 export function findLocalDevBinary(extensionDir: string): string | null {
@@ -155,18 +153,18 @@ export function formatError(error: unknown): string {
 }
 
 function commandForMode(
-  mode: LaunchMode,
+  mode: ResolvedLaunchMode,
   extensionDir: string,
-  configuredPath: string
+  configuredPath: string,
+  managedBinaryPath?: string | null
 ): string {
-  if (mode === "bundled") {
-    const bundled = findBundledBinary(extensionDir);
-    if (!bundled) {
+  if (mode === "managed") {
+    if (!managedBinaryPath) {
       throw new Error(
-        `No bundled Bifrost binary found for ${process.platform}-${process.arch}. Configure bifrost.serverPath or choose launch mode "path".`
+        `No managed Bifrost binary found for ${process.platform}-${process.arch}. Install Bifrost or choose launch mode "path".`
       );
     }
-    return bundled;
+    return managedBinaryPath;
   }
 
   const configured = configuredPath.trim();
