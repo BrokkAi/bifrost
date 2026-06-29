@@ -1,11 +1,13 @@
 // Ruby usage discovery via `RubyUsageGraphStrategy`. Ruby's dynamic dispatch
-// rarely exposes a receiver's type statically, so usages are resolved by
-// method/constant name. These tests pin name-based cross-file call discovery,
-// including calls reaching a method through an included module.
+// only permits precise graph hits when parser/analyzer facts prove the receiver
+// or constant target. These tests pin structured Ruby usage discovery.
 
 mod common;
 
-use brokk_bifrost::usages::{ImportGraphCandidateProvider, UsageFinder};
+use brokk_bifrost::hash::HashSet;
+use brokk_bifrost::usages::{
+    CandidateFileProvider, FuzzyResult, ImportGraphCandidateProvider, UsageFinder,
+};
 use brokk_bifrost::{CodeUnit, IAnalyzer, ProjectFile, RubyAnalyzer, TestProject};
 use common::ruby_analyzer_with_files;
 
@@ -22,6 +24,47 @@ fn definition(analyzer: &RubyAnalyzer, fq_name: &str) -> CodeUnit {
         .into_iter()
         .next()
         .unwrap_or_else(|| panic!("missing definition for {fq_name}"))
+}
+
+fn hit_enclosing_ids(analyzer: &RubyAnalyzer, fq_name: &str) -> Vec<String> {
+    let target = definition(analyzer, fq_name);
+    analyzer
+        .find_usages(&[target])
+        .into_either()
+        .expect("usage lookup should succeed")
+        .iter()
+        .map(|hit| hit.enclosing.identifier().to_string())
+        .collect()
+}
+
+fn hit_source_lines(
+    hits: &std::collections::BTreeSet<brokk_bifrost::usages::UsageHit>,
+) -> Vec<String> {
+    hits.iter()
+        .map(|hit| {
+            let source = std::fs::read_to_string(hit.file.abs_path()).expect("read hit file");
+            source
+                .lines()
+                .nth(hit.line - 1)
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        })
+        .collect()
+}
+
+struct FixedCandidateProvider {
+    files: HashSet<ProjectFile>,
+}
+
+impl CandidateFileProvider for FixedCandidateProvider {
+    fn find_candidates(
+        &self,
+        _target: &CodeUnit,
+        _analyzer: &dyn IAnalyzer,
+    ) -> HashSet<ProjectFile> {
+        self.files.clone()
+    }
 }
 
 #[test]
@@ -135,5 +178,314 @@ end
         hits.iter()
             .map(|hit| hit.enclosing.fq_name())
             .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn resolves_constant_usages_through_project_local_require_visibility() {
+    let (project, analyzer) = ruby_analyzer_with_files(&[
+        (
+            "app/main.rb",
+            r#"
+require "app/models/user"
+
+class App
+  def run
+    User
+  end
+end
+"#,
+        ),
+        (
+            "app/models/user.rb",
+            r#"
+class User
+end
+"#,
+        ),
+        (
+            "app/other.rb",
+            r#"
+class Other
+  def run
+    User
+  end
+end
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "User");
+    let provider = FixedCandidateProvider {
+        files: [project.file("app/main.rb"), project.file("app/other.rb")]
+            .into_iter()
+            .collect(),
+    };
+    let hits = UsageFinder::new()
+        .query_with_provider(&analyzer, &[target], Some(&provider), 100, 100)
+        .result
+        .into_either()
+        .expect("usage lookup should succeed");
+    let enclosing: Vec<String> = hits.iter().map(|hit| hit.enclosing.fq_name()).collect();
+
+    assert!(
+        enclosing.iter().any(|name| name == "App.run"),
+        "{enclosing:?}"
+    );
+    assert!(
+        enclosing.iter().all(|name| name != "Other.run"),
+        "{enclosing:?}"
+    );
+}
+
+#[test]
+fn resolves_relative_qualified_constants_through_lexical_namespace() {
+    let (_project, analyzer) = ruby_analyzer_with_files(&[(
+        "app/models.rb",
+        r#"
+module A
+  module B
+    class C
+    end
+  end
+
+  class App
+    def run
+      B::C
+    end
+  end
+end
+
+module Other
+  module B
+    class C
+    end
+  end
+end
+"#,
+    )]);
+
+    let target = definition(&analyzer, "A$B$C");
+    let hits = analyzer
+        .find_usages(&[target])
+        .into_either()
+        .expect("usage lookup should succeed");
+    let enclosing: Vec<String> = hits.iter().map(|hit| hit.enclosing.fq_name()).collect();
+
+    assert!(
+        enclosing.iter().any(|name| name == "A$App.run"),
+        "{enclosing:?}"
+    );
+}
+
+#[test]
+fn resolves_explicit_receiver_from_local_construction_without_same_name_false_positives() {
+    let (_project, analyzer) = ruby_analyzer_with_files(&[(
+        "app/user.rb",
+        r#"
+class User
+  def save
+  end
+end
+
+class Account
+  def save
+  end
+end
+
+class App
+  def run
+    user = User.new
+    user.save
+
+    account = Account.new
+    account.save
+  end
+end
+"#,
+    )]);
+
+    let target = definition(&analyzer, "User.save");
+    let hits = analyzer
+        .find_usages(&[target])
+        .into_either()
+        .expect("usage lookup should succeed");
+    let snippets: Vec<String> = hits.iter().map(|hit| hit.snippet.clone()).collect();
+
+    assert!(snippets.iter().any(|snippet| snippet.contains("user.save")));
+    assert!(
+        !snippets
+            .iter()
+            .any(|snippet| snippet.contains("account.save"))
+    );
+}
+
+#[test]
+fn reports_class_constant_usages_when_constant_is_call_receiver() {
+    let (_project, analyzer) = ruby_analyzer_with_files(&[(
+        "app/user.rb",
+        r#"
+class User
+  def self.find
+  end
+end
+
+class App
+  def run
+    User.find
+    User.new
+  end
+end
+"#,
+    )]);
+
+    let target = definition(&analyzer, "User");
+    let hits = analyzer
+        .find_usages(&[target])
+        .into_either()
+        .expect("usage lookup should succeed");
+    let lines = hit_source_lines(&hits);
+
+    assert!(lines.iter().any(|line| line == "User.find"), "{lines:?}");
+    assert!(lines.iter().any(|line| line == "User.new"), "{lines:?}");
+}
+
+#[test]
+fn resolves_bare_calls_through_enclosing_class_and_superclass() {
+    let (_project, analyzer) = ruby_analyzer_with_files(&[(
+        "app/service.rb",
+        r#"
+class BaseService
+  def audit
+  end
+end
+
+class UserService < BaseService
+  def run
+    audit
+  end
+end
+"#,
+    )]);
+
+    let enclosing = hit_enclosing_ids(&analyzer, "BaseService.audit");
+    assert!(enclosing.iter().any(|id| id == "run"), "{enclosing:?}");
+}
+
+#[test]
+fn resolves_bare_calls_inside_singleton_class_as_class_method_calls() {
+    let (_project, analyzer) = ruby_analyzer_with_files(&[(
+        "app/user.rb",
+        r#"
+class User
+  class << self
+    def run
+      build
+      self.build
+    end
+
+    def build
+    end
+  end
+end
+"#,
+    )]);
+
+    let target = definition(&analyzer, "User.build");
+    let hits = analyzer
+        .find_usages(&[target])
+        .into_either()
+        .expect("usage lookup should succeed");
+    let lines = hit_source_lines(&hits);
+
+    assert!(lines.iter().any(|line| line == "build"), "{lines:?}");
+    assert!(lines.iter().any(|line| line == "self.build"), "{lines:?}");
+}
+
+#[test]
+fn distinguishes_include_and_extend_receiver_polarity() {
+    let (_project, analyzer) = ruby_analyzer_with_files(&[(
+        "app/user.rb",
+        r#"
+module Findable
+  def find
+  end
+end
+
+module Auditable
+  def audit
+  end
+end
+
+class User
+  extend Findable
+  include Auditable
+end
+
+class App
+  def run
+    User.find
+    User.new.audit
+    User.audit
+    User.new.find
+  end
+end
+"#,
+    )]);
+
+    let find = definition(&analyzer, "Findable.find");
+    let find_hits = analyzer
+        .find_usages(&[find])
+        .into_either()
+        .expect("find lookup should succeed");
+    let find_lines = hit_source_lines(&find_hits);
+    assert!(find_lines.iter().any(|line| line == "User.find"));
+    assert!(
+        !find_lines.iter().any(|line| line == "User.new.find"),
+        "{find_lines:?}"
+    );
+
+    let audit = definition(&analyzer, "Auditable.audit");
+    let audit_hits = analyzer
+        .find_usages(&[audit])
+        .into_either()
+        .expect("audit lookup should succeed");
+    let audit_lines = hit_source_lines(&audit_hits);
+    assert!(audit_lines.iter().any(|line| line == "User.new.audit"));
+    assert!(
+        !audit_lines.iter().any(|line| line == "User.audit"),
+        "{audit_lines:?}"
+    );
+}
+
+#[test]
+fn reports_unsafe_inference_for_only_dynamic_or_untyped_same_name_calls() {
+    let (_project, analyzer) = ruby_analyzer_with_files(&[(
+        "app/user.rb",
+        r#"
+class User
+  def save
+  end
+end
+
+class App
+  def run(obj)
+    obj.save
+    send(:save)
+  end
+end
+"#,
+    )]);
+
+    let target = definition(&analyzer, "User.save");
+    let query = UsageFinder::new().query(&analyzer, &[target], 100, 100);
+    let diagnostic = query.graph_failure.expect("graph failure diagnostic");
+
+    assert_eq!("RubyUsageGraphStrategy", diagnostic.strategy);
+    assert_eq!("unsafe_inference", diagnostic.reason_kind);
+    assert!(
+        matches!(query.result, FuzzyResult::Failure { .. }),
+        "expected failure, got {:?}",
+        query.result
     );
 }
