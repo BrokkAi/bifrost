@@ -1169,6 +1169,11 @@ fn bifrost_lsp_server_reports_cold_start_progress_when_client_supports_it() {
         "class ProgressFixture {\n    void work() {}\n}\n",
     )
     .expect("write progress fixture");
+    fs::write(
+        root.join("progress_fixture.py"),
+        "def work():\n    return 1\n",
+    )
+    .expect("write python progress fixture");
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
         .arg("--root")
@@ -1225,17 +1230,39 @@ fn bifrost_lsp_server_reports_cold_start_progress_when_client_supports_it() {
 
     let mut saw_report = false;
     let mut saw_end = false;
+    let mut last_percentage = 0;
+    let mut saw_java_index = false;
+    let mut saw_python_after_java_index = false;
     for _ in 0..32 {
         let msg = read_notification(&mut reader, &mut stderr, "$/progress");
         assert_eq!(msg["params"]["token"], token);
         match msg["params"]["value"]["kind"].as_str() {
             Some("report") => {
                 saw_report = true;
-                if let Some(percentage) = msg["params"]["value"]["percentage"].as_u64() {
+                let percentage = msg["params"]["value"]["percentage"]
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("startup report must include percentage: {msg}"));
+                assert!(
+                    percentage <= 99,
+                    "startup reports should leave completion to end: {msg}"
+                );
+                assert!(
+                    percentage >= last_percentage,
+                    "startup report percentages should not move backwards: {msg}"
+                );
+                last_percentage = percentage;
+                let message = msg["params"]["value"]["message"]
+                    .as_str()
+                    .unwrap_or_default();
+                if message.contains("Indexed Java declarations") {
+                    saw_java_index = true;
                     assert!(
-                        percentage <= 99,
-                        "startup reports should leave completion to end: {msg}"
+                        percentage < 99,
+                        "first language index must not complete multi-language startup: {msg}"
                     );
+                }
+                if saw_java_index && message.contains("Python") {
+                    saw_python_after_java_index = true;
                 }
             }
             Some("end") => {
@@ -1246,6 +1273,11 @@ fn bifrost_lsp_server_reports_cold_start_progress_when_client_supports_it() {
         }
     }
     assert!(saw_report, "expected at least one progress report");
+    assert!(saw_java_index, "expected Java index progress report");
+    assert!(
+        saw_python_after_java_index,
+        "expected Python progress after Java index report"
+    );
     assert!(saw_end, "expected final progress end notification");
 
     write_message(

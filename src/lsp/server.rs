@@ -324,6 +324,9 @@ struct StartupProgress {
 #[derive(Default)]
 struct StartupProgressState {
     last_parse_report_by_language: HashMap<crate::analyzer::Language, usize>,
+    progress_by_language: HashMap<crate::analyzer::Language, u32>,
+    expected_language_count: usize,
+    last_report_percentage: u32,
 }
 
 impl StartupProgress {
@@ -386,6 +389,11 @@ impl StartupProgress {
         }
     }
 
+    fn set_expected_language_count(&self, count: usize) {
+        let mut state = self.state.lock().expect("startup progress state poisoned");
+        state.expected_language_count = count;
+    }
+
     fn begin(&self, title: &str) -> Result<(), String> {
         self.send(WorkDoneProgress::Begin(WorkDoneProgressBegin {
             title: title.to_string(),
@@ -396,17 +404,17 @@ impl StartupProgress {
     }
 
     fn report_analyzer_event(&self, event: BuildProgressEvent) {
-        let should_report = {
+        let percentage = {
             let mut state = self.state.lock().expect("startup progress state poisoned");
-            should_report_progress_event(&mut state, &event)
+            if !should_report_progress_event(&mut state, &event) {
+                return;
+            }
+            progress_percentage_for_event(&mut state, &event)
         };
-        if !should_report {
-            return;
-        }
         let _ = self.send(WorkDoneProgress::Report(WorkDoneProgressReport {
             cancellable: Some(false),
             message: Some(progress_message_for_event(&event)),
-            percentage: None,
+            percentage: Some(percentage),
         }));
     }
 
@@ -477,6 +485,48 @@ fn should_report_progress_event(
         }
         _ => true,
     }
+}
+
+fn progress_percentage_for_event(
+    state: &mut StartupProgressState,
+    event: &BuildProgressEvent,
+) -> u32 {
+    const PROGRESS_UNITS: u32 = 1_000;
+    let language_units = progress_units_for_event(event);
+    let language_progress = state
+        .progress_by_language
+        .entry(event.language)
+        .or_default();
+    *language_progress = (*language_progress).max(language_units);
+
+    let expected_language_count = state
+        .expected_language_count
+        .max(state.progress_by_language.len())
+        .max(1);
+    let completed_units: u32 = state.progress_by_language.values().sum();
+    let computed = ((completed_units as u64) * 99
+        / ((expected_language_count as u64) * PROGRESS_UNITS as u64)) as u32;
+    let percentage = computed.clamp(0, 99).max(state.last_report_percentage);
+    state.last_report_percentage = percentage;
+    percentage
+}
+
+fn progress_units_for_event(event: &BuildProgressEvent) -> u32 {
+    const PROGRESS_UNITS: u32 = 1_000;
+    let (phase_start, phase_end) = match event.phase {
+        BuildProgressPhase::Enumerate => (0, 50),
+        BuildProgressPhase::Reconcile => (50, 200),
+        BuildProgressPhase::Parse => (200, 800),
+        BuildProgressPhase::Persist => (800, 900),
+        BuildProgressPhase::Index => (900, PROGRESS_UNITS),
+    };
+    let phase_span = phase_end - phase_start;
+    let phase_progress = if event.total == 0 {
+        1.0
+    } else {
+        (event.completed.min(event.total) as f64) / (event.total as f64)
+    };
+    phase_start + ((phase_span as f64) * phase_progress).floor() as u32
 }
 
 fn handle_request(
@@ -996,6 +1046,9 @@ impl ServerState {
         let (project, active_roots) = build_project_for_roots(roots, &excluded_paths)?;
         let overlay = Arc::new(OverlayProject::new(project));
         let project = Arc::clone(&overlay) as Arc<dyn Project>;
+        if let Some(progress) = progress {
+            progress.set_expected_language_count(project.analyzer_languages().len());
+        }
         let workspace = build_workspace_for_lsp(project, progress);
         Ok(Self {
             active_roots,
