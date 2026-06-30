@@ -70,13 +70,35 @@ Evidence (direct, bypassing LSP):
 
 So the Python usage-graph strategy resolves *exported / cross-file* member usages
 (matching `constructed_local_receiver_resolves_member_usage` in
-`tests/usages_python_graph_test.rs`) but misses same-file instance-method /
-attribute usages. Class-name usages and class-qualified member calls
-(`MyClass.testMethod`) DO resolve same-file; instance-receiver member usages do
-not. For an LSP `references` server this is a real gap (IntelliJ counts same-file
-usages). This blocks 6 ported cases. Next step: trace the Python graph's
-candidate-file selection / seeding to include the definition's own file for
-member queries, and fix the root cause (no text-search fallback).
+`tests/usages_python_graph_test.rs`) but misses some same-file instance-receiver
+usages. For an LSP `references` server this is a real gap (IntelliJ counts
+same-file usages). This blocks 6 ported cases.
+
+Granular same-file probe (UsageFinder hits for target `m.Foo.bar`):
+
+- class-qualified `Foo.bar(None)` = 1 (works)
+- typed-annotation receiver `def run(f: Foo): f.bar()` = 1 (works)
+- bare top-level function / class usage = 1 (works)
+- constructed local `f = Foo(); f.bar()` = 0  (FAILS — but the cross-file
+  equivalent passes)
+- self receiver `self.bar()` inside the class = 0  (FAILS)
+
+So Bug 2 decomposes:
+
+- Bug 2a (highest value): `self.`-receiver member usages are not resolved — `self`
+  is not typed as the enclosing class for same-file member matching. `self.x` is
+  the most common Python member access and is inherently same-file; this is the
+  root of the attribute cases (ReassignedInstanceAttribute, ReassignedClassAttribute,
+  ConditionalFunctions, NameShadowing).
+- Bug 2b: constructed-local receiver (`f = Foo()`) is not seeded with its type
+  when the class is defined in the same file, even though the cross-file path
+  seeds it correctly (likely the seeding hangs off an import edge that does not
+  exist same-file).
+
+Next step: in `src/analyzer/usages/python_graph/` (receiver-type seeding in
+`extractor.rs`, `resolver.rs`), make (2a) `self` resolve to the enclosing class
+type and (2b) same-file constructor assignments seed the local's type, mirroring
+the cross-file seeding path. Fix the root cause; no text-search fallback.
 
 
 ## Decision Log
