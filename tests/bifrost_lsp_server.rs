@@ -7687,6 +7687,7 @@ fn write_stub_command(path: &Path, body: &str) {
     fs::set_permissions(path, permissions).expect("chmod stub command");
 }
 
+#[cfg(unix)]
 fn formatting_response(
     stdin: &mut impl Write,
     reader: &mut impl BufRead,
