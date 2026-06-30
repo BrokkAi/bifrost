@@ -15,3 +15,4 @@ bifrost_searchtools/*.so
 
 .mjolnir
 .idea
+**/.DS_Store
