@@ -455,6 +455,22 @@ fn namespace_packages_from(
     (by_alias, dot_imports)
 }
 
+pub(crate) fn resolve_go_import_namespaces(
+    analyzer: &GoAnalyzer,
+    file: &ProjectFile,
+    package_names: &HashMap<ProjectFile, String>,
+) -> (HashMap<String, Vec<String>>, Vec<String>) {
+    let dir_index = build_parent_dir_index(package_names.keys());
+    let module_path = read_go_module_path(file.root());
+    namespace_packages_from(
+        analyzer,
+        file,
+        &dir_index,
+        module_path.as_deref(),
+        |target| package_names.get(target).cloned(),
+    )
+}
+
 fn parse_go_file(file: &ProjectFile) -> Option<ParsedFile> {
     let source = file.read_to_string().ok()?;
     let mut parser = Parser::new();
@@ -1335,7 +1351,7 @@ fn same_go_package(graph: &GoProjectGraph, left: &ProjectFile, right: &ProjectFi
     left_parsed.package_name == right_parsed.package_name
 }
 
-pub(in crate::analyzer::usages) fn extract_go_import_path(raw_import: &str) -> Option<String> {
+pub(crate) fn extract_go_import_path(raw_import: &str) -> Option<String> {
     let trimmed = raw_import.trim();
     trimmed
         .split_whitespace()

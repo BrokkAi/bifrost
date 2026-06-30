@@ -1,6 +1,7 @@
 mod adapter;
 mod cache;
 mod declarations;
+pub(crate) mod diagnostics;
 mod hierarchy;
 mod imports;
 pub(crate) mod packages;
@@ -9,7 +10,7 @@ mod tests;
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::{
     AnalyzerConfig, BuildProgress, CodeUnit, IAnalyzer, ImportAnalysisProvider, Language, Project,
-    ProjectFile, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
+    ProjectFile, SemanticDiagnostic, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
     TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
 };
 use std::collections::BTreeSet;
@@ -98,6 +99,20 @@ impl GoAnalyzer {
             return String::new();
         };
         determine_go_package_name(tree.root_node(), source)
+    }
+
+    pub(crate) fn package_clause_names(&self) -> &crate::hash::HashMap<ProjectFile, String> {
+        self.memo_caches.package_clause_names.get_or_init(|| {
+            self.get_analyzed_files()
+                .into_iter()
+                .filter(|file| file_language(file) == Language::Go)
+                .filter_map(|file| {
+                    let source = self.project().read_source(&file).ok()?;
+                    let package_name = self.determine_package_name(&source);
+                    (!package_name.is_empty()).then_some((file, package_name))
+                })
+                .collect()
+        })
     }
 
     pub fn format_test_module(path: impl AsRef<Path>) -> String {
@@ -272,6 +287,13 @@ impl IAnalyzer for GoAnalyzer {
 
     fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
         self.inner.parse_errors(file)
+    }
+
+    fn semantic_diagnostics(&self, file: &ProjectFile, source: &str) -> Vec<SemanticDiagnostic> {
+        diagnostics::collect_go_semantic_diagnostics(self, file, source)
+            .into_iter()
+            .map(Into::into)
+            .collect()
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {

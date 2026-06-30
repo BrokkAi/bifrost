@@ -796,6 +796,14 @@ pub struct ImportInfo {
     pub alias: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticDiagnostic {
+    pub(crate) range: Range,
+    pub(crate) source: &'static str,
+    pub(crate) kind: &'static str,
+    pub(crate) message: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DeclarationKind {
     Parameter,

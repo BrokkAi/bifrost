@@ -1,13 +1,15 @@
 use lsp_types::{
     Diagnostic, DiagnosticSeverity, DocumentDiagnosticParams, DocumentDiagnosticReport,
-    DocumentDiagnosticReportResult, FullDocumentDiagnosticReport,
+    DocumentDiagnosticReportResult, FullDocumentDiagnosticReport, NumberOrString,
     RelatedFullDocumentDiagnosticReport, Uri,
 };
 use tree_sitter::{Language as TsLanguage, Parser};
 
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::tree_sitter_analyzer::collect_parse_errors;
-use crate::analyzer::{Language, ParseError, ParseErrorKind, Project, WorkspaceAnalyzer};
+use crate::analyzer::{
+    Language, ParseError, ParseErrorKind, Project, SemanticDiagnostic, WorkspaceAnalyzer,
+};
 use crate::lsp::conversion::byte_range_to_lsp_range;
 use crate::lsp::handlers::util::project_file_for_uri;
 use crate::text_utils::compute_line_starts;
@@ -78,12 +80,20 @@ fn build_report(
         }
     };
 
-    Some(
-        errors
-            .into_iter()
-            .map(|err| parse_error_to_diagnostic(err, &content, &line_starts))
-            .collect(),
-    )
+    let mut diagnostics: Vec<_> = errors
+        .into_iter()
+        .map(|err| parse_error_to_diagnostic(err, &content, &line_starts))
+        .collect();
+    if diagnostics.is_empty() {
+        diagnostics.extend(
+            workspace
+                .analyzer()
+                .semantic_diagnostics(&project_file, &content)
+                .into_iter()
+                .map(|diagnostic| semantic_diagnostic_to_lsp(diagnostic, &content, &line_starts)),
+        );
+    }
+    Some(diagnostics)
 }
 
 /// Render a cached [`ParseError`] into the LSP `Diagnostic` shape. Both the
@@ -108,6 +118,24 @@ fn parse_error_to_diagnostic(
         code_description: None,
         source: Some(DIAGNOSTIC_SOURCE.to_string()),
         message,
+        related_information: None,
+        tags: None,
+        data: None,
+    }
+}
+
+fn semantic_diagnostic_to_lsp(
+    diagnostic: SemanticDiagnostic,
+    content: &str,
+    line_starts: &[usize],
+) -> Diagnostic {
+    Diagnostic {
+        range: byte_range_to_lsp_range(content, line_starts, &diagnostic.range),
+        severity: Some(DiagnosticSeverity::ERROR),
+        code: Some(NumberOrString::String(diagnostic.kind.to_string())),
+        code_description: None,
+        source: Some(diagnostic.source.to_string()),
+        message: diagnostic.message,
         related_information: None,
         tags: None,
         data: None,

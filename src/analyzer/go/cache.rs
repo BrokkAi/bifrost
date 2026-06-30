@@ -14,6 +14,7 @@ pub(super) struct GoMemoCaches {
     pub(super) referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     pub(super) reverse_import_index: Arc<OnceLock<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     pub(super) hierarchy_index: Arc<OnceLock<GoHierarchyIndex>>,
+    pub(super) package_clause_names: Arc<OnceLock<HashMap<ProjectFile, String>>>,
 }
 
 impl GoMemoCaches {
@@ -24,6 +25,7 @@ impl GoMemoCaches {
             referencing_files: build_weighted_cache(budget_bytes / 8, weight_project_file_set),
             reverse_import_index: Arc::new(OnceLock::new()),
             hierarchy_index: Arc::new(OnceLock::new()),
+            package_clause_names: Arc::new(OnceLock::new()),
         }
     }
 

@@ -3,7 +3,7 @@ use serde_json::{Value, json};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use tempfile::TempDir;
 
 /// Build an LSP-correct `file://` URI for `path`. On Windows, `Path::display()`
@@ -56,6 +56,71 @@ fn write_jvm_type_context_fixtures(root: &Path, prefix: &str) -> JvmTypeContextF
         csharp_source,
         scala_path,
         scala_source,
+    }
+}
+
+struct LspTestServer {
+    child: Child,
+    stdin: ChildStdin,
+    reader: BufReader<ChildStdout>,
+    stderr: ChildStderr,
+}
+
+impl LspTestServer {
+    fn start(root: &Path) -> Self {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+            .arg("--root")
+            .arg(root)
+            .arg("--server")
+            .arg("lsp")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn bifrost");
+
+        let stdin = child.stdin.take().expect("stdin");
+        let stdout = child.stdout.take().expect("stdout");
+        let stderr = child.stderr.take().expect("stderr");
+        Self {
+            child,
+            stdin,
+            reader: BufReader::new(stdout),
+            stderr,
+        }
+    }
+
+    fn initialize(&mut self, root: &Path) {
+        let root_uri = uri_for(root);
+        self.write(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"processId": null, "rootUri": root_uri, "capabilities": {}}
+        }));
+        let _ = self.read_message();
+        self.write(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+    }
+
+    fn write(&mut self, message: Value) {
+        write_message(&mut self.stdin, message);
+    }
+
+    fn read_message(&mut self) -> Value {
+        read_message(&mut self.reader, &mut self.stderr)
+    }
+
+    fn read_notification(&mut self, method: &str) -> Value {
+        read_notification(&mut self.reader, &mut self.stderr, method)
+    }
+
+    fn shutdown(mut self, id: u64) {
+        self.write(json!({"jsonrpc": "2.0", "id": id, "method": "shutdown"}));
+        let _ = self.read_message();
+        self.write(json!({"jsonrpc": "2.0", "method": "exit"}));
+        drop(self.stdin);
+        let status = self.child.wait().expect("wait bifrost");
+        assert!(status.success(), "bifrost exited unsuccessfully: {status}");
     }
 }
 
@@ -6105,6 +6170,113 @@ fn bifrost_lsp_server_diagnostics_edge_cases() {
 }
 
 #[test]
+fn bifrost_lsp_server_go_semantic_diagnostics_pull_reports_unrecognized_symbols() {
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    fs::write(
+        temp_root.join("go.mod"),
+        "module example.com/app\n\ngo 1.22\n",
+    )
+    .expect("write go.mod");
+    fs::create_dir_all(temp_root.join("store")).expect("create store");
+    fs::write(
+        temp_root.join("store/store.go"),
+        "package store\n\nfunc Present() {}\n",
+    )
+    .expect("write store");
+    fs::write(
+        temp_root.join("main.go"),
+        r#"
+package main
+
+import "example.com/app/store"
+
+func Run() {
+    missingValue
+    store.Missing()
+}
+"#,
+    )
+    .expect("write main.go");
+
+    let mut server = LspTestServer::start(&temp_root);
+    server.initialize(&temp_root);
+    let main_uri = uri_for(&temp_root.join("main.go"));
+
+    server.write(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/diagnostic",
+        "params": {"textDocument": {"uri": main_uri}}
+    }));
+    let response = server.read_message();
+    let items = response["result"]["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected items array, got {response}"));
+    assert!(
+        items.iter().any(|item| item["source"] == "bifrost-go"
+            && item["code"] == "go_unrecognized_symbol"
+            && item["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("missingValue"))),
+        "expected missingValue semantic diagnostic: {response}"
+    );
+    assert!(
+        items.iter().any(|item| item["source"] == "bifrost-go"
+            && item["code"] == "go_unrecognized_package_member"
+            && item["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("Missing"))),
+        "expected store.Missing semantic diagnostic: {response}"
+    );
+
+    server.shutdown(3);
+}
+
+#[test]
+fn bifrost_lsp_server_go_malformed_file_reports_parse_not_semantic_diagnostics() {
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    fs::write(
+        temp_root.join("go.mod"),
+        "module example.com/app\n\ngo 1.22\n",
+    )
+    .expect("write go.mod");
+    fs::write(
+        temp_root.join("broken.go"),
+        "package main\n\nfunc Run( {\n    missingValue\n}\n",
+    )
+    .expect("write broken.go");
+
+    let mut server = LspTestServer::start(&temp_root);
+    server.initialize(&temp_root);
+    let broken_uri = uri_for(&temp_root.join("broken.go"));
+
+    server.write(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/diagnostic",
+        "params": {"textDocument": {"uri": broken_uri}}
+    }));
+    let response = server.read_message();
+    let items = response["result"]["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected items array, got {response}"));
+    assert!(
+        items
+            .iter()
+            .any(|item| item["source"] == "bifrost-tree-sitter"),
+        "expected parse diagnostic for malformed Go: {response}"
+    );
+    assert!(
+        items.iter().all(|item| item["source"] != "bifrost-go"),
+        "malformed Go must suppress semantic diagnostics: {response}"
+    );
+
+    server.shutdown(3);
+}
+
+#[test]
 fn bifrost_lsp_server_did_save_triggers_reindex() {
     let temp = TempDir::new().expect("temp dir");
     let temp_root = temp.path().canonicalize().expect("canon temp");
@@ -6492,6 +6664,52 @@ fn bifrost_lsp_server_did_save_publishes_diagnostics() {
     drop(stdin);
     let status = child.wait().expect("wait bifrost");
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
+fn bifrost_lsp_server_did_save_publishes_go_semantic_diagnostics() {
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    fs::write(
+        temp_root.join("go.mod"),
+        "module example.com/app\n\ngo 1.22\n",
+    )
+    .expect("write go.mod");
+    fs::write(
+        temp_root.join("main.go"),
+        "package main\n\nfunc Run() {\n    println(\"ok\")\n}\n",
+    )
+    .expect("write fixture");
+
+    let mut server = LspTestServer::start(&temp_root);
+    server.initialize(&temp_root);
+    let main_uri = uri_for(&temp_root.join("main.go"));
+
+    fs::write(
+        temp_root.join("main.go"),
+        "package main\n\nfunc Run() {\n    missingValue\n}\n",
+    )
+    .expect("rewrite fixture");
+    server.write(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didSave",
+        "params": {"textDocument": {"uri": main_uri}}
+    }));
+
+    let publish = server.read_notification("textDocument/publishDiagnostics");
+    let items = publish["params"]["diagnostics"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected diagnostics array, got {publish}"));
+    assert!(
+        items.iter().any(|item| item["source"] == "bifrost-go"
+            && item["code"] == "go_unrecognized_symbol"
+            && item["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("missingValue"))),
+        "expected publishDiagnostics semantic Go item: {publish}"
+    );
+
+    server.shutdown(99);
 }
 
 #[test]

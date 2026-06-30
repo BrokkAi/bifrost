@@ -4,7 +4,7 @@ use crate::analyzer::{
     DeclarationInfo, DefinitionLookupIndex, ExceptionHandlingSmell, ExceptionSmellWeights,
     GoAnalyzer, IAnalyzer, ImportAnalysisProvider, ImportInfo, JavaAnalyzer, JavascriptAnalyzer,
     Language, PhpAnalyzer, Project, ProjectFile, PythonAnalyzer, Range, RubyAnalyzer, RustAnalyzer,
-    ScalaAnalyzer, SignatureMetadata, TestDetectionProvider, TypeAliasProvider,
+    ScalaAnalyzer, SemanticDiagnostic, SignatureMetadata, TestDetectionProvider, TypeAliasProvider,
     TypeHierarchyProvider, TypescriptAnalyzer,
 };
 use crate::hash::HashSet;
@@ -400,6 +400,12 @@ impl IAnalyzer for MultiAnalyzer {
     fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
         self.delegate_for_file(file)
             .and_then(|delegate| delegate.analyzer().parse_errors(file))
+    }
+
+    fn semantic_diagnostics(&self, file: &ProjectFile, source: &str) -> Vec<SemanticDiagnostic> {
+        self.delegate_for_file(file)
+            .map(|delegate| delegate.analyzer().semantic_diagnostics(file, source))
+            .unwrap_or_default()
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {
