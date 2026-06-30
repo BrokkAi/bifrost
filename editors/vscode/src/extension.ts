@@ -17,12 +17,14 @@ import {
   BifrostMcpConfig,
   formatError,
   LaunchMode,
+  appendBifrostGitignoreEntry,
   parseExtraArgs,
   parsePathSettings,
   sourceFileWatchers,
   spawnBifrostServer,
   supportedWorkspaceRoot,
-  validateLaunchCommand
+  validateLaunchCommand,
+  workspaceGitignoreNeedsBifrostEntry
 } from "./lifecycle";
 import {
   findManagedBinary,
@@ -39,6 +41,7 @@ let outputChannel: vscode.OutputChannel | undefined;
 let lastLaunchConfig: BifrostLaunchConfig | undefined;
 let startInFlight: Promise<void> | undefined;
 let extensionActive = false;
+const BIFROST_GITIGNORE_DECLINED_KEY_PREFIX = "bifrost.gitignorePromptDeclined:";
 
 export function activate(context: vscode.ExtensionContext): void {
   extensionActive = true;
@@ -112,6 +115,7 @@ async function startClientInner(context: vscode.ExtensionContext): Promise<void>
     log("No workspace folder is open; Bifrost language server was not started.");
     return;
   }
+  void promptAppendBifrostGitignore(context, root);
 
   const config = vscode.workspace.getConfiguration("bifrost");
   const command = config.get<string>("serverPath") || "bifrost";
@@ -298,6 +302,50 @@ async function promptRestartAfterConfigurationChange(
   );
   if (choice === "Restart") {
     await restartClient(context);
+  }
+}
+
+async function promptAppendBifrostGitignore(
+  context: vscode.ExtensionContext,
+  workspaceRoot: string
+): Promise<void> {
+  const declinedKey = `${BIFROST_GITIGNORE_DECLINED_KEY_PREFIX}${workspaceRoot}`;
+  if (context.workspaceState.get<boolean>(declinedKey)) {
+    return;
+  }
+
+  let needsEntry: boolean;
+  try {
+    needsEntry = await workspaceGitignoreNeedsBifrostEntry(workspaceRoot);
+  } catch (error) {
+    log(`Failed to inspect .gitignore for Bifrost cache entry: ${formatError(error)}`);
+    return;
+  }
+
+  if (!needsEntry) {
+    await context.workspaceState.update(declinedKey, undefined);
+    return;
+  }
+
+  const choice = await vscode.window.showInformationMessage(
+    "Bifrost stores workspace cache data in .bifrost. Add .bifrost to .gitignore?",
+    "Add",
+    "No"
+  );
+  if (choice !== "Add") {
+    await context.workspaceState.update(declinedKey, true);
+    log("User declined adding .bifrost to .gitignore.");
+    return;
+  }
+
+  try {
+    await appendBifrostGitignoreEntry(workspaceRoot);
+    await context.workspaceState.update(declinedKey, undefined);
+    log("Added .bifrost to .gitignore.");
+  } catch (error) {
+    const message = formatError(error);
+    log(`Failed to update .gitignore for Bifrost cache entry: ${message}`);
+    void vscode.window.showWarningMessage(`Bifrost could not update .gitignore: ${message}`);
   }
 }
 

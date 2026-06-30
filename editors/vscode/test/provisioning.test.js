@@ -392,6 +392,34 @@ test("builds MCP host commands from config", () => {
   );
 });
 
+test("detects existing bifrost gitignore entries", () => {
+  assert.equal(lifecycle.gitignoreIncludesBifrostEntry(".bifrost\n"), true);
+  assert.equal(lifecycle.gitignoreIncludesBifrostEntry("/.bifrost/\n"), true);
+  assert.equal(lifecycle.gitignoreIncludesBifrostEntry("# .bifrost\nnode_modules\n"), false);
+  assert.equal(lifecycle.gitignoreIncludesBifrostEntry(".bifrost-cache\n"), false);
+});
+
+test("appends bifrost gitignore entry when missing", async () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-vscode-test-"));
+  const gitignorePath = path.join(temp, ".gitignore");
+  fs.writeFileSync(gitignorePath, "target");
+
+  assert.equal(await lifecycle.workspaceGitignoreNeedsBifrostEntry(temp), true);
+  await lifecycle.appendBifrostGitignoreEntry(temp);
+
+  assert.equal(fs.readFileSync(gitignorePath, "utf8"), "target\n.bifrost\n");
+  assert.equal(await lifecycle.workspaceGitignoreNeedsBifrostEntry(temp), false);
+});
+
+test("creates gitignore with bifrost entry when missing", async () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-vscode-test-"));
+
+  assert.equal(await lifecycle.workspaceGitignoreNeedsBifrostEntry(temp), true);
+  await lifecycle.appendBifrostGitignoreEntry(temp);
+
+  assert.equal(fs.readFileSync(path.join(temp, ".gitignore"), "utf8"), ".bifrost\n");
+});
+
 test("parses bifrost --version output", () => {
   assert.equal(provisioning.parseBifrostVersion("bifrost 0.6.8\n"), "0.6.8");
   assert.equal(provisioning.parseBifrostVersion("bifrost v0.6.8\n"), "0.6.8");
