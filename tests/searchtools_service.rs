@@ -1357,12 +1357,9 @@ fn scan_usages_returns_call_sites_grouped_by_file() {
     assert_eq!(0, array_len(&value, "too_many_callsites"));
 }
 
-#[test]
-fn scan_usages_mcp_call_uses_ruby_receiver_aware_resolution() {
-    let project = InlineTestProject::with_language(Language::Ruby)
-        .file(
-            "app/user.rb",
-            r#"
+fn assert_ruby_user_save_scan_usages_hit(user_call: &str, account_call: &str, expected_hit: &str) {
+    let source = format!(
+        r#"
 class User
   def save
   end
@@ -1376,14 +1373,16 @@ end
 class App
   def run
     user = User.new
-    user.save
+    {user_call}
 
     account = Account.new
-    account.save
+    {account_call}
   end
 end
-"#,
-        )
+"#
+    );
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file("app/user.rb", source)
         .build();
     let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
         .expect("service");
@@ -1408,72 +1407,22 @@ end
         hits.iter().any(|hit| hit["snippet"]
             .as_str()
             .unwrap_or_default()
-            .contains("user.save")),
-        "expected user.save hit: {value}"
-    );
-    assert!(
-        hits.iter().all(|hit| !hit["snippet"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("account.save")),
-        "must not report Account#save as User#save usage: {value}"
+            .contains(expected_hit)),
+        "expected {expected_hit} hit: {value}"
     );
 }
 
 #[test]
+fn scan_usages_mcp_call_uses_ruby_receiver_aware_resolution() {
+    assert_ruby_user_save_scan_usages_hit("user.save", "account.save", "user.save");
+}
+
+#[test]
 fn scan_usages_mcp_call_resolves_ruby_public_send_symbol_dispatch() {
-    let project = InlineTestProject::with_language(Language::Ruby)
-        .file(
-            "app/user.rb",
-            r#"
-class User
-  def save
-  end
-end
-
-class Account
-  def save
-  end
-end
-
-class App
-  def run
-    user = User.new
-    user.public_send(:save)
-    user.public_send(:missing, :save)
-
-    account = Account.new
-    account.public_send(:save)
-  end
-end
-"#,
-        )
-        .build();
-    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
-        .expect("service");
-
-    let payload = service
-        .call_tool_json(
-            "scan_usages",
-            r#"{"symbols":["User.save"],"include_tests":true}"#,
-        )
-        .unwrap();
-    let value: Value = serde_json::from_str(&payload).unwrap();
-
-    assert_eq!(0, array_len(&value, "not_found"), "payload: {value}");
-    assert_eq!(0, array_len(&value, "ambiguous"), "payload: {value}");
-    assert_eq!(0, array_len(&value, "failures"), "payload: {value}");
-    let usages = value["usages"].as_array().unwrap();
-    assert_eq!(1, usages.len(), "payload: {value}");
-    assert_eq!("User.save", usages[0]["symbol"], "payload: {value}");
-    assert_eq!(1, usages[0]["total_hits"], "payload: {value}");
-    let hits = usages[0]["files"][0]["hits"].as_array().unwrap();
-    assert!(
-        hits.iter().any(|hit| hit["snippet"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("user.public_send(:save)")),
-        "expected user.public_send(:save) hit: {value}"
+    assert_ruby_user_save_scan_usages_hit(
+        "user.public_send(:save)\n    user.public_send(:missing, :save)",
+        "account.public_send(:save)",
+        "user.public_send(:save)",
     );
 }
 
