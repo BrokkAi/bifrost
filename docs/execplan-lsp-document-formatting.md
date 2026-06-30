@@ -18,6 +18,9 @@ The user-visible behavior is: start `bifrost --lsp`, initialize with optional `f
 - [x] (2026-06-30 11:24Z) Added VS Code settings for `bifrost.formatterCommands` and forwarded non-empty rules through LSP initialization options. Evidence: `npm test` passed after installing local VS Code dependencies.
 - [x] (2026-06-30 11:24Z) Added unit, LSP integration, and ignored opt-in real-tool tests. Evidence: `cargo test formatting --lib --features nlp` passed 8 tests with 1 ignored opt-in rustfmt integration test; `cargo test --test bifrost_lsp_server formatting --features nlp` passed 5 LSP tests.
 - [x] (2026-06-30 11:29Z) Ran formatting, focused tests, VS Code tests, and `cargo clippy-no-cuda`; updated this ExecPlan with outcomes. Evidence: `cargo fmt --check`, `cargo test formatting --lib --features nlp`, `cargo test --test bifrost_lsp_server formatting --features nlp`, `npm test`, and `cargo clippy-no-cuda` all passed.
+- [x] (2026-06-30 12:14Z) Ran guided review with security, DRY, senior-dev intent, DevOps, and architecture reviewers. Evidence: reviewers reported issues around multi-root formatter roots, Rust stdin edition, hung formatters, JS/TS discovery boundaries, Windows npm command resolution, unbounded output, and overly broad npm script auto-discovery; DRY reported no findings.
+- [x] (2026-06-30 12:39Z) Addressed guided-review findings in the formatter layer. Evidence: `cargo test formatting --lib --features nlp` passed 14 tests with 1 ignored opt-in rustfmt integration test after adding multi-root root selection, Rust edition discovery, formatter timeout/process-group termination, bounded formatter output, Windows `npm.cmd`, safe JS/TS script filtering, and manifest discovery stop bounds.
+- [x] (2026-06-30 12:50Z) Ran final post-review validation. Evidence: `cargo fmt --check`, `cargo test formatting --lib --features nlp`, `cargo test --test bifrost_lsp_server formatting --features nlp`, `npm test` in `editors/vscode`, and `cargo clippy-no-cuda` all passed.
 
 ## Surprises & Discoveries
 
@@ -29,6 +32,15 @@ The user-visible behavior is: start `bifrost --lsp`, initialize with optional `f
 
 - Observation: the VS Code extension worktree did not have `node_modules` installed.
   Evidence: the first `npm test` failed with `sh: tsc: command not found`; `npm install` added local dependencies and the following `npm test` passed 13 unit tests.
+
+- Observation: `MultiRootProject` stores files relative to a common ancestor for analyzer-wide identity, but formatter commands need the owning workspace folder root.
+  Evidence: guided review pointed out that globs like `src/**/*.ts`, `{workspaceRoot}`, and relative `cwd` values were evaluated against the common parent in multi-root workspaces; `Project::workspace_root_for_file` now exposes the owning root for formatter use.
+
+- Observation: `rustfmt` defaults stdin input to Rust 2015 unless an edition is supplied.
+  Evidence: guided review reproduced `printf 'async fn f() {}\n' | rustfmt --emit stdout` failing with E0670; the Rust built-in now passes the nearest `Cargo.toml` package edition, falling back to 2024.
+
+- Observation: a formatter child can block the LSP request loop if it never exits, emits unbounded output, or leaves inherited pipes open through descendants.
+  Evidence: guided review flagged `wait_with_output()` and unbounded pipe reads; the executor now enforces a timeout, output caps, Unix process-group termination, and a bounded reader grace period.
 
 ## Decision Log
 
@@ -48,11 +60,19 @@ The user-visible behavior is: start `bifrost --lsp`, initialize with optional `f
   Rationale: GitHub issues #368 and #369 track those different LSP contracts separately; this plan builds the reusable resolver/executor they can use later.
   Date/Author: 2026-06-30 / Codex.
 
+- Decision: JS/TS built-in discovery may only auto-run narrowly recognized Prettier stdin scripts.
+  Rationale: Running any package script with a formatter-looking name is too broad for an automatic LSP formatting fallback. Project-specific scripts remain supported through explicit `formatterCommands`, while built-in discovery rejects script bodies containing shell metacharacters or non-Prettier commands.
+  Date/Author: 2026-06-30 / Codex.
+
+- Decision: Add a project-level owning-root query instead of changing analyzer file identity.
+  Rationale: Analyzer multi-root identity intentionally uses the common ancestor, but formatter behavior is workspace-root-sensitive. A small `Project::workspace_root_for_file` method lets formatting use the correct root without destabilizing existing analyzer paths.
+  Date/Author: 2026-06-30 / Codex.
+
 ## Outcomes & Retrospective
 
 Completed #42's document-formatting slice. Bifrost now advertises and handles `textDocument/formatting`, resolves formatter commands from ordered configuration rules before conservative built-ins, formats overlay-aware document text through stdin/stdout commands, and returns ordinary full-document LSP edits. VS Code now exposes `bifrost.formatterCommands` and forwards rules to the server. Range formatting and on-type formatting remain separate follow-up issues.
 
-The final validation bundle passed on 2026-06-30: `cargo fmt --check`, `cargo test formatting --lib --features nlp`, `cargo test --test bifrost_lsp_server formatting --features nlp`, `npm test` in `editors/vscode`, and `cargo clippy-no-cuda`.
+The initial validation bundle passed on 2026-06-30, then guided review found several concrete safety and workspace-root issues. After addressing those findings, the final post-review validation bundle also passed: `cargo fmt --check`, `cargo test formatting --lib --features nlp`, `cargo test --test bifrost_lsp_server formatting --features nlp`, `npm test` in `editors/vscode`, and `cargo clippy-no-cuda`.
 
 ## Context and Orientation
 

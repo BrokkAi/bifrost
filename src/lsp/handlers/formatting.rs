@@ -1,6 +1,9 @@
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use glob::Pattern;
 use lsp_types::{DocumentFormattingParams, TextEdit};
@@ -12,6 +15,13 @@ use crate::lsp::conversion::byte_range_to_lsp_range;
 use crate::lsp::handlers::util::read_document_for_uri;
 
 const MAX_ERROR_OUTPUT_CHARS: usize = 1_000;
+const MAX_FORMATTER_STDERR_BYTES: usize = 64 * 1024;
+const MAX_FORMATTER_STDOUT_BYTES: usize = 32 * 1024 * 1024;
+const FORMATTER_READER_GRACE: Duration = Duration::from_secs(1);
+#[cfg(not(test))]
+const FORMATTER_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const FORMATTER_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -35,8 +45,9 @@ pub(crate) struct FormatterCommand {
 }
 
 struct FormatContext<'a> {
-    project: &'a dyn Project,
     file: &'a ProjectFile,
+    workspace_root: PathBuf,
+    relative_file: PathBuf,
     language: Language,
 }
 
@@ -55,8 +66,9 @@ pub(crate) fn handle(
         return Ok(None);
     }
     let context = FormatContext {
-        project,
         file: &file,
+        workspace_root: project.workspace_root_for_file(&file),
+        relative_file: formatter_relative_file(project, &file),
         language,
     };
     let Some(command) = resolve_formatter_command(&context, rules)? else {
@@ -106,8 +118,8 @@ fn formatter_command_from_rule(
         .cwd
         .as_ref()
         .map(|cwd| expand_placeholders(cwd, context))
-        .map(|cwd| resolve_cwd(&cwd, context.project.root()))
-        .unwrap_or_else(|| context.project.root().to_path_buf());
+        .map(|cwd| resolve_cwd(&cwd, &context.workspace_root))
+        .unwrap_or_else(|| context.workspace_root.clone());
     let args = rule
         .args
         .iter()
@@ -126,7 +138,7 @@ fn rule_matches(rule: &FormatterCommandRule, context: &FormatContext<'_>) -> boo
     {
         return false;
     }
-    let rel = normalized_rel_path(context.file);
+    let rel = normalized_rel_path(context);
     if !rule.include.is_empty()
         && !rule
             .include
@@ -143,7 +155,11 @@ fn rule_matches(rule: &FormatterCommandRule, context: &FormatContext<'_>) -> boo
 
 fn discover_builtin_formatter(context: &FormatContext<'_>) -> Option<FormatterCommand> {
     match context.language {
-        Language::Rust => Some(standard_command(context, "rustfmt", ["--emit", "stdout"])),
+        Language::Rust => Some(standard_command(
+            context,
+            "rustfmt",
+            ["--edition", &rust_edition(context), "--emit", "stdout"],
+        )),
         Language::Go => Some(standard_command(context, "gofmt", [])),
         Language::Cpp => Some(standard_command(
             context,
@@ -176,12 +192,16 @@ fn standard_command<const N: usize>(
             .into_iter()
             .map(|arg| expand_placeholders(arg, context))
             .collect(),
-        cwd: context.project.root().to_path_buf(),
+        cwd: standard_command_cwd(context),
     }
 }
 
 fn discover_package_script(context: &FormatContext<'_>) -> Option<FormatterCommand> {
-    let package_json = nearest_manifest(context.file.abs_path().parent()?, "package.json")?;
+    let package_json = nearest_manifest(
+        context.file.abs_path().parent()?,
+        &context.workspace_root,
+        "package.json",
+    )?;
     let package_root = package_json.parent()?.to_path_buf();
     let raw = std::fs::read_to_string(&package_json).ok()?;
     let json: serde_json::Value = serde_json::from_str(&raw).ok()?;
@@ -197,40 +217,33 @@ fn discover_package_script(context: &FormatContext<'_>) -> Option<FormatterComma
         scripts
             .get(*name)
             .and_then(|value| value.as_str())
-            .is_some()
+            .is_some_and(is_safe_prettier_script)
     })?;
     Some(FormatterCommand {
-        command: "npm".to_string(),
+        command: npm_command().to_string(),
         args: vec!["run".to_string(), script_name.to_string(), "--".to_string()],
         cwd: package_root,
     })
 }
 
-fn nearest_manifest(start: &Path, name: &str) -> Option<PathBuf> {
+fn nearest_manifest(start: &Path, stop_at: &Path, name: &str) -> Option<PathBuf> {
     for dir in start.ancestors() {
+        if !dir.starts_with(stop_at) {
+            break;
+        }
         let candidate = dir.join(name);
         if candidate.is_file() {
             return Some(candidate);
+        }
+        if dir == stop_at {
+            break;
         }
     }
     None
 }
 
 fn run_formatter_command(command: &FormatterCommand, input: &str) -> Result<String, String> {
-    let mut child = Command::new(&command.command)
-        .args(&command.args)
-        .current_dir(&command.cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| {
-            format!(
-                "failed to start formatter `{}` in {}: {err}",
-                command_line_for_message(command),
-                command.cwd.display()
-            )
-        })?;
+    let mut child = spawn_formatter(command)?;
     {
         let mut stdin = child.stdin.take().ok_or_else(|| {
             format!(
@@ -245,26 +258,270 @@ fn run_formatter_command(command: &FormatterCommand, input: &str) -> Result<Stri
             )
         })?;
     }
-    let output = child.wait_with_output().map_err(|err| {
+    let stdout = child.stdout.take().ok_or_else(|| {
         format!(
-            "failed to wait for formatter `{}`: {err}",
+            "failed to open stdout for formatter `{}`",
             command_line_for_message(command)
         )
     })?;
-    if !output.status.success() {
+    let stderr = child.stderr.take().ok_or_else(|| {
+        format!(
+            "failed to open stderr for formatter `{}`",
+            command_line_for_message(command)
+        )
+    })?;
+    let stdout_reader = spawn_pipe_reader(stdout, max_stdout_bytes(input.len()));
+    let stderr_reader = spawn_pipe_reader(stderr, MAX_FORMATTER_STDERR_BYTES);
+    let status = wait_for_formatter(&mut child, command)?;
+    let stdout = collect_pipe("stdout", stdout_reader, command, Some(&mut child))?;
+    let stderr = collect_pipe("stderr", stderr_reader, command, Some(&mut child))?;
+    if !status.success() {
         return Err(format!(
             "formatter `{}` exited with status {}: {}",
             command_line_for_message(command),
-            output.status,
-            truncate_for_error(&String::from_utf8_lossy(&output.stderr))
+            status,
+            truncate_for_error(&String::from_utf8_lossy(&stderr))
         ));
     }
-    String::from_utf8(output.stdout).map_err(|err| {
+    String::from_utf8(stdout).map_err(|err| {
         format!(
             "formatter `{}` emitted non-UTF-8 stdout: {err}",
             command_line_for_message(command)
         )
     })
+}
+
+fn wait_for_formatter(
+    child: &mut std::process::Child,
+    command: &FormatterCommand,
+) -> Result<std::process::ExitStatus, String> {
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if started.elapsed() >= FORMATTER_TIMEOUT => {
+                terminate_formatter(child);
+                let _ = child.wait();
+                return Err(format!(
+                    "formatter `{}` timed out after {}",
+                    command_line_for_message(command),
+                    format_duration(FORMATTER_TIMEOUT)
+                ));
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(err) => {
+                return Err(format!(
+                    "failed to wait for formatter `{}`: {err}",
+                    command_line_for_message(command)
+                ));
+            }
+        }
+    }
+}
+
+fn spawn_formatter(command: &FormatterCommand) -> Result<std::process::Child, String> {
+    let mut builder = Command::new(&command.command);
+    builder
+        .args(&command.args)
+        .current_dir(&command.cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_formatter_process(&mut builder);
+    builder.spawn().map_err(|err| {
+        format!(
+            "failed to start formatter `{}` in {}: {err}",
+            command_line_for_message(command),
+            command.cwd.display()
+        )
+    })
+}
+
+#[cfg(unix)]
+fn configure_formatter_process(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn configure_formatter_process(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn terminate_formatter(child: &mut std::process::Child) {
+    let pid = child.id() as libc::pid_t;
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+    }
+    let _ = child.kill();
+}
+
+#[cfg(not(unix))]
+fn terminate_formatter(child: &mut std::process::Child) {
+    let _ = child.kill();
+}
+
+type PipeReadResult = Result<Vec<u8>, String>;
+
+fn spawn_pipe_reader(
+    pipe: impl Read + Send + 'static,
+    limit: usize,
+) -> mpsc::Receiver<PipeReadResult> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = sender.send(read_pipe_limited(pipe, limit));
+    });
+    receiver
+}
+
+fn collect_pipe(
+    name: &str,
+    receiver: mpsc::Receiver<PipeReadResult>,
+    command: &FormatterCommand,
+    child: Option<&mut std::process::Child>,
+) -> Result<Vec<u8>, String> {
+    match receiver.recv_timeout(FORMATTER_READER_GRACE) {
+        Ok(Ok(bytes)) => Ok(bytes),
+        Ok(Err(err)) => Err(format!(
+            "failed to read formatter `{}` {name}: {err}",
+            command_line_for_message(command)
+        )),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            if let Some(child) = child {
+                terminate_formatter(child);
+                let _ = child.wait();
+            }
+            Err(format!(
+                "formatter `{}` did not close {name}",
+                command_line_for_message(command)
+            ))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(format!(
+            "formatter `{}` {name} reader stopped unexpectedly",
+            command_line_for_message(command)
+        )),
+    }
+}
+
+fn read_pipe_limited(mut pipe: impl Read, limit: usize) -> PipeReadResult {
+    let mut bytes = Vec::new();
+    let mut buf = [0; 8192];
+    loop {
+        let read = pipe.read(&mut buf).map_err(|err| err.to_string())?;
+        if read == 0 {
+            return Ok(bytes);
+        }
+        if bytes.len().saturating_add(read) > limit {
+            return Err(format!("output exceeded {} bytes", limit));
+        }
+        bytes.extend_from_slice(&buf[..read]);
+    }
+}
+
+fn max_stdout_bytes(input_len: usize) -> usize {
+    input_len
+        .saturating_mul(4)
+        .saturating_add(1024 * 1024)
+        .min(MAX_FORMATTER_STDOUT_BYTES)
+}
+
+fn standard_command_cwd(context: &FormatContext<'_>) -> PathBuf {
+    let start = context.file.abs_path();
+    let start_dir = start.parent().unwrap_or(start.as_path());
+    match context.language {
+        Language::Rust => nearest_manifest(start_dir, &context.workspace_root, "Cargo.toml")
+            .and_then(|manifest| manifest.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| context.workspace_root.clone()),
+        Language::Go => nearest_manifest(start_dir, &context.workspace_root, "go.mod")
+            .and_then(|manifest| manifest.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| context.workspace_root.clone()),
+        Language::Python => ["pyproject.toml", "setup.cfg"]
+            .into_iter()
+            .find_map(|name| {
+                nearest_manifest(start_dir, &context.workspace_root, name)
+                    .and_then(|manifest| manifest.parent().map(Path::to_path_buf))
+            })
+            .unwrap_or_else(|| context.workspace_root.clone()),
+        Language::Cpp => nearest_manifest(start_dir, &context.workspace_root, ".clang-format")
+            .and_then(|manifest| manifest.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| context.workspace_root.clone()),
+        _ => context.workspace_root.clone(),
+    }
+}
+
+fn rust_edition(context: &FormatContext<'_>) -> String {
+    let abs_path = context.file.abs_path();
+    let Some(manifest) = nearest_manifest(
+        abs_path.parent().unwrap_or(abs_path.as_path()),
+        &context.workspace_root,
+        "Cargo.toml",
+    ) else {
+        return "2024".to_string();
+    };
+    let Ok(raw) = std::fs::read_to_string(manifest) else {
+        return "2024".to_string();
+    };
+    toml::from_str::<toml::Value>(&raw)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("package")
+                .and_then(|package| package.get("edition"))
+                .and_then(toml::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "2024".to_string())
+}
+
+fn is_safe_prettier_script(script: &str) -> bool {
+    let script = script.trim();
+    if script.is_empty()
+        || script.chars().any(|ch| {
+            matches!(
+                ch,
+                '&' | '|' | ';' | '<' | '>' | '(' | ')' | '$' | '`' | '\n' | '\r'
+            )
+        })
+    {
+        return false;
+    }
+    script
+        .split_whitespace()
+        .next()
+        .is_some_and(|command| command == "prettier" || command.ends_with("/prettier"))
+}
+
+#[cfg(windows)]
+fn npm_command() -> &'static str {
+    "npm.cmd"
+}
+
+#[cfg(not(windows))]
+fn npm_command() -> &'static str {
+    "npm"
+}
+
+fn formatter_relative_file(project: &dyn Project, file: &ProjectFile) -> PathBuf {
+    let workspace_root = project.workspace_root_for_file(file);
+    file.abs_path()
+        .strip_prefix(&workspace_root)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|_| file.rel_path().to_path_buf())
+}
+
+fn format_duration(duration: Duration) -> String {
+    if duration.as_secs() > 0 {
+        format!("{} seconds", duration.as_secs())
+    } else {
+        format!("{} milliseconds", duration.as_millis())
+    }
 }
 
 fn parse_language(input: &str) -> Option<Language> {
@@ -294,11 +551,11 @@ fn expand_placeholders(value: &str, context: &FormatContext<'_>) -> String {
         .replace("{file}", &context.file.abs_path().display().to_string())
         .replace(
             "{relativeFile}",
-            &context.file.rel_path().to_string_lossy().replace('\\', "/"),
+            &context.relative_file.to_string_lossy().replace('\\', "/"),
         )
         .replace(
             "{workspaceRoot}",
-            &context.project.root().display().to_string(),
+            &context.workspace_root.display().to_string(),
         )
         .replace("{language}", language_label(context.language))
 }
@@ -318,8 +575,8 @@ fn glob_matches(pattern: &str, rel: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn normalized_rel_path(file: &ProjectFile) -> String {
-    file.rel_path().to_string_lossy().replace('\\', "/")
+fn normalized_rel_path(context: &FormatContext<'_>) -> String {
+    context.relative_file.to_string_lossy().replace('\\', "/")
 }
 
 fn language_label(language: Language) -> &'static str {
@@ -374,7 +631,7 @@ fn stub_command(path: &Path, body: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::{FilesystemProject, Project};
+    use crate::analyzer::{FilesystemProject, MultiRootProject, Project};
 
     fn project(root: &Path) -> FilesystemProject {
         FilesystemProject::new(root).expect("filesystem project")
@@ -386,6 +643,19 @@ mod tests {
             .expect("project file")
     }
 
+    fn context<'a>(
+        project: &'a dyn Project,
+        file: &'a ProjectFile,
+        language: Language,
+    ) -> FormatContext<'a> {
+        FormatContext {
+            file,
+            workspace_root: project.workspace_root_for_file(file),
+            relative_file: formatter_relative_file(project, file),
+            language,
+        }
+    }
+
     #[test]
     fn formatter_rule_matches_language_include_and_exclude() {
         let temp = tempfile::tempdir().unwrap();
@@ -395,11 +665,7 @@ mod tests {
         std::fs::write(root.join("src/generated/app.ts"), "let x=1;").unwrap();
         let project = project(&root);
         let file = project_file(&project, "src/app.ts");
-        let ctx = FormatContext {
-            project: &project,
-            file: &file,
-            language: Language::TypeScript,
-        };
+        let ctx = context(&project, &file, Language::TypeScript);
         let rule = FormatterCommandRule {
             include: vec!["src/**/*.ts".to_string()],
             exclude: vec!["src/generated/**".to_string()],
@@ -411,11 +677,7 @@ mod tests {
         assert!(rule_matches(&rule, &ctx));
 
         let generated_file = project_file(&project, "src/generated/app.ts");
-        let generated_ctx = FormatContext {
-            project: &project,
-            file: &generated_file,
-            language: Language::TypeScript,
-        };
+        let generated_ctx = context(&project, &generated_file, Language::TypeScript);
         assert!(!rule_matches(&rule, &generated_ctx));
     }
 
@@ -427,11 +689,7 @@ mod tests {
         std::fs::write(root.join("pkg/src/lib.rs"), "fn main(){}").unwrap();
         let project = project(&root);
         let file = project_file(&project, "pkg/src/lib.rs");
-        let ctx = FormatContext {
-            project: &project,
-            file: &file,
-            language: Language::Rust,
-        };
+        let ctx = context(&project, &file, Language::Rust);
         let rule = FormatterCommandRule {
             include: Vec::new(),
             exclude: Vec::new(),
@@ -466,11 +724,7 @@ mod tests {
         std::fs::write(root.join("main.go"), "package main\n").unwrap();
         let project = project(&root);
         let file = project_file(&project, "main.go");
-        let ctx = FormatContext {
-            project: &project,
-            file: &file,
-            language: Language::Go,
-        };
+        let ctx = context(&project, &file, Language::Go);
         let rules = vec![FormatterCommandRule {
             include: vec!["*.go".to_string()],
             exclude: Vec::new(),
@@ -490,15 +744,30 @@ mod tests {
         std::fs::write(root.join("lib.rs"), "fn main(){}").unwrap();
         let project = project(&root);
         let file = project_file(&project, "lib.rs");
-        let ctx = FormatContext {
-            project: &project,
-            file: &file,
-            language: Language::Rust,
-        };
+        let ctx = context(&project, &file, Language::Rust);
         let command = discover_builtin_formatter(&ctx).unwrap();
         assert_eq!(command.command, "rustfmt");
-        assert_eq!(command.args, vec!["--emit", "stdout"]);
+        assert_eq!(command.args, vec!["--edition", "2024", "--emit", "stdout"]);
         assert_eq!(command.cwd, root);
+    }
+
+    #[test]
+    fn rust_builtin_uses_nearest_cargo_manifest_edition_and_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("crate/src")).unwrap();
+        std::fs::write(
+            root.join("crate/Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("crate/src/lib.rs"), "async fn f() {}\n").unwrap();
+        let project = project(&root);
+        let file = project_file(&project, "crate/src/lib.rs");
+        let ctx = context(&project, &file, Language::Rust);
+        let command = discover_builtin_formatter(&ctx).unwrap();
+        assert_eq!(command.args, vec!["--edition", "2021", "--emit", "stdout"]);
+        assert_eq!(command.cwd, root.join("crate"));
     }
 
     #[test]
@@ -514,15 +783,80 @@ mod tests {
         std::fs::write(root.join("web/src/app.ts"), "const x=1;").unwrap();
         let project = project(&root);
         let file = project_file(&project, "web/src/app.ts");
-        let ctx = FormatContext {
-            project: &project,
-            file: &file,
-            language: Language::TypeScript,
-        };
+        let ctx = context(&project, &file, Language::TypeScript);
         let command = discover_builtin_formatter(&ctx).unwrap();
         assert_eq!(command.command, "npm");
         assert_eq!(command.args, vec!["run", "format:stdin", "--"]);
         assert_eq!(command.cwd, root.join("web"));
+    }
+
+    #[test]
+    fn package_script_discovery_stops_at_project_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let outer = temp.path().canonicalize().unwrap();
+        let root = outer.join("workspace");
+        std::fs::create_dir_all(root.join("web/src")).unwrap();
+        std::fs::write(
+            outer.join("package.json"),
+            r#"{"scripts":{"format:stdin":"prettier"}}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("web/src/app.ts"), "const x=1;").unwrap();
+        let project = project(&root);
+        let file = project_file(&project, "web/src/app.ts");
+        let ctx = context(&project, &file, Language::TypeScript);
+        assert!(discover_builtin_formatter(&ctx).is_none());
+    }
+
+    #[test]
+    fn package_script_discovery_rejects_shell_script_body() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("web/src")).unwrap();
+        std::fs::write(
+            root.join("web/package.json"),
+            r#"{"scripts":{"format:stdin":"prettier --stdin-filepath src/app.ts && curl example.com"}}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("web/src/app.ts"), "const x=1;").unwrap();
+        let project = project(&root);
+        let file = project_file(&project, "web/src/app.ts");
+        let ctx = context(&project, &file, Language::TypeScript);
+        assert!(discover_builtin_formatter(&ctx).is_none());
+    }
+
+    #[test]
+    fn formatter_rules_use_owning_workspace_root_in_multi_root_project() {
+        let temp = tempfile::tempdir().unwrap();
+        let outer = temp.path().canonicalize().unwrap();
+        let service_a = outer.join("service-a");
+        let service_b = outer.join("service-b");
+        std::fs::create_dir_all(service_a.join("src")).unwrap();
+        std::fs::create_dir_all(service_b.join("src")).unwrap();
+        std::fs::write(service_a.join("src/app.ts"), "const x=1;").unwrap();
+        std::fs::write(service_b.join("src/app.ts"), "const x=1;").unwrap();
+        let project =
+            MultiRootProject::new([service_a.clone(), service_b]).expect("multi root project");
+        let file = project
+            .file_by_abs_path(&service_a.join("src/app.ts"))
+            .expect("project file");
+        let ctx = context(&project, &file, Language::TypeScript);
+        let rule = FormatterCommandRule {
+            include: vec!["src/**/*.ts".to_string()],
+            exclude: Vec::new(),
+            language: Some("typescript".to_string()),
+            command: "fmt".to_string(),
+            args: vec!["{relativeFile}".to_string(), "{workspaceRoot}".to_string()],
+            cwd: Some("tools".to_string()),
+        };
+
+        assert!(rule_matches(&rule, &ctx));
+        let command = formatter_command_from_rule(&rule, &ctx).unwrap();
+        assert_eq!(command.cwd, service_a.join("tools"));
+        assert_eq!(
+            command.args,
+            vec!["src/app.ts".to_string(), service_a.display().to_string()]
+        );
     }
 
     #[test]
@@ -532,11 +866,7 @@ mod tests {
         std::fs::write(root.join("main.rb"), "puts 'hi'\n").unwrap();
         let project = project(&root);
         let file = project_file(&project, "main.rb");
-        let ctx = FormatContext {
-            project: &project,
-            file: &file,
-            language: Language::Ruby,
-        };
+        let ctx = context(&project, &file, Language::Ruby);
         assert!(discover_builtin_formatter(&ctx).is_none());
     }
 
@@ -572,6 +902,27 @@ mod tests {
     }
 
     #[test]
+    fn formatter_pipe_reader_rejects_oversized_output() {
+        let error = read_pipe_limited(&b"abcdef"[..], 5).unwrap_err();
+        assert!(error.contains("exceeded 5 bytes"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn formatter_executor_times_out_hung_formatter() {
+        let temp = tempfile::tempdir().unwrap();
+        let stub = temp.path().join("stub-hang");
+        stub_command(&stub, "#!/bin/sh\nwhile true; do :; done\n");
+        let command = FormatterCommand {
+            command: stub.display().to_string(),
+            args: Vec::new(),
+            cwd: temp.path().to_path_buf(),
+        };
+        let error = run_formatter_command(&command, "hello\n").unwrap_err();
+        assert!(error.contains("timed out"), "{error}");
+    }
+
+    #[test]
     #[ignore = "requires BIFROST_FORMATTER_INTEGRATION_TESTS=1 and rustfmt on PATH"]
     fn formatter_integration_rustfmt_stdout_contract() {
         if std::env::var("BIFROST_FORMATTER_INTEGRATION_TESTS")
@@ -585,7 +936,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let command = FormatterCommand {
             command: "rustfmt".to_string(),
-            args: vec!["--emit".to_string(), "stdout".to_string()],
+            args: vec![
+                "--edition".to_string(),
+                "2024".to_string(),
+                "--emit".to_string(),
+                "stdout".to_string(),
+            ],
             cwd: temp.path().to_path_buf(),
         };
         let output = run_formatter_command(&command, "fn main(){println!(\"hi\");}\n").unwrap();

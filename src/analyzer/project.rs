@@ -34,6 +34,10 @@ const OVERLAY_REJECTION_LOG_MAX_ENTRIES: usize = 256;
 
 pub trait Project: Send + Sync {
     fn root(&self) -> &Path;
+    fn workspace_root_for_file(&self, file: &ProjectFile) -> PathBuf {
+        let _ = file;
+        self.root().to_path_buf()
+    }
     fn analyzer_languages(&self) -> BTreeSet<Language>;
     fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>>;
     fn analyzable_files(&self, language: Language) -> io::Result<BTreeSet<ProjectFile>>;
@@ -371,6 +375,15 @@ impl Project for MultiRootProject {
         &self.root
     }
 
+    fn workspace_root_for_file(&self, file: &ProjectFile) -> PathBuf {
+        let abs_path = file.abs_path();
+        self.roots
+            .iter()
+            .find(|root| abs_path.starts_with(root.root()))
+            .map(|root| root.root().to_path_buf())
+            .unwrap_or_else(|| self.root.clone())
+    }
+
     fn analyzer_languages(&self) -> BTreeSet<Language> {
         self.all_files()
             .map(|files| {
@@ -655,6 +668,10 @@ fn prune_throttle_map(log: &mut HashMap<PathBuf, Instant>, now: Instant) {
 impl Project for OverlayProject {
     fn root(&self) -> &Path {
         self.delegate.root()
+    }
+
+    fn workspace_root_for_file(&self, file: &ProjectFile) -> PathBuf {
+        self.delegate.workspace_root_for_file(file)
     }
 
     fn analyzer_languages(&self) -> BTreeSet<Language> {
