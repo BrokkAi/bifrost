@@ -367,9 +367,9 @@ fn run_formatter_command(
     let status = wait_for_formatter(&mut child, command, cancellation);
     cancellation.clear_pid();
     let status = status?;
-    collect_stdin_writer(stdin_writer, command)?;
     let stdout = collect_pipe("stdout", stdout_reader, command, Some(&mut child))?;
     let stderr = collect_pipe("stderr", stderr_reader, command, Some(&mut child))?;
+    let stdin_result = collect_stdin_writer(stdin_writer, command);
     if !status.success() {
         return Err(format!(
             "formatter `{}` exited with status {}: {}",
@@ -378,6 +378,7 @@ fn run_formatter_command(
             truncate_for_error(&String::from_utf8_lossy(&stderr))
         ));
     }
+    stdin_result?;
     String::from_utf8(stdout).map_err(|err| {
         format!(
             "formatter `{}` emitted non-UTF-8 stdout: {err}",
