@@ -7677,60 +7677,6 @@ fn shutdown_lsp(
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");
 }
 
-#[test]
-fn bifrost_lsp_server_formatting_capability_is_advertised() {
-    let temp = TempDir::new().expect("tempdir");
-    let root = temp.path().canonicalize().expect("canon temp");
-    let root_uri = uri_for(&root);
-    let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
-        .arg("--root")
-        .arg(&root)
-        .arg("--server")
-        .arg("lsp")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn bifrost");
-    let mut stdin = child.stdin.take().expect("stdin");
-    let stdout = child.stdout.take().expect("stdout");
-    let mut stderr = child.stderr.take().expect("stderr");
-    let mut reader = BufReader::new(stdout);
-
-    write_message(
-        &mut stdin,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "processId": null,
-                "rootUri": root_uri,
-                "capabilities": {}
-            }
-        }),
-    );
-    let initialize = read_response_for_id(&mut reader, &mut stderr, 1);
-    assert!(
-        initialize["result"]["capabilities"]["documentFormattingProvider"].is_object(),
-        "documentFormattingProvider should be advertised: {initialize}"
-    );
-    write_message(
-        &mut stdin,
-        json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
-    );
-
-    write_message(
-        &mut stdin,
-        json!({"jsonrpc": "2.0", "id": 99, "method": "shutdown"}),
-    );
-    let _ = read_response_for_id(&mut reader, &mut stderr, 99);
-    write_message(&mut stdin, json!({"jsonrpc": "2.0", "method": "exit"}));
-    drop(stdin);
-    let status = child.wait().expect("wait bifrost");
-    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
-}
-
 #[cfg(unix)]
 fn write_stub_command(path: &Path, body: &str) {
     use std::os::unix::fs::PermissionsExt;

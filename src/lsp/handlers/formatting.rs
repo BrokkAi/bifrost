@@ -134,7 +134,7 @@ fn formatter_command_from_rule(
 
 fn rule_matches(rule: &FormatterCommandRule, context: &FormatContext<'_>) -> bool {
     if let Some(language) = rule.language.as_deref()
-        && parse_language(language) != Some(context.language)
+        && Language::from_config_label(language) != Some(context.language)
     {
         return false;
     }
@@ -218,6 +218,7 @@ fn discover_package_script(context: &FormatContext<'_>) -> Option<FormatterComma
             .get(*name)
             .and_then(|value| value.as_str())
             .is_some_and(is_safe_prettier_script)
+            && !has_npm_lifecycle_script(scripts, name)
     })?;
     Some(FormatterCommand {
         command: npm_command().to_string(),
@@ -244,20 +245,12 @@ fn nearest_manifest(start: &Path, stop_at: &Path, name: &str) -> Option<PathBuf>
 
 fn run_formatter_command(command: &FormatterCommand, input: &str) -> Result<String, String> {
     let mut child = spawn_formatter(command)?;
-    {
-        let mut stdin = child.stdin.take().ok_or_else(|| {
-            format!(
-                "failed to open stdin for formatter `{}`",
-                command_line_for_message(command)
-            )
-        })?;
-        stdin.write_all(input.as_bytes()).map_err(|err| {
-            format!(
-                "failed to write document to formatter `{}`: {err}",
-                command_line_for_message(command)
-            )
-        })?;
-    }
+    let stdin = child.stdin.take().ok_or_else(|| {
+        format!(
+            "failed to open stdin for formatter `{}`",
+            command_line_for_message(command)
+        )
+    })?;
     let stdout = child.stdout.take().ok_or_else(|| {
         format!(
             "failed to open stdout for formatter `{}`",
@@ -272,7 +265,9 @@ fn run_formatter_command(command: &FormatterCommand, input: &str) -> Result<Stri
     })?;
     let stdout_reader = spawn_pipe_reader(stdout, max_stdout_bytes(input.len()));
     let stderr_reader = spawn_pipe_reader(stderr, MAX_FORMATTER_STDERR_BYTES);
+    let stdin_writer = spawn_stdin_writer(stdin, input.as_bytes().to_vec());
     let status = wait_for_formatter(&mut child, command)?;
+    collect_stdin_writer(stdin_writer, command)?;
     let stdout = collect_pipe("stdout", stdout_reader, command, Some(&mut child))?;
     let stderr = collect_pipe("stderr", stderr_reader, command, Some(&mut child))?;
     if !status.success() {
@@ -369,6 +364,40 @@ fn terminate_formatter(child: &mut std::process::Child) {
 }
 
 type PipeReadResult = Result<Vec<u8>, String>;
+type StdinWriteResult = Result<(), String>;
+
+fn spawn_stdin_writer(
+    mut stdin: impl Write + Send + 'static,
+    input: Vec<u8>,
+) -> mpsc::Receiver<StdinWriteResult> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let result = stdin.write_all(&input).map_err(|err| err.to_string());
+        let _ = sender.send(result);
+    });
+    receiver
+}
+
+fn collect_stdin_writer(
+    receiver: mpsc::Receiver<StdinWriteResult>,
+    command: &FormatterCommand,
+) -> Result<(), String> {
+    match receiver.recv_timeout(FORMATTER_READER_GRACE) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => Err(format!(
+            "failed to write document to formatter `{}`: {err}",
+            command_line_for_message(command)
+        )),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(format!(
+            "formatter `{}` did not finish reading stdin",
+            command_line_for_message(command)
+        )),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(format!(
+            "formatter `{}` stdin writer stopped unexpectedly",
+            command_line_for_message(command)
+        )),
+    }
+}
 
 fn spawn_pipe_reader(
     pipe: impl Read + Send + 'static,
@@ -498,6 +527,13 @@ fn is_safe_prettier_script(script: &str) -> bool {
         .is_some_and(|command| command == "prettier" || command.ends_with("/prettier"))
 }
 
+fn has_npm_lifecycle_script(
+    scripts: &serde_json::Map<String, serde_json::Value>,
+    name: &str,
+) -> bool {
+    scripts.contains_key(&format!("pre{name}")) || scripts.contains_key(&format!("post{name}"))
+}
+
 #[cfg(windows)]
 fn npm_command() -> &'static str {
     "npm.cmd"
@@ -524,28 +560,6 @@ fn format_duration(duration: Duration) -> String {
     }
 }
 
-fn parse_language(input: &str) -> Option<Language> {
-    let normalized = input
-        .trim()
-        .trim_start_matches('.')
-        .to_ascii_lowercase()
-        .replace(['_', '-'], "");
-    match normalized.as_str() {
-        "java" => Some(Language::Java),
-        "go" => Some(Language::Go),
-        "c" | "cc" | "cpp" | "cxx" | "c++" => Some(Language::Cpp),
-        "javascript" | "js" | "jsx" | "mjs" | "cjs" => Some(Language::JavaScript),
-        "typescript" | "ts" | "tsx" => Some(Language::TypeScript),
-        "python" | "py" => Some(Language::Python),
-        "rust" | "rs" => Some(Language::Rust),
-        "php" => Some(Language::Php),
-        "scala" => Some(Language::Scala),
-        "csharp" | "c#" | "cs" => Some(Language::CSharp),
-        "ruby" | "rb" => Some(Language::Ruby),
-        _ => None,
-    }
-}
-
 fn expand_placeholders(value: &str, context: &FormatContext<'_>) -> String {
     value
         .replace("{file}", &context.file.abs_path().display().to_string())
@@ -557,7 +571,7 @@ fn expand_placeholders(value: &str, context: &FormatContext<'_>) -> String {
             "{workspaceRoot}",
             &context.workspace_root.display().to_string(),
         )
-        .replace("{language}", language_label(context.language))
+        .replace("{language}", context.language.config_label())
 }
 
 fn resolve_cwd(value: &str, workspace_root: &Path) -> PathBuf {
@@ -577,23 +591,6 @@ fn glob_matches(pattern: &str, rel: &str) -> bool {
 
 fn normalized_rel_path(context: &FormatContext<'_>) -> String {
     context.relative_file.to_string_lossy().replace('\\', "/")
-}
-
-fn language_label(language: Language) -> &'static str {
-    match language {
-        Language::None => "none",
-        Language::Java => "java",
-        Language::Go => "go",
-        Language::Cpp => "cpp",
-        Language::JavaScript => "javascript",
-        Language::TypeScript => "typescript",
-        Language::Python => "python",
-        Language::Rust => "rust",
-        Language::Php => "php",
-        Language::Scala => "scala",
-        Language::CSharp => "csharp",
-        Language::Ruby => "ruby",
-    }
 }
 
 fn command_line_for_message(command: &FormatterCommand) -> String {
@@ -826,6 +823,23 @@ mod tests {
     }
 
     #[test]
+    fn package_script_discovery_rejects_npm_lifecycle_hooks() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("web/src")).unwrap();
+        std::fs::write(
+            root.join("web/package.json"),
+            r#"{"scripts":{"format:stdin":"prettier --stdin-filepath src/app.ts","preformat:stdin":"curl example.com"}}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("web/src/app.ts"), "const x=1;").unwrap();
+        let project = project(&root);
+        let file = project_file(&project, "web/src/app.ts");
+        let ctx = context(&project, &file, Language::TypeScript);
+        assert!(discover_builtin_formatter(&ctx).is_none());
+    }
+
+    #[test]
     fn formatter_rules_use_owning_workspace_root_in_multi_root_project() {
         let temp = tempfile::tempdir().unwrap();
         let outer = temp.path().canonicalize().unwrap();
@@ -860,6 +874,38 @@ mod tests {
     }
 
     #[test]
+    fn formatter_rules_use_deepest_workspace_root_in_nested_multi_root_project() {
+        let temp = tempfile::tempdir().unwrap();
+        let outer = temp.path().canonicalize().unwrap();
+        let parent = outer.join("repo");
+        let nested = parent.join("frontend");
+        std::fs::create_dir_all(nested.join("src")).unwrap();
+        std::fs::write(nested.join("src/app.ts"), "const x=1;").unwrap();
+        let project =
+            MultiRootProject::new([parent.clone(), nested.clone()]).expect("multi root project");
+        let file = project
+            .file_by_abs_path(&nested.join("src/app.ts"))
+            .expect("project file");
+        let ctx = context(&project, &file, Language::TypeScript);
+        let rule = FormatterCommandRule {
+            include: vec!["src/**/*.ts".to_string()],
+            exclude: Vec::new(),
+            language: Some("typescript".to_string()),
+            command: "fmt".to_string(),
+            args: vec!["{relativeFile}".to_string(), "{workspaceRoot}".to_string()],
+            cwd: Some("tools".to_string()),
+        };
+
+        assert!(rule_matches(&rule, &ctx));
+        let command = formatter_command_from_rule(&rule, &ctx).unwrap();
+        assert_eq!(command.cwd, nested.join("tools"));
+        assert_eq!(
+            command.args,
+            vec!["src/app.ts".to_string(), nested.display().to_string()]
+        );
+    }
+
+    #[test]
     fn ambiguous_languages_require_override_rules() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
@@ -883,6 +929,22 @@ mod tests {
         };
         let output = run_formatter_command(&command, "hello\n").unwrap();
         assert_eq!(output, "HELLO\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn formatter_executor_drains_stdout_while_writing_large_stdin() {
+        let temp = tempfile::tempdir().unwrap();
+        let stub = temp.path().join("stub-cat");
+        stub_command(&stub, "#!/bin/sh\ncat\n");
+        let command = FormatterCommand {
+            command: stub.display().to_string(),
+            args: Vec::new(),
+            cwd: temp.path().to_path_buf(),
+        };
+        let input = "x".repeat(2 * 1024 * 1024);
+        let output = run_formatter_command(&command, &input).unwrap();
+        assert_eq!(output, input);
     }
 
     #[cfg(unix)]

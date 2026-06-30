@@ -4,6 +4,7 @@ use std::io;
 use std::panic;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, Once};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use lsp_server::{
@@ -534,6 +535,10 @@ fn handle_request(
     state: &mut ServerState,
     req: Request,
 ) -> Result<(), String> {
+    if req.method == Formatting::METHOD {
+        return handle_formatting_request(connection, state, req);
+    }
+
     let id = req.id.clone();
     let id_for_log = format!("{id:?}");
     let method = req.method.clone();
@@ -553,9 +558,6 @@ fn handle_request(
                 state.project(),
                 &params,
             ))
-        }),
-        Formatting::METHOD => decode_and_run::<Formatting, _>(req, |params| {
-            formatting::handle(state.project(), &params, &state.formatter_commands)
         }),
         WorkspaceSymbolRequest::METHOD => {
             decode_and_run::<WorkspaceSymbolRequest, _>(req, |params| {
@@ -700,6 +702,36 @@ fn handle_request(
         .sender
         .send(Message::Response(response))
         .map_err(|err| format!("Failed to send LSP response: {err}"))
+}
+
+fn handle_formatting_request(
+    connection: &Connection,
+    state: &ServerState,
+    req: Request,
+) -> Result<(), String> {
+    let id = req.id.clone();
+    let method = req.method.clone();
+    let project = Arc::clone(&state.overlay);
+    let rules = state.formatter_commands.clone();
+    let sender = connection.sender.clone();
+    thread::spawn(move || {
+        let response = decode_and_run::<Formatting, _>(req, |params| {
+            formatting::handle(project.as_ref(), &params, &rules)
+        });
+        if let Some(error) = response.error.as_ref() {
+            eprintln!(
+                "[bifrost-lsp] request error method={} id={:?} code={} message={}",
+                method, id, error.code, error.message
+            );
+        }
+        if let Err(err) = sender.send(Message::Response(response)) {
+            eprintln!(
+                "[bifrost-lsp] failed to send formatting response method={} id={:?}: {err}",
+                method, id
+            );
+        }
+    });
+    Ok(())
 }
 
 /// Decode the typed params for an LSP request and run `handler`, mapping any
@@ -1554,11 +1586,51 @@ fn collect_workspace_roots(
 }
 
 fn bifrost_initialization_options(params: &InitializeParams) -> BifrostInitializationOptions {
-    params
-        .initialization_options
-        .clone()
-        .and_then(|value| serde_json::from_value(value).ok())
-        .unwrap_or_default()
+    let Some(value) = params.initialization_options.as_ref() else {
+        return BifrostInitializationOptions::default();
+    };
+    let Some(object) = value.as_object() else {
+        eprintln!("[bifrost-lsp] ignoring initializationOptions that is not an object");
+        return BifrostInitializationOptions::default();
+    };
+    BifrostInitializationOptions {
+        roots: optional_string_array(object, "roots"),
+        exclude: optional_string_array(object, "exclude"),
+        formatter_commands: match object.get("formatterCommands") {
+            Some(value) => serde_json::from_value(value.clone()).unwrap_or_else(|err| {
+                eprintln!(
+                    "[bifrost-lsp] ignoring invalid initializationOptions.formatterCommands: {err}"
+                );
+                Vec::new()
+            }),
+            None => Vec::new(),
+        },
+    }
+}
+
+fn optional_string_array(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Vec<String> {
+    let Some(value) = object.get(key) else {
+        return Vec::new();
+    };
+    let Some(items) = value.as_array() else {
+        eprintln!("[bifrost-lsp] ignoring initializationOptions.{key} that is not an array");
+        return Vec::new();
+    };
+    items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            item.as_str().map(str::to_string).or_else(|| {
+                eprintln!(
+                    "[bifrost-lsp] ignoring initializationOptions.{key}[{index}] that is not a string"
+                );
+                None
+            })
+        })
+        .collect()
 }
 
 fn workspace_root_for_config_path(raw: &str, base: &Path) -> Option<WorkspaceRoot> {
@@ -1626,4 +1698,30 @@ fn path_is_within_any(path: &Path, candidates: &[PathBuf]) -> bool {
     candidates
         .iter()
         .any(|candidate| normalized == *candidate || normalized.starts_with(candidate))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn invalid_formatter_commands_do_not_discard_roots_or_exclude() {
+        let params: InitializeParams = serde_json::from_value(json!({
+            "processId": null,
+            "rootUri": null,
+            "capabilities": {},
+            "initializationOptions": {
+                "roots": ["service-a"],
+                "exclude": ["target"],
+                "formatterCommands": [{"include": ["*.rs"]}]
+            }
+        }))
+        .unwrap();
+
+        let options = bifrost_initialization_options(&params);
+        assert_eq!(options.roots, vec!["service-a"]);
+        assert_eq!(options.exclude, vec!["target"]);
+        assert!(options.formatter_commands.is_empty());
+    }
 }

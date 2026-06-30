@@ -21,6 +21,9 @@ The user-visible behavior is: start `bifrost --lsp`, initialize with optional `f
 - [x] (2026-06-30 12:14Z) Ran guided review with security, DRY, senior-dev intent, DevOps, and architecture reviewers. Evidence: reviewers reported issues around multi-root formatter roots, Rust stdin edition, hung formatters, JS/TS discovery boundaries, Windows npm command resolution, unbounded output, and overly broad npm script auto-discovery; DRY reported no findings.
 - [x] (2026-06-30 12:39Z) Addressed guided-review findings in the formatter layer. Evidence: `cargo test formatting --lib --features nlp` passed 14 tests with 1 ignored opt-in rustfmt integration test after adding multi-root root selection, Rust edition discovery, formatter timeout/process-group termination, bounded formatter output, Windows `npm.cmd`, safe JS/TS script filtering, and manifest discovery stop bounds.
 - [x] (2026-06-30 12:50Z) Ran final post-review validation. Evidence: `cargo fmt --check`, `cargo test formatting --lib --features nlp`, `cargo test --test bifrost_lsp_server formatting --features nlp`, `npm test` in `editors/vscode`, and `cargo clippy-no-cuda` all passed.
+- [x] (2026-06-30 13:17Z) Ran a second guided review against `origin/master`. Evidence: reviewers reported remaining issues around streaming formatter deadlock, npm lifecycle script bypass, malformed formatter config dropping roots/excludes, synchronous formatting on the LSP loop, nested workspace root selection, duplicated language mapping, and duplicate capability-test startup.
+- [x] (2026-06-30 13:34Z) Addressed the second guided-review findings. Evidence: formatter stdin writing now runs concurrently with stdout/stderr draining and timeout; JS/TS package discovery rejects formatter lifecycle hooks; formatting requests run on a worker thread; invalid formatter configuration no longer discards roots/excludes; nested multi-root selection chooses the deepest root; formatter language labels moved to `Language`; duplicate LSP capability test was removed.
+- [x] (2026-06-30 13:42Z) Ran final validation after second-review fixes. Evidence: `cargo fmt --check`, `cargo test formatting --lib --features nlp`, `cargo test --test bifrost_lsp_server formatting --features nlp`, `cargo test invalid_formatter_commands_do_not_discard_roots_or_exclude --lib --features nlp`, `npm test` in `editors/vscode`, and `cargo clippy-no-cuda` all passed.
 
 ## Surprises & Discoveries
 
@@ -41,6 +44,15 @@ The user-visible behavior is: start `bifrost --lsp`, initialize with optional `f
 
 - Observation: a formatter child can block the LSP request loop if it never exits, emits unbounded output, or leaves inherited pipes open through descendants.
   Evidence: guided review flagged `wait_with_output()` and unbounded pipe reads; the executor now enforces a timeout, output caps, Unix process-group termination, and a bounded reader grace period.
+
+- Observation: draining stdout/stderr after writing all stdin is still unsafe for streaming formatters.
+  Evidence: the second guided review pointed out that a formatter like `cat` can fill stdout while Bifrost is still blocked in `stdin.write_all`; stdin writing now runs concurrently with output readers, covered by a large-input `cat` test.
+
+- Observation: `npm run` executes `pre<script>` and `post<script>` lifecycle hooks even when the target script body is safe.
+  Evidence: the second guided review showed that `preformat:stdin` could bypass the built-in script-body filter; package-script discovery now rejects formatter scripts with lifecycle hooks.
+
+- Observation: formatter execution should not occupy the single LSP dispatch loop.
+  Evidence: the second guided review flagged synchronous process execution in `handle_request`; formatting requests now clone the overlay project and rules, execute on a worker thread, and send the response asynchronously.
 
 ## Decision Log
 
@@ -68,11 +80,19 @@ The user-visible behavior is: start `bifrost --lsp`, initialize with optional `f
   Rationale: Analyzer multi-root identity intentionally uses the common ancestor, but formatter behavior is workspace-root-sensitive. A small `Project::workspace_root_for_file` method lets formatting use the correct root without destabilizing existing analyzer paths.
   Date/Author: 2026-06-30 / Codex.
 
+- Decision: Ignore invalid formatter command configuration while preserving other initialization options.
+  Rationale: `connection.initialize` has already replied before workspace setup sees initialization options, so failing there would terminate after a nominal initialize response. Logging and dropping only invalid formatter commands preserves `roots` and `exclude` and avoids accidental broad indexing.
+  Date/Author: 2026-06-30 / Codex.
+
+- Decision: Move formatter-facing language labels onto `Language`.
+  Rationale: Formatter rule parsing and `{language}` placeholders should not maintain a separate language alias table from analyzer language metadata.
+  Date/Author: 2026-06-30 / Codex.
+
 ## Outcomes & Retrospective
 
 Completed #42's document-formatting slice. Bifrost now advertises and handles `textDocument/formatting`, resolves formatter commands from ordered configuration rules before conservative built-ins, formats overlay-aware document text through stdin/stdout commands, and returns ordinary full-document LSP edits. VS Code now exposes `bifrost.formatterCommands` and forwards rules to the server. Range formatting and on-type formatting remain separate follow-up issues.
 
-The initial validation bundle passed on 2026-06-30, then guided review found several concrete safety and workspace-root issues. After addressing those findings, the final post-review validation bundle also passed: `cargo fmt --check`, `cargo test formatting --lib --features nlp`, `cargo test --test bifrost_lsp_server formatting --features nlp`, `npm test` in `editors/vscode`, and `cargo clippy-no-cuda`.
+The initial validation bundle passed on 2026-06-30, then guided review found several concrete safety and workspace-root issues. After addressing those findings, the first post-review validation bundle also passed: `cargo fmt --check`, `cargo test formatting --lib --features nlp`, `cargo test --test bifrost_lsp_server formatting --features nlp`, `npm test` in `editors/vscode`, and `cargo clippy-no-cuda`. A second guided review found additional process, npm lifecycle, initialization parsing, nested-root, and cleanup findings; after fixing those, the final validation bundle also passed: `cargo fmt --check`, `cargo test formatting --lib --features nlp`, `cargo test --test bifrost_lsp_server formatting --features nlp`, `cargo test invalid_formatter_commands_do_not_discard_roots_or_exclude --lib --features nlp`, `npm test`, and `cargo clippy-no-cuda`.
 
 ## Context and Orientation
 

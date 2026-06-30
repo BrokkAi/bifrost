@@ -379,7 +379,8 @@ impl Project for MultiRootProject {
         let abs_path = file.abs_path();
         self.roots
             .iter()
-            .find(|root| abs_path.starts_with(root.root()))
+            .filter(|root| abs_path.starts_with(root.root()))
+            .max_by_key(|root| root.root().components().count())
             .map(|root| root.root().to_path_buf())
             .unwrap_or_else(|| self.root.clone())
     }
