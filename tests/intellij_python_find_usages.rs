@@ -241,10 +241,12 @@ fn self_receiver_inherited_method_usage_resolves() {
 
 // IntelliJ PY-6241 NameShadowing: caret on the `@property` getter `x`. IntelliJ
 // counts 2: the `@x.setter` (line 9) and `@x.deleter` (line 13) decorator
-// references. These reference the property by its bare class-body name (the
-// `x` in `@x.setter`), not through a receiver, so member matching skips them.
+// references. Here `x` is the *object* of a decorator attribute (`x.setter`),
+// lexically attached to the setter/deleter method, so it is neither a bare
+// class-body identifier nor a `self`-receiver; resolving it also requires
+// merging the getter/setter/deleter property definitions.
 #[test]
-#[ignore = "bifrost gap: bare-name member references in class body (e.g. @x.setter)"]
+#[ignore = "bifrost gap: decorator member references (@x.setter) + property getter/setter/deleter merge"]
 fn name_shadowing() {
     let (_temp, file, locations) = references_for(
         "NameShadowing.py",
@@ -255,10 +257,12 @@ fn name_shadowing() {
 
 // IntelliJ PY-5458 WrappedMethod: caret on method `testMethod`. IntelliJ counts
 // 3: the `MyClass.testMethod(...)` call (line 2) and both `testMethod` tokens in
-// `testMethod = staticmethod(testMethod)` (line 9). bifrost resolves the
-// class-qualified call on line 2 but not the bare-name reassignments on line 9.
+// `testMethod = staticmethod(testMethod)` (line 9). After the class-body
+// bare-name fix bifrost finds [2, 9] — the qualified call and the `staticmethod`
+// argument. It still omits the line-9 LHS, which is the assignment *target*
+// (a reassignment) and is modeled as a declaration, not a usage.
 #[test]
-#[ignore = "bifrost gap: bare-name member references in class body (testMethod = staticmethod(testMethod))"]
+#[ignore = "bifrost finds [2, 9]; omits the line-9 reassignment target (assignment target = declaration)"]
 fn wrapped_method() {
     let (_temp, file, locations) = references_for(
         "WrappedMethod.py",

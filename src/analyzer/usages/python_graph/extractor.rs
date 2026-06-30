@@ -325,6 +325,37 @@ impl ScanCtx<'_> {
         self.receiver_type_matches_target(raw_type)
     }
 
+    /// Whether `node` sits directly in the body of the target member's owner
+    /// class — the class itself or a class-level field of it (e.g. the
+    /// initializer of `alias = method`), but NOT inside a method. In a Python
+    /// class body the member names are directly in scope, so a bare reference
+    /// there is a usage of the member; inside a method you instead need
+    /// `self.member`.
+    fn node_directly_in_owner_class_body(&self, node: Node<'_>) -> bool {
+        let Some(target_owner) = self.target_owner.as_ref() else {
+            return false;
+        };
+        let range = Range {
+            start_byte: node.start_byte(),
+            end_byte: node.end_byte(),
+            start_line: 0,
+            end_line: 0,
+        };
+        let Some(enclosing) = self.analyzer.enclosing_code_unit(self.file, &range) else {
+            return false;
+        };
+        if &enclosing == target_owner {
+            return true;
+        }
+        // A class-level assignment (`alias = member`) nests the reference inside
+        // a field CodeUnit; that field is still in the class namespace. A method
+        // body is not — bare names there don't reach the class members.
+        if enclosing.is_function() {
+            return false;
+        }
+        target_owner_code_unit(self.analyzer, &enclosing).as_ref() == Some(target_owner)
+    }
+
     /// Whether the class enclosing `node` is the target member's owner (or a
     /// subclass of it, for inherited members). Used to resolve `self`/`cls`
     /// receivers, whose type is the lexically enclosing class.
@@ -408,9 +439,6 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn handle_identifier_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if ctx.target_member.is_some() {
-        return;
-    }
     if node
         .parent()
         .is_some_and(|parent| parent.kind() == "attribute")
@@ -418,7 +446,18 @@ fn handle_identifier_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     let text = slice(node, ctx.source);
-    if text.is_empty() || !ctx.binds_target(text, node) || is_declaration_identifier(node) {
+    if text.is_empty() || is_declaration_identifier(node) {
+        return;
+    }
+    if let Some(member) = ctx.target_member {
+        // For a member target, a bare identifier is a usage only when it names
+        // the member directly in the owner class body (the class namespace).
+        if text == member && ctx.node_directly_in_owner_class_body(node) {
+            record_hit(node, ctx);
+        }
+        return;
+    }
+    if !ctx.binds_target(text, node) {
         return;
     }
     record_hit(node, ctx);

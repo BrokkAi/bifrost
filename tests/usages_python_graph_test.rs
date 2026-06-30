@@ -1949,3 +1949,29 @@ fn module_level_constructed_local_resolves_member_usage() {
         1,
     );
 }
+
+// Bug: a bare reference to a member in the class body (the Python class
+// namespace) — e.g. `alias = method` — is a usage of that member. Inside a
+// method body a bare name would NOT reach the member (you need `self.`).
+#[test]
+fn class_body_bare_member_reference_resolves() {
+    assert_eq!(
+        single_file_member_hits(
+            "class C:\n    def foo(self):\n        pass\n\n    alias = foo\n",
+            "m.C.foo",
+        ),
+        1,
+    );
+}
+
+#[test]
+fn bare_member_name_inside_method_is_not_a_usage() {
+    // `foo` here is an unrelated local, not the method C.foo.
+    assert_eq!(
+        single_file_member_hits(
+            "class C:\n    def foo(self):\n        pass\n\n    def bar(self):\n        foo = 1\n        return foo\n",
+            "m.C.foo",
+        ),
+        0,
+    );
+}

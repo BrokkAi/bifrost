@@ -41,6 +41,11 @@ scope by architecture and are not ported.
 - 2026-06-30: Fixed Bug 2b (module-scope receiver seeding). Re-characterized as
   scope-level (module vs function), not same-file. Canonical regressions added to
   `tests/usages_python_graph_test.rs` (56 pass). No regressions; clippy clean.
+- 2026-06-30: Added class-body bare-name member-reference matching (WrappedMethod
+  [2] -> [2, 9]). Regressions (+ negative in-method guard) in
+  `usages_python_graph_test.rs` (58 pass). WrappedMethod/NameShadowing remain
+  ignored for precisely-documented deeper reasons (reassignment-target modeling;
+  decorator/property attribution). No regressions; clippy clean.
 
 
 ## Surprises and Discoveries
@@ -95,6 +100,31 @@ declarations and keys them by the module CodeUnit. Verified `ctorlocal_module`=1
 regression `module_level_constructed_local_resolves_member_usage` in
 `tests/usages_python_graph_test.rs`. `init_usages` remains blocked only by the
 separate constructor-call -> `__init__` mapping gap.
+
+### Bare-name class-body member references (PARTIAL)
+
+A bare reference to a member inside the owner class body — the Python class
+namespace, e.g. `alias = method` or `testMethod = staticmethod(testMethod)` —
+was never matched: `handle_identifier_candidate` returned early for any member
+target. Fix: match a bare identifier equal to the member name when it sits
+directly in the owner class body. "Directly in the class body" means the
+enclosing CodeUnit is the class itself or a class-level *field* of it (a
+class-level assignment nests the reference inside a field CodeUnit), but NOT a
+method — inside a method a bare name does not reach the class members.
+New `ScanCtx::node_directly_in_owner_class_body`; regressions
+`class_body_bare_member_reference_resolves` and (negative)
+`bare_member_name_inside_method_is_not_a_usage`.
+
+This advanced WrappedMethod from [2] to [2, 9]. Two related cases remain
+divergent and are documented, not forced:
+
+- WrappedMethod still omits the line-9 LHS of `testMethod = staticmethod(...)`,
+  which is an assignment *target* (reassignment) and is modeled as a declaration
+  rather than a usage. IntelliJ counts it.
+- NameShadowing's `@x.setter` / `@x.deleter` references the property as the
+  *object* of a decorator attribute, lexically attached to the setter/deleter
+  method; resolving it also needs the getter/setter/deleter property definitions
+  merged. Out of scope for the bare-identifier rule.
 
 ### Bug 2 (historical): same-file Python member usages are not resolved
 
@@ -171,8 +201,10 @@ PASS:
 
 OPEN gaps (`#[ignore]`, distinct from Bug 2a/2b):
 - InitUsages — constructor-call `C()` is not mapped to the class `__init__` method.
-- NameShadowing — bare-name member references in class body (`@x.setter`).
-- WrappedMethod — bare-name member references (`testMethod = staticmethod(testMethod)`).
+- WrappedMethod — finds [2, 9]; omits the line-9 reassignment target (assignment
+  target modeled as a declaration). IntelliJ wants [2, 9, 9].
+- NameShadowing — decorator member references (`@x.setter`) + property
+  getter/setter/deleter merge.
 
 BY DESIGN divergence (`#[ignore]`, will not pass):
 - ReassignedInstanceAttribute, ReassignedClassAttribute — bifrost models
