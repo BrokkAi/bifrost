@@ -7772,6 +7772,84 @@ fn bifrost_lsp_server_formatting_uses_did_open_overlay() {
 
 #[cfg(unix)]
 #[test]
+fn bifrost_lsp_server_formatting_uses_request_time_snapshot() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("lib.rs");
+    let stub_path = root.join("slow-upper-format");
+    fs::write(&file_path, "fn disk() {}\n").expect("write disk file");
+    write_stub_command(
+        &stub_path,
+        "#!/bin/sh\nsleep 1\ntr '[:lower:]' '[:upper:]'\n",
+    );
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server_with_params(
+        &root,
+        json!({
+            "processId": null,
+            "rootUri": uri_for(&root),
+            "capabilities": {},
+            "initializationOptions": {
+                "formatterCommands": [{
+                    "include": ["*.rs"],
+                    "language": "rust",
+                    "command": stub_path.display().to_string()
+                }]
+            }
+        }),
+    );
+    let file_uri = uri_for(&file_path);
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": file_uri,
+                    "languageId": "rust",
+                    "version": 1,
+                    "text": "fn before() {}\n"
+                }
+            }
+        }),
+    );
+    let _ = read_notification(&mut reader, &mut stderr, "textDocument/publishDiagnostics");
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "textDocument/formatting",
+            "params": {
+                "textDocument": {"uri": file_uri},
+                "options": {"tabSize": 4, "insertSpaces": true}
+            }
+        }),
+    );
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didChange",
+            "params": {
+                "textDocument": {"uri": file_uri, "version": 2},
+                "contentChanges": [{"text": "fn after() {}\n"}]
+            }
+        }),
+    );
+
+    let response = read_response_for_id(&mut reader, &mut stderr, 10);
+    let edits = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected formatting edits, got {response}"));
+    assert_eq!(edits[0]["newText"], "FN BEFORE() {}\n");
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[cfg(unix)]
+#[test]
 fn bifrost_lsp_server_formatting_returns_empty_edits_for_noop() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().canonicalize().expect("canon temp");

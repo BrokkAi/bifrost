@@ -24,6 +24,9 @@ The user-visible behavior is: start `bifrost --lsp`, initialize with optional `f
 - [x] (2026-06-30 13:17Z) Ran a second guided review against `origin/master`. Evidence: reviewers reported remaining issues around streaming formatter deadlock, npm lifecycle script bypass, malformed formatter config dropping roots/excludes, synchronous formatting on the LSP loop, nested workspace root selection, duplicated language mapping, and duplicate capability-test startup.
 - [x] (2026-06-30 13:34Z) Addressed the second guided-review findings. Evidence: formatter stdin writing now runs concurrently with stdout/stderr draining and timeout; JS/TS package discovery rejects formatter lifecycle hooks; formatting requests run on a worker thread; invalid formatter configuration no longer discards roots/excludes; nested multi-root selection chooses the deepest root; formatter language labels moved to `Language`; duplicate LSP capability test was removed.
 - [x] (2026-06-30 13:42Z) Ran final validation after second-review fixes. Evidence: `cargo fmt --check`, `cargo test formatting --lib --features nlp`, `cargo test --test bifrost_lsp_server formatting --features nlp`, `cargo test invalid_formatter_commands_do_not_discard_roots_or_exclude --lib --features nlp`, `npm test` in `editors/vscode`, and `cargo clippy-no-cuda` all passed.
+- [x] (2026-06-30 14:06Z) Ran a third guided review against `origin/master`. Evidence: reviewers reported remaining issues around async overlay snapshot races, JS/TS workspace script execution, unqualified built-in executable lookup on Windows, `ScopedProject` dropping owning roots, unbounded formatting workers, Windows process-tree cleanup, missing JS formatter file paths, and minor duplicated test helpers.
+- [x] (2026-06-30 14:24Z) Addressed the third guided-review findings. Evidence: formatting now snapshots document text and command resolution before spawning worker execution; formatting workers are bounded; JS/TS built-in package-script discovery was removed in favor of explicit override rules; built-in command lookup resolves trusted absolute paths on Windows; Windows timeout cleanup uses `taskkill /T /F`; `ScopedProject` delegates `workspace_root_for_file`; request-time snapshot and scoped-project regressions were added.
+- [x] (2026-06-30 14:38Z) Ran final validation after third-review fixes. Evidence: `cargo fmt --check`, `cargo test formatting --lib --features nlp`, `cargo test --test bifrost_lsp_server formatting --features nlp`, `cargo test lsp::server::tests --lib --features nlp`, `npm test` in `editors/vscode`, and `cargo clippy-no-cuda` all passed.
 
 ## Surprises & Discoveries
 
@@ -54,6 +57,15 @@ The user-visible behavior is: start `bifrost --lsp`, initialize with optional `f
 - Observation: formatter execution should not occupy the single LSP dispatch loop.
   Evidence: the second guided review flagged synchronous process execution in `handle_request`; formatting requests now clone the overlay project and rules, execute on a worker thread, and send the response asynchronously.
 
+- Observation: moving formatter execution to a worker is not sufficient unless the request input is snapshotted first.
+  Evidence: the third guided review showed that a `didChange` arriving before the worker read the overlay could make an older formatting request format newer text; the server now prepares the formatter command and document content on the LSP loop before spawning execution.
+
+- Observation: safe JS/TS package-script autodiscovery is not practical without a workspace-trust prompt.
+  Evidence: the third guided review showed that even constrained `npm run` scripts can load project-controlled Prettier plugins or otherwise execute workspace code; JS/TS now requires explicit `formatterCommands`.
+
+- Observation: wrapper projects must delegate formatter root ownership.
+  Evidence: the third guided review found that `ScopedProject` fell back to the trait default for `workspace_root_for_file`, losing multi-root ownership whenever excludes wrapped the project.
+
 ## Decision Log
 
 - Decision: Use a stdin/stdout-only formatter contract for v1.
@@ -72,8 +84,8 @@ The user-visible behavior is: start `bifrost --lsp`, initialize with optional `f
   Rationale: GitHub issues #368 and #369 track those different LSP contracts separately; this plan builds the reusable resolver/executor they can use later.
   Date/Author: 2026-06-30 / Codex.
 
-- Decision: JS/TS built-in discovery may only auto-run narrowly recognized Prettier stdin scripts.
-  Rationale: Running any package script with a formatter-looking name is too broad for an automatic LSP formatting fallback. Project-specific scripts remain supported through explicit `formatterCommands`, while built-in discovery rejects script bodies containing shell metacharacters or non-Prettier commands.
+- Decision: JS/TS has no built-in formatter autodiscovery in v1.
+  Rationale: Running workspace `package.json` scripts or project-local Prettier plugins is not conservative without a trust/approval UI. Project-specific JS/TS formatting remains supported through explicit `formatterCommands`.
   Date/Author: 2026-06-30 / Codex.
 
 - Decision: Add a project-level owning-root query instead of changing analyzer file identity.
@@ -88,11 +100,15 @@ The user-visible behavior is: start `bifrost --lsp`, initialize with optional `f
   Rationale: Formatter rule parsing and `{language}` placeholders should not maintain a separate language alias table from analyzer language metadata.
   Date/Author: 2026-06-30 / Codex.
 
+- Decision: Bound formatter execution instead of allowing unbounded detached workers.
+  Rationale: Formatting should not block ordinary LSP traffic, but a client should also not be able to create unbounded formatter processes and helper threads. The server rejects requests over the in-flight limit.
+  Date/Author: 2026-06-30 / Codex.
+
 ## Outcomes & Retrospective
 
 Completed #42's document-formatting slice. Bifrost now advertises and handles `textDocument/formatting`, resolves formatter commands from ordered configuration rules before conservative built-ins, formats overlay-aware document text through stdin/stdout commands, and returns ordinary full-document LSP edits. VS Code now exposes `bifrost.formatterCommands` and forwards rules to the server. Range formatting and on-type formatting remain separate follow-up issues.
 
-The initial validation bundle passed on 2026-06-30, then guided review found several concrete safety and workspace-root issues. After addressing those findings, the first post-review validation bundle also passed: `cargo fmt --check`, `cargo test formatting --lib --features nlp`, `cargo test --test bifrost_lsp_server formatting --features nlp`, `npm test` in `editors/vscode`, and `cargo clippy-no-cuda`. A second guided review found additional process, npm lifecycle, initialization parsing, nested-root, and cleanup findings; after fixing those, the final validation bundle also passed: `cargo fmt --check`, `cargo test formatting --lib --features nlp`, `cargo test --test bifrost_lsp_server formatting --features nlp`, `cargo test invalid_formatter_commands_do_not_discard_roots_or_exclude --lib --features nlp`, `npm test`, and `cargo clippy-no-cuda`.
+The initial validation bundle passed on 2026-06-30, then guided review found several concrete safety and workspace-root issues. After addressing those findings, the first post-review validation bundle also passed: `cargo fmt --check`, `cargo test formatting --lib --features nlp`, `cargo test --test bifrost_lsp_server formatting --features nlp`, `npm test` in `editors/vscode`, and `cargo clippy-no-cuda`. A second guided review found additional process, npm lifecycle, initialization parsing, nested-root, and cleanup findings; after fixing those, the final validation bundle also passed: `cargo fmt --check`, `cargo test formatting --lib --features nlp`, `cargo test --test bifrost_lsp_server formatting --features nlp`, `cargo test invalid_formatter_commands_do_not_discard_roots_or_exclude --lib --features nlp`, `npm test`, and `cargo clippy-no-cuda`. A third guided review found remaining async snapshot, JS/TS autodiscovery, Windows execution, scoped-root, and worker-bound issues; after fixing those, the final validation bundle passed again: `cargo fmt --check`, `cargo test formatting --lib --features nlp`, `cargo test --test bifrost_lsp_server formatting --features nlp`, `cargo test lsp::server::tests --lib --features nlp`, `npm test`, and `cargo clippy-no-cuda`.
 
 ## Context and Orientation
 

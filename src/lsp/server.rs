@@ -3,6 +3,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::panic;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -711,13 +712,81 @@ fn handle_formatting_request(
 ) -> Result<(), String> {
     let id = req.id.clone();
     let method = req.method.clone();
-    let project = Arc::clone(&state.overlay);
+    let params = match req.extract::<lsp_types::DocumentFormattingParams>(Formatting::METHOD) {
+        Ok((_, params)) => params,
+        Err(ExtractError::JsonError { error, .. }) => {
+            let response = Response::new_err(
+                id,
+                ErrorCode::InvalidParams as i32,
+                format!("Failed to decode params for {method}: {error}"),
+            );
+            return connection
+                .sender
+                .send(Message::Response(response))
+                .map_err(|err| format!("Failed to send LSP response: {err}"));
+        }
+        Err(ExtractError::MethodMismatch(_)) => {
+            let response = Response::new_err(
+                id,
+                ErrorCode::MethodNotFound as i32,
+                format!("Method not implemented: {method}"),
+            );
+            return connection
+                .sender
+                .send(Message::Response(response))
+                .map_err(|err| format!("Failed to send LSP response: {err}"));
+        }
+    };
     let rules = state.formatter_commands.clone();
+    let prepared = match formatting::prepare(state.project(), &params, &rules) {
+        Ok(Some(prepared)) => prepared,
+        Ok(None) => {
+            let response = Response::new_ok(id, serde_json::Value::Null);
+            return connection
+                .sender
+                .send(Message::Response(response))
+                .map_err(|err| format!("Failed to send LSP response: {err}"));
+        }
+        Err(message) => {
+            let response = Response::new_err(id, ErrorCode::InternalError as i32, message);
+            return connection
+                .sender
+                .send(Message::Response(response))
+                .map_err(|err| format!("Failed to send LSP response: {err}"));
+        }
+    };
+    if state
+        .active_formatting_requests
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            (active < MAX_CONCURRENT_FORMATTING_REQUESTS).then_some(active + 1)
+        })
+        .is_err()
+    {
+        let response = Response::new_err(
+            id,
+            ErrorCode::InternalError as i32,
+            "too many concurrent formatting requests".to_string(),
+        );
+        return connection
+            .sender
+            .send(Message::Response(response))
+            .map_err(|err| format!("Failed to send LSP response: {err}"));
+    }
     let sender = connection.sender.clone();
+    let active = Arc::clone(&state.active_formatting_requests);
     thread::spawn(move || {
-        let response = decode_and_run::<Formatting, _>(req, |params| {
-            formatting::handle(project.as_ref(), &params, &rules)
-        });
+        let result = formatting::run_prepared(prepared);
+        let response = match result {
+            Ok(edits) => match serde_json::to_value(edits) {
+                Ok(value) => Response::new_ok(id.clone(), value),
+                Err(err) => Response::new_err(
+                    id.clone(),
+                    ErrorCode::InternalError as i32,
+                    format!("Failed to serialize {method} result: {err}"),
+                ),
+            },
+            Err(message) => Response::new_err(id.clone(), ErrorCode::InternalError as i32, message),
+        };
         if let Some(error) = response.error.as_ref() {
             eprintln!(
                 "[bifrost-lsp] request error method={} id={:?} code={} message={}",
@@ -730,6 +799,7 @@ fn handle_formatting_request(
                 method, id
             );
         }
+        active.fetch_sub(1, Ordering::AcqRel);
     });
     Ok(())
 }
@@ -1030,6 +1100,7 @@ pub(crate) struct ServerState {
     malformed_didchange_log: Mutex<HashMap<String, Instant>>,
     published_diagnostic_uris: Vec<Uri>,
     open_documents: HashMap<String, OpenDocument>,
+    active_formatting_requests: Arc<AtomicUsize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1074,6 +1145,7 @@ const MALFORMED_DIDCHANGE_LOG_THROTTLE: Duration = Duration::from_secs(60);
 /// `OVERLAY_REJECTION_LOG_MAX_ENTRIES`: a sloppy or hostile client could
 /// otherwise send a stream of distinct URIs and grow the map without bound.
 const MALFORMED_DIDCHANGE_LOG_MAX_ENTRIES: usize = 256;
+const MAX_CONCURRENT_FORMATTING_REQUESTS: usize = 2;
 
 impl ServerState {
     fn new(config: LspWorkspaceConfig, progress: Option<&StartupProgress>) -> Result<Self, String> {
@@ -1101,6 +1173,7 @@ impl ServerState {
             malformed_didchange_log: Mutex::new(HashMap::new()),
             published_diagnostic_uris: Vec::new(),
             open_documents: HashMap::new(),
+            active_formatting_requests: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -1325,6 +1398,10 @@ impl ScopedProject {
 impl Project for ScopedProject {
     fn root(&self) -> &Path {
         self.inner.root()
+    }
+
+    fn workspace_root_for_file(&self, file: &ProjectFile) -> PathBuf {
+        self.inner.workspace_root_for_file(file)
     }
 
     fn analyzer_languages(&self) -> BTreeSet<crate::analyzer::Language> {
@@ -1723,5 +1800,20 @@ mod tests {
         assert_eq!(options.roots, vec!["service-a"]);
         assert_eq!(options.exclude, vec!["target"]);
         assert!(options.formatter_commands.is_empty());
+    }
+
+    #[test]
+    fn scoped_project_delegates_workspace_root_for_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let outer = temp.path().canonicalize().unwrap();
+        let parent = outer.join("repo");
+        let nested = parent.join("frontend");
+        std::fs::create_dir_all(nested.join("src")).unwrap();
+        std::fs::write(nested.join("src/app.ts"), "const x=1;").unwrap();
+        let inner = Arc::new(MultiRootProject::new([parent, nested.clone()]).unwrap());
+        let scoped = ScopedProject::new(inner, vec![outer.join("ignored")]);
+        let file = scoped.file_by_abs_path(&nested.join("src/app.ts")).unwrap();
+
+        assert_eq!(scoped.workspace_root_for_file(&file), nested);
     }
 }

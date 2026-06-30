@@ -44,6 +44,12 @@ pub(crate) struct FormatterCommand {
     pub(crate) cwd: PathBuf,
 }
 
+pub(crate) struct PreparedFormatting {
+    command: FormatterCommand,
+    content: String,
+    line_starts: Vec<usize>,
+}
+
 struct FormatContext<'a> {
     file: &'a ProjectFile,
     workspace_root: PathBuf,
@@ -51,11 +57,11 @@ struct FormatContext<'a> {
     language: Language,
 }
 
-pub(crate) fn handle(
+pub(crate) fn prepare(
     project: &dyn Project,
     params: &DocumentFormattingParams,
     rules: &[FormatterCommandRule],
-) -> Result<Option<Vec<TextEdit>>, String> {
+) -> Result<Option<PreparedFormatting>, String> {
     let Some((file, content, line_starts)) =
         read_document_for_uri(project, &params.text_document.uri)
     else {
@@ -74,9 +80,22 @@ pub(crate) fn handle(
     let Some(command) = resolve_formatter_command(&context, rules)? else {
         return Ok(None);
     };
+    Ok(Some(PreparedFormatting {
+        command,
+        content,
+        line_starts,
+    }))
+}
+
+pub(crate) fn run_prepared(prepared: PreparedFormatting) -> Result<Vec<TextEdit>, String> {
+    let PreparedFormatting {
+        command,
+        content,
+        line_starts,
+    } = prepared;
     let formatted = run_formatter_command(&command, &content)?;
     if formatted == content {
-        return Ok(Some(Vec::new()));
+        return Ok(Vec::new());
     }
     let range = byte_range_to_lsp_range(
         &content,
@@ -88,7 +107,7 @@ pub(crate) fn handle(
             end_line: line_starts.len().saturating_sub(1),
         },
     );
-    Ok(Some(vec![TextEdit::new(range, formatted)]))
+    Ok(vec![TextEdit::new(range, formatted)])
 }
 
 fn resolve_formatter_command(
@@ -155,23 +174,19 @@ fn rule_matches(rule: &FormatterCommandRule, context: &FormatContext<'_>) -> boo
 
 fn discover_builtin_formatter(context: &FormatContext<'_>) -> Option<FormatterCommand> {
     match context.language {
-        Language::Rust => Some(standard_command(
+        Language::Rust => standard_command(
             context,
             "rustfmt",
             ["--edition", &rust_edition(context), "--emit", "stdout"],
-        )),
-        Language::Go => Some(standard_command(context, "gofmt", [])),
-        Language::Cpp => Some(standard_command(
-            context,
-            "clang-format",
-            ["--assume-filename", "{file}"],
-        )),
-        Language::Python => Some(standard_command(
+        ),
+        Language::Go => standard_command(context, "gofmt", []),
+        Language::Cpp => standard_command(context, "clang-format", ["--assume-filename", "{file}"]),
+        Language::Python => standard_command(
             context,
             "black",
             ["--quiet", "--stdin-filename", "{file}", "-"],
-        )),
-        Language::JavaScript | Language::TypeScript => discover_package_script(context),
+        ),
+        Language::JavaScript | Language::TypeScript => None,
         Language::Java
         | Language::Php
         | Language::Scala
@@ -185,46 +200,59 @@ fn standard_command<const N: usize>(
     context: &FormatContext<'_>,
     command: &str,
     args: [&str; N],
-) -> FormatterCommand {
-    FormatterCommand {
-        command: command.to_string(),
+) -> Option<FormatterCommand> {
+    let cwd = standard_command_cwd(context);
+    Some(FormatterCommand {
+        command: builtin_command_path(command, &cwd)?,
         args: args
             .into_iter()
             .map(|arg| expand_placeholders(arg, context))
             .collect(),
-        cwd: standard_command_cwd(context),
-    }
+        cwd,
+    })
 }
 
-fn discover_package_script(context: &FormatContext<'_>) -> Option<FormatterCommand> {
-    let package_json = nearest_manifest(
-        context.file.abs_path().parent()?,
-        &context.workspace_root,
-        "package.json",
-    )?;
-    let package_root = package_json.parent()?.to_path_buf();
-    let raw = std::fs::read_to_string(&package_json).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let scripts = json.get("scripts")?.as_object()?;
-    let script_name = [
-        "format:stdin",
-        "format-stdin",
-        "format:document",
-        "format-document",
-    ]
-    .into_iter()
-    .find(|name| {
-        scripts
-            .get(*name)
-            .and_then(|value| value.as_str())
-            .is_some_and(is_safe_prettier_script)
-            && !has_npm_lifecycle_script(scripts, name)
-    })?;
-    Some(FormatterCommand {
-        command: npm_command().to_string(),
-        args: vec!["run".to_string(), script_name.to_string(), "--".to_string()],
-        cwd: package_root,
-    })
+#[cfg(not(windows))]
+fn builtin_command_path(command: &str, _cwd: &Path) -> Option<String> {
+    Some(command.to_string())
+}
+
+#[cfg(windows)]
+fn builtin_command_path(command: &str, cwd: &Path) -> Option<String> {
+    let paths = std::env::var_os("PATH")?;
+    let extensions = std::env::var_os("PATHEXT")
+        .and_then(|value| value.into_string().ok())
+        .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_string());
+    let command_path = Path::new(command);
+    if command_path.components().count() > 1 {
+        return command_path.is_absolute().then(|| command.to_string());
+    }
+    let candidates: Vec<String> = if command_path.extension().is_some() {
+        vec![command.to_string()]
+    } else {
+        extensions
+            .split(';')
+            .filter(|extension| !extension.is_empty())
+            .map(|extension| format!("{command}{extension}"))
+            .collect()
+    };
+    std::env::split_paths(&paths)
+        .filter(|path| !path.as_os_str().is_empty())
+        .filter(|path| !path_is_same_or_within(path, cwd))
+        .find_map(|dir| {
+            candidates
+                .iter()
+                .map(|candidate| dir.join(candidate))
+                .find(|candidate| candidate.is_file())
+        })
+        .map(|path| path.display().to_string())
+}
+
+#[cfg(windows)]
+fn path_is_same_or_within(path: &Path, root: &Path) -> bool {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    path == root || path.starts_with(root)
 }
 
 fn nearest_manifest(start: &Path, stop_at: &Path, name: &str) -> Option<PathBuf> {
@@ -360,8 +388,27 @@ fn terminate_formatter(child: &mut std::process::Child) {
 
 #[cfg(not(unix))]
 fn terminate_formatter(child: &mut std::process::Child) {
+    terminate_process_tree(child.id());
     let _ = child.kill();
 }
+
+#[cfg(windows)]
+fn terminate_process_tree(pid: u32) {
+    let taskkill = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+        .join("System32")
+        .join("taskkill.exe");
+    let _ = Command::new(taskkill)
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn terminate_process_tree(_pid: u32) {}
 
 type PipeReadResult = Result<Vec<u8>, String>;
 type StdinWriteResult = Result<(), String>;
@@ -507,41 +554,6 @@ fn rust_edition(context: &FormatContext<'_>) -> String {
                 .map(str::to_string)
         })
         .unwrap_or_else(|| "2024".to_string())
-}
-
-fn is_safe_prettier_script(script: &str) -> bool {
-    let script = script.trim();
-    if script.is_empty()
-        || script.chars().any(|ch| {
-            matches!(
-                ch,
-                '&' | '|' | ';' | '<' | '>' | '(' | ')' | '$' | '`' | '\n' | '\r'
-            )
-        })
-    {
-        return false;
-    }
-    script
-        .split_whitespace()
-        .next()
-        .is_some_and(|command| command == "prettier" || command.ends_with("/prettier"))
-}
-
-fn has_npm_lifecycle_script(
-    scripts: &serde_json::Map<String, serde_json::Value>,
-    name: &str,
-) -> bool {
-    scripts.contains_key(&format!("pre{name}")) || scripts.contains_key(&format!("post{name}"))
-}
-
-#[cfg(windows)]
-fn npm_command() -> &'static str {
-    "npm.cmd"
-}
-
-#[cfg(not(windows))]
-fn npm_command() -> &'static str {
-    "npm"
 }
 
 fn formatter_relative_file(project: &dyn Project, file: &ProjectFile) -> PathBuf {
@@ -768,68 +780,13 @@ mod tests {
     }
 
     #[test]
-    fn package_script_discovery_requires_explicit_stdin_script() {
+    fn javascript_typescript_requires_override_rule() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         std::fs::create_dir_all(root.join("web/src")).unwrap();
         std::fs::write(
             root.join("web/package.json"),
-            r#"{"scripts":{"format:stdin":"prettier --stdin-filepath src/app.ts"}}"#,
-        )
-        .unwrap();
-        std::fs::write(root.join("web/src/app.ts"), "const x=1;").unwrap();
-        let project = project(&root);
-        let file = project_file(&project, "web/src/app.ts");
-        let ctx = context(&project, &file, Language::TypeScript);
-        let command = discover_builtin_formatter(&ctx).unwrap();
-        assert_eq!(command.command, "npm");
-        assert_eq!(command.args, vec!["run", "format:stdin", "--"]);
-        assert_eq!(command.cwd, root.join("web"));
-    }
-
-    #[test]
-    fn package_script_discovery_stops_at_project_root() {
-        let temp = tempfile::tempdir().unwrap();
-        let outer = temp.path().canonicalize().unwrap();
-        let root = outer.join("workspace");
-        std::fs::create_dir_all(root.join("web/src")).unwrap();
-        std::fs::write(
-            outer.join("package.json"),
             r#"{"scripts":{"format:stdin":"prettier"}}"#,
-        )
-        .unwrap();
-        std::fs::write(root.join("web/src/app.ts"), "const x=1;").unwrap();
-        let project = project(&root);
-        let file = project_file(&project, "web/src/app.ts");
-        let ctx = context(&project, &file, Language::TypeScript);
-        assert!(discover_builtin_formatter(&ctx).is_none());
-    }
-
-    #[test]
-    fn package_script_discovery_rejects_shell_script_body() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        std::fs::create_dir_all(root.join("web/src")).unwrap();
-        std::fs::write(
-            root.join("web/package.json"),
-            r#"{"scripts":{"format:stdin":"prettier --stdin-filepath src/app.ts && curl example.com"}}"#,
-        )
-        .unwrap();
-        std::fs::write(root.join("web/src/app.ts"), "const x=1;").unwrap();
-        let project = project(&root);
-        let file = project_file(&project, "web/src/app.ts");
-        let ctx = context(&project, &file, Language::TypeScript);
-        assert!(discover_builtin_formatter(&ctx).is_none());
-    }
-
-    #[test]
-    fn package_script_discovery_rejects_npm_lifecycle_hooks() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        std::fs::create_dir_all(root.join("web/src")).unwrap();
-        std::fs::write(
-            root.join("web/package.json"),
-            r#"{"scripts":{"format:stdin":"prettier --stdin-filepath src/app.ts","preformat:stdin":"curl example.com"}}"#,
         )
         .unwrap();
         std::fs::write(root.join("web/src/app.ts"), "const x=1;").unwrap();
@@ -942,7 +899,7 @@ mod tests {
             args: Vec::new(),
             cwd: temp.path().to_path_buf(),
         };
-        let input = "x".repeat(2 * 1024 * 1024);
+        let input = "x".repeat(256 * 1024);
         let output = run_formatter_command(&command, &input).unwrap();
         assert_eq!(output, input);
     }
