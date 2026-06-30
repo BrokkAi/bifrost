@@ -646,6 +646,51 @@ end
 }
 
 #[test]
+fn ruby_usage_resolves_top_level_bare_method_call() {
+    let (_project, analyzer) = ruby_analyzer_with_files(&[(
+        "app/report.rb",
+        r#"
+module Reports
+  class InvoiceReport
+    def render
+      normalize_total(19)
+    end
+  end
+end
+
+def render_shadow(normalize_total)
+  normalize_total
+end
+
+def normalize_total(value = 0)
+  value.round
+end
+"#,
+    )]);
+
+    let target = definition(&analyzer, "normalize_total");
+    let hits = analyzer
+        .find_usages(&[target])
+        .into_either()
+        .expect("usage lookup should succeed");
+    let lines = hit_source_lines(&hits);
+    let enclosing: Vec<String> = hits.iter().map(|hit| hit.enclosing.fq_name()).collect();
+
+    assert!(
+        lines.iter().any(|line| line == "normalize_total(19)"),
+        "{lines:?}"
+    );
+    assert!(
+        !enclosing.iter().any(|name| name == "normalize_total"),
+        "{enclosing:?}"
+    );
+    assert!(
+        !enclosing.iter().any(|name| name == "render_shadow"),
+        "{enclosing:?}"
+    );
+}
+
+#[test]
 fn resolves_bare_calls_inside_singleton_class_as_class_method_calls() {
     let (_project, analyzer) = ruby_analyzer_with_files(&[(
         "app/user.rb",

@@ -112,6 +112,70 @@ end
 }
 
 #[test]
+fn ruby_get_definition_resolves_top_level_bare_method_call() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "app/report.rb",
+            r#"module Reports
+  class InvoiceReport
+    def render
+      normalize_total(19)
+    end
+  end
+end
+
+def normalize_total(value)
+  value.round
+end
+"#,
+        )
+        .build();
+
+    let line = "      normalize_total(19)";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/report.rb","line":4,"column":{}}}]}}"#,
+            column_of(line, "normalize_total")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "normalize_total",
+        "{value}"
+    );
+}
+
+#[test]
+fn ruby_get_definition_keeps_top_level_method_parameter_shadowed() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "app/report.rb",
+            r#"def render(normalize_total)
+  normalize_total
+end
+
+def normalize_total
+end
+"#,
+        )
+        .build();
+
+    let line = "  normalize_total";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/report.rb","line":2,"column":{}}}]}}"#,
+            column_of(line, "normalize_total")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
 fn ruby_get_definition_resolves_explicit_class_receiver_call() {
     let project = InlineTestProject::with_language(Language::Ruby)
         .file(

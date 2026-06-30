@@ -216,7 +216,14 @@ fn ruby_method_outcome(
         );
     };
 
-    let candidates = semantic.resolve_method_candidates(support, visible_files, &receiver, member);
+    let candidates = if call
+        .and_then(|call| call.child_by_field_name("receiver"))
+        .is_none()
+    {
+        semantic.resolve_bare_method_candidates(support, visible_files, &receiver, member)
+    } else {
+        semantic.resolve_method_candidates(support, visible_files, &receiver, member)
+    };
 
     if candidates.is_empty() {
         return no_definition(

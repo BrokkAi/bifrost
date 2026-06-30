@@ -167,12 +167,15 @@ impl RubyTargetSpec {
             });
         }
         if target.is_function() {
-            analyzer.parent_of(target)?;
+            let singleton_declaration = is_singleton_method_declaration(analyzer, target);
+            if analyzer.parent_of(target).is_none() && singleton_declaration {
+                return None;
+            }
             return Some(Self {
                 target: target.clone(),
                 kind: RubyTargetKind::Method,
                 member_name: target.identifier().to_string(),
-                singleton_declaration: is_singleton_method_declaration(analyzer, target),
+                singleton_declaration,
             });
         }
         None
@@ -183,6 +186,7 @@ impl RubyTargetSpec {
 pub(crate) enum ReceiverMode {
     Instance,
     Class,
+    TopLevel,
 }
 
 #[derive(Clone)]
@@ -326,6 +330,9 @@ impl<'a> RubySemanticIndex<'a> {
         };
 
         match receiver.mode {
+            ReceiverMode::TopLevel => {
+                self.resolve_top_level_method_candidates(support, &visible_files, member)
+            }
             ReceiverMode::Instance => {
                 for owner in self.receiver_owner_lookup_order(&receiver.owner_fq_name) {
                     let mut prepended = Vec::new();
@@ -380,6 +387,43 @@ impl<'a> RubySemanticIndex<'a> {
                 Vec::new()
             }
         }
+    }
+
+    pub(crate) fn resolve_bare_method_candidates(
+        &self,
+        support: &crate::analyzer::DefinitionLookupIndex,
+        visible_files: &HashSet<ProjectFile>,
+        receiver: &ReceiverType,
+        member: &str,
+    ) -> Vec<CodeUnit> {
+        let candidates = self.resolve_method_candidates(support, visible_files, receiver, member);
+        if !candidates.is_empty() || receiver.mode == ReceiverMode::TopLevel {
+            return candidates;
+        }
+        let visible_files: Vec<ProjectFile> = visible_files.iter().cloned().collect();
+        self.resolve_top_level_method_candidates(support, &visible_files, member)
+    }
+
+    fn resolve_top_level_method_candidates(
+        &self,
+        support: &crate::analyzer::DefinitionLookupIndex,
+        visible_files: &[ProjectFile],
+        member: &str,
+    ) -> Vec<CodeUnit> {
+        support
+            .file_identifier_in_files(visible_files, member)
+            .into_iter()
+            .filter(|unit| {
+                unit.is_function()
+                    && unit.identifier() == member
+                    && self.analyzer.parent_of(unit).is_none()
+                    && !ruby_method_lookup_mode_matches(
+                        self.analyzer,
+                        unit,
+                        RubyMethodLookupMode::SingletonMethod,
+                    )
+            })
+            .collect()
     }
 
     fn push_mixin_methods(
@@ -644,7 +688,7 @@ impl RubyWalkState<'_, '_> {
             None => self.enclosing_receiver(),
         };
         match receiver {
-            Some(receiver) => self.record_method_hit_for_receiver(&receiver, method),
+            Some(receiver) => self.record_bare_method_hit_for_receiver(&receiver, method),
             None => {
                 *self.scan.saw_unproven_match = true;
             }
@@ -661,20 +705,24 @@ impl RubyWalkState<'_, '_> {
             return;
         }
         match self.enclosing_receiver() {
-            Some(receiver) => self.record_method_hit_for_receiver(&receiver, node),
+            Some(receiver) => self.record_bare_method_hit_for_receiver(&receiver, node),
             None => {
                 *self.scan.saw_unproven_match = true;
             }
         }
     }
 
-    fn record_method_hit_for_receiver(&mut self, receiver: &ReceiverType, hit_node: Node<'_>) {
-        let candidates = self.scan.semantic.resolve_method_candidates(
+    fn record_bare_method_hit_for_receiver(&mut self, receiver: &ReceiverType, hit_node: Node<'_>) {
+        let candidates = self.scan.semantic.resolve_bare_method_candidates(
             self.scan.support,
             &self.scan.visible_files,
             receiver,
             &self.scan.spec.member_name,
         );
+        self.record_method_hit_from_candidates(&candidates, hit_node);
+    }
+
+    fn record_method_hit_from_candidates(&mut self, candidates: &[CodeUnit], hit_node: Node<'_>) {
         if candidates.iter().any(|candidate| {
             candidate == &self.scan.spec.target
                 || candidate.fq_name() == self.scan.spec.target.fq_name()
@@ -1216,6 +1264,13 @@ pub(crate) fn ruby_enclosing_receiver(
     lexical_stack: &[String],
     method_stack: &[ReceiverMode],
 ) -> Option<ReceiverType> {
+    if lexical_stack.is_empty() {
+        return Some(ReceiverType {
+            owner_fq_name: String::new(),
+            mode: ReceiverMode::TopLevel,
+        });
+    }
+
     let owner_fq_name = lexical_stack.last()?.clone();
     let mode = method_stack
         .last()
@@ -1371,7 +1426,22 @@ pub(crate) fn method_receiver_mode(node: Node<'_>) -> ReceiverMode {
         }
         parent = current.parent();
     }
-    ReceiverMode::Instance
+    if has_enclosing_type(node) {
+        ReceiverMode::Instance
+    } else {
+        ReceiverMode::TopLevel
+    }
+}
+
+fn has_enclosing_type(node: Node<'_>) -> bool {
+    let mut parent = node.parent();
+    while let Some(current) = parent {
+        if matches!(current.kind(), "class" | "module") {
+            return true;
+        }
+        parent = current.parent();
+    }
+    false
 }
 
 pub(crate) fn is_declaration_identifier(node: Node<'_>) -> bool {
