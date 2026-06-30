@@ -20,6 +20,7 @@
     "url": "https://github.com/BrokkAi/bifrost"
   },
   "license": "LGPL-3.0-or-later",
+  "icon": "icon.png",
   "engines": {
     "vscode": "^1.90.0"
   },
