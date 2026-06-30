@@ -757,6 +757,30 @@ mod tests {
         }
     }
 
+    #[cfg(not(windows))]
+    fn assert_command_invokes(actual: &str, expected: &str) {
+        assert_eq!(actual, expected);
+    }
+
+    #[cfg(windows)]
+    fn assert_command_invokes(actual: &str, expected: &str) {
+        let stem = Path::new(actual)
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or(actual);
+        assert_eq!(stem.to_ascii_lowercase(), expected.to_ascii_lowercase());
+    }
+
+    #[cfg(not(windows))]
+    fn configured_test_command(_root: &Path, command: &str) -> String {
+        command.to_string()
+    }
+
+    #[cfg(windows)]
+    fn configured_test_command(root: &Path, command: &str) -> String {
+        root.join(format!("{command}.exe")).display().to_string()
+    }
+
     #[test]
     fn formatter_rule_matches_language_include_and_exclude() {
         let temp = tempfile::tempdir().unwrap();
@@ -805,7 +829,7 @@ mod tests {
             cwd: Some("{workspaceRoot}/pkg".to_string()),
         };
         let command = formatter_command_from_rule(&rule, &ctx).unwrap();
-        assert_eq!(command.command, "rustfmt");
+        assert_command_invokes(&command.command, "rustfmt");
         assert_eq!(
             command.args,
             vec![
@@ -830,12 +854,12 @@ mod tests {
             include: vec!["*.go".to_string()],
             exclude: Vec::new(),
             language: Some("go".to_string()),
-            command: "custom-gofmt".to_string(),
+            command: configured_test_command(&root, "custom-gofmt"),
             args: Vec::new(),
             cwd: None,
         }];
         let command = resolve_formatter_command(&ctx, &rules).unwrap().unwrap();
-        assert_eq!(command.command, "custom-gofmt");
+        assert_command_invokes(&command.command, "custom-gofmt");
     }
 
     #[test]
@@ -847,7 +871,7 @@ mod tests {
         let file = project_file(&project, "lib.rs");
         let ctx = context(&project, &file, Language::Rust);
         let command = discover_builtin_formatter(&ctx).unwrap();
-        assert_eq!(command.command, "rustfmt");
+        assert_command_invokes(&command.command, "rustfmt");
         assert_eq!(command.args, vec!["--edition", "2024", "--emit", "stdout"]);
         assert_eq!(command.cwd, root);
     }
