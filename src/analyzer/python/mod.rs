@@ -2,6 +2,7 @@ mod adapter;
 mod cache;
 mod clones;
 mod declarations;
+mod diagnostics;
 mod hierarchy;
 mod imports;
 mod tests;
@@ -15,9 +16,9 @@ use crate::analyzer::usages::{
 };
 use crate::analyzer::{
     AnalyzerConfig, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit, CodeUnitType,
-    IAnalyzer, ImportAnalysisProvider, Language, Project, ProjectFile, SignatureMetadata,
-    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer,
-    TypeHierarchyProvider, build_reverse_import_index,
+    IAnalyzer, ImportAnalysisProvider, Language, Project, ProjectFile, SemanticDiagnostic,
+    SignatureMetadata, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
+    TreeSitterAnalyzer, TypeHierarchyProvider, build_reverse_import_index,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::profiling;
@@ -635,6 +636,13 @@ impl IAnalyzer for PythonAnalyzer {
 
     fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
         self.inner.parse_errors(file)
+    }
+
+    fn semantic_diagnostics(&self, file: &ProjectFile, source: &str) -> Vec<SemanticDiagnostic> {
+        diagnostics::collect_python_semantic_diagnostics(self, file, source)
+            .into_iter()
+            .map(Into::into)
+            .collect()
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {

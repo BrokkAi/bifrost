@@ -22,6 +22,7 @@ mod python;
 mod ruby;
 mod rust;
 mod scala;
+pub(crate) mod semantic_diagnostics;
 mod source_content;
 pub(crate) mod symbol_lookup;
 pub(crate) mod tree_sitter_analyzer;

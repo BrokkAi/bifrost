@@ -1,12 +1,15 @@
 use crate::analyzer::go::packages::canonical_go_package_name;
+use crate::analyzer::semantic_diagnostics::{
+    ScopeStack, contains_node, node_range, node_text, same_node,
+};
 use crate::analyzer::tree_sitter_analyzer::collect_parse_errors;
 use crate::analyzer::usages::go_graph::resolve_go_import_namespaces;
 use crate::analyzer::{
     DefinitionLookupIndex, GoAnalyzer, IAnalyzer, ProjectFile, Range, SemanticDiagnostic,
     resolve_analyzer,
 };
-use crate::hash::{HashMap, HashSet};
-use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
+use crate::hash::HashMap;
+use crate::text_utils::compute_line_starts;
 use tree_sitter::{Node, Parser, Tree};
 
 pub(crate) const GO_UNRECOGNIZED_SYMBOL: &str = "go_unrecognized_symbol";
@@ -370,36 +373,6 @@ impl GoDiagnosticCollector<'_> {
     }
 }
 
-#[derive(Default)]
-struct ScopeStack {
-    scopes: Vec<HashSet<String>>,
-}
-
-impl ScopeStack {
-    fn enter(&mut self) {
-        self.scopes.push(HashSet::default());
-    }
-
-    fn exit(&mut self) {
-        self.scopes.pop();
-    }
-
-    fn declare(&mut self, name: String) {
-        if name == "_" {
-            return;
-        }
-        if self.scopes.is_empty() {
-            self.enter();
-        }
-        let scope = self.scopes.last_mut().expect("scope exists after enter");
-        scope.insert(name);
-    }
-
-    fn contains(&self, name: &str) -> bool {
-        self.scopes.iter().rev().any(|scope| scope.contains(name))
-    }
-}
-
 struct GoImportNamespaces {
     alias_packages: HashMap<String, Vec<String>>,
     dot_packages: Vec<String>,
@@ -595,27 +568,6 @@ fn is_keyed_element_key(node: Node<'_>) -> bool {
         current = parent;
     }
     false
-}
-
-fn node_range(node: Node<'_>, line_starts: &[usize]) -> Range {
-    Range {
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_line: find_line_index_for_offset(line_starts, node.start_byte()) + 1,
-        end_line: find_line_index_for_offset(line_starts, node.end_byte().saturating_sub(1)) + 1,
-    }
-}
-
-fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    source.get(node.start_byte()..node.end_byte()).unwrap_or("")
-}
-
-fn same_node(left: Node<'_>, right: Node<'_>) -> bool {
-    left.start_byte() == right.start_byte() && left.end_byte() == right.end_byte()
-}
-
-fn contains_node(container: Node<'_>, node: Node<'_>) -> bool {
-    container.start_byte() <= node.start_byte() && node.end_byte() <= container.end_byte()
 }
 
 fn is_predeclared_go_name(name: &str) -> bool {
