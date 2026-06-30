@@ -1098,17 +1098,19 @@ fn rust_imported_export_candidates(
             Vec::new()
         } else {
             let binder = lexical_scope::visible_import_binder_at(&source, reference_byte);
-            if rust_binder_has_external_binding(rust, file, &binder, reference) {
+            let targets = rust.resolve_imported_export_from_binder(file, &binder, reference);
+            if targets.is_empty() && rust_binder_has_external_binding(&binder, reference) {
                 return Vec::new();
             }
-            rust.resolve_imported_export_from_binder(file, &binder, reference)
+            targets
         }
     } else {
         let binder = rust.import_binder_of(file);
-        if rust_binder_has_external_binding(rust, file, &binder, reference) {
+        let targets = rust.resolve_imported_export(file, reference);
+        if targets.is_empty() && rust_binder_has_external_binding(&binder, reference) {
             return Vec::new();
         }
-        rust.resolve_imported_export(file, reference)
+        targets
     };
     for (target_file, target_name) in targets {
         candidates.extend(support.file_identifier(&target_file, &target_name));
@@ -1118,19 +1120,12 @@ fn rust_imported_export_candidates(
     candidates
 }
 
-fn rust_binder_has_external_binding(
-    rust: &crate::analyzer::RustAnalyzer,
-    file: &ProjectFile,
-    binder: &ImportBinder,
-    reference: &str,
-) -> bool {
+fn rust_binder_has_external_binding(binder: &ImportBinder, reference: &str) -> bool {
     binder
         .bindings
         .iter()
         .any(|(local_name, binding)| match binding.kind {
-            ImportKind::Named | ImportKind::Namespace if local_name == reference => rust
-                .resolve_module_files(file, &binding.module_specifier)
-                .is_empty(),
+            ImportKind::Named | ImportKind::Namespace if local_name == reference => true,
             ImportKind::Default | ImportKind::CommonJsRequire | ImportKind::Glob => false,
             ImportKind::Named | ImportKind::Namespace => false,
         })
