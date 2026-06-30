@@ -189,7 +189,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      id-token: write
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -241,16 +240,10 @@ jobs:
           tag_name: ${{ steps.tag.outputs.name }}
           files: dist/*.vsix
 
-      - name: Azure login
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
       - name: Publish extension to Visual Studio Marketplace
         run: >
           npx --no-install vsce publish
-          --azure-credential
           --packagePath "../../dist/bifrost-vscode-${{ steps.tag.outputs.name }}.vsix"
         working-directory: editors/vscode
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
