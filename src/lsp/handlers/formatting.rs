@@ -679,12 +679,22 @@ fn expand_placeholders(value: &str, context: &FormatContext<'_>) -> String {
 }
 
 fn resolve_cwd(value: &str, workspace_root: &Path) -> PathBuf {
-    let path = PathBuf::from(value);
+    let path = PathBuf::from(normalize_cwd_value(value));
     if path.is_absolute() {
         path
     } else {
         workspace_root.join(path)
     }
+}
+
+#[cfg(not(windows))]
+fn normalize_cwd_value(value: &str) -> String {
+    value.to_string()
+}
+
+#[cfg(windows)]
+fn normalize_cwd_value(value: &str) -> String {
+    value.replace('/', "\\")
 }
 
 fn glob_matches(pattern: &str, rel: &str) -> bool {
