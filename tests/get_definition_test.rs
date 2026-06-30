@@ -855,6 +855,131 @@ Billing::Invoice::DEFAULT_CURRENCY = "USD"
 }
 
 #[test]
+fn ruby_get_definition_resolves_instance_variable_field() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "invoice.rb",
+            r#"class Invoice
+  def initialize
+    @status = "draft"
+  end
+
+  def status
+    @status
+  end
+end
+"#,
+        )
+        .build();
+
+    let line = "    @status";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"invoice.rb","line":7,"column":{}}}]}}"#,
+            column_of(line, "@status")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["reference"]["target"], "@status", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Invoice.@status",
+        "{value}"
+    );
+}
+
+#[test]
+fn ruby_get_definition_resolves_class_variable_field() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "invoice.rb",
+            r#"class Invoice
+  @@sequence = 0
+
+  def self.build
+    @@sequence += 1
+  end
+end
+"#,
+        )
+        .build();
+
+    let line = "    @@sequence += 1";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"invoice.rb","line":5,"column":{}}}]}}"#,
+            column_of(line, "@@sequence")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["reference"]["target"], "@@sequence", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Invoice.@@sequence",
+        "{value}"
+    );
+}
+
+#[test]
+fn ruby_get_definition_resolves_class_instance_variable_field() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "invoice.rb",
+            r#"class Invoice
+  @last_build = nil
+
+  def self.build
+    @last_build = new
+  end
+
+  def self.last_build
+    @last_build
+  end
+end
+"#,
+        )
+        .build();
+
+    let line = "    @last_build";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"invoice.rb","line":9,"column":{}}}]}}"#,
+            column_of(line, "@last_build")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["reference"]["target"], "@last_build", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Invoice.$singleton.@last_build",
+        "{value}"
+    );
+
+    let line = "    @last_build = new";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"invoice.rb","line":5,"column":{}}}]}}"#,
+            column_of(line, "@last_build")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["reference"]["target"], "@last_build", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Invoice.$singleton.@last_build",
+        "{value}"
+    );
+}
+
+#[test]
 fn rust_named_import_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(

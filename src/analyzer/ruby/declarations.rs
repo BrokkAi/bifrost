@@ -41,6 +41,13 @@ struct RubyWork<'tree> {
     parent: Option<CodeUnit>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RubyFieldScope {
+    Instance,
+    ClassVariable,
+    SingletonClass,
+}
+
 /// Pushes a node's named children as statement work items. Children are pushed
 /// in reverse so the stack pops them in source order.
 fn push_named_children<'tree>(
@@ -86,7 +93,9 @@ impl RubyVisitor<'_> {
                 }
             }
             "method" | "singleton_method" => self.visit_method(node, segments, parent),
-            "assignment" => self.visit_assignment(node, segments, parent),
+            "assignment" | "operator_assignment" => {
+                self.visit_assignment(node, segments, parent, None)
+            }
             "call" => self.visit_call(node, segments, parent),
             kind if is_descendable_container(kind) => {
                 push_named_children(node, segments, parent, stack);
@@ -132,6 +141,12 @@ impl RubyVisitor<'_> {
                 .set_raw_supertypes(code_unit.clone(), supertypes);
         }
 
+        self.visit_scope_field_assignments(
+            node,
+            &new_segments,
+            Some(&code_unit),
+            RubyFieldScope::SingletonClass,
+        );
         if let Some(body) = node.child_by_field_name("body") {
             push_named_children(body, &new_segments, Some(&code_unit), stack);
         }
@@ -163,13 +178,27 @@ impl RubyVisitor<'_> {
             code_unit,
             ruby_signature_metadata(first_line(node, self.source), node, self.source),
         );
-        // Method bodies are leaves for declaration purposes.
+        // Method bodies are otherwise leaves for declaration purposes, but Ruby
+        // instance/class variables are declarations even when first assigned in
+        // methods.
+        self.visit_scope_field_assignments(node, segments, parent, ruby_method_field_scope(node));
     }
 
-    fn visit_assignment(&mut self, node: Node<'_>, segments: &[String], parent: Option<&CodeUnit>) {
+    fn visit_assignment(
+        &mut self,
+        node: Node<'_>,
+        segments: &[String],
+        parent: Option<&CodeUnit>,
+        field_scope: Option<RubyFieldScope>,
+    ) {
         let Some(left) = node.child_by_field_name("left") else {
             return;
         };
+        if let Some(field_scope) = ruby_field_scope_for_assignment_left(left, segments, field_scope)
+        {
+            self.visit_variable_field_assignment(node, left, segments, parent, field_scope);
+            return;
+        }
         // Only constant assignments are declarations; locals are lowercase.
         if !matches!(left.kind(), "constant" | "scope_resolution") {
             return;
@@ -185,6 +214,68 @@ impl RubyVisitor<'_> {
             String::new(),
             short_name,
         );
+        self.parsed
+            .replace_code_unit(code_unit.clone(), node, self.source, parent.cloned(), None);
+        self.parsed.add_signature(
+            code_unit,
+            ruby_node_text(node, self.source).trim().to_string(),
+        );
+    }
+
+    fn visit_scope_field_assignments(
+        &mut self,
+        node: Node<'_>,
+        segments: &[String],
+        parent: Option<&CodeUnit>,
+        field_scope: RubyFieldScope,
+    ) {
+        let mut stack = vec![node];
+        while let Some(current) = stack.pop() {
+            if current != node
+                && matches!(
+                    current.kind(),
+                    "class" | "module" | "method" | "singleton_method" | "singleton_class"
+                )
+            {
+                continue;
+            }
+            if matches!(current.kind(), "assignment" | "operator_assignment") {
+                self.visit_assignment(current, segments, parent, Some(field_scope));
+                continue;
+            }
+            for index in (0..current.named_child_count()).rev() {
+                if let Some(child) = current.named_child(index) {
+                    stack.push(child);
+                }
+            }
+        }
+    }
+
+    fn visit_variable_field_assignment(
+        &mut self,
+        node: Node<'_>,
+        left: Node<'_>,
+        segments: &[String],
+        parent: Option<&CodeUnit>,
+        field_scope: RubyFieldScope,
+    ) {
+        let Some(short_name) = ruby_field_short_name(segments, left, self.source, field_scope)
+        else {
+            return;
+        };
+        let code_unit = CodeUnit::new(
+            self.file.clone(),
+            CodeUnitType::Field,
+            String::new(),
+            short_name,
+        );
+        if self
+            .parsed
+            .first_range_start(&code_unit)
+            .is_some_and(|start| start <= node.start_byte())
+        {
+            return;
+        }
         self.parsed
             .replace_code_unit(code_unit.clone(), node, self.source, parent.cloned(), None);
         self.parsed.add_signature(
@@ -253,6 +344,71 @@ fn member_short_name(segments: &[String], name: &str) -> String {
     } else {
         format!("{}.{}", segments.join("$"), name)
     }
+}
+
+pub(crate) fn ruby_variable_field_name(node: Node<'_>, source: &str) -> Option<String> {
+    if !matches!(node.kind(), "instance_variable" | "class_variable") {
+        return None;
+    }
+    let name = ruby_node_text(node, source).trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+pub(crate) fn ruby_field_short_name(
+    segments: &[String],
+    node: Node<'_>,
+    source: &str,
+    scope: RubyFieldScope,
+) -> Option<String> {
+    if segments.is_empty() {
+        return None;
+    }
+    let name = ruby_variable_field_name(node, source)?;
+    let member = match scope {
+        RubyFieldScope::Instance | RubyFieldScope::ClassVariable => name,
+        RubyFieldScope::SingletonClass => format!("$singleton.{name}"),
+    };
+    Some(member_short_name(segments, &member))
+}
+
+pub(crate) fn ruby_field_scope_for_assignment_left(
+    left: Node<'_>,
+    segments: &[String],
+    current_scope: Option<RubyFieldScope>,
+) -> Option<RubyFieldScope> {
+    if segments.is_empty() {
+        return None;
+    }
+    match left.kind() {
+        "class_variable" => Some(RubyFieldScope::ClassVariable),
+        "instance_variable" => Some(current_scope.unwrap_or(RubyFieldScope::SingletonClass)),
+        _ => None,
+    }
+}
+
+fn ruby_method_field_scope(node: Node<'_>) -> RubyFieldScope {
+    if method_is_singleton_context(node) {
+        RubyFieldScope::SingletonClass
+    } else {
+        RubyFieldScope::Instance
+    }
+}
+
+fn method_is_singleton_context(node: Node<'_>) -> bool {
+    if node.kind() == "singleton_method" {
+        return true;
+    }
+    let mut parent = node.parent();
+    while let Some(current) = parent {
+        if current.kind() == "singleton_class" {
+            return true;
+        }
+        if matches!(current.kind(), "class" | "module") {
+            break;
+        }
+        parent = current.parent();
+    }
+    false
 }
 
 fn assignment_constant_short_name(lexical_segments: &[String], name_path: &RubyNamePath) -> String {
@@ -420,13 +576,13 @@ pub(super) fn is_descendable_container(kind: &str) -> bool {
             | "when"
             | "in_clause"
             | "begin"
+            | "body_statement"
             | "do"
             | "do_block"
             | "block"
             | "then"
             | "ensure"
             | "rescue"
-            | "body_statement"
             | "parenthesized_statements"
             | "begin_block"
             | "end_block"

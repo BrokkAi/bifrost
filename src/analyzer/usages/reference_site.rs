@@ -1,4 +1,5 @@
-use crate::analyzer::{ProjectFile, Range};
+use crate::analyzer::common::language_for_file;
+use crate::analyzer::{Language, ProjectFile, Range};
 use crate::path_utils::rel_path_string;
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use tree_sitter::Node;
@@ -26,6 +27,7 @@ pub(crate) fn resolve_reference_site(
     source: &str,
 ) -> Result<ResolvedReferenceSite, String> {
     let line_starts = compute_line_starts(source);
+    let allow_at_ident = language_for_file(&request.file) == Language::Ruby;
     let (selection_start, selection_end) = match (
         request.start_byte,
         request.end_byte,
@@ -44,7 +46,7 @@ pub(crate) fn resolve_reference_site(
                     "byte range [{start}, {end}) does not align to UTF-8 character boundaries"
                 ));
             }
-            if let Some(token) = token_bounds_at(source, start) {
+            if let Some(token) = token_bounds_at(source, start, allow_at_ident) {
                 if end > token.1 {
                     return Err(
                         "byte range must identify a single reference token; use start_byte inside the token for qualified expressions"
@@ -68,7 +70,7 @@ pub(crate) fn resolve_reference_site(
                     "start_byte {start} does not align to a UTF-8 character boundary"
                 ));
             }
-            token_bounds_at(source, start)
+            token_bounds_at(source, start, allow_at_ident)
                 .ok_or_else(|| format!("no reference token at byte {start}"))?
         }
         (_, _, Some(line), column) => {
@@ -86,13 +88,18 @@ pub(crate) fn resolve_reference_site(
             }
             let point =
                 byte_offset_for_character_column(source, line_start, line_end, line, column)?;
-            token_bounds_at(source, point.min(source.len().saturating_sub(1)))
-                .ok_or_else(|| format!("no reference token at line {line}, column {column}"))?
+            token_bounds_at(
+                source,
+                point.min(source.len().saturating_sub(1)),
+                allow_at_ident,
+            )
+            .ok_or_else(|| format!("no reference token at line {line}, column {column}"))?
         }
         _ => return Err("provide either start_byte or line/column".to_string()),
     };
 
-    let (start, end) = expand_reference_expression(source, selection_start, selection_end);
+    let (start, end) =
+        expand_reference_expression(source, selection_start, selection_end, allow_at_ident);
     if start >= end {
         return Err("reference selection is empty".to_string());
     }
@@ -142,44 +149,52 @@ pub(crate) fn byte_offset_for_character_column(
     Err(format!("column {column} is outside line {line_number}"))
 }
 
-fn token_bounds_at(source: &str, byte: usize) -> Option<(usize, usize)> {
+fn token_bounds_at(source: &str, byte: usize, allow_at_ident: bool) -> Option<(usize, usize)> {
     if source.is_empty() {
         return None;
     }
     let bytes = source.as_bytes();
     let mut idx = byte.min(bytes.len().saturating_sub(1));
-    if !is_ident_byte(bytes[idx]) && idx > 0 && is_ident_byte(bytes[idx - 1]) {
+    if !is_ident_byte(bytes[idx], allow_at_ident)
+        && idx > 0
+        && is_ident_byte(bytes[idx - 1], allow_at_ident)
+    {
         idx -= 1;
     }
-    if !is_ident_byte(bytes[idx]) {
+    if !is_ident_byte(bytes[idx], allow_at_ident) {
         return None;
     }
     let mut start = idx;
-    while start > 0 && is_ident_byte(bytes[start - 1]) {
+    while start > 0 && is_ident_byte(bytes[start - 1], allow_at_ident) {
         start -= 1;
     }
     let mut end = idx + 1;
-    while end < bytes.len() && is_ident_byte(bytes[end]) {
+    while end < bytes.len() && is_ident_byte(bytes[end], allow_at_ident) {
         end += 1;
     }
     Some((start, end))
 }
 
-fn expand_reference_expression(source: &str, start: usize, end: usize) -> (usize, usize) {
+fn expand_reference_expression(
+    source: &str,
+    start: usize,
+    end: usize,
+    allow_at_ident: bool,
+) -> (usize, usize) {
     let bytes = source.as_bytes();
     let mut left = start;
     let mut right = end;
     loop {
         if left >= 2 && &bytes[left - 2..left] == b"::" {
             left -= 2;
-            while left > 0 && is_ident_byte(bytes[left - 1]) {
+            while left > 0 && is_ident_byte(bytes[left - 1], allow_at_ident) {
                 left -= 1;
             }
             continue;
         }
         if left >= 1 && bytes[left - 1] == b'.' {
             left -= 1;
-            while left > 0 && is_ident_byte(bytes[left - 1]) {
+            while left > 0 && is_ident_byte(bytes[left - 1], allow_at_ident) {
                 left -= 1;
             }
             continue;
@@ -189,14 +204,14 @@ fn expand_reference_expression(source: &str, start: usize, end: usize) -> (usize
     loop {
         if right + 2 <= bytes.len() && &bytes[right..right + 2] == b"::" {
             right += 2;
-            while right < bytes.len() && is_ident_byte(bytes[right]) {
+            while right < bytes.len() && is_ident_byte(bytes[right], allow_at_ident) {
                 right += 1;
             }
             continue;
         }
         if right < bytes.len() && bytes[right] == b'.' {
             right += 1;
-            while right < bytes.len() && is_ident_byte(bytes[right]) {
+            while right < bytes.len() && is_ident_byte(bytes[right], allow_at_ident) {
                 right += 1;
             }
             continue;
@@ -206,8 +221,8 @@ fn expand_reference_expression(source: &str, start: usize, end: usize) -> (usize
     (left, right)
 }
 
-fn is_ident_byte(byte: u8) -> bool {
-    byte == b'_' || byte.is_ascii_alphanumeric()
+fn is_ident_byte(byte: u8, allow_at_ident: bool) -> bool {
+    byte == b'_' || (allow_at_ident && byte == b'@') || byte.is_ascii_alphanumeric()
 }
 
 pub(crate) fn smallest_named_node_covering<'tree>(
@@ -247,7 +262,7 @@ mod tests {
         let end = start + "helper".len();
 
         assert_eq!(
-            expand_reference_expression(source, start, end),
+            expand_reference_expression(source, start, end, false),
             (start - 1, end)
         );
 
@@ -256,7 +271,7 @@ mod tests {
         let end = start + "helper".len();
 
         assert_eq!(
-            expand_reference_expression(source, start, end),
+            expand_reference_expression(source, start, end, false),
             (start, end)
         );
     }

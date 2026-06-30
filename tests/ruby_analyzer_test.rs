@@ -5,7 +5,7 @@
 mod common;
 
 use brokk_bifrost::{
-    CodeUnit, IAnalyzer, ImportAnalysisProvider, ProjectFile, RubyAnalyzer, TestProject,
+    CodeUnit, IAnalyzer, ImportAnalysisProvider, Language, ProjectFile, RubyAnalyzer, TestProject,
     TypeHierarchyProvider,
 };
 use common::InlineTestProject;
@@ -114,6 +114,81 @@ fn captures_attr_macros_and_constants() {
             .iter()
             .any(|cu| cu.is_field() && cu.identifier() == "MAX_BALANCE")
     );
+}
+
+#[test]
+fn indexes_ruby_variable_fields_by_scope() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "invoice.rb",
+            r#"class Invoice
+  @last_build = nil
+  @@sequence = 0
+
+  def initialize
+    @status = "draft"
+  end
+
+  def status
+    @status
+  end
+
+  def self.build
+    @last_build = new
+    @@sequence += 1
+  end
+
+  def self.last_build
+    @last_build
+  end
+end
+"#,
+        )
+        .build();
+    let analyzer = RubyAnalyzer::from_project(project.project().clone());
+
+    let instance = analyzer.get_definitions("Invoice.@status");
+    assert_eq!(1, instance.len(), "{instance:?}");
+    assert!(instance[0].is_field());
+    assert_eq!(instance[0].identifier(), "@status");
+
+    let class_variable = analyzer.get_definitions("Invoice.@@sequence");
+    assert_eq!(1, class_variable.len(), "{class_variable:?}");
+    assert!(class_variable[0].is_field());
+    assert_eq!(class_variable[0].identifier(), "@@sequence");
+
+    let singleton = analyzer.get_definitions("Invoice.$singleton.@last_build");
+    assert_eq!(1, singleton.len(), "{singleton:?}");
+    assert!(singleton[0].is_field());
+    assert_eq!(singleton[0].identifier(), "@last_build");
+}
+
+#[test]
+fn indexes_ruby_variable_fields_from_compound_assignment() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "invoice.rb",
+            r#"class Invoice
+  def status
+    @status ||= "draft"
+  end
+
+  def self.build
+    @@sequence += 1
+  end
+end
+"#,
+        )
+        .build();
+    let analyzer = RubyAnalyzer::from_project(project.project().clone());
+
+    let instance = analyzer.get_definitions("Invoice.@status");
+    assert_eq!(1, instance.len(), "{instance:?}");
+    assert!(instance[0].is_field());
+
+    let class_variable = analyzer.get_definitions("Invoice.@@sequence");
+    assert_eq!(1, class_variable.len(), "{class_variable:?}");
+    assert!(class_variable[0].is_field());
 }
 
 #[test]

@@ -343,6 +343,12 @@ impl ParsedFile {
         self.ranges.insert(code_unit.clone(), vec![range]);
     }
 
+    pub(crate) fn first_range_start(&self, code_unit: &CodeUnit) -> Option<usize> {
+        self.ranges
+            .get(code_unit)
+            .and_then(|ranges| ranges.iter().map(|range| range.start_byte).min())
+    }
+
     fn remove_code_unit(&mut self, code_unit: &CodeUnit) {
         if let Some(children) = self.children.remove(code_unit) {
             for child in children {
