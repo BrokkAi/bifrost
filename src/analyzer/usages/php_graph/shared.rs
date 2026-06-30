@@ -47,7 +47,7 @@ impl<'a> UsageQueryResolver<'a> for PhpQueryResolver<'a> {
             .collect();
 
         let hierarchy = matches!(spec.kind, TargetKind::Method | TargetKind::Field)
-            .then(|| PhpHierarchyIndex::build(self.php, &files));
+            .then(|| PhpHierarchyIndex::for_target_owner(self.php, &spec, &files));
         let empty_hierarchy = PhpHierarchyIndex::default();
         let hierarchy = hierarchy.as_ref().unwrap_or(&empty_hierarchy);
         let mut hits: BTreeSet<UsageHit> = BTreeSet::new();

@@ -1,5 +1,6 @@
 mod common;
 
+use brokk_bifrost::searchtools::{ScanUsagesParams, scan_usages};
 use brokk_bifrost::usages::{FuzzyResult, PhpUsageGraphStrategy, UsageAnalyzer, UsageFinder};
 use brokk_bifrost::{CodeUnit, IAnalyzer, Language, OverlayProject, PhpAnalyzer};
 use common::InlineTestProject;
@@ -182,6 +183,103 @@ function build(): \App\Service {
             .any(|hit| hit.file == project.file("src/Consumer.php")),
         "expected protected sibling usage hit, got {hits:?}"
     );
+}
+
+#[test]
+fn composer_psr4_method_targets_scan_out_of_directory_typed_receivers() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "composer.json",
+            r#"{
+  "autoload": {
+    "psr-4": {
+      "App\\": "src/"
+    }
+  },
+  "autoload-dev": {
+    "psr-4": {
+      "Tests\\": "tests/"
+    }
+  }
+}
+"#,
+        )
+        .file(
+            "src/Service.php",
+            r#"<?php
+namespace App;
+class Service {
+    public function run(): void {}
+}
+"#,
+        )
+        .file(
+            "tests/Consumer.php",
+            r#"<?php
+namespace Tests;
+use App\Service;
+class ChildService extends Service {}
+class Consumer {
+    public function exercise(ChildService $service): void {
+        $service->run();
+    }
+}
+"#,
+        )
+        .file(
+            "tests/NoCandidate.php",
+            r#"<?php
+namespace Tests;
+use App\Service;
+class NoCandidate {
+    public function exercise(Service $service): void {
+        $service->other();
+    }
+}
+"#,
+        )
+        .build();
+    let analyzer = PhpAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "App.Service.run");
+
+    let query = UsageFinder::new().query(&analyzer, std::slice::from_ref(&target), 1000, 1000);
+    let hits = query
+        .result
+        .into_either()
+        .expect("composer-backed method usage query succeeds");
+
+    assert!(
+        query
+            .candidate_files
+            .contains(&project.file("tests/Consumer.php")),
+        "Composer expansion should keep out-of-directory PHP method consumers in scope"
+    );
+    assert_eq!(
+        1,
+        hits.len(),
+        "expected only the matching method call: {hits:?}"
+    );
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == project.file("tests/Consumer.php") && hit.line == 7),
+        "expected typed receiver method usage hit, got {hits:?}"
+    );
+
+    let scoped = scan_usages(
+        &analyzer,
+        ScanUsagesParams {
+            symbols: Some(vec!["App.Service.run".to_string()]),
+            targets: Vec::new(),
+            include_tests: true,
+            paths: Some(vec!["tests/Consumer.php".to_string()]),
+        },
+    );
+    assert!(
+        scoped.failures.is_empty() && scoped.not_found.is_empty() && scoped.ambiguous.is_empty(),
+        "path-scoped method query should resolve cleanly: {scoped:?}"
+    );
+    assert_eq!(1, scoped.usages.len(), "scoped usages: {scoped:?}");
+    assert_eq!(1, scoped.usages[0].total_hits, "scoped usages: {scoped:?}");
 }
 
 #[test]
