@@ -3,9 +3,9 @@ use crate::analyzer::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, FuzzyResult
 use crate::analyzer::{
     CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType, CommentDensityStats,
     DeclarationInfo, DefinitionLookupIndex, ExceptionHandlingSmell, ExceptionSmellWeights,
-    ImportAnalysisProvider, Language, ParseError, Project, ProjectFile, Range, SignatureMetadata,
-    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TypeAliasProvider,
-    TypeHierarchyProvider, metrics_from_declarations,
+    ImportAnalysisProvider, Language, ParseError, Project, ProjectFile, Range, SemanticDiagnostic,
+    SignatureMetadata, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
+    TypeAliasProvider, TypeHierarchyProvider, metrics_from_declarations,
 };
 use std::any::Any;
 use std::cmp::Ordering;
@@ -71,6 +71,10 @@ pub trait IAnalyzer: Send + Sync + Any {
     /// profiles.
     fn parse_errors(&self, _file: &ProjectFile) -> Option<Vec<ParseError>> {
         None
+    }
+
+    fn semantic_diagnostics(&self, _file: &ProjectFile, _source: &str) -> Vec<SemanticDiagnostic> {
+        Vec::new()
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String>;
