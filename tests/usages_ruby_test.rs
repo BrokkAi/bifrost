@@ -53,6 +53,18 @@ fn hit_source_lines(
         .collect()
 }
 
+fn hit_texts(hits: &std::collections::BTreeSet<brokk_bifrost::usages::UsageHit>) -> Vec<String> {
+    hits.iter()
+        .map(|hit| {
+            let source = std::fs::read_to_string(hit.file.abs_path()).expect("read hit file");
+            source
+                .get(hit.start_offset..hit.end_offset)
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect()
+}
+
 struct FixedCandidateProvider {
     files: HashSet<ProjectFile>,
 }
@@ -276,6 +288,137 @@ end
         enclosing.iter().any(|name| name == "A$App.run"),
         "{enclosing:?}"
     );
+}
+
+#[test]
+fn reports_terminal_class_segment_for_required_qualified_construction() {
+    let (_project, analyzer) = ruby_analyzer_with_files(&[
+        (
+            "app/report.rb",
+            r#"
+require_relative "../lib/billing/invoice"
+
+module Reports
+  class InvoiceReport
+    def render
+      invoice = Billing::Invoice.build
+    end
+  end
+end
+"#,
+        ),
+        (
+            "lib/billing/invoice.rb",
+            r#"
+module Billing
+  class Invoice
+    def self.build
+      new
+    end
+  end
+end
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "Billing$Invoice");
+    let hits = analyzer
+        .find_usages(&[target])
+        .into_either()
+        .expect("usage lookup should succeed");
+    let lines = hit_source_lines(&hits);
+    let texts = hit_texts(&hits);
+
+    assert!(
+        lines
+            .iter()
+            .any(|line| line == "invoice = Billing::Invoice.build"),
+        "{lines:?}"
+    );
+    assert!(texts.iter().any(|text| text == "Invoice"), "{texts:?}");
+    assert!(
+        !texts.iter().any(|text| text == "Billing::Invoice"),
+        "{texts:?}"
+    );
+}
+
+#[test]
+fn reports_terminal_nested_constant_segment_from_lexical_namespace() {
+    let (_project, analyzer) = ruby_analyzer_with_files(&[
+        (
+            "lib/billing/invoice.rb",
+            r#"
+require_relative "money"
+
+module Billing
+  class Invoice
+    DEFAULT_CURRENCY = Money::Currency.new("USD")
+  end
+end
+"#,
+        ),
+        (
+            "lib/billing/money.rb",
+            r#"
+module Billing
+  module Money
+    class Currency
+    end
+  end
+end
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "Billing$Money$Currency");
+    let hits = analyzer
+        .find_usages(&[target])
+        .into_either()
+        .expect("usage lookup should succeed");
+    let lines = hit_source_lines(&hits);
+    let texts = hit_texts(&hits);
+
+    assert!(
+        lines
+            .iter()
+            .any(|line| line == "DEFAULT_CURRENCY = Money::Currency.new(\"USD\")"),
+        "{lines:?}"
+    );
+    assert!(texts.iter().any(|text| text == "Currency"), "{texts:?}");
+    assert!(
+        !texts.iter().any(|text| text == "Money::Currency"),
+        "{texts:?}"
+    );
+}
+
+#[test]
+fn reports_superclass_reference_before_entering_declared_class_scope() {
+    let (_project, analyzer) = ruby_analyzer_with_files(&[(
+        "lib/billing/invoice.rb",
+        r#"
+module Billing
+  class Record
+  end
+
+  class Invoice < Record
+  end
+end
+"#,
+    )]);
+
+    let target = definition(&analyzer, "Billing$Record");
+    let hits = analyzer
+        .find_usages(&[target])
+        .into_either()
+        .expect("usage lookup should succeed");
+    let lines = hit_source_lines(&hits);
+    let texts = hit_texts(&hits);
+
+    assert!(
+        lines.iter().any(|line| line == "class Invoice < Record"),
+        "{lines:?}"
+    );
+    assert!(texts.iter().any(|text| text == "Record"), "{texts:?}");
 }
 
 #[test]
