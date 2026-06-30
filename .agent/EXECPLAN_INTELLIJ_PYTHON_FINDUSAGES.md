@@ -46,6 +46,16 @@ scope by architecture and are not ported.
   `usages_python_graph_test.rs` (58 pass). WrappedMethod/NameShadowing remain
   ignored for precisely-documented deeper reasons (reassignment-target modeling;
   decorator/property attribution). No regressions; clippy clean.
+- 2026-06-30: Clarified the AGENTS.md "no regex/text-search fallbacks" directive
+  (it bans regex-instead-of-tree-sitter hacks, not principled best-effort from
+  structured data). Fixed InitUsages (constructor call `C()` -> `__init__`) and
+  NameShadowing (decorator member refs `@x.setter`/`@x.deleter` as the object of
+  a class-body attribute access; the property is already one CodeUnit so no merge
+  was needed). Ported suite now 9 pass / 6 ignored; the implicitly-resolved
+  ignores re-labeled "deferred best-effort" rather than "by design". Canonical
+  regressions added (`constructor_call_is_a_usage_of_init`,
+  `class_body_decorator_member_reference_resolves`, 60 pass). No regressions;
+  clippy clean.
 
 
 ## Surprises and Discoveries
@@ -191,28 +201,27 @@ the cross-file seeding path. Fix the root cause; no text-search fallback.
 
 ## Triage table (every PyFindUsagesTest method)
 
-PASS:
+PASS (9):
 - ClassUsages, UnresolvedClassInit, FunctionUsagesWithSameNameDecorator,
-  ConditionalFunctions (self-attribute, after Bug 2a; adapted to
-  includeDeclaration=false).
+  ConditionalFunctions (self-attribute, Bug 2a; adapted to includeDeclaration=false),
+  InitUsages (constructor -> __init__), NameShadowing (decorator member refs).
 - Regressions: `method_name_cursor_resolves_in_single_method_class` (Bug 1),
-  `self_receiver_method_usage_resolves` + `self_receiver_inherited_method_usage_resolves`
+  `self_receiver_method_usage_resolves`, `self_receiver_inherited_method_usage_resolves`
   (Bug 2a).
 
-OPEN gaps (`#[ignore]`, distinct from Bug 2a/2b):
-- InitUsages — constructor-call `C()` is not mapped to the class `__init__` method.
-- WrappedMethod — finds [2, 9]; omits the line-9 reassignment target (assignment
-  target modeled as a declaration). IntelliJ wants [2, 9, 9].
-- NameShadowing — decorator member references (`@x.setter`) + property
-  getter/setter/deleter merge.
+DEFERRED (`#[ignore]`, best-effort permitted but not yet implemented):
+- ImplicitlyResolvedUsages, ImplicitlyResolvedFieldUsages — untyped receiver; a
+  structured name-based best-effort would resolve them. (After the AGENTS.md
+  design-philosophy clarification, these are deferred enhancements, not design
+  prohibitions.)
 
-BY DESIGN divergence (`#[ignore]`, will not pass):
+OUT OF SCOPE / model divergence (`#[ignore]`):
 - ReassignedInstanceAttribute, ReassignedClassAttribute — bifrost models
   attributes per-class; IntelliJ merges across the hierarchy by name. (After
   Bug 2a bifrost resolves the same-class subset, e.g. [13, 16].)
-- ImplicitlyResolvedUsages, ImplicitlyResolvedFieldUsages — untyped-receiver
-  name-only fallback.
-- Imports — external module not indexed.
+- Imports — external (non-project) module not indexed.
+- WrappedMethod — finds [2, 9]; omits the line-9 reassignment *target* (assignment
+  target modeled as a declaration). IntelliJ wants [2, 9, 9].
 
 OUT OF ENVELOPE (not ported — target is a local/param/comprehension binding):
 - ReassignedLocalUsages, NonGlobalUsages, LambdaParameter,

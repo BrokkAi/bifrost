@@ -50,6 +50,8 @@ to their source and fix the root cause, even when that increases the blast radiu
 For analyzer resolution and usage analysis, do not add regex/text-search fallbacks that mask missing structured support.
 Surface the structured failure and fix the graph/resolver instead.
 
+To be precise about what this bans: the prohibition is on *hacking around a gap with string scanning* — using regexes, `split`, or substring matching in place of the tree-sitter AST / analyzer structures that already carry the answer. It is NOT a prohibition on principled best-effort resolution when the information genuinely is incomplete. When a precise answer is unavailable (e.g. a receiver whose type cannot be inferred, or a name that may resolve to one of several declarations), it is fine — often correct — to fall back to a structured, name-based best-effort built on AST nodes and CodeUnits, as long as it does not silently mask a structured failure we could have resolved. "Don't use a regex instead of tree-sitter" is the rule; "never make a best-effort guess from the structure you do have" is not.
+
 Do not replace parser support with small source-text "mini parsers" built from string splitting, regexes, or delimiter
 scanning. For example, do not parse Rust paths or type syntax with `split("::")`, `split_once(':')`, or manual generic
 delimiter walks when tree-sitter nodes, analyzer declaration ranges, import binders, or existing resolver helpers can

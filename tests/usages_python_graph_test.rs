@@ -1975,3 +1975,29 @@ fn bare_member_name_inside_method_is_not_a_usage() {
         0,
     );
 }
+
+// A constructor call `C()` invokes `__init__`, so it is a usage of `__init__`.
+// Passing the class as a value (`print(C)`) is not.
+#[test]
+fn constructor_call_is_a_usage_of_init() {
+    assert_eq!(
+        single_file_member_hits(
+            "class C:\n    def __init__(self):\n        pass\n\nc = C()\nprint(C)\n",
+            "m.C.__init__",
+        ),
+        1,
+    );
+}
+
+// A bare member used as the object of an attribute access in the class body
+// (e.g. a property's `@x.setter` / `@x.deleter` decorators) is a usage of `x`.
+#[test]
+fn class_body_decorator_member_reference_resolves() {
+    assert_eq!(
+        single_file_member_hits(
+            "class C:\n    @property\n    def x(self):\n        return self._x\n\n    @x.setter\n    def x(self, value):\n        self._x = value\n\n    @x.deleter\n    def x(self):\n        del self._x\n",
+            "m.C.x",
+        ),
+        2,
+    );
+}

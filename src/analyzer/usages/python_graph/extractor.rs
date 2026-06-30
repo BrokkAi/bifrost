@@ -450,6 +450,12 @@ fn handle_identifier_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     if let Some(member) = ctx.target_member {
+        // A constructor call `Owner(...)` invokes the class's `__init__`, so it
+        // is a usage of `__init__` even though `__init__` never appears.
+        if member == "__init__" && is_call_callee(node) && ctx.binds_target(text, node) {
+            record_hit(node, ctx);
+            return;
+        }
         // For a member target, a bare identifier is a usage only when it names
         // the member directly in the owner class body (the class namespace).
         if text == member && ctx.node_directly_in_owner_class_body(node) {
@@ -479,6 +485,17 @@ fn handle_attribute_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         record_hit(attribute, ctx);
     }
 
+    // A bare member name used as the *object* of an attribute access in the
+    // owner class body — e.g. the `x` in `@x.setter`/`@x.deleter` decorating a
+    // property `x` — is a usage of that member.
+    if let Some(member) = ctx.target_member
+        && object.kind() == "identifier"
+        && object_text == member
+        && ctx.node_directly_in_owner_class_body(object)
+    {
+        record_hit(object, ctx);
+    }
+
     let namespace_match = ctx.edges.iter().any(|edge| {
         matches!(edge.kind, ImportEdgeKind::Namespace)
             && (edge.local_name == object_text
@@ -491,6 +508,16 @@ fn handle_attribute_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 
 pub(in crate::analyzer::usages) fn slice<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     source.get(node.start_byte()..node.end_byte()).unwrap_or("")
+}
+
+/// Whether `node` is the `function` callee of a call expression (`node(...)`).
+fn is_call_callee(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        parent.kind() == "call"
+            && parent
+                .child_by_field_name("function")
+                .is_some_and(|function| function.id() == node.id())
+    })
 }
 
 pub(in crate::analyzer::usages) fn is_declaration_identifier(node: Node<'_>) -> bool {

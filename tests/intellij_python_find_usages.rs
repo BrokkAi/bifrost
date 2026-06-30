@@ -18,13 +18,15 @@
 //! IntelliJ find-usages excludes the declaration site, so every reference query
 //! here uses `includeDeclaration = false`.
 //!
-//! Triage outcomes are recorded per test:
+//! Triage outcomes are recorded per test (full table in the ExecPlan):
 //! - PASS: bifrost matches IntelliJ.
-//! - `#[ignore]` "bifrost gap: same-file Python member usages": blocked on the
-//!   usage graph not resolving same-file instance-receiver member usages
-//!   (Bug 2). These should light up once that gap is closed.
-//! - `#[ignore]` "by design": bifrost deliberately differs (no name-only member
-//!   fallback for untyped receivers; external modules are not indexed).
+//! - `#[ignore]` "deferred": a precise answer is unavailable (e.g. an untyped
+//!   receiver) and a structured name-based best-effort would resolve it, but
+//!   that is not yet implemented. Not a design prohibition.
+//! - `#[ignore]` "out of scope / model divergence": bifrost is project-scoped
+//!   (external modules are not indexed) or models the program differently from
+//!   IntelliJ's PSI (e.g. attributes per-class rather than merged by name).
+//! - `#[ignore]` <case-specific>: a narrower remaining gap, explained inline.
 
 mod common;
 
@@ -155,12 +157,10 @@ fn function_usages_with_same_name_decorator() {
 // Single-file, in-envelope cases — remaining gaps (distinct from Bug 2a)
 // ---------------------------------------------------------------------------
 
-// IntelliJ PY-292 InitUsages: caret on `__init__`. IntelliJ resolves the
-// constructor call `c = C()` (line 4) to `__init__`. bifrost does not map a
-// constructor call `C()` to the class's `__init__` method (the call is a usage
-// of the class, not of `__init__`).
+// IntelliJ PY-292 InitUsages: caret on `__init__`. The constructor call
+// `c = C()` (line 4) invokes `__init__`, so it counts as a usage; `print(C)`
+// (line 5) passes the class as a value and does not.
 #[test]
-#[ignore = "bifrost gap: constructor-call C() is not mapped to the class __init__ method"]
 fn init_usages() {
     let (_temp, file, locations) = references_for(
         "InitUsages.py",
@@ -239,14 +239,10 @@ fn self_receiver_inherited_method_usage_resolves() {
     assert_reference_lines(&locations, &file, &[6]);
 }
 
-// IntelliJ PY-6241 NameShadowing: caret on the `@property` getter `x`. IntelliJ
-// counts 2: the `@x.setter` (line 9) and `@x.deleter` (line 13) decorator
-// references. Here `x` is the *object* of a decorator attribute (`x.setter`),
-// lexically attached to the setter/deleter method, so it is neither a bare
-// class-body identifier nor a `self`-receiver; resolving it also requires
-// merging the getter/setter/deleter property definitions.
+// IntelliJ PY-6241 NameShadowing: caret on the `@property` getter `x`. The
+// `@x.setter` (line 9) and `@x.deleter` (line 13) decorators reference the
+// property `x` as the object of an attribute access in the class body.
 #[test]
-#[ignore = "bifrost gap: decorator member references (@x.setter) + property getter/setter/deleter merge"]
 fn name_shadowing() {
     let (_temp, file, locations) = references_for(
         "NameShadowing.py",
@@ -272,15 +268,20 @@ fn wrapped_method() {
 }
 
 // ---------------------------------------------------------------------------
-// Single-file, in-envelope cases — BY DESIGN divergence (won't pass)
+// Single-file, in-envelope cases — DEFERRED (best-effort permitted, not done)
+//
+// These are not design prohibitions. A precise answer is unavailable because a
+// receiver type cannot be inferred, and a structured name-based best-effort
+// would resolve them (see the "Design philosophy" note in AGENTS.md). They are
+// left ignored for now rather than chased in this pass.
 // ---------------------------------------------------------------------------
 
 // IntelliJ ImplicitlyResolvedUsages: caret on method `unique_long_identifier`.
-// `q` is an untyped parameter, so the `q.unique_long_identifier()` call resolves
-// in IntelliJ only by name (unique-name fallback). bifrost deliberately does NOT
-// do name-only member fallback for untyped receivers.
+// `q` is an untyped parameter, so `q.unique_long_identifier()` cannot be resolved
+// by receiver type. A name-based best-effort (the member name is unique in the
+// project) would match it; bifrost does not yet do this for untyped receivers.
 #[test]
-#[ignore = "by design: bifrost does not do name-only member fallback for untyped receivers"]
+#[ignore = "deferred: name-based best-effort member resolution for untyped receivers not yet implemented"]
 fn implicitly_resolved_usages() {
     let (_temp, file, locations) = references_for(
         "ImplicitlyResolvedUsages.py",
@@ -291,9 +292,9 @@ fn implicitly_resolved_usages() {
 
 // IntelliJ ImplicitlyResolvedFieldUsages: caret on the attribute write
 // `self.unique_some_identifier = 12`. The read `q.unique_some_identifier` has an
-// untyped receiver `q`; bifrost will not resolve it by name alone.
+// untyped receiver `q`; same deferred name-based best-effort as above.
 #[test]
-#[ignore = "by design: bifrost does not do name-only member fallback for untyped receivers"]
+#[ignore = "deferred: name-based best-effort member resolution for untyped receivers not yet implemented"]
 fn implicitly_resolved_field_usages() {
     let (_temp, file, locations) = references_for(
         "ImplicitlyResolvedFieldUsages.py",
@@ -302,10 +303,15 @@ fn implicitly_resolved_field_usages() {
     assert_reference_lines(&locations, &file, &[5]);
 }
 
+// ---------------------------------------------------------------------------
+// Single-file, in-envelope cases — OUT OF SCOPE / model divergence
+// ---------------------------------------------------------------------------
+
 // IntelliJ PY-1514 Imports: caret on `re` in `import re`. `re` is an external
-// module, not a project symbol, so bifrost does not index or resolve it.
+// (non-project) module; bifrost is a project-scoped analyzer and has no CodeUnit
+// for it, so it cannot enumerate `re`'s usages. Out of scope by design.
 #[test]
-#[ignore = "by design: bifrost does not index external (non-project) modules"]
+#[ignore = "out of scope: bifrost is project-scoped and does not index external modules like `re`"]
 fn imports() {
     let (_temp, file, locations) =
         references_for("Imports.py", "import r<caret>e\n\nx = re.compile('')\n");
