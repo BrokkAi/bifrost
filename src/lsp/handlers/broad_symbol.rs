@@ -99,14 +99,23 @@ pub(super) fn code_unit_declaration_name_range(
     Some(node_byte_range(name_node))
 }
 
+/// Find the node whose byte span exactly equals `range`. When several nested
+/// nodes share that exact span — e.g. a single-statement `block` and the
+/// `function_definition` it wraps both span the method's range — return the
+/// *deepest* such node. The shallow wrapper (a `block`) carries no `name`
+/// field, so returning it would defeat declaration-name resolution; the deepest
+/// match is the actual declaration node (`function_definition`, `class_definition`, …).
 fn node_for_exact_range<'tree>(root: Node<'tree>, range: &ByteRange) -> Option<Node<'tree>> {
+    let mut best: Option<Node<'tree>> = None;
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
-        if node.start_byte() == range.start_byte && node.end_byte() == range.end_byte {
-            return Some(node);
-        }
         if node.start_byte() > range.start_byte || node.end_byte() < range.end_byte {
             continue;
+        }
+        if node.start_byte() == range.start_byte && node.end_byte() == range.end_byte {
+            // Exact-span nodes form a nested chain; each deeper one is popped
+            // after its ancestor, so overwriting keeps the deepest.
+            best = Some(node);
         }
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
@@ -115,7 +124,7 @@ fn node_for_exact_range<'tree>(root: Node<'tree>, range: &ByteRange) -> Option<N
             }
         }
     }
-    None
+    best
 }
 
 fn declaration_name_node<'tree>(
