@@ -1,5 +1,5 @@
 import { ChildProcess, spawn } from "child_process";
-import { existsSync, statSync } from "fs";
+import { constants as fsConstants, existsSync, promises as fs, statSync } from "fs";
 import path from "path";
 import * as vscode from "vscode";
 
@@ -150,6 +150,30 @@ export function spawnBifrostServer(
   return { process: child, commandLine };
 }
 
+export async function validateLaunchCommand(config: BifrostLaunchConfig): Promise<void> {
+  const command = config.command;
+  if (!command.trim()) {
+    throw new Error("Bifrost server path is empty. Configure bifrost.serverPath or choose bundled launch mode.");
+  }
+
+  if (isPathLikeCommand(command)) {
+    await validateExecutablePath(command, config.cwd);
+    return;
+  }
+
+  const resolved = await findOnPath(
+    command,
+    config.env.PATH ?? process.env.PATH ?? "",
+    config.env.PATHEXT ?? process.env.PATHEXT,
+    config.cwd
+  );
+  if (!resolved) {
+    throw new Error(
+      `Bifrost binary "${command}" was not found on PATH. Configure bifrost.serverPath, install Bifrost on PATH, or choose bundled launch mode.`
+    );
+  }
+}
+
 export function findLocalDevBinary(extensionDir: string): string | null {
   const executable = process.platform === "win32" ? "bifrost.exe" : "bifrost";
   const candidates = [
@@ -251,6 +275,91 @@ function spawnCommand(
   }
 
   return spawn(command, args, { cwd, env, stdio: ["pipe", "pipe", "pipe"] });
+}
+
+function isPathLikeCommand(command: string): boolean {
+  return path.isAbsolute(command) || command.includes("/") || command.includes("\\");
+}
+
+async function validateExecutablePath(command: string, cwd?: string): Promise<void> {
+  const resolvedCommand = path.isAbsolute(command) || !cwd ? command : path.resolve(cwd, command);
+  let stat;
+  try {
+    stat = await fs.stat(resolvedCommand);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") {
+      throw new Error(
+        `Bifrost binary was not found at ${resolvedCommand}. Configure bifrost.serverPath, rebuild the binary, or choose bundled launch mode.`
+      );
+    }
+    throw error;
+  }
+
+  if (!stat.isFile()) {
+    throw new Error(`Bifrost server path is not a file: ${resolvedCommand}`);
+  }
+
+  const accessMode = process.platform === "win32" ? fsConstants.F_OK : fsConstants.X_OK;
+  try {
+    await fs.access(resolvedCommand, accessMode);
+  } catch {
+    throw new Error(`Bifrost binary is not executable: ${resolvedCommand}`);
+  }
+}
+
+async function findOnPath(
+  command: string,
+  pathValue: string,
+  pathExt: string | undefined,
+  cwd: string
+): Promise<string | null> {
+  const pathEntries = pathValue.split(path.delimiter);
+  const candidateNames = commandNamesForPathLookup(command, pathExt);
+  let firstCandidateError: Error | null = null;
+  for (const entry of pathEntries) {
+    const resolvedEntry = entry ? resolvePathEntry(entry, cwd) : cwd;
+    for (const candidateName of candidateNames) {
+      const candidate = path.join(resolvedEntry, candidateName);
+      try {
+        await validateExecutablePath(candidate);
+        return candidate;
+      } catch (error) {
+        if (!isMissingPathError(error) && !firstCandidateError) {
+          firstCandidateError = error instanceof Error ? error : new Error(String(error));
+        }
+      }
+    }
+  }
+  if (firstCandidateError) {
+    throw firstCandidateError;
+  }
+  return null;
+}
+
+function resolvePathEntry(entry: string, cwd: string): string {
+  return path.isAbsolute(entry) ? entry : path.resolve(cwd, entry);
+}
+
+function commandNamesForPathLookup(command: string, pathExt: string | undefined): string[] {
+  if (process.platform !== "win32") {
+    return [command];
+  }
+
+  const extension = path.extname(command);
+  if (extension) {
+    return [command];
+  }
+
+  return (pathExt ?? ".COM;.EXE;.BAT;.CMD")
+    .split(";")
+    .map((value) => value.trim())
+    .filter(Boolean)
+    .map((extension) => `${command}${extension.toLowerCase()}`);
+}
+
+function isMissingPathError(error: unknown): boolean {
+  return error instanceof Error && error.message.startsWith("Bifrost binary was not found at ");
 }
 
 function formatSpawnError(error: Error): string {

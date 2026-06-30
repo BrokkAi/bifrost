@@ -198,6 +198,21 @@ test("builds path MCP config from configured server path", () => {
   });
 });
 
+test("normalizes configured server path before validating and spawning", () => {
+  const config = lifecycle.buildLaunchConfig(
+    "/workspace",
+    "/extension",
+    "path",
+    "  /custom/bin/bifrost  ",
+    [],
+    false,
+    2000,
+    null
+  );
+
+  assert.equal(config.command, "/custom/bin/bifrost");
+});
+
 test("builds path MCP config from local development binary", () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-vscode-test-"));
   const extensionDir = path.join(temp, "editors", "vscode");
@@ -217,6 +232,144 @@ test("builds path MCP config from local development binary", () => {
     command: binaryPath,
     args: ["--root", "/workspace", "--mcp", "searchtools"]
   });
+});
+
+test("validates configured absolute launch command before startup", async () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-vscode-test-"));
+  const binaryPath = path.join(temp, "bifrost");
+  fs.writeFileSync(binaryPath, "#!/bin/sh\nexit 0\n");
+  if (process.platform !== "win32") {
+    fs.chmodSync(binaryPath, 0o755);
+  }
+
+  await lifecycle.validateLaunchCommand({
+    command: binaryPath,
+    args: ["--root", "/workspace", "--lsp"],
+    cwd: "/workspace",
+    env: process.env,
+    label: "path"
+  });
+});
+
+test("rejects unnormalized absolute launch command before startup", async () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-vscode-test-"));
+  const binaryPath = path.join(temp, "bifrost");
+  fs.writeFileSync(binaryPath, "#!/bin/sh\nexit 0\n");
+  if (process.platform !== "win32") {
+    fs.chmodSync(binaryPath, 0o755);
+  }
+
+  await assert.rejects(
+    lifecycle.validateLaunchCommand({
+      command: ` ${binaryPath} `,
+      args: ["--root", "/workspace", "--lsp"],
+      cwd: "/workspace",
+      env: process.env,
+      label: "path"
+    }),
+    /Bifrost binary was not found/
+  );
+});
+
+test("rejects missing configured absolute launch command before startup", async () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-vscode-test-"));
+  const binaryPath = path.join(temp, "missing-bifrost");
+
+  await assert.rejects(
+    lifecycle.validateLaunchCommand({
+      command: binaryPath,
+      args: ["--root", "/workspace", "--lsp"],
+      cwd: "/workspace",
+      env: process.env,
+      label: "path"
+    }),
+    /Bifrost binary was not found/
+  );
+});
+
+test("validates relative launch command from workspace cwd before startup", async () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-vscode-test-"));
+  const binaryPath = path.join(temp, "target", "debug", "bifrost");
+  fs.mkdirSync(path.dirname(binaryPath), { recursive: true });
+  fs.writeFileSync(binaryPath, "#!/bin/sh\nexit 0\n");
+  if (process.platform !== "win32") {
+    fs.chmodSync(binaryPath, 0o755);
+  }
+
+  await lifecycle.validateLaunchCommand({
+    command: "./target/debug/bifrost",
+    args: ["--root", temp, "--lsp"],
+    cwd: temp,
+    env: process.env,
+    label: "path"
+  });
+});
+
+test("validates relative PATH launch command from workspace cwd before startup", async () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-vscode-test-"));
+  const binaryPath = path.join(temp, "target", "debug", process.platform === "win32" ? "bifrost.exe" : "bifrost");
+  fs.mkdirSync(path.dirname(binaryPath), { recursive: true });
+  fs.writeFileSync(binaryPath, "#!/bin/sh\nexit 0\n");
+  if (process.platform !== "win32") {
+    fs.chmodSync(binaryPath, 0o755);
+  }
+
+  await lifecycle.validateLaunchCommand({
+    command: "bifrost",
+    args: ["--root", temp, "--lsp"],
+    cwd: temp,
+    env: { ...process.env, PATH: path.join("target", "debug") },
+    label: "path"
+  });
+});
+
+test("validates PATH launch command before startup", async () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-vscode-test-"));
+  const binaryPath = path.join(temp, process.platform === "win32" ? "bifrost.exe" : "bifrost");
+  fs.writeFileSync(binaryPath, "#!/bin/sh\nexit 0\n");
+  if (process.platform !== "win32") {
+    fs.chmodSync(binaryPath, 0o755);
+  }
+
+  await lifecycle.validateLaunchCommand({
+    command: "bifrost",
+    args: ["--root", "/workspace", "--lsp"],
+    cwd: "/workspace",
+    env: { ...process.env, PATH: temp },
+    label: "path"
+  });
+});
+
+test("rejects missing PATH launch command before startup", async () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-vscode-test-"));
+
+  await assert.rejects(
+    lifecycle.validateLaunchCommand({
+      command: "bifrost",
+      args: ["--root", "/workspace", "--lsp"],
+      cwd: "/workspace",
+      env: { ...process.env, PATH: temp },
+      label: "path"
+    }),
+    /was not found on PATH/
+  );
+});
+
+test("preserves PATH candidate validation errors before startup", async () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-vscode-test-"));
+  const binaryPath = path.join(temp, process.platform === "win32" ? "bifrost.exe" : "bifrost");
+  fs.mkdirSync(binaryPath);
+
+  await assert.rejects(
+    lifecycle.validateLaunchCommand({
+      command: "bifrost",
+      args: ["--root", "/workspace", "--lsp"],
+      cwd: "/workspace",
+      env: { ...process.env, PATH: temp },
+      label: "path"
+    }),
+    /Bifrost server path is not a file/
+  );
 });
 
 test("builds MCP host commands from config", () => {

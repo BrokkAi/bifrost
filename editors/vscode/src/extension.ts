@@ -21,7 +21,8 @@ import {
   parsePathSettings,
   sourceFileWatchers,
   spawnBifrostServer,
-  supportedWorkspaceRoot
+  supportedWorkspaceRoot,
+  validateLaunchCommand
 } from "./lifecycle";
 import {
   findManagedBinary,
@@ -150,6 +151,17 @@ async function startClientInner(context: vscode.ExtensionContext): Promise<void>
   }
 
   lastLaunchConfig = launchConfig;
+  try {
+    await validateLaunchCommand(launchConfig);
+  } catch (error) {
+    const message = formatError(error);
+    setStatus("$(error) Bifrost", `${message}\n\nClick to retry.`);
+    setStatusCommand("bifrost.startServer");
+    log(`Bifrost launch validation failed: ${message}`);
+    void vscode.window.showErrorMessage(`Bifrost: ${message}`);
+    return;
+  }
+
   setStatus("$(sync~spin) Bifrost", "Starting Bifrost language server...");
   log(`Starting Bifrost language server using ${launchConfig.label} launch mode.`);
 
@@ -190,6 +202,9 @@ async function startClientInner(context: vscode.ExtensionContext): Promise<void>
         const message = formatError(error);
         log(`Bifrost language server connection error: ${message}`);
         setStatus("$(error) Bifrost", message);
+        if (client?.state === State.Starting) {
+          return { action: ErrorAction.Continue, handled: true };
+        }
         return { action: ErrorAction.Shutdown, handled: true };
       },
       closed: () => {
