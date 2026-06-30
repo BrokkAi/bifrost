@@ -80,6 +80,9 @@ fn references_multifile(files: &[(&str, &str)]) -> (TempDir, PathBuf, Vec<RefLoc
     let mut caret: Option<(PathBuf, u64, u64)> = None;
     for (name, src) in files {
         let path = root.join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create parent dirs");
+        }
         if src.contains("<caret>") {
             let (clean, line, character) = split_caret(src);
             std::fs::write(&path, clean).expect("write caret fixture");
@@ -156,6 +159,26 @@ fn const_imported_from_another_file() {
     assert_eq!(
         reference_counts_by_file(&locations, &["definer.py", "consumer.py"]),
         vec![3, 2],
+    );
+}
+
+// IntelliJ PY-7348 NamespacePackageUsages: caret on `nspkg1`, a PEP-420 namespace
+// package (a directory with no `__init__.py`). IntelliJ counts 3 (the two imports
+// + the `print(nspkg1)`). bifrost models files as modules and does not synthesize
+// a module CodeUnit for an implicit namespace-package directory, so the cursor
+// does not resolve and no usages are found. Out of scope by design.
+#[test]
+#[ignore = "out of scope: bifrost does not model PEP-420 namespace packages (directories without __init__.py)"]
+fn namespace_package_usages() {
+    let (_t, _root, locations) = references_multifile(&[
+        ("b.py", "import nspkg1\n"),
+        ("a.py", "import nspkg1.m1\n\nprint(ns<caret>pkg1)\n"),
+        ("nspkg1/m1.py", "\n"),
+    ]);
+    // IntelliJ's expectation: 1 in b.py, 2 in a.py.
+    assert_eq!(
+        reference_counts_by_file(&locations, &["b.py", "a.py"]),
+        vec![1, 2],
     );
 }
 
