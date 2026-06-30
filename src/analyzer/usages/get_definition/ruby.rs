@@ -106,6 +106,9 @@ enum RubyReferenceNode<'tree> {
 fn ruby_reference_node(mut node: Node<'_>) -> Option<RubyReferenceNode<'_>> {
     while let Some(parent) = node.parent() {
         if parent.kind() == "scope_resolution" {
+            if is_assignment_lhs_owner_scope(node, parent) {
+                break;
+            }
             node = parent;
         } else {
             break;
@@ -141,6 +144,24 @@ fn ruby_reference_node(mut node: Node<'_>) -> Option<RubyReferenceNode<'_>> {
             }
         }
     }
+}
+
+fn is_assignment_lhs_owner_scope(child: Node<'_>, parent: Node<'_>) -> bool {
+    parent.child_by_field_name("scope") == Some(child)
+        && scope_resolution_chain_is_assignment_left(parent)
+}
+
+fn scope_resolution_chain_is_assignment_left(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        if parent.kind() == "assignment" {
+            return parent.child_by_field_name("left") == Some(node);
+        }
+        if parent.kind() != "scope_resolution" {
+            return false;
+        }
+        node = parent;
+    }
+    false
 }
 
 fn ruby_constant_outcome(

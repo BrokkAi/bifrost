@@ -392,6 +392,136 @@ end
 }
 
 #[test]
+fn resolves_namespaced_class_constant_field_usages() {
+    let (_project, analyzer) = ruby_analyzer_with_files(&[
+        (
+            "app/report.rb",
+            r#"require_relative "../lib/billing/invoice"
+
+module Reports
+  class InvoiceReport
+    def render
+      Billing::Invoice::DEFAULT_CURRENCY
+      Other::Invoice::DEFAULT_CURRENCY
+    end
+  end
+end
+"#,
+        ),
+        (
+            "lib/billing/invoice.rb",
+            r#"module Billing
+  class Invoice
+    DEFAULT_CURRENCY = Money::Currency.new("USD")
+  end
+end
+"#,
+        ),
+        (
+            "lib/other/invoice.rb",
+            r#"module Other
+  class Invoice
+    DEFAULT_CURRENCY = "EUR"
+  end
+end
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "Billing$Invoice.DEFAULT_CURRENCY");
+    let hits = analyzer
+        .find_usages(&[target])
+        .into_either()
+        .expect("usage lookup should succeed");
+    let lines = hit_source_lines(&hits);
+    let texts = hit_texts(&hits);
+
+    assert!(
+        lines
+            .iter()
+            .any(|line| line == "Billing::Invoice::DEFAULT_CURRENCY"),
+        "{lines:?}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line == "Other::Invoice::DEFAULT_CURRENCY"),
+        "{lines:?}"
+    );
+    assert!(
+        texts.iter().any(|text| text == "DEFAULT_CURRENCY"),
+        "{texts:?}"
+    );
+    assert!(
+        !texts
+            .iter()
+            .any(|text| text == "Billing::Invoice::DEFAULT_CURRENCY"),
+        "{texts:?}"
+    );
+}
+
+#[test]
+fn resolves_absolute_namespaced_class_constant_field_usages() {
+    let (_project, analyzer) = ruby_analyzer_with_files(&[(
+        "app/report.rb",
+        r#"module Billing
+  class Invoice
+    DEFAULT_CURRENCY = "USD"
+  end
+end
+
+module Reports
+  module Billing
+    class Invoice
+      DEFAULT_CURRENCY = "ZAR"
+    end
+  end
+
+  class InvoiceReport
+    def render
+      ::Billing::Invoice::DEFAULT_CURRENCY
+    end
+  end
+end
+"#,
+    )]);
+
+    let target = definition(&analyzer, "Billing$Invoice.DEFAULT_CURRENCY");
+    let hits = analyzer
+        .find_usages(&[target])
+        .into_either()
+        .expect("usage lookup should succeed");
+    let lines = hit_source_lines(&hits);
+
+    assert!(
+        lines
+            .iter()
+            .any(|line| line == "::Billing::Invoice::DEFAULT_CURRENCY"),
+        "{lines:?}"
+    );
+}
+
+#[test]
+fn indexes_absolute_namespaced_constant_assignment_as_top_level_field() {
+    let (_project, analyzer) = ruby_analyzer_with_files(&[(
+        "app/report.rb",
+        r#"module Billing
+  class Invoice
+  end
+end
+
+module Reports
+  ::Billing::Invoice::DEFAULT_CURRENCY = "USD"
+end
+"#,
+    )]);
+
+    let definitions = analyzer.get_definitions("Billing$Invoice.DEFAULT_CURRENCY");
+
+    assert_eq!(1, definitions.len(), "{definitions:?}");
+}
+
+#[test]
 fn reports_superclass_reference_before_entering_declared_class_scope() {
     let (_project, analyzer) = ruby_analyzer_with_files(&[(
         "lib/billing/invoice.rb",

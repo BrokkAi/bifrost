@@ -656,6 +656,141 @@ end
 }
 
 #[test]
+fn ruby_get_definition_resolves_namespaced_class_constant_field() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "app/report.rb",
+            r#"require_relative "../lib/billing/invoice"
+
+module Reports
+  class InvoiceReport
+    def render
+      Billing::Invoice::DEFAULT_CURRENCY
+      Other::Invoice::DEFAULT_CURRENCY
+    end
+  end
+end
+"#,
+        )
+        .file(
+            "lib/billing/invoice.rb",
+            r#"module Billing
+  class Invoice
+    DEFAULT_CURRENCY = Money::Currency.new("USD")
+  end
+end
+"#,
+        )
+        .file(
+            "lib/other/invoice.rb",
+            r#"module Other
+  class Invoice
+    DEFAULT_CURRENCY = "EUR"
+  end
+end
+"#,
+        )
+        .build();
+
+    let line = "      Billing::Invoice::DEFAULT_CURRENCY";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/report.rb","line":6,"column":{}}}]}}"#,
+            column_of(line, "DEFAULT_CURRENCY")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Billing$Invoice.DEFAULT_CURRENCY",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["path"], "lib/billing/invoice.rb",
+        "{value}"
+    );
+}
+
+#[test]
+fn ruby_get_definition_resolves_absolute_namespaced_class_constant_field() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "app/report.rb",
+            r#"module Billing
+  class Invoice
+    DEFAULT_CURRENCY = "USD"
+  end
+end
+
+module Reports
+  module Billing
+    class Invoice
+      DEFAULT_CURRENCY = "ZAR"
+    end
+  end
+
+  class InvoiceReport
+    def render
+      ::Billing::Invoice::DEFAULT_CURRENCY
+    end
+  end
+end
+"#,
+        )
+        .build();
+
+    let line = "      ::Billing::Invoice::DEFAULT_CURRENCY";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/report.rb","line":16,"column":{}}}]}}"#,
+            column_of(line, "DEFAULT_CURRENCY")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Billing$Invoice.DEFAULT_CURRENCY",
+        "{value}"
+    );
+}
+
+#[test]
+fn ruby_get_definition_resolves_owner_segments_in_scoped_constant_assignment() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "app/report.rb",
+            r#"module Billing
+  class Invoice
+  end
+end
+
+Billing::Invoice::DEFAULT_CURRENCY = "USD"
+"#,
+        )
+        .build();
+
+    let line = "Billing::Invoice::DEFAULT_CURRENCY = \"USD\"";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/report.rb","line":6,"column":{}}}]}}"#,
+            column_of(line, "Invoice")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Billing$Invoice",
+        "{value}"
+    );
+}
+
+#[test]
 fn rust_named_import_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(

@@ -5,7 +5,7 @@
 //! tracked as unsafe inference and surfaced through the existing query-level
 //! graph diagnostic when no structured hits were found.
 
-use crate::analyzer::ruby::parse_ruby_tree;
+use crate::analyzer::ruby::{extract_name_path, extract_name_segments, parse_ruby_tree};
 use crate::analyzer::type_relations::TypeRelationKind;
 use crate::analyzer::usages::common::{
     SNIPPET_CONTEXT_LINES, TreeWalkAction, language_for_target, usage_hit, walk_tree_iterative,
@@ -287,14 +287,7 @@ impl<'a> RubySemanticIndex<'a> {
         node: Node<'_>,
         source: &str,
     ) -> Option<CodeUnit> {
-        let name = qualified_internal_name(node, source)?;
-        let mut candidates = Vec::new();
-        if !is_absolute_scope_resolution(node) {
-            for owner in lexical_stack.iter().rev() {
-                candidates.push(format!("{owner}${name}"));
-            }
-        }
-        candidates.push(name);
+        let candidates = constant_lookup_candidates(lexical_stack, node, source)?;
 
         candidates.into_iter().find_map(|candidate| {
             self.analyzer
@@ -1338,11 +1331,28 @@ pub(crate) fn is_declaration_constant(node: Node<'_>) -> bool {
     {
         return true;
     }
-    if let Some(parent) = node.parent()
-        && parent.kind() == "assignment"
-        && parent.child_by_field_name("left") == Some(node)
-    {
+    if is_assignment_left_constant(node) {
         return true;
+    }
+    false
+}
+
+fn is_assignment_left_constant(node: Node<'_>) -> bool {
+    let mut topmost = node;
+    while let Some(parent) = topmost.parent() {
+        if parent.kind() == "assignment" {
+            if parent.child_by_field_name("left") != Some(topmost) {
+                return false;
+            }
+            return node == topmost
+                || topmost
+                    .child_by_field_name("name")
+                    .is_some_and(|name| name == node);
+        }
+        if parent.kind() != "scope_resolution" {
+            return false;
+        }
+        topmost = parent;
     }
     false
 }
@@ -1386,44 +1396,11 @@ pub(crate) fn is_call_method_identifier(node: Node<'_>) -> bool {
     })
 }
 
-fn qualified_internal_name(node: Node<'_>, source: &str) -> Option<String> {
-    let segments = extract_name_segments(node, source);
-    (!segments.is_empty()).then(|| segments.join("$"))
-}
-
-fn is_absolute_scope_resolution(node: Node<'_>) -> bool {
-    node.kind() == "scope_resolution" && node.child_by_field_name("scope").is_none()
-}
-
 fn constant_hit_node(node: Node<'_>) -> Node<'_> {
     if node.kind() == "scope_resolution" {
         node.child_by_field_name("name").unwrap_or(node)
     } else {
         node
-    }
-}
-
-pub(crate) fn extract_name_segments(node: Node<'_>, source: &str) -> Vec<String> {
-    match node.kind() {
-        "scope_resolution" => {
-            let mut segments = node
-                .child_by_field_name("scope")
-                .map(|scope| extract_name_segments(scope, source))
-                .unwrap_or_default();
-            if let Some(name) = node.child_by_field_name("name") {
-                segments.extend(extract_name_segments(name, source));
-            }
-            segments
-        }
-        "constant" => {
-            let text = node_text(node, source);
-            if text.is_empty() {
-                Vec::new()
-            } else {
-                vec![text.to_string()]
-            }
-        }
-        _ => Vec::new(),
     }
 }
 
@@ -1441,4 +1418,46 @@ pub(crate) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
         .get(node.start_byte()..node.end_byte())
         .unwrap_or("")
         .trim()
+}
+
+fn constant_lookup_candidates(
+    lexical_stack: &[String],
+    node: Node<'_>,
+    source: &str,
+) -> Option<Vec<String>> {
+    let path = extract_name_path(node, source);
+    if path.segments.is_empty() {
+        return None;
+    }
+
+    let name = path.segments.join("$");
+    let mut candidates = Vec::new();
+    if !path.absolute {
+        for owner in lexical_stack.iter().rev() {
+            candidates.push(format!("{owner}${name}"));
+        }
+    }
+    candidates.push(name);
+
+    let Some((constant_name, owner_segments)) = path.segments.split_last() else {
+        return Some(candidates);
+    };
+    if owner_segments.is_empty() {
+        if !path.absolute {
+            for owner in lexical_stack.iter().rev() {
+                candidates.push(format!("{owner}.{constant_name}"));
+            }
+        }
+        return Some(candidates);
+    }
+
+    let owner_name = owner_segments.join("$");
+    if !path.absolute {
+        for owner in lexical_stack.iter().rev() {
+            candidates.push(format!("{owner}${owner_name}.{constant_name}"));
+        }
+    }
+    candidates.push(format!("{owner_name}.{constant_name}"));
+
+    Some(candidates)
 }

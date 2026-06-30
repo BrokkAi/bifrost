@@ -25,7 +25,7 @@ use cache::{
     weight_project_file_set,
 };
 
-pub(crate) use declarations::parse_ruby_tree;
+pub(crate) use declarations::{extract_name_path, extract_name_segments, parse_ruby_tree};
 
 #[derive(Clone)]
 pub struct RubyAnalyzer {

@@ -171,18 +171,19 @@ impl RubyVisitor<'_> {
             return;
         };
         // Only constant assignments are declarations; locals are lowercase.
-        if left.kind() != "constant" {
+        if !matches!(left.kind(), "constant" | "scope_resolution") {
             return;
         }
-        let name = ruby_node_text(left, self.source).trim();
-        if name.is_empty() {
+        let name_path = extract_name_path(left, self.source);
+        if name_path.segments.is_empty() {
             return;
         }
+        let short_name = assignment_constant_short_name(segments, &name_path);
         let code_unit = CodeUnit::new(
             self.file.clone(),
             CodeUnitType::Field,
             String::new(),
-            member_short_name(segments, name),
+            short_name,
         );
         self.parsed
             .replace_code_unit(code_unit.clone(), node, self.source, parent.cloned(), None);
@@ -254,28 +255,61 @@ fn member_short_name(segments: &[String], name: &str) -> String {
     }
 }
 
+fn assignment_constant_short_name(lexical_segments: &[String], name_path: &RubyNamePath) -> String {
+    let Some((name, owner_segments)) = name_path.segments.split_last() else {
+        return String::new();
+    };
+    if owner_segments.is_empty() {
+        return member_short_name(lexical_segments, name);
+    }
+    if name_path.absolute || owner_segments.len() > 1 || lexical_segments.is_empty() {
+        return member_short_name(owner_segments, name);
+    }
+
+    let mut resolved_owner = Vec::new();
+    resolved_owner.extend_from_slice(lexical_segments);
+    resolved_owner.extend_from_slice(owner_segments);
+    member_short_name(&resolved_owner, name)
+}
+
+pub(crate) struct RubyNamePath {
+    pub(crate) segments: Vec<String>,
+    pub(crate) absolute: bool,
+}
+
 /// Extracts the namespace segments from a class/module name node by walking the
 /// AST (not by string-splitting `::`). A plain `(constant)` yields one segment;
 /// a `(scope_resolution)` like `A::B` walks its `scope` and `name` fields to
 /// yield `["A", "B"]`.
-pub(super) fn extract_name_segments(name_node: Node<'_>, source: &str) -> Vec<String> {
+pub(crate) fn extract_name_segments(name_node: Node<'_>, source: &str) -> Vec<String> {
+    extract_name_path(name_node, source).segments
+}
+
+pub(crate) fn extract_name_path(name_node: Node<'_>, source: &str) -> RubyNamePath {
     match name_node.kind() {
         "scope_resolution" => {
-            let mut segments = name_node
+            let mut path = name_node
                 .child_by_field_name("scope")
-                .map(|scope| extract_name_segments(scope, source))
-                .unwrap_or_default();
+                .map(|scope| extract_name_path(scope, source))
+                .unwrap_or_else(|| RubyNamePath {
+                    segments: Vec::new(),
+                    absolute: true,
+                });
             if let Some(name) = name_node.child_by_field_name("name") {
-                segments.extend(extract_name_segments(name, source));
+                path.segments.extend(extract_name_segments(name, source));
             }
-            segments
+            path
         }
         _ => {
             let text = ruby_node_text(name_node, source).trim();
-            if text.is_empty() {
+            let segments = if text.is_empty() {
                 Vec::new()
             } else {
                 vec![text.to_string()]
+            };
+            RubyNamePath {
+                segments,
+                absolute: false,
             }
         }
     }
@@ -283,7 +317,7 @@ pub(super) fn extract_name_segments(name_node: Node<'_>, source: &str) -> Vec<St
 
 /// Renders a `constant`/`scope_resolution` reference node into the internal
 /// `$`-joined name used as a `CodeUnit` key (e.g. `A::B` -> `A$B`).
-pub(super) fn qualified_internal_name(node: Node<'_>, source: &str) -> Option<String> {
+pub(crate) fn qualified_internal_name(node: Node<'_>, source: &str) -> Option<String> {
     let segments = extract_name_segments(node, source);
     (!segments.is_empty()).then(|| segments.join("$"))
 }
