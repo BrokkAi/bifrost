@@ -539,6 +539,7 @@ impl RubyWalkState<'_, '_> {
     fn enter(&mut self, node: Node<'_>) -> TreeWalkAction {
         match node.kind() {
             "class" | "module" => {
+                self.record_superclass_reference(node);
                 if let Some(owner) = self.type_owner(node) {
                     self.lexical_stack.push(owner);
                     self.exits.push(RubyExit::Lexical);
@@ -605,6 +606,24 @@ impl RubyWalkState<'_, '_> {
         }
     }
 
+    fn record_superclass_reference(&mut self, node: Node<'_>) {
+        if self.scan.spec.kind != RubyTargetKind::TypeOrConstant {
+            return;
+        }
+        let Some(superclass) = node.child_by_field_name("superclass") else {
+            return;
+        };
+        let mut stack = vec![superclass];
+        while let Some(current) = stack.pop() {
+            self.record_constant_reference(current);
+            for index in (0..current.named_child_count()).rev() {
+                if let Some(child) = current.named_child(index) {
+                    stack.push(child);
+                }
+            }
+        }
+    }
+
     fn record_constant_reference(&mut self, node: Node<'_>) {
         if !matches!(node.kind(), "constant" | "scope_resolution") || is_declaration_constant(node)
         {
@@ -618,7 +637,7 @@ impl RubyWalkState<'_, '_> {
             self.scan.source,
         ) && self.scan.semantic.target_matches_constant(&unit)
         {
-            self.record_hit(node);
+            self.record_hit(constant_hit_node(node));
         }
     }
 
@@ -1070,6 +1089,14 @@ fn qualified_internal_name(node: Node<'_>, source: &str) -> Option<String> {
 
 fn is_absolute_scope_resolution(node: Node<'_>) -> bool {
     node.kind() == "scope_resolution" && node.child_by_field_name("scope").is_none()
+}
+
+fn constant_hit_node(node: Node<'_>) -> Node<'_> {
+    if node.kind() == "scope_resolution" {
+        node.child_by_field_name("name").unwrap_or(node)
+    } else {
+        node
+    }
 }
 
 pub(crate) fn extract_name_segments(node: Node<'_>, source: &str) -> Vec<String> {
