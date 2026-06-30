@@ -7810,7 +7810,11 @@ fn bifrost_lsp_server_formatting_uses_did_open_overlay() {
     let edits = response["result"]
         .as_array()
         .unwrap_or_else(|| panic!("expected formatting edits, got {response}"));
-    assert_eq!(edits.len(), 1, "expected one full-document edit: {response}");
+    assert_eq!(
+        edits.len(),
+        1,
+        "expected one full-document edit: {response}"
+    );
     assert_eq!(edits[0]["newText"], "FN OVERLAY() {}\n");
     assert_eq!(edits[0]["range"]["start"]["line"], 0);
     assert_eq!(edits[0]["range"]["start"]["character"], 0);
@@ -7849,7 +7853,10 @@ fn bifrost_lsp_server_formatting_returns_empty_edits_for_noop() {
     let edits = response["result"]
         .as_array()
         .unwrap_or_else(|| panic!("expected formatting edits, got {response}"));
-    assert!(edits.is_empty(), "expected no-op formatting edits: {response}");
+    assert!(
+        edits.is_empty(),
+        "expected no-op formatting edits: {response}"
+    );
 
     shutdown_lsp(child, stdin, reader, stderr);
 }
@@ -7899,7 +7906,10 @@ fn bifrost_lsp_server_formatting_reports_formatter_failure() {
     let file_path = root.join("lib.rs");
     let stub_path = root.join("fail-format");
     fs::write(&file_path, "fn main() {}\n").expect("write disk file");
-    write_stub_command(&stub_path, "#!/bin/sh\necho formatter exploded >&2\nexit 7\n");
+    write_stub_command(
+        &stub_path,
+        "#!/bin/sh\necho formatter exploded >&2\nexit 7\n",
+    );
 
     let (child, mut stdin, mut reader, mut stderr) = start_lsp_server_with_params(
         &root,

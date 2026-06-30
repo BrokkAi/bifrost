@@ -17,11 +17,11 @@ use lsp_types::notification::{
 };
 use lsp_types::request::{
     CallHierarchyIncomingCalls, CallHierarchyOutgoingCalls, CallHierarchyPrepare, Completion,
-    DocumentDiagnosticRequest, DocumentHighlightRequest, DocumentSymbolRequest, Formatting,
-    FoldingRangeRequest, GotoDefinition, GotoImplementation, GotoTypeDefinition, HoverRequest,
-    PrepareRenameRequest, References, Rename, Request as LspRequestTrait, SignatureHelpRequest,
-    TypeHierarchyPrepare, TypeHierarchySubtypes, TypeHierarchySupertypes, WorkDoneProgressCreate,
-    WorkspaceSymbolRequest,
+    DocumentDiagnosticRequest, DocumentHighlightRequest, DocumentSymbolRequest,
+    FoldingRangeRequest, Formatting, GotoDefinition, GotoImplementation, GotoTypeDefinition,
+    HoverRequest, PrepareRenameRequest, References, Rename, Request as LspRequestTrait,
+    SignatureHelpRequest, TypeHierarchyPrepare, TypeHierarchySubtypes, TypeHierarchySupertypes,
+    WorkDoneProgressCreate, WorkspaceSymbolRequest,
 };
 use lsp_types::{
     DidChangeTextDocumentParams, DidChangeWatchedFilesParams, DidChangeWorkspaceFoldersParams,

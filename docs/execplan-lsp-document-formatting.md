@@ -17,7 +17,7 @@ The user-visible behavior is: start `bifrost --lsp`, initialize with optional `f
 - [x] (2026-06-30 11:17Z) Wired `textDocument/formatting` into LSP capabilities, request dispatch, and the formatter handler. Evidence: `cargo test --test bifrost_lsp_server formatting --features nlp` passed 5 focused LSP tests covering capability advertisement, overlay text, no-op edits, cwd, and formatter failure.
 - [x] (2026-06-30 11:24Z) Added VS Code settings for `bifrost.formatterCommands` and forwarded non-empty rules through LSP initialization options. Evidence: `npm test` passed after installing local VS Code dependencies.
 - [x] (2026-06-30 11:24Z) Added unit, LSP integration, and ignored opt-in real-tool tests. Evidence: `cargo test formatting --lib --features nlp` passed 8 tests with 1 ignored opt-in rustfmt integration test; `cargo test --test bifrost_lsp_server formatting --features nlp` passed 5 LSP tests.
-- [ ] Run formatting, focused tests, and `cargo clippy-no-cuda`; update this ExecPlan with outcomes.
+- [x] (2026-06-30 11:29Z) Ran formatting, focused tests, VS Code tests, and `cargo clippy-no-cuda`; updated this ExecPlan with outcomes. Evidence: `cargo fmt --check`, `cargo test formatting --lib --features nlp`, `cargo test --test bifrost_lsp_server formatting --features nlp`, `npm test`, and `cargo clippy-no-cuda` all passed.
 
 ## Surprises & Discoveries
 
@@ -50,7 +50,9 @@ The user-visible behavior is: start `bifrost --lsp`, initialize with optional `f
 
 ## Outcomes & Retrospective
 
-This section is intentionally empty at creation. Update it after each major milestone and at completion.
+Completed #42's document-formatting slice. Bifrost now advertises and handles `textDocument/formatting`, resolves formatter commands from ordered configuration rules before conservative built-ins, formats overlay-aware document text through stdin/stdout commands, and returns ordinary full-document LSP edits. VS Code now exposes `bifrost.formatterCommands` and forwards rules to the server. Range formatting and on-type formatting remain separate follow-up issues.
+
+The final validation bundle passed on 2026-06-30: `cargo fmt --check`, `cargo test formatting --lib --features nlp`, `cargo test --test bifrost_lsp_server formatting --features nlp`, `npm test` in `editors/vscode`, and `cargo clippy-no-cuda`.
 
 ## Context and Orientation
 

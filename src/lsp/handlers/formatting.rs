@@ -193,7 +193,12 @@ fn discover_package_script(context: &FormatContext<'_>) -> Option<FormatterComma
         "format-document",
     ]
     .into_iter()
-    .find(|name| scripts.get(*name).and_then(|value| value.as_str()).is_some())?;
+    .find(|name| {
+        scripts
+            .get(*name)
+            .and_then(|value| value.as_str())
+            .is_some()
+    })?;
     Some(FormatterCommand {
         command: "npm".to_string(),
         args: vec!["run".to_string(), script_name.to_string(), "--".to_string()],
@@ -446,7 +451,7 @@ mod tests {
             command.args,
             vec![
                 "--stdin-filename",
-            &root.join("pkg/src/lib.rs").display().to_string(),
+                &root.join("pkg/src/lib.rs").display().to_string(),
                 "pkg/src/lib.rs",
                 "rust",
             ]
@@ -569,7 +574,11 @@ mod tests {
     #[test]
     #[ignore = "requires BIFROST_FORMATTER_INTEGRATION_TESTS=1 and rustfmt on PATH"]
     fn formatter_integration_rustfmt_stdout_contract() {
-        if std::env::var("BIFROST_FORMATTER_INTEGRATION_TESTS").ok().as_deref() != Some("1") {
+        if std::env::var("BIFROST_FORMATTER_INTEGRATION_TESTS")
+            .ok()
+            .as_deref()
+            != Some("1")
+        {
             eprintln!("set BIFROST_FORMATTER_INTEGRATION_TESTS=1 to run real formatter tests");
             return;
         }
