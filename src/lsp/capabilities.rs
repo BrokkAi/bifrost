@@ -1,5 +1,5 @@
 use lsp_types::{
-    CompletionOptions, DiagnosticOptions, DiagnosticServerCapabilities,
+    CompletionOptions, DiagnosticOptions, DiagnosticServerCapabilities, DocumentFormattingOptions,
     FoldingRangeProviderCapability, HoverProviderCapability, ImplementationProviderCapability,
     OneOf, RenameOptions, ServerCapabilities, SignatureHelpOptions, TextDocumentSyncCapability,
     TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions,
@@ -47,6 +47,9 @@ pub fn server_capabilities() -> ServerCapabilities {
         implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
         document_highlight_provider: Some(OneOf::Left(true)),
         document_symbol_provider: Some(OneOf::Left(true)),
+        document_formatting_provider: Some(OneOf::Right(DocumentFormattingOptions {
+            work_done_progress_options: WorkDoneProgressOptions::default(),
+        })),
         folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         references_provider: Some(OneOf::Left(true)),

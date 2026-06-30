@@ -130,7 +130,10 @@ fn bifrost_lsp_server_handles_initialize_and_shutdown() {
         initialize["result"]["capabilities"]["renameProvider"]["prepareProvider"], true,
         "renameProvider with prepare support should be advertised: {initialize}"
     );
-
+    assert!(
+        initialize["result"]["capabilities"]["documentFormattingProvider"].is_object(),
+        "documentFormattingProvider should be advertised: {initialize}"
+    );
     write_message(
         &mut stdin,
         json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
@@ -7672,6 +7675,253 @@ fn shutdown_lsp(
     drop(stdin);
     let status = child.wait().expect("wait bifrost");
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
+fn bifrost_lsp_server_formatting_capability_is_advertised() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let root_uri = uri_for(&root);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(&root)
+        .arg("--server")
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bifrost");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "processId": null,
+                "rootUri": root_uri,
+                "capabilities": {}
+            }
+        }),
+    );
+    let initialize = read_response_for_id(&mut reader, &mut stderr, 1);
+    assert!(
+        initialize["result"]["capabilities"]["documentFormattingProvider"].is_object(),
+        "documentFormattingProvider should be advertised: {initialize}"
+    );
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+    );
+
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 99, "method": "shutdown"}),
+    );
+    let _ = read_response_for_id(&mut reader, &mut stderr, 99);
+    write_message(&mut stdin, json!({"jsonrpc": "2.0", "method": "exit"}));
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[cfg(unix)]
+fn write_stub_command(path: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::write(path, body).expect("write stub command");
+    let mut permissions = fs::metadata(path).expect("stub metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).expect("chmod stub command");
+}
+
+fn formatting_response(
+    stdin: &mut impl Write,
+    reader: &mut impl BufRead,
+    stderr: &mut impl Read,
+    id: u64,
+    file_uri: &str,
+) -> Value {
+    write_message(
+        stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "textDocument/formatting",
+            "params": {
+                "textDocument": {"uri": file_uri},
+                "options": {"tabSize": 4, "insertSpaces": true}
+            }
+        }),
+    );
+    read_response_for_id(reader, stderr, id)
+}
+
+#[cfg(unix)]
+#[test]
+fn bifrost_lsp_server_formatting_uses_did_open_overlay() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("lib.rs");
+    let stub_path = root.join("upper-format");
+    fs::write(&file_path, "fn disk() {}\n").expect("write disk file");
+    write_stub_command(&stub_path, "#!/bin/sh\ntr '[:lower:]' '[:upper:]'\n");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server_with_params(
+        &root,
+        json!({
+            "processId": null,
+            "rootUri": uri_for(&root),
+            "capabilities": {},
+            "initializationOptions": {
+                "formatterCommands": [{
+                    "include": ["*.rs"],
+                    "language": "rust",
+                    "command": stub_path.display().to_string()
+                }]
+            }
+        }),
+    );
+    let file_uri = uri_for(&file_path);
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": file_uri,
+                    "languageId": "rust",
+                    "version": 1,
+                    "text": "fn overlay() {}\n"
+                }
+            }
+        }),
+    );
+    let _ = read_notification(&mut reader, &mut stderr, "textDocument/publishDiagnostics");
+
+    let response = formatting_response(&mut stdin, &mut reader, &mut stderr, 10, &file_uri);
+    let edits = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected formatting edits, got {response}"));
+    assert_eq!(edits.len(), 1, "expected one full-document edit: {response}");
+    assert_eq!(edits[0]["newText"], "FN OVERLAY() {}\n");
+    assert_eq!(edits[0]["range"]["start"]["line"], 0);
+    assert_eq!(edits[0]["range"]["start"]["character"], 0);
+    assert_eq!(edits[0]["range"]["end"]["line"], 1);
+    assert_eq!(edits[0]["range"]["end"]["character"], 0);
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[cfg(unix)]
+#[test]
+fn bifrost_lsp_server_formatting_returns_empty_edits_for_noop() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("lib.rs");
+    let stub_path = root.join("cat-format");
+    fs::write(&file_path, "fn unchanged() {}\n").expect("write disk file");
+    write_stub_command(&stub_path, "#!/bin/sh\ncat\n");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server_with_params(
+        &root,
+        json!({
+            "processId": null,
+            "rootUri": uri_for(&root),
+            "capabilities": {},
+            "initializationOptions": {
+                "formatterCommands": [{
+                    "include": ["*.rs"],
+                    "command": stub_path.display().to_string()
+                }]
+            }
+        }),
+    );
+    let file_uri = uri_for(&file_path);
+    let response = formatting_response(&mut stdin, &mut reader, &mut stderr, 10, &file_uri);
+    let edits = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected formatting edits, got {response}"));
+    assert!(edits.is_empty(), "expected no-op formatting edits: {response}");
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[cfg(unix)]
+#[test]
+fn bifrost_lsp_server_formatting_respects_configured_cwd() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let package = root.join("pkg");
+    fs::create_dir_all(&package).expect("create package");
+    let file_path = package.join("lib.rs");
+    let stub_path = root.join("pwd-format");
+    fs::write(&file_path, "fn main() {}\n").expect("write disk file");
+    write_stub_command(&stub_path, "#!/bin/sh\npwd\n");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server_with_params(
+        &root,
+        json!({
+            "processId": null,
+            "rootUri": uri_for(&root),
+            "capabilities": {},
+            "initializationOptions": {
+                "formatterCommands": [{
+                    "include": ["pkg/*.rs"],
+                    "command": stub_path.display().to_string(),
+                    "cwd": "pkg"
+                }]
+            }
+        }),
+    );
+    let file_uri = uri_for(&file_path);
+    let response = formatting_response(&mut stdin, &mut reader, &mut stderr, 10, &file_uri);
+    let edits = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected formatting edits, got {response}"));
+    assert_eq!(edits[0]["newText"], format!("{}\n", package.display()));
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[cfg(unix)]
+#[test]
+fn bifrost_lsp_server_formatting_reports_formatter_failure() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("lib.rs");
+    let stub_path = root.join("fail-format");
+    fs::write(&file_path, "fn main() {}\n").expect("write disk file");
+    write_stub_command(&stub_path, "#!/bin/sh\necho formatter exploded >&2\nexit 7\n");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server_with_params(
+        &root,
+        json!({
+            "processId": null,
+            "rootUri": uri_for(&root),
+            "capabilities": {},
+            "initializationOptions": {
+                "formatterCommands": [{
+                    "include": ["*.rs"],
+                    "command": stub_path.display().to_string()
+                }]
+            }
+        }),
+    );
+    let file_uri = uri_for(&file_path);
+    let response = formatting_response(&mut stdin, &mut reader, &mut stderr, 10, &file_uri);
+    let error = response["error"]["message"].as_str().unwrap_or_default();
+    assert!(error.contains("formatter exploded"), "{response}");
+    assert!(error.contains("exited with status"), "{response}");
+
+    shutdown_lsp(child, stdin, reader, stderr);
 }
 
 #[test]

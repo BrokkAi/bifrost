@@ -14,9 +14,9 @@ The user-visible behavior is: start `bifrost --lsp`, initialize with optional `f
 
 - [x] (2026-06-30 10:59Z) Created this ExecPlan after confirming the branch is `42-lsp-document-formatting-with-workspace-aware-formatter-commands` and the tree is clean.
 - [x] (2026-06-30 11:06Z) Implemented the formatter command model, ordered rule matching, placeholder expansion, conservative built-in discovery, and stdin/stdout executor. Evidence: `cargo test formatting --lib --features nlp` passed 8 focused formatter tests.
-- [ ] Wire `textDocument/formatting` into LSP capabilities, request dispatch, and a dedicated handler that returns full-document edits.
-- [ ] Add VS Code settings for `bifrost.formatterCommands` and forward them through LSP initialization options.
-- [ ] Add unit, LSP integration, and ignored opt-in real-tool tests.
+- [x] (2026-06-30 11:17Z) Wired `textDocument/formatting` into LSP capabilities, request dispatch, and the formatter handler. Evidence: `cargo test --test bifrost_lsp_server formatting --features nlp` passed 5 focused LSP tests covering capability advertisement, overlay text, no-op edits, cwd, and formatter failure.
+- [x] (2026-06-30 11:24Z) Added VS Code settings for `bifrost.formatterCommands` and forwarded non-empty rules through LSP initialization options. Evidence: `npm test` passed after installing local VS Code dependencies.
+- [x] (2026-06-30 11:24Z) Added unit, LSP integration, and ignored opt-in real-tool tests. Evidence: `cargo test formatting --lib --features nlp` passed 8 tests with 1 ignored opt-in rustfmt integration test; `cargo test --test bifrost_lsp_server formatting --features nlp` passed 5 LSP tests.
 - [ ] Run formatting, focused tests, and `cargo clippy-no-cuda`; update this ExecPlan with outcomes.
 
 ## Surprises & Discoveries
@@ -26,6 +26,9 @@ The user-visible behavior is: start `bifrost --lsp`, initialize with optional `f
 
 - Observation: macOS temp directories may compare as `/var/...` in test setup but `/private/var/...` after project canonicalization.
   Evidence: the first focused formatter test run failed only on path equality; canonicalizing temp roots in tests fixed it.
+
+- Observation: the VS Code extension worktree did not have `node_modules` installed.
+  Evidence: the first `npm test` failed with `sh: tsc: command not found`; `npm install` added local dependencies and the following `npm test` passed 13 unit tests.
 
 ## Decision Log
 

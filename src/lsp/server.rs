@@ -17,7 +17,7 @@ use lsp_types::notification::{
 };
 use lsp_types::request::{
     CallHierarchyIncomingCalls, CallHierarchyOutgoingCalls, CallHierarchyPrepare, Completion,
-    DocumentDiagnosticRequest, DocumentHighlightRequest, DocumentSymbolRequest,
+    DocumentDiagnosticRequest, DocumentHighlightRequest, DocumentSymbolRequest, Formatting,
     FoldingRangeRequest, GotoDefinition, GotoImplementation, GotoTypeDefinition, HoverRequest,
     PrepareRenameRequest, References, Rename, Request as LspRequestTrait, SignatureHelpRequest,
     TypeHierarchyPrepare, TypeHierarchySubtypes, TypeHierarchySupertypes, WorkDoneProgressCreate,
@@ -43,8 +43,8 @@ use crate::lsp::handlers::util::{
 };
 use crate::lsp::handlers::{
     call_hierarchy, completion, definition, diagnostic, document_highlight, document_symbol,
-    folding_range, hover, references, rename, signature_help, type_definition, type_hierarchy,
-    workspace_symbol,
+    folding_range, formatting, hover, references, rename, signature_help, type_definition,
+    type_hierarchy, workspace_symbol,
 };
 
 /// Run the LSP server over stdio. `fallback_root` is used when the client does
@@ -554,6 +554,9 @@ fn handle_request(
                 &params,
             ))
         }),
+        Formatting::METHOD => decode_and_run::<Formatting, _>(req, |params| {
+            formatting::handle(state.project(), &params, &state.formatter_commands)
+        }),
         WorkspaceSymbolRequest::METHOD => {
             decode_and_run::<WorkspaceSymbolRequest, _>(req, |params| {
                 Ok(workspace_symbol::handle(&state.workspace, &params))
@@ -974,6 +977,7 @@ pub(crate) struct ServerState {
     active_roots: Vec<WorkspaceRoot>,
     configured_roots: bool,
     excluded_paths: Vec<PathBuf>,
+    formatter_commands: Vec<formatting::FormatterCommandRule>,
     workspace: WorkspaceAnalyzer,
     /// The `OverlayProject` is shared with the analyzer (via `Arc<dyn Project>`
     /// inside `WorkspaceAnalyzer`) and with request-time read paths in
@@ -1008,6 +1012,7 @@ struct LspWorkspaceConfig {
     roots: Vec<WorkspaceRoot>,
     configured_roots: bool,
     excluded_paths: Vec<PathBuf>,
+    formatter_commands: Vec<formatting::FormatterCommandRule>,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -1017,6 +1022,8 @@ struct BifrostInitializationOptions {
     roots: Vec<String>,
     #[serde(default)]
     exclude: Vec<String>,
+    #[serde(default)]
+    formatter_commands: Vec<formatting::FormatterCommandRule>,
 }
 
 #[derive(Clone, Debug)]
@@ -1042,6 +1049,7 @@ impl ServerState {
             roots,
             configured_roots,
             excluded_paths,
+            formatter_commands,
         } = config;
         let (project, active_roots) = build_project_for_roots(roots, &excluded_paths)?;
         let overlay = Arc::new(OverlayProject::new(project));
@@ -1054,6 +1062,7 @@ impl ServerState {
             active_roots,
             configured_roots,
             excluded_paths,
+            formatter_commands,
             workspace,
             overlay,
             completion_cache: completion::CompletionCache::new(),
@@ -1510,6 +1519,7 @@ fn collect_workspace_config(
         roots,
         configured_roots,
         excluded_paths,
+        formatter_commands: options.formatter_commands,
     })
 }
 

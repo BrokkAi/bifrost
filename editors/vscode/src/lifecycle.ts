@@ -22,6 +22,16 @@ export interface BifrostServerHandle {
 export interface BifrostInitializationOptions {
   roots?: string[];
   exclude?: string[];
+  formatterCommands?: BifrostFormatterCommandRule[];
+}
+
+export interface BifrostFormatterCommandRule {
+  include?: string[];
+  exclude?: string[];
+  language?: string;
+  command: string;
+  args?: string[];
+  cwd?: string;
 }
 
 export interface BifrostMcpConfig {

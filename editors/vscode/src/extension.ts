@@ -10,6 +10,7 @@ import {
 } from "vscode-languageclient/node";
 import {
   BifrostLaunchConfig,
+  BifrostFormatterCommandRule,
   BifrostInitializationOptions,
   buildLaunchConfig,
   buildMcpConfig,
@@ -120,12 +121,16 @@ async function startClientInner(context: vscode.ExtensionContext): Promise<void>
   const extraArgs = parseExtraArgs(config.get<string[]>("extraArgs") ?? []);
   const roots = parsePathSettings(config.get<string[]>("roots") ?? [], root);
   const exclude = parsePathSettings(config.get<string[]>("exclude") ?? [], root);
+  const formatterCommands = config.get<BifrostFormatterCommandRule[]>("formatterCommands") ?? [];
   const initializationOptions: BifrostInitializationOptions = {};
   if (roots.length > 0) {
     initializationOptions.roots = roots;
   }
   if (exclude.length > 0) {
     initializationOptions.exclude = exclude;
+  }
+  if (formatterCommands.length > 0) {
+    initializationOptions.formatterCommands = formatterCommands;
   }
 
   let launchConfig: BifrostLaunchConfig;

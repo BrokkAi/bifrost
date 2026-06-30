@@ -354,7 +354,7 @@ fn truncate_for_error(value: &str) -> String {
     out
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn stub_command(path: &Path, body: &str) {
     use std::os::unix::fs::PermissionsExt;
 
@@ -564,5 +564,23 @@ mod tests {
         let error = run_formatter_command(&command, "hello\n").unwrap_err();
         assert!(error.contains("exited with status"), "{error}");
         assert!(error.contains("nope"), "{error}");
+    }
+
+    #[test]
+    #[ignore = "requires BIFROST_FORMATTER_INTEGRATION_TESTS=1 and rustfmt on PATH"]
+    fn formatter_integration_rustfmt_stdout_contract() {
+        if std::env::var("BIFROST_FORMATTER_INTEGRATION_TESTS").ok().as_deref() != Some("1") {
+            eprintln!("set BIFROST_FORMATTER_INTEGRATION_TESTS=1 to run real formatter tests");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let command = FormatterCommand {
+            command: "rustfmt".to_string(),
+            args: vec!["--emit".to_string(), "stdout".to_string()],
+            cwd: temp.path().to_path_buf(),
+        };
+        let output = run_formatter_command(&command, "fn main(){println!(\"hi\");}\n").unwrap();
+        assert!(output.contains("fn main()"), "{output}");
+        assert!(output.contains("println!"), "{output}");
     }
 }
