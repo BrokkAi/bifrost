@@ -6,6 +6,7 @@ pub mod diagnostic;
 pub mod document_highlight;
 pub mod document_symbol;
 pub mod folding_range;
+pub mod formatting;
 pub(crate) mod hierarchy_support;
 pub mod hover;
 pub(crate) mod import_ambiguity;
