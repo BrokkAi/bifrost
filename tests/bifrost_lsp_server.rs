@@ -8617,7 +8617,7 @@ fn bifrost_lsp_server_formatting_respects_configured_cwd() {
     let file_path = package.join("lib.rs");
     let stub_path = root.join("pwd-format");
     fs::write(&file_path, "fn main() {}\n").expect("write disk file");
-    write_stub_command(&stub_path, "#!/bin/sh\npwd\n");
+    write_stub_command(&stub_path, "#!/bin/sh\ncat >/dev/null\npwd\n");
 
     let (child, mut stdin, mut reader, mut stderr) = start_lsp_server_with_params(
         &root,
