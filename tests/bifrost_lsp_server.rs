@@ -1,3 +1,5 @@
+mod common;
+
 use brokk_bifrost::lsp::conversion::path_to_uri_string;
 use serde_json::{Value, json};
 use std::fs;
@@ -2224,6 +2226,52 @@ fn bifrost_lsp_server_goto_definition_finds_class_a_from_b() {
     drop(stdin);
     let status = child.wait().expect("wait bifrost");
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
+fn bifrost_lsp_server_definition_resolves_rust_associated_path_type_segment() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let src = root.join("src");
+    fs::create_dir_all(&src).expect("create src");
+    let main_path = src.join("main.rs");
+    let main_source = common::RUST_ASSOCIATED_PATH_MAIN;
+    fs::write(&main_path, main_source).expect("write main.rs");
+    fs::write(src.join("state.rs"), common::RUST_ASSOCIATED_PATH_STATE).expect("write state.rs");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&main_path);
+    let (line, character) = position_after(main_source, "    app_with_state(");
+    let response = text_document_position_response(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        10,
+        "textDocument/definition",
+        &file_uri,
+        line,
+        character,
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+
+    let locations = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected definition locations, got {response}"));
+    assert_eq!(
+        locations.len(),
+        1,
+        "expected one AppState definition location, got {response}"
+    );
+    let uri = locations[0]["uri"].as_str().expect("location uri");
+    assert!(
+        uri.ends_with("/src/state.rs"),
+        "expected state.rs definition, got {response}"
+    );
+    assert_eq!(
+        locations[0]["range"]["start"]["line"], 3,
+        "expected AppState struct declaration line, got {response}"
+    );
 }
 
 #[test]

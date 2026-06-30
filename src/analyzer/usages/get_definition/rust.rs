@@ -25,10 +25,12 @@ pub(super) fn resolve_rust(
     let refs = rust.reference_context_of(file);
     let (candidates, scoped_lookup_failed) = if let Some((path, name)) = reference.rsplit_once("::")
     {
-        let resolved = refs
-            .resolve_scoped(path, name)
-            .map(|fqn| support.fqn(&fqn))
-            .unwrap_or_default();
+        let resolved = rust_focused_scoped_segment_candidates(rust, support, file, site)
+            .unwrap_or_else(|| {
+                refs.resolve_scoped(path, name)
+                    .map(|fqn| support.fqn(&fqn))
+                    .unwrap_or_default()
+            });
         (resolved, true)
     } else {
         let mut resolved = refs
@@ -69,6 +71,53 @@ pub(super) fn resolve_rust(
         "no_indexed_definition",
         format!("`{reference}` did not resolve to an indexed Rust definition"),
     )
+}
+
+fn rust_focused_scoped_segment_candidates(
+    rust: &RustAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    site: &ResolvedReferenceSite,
+) -> Option<Vec<CodeUnit>> {
+    let segments = reference_segments(site, "::", 2)?;
+    let focus_index = focus_segment_index(site, &segments)?;
+    if focus_index + 1 == segments.len() {
+        return None;
+    }
+    let refs = rust.reference_context_of(file);
+    let resolved = if focus_index == 0 {
+        let (reference, _, _) = &segments[0];
+        let mut resolved = refs
+            .resolve_bare(reference)
+            .map(|fqn| support.fqn(fqn))
+            .unwrap_or_default();
+        if resolved.is_empty() {
+            let imported = rust_imported_export_candidates(
+                rust,
+                support,
+                file,
+                reference,
+                Some(site.focus_start_byte),
+            );
+            resolved = if imported.is_empty() {
+                support.file_identifier(file, reference)
+            } else {
+                imported
+            };
+        }
+        resolved
+    } else {
+        let path = segments[..focus_index]
+            .iter()
+            .map(|(segment, _, _)| segment.as_str())
+            .collect::<Vec<_>>()
+            .join("::");
+        let (name, _, _) = &segments[focus_index];
+        refs.resolve_scoped(&path, name)
+            .map(|fqn| support.fqn(&fqn))
+            .unwrap_or_default()
+    };
+    (!resolved.is_empty()).then_some(resolved)
 }
 
 fn resolve_rust_field(
@@ -122,11 +171,11 @@ fn rust_resolve_dotted_reference_text(
     site: &ResolvedReferenceSite,
     cache: &mut RustTypeLookupCache,
 ) -> Option<DefinitionLookupOutcome> {
-    let segments = dotted_reference_segments(site)?;
+    let segments = reference_segments(site, ".", 1)?;
     if segments.len() < 2 {
         return None;
     }
-    let focus_index = dotted_focus_segment_index(site, &segments)?;
+    let focus_index = focus_segment_index(site, &segments)?;
     if focus_index == 0 {
         return None;
     }
@@ -183,10 +232,14 @@ fn rust_resolve_dotted_reference_text(
     None
 }
 
-fn dotted_reference_segments(site: &ResolvedReferenceSite) -> Option<Vec<(String, usize, usize)>> {
+fn reference_segments(
+    site: &ResolvedReferenceSite,
+    delimiter: &str,
+    delimiter_width: usize,
+) -> Option<Vec<(String, usize, usize)>> {
     let mut segments = Vec::new();
     let mut offset = 0usize;
-    for part in site.text.split('.') {
+    for part in site.text.split(delimiter) {
         if part.is_empty()
             || !part
                 .chars()
@@ -197,12 +250,12 @@ fn dotted_reference_segments(site: &ResolvedReferenceSite) -> Option<Vec<(String
         let start = offset;
         let end = start + part.len();
         segments.push((part.to_string(), start, end));
-        offset = end + 1;
+        offset = end + delimiter_width;
     }
     Some(segments)
 }
 
-fn dotted_focus_segment_index(
+fn focus_segment_index(
     site: &ResolvedReferenceSite,
     segments: &[(String, usize, usize)],
 ) -> Option<usize> {
