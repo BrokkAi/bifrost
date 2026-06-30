@@ -24,6 +24,20 @@ export interface BifrostInitializationOptions {
   exclude?: string[];
 }
 
+export interface BifrostMcpConfig {
+  mcpServers: {
+    bifrost: {
+      command: string;
+      args: string[];
+    };
+  };
+}
+
+export interface BifrostMcpHostCommands {
+  codex: string;
+  claudeCode: string;
+}
+
 export function resolveLaunchMode(
   mode: LaunchMode,
   configuredPath: string,
@@ -58,7 +72,7 @@ export function buildLaunchConfig(
     configuredPath,
     managedBinaryPath
   );
-  const args = ["--root", workspaceRoot, "--server", "lsp", ...extraArgs];
+  const args = ["--root", workspaceRoot, "--lsp", ...extraArgs];
   return {
     command,
     args,
@@ -70,6 +84,39 @@ export function buildLaunchConfig(
       RUST_BACKTRACE: process.env.RUST_BACKTRACE ?? "1"
     },
     label: resolvedMode
+  };
+}
+
+export function buildMcpConfig(
+  workspaceRoot: string,
+  extensionDir: string,
+  mode: LaunchMode,
+  configuredPath: string,
+  managedBinaryPath?: string | null
+): BifrostMcpConfig {
+  const resolvedMode = resolveLaunchMode(mode, configuredPath, managedBinaryPath);
+  const command = commandForMode(
+    resolvedMode,
+    extensionDir,
+    configuredPath,
+    managedBinaryPath
+  );
+  return {
+    mcpServers: {
+      bifrost: {
+        command,
+        args: ["--root", workspaceRoot, "--mcp", "searchtools"]
+      }
+    }
+  };
+}
+
+export function buildMcpHostCommands(config: BifrostMcpConfig): BifrostMcpHostCommands {
+  const server = config.mcpServers.bifrost;
+  const commandLine = formatCommandLine(server.command, server.args);
+  return {
+    codex: `codex mcp add bifrost -- ${commandLine}`,
+    claudeCode: `claude mcp add --scope user bifrost -- ${commandLine}`
   };
 }
 

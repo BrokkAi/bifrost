@@ -117,6 +117,14 @@
         "title": "Bifrost: Restart Language Server"
       },
       {
+        "command": "bifrost.copyMcpConfig",
+        "title": "Bifrost: Copy MCP Config"
+      },
+      {
+        "command": "bifrost.openMcpSetup",
+        "title": "Bifrost: Open MCP Setup"
+      },
+      {
         "command": "bifrost.showOutput",
         "title": "Bifrost: Show Output"
       }

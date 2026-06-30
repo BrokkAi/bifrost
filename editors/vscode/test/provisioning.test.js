@@ -161,9 +161,82 @@ test("builds managed launch config when bundled mode has an installed binary", (
   );
   assert.equal(config.command, "/managed/bifrost");
   assert.equal(config.label, "managed");
-  assert.deepEqual(config.args, ["--root", "/workspace", "--server", "lsp", "--flag"]);
+  assert.deepEqual(config.args, ["--root", "/workspace", "--lsp", "--flag"]);
   assert.equal(config.env.BIFROST_LSP_DEBUG, "1");
   assert.equal(config.env.BIFROST_LSP_SLOW_MS, "123");
+});
+
+test("builds managed MCP config with searchtools toolset", () => {
+  const config = lifecycle.buildMcpConfig(
+    "/workspace",
+    "/extension",
+    "bundled",
+    "bifrost",
+    "/managed/bifrost"
+  );
+  assert.deepEqual(config, {
+    mcpServers: {
+      bifrost: {
+        command: "/managed/bifrost",
+        args: ["--root", "/workspace", "--mcp", "searchtools"]
+      }
+    }
+  });
+});
+
+test("builds path MCP config from configured server path", () => {
+  const config = lifecycle.buildMcpConfig(
+    "/workspace",
+    "/extension",
+    "path",
+    "/custom/bin/bifrost",
+    null
+  );
+  assert.deepEqual(config.mcpServers.bifrost, {
+    command: "/custom/bin/bifrost",
+    args: ["--root", "/workspace", "--mcp", "searchtools"]
+  });
+});
+
+test("builds path MCP config from local development binary", () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-vscode-test-"));
+  const extensionDir = path.join(temp, "editors", "vscode");
+  const binaryPath = path.join(temp, "target", "debug", "bifrost");
+  fs.mkdirSync(path.dirname(binaryPath), { recursive: true });
+  fs.mkdirSync(extensionDir, { recursive: true });
+  fs.writeFileSync(binaryPath, "binary");
+
+  const config = lifecycle.buildMcpConfig(
+    "/workspace",
+    extensionDir,
+    "path",
+    "bifrost",
+    null
+  );
+  assert.deepEqual(config.mcpServers.bifrost, {
+    command: binaryPath,
+    args: ["--root", "/workspace", "--mcp", "searchtools"]
+  });
+});
+
+test("builds MCP host commands from config", () => {
+  const commands = lifecycle.buildMcpHostCommands({
+    mcpServers: {
+      bifrost: {
+        command: "/custom bin/bifrost",
+        args: ["--root", "/workspace path", "--mcp", "searchtools"]
+      }
+    }
+  });
+
+  assert.equal(
+    commands.codex,
+    'codex mcp add bifrost -- "/custom bin/bifrost" --root "/workspace path" --mcp searchtools'
+  );
+  assert.equal(
+    commands.claudeCode,
+    'claude mcp add --scope user bifrost -- "/custom bin/bifrost" --root "/workspace path" --mcp searchtools'
+  );
 });
 
 test("parses bifrost --version output", () => {

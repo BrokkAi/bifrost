@@ -76,17 +76,17 @@ cargo build --bin bifrost
 Run it against a project root:
 
 ```bash
-./target/debug/bifrost --root /path/to/project --server searchtools
+./target/debug/bifrost --root /path/to/project --mcp searchtools
 ```
 
-Or just start it from the project root and let the defaults kick in:
+Or start it from the project root with an explicit MCP toolset:
 
 ```bash
 cd /path/to/project
-bifrost
+bifrost --mcp searchtools
 ```
 
-By default, `bifrost` uses the current working directory as `--root` and `searchtools` as `--server`. Run `bifrost --help` to see all options.
+By default, `bifrost` uses the current working directory as `--root`. Select a mode with `--mcp`, `--lsp`, or `--tool`. Run `bifrost --help` to see all options.
 
 ### Integrating with MCP hosts
 
@@ -110,14 +110,14 @@ directory the host uses as the subprocess working directory.
 Codex CLI:
 
 ```bash
-codex mcp add bifrost -- bifrost --root /path/to/project --server core
+codex mcp add bifrost -- bifrost --root /path/to/project --mcp core
 codex mcp list
 ```
 
 Claude Code:
 
 ```bash
-claude mcp add --scope user bifrost -- bifrost --root /path/to/project --server core
+claude mcp add --scope user bifrost -- bifrost --root /path/to/project --mcp core
 claude mcp list
 ```
 
@@ -128,31 +128,29 @@ For JSON-based MCP configuration, such as Claude Desktop's
 {
   "mcpServers": {
     "bifrost": {
-      "command": "bifrost",
-      "args": [
-        "--root",
-        "/path/to/project",
-        "--server",
-        "core"
-      ]
+      "command": "/path/to/bifrost",
+      "args": ["--root", "${workspaceFolder}", "--mcp", "searchtools"]
     }
   }
 }
 ```
 
 Use an absolute binary path if `bifrost` is not on the host's `PATH`, for
-example `/path/to/bifrost/target/debug/bifrost`. Replace `core` with
-`searchtools` to expose every Bifrost MCP tool, or with a smaller composition
-such as `symbol|workspace` when the host should see fewer tools.
+example `/path/to/bifrost/target/debug/bifrost`. Replace
+`${workspaceFolder}` with the project root syntax supported by your host, or
+with an absolute project path. Use `searchtools` to expose every Bifrost MCP
+tool, `core` for the common agent toolset, or a smaller composition such as
+`symbol|workspace` when the host should see fewer tools.
 
 ## VS Code LSP Extension
 
 The repository includes a minimal VS Code language-client wrapper in
 `editors/vscode`. It starts the existing Bifrost stdio LSP server with
-`bifrost --root <workspace-root> --server lsp`.
+`bifrost --root <workspace-root> --lsp`.
 
 See `editors/vscode/README.md` for development-host setup, the
-`bifrost.serverPath` setting, and debug settings such as `bifrost.debug` and
+`bifrost.serverPath` setting, `Bifrost: Open MCP Setup`,
+`Bifrost: Copy MCP Config`, and debug settings such as `bifrost.debug` and
 `bifrost.slowRequestMs`.
 
 #### Skills and workflow commands
@@ -164,7 +162,9 @@ skills such as `/brokk:guided-review`.
 Those skills are currently packaged by the Brokk host plugin, whose source lives
 in `BrokkAi/brokk` under `claude-plugin/`. The repository name is historical:
 the plugin uses Bifrost for its analyzer-backed MCP tools, but the skill bundle
-has not yet moved into this repository.
+has not yet moved into this repository. See
+`docs/agent-plugin-publication.md` for the Bifrost-owned Agent Plugin
+publication path.
 
 Claude Code plugin install:
 
@@ -195,7 +195,7 @@ Direct `--tool` mode prints rendered text by default. The `--args` payload is in
 ./target/debug/bifrost --root /path/to/project --tool get_symbol_sources --sources src --sources 'tests/**/*.rs' --args '{"symbols":["src/main.rs"]}'
 ```
 
-`--server` accepts ordered compositions of toolsets separated by `|`:
+`--mcp` accepts ordered compositions of toolsets separated by `|`:
 
 - `searchtools` expands to all toolsets in the canonical order `symbol|nlp|workspace|extended|text|slopcop`
 - `core` expands to `symbol|nlp|workspace`
@@ -204,11 +204,11 @@ Direct `--tool` mode prints rendered text by default. The `--args` payload is in
 Examples:
 
 ```bash
-./target/debug/bifrost --root /path/to/project --server core
-./target/debug/bifrost --root /path/to/project --server "symbol|workspace"
-./target/debug/bifrost --root /path/to/project --server extended
-./target/debug/bifrost --root /path/to/project --server "text|extended"
-./target/debug/bifrost --root /path/to/project --server slopcop
+./target/debug/bifrost --root /path/to/project --mcp core
+./target/debug/bifrost --root /path/to/project --mcp "symbol|workspace"
+./target/debug/bifrost --root /path/to/project --mcp extended
+./target/debug/bifrost --root /path/to/project --mcp "text|extended"
+./target/debug/bifrost --root /path/to/project --mcp slopcop
 ```
 
 `searchtools` remains the compatibility mode and exposes the full current union of MCP tools in toolset order. Pass `--no-line-numbers` to remove rendered line and line-range prefixes from the MCP text preview while keeping `structuredContent` unchanged.
