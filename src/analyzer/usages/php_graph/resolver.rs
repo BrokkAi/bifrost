@@ -1,10 +1,9 @@
-use crate::analyzer::usages::common::language_for_file;
 pub(in crate::analyzer::usages) use crate::analyzer::usages::common::node_text;
 use crate::analyzer::{
-    CodeUnit, IAnalyzer, Language, PhpAnalyzer, PhpFileContext, ProjectFile, Range,
-    TypeHierarchyProvider, resolve_php_type,
+    CodeUnit, IAnalyzer, PhpAnalyzer, PhpFileContext, ProjectFile, Range, TypeHierarchyProvider,
+    resolve_php_type,
 };
-use crate::hash::{HashMap, HashSet};
+use crate::hash::HashSet;
 use crate::text_utils::find_line_index_for_offset;
 use tree_sitter::Node;
 
@@ -20,6 +19,7 @@ pub(super) enum TargetKind {
 pub(super) struct TargetSpec {
     pub(super) target: CodeUnit,
     pub(super) kind: TargetKind,
+    pub(super) owner: Option<CodeUnit>,
     pub(super) owner_fq_name: Option<String>,
     pub(super) target_fq_name: String,
     pub(super) member_name: String,
@@ -31,6 +31,7 @@ impl TargetSpec {
             return Some(Self {
                 target: target.clone(),
                 kind: TargetKind::Type,
+                owner: None,
                 owner_fq_name: None,
                 target_fq_name: target.fq_name(),
                 member_name: target.identifier().to_string(),
@@ -55,11 +56,13 @@ impl TargetSpec {
         } else {
             return None;
         };
+        let owner_fq_name = parent.as_ref().map(|owner| owner.fq_name());
 
         Some(Self {
             target: target.clone(),
             kind,
-            owner_fq_name: parent.map(|owner| owner.fq_name()),
+            owner: parent,
+            owner_fq_name,
             target_fq_name: target.fq_name(),
             member_name: target.identifier().to_string(),
         })
@@ -68,55 +71,59 @@ impl TargetSpec {
 
 #[derive(Default)]
 pub(super) struct PhpHierarchyIndex {
-    ancestors: HashMap<String, HashSet<String>>,
-    interfaces: HashSet<String>,
+    owner_fq_name: Option<String>,
+    owner_is_interface: bool,
+    descendant_fq_names: HashSet<String>,
 }
 
 impl PhpHierarchyIndex {
-    pub(super) fn build(php: &PhpAnalyzer, files: &HashSet<ProjectFile>) -> Self {
-        let mut hierarchy = Self::default();
-        for file in files {
-            if language_for_file(file) != Language::Php {
-                continue;
-            }
-            for code_unit in php.declarations(file).filter(|unit| unit.is_class()) {
-                let type_name = code_unit.fq_name();
-                if php.is_interface(code_unit) {
-                    hierarchy.interfaces.insert(type_name.clone());
-                }
-                let ancestors = php
-                    .get_direct_ancestors(code_unit)
-                    .into_iter()
-                    .map(|ancestor| ancestor.fq_name())
-                    .collect::<HashSet<_>>();
-                if !ancestors.is_empty() {
-                    hierarchy.ancestors.insert(type_name, ancestors);
-                }
-            }
+    pub(super) fn for_target_owner(
+        php: &PhpAnalyzer,
+        spec: &TargetSpec,
+        files: &HashSet<ProjectFile>,
+    ) -> Self {
+        let Some(owner) = spec.owner.as_ref() else {
+            return Self::default();
+        };
+        let owner_fq_name = owner.fq_name();
+        let descendant_fq_names = files
+            .iter()
+            .flat_map(|file| php.declarations(file))
+            .filter(|unit| unit.is_class())
+            .filter(|unit| unit.fq_name() != owner_fq_name)
+            .filter(|unit| class_is_subtype_of_owner(php, unit, &owner_fq_name))
+            .map(|unit| unit.fq_name())
+            .collect();
+        Self {
+            owner_fq_name: Some(owner_fq_name),
+            owner_is_interface: php.is_interface(owner),
+            descendant_fq_names,
         }
-        hierarchy
     }
 
     fn is_subtype(&self, receiver_fq_name: &str, owner: &str) -> bool {
-        let mut stack: Vec<&str> = self
-            .ancestors
-            .get(receiver_fq_name)
-            .map(|ancestors| ancestors.iter().map(String::as_str).collect())
-            .unwrap_or_default();
-        let mut visited: HashSet<&str> = HashSet::default();
-        while let Some(candidate) = stack.pop() {
-            if candidate == owner {
-                return true;
-            }
-            if !visited.insert(candidate) {
-                continue;
-            }
-            if let Some(ancestors) = self.ancestors.get(candidate) {
-                stack.extend(ancestors.iter().map(String::as_str));
-            }
-        }
-        false
+        self.owner_fq_name.as_deref() == Some(owner)
+            && self.descendant_fq_names.contains(receiver_fq_name)
     }
+}
+
+fn class_is_subtype_of_owner(
+    php: &PhpAnalyzer,
+    class_unit: &CodeUnit,
+    owner_fq_name: &str,
+) -> bool {
+    let mut stack = php.get_direct_ancestors(class_unit);
+    let mut visited = HashSet::default();
+    while let Some(candidate) = stack.pop() {
+        let candidate_fq_name = candidate.fq_name();
+        if candidate_fq_name == owner_fq_name {
+            return true;
+        }
+        if visited.insert(candidate_fq_name) {
+            stack.extend(php.get_direct_ancestors(&candidate));
+        }
+    }
+    false
 }
 
 pub(super) fn receiver_type_matches(
@@ -125,7 +132,7 @@ pub(super) fn receiver_type_matches(
     hierarchy: &PhpHierarchyIndex,
 ) -> bool {
     if receiver_fq_name == owner {
-        return !hierarchy.interfaces.contains(owner);
+        return !hierarchy.owner_is_interface;
     }
     hierarchy.is_subtype(receiver_fq_name, owner)
 }
