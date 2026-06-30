@@ -101,6 +101,54 @@ impl LspServer {
         id
     }
 
+    /// Send an arbitrary request and return the matching response `Value`. The
+    /// id is allocated and matched internally.
+    pub fn request(&mut self, method: &str, params: Value) -> Value {
+        let id = self.next_id();
+        write_message(
+            &mut self.stdin,
+            json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}),
+        );
+        read_response_for_id(&mut self.reader, &mut self.stderr, id)
+    }
+
+    /// A `textDocument/<...>` request that takes only a document URI + position
+    /// (definition, hover, documentHighlight, implementation, ...). Returns the
+    /// raw response `Value`.
+    pub fn text_document_position_response(
+        &mut self,
+        method: &str,
+        file_uri: &str,
+        line: u64,
+        character: u64,
+    ) -> Value {
+        self.request(
+            method,
+            json!({
+                "textDocument": {"uri": file_uri},
+                "position": {"line": line, "character": character},
+            }),
+        )
+    }
+
+    /// `textDocument/references` by URI string, returning the raw response.
+    pub fn references_response(
+        &mut self,
+        file_uri: &str,
+        line: u64,
+        character: u64,
+        include_declaration: bool,
+    ) -> Value {
+        self.request(
+            "textDocument/references",
+            json!({
+                "textDocument": {"uri": file_uri},
+                "position": {"line": line, "character": character},
+                "context": {"includeDeclaration": include_declaration},
+            }),
+        )
+    }
+
     /// Send `textDocument/references` for the file at `file_path` and return the
     /// raw response `Value`.
     pub fn references_raw(
@@ -177,13 +225,13 @@ impl LspServer {
     }
 }
 
-fn write_message(stdin: &mut impl Write, payload: Value) {
+pub fn write_message(stdin: &mut impl Write, payload: Value) {
     let body = serde_json::to_string(&payload).expect("serialize");
     write!(stdin, "Content-Length: {}\r\n\r\n{}", body.len(), body).expect("write");
     stdin.flush().expect("flush");
 }
 
-fn read_message(reader: &mut impl BufRead, stderr: &mut impl Read) -> Value {
+pub fn read_message(reader: &mut impl BufRead, stderr: &mut impl Read) -> Value {
     let mut content_length: Option<usize> = None;
     loop {
         let mut header = String::new();
@@ -207,7 +255,7 @@ fn read_message(reader: &mut impl BufRead, stderr: &mut impl Read) -> Value {
     serde_json::from_slice(&body).expect("valid json response")
 }
 
-fn read_response_for_id(reader: &mut impl BufRead, stderr: &mut impl Read, id: u64) -> Value {
+pub fn read_response_for_id(reader: &mut impl BufRead, stderr: &mut impl Read, id: u64) -> Value {
     for _ in 0..32 {
         let msg = read_message(reader, stderr);
         if msg["id"].as_u64() == Some(id) {

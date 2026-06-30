@@ -1,21 +1,12 @@
 mod common;
 
-use brokk_bifrost::lsp::conversion::path_to_uri_string;
+use common::lsp_client::{LspServer, read_message, read_response_for_id, uri_for, write_message};
 use serde_json::{Value, json};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use tempfile::TempDir;
-
-/// Build an LSP-correct `file://` URI for `path`. On Windows, `Path::display()`
-/// of a canonicalized path emits the extended-length form (`\\?\C:\…`) which
-/// is NOT a valid URI; the crate's path_to_uri_string handles drive letters,
-/// percent-encoding, and the leading-slash convention correctly. Tests use
-/// this helper instead of hand-rolling `format!("file://{}", path.display())`.
-fn uri_for(path: &Path) -> String {
-    path_to_uri_string(path)
-}
 
 /// Java fixture used by the completion-handler integration tests. `gree` on
 /// line 3 is a stand-alone identifier prefix — tree-sitter still extracts the
@@ -4307,8 +4298,7 @@ fn bifrost_lsp_server_definition_selects_rust_function_declaration_across_identi
     let root = temp.path().canonicalize().expect("canon temp");
     let file_path = write_rust_attributed_async_function_fixture(&root);
 
-    let (child, stdin, reader, stderr) = start_lsp_server(&root);
-    let mut client = LspTestClient::new(stdin, reader, stderr, 10);
+    let mut client = LspServer::start(&root);
     let file_uri = uri_for(&file_path);
 
     let name_start = RUST_ATTRIBUTED_ASYNC_FUNCTION_SOURCE
@@ -4343,8 +4333,7 @@ fn bifrost_lsp_server_definition_selects_rust_function_declaration_across_identi
         );
     }
 
-    let (stdin, reader, stderr) = client.into_parts();
-    shutdown_lsp(child, stdin, reader, stderr);
+    client.shutdown();
 }
 
 #[test]
@@ -4643,8 +4632,7 @@ fn bifrost_lsp_server_definition_ignores_literals_keywords_unresolved_and_ambigu
     let root = temp.path().canonicalize().expect("canon temp");
     let file_path = write_invalid_contexts_fixture(&root);
 
-    let (child, stdin, reader, stderr) = start_lsp_server(&root);
-    let mut client = LspTestClient::new(stdin, reader, stderr, 10);
+    let mut client = LspServer::start(&root);
     let file_uri = uri_for(&file_path);
     let responses = collect_invalid_context_endpoint_responses(
         &mut client,
@@ -4652,8 +4640,7 @@ fn bifrost_lsp_server_definition_ignores_literals_keywords_unresolved_and_ambigu
         BroadEndpoint::Definition,
     );
 
-    let (stdin, reader, stderr) = client.into_parts();
-    shutdown_lsp(child, stdin, reader, stderr);
+    client.shutdown();
 
     assert_no_invalid_context_results(BroadEndpoint::Definition, &responses);
 }
@@ -4664,14 +4651,12 @@ fn bifrost_lsp_server_hover_ignores_literals_keywords_unresolved_and_ambiguous_t
     let root = temp.path().canonicalize().expect("canon temp");
     let file_path = write_invalid_contexts_fixture(&root);
 
-    let (child, stdin, reader, stderr) = start_lsp_server(&root);
-    let mut client = LspTestClient::new(stdin, reader, stderr, 10);
+    let mut client = LspServer::start(&root);
     let file_uri = uri_for(&file_path);
     let responses =
         collect_invalid_context_endpoint_responses(&mut client, &file_uri, BroadEndpoint::Hover);
 
-    let (stdin, reader, stderr) = client.into_parts();
-    shutdown_lsp(child, stdin, reader, stderr);
+    client.shutdown();
 
     assert_no_invalid_context_results(BroadEndpoint::Hover, &responses);
 }
@@ -4682,8 +4667,7 @@ fn bifrost_lsp_server_references_ignore_literals_keywords_unresolved_and_ambiguo
     let root = temp.path().canonicalize().expect("canon temp");
     let file_path = write_invalid_contexts_fixture(&root);
 
-    let (child, stdin, reader, stderr) = start_lsp_server(&root);
-    let mut client = LspTestClient::new(stdin, reader, stderr, 10);
+    let mut client = LspServer::start(&root);
     let file_uri = uri_for(&file_path);
     let responses = collect_invalid_context_endpoint_responses(
         &mut client,
@@ -4691,8 +4675,7 @@ fn bifrost_lsp_server_references_ignore_literals_keywords_unresolved_and_ambiguo
         BroadEndpoint::References,
     );
 
-    let (stdin, reader, stderr) = client.into_parts();
-    shutdown_lsp(child, stdin, reader, stderr);
+    client.shutdown();
 
     assert_no_invalid_context_results(BroadEndpoint::References, &responses);
 }
@@ -4704,8 +4687,7 @@ fn bifrost_lsp_server_document_highlight_ignores_literals_keywords_unresolved_an
     let root = temp.path().canonicalize().expect("canon temp");
     let file_path = write_invalid_contexts_fixture(&root);
 
-    let (child, stdin, reader, stderr) = start_lsp_server(&root);
-    let mut client = LspTestClient::new(stdin, reader, stderr, 10);
+    let mut client = LspServer::start(&root);
     let file_uri = uri_for(&file_path);
     let responses = collect_invalid_context_endpoint_responses(
         &mut client,
@@ -4713,8 +4695,7 @@ fn bifrost_lsp_server_document_highlight_ignores_literals_keywords_unresolved_an
         BroadEndpoint::DocumentHighlight,
     );
 
-    let (stdin, reader, stderr) = client.into_parts();
-    shutdown_lsp(child, stdin, reader, stderr);
+    client.shutdown();
 
     assert_no_invalid_context_results(BroadEndpoint::DocumentHighlight, &responses);
 }
@@ -4725,8 +4706,7 @@ fn bifrost_lsp_server_broad_endpoints_ignore_csharp_ambiguous_using_type() {
     let root = temp.path().canonicalize().expect("canon temp");
     let file_path = write_csharp_ambiguous_using_fixture(&root);
 
-    let (child, stdin, reader, stderr) = start_lsp_server(&root);
-    let mut client = LspTestClient::new(stdin, reader, stderr, 10);
+    let mut client = LspServer::start(&root);
     let file_uri = uri_for(&file_path);
     let (line, character) = position_after(CSHARP_AMBIGUOUS_USING_SOURCE, "            ");
     let responses = [
@@ -4744,8 +4724,7 @@ fn bifrost_lsp_server_broad_endpoints_ignore_csharp_ambiguous_using_type() {
     })
     .collect::<Vec<_>>();
 
-    let (stdin, reader, stderr) = client.into_parts();
-    shutdown_lsp(child, stdin, reader, stderr);
+    client.shutdown();
 
     for (endpoint, response) in responses {
         let no_result = response["result"].is_null()
@@ -4765,8 +4744,7 @@ fn bifrost_lsp_server_broad_endpoints_ignore_scala_ambiguous_wildcard_import_typ
     let root = temp.path().canonicalize().expect("canon temp");
     let file_path = write_scala_ambiguous_import_fixture(&root);
 
-    let (child, stdin, reader, stderr) = start_lsp_server(&root);
-    let mut client = LspTestClient::new(stdin, reader, stderr, 10);
+    let mut client = LspServer::start(&root);
     let file_uri = uri_for(&file_path);
     let (line, character) = position_after(SCALA_AMBIGUOUS_IMPORT_SOURCE, "  val target: ");
     let responses = [
@@ -4784,8 +4762,7 @@ fn bifrost_lsp_server_broad_endpoints_ignore_scala_ambiguous_wildcard_import_typ
     })
     .collect::<Vec<_>>();
 
-    let (stdin, reader, stderr) = client.into_parts();
-    shutdown_lsp(child, stdin, reader, stderr);
+    client.shutdown();
 
     for (endpoint, response) in responses {
         let no_result = response["result"].is_null()
@@ -9152,18 +9129,6 @@ fn read_notification(
     panic!("did not receive {expected_method} within 32 messages");
 }
 
-/// Read messages until the response with the given id arrives, skipping
-/// notifications (e.g. publishDiagnostics) the server may interleave.
-fn read_response_for_id(reader: &mut impl BufRead, stderr: &mut impl Read, id: u64) -> Value {
-    for _ in 0..32 {
-        let msg = read_message(reader, stderr);
-        if msg["id"].as_u64() == Some(id) {
-            return msg;
-        }
-    }
-    panic!("did not receive response with id {id} within 32 messages");
-}
-
 fn type_definition_response(
     stdin: &mut impl Write,
     reader: &mut impl BufRead,
@@ -9238,79 +9203,6 @@ fn references_response(
     read_response_for_id(reader, stderr, id)
 }
 
-struct LspTestClient {
-    stdin: ChildStdin,
-    reader: BufReader<ChildStdout>,
-    stderr: ChildStderr,
-    next_id: u64,
-}
-
-impl LspTestClient {
-    fn new(
-        stdin: ChildStdin,
-        reader: BufReader<ChildStdout>,
-        stderr: ChildStderr,
-        next_id: u64,
-    ) -> Self {
-        Self {
-            stdin,
-            reader,
-            stderr,
-            next_id,
-        }
-    }
-
-    fn into_parts(self) -> (ChildStdin, BufReader<ChildStdout>, ChildStderr) {
-        (self.stdin, self.reader, self.stderr)
-    }
-
-    fn text_document_position_response(
-        &mut self,
-        method: &str,
-        file_uri: &str,
-        line: u64,
-        character: u64,
-    ) -> Value {
-        let id = self.next_id();
-        text_document_position_response(
-            &mut self.stdin,
-            &mut self.reader,
-            &mut self.stderr,
-            id,
-            method,
-            file_uri,
-            line,
-            character,
-        )
-    }
-
-    fn references_response(
-        &mut self,
-        file_uri: &str,
-        line: u64,
-        character: u64,
-        include_declaration: bool,
-    ) -> Value {
-        let id = self.next_id();
-        references_response(
-            &mut self.stdin,
-            &mut self.reader,
-            &mut self.stderr,
-            id,
-            file_uri,
-            line,
-            character,
-            include_declaration,
-        )
-    }
-
-    fn next_id(&mut self) -> u64 {
-        let id = self.next_id;
-        self.next_id += 1;
-        id
-    }
-}
-
 #[derive(Clone, Copy)]
 enum BroadEndpoint {
     Definition,
@@ -9355,7 +9247,7 @@ fn invalid_context_targets() -> Vec<(&'static str, u64, u64)> {
 }
 
 fn collect_invalid_context_endpoint_responses(
-    client: &mut LspTestClient,
+    client: &mut LspServer,
     file_uri: &str,
     endpoint: BroadEndpoint,
 ) -> Vec<(&'static str, Value)> {
@@ -9369,7 +9261,7 @@ fn collect_invalid_context_endpoint_responses(
 }
 
 fn endpoint_response(
-    client: &mut LspTestClient,
+    client: &mut LspServer,
     file_uri: &str,
     endpoint: BroadEndpoint,
     line: u64,
@@ -9433,34 +9325,4 @@ fn implementation_response(
         line,
         character,
     )
-}
-
-fn write_message(stdin: &mut impl Write, payload: Value) {
-    let body = serde_json::to_string(&payload).expect("serialize");
-    write!(stdin, "Content-Length: {}\r\n\r\n{}", body.len(), body).expect("write");
-    stdin.flush().expect("flush");
-}
-
-fn read_message(reader: &mut impl BufRead, stderr: &mut impl Read) -> Value {
-    let mut content_length: Option<usize> = None;
-    loop {
-        let mut header = String::new();
-        let bytes = reader.read_line(&mut header).expect("read header");
-        if bytes == 0 {
-            let mut buf = String::new();
-            let _ = stderr.read_to_string(&mut buf);
-            panic!("server closed; stderr:\n{buf}");
-        }
-        let trimmed = header.trim_end_matches(['\r', '\n']);
-        if trimmed.is_empty() {
-            break;
-        }
-        if let Some(rest) = trimmed.strip_prefix("Content-Length: ") {
-            content_length = Some(rest.parse().expect("Content-Length value"));
-        }
-    }
-    let len = content_length.expect("missing Content-Length header");
-    let mut body = vec![0u8; len];
-    reader.read_exact(&mut body).expect("read body");
-    serde_json::from_slice(&body).expect("valid json response")
 }
