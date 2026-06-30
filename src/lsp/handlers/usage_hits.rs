@@ -1,5 +1,9 @@
-use crate::analyzer::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, UsageFinder, UsageHit};
+use crate::analyzer::usages::{
+    DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, ExplicitCandidateProvider, UsageFinder, UsageHit,
+};
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
+use crate::hash::HashSet;
+use std::sync::Arc;
 
 pub(super) fn usage_hits_for_candidates(
     analyzer: &dyn IAnalyzer,
@@ -17,10 +21,17 @@ pub(super) fn usage_hits_for_candidates_in_file(
     candidates: &[CodeUnit],
     file: &ProjectFile,
 ) -> Vec<UsageHit> {
-    let scoped_file = file.clone();
+    let files: HashSet<ProjectFile> = [file.clone()].into_iter().collect();
+    let provider = ExplicitCandidateProvider::new(Arc::new(files));
     UsageFinder::new()
-        .with_file_filter(move |candidate_file| candidate_file == &scoped_file)
-        .find_usages(analyzer, candidates, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES)
+        .query_with_provider(
+            analyzer,
+            candidates,
+            Some(&provider),
+            DEFAULT_MAX_FILES,
+            DEFAULT_MAX_USAGES,
+        )
+        .result
         .all_hits()
         .into_iter()
         .filter(|hit| &hit.file == file)

@@ -19,6 +19,7 @@ pub(super) struct BroadSymbolTarget {
     pub(super) line_starts: Vec<usize>,
     pub(super) start_byte: usize,
     pub(super) end_byte: usize,
+    pub(super) declaration_site: bool,
     pub(super) candidates: Vec<CodeUnit>,
 }
 
@@ -37,22 +38,24 @@ pub(super) fn broad_symbol_target_at_position(
         start_line: 0,
         end_line: 0,
     };
-    let candidates =
-        selected_code_unit_declaration_at_cursor(analyzer, &file, &content, &selected, |_| true)
-            .map(|declaration| vec![declaration])
-            .or_else(|| {
-                let identifier = content.get(start_byte..end_byte)?;
-                if is_ambiguous_imported_reference(analyzer, &file, identifier) {
-                    return None;
-                }
-                resolved_reference_candidates(
-                    analyzer,
-                    &file,
-                    Arc::new(content.clone()),
-                    start_byte,
-                    end_byte,
-                )
-            })?;
+    let declaration =
+        selected_code_unit_declaration_at_cursor(analyzer, &file, &content, &selected, |_| true);
+    let declaration_site = declaration.is_some();
+    let candidates = declaration
+        .map(|declaration| vec![declaration])
+        .or_else(|| {
+            let identifier = content.get(start_byte..end_byte)?;
+            if is_ambiguous_imported_reference(analyzer, &file, identifier) {
+                return None;
+            }
+            resolved_reference_candidates(
+                analyzer,
+                &file,
+                Arc::new(content.clone()),
+                start_byte,
+                end_byte,
+            )
+        })?;
 
     Some(BroadSymbolTarget {
         file,
@@ -60,6 +63,7 @@ pub(super) fn broad_symbol_target_at_position(
         line_starts,
         start_byte,
         end_byte,
+        declaration_site,
         candidates,
     })
 }

@@ -1098,9 +1098,16 @@ fn rust_imported_export_candidates(
             Vec::new()
         } else {
             let binder = lexical_scope::visible_import_binder_at(&source, reference_byte);
+            if rust_binder_has_external_binding(rust, file, &binder, reference) {
+                return Vec::new();
+            }
             rust.resolve_imported_export_from_binder(file, &binder, reference)
         }
     } else {
+        let binder = rust.import_binder_of(file);
+        if rust_binder_has_external_binding(rust, file, &binder, reference) {
+            return Vec::new();
+        }
         rust.resolve_imported_export(file, reference)
     };
     for (target_file, target_name) in targets {
@@ -1109,6 +1116,24 @@ fn rust_imported_export_candidates(
     sort_units(&mut candidates);
     candidates.dedup();
     candidates
+}
+
+fn rust_binder_has_external_binding(
+    rust: &crate::analyzer::RustAnalyzer,
+    file: &ProjectFile,
+    binder: &ImportBinder,
+    reference: &str,
+) -> bool {
+    binder
+        .bindings
+        .iter()
+        .any(|(local_name, binding)| match binding.kind {
+            ImportKind::Named | ImportKind::Namespace if local_name == reference => rust
+                .resolve_module_files(file, &binding.module_specifier)
+                .is_empty(),
+            ImportKind::Default | ImportKind::CommonJsRequire | ImportKind::Glob => false,
+            ImportKind::Named | ImportKind::Namespace => false,
+        })
 }
 
 fn rust_reference_looks_external(reference: &str) -> bool {

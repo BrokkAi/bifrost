@@ -1,6 +1,7 @@
-use lsp_types::{GotoDefinitionParams, GotoDefinitionResponse};
+use lsp_types::{GotoDefinitionParams, GotoDefinitionResponse, Location};
 
-use crate::analyzer::{Project, WorkspaceAnalyzer};
+use crate::analyzer::{Project, Range as ByteRange, WorkspaceAnalyzer};
+use crate::lsp::conversion::byte_range_to_lsp_range;
 use crate::lsp::handlers::broad_symbol::broad_symbol_target_at_position;
 use crate::lsp::handlers::util::code_unit_location;
 
@@ -22,6 +23,22 @@ pub fn handle(
         uri,
         &params.text_document_position_params.position,
     )?;
+    if target.declaration_site {
+        let range = byte_range_to_lsp_range(
+            &target.content,
+            &target.line_starts,
+            &ByteRange {
+                start_byte: target.start_byte,
+                end_byte: target.end_byte,
+                start_line: 0,
+                end_line: 0,
+            },
+        );
+        return Some(GotoDefinitionResponse::Array(vec![Location {
+            uri: uri.clone(),
+            range,
+        }]));
+    }
 
     let mut locations = Vec::with_capacity(target.candidates.len());
     for cu in target.candidates {

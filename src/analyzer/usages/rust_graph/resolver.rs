@@ -2,7 +2,10 @@ use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, RustAnalyzer};
 use std::collections::BTreeSet;
 
 pub(super) fn supports_same_file_local_scan(analyzer: &RustAnalyzer, target: &CodeUnit) -> bool {
-    target.is_function() && analyzer.parent_of(target).is_none()
+    target.is_function()
+        && analyzer.parent_of(target).is_none()
+        && (!is_public_like_declaration(analyzer, target)
+            || analyzer.is_rust_cfg_test_declaration(target))
 }
 
 pub(super) fn is_member_target(analyzer: &RustAnalyzer, target: &CodeUnit) -> bool {
