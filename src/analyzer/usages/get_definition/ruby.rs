@@ -1,4 +1,5 @@
 use super::*;
+use crate::analyzer::ruby::{RubyFieldScope, ruby_field_short_name};
 
 pub(super) fn resolve_ruby(
     analyzer: &dyn IAnalyzer,
@@ -83,6 +84,9 @@ pub(super) fn resolve_ruby(
                 source,
             )
         }
+        Some(RubyReferenceNode::Variable(variable)) => {
+            ruby_field_outcome(analyzer, support, &semantic, &context, variable, source)
+        }
         None => no_definition(
             "unsupported_ruby_reference_shape",
             format!(
@@ -101,6 +105,7 @@ enum RubyReferenceNode<'tree> {
         method: Node<'tree>,
     },
     Identifier(Node<'tree>),
+    Variable(Node<'tree>),
 }
 
 fn ruby_reference_node(mut node: Node<'_>) -> Option<RubyReferenceNode<'_>> {
@@ -116,6 +121,7 @@ fn ruby_reference_node(mut node: Node<'_>) -> Option<RubyReferenceNode<'_>> {
     }
     match node.kind() {
         "constant" | "scope_resolution" => Some(RubyReferenceNode::Constant(node)),
+        "instance_variable" | "class_variable" => Some(RubyReferenceNode::Variable(node)),
         "identifier" => {
             if ruby_is_call_method_identifier(node) {
                 return Some(RubyReferenceNode::Method {
@@ -182,6 +188,87 @@ fn ruby_constant_outcome(
         );
     };
     candidates_outcome(vec![unit])
+}
+
+fn ruby_field_outcome(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    semantic: &RubySemanticIndex<'_>,
+    context: &RubyLookupContext,
+    node: Node<'_>,
+    source: &str,
+) -> DefinitionLookupOutcome {
+    let raw = ruby_node_text(node, source);
+    let Some((owner, scope)) =
+        ruby_field_reference_owner_and_scope(&context.lexical_stack, &context.method_stack, node)
+    else {
+        return no_definition(
+            "unsupported_ruby_receiver",
+            format!("receiver for Ruby field `{raw}` is not resolved"),
+        );
+    };
+
+    let owners: Vec<String> = match scope {
+        RubyFieldScope::ClassVariable => std::iter::once(owner.clone())
+            .chain(semantic.ancestor_lookup_order(&owner))
+            .collect(),
+        RubyFieldScope::Instance | RubyFieldScope::SingletonClass => vec![owner],
+    };
+
+    let mut candidates = Vec::new();
+    for owner in owners {
+        let segments: Vec<String> = owner
+            .split('$')
+            .filter(|segment| !segment.is_empty())
+            .map(str::to_string)
+            .collect();
+        if let Some(fqn) = ruby_field_short_name(&segments, node, source, scope) {
+            candidates.extend(support.fqn(&fqn));
+        }
+    }
+    candidates.retain(|unit| {
+        unit.is_field()
+            && unit.identifier() == raw
+            && context.visible_files.contains(unit.source())
+            && ruby_field_target_from_code_unit(unit).is_some_and(|target| target.scope == scope)
+    });
+    sort_units(&mut candidates);
+    candidates.dedup();
+
+    if candidates
+        .iter()
+        .any(|candidate| ruby_is_indexed_field_declaration_site(analyzer, candidate, node))
+    {
+        return no_definition(
+            "declaration_or_import_site",
+            format!("`{raw}` is not a Ruby reference site"),
+        );
+    }
+
+    if candidates.is_empty() {
+        return no_definition(
+            "no_indexed_definition",
+            format!("Ruby field `{raw}` did not resolve to an indexed definition"),
+        );
+    }
+    candidates_outcome(candidates)
+}
+
+fn ruby_is_indexed_field_declaration_site(
+    analyzer: &dyn IAnalyzer,
+    target: &CodeUnit,
+    node: Node<'_>,
+) -> bool {
+    if !ruby_is_plain_assignment_left_variable(node) {
+        return false;
+    }
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    analyzer
+        .ranges(target)
+        .iter()
+        .any(|range| range.start_byte == parent.start_byte() && range.end_byte == parent.end_byte())
 }
 
 fn ruby_method_outcome(

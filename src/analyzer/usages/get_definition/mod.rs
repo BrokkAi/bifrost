@@ -41,9 +41,12 @@ use crate::analyzer::usages::ruby_graph::{
     is_declaration_constant as ruby_is_declaration_constant,
     is_declaration_identifier as ruby_is_declaration_identifier,
     is_dynamic_dispatch_method as ruby_is_dynamic_dispatch_method,
+    is_plain_assignment_left_variable as ruby_is_plain_assignment_left_variable,
     method_receiver_mode as ruby_method_receiver_mode, node_text as ruby_node_text,
-    ruby_enclosing_receiver, ruby_receiver_type, ruby_seed_assignment, ruby_seed_parameter_shadows,
-    ruby_type_owner, symbol_or_string_value as ruby_symbol_or_string_value,
+    ruby_enclosing_receiver, ruby_field_reference_owner_and_scope,
+    ruby_field_target as ruby_field_target_from_code_unit, ruby_receiver_type,
+    ruby_seed_assignment, ruby_seed_parameter_shadows, ruby_type_owner,
+    symbol_or_string_value as ruby_symbol_or_string_value,
 };
 use crate::analyzer::usages::scala_graph::{
     ScalaNameResolver, ScalaProjectTypes, package_name_of as scala_package_name_of,

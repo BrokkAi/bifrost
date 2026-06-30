@@ -502,6 +502,97 @@ end
 }
 
 #[test]
+fn resolves_ruby_instance_variable_field_usages() {
+    let (_project, analyzer) = ruby_analyzer_with_files(&[(
+        "lib/billing/invoice.rb",
+        r#"class Invoice
+  def initialize
+    @status = "draft"
+  end
+
+  def status
+    @status
+  end
+end
+"#,
+    )]);
+
+    let target = definition(&analyzer, "Invoice.@status");
+    let hits = analyzer
+        .find_usages(&[target])
+        .into_either()
+        .expect("usage lookup should succeed");
+    let lines = hit_source_lines(&hits);
+    let texts = hit_texts(&hits);
+
+    assert!(lines.iter().any(|line| line == "@status"), "{lines:?}");
+    assert!(texts.iter().all(|text| text == "@status"), "{texts:?}");
+}
+
+#[test]
+fn resolves_ruby_class_variable_field_usages() {
+    let (_project, analyzer) = ruby_analyzer_with_files(&[(
+        "lib/billing/invoice.rb",
+        r#"class Invoice
+  @@sequence = 0
+
+  def self.build
+    @@sequence += 1
+  end
+end
+"#,
+    )]);
+
+    let target = definition(&analyzer, "Invoice.@@sequence");
+    let hits = analyzer
+        .find_usages(&[target])
+        .into_either()
+        .expect("usage lookup should succeed");
+    let lines = hit_source_lines(&hits);
+    let texts = hit_texts(&hits);
+
+    assert!(
+        lines.iter().any(|line| line == "@@sequence += 1"),
+        "{lines:?}"
+    );
+    assert!(texts.iter().all(|text| text == "@@sequence"), "{texts:?}");
+}
+
+#[test]
+fn resolves_ruby_class_instance_variable_field_usages() {
+    let (_project, analyzer) = ruby_analyzer_with_files(&[(
+        "lib/billing/invoice.rb",
+        r#"class Invoice
+  @last_build = nil
+
+  def self.build
+    @last_build = new
+  end
+
+  def self.last_build
+    @last_build
+  end
+end
+"#,
+    )]);
+
+    let target = definition(&analyzer, "Invoice.$singleton.@last_build");
+    let hits = analyzer
+        .find_usages(&[target])
+        .into_either()
+        .expect("usage lookup should succeed");
+    let lines = hit_source_lines(&hits);
+    let texts = hit_texts(&hits);
+
+    assert!(
+        lines.iter().any(|line| line == "@last_build = new"),
+        "{lines:?}"
+    );
+    assert!(lines.iter().any(|line| line == "@last_build"), "{lines:?}");
+    assert!(texts.iter().all(|text| text == "@last_build"), "{texts:?}");
+}
+
+#[test]
 fn indexes_absolute_namespaced_constant_assignment_as_top_level_field() {
     let (_project, analyzer) = ruby_analyzer_with_files(&[(
         "app/report.rb",

@@ -25,7 +25,10 @@ use cache::{
     weight_project_file_set,
 };
 
-pub(crate) use declarations::{extract_name_path, extract_name_segments, parse_ruby_tree};
+pub(crate) use declarations::{
+    RubyFieldScope, extract_name_path, extract_name_segments, parse_ruby_tree,
+    ruby_field_short_name, ruby_variable_field_name,
+};
 
 #[derive(Clone)]
 pub struct RubyAnalyzer {

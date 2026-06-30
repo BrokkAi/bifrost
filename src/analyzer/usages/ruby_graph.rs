@@ -5,7 +5,10 @@
 //! tracked as unsafe inference and surfaced through the existing query-level
 //! graph diagnostic when no structured hits were found.
 
-use crate::analyzer::ruby::{extract_name_path, extract_name_segments, parse_ruby_tree};
+use crate::analyzer::ruby::{
+    RubyFieldScope, extract_name_path, extract_name_segments, parse_ruby_tree,
+    ruby_variable_field_name,
+};
 use crate::analyzer::type_relations::TypeRelationKind;
 use crate::analyzer::usages::common::{
     SNIPPET_CONTEXT_LINES, TreeWalkAction, language_for_target, usage_hit, walk_tree_iterative,
@@ -147,6 +150,7 @@ impl UsageAnalyzer for RubyUsageGraphStrategy {
 enum RubyTargetKind {
     TypeOrConstant,
     Method,
+    Field(RubyFieldScope),
 }
 
 pub(crate) struct RubyTargetSpec {
@@ -154,16 +158,35 @@ pub(crate) struct RubyTargetSpec {
     kind: RubyTargetKind,
     pub(crate) member_name: String,
     singleton_declaration: bool,
+    field_owner: Option<String>,
+}
+
+pub(crate) struct RubyFieldTarget {
+    pub(crate) owner: String,
+    pub(crate) scope: RubyFieldScope,
+    pub(crate) member: String,
 }
 
 impl RubyTargetSpec {
     pub(crate) fn from_target(analyzer: &dyn IAnalyzer, target: &CodeUnit) -> Option<Self> {
+        if target.is_field()
+            && let Some(field) = ruby_field_target(target)
+        {
+            return Some(Self {
+                target: target.clone(),
+                kind: RubyTargetKind::Field(field.scope),
+                member_name: field.member,
+                singleton_declaration: false,
+                field_owner: Some(field.owner),
+            });
+        }
         if target.is_class() || target.is_module() || target.is_field() {
             return Some(Self {
                 target: target.clone(),
                 kind: RubyTargetKind::TypeOrConstant,
                 member_name: target.identifier().to_string(),
                 singleton_declaration: false,
+                field_owner: None,
             });
         }
         if target.is_function() {
@@ -176,10 +199,41 @@ impl RubyTargetSpec {
                 kind: RubyTargetKind::Method,
                 member_name: target.identifier().to_string(),
                 singleton_declaration,
+                field_owner: None,
             });
         }
         None
     }
+}
+
+pub(crate) fn ruby_field_target(target: &CodeUnit) -> Option<RubyFieldTarget> {
+    let member = target.identifier();
+    let short_name = target.short_name();
+    if member.starts_with("@@") {
+        let owner = short_name.strip_suffix(&format!(".{member}"))?;
+        return (!owner.is_empty()).then(|| RubyFieldTarget {
+            owner: owner.to_string(),
+            scope: RubyFieldScope::ClassVariable,
+            member: member.to_string(),
+        });
+    }
+    if member.starts_with('@') {
+        let singleton_suffix = format!(".$singleton.{member}");
+        if let Some(owner) = short_name.strip_suffix(&singleton_suffix) {
+            return (!owner.is_empty()).then(|| RubyFieldTarget {
+                owner: owner.to_string(),
+                scope: RubyFieldScope::SingletonClass,
+                member: member.to_string(),
+            });
+        }
+        let owner = short_name.strip_suffix(&format!(".{member}"))?;
+        return (!owner.is_empty()).then(|| RubyFieldTarget {
+            owner: owner.to_string(),
+            scope: RubyFieldScope::Instance,
+            member: member.to_string(),
+        });
+    }
+    None
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -449,7 +503,7 @@ impl<'a> RubySemanticIndex<'a> {
         out
     }
 
-    fn ancestor_lookup_order(&self, owner: &str) -> Vec<String> {
+    pub(crate) fn ancestor_lookup_order(&self, owner: &str) -> Vec<String> {
         let mut out = Vec::new();
         let mut visited = HashSet::default();
         let mut stack: Vec<String> = self
@@ -627,6 +681,7 @@ impl RubyWalkState<'_, '_> {
         match self.scan.spec.kind {
             RubyTargetKind::TypeOrConstant => self.record_constant_reference(node),
             RubyTargetKind::Method => self.record_method_reference(node),
+            RubyTargetKind::Field(_) => self.record_field_reference(node),
         }
     }
 
@@ -646,6 +701,62 @@ impl RubyWalkState<'_, '_> {
                 }
             }
         }
+    }
+
+    fn record_field_reference(&mut self, node: Node<'_>) {
+        let Some(name) = ruby_variable_field_name(node, self.scan.source) else {
+            return;
+        };
+        if name != self.scan.spec.member_name || self.is_target_field_declaration_site(node) {
+            return;
+        }
+        let Some((owner, scope)) =
+            ruby_field_reference_owner_and_scope(&self.lexical_stack, &self.method_stack, node)
+        else {
+            return;
+        };
+        if self.field_reference_matches_target(&owner, scope) {
+            self.record_hit(node);
+        }
+    }
+
+    fn field_reference_matches_target(&self, owner: &str, scope: RubyFieldScope) -> bool {
+        if self.scan.spec.kind != RubyTargetKind::Field(scope) {
+            return false;
+        }
+        let Some(target_owner) = self.scan.spec.field_owner.as_deref() else {
+            return false;
+        };
+        match scope {
+            RubyFieldScope::ClassVariable => {
+                owner == target_owner
+                    || self
+                        .scan
+                        .semantic
+                        .ancestor_lookup_order(owner)
+                        .iter()
+                        .any(|ancestor| ancestor == target_owner)
+            }
+            RubyFieldScope::Instance | RubyFieldScope::SingletonClass => owner == target_owner,
+        }
+    }
+
+    fn is_target_field_declaration_site(&self, node: Node<'_>) -> bool {
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        if !matches!(parent.kind(), "assignment" | "operator_assignment")
+            || parent.child_by_field_name("left") != Some(node)
+        {
+            return false;
+        }
+        self.scan
+            .analyzer
+            .ranges(&self.scan.spec.target)
+            .iter()
+            .any(|range| {
+                range.start_byte == parent.start_byte() && range.end_byte == parent.end_byte()
+            })
     }
 
     fn record_constant_reference(&mut self, node: Node<'_>) {
@@ -1282,6 +1393,30 @@ pub(crate) fn ruby_enclosing_receiver(
     })
 }
 
+pub(crate) fn ruby_field_reference_owner_and_scope(
+    lexical_stack: &[String],
+    method_stack: &[ReceiverMode],
+    node: Node<'_>,
+) -> Option<(String, RubyFieldScope)> {
+    match node.kind() {
+        "class_variable" => lexical_stack
+            .last()
+            .cloned()
+            .map(|owner| (owner, RubyFieldScope::ClassVariable)),
+        "instance_variable" => {
+            let owner = lexical_stack.last()?.clone();
+            let scope = match method_stack.last().copied() {
+                Some(ReceiverMode::Instance) => RubyFieldScope::Instance,
+                Some(ReceiverMode::Class | ReceiverMode::TopLevel) | None => {
+                    RubyFieldScope::SingletonClass
+                }
+            };
+            Some((owner, scope))
+        }
+        _ => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn ruby_seed_assignment(
     semantic: &RubySemanticIndex<'_>,
@@ -1458,6 +1593,16 @@ pub(crate) fn is_declaration_identifier(node: Node<'_>) -> bool {
         return true;
     }
     false
+}
+
+pub(crate) fn is_plain_assignment_left_variable(node: Node<'_>) -> bool {
+    if !matches!(node.kind(), "instance_variable" | "class_variable") {
+        return false;
+    }
+    node.parent().is_some_and(|parent| {
+        matches!(parent.kind(), "assignment" | "operator_assignment")
+            && parent.child_by_field_name("left") == Some(node)
+    })
 }
 
 pub(crate) fn is_call_method_identifier(node: Node<'_>) -> bool {
