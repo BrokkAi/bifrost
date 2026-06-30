@@ -66,6 +66,17 @@ scope by architecture and are not ported.
   cross-file no-hit parity tests preserved. Ported suite 11 pass / 4 ignored.
   Regressions `untyped_receiver_resolves_unique_same_file_member` (+ negative
   `..._does_not_resolve_ambiguous_same_file_member`), 62 pass. clippy clean.
+- 2026-06-30: Folded the LSP test client. Consolidated framing/spawn into
+  `tests/common/lsp_client.rs` (the canonical owned `LspServer`); removed the
+  duplicate helpers and the half-built `LspTestClient` from
+  `tests/bifrost_lsp_server.rs` and migrated its 7 sites to the handle
+  (net -90 lines; 135 LSP tests green; clippy clean).
+- 2026-06-30: Breadth — added the multi-file harness (`references_multifile`,
+  `reference_counts_by_file`) and ported ConstImportedFromAnotherFile. New
+  finding: the cross-file consumer read resolves, but same-file bare-name usages
+  of a module-level FIELD are not found (module-level functions are — so this is
+  a field-path gap, analogous to the class-member bare-name work but at module
+  scope). Ported as an `#[ignore]` documenting the gap.
 
 
 ## Surprises and Discoveries

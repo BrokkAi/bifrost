@@ -71,6 +71,43 @@ fn references_for(name: &str, source_with_caret: &str) -> (TempDir, PathBuf, Vec
     (temp, file, locations)
 }
 
+/// Write several files (exactly one carrying a `<caret>`) into one temp project,
+/// run find-usages at the caret, and return the project root + resolved
+/// locations across all files.
+fn references_multifile(files: &[(&str, &str)]) -> (TempDir, PathBuf, Vec<RefLocation>) {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let mut caret: Option<(PathBuf, u64, u64)> = None;
+    for (name, src) in files {
+        let path = root.join(name);
+        if src.contains("<caret>") {
+            let (clean, line, character) = split_caret(src);
+            std::fs::write(&path, clean).expect("write caret fixture");
+            caret = Some((path, line, character));
+        } else {
+            std::fs::write(&path, src).expect("write fixture");
+        }
+    }
+    let (caret_path, line, character) = caret.expect("one file must contain <caret>");
+    let mut server = LspServer::start(&root);
+    let locations = server.references(&caret_path, line, character, false);
+    server.shutdown();
+    (temp, root, locations)
+}
+
+/// Count of resolved locations whose URI ends with each given file name.
+fn reference_counts_by_file(locations: &[RefLocation], names: &[&str]) -> Vec<usize> {
+    names
+        .iter()
+        .map(|name| {
+            locations
+                .iter()
+                .filter(|loc| loc.uri.ends_with(name))
+                .count()
+        })
+        .collect()
+}
+
 /// Assert the multiset of reference lines (0-based) returned for a caret query,
 /// regardless of column.
 fn assert_reference_lines(locations: &[RefLocation], file: &Path, expected_lines: &[u64]) {
@@ -86,6 +123,39 @@ fn assert_reference_lines(locations: &[RefLocation], file: &Path, expected_lines
     assert_eq!(
         got, expected,
         "reference lines in {file:?} mismatch\n locations: {locations:#?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Multi-file (cross-file) cases
+// ---------------------------------------------------------------------------
+
+// IntelliJ PY-27004 ConstImportedFromAnotherFile: caret on `SOME_CONST` in the
+// definer. IntelliJ counts 5 = 3 in the definer (two assignments + the print)
+// and 2 in the consumer (the import + the print).
+//
+// bifrost resolves the cross-file consumer *read* (`print(SOME_CONST)`) but
+// currently finds none of the definer's same-file references and not the import
+// statement: same-file usages of a module-level FIELD via its bare name are not
+// resolved (module-level FUNCTIONS are — so this is a field-path gap, distinct
+// from the class-member work). Counts per file end up [definer=0, consumer=1].
+#[test]
+#[ignore = "bifrost gap: same-file bare-name usages of a module-level field are not resolved (functions are)"]
+fn const_imported_from_another_file() {
+    let (_t, _root, locations) = references_multifile(&[
+        (
+            "definer.py",
+            "SOME_CONST = False\nif some_cond:\n    SOME_CONST = True\nprint(<caret>SOME_CONST)\n",
+        ),
+        (
+            "consumer.py",
+            "from definer import SOME_CONST\nprint(SOME_CONST)\n",
+        ),
+    ]);
+    // IntelliJ's expectation: 3 references in the definer, 2 in the consumer.
+    assert_eq!(
+        reference_counts_by_file(&locations, &["definer.py", "consumer.py"]),
+        vec![3, 2],
     );
 }
 
