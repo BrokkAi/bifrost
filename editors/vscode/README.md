@@ -48,6 +48,8 @@ after a successful install. Managed binaries are checked with
 - `Bifrost: Start Language Server`
 - `Bifrost: Stop Language Server`
 - `Bifrost: Restart Language Server`
+- `Bifrost: Open MCP Setup`
+- `Bifrost: Copy MCP Config`
 - `Bifrost: Show Output`
 
 The status bar item shows the current server state and can start or restart the
@@ -85,7 +87,7 @@ set:
 The extension starts Bifrost with:
 
 ```bash
-bifrost --root <workspace-root> --server lsp
+bifrost --root <workspace-root> --lsp
 ```
 
 `--root` is the fallback root. VS Code still sends active workspace folders
@@ -104,6 +106,38 @@ After changing these settings, run `Bifrost: Restart Language Server` or accept
 the restart prompt. The extension sends the resolved paths as LSP
 `initializationOptions`, so excluded files should disappear from workspace
 symbol results and document-level LSP lookups.
+
+## MCP Setup
+
+Run `Bifrost: Open MCP Setup` from the Command Palette to choose a setup action:
+copy generic `mcp.json`, copy a Codex CLI command, copy a Claude Code command,
+or open the Bifrost MCP docs. `Bifrost: Copy MCP Config` remains available when
+you only want the generic JSON entry.
+
+These commands are manual. The extension does not open MCP setup on activation,
+does not mutate external host configuration, and does not prompt again after a
+dismissal.
+
+The MCP setup commands use the same binary resolution settings as the language
+server where practical: a configured `bifrost.serverPath`, the
+extension-managed binary, a local development build, or `bifrost` on `PATH`.
+
+The copied entry uses the current workspace root and starts a separate Bifrost
+MCP process:
+
+```json
+{
+  "mcpServers": {
+    "bifrost": {
+      "command": "/path/to/bifrost",
+      "args": ["--root", "/path/to/workspace", "--mcp", "searchtools"]
+    }
+  }
+}
+```
+
+Do not point MCP hosts at the VS Code LSP process. The extension and MCP hosts
+should launch separate stdio processes from the same Bifrost binary/release.
 
 ## Packaging
 

@@ -12,6 +12,9 @@ import {
   BifrostLaunchConfig,
   BifrostInitializationOptions,
   buildLaunchConfig,
+  buildMcpConfig,
+  buildMcpHostCommands,
+  BifrostMcpConfig,
   formatError,
   LaunchMode,
   parseExtraArgs,
@@ -52,7 +55,9 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("bifrost.startServer", () => startClient(context)),
     vscode.commands.registerCommand("bifrost.stopServer", stopClient),
     vscode.commands.registerCommand("bifrost.restartServer", () => restartClient(context)),
-    vscode.commands.registerCommand("bifrost.showOutput", () => outputChannel?.show(true))
+    vscode.commands.registerCommand("bifrost.showOutput", () => outputChannel?.show(true)),
+    vscode.commands.registerCommand("bifrost.copyMcpConfig", () => copyMcpConfig(context)),
+    vscode.commands.registerCommand("bifrost.openMcpSetup", () => openMcpSetup(context))
   );
 
   context.subscriptions.push(
@@ -279,6 +284,102 @@ async function promptRestartAfterConfigurationChange(
   if (choice === "Restart") {
     await restartClient(context);
   }
+}
+
+async function copyMcpConfig(context: vscode.ExtensionContext): Promise<void> {
+  try {
+    const mcpConfig = await resolveMcpConfig(context);
+    await copyText(`${JSON.stringify(mcpConfig, null, 2)}\n`, "Bifrost MCP configuration");
+  } catch (error) {
+    const message = formatError(error);
+    log(`MCP configuration generation failed: ${message}`);
+    void vscode.window.showErrorMessage(`Bifrost: ${message}`);
+  }
+}
+
+async function openMcpSetup(context: vscode.ExtensionContext): Promise<void> {
+  let mcpConfig: BifrostMcpConfig;
+  try {
+    mcpConfig = await resolveMcpConfig(context);
+  } catch (error) {
+    const message = formatError(error);
+    log(`MCP setup failed: ${message}`);
+    void vscode.window.showErrorMessage(`Bifrost: ${message}`);
+    return;
+  }
+
+  const hostCommands = buildMcpHostCommands(mcpConfig);
+  const choice = await vscode.window.showQuickPick(
+    [
+      {
+        label: "Copy generic mcp.json",
+        detail: "Copy a JSON mcpServers entry for hosts that use mcp.json.",
+        action: "json" as const
+      },
+      {
+        label: "Copy Codex CLI command",
+        detail: "Copy a codex mcp add command using the resolved Bifrost binary.",
+        action: "codex" as const
+      },
+      {
+        label: "Copy Claude Code command",
+        detail: "Copy a claude mcp add command using the resolved Bifrost binary.",
+        action: "claude" as const
+      },
+      {
+        label: "Open Bifrost MCP docs",
+        detail: "Open the MCP setup documentation in the Bifrost repository.",
+        action: "docs" as const
+      }
+    ],
+    {
+      title: "Bifrost MCP Setup",
+      placeHolder: "Choose an MCP setup action"
+    }
+  );
+
+  if (!choice) {
+    log("Bifrost MCP setup was dismissed.");
+    return;
+  }
+
+  if (choice.action === "json") {
+    await copyText(`${JSON.stringify(mcpConfig, null, 2)}\n`, "Bifrost MCP configuration");
+  } else if (choice.action === "codex") {
+    await copyText(`${hostCommands.codex}\n`, "Bifrost Codex MCP command");
+  } else if (choice.action === "claude") {
+    await copyText(`${hostCommands.claudeCode}\n`, "Bifrost Claude Code MCP command");
+  } else {
+    await vscode.env.openExternal(
+      vscode.Uri.parse("https://github.com/BrokkAi/bifrost#integrating-with-mcp-hosts")
+    );
+    log("Opened Bifrost MCP documentation.");
+  }
+}
+
+async function resolveMcpConfig(context: vscode.ExtensionContext): Promise<BifrostMcpConfig> {
+  const root = supportedWorkspaceRoot();
+  if (!root) {
+    throw new Error("Open a folder to generate a Bifrost MCP configuration.");
+  }
+
+  const config = vscode.workspace.getConfiguration("bifrost");
+  const command = config.get<string>("serverPath") || "bifrost";
+  const mode = config.get<LaunchMode>("launchMode") || "auto";
+  const managedBinaryPath = await prepareManagedBinary(context, mode, command);
+  return buildMcpConfig(
+    root,
+    context.extensionUri.fsPath,
+    mode,
+    command,
+    managedBinaryPath
+  );
+}
+
+async function copyText(text: string, label: string): Promise<void> {
+  await vscode.env.clipboard.writeText(text);
+  log(`Copied ${label} to the clipboard.`);
+  void vscode.window.showInformationMessage(`${label} copied to clipboard.`);
 }
 
 async function prepareManagedBinary(
