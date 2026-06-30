@@ -44,6 +44,32 @@ pub struct LspServer {
 }
 
 impl LspServer {
+    /// Spawn the server rooted at `root` without performing the initialize
+    /// handshake.
+    pub fn spawn(root: &Path) -> Self {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+            .arg("--root")
+            .arg(root)
+            .arg("--server")
+            .arg("lsp")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn bifrost");
+        let stdin = child.stdin.take().expect("stdin");
+        let stdout = child.stdout.take().expect("stdout");
+        let stderr = child.stderr.take().expect("stderr");
+
+        Self {
+            child,
+            stdin,
+            reader: BufReader::new(stdout),
+            stderr,
+            next_id: 1,
+        }
+    }
+
     /// Spawn the server rooted at `root` and complete the initialize handshake.
     pub fn start(root: &Path) -> Self {
         let root_uri = uri_for(root);
@@ -112,6 +138,37 @@ impl LspServer {
         read_response_for_id(&mut self.reader, &mut self.stderr, id)
     }
 
+    /// Send an arbitrary notification.
+    pub fn notify(&mut self, method: &str, params: Value) {
+        self.notify_value(json!({"jsonrpc": "2.0", "method": method, "params": params}));
+    }
+
+    /// Send a fully-formed JSON-RPC message.
+    pub fn notify_value(&mut self, value: Value) {
+        write_message(&mut self.stdin, value);
+    }
+
+    /// Read the next inbound JSON-RPC message.
+    pub fn read_message(&mut self) -> Value {
+        read_message(&mut self.reader, &mut self.stderr)
+    }
+
+    /// Read inbound messages until a notification with `method` arrives.
+    pub fn read_notification(&mut self, method: &str) -> Value {
+        for _ in 0..32 {
+            let msg = self.read_message();
+            if msg["method"] == method {
+                return msg;
+            }
+        }
+        panic!("did not receive {method} within 32 messages");
+    }
+
+    /// Read inbound messages until the response with `id` arrives.
+    pub fn read_response_for_id(&mut self, id: u64) -> Value {
+        read_response_for_id(&mut self.reader, &mut self.stderr, id)
+    }
+
     /// A `textDocument/<...>` request that takes only a document URI + position
     /// (definition, hover, documentHighlight, implementation, ...). Returns the
     /// raw response `Value`.
@@ -129,6 +186,118 @@ impl LspServer {
                 "position": {"line": line, "character": character},
             }),
         )
+    }
+
+    pub fn type_definition_response(&mut self, file_uri: &str, line: u64, character: u64) -> Value {
+        self.text_document_position_response(
+            "textDocument/typeDefinition",
+            file_uri,
+            line,
+            character,
+        )
+    }
+
+    pub fn implementation_response(&mut self, file_uri: &str, line: u64, character: u64) -> Value {
+        self.text_document_position_response(
+            "textDocument/implementation",
+            file_uri,
+            line,
+            character,
+        )
+    }
+
+    pub fn completion_response(&mut self, file_uri: &str, line: u64, character: u64) -> Value {
+        self.text_document_position_response("textDocument/completion", file_uri, line, character)
+    }
+
+    pub fn hover_response(&mut self, file_uri: &str, line: u64, character: u64) -> Value {
+        self.text_document_position_response("textDocument/hover", file_uri, line, character)
+    }
+
+    pub fn signature_help(&mut self, uri: &str, line: u64, character: u64) -> Value {
+        let response = self.text_document_position_response(
+            "textDocument/signatureHelp",
+            uri,
+            line,
+            character,
+        );
+        assert!(
+            response["error"].is_null(),
+            "unexpected signatureHelp error: {response}"
+        );
+        assert!(
+            response["result"].is_object(),
+            "expected signatureHelp result object, got {response}"
+        );
+        response["result"].clone()
+    }
+
+    pub fn workspace_symbol(&mut self, query: &str) -> Value {
+        self.request("workspace/symbol", json!({"query": query}))
+    }
+
+    pub fn document_symbol(&mut self, file_uri: &str) -> Value {
+        self.request(
+            "textDocument/documentSymbol",
+            json!({"textDocument": {"uri": file_uri}}),
+        )
+    }
+
+    pub fn prepare_type_hierarchy(&mut self, uri: &str, line: u64, character: u64) -> Value {
+        self.prepare_hierarchy("textDocument/prepareTypeHierarchy", uri, (line, character))
+    }
+
+    pub fn prepare_type_hierarchy_result(&mut self, uri: &str, line: u64, character: u64) -> Value {
+        self.prepare_hierarchy_result("textDocument/prepareTypeHierarchy", uri, (line, character))
+    }
+
+    pub fn type_hierarchy_relation(&mut self, method: &str, item: Value) -> Vec<Value> {
+        self.hierarchy_relation(method, item)
+    }
+
+    #[cfg(unix)]
+    pub fn formatting_response(&mut self, file_uri: &str) -> Value {
+        self.request(
+            "textDocument/formatting",
+            json!({
+                "textDocument": {"uri": file_uri},
+                "options": {"tabSize": 4, "insertSpaces": true}
+            }),
+        )
+    }
+
+    pub fn prepare_hierarchy(&mut self, method: &str, uri: &str, position: (u64, u64)) -> Value {
+        let result = self.prepare_hierarchy_result(method, uri, position);
+        let items = result
+            .as_array()
+            .unwrap_or_else(|| panic!("expected prepare array, got {result}"));
+        assert_eq!(items.len(), 1, "expected one prepared item: {items:#?}");
+        items[0].clone()
+    }
+
+    pub fn prepare_hierarchy_result(
+        &mut self,
+        method: &str,
+        uri: &str,
+        position: (u64, u64),
+    ) -> Value {
+        let (line, character) = position;
+        let response = self.request(
+            method,
+            json!({
+                "textDocument": {"uri": uri},
+                "position": {"line": line, "character": character}
+            }),
+        );
+        response["result"].clone()
+    }
+
+    pub fn hierarchy_relation(&mut self, method: &str, item: Value) -> Vec<Value> {
+        let response = self.request(method, json!({"item": item}));
+        response["result"]
+            .as_array()
+            .unwrap_or_else(|| panic!("expected {method} array, got {response}"))
+            .clone()
     }
 
     /// `textDocument/references` by URI string, returning the raw response.
@@ -218,6 +387,27 @@ impl LspServer {
             json!({"jsonrpc": "2.0", "id": 999, "method": "shutdown"}),
         );
         let _ = read_response_for_id(&mut self.reader, &mut self.stderr, 999);
+        write_message(&mut self.stdin, json!({"jsonrpc": "2.0", "method": "exit"}));
+        drop(self.stdin);
+        let status = self.child.wait().expect("wait bifrost");
+        assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+    }
+
+    /// Graceful `shutdown`/`exit` using an explicit request id.
+    pub fn shutdown_with_id(mut self, id: u64) {
+        write_message(
+            &mut self.stdin,
+            json!({"jsonrpc": "2.0", "id": id, "method": "shutdown"}),
+        );
+        let _ = read_response_for_id(&mut self.reader, &mut self.stderr, id);
+        write_message(&mut self.stdin, json!({"jsonrpc": "2.0", "method": "exit"}));
+        drop(self.stdin);
+        let status = self.child.wait().expect("wait bifrost");
+        assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+    }
+
+    /// Send `exit`, close stdin, and assert a clean process exit.
+    pub fn exit(mut self) {
         write_message(&mut self.stdin, json!({"jsonrpc": "2.0", "method": "exit"}));
         drop(self.stdin);
         let status = self.child.wait().expect("wait bifrost");
