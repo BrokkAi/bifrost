@@ -6277,6 +6277,80 @@ fn bifrost_lsp_server_go_malformed_file_reports_parse_not_semantic_diagnostics()
 }
 
 #[test]
+fn bifrost_lsp_server_python_semantic_diagnostics_pull_reports_unrecognized_symbols() {
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    fs::write(
+        temp_root.join("app.py"),
+        r#"
+def run():
+    missing_value
+"#,
+    )
+    .expect("write app.py");
+
+    let mut server = LspTestServer::start(&temp_root);
+    server.initialize(&temp_root);
+    let app_uri = uri_for(&temp_root.join("app.py"));
+
+    server.write(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/diagnostic",
+        "params": {"textDocument": {"uri": app_uri}}
+    }));
+    let response = server.read_message();
+    let items = response["result"]["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected items array, got {response}"));
+    assert!(
+        items.iter().any(|item| item["source"] == "bifrost-python"
+            && item["code"] == "python_unrecognized_symbol"
+            && item["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("missing_value"))),
+        "expected missing_value semantic diagnostic: {response}"
+    );
+
+    server.shutdown(3);
+}
+
+#[test]
+fn bifrost_lsp_server_python_semantic_diagnostics_malformed_file_reports_parse_not_semantic() {
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    fs::write(temp_root.join("broken.py"), "def run(\n    missing_value\n")
+        .expect("write broken.py");
+
+    let mut server = LspTestServer::start(&temp_root);
+    server.initialize(&temp_root);
+    let broken_uri = uri_for(&temp_root.join("broken.py"));
+
+    server.write(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/diagnostic",
+        "params": {"textDocument": {"uri": broken_uri}}
+    }));
+    let response = server.read_message();
+    let items = response["result"]["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected items array, got {response}"));
+    assert!(
+        items
+            .iter()
+            .any(|item| item["source"] == "bifrost-tree-sitter"),
+        "expected parse diagnostic for malformed Python: {response}"
+    );
+    assert!(
+        items.iter().all(|item| item["source"] != "bifrost-python"),
+        "malformed Python must suppress semantic diagnostics: {response}"
+    );
+
+    server.shutdown(3);
+}
+
+#[test]
 fn bifrost_lsp_server_did_save_triggers_reindex() {
     let temp = TempDir::new().expect("temp dir");
     let temp_root = temp.path().canonicalize().expect("canon temp");
@@ -6707,6 +6781,40 @@ fn bifrost_lsp_server_did_save_publishes_go_semantic_diagnostics() {
                 .as_str()
                 .is_some_and(|message| message.contains("missingValue"))),
         "expected publishDiagnostics semantic Go item: {publish}"
+    );
+
+    server.shutdown(99);
+}
+
+#[test]
+fn bifrost_lsp_server_did_save_publishes_python_semantic_diagnostics() {
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    fs::write(temp_root.join("app.py"), "def run():\n    print(\"ok\")\n").expect("write fixture");
+
+    let mut server = LspTestServer::start(&temp_root);
+    server.initialize(&temp_root);
+    let app_uri = uri_for(&temp_root.join("app.py"));
+
+    fs::write(temp_root.join("app.py"), "def run():\n    missing_value\n")
+        .expect("rewrite fixture");
+    server.write(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didSave",
+        "params": {"textDocument": {"uri": app_uri}}
+    }));
+
+    let publish = server.read_notification("textDocument/publishDiagnostics");
+    let items = publish["params"]["diagnostics"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected diagnostics array, got {publish}"));
+    assert!(
+        items.iter().any(|item| item["source"] == "bifrost-python"
+            && item["code"] == "python_unrecognized_symbol"
+            && item["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("missing_value"))),
+        "expected publishDiagnostics semantic Python item: {publish}"
     );
 
     server.shutdown(99);
