@@ -7772,7 +7772,7 @@ fn bifrost_lsp_server_formatting_uses_did_open_overlay() {
 
 #[cfg(unix)]
 #[test]
-fn bifrost_lsp_server_formatting_uses_request_time_snapshot() {
+fn bifrost_lsp_server_formatting_suppresses_stale_snapshot_edits() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().canonicalize().expect("canon temp");
     let file_path = root.join("lib.rs");
@@ -7843,9 +7843,122 @@ fn bifrost_lsp_server_formatting_uses_request_time_snapshot() {
     let edits = response["result"]
         .as_array()
         .unwrap_or_else(|| panic!("expected formatting edits, got {response}"));
-    assert_eq!(edits[0]["newText"], "FN BEFORE() {}\n");
+    assert!(
+        edits.is_empty(),
+        "expected stale formatting response to be suppressed, got {response}"
+    );
 
     shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[cfg(unix)]
+#[test]
+fn bifrost_lsp_server_formatting_cancel_stops_active_formatter() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("lib.rs");
+    let stub_path = root.join("slow-format");
+    fs::write(&file_path, "fn main() {}\n").expect("write disk file");
+    write_stub_command(&stub_path, "#!/bin/sh\nsleep 10\ncat\n");
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server_with_params(
+        &root,
+        json!({
+            "processId": null,
+            "rootUri": uri_for(&root),
+            "capabilities": {},
+            "initializationOptions": {
+                "formatterCommands": [{
+                    "include": ["*.rs"],
+                    "language": "rust",
+                    "command": stub_path.display().to_string()
+                }]
+            }
+        }),
+    );
+    let file_uri = uri_for(&file_path);
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "textDocument/formatting",
+            "params": {
+                "textDocument": {"uri": file_uri},
+                "options": {"tabSize": 4, "insertSpaces": true}
+            }
+        }),
+    );
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "$/cancelRequest",
+            "params": {"id": 10}
+        }),
+    );
+
+    let response = read_response_for_id(&mut reader, &mut stderr, 10);
+    assert_eq!(response["error"]["code"], -32800, "{response}");
+    let message = response["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("cancelled"), "{response}");
+
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[cfg(unix)]
+#[test]
+fn bifrost_lsp_server_formatting_shutdown_cancels_active_formatter() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("lib.rs");
+    let stub_path = root.join("slow-format");
+    fs::write(&file_path, "fn main() {}\n").expect("write disk file");
+    write_stub_command(&stub_path, "#!/bin/sh\nsleep 10\ncat\n");
+
+    let (mut child, mut stdin, mut reader, mut stderr) = start_lsp_server_with_params(
+        &root,
+        json!({
+            "processId": null,
+            "rootUri": uri_for(&root),
+            "capabilities": {},
+            "initializationOptions": {
+                "formatterCommands": [{
+                    "include": ["*.rs"],
+                    "language": "rust",
+                    "command": stub_path.display().to_string()
+                }]
+            }
+        }),
+    );
+    let file_uri = uri_for(&file_path);
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "textDocument/formatting",
+            "params": {
+                "textDocument": {"uri": file_uri},
+                "options": {"tabSize": 4, "insertSpaces": true}
+            }
+        }),
+    );
+
+    let started = std::time::Instant::now();
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 99, "method": "shutdown"}),
+    );
+    let _ = read_response_for_id(&mut reader, &mut stderr, 99);
+    write_message(&mut stdin, json!({"jsonrpc": "2.0", "method": "exit"}));
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "shutdown waited for slow formatter instead of cancelling it"
+    );
 }
 
 #[cfg(unix)]

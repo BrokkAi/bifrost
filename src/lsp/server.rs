@@ -13,9 +13,9 @@ use lsp_server::{
     Response,
 };
 use lsp_types::notification::{
-    DidChangeTextDocument, DidChangeWatchedFiles, DidChangeWorkspaceFolders, DidCloseTextDocument,
-    DidOpenTextDocument, DidSaveTextDocument, Notification as LspNotificationTrait, Progress,
-    PublishDiagnostics,
+    Cancel, DidChangeTextDocument, DidChangeWatchedFiles, DidChangeWorkspaceFolders,
+    DidCloseTextDocument, DidOpenTextDocument, DidSaveTextDocument,
+    Notification as LspNotificationTrait, Progress, PublishDiagnostics,
 };
 use lsp_types::request::{
     CallHierarchyIncomingCalls, CallHierarchyOutgoingCalls, CallHierarchyPrepare, Completion,
@@ -26,11 +26,12 @@ use lsp_types::request::{
     WorkDoneProgressCreate, WorkspaceSymbolRequest,
 };
 use lsp_types::{
-    DidChangeTextDocumentParams, DidChangeWatchedFilesParams, DidChangeWorkspaceFoldersParams,
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
-    FileChangeType, InitializeParams, ProgressParams, ProgressParamsValue, ProgressToken,
-    PublishDiagnosticsParams, Uri, WorkDoneProgress, WorkDoneProgressBegin,
-    WorkDoneProgressCreateParams, WorkDoneProgressEnd, WorkDoneProgressReport,
+    CancelParams, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
+    DidChangeWorkspaceFoldersParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+    DidSaveTextDocumentParams, FileChangeType, InitializeParams, NumberOrString, ProgressParams,
+    ProgressParamsValue, ProgressToken, PublishDiagnosticsParams, Uri, WorkDoneProgress,
+    WorkDoneProgressBegin, WorkDoneProgressCreateParams, WorkDoneProgressEnd,
+    WorkDoneProgressReport,
 };
 
 use crate::analyzer::{
@@ -101,6 +102,10 @@ pub(crate) fn run_with_connection(
     let mut state = state_result?;
 
     let result = main_loop(&connection, &mut state, pending_messages);
+    state.formatting_jobs.cancel_all();
+    state
+        .formatting_jobs
+        .wait_for_empty(FORMATTER_SHUTDOWN_GRACE);
     drop(progress);
     // Drop the connection before joining the IO threads so the writer thread
     // sees its sender close and exits — otherwise io_threads.join() blocks
@@ -737,31 +742,7 @@ fn handle_formatting_request(
                 .map_err(|err| format!("Failed to send LSP response: {err}"));
         }
     };
-    let rules = state.formatter_commands.clone();
-    let prepared = match formatting::prepare(state.project(), &params, &rules) {
-        Ok(Some(prepared)) => prepared,
-        Ok(None) => {
-            let response = Response::new_ok(id, serde_json::Value::Null);
-            return connection
-                .sender
-                .send(Message::Response(response))
-                .map_err(|err| format!("Failed to send LSP response: {err}"));
-        }
-        Err(message) => {
-            let response = Response::new_err(id, ErrorCode::InternalError as i32, message);
-            return connection
-                .sender
-                .send(Message::Response(response))
-                .map_err(|err| format!("Failed to send LSP response: {err}"));
-        }
-    };
-    if state
-        .active_formatting_requests
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-            (active < MAX_CONCURRENT_FORMATTING_REQUESTS).then_some(active + 1)
-        })
-        .is_err()
-    {
+    let Some(slot) = state.formatting_jobs.try_acquire() else {
         let response = Response::new_err(
             id,
             ErrorCode::InternalError as i32,
@@ -771,21 +752,64 @@ fn handle_formatting_request(
             .sender
             .send(Message::Response(response))
             .map_err(|err| format!("Failed to send LSP response: {err}"));
-    }
+    };
+    let document_generation = state.document_generation(&params.text_document.uri);
+    let document_uri = params.text_document.uri.clone();
+    let rules = state.formatter_commands.clone();
+    let prepared = match formatting::prepare(state.project(), &params, &rules) {
+        Ok(Some(prepared)) => prepared,
+        Ok(None) => {
+            drop(slot);
+            let response = Response::new_ok(id, serde_json::Value::Null);
+            return connection
+                .sender
+                .send(Message::Response(response))
+                .map_err(|err| format!("Failed to send LSP response: {err}"));
+        }
+        Err(message) => {
+            drop(slot);
+            let response = Response::new_err(id, ErrorCode::InternalError as i32, message);
+            return connection
+                .sender
+                .send(Message::Response(response))
+                .map_err(|err| format!("Failed to send LSP response: {err}"));
+        }
+    };
+    let cancellation = formatting::FormatterCancellation::new();
+    state
+        .formatting_jobs
+        .insert(id.clone(), cancellation.clone());
     let sender = connection.sender.clone();
-    let active = Arc::clone(&state.active_formatting_requests);
+    let generations = Arc::clone(&state.document_generations);
+    let jobs = state.formatting_jobs.clone();
     thread::spawn(move || {
-        let result = formatting::run_prepared(prepared);
-        let response = match result {
-            Ok(edits) => match serde_json::to_value(edits) {
-                Ok(value) => Response::new_ok(id.clone(), value),
-                Err(err) => Response::new_err(
-                    id.clone(),
-                    ErrorCode::InternalError as i32,
-                    format!("Failed to serialize {method} result: {err}"),
-                ),
-            },
-            Err(message) => Response::new_err(id.clone(), ErrorCode::InternalError as i32, message),
+        let result = formatting::run_prepared_with_cancellation(prepared, &cancellation);
+        let current_generation = generations
+            .lock()
+            .expect("document generation lock poisoned")
+            .get(document_uri.as_str())
+            .copied()
+            .unwrap_or(0);
+        let response = if current_generation != document_generation && !cancellation.is_cancelled()
+        {
+            Response::new_ok(id.clone(), serde_json::Value::Array(Vec::new()))
+        } else {
+            match result {
+                Ok(edits) => match serde_json::to_value(edits) {
+                    Ok(value) => Response::new_ok(id.clone(), value),
+                    Err(err) => Response::new_err(
+                        id.clone(),
+                        ErrorCode::InternalError as i32,
+                        format!("Failed to serialize {method} result: {err}"),
+                    ),
+                },
+                Err(message) if cancellation.is_cancelled() => {
+                    Response::new_err(id.clone(), ErrorCode::RequestCanceled as i32, message)
+                }
+                Err(message) => {
+                    Response::new_err(id.clone(), ErrorCode::InternalError as i32, message)
+                }
+            }
         };
         if let Some(error) = response.error.as_ref() {
             eprintln!(
@@ -799,7 +823,8 @@ fn handle_formatting_request(
                 method, id
             );
         }
-        active.fetch_sub(1, Ordering::AcqRel);
+        jobs.remove(&id);
+        drop(slot);
     });
     Ok(())
 }
@@ -842,6 +867,13 @@ where
             ),
         },
         Err(message) => Response::new_err(id, ErrorCode::InternalError as i32, message),
+    }
+}
+
+fn request_id_from_number_or_string(id: NumberOrString) -> RequestId {
+    match id {
+        NumberOrString::Number(value) => RequestId::from(value),
+        NumberOrString::String(value) => RequestId::from(value),
     }
 }
 
@@ -1022,6 +1054,13 @@ fn handle_notification(
             }
             Ok(())
         }
+        Cancel::METHOD => {
+            let params: CancelParams = serde_json::from_value(note.params)
+                .map_err(|err| format!("Failed to decode {} params: {err}", Cancel::METHOD))?;
+            let id = request_id_from_number_or_string(params.id);
+            state.formatting_jobs.cancel(&id);
+            Ok(())
+        }
         _ => {
             // `initialized` and every unsupported notification falls through;
             // unknown notifications are spec-required to be silently ignored.
@@ -1100,7 +1139,8 @@ pub(crate) struct ServerState {
     malformed_didchange_log: Mutex<HashMap<String, Instant>>,
     published_diagnostic_uris: Vec<Uri>,
     open_documents: HashMap<String, OpenDocument>,
-    active_formatting_requests: Arc<AtomicUsize>,
+    document_generations: Arc<Mutex<HashMap<String, u64>>>,
+    formatting_jobs: FormattingJobs,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1146,6 +1186,82 @@ const MALFORMED_DIDCHANGE_LOG_THROTTLE: Duration = Duration::from_secs(60);
 /// otherwise send a stream of distinct URIs and grow the map without bound.
 const MALFORMED_DIDCHANGE_LOG_MAX_ENTRIES: usize = 256;
 const MAX_CONCURRENT_FORMATTING_REQUESTS: usize = 2;
+const FORMATTER_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+
+struct FormattingSlot {
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for FormattingSlot {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[derive(Clone, Default)]
+struct FormattingJobs {
+    active: Arc<AtomicUsize>,
+    jobs: Arc<Mutex<HashMap<RequestId, formatting::FormatterCancellation>>>,
+}
+
+impl FormattingJobs {
+    fn try_acquire(&self) -> Option<FormattingSlot> {
+        self.active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < MAX_CONCURRENT_FORMATTING_REQUESTS).then_some(active + 1)
+            })
+            .ok()
+            .map(|_| FormattingSlot {
+                active: Arc::clone(&self.active),
+            })
+    }
+
+    fn insert(&self, id: RequestId, cancellation: formatting::FormatterCancellation) {
+        self.jobs
+            .lock()
+            .expect("formatting job lock poisoned")
+            .insert(id, cancellation);
+    }
+
+    fn remove(&self, id: &RequestId) {
+        self.jobs
+            .lock()
+            .expect("formatting job lock poisoned")
+            .remove(id);
+    }
+
+    fn cancel(&self, id: &RequestId) {
+        let job = self
+            .jobs
+            .lock()
+            .expect("formatting job lock poisoned")
+            .get(id)
+            .cloned();
+        if let Some(job) = job {
+            job.cancel();
+        }
+    }
+
+    fn cancel_all(&self) {
+        let jobs: Vec<_> = self
+            .jobs
+            .lock()
+            .expect("formatting job lock poisoned")
+            .values()
+            .cloned()
+            .collect();
+        for job in jobs {
+            job.cancel();
+        }
+    }
+
+    fn wait_for_empty(&self, timeout: Duration) {
+        let started = Instant::now();
+        while self.active.load(Ordering::Acquire) > 0 && started.elapsed() < timeout {
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
 
 impl ServerState {
     fn new(config: LspWorkspaceConfig, progress: Option<&StartupProgress>) -> Result<Self, String> {
@@ -1173,7 +1289,8 @@ impl ServerState {
             malformed_didchange_log: Mutex::new(HashMap::new()),
             published_diagnostic_uris: Vec::new(),
             open_documents: HashMap::new(),
-            active_formatting_requests: Arc::new(AtomicUsize::new(0)),
+            document_generations: Arc::new(Mutex::new(HashMap::new())),
+            formatting_jobs: FormattingJobs::default(),
         })
     }
 
@@ -1256,6 +1373,7 @@ impl ServerState {
     }
 
     fn remember_open_document(&mut self, uri: Uri, abs_path: PathBuf, text: String) {
+        self.bump_document_generation(&uri);
         self.open_documents.insert(
             uri.as_str().to_string(),
             OpenDocument {
@@ -1267,13 +1385,33 @@ impl ServerState {
     }
 
     fn update_open_document_text(&mut self, uri: &Uri, text: String) {
+        self.bump_document_generation(uri);
         if let Some(document) = self.open_documents.get_mut(uri.as_str()) {
             document.text = text;
         }
     }
 
     fn forget_open_document(&mut self, uri: &Uri) {
+        self.bump_document_generation(uri);
         self.open_documents.remove(uri.as_str());
+    }
+
+    fn bump_document_generation(&self, uri: &Uri) {
+        let mut generations = self
+            .document_generations
+            .lock()
+            .expect("document generation lock poisoned");
+        let generation = generations.entry(uri.as_str().to_string()).or_insert(0);
+        *generation = generation.saturating_add(1);
+    }
+
+    fn document_generation(&self, uri: &Uri) -> u64 {
+        self.document_generations
+            .lock()
+            .expect("document generation lock poisoned")
+            .get(uri.as_str())
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Emit a single stderr warning for `uri` if we haven't logged one

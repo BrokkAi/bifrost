@@ -1,7 +1,8 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -50,6 +51,41 @@ pub(crate) struct PreparedFormatting {
     line_starts: Vec<usize>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FormatterCancellation {
+    cancelled: Arc<AtomicBool>,
+    pid: Arc<AtomicU32>,
+}
+
+impl FormatterCancellation {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        let pid = self.pid.load(Ordering::Acquire);
+        if pid != 0 {
+            terminate_process_id(pid);
+        }
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    fn set_pid(&self, pid: u32) {
+        self.pid.store(pid, Ordering::Release);
+        if self.is_cancelled() {
+            terminate_process_id(pid);
+        }
+    }
+
+    fn clear_pid(&self) {
+        self.pid.store(0, Ordering::Release);
+    }
+}
+
 struct FormatContext<'a> {
     file: &'a ProjectFile,
     workspace_root: PathBuf,
@@ -87,13 +123,16 @@ pub(crate) fn prepare(
     }))
 }
 
-pub(crate) fn run_prepared(prepared: PreparedFormatting) -> Result<Vec<TextEdit>, String> {
+pub(crate) fn run_prepared_with_cancellation(
+    prepared: PreparedFormatting,
+    cancellation: &FormatterCancellation,
+) -> Result<Vec<TextEdit>, String> {
     let PreparedFormatting {
         command,
         content,
         line_starts,
     } = prepared;
-    let formatted = run_formatter_command(&command, &content)?;
+    let formatted = run_formatter_command(&command, &content, cancellation)?;
     if formatted == content {
         return Ok(Vec::new());
     }
@@ -144,11 +183,8 @@ fn formatter_command_from_rule(
         .iter()
         .map(|arg| expand_placeholders(arg, context))
         .collect();
-    Ok(FormatterCommand {
-        command: command.to_string(),
-        args,
-        cwd,
-    })
+    let command = configured_command_path(command, &cwd)?;
+    Ok(FormatterCommand { command, args, cwd })
 }
 
 fn rule_matches(rule: &FormatterCommandRule, context: &FormatContext<'_>) -> bool {
@@ -219,6 +255,29 @@ fn builtin_command_path(command: &str, _cwd: &Path) -> Option<String> {
 
 #[cfg(windows)]
 fn builtin_command_path(command: &str, cwd: &Path) -> Option<String> {
+    resolve_windows_command_outside_cwd(command, cwd)
+}
+
+#[cfg(not(windows))]
+fn configured_command_path(command: &str, _cwd: &Path) -> Result<String, String> {
+    Ok(command.to_string())
+}
+
+#[cfg(windows)]
+fn configured_command_path(command: &str, cwd: &Path) -> Result<String, String> {
+    if Path::new(command).components().count() > 1 {
+        return Ok(command.to_string());
+    }
+    resolve_windows_command_outside_cwd(command, cwd).ok_or_else(|| {
+        format!(
+            "formatter command `{command}` was not found outside formatter cwd {}",
+            cwd.display()
+        )
+    })
+}
+
+#[cfg(windows)]
+fn resolve_windows_command_outside_cwd(command: &str, cwd: &Path) -> Option<String> {
     let paths = std::env::var_os("PATH")?;
     let extensions = std::env::var_os("PATHEXT")
         .and_then(|value| value.into_string().ok())
@@ -271,8 +330,19 @@ fn nearest_manifest(start: &Path, stop_at: &Path, name: &str) -> Option<PathBuf>
     None
 }
 
-fn run_formatter_command(command: &FormatterCommand, input: &str) -> Result<String, String> {
+fn run_formatter_command(
+    command: &FormatterCommand,
+    input: &str,
+    cancellation: &FormatterCancellation,
+) -> Result<String, String> {
+    if cancellation.is_cancelled() {
+        return Err(format!(
+            "formatter `{}` was cancelled",
+            command_line_for_message(command)
+        ));
+    }
     let mut child = spawn_formatter(command)?;
+    cancellation.set_pid(child.id());
     let stdin = child.stdin.take().ok_or_else(|| {
         format!(
             "failed to open stdin for formatter `{}`",
@@ -294,7 +364,9 @@ fn run_formatter_command(command: &FormatterCommand, input: &str) -> Result<Stri
     let stdout_reader = spawn_pipe_reader(stdout, max_stdout_bytes(input.len()));
     let stderr_reader = spawn_pipe_reader(stderr, MAX_FORMATTER_STDERR_BYTES);
     let stdin_writer = spawn_stdin_writer(stdin, input.as_bytes().to_vec());
-    let status = wait_for_formatter(&mut child, command)?;
+    let status = wait_for_formatter(&mut child, command, cancellation);
+    cancellation.clear_pid();
+    let status = status?;
     collect_stdin_writer(stdin_writer, command)?;
     let stdout = collect_pipe("stdout", stdout_reader, command, Some(&mut child))?;
     let stderr = collect_pipe("stderr", stderr_reader, command, Some(&mut child))?;
@@ -317,9 +389,18 @@ fn run_formatter_command(command: &FormatterCommand, input: &str) -> Result<Stri
 fn wait_for_formatter(
     child: &mut std::process::Child,
     command: &FormatterCommand,
+    cancellation: &FormatterCancellation,
 ) -> Result<std::process::ExitStatus, String> {
     let started = Instant::now();
     loop {
+        if cancellation.is_cancelled() {
+            terminate_formatter(child);
+            let _ = child.wait();
+            return Err(format!(
+                "formatter `{}` was cancelled",
+                command_line_for_message(command)
+            ));
+        }
         match child.try_wait() {
             Ok(Some(status)) => return Ok(status),
             Ok(None) if started.elapsed() >= FORMATTER_TIMEOUT => {
@@ -379,17 +460,28 @@ fn configure_formatter_process(_command: &mut Command) {}
 
 #[cfg(unix)]
 fn terminate_formatter(child: &mut std::process::Child) {
-    let pid = child.id() as libc::pid_t;
+    terminate_process_id(child.id());
+    let _ = child.kill();
+}
+
+#[cfg(unix)]
+fn terminate_process_id(pid: u32) {
+    let pid = pid as libc::pid_t;
     unsafe {
         libc::kill(-pid, libc::SIGKILL);
+        libc::kill(pid, libc::SIGKILL);
     }
-    let _ = child.kill();
 }
 
 #[cfg(not(unix))]
 fn terminate_formatter(child: &mut std::process::Child) {
-    terminate_process_tree(child.id());
+    terminate_process_id(child.id());
     let _ = child.kill();
+}
+
+#[cfg(not(unix))]
+fn terminate_process_id(pid: u32) {
+    terminate_process_tree(pid);
 }
 
 #[cfg(windows)]
@@ -873,6 +965,10 @@ mod tests {
         assert!(discover_builtin_formatter(&ctx).is_none());
     }
 
+    fn run_test_formatter(command: &FormatterCommand, input: &str) -> Result<String, String> {
+        run_formatter_command(command, input, &FormatterCancellation::new())
+    }
+
     #[cfg(unix)]
     #[test]
     fn formatter_executor_passes_stdin_and_returns_stdout() {
@@ -884,7 +980,7 @@ mod tests {
             args: Vec::new(),
             cwd: temp.path().to_path_buf(),
         };
-        let output = run_formatter_command(&command, "hello\n").unwrap();
+        let output = run_test_formatter(&command, "hello\n").unwrap();
         assert_eq!(output, "HELLO\n");
     }
 
@@ -900,7 +996,7 @@ mod tests {
             cwd: temp.path().to_path_buf(),
         };
         let input = "x".repeat(256 * 1024);
-        let output = run_formatter_command(&command, &input).unwrap();
+        let output = run_test_formatter(&command, &input).unwrap();
         assert_eq!(output, input);
     }
 
@@ -915,7 +1011,7 @@ mod tests {
             args: Vec::new(),
             cwd: temp.path().to_path_buf(),
         };
-        let error = run_formatter_command(&command, "hello\n").unwrap_err();
+        let error = run_test_formatter(&command, "hello\n").unwrap_err();
         assert!(error.contains("exited with status"), "{error}");
         assert!(error.contains("nope"), "{error}");
     }
@@ -937,7 +1033,7 @@ mod tests {
             args: Vec::new(),
             cwd: temp.path().to_path_buf(),
         };
-        let error = run_formatter_command(&command, "hello\n").unwrap_err();
+        let error = run_test_formatter(&command, "hello\n").unwrap_err();
         assert!(error.contains("timed out"), "{error}");
     }
 
@@ -963,7 +1059,7 @@ mod tests {
             ],
             cwd: temp.path().to_path_buf(),
         };
-        let output = run_formatter_command(&command, "fn main(){println!(\"hi\");}\n").unwrap();
+        let output = run_test_formatter(&command, "fn main(){println!(\"hi\");}\n").unwrap();
         assert!(output.contains("fn main()"), "{output}");
         assert!(output.contains("println!"), "{output}");
     }
