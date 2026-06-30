@@ -5,7 +5,7 @@ use crate::analyzer::usages::rust_graph::hits::{
     member_hit_enclosing, push_member_hit, record_hit, record_module_qualified_hits,
 };
 use crate::analyzer::usages::rust_graph::resolver::is_trait_owner;
-use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, RustAnalyzer};
+use crate::analyzer::{CodeUnit, IAnalyzer, ImportAnalysisProvider, ProjectFile, RustAnalyzer};
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::compute_line_starts;
 use rayon::prelude::*;
@@ -22,33 +22,33 @@ pub(crate) struct RustProjectGraph {
     parsed: HashMap<ProjectFile, ParsedFile>,
 }
 
-/// Parse every Rust file once for tree reuse during the forward scan. Re-export
-/// and importer resolution now lives on the analyzer (`RustAnalyzer::usage_*`,
-/// see [`super::super::rust_graph`]), so this no longer builds a cross-file graph.
-pub(super) fn build_rust_graph(analyzer: &RustAnalyzer) -> RustProjectGraph {
-    let parsed: HashMap<ProjectFile, ParsedFile> = analyzer
-        .get_analyzed_files()
+pub(super) fn build_rust_graph_for_files(
+    files: impl IntoIterator<Item = ProjectFile>,
+) -> RustProjectGraph {
+    let parsed: HashMap<ProjectFile, ParsedFile> = files
         .into_iter()
         .collect::<Vec<_>>()
         .par_iter()
-        .filter_map(|file| {
-            let source = file.read_to_string().ok()?;
-            let mut parser = Parser::new();
-            parser
-                .set_language(&tree_sitter_rust::LANGUAGE.into())
-                .ok()?;
-            let tree = parser.parse(source.as_str(), None)?;
-            Some((
-                file.clone(),
-                ParsedFile {
-                    source: Arc::new(source),
-                    tree,
-                },
-            ))
-        })
+        .filter_map(parse_rust_graph_file)
         .collect();
 
     RustProjectGraph { parsed }
+}
+
+fn parse_rust_graph_file(file: &ProjectFile) -> Option<(ProjectFile, ParsedFile)> {
+    let source = file.read_to_string().ok()?;
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .ok()?;
+    let tree = parser.parse(source.as_str(), None)?;
+    Some((
+        file.clone(),
+        ParsedFile {
+            source: Arc::new(source),
+            tree,
+        },
+    ))
 }
 
 pub(super) fn effective_scan_files(
@@ -72,9 +72,21 @@ pub(super) fn effective_scan_files(
         return filtered_candidates;
     }
 
+    let seed_names: HashSet<&str> = seeds.iter().map(|(_, name)| name.as_str()).collect();
+    let textual_candidates = analyzed.into_iter().filter(|file| {
+        file.read_to_string().ok().is_some_and(|source| {
+            source.contains(target.identifier())
+                || seed_names
+                    .iter()
+                    .any(|seed_name| source.contains(seed_name))
+        })
+    });
+
     analyzer
         .usage_importers(seeds)
         .into_iter()
+        .chain(analyzer.referencing_files_of(target.source()))
+        .chain(textual_candidates)
         .chain(std::iter::once(target.source().clone()))
         .collect()
 }

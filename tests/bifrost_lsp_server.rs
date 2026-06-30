@@ -176,11 +176,11 @@ fn bifrost_lsp_server_handles_initialize_and_shutdown() {
     );
     assert_eq!(
         initialize["result"]["capabilities"]["typeDefinitionProvider"], true,
-        "typeDefinitionProvider should be advertised: {initialize}"
+        "typeDefinitionProvider should be advertised while the handler is supported: {initialize}"
     );
     assert_eq!(
         initialize["result"]["capabilities"]["implementationProvider"], true,
-        "implementationProvider should be advertised: {initialize}"
+        "implementationProvider should be advertised while the handler is supported: {initialize}"
     );
     assert!(
         initialize["result"]["capabilities"]["signatureHelpProvider"].is_object(),
@@ -3916,6 +3916,56 @@ const SCALA_AMBIGUOUS_IMPORT_SOURCE: &str = "package app\nimport alpha.*\nimport
 const DUPLICATE_DECLARATION_NAME_SOURCE: &str =
     "class Widget {\n    Widget Widget() {\n        return this;\n    }\n}\n";
 
+const RUST_ATTRIBUTED_ASYNC_FUNCTION_SOURCE: &str = "\
+#[cfg(test)]
+pub async fn memory_pool() -> SqlitePool {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect(\"memory database should connect\");
+
+    pool
+}
+
+pub async fn caller_one() {
+    memory_pool().await;
+}
+
+pub async fn caller_two() {
+    memory_pool().await;
+}
+";
+
+const RUST_EXTERNAL_GLOB_WITH_LOCAL_IMPORT_MAIN_SOURCE: &str = "\
+mod state;
+
+use sqlx::*;
+use state::AppState;
+
+pub fn app() {
+    let _state: AppState;
+}
+";
+
+const RUST_APP_STATE_SOURCE: &str = "\
+pub struct AppState;
+
+impl AppState {
+    pub fn with_environment() -> Self {
+        Self
+    }
+}
+";
+
+const RUST_EXTERNAL_IMPORT_HOVER_SOURCE: &str = "\
+use sqlx::SqlitePool;
+
+pub async fn connect() -> SqlitePool {
+    todo!()
+}
+";
+
 fn write_comment_targets_fixture(root: &Path) -> PathBuf {
     let file_path = root.join("CommentTargets.java");
     fs::write(&file_path, COMMENT_TARGETS_SOURCE).expect("write CommentTargets.java");
@@ -3925,6 +3975,34 @@ fn write_comment_targets_fixture(root: &Path) -> PathBuf {
 fn write_duplicate_declaration_name_fixture(root: &Path) -> PathBuf {
     let file_path = root.join("Widget.java");
     fs::write(&file_path, DUPLICATE_DECLARATION_NAME_SOURCE).expect("write Widget.java");
+    file_path
+}
+
+fn write_rust_attributed_async_function_fixture(root: &Path) -> PathBuf {
+    let src = root.join("src");
+    fs::create_dir_all(&src).expect("create Rust src");
+    let file_path = src.join("lib.rs");
+    fs::write(&file_path, RUST_ATTRIBUTED_ASYNC_FUNCTION_SOURCE)
+        .expect("write Rust attributed async function fixture");
+    file_path
+}
+
+fn write_rust_external_import_hover_fixture(root: &Path) -> PathBuf {
+    let src = root.join("src");
+    fs::create_dir_all(&src).expect("create Rust src");
+    let file_path = src.join("lib.rs");
+    fs::write(&file_path, RUST_EXTERNAL_IMPORT_HOVER_SOURCE)
+        .expect("write Rust external import hover fixture");
+    file_path
+}
+
+fn write_rust_external_glob_with_local_import_fixture(root: &Path) -> PathBuf {
+    let src = root.join("src");
+    fs::create_dir_all(&src).expect("create Rust src");
+    let file_path = src.join("main.rs");
+    fs::write(&file_path, RUST_EXTERNAL_GLOB_WITH_LOCAL_IMPORT_MAIN_SOURCE)
+        .expect("write Rust external glob local import main fixture");
+    fs::write(src.join("state.rs"), RUST_APP_STATE_SOURCE).expect("write Rust AppState fixture");
     file_path
 }
 
@@ -4119,7 +4197,7 @@ fn bifrost_lsp_server_definition_and_hover_select_duplicate_declaration_name() {
     assert_eq!(
         definition_items.len(),
         1,
-        "method declaration should resolve itself, got {definition}"
+        "definition on declaration should resolve to its current location, got {definition}"
     );
     assert_eq!(
         definition_items[0]["range"]["start"]["line"], 1,
@@ -4135,6 +4213,206 @@ fn bifrost_lsp_server_definition_and_hover_select_duplicate_declaration_name() {
     assert_eq!(
         hover["result"]["range"]["start"]["character"], 11,
         "hover should highlight the method name under the cursor, not the return type: {hover}"
+    );
+}
+
+#[test]
+fn bifrost_lsp_server_definition_selects_rust_attributed_async_function_declaration() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = write_rust_attributed_async_function_fixture(&root);
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+
+    let (line, character) = position_after(RUST_ATTRIBUTED_ASYNC_FUNCTION_SOURCE, "pub async fn ");
+    let definition = text_document_position_response(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        10,
+        "textDocument/definition",
+        &file_uri,
+        line,
+        character,
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+
+    let definition_items = definition["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected definition locations, got {definition}"));
+    assert_eq!(
+        definition_items.len(),
+        1,
+        "definition on declaration should resolve to its current location, got {definition}"
+    );
+    assert_eq!(
+        definition_items[0]["range"]["start"]["line"], 1,
+        "definition should target the function declaration, got {definition}"
+    );
+}
+
+#[test]
+fn bifrost_lsp_server_definition_selects_rust_function_declaration_across_identifier_token() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = write_rust_attributed_async_function_fixture(&root);
+
+    let (child, stdin, reader, stderr) = start_lsp_server(&root);
+    let mut client = LspTestClient::new(stdin, reader, stderr, 10);
+    let file_uri = uri_for(&file_path);
+
+    let name_start = RUST_ATTRIBUTED_ASYNC_FUNCTION_SOURCE
+        .find("memory_pool()")
+        .expect("function name exists");
+    let name_end = name_start + "memory_pool".len();
+    let offsets = [
+        ("start", name_start),
+        ("middle", name_start + "memory".len()),
+        ("end", name_end),
+    ];
+
+    for (label, offset) in offsets {
+        let (line, character) = position_at(RUST_ATTRIBUTED_ASYNC_FUNCTION_SOURCE, offset);
+        let definition = client.text_document_position_response(
+            "textDocument/definition",
+            &file_uri,
+            line,
+            character,
+        );
+        let definition_items = definition["result"].as_array().unwrap_or_else(|| {
+            panic!("expected definition locations from {label} cursor, got {definition}")
+        });
+        assert_eq!(
+            definition_items.len(),
+            1,
+            "{label} cursor should resolve one definition, got {definition}"
+        );
+        assert_eq!(
+            definition_items[0]["range"]["start"]["line"], 1,
+            "{label} cursor should target the function declaration, got {definition}"
+        );
+    }
+
+    let (stdin, reader, stderr) = client.into_parts();
+    shutdown_lsp(child, stdin, reader, stderr);
+}
+
+#[test]
+fn bifrost_lsp_server_definition_resolves_rust_attributed_async_function_call_to_declaration() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = write_rust_attributed_async_function_fixture(&root);
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+
+    let (line, character) =
+        position_after(RUST_ATTRIBUTED_ASYNC_FUNCTION_SOURCE, "    memory_pool");
+    let definition = text_document_position_response(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        10,
+        "textDocument/definition",
+        &file_uri,
+        line,
+        character,
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+
+    let definition_items = definition["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected definition locations, got {definition}"));
+    assert_eq!(
+        definition_items.len(),
+        1,
+        "function call should resolve to the declaration, got {definition}"
+    );
+    assert_eq!(
+        definition_items[0]["range"]["start"]["line"], 1,
+        "definition should target the function declaration, got {definition}"
+    );
+}
+
+#[test]
+fn bifrost_lsp_server_hover_fast_fails_rust_external_import() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = write_rust_external_import_hover_fixture(&root);
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+
+    let (line, character) = position_after(RUST_EXTERNAL_IMPORT_HOVER_SOURCE, "use sqlx::");
+    let hover = text_document_position_response(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        10,
+        "textDocument/hover",
+        &file_uri,
+        line,
+        character,
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+
+    assert!(
+        hover["result"].is_null(),
+        "external Rust imports should not trigger workspace definition hover, got {hover}"
+    );
+}
+
+#[test]
+fn bifrost_lsp_server_definition_resolves_rust_local_import_despite_external_glob() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = write_rust_external_glob_with_local_import_fixture(&root);
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+
+    let app_state_offset = RUST_EXTERNAL_GLOB_WITH_LOCAL_IMPORT_MAIN_SOURCE
+        .find("AppState;")
+        .expect("AppState type annotation exists")
+        + "App".len();
+    let (line, character) = position_at(
+        RUST_EXTERNAL_GLOB_WITH_LOCAL_IMPORT_MAIN_SOURCE,
+        app_state_offset,
+    );
+    let definition = text_document_position_response(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        10,
+        "textDocument/definition",
+        &file_uri,
+        line,
+        character,
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+
+    let definition_items = definition["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected definition locations, got {definition}"));
+    assert_eq!(
+        definition_items.len(),
+        1,
+        "local AppState import should resolve despite external glob, got {definition}"
+    );
+    assert!(
+        definition_items[0]["uri"]
+            .as_str()
+            .is_some_and(|uri| uri.ends_with("/src/state.rs")),
+        "definition should target sibling state.rs, got {definition}"
+    );
+    assert_eq!(
+        definition_items[0]["range"]["start"]["line"], 0,
+        "definition should target the AppState struct declaration, got {definition}"
     );
 }
 
@@ -7964,6 +8242,10 @@ fn assert_signature_parameter_offsets(result: &Value, signature_index: usize, ex
 
 fn position_after(source: &str, needle: &str) -> (u64, u64) {
     let byte_offset = source.find(needle).expect("needle exists") + needle.len();
+    position_at(source, byte_offset)
+}
+
+fn position_at(source: &str, byte_offset: usize) -> (u64, u64) {
     let before = &source[..byte_offset];
     let line = before.bytes().filter(|byte| *byte == b'\n').count() as u64;
     let line_start = before.rfind('\n').map(|index| index + 1).unwrap_or(0);

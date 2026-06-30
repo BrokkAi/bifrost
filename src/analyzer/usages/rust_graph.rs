@@ -8,7 +8,8 @@ use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::model::{FuzzyResult, ReferenceGraphResult};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::rust_graph::extractor::{
-    build_rust_graph, effective_scan_files, scan_files_for_member_target, scan_files_for_target,
+    build_rust_graph_for_files, effective_scan_files, scan_files_for_member_target,
+    scan_files_for_target,
 };
 use crate::analyzer::usages::rust_graph::resolver::{
     infer_graph_seeds, is_graph_visible_member_target, is_member_target,
@@ -63,26 +64,19 @@ impl<'a> UsageQueryResolver<'a> for RustQueryResolver<'a> {
         };
         let rust = self.rust;
 
-        let graph = build_rust_graph(rust);
-        let graph = &graph;
-        let seeds = infer_graph_seeds(rust, target);
-
-        let hits = if seeds.is_empty() && supports_same_file_local_scan(rust, target) {
-            scan_files_for_target(
-                analyzer,
-                rust,
-                graph,
-                [target.source().clone()].into_iter().collect(),
-                target,
-                None,
-            )
-        } else if seeds.is_empty() {
-            return GraphUsageOutcome::fallback_safe(
-                target.fq_name(),
-                GraphFailureReason::NoGraphSeed("no export seed resolved"),
-                "RustExportUsageGraphStrategy",
-            );
+        let hits = if supports_same_file_local_scan(rust, target) {
+            let scan_files: HashSet<ProjectFile> = [target.source().clone()].into_iter().collect();
+            let graph = build_rust_graph_for_files(scan_files.clone());
+            scan_files_for_target(analyzer, rust, &graph, scan_files, target, None)
         } else if is_member_target(rust, target) {
+            let seeds = infer_graph_seeds(rust, target);
+            if seeds.is_empty() {
+                return GraphUsageOutcome::fallback_safe(
+                    target.fq_name(),
+                    GraphFailureReason::NoGraphSeed("no export seed resolved"),
+                    "RustExportUsageGraphStrategy",
+                );
+            }
             if !is_graph_visible_member_target(rust, target) {
                 return GraphUsageOutcome::Resolved(FuzzyResult::success(
                     target.clone(),
@@ -90,10 +84,20 @@ impl<'a> UsageQueryResolver<'a> for RustQueryResolver<'a> {
                 ));
             }
             let scan_files = effective_scan_files(rust, candidate_files, target, &seeds);
-            scan_files_for_member_target(analyzer, graph, rust, scan_files, target, &seeds)
+            let graph = build_rust_graph_for_files(scan_files.clone());
+            scan_files_for_member_target(analyzer, &graph, rust, scan_files, target, &seeds)
         } else {
+            let seeds = infer_graph_seeds(rust, target);
+            if seeds.is_empty() {
+                return GraphUsageOutcome::fallback_safe(
+                    target.fq_name(),
+                    GraphFailureReason::NoGraphSeed("no export seed resolved"),
+                    "RustExportUsageGraphStrategy",
+                );
+            }
             let scan_files = effective_scan_files(rust, candidate_files, target, &seeds);
-            scan_files_for_target(analyzer, rust, graph, scan_files, target, Some(&seeds))
+            let graph = build_rust_graph_for_files(scan_files.clone());
+            scan_files_for_target(analyzer, rust, &graph, scan_files, target, Some(&seeds))
         };
 
         let hits: BTreeSet<_> = hits

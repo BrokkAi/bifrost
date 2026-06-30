@@ -84,6 +84,79 @@ pub fn get_summaries() {
 }
 
 #[test]
+fn rust_graph_strategy_finds_pub_cfg_test_async_function_calls() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[(
+        "src/db.rs",
+        r#"
+#[cfg(test)]
+pub async fn memory_pool() {}
+
+#[cfg(test)]
+pub async fn caller_one() {
+    memory_pool().await;
+}
+"#,
+    )]);
+
+    let target = definition(&analyzer, "db.memory_pool");
+    let candidates = BTreeSet::new();
+
+    let result = brokk_bifrost::usages::RustExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates.into_iter().collect(),
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("expected cfg(test) async function usages");
+    assert_eq!(1, hits.len(), "expected the memory_pool() call: {hits:?}");
+}
+
+#[test]
+fn rust_graph_strategy_does_not_treat_negated_cfg_test_as_same_file_only() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/db.rs",
+            r#"
+#[cfg(not(test))]
+pub fn runtime_pool() {}
+"#,
+        ),
+        (
+            "src/lib.rs",
+            r#"
+pub mod db;
+
+use crate::db::runtime_pool;
+
+pub fn caller() {
+    runtime_pool();
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "db.runtime_pool");
+    let candidates = BTreeSet::new();
+
+    let result = brokk_bifrost::usages::RustExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates.into_iter().collect(),
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("expected public function usages outside cfg(test) fast path");
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == project.file("src/lib.rs")),
+        "expected cross-file runtime_pool() usage, got {hits:?}"
+    );
+}
+
+#[test]
 fn rust_graph_strategy_respects_explicit_candidate_files() {
     let (project, analyzer) = rust_analyzer_with_files(&[
         ("src/service.rs", "pub struct Service;\n"),
