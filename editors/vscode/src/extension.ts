@@ -10,6 +10,7 @@ import {
 } from "vscode-languageclient/node";
 import {
   BifrostLaunchConfig,
+  BifrostFormatterCommandRule,
   BifrostInitializationOptions,
   buildLaunchConfig,
   buildMcpConfig,
@@ -125,12 +126,16 @@ async function startClientInner(context: vscode.ExtensionContext): Promise<void>
   const extraArgs = parseExtraArgs(config.get<string[]>("extraArgs") ?? []);
   const roots = parsePathSettings(config.get<string[]>("roots") ?? [], root);
   const exclude = parsePathSettings(config.get<string[]>("exclude") ?? [], root);
+  const formatterCommands = trustedFormatterCommands(config);
   const initializationOptions: BifrostInitializationOptions = {};
   if (roots.length > 0) {
     initializationOptions.roots = roots;
   }
   if (exclude.length > 0) {
     initializationOptions.exclude = exclude;
+  }
+  if (formatterCommands.length > 0) {
+    initializationOptions.formatterCommands = formatterCommands;
   }
 
   let launchConfig: BifrostLaunchConfig;
@@ -239,6 +244,24 @@ async function startClientInner(context: vscode.ExtensionContext): Promise<void>
     log(`Bifrost language client failed to start: ${message}`);
     outputChannel?.show(true);
   }
+}
+
+function trustedFormatterCommands(
+  config: vscode.WorkspaceConfiguration
+): BifrostFormatterCommandRule[] {
+  const inspected = config.inspect<BifrostFormatterCommandRule[]>("formatterCommands");
+  if (!inspected) {
+    return [];
+  }
+  const hasWorkspaceRules =
+    (inspected.workspaceValue?.length ?? 0) > 0 ||
+    (inspected.workspaceFolderValue?.length ?? 0) > 0;
+  if (hasWorkspaceRules) {
+    log(
+      "Ignoring workspace-scoped bifrost.formatterCommands; configure formatter commands in user settings."
+    );
+  }
+  return inspected.globalValue ?? [];
 }
 
 async function stopClient(options: { updateUi?: boolean } = {}): Promise<void> {

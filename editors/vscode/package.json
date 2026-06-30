@@ -101,6 +101,53 @@
           },
           "default": [],
           "description": "Workspace-relative or absolute files or directories to exclude from Bifrost indexing and LSP lookups."
+        },
+        "bifrost.formatterCommands": {
+          "type": "array",
+          "default": [],
+          "description": "Ordered formatter command rules passed to Bifrost from user settings only. Rules run without a shell, receive document text on stdin, and must write the formatted document to stdout.",
+          "items": {
+            "type": "object",
+            "required": [
+              "command"
+            ],
+            "properties": {
+              "include": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Workspace-relative glob patterns this formatter rule applies to."
+              },
+              "exclude": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Workspace-relative glob patterns this formatter rule must not apply to."
+              },
+              "language": {
+                "type": "string",
+                "description": "Optional Bifrost language filter, such as rust, go, typescript, java, csharp, php, or ruby."
+              },
+              "command": {
+                "type": "string",
+                "description": "Executable name or path. This is executed directly and is not shell-parsed."
+              },
+              "args": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Command arguments. Supports {file}, {relativeFile}, {workspaceRoot}, and {language} placeholders."
+              },
+              "cwd": {
+                "type": "string",
+                "description": "Working directory for the formatter. Relative paths are resolved against the workspace root and support placeholders."
+              }
+            },
+            "additionalProperties": false
+          }
         }
       }
     },

@@ -26,6 +26,23 @@ pub enum Language {
 }
 
 impl Language {
+    pub fn config_label(self) -> &'static str {
+        match self {
+            Language::None => "none",
+            Language::Java => "java",
+            Language::Go => "go",
+            Language::Cpp => "cpp",
+            Language::JavaScript => "javascript",
+            Language::TypeScript => "typescript",
+            Language::Python => "python",
+            Language::Rust => "rust",
+            Language::Php => "php",
+            Language::Scala => "scala",
+            Language::CSharp => "csharp",
+            Language::Ruby => "ruby",
+        }
+    }
+
     pub fn extensions(self) -> &'static [&'static str] {
         match self {
             Language::None => &[],
@@ -63,6 +80,38 @@ impl Language {
             }
         }
         Language::None
+    }
+
+    pub fn from_config_label(input: &str) -> Option<Self> {
+        let normalized = input
+            .trim()
+            .trim_start_matches('.')
+            .to_ascii_lowercase()
+            .replace(['_', '-'], "");
+        for language in [
+            Language::Java,
+            Language::Go,
+            Language::Cpp,
+            Language::JavaScript,
+            Language::TypeScript,
+            Language::Python,
+            Language::Rust,
+            Language::Php,
+            Language::Scala,
+            Language::CSharp,
+            Language::Ruby,
+        ] {
+            if normalized == language.config_label()
+                || language.extensions().contains(&normalized.as_str())
+            {
+                return Some(language);
+            }
+        }
+        match normalized.as_str() {
+            "c++" => Some(Language::Cpp),
+            "c#" => Some(Language::CSharp),
+            _ => None,
+        }
     }
 }
 
