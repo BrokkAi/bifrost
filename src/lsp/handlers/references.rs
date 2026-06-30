@@ -1,18 +1,14 @@
 use lsp_types::{Location, ReferenceParams, Uri};
 
-use crate::analyzer::usages::{
-    DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, FuzzyResult, UsageFinder, UsageHit,
-};
+use crate::analyzer::usages::UsageHit;
 use crate::analyzer::{CodeUnit, IAnalyzer, Project, Range as ByteRange, WorkspaceAnalyzer};
-use crate::lsp::conversion::{
-    byte_range_to_lsp_range, path_to_uri_string, position_to_byte_offset,
-};
-use crate::lsp::handlers::util::{
-    FileContentCache, identifier_at_offset, read_document_for_uri, resolve_identifier_candidates,
-};
+use crate::lsp::conversion::{byte_range_to_lsp_range, path_to_uri_string};
+use crate::lsp::handlers::broad_symbol::broad_symbol_target_at_position;
+use crate::lsp::handlers::usage_hits::usage_hits_for_candidates;
+use crate::lsp::handlers::util::FileContentCache;
 
 /// Resolve `textDocument/references`. Strategy:
-/// 1. Identifier under cursor -> resolve all matching CodeUnits (overloads).
+/// 1. Prove the cursor is on a real declaration or structured reference.
 /// 2. Run UsageFinder over the workspace.
 /// 3. Map each UsageHit to an LSP Location.
 /// 4. Optionally include the declaration site itself when
@@ -23,32 +19,22 @@ pub fn handle(
     params: &ReferenceParams,
 ) -> Option<Vec<Location>> {
     let uri = &params.text_document_position.text_document.uri;
-    let (_, content, line_starts) = read_document_for_uri(project, uri)?;
-    let byte_offset = position_to_byte_offset(
-        &content,
-        &line_starts,
-        &params.text_document_position.position,
-    );
-    let identifier = identifier_at_offset(&content, byte_offset)?;
-
     let analyzer = workspace.analyzer();
-    let overloads = resolve_identifier_candidates(analyzer, identifier);
-    if overloads.is_empty() {
-        return None;
-    }
-
-    let result =
-        UsageFinder::new().find_usages(analyzer, &overloads, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES);
-    let hits = collect_hits(result);
+    let target = broad_symbol_target_at_position(
+        analyzer,
+        project,
+        uri,
+        &params.text_document_position.position,
+    )?;
 
     let mut content_cache = FileContentCache::default();
-    let mut locations: Vec<Location> = hits
+    let mut locations: Vec<Location> = usage_hits_for_candidates(analyzer, &target.candidates)
         .into_iter()
         .filter_map(|hit| usage_hit_to_location(&hit, &mut content_cache))
         .collect();
 
     if params.context.include_declaration {
-        for cu in &overloads {
+        for cu in &target.candidates {
             if let Some(loc) = code_unit_location(analyzer, cu, &mut content_cache) {
                 locations.push(loc);
             }
@@ -65,10 +51,6 @@ pub fn handle(
     locations.dedup_by(|a, b| a.uri.as_str() == b.uri.as_str() && a.range == b.range);
 
     Some(locations)
-}
-
-fn collect_hits(result: FuzzyResult) -> Vec<UsageHit> {
-    result.all_hits().into_iter().collect()
 }
 
 fn usage_hit_to_location(hit: &UsageHit, cache: &mut FileContentCache) -> Option<Location> {

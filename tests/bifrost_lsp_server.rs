@@ -3,7 +3,7 @@ use serde_json::{Value, json};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use tempfile::TempDir;
 
 /// Build an LSP-correct `file://` URI for `path`. On Windows, `Path::display()`
@@ -3835,6 +3835,576 @@ fn bifrost_lsp_server_references_finds_class_a_usages() {
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");
 }
 
+const COMMENT_TARGETS_SOURCE: &str = "class CommentTargets {\n    // target\n    void target() {}\n    void caller() {\n        target();\n    }\n}\n";
+
+const SHIFTED_COMMENT_TARGETS_SOURCE: &str = "// unsaved header\nclass CommentTargets {\n    // target\n    void target() {}\n    void caller() {\n        target();\n    }\n}\n";
+
+const INVALID_CONTEXTS_SOURCE: &str = "import a.*;\nimport b.*;\nclass InvalidContexts {\n    String literal = \"Shared\";\n    void caller() {\n        Shared ambiguous = null;\n        int value = MissingShared;\n        if (true) {}\n    }\n}\n";
+
+const CSHARP_AMBIGUOUS_USING_SOURCE: &str = "using Alpha;\nusing Beta;\nnamespace App {\n    public class Consumer {\n        public void Execute() {\n            Target target = null;\n        }\n    }\n}\n";
+
+const SCALA_AMBIGUOUS_IMPORT_SOURCE: &str = "package app\nimport alpha.*\nimport beta.*\nclass Consumer {\n  val target: Target = null\n}\n";
+
+const DUPLICATE_DECLARATION_NAME_SOURCE: &str =
+    "class Widget {\n    Widget Widget() {\n        return this;\n    }\n}\n";
+
+fn write_comment_targets_fixture(root: &Path) -> PathBuf {
+    let file_path = root.join("CommentTargets.java");
+    fs::write(&file_path, COMMENT_TARGETS_SOURCE).expect("write CommentTargets.java");
+    file_path
+}
+
+fn write_duplicate_declaration_name_fixture(root: &Path) -> PathBuf {
+    let file_path = root.join("Widget.java");
+    fs::write(&file_path, DUPLICATE_DECLARATION_NAME_SOURCE).expect("write Widget.java");
+    file_path
+}
+
+fn write_invalid_contexts_fixture(root: &Path) -> PathBuf {
+    let package_a = root.join("a");
+    let package_b = root.join("b");
+    fs::create_dir_all(&package_a).expect("create package a");
+    fs::create_dir_all(&package_b).expect("create package b");
+    fs::write(
+        package_a.join("Shared.java"),
+        "package a;\npublic class Shared {}\n",
+    )
+    .expect("write a.Shared");
+    fs::write(
+        package_b.join("Shared.java"),
+        "package b;\npublic class Shared {}\n",
+    )
+    .expect("write b.Shared");
+    let file_path = root.join("InvalidContexts.java");
+    fs::write(&file_path, INVALID_CONTEXTS_SOURCE).expect("write InvalidContexts.java");
+    file_path
+}
+
+fn write_csharp_ambiguous_using_fixture(root: &Path) -> PathBuf {
+    let alpha = root.join("Alpha");
+    let beta = root.join("Beta");
+    let app = root.join("App");
+    fs::create_dir_all(&alpha).expect("create Alpha namespace");
+    fs::create_dir_all(&beta).expect("create Beta namespace");
+    fs::create_dir_all(&app).expect("create App namespace");
+    fs::write(
+        alpha.join("Target.cs"),
+        "namespace Alpha { public class Target {} }\n",
+    )
+    .expect("write Alpha.Target");
+    fs::write(
+        beta.join("Target.cs"),
+        "namespace Beta { public class Target {} }\n",
+    )
+    .expect("write Beta.Target");
+    let file_path = app.join("Consumer.cs");
+    fs::write(&file_path, CSHARP_AMBIGUOUS_USING_SOURCE).expect("write Consumer.cs");
+    file_path
+}
+
+fn write_scala_ambiguous_import_fixture(root: &Path) -> PathBuf {
+    let alpha = root.join("alpha");
+    let beta = root.join("beta");
+    let app = root.join("app");
+    fs::create_dir_all(&alpha).expect("create alpha package");
+    fs::create_dir_all(&beta).expect("create beta package");
+    fs::create_dir_all(&app).expect("create app package");
+    fs::write(alpha.join("Target.scala"), "package alpha\nclass Target\n")
+        .expect("write alpha.Target");
+    fs::write(beta.join("Target.scala"), "package beta\nclass Target\n")
+        .expect("write beta.Target");
+    let file_path = app.join("Consumer.scala");
+    fs::write(&file_path, SCALA_AMBIGUOUS_IMPORT_SOURCE).expect("write Consumer.scala");
+    file_path
+}
+
+#[test]
+fn bifrost_lsp_server_definition_ignores_comment_token() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = write_comment_targets_fixture(&root);
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+
+    let (valid_line, valid_character) = position_after(COMMENT_TARGETS_SOURCE, "void ");
+    let valid_definition = text_document_position_response(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        10,
+        "textDocument/definition",
+        &file_uri,
+        valid_line,
+        valid_character,
+    );
+
+    let (comment_line, comment_character) = position_after(COMMENT_TARGETS_SOURCE, "    // ");
+    let comment_definition = text_document_position_response(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        11,
+        "textDocument/definition",
+        &file_uri,
+        comment_line,
+        comment_character,
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+
+    assert!(
+        valid_definition["result"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+        "valid declaration should resolve definition, got {valid_definition}"
+    );
+    assert!(
+        comment_definition["result"].is_null(),
+        "comment token must not resolve definition, got {comment_definition}"
+    );
+}
+
+#[test]
+fn bifrost_lsp_server_hover_ignores_comment_token() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = write_comment_targets_fixture(&root);
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+
+    let (valid_line, valid_character) = position_after(COMMENT_TARGETS_SOURCE, "void ");
+    let valid_hover = text_document_position_response(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        10,
+        "textDocument/hover",
+        &file_uri,
+        valid_line,
+        valid_character,
+    );
+
+    let (comment_line, comment_character) = position_after(COMMENT_TARGETS_SOURCE, "    // ");
+    let comment_hover = text_document_position_response(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        11,
+        "textDocument/hover",
+        &file_uri,
+        comment_line,
+        comment_character,
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+
+    assert!(
+        valid_hover["result"]["contents"]["value"]
+            .as_str()
+            .is_some_and(|value| value.contains("target")),
+        "valid declaration should produce hover, got {valid_hover}"
+    );
+    assert!(
+        comment_hover["result"].is_null(),
+        "comment token must not produce hover, got {comment_hover}"
+    );
+}
+
+#[test]
+fn bifrost_lsp_server_definition_and_hover_select_duplicate_declaration_name() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = write_duplicate_declaration_name_fixture(&root);
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+
+    let (line, character) = position_after(DUPLICATE_DECLARATION_NAME_SOURCE, "    Widget ");
+    let definition = text_document_position_response(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        10,
+        "textDocument/definition",
+        &file_uri,
+        line,
+        character,
+    );
+    let hover = text_document_position_response(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        11,
+        "textDocument/hover",
+        &file_uri,
+        line,
+        character,
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+
+    let definition_items = definition["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected definition locations, got {definition}"));
+    assert_eq!(
+        definition_items.len(),
+        1,
+        "method declaration should resolve itself, got {definition}"
+    );
+    assert_eq!(
+        definition_items[0]["range"]["start"]["line"], 1,
+        "definition should target the method declaration, got {definition}"
+    );
+    let hover_value = hover["result"]["contents"]["value"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected hover contents, got {hover}"));
+    assert!(
+        hover_value.contains("Widget Widget()"),
+        "hover should describe the method declaration, got {hover_value}"
+    );
+    assert_eq!(
+        hover["result"]["range"]["start"]["character"], 11,
+        "hover should highlight the method name under the cursor, not the return type: {hover}"
+    );
+}
+
+#[test]
+fn bifrost_lsp_server_references_ignore_comment_token() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = write_comment_targets_fixture(&root);
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+
+    let (valid_line, valid_character) = position_after(COMMENT_TARGETS_SOURCE, "void ");
+    let valid_references = references_response(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        10,
+        &file_uri,
+        valid_line,
+        valid_character,
+        true,
+    );
+
+    let (comment_line, comment_character) = position_after(COMMENT_TARGETS_SOURCE, "    // ");
+    let comment_references = references_response(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        11,
+        &file_uri,
+        comment_line,
+        comment_character,
+        true,
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+
+    assert!(
+        valid_references["result"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+        "valid declaration should find references, got {valid_references}"
+    );
+    assert!(
+        comment_references["result"].is_null()
+            || comment_references["result"]
+                .as_array()
+                .is_some_and(|items| items.is_empty()),
+        "comment token must not find references, got {comment_references}"
+    );
+}
+
+#[test]
+fn bifrost_lsp_server_document_highlight_ignores_comment_token() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = write_comment_targets_fixture(&root);
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+
+    let (valid_line, valid_character) = position_after(COMMENT_TARGETS_SOURCE, "void ");
+    let valid_highlights = text_document_position_response(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        10,
+        "textDocument/documentHighlight",
+        &file_uri,
+        valid_line,
+        valid_character,
+    );
+
+    let (comment_line, comment_character) = position_after(COMMENT_TARGETS_SOURCE, "    // ");
+    let comment_highlights = text_document_position_response(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        11,
+        "textDocument/documentHighlight",
+        &file_uri,
+        comment_line,
+        comment_character,
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+
+    assert!(
+        valid_highlights["result"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+        "valid declaration should produce highlights, got {valid_highlights}"
+    );
+    assert!(
+        comment_highlights["result"].is_null()
+            || comment_highlights["result"]
+                .as_array()
+                .is_some_and(|items| items.is_empty()),
+        "comment token must not produce highlights, got {comment_highlights}"
+    );
+}
+
+#[test]
+fn bifrost_lsp_server_references_and_document_highlight_use_shifted_overlay_declaration() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = write_comment_targets_fixture(&root);
+
+    let (child, mut stdin, mut reader, mut stderr) = start_lsp_server(&root);
+    let file_uri = uri_for(&file_path);
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": file_uri,
+                    "languageId": "java",
+                    "version": 1,
+                    "text": SHIFTED_COMMENT_TARGETS_SOURCE
+                }
+            }
+        }),
+    );
+    let _ = read_notification(&mut reader, &mut stderr, "textDocument/publishDiagnostics");
+
+    let (line, character) = position_after(SHIFTED_COMMENT_TARGETS_SOURCE, "void ");
+    let references = references_response(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        10,
+        &file_uri,
+        line,
+        character,
+        true,
+    );
+    let highlights = text_document_position_response(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        11,
+        "textDocument/documentHighlight",
+        &file_uri,
+        line,
+        character,
+    );
+
+    shutdown_lsp(child, stdin, reader, stderr);
+
+    assert!(
+        references["result"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+        "shifted overlay declaration should find references, got {references}"
+    );
+    assert!(
+        highlights["result"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+        "shifted overlay declaration should produce highlights, got {highlights}"
+    );
+    assert!(
+        highlights["result"].as_array().is_some_and(|items| {
+            items.iter().any(|item| {
+                item["range"]["start"]["line"] == line
+                    && item["range"]["start"]["character"] == character
+            })
+        }),
+        "shifted overlay declaration should highlight the overlaid declaration name, got {highlights}"
+    );
+}
+
+#[test]
+fn bifrost_lsp_server_definition_ignores_literals_keywords_unresolved_and_ambiguous_tokens() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = write_invalid_contexts_fixture(&root);
+
+    let (child, stdin, reader, stderr) = start_lsp_server(&root);
+    let mut client = LspTestClient::new(stdin, reader, stderr, 10);
+    let file_uri = uri_for(&file_path);
+    let responses = collect_invalid_context_endpoint_responses(
+        &mut client,
+        &file_uri,
+        BroadEndpoint::Definition,
+    );
+
+    let (stdin, reader, stderr) = client.into_parts();
+    shutdown_lsp(child, stdin, reader, stderr);
+
+    assert_no_invalid_context_results(BroadEndpoint::Definition, &responses);
+}
+
+#[test]
+fn bifrost_lsp_server_hover_ignores_literals_keywords_unresolved_and_ambiguous_tokens() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = write_invalid_contexts_fixture(&root);
+
+    let (child, stdin, reader, stderr) = start_lsp_server(&root);
+    let mut client = LspTestClient::new(stdin, reader, stderr, 10);
+    let file_uri = uri_for(&file_path);
+    let responses =
+        collect_invalid_context_endpoint_responses(&mut client, &file_uri, BroadEndpoint::Hover);
+
+    let (stdin, reader, stderr) = client.into_parts();
+    shutdown_lsp(child, stdin, reader, stderr);
+
+    assert_no_invalid_context_results(BroadEndpoint::Hover, &responses);
+}
+
+#[test]
+fn bifrost_lsp_server_references_ignore_literals_keywords_unresolved_and_ambiguous_tokens() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = write_invalid_contexts_fixture(&root);
+
+    let (child, stdin, reader, stderr) = start_lsp_server(&root);
+    let mut client = LspTestClient::new(stdin, reader, stderr, 10);
+    let file_uri = uri_for(&file_path);
+    let responses = collect_invalid_context_endpoint_responses(
+        &mut client,
+        &file_uri,
+        BroadEndpoint::References,
+    );
+
+    let (stdin, reader, stderr) = client.into_parts();
+    shutdown_lsp(child, stdin, reader, stderr);
+
+    assert_no_invalid_context_results(BroadEndpoint::References, &responses);
+}
+
+#[test]
+fn bifrost_lsp_server_document_highlight_ignores_literals_keywords_unresolved_and_ambiguous_tokens()
+{
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = write_invalid_contexts_fixture(&root);
+
+    let (child, stdin, reader, stderr) = start_lsp_server(&root);
+    let mut client = LspTestClient::new(stdin, reader, stderr, 10);
+    let file_uri = uri_for(&file_path);
+    let responses = collect_invalid_context_endpoint_responses(
+        &mut client,
+        &file_uri,
+        BroadEndpoint::DocumentHighlight,
+    );
+
+    let (stdin, reader, stderr) = client.into_parts();
+    shutdown_lsp(child, stdin, reader, stderr);
+
+    assert_no_invalid_context_results(BroadEndpoint::DocumentHighlight, &responses);
+}
+
+#[test]
+fn bifrost_lsp_server_broad_endpoints_ignore_csharp_ambiguous_using_type() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = write_csharp_ambiguous_using_fixture(&root);
+
+    let (child, stdin, reader, stderr) = start_lsp_server(&root);
+    let mut client = LspTestClient::new(stdin, reader, stderr, 10);
+    let file_uri = uri_for(&file_path);
+    let (line, character) = position_after(CSHARP_AMBIGUOUS_USING_SOURCE, "            ");
+    let responses = [
+        BroadEndpoint::Definition,
+        BroadEndpoint::Hover,
+        BroadEndpoint::References,
+        BroadEndpoint::DocumentHighlight,
+    ]
+    .into_iter()
+    .map(|endpoint| {
+        (
+            endpoint.label(),
+            endpoint_response(&mut client, &file_uri, endpoint, line, character),
+        )
+    })
+    .collect::<Vec<_>>();
+
+    let (stdin, reader, stderr) = client.into_parts();
+    shutdown_lsp(child, stdin, reader, stderr);
+
+    for (endpoint, response) in responses {
+        let no_result = response["result"].is_null()
+            || response["result"]
+                .as_array()
+                .is_some_and(|items| items.is_empty());
+        assert!(
+            no_result,
+            "C# ambiguous using type must not produce {endpoint} result, got {response}"
+        );
+    }
+}
+
+#[test]
+fn bifrost_lsp_server_broad_endpoints_ignore_scala_ambiguous_wildcard_import_type() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = write_scala_ambiguous_import_fixture(&root);
+
+    let (child, stdin, reader, stderr) = start_lsp_server(&root);
+    let mut client = LspTestClient::new(stdin, reader, stderr, 10);
+    let file_uri = uri_for(&file_path);
+    let (line, character) = position_after(SCALA_AMBIGUOUS_IMPORT_SOURCE, "  val target: ");
+    let responses = [
+        BroadEndpoint::Definition,
+        BroadEndpoint::Hover,
+        BroadEndpoint::References,
+        BroadEndpoint::DocumentHighlight,
+    ]
+    .into_iter()
+    .map(|endpoint| {
+        (
+            endpoint.label(),
+            endpoint_response(&mut client, &file_uri, endpoint, line, character),
+        )
+    })
+    .collect::<Vec<_>>();
+
+    let (stdin, reader, stderr) = client.into_parts();
+    shutdown_lsp(child, stdin, reader, stderr);
+
+    for (endpoint, response) in responses {
+        let no_result = response["result"].is_null()
+            || response["result"]
+                .as_array()
+                .is_some_and(|items| items.is_empty());
+        assert!(
+            no_result,
+            "Scala ambiguous wildcard import type must not produce {endpoint} result, got {response}"
+        );
+    }
+}
+
 #[test]
 fn bifrost_lsp_server_prepare_rename_returns_identifier_range() {
     let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -7549,12 +8119,35 @@ fn type_definition_response(
     line: u64,
     character: u64,
 ) -> Value {
+    text_document_position_response(
+        stdin,
+        reader,
+        stderr,
+        id,
+        "textDocument/typeDefinition",
+        file_uri,
+        line,
+        character,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn text_document_position_response(
+    stdin: &mut impl Write,
+    reader: &mut impl BufRead,
+    stderr: &mut impl Read,
+    id: u64,
+    method: &str,
+    file_uri: &str,
+    line: u64,
+    character: u64,
+) -> Value {
     write_message(
         stdin,
         json!({
             "jsonrpc": "2.0",
             "id": id,
-            "method": "textDocument/typeDefinition",
+            "method": method,
             "params": {
                 "textDocument": {"uri": file_uri},
                 "position": {"line": line, "character": character}
@@ -7562,6 +8155,209 @@ fn type_definition_response(
         }),
     );
     read_response_for_id(reader, stderr, id)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn references_response(
+    stdin: &mut impl Write,
+    reader: &mut impl BufRead,
+    stderr: &mut impl Read,
+    id: u64,
+    file_uri: &str,
+    line: u64,
+    character: u64,
+    include_declaration: bool,
+) -> Value {
+    write_message(
+        stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "textDocument/references",
+            "params": {
+                "textDocument": {"uri": file_uri},
+                "position": {"line": line, "character": character},
+                "context": {"includeDeclaration": include_declaration}
+            }
+        }),
+    );
+    read_response_for_id(reader, stderr, id)
+}
+
+struct LspTestClient {
+    stdin: ChildStdin,
+    reader: BufReader<ChildStdout>,
+    stderr: ChildStderr,
+    next_id: u64,
+}
+
+impl LspTestClient {
+    fn new(
+        stdin: ChildStdin,
+        reader: BufReader<ChildStdout>,
+        stderr: ChildStderr,
+        next_id: u64,
+    ) -> Self {
+        Self {
+            stdin,
+            reader,
+            stderr,
+            next_id,
+        }
+    }
+
+    fn into_parts(self) -> (ChildStdin, BufReader<ChildStdout>, ChildStderr) {
+        (self.stdin, self.reader, self.stderr)
+    }
+
+    fn text_document_position_response(
+        &mut self,
+        method: &str,
+        file_uri: &str,
+        line: u64,
+        character: u64,
+    ) -> Value {
+        let id = self.next_id();
+        text_document_position_response(
+            &mut self.stdin,
+            &mut self.reader,
+            &mut self.stderr,
+            id,
+            method,
+            file_uri,
+            line,
+            character,
+        )
+    }
+
+    fn references_response(
+        &mut self,
+        file_uri: &str,
+        line: u64,
+        character: u64,
+        include_declaration: bool,
+    ) -> Value {
+        let id = self.next_id();
+        references_response(
+            &mut self.stdin,
+            &mut self.reader,
+            &mut self.stderr,
+            id,
+            file_uri,
+            line,
+            character,
+            include_declaration,
+        )
+    }
+
+    fn next_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BroadEndpoint {
+    Definition,
+    Hover,
+    References,
+    DocumentHighlight,
+}
+
+impl BroadEndpoint {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Definition => "definition",
+            Self::Hover => "hover",
+            Self::References => "references",
+            Self::DocumentHighlight => "documentHighlight",
+        }
+    }
+}
+
+fn invalid_context_targets() -> Vec<(&'static str, u64, u64)> {
+    [
+        (
+            "string literal",
+            position_after(INVALID_CONTEXTS_SOURCE, "\""),
+        ),
+        (
+            "ambiguous type reference",
+            position_after(INVALID_CONTEXTS_SOURCE, "        "),
+        ),
+        (
+            "unresolved expression",
+            position_after(INVALID_CONTEXTS_SOURCE, "int value = "),
+        ),
+        (
+            "keyword",
+            position_after(INVALID_CONTEXTS_SOURCE, "        if"),
+        ),
+    ]
+    .into_iter()
+    .map(|(label, (line, character))| (label, line, character))
+    .collect()
+}
+
+fn collect_invalid_context_endpoint_responses(
+    client: &mut LspTestClient,
+    file_uri: &str,
+    endpoint: BroadEndpoint,
+) -> Vec<(&'static str, Value)> {
+    invalid_context_targets()
+        .into_iter()
+        .map(|(label, line, character)| {
+            let response = endpoint_response(client, file_uri, endpoint, line, character);
+            (label, response)
+        })
+        .collect()
+}
+
+fn endpoint_response(
+    client: &mut LspTestClient,
+    file_uri: &str,
+    endpoint: BroadEndpoint,
+    line: u64,
+    character: u64,
+) -> Value {
+    match endpoint {
+        BroadEndpoint::Definition => client.text_document_position_response(
+            "textDocument/definition",
+            file_uri,
+            line,
+            character,
+        ),
+        BroadEndpoint::Hover => {
+            client.text_document_position_response("textDocument/hover", file_uri, line, character)
+        }
+        BroadEndpoint::References => client.references_response(file_uri, line, character, true),
+        BroadEndpoint::DocumentHighlight => client.text_document_position_response(
+            "textDocument/documentHighlight",
+            file_uri,
+            line,
+            character,
+        ),
+    }
+}
+
+fn assert_no_invalid_context_results(endpoint: BroadEndpoint, responses: &[(&'static str, Value)]) {
+    for (label, response) in responses {
+        let no_result = match endpoint {
+            BroadEndpoint::Definition | BroadEndpoint::Hover => response["result"].is_null(),
+            BroadEndpoint::References | BroadEndpoint::DocumentHighlight => {
+                response["result"].is_null()
+                    || response["result"]
+                        .as_array()
+                        .is_some_and(|items| items.is_empty())
+            }
+        };
+        assert!(
+            no_result,
+            "{label} must not produce {} result, got {response}",
+            endpoint.label()
+        );
+    }
 }
 
 fn implementation_response(
@@ -7573,19 +8369,16 @@ fn implementation_response(
     line: u64,
     character: u64,
 ) -> Value {
-    write_message(
+    text_document_position_response(
         stdin,
-        json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": "textDocument/implementation",
-            "params": {
-                "textDocument": {"uri": file_uri},
-                "position": {"line": line, "character": character}
-            }
-        }),
-    );
-    read_response_for_id(reader, stderr, id)
+        reader,
+        stderr,
+        id,
+        "textDocument/implementation",
+        file_uri,
+        line,
+        character,
+    )
 }
 
 fn write_message(stdin: &mut impl Write, payload: Value) {

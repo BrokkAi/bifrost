@@ -37,6 +37,7 @@ pub(crate) fn find_line_index_for_offset(line_starts: &[usize], offset: usize) -
 /// Extract the alphanumeric/underscore identifier surrounding `offset` in
 /// `content`. Returns `None` if neither the byte at `offset` nor the byte
 /// immediately before it is part of an identifier.
+#[cfg(test)]
 pub(crate) fn identifier_at_offset(content: &str, offset: usize) -> Option<&str> {
     let (start, end) = identifier_span_at_offset(content, offset)?;
     content.get(start..end)

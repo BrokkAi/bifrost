@@ -258,6 +258,7 @@ impl JavaAnalyzer {
 
     fn resolve_imports_uncached(&self, file: &ProjectFile) -> HashMap<String, CodeUnit> {
         let mut resolved = HashMap::default();
+        let mut wildcard_resolved = HashMap::<String, CodeUnit>::default();
 
         for import in self.inner.import_info_of(file) {
             if import
@@ -291,9 +292,17 @@ impl JavaAnalyzer {
 
             let package_name = import_path.trim_end_matches(".*");
             for code_unit in self.inner.class_declarations_in_package(package_name) {
-                resolved
-                    .entry(code_unit.identifier().to_string())
-                    .or_insert(code_unit.clone());
+                let identifier = code_unit.identifier().to_string();
+                if resolved.contains_key(&identifier)
+                    && !wildcard_resolved.contains_key(&identifier)
+                {
+                    continue;
+                }
+                if wildcard_resolved.contains_key(&identifier) {
+                    continue;
+                }
+                wildcard_resolved.insert(identifier.clone(), code_unit.clone());
+                resolved.insert(identifier, code_unit.clone());
             }
         }
 

@@ -1,3 +1,4 @@
+pub(crate) mod broad_symbol;
 pub mod call_hierarchy;
 pub mod completion;
 pub mod definition;
@@ -7,11 +8,13 @@ pub mod document_symbol;
 pub mod folding_range;
 pub(crate) mod hierarchy_support;
 pub mod hover;
+pub(crate) mod import_ambiguity;
 pub mod references;
 pub mod rename;
 pub mod signature_help;
 pub mod type_definition;
 pub mod type_hierarchy;
 pub(crate) mod type_target;
+pub(crate) mod usage_hits;
 pub(crate) mod util;
 pub mod workspace_symbol;
