@@ -11,6 +11,39 @@ use std::path::Path;
 pub use inline_project::{BuiltInlineTestProject, InlineTestProject};
 
 #[allow(dead_code)]
+pub const RUST_ASSOCIATED_PATH_MAIN: &str = r#"
+pub mod state;
+
+use state::AppState;
+
+pub struct Repositories;
+pub struct Environment;
+pub struct Router;
+
+fn app_with_state(_state: AppState) -> Router {
+    Router
+}
+
+fn app_with_environment(repositories: Repositories, environment: Environment) -> Router {
+    let _ = state::AppState::with_environment(Repositories, Environment);
+    app_with_state(AppState::with_environment(repositories, environment))
+}
+"#;
+
+#[allow(dead_code)]
+pub const RUST_ASSOCIATED_PATH_STATE: &str = r#"
+use crate::{Environment, Repositories};
+
+pub struct AppState;
+
+impl AppState {
+    pub fn with_environment(_repositories: Repositories, _environment: Environment) -> Self {
+        Self
+    }
+}
+"#;
+
+#[allow(dead_code)]
 pub fn js_fixture_project() -> TestProject {
     TestProject::new(
         std::fs::canonicalize("tests/fixtures/testcode-js").unwrap(),

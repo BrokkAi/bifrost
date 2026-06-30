@@ -1018,6 +1018,76 @@ pub fn format_value() {}
 }
 
 #[test]
+fn rust_associated_path_type_segment_resolves_imported_sibling_type() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/main.rs", common::RUST_ASSOCIATED_PATH_MAIN)
+        .file("src/state.rs", common::RUST_ASSOCIATED_PATH_STATE)
+        .build();
+
+    let line = "    app_with_state(AppState::with_environment(repositories, environment))";
+    let type_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/main.rs","line":16,"column":{}}}]}}"#,
+            column_of(line, "AppState")
+        ),
+    );
+
+    let type_result = &type_value["results"][0];
+    assert_eq!(type_result["status"], "resolved", "{type_value}");
+    assert_eq!(
+        type_result["reference"]["target"], "AppState::with_environment",
+        "{type_value}"
+    );
+    assert_eq!(
+        type_result["definitions"][0]["path"], "src/state.rs",
+        "{type_value}"
+    );
+    assert_eq!(
+        type_result["definitions"][0]["fqn"], "state.AppState",
+        "{type_value}"
+    );
+
+    let method_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/main.rs","line":16,"column":{}}}]}}"#,
+            column_of(line, "with_environment")
+        ),
+    );
+
+    let method_result = &method_value["results"][0];
+    assert_eq!(method_result["status"], "resolved", "{method_value}");
+    assert_eq!(
+        method_result["definitions"][0]["fqn"], "state.AppState.with_environment",
+        "{method_value}"
+    );
+    assert_eq!(
+        method_result["definitions"][0]["path"], "src/state.rs",
+        "{method_value}"
+    );
+
+    let line = "    let _ = state::AppState::with_environment(Repositories, Environment);";
+    let scoped_type_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/main.rs","line":15,"column":{}}}]}}"#,
+            column_of(line, "AppState")
+        ),
+    );
+
+    let scoped_type_result = &scoped_type_value["results"][0];
+    assert_eq!(
+        scoped_type_result["status"], "resolved",
+        "{scoped_type_value}"
+    );
+    assert_eq!(
+        scoped_type_result["definitions"][0]["fqn"], "state.AppState",
+        "{scoped_type_value}"
+    );
+}
+
+#[test]
 fn rust_type_lookup_resolves_explicit_local_binding_type() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(
@@ -4201,6 +4271,19 @@ pub mod inner {
             }]
         })
         .to_string(),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "inner.helper", "{value}");
+
+    let line = "        crate::inner::helper!();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/lib.rs","line":8,"column":{}}}]}}"#,
+            column_of(line, "crate")
+        ),
     );
 
     let result = &value["results"][0];
