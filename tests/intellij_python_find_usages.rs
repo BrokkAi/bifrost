@@ -152,13 +152,14 @@ fn function_usages_with_same_name_decorator() {
 }
 
 // ---------------------------------------------------------------------------
-// Single-file, in-envelope cases — BLOCKED on Bug 2 (same-file member usages)
+// Single-file, in-envelope cases — remaining gaps (distinct from Bug 2a)
 // ---------------------------------------------------------------------------
 
 // IntelliJ PY-292 InitUsages: caret on `__init__`. IntelliJ resolves the
-// constructor call `c = C()` (line 4) to `__init__` => 1 usage.
+// constructor call `c = C()` (line 4) to `__init__`. bifrost neither maps a
+// constructor call to `__init__` nor (Bug 2b) seeds the same-file local `c`.
 #[test]
-#[ignore = "bifrost gap: same-file Python member usages + constructor->__init__ mapping (Bug 2)"]
+#[ignore = "bifrost gap: constructor-call -> __init__ mapping + same-file ctor local (Bug 2b)"]
 fn init_usages() {
     let (_temp, file, locations) = references_for(
         "InitUsages.py",
@@ -168,11 +169,13 @@ fn init_usages() {
 }
 
 // IntelliJ PY-4338 ReassignedInstanceAttribute: caret on `self.bacaba = 3`
-// (line 13) in subclass B. IntelliJ merges `bacaba` across the A/B hierarchy by
-// name and counts 5 (all `self.bacaba` occurrences). Py2 `print` modernized to
-// `print(...)` so the file parses under bifrost's Py3 grammar.
+// (line 13) in subclass B. After Bug 2a bifrost resolves the same-class B
+// usages (excluding the B declaration site) -> [13, 16], but it models
+// `A.bacaba` and `B.bacaba` as distinct fields, whereas IntelliJ merges
+// `bacaba` across the A/B hierarchy by name -> [2, 5, 10, 13, 16]. Py2 `print`
+// modernized to `print(...)`.
 #[test]
-#[ignore = "bifrost gap: same-file Python member usages (Bug 2)"]
+#[ignore = "by design: bifrost models attributes per-class (no by-name merge across the hierarchy)"]
 fn reassigned_instance_attribute() {
     let (_temp, file, locations) = references_for(
         "ReassignedInstanceAttribute.py",
@@ -182,10 +185,10 @@ fn reassigned_instance_attribute() {
 }
 
 // IntelliJ PY-4338 ReassignedClassAttribute: caret on a `self.bacaba` read in
-// subclass B (line 16). IntelliJ counts 6, merging the class-level `bacaba = N`
-// and the instance writes across A/B. Py2 `print` modernized.
+// subclass B (line 16). Same per-class-attribute divergence as above. Py2
+// `print` modernized.
 #[test]
-#[ignore = "bifrost gap: same-file Python member usages (Bug 2)"]
+#[ignore = "by design: bifrost models attributes per-class (no by-name merge across the hierarchy)"]
 fn reassigned_class_attribute() {
     let (_temp, file, locations) = references_for(
         "ReassignedClassAttribute.py",
@@ -194,24 +197,53 @@ fn reassigned_class_attribute() {
     assert_reference_lines(&locations, &file, &[1, 3, 6, 10, 13, 16]);
 }
 
+// ---------------------------------------------------------------------------
+// Bug 2a fix coverage — same-file `self.`-receiver member usages
+// ---------------------------------------------------------------------------
+
 // IntelliJ PY-1448 ConditionalFunctions: caret on attribute `a`
-// (`self.a = None`). IntelliJ counts 3: the writes at lines 6, 10, 13 across the
-// conditionally-defined `func` methods.
+// (`self.a = None`, line 6). IntelliJ counts 3 writes (lines 6, 10, 13). bifrost
+// excludes the declaration site (line 6, the `__init__` assignment) under
+// includeDeclaration=false and reports the two conditional-method writes — the
+// correct result for our semantics; the underlying `self.a` resolution is what
+// Bug 2a fixed.
 #[test]
-#[ignore = "bifrost gap: same-file Python member usages (Bug 2)"]
 fn conditional_functions() {
     let (_temp, file, locations) = references_for(
         "ConditionalFunctions.py",
         "import sys\n\nvar = (sys.platform == 'win32')\n\nclass A():\n    def __init__(self):\n        self.<caret>a = None\n\n    if var:\n        def func(self):\n            self.a = \"\"\n    else:\n        def func(self):\n            self.a = ()\n",
     );
-    assert_reference_lines(&locations, &file, &[6, 10, 13]);
+    assert_reference_lines(&locations, &file, &[10, 13]);
+}
+
+// Bug 2a regression (not from IntelliJ): a `self.method()` call in a sibling
+// method is a usage of that method, and an inherited `self.method()` in a
+// subclass resolves through the type hierarchy. Before the fix `self` resolved
+// to no type and these returned zero usages.
+#[test]
+fn self_receiver_method_usage_resolves() {
+    let (_temp, file, locations) = references_for(
+        "self_method.py",
+        "class Foo:\n    def b<caret>ar(self):\n        pass\n\n    def baz(self):\n        self.bar()\n",
+    );
+    assert_reference_lines(&locations, &file, &[5]);
+}
+
+#[test]
+fn self_receiver_inherited_method_usage_resolves() {
+    let (_temp, file, locations) = references_for(
+        "self_inherited.py",
+        "class A:\n    def b<caret>ar(self):\n        pass\n\nclass B(A):\n    def baz(self):\n        self.bar()\n",
+    );
+    assert_reference_lines(&locations, &file, &[6]);
 }
 
 // IntelliJ PY-6241 NameShadowing: caret on the `@property` getter `x`. IntelliJ
 // counts 2: the `@x.setter` (line 9) and `@x.deleter` (line 13) decorator
-// references.
+// references. These reference the property by its bare class-body name (the
+// `x` in `@x.setter`), not through a receiver, so member matching skips them.
 #[test]
-#[ignore = "bifrost gap: same-file Python member usages / decorator references (Bug 2)"]
+#[ignore = "bifrost gap: bare-name member references in class body (e.g. @x.setter)"]
 fn name_shadowing() {
     let (_temp, file, locations) = references_for(
         "NameShadowing.py",
@@ -225,7 +257,7 @@ fn name_shadowing() {
 // `testMethod = staticmethod(testMethod)` (line 9). bifrost resolves the
 // class-qualified call on line 2 but not the bare-name reassignments on line 9.
 #[test]
-#[ignore = "bifrost gap: same-file Python member usages (bare-name member refs, Bug 2)"]
+#[ignore = "bifrost gap: bare-name member references in class body (testMethod = staticmethod(testMethod))"]
 fn wrapped_method() {
     let (_temp, file, locations) = references_for(
         "WrappedMethod.py",

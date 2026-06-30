@@ -305,6 +305,13 @@ impl ScanCtx<'_> {
             return true;
         }
 
+        // `self`/`cls` is implicitly typed as the enclosing class, so a same-file
+        // `self.member` access is a usage of that class's member even though the
+        // receiver is never assigned a type the way a local or parameter is.
+        if matches!(expr, "self" | "cls") && self.self_receiver_matches_target(node) {
+            return true;
+        }
+
         let Some(scope_facts) = self.scope_facts_for_node(node) else {
             return false;
         };
@@ -316,6 +323,41 @@ impl ScanCtx<'_> {
             return false;
         };
         self.receiver_type_matches_target(raw_type)
+    }
+
+    /// Whether the class enclosing `node` is the target member's owner (or a
+    /// subclass of it, for inherited members). Used to resolve `self`/`cls`
+    /// receivers, whose type is the lexically enclosing class.
+    fn self_receiver_matches_target(&self, node: Node<'_>) -> bool {
+        let Some(target_owner) = self.target_owner.as_ref() else {
+            return false;
+        };
+        let range = Range {
+            start_byte: node.start_byte(),
+            end_byte: node.end_byte(),
+            start_line: 0,
+            end_line: 0,
+        };
+        let Some(enclosing) = self.analyzer.enclosing_code_unit(self.file, &range) else {
+            return false;
+        };
+        let enclosing_class = if enclosing.is_class() {
+            enclosing
+        } else {
+            match target_owner_code_unit(self.analyzer, &enclosing) {
+                Some(class) => class,
+                None => return false,
+            }
+        };
+        if &enclosing_class == target_owner {
+            return true;
+        }
+        self.analyzer
+            .type_hierarchy_provider()
+            .map(|provider| provider.get_ancestors(&enclosing_class))
+            .unwrap_or_default()
+            .into_iter()
+            .any(|ancestor| ancestor == *target_owner)
     }
 
     fn receiver_type_matches_target(&self, raw_type: &str) -> bool {

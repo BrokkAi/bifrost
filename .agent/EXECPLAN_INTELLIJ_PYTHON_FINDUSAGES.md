@@ -32,6 +32,12 @@ scope by architecture and are not ported.
 - 2026-06-30: Suite green — 4 passing (incl. Bug 1 regression), 9 quarantined
   `#[ignore]` with precise reasons. `cargo fmt`, `cargo clippy-no-cuda`, and the
   `bifrost_lsp_server` + `get_definition_test` suites (324 tests) all pass.
+- 2026-06-30: Fixed Bug 2a (`self`/`cls` receiver resolution). Suite now 7
+  passing / 8 ignored. `conditional_functions` promoted to PASS (adapted to
+  bifrost's includeDeclaration=false semantics); added `self_receiver_*`
+  regressions. No regressions: Python usage suites, LSP, get-definition all green;
+  clippy clean. Remaining ignores re-triaged (see below) — most are no longer
+  "same-file member" but distinct, narrower gaps.
 
 
 ## Surprises and Discoveries
@@ -58,7 +64,28 @@ matches (exact-span nodes form a nested chain; the deepest is the real
 declaration node). Regression test:
 `method_name_cursor_resolves_in_single_method_class`.
 
-### Bug 2 (OPEN): same-file Python member usages are not resolved
+### Bug 2a (FIXED): `self`/`cls`-receiver member usages were not resolved
+
+`self`/`cls` is never assigned a type the way a local or parameter is, so the
+receiver-matching path in `src/analyzer/usages/python_graph/extractor.rs`
+(`receiver_binds_target`) found no type for it and `self.member` accesses matched
+nothing. Fix: when the receiver expression is `self` or `cls`, resolve the
+lexically enclosing class (`enclosing_code_unit` -> `target_owner_code_unit`) and
+match it against the target member's owner, directly or via the type hierarchy
+(so inherited `self.method()` in a subclass resolves too). New method
+`ScanCtx::self_receiver_matches_target`. Verified: `self.bar()`, `self.attr`, and
+inherited `self.bar()` all resolve (1 hit each); class-qualified and
+typed-annotation paths unchanged.
+
+### Bug 2b (OPEN): same-file constructed-local receiver not seeded
+
+`f = Foo(); f.bar()` in the same file as `Foo` still yields 0 hits, while the
+cross-file equivalent yields 1. The constructor-assignment receiver seeding hangs
+off the cross-file import path; same-file local construction is not seeded. Lower
+priority than 2a (constructed locals are less common than `self.`); tracked for a
+follow-up. Blocks `init_usages` (which also needs constructor->__init__ mapping).
+
+### Bug 2 (historical): same-file Python member usages are not resolved
 
 Even after Bug 1, caret on a method/attribute resolves but finds zero usages for
 same-file instance-receiver accesses.
@@ -124,16 +151,25 @@ the cross-file seeding path. Fix the root cause; no text-search fallback.
 ## Triage table (every PyFindUsagesTest method)
 
 PASS:
-- ClassUsages, UnresolvedClassInit, FunctionUsagesWithSameNameDecorator.
-- (plus Bug 1 regression `method_name_cursor_resolves_in_single_method_class`.)
+- ClassUsages, UnresolvedClassInit, FunctionUsagesWithSameNameDecorator,
+  ConditionalFunctions (self-attribute, after Bug 2a; adapted to
+  includeDeclaration=false).
+- Regressions: `method_name_cursor_resolves_in_single_method_class` (Bug 1),
+  `self_receiver_method_usage_resolves` + `self_receiver_inherited_method_usage_resolves`
+  (Bug 2a).
 
-BLOCKED on Bug 2 (`#[ignore]`, should pass once same-file member usages resolve):
-- InitUsages (also needs constructor->__init__ mapping), ReassignedInstanceAttribute,
-  ReassignedClassAttribute, ConditionalFunctions, NameShadowing, WrappedMethod.
+OPEN gaps (`#[ignore]`, distinct from Bug 2a):
+- InitUsages — constructor-call -> `__init__` mapping + same-file ctor local (Bug 2b).
+- NameShadowing — bare-name member references in class body (`@x.setter`).
+- WrappedMethod — bare-name member references (`testMethod = staticmethod(testMethod)`).
 
 BY DESIGN divergence (`#[ignore]`, will not pass):
-- ImplicitlyResolvedUsages, ImplicitlyResolvedFieldUsages (untyped-receiver
-  name-only fallback), Imports (external module not indexed).
+- ReassignedInstanceAttribute, ReassignedClassAttribute — bifrost models
+  attributes per-class; IntelliJ merges across the hierarchy by name. (After
+  Bug 2a bifrost resolves the same-class subset, e.g. [13, 16].)
+- ImplicitlyResolvedUsages, ImplicitlyResolvedFieldUsages — untyped-receiver
+  name-only fallback.
+- Imports — external module not indexed.
 
 OUT OF ENVELOPE (not ported — target is a local/param/comprehension binding):
 - ReassignedLocalUsages, NonGlobalUsages, LambdaParameter,
