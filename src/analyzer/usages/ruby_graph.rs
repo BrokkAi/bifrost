@@ -243,6 +243,12 @@ pub(crate) enum ReceiverMode {
     TopLevel,
 }
 
+#[derive(Clone, Copy)]
+enum ExplicitReceiverLookup {
+    Bare,
+    ReceiverOnly,
+}
+
 #[derive(Clone)]
 pub(crate) struct ReceiverType {
     pub(crate) owner_fq_name: String,
@@ -784,8 +790,14 @@ impl RubyWalkState<'_, '_> {
         if node.kind() != "call" {
             return;
         }
-        if self.dynamic_call_mentions_target(node) {
-            *self.scan.saw_unproven_match = true;
+        if let Some(dispatched_method) =
+            dynamic_dispatch_target_argument(node, self.scan.source, &self.scan.spec.member_name)
+        {
+            self.record_method_hit_for_call_receiver(
+                node,
+                dispatched_method,
+                ExplicitReceiverLookup::ReceiverOnly,
+            );
             return;
         }
         let Some(method) = node.child_by_field_name("method") else {
@@ -794,16 +806,7 @@ impl RubyWalkState<'_, '_> {
         if node_text(method, self.scan.source) != self.scan.spec.member_name {
             return;
         }
-        let receiver = match node.child_by_field_name("receiver") {
-            Some(receiver) => self.receiver_type(receiver),
-            None => self.enclosing_receiver(),
-        };
-        match receiver {
-            Some(receiver) => self.record_bare_method_hit_for_receiver(&receiver, method),
-            None => {
-                *self.scan.saw_unproven_match = true;
-            }
-        }
+        self.record_method_hit_for_call_receiver(node, method, ExplicitReceiverLookup::Bare);
     }
 
     fn record_bare_identifier_method_reference(&mut self, node: Node<'_>) {
@@ -831,6 +834,39 @@ impl RubyWalkState<'_, '_> {
             &self.scan.spec.member_name,
         );
         self.record_method_hit_from_candidates(&candidates, hit_node);
+    }
+
+    fn record_explicit_receiver_method_hit(&mut self, receiver: &ReceiverType, hit_node: Node<'_>) {
+        let candidates = self.scan.semantic.resolve_method_candidates(
+            self.scan.support,
+            &self.scan.visible_files,
+            receiver,
+            &self.scan.spec.member_name,
+        );
+        self.record_method_hit_from_candidates(&candidates, hit_node);
+    }
+
+    fn record_method_hit_for_call_receiver(
+        &mut self,
+        call: Node<'_>,
+        hit_node: Node<'_>,
+        explicit_receiver_lookup: ExplicitReceiverLookup,
+    ) {
+        let receiver_node = call.child_by_field_name("receiver");
+        let receiver = match receiver_node {
+            Some(receiver) => self.receiver_type(receiver),
+            None => self.enclosing_receiver(),
+        };
+        let Some(receiver) = receiver else {
+            *self.scan.saw_unproven_match = true;
+            return;
+        };
+        match (receiver_node, explicit_receiver_lookup) {
+            (Some(_), ExplicitReceiverLookup::ReceiverOnly) => {
+                self.record_explicit_receiver_method_hit(&receiver, hit_node);
+            }
+            _ => self.record_bare_method_hit_for_receiver(&receiver, hit_node),
+        }
     }
 
     fn record_method_hit_from_candidates(&mut self, candidates: &[CodeUnit], hit_node: Node<'_>) {
@@ -878,23 +914,6 @@ impl RubyWalkState<'_, '_> {
         ruby_seed_parameter_shadows(&mut self.locals, node, self.scan.source);
     }
 
-    fn dynamic_call_mentions_target(&self, node: Node<'_>) -> bool {
-        let Some(method) = node.child_by_field_name("method") else {
-            return false;
-        };
-        if !is_dynamic_dispatch_method(method, self.scan.source) {
-            return false;
-        }
-        let Some(arguments) = node.child_by_field_name("arguments") else {
-            return false;
-        };
-        let mut cursor = arguments.walk();
-        arguments.named_children(&mut cursor).any(|arg| {
-            symbol_or_string_value(arg, self.scan.source)
-                .is_some_and(|value| value == self.scan.spec.member_name)
-        })
-    }
-
     fn record_hit(&mut self, node: Node<'_>) {
         let start_byte = node.start_byte();
         let end_byte = node.end_byte();
@@ -937,6 +956,23 @@ pub(crate) fn is_dynamic_dispatch_method(method: Node<'_>, source: &str) -> bool
         node_text(method, source),
         "send" | "__send__" | "public_send"
     )
+}
+
+fn dynamic_dispatch_target_argument<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    member: &str,
+) -> Option<Node<'tree>> {
+    let method = node.child_by_field_name("method")?;
+    if !is_dynamic_dispatch_method(method, source) {
+        return None;
+    }
+    let arguments = node.child_by_field_name("arguments")?;
+    let mut cursor = arguments.walk();
+    let first_argument = arguments.named_children(&mut cursor).next()?;
+    symbol_or_string_value(first_argument, source)
+        .is_some_and(|value| value == member)
+        .then_some(first_argument)
 }
 
 fn language_for_file(file: &ProjectFile) -> Language {

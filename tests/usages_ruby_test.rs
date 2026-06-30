@@ -953,6 +953,91 @@ end
 }
 
 #[test]
+fn resolves_public_send_symbol_dispatch_with_receiver_aware_mixin_lookup() {
+    let (_project, analyzer) = ruby_analyzer_with_files(&[(
+        "app/report.rb",
+        r#"
+module Billing
+  module Auditable
+    def audit
+    end
+  end
+
+  class Invoice
+    include Auditable
+  end
+
+  class Other
+    def audit
+    end
+  end
+end
+
+class Report
+  def run
+    invoice = Billing::Invoice.new
+    invoice.public_send(:audit)
+
+    other = Billing::Other.new
+    other.public_send(:audit)
+    invoice.public_send(:missing, :audit)
+  end
+end
+"#,
+    )]);
+
+    let target = definition(&analyzer, "Billing$Auditable.audit");
+    let hits = analyzer
+        .find_usages(&[target])
+        .into_either()
+        .expect("audit lookup should succeed");
+    let lines = hit_source_lines(&hits);
+    let texts = hit_texts(&hits);
+
+    assert_eq!(1, hits.len(), "expected one precise hit, got {lines:?}");
+    assert!(
+        lines
+            .iter()
+            .any(|line| line == "invoice.public_send(:audit)"),
+        "{lines:?}"
+    );
+    assert_eq!(vec![":audit".to_string()], texts);
+}
+
+#[test]
+fn public_send_with_explicit_receiver_does_not_fallback_to_top_level_method() {
+    let (_project, analyzer) = ruby_analyzer_with_files(&[(
+        "app/report.rb",
+        r#"
+class User
+end
+
+class Report
+  def run
+    user = User.new
+    user.public_send(:save)
+  end
+end
+
+def save
+end
+"#,
+    )]);
+
+    let target = definition(&analyzer, "save");
+    let query = UsageFinder::new().query(&analyzer, &[target], 100, 100);
+
+    assert!(
+        matches!(query.result, FuzzyResult::Failure { .. }),
+        "explicit public_send receiver must not resolve through top-level fallback: {:?}",
+        query.result
+    );
+    let diagnostic = query.graph_failure.expect("graph failure diagnostic");
+    assert_eq!("RubyUsageGraphStrategy", diagnostic.strategy);
+    assert_eq!("unsafe_inference", diagnostic.reason_kind);
+}
+
+#[test]
 fn resolves_inherited_self_new_factory_receiver_usage() {
     let (_project, analyzer) = ruby_analyzer_with_files(&[(
         "app.rb",

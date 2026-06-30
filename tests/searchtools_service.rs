@@ -1421,6 +1421,63 @@ end
 }
 
 #[test]
+fn scan_usages_mcp_call_resolves_ruby_public_send_symbol_dispatch() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "app/user.rb",
+            r#"
+class User
+  def save
+  end
+end
+
+class Account
+  def save
+  end
+end
+
+class App
+  def run
+    user = User.new
+    user.public_send(:save)
+    user.public_send(:missing, :save)
+
+    account = Account.new
+    account.public_send(:save)
+  end
+end
+"#,
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages",
+            r#"{"symbols":["User.save"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert_eq!(0, array_len(&value, "not_found"), "payload: {value}");
+    assert_eq!(0, array_len(&value, "ambiguous"), "payload: {value}");
+    assert_eq!(0, array_len(&value, "failures"), "payload: {value}");
+    let usages = value["usages"].as_array().unwrap();
+    assert_eq!(1, usages.len(), "payload: {value}");
+    assert_eq!("User.save", usages[0]["symbol"], "payload: {value}");
+    assert_eq!(1, usages[0]["total_hits"], "payload: {value}");
+    let hits = usages[0]["files"][0]["hits"].as_array().unwrap();
+    assert!(
+        hits.iter().any(|hit| hit["snippet"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("user.public_send(:save)")),
+        "expected user.public_send(:save) hit: {value}"
+    );
+}
+
+#[test]
 fn scan_usages_mcp_call_surfaces_ruby_unsafe_inference() {
     let project = InlineTestProject::with_language(Language::Ruby)
         .file(
