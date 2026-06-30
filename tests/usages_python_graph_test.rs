@@ -1896,3 +1896,56 @@ fn parity_cached_definitions_by_identifier_finds_member_identifier_fallback() {
 fn parity_cached_exact_member_resolves_only_within_source_file() {
     panic!("parity marker only");
 }
+
+// --- Same-file member-usage regressions (Bug 2a / Bug 2b) ---
+
+/// UsageFinder hit count for `fq` defined and used within a single file `m.py`.
+fn single_file_member_hits(src: &str, fq: &str) -> usize {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("m.py", src)
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, fq);
+    UsageFinder::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), 100, 100)
+        .all_hits()
+        .len()
+}
+
+// Bug 2a: `self` is implicitly typed as the enclosing class, so a `self.bar()`
+// call in a sibling method counts as a usage of `bar`.
+#[test]
+fn self_receiver_resolves_same_file_member_usage() {
+    assert_eq!(
+        single_file_member_hits(
+            "class Foo:\n    def bar(self):\n        pass\n\n    def baz(self):\n        self.bar()\n",
+            "m.Foo.bar",
+        ),
+        1,
+    );
+}
+
+// Bug 2a: an inherited `self.bar()` in a subclass resolves through the hierarchy.
+#[test]
+fn self_receiver_resolves_inherited_member_usage() {
+    assert_eq!(
+        single_file_member_hits(
+            "class A:\n    def bar(self):\n        pass\n\nclass B(A):\n    def baz(self):\n        self.bar()\n",
+            "m.A.bar",
+        ),
+        1,
+    );
+}
+
+// Bug 2b: a constructed local at module scope is seeded with its type, so
+// `f.bar()` resolves the same way it does inside a function body.
+#[test]
+fn module_level_constructed_local_resolves_member_usage() {
+    assert_eq!(
+        single_file_member_hits(
+            "class Foo:\n    def bar(self):\n        pass\n\nf = Foo()\nf.bar()\n",
+            "m.Foo.bar",
+        ),
+        1,
+    );
+}

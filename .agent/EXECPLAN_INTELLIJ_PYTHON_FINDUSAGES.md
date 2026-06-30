@@ -38,6 +38,9 @@ scope by architecture and are not ported.
   regressions. No regressions: Python usage suites, LSP, get-definition all green;
   clippy clean. Remaining ignores re-triaged (see below) — most are no longer
   "same-file member" but distinct, narrower gaps.
+- 2026-06-30: Fixed Bug 2b (module-scope receiver seeding). Re-characterized as
+  scope-level (module vs function), not same-file. Canonical regressions added to
+  `tests/usages_python_graph_test.rs` (56 pass). No regressions; clippy clean.
 
 
 ## Surprises and Discoveries
@@ -77,13 +80,21 @@ match it against the target member's owner, directly or via the type hierarchy
 inherited `self.bar()` all resolve (1 hit each); class-qualified and
 typed-annotation paths unchanged.
 
-### Bug 2b (OPEN): same-file constructed-local receiver not seeded
+### Bug 2b (FIXED): module-level constructed-local receiver not seeded
 
-`f = Foo(); f.bar()` in the same file as `Foo` still yields 0 hits, while the
-cross-file equivalent yields 1. The constructor-assignment receiver seeding hangs
-off the cross-file import path; same-file local construction is not seeded. Lower
-priority than 2a (constructed locals are less common than `self.`); tracked for a
-follow-up. Blocks `init_usages` (which also needs constructor->__init__ mapping).
+`f = Foo(); f.bar()` at module scope yielded 0 hits, while the same code inside a
+function yielded 1. Root cause: `collect_scope_facts` built per-function and
+per-class scope bindings but never the **module** scope, so a top-level
+`f = Foo()` binding was lost and `enclosing_code_unit` resolved the usage to the
+module (which had no facts). This was mischaracterized as "same-file" — the real
+axis is scope level (module vs function), confirmed by probe: `ctorlocal_func`=1,
+`ctorlocal_module`=0.
+
+Fix: `collect_scope_facts` now also collects bindings for `is_module()`
+declarations and keys them by the module CodeUnit. Verified `ctorlocal_module`=1;
+regression `module_level_constructed_local_resolves_member_usage` in
+`tests/usages_python_graph_test.rs`. `init_usages` remains blocked only by the
+separate constructor-call -> `__init__` mapping gap.
 
 ### Bug 2 (historical): same-file Python member usages are not resolved
 
@@ -158,8 +169,8 @@ PASS:
   `self_receiver_method_usage_resolves` + `self_receiver_inherited_method_usage_resolves`
   (Bug 2a).
 
-OPEN gaps (`#[ignore]`, distinct from Bug 2a):
-- InitUsages — constructor-call -> `__init__` mapping + same-file ctor local (Bug 2b).
+OPEN gaps (`#[ignore]`, distinct from Bug 2a/2b):
+- InitUsages — constructor-call `C()` is not mapped to the class `__init__` method.
 - NameShadowing — bare-name member references in class body (`@x.setter`).
 - WrappedMethod — bare-name member references (`testMethod = staticmethod(testMethod)`).
 

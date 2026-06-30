@@ -577,6 +577,19 @@ pub(in crate::analyzer::usages) fn collect_scope_facts(
         }
         scope_facts.insert(declaration.clone(), facts);
     }
+
+    // Module-level statements (e.g. a top-level `f = Foo()`) form their own scope.
+    // `enclosing_code_unit` resolves a top-level usage to the module CodeUnit, so
+    // its bindings must be recorded too, otherwise constructed-local receivers
+    // used at module scope resolve to no type.
+    for declaration in declarations.iter().filter(|d| d.is_module()) {
+        let Some(source) = analyzer.get_source(declaration, false) else {
+            continue;
+        };
+        let facts =
+            collect_scope_facts_from_source(&source, edges, target_short, target_self_file, false);
+        scope_facts.insert(declaration.clone(), facts);
+    }
     scope_facts
 }
 

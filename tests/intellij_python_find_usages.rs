@@ -156,10 +156,11 @@ fn function_usages_with_same_name_decorator() {
 // ---------------------------------------------------------------------------
 
 // IntelliJ PY-292 InitUsages: caret on `__init__`. IntelliJ resolves the
-// constructor call `c = C()` (line 4) to `__init__`. bifrost neither maps a
-// constructor call to `__init__` nor (Bug 2b) seeds the same-file local `c`.
+// constructor call `c = C()` (line 4) to `__init__`. bifrost does not map a
+// constructor call `C()` to the class's `__init__` method (the call is a usage
+// of the class, not of `__init__`).
 #[test]
-#[ignore = "bifrost gap: constructor-call -> __init__ mapping + same-file ctor local (Bug 2b)"]
+#[ignore = "bifrost gap: constructor-call C() is not mapped to the class __init__ method"]
 fn init_usages() {
     let (_temp, file, locations) = references_for(
         "InitUsages.py",
