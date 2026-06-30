@@ -21,6 +21,7 @@ use crate::hash::{HashMap, HashSet};
 use crate::text_utils::{
     compute_line_starts, find_line_index_for_offset, trimmed_snippet_around_line,
 };
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 use tree_sitter::Node;
 
@@ -92,6 +93,7 @@ impl RubyUsageGraphStrategy {
             let mut scan = RubyFileScan {
                 analyzer,
                 semantic: &semantic,
+                support: analyzer.definition_lookup_index(),
                 file,
                 source: &source,
                 line_starts: &line_starts,
@@ -150,7 +152,6 @@ enum RubyTargetKind {
 pub(crate) struct RubyTargetSpec {
     pub(crate) target: CodeUnit,
     kind: RubyTargetKind,
-    owner: Option<CodeUnit>,
     pub(crate) member_name: String,
     singleton_declaration: bool,
 }
@@ -161,17 +162,15 @@ impl RubyTargetSpec {
             return Some(Self {
                 target: target.clone(),
                 kind: RubyTargetKind::TypeOrConstant,
-                owner: analyzer.parent_of(target),
                 member_name: target.identifier().to_string(),
                 singleton_declaration: false,
             });
         }
         if target.is_function() {
-            let owner = analyzer.parent_of(target)?;
+            analyzer.parent_of(target)?;
             return Some(Self {
                 target: target.clone(),
                 kind: RubyTargetKind::Method,
-                owner: Some(owner),
                 member_name: target.identifier().to_string(),
                 singleton_declaration: is_singleton_method_declaration(analyzer, target),
             });
@@ -196,10 +195,11 @@ pub(crate) struct RubySemanticIndex<'a> {
     analyzer: &'a dyn IAnalyzer,
     ruby: &'a RubyAnalyzer,
     target: Option<CodeUnit>,
-    target_owner_fq_name: Option<String>,
     ancestors: HashMap<String, HashSet<String>>,
-    mixin_instance_owners: HashMap<String, HashSet<String>>,
-    mixin_class_owners: HashMap<String, HashSet<String>>,
+    mixin_included_owners: HashMap<String, Vec<String>>,
+    mixin_prepended_owners: HashMap<String, Vec<String>>,
+    mixin_class_owners: HashMap<String, Vec<String>>,
+    factory_return_cache: RefCell<HashMap<FactoryInferenceKey, Option<String>>>,
 }
 
 impl<'a> RubySemanticIndex<'a> {
@@ -208,27 +208,22 @@ impl<'a> RubySemanticIndex<'a> {
         ruby: &'a RubyAnalyzer,
         spec: &RubyTargetSpec,
     ) -> Self {
-        Self::build_with_target(
-            analyzer,
-            ruby,
-            Some(spec.target.clone()),
-            spec.owner.as_ref(),
-        )
+        Self::build_with_target(analyzer, ruby, Some(spec.target.clone()))
     }
 
     pub(crate) fn build_for_lookup(analyzer: &'a dyn IAnalyzer, ruby: &'a RubyAnalyzer) -> Self {
-        Self::build_with_target(analyzer, ruby, None, None)
+        Self::build_with_target(analyzer, ruby, None)
     }
 
     fn build_with_target(
         analyzer: &'a dyn IAnalyzer,
         ruby: &'a RubyAnalyzer,
         target: Option<CodeUnit>,
-        target_owner: Option<&CodeUnit>,
     ) -> Self {
         let mut ancestors = HashMap::default();
-        let mut mixin_instance_owners: HashMap<String, HashSet<String>> = HashMap::default();
-        let mut mixin_class_owners: HashMap<String, HashSet<String>> = HashMap::default();
+        let mut mixin_included_owners: HashMap<String, Vec<String>> = HashMap::default();
+        let mut mixin_prepended_owners: HashMap<String, Vec<String>> = HashMap::default();
+        let mut mixin_class_owners: HashMap<String, Vec<String>> = HashMap::default();
 
         for unit in analyzer
             .all_declarations()
@@ -248,26 +243,23 @@ impl<'a> RubySemanticIndex<'a> {
 
         for relation in ruby.mixin_relations() {
             let entry = match relation.kind {
-                TypeRelationKind::MixinInclude | TypeRelationKind::MixinPrepend => {
-                    &mut mixin_instance_owners
-                }
+                TypeRelationKind::MixinInclude => &mut mixin_included_owners,
+                TypeRelationKind::MixinPrepend => &mut mixin_prepended_owners,
                 TypeRelationKind::MixinExtend => &mut mixin_class_owners,
                 _ => continue,
             };
-            entry
-                .entry(relation.from.fq_name())
-                .or_default()
-                .insert(relation.to.fq_name());
+            push_ordered_mixin(entry, relation.from.fq_name(), relation.to.fq_name());
         }
 
         Self {
             analyzer,
             ruby,
             target,
-            target_owner_fq_name: target_owner.map(CodeUnit::fq_name),
             ancestors,
-            mixin_instance_owners,
+            mixin_included_owners,
+            mixin_prepended_owners,
             mixin_class_owners,
+            factory_return_cache: RefCell::new(HashMap::default()),
         }
     }
 
@@ -318,42 +310,6 @@ impl<'a> RubySemanticIndex<'a> {
             .is_some_and(|target| unit == target || unit.fq_name() == target.fq_name())
     }
 
-    pub(crate) fn method_matches_receiver(
-        &self,
-        receiver: &ReceiverType,
-        spec: &RubyTargetSpec,
-    ) -> bool {
-        let target_owner = spec
-            .owner
-            .as_ref()
-            .map(CodeUnit::fq_name)
-            .or_else(|| self.target_owner_fq_name.clone());
-        let Some(target_owner) = target_owner.as_deref() else {
-            return false;
-        };
-        match receiver.mode {
-            ReceiverMode::Instance => {
-                !spec.singleton_declaration
-                    && (self.owner_or_ancestor_matches(&receiver.owner_fq_name, target_owner)
-                        || self.mixin_matches(
-                            &receiver.owner_fq_name,
-                            target_owner,
-                            &self.mixin_instance_owners,
-                        ))
-            }
-            ReceiverMode::Class => {
-                (spec.singleton_declaration
-                    && self.owner_or_ancestor_matches(&receiver.owner_fq_name, target_owner))
-                    || (!spec.singleton_declaration
-                        && self.mixin_matches(
-                            &receiver.owner_fq_name,
-                            target_owner,
-                            &self.mixin_class_owners,
-                        ))
-            }
-        }
-    }
-
     pub(crate) fn resolve_method_candidates(
         &self,
         support: &crate::analyzer::DefinitionLookupIndex,
@@ -363,13 +319,12 @@ impl<'a> RubySemanticIndex<'a> {
     ) -> Vec<CodeUnit> {
         let visible_files: Vec<ProjectFile> = visible_files.iter().cloned().collect();
         let mut seen = HashSet::default();
-        let mut push_owner = |owner: &str, out: &mut Vec<CodeUnit>| {
+        let mut push_owner = |owner: &str, mode: RubyMethodLookupMode, out: &mut Vec<CodeUnit>| {
             for unit in support.fqn_direct_children(owner) {
                 if unit.is_function()
                     && unit.identifier() == member
                     && visible_files.contains(unit.source())
-                    && RubyTargetSpec::from_target(self.analyzer, &unit)
-                        .is_some_and(|spec| self.method_matches_receiver(receiver, &spec))
+                    && ruby_method_lookup_mode_matches(self.analyzer, &unit, mode)
                     && seen.insert(unit.clone())
                 {
                     out.push(unit);
@@ -377,91 +332,78 @@ impl<'a> RubySemanticIndex<'a> {
             }
         };
 
-        let mut direct = Vec::new();
-        push_owner(&receiver.owner_fq_name, &mut direct);
-        if !direct.is_empty() {
-            return direct;
-        }
+        match receiver.mode {
+            ReceiverMode::Instance => {
+                for owner in self.receiver_owner_lookup_order(&receiver.owner_fq_name) {
+                    let mut prepended = Vec::new();
+                    self.push_mixin_methods(
+                        &owner,
+                        &self.mixin_prepended_owners,
+                        &mut push_owner,
+                        &mut prepended,
+                    );
+                    if !prepended.is_empty() {
+                        return prepended;
+                    }
 
-        let mut mixed = Vec::new();
-        let mixin_index = match receiver.mode {
-            ReceiverMode::Instance => &self.mixin_instance_owners,
-            ReceiverMode::Class => &self.mixin_class_owners,
-        };
-        for owner in self.receiver_owner_lookup_order(&receiver.owner_fq_name) {
-            if let Some(mixins) = mixin_index.get(&owner) {
-                for mixin in mixins {
-                    push_owner(mixin, &mut mixed);
+                    let mut direct = Vec::new();
+                    push_owner(&owner, RubyMethodLookupMode::InstanceMethod, &mut direct);
+                    if !direct.is_empty() {
+                        return direct;
+                    }
+
+                    let mut included = Vec::new();
+                    self.push_mixin_methods(
+                        &owner,
+                        &self.mixin_included_owners,
+                        &mut push_owner,
+                        &mut included,
+                    );
+                    if !included.is_empty() {
+                        return included;
+                    }
                 }
+                Vec::new()
             }
-            if !mixed.is_empty() {
-                return mixed;
-            }
-        }
+            ReceiverMode::Class => {
+                for owner in self.receiver_owner_lookup_order(&receiver.owner_fq_name) {
+                    let mut direct = Vec::new();
+                    push_owner(&owner, RubyMethodLookupMode::SingletonMethod, &mut direct);
+                    if !direct.is_empty() {
+                        return direct;
+                    }
 
-        let mut inherited = Vec::new();
-        for ancestor in self.ancestor_lookup_order(&receiver.owner_fq_name) {
-            push_owner(&ancestor, &mut inherited);
-            if !inherited.is_empty() {
-                return inherited;
+                    let mut extended = Vec::new();
+                    self.push_mixin_methods(
+                        &owner,
+                        &self.mixin_class_owners,
+                        &mut push_owner,
+                        &mut extended,
+                    );
+                    if !extended.is_empty() {
+                        return extended;
+                    }
+                }
+                Vec::new()
             }
         }
-        inherited
     }
 
-    fn owner_or_ancestor_matches(&self, owner: &str, target_owner: &str) -> bool {
-        if owner == target_owner {
-            return true;
-        }
-        let mut visited = HashSet::default();
-        let mut stack: Vec<String> = self
-            .ancestors
-            .get(owner)
-            .map(|items| items.iter().cloned().collect())
-            .unwrap_or_default();
-        while let Some(candidate) = stack.pop() {
-            if candidate == target_owner {
-                return true;
-            }
-            if visited.insert(candidate.clone())
-                && let Some(next) = self.ancestors.get(&candidate)
-            {
-                stack.extend(next.iter().cloned());
-            }
-        }
-        false
-    }
-
-    fn mixin_matches(
+    fn push_mixin_methods(
         &self,
         owner: &str,
-        target_owner: &str,
-        index: &HashMap<String, HashSet<String>>,
-    ) -> bool {
-        let mut receiver_owners = vec![owner.to_string()];
-        receiver_owners.extend(self.all_ancestors(owner));
-        receiver_owners.iter().any(|receiver_owner| {
-            index
-                .get(receiver_owner)
-                .is_some_and(|mixins| mixins.contains(target_owner))
-        })
-    }
-
-    fn all_ancestors(&self, owner: &str) -> HashSet<String> {
-        let mut out = HashSet::default();
-        let mut stack: Vec<String> = self
-            .ancestors
-            .get(owner)
-            .map(|items| items.iter().cloned().collect())
-            .unwrap_or_default();
-        while let Some(candidate) = stack.pop() {
-            if out.insert(candidate.clone())
-                && let Some(next) = self.ancestors.get(&candidate)
-            {
-                stack.extend(next.iter().cloned());
+        index: &HashMap<String, Vec<String>>,
+        push_owner: &mut impl FnMut(&str, RubyMethodLookupMode, &mut Vec<CodeUnit>),
+        out: &mut Vec<CodeUnit>,
+    ) {
+        if let Some(mixins) = index.get(owner) {
+            for mixin in mixins.iter().rev() {
+                push_owner(mixin, RubyMethodLookupMode::InstanceMethod, out);
+                if !out.is_empty() {
+                    break;
+                }
             }
         }
-        out
     }
 
     fn receiver_owner_lookup_order(&self, owner: &str) -> Vec<String> {
@@ -491,9 +433,54 @@ impl<'a> RubySemanticIndex<'a> {
     }
 }
 
+fn push_ordered_mixin(index: &mut HashMap<String, Vec<String>>, from: String, to: String) {
+    let owners = index.entry(from).or_default();
+    if !owners.contains(&to) {
+        owners.push(to);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RubyMethodLookupMode {
+    InstanceMethod,
+    SingletonMethod,
+}
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct FactoryInferenceKey {
+    method: CodeUnit,
+    invocation_owner_fq_name: String,
+}
+
+struct FactoryInferenceFrame {
+    method: CodeUnit,
+    invocation_owner_fq_name: String,
+}
+
+enum FactoryMethodOutcome {
+    Owner(String),
+    Chain(Vec<FactoryInferenceFrame>),
+    Unknown,
+}
+
+fn ruby_method_lookup_mode_matches(
+    analyzer: &dyn IAnalyzer,
+    unit: &CodeUnit,
+    mode: RubyMethodLookupMode,
+) -> bool {
+    let Some(spec) = RubyTargetSpec::from_target(analyzer, unit) else {
+        return false;
+    };
+    match mode {
+        RubyMethodLookupMode::InstanceMethod => !spec.singleton_declaration,
+        RubyMethodLookupMode::SingletonMethod => spec.singleton_declaration,
+    }
+}
+
 struct RubyFileScan<'a> {
     analyzer: &'a dyn IAnalyzer,
     semantic: &'a RubySemanticIndex<'a>,
+    support: &'a crate::analyzer::DefinitionLookupIndex,
     file: &'a ProjectFile,
     source: &'a str,
     line_starts: &'a [usize],
@@ -664,15 +651,8 @@ impl RubyWalkState<'_, '_> {
             None => self.enclosing_receiver(),
         };
         match receiver {
-            Some(receiver)
-                if self
-                    .scan
-                    .semantic
-                    .method_matches_receiver(&receiver, self.scan.spec) =>
-            {
-                self.record_hit(method);
-            }
-            Some(_) | None => {
+            Some(receiver) => self.record_method_hit_for_receiver(&receiver, method),
+            None => {
                 *self.scan.saw_unproven_match = true;
             }
         }
@@ -688,17 +668,27 @@ impl RubyWalkState<'_, '_> {
             return;
         }
         match self.enclosing_receiver() {
-            Some(receiver)
-                if self
-                    .scan
-                    .semantic
-                    .method_matches_receiver(&receiver, self.scan.spec) =>
-            {
-                self.record_hit(node);
-            }
-            Some(_) | None => {
+            Some(receiver) => self.record_method_hit_for_receiver(&receiver, node),
+            None => {
                 *self.scan.saw_unproven_match = true;
             }
+        }
+    }
+
+    fn record_method_hit_for_receiver(&mut self, receiver: &ReceiverType, hit_node: Node<'_>) {
+        let candidates = self.scan.semantic.resolve_method_candidates(
+            self.scan.support,
+            &self.scan.visible_files,
+            receiver,
+            &self.scan.spec.member_name,
+        );
+        if candidates.iter().any(|candidate| {
+            candidate == &self.scan.spec.target
+                || candidate.fq_name() == self.scan.spec.target.fq_name()
+        }) {
+            self.record_hit(hit_node);
+        } else if candidates.is_empty() {
+            *self.scan.saw_unproven_match = true;
         }
     }
 
@@ -884,10 +874,46 @@ pub(crate) fn ruby_constructed_receiver_type(
     source: &str,
 ) -> Option<ReceiverType> {
     let method = node.child_by_field_name("method")?;
-    if node_text(method, source) != "new" {
-        return None;
-    }
+    let method_name = node_text(method, source);
     let receiver = node.child_by_field_name("receiver")?;
+
+    if method_name == "new" {
+        return ruby_new_receiver_type(
+            semantic,
+            file,
+            visible_files,
+            lexical_stack,
+            locals,
+            method_stack,
+            receiver,
+            source,
+        );
+    }
+
+    let class = ruby_receiver_type(
+        semantic,
+        file,
+        visible_files,
+        lexical_stack,
+        locals,
+        method_stack,
+        receiver,
+        source,
+    )?;
+    ruby_factory_return_receiver_type(semantic, visible_files, &class, method_name)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ruby_new_receiver_type(
+    semantic: &RubySemanticIndex<'_>,
+    file: &ProjectFile,
+    visible_files: &HashSet<ProjectFile>,
+    lexical_stack: &[String],
+    locals: &LocalInferenceEngine<String>,
+    method_stack: &[ReceiverMode],
+    receiver: Node<'_>,
+    source: &str,
+) -> Option<ReceiverType> {
     let class = ruby_receiver_type(
         semantic,
         file,
@@ -902,6 +928,295 @@ pub(crate) fn ruby_constructed_receiver_type(
         owner_fq_name: class.owner_fq_name,
         mode: ReceiverMode::Instance,
     })
+}
+
+fn ruby_factory_return_receiver_type(
+    semantic: &RubySemanticIndex<'_>,
+    visible_files: &HashSet<ProjectFile>,
+    class: &ReceiverType,
+    method_name: &str,
+) -> Option<ReceiverType> {
+    if class.mode != ReceiverMode::Class {
+        return None;
+    }
+
+    semantic
+        .resolve_method_candidates(
+            semantic.analyzer.definition_lookup_index(),
+            visible_files,
+            class,
+            method_name,
+        )
+        .into_iter()
+        .find_map(|candidate| {
+            ruby_infer_method_return_instance_owner(
+                semantic,
+                candidate,
+                class.owner_fq_name.clone(),
+            )
+            .map(|owner_fq_name| ReceiverType {
+                owner_fq_name,
+                mode: ReceiverMode::Instance,
+            })
+        })
+}
+
+fn ruby_infer_method_return_instance_owner(
+    semantic: &RubySemanticIndex<'_>,
+    method_unit: CodeUnit,
+    invocation_owner_fq_name: String,
+) -> Option<String> {
+    let start = FactoryInferenceFrame {
+        method: method_unit,
+        invocation_owner_fq_name,
+    };
+    let start_key = start.key();
+    if let Some(cached) = semantic.factory_return_cache.borrow().get(&start_key) {
+        return cached.clone();
+    }
+
+    let mut stack = vec![start];
+    let mut visited = HashSet::default();
+    while let Some(frame) = stack.pop() {
+        let key = frame.key();
+        if let Some(cached) = semantic.factory_return_cache.borrow().get(&key) {
+            if cached.is_some() {
+                semantic
+                    .factory_return_cache
+                    .borrow_mut()
+                    .insert(start_key, cached.clone());
+                return cached.clone();
+            }
+            continue;
+        }
+        if !visited.insert(key.clone()) {
+            semantic.factory_return_cache.borrow_mut().insert(key, None);
+            continue;
+        }
+
+        match ruby_factory_method_outcome(semantic, &frame) {
+            FactoryMethodOutcome::Owner(owner) => {
+                semantic
+                    .factory_return_cache
+                    .borrow_mut()
+                    .insert(key, Some(owner.clone()));
+                semantic
+                    .factory_return_cache
+                    .borrow_mut()
+                    .insert(start_key, Some(owner.clone()));
+                return Some(owner);
+            }
+            FactoryMethodOutcome::Chain(next) => {
+                if next.is_empty() {
+                    semantic.factory_return_cache.borrow_mut().insert(key, None);
+                } else {
+                    stack.extend(next.into_iter().rev());
+                }
+            }
+            FactoryMethodOutcome::Unknown => {
+                semantic.factory_return_cache.borrow_mut().insert(key, None);
+            }
+        }
+    }
+    semantic
+        .factory_return_cache
+        .borrow_mut()
+        .insert(start_key, None);
+    None
+}
+
+impl FactoryInferenceFrame {
+    fn key(&self) -> FactoryInferenceKey {
+        FactoryInferenceKey {
+            method: self.method.clone(),
+            invocation_owner_fq_name: self.invocation_owner_fq_name.clone(),
+        }
+    }
+}
+
+fn ruby_factory_method_outcome(
+    semantic: &RubySemanticIndex<'_>,
+    frame: &FactoryInferenceFrame,
+) -> FactoryMethodOutcome {
+    let Some(owner) = semantic.analyzer.parent_of(&frame.method) else {
+        return FactoryMethodOutcome::Unknown;
+    };
+    let Ok(source) = semantic
+        .analyzer
+        .project()
+        .read_source(frame.method.source())
+    else {
+        return FactoryMethodOutcome::Unknown;
+    };
+    let Some(tree) = parse_ruby_tree(&source) else {
+        return FactoryMethodOutcome::Unknown;
+    };
+    let ranges = semantic.analyzer.ranges(&frame.method);
+    let Some(node) = ruby_method_node_for_ranges(tree.root_node(), ranges) else {
+        return FactoryMethodOutcome::Unknown;
+    };
+    let Some(expression) = ruby_tail_expression(node) else {
+        return FactoryMethodOutcome::Unknown;
+    };
+    let expression = if expression.kind() == "assignment" {
+        let Some(right) = expression.child_by_field_name("right") else {
+            return FactoryMethodOutcome::Unknown;
+        };
+        right
+    } else {
+        expression
+    };
+    if expression.kind() != "call"
+        || expression
+            .child_by_field_name("method")
+            .is_none_or(|method| node_text(method, &source) != "new")
+    {
+        return FactoryMethodOutcome::Unknown;
+    }
+    let Some(receiver) = expression.child_by_field_name("receiver") else {
+        return FactoryMethodOutcome::Unknown;
+    };
+    ruby_factory_new_receiver_outcome(
+        semantic,
+        frame.method.source(),
+        &source,
+        &owner.fq_name(),
+        &frame.invocation_owner_fq_name,
+        receiver,
+    )
+}
+
+fn ruby_method_node_for_ranges<'tree>(root: Node<'tree>, ranges: &[Range]) -> Option<Node<'tree>> {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if matches!(node.kind(), "method" | "singleton_method")
+            && ranges.iter().any(|range| {
+                range.start_byte == node.start_byte() && range.end_byte == node.end_byte()
+            })
+        {
+            return Some(node);
+        }
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    None
+}
+
+fn ruby_factory_new_receiver_outcome(
+    semantic: &RubySemanticIndex<'_>,
+    file: &ProjectFile,
+    source: &str,
+    owner_fq_name: &str,
+    invocation_owner_fq_name: &str,
+    receiver: Node<'_>,
+) -> FactoryMethodOutcome {
+    let lexical_stack = ruby_lexical_stack_for_owner(owner_fq_name);
+    match receiver.kind() {
+        "self" => FactoryMethodOutcome::Owner(invocation_owner_fq_name.to_string()),
+        "constant" | "scope_resolution" => {
+            let visible_files = semantic.visible_files_from(file);
+            semantic
+                .resolve_constant(file, &visible_files, &lexical_stack, receiver, source)
+                .filter(|unit| unit.is_class() || unit.is_module())
+                .map(|unit| FactoryMethodOutcome::Owner(unit.fq_name()))
+                .unwrap_or(FactoryMethodOutcome::Unknown)
+        }
+        "call" => ruby_factory_chained_call_outcome(
+            semantic,
+            file,
+            source,
+            &lexical_stack,
+            invocation_owner_fq_name,
+            receiver,
+        ),
+        _ => FactoryMethodOutcome::Unknown,
+    }
+}
+
+fn ruby_factory_chained_call_outcome(
+    semantic: &RubySemanticIndex<'_>,
+    file: &ProjectFile,
+    source: &str,
+    lexical_stack: &[String],
+    invocation_owner_fq_name: &str,
+    call: Node<'_>,
+) -> FactoryMethodOutcome {
+    let Some(method) = call.child_by_field_name("method") else {
+        return FactoryMethodOutcome::Unknown;
+    };
+    let method_name = node_text(method, source);
+    let Some(receiver) = call.child_by_field_name("receiver") else {
+        return FactoryMethodOutcome::Unknown;
+    };
+    let Some(owner_fq_name) = ruby_factory_class_receiver_owner(
+        semantic,
+        file,
+        source,
+        lexical_stack,
+        invocation_owner_fq_name,
+        receiver,
+    ) else {
+        return FactoryMethodOutcome::Unknown;
+    };
+    let visible_files = semantic.visible_files_from(file);
+    let class = ReceiverType {
+        owner_fq_name: owner_fq_name.clone(),
+        mode: ReceiverMode::Class,
+    };
+    let frames = semantic
+        .resolve_method_candidates(
+            semantic.analyzer.definition_lookup_index(),
+            &visible_files,
+            &class,
+            method_name,
+        )
+        .into_iter()
+        .map(|method| FactoryInferenceFrame {
+            method,
+            invocation_owner_fq_name: owner_fq_name.clone(),
+        })
+        .collect();
+    FactoryMethodOutcome::Chain(frames)
+}
+
+fn ruby_factory_class_receiver_owner(
+    semantic: &RubySemanticIndex<'_>,
+    file: &ProjectFile,
+    source: &str,
+    lexical_stack: &[String],
+    invocation_owner_fq_name: &str,
+    receiver: Node<'_>,
+) -> Option<String> {
+    match receiver.kind() {
+        "self" => Some(invocation_owner_fq_name.to_string()),
+        "constant" | "scope_resolution" => {
+            let visible_files = semantic.visible_files_from(file);
+            semantic
+                .resolve_constant(file, &visible_files, lexical_stack, receiver, source)
+                .filter(|unit| unit.is_class() || unit.is_module())
+                .map(|unit| unit.fq_name())
+        }
+        _ => None,
+    }
+}
+
+fn ruby_tail_expression(node: Node<'_>) -> Option<Node<'_>> {
+    let body = node.child_by_field_name("body")?;
+    let mut cursor = body.walk();
+    body.named_children(&mut cursor).last()
+}
+
+fn ruby_lexical_stack_for_owner(owner_fq_name: &str) -> Vec<String> {
+    let segments: Vec<_> = owner_fq_name
+        .split('$')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    (1..=segments.len())
+        .map(|end| segments[..end].join("$"))
+        .collect()
 }
 
 pub(crate) fn ruby_enclosing_receiver(
@@ -997,32 +1312,21 @@ pub(crate) fn is_singleton_method_declaration(analyzer: &dyn IAnalyzer, target: 
     if ranges.is_empty() {
         return false;
     }
-    let mut stack = vec![tree.root_node()];
-    while let Some(node) = stack.pop() {
-        if matches!(node.kind(), "method" | "singleton_method")
-            && ranges.iter().any(|range| {
-                range.start_byte == node.start_byte() && range.end_byte == node.end_byte()
-            })
-        {
-            if node.kind() == "singleton_method" {
-                return true;
-            }
-            let mut parent = node.parent();
-            while let Some(current) = parent {
-                if current.kind() == "singleton_class" {
-                    return true;
-                }
-                if matches!(current.kind(), "class" | "module") {
-                    break;
-                }
-                parent = current.parent();
-            }
+    let Some(node) = ruby_method_node_for_ranges(tree.root_node(), ranges) else {
+        return false;
+    };
+    if node.kind() == "singleton_method" {
+        return true;
+    }
+    let mut parent = node.parent();
+    while let Some(current) = parent {
+        if current.kind() == "singleton_class" {
+            return true;
         }
-        for index in (0..node.named_child_count()).rev() {
-            if let Some(child) = node.named_child(index) {
-                stack.push(child);
-            }
+        if matches!(current.kind(), "class" | "module") {
+            break;
         }
+        parent = current.parent();
     }
     false
 }

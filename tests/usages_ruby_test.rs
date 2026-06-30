@@ -602,6 +602,240 @@ end
 }
 
 #[test]
+fn resolves_build_receiver_include_and_prepend_usage_precedence() {
+    let (_project, analyzer) = ruby_analyzer_with_files(&[
+        (
+            "app/report.rb",
+            r#"require_relative "../lib/billing/invoice"
+
+module Reports
+  class InvoiceReport
+    def render
+      invoice = Billing::Invoice.build
+      invoice.audit
+      invoice.total_label
+    end
+  end
+end
+"#,
+        ),
+        (
+            "lib/billing/invoice.rb",
+            r#"module Billing
+  module Auditable
+    def audit
+    end
+  end
+
+  module Formatting
+    def total_label
+    end
+  end
+
+  class Invoice
+    include Auditable
+    prepend Formatting
+
+    def total_label
+    end
+
+    def self.build
+      @last_build = Invoice.new
+    end
+  end
+end
+"#,
+        ),
+    ]);
+
+    let audit = definition(&analyzer, "Billing$Auditable.audit");
+    let audit_hits = analyzer
+        .find_usages(&[audit])
+        .into_either()
+        .expect("audit lookup should succeed");
+    let audit_lines = hit_source_lines(&audit_hits);
+    assert!(
+        audit_lines.iter().any(|line| line == "invoice.audit"),
+        "{audit_lines:?}"
+    );
+
+    let formatting = definition(&analyzer, "Billing$Formatting.total_label");
+    let formatting_hits = analyzer
+        .find_usages(&[formatting])
+        .into_either()
+        .expect("formatting lookup should succeed");
+    let formatting_lines = hit_source_lines(&formatting_hits);
+    assert!(
+        formatting_lines
+            .iter()
+            .any(|line| line == "invoice.total_label"),
+        "{formatting_lines:?}"
+    );
+
+    let invoice_total_label = definition(&analyzer, "Billing$Invoice.total_label");
+    let invoice_hits = analyzer
+        .find_usages(&[invoice_total_label])
+        .into_either()
+        .expect("shadowed class method lookup should succeed");
+    let invoice_lines = hit_source_lines(&invoice_hits);
+    assert!(
+        !invoice_lines
+            .iter()
+            .any(|line| line == "invoice.total_label"),
+        "{invoice_lines:?}"
+    );
+}
+
+#[test]
+fn resolves_inherited_self_new_factory_receiver_usage() {
+    let (_project, analyzer) = ruby_analyzer_with_files(&[(
+        "app.rb",
+        r#"module Auditable
+  def audit
+  end
+end
+
+class Base
+  def self.build
+    self.new
+  end
+end
+
+class Child < Base
+  include Auditable
+end
+
+class App
+  def run
+    Child.build.audit
+  end
+end
+"#,
+    )]);
+
+    let audit = definition(&analyzer, "Auditable.audit");
+    let hits = analyzer
+        .find_usages(&[audit])
+        .into_either()
+        .expect("audit lookup should succeed");
+    let lines = hit_source_lines(&hits);
+    assert!(
+        lines.iter().any(|line| line == "Child.build.audit"),
+        "{lines:?}"
+    );
+}
+
+#[test]
+fn recursive_factory_receiver_fails_closed_for_usages() {
+    let (_project, analyzer) = ruby_analyzer_with_files(&[(
+        "app.rb",
+        r#"class Thing
+  def self.build
+    Thing.build.new
+  end
+
+  def audit
+  end
+end
+
+class App
+  def run
+    Thing.build.audit
+  end
+end
+"#,
+    )]);
+
+    let audit = definition(&analyzer, "Thing.audit");
+    let query = UsageFinder::new().query(&analyzer, &[audit], 100, 100);
+    assert!(
+        matches!(query.result, FuzzyResult::Failure { .. }),
+        "recursive factory inference should not invent a hit: {:?}",
+        query.result
+    );
+}
+
+#[test]
+fn resolves_multi_argument_mixin_usage_precedence() {
+    let (_project, analyzer) = ruby_analyzer_with_files(&[(
+        "app.rb",
+        r#"module A
+  def audit
+  end
+
+  def label
+  end
+end
+
+module B
+  def audit
+  end
+
+  def label
+  end
+end
+
+class Included
+  include A, B
+end
+
+class Prepended
+  prepend A, B
+
+  def label
+  end
+end
+
+class App
+  def run
+    Included.new.audit
+    Prepended.new.label
+  end
+end
+"#,
+    )]);
+
+    let a_audit = definition(&analyzer, "A.audit");
+    let a_audit_hits = analyzer
+        .find_usages(&[a_audit])
+        .into_either()
+        .expect("A.audit lookup should succeed");
+    let a_audit_lines = hit_source_lines(&a_audit_hits);
+    assert!(
+        a_audit_lines
+            .iter()
+            .any(|line| line == "Included.new.audit"),
+        "{a_audit_lines:?}"
+    );
+
+    let b_audit = definition(&analyzer, "B.audit");
+    let b_audit_hits = analyzer
+        .find_usages(&[b_audit])
+        .into_either()
+        .expect("B.audit lookup should succeed");
+    let b_audit_lines = hit_source_lines(&b_audit_hits);
+    assert!(
+        !b_audit_lines
+            .iter()
+            .any(|line| line == "Included.new.audit"),
+        "{b_audit_lines:?}"
+    );
+
+    let a_label = definition(&analyzer, "A.label");
+    let a_label_hits = analyzer
+        .find_usages(&[a_label])
+        .into_either()
+        .expect("A.label lookup should succeed");
+    let a_label_lines = hit_source_lines(&a_label_hits);
+    assert!(
+        a_label_lines
+            .iter()
+            .any(|line| line == "Prepended.new.label"),
+        "{a_label_lines:?}"
+    );
+}
+
+#[test]
 fn reports_unsafe_inference_for_only_dynamic_or_untyped_same_name_calls() {
     let (_project, analyzer) = ruby_analyzer_with_files(&[(
         "app/user.rb",

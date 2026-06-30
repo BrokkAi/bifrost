@@ -206,6 +206,239 @@ end
 }
 
 #[test]
+fn ruby_get_definition_resolves_build_receiver_include_and_prepend_methods() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "app/report.rb",
+            r#"require_relative "../lib/billing/invoice"
+
+module Reports
+  class InvoiceReport
+    def render
+      invoice = Billing::Invoice.build
+      invoice.audit
+      invoice.total_label
+    end
+  end
+end
+"#,
+        )
+        .file(
+            "lib/billing/invoice.rb",
+            r#"module Billing
+  module Auditable
+    def audit
+    end
+  end
+
+  module Formatting
+    def total_label
+    end
+  end
+
+  class Invoice
+    include Auditable
+    prepend Formatting
+
+    def total_label
+    end
+
+    def self.build
+      @last_build = Invoice.new
+    end
+  end
+end
+"#,
+        )
+        .build();
+
+    let audit_line = "      invoice.audit";
+    let audit_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/report.rb","line":7,"column":{}}}]}}"#,
+            column_of(audit_line, "audit")
+        ),
+    );
+    let audit_result = &audit_value["results"][0];
+    assert_eq!(audit_result["status"], "resolved", "{audit_value}");
+    assert_eq!(
+        audit_result["definitions"][0]["fqn"], "Billing$Auditable.audit",
+        "{audit_value}"
+    );
+
+    let total_label_line = "      invoice.total_label";
+    let total_label_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/report.rb","line":8,"column":{}}}]}}"#,
+            column_of(total_label_line, "total_label")
+        ),
+    );
+    let total_label_result = &total_label_value["results"][0];
+    assert_eq!(
+        total_label_result["status"], "resolved",
+        "{total_label_value}"
+    );
+    assert_eq!(
+        total_label_result["definitions"][0]["fqn"], "Billing$Formatting.total_label",
+        "{total_label_value}"
+    );
+}
+
+#[test]
+fn ruby_get_definition_resolves_inherited_self_new_factory_receiver() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "app.rb",
+            r#"module Auditable
+  def audit
+  end
+end
+
+class Base
+  def self.build
+    self.new
+  end
+end
+
+class Child < Base
+  include Auditable
+end
+
+class App
+  def run
+    Child.build.audit
+  end
+end
+"#,
+        )
+        .build();
+
+    let line = "    Child.build.audit";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.rb","line":18,"column":{}}}]}}"#,
+            column_of(line, "audit")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Auditable.audit",
+        "{value}"
+    );
+}
+
+#[test]
+fn ruby_get_definition_factory_cycle_fails_closed() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "app.rb",
+            r#"class Thing
+  def self.build
+    Thing.build.new
+  end
+end
+
+class App
+  def run
+    Thing.build.audit
+  end
+end
+"#,
+        )
+        .build();
+
+    let line = "    Thing.build.audit";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.rb","line":9,"column":{}}}]}}"#,
+            column_of(line, "audit")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn ruby_get_definition_respects_multi_argument_mixin_precedence() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "app.rb",
+            r#"module A
+  def audit
+  end
+
+  def label
+  end
+end
+
+module B
+  def audit
+  end
+
+  def label
+  end
+end
+
+class Included
+  include A, B
+end
+
+class Prepended
+  prepend A, B
+
+  def label
+  end
+end
+
+class App
+  def run
+    Included.new.audit
+    Prepended.new.label
+  end
+end
+"#,
+        )
+        .build();
+
+    let audit_line = "    Included.new.audit";
+    let audit_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.rb","line":30,"column":{}}}]}}"#,
+            column_of(audit_line, "audit")
+        ),
+    );
+    let audit_result = &audit_value["results"][0];
+    assert_eq!(audit_result["status"], "resolved", "{audit_value}");
+    assert_eq!(
+        audit_result["definitions"][0]["fqn"], "A.audit",
+        "{audit_value}"
+    );
+
+    let label_line = "    Prepended.new.label";
+    let label_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.rb","line":31,"column":{}}}]}}"#,
+            column_of(label_line, "label")
+        ),
+    );
+    let label_result = &label_value["results"][0];
+    assert_eq!(label_result["status"], "resolved", "{label_value}");
+    assert_eq!(
+        label_result["definitions"][0]["fqn"], "A.label",
+        "{label_value}"
+    );
+}
+
+#[test]
 fn ruby_get_definition_resolves_constant_through_project_local_require() {
     let project = InlineTestProject::with_language(Language::Ruby)
         .file(

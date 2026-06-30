@@ -116,17 +116,21 @@ impl RubyAnalyzer {
                             continue;
                         };
                         let mut arg_cursor = arguments.walk();
+                        let mut targets = Vec::new();
                         for arg in arguments.named_children(&mut arg_cursor) {
                             if matches!(arg.kind(), "constant" | "scope_resolution")
                                 && let Some(name) = qualified_internal_name(arg, source)
                                 && let Some(target) = self.resolve_mixin_target(file, &name)
                             {
-                                relations.push(TypeRelation {
-                                    from: owner.clone(),
-                                    to: target,
-                                    kind,
-                                });
+                                targets.push(target);
                             }
+                        }
+                        for target in targets.into_iter().rev() {
+                            relations.push(TypeRelation {
+                                from: owner.clone(),
+                                to: target,
+                                kind,
+                            });
                         }
                     }
                     kind if is_descendable_container(kind) => stack.push(child),
