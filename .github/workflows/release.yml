@@ -60,12 +60,9 @@ jobs:
       - name: Resolve tag
         id: tag
         shell: bash
-        run: |
-          if [ -n "${{ inputs.tag }}" ]; then
-            echo "name=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
-          fi
+        env:
+          RELEASE_TAG_INPUT: ${{ inputs.tag }}
+        run: scripts/resolve-release-tag.sh
 
       - name: Install Rust toolchain
         shell: bash
@@ -157,15 +154,17 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
       - name: Resolve tag
         id: tag
         shell: bash
-        run: |
-          if [ -n "${{ inputs.tag }}" ]; then
-            echo "name=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
-          fi
+        env:
+          RELEASE_TAG_INPUT: ${{ inputs.tag }}
+        run: scripts/resolve-release-tag.sh
 
       - name: Download all artifacts
         uses: actions/download-artifact@v7
@@ -183,3 +182,75 @@ jobs:
             dist/*.tar.gz
             dist/*.zip
             dist/*.sha256
+
+  vscode:
+    name: vscode extension
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        env:
+          RELEASE_TAG_INPUT: ${{ inputs.tag }}
+        run: scripts/resolve-release-tag.sh
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
+
+      - name: Install extension dependencies
+        run: npm ci
+        working-directory: editors/vscode
+
+      - name: Prepare extension manifest
+        run: >
+          node scripts/prepare-vscode-extension-manifest.mjs
+          --version "${{ steps.tag.outputs.version }}"
+          --manifest editors/vscode/package.json
+          --dist dist
+
+      - name: Test extension
+        run: npm test
+        working-directory: editors/vscode
+
+      - name: Package extension
+        run: npx --no-install vsce package --out "../../dist/bifrost-vscode-${{ steps.tag.outputs.name }}.vsix"
+        working-directory: editors/vscode
+
+      - name: Upload VSIX to GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          files: dist/*.vsix
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Publish extension to Visual Studio Marketplace
+        run: >
+          npx --no-install vsce publish
+          --azure-credential
+          --packagePath "../../dist/bifrost-vscode-${{ steps.tag.outputs.name }}.vsix"
+        working-directory: editors/vscode

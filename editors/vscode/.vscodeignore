@@ -2,10 +2,13 @@
 .vscode-test/**
 node_modules/**
 src/**
+test/**
+out-test/**
 *.ts
 **/*.map
 .gitignore
 esbuild.mjs
 tsconfig.json
+tsconfig.test.json
 package-lock.json
 *.vsix
