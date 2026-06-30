@@ -104,7 +104,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
         .arg("--force-semantic-cpu")
         .arg("--root")
         .arg(fixture_root.path())
-        .arg("--server")
+        .arg("--mcp")
         .arg("searchtools")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -559,27 +559,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
 }
 
 #[test]
-fn bifrost_without_a_mode_errors() {
-    // No --mcp/--lsp/--tool: there is no implicit default, so the process must
-    // exit with an error rather than silently starting a server.
-    let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
-        .env("BIFROST_SEMANTIC_INDEX", "off")
-        .stdin(Stdio::null())
-        .output()
-        .expect("run bifrost");
-    assert!(
-        !output.status.success(),
-        "bifrost with no mode should exit non-zero"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("no mode selected"),
-        "expected a no-mode error, got stderr:\n{stderr}"
-    );
-}
-
-#[test]
-fn bifrost_searchtools_server_defaults_root_to_cwd() {
+fn bifrost_defaults_to_cwd_searchtools_server() {
     let fixture_root = TempDir::new().expect("temp dir");
     fs::write(
         fixture_root.path().join("DefaultRoot.java"),
@@ -598,7 +578,7 @@ fn bifrost_searchtools_server_defaults_root_to_cwd() {
     repo.commit(Some("HEAD"), &sig, &sig, "initial", &tree, &[])
         .expect("initial commit");
 
-    let mut child = spawn_searchtools_server_in_cwd(fixture_root.path());
+    let mut child = spawn_server_no_args(fixture_root.path());
 
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
@@ -824,7 +804,7 @@ fn bifrost_semantic_search_fails_cleanly_without_models() {
         .arg("--force-semantic-cpu")
         .arg("--root")
         .arg(&fixture_root)
-        .arg("--server")
+        .arg("--mcp")
         .arg("nlp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1907,7 +1887,7 @@ fn spawn_server(root: &std::path::Path, mode: &str, extra_args: &[&str]) -> std:
     let mut command = Command::new(env!("CARGO_BIN_EXE_bifrost"));
     command.env("BIFROST_SEMANTIC_INDEX", "off");
     command.arg("--force-semantic-cpu");
-    command.arg("--root").arg(root).arg("--server").arg(mode);
+    command.arg("--root").arg(root).arg("--mcp").arg(mode);
     for arg in extra_args {
         command.arg(arg);
     }
@@ -1919,10 +1899,10 @@ fn spawn_server(root: &std::path::Path, mode: &str, extra_args: &[&str]) -> std:
         .expect("spawn bifrost")
 }
 
-fn spawn_searchtools_server_in_cwd(cwd: &std::path::Path) -> std::process::Child {
-    // No --root: the server must default its root to the working directory.
+fn spawn_server_no_args(cwd: &std::path::Path) -> std::process::Child {
+    // No mode: the compatibility contract is MCP searchtools. No --root: the
+    // server must default its root to the working directory.
     Command::new(env!("CARGO_BIN_EXE_bifrost"))
-        .args(["--mcp", "searchtools"])
         .env("BIFROST_SEMANTIC_INDEX", "off")
         .current_dir(cwd)
         .stdin(Stdio::piped())

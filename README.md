@@ -86,7 +86,7 @@ cd /path/to/project
 bifrost --mcp searchtools
 ```
 
-By default, `bifrost` uses the current working directory as `--root`. Select a mode with `--mcp`, `--lsp`, or `--tool`. Run `bifrost --help` to see all options.
+By default, `bifrost` uses the current working directory as `--root` and `searchtools` as the MCP toolset. Select a different mode with `--mcp`, `--lsp`, or `--tool`. Run `bifrost --help` to see all options.
 
 ### Integrating with MCP hosts
 

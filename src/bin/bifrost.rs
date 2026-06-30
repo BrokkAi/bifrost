@@ -139,13 +139,7 @@ fn run() -> Result<(), String> {
         return run_lsp_stdio_server(root);
     }
 
-    // A mode must be chosen explicitly; there is no implicit default.
-    let Some(mode) = mcp_mode.as_deref() else {
-        return Err(
-            "no mode selected: pass --mcp TOOLSETS (e.g. --mcp core), --lsp, or --tool NAME"
-                .to_string(),
-        );
-    };
+    let mode = mcp_mode.as_deref().unwrap_or("searchtools");
     let git_repo = brokk_bifrost::mcp_registry::workspace_is_git(&root);
     let spec = resolve_server_spec_for_render_options(mode, render_options, git_repo)?;
     run_stdio_server(root, render_options, &spec)
@@ -374,6 +368,7 @@ fn print_general_help() {
     // from the registry so it never drifts.
     let top = r#"
 USAGE:
+    bifrost                  Run an MCP server over stdio (default: --mcp searchtools)
     bifrost --mcp TOOLSETS     Run an MCP server over stdio (e.g. --mcp core)
     bifrost --lsp              Run a Language Server (LSP) over stdio
     bifrost --tool NAME        Run a single tool once, print the result, and exit
@@ -415,6 +410,9 @@ MCP TOOLSETS (--mcp):
     Run `bifrost --help <tool>` for a tool's description and parameters.
 
 EXAMPLES:
+    # MCP server from the current directory, using the compatibility searchtools set:
+    bifrost
+
     # MCP server an agent connects to (core toolset), speaking MCP over stdio:
     bifrost --root /path/to/project --mcp core
 
