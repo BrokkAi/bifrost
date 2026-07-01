@@ -4,11 +4,13 @@
 
 The first blessed Ubuntu baseline was promoted from the successful PR-path benchmark run on June 5, 2026 (`run-20260605T072813Z.json` from PR #172).
 
-The current blessed Ubuntu baseline was promoted from the successful PR-path
-benchmark run on June 22, 2026 (`run-20260622T104233Z.json` from PR #224),
-after the benchmark manifest switched Express `scan_usages` to a precise
-location target and restored the `fmt-cpp get_definition` scenario below the
-previous baseline.
+The current blessed Ubuntu baseline was promoted from the successful scheduled
+benchmark run on July 1, 2026 (`run-20260701T104146Z.json` from Actions run
+28511308801). The report had zero scenario failures across 71 scenarios. The
+previous baseline flagged the sustained `fastroute-php scan_usages` timing
+increase as a regression; this promotion accepts the current post-June 29
+performance level and includes the Google Gson hierarchy scenarios added after
+the June 22 baseline.
 
 It is not written automatically. Promote it deliberately:
 
