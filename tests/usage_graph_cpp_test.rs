@@ -53,17 +53,18 @@ fn resolves_instance_pointer_static_and_free_calls() {
 }
 
 #[test]
-fn unqualified_self_call_attributes_to_enclosing_class() {
+fn unqualified_self_call_does_not_create_usage_graph_edge() {
     let value = usage_graph();
 
-    // An unqualified `local()` call attributes to the enclosing class.
+    // An unqualified `local()` call is an implicit self-receiver reference. It
+    // belongs to editor references, not the external usage_graph edge surface.
     assert!(
-        has_edge(
+        !has_edge(
             &value,
             "example.Consumer.callsLocal",
             "example.Consumer.local"
         ),
-        "expected callsLocal -> Consumer.local: {}",
+        "self-receiver calls must not appear as usage_graph edges: {}",
         value["edges"]
     );
 }

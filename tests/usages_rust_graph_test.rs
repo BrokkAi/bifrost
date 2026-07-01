@@ -706,6 +706,34 @@ fn member(
 }
 
 #[test]
+fn rust_self_receiver_is_editor_only_member_usage() {
+    let (project, analyzer) = rust_analyzer_with_files(&[(
+        "src/service.rs",
+        r#"
+pub struct Foo;
+impl Foo {
+    pub fn target(&self) {}
+    pub fn caller(&self) {
+        self.target();
+    }
+}
+"#,
+    )]);
+
+    let target = member(&analyzer, &project.file("src/service.rs"), "Foo", "target");
+    let result = UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target));
+
+    assert!(
+        result.all_hits().is_empty(),
+        "scan_usages/external surface must not count self-receiver hits: {:?}",
+        result.all_hits()
+    );
+    let editor_hits = result.all_hits_including_imports();
+    assert_eq!(1, editor_hits.len(), "editor hits: {editor_hits:?}");
+    assert!(editor_hits.iter().all(|hit| hit.snippet.contains("self.target")));
+}
+
+#[test]
 fn usage_finder_routes_rust_member_targets_through_graph() {
     let (project, analyzer) = rust_analyzer_with_files(&[
         (

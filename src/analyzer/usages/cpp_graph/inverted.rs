@@ -25,6 +25,7 @@
 use super::resolver::{
     TargetKind, VisibilityIndex, extract_variable_name, first_type_child,
     infer_cpp_initializer_type, is_declaration_name, is_declarator_node, normalize_type_text,
+    type_owner_of,
 };
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
@@ -188,6 +189,9 @@ fn record_call(
             else {
                 return;
             };
+            if receiver_is_self_like(receiver) {
+                return;
+            }
             if let Some(owner) = receiver_type_fqn(receiver, ctx, bindings) {
                 ctx.record(format!("{owner}.{name}"), field);
             }
@@ -205,15 +209,27 @@ fn record_call(
                 ctx.visibility
                     .resolve_named(ctx.file, name, TargetKind::FreeFunction)
             {
+                if type_owner_of(ctx.analyzer, &unit).is_some() {
+                    return;
+                }
                 ctx.record(unit.fq_name(), function);
                 return;
             }
-            // Otherwise an unqualified member call (`this`/inherited).
-            if let Some(owner) = ctx.enclosing_class(function.start_byte()) {
-                ctx.record(format!("{owner}.{name}"), function);
-            }
+            // Otherwise this is an unqualified member call (`this`/inherited).
+            // That belongs to editor references, not the usage_graph edge surface.
         }
         _ => {}
+    }
+}
+
+fn receiver_is_self_like(receiver: Node<'_>) -> bool {
+    match receiver.kind() {
+        "this" => true,
+        "parenthesized_expression" | "pointer_expression" => receiver
+            .child_by_field_name("argument")
+            .or_else(|| receiver.named_child(0))
+            .is_some_and(receiver_is_self_like),
+        _ => false,
     }
 }
 

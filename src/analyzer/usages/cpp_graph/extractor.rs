@@ -1,6 +1,7 @@
 use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::usages::cpp_graph::hits::{
     enclosing_context, is_member_field_declaration_context, push_definition_hit, push_hit,
+    push_self_receiver_hit,
 };
 use crate::analyzer::usages::cpp_graph::resolver::*;
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
@@ -321,7 +322,8 @@ fn maybe_record_free_function_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if node.kind() != "call_expression" {
         return;
     }
-    let Some(function) = node.child_by_field_name("function") else {
+    let Some(function) = node.child_by_field_name("function").or_else(|| node.named_child(0))
+    else {
         return;
     };
     let text = node_text(function, ctx.source);
@@ -415,13 +417,18 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             return;
         }
         if receiver_matches_target(receiver, ctx) {
-            push_hit(operator, ctx);
+            if receiver_is_self_like(receiver) {
+                push_self_receiver_hit(operator, ctx);
+            } else {
+                push_hit(operator, ctx);
+            }
         } else if !receiver_has_known_non_target(receiver, ctx) {
             *ctx.saw_unproven_match = true;
         }
         return;
     }
-    let Some(function) = node.child_by_field_name("function") else {
+    let Some(function) = node.child_by_field_name("function").or_else(|| node.named_child(0))
+    else {
         return;
     };
     let text = node_text(function, ctx.source);
@@ -434,8 +441,13 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     {
         return;
     }
+    let self_receiver = receiver_is_self_like(function);
     if receiver_matches_target(function, ctx) || same_owner_context(function, ctx) {
-        push_hit(function_terminal_node(function), ctx);
+        if self_receiver || same_owner_context(function, ctx) {
+            push_self_receiver_hit(function_terminal_node(function), ctx);
+        } else {
+            push_hit(function_terminal_node(function), ctx);
+        }
     } else if !receiver_has_known_non_target(function, ctx)
         && !known_non_target_owner_context(function, ctx)
     {
@@ -453,6 +465,9 @@ fn maybe_record_method_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
     *ctx.raw_match_count += 1;
     if !function_definition_signature_matches_target(node, ctx) {
+        return;
+    }
+    if node_inside_target_declaration(function, ctx) {
         return;
     }
     if definition_name_candidates(function, ctx)
@@ -485,6 +500,16 @@ fn maybe_record_method_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     } else {
         *ctx.saw_unproven_match = true;
     }
+}
+
+fn node_inside_target_declaration(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    if ctx.file != ctx.spec.target.source() {
+        return false;
+    }
+    ctx.analyzer
+        .ranges(&ctx.spec.target)
+        .iter()
+        .any(|range| node.start_byte() >= range.start_byte && node.end_byte() <= range.end_byte)
 }
 
 fn explicit_operator_call(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
@@ -857,6 +882,24 @@ fn receiver_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
             let text = node_text(node, ctx.source);
             qualified_owner_matches(text, ctx)
         }
+    }
+}
+
+fn receiver_is_self_like(node: Node<'_>) -> bool {
+    match node.kind() {
+        "this" => true,
+        "field_expression" => node
+            .child_by_field_name("argument")
+            .or_else(|| node.child_by_field_name("object"))
+            .is_some_and(receiver_is_self_like),
+        "call_expression" => node
+            .child_by_field_name("function")
+            .is_some_and(receiver_is_self_like),
+        "pointer_expression" | "parenthesized_expression" => node
+            .child_by_field_name("argument")
+            .or_else(|| node.named_child(0))
+            .is_some_and(receiver_is_self_like),
+        _ => false,
     }
 }
 

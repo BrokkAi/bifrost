@@ -8,17 +8,22 @@ use crate::text_utils::{find_line_index_for_offset, snippet_around_line};
 use tree_sitter::Node;
 
 pub(super) fn push_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    push_hit_with_options(node, ctx, false);
+    push_hit_with_options(node, ctx, false, false);
+}
+
+pub(super) fn push_self_receiver_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    push_hit_with_options(node, ctx, false, true);
 }
 
 pub(super) fn push_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    push_hit_with_options(node, ctx, true);
+    push_hit_with_options(node, ctx, true, false);
 }
 
 fn push_hit_with_options(
     node: Node<'_>,
     ctx: &mut ScanCtx<'_>,
     allow_logical_target_enclosing: bool,
+    self_receiver: bool,
 ) {
     if *ctx.limit_exceeded {
         return;
@@ -37,14 +42,19 @@ fn push_hit_with_options(
     {
         return;
     }
-    ctx.hits.insert(usage_hit(
+    let hit = usage_hit(
         ctx.file,
         line_idx,
         start,
         end,
         enclosing,
         snippet_around_line(ctx.source, ctx.line_starts, line_idx, SNIPPET_CONTEXT_LINES),
-    ));
+    );
+    ctx.hits.insert(if self_receiver {
+        hit.into_self_receiver()
+    } else {
+        hit
+    });
     if ctx.hits.len() > ctx.max_usages {
         *ctx.limit_exceeded = true;
     }

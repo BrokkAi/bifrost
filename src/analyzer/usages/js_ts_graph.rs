@@ -144,6 +144,22 @@ impl<'a> UsageQueryResolver<'a> for JsTsQueryResolver {
             owner_seed_allowed,
         );
         if seeds.is_empty() {
+            let mut self_file = HashSet::default();
+            self_file.insert(target.source().clone());
+            let local_hits = scan_files_for_seeds(
+                analyzer,
+                index,
+                &self_file,
+                target,
+                &BTreeSet::new(),
+                language,
+            );
+            if !local_hits.is_empty() {
+                return GraphUsageOutcome::Resolved(FuzzyResult::success(
+                    target.clone(),
+                    local_hits,
+                ));
+            }
             return GraphUsageOutcome::fallback_safe(
                 target.fq_name(),
                 GraphFailureReason::NoGraphSeed("no export seed resolved"),

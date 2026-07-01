@@ -145,6 +145,39 @@ fn constructor_definition_with_arity(
     })
 }
 
+#[test]
+fn cpp_this_receiver_is_editor_only_member_usage() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[(
+        "foo.cpp",
+        r#"
+struct Foo {
+  void target() {}
+  void caller() {
+    this->target();
+    target();
+  }
+};
+"#,
+    )]);
+
+    let target = member_function_definition(&analyzer, "Foo", "target");
+    let result = UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target));
+
+    assert!(
+        result.all_hits().is_empty(),
+        "scan_usages/external surface must not count self-receiver hits: {:?}",
+        result.all_hits()
+    );
+    let editor_hits = result.all_hits_including_imports();
+    assert_eq!(2, editor_hits.len(), "editor hits: {editor_hits:?}");
+    assert!(
+        editor_hits
+            .iter()
+            .all(|hit| hit.snippet.contains("target();")),
+        "editor hits: {editor_hits:?}"
+    );
+}
+
 fn signature_arity(signature: Option<&str>) -> usize {
     let Some(signature) = signature else {
         return 0;
@@ -235,24 +268,36 @@ fn usage_hits(analyzer: &CppAnalyzer, target: &CodeUnit) -> Vec<HitSummary> {
         .into_either()
         .expect("cpp graph success")
         .into_iter()
-        .map(|hit| {
-            let line = hit
-                .file
-                .read_to_string()
-                .ok()
-                .and_then(|source| {
-                    source
-                        .lines()
-                        .nth(hit.line.saturating_sub(1))
-                        .map(str::to_string)
-                })
-                .unwrap_or_default();
-            HitSummary {
-                file: slash_path(&hit.file),
-                line,
-            }
-        })
+        .map(hit_summary)
         .collect()
+}
+
+fn editor_usage_hits(analyzer: &CppAnalyzer, target: &CodeUnit) -> Vec<HitSummary> {
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    CppUsageGraphStrategy::new()
+        .find_usages(analyzer, std::slice::from_ref(target), &candidates, 1000)
+        .all_hits_including_imports()
+        .into_iter()
+        .map(hit_summary)
+        .collect()
+}
+
+fn hit_summary(hit: brokk_bifrost::usages::UsageHit) -> HitSummary {
+    let line = hit
+        .file
+        .read_to_string()
+        .ok()
+        .and_then(|source| {
+            source
+                .lines()
+                .nth(hit.line.saturating_sub(1))
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    HitSummary {
+        file: slash_path(&hit.file),
+        line,
+    }
 }
 
 fn slash_path(file: &ProjectFile) -> String {
@@ -1252,12 +1297,22 @@ void outside(Target& target, Other& other) {
             && slash_path(unit.source()) == "target.cpp"
     });
     let run_hits = usage_hits(&analyzer, &run);
-    assert_eq!(3, run_hits.len(), "run hits were {run_hits:#?}");
-    assert_hit_contains(&run_hits, "target.cpp", "run();");
-    assert_hit_contains(&run_hits, "target.cpp", "this->run();");
+    assert_eq!(1, run_hits.len(), "run hits were {run_hits:#?}");
     assert_hit_contains(&run_hits, "target.cpp", "target.run();");
+    assert_no_hit_contains(&run_hits, "    run();");
+    assert_no_hit_contains(&run_hits, "this->run();");
     assert_no_hit_contains(&run_hits, "Other::run");
     assert_no_hit_contains(&run_hits, "other.run()");
+
+    let editor_run_hits = editor_usage_hits(&analyzer, &run);
+    assert_eq!(
+        3,
+        editor_run_hits.len(),
+        "editor run hits were {editor_run_hits:#?}"
+    );
+    assert_hit_contains(&editor_run_hits, "target.cpp", "run();");
+    assert_hit_contains(&editor_run_hits, "target.cpp", "this->run();");
+    assert_hit_contains(&editor_run_hits, "target.cpp", "target.run();");
 
     let value = field_definition_with_owner(&analyzer, "Target", "value");
     let value_hits = usage_hits(&analyzer, &value);

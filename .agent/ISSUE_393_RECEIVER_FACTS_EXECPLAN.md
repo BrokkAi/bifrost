@@ -14,7 +14,7 @@ The observable result is that #387 and #386 have concrete regression coverage: L
 
 - [x] (2026-07-01T07:58Z) Created this ExecPlan at `.agent/ISSUE_393_RECEIVER_FACTS_EXECPLAN.md`.
 - [x] (2026-07-01T08:03Z) Added the shared receiver/fact vocabulary and usage-hit surface helpers; focused surface and existing JS/TS/Python usage tests passed.
-- [ ] Implement and test self-receiver hit classification for #387.
+- [x] (2026-07-01T09:39Z) Implemented and tested self-receiver hit classification for #387 across JS/TS, C++, and Rust.
 - [ ] Implement and test JS/TS scope-aware member-assignment declaration filtering for #386.
 - [ ] Run focused tests, `cargo fmt`, and `cargo clippy-no-cuda`; commit after each completed milestone.
 
@@ -35,6 +35,15 @@ The observable result is that #387 and #386 have concrete regression coverage: L
 - Observation: The first shared-surface milestone did not change existing JS/TS or Python usage graph behavior.
   Evidence: `cargo test --lib usage_hit`, `cargo test --test usages_js_ts_graph_test`, and `cargo test --test usages_python_graph_test` all passed after adding `UsageHitSurface`, `UsageHitKind::SelfReceiver`, and `receiver_facts`.
 
+- Observation: JS/TS and Rust local, unexported member targets need same-file receiver scans before returning `NoGraphSeed`.
+  Evidence: The unignored LSP fixtures use local `class Foo` / private Rust `fn target`; `cargo test --test cross_language_self_usages` only passed after adding no-seed same-file scans for structurally proven `this.target()` and `self.target()`.
+
+- Observation: LSP declaration targeting for C++/Rust method declarations needed a broader declaration-name fallback.
+  Evidence: The analyzers returned `Foo.target` from `enclosing_code_unit`, but LSP references returned `null` until `src/lsp/handlers/broad_symbol.rs` could find a matching declaration identifier in the containing AST node when no `name` field was present.
+
+- Observation: Rust `self.field` and direct self field accesses are external receiver evidence, not `SelfReceiver` hits.
+  Evidence: `cargo test --test usages_rust_graph_test` initially failed existing field receiver tests until `SelfReceiver` classification was narrowed to non-field targets with direct `self.method()` receivers.
+
 ## Decision Log
 
 - Decision: Implement #393 as “contract plus fixes,” not contract-only.
@@ -51,7 +60,10 @@ The observable result is that #387 and #386 have concrete regression coverage: L
 
 ## Outcomes & Retrospective
 
-Update this section after each milestone. At completion, summarize which #386/#387 tests were unignored, which surfaces changed, and any language-specific receiver semantics deferred to #394 or narrower follow-up issues.
+- #387 milestone: unignored C++, JavaScript, TypeScript, and Rust cases in `tests/cross_language_self_usages.rs`. LSP references now include structurally proven same-class `this.target()` / `self.target()` hits for those languages, while `FuzzyResult::all_hits()` and usage graph surfaces exclude them as `SelfReceiver`.
+- Added graph regressions proving same-class receiver calls do not create `usage_graph` edges for TypeScript, C++, and Rust.
+- C++ also treats implicit same-owner calls (`target()`) as editor-visible self-receiver hits in the forward usage scan and skips them in the inverted graph.
+- Deferred richer receiver/value analysis remains #394 territory: receiver chains such as object-sensitive local aliases are still only handled where existing structured resolver support proves them.
 
 ## Context and Orientation
 

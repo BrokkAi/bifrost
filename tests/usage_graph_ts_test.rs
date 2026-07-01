@@ -6,8 +6,9 @@
 
 mod common;
 
-use brokk_bifrost::SearchToolsService;
-use common::usage_graph::has_edge;
+use brokk_bifrost::{Language, SearchToolsService};
+use common::InlineTestProject;
+use common::usage_graph::{has_edge, usage_graph_at};
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -49,5 +50,29 @@ fn namespace_imports_resolve_member_calls() {
     assert!(
         has_edge(&graph, "go", "parse"),
         "namespace member call go -> parse should be an edge"
+    );
+}
+
+#[test]
+fn this_receiver_call_does_not_create_usage_graph_edge() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "service.ts",
+            r#"
+export class Service {
+  target() {}
+  caller() {
+    this.target();
+  }
+}
+"#,
+        )
+        .build();
+
+    let graph = usage_graph_at(project.root(), "{}");
+    assert!(
+        !has_edge(&graph, "Service.caller", "Service.target"),
+        "self-receiver calls must not appear as usage_graph edges: {}",
+        graph["edges"]
     );
 }
