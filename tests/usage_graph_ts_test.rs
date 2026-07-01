@@ -175,6 +175,42 @@ export function caller(flag: boolean) {
 }
 
 #[test]
+fn ts_factory_receiver_fanout_over_cap_emits_no_partial_edge() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "service.ts",
+            r#"
+export class A { run() {} }
+export class B { run() {} }
+export class C { run() {} }
+export class D { run() {} }
+export class E { run() {} }
+export function make(which: number) {
+  if (which === 0) return new A();
+  if (which === 1) return new B();
+  if (which === 2) return new C();
+  if (which === 3) return new D();
+  return new E();
+}
+export function caller(which: number) {
+  const service = make(which);
+  service.run();
+}
+"#,
+        )
+        .build();
+
+    let graph = usage_graph_at(project.root(), "{}");
+    for target in ["A.run", "B.run", "C.run", "D.run", "E.run"] {
+        assert!(
+            !has_edge(&graph, "caller", target),
+            "fanout-over-cap receiver must not emit partial {target} edge: {}",
+            graph["edges"]
+        );
+    }
+}
+
+#[test]
 fn js_factory_receiver_call_edges_only_to_constructed_type() {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file(

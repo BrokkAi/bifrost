@@ -447,6 +447,18 @@ mod tests {
     }
 
     #[test]
+    fn exceeded_budget_is_terminal_for_graph() {
+        let outcome: ReceiverAnalysisOutcome<ReceiverValue> =
+            ReceiverAnalysisOutcome::ExceededBudget {
+                limit: "scope_nodes",
+            };
+
+        assert!(outcome.is_terminal_for_graph());
+        assert!(!outcome.is_precise());
+        assert_eq!(outcome.into_precise(), None);
+    }
+
+    #[test]
     fn cache_key_owns_query_identity_without_source_text() {
         let file = file();
         let budget = ReceiverAnalysisBudget::default();

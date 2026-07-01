@@ -644,3 +644,127 @@ fn dedup_units(mut units: Vec<CodeUnit>, limit: usize) -> Vec<CodeUnit> {
     units.truncate(limit.saturating_add(1));
     units
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::usages::receiver_analysis::DEFAULT_RECEIVER_MAX_TARGETS;
+    use crate::analyzer::{ProjectFile, TestProject, TypescriptAnalyzer};
+    use std::path::PathBuf;
+    use tree_sitter::Parser;
+
+    fn test_project(source: &str) -> (tempfile::TempDir, ProjectFile, TypescriptAnalyzer) {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = ProjectFile::new(root.clone(), PathBuf::from("src/app.ts"));
+        file.write(source).expect("write source");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+        (temp, file, analyzer)
+    }
+
+    fn parse(source: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .expect("typescript parser");
+        parser.parse(source, None).expect("parse source")
+    }
+
+    fn receiver_node<'tree>(
+        root: Node<'tree>,
+        source: &str,
+        marker: &str,
+        receiver: &str,
+    ) -> Node<'tree> {
+        let marker_start = source.find(marker).expect("marker");
+        let receiver_start = source[marker_start..]
+            .find(receiver)
+            .map(|offset| marker_start + offset)
+            .expect("receiver");
+        smallest_named_node_covering(root, receiver_start, receiver_start + receiver.len())
+            .expect("receiver node")
+    }
+
+    #[test]
+    fn tiny_scope_budget_exits_without_precise_targets() {
+        let source = r#"
+class Service { run() {} }
+function makeService() { return new Service(); }
+export function caller() {
+  const service = makeService();
+  service.run();
+}
+"#;
+        let (_temp, file, analyzer) = test_project(source);
+        let tree = parse(source);
+        let provider = JsTsReceiverFactProvider::new(
+            &analyzer,
+            Language::TypeScript,
+            &file,
+            source,
+            tree.root_node(),
+        );
+        let receiver = receiver_node(tree.root_node(), source, "service.run", "service");
+
+        let outcome = provider.resolve_member_targets(
+            receiver,
+            "run",
+            receiver.start_byte(),
+            ReceiverAnalysisBudget::tiny(),
+        );
+
+        assert_eq!(
+            outcome,
+            ReceiverAnalysisOutcome::ExceededBudget {
+                limit: "scope_nodes"
+            }
+        );
+        assert!(outcome.is_terminal_for_graph());
+    }
+
+    #[test]
+    fn fanout_over_default_target_cap_is_ambiguous() {
+        let source = r#"
+class A { run() {} }
+class B { run() {} }
+class C { run() {} }
+class D { run() {} }
+class E { run() {} }
+function make(which: number) {
+  if (which === 0) return new A();
+  if (which === 1) return new B();
+  if (which === 2) return new C();
+  if (which === 3) return new D();
+  return new E();
+}
+export function caller(which: number) {
+  const service = make(which);
+  service.run();
+}
+"#;
+        let (_temp, file, analyzer) = test_project(source);
+        let tree = parse(source);
+        let provider = JsTsReceiverFactProvider::new(
+            &analyzer,
+            Language::TypeScript,
+            &file,
+            source,
+            tree.root_node(),
+        );
+        let receiver = receiver_node(tree.root_node(), source, "service.run", "service");
+
+        let outcome = provider.resolve_member_targets(
+            receiver,
+            "run",
+            receiver.start_byte(),
+            ReceiverAnalysisBudget::default(),
+        );
+
+        assert!(
+            matches!(outcome, ReceiverAnalysisOutcome::Ambiguous(ref targets) if targets.len() > DEFAULT_RECEIVER_MAX_TARGETS),
+            "expected fanout to become ambiguous, got {outcome:?}"
+        );
+        assert!(outcome.is_terminal_for_graph());
+    }
+}
