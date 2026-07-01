@@ -15,7 +15,7 @@ The change improves both recall and precision. Recall improves because calls thr
 - [x] (2026-07-01T10:30Z) Created this ExecPlan at `.agent/ISSUE_394_OBJECT_SENSITIVE_RECEIVER_EXECPLAN.md`.
 - [x] (2026-07-01T10:35Z) Add the shared receiver analysis API, budget model, no-op provider, cache key shape, and unit tests.
 - [x] (2026-07-01T10:48Z) Implement and test the JS/TS milestone, including a second consumer through `get_definition` or type lookup.
-- [ ] Implement and test the Java milestone.
+- [x] (2026-07-01T10:54Z) Implement and test the Java milestone.
 - [ ] Implement and test the C# milestone.
 - [ ] Implement and test the C++ milestone.
 - [ ] Implement and test the Go milestone.
@@ -47,6 +47,9 @@ The change improves both recall and precision. Recall improves because calls thr
 - Observation: JS/TS get-definition already had a local `new Class()` receiver path, but factory-returned receivers were not behind a composable provider.
   Evidence: `src/analyzer/usages/get_definition/js_ts.rs` called `jsts_local_new_receiver_owner_candidates` directly before this milestone.
 
+- Observation: Java whole-workspace graph already had declared-type receiver inference; the object-sensitive gap was untyped locals initialized from constructor/factory results.
+  Evidence: `src/analyzer/usages/java_graph/inverted.rs` seeded locals from declaration types and skipped untyped/shadowed locals before this milestone.
+
 ## Decision Log
 
 - Decision: Implement #394 as a shared demand-driven provider plus language milestones, not as another set of independent language-specific heuristics.
@@ -70,6 +73,8 @@ The change improves both recall and precision. Recall improves because calls thr
 Shared API milestone complete. Added `src/analyzer/usages/receiver_analysis.rs` and exposed it internally from `src/analyzer/usages/mod.rs`. The module defines bounded receiver outcomes, receiver values, the default budget, query/cache-key shapes, a budget tracker, the provider trait, and a no-op provider for unsupported rollout stages. Validation: `cargo test --lib receiver_analysis` passed 9 tests after the JS/TS milestone added exact-single receiver classification coverage.
 
 JS/TS milestone complete. Added `src/analyzer/usages/js_ts_graph/receiver_analysis.rs` and wired it into JS/TS usage graph member resolution and JS/TS get-definition member lookup. The first provider slice resolves `new Service()`, local receivers assigned from factory calls, top-level factories returning constructed values, and class factory methods returning constructed values. Ambiguous factory returns stop without emitting a partial same-name edge. Validation so far: `cargo test --test usages_js_ts_graph_test`, `cargo test --test usage_graph_ts_test`, and `cargo test --test get_definition_test typescript_factory_receiver_member_resolves_to_definition` passed.
+
+Java milestone complete. Extended `src/analyzer/usages/java_graph/inverted.rs` so untyped `var` locals can be seeded from constructor expressions, same-class factory method returns, and cross-file static factory declared return types. Multi-target factory returns are treated as ambiguous and do not seed a receiver binding, so no partial same-name member edge is emitted. Validation: `cargo test --test usage_graph_java_test` passed 11 tests.
 
 At completion, summarize which languages gained object-sensitive receiver tests, which consumers query the provider, any budget behavior observed, and any language-specific receiver semantics deferred to follow-up issues.
 

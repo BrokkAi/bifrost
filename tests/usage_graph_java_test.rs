@@ -247,6 +247,131 @@ public class ProdTest {
 }
 
 #[test]
+fn object_sensitive_factory_receiver_resolves_only_constructed_type() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "com/example/Service.java",
+            r#"
+package com.example;
+
+class Service {
+    void run() {}
+
+    static Service create() {
+        return new Service();
+    }
+}
+"#,
+        )
+        .file(
+            "com/example/Other.java",
+            r#"
+package com.example;
+
+class Other {
+    void run() {}
+}
+"#,
+        )
+        .file(
+            "com/example/Controller.java",
+            r#"
+package com.example;
+
+class Controller {
+    Service makeService() {
+        return new Service();
+    }
+
+    void viaFactory() {
+        var service = makeService();
+        service.run();
+    }
+
+    void viaStaticFactory() {
+        var service = Service.create();
+        service.run();
+    }
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    for caller in [
+        "com.example.Controller.viaFactory",
+        "com.example.Controller.viaStaticFactory",
+    ] {
+        assert!(
+            find_edge(&value, caller, "com.example.Service.run").is_some(),
+            "{caller} should edge to Service.run: {}",
+            value["edges"]
+        );
+        assert!(
+            find_edge(&value, caller, "com.example.Other.run").is_none(),
+            "{caller} must not edge to Other.run by method name: {}",
+            value["edges"]
+        );
+    }
+}
+
+#[test]
+fn ambiguous_factory_receiver_emits_no_partial_edge() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "com/example/Service.java",
+            "package com.example;\nclass Service { void run() {} }\n",
+        )
+        .file(
+            "com/example/Other.java",
+            "package com.example;\nclass Other { void run() {} }\n",
+        )
+        .file(
+            "com/example/Controller.java",
+            r#"
+package com.example;
+
+class Controller {
+    Object choose(boolean flag) {
+        if (flag) {
+            return new Service();
+        }
+        return new Other();
+    }
+
+    void caller(boolean flag) {
+        var service = choose(flag);
+        service.run();
+    }
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        find_edge(
+            &value,
+            "com.example.Controller.caller",
+            "com.example.Service.run"
+        )
+        .is_none(),
+        "ambiguous receiver must not choose Service.run: {}",
+        value["edges"]
+    );
+    assert!(
+        find_edge(
+            &value,
+            "com.example.Controller.caller",
+            "com.example.Other.run"
+        )
+        .is_none(),
+        "ambiguous receiver must not choose Other.run: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn scoped_usage_graph_skips_unrelated_invalid_java_callers() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(
