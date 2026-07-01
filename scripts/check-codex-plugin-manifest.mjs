@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import fs from "node:fs";
+import assert from "node:assert/strict";
 
 const cargoToml = fs.readFileSync("Cargo.toml", "utf8");
 const cargoVersion = cargoToml.match(/^version = "([^"]+)"$/m)?.[1];
@@ -21,6 +22,24 @@ const claudeManifest = JSON.parse(fs.readFileSync(claudeManifestPath, "utf8"));
 if (claudeManifest.version !== cargoVersion) {
   throw new Error(
     `${claudeManifestPath} version ${claudeManifest.version} does not match Cargo.toml version ${cargoVersion}`,
+  );
+}
+
+const sharedManifestFields = [
+  "name",
+  "description",
+  "author",
+  "homepage",
+  "repository",
+  "license",
+  "keywords",
+  "mcpServers",
+];
+for (const field of sharedManifestFields) {
+  assert.deepStrictEqual(
+    claudeManifest[field],
+    codexManifest[field],
+    `${claudeManifestPath} field ${field} does not match ${codexManifestPath}`,
   );
 }
 
