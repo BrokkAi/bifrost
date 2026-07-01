@@ -39,10 +39,10 @@ use crate::analyzer::usages::inverted_edges::{
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::{
-    IAnalyzer, PhpAnalyzer, PhpFileContext, ProjectFile, resolve_php_constant,
+    CodeUnit, IAnalyzer, PhpAnalyzer, PhpFileContext, ProjectFile, resolve_php_constant,
     resolve_php_function, resolve_php_type,
 };
-use crate::hash::HashSet;
+use crate::hash::{HashMap, HashSet};
 use tree_sitter::Node;
 
 /// Build the whole PHP `caller -> callee` edge set in a single inverted pass over
@@ -62,9 +62,11 @@ where
         parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
             let ctx = php.file_context_from_source(file, parsed.source.as_str());
             let mut scan = PhpScan {
+                php,
                 ctx,
                 source: parsed.source.as_str(),
                 class_ranges: ClassRangeIndex::build(analyzer, file),
+                return_type_cache: HashMap::default(),
                 collector,
             };
             let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
@@ -74,9 +76,11 @@ where
 }
 
 struct PhpScan<'a, 'b> {
+    php: &'a PhpAnalyzer,
     ctx: PhpFileContext,
     source: &'a str,
     class_ranges: ClassRangeIndex,
+    return_type_cache: HashMap<String, Option<String>>,
     collector: &'a mut EdgeCollector<'b>,
 }
 
@@ -243,11 +247,12 @@ fn seed_parameters(
     });
 }
 
-/// Seed `$x = new Foo()` locals into the binding scope. Other assignments shadow
-/// the name (so an untyped local is not later read as a static type).
+/// Seed `$x = new Foo()` and `$x = factory()` locals into the binding scope when
+/// the RHS has a structurally declared class result. Other assignments shadow the
+/// name (so an untyped local is not later read as a static type).
 fn seed_assignment(
     node: Node<'_>,
-    scan: &PhpScan<'_, '_>,
+    scan: &mut PhpScan<'_, '_>,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
     let Some((left, right)) = assignment_parts(node) else {
@@ -260,14 +265,107 @@ fn seed_assignment(
     if name.is_empty() {
         return;
     }
-    let resolved = (right.kind() == "object_creation_expression")
-        .then(|| object_creation_type(right))
-        .flatten()
-        .and_then(|type_node| scan.resolve_type_fqn(node_text(type_node, scan.source)));
+    let resolved = assignment_receiver_type_fqn(right, scan);
     match resolved {
         Some(fqn) => bindings.seed_symbol(name.to_string(), fqn),
         None => bindings.declare_shadow(name.to_string()),
     }
+}
+
+fn assignment_receiver_type_fqn(right: Node<'_>, scan: &mut PhpScan<'_, '_>) -> Option<String> {
+    match right.kind() {
+        "object_creation_expression" => object_creation_type(right)
+            .and_then(|type_node| scan.resolve_type_fqn(node_text(type_node, scan.source))),
+        "function_call_expression" => {
+            let function = right.child_by_field_name("function")?;
+            if !matches!(function.kind(), "name" | "qualified_name") {
+                return None;
+            }
+            let fqn = resolve_php_function(node_text(function, scan.source), &scan.ctx)?;
+            declared_callable_return_type_fqn(scan, &fqn)
+        }
+        "scoped_call_expression" => {
+            let scope = right.child_by_field_name("scope")?;
+            let name = right.child_by_field_name("name")?;
+            let method = node_text(name, scan.source);
+            if method.is_empty() {
+                return None;
+            }
+            let owner = scope_class_fqn(scope, scan)?;
+            declared_callable_return_type_fqn(scan, &format!("{owner}.{method}"))
+        }
+        _ => None,
+    }
+}
+
+fn declared_callable_return_type_fqn(
+    scan: &mut PhpScan<'_, '_>,
+    callable_fqn: &str,
+) -> Option<String> {
+    if let Some(cached) = scan.return_type_cache.get(callable_fqn) {
+        return cached.clone();
+    }
+
+    let mut definitions = scan
+        .php
+        .definitions(callable_fqn)
+        .filter(|unit| unit.is_function());
+    let resolved = definitions.next().and_then(|callable| {
+        if definitions.next().is_some() {
+            return None;
+        }
+        declared_return_type_fqn(scan.php, callable)
+    });
+    scan.return_type_cache
+        .insert(callable_fqn.to_string(), resolved.clone());
+    resolved
+}
+
+fn declared_return_type_fqn(php: &PhpAnalyzer, callable: &CodeUnit) -> Option<String> {
+    let source = php.project().read_source(callable.source()).ok()?;
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
+        .ok()?;
+    let tree = parser.parse(source.as_str(), None)?;
+    let declaration = callable_declaration_node(php, callable, tree.root_node())?;
+    let return_type = declaration.child_by_field_name("return_type")?;
+    let raw = node_text(return_type, &source).trim();
+    if matches!(raw, "self" | "static") {
+        return php.parent_of(callable).map(|owner| owner.fq_name());
+    }
+    resolve_php_type(
+        raw,
+        &php.file_context_from_source(callable.source(), source.as_str()),
+    )
+}
+
+fn callable_declaration_node<'tree>(
+    php: &PhpAnalyzer,
+    callable: &CodeUnit,
+    root: Node<'tree>,
+) -> Option<Node<'tree>> {
+    let ranges = php.ranges(callable);
+    let start = ranges.iter().map(|range| range.start_byte).min()?;
+    let end = ranges.iter().map(|range| range.end_byte).max()?;
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if matches!(node.kind(), "function_definition" | "method_declaration")
+            && node.start_byte() >= start
+            && node.end_byte() <= end
+        {
+            return Some(node);
+        }
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index)
+                && child.end_byte() >= start
+                && child.start_byte() <= end
+            {
+                stack.push(child);
+            }
+        }
+    }
+    None
 }
 
 /// True when `node` is the type name inside a `new X(..)` expression (so the

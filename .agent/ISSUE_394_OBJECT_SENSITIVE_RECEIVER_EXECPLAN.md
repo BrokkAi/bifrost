@@ -19,7 +19,7 @@ The change improves both recall and precision. Recall improves because calls thr
 - [x] (2026-07-01T10:56Z) Implement and test the C# milestone.
 - [x] (2026-07-01T10:58Z) Implement and test the C++ milestone.
 - [x] (2026-07-01T11:00Z) Implement and test the Go milestone.
-- [ ] Implement and test the PHP milestone.
+- [x] (2026-07-01T11:08Z) Implement and test the PHP milestone.
 - [ ] Implement and test the Python milestone.
 - [ ] Implement and test the Ruby milestone.
 - [ ] Implement and test the Rust milestone.
@@ -59,6 +59,9 @@ The change improves both recall and precision. Recall improves because calls thr
 - Observation: Go already had a constructor-return index used by the inverted graph.
   Evidence: `src/analyzer/usages/go_graph/resolver.rs` builds `constructor_return_types`, and `src/analyzer/usages/go_graph/inverted.rs` uses it when seeding short-var receiver bindings.
 
+- Observation: PHP already seeded local receiver facts from `new Service()`, but not from factory calls.
+  Evidence: `src/analyzer/usages/php_graph/inverted.rs` seeded `$x = new Foo()` and shadowed other assignments before the PHP milestone.
+
 ## Decision Log
 
 - Decision: Implement #394 as a shared demand-driven provider plus language milestones, not as another set of independent language-specific heuristics.
@@ -90,6 +93,8 @@ C# milestone complete. Extended `src/analyzer/usages/csharp_graph/inverted.rs` s
 C++ milestone complete. Added regression coverage for `auto` receivers initialized from free factories and static factories, and extended C++ initializer inference to resolve `Service::create()` return types from visible static method declarations. Unsupported conditional receivers remain unseeded and do not emit partial same-name member edges. Validation: `cargo test --test usage_graph_cpp_test` passed 11 tests.
 
 Go milestone complete. Added inline regression coverage proving `service := makeService(); service.Run()` resolves only to `Service.Run`, while an unsupported interface-return factory remains unseeded and emits no partial same-name edge. The existing constructor-return index already provided the implementation. Validation: `cargo test --test usage_graph_go_test` passed 10 tests.
+
+PHP milestone complete. Extended `src/analyzer/usages/php_graph/inverted.rs` so `$x = makeService()` and `$x = Service::create()` seed receiver facts only when the called free function or static method has a single declared class return type. The implementation uses AST declaration lookup and a per-file return-type cache, not text fallback. Untyped ambiguous factories remain unseeded and do not emit partial same-name member edges. Validation: `cargo test --test usage_graph_php_test` passed 11 tests.
 
 At completion, summarize which languages gained object-sensitive receiver tests, which consumers query the provider, any budget behavior observed, and any language-specific receiver semantics deferred to follow-up issues.
 
