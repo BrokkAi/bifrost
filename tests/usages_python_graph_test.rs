@@ -2049,3 +2049,24 @@ fn module_level_field_resolves_despite_reassignment() {
         1,
     );
 }
+
+// The `from service import Widget` binding is an Import-kind hit: excluded from
+// the call-graph hit set (all_hits / into_either) but included by the IDE
+// find-references accessor (all_hits_including_imports).
+#[test]
+fn import_binding_is_import_kind_hit() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("service.py", "class Widget:\n    pass\n")
+        .file(
+            "consumer.py",
+            "from service import Widget\n\ndef run():\n    return Widget()\n",
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.Widget");
+    let result = UsageFinder::new().find_usages(&analyzer, std::slice::from_ref(&target), 100, 100);
+    // Call-graph surfaces: only the `Widget()` construction.
+    assert_eq!(result.all_hits().len(), 1);
+    // find-references: also the `from service import Widget` binding.
+    assert_eq!(result.all_hits_including_imports().len(), 2);
+}

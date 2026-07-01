@@ -8,7 +8,7 @@ use crate::analyzer::symbol_lookup::{
 };
 use crate::analyzer::usages::{
     CONFIDENCE_THRESHOLD, CandidateFileProvider, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES,
-    ExplicitCandidateProvider, FuzzyResult, UsageFinder, UsageHit,
+    ExplicitCandidateProvider, FuzzyResult, UsageFinder, UsageHit, UsageHitKind,
 };
 use crate::analyzer::{CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, Range};
 use crate::hash::{HashMap, HashSet};
@@ -3384,6 +3384,11 @@ fn filter_and_dedupe_hits(
     let mut rows: BTreeMap<(String, usize, String), UsageHitRow> = BTreeMap::new();
     let mut definition_sites_excluded = 0usize;
     for hit in hits {
+        // Import bindings are for the IDE find-references surface, not the
+        // call-graph/relevance rendering here.
+        if hit.kind == UsageHitKind::Import {
+            continue;
+        }
         if definition_ranges
             .get(&hit.file)
             .is_some_and(|ranges| ranges.iter().any(|range| ranges_overlap(range, &hit)))

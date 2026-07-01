@@ -8,7 +8,9 @@ use crate::analyzer::usages::get_definition::{
     DefinitionLookupRequest, DefinitionLookupStatus, byte_offset_for_character_column,
     resolve_definition_batch_with_source,
 };
-use crate::analyzer::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, FuzzyResult, UsageFinder};
+use crate::analyzer::usages::{
+    DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, FuzzyResult, UsageFinder, UsageHitKind,
+};
 use crate::analyzer::{
     CodeUnit, CodeUnitType, IAnalyzer, Language, Project, ProjectFile, Range as ByteRange,
 };
@@ -135,6 +137,7 @@ pub(crate) fn rename_symbol(
         FuzzyResult::Success { hits_by_overload } => hits_by_overload
             .into_values()
             .flat_map(|hits| hits.into_iter())
+            .filter(|hit| hit.kind != UsageHitKind::Import)
             .collect::<Vec<_>>(),
         FuzzyResult::Ambiguous { .. } => {
             return Err(RenameFailure {

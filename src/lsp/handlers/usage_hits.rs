@@ -11,7 +11,7 @@ pub(super) fn usage_hits_for_candidates(
 ) -> Vec<UsageHit> {
     UsageFinder::new()
         .find_usages(analyzer, candidates, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES)
-        .all_hits()
+        .all_hits_including_imports()
         .into_iter()
         .collect()
 }
@@ -32,7 +32,7 @@ pub(super) fn usage_hits_for_candidates_in_file(
             DEFAULT_MAX_USAGES,
         )
         .result
-        .all_hits()
+        .all_hits_including_imports()
         .into_iter()
         .filter(|hit| &hit.file == file)
         .collect()

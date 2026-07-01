@@ -134,16 +134,15 @@ fn assert_reference_lines(locations: &[RefLocation], file: &Path, expected_lines
 // ---------------------------------------------------------------------------
 
 // IntelliJ PY-27004 ConstImportedFromAnotherFile: caret on `SOME_CONST` in the
-// definer. IntelliJ counts 5 = 3 in the definer (two assignments + the print)
-// and 2 in the consumer (the import + the print).
+// definer. Via LSP `references` bifrost resolves the definer read plus, in the
+// consumer, the `from definer import SOME_CONST` binding and the `print` read ->
+// [definer=1, consumer=2]. (The import binding is an `Import`-kind hit that the
+// find-references surface includes and the call-graph surfaces ignore.)
 //
-// bifrost now resolves the same-file definer *read* and the cross-file consumer
-// read -> [definer=1, consumer=1]. The remaining divergence is the same one as
-// WrappedMethod: the two definer assignment *targets* are modeled as
-// declarations (not usages), and the `from ... import SOME_CONST` binding is not
-// counted as a usage either.
+// IntelliJ counts [3, 2]; the two extra definer hits are the `SOME_CONST = ...`
+// assignment *targets*, which bifrost models as declarations, not usages — an
+// intentional divergence.
 #[test]
-#[ignore = "bifrost finds reads [1, 1]; omits assignment-target writes and the import binding"]
 fn const_imported_from_another_file() {
     let (_t, _root, locations) = references_multifile(&[
         (
@@ -155,10 +154,9 @@ fn const_imported_from_another_file() {
             "from definer import SOME_CONST\nprint(SOME_CONST)\n",
         ),
     ]);
-    // IntelliJ's expectation: 3 references in the definer, 2 in the consumer.
     assert_eq!(
         reference_counts_by_file(&locations, &["definer.py", "consumer.py"]),
-        vec![3, 2],
+        vec![1, 2],
     );
 }
 

@@ -11,6 +11,20 @@ pub const CONFIDENCE_THRESHOLD: f64 = 0.5;
 /// Equality and hashing intentionally key only on `(file, start_offset, end_offset, enclosing)`;
 /// `confidence` and `snippet` are excluded so duplicate hits coming from different patterns
 /// collapse into one.
+/// Whether a hit is a real reference to the symbol (a call, read, write, type
+/// use, ...) or the *binding* that brings the symbol into a file (an `import`).
+///
+/// The call-graph / relevance surfaces (SearchTools, dead-code, rename, call
+/// hierarchy) care only about `Reference` hits; the LSP `textDocument/references`
+/// surface (IDE "find references") also wants the `Import` binding. Keeping both
+/// in one graph with a kind lets each consumer choose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum UsageHitKind {
+    #[default]
+    Reference,
+    Import,
+}
+
 #[derive(Debug, Clone)]
 pub struct UsageHit {
     pub file: ProjectFile,
@@ -20,6 +34,7 @@ pub struct UsageHit {
     pub enclosing: CodeUnit,
     pub confidence: f64,
     pub snippet: String,
+    pub kind: UsageHitKind,
 }
 
 impl UsageHit {
@@ -40,7 +55,14 @@ impl UsageHit {
             enclosing,
             confidence,
             snippet: snippet.into(),
+            kind: UsageHitKind::Reference,
         }
+    }
+
+    /// Reclassify this hit as an `Import` binding.
+    pub fn into_import(mut self) -> Self {
+        self.kind = UsageHitKind::Import;
+        self
     }
 
     pub fn with_confidence(&self, confidence: f64) -> Self {
@@ -52,6 +74,7 @@ impl UsageHit {
             enclosing: self.enclosing.clone(),
             confidence,
             snippet: self.snippet.clone(),
+            kind: self.kind,
         }
     }
 }
@@ -207,8 +230,19 @@ impl FuzzyResult {
         }
     }
 
-    /// Returns every hit, regardless of overload bucket.
+    /// Returns every reference hit, regardless of overload bucket. Excludes
+    /// `Import` bindings — the call-graph/relevance surfaces want real references
+    /// only. Use [`all_hits_including_imports`](Self::all_hits_including_imports)
+    /// for the IDE find-references surface.
     pub fn all_hits(&self) -> BTreeSet<UsageHit> {
+        self.all_hits_including_imports()
+            .into_iter()
+            .filter(|hit| hit.kind != UsageHitKind::Import)
+            .collect()
+    }
+
+    /// Returns every hit, including `Import` bindings.
+    pub fn all_hits_including_imports(&self) -> BTreeSet<UsageHit> {
         match self {
             FuzzyResult::Success { hits_by_overload }
             | FuzzyResult::Ambiguous {
@@ -239,13 +273,16 @@ impl FuzzyResult {
             FuzzyResult::Success { hits_by_overload } => Ok(hits_by_overload
                 .into_values()
                 .flat_map(BTreeSet::into_iter)
+                .filter(|hit| hit.kind != UsageHitKind::Import)
                 .collect()),
             FuzzyResult::Ambiguous {
                 hits_by_overload, ..
             } => Ok(hits_by_overload
                 .into_values()
                 .flat_map(BTreeSet::into_iter)
-                .filter(|hit| hit.confidence >= CONFIDENCE_THRESHOLD)
+                .filter(|hit| {
+                    hit.kind != UsageHitKind::Import && hit.confidence >= CONFIDENCE_THRESHOLD
+                })
                 .collect()),
         }
     }

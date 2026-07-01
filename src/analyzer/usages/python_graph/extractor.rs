@@ -3,7 +3,7 @@ use crate::analyzer::usages::local_inference::{
     LocalBindingsSnapshot, LocalInferenceConfig, LocalInferenceEngine, SymbolResolution,
 };
 use crate::analyzer::usages::model::{ExportIndex, ImportBinder, UsageHit};
-use crate::analyzer::usages::python_graph::hits::record_hit;
+use crate::analyzer::usages::python_graph::hits::{record_hit, record_import_hit};
 use crate::analyzer::usages::python_graph::resolver::{
     member_name, normalized_receiver_type, receiver_annotation_matches_target,
     resolve_receiver_type, target_owner_code_unit, top_level_identifier,
@@ -454,7 +454,10 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let mut stack = vec![node];
     while let Some(node) = stack.pop() {
         match node.kind() {
-            "import_statement" | "import_from_statement" => continue,
+            "import_statement" | "import_from_statement" => {
+                handle_import_candidate(node, ctx);
+                continue;
+            }
             "identifier" => handle_identifier_candidate(node, ctx),
             "attribute" => handle_attribute_candidate(node, ctx),
             _ => {}
@@ -464,6 +467,35 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         let mut children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
         children.reverse();
         stack.extend(children);
+    }
+}
+
+/// Emit an `Import`-binding hit for `from <mod> import <target>` (the token that
+/// brings the target into this file). Gated on there being an import edge whose
+/// local name is the target — so a same-named symbol imported from a different
+/// module is not falsely counted. Only top-level symbols (not members) are
+/// imported by their own name.
+fn handle_import_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if ctx.target_member.is_some() {
+        return;
+    }
+    if !ctx
+        .edges
+        .iter()
+        .any(|edge| edge.local_name == ctx.target_short)
+    {
+        return;
+    }
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "identifier" && slice(node, ctx.source) == ctx.target_short {
+            record_import_hit(node, ctx);
+            return;
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
     }
 }
 
