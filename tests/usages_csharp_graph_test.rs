@@ -367,15 +367,144 @@ namespace App {
     let imports: Vec<_> = provider
         .import_info_of(&file)
         .iter()
-        .map(|info| info.raw_snippet.as_str())
+        .map(|info| {
+            (
+                info.raw_snippet.as_str(),
+                info.identifier.as_deref(),
+                info.alias.as_deref(),
+            )
+        })
         .collect();
     assert_eq!(
-        vec!["global using Shared;", "using System.Collections.Generic;"],
+        vec![
+            ("global using Shared;", Some("Shared"), None),
+            ("using System.Collections.Generic;", Some("Generic"), None),
+            (
+                "using Alias = Other.Target;",
+                Some("Other.Target"),
+                Some("Alias"),
+            ),
+        ],
         imports
     );
     assert_eq!(
         vec!["Shared", "System.Collections.Generic"],
         analyzer.using_namespaces_of(&file)
+    );
+}
+
+#[test]
+fn csharp_graph_counts_using_alias_constructor_as_target_type_usage() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "src/Handlers.cs",
+            r#"
+namespace Example.Parity {
+    public class ConsoleHandler {
+        public ConsoleHandler() {}
+    }
+}
+"#,
+        ),
+        (
+            "src/Consumers.cs",
+            r#"
+using WorkerAlias = Example.Parity.ConsoleHandler;
+using Example.Parity;
+using SimpleAlias = ConsoleHandler;
+
+class Consumer {
+    void Run() {
+        var w = new WorkerAlias();
+        var s = new SimpleAlias();
+        Example.Parity.ConsoleHandler direct = new Example.Parity.ConsoleHandler();
+    }
+}
+"#,
+        ),
+    ]);
+
+    let target = type_definition(&analyzer, "Example.Parity.ConsoleHandler");
+    let hits = graph_hits(&analyzer, &target);
+
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("src/Consumers.cs")
+                && hit
+                    .snippet
+                    .lines()
+                    .any(|line| line.trim() == "var w = new WorkerAlias();")
+        }),
+        "alias constructor site should count as target type usage: {hits:#?}"
+    );
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("src/Consumers.cs")
+                && hit
+                    .snippet
+                    .lines()
+                    .any(|line| line.trim() == "var s = new SimpleAlias();")
+        }),
+        "simple alias constructor site should count as target type usage: {hits:#?}"
+    );
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == project.file("src/Consumers.cs")
+                && hit
+                    .snippet
+                    .lines()
+                    .any(|line| line.trim().contains("new Example.Parity.ConsoleHandler()"))
+        }),
+        "alias-free constructor site should remain a target type usage: {hits:#?}"
+    );
+}
+
+#[test]
+fn csharp_graph_does_not_leak_unrelated_using_alias_to_target_type() {
+    let (_project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "src/Handlers.cs",
+            r#"
+namespace Example.Parity {
+    public class ConsoleHandler {
+        public ConsoleHandler() {}
+    }
+}
+"#,
+        ),
+        (
+            "src/Other.cs",
+            r#"
+namespace Example.Other {
+    public class ConsoleHandler {
+        public ConsoleHandler() {}
+    }
+}
+"#,
+        ),
+        (
+            "src/Consumers.cs",
+            r#"
+using WorkerAlias = Example.Other.ConsoleHandler;
+
+class Consumer {
+    void Run() {
+        var w = new WorkerAlias();
+    }
+}
+"#,
+        ),
+    ]);
+
+    let target = type_definition(&analyzer, "Example.Parity.ConsoleHandler");
+    let hits = graph_hits(&analyzer, &target);
+
+    assert!(
+        !hits.iter().any(|hit| hit
+            .snippet
+            .lines()
+            .any(|line| line.trim() == "var w = new WorkerAlias();")),
+        "alias to a different type must not count as target usage: {hits:#?}"
     );
 }
 

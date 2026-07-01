@@ -589,6 +589,9 @@ fn resolve_csharp_constructor(
         return no_definition("no_reference_text", "C# constructor call has no type");
     };
     let reference = csharp_reference_type_text(type_node, source);
+    if csharp.using_aliases_of(file).contains_key(&reference) {
+        return csharp_type_outcome(csharp, support, file, &reference);
+    }
     let owners = csharp_visible_type_candidates(csharp, file, &reference);
     let mut constructors = Vec::new();
     for owner in &owners {
@@ -991,21 +994,10 @@ fn csharp_alias_using_boundary_for_type(
     file: &ProjectFile,
     reference: &str,
 ) -> bool {
-    for raw in csharp.import_statements(file) {
-        let trimmed = raw
-            .trim()
-            .trim_start_matches("global ")
-            .trim_start_matches("using ")
-            .trim_end_matches(';')
-            .trim();
-        let Some((alias, target)) = trimmed.split_once('=') else {
-            continue;
-        };
-        if alias.trim() == reference && !csharp_workspace_type_exists(support, target.trim()) {
-            return true;
-        }
-    }
-    false
+    csharp
+        .using_aliases_of(file)
+        .get(reference)
+        .is_some_and(|target| !csharp_workspace_type_exists(support, target))
 }
 
 fn csharp_static_using_boundary_for_member(

@@ -113,7 +113,13 @@ fn scan_type_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     {
         return;
     }
-    if normalize_type_text(node_text(node, ctx.source)) != ctx.spec.member_name {
+    let raw_name = normalize_type_text(node_text(node, ctx.source));
+    if raw_name != ctx.spec.member_name
+        && !ctx
+            .csharp
+            .using_aliases_of(ctx.file)
+            .contains_key(&raw_name)
+    {
         return;
     }
     let reference = reference_type_text(node, ctx.source);

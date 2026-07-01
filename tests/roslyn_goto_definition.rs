@@ -28,22 +28,43 @@ fn split_caret(source: &str) -> (String, u64, u64) {
 }
 
 fn definition_lines(name: &str, source_with_caret: &str) -> (TempDir, Vec<u64>) {
-    let (source, line, character) = split_caret(source_with_caret);
+    definition_lines_in_file_set(name, &[(name, source_with_caret)], name)
+}
+
+fn definition_lines_in_file_set(
+    caret_name: &str,
+    files: &[(&str, &str)],
+    target_name: &str,
+) -> (TempDir, Vec<u64>) {
+    let caret_source = files
+        .iter()
+        .find_map(|(name, contents)| (*name == caret_name).then_some(*contents))
+        .expect("caret file must be present");
+    let (source, line, character) = split_caret(caret_source);
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().canonicalize().expect("canon temp");
-    let file: PathBuf = root.join(name);
-    std::fs::write(&file, source).expect("write fixture");
+    let caret_file: PathBuf = root.join(caret_name);
+    for (name, contents) in files {
+        let path = root.join(name);
+        std::fs::create_dir_all(path.parent().expect("fixture parent")).expect("mkdir fixture");
+        let contents = if *name == caret_name {
+            source.as_str()
+        } else {
+            contents
+        };
+        std::fs::write(path, contents).expect("write fixture");
+    }
 
     let mut server = LspServer::start(&root);
     let response = server.text_document_position_response(
         "textDocument/definition",
-        &uri_for(&file),
+        &uri_for(&caret_file),
         line,
         character,
     );
     server.shutdown();
 
-    let file_uri = uri_for(&file);
+    let file_uri = uri_for(&root.join(target_name));
     let lines = match &response["result"] {
         Value::Array(items) => items
             .iter()
@@ -69,6 +90,19 @@ fn assert_does_not_resolve_to_line(name: &str, source_with_caret: &str, forbidde
     assert!(
         !lines.contains(&forbidden),
         "expected {name} NOT to resolve to line {forbidden}, got {lines:?}"
+    );
+}
+
+fn assert_resolves_to_line_in_file_set(
+    caret_name: &str,
+    files: &[(&str, &str)],
+    target_name: &str,
+    expected: u64,
+) {
+    let (_t, lines) = definition_lines_in_file_set(caret_name, files, target_name);
+    assert!(
+        lines.contains(&expected),
+        "expected {caret_name} to resolve to {target_name}:{expected}, got {lines:?}"
     );
 }
 
@@ -129,6 +163,25 @@ fn roslyn_def_namespace_qualified_type() {
     assert_resolves_to_line(
         "a.cs",
         "namespace NS {\n    class SomeClass {}\n}\nclass Program {\n    void Run() {\n        NS.SomeClass<caret> c = null;\n    }\n}\n",
+        1,
+    );
+}
+
+#[test]
+fn roslyn_def_csharp_using_alias_type_cross_file() {
+    assert_resolves_to_line_in_file_set(
+        "src/Consumers.cs",
+        &[
+            (
+                "src/Handlers.cs",
+                "namespace Example.Parity {\n    public class ConsoleHandler {\n        public ConsoleHandler() {}\n    }\n}\n",
+            ),
+            (
+                "src/Consumers.cs",
+                "using WorkerAlias = Example.Parity.ConsoleHandler;\n\nclass Consumer {\n    void Run() {\n        var w = new WorkerAlias<caret>();\n    }\n}\n",
+            ),
+        ],
+        "src/Handlers.cs",
         1,
     );
 }

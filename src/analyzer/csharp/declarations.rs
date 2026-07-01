@@ -3,7 +3,7 @@ use crate::analyzer::{CodeUnit, CodeUnitType, ParameterMetadata, ProjectFile, Si
 use crate::hash::HashSet;
 use tree_sitter::{Node, Tree};
 
-use super::imports::{csharp_import_info, csharp_using_namespace, normalize_csharp_type_name};
+use super::imports::{csharp_import_info_from_using_directive, normalize_csharp_type_name};
 
 pub(super) fn parse_csharp_file(
     file: &ProjectFile,
@@ -138,8 +138,8 @@ impl<'a> CSharpVisitor<'a> {
             return;
         }
         self.parsed.import_statements.push(raw.clone());
-        if csharp_using_namespace(&raw).is_some() {
-            self.parsed.imports.push(csharp_import_info(raw));
+        if let Some(info) = csharp_import_info_from_using_directive(node, self.source, raw) {
+            self.parsed.imports.push(info);
         }
     }
 

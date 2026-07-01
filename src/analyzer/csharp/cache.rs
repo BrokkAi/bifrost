@@ -9,6 +9,7 @@ use crate::analyzer::js_ts::build_weighted_cache;
 pub(super) struct CSharpMemoCaches {
     budget_bytes: u64,
     pub(super) using_namespaces: Cache<ProjectFile, Arc<Vec<String>>>,
+    pub(super) using_aliases: Cache<ProjectFile, Arc<HashMap<String, String>>>,
     pub(super) imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
     pub(super) referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     pub(super) direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
@@ -16,6 +17,7 @@ pub(super) struct CSharpMemoCaches {
     pub(super) direct_descendant_index: OnceLock<HashMap<String, Arc<HashSet<CodeUnit>>>>,
     pub(super) reverse_import_index: OnceLock<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
     pub(super) global_using_namespaces: OnceLock<HashSet<String>>,
+    pub(super) global_using_aliases: OnceLock<HashMap<String, String>>,
 }
 
 impl CSharpMemoCaches {
@@ -23,6 +25,7 @@ impl CSharpMemoCaches {
         Self {
             budget_bytes,
             using_namespaces: build_weighted_cache(budget_bytes / 8, weight_string_vec),
+            using_aliases: build_weighted_cache(budget_bytes / 8, weight_string_map),
             imported_code_units: build_weighted_cache(
                 budget_bytes / 4,
                 weight_project_code_unit_set,
@@ -36,6 +39,7 @@ impl CSharpMemoCaches {
             direct_descendant_index: OnceLock::new(),
             reverse_import_index: OnceLock::new(),
             global_using_namespaces: OnceLock::new(),
+            global_using_aliases: OnceLock::new(),
         }
     }
 
@@ -47,6 +51,16 @@ impl CSharpMemoCaches {
 fn weight_string_vec(_key: &ProjectFile, value: &Arc<Vec<String>>) -> u32 {
     weight_bytes(
         size_of::<Vec<String>>() as u64 + value.iter().map(|item| item.len() as u64).sum::<u64>(),
+    )
+}
+
+fn weight_string_map(_key: &ProjectFile, value: &Arc<HashMap<String, String>>) -> u32 {
+    weight_bytes(
+        size_of::<HashMap<String, String>>() as u64
+            + value
+                .iter()
+                .map(|(key, value)| key.len() as u64 + value.len() as u64)
+                .sum::<u64>(),
     )
 }
 

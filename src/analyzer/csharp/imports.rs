@@ -4,6 +4,7 @@ use crate::analyzer::{
 };
 use crate::hash::HashSet;
 use std::sync::Arc;
+use tree_sitter::Node;
 
 use super::CSharpAnalyzer;
 
@@ -13,10 +14,11 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
             return (*cached).clone();
         }
         let namespaces = self.using_namespaces_of(file);
-        if namespaces.is_empty() {
+        let aliases = self.using_aliases_of(file);
+        if namespaces.is_empty() && aliases.is_empty() {
             return HashSet::default();
         }
-        let imported: HashSet<CodeUnit> = self
+        let mut imported: HashSet<CodeUnit> = self
             .get_all_declarations()
             .into_iter()
             .filter(|unit| unit.kind() == CodeUnitType::Class)
@@ -26,6 +28,9 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
                     .any(|namespace| unit.package_name() == namespace)
             })
             .collect();
+        for target in aliases.values() {
+            imported.extend(self.visible_type_candidates(file, target));
+        }
         self.memo_caches
             .imported_code_units
             .insert(file.clone(), Arc::new(imported.clone()));
@@ -120,11 +125,19 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
             .map(|unit| unit.package_name().to_string())
             .collect();
         let source_imports = self.using_namespaces_of(source_file);
+        let source_aliases = self.using_aliases_of(source_file);
         imports
             .iter()
             .filter_map(|import| csharp_using_namespace(&import.raw_snippet))
             .chain(source_imports)
             .any(|namespace| target_namespaces.contains(&namespace))
+            || source_aliases.values().any(|alias_target| {
+                let candidates = self.visible_type_candidates(source_file, alias_target);
+                self.get_declarations(target)
+                    .into_iter()
+                    .filter(|unit| unit.kind() == CodeUnitType::Class)
+                    .any(|unit| candidates.contains(&unit))
+            })
     }
 }
 
@@ -150,6 +163,43 @@ pub(super) fn csharp_import_info(raw: String) -> ImportInfo {
         identifier,
         alias: None,
     }
+}
+
+pub(super) fn csharp_import_info_from_using_directive(
+    node: Node<'_>,
+    source: &str,
+    raw: String,
+) -> Option<ImportInfo> {
+    if csharp_using_namespace(&raw).is_some() {
+        return Some(csharp_import_info(raw));
+    }
+    csharp_using_alias_from_node(node, source).map(|(alias, target)| ImportInfo {
+        raw_snippet: raw,
+        is_wildcard: false,
+        identifier: Some(target),
+        alias: Some(alias),
+    })
+}
+
+pub(super) fn csharp_using_alias_from_import(import: &ImportInfo) -> Option<(String, String)> {
+    Some((import.alias.clone()?, import.identifier.clone()?))
+}
+
+pub(super) fn csharp_using_alias_from_node(
+    node: Node<'_>,
+    source: &str,
+) -> Option<(String, String)> {
+    let alias_node = node.child_by_field_name("name")?;
+    let alias = node_text(alias_node, source).trim().to_string();
+    if alias.is_empty() {
+        return None;
+    }
+    let mut cursor = node.walk();
+    let target_node = node.named_children(&mut cursor).find(|child| {
+        child.start_byte() >= alias_node.end_byte() && child.id() != alias_node.id()
+    })?;
+    let target = node_text(target_node, source).trim().to_string();
+    (!target.is_empty()).then_some((alias, target))
 }
 
 pub(super) fn csharp_type_name_matches(unit: &CodeUnit, raw_name: &str) -> bool {
@@ -179,4 +229,8 @@ pub(super) fn normalize_csharp_type_name(raw_name: &str) -> String {
         .unwrap_or(without_arrays)
         .trim()
         .to_string()
+}
+
+fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    node.utf8_text(source.as_bytes()).unwrap_or("")
 }

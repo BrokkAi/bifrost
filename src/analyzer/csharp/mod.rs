@@ -13,7 +13,7 @@ use crate::analyzer::{
     Language, Project, ProjectFile, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
     TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
 };
-use crate::hash::HashSet;
+use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -21,7 +21,7 @@ use std::sync::Arc;
 use adapter::CSharpAdapter;
 use cache::CSharpMemoCaches;
 use clones::{build_csharp_clone_candidate_data, refine_csharp_clone_similarity};
-use imports::{csharp_type_name_matches, csharp_using_namespace};
+use imports::{csharp_type_name_matches, csharp_using_alias_from_import, csharp_using_namespace};
 use tests::detect_csharp_test_assertion_smells;
 
 #[derive(Clone)]
@@ -129,6 +129,28 @@ impl CSharpAnalyzer {
         namespaces
     }
 
+    pub fn using_aliases_of(&self, file: &ProjectFile) -> HashMap<String, String> {
+        if let Some(cached) = self.memo_caches.using_aliases.get(file) {
+            return (*cached).clone();
+        }
+
+        let mut aliases: HashMap<String, String> = self
+            .inner
+            .import_info_of(file)
+            .iter()
+            .filter_map(csharp_using_alias_from_import)
+            .collect();
+        for (alias, target) in self.global_using_aliases() {
+            aliases
+                .entry(alias.clone())
+                .or_insert_with(|| target.clone());
+        }
+        self.memo_caches
+            .using_aliases
+            .insert(file.clone(), Arc::new(aliases.clone()));
+        aliases
+    }
+
     fn global_using_namespaces(&self) -> &HashSet<String> {
         self.memo_caches.global_using_namespaces.get_or_init(|| {
             self.inner
@@ -140,7 +162,34 @@ impl CSharpAnalyzer {
         })
     }
 
+    fn global_using_aliases(&self) -> &HashMap<String, String> {
+        self.memo_caches.global_using_aliases.get_or_init(|| {
+            self.inner
+                .all_files()
+                .flat_map(|file| self.inner.import_info_of(file).iter())
+                .filter(|import| import.raw_snippet.trim_start().starts_with("global using "))
+                .filter_map(csharp_using_alias_from_import)
+                .collect()
+        })
+    }
+
     pub fn visible_type_candidates(&self, file: &ProjectFile, name: &str) -> Vec<CodeUnit> {
+        self.visible_type_candidates_inner(file, name, true)
+    }
+
+    fn visible_type_candidates_inner(
+        &self,
+        file: &ProjectFile,
+        name: &str,
+        resolve_aliases: bool,
+    ) -> Vec<CodeUnit> {
+        if resolve_aliases
+            && let Some(target) = self.using_aliases_of(file).get(name)
+            && target != name
+        {
+            return self.visible_type_candidates_inner(file, target, false);
+        }
+
         let mut namespaces = self.using_namespaces_of(file);
         let file_namespace = self.namespace_of_file(file);
         if !file_namespace.is_empty() {
