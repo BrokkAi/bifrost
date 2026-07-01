@@ -932,7 +932,7 @@ pub(in crate::analyzer::usages) fn is_declaration_name(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
-    parent.child_by_field_name("name") == Some(node)
+    parent.child_by_field_name("name") == Some(node) && parent.kind() != "template_function"
         || parent.kind() == "enumerator"
         || matches!(parent.kind(), "function_declarator" | "init_declarator")
             && parent

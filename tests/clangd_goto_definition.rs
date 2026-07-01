@@ -103,6 +103,26 @@ fn clangd_def_method_call() {
     );
 }
 
+// bifrost probe for #429: an explicit-template free-function call should resolve
+// from the template_function's name field, not treat that name as a declaration.
+#[test]
+fn clangd_def_explicit_template_function_call() {
+    assert_resolves_to_line(
+        "a.cpp",
+        "namespace parity {\ntemplate <typename T>\nT choose(T a, T b) { return a; }\n}\nint main() {\n    auto x = parity::cho<caret>ose<int>(1, 2);\n}\n",
+        2,
+    );
+}
+
+#[test]
+fn clangd_def_unqualified_explicit_template_function_call_inside_namespace() {
+    assert_resolves_to_line(
+        "a.cpp",
+        "namespace parity {\ntemplate <typename T>\nT choose(T a, T b) { return a; }\nint use() {\n    return cho<caret>ose<int>(1, 2);\n}\n}\n",
+        2,
+    );
+}
+
 // clangd LocateSymbol.All "Typedef": `Foo bar;` resolves to the typedef decl.
 #[test]
 fn clangd_def_typedef() {

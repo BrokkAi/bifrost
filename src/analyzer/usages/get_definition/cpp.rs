@@ -171,6 +171,12 @@ fn cpp_reference_node(node: Node<'_>) -> Option<CppReferenceNode<'_>> {
             current = parent;
             continue;
         }
+        if parent.kind() == "template_function"
+            && parent.child_by_field_name("name") == Some(current)
+        {
+            current = parent;
+            continue;
+        }
         if parent.kind() == "field_expression"
             && parent.child_by_field_name("field") == Some(current)
         {
@@ -328,13 +334,13 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
             resolve_cpp_constructor(ctx, call)
         }
         "qualified_identifier" => {
-            let text = cpp_node_text(function, ctx.source);
+            let text = cpp_callable_reference_text(function, ctx.source);
             let mut candidates = cpp_visible_name_candidates(
                 ctx.analyzer,
                 ctx.visibility,
                 ctx.file,
                 ctx.support,
-                text,
+                &text,
                 Some(CppTargetKind::FreeFunction),
                 cpp_lexical_namespace(function, ctx.source).as_deref(),
             );
@@ -360,7 +366,9 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                 return candidates_outcome(candidates);
             }
             if let Some(scope) = function.child_by_field_name("scope")
-                && let Some(name) = function.child_by_field_name("name")
+                && let Some(name) = function
+                    .child_by_field_name("name")
+                    .and_then(cpp_callable_name_node)
             {
                 let member = cpp_node_text(name, ctx.source);
                 if let Some(owner) = ctx
@@ -389,7 +397,7 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                     }
                 }
             }
-            if cpp_unresolved_include_boundary(ctx.analyzer, ctx.file, text) {
+            if cpp_unresolved_include_boundary(ctx.analyzer, ctx.file, &text) {
                 return boundary(format!(
                     "`{text}` appears to cross a C++ include boundary not indexed in this workspace"
                 ));
@@ -399,12 +407,15 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                 format!("`{text}` did not resolve to an indexed C++ callable"),
             )
         }
-        "identifier" => {
-            let name = cpp_node_text(function, ctx.source);
+        "identifier" | "template_function" => {
+            let Some(name_node) = cpp_callable_name_node(function) else {
+                return no_definition("no_function_name", "C++ call name is blank");
+            };
+            let name = cpp_node_text(name_node, ctx.source);
             if name.is_empty() {
                 return no_definition("no_function_name", "C++ call name is blank");
             }
-            let bindings = cpp_bindings_before(ctx, ctx.root, function.start_byte());
+            let bindings = cpp_bindings_before(ctx, ctx.root, name_node.start_byte());
             if bindings.is_shadowed(name) {
                 return no_definition(
                     "local_variable_reference",
@@ -418,7 +429,7 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                 ctx.support,
                 name,
                 Some(CppTargetKind::FreeFunction),
-                None,
+                cpp_lexical_namespace(name_node, ctx.source).as_deref(),
             );
             if !candidates.is_empty() {
                 candidates = cpp_filter_candidates_by_call_lazy(
@@ -451,7 +462,7 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                 ctx.file,
                 ctx.source,
                 ctx.root,
-                function.start_byte(),
+                name_node.start_byte(),
             ) {
                 let member_candidates =
                     cpp_member_candidates_lazy(ctx, vec![owner], name, Some(call_arity), || {
@@ -482,6 +493,32 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
             ),
         ),
     }
+}
+
+fn cpp_callable_name_node(node: Node<'_>) -> Option<Node<'_>> {
+    if node.kind() == "template_function" {
+        node.child_by_field_name("name")
+    } else {
+        Some(node)
+    }
+}
+
+fn cpp_callable_reference_text(node: Node<'_>, source: &str) -> String {
+    if node.kind() == "qualified_identifier"
+        && let (Some(scope), Some(name)) = (
+            node.child_by_field_name("scope"),
+            node.child_by_field_name("name")
+                .and_then(cpp_callable_name_node),
+        )
+    {
+        return format!(
+            "{}::{}",
+            cpp_node_text(scope, source),
+            cpp_node_text(name, source)
+        );
+    }
+    let name = cpp_callable_name_node(node).unwrap_or(node);
+    cpp_node_text(name, source).to_string()
 }
 
 fn resolve_cpp_constructor(
