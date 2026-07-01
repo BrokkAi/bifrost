@@ -97,10 +97,9 @@ fn constructor_reference_to_class() {
 }
 
 // IntelliJ resolve/QualifiedTarget: `foo.bar = 1` — the `foo` receiver resolves
-// to the module-level target `foo = Foo()` (line 3). bifrost instead points at
-// the `foo` occurrence on line 4 (the reassignment-target statement).
+// to the module-level target `foo = Foo()` (line 3). An attribute-target
+// assignment (`foo.bar = 1`) no longer spuriously (re)declares `foo`/`bar`.
 #[test]
-#[ignore = "bifrost quirk: module target `foo` resolves to its line-4 occurrence, not the defining assignment on line 3"]
 fn module_target_reference() {
     assert_resolves_to_line(
         "QualifiedTarget.py",

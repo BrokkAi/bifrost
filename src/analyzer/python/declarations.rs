@@ -719,13 +719,20 @@ fn extract_python_supertypes(node: Node<'_>, source: &str) -> Vec<String> {
 fn collect_assigned_names(node: Node<'_>, source: &str) -> Vec<String> {
     let mut names = Vec::new();
     walk_named_tree_preorder(node, true, |node| {
-        if node.kind() == "identifier" {
-            let text = py_node_text(node, source).trim();
-            if !text.is_empty() {
-                names.push(text.to_string());
+        match node.kind() {
+            // An attribute or subscript target (`foo.bar = …`, `foo[i] = …`)
+            // mutates an existing object; it declares neither the receiver nor
+            // the member as a name, so do not descend into it.
+            "attribute" | "subscript" => WalkControl::SkipChildren,
+            "identifier" => {
+                let text = py_node_text(node, source).trim();
+                if !text.is_empty() {
+                    names.push(text.to_string());
+                }
+                WalkControl::Continue
             }
+            _ => WalkControl::Continue,
         }
-        WalkControl::Continue
     });
     names
 }
