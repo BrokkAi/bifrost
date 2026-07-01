@@ -797,6 +797,13 @@ fn csharp_receiver_type_units(
         "qualified_name" | "generic_name" => {
             csharp_visible_type_candidates(csharp, file, csharp_node_text(receiver, source))
         }
+        // `new Foo().Member` — the receiver is typed by the class being constructed.
+        "object_creation_expression" => receiver
+            .child_by_field_name("type")
+            .map(|type_node| {
+                csharp_visible_type_candidates(csharp, file, csharp_node_text(type_node, source))
+            })
+            .unwrap_or_default(),
         _ => Vec::new(),
     }
 }
